@@ -5,8 +5,10 @@
 //!   the local allowlist, unsafe identifiers, missing repo checkout, disk
 //!   below the floor. These can't succeed by waiting.
 //! - DEFER (hold in a FIFO queue, re-admit when a slot frees): at the
-//!   concurrency cap. The queue is drained by the build-finished hook —
-//!   the capacity-freed re-poll pattern.
+//!   concurrency cap, or below live resource headroom. The queue is drained by
+//!   the build-finished hook — the capacity-freed re-poll pattern — and, for a
+//!   headroom defer with nothing running to finish, by a waker
+//!   ([`spawn_headroom_waker`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -26,12 +28,96 @@ pub(crate) enum Admission {
     Reject(String),
 }
 
+/// Live resource headroom, as injected into [`admission_decision`].
+///
+/// `admission_decision` stays PURE — it takes this, it never probes. That is
+/// why the whole ladder is unit-testable without a live box, and it is also why
+/// a wrong threshold can be argued about in a test rather than in production.
+///
+/// Every field is `Option`: an unreadable sensor is UNKNOWN, and unknown means
+/// **no headroom opinion at all** (fail open). A telemetry gap must never brick
+/// the lane — the same posture the disk and commit probes already take.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Headroom {
+    /// Swap ceiling and how much of it is spent. Reported as a pair because a
+    /// bare byte count cannot be read as pressure — the ceiling differs per
+    /// host and per job.
+    pub(crate) swap_total_bytes: Option<u64>,
+    pub(crate) swap_used_bytes: Option<u64>,
+    /// Free commit (Windows) / MemAvailable (elsewhere) — the same quantity
+    /// [`MIN_FREE_COMMIT_GB`] rejects on, and the same one the A1 snapshot
+    /// publishes as `commit_available_bytes`.
+    pub(crate) commit_available_bytes: Option<u64>,
+}
+
+impl Headroom {
+    /// Fraction of the swap ceiling in use, or `None` when swap is unreadable
+    /// or the ceiling is zero (a box with no swap has no swap pressure to
+    /// measure — it has an OOM killer instead, which the commit floor covers).
+    pub(crate) fn swap_used_ratio(&self) -> Option<f64> {
+        let total = self.swap_total_bytes?;
+        let used = self.swap_used_bytes?;
+        (total > 0).then(|| used as f64 / total as f64)
+    }
+}
+
+/// Swap-utilisation fraction at which we stop **adding** CI load to this box.
+///
+/// **Swap leads, not `mem_available`.** This fleet measured it: on a saturated
+/// box `mem_used`/`mem_avail` are pinned by the kernel reserve and stay flat —
+/// −13.5 ± 11.2 M/day, indistinguishable from zero — while `swap_used` moved
+/// +138.6 ± 41.7 M/day over the same runs (plan
+/// `2026-07-28-coord-ci-memory-headroom-sizing-review`; the finding is written
+/// into `qontinui-coord/.github/scripts/resource-sampler.sh`'s own header:
+/// *"Leading with mem_avail is what let a saturating metric read as an
+/// all-clear."*). Ranking on memory-available here would reproduce the
+/// 2026-08-02 misdiagnosis in code.
+///
+/// **Why 0.5.** The threshold has to answer "can the remaining ceiling absorb
+/// one more of these jobs?", and a coord `rust-ci` job is known to consume
+/// ~14 GB while `coord-db-tests` fallocates 12 G of swap for itself. On a host
+/// whose swap ceiling is sized for roughly one such job, half-spent means the
+/// next one has nowhere to go. Half is also the point past which the ratio has
+/// stopped being noise on an idle box (steady-state here sits under 5%).
+///
+/// The cost of being wrong is bounded by the verdict, which is why this is a
+/// round number rather than a fitted one: too low and a build waits ~60s longer
+/// than it needed to; too high and it starts on a thrashing box. Deferring is
+/// recoverable in a way that a 0xc0000409 rustc abort — which poisons the
+/// incremental cache and makes the *next* build cold — is not.
+pub(crate) const SWAP_DEFER_RATIO: f64 = 0.5;
+
+/// Free-commit level at which we defer, expressed in GiB.
+///
+/// Strictly above [`MIN_FREE_COMMIT_GB`], and deliberately so: **you defer
+/// before you reject.** The reject floor is the last line — a build that gets
+/// there is turned away and coord must find another home for it. The defer band
+/// above it is where a build simply waits for the box to breathe, which is what
+/// memory pressure usually needs, because memory frees on its own and disk does
+/// not. Collapsing the two onto one number would turn every transient spike
+/// into a rejected dispatch.
+///
+/// It also sits above the supervisor's 5 GiB defer floor, which is intentional
+/// and not a drift: **CI work has somewhere else to go and a local build does
+/// not.** A deferred dispatch is one coord can hand to the other host; a
+/// deferred supervisor build is an operator waiting at a keyboard. The lane
+/// with an alternative should be the first to step back.
+pub(crate) const DEFER_FREE_COMMIT_GB: u64 = MIN_FREE_COMMIT_GB * 2;
+
 /// Pure admission decision over injected inputs (no globals — unit-tested
 /// without settings files or live state).
+///
+/// Order is load-bearing: **rejects first, then defers.** Nothing below the
+/// allowlist check can turn a `Defer` into a `Reject`, which is the property
+/// `at_cap_defers_never_rejects` pins and which the headroom arm must not
+/// weaken — coord *prefers*, the node *decides*, and a node that rejects on a
+/// transient reading makes coord re-home work that would have run fine in a
+/// minute.
 pub(crate) fn admission_decision(
     settings: &CiNodeSettings,
     repo: &str,
     running_count: usize,
+    headroom: Headroom,
 ) -> Admission {
     if !settings.enabled {
         return Admission::Reject("ci_node is disabled on this device".to_string());
@@ -44,7 +130,74 @@ pub(crate) fn admission_decision(
     if running_count >= settings.max_concurrent_builds.max(1) as usize {
         return Admission::Defer;
     }
+    if headroom_defers(headroom) {
+        return Admission::Defer;
+    }
     Admission::Proceed
+}
+
+/// `true` when live headroom says "not one more build right now".
+///
+/// Split out from [`admission_decision`] so the threshold policy can be
+/// exercised on its own, and so a future caller can ask the question without
+/// assembling a whole `CiNodeSettings`.
+pub(crate) fn headroom_defers(headroom: Headroom) -> bool {
+    // Swap FIRST — see `SWAP_DEFER_RATIO`.
+    if let Some(ratio) = headroom.swap_used_ratio() {
+        if ratio >= SWAP_DEFER_RATIO {
+            return true;
+        }
+    }
+    if let Some(free) = headroom.commit_available_bytes {
+        if free / (1024 * 1024 * 1024) < DEFER_FREE_COMMIT_GB {
+            return true;
+        }
+    }
+    // Every reading unavailable ⇒ no opinion ⇒ proceed. Fail open.
+    false
+}
+
+/// Live headroom probe. Every field degrades to `None` independently, so a
+/// partially-blind box still contributes the half it can read.
+///
+/// ## Windows deliberately supplies no swap reading
+///
+/// The swap-leads finding was measured on Linux, from `/proc/meminfo` and
+/// `free` — a real pagefile figure. On Windows, sysinfo derives "swap" from the
+/// commit charge (roughly commit-limit minus physical), so populating the swap
+/// fields there would not give the decision a second, independent signal: it
+/// would give it the SAME commit reading a second time, wearing a Linux name,
+/// and then compare it against a ratio calibrated on Linux. On this box that
+/// derived ratio sits near 0.44 while the machine is comfortably idle — it
+/// would defer builds on a healthy host.
+///
+/// So Windows leaves swap `None` and lets the commit arm decide, which is
+/// exactly the arm the supervisor and `cargo-guard.sh` already guard on. What
+/// must never happen — and does not, on either platform — is leading on
+/// *memory-available*, the metric this fleet measured as pinned under
+/// saturation. The `wsl` lane's REAL swap figures still reach coord in the A1
+/// sample (`fleet::resource_sample` reads them from `/proc/meminfo` inside the
+/// VM), where §B1's cross-machine ranking can use them honestly.
+fn probe_headroom() -> Headroom {
+    #[cfg(windows)]
+    let (swap_total_bytes, swap_used_bytes) = (None, None);
+
+    #[cfg(not(windows))]
+    let (swap_total_bytes, swap_used_bytes) = {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let total = sys.total_swap();
+        (
+            (total > 0).then_some(total),
+            (total > 0).then(|| sys.used_swap()),
+        )
+    };
+
+    Headroom {
+        swap_total_bytes,
+        swap_used_bytes,
+        commit_available_bytes: crate::fleet::resource_sample::available_commit_bytes(),
+    }
 }
 
 /// Allowlist match: an entry equals the full slug (`owner/name`) or the
@@ -56,57 +209,93 @@ pub(crate) fn repo_allowed(allowlist: &[String], repo: &str) -> bool {
         .any(|entry| entry == repo || entry == basename)
 }
 
-/// Pick the free space (GiB) of the volume holding `root` from a
-/// `(mount_point, available_bytes)` list — longest matching mount wins.
-/// Pure for tests; the live caller feeds it `sysinfo::Disks`.
-pub(crate) fn pick_volume_free_gb(mounts: &[(PathBuf, u64)], root: &Path) -> Option<u64> {
+/// Pick the volume holding `root` from a `(mount_point, total_bytes,
+/// available_bytes)` list — longest matching mount wins. Pure for tests; the
+/// live caller feeds it `sysinfo::Disks`.
+pub(crate) fn pick_volume<'a>(
+    mounts: &'a [(PathBuf, u64, u64)],
+    root: &Path,
+) -> Option<&'a (PathBuf, u64, u64)> {
     mounts
         .iter()
-        .filter(|(mount, _)| root.starts_with(mount))
-        .max_by_key(|(mount, _)| mount.as_os_str().len())
-        .map(|(_, avail)| avail / (1024 * 1024 * 1024))
+        .filter(|(mount, _, _)| root.starts_with(mount))
+        .max_by_key(|(mount, _, _)| mount.as_os_str().len())
 }
 
-/// Live free-disk probe for the QONTINUI_ROOT volume. `None` when the
-/// volume can't be resolved — the caller fails OPEN with a warning (a
-/// telemetry gap must not brick the lane; the 20 GiB floor is a guard, not
-/// a security boundary).
-fn free_disk_gb_for(root: &Path) -> Option<u64> {
+/// Live volume probe for `root`: `(mount_point, total_bytes,
+/// available_bytes)`. `None` when the volume can't be resolved — every caller
+/// fails OPEN with a warning (a telemetry gap must not brick the lane; the
+/// 20 GiB floor is a guard, not a security boundary).
+///
+/// One probe site, shared by the disk floor and by the A1 resource sample
+/// (`fleet::resource_sample`), so the number the dashboard renders and the
+/// number the gate trips on are literally the same reading. Two probes of "free
+/// disk" that disagree is how an operator ends up debugging the dashboard
+/// instead of the machine.
+pub(crate) fn probe_volume_for(root: &Path) -> Option<(PathBuf, u64, u64)> {
     let disks = sysinfo::Disks::new_with_refreshed_list();
-    let mounts: Vec<(PathBuf, u64)> = disks
+    let mounts: Vec<(PathBuf, u64, u64)> = disks
         .list()
         .iter()
-        .map(|d| (d.mount_point().to_path_buf(), d.available_space()))
+        .map(|d| {
+            (
+                d.mount_point().to_path_buf(),
+                d.total_space(),
+                d.available_space(),
+            )
+        })
         .collect();
-    pick_volume_free_gb(&mounts, root)
+    pick_volume(&mounts, root).cloned()
 }
 
-/// Minimum available RAM (GiB) to START a build (plan §4.6: "minimum free
-/// RAM" alongside the disk floor). Fixed rather than a setting — 4 GiB is
-/// well under any machine that can build these workspaces at all, so the
-/// gate only trips when the box is genuinely starved and one more rustc
-/// would push it into OOM/thrash territory.
-pub(crate) const MIN_FREE_RAM_GB: u64 = 4;
+fn free_disk_gb_for(root: &Path) -> Option<u64> {
+    probe_volume_for(root).map(|(_, _, avail)| avail / (1024 * 1024 * 1024))
+}
 
-/// `true` when available RAM is below the floor. Pure over injected bytes.
-pub(crate) fn ram_below_floor(available_bytes: u64, floor_gb: u64) -> bool {
+/// Minimum free **commit** (GiB) to START a build (plan §4.6: "minimum free
+/// RAM" alongside the disk floor).
+///
+/// ## The quantity (plan §A3)
+///
+/// Renamed from `MIN_FREE_RAM_GB` because the old name was the bug. Three
+/// lanes guard builds on this machine — the supervisor's build pool
+/// (5 GiB), `cargo-guard.sh` (5 GiB), and this one — and the first two already
+/// read Windows **free commit** by design, `available_commit_bytes()`
+/// documenting that "keeping both lanes on one metric is the point". `ci_node`
+/// was the sole divergence: it probed sysinfo's available-memory reading,
+/// which on Windows is physical-available, not commit. So "4 GB free" here and
+/// "5 GB free" there were not 1 GiB apart — they were different quantities that
+/// happened to share a unit, and nothing could detect that, because nothing
+/// could see both. It now reads
+/// [`crate::fleet::resource_sample::available_commit_bytes`], the same function
+/// that produces the A1 snapshot's `commit_available_bytes` column.
+///
+/// ## The number, and why it is LOWER than the supervisor's 5
+///
+/// Converging the quantity must not converge the **verdict**, and it has not:
+/// this floor is a hard **reject** (a dispatch coord must re-home), while the
+/// supervisor's is a **defer** (a build that waits). A rejecting lane must sit
+/// *below* a deferring one, or it would turn away work the deferring lane would
+/// happily have run a minute later. 4 GiB is well under any machine that can
+/// build these workspaces at all, so the gate only trips when the box is
+/// genuinely starved and one more rustc would push it into OOM/thrash territory
+/// — and [`DEFER_FREE_COMMIT_GB`] gives this lane its own defer band above it.
+pub(crate) const MIN_FREE_COMMIT_GB: u64 = 4;
+
+/// `true` when free commit is below the floor. Pure over injected bytes.
+pub(crate) fn commit_below_floor(available_bytes: u64, floor_gb: u64) -> bool {
     available_bytes / (1024 * 1024 * 1024) < floor_gb
-}
-
-/// Live available-RAM probe. `None` degrades to fail-open like the disk
-/// probe (a telemetry gap must not brick the lane).
-fn available_ram_bytes() -> Option<u64> {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    let avail = sys.available_memory();
-    (avail > 0).then_some(avail)
 }
 
 struct CiState {
     /// dispatch_id → cancel token for the running build.
     running: HashMap<String, CancellationToken>,
-    /// Deferred (at-cap) dispatches, FIFO.
+    /// Deferred (at-cap, or below headroom) dispatches, FIFO.
     queued: VecDeque<CiDispatchPayload>,
+    /// A [`spawn_headroom_waker`] task is in flight. At most one, ever —
+    /// otherwise a box that stays under the headroom threshold would accrue one
+    /// sleeping task per redelivered dispatch.
+    waker_armed: bool,
 }
 
 fn ci_state() -> &'static Mutex<CiState> {
@@ -115,8 +304,17 @@ fn ci_state() -> &'static Mutex<CiState> {
         Mutex::new(CiState {
             running: HashMap::new(),
             queued: VecDeque::new(),
+            waker_armed: false,
         })
     })
+}
+
+/// `(running, queued)` — this device's live CI occupancy, for the A1 resource
+/// sample. The sample reports the same numbers admission decides on, so the
+/// dashboard cannot show a device idle while it is deferring work.
+pub(crate) fn occupancy() -> (usize, usize) {
+    let state = ci_state().lock().unwrap();
+    (state.running.len(), state.queued.len())
 }
 
 /// Coord base for reporting on a payload (payload-pinned URL first, profile
@@ -156,6 +354,10 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
     }
 
     let settings = crate::settings::get_ci_node_settings();
+    // Probed OUTSIDE the state lock: `sysinfo` refreshes touch the OS, and
+    // holding the admission mutex across that would serialise every dispatch
+    // behind one machine probe.
+    let headroom = probe_headroom();
     let decision = {
         let state = ci_state().lock().unwrap();
         // Dedup: a dispatch already running or queued here is a duplicate
@@ -172,22 +374,75 @@ pub(crate) fn submit(payload: CiDispatchPayload) {
             );
             return;
         }
-        admission_decision(&settings, &payload.repo, state.running.len())
+        admission_decision(&settings, &payload.repo, state.running.len(), headroom)
     };
 
     match decision {
         Admission::Reject(reason) => reject(&payload, reason),
         Admission::Defer => {
+            let (dispatch_id, repo) = (payload.dispatch_id.clone(), payload.repo.clone());
+            let (depth, needs_waker) = {
+                let mut state = ci_state().lock().unwrap();
+                state.queued.push_back(payload);
+                // An at-cap defer is drained by `on_build_finished` — something
+                // is running, so something will finish. A HEADROOM defer has no
+                // such guarantee: with nothing running, nothing will ever
+                // finish, and the dispatch would sit in the queue until its
+                // lease expired with no local trace. Arm a waker for exactly
+                // that case.
+                let needs = state.running.is_empty() && !state.waker_armed;
+                if needs {
+                    state.waker_armed = true;
+                }
+                (state.queued.len(), needs)
+            };
             info!(
-                "ci_node: at capacity — deferring dispatch {} for {} (queue depth {})",
-                payload.dispatch_id,
-                payload.repo,
-                ci_state().lock().unwrap().queued.len() + 1
+                "ci_node: deferring dispatch {dispatch_id} for {repo} (queue depth {depth}, \
+                 waker_armed={needs_waker}) — at cap or below live headroom {headroom:?}"
             );
-            ci_state().lock().unwrap().queued.push_back(payload);
+            if needs_waker {
+                spawn_headroom_waker();
+            }
         }
         Admission::Proceed => start_build(payload, settings),
     }
+}
+
+/// How long a headroom-deferred dispatch waits before we re-test the box.
+///
+/// Long enough that a defer is not a busy-loop against `sysinfo`, short enough
+/// that a spike which clears in a minute costs a minute. Memory pressure here
+/// is typically transient — that is the whole reason this arm defers instead of
+/// rejecting.
+const HEADROOM_RETRY_SECS: u64 = 60;
+
+/// Re-test admission for the head of the queue after [`HEADROOM_RETRY_SECS`].
+///
+/// Only ever one in flight (`waker_armed`). It disarms *before* re-submitting,
+/// so a dispatch that defers again immediately re-arms rather than being
+/// stranded by its own predecessor's flag.
+fn spawn_headroom_waker() {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(HEADROOM_RETRY_SECS)).await;
+        let next = {
+            let mut state = ci_state().lock().unwrap();
+            state.waker_armed = false;
+            // If a build started in the meantime, `on_build_finished` owns the
+            // drain again and this waker has nothing to do.
+            if state.running.is_empty() {
+                state.queued.pop_front()
+            } else {
+                None
+            }
+        };
+        if let Some(payload) = next {
+            info!(
+                "ci_node: re-testing headroom for deferred dispatch {}",
+                payload.dispatch_id
+            );
+            submit(payload);
+        }
+    });
 }
 
 /// Start one admitted build: disk floor gate, then spawn the executor task
@@ -224,21 +479,23 @@ fn start_build(payload: CiDispatchPayload, settings: CiNodeSettings) {
         ),
     }
 
-    // RAM floor (plan §4.6): a build admitted onto a starved box would OOM
-    // the developer's own work before it OOMs itself.
-    match available_ram_bytes() {
-        Some(avail) if ram_below_floor(avail, MIN_FREE_RAM_GB) => {
+    // Memory floor (plan §4.6): a build admitted onto a starved box would OOM
+    // the developer's own work before it OOMs itself. Reads free COMMIT — the
+    // same quantity the supervisor and `cargo-guard.sh` guard on and the same
+    // one the A1 snapshot publishes; see `MIN_FREE_COMMIT_GB`.
+    match crate::fleet::resource_sample::available_commit_bytes() {
+        Some(avail) if commit_below_floor(avail, MIN_FREE_COMMIT_GB) => {
             reject(
                 &payload,
                 format!(
-                    "available RAM {} GiB is below the {MIN_FREE_RAM_GB} GiB floor",
+                    "free commit {} GiB is below the {MIN_FREE_COMMIT_GB} GiB floor",
                     avail / (1024 * 1024 * 1024)
                 ),
             );
             return;
         }
         Some(_) => {}
-        None => warn!("ci_node: could not resolve available RAM — proceeding (fail-open guard)"),
+        None => warn!("ci_node: could not resolve free commit — proceeding (fail-open guard)"),
     }
 
     let token = CancellationToken::new();
@@ -272,8 +529,8 @@ fn start_build(payload: CiDispatchPayload, settings: CiNodeSettings) {
 }
 
 /// Build-finished hook: free the slot, then re-admit the oldest deferred
-/// dispatch (fresh settings + disk gate — conditions may have changed while
-/// it waited).
+/// dispatch (fresh settings + fresh headroom + disk gate — conditions may have
+/// changed while it waited).
 fn on_build_finished(dispatch_id: &str) {
     let next = {
         let mut state = ci_state().lock().unwrap();
@@ -351,11 +608,20 @@ mod tests {
         }
     }
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Every sensor unreadable. This is what an admission call looks like on a
+    /// box whose telemetry has gone dark, and it must behave exactly as the
+    /// pre-headroom code did — which is why every legacy test below passes it.
+    fn blind() -> Headroom {
+        Headroom::default()
+    }
+
     #[test]
     fn disabled_is_a_hard_reject() {
         let s = settings(false, &["qontinui-runner"], 1);
         assert!(matches!(
-            admission_decision(&s, "qontinui/qontinui-runner", 0),
+            admission_decision(&s, "qontinui/qontinui-runner", 0, blind()),
             Admission::Reject(r) if r.contains("disabled")
         ));
     }
@@ -364,13 +630,13 @@ mod tests {
     fn unlisted_repo_is_a_hard_reject_and_empty_allowlist_runs_nothing() {
         let s = settings(true, &["qontinui-runner"], 1);
         assert!(matches!(
-            admission_decision(&s, "qontinui/qontinui-coord", 0),
+            admission_decision(&s, "qontinui/qontinui-coord", 0, blind()),
             Admission::Reject(r) if r.contains("repo_allowlist")
         ));
         // Empty allowlist = nothing runnable, even enabled.
         let s = settings(true, &[], 1);
         assert!(matches!(
-            admission_decision(&s, "qontinui/qontinui-runner", 0),
+            admission_decision(&s, "qontinui/qontinui-runner", 0, blind()),
             Admission::Reject(_)
         ));
     }
@@ -379,21 +645,159 @@ mod tests {
     fn at_cap_defers_never_rejects() {
         let s = settings(true, &["qontinui-runner"], 1);
         assert_eq!(
-            admission_decision(&s, "qontinui/qontinui-runner", 1),
+            admission_decision(&s, "qontinui/qontinui-runner", 1, blind()),
             Admission::Defer
         );
         // Below cap proceeds.
         assert_eq!(
-            admission_decision(&s, "qontinui/qontinui-runner", 0),
+            admission_decision(&s, "qontinui/qontinui-runner", 0, blind()),
             Admission::Proceed
         );
         // cap=0 is treated as 1 (a nonsensical hand-edit must not brick
         // admission into permanent deferral at running=0).
         let s0 = settings(true, &["qontinui-runner"], 0);
         assert_eq!(
-            admission_decision(&s0, "qontinui/qontinui-runner", 0),
+            admission_decision(&s0, "qontinui/qontinui-runner", 0, blind()),
             Admission::Proceed
         );
+    }
+
+    // ---- §B2 lever #3: defer on live headroom ----
+
+    #[test]
+    fn swap_pressure_defers_even_with_a_free_slot() {
+        let s = settings(true, &["qontinui-runner"], 4);
+        // Below the ratio: proceed. `mem_avail`-equivalent is deliberately
+        // healthy in BOTH cases — the point of leading on swap is that a
+        // roomy-looking memory reading must not veto the swap signal.
+        let calm = Headroom {
+            swap_total_bytes: Some(8 * GIB),
+            swap_used_bytes: Some(3 * GIB), // 37.5%
+            commit_available_bytes: Some(24 * GIB),
+        };
+        assert_eq!(
+            admission_decision(&s, "qontinui/qontinui-runner", 0, calm),
+            Admission::Proceed
+        );
+
+        let pressed = Headroom {
+            swap_used_bytes: Some(4 * GIB), // exactly 50% — the threshold is inclusive
+            ..calm
+        };
+        assert_eq!(
+            admission_decision(&s, "qontinui/qontinui-runner", 0, pressed),
+            Admission::Defer,
+            "swap at the ceiling ratio must defer even though the box is far \
+             below its concurrency cap and mem/commit look healthy"
+        );
+    }
+
+    #[test]
+    fn low_free_commit_defers_above_the_reject_floor() {
+        let s = settings(true, &["qontinui-runner"], 4);
+        // Between the reject floor (4 GiB) and the defer band (8 GiB): the
+        // build waits, it is NOT turned away.
+        let squeezed = Headroom {
+            swap_total_bytes: Some(8 * GIB),
+            swap_used_bytes: Some(0),
+            commit_available_bytes: Some(6 * GIB),
+        };
+        assert_eq!(
+            admission_decision(&s, "qontinui/qontinui-runner", 0, squeezed),
+            Admission::Defer
+        );
+        assert!(
+            DEFER_FREE_COMMIT_GB > MIN_FREE_COMMIT_GB,
+            "you defer before you reject — a defer band at or below the reject \
+             floor would make the defer arm unreachable"
+        );
+        // Just inside the band boundary proceeds.
+        assert_eq!(
+            admission_decision(
+                &s,
+                "qontinui/qontinui-runner",
+                0,
+                Headroom {
+                    commit_available_bytes: Some(DEFER_FREE_COMMIT_GB * GIB),
+                    ..squeezed
+                }
+            ),
+            Admission::Proceed
+        );
+    }
+
+    #[test]
+    fn headroom_never_rejects() {
+        let s = settings(true, &["qontinui-runner"], 4);
+        // The worst reading we can construct: swap full, commit gone.
+        let starved = Headroom {
+            swap_total_bytes: Some(8 * GIB),
+            swap_used_bytes: Some(8 * GIB),
+            commit_available_bytes: Some(0),
+        };
+        for running in [0usize, 1, 9] {
+            assert!(
+                !matches!(
+                    admission_decision(&s, "qontinui/qontinui-runner", running, starved),
+                    Admission::Reject(_)
+                ),
+                "headroom is a DEFER lever; coord prefers, the node decides, and \
+                 a transient reading must never re-home work (running={running})"
+            );
+        }
+        assert_eq!(
+            admission_decision(&s, "qontinui/qontinui-runner", 0, starved),
+            Admission::Defer
+        );
+    }
+
+    #[test]
+    fn an_unreadable_sensor_fails_open() {
+        let s = settings(true, &["qontinui-runner"], 4);
+        // Nothing readable at all — the pre-headroom behaviour, exactly.
+        assert_eq!(
+            admission_decision(&s, "qontinui/qontinui-runner", 0, blind()),
+            Admission::Proceed,
+            "a telemetry gap must never brick the lane"
+        );
+        // Half-blind boxes still use the half they can read, and a swap
+        // ceiling of zero is 'no swap pressure to measure', not 'saturated'.
+        let no_swap = Headroom {
+            swap_total_bytes: Some(0),
+            swap_used_bytes: Some(0),
+            commit_available_bytes: Some(24 * GIB),
+        };
+        assert_eq!(no_swap.swap_used_ratio(), None);
+        assert_eq!(
+            admission_decision(&s, "qontinui/qontinui-runner", 0, no_swap),
+            Admission::Proceed
+        );
+        // A used-without-total reading is not a ratio.
+        assert_eq!(
+            Headroom {
+                swap_total_bytes: None,
+                swap_used_bytes: Some(9 * GIB),
+                commit_available_bytes: None,
+            }
+            .swap_used_ratio(),
+            None
+        );
+        assert!(!headroom_defers(blind()));
+    }
+
+    #[test]
+    fn swap_is_ranked_before_memory_not_after() {
+        // The measured failure this ordering exists to prevent: on a saturated
+        // box mem/commit read as an all-clear while swap is the metric that
+        // actually moved (-13.5 +/- 11.2 M/day vs +138.6 +/- 41.7 M/day). If
+        // commit were consulted first, or swap ignored, this would proceed.
+        let saturating = Headroom {
+            swap_total_bytes: Some(8 * GIB),
+            swap_used_bytes: Some(7 * GIB),
+            commit_available_bytes: Some(64 * GIB), // "plenty of memory"
+        };
+        assert!(headroom_defers(saturating));
+        assert_eq!(SWAP_DEFER_RATIO, 0.5);
     }
 
     #[test]
@@ -417,36 +821,69 @@ mod tests {
     }
 
     #[test]
-    fn ram_floor_threshold() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        assert!(ram_below_floor(3 * GIB, MIN_FREE_RAM_GB));
-        assert!(ram_below_floor(4 * GIB - 1, MIN_FREE_RAM_GB));
-        assert!(!ram_below_floor(4 * GIB, MIN_FREE_RAM_GB));
-        assert!(!ram_below_floor(64 * GIB, MIN_FREE_RAM_GB));
+    fn commit_floor_threshold() {
+        assert!(commit_below_floor(3 * GIB, MIN_FREE_COMMIT_GB));
+        assert!(commit_below_floor(4 * GIB - 1, MIN_FREE_COMMIT_GB));
+        assert!(!commit_below_floor(4 * GIB, MIN_FREE_COMMIT_GB));
+        assert!(!commit_below_floor(64 * GIB, MIN_FREE_COMMIT_GB));
+    }
+
+    /// §A3: the floor and the published snapshot must resolve their memory
+    /// quantity from ONE function.
+    ///
+    /// Pinned at the SOURCE level rather than by comparing two live readings —
+    /// free commit changes between any two calls, so a value comparison here
+    /// would be a flake generator. What is worth pinning is not the number, it
+    /// is that there is only one place the number comes from: the old defect
+    /// was invisible precisely because two lanes each had their own probe, and
+    /// "4 GB free" here and "5 GB free" in the supervisor were not 1 GiB apart
+    /// but two different quantities sharing a unit.
+    #[test]
+    fn the_memory_floor_reads_the_published_snapshot_field() {
+        const SRC: &str = include_str!("admission.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(SRC);
+        assert!(
+            !prod.contains("available_memory()"),
+            "ci_node must resolve its memory floor from \
+             `fleet::resource_sample::available_commit_bytes`, not a private \
+             physical-available reading of its own (plan §A3)"
+        );
+        assert!(
+            prod.contains("resource_sample::available_commit_bytes()"),
+            "the floor's probe must be the shared one"
+        );
     }
 
     #[test]
     fn volume_pick_prefers_longest_mount_prefix() {
         let mounts = vec![
-            (PathBuf::from("C:\\"), 5 * 1024 * 1024 * 1024_u64),
-            (PathBuf::from("D:\\"), 100 * 1024 * 1024 * 1024_u64),
+            (PathBuf::from("C:\\"), 20 * GIB, 5 * GIB),
+            (PathBuf::from("D:\\"), 200 * GIB, 100 * GIB),
         ];
         // Windows-shaped paths only resolve on Windows path semantics;
         // use starts_with-compatible shapes for a portable test instead.
         let mounts_portable = vec![
-            (PathBuf::from("/"), 5 * 1024 * 1024 * 1024_u64),
-            (PathBuf::from("/data"), 100 * 1024 * 1024 * 1024_u64),
+            (PathBuf::from("/"), 20 * GIB, 5 * GIB),
+            (PathBuf::from("/data"), 200 * GIB, 100 * GIB),
         ];
         assert_eq!(
-            pick_volume_free_gb(&mounts_portable, Path::new("/data/qontinui-root")),
-            Some(100)
+            pick_volume(&mounts_portable, Path::new("/data/qontinui-root")).map(|v| v.2),
+            Some(100 * GIB)
+        );
+        // The sample reports total + mount alongside free, from this same pick.
+        assert_eq!(
+            pick_volume(&mounts_portable, Path::new("/data/qontinui-root")).map(|v| v.1),
+            Some(200 * GIB)
         );
         assert_eq!(
-            pick_volume_free_gb(&mounts_portable, Path::new("/home/x")),
-            Some(5)
+            pick_volume(&mounts_portable, Path::new("/home/x")).map(|v| v.2),
+            Some(5 * GIB)
         );
         assert_eq!(
-            pick_volume_free_gb(&mounts, Path::new("/nowhere")),
+            pick_volume(&mounts, Path::new("/nowhere")),
             None,
             "no matching mount → None (caller fails open)"
         );

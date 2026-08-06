@@ -40,6 +40,12 @@ use tracing::{debug, info, warn};
 
 use crate::database::pg::PgDb;
 
+/// Per-machine resource samples (plan §A1/§A2). Driven from
+/// [`spawn_budget_republisher`] so it inherits that function's
+/// shared-machine-state ownership gate instead of restating it — see the
+/// module docs.
+pub(crate) mod resource_sample;
+
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
 /// as `Build`. Dev workstations collapse both onto one machine_id
@@ -649,7 +655,7 @@ pub async fn publish_on_startup(role: MachineRole) {
 
 /// Re-publish cadence for [`spawn_budget_republisher`], in seconds.
 /// Overridable via `COORD_BUDGET_REPUBLISH_SECS`, floored at 60s.
-const BUDGET_REPUBLISH_DEFAULT_SECS: u64 = 600;
+pub(crate) const BUDGET_REPUBLISH_DEFAULT_SECS: u64 = 600;
 
 /// Resolve the re-publish interval, applying the 60s floor.
 fn budget_republish_secs() -> u64 {
@@ -690,6 +696,30 @@ fn budget_republish_secs() -> u64 {
 /// `fleet-heartbeat` thread rather than `fleet-publishers`, so the sweep tasks
 /// that block that runtime for minutes at a time (the 2026-06-03 heartbeat
 /// starvation) cannot stall the re-assert either.
+///
+/// ## It also drives the resource sampler (plan §A1/§A2)
+///
+/// [`resource_sample::publish_once`] rides this loop rather than getting a
+/// timer of its own, for two reasons that point the same way:
+///
+/// 1. **The gate.** Every runner on the box shares one `machine.json`, hence
+///    one `device_id`, so a `test-*` runner's samples would be
+///    indistinguishable from the primary's while describing a different
+///    workload — and coord's allocator reads them. The early return above is
+///    the same shared-machine-state ownership check that protects the budget
+///    column; hanging the sampler off it inherits that rather than restating it.
+/// 2. **One periodic publisher.** A second timer is a second thing to reason
+///    about at 3 a.m.
+///
+/// The two payloads keep **separate cadences**: the loop ticks on the sample
+/// interval (30s, jittered) and re-asserts the budget only once its own,
+/// much slower deadline has passed. The budget is an *authoritative column*
+/// coord's dispatchers read as declared capacity; a sample is an *observation*
+/// that ages out. Re-asserting an authoritative value fast buys nothing and
+/// multiplies the blast radius of a wrong one. The budget's effective cadence
+/// therefore has up to one sample interval of granularity error (600s becomes
+/// 600–630s), which is immaterial for a self-heal loop and is the price of not
+/// running two timers.
 pub fn spawn_budget_republisher(role: MachineRole) {
     if !budget_publish_allowed(crate::instance::owns_shared_root_state()) {
         info!(
@@ -699,25 +729,41 @@ pub fn spawn_budget_republisher(role: MachineRole) {
         );
         return;
     }
-    let secs = budget_republish_secs();
-    info!("fleet::budget_republisher: starting, interval={secs}s");
+    let budget_secs = budget_republish_secs();
+    let sample_secs = resource_sample::sample_interval_secs();
+    info!(
+        "fleet::budget_republisher: starting, budget_interval={budget_secs}s \
+         resource_sample_interval={sample_secs}s"
+    );
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(secs));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // The boot publish already ran on the publishers thread; skip the
-        // immediate tick `interval` always yields so the first re-assert
-        // happens one full period later.
-        tick.tick().await;
+        // Sleep-per-iteration rather than `tokio::time::interval`, because the
+        // sample cadence is jittered. It keeps `MissedTickBehavior::Skip`
+        // semantics for free: a tick that ran long simply delays the next one,
+        // never a catch-up burst of POSTs against a coord that was slow.
+        //
+        // The boot publish already ran on the publishers thread, so neither
+        // payload fires immediately — the first sample lands one sample
+        // interval in, the first re-assert one full budget period in.
+        let mut next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
         loop {
-            tick.tick().await;
-            // Resources are re-detected each tick: disk fills, and the
-            // ci_node settings this derives `max_concurrent_builds` from can
-            // change while the runner is up (the setting is designed to need
-            // no restart — `ci_node/subscription.rs` re-reads it every loop).
+            tokio::time::sleep(resource_sample::jittered_sleep(sample_secs)).await;
+
+            // Observation lane: best-effort, never retried, never fatal.
+            resource_sample::publish_once().await;
+
+            if tokio::time::Instant::now() < next_budget {
+                continue;
+            }
+            // Authoritative lane. Resources are re-detected each time: disk
+            // fills, and the ci_node settings this derives
+            // `max_concurrent_builds` from can change while the runner is up
+            // (the setting is designed to need no restart —
+            // `ci_node/subscription.rs` re-reads it every loop).
             let resources = detect_resources();
             if let Err(e) = publish_budget(role, resources, 0).await {
                 warn!("fleet::budget_republisher: re-publish failed (will retry): {e}");
             }
+            next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
         }
     });
 }
