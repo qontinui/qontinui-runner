@@ -572,11 +572,80 @@ async fn health(
         pg_reachable,
     );
 
-    // One-way readiness flag flipped by the first successful UI Bridge IPC
-    // response (see `mcp::ui_bridge::request::ui_bridge_request_inner`).
-    // Distinguishes "Tauri shell is responsive" from "React app has actually
-    // mounted past App.tsx's loading screen and is processing UI Bridge IPC".
-    let frontend_ready = state.app_state.frontend_ready.load(Ordering::Relaxed);
+    // `frontendReady` is DERIVED, not latched (2026-08-05).
+    //
+    // It used to be `AppState::frontend_ready`, a one-way latch flipped by the
+    // first successful UI Bridge IPC response. Nothing inside the runner ever
+    // drives that path — the 3s `ui-bridge-ping`/`ui-bridge-pong` loop bypasses
+    // it, and the startup `ui_bridge_invoke_probe` uses its own invoke store —
+    // so on a perfectly healthy, idle runner the latch stayed `false` until
+    // some EXTERNAL client happened to call a `/ui-bridge/*` route. It measured
+    // "has anyone used the UI Bridge yet", not "is the frontend ready", and
+    // because it was one-way it was also wrong in the other direction: once
+    // true it stayed true through a dead WebView2 host.
+    //
+    // Worse, the two states were indistinguishable: a frontend that never
+    // loaded (2026-08-05 morning: every invoke probe logged "frontend did not
+    // reply within probe timeout") and a frontend serving a full 16-element
+    // snapshot both read `frontendReady: false`.
+    //
+    // `classify_frontend_state` already answers this exact question correctly
+    // and is IPC-free by construction, so it works precisely when the React
+    // tree is down. It was built for the identical defect on the UI-Bridge
+    // diagnostics routes ("`ready`/`sdk_connected` used to be `last_pong > 0`,
+    // a latch that flips true on the first pong and is never reset"); /health
+    // simply never adopted it. The pong is emitted from React
+    // (`useUIBridgeEventHandler.ts`), from the SAME `useEffect` that registers
+    // the `ui-bridge-request` listener — so a pong already proves both that the
+    // app mounted past the loading screen and that the UI-Bridge listener is
+    // wired. That is the whole distinction the latch claimed to draw, and the
+    // pong establishes it on a self-driving 3s loop instead of waiting on
+    // external traffic.
+    let main_window = {
+        use tauri::Manager;
+        state
+            .app_handle
+            .get_webview_window(qontinui_runner_lib::get_main_window_label())
+    };
+    let frontend_state = crate::mcp::ui_bridge::request::classify_frontend_state(
+        crate::mcp::ui_bridge::request::FrontendStateInputs {
+            window_exists: main_window.is_some(),
+            window_visible: main_window
+                .as_ref()
+                .and_then(|w| w.is_visible().ok())
+                .unwrap_or(false),
+            last_pong,
+            last_pong_age_ms: pong_age_ms,
+            console_error_count: console_errors,
+            process_uptime_ms: uptime_secs.saturating_mul(1000),
+            has_ui_error: ui_error_snapshot.is_some(),
+        },
+    );
+    // `Responsive` specifically, NOT `is_ready()`. The two diagnostics routes
+    // use `is_ready()` to answer a different question ("has the SDK ever
+    // connected and not since crashed"), and it is deliberately lenient:
+    // `last_pong > 0 && != TreeCrashed` reports READY for a `WindowMissing`
+    // frontend whose WebView is gone (asserted in `request.rs`'s
+    // `frontend_state_tests`). For `/health`'s `frontendReady` the useful
+    // question is "can the frontend serve a UI Bridge call right now", so every
+    // non-`Responsive` branch — missing window, booting, never ponged, crashed
+    // tree, gone silent — is not ready.
+    //
+    // This makes `frontendReady` strictly stronger than the sibling
+    // `responsive` field (a 15s pong-age test): it additionally requires that
+    // the WebView window exists and that React's error boundary is not holding
+    // a throw. Those are precisely the two failures a pong CANNOT see, because
+    // the SDK's pong loop survives under the error boundary's fallback.
+    let frontend_ready =
+        frontend_state == crate::mcp::ui_bridge::request::FrontendState::Responsive;
+
+    // The raw latch is preserved under an honest name rather than deleted: "a
+    // full UI-Bridge request/response round-trip has completed at least once
+    // since boot" is genuinely useful — it exercises the entire path end to end
+    // (request emitted → frontend handler ran → response decoded on the oneshot
+    // channel), which a pong does not. It just isn't readiness, and it can only
+    // ever become true if something external asks.
+    let ui_bridge_ipc_observed = state.app_state.frontend_ready.load(Ordering::Relaxed);
 
     // Build/deploy drift vs origin/main (plan 2026-07-03-runner-session-
     // tracking-drift-and-guardrails Phase 3 item 3). `mainSha` is
@@ -591,6 +660,14 @@ async fn health(
         "ready": last_pong > 0,
         "responsive": responsive,
         "frontendReady": frontend_ready,
+        // Why `frontendReady` is what it is. A bare boolean cannot separate
+        // "still booting" from "never mounted" from "mounted then crashed" from
+        // "went silent"; this names the branch that decided.
+        "frontendState": frontend_state.as_str(),
+        // "A UI-Bridge request/response round-trip has completed since boot."
+        // NOT readiness — externally driven and one-way. See the derivation
+        // comment above.
+        "uiBridgeIpcObserved": ui_bridge_ipc_observed,
         "lastHeartbeat": last_pong,
         "heartbeatAgeMs": pong_age_ms,
         "uptimeSeconds": uptime_secs,
@@ -621,6 +698,14 @@ async fn health(
         // chains missed (plain shell, or a session that never sniffed/
         // registered).
         "selfId": self_id_health_snapshot(),
+        // Semantic recall (plan 2026-07-30, Phase 3): how each proxied
+        // `coord_memory_search` ended — did it get a query vector or not.
+        // Non-search traffic is neither touched nor counted, so `enriched`
+        // climbing is the only positive proof the semantic arm is actually
+        // firing; the arm can silently stop (dead embedder, tool rename, a
+        // coord parameter rename) and degrade to FTS-only with no other
+        // signal at the call site.
+        "memorySearchEnrichment": memory_enrich_health_snapshot(),
         // Session-fabric Phase 3: how each `POST /coord/session-handles/register`
         // ended, since this process booted. coord records nothing for a
         // REFUSED bind, so a systematically-denied registry (the wrong
@@ -673,6 +758,24 @@ async fn health(
         "ui_error": ui_error_json.clone(),
         "recent_crash": recent_crash_json.clone(),
     });
+
+    // Debug builds only: routes caught shipping a non-JSON error body, i.e.
+    // handlers that bypassed the canonical envelope. `count` is 0 on a healthy
+    // build; anything else is a handler bug with the offending routes listed.
+    //
+    // This is the surface that replaced `envelope_audit`'s panic. A panic was
+    // swallowed by `CatchPanicLayer` and left nothing a caller could assert on;
+    // this is queryable, cumulative, and survives the request that produced it.
+    #[cfg(debug_assertions)]
+    {
+        data.as_object_mut().unwrap().insert(
+            "envelopeViolations".to_string(),
+            serde_json::json!({
+                "count": crate::mcp::envelope_audit::violation_count(),
+                "recent": crate::mcp::envelope_audit::violations(),
+            }),
+        );
+    }
 
     if let Some((screenshot, width, height)) = diagnostic_screenshot {
         data.as_object_mut().unwrap().insert(
@@ -1285,6 +1388,271 @@ fn coord_mcp_request_gate_one(req: &serde_json::Value) -> Result<(), CoordMcpBod
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Semantic recall: fill in `coord_memory_search`'s query vector
+// (plan `2026-07-30-semantic-recall-query-embedding-via-runner`, Phases 2-3)
+//
+// The web backend accepts a query vector and by DESIGN never computes one, so
+// coord's memory search has always run full-text only. The runner is the
+// fleet's embedder (`2026-07-13-runner-paid-embedding`) and is already sitting
+// in the request path, so it is the one place that can put an existing vector
+// into an existing field. Coord's side of the wire contract landed first
+// (coord `bd0d30f3`) and must be SERVING before this enriches anything —
+// `additionalProperties: false` would otherwise reject the fields.
+// ---------------------------------------------------------------------------
+
+/// Hard ceiling on the query embed.
+///
+/// This MUST be imposed out here: `EmbeddingClient` builds its own reqwest
+/// client with a **30 s** timeout, 200x this budget, so relying on the client's
+/// own ceiling would stall a search for half a minute on a wedged embedding
+/// service — the precise failure the fail-open design exists to prevent.
+///
+/// Sized from measurement, not guesswork: the local service was probed at
+/// ~10 ms warm and 6.01 s cold. The warm path keeps a ~15x margin; the cold
+/// path deliberately blows the budget and loses its semantic arm, because a
+/// 6-second search is worse than a lexical one.
+const MEMORY_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Where a `coord_memory_search` enrichment attempt ended.
+///
+/// Counted ONLY for requests that are themselves `coord_memory_search`
+/// tools/calls — every other proxied request is untouched and uncounted, so
+/// these series read as "of the searches that went through, how many got a
+/// vector". Without them "semantic recall is on" is unfalsifiable, which is
+/// exactly the failure mode this work exists to correct: the arm can silently
+/// stop firing (a tool rename, a dead embedder, a coord parameter rename) and
+/// degrade to FTS-only with no signal at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryEnrichOutcome {
+    /// A query vector was computed and injected.
+    Enriched,
+    /// The caller supplied `query_embedding` themselves — never overwritten.
+    SkippedPresent,
+    /// The local embedding service errored or was unreachable.
+    SkippedUnavailable,
+    /// The embed exceeded [`MEMORY_EMBED_TIMEOUT`].
+    SkippedTimeout,
+    /// A `coord_memory_search` call whose shape could not be enriched (a
+    /// JSON-RPC batch, or no usable string `params.arguments.query_text`).
+    SkippedParse,
+}
+
+impl MemoryEnrichOutcome {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Enriched => "enriched",
+            Self::SkippedPresent => "skipped_present",
+            Self::SkippedUnavailable => "skipped_unavailable",
+            Self::SkippedTimeout => "skipped_timeout",
+            Self::SkippedParse => "skipped_parse",
+        }
+    }
+
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Enriched,
+        Self::SkippedPresent,
+        Self::SkippedUnavailable,
+        Self::SkippedTimeout,
+        Self::SkippedParse,
+    ];
+}
+
+/// Per-outcome counters, in declaration order of [`MemoryEnrichOutcome::ALL`].
+fn memory_enrich_counters() -> &'static [std::sync::atomic::AtomicU64; 5] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 5]> =
+        std::sync::OnceLock::new();
+    COUNTERS.get_or_init(Default::default)
+}
+
+fn record_memory_enrich_outcome(outcome: MemoryEnrichOutcome) {
+    let idx = MemoryEnrichOutcome::ALL
+        .iter()
+        .position(|o| *o == outcome)
+        .unwrap_or(0);
+    memory_enrich_counters()[idx].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot of the enrichment counters for `GET /health`.
+pub(crate) fn memory_enrich_health_snapshot() -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for (i, outcome) in MemoryEnrichOutcome::ALL.iter().enumerate() {
+        obj.insert(
+            outcome.label().to_string(),
+            serde_json::json!(memory_enrich_counters()[i].load(Ordering::Relaxed)),
+        );
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// What a proxied body is, as far as query-vector enrichment is concerned.
+enum MemorySearchShape<'a> {
+    /// Not a `coord_memory_search` tools/call. Do not touch, do not count —
+    /// this is the overwhelming majority of proxied traffic and its bytes stay
+    /// identical.
+    NotASearch,
+    /// Enrichable; carries the query text to embed.
+    Enrichable(&'a str),
+    /// A search, but not one we will rewrite. Carries the outcome to record.
+    Skip(MemoryEnrichOutcome),
+}
+
+fn is_memory_search_call(req: &serde_json::Value) -> bool {
+    req.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && req.pointer("/params/name").and_then(|n| n.as_str()) == Some("coord_memory_search")
+}
+
+/// Decide whether a parsed proxy body is an enrichable `coord_memory_search`.
+///
+/// Pure over its input, so the whole trigger matrix is unit-testable without an
+/// HTTP server or a live embedding service — which matters more than usual
+/// here, because the guarantee being protected is that EVERY other request
+/// stays byte-identical.
+fn classify_memory_search(parsed: &serde_json::Value) -> MemorySearchShape<'_> {
+    // Batches are never rewritten. coord's `/mcp` is single-shot per POST, so a
+    // batch carrying a search is a shape we do not produce; rewriting one would
+    // mean reasoning about partial-batch enrichment for no caller that exists.
+    if let Some(elems) = parsed.as_array() {
+        return if elems.iter().any(is_memory_search_call) {
+            MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedParse)
+        } else {
+            MemorySearchShape::NotASearch
+        };
+    }
+    if !is_memory_search_call(parsed) {
+        return MemorySearchShape::NotASearch;
+    }
+    let args = parsed.pointer("/params/arguments");
+    // A caller who computed their own vector is authoritative over ours; theirs
+    // may be in a deliberately different space, and silently replacing it would
+    // make the response's `vector_arm` describe an arm the caller never asked
+    // for.
+    if args.and_then(|a| a.get("query_embedding")).is_some() {
+        return MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedPresent);
+    }
+    match args
+        .and_then(|a| a.get("query_text"))
+        .and_then(|t| t.as_str())
+    {
+        Some(t) if !t.trim().is_empty() => MemorySearchShape::Enrichable(t),
+        _ => MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedParse),
+    }
+}
+
+/// Write the computed pair into a parsed `coord_memory_search` body.
+///
+/// The model tag travels under **`query_embedding_model`** — the QUERY leg's
+/// field name. The WRITE leg of the same memory API calls the same tag
+/// `embedding_model`, and both coord and the backend reject a vector whose
+/// space is unnamed, so using the write leg's name here would make every
+/// enriched search fail CLOSED with a 422 instead of degrading to FTS. That is
+/// not hypothetical: the runner's sibling tenant-memory arm shipped with
+/// exactly that mistake.
+fn inject_query_embedding(parsed: &mut serde_json::Value, embedding: Vec<f32>) -> bool {
+    let Some(args) = parsed
+        .pointer_mut("/params/arguments")
+        .and_then(|a| a.as_object_mut())
+    else {
+        return false;
+    };
+    args.insert("query_embedding".to_string(), serde_json::json!(embedding));
+    args.insert(
+        "query_embedding_model".to_string(),
+        serde_json::Value::String(
+            crate::database::embedding_client::EMBEDDING_MODEL_TAG.to_string(),
+        ),
+    );
+    true
+}
+
+/// Fill in `coord_memory_search`'s query vector, or leave the body alone.
+///
+/// `Some(bytes)` ONLY when a vector was computed and injected. `None` means
+/// "forward the original bytes unchanged" and covers every non-search request
+/// and every failure path.
+///
+/// **Fail open, always.** Embedder down, embed error, timeout, unexpected
+/// shape — all forward the request untouched, and the caller gets exactly
+/// today's behaviour (`vector_arm: "skipped_no_embedding"`, FTS hits). Recall
+/// must never break because a local service is slow or missing.
+async fn enrich_memory_search_body(body: &[u8]) -> Option<Vec<u8>> {
+    // No `is_available()` pre-check. It is a second round trip AND a TOCTOU
+    // window — the service can die between the probe and the compute, so the
+    // error path has to exist either way. One call, one failure path.
+    //
+    // Shared client (same posture as `COORD_PROXY_CLIENT` below): this runs on
+    // EVERY proxied request, and building a reqwest client per call would both
+    // waste work on the non-search majority and throw away the connection pool
+    // — which is exactly what the 150 ms budget cannot afford.
+    static EMBED_CLIENT: std::sync::OnceLock<crate::database::embedding_client::EmbeddingClient> =
+        std::sync::OnceLock::new();
+    let client = EMBED_CLIENT.get_or_init(crate::database::embedding_client::EmbeddingClient::new);
+    enrich_memory_search_body_with(body, client).await
+}
+
+/// Embedder-parameterized core of [`enrich_memory_search_body`], so tests can
+/// point it at an unreachable (or slow) service without depending on whether
+/// this machine happens to be running the real one. Same shape as the sibling
+/// `retrieve_tenant_memory_at`.
+async fn enrich_memory_search_body_with(
+    body: &[u8],
+    client: &crate::database::embedding_client::EmbeddingClient,
+) -> Option<Vec<u8>> {
+    let mut parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let query_text = match classify_memory_search(&parsed) {
+        MemorySearchShape::NotASearch => return None,
+        MemorySearchShape::Skip(outcome) => {
+            record_memory_enrich_outcome(outcome);
+            return None;
+        }
+        MemorySearchShape::Enrichable(t) => t.to_string(),
+    };
+
+    let embedding = match tokio::time::timeout(
+        MEMORY_EMBED_TIMEOUT,
+        client.compute_text_embedding(&query_text),
+    )
+    .await
+    {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => {
+            tracing::debug!(
+                error = %e,
+                "coord-mcp proxy: query embed failed — forwarding search FTS-only"
+            );
+            record_memory_enrich_outcome(MemoryEnrichOutcome::SkippedUnavailable);
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(
+                timeout_ms = MEMORY_EMBED_TIMEOUT.as_millis() as u64,
+                "coord-mcp proxy: query embed timed out — forwarding search FTS-only"
+            );
+            record_memory_enrich_outcome(MemoryEnrichOutcome::SkippedTimeout);
+            return None;
+        }
+    };
+
+    if !inject_query_embedding(&mut parsed, embedding) {
+        record_memory_enrich_outcome(MemoryEnrichOutcome::SkippedParse);
+        return None;
+    }
+    match serde_json::to_vec(&parsed) {
+        Ok(bytes) => {
+            record_memory_enrich_outcome(MemoryEnrichOutcome::Enriched);
+            Some(bytes)
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "coord-mcp proxy: enriched body failed to serialize — forwarding original"
+            );
+            record_memory_enrich_outcome(MemoryEnrichOutcome::SkippedParse);
+            None
+        }
+    }
+}
+
 async fn coord_mcp_proxy_handler(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     headers: axum::http::HeaderMap,
@@ -1514,12 +1882,20 @@ async fn coord_mcp_proxy_handler(
             .expect("coord-mcp proxy reqwest client")
     });
 
+    // Semantic recall (Phase 2): put a locally-computed query vector into
+    // `coord_memory_search`'s existing field. `None` — every other request, and
+    // every failure path — forwards the ORIGINAL bytes, byte-identically.
+    let forward_body = match enrich_memory_search_body(&body).await {
+        Some(rewritten) => rewritten,
+        None => body.to_vec(),
+    };
+
     // Resolve the upstream once, WITH its source, so every error emitted below
     // can name both the exact URL dialed and how it was chosen (plan
     // 2026-07-16-runner-prod-coord-base-default-and-502-self-diagnosis, D3) —
     // a bare 502 that names neither cost real diagnostic time in the incident.
     let (url, coord_base_source) = crate::coord_mcp::coord_mcp_url_with_source();
-    let mut req = client.post(&url).bearer_auth(&bearer).body(body.to_vec());
+    let mut req = client.post(&url).bearer_auth(&bearer).body(forward_body);
     for (name, value) in headers.iter() {
         let n = name.as_str();
         // Hop-by-hop / recomputed headers, plus the ones we own: the nonce must
@@ -4692,17 +5068,19 @@ pub fn create_router(
     // Layer ordering (`.layer()` is bottom-up — last call = outermost):
     //
     //   [CatchPanicLayer]              ← outermost: panics → 500 JSON
-    //     [envelope_audit_middleware]  ← debug-only: panics if error is non-JSON
-    //       [envelope_rewrite_middleware] ← rewrites 4xx text/plain → JSON envelope
+    //     [envelope_audit_middleware]  ← debug-only: REPORTS non-JSON errors
+    //       [envelope_rewrite_middleware] ← rewrites 4xx/5xx text/plain → JSON
     //         [TraceLayer, CORS, BodyLimit, ...]
     //           [handlers]
     //
     // The panic layer must remain outermost so it can catch panics that
     // originate in any layer below, including the audit and envelope layers.
-    // The audit layer sits INSIDE CatchPanicLayer (panics are caught → 500
-    // JSON) and OUTSIDE envelope_rewrite (observes the post-rewrite response).
-    // A non-JSON error response after the rewrite is a definitive handler bug
-    // surfaced as a panic in debug builds; compiles away entirely in release.
+    // The audit layer sits OUTSIDE envelope_rewrite so it observes the
+    // post-rewrite response. A non-JSON error response after the rewrite is a
+    // definitive handler bug; as of 2026-08-05 the audit REPORTS it (ERROR log
+    // + violation registry) and forwards the response unchanged rather than
+    // panicking — see `mcp::envelope_audit` for why the panic was net-harmful.
+    // Compiles away entirely in release.
     //
     // The #[cfg(debug_assertions)] audit layer cannot be placed inline in a
     // method-chain call, so we use a let-rebind pattern:
@@ -5163,6 +5541,232 @@ mod self_id_chain_tests {
             select_lifecycle_caller(&records, "D:/repo", None, |_| true),
             None
         );
+    }
+}
+
+/// Semantic-recall enrichment (plan
+/// `2026-07-30-semantic-recall-query-embedding-via-runner`, Phases 2-3).
+///
+/// The classifier and the injector are pure, so the whole trigger matrix is
+/// asserted here without an HTTP server or a live embedding service. The
+/// load-bearing guarantee is the NEGATIVE one — every request that is not an
+/// enrichable `coord_memory_search` must reach coord byte-identical — so the
+/// non-trigger cases get as much attention as the trigger case.
+#[cfg(test)]
+mod memory_search_enrichment_tests {
+    use super::{
+        classify_memory_search, inject_query_embedding, memory_enrich_health_snapshot,
+        MemoryEnrichOutcome, MemorySearchShape, MEMORY_EMBED_TIMEOUT,
+    };
+    use serde_json::json;
+
+    fn search_call(args: serde_json::Value) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "coord_memory_search", "arguments": args },
+        })
+    }
+
+    /// (a) The passthrough regression test: a non-`coord_memory_search` request
+    /// is never classified as enrichable, so its bytes are forwarded verbatim.
+    #[test]
+    fn other_requests_are_never_touched() {
+        let others = vec![
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+            search_call(json!({"query_text": "x"})).clone_with_tool("coord_memory_record"),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                   "params":{"name":"coord_orient","arguments":{"query_text":"x"}}}),
+        ];
+        for body in others {
+            assert!(
+                matches!(classify_memory_search(&body), MemorySearchShape::NotASearch),
+                "must not be enrichable: {body}"
+            );
+        }
+    }
+
+    /// (c) A caller-supplied vector is NEVER overwritten — theirs may be in a
+    /// deliberately different space.
+    #[test]
+    fn caller_supplied_vector_is_never_overwritten() {
+        let body = search_call(json!({
+            "query_text": "login",
+            "query_embedding": [0.1, 0.2, 0.3],
+        }));
+        assert!(matches!(
+            classify_memory_search(&body),
+            MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedPresent)
+        ));
+    }
+
+    #[test]
+    fn a_plain_search_is_enrichable() {
+        let body = search_call(json!({"query_text": "how does the merge train hold a PR"}));
+        match classify_memory_search(&body) {
+            MemorySearchShape::Enrichable(t) => {
+                assert_eq!(t, "how does the merge train hold a PR")
+            }
+            _ => panic!("a plain coord_memory_search must be enrichable"),
+        }
+    }
+
+    /// Shapes that ARE a search but cannot be enriched are counted, not
+    /// silently dropped — otherwise a body shape we stopped handling would
+    /// look identical to "no searches happened".
+    #[test]
+    fn unenrichable_search_shapes_are_classified_as_parse_skips() {
+        let missing_text = search_call(json!({"limit": 5}));
+        let blank_text = search_call(json!({"query_text": "   "}));
+        let non_string = search_call(json!({"query_text": 42}));
+        // A JSON-RPC batch carrying a search: deliberately not rewritten.
+        let batch = json!([search_call(json!({"query_text": "a"}))]);
+        for body in [missing_text, blank_text, non_string, batch] {
+            assert!(
+                matches!(
+                    classify_memory_search(&body),
+                    MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedParse)
+                ),
+                "expected a parse skip for {body}"
+            );
+        }
+    }
+
+    /// A batch with no search at all is ordinary traffic — not a skip, not
+    /// counted.
+    #[test]
+    fn a_batch_without_a_search_is_ordinary_traffic() {
+        let batch = json!([json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})]);
+        assert!(matches!(
+            classify_memory_search(&batch),
+            MemorySearchShape::NotASearch
+        ));
+    }
+
+    /// (d) The enriched body carries the vector AND the exact model tag —
+    /// under the QUERY leg's field name. Naming it `embedding_model` (the
+    /// write leg's spelling) makes the backend reject every enriched search
+    /// with a 422, i.e. fail CLOSED, which is the opposite of the design.
+    #[test]
+    fn injection_writes_the_pair_under_the_query_leg_field_names() {
+        let mut body = search_call(json!({"query_text": "login"}));
+        let embedding: Vec<f32> = (0..384).map(|i| i as f32 * 0.001).collect();
+        assert!(inject_query_embedding(&mut body, embedding));
+
+        let args = &body["params"]["arguments"];
+        assert_eq!(
+            args["query_embedding"]
+                .as_array()
+                .expect("vector must be present")
+                .len(),
+            384
+        );
+        assert_eq!(
+            args["query_embedding_model"],
+            crate::database::embedding_client::EMBEDDING_MODEL_TAG
+        );
+        assert!(
+            args.get("embedding_model").is_none(),
+            "the WRITE leg's field name must never appear on the query leg"
+        );
+        assert_eq!(
+            args["query_text"], "login",
+            "the query text still rides along"
+        );
+    }
+
+    #[test]
+    fn injection_declines_a_body_with_no_arguments_object() {
+        let mut body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "coord_memory_search" },
+        });
+        assert!(
+            !inject_query_embedding(&mut body, vec![0.0; 384]),
+            "no arguments object ⇒ decline rather than fabricate one"
+        );
+    }
+
+    /// (b) Embedder unavailable ⇒ the body is forwarded UNMODIFIED. This is
+    /// the fail-open guarantee: recall degrades to today's FTS-only answer,
+    /// it never errors. Pointed at a port nothing listens on, so the verdict
+    /// does not depend on whether this machine runs the real service.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unavailable_embedder_leaves_the_body_untouched() {
+        let client =
+            crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
+        let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
+        let out = super::enrich_memory_search_body_with(&body, &client).await;
+        assert!(
+            out.is_none(),
+            "a dead embedder must forward the original bytes, not fail the search"
+        );
+    }
+
+    /// The same fail-open path covers non-search traffic without ever dialing
+    /// the embedder at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_search_traffic_is_returned_untouched() {
+        let client =
+            crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/list"
+        }))
+        .unwrap();
+        assert!(super::enrich_memory_search_body_with(&body, &client)
+            .await
+            .is_none());
+    }
+
+    /// (e) The budget must stay far under the embedding client's OWN 30 s
+    /// ceiling, or a wedged service stalls the search instead of losing its
+    /// semantic arm.
+    #[test]
+    fn the_embed_budget_is_far_below_the_clients_own_timeout() {
+        assert!(
+            MEMORY_EMBED_TIMEOUT < std::time::Duration::from_secs(1),
+            "a sub-second ceiling is the whole point: EmbeddingClient's own \
+             timeout is 30s, which would stall a search"
+        );
+    }
+
+    /// A missing series reads as "this outcome never happens", which is the
+    /// ambiguity the counters exist to remove.
+    #[test]
+    fn health_snapshot_renders_every_series() {
+        let snap = memory_enrich_health_snapshot();
+        let obj = snap.as_object().expect("snapshot must be an object");
+        for outcome in MemoryEnrichOutcome::ALL {
+            assert!(
+                obj.contains_key(outcome.label()),
+                "missing series: {}",
+                outcome.label()
+            );
+        }
+        assert_eq!(obj.len(), MemoryEnrichOutcome::ALL.len());
+    }
+
+    #[test]
+    fn every_outcome_has_a_distinct_label() {
+        let mut labels: Vec<_> = MemoryEnrichOutcome::ALL.iter().map(|o| o.label()).collect();
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(before, labels.len(), "outcome labels must be distinct");
+    }
+
+    /// Small helper so the non-trigger table above stays readable.
+    trait WithTool {
+        fn clone_with_tool(&self, name: &str) -> serde_json::Value;
+    }
+    impl WithTool for serde_json::Value {
+        fn clone_with_tool(&self, name: &str) -> serde_json::Value {
+            let mut v = self.clone();
+            v["params"]["name"] = serde_json::Value::String(name.to_string());
+            v
+        }
     }
 }
 

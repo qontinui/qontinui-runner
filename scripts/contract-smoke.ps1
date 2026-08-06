@@ -556,17 +556,30 @@ function Dump-DirectRunnerDiagnostics {
 function Wait-DirectRunnerReady {
     param([int]$Port, [int]$TimeoutSecs = 180, $Process)
     $healthUrl = "http://localhost:$Port/health"
-    # `frontendReady` is a one-way flag flipped ONLY by the runner's first
-    # successful UI Bridge IPC round-trip (request.rs:505-512). A passive
-    # /health poll never triggers that round-trip, so the flag stays false
-    # forever even though the WebView2 React app has mounted and the IPC
-    # listener is live. So once the HTTP shell is responsive we actively poke
-    # a cheap UI Bridge route (GET /ui-bridge/control/elements) to drive the
-    # IPC round-trip, then re-check the flag. `frontendReady` lives under the
-    # `data` envelope in /health.
+    # Gate on `uiBridgeIpcObserved`, NOT `frontendReady`.
+    #
+    # What this smoke needs before it starts walking every UI_BRIDGE_ROUTES
+    # entry is proof that a full UI Bridge IPC round-trip has actually
+    # completed — otherwise the first route probes land in the 503
+    # transport-failure path and CI goes intermittently red. That is exactly
+    # what the one-way latch in `AppState::frontend_ready` measures, and it is
+    # the only thing that does.
+    #
+    # It used to be published as `frontendReady`. As of 2026-08-05 `/health`
+    # derives `frontendReady` from the frontend-liveness ladder instead (it now
+    # goes true off the self-driving 3s pong loop, with no IPC round-trip
+    # involved) and publishes the raw latch under its honest name,
+    # `uiBridgeIpcObserved`. Polling `frontendReady` here would return true on
+    # the first poll, skip the poke below, and start probing routes before the
+    # IPC path was ever exercised.
+    #
+    # A passive /health poll never drives the round-trip, so once the HTTP shell
+    # is responsive we actively poke a cheap UI Bridge route
+    # (GET /ui-bridge/control/elements) to force it, then re-check the flag.
+    # Both fields live under the `data` envelope in /health.
     $pokeUrl = "http://localhost:$Port/ui-bridge/control/elements"
     $deadline = (Get-Date).AddSeconds($TimeoutSecs)
-    Write-Host "Polling $healthUrl for frontendReady:true (timeout ${TimeoutSecs}s) ..."
+    Write-Host "Polling $healthUrl for uiBridgeIpcObserved:true (timeout ${TimeoutSecs}s) ..."
     while ((Get-Date) -lt $deadline) {
         if ($Process -and $Process.HasExited) {
             throw "direct-exe runner exited early with code $($Process.ExitCode) before becoming ready"
@@ -577,28 +590,33 @@ function Wait-DirectRunnerReady {
             if ($resp.StatusCode -eq 200) {
                 $h = $null
                 try { $h = $resp.Content | ConvertFrom-Json } catch { $h = $null }
-                # frontendReady is nested under data (and mirrored at top level
-                # on some builds); accept either.
+                # `uiBridgeIpcObserved` is nested under data. Fall back to the
+                # legacy `frontendReady` (top level or under data) so this
+                # script still gates correctly against a runner built BEFORE
+                # the 2026-08-05 rename, where `frontendReady` still carried
+                # the latch.
                 $fr = $null
                 if ($h) {
-                    if ($h.PSObject.Properties.Name -contains 'data' -and $h.data -and ($h.data.PSObject.Properties.Name -contains 'frontendReady')) {
-                        $fr = $h.data.frontendReady
+                    $respObj = if ($h.PSObject.Properties.Name -contains 'data' -and $h.data) { $h.data } else { $h }
+                    if ($respObj.PSObject.Properties.Name -contains 'uiBridgeIpcObserved') {
+                        $fr = $respObj.uiBridgeIpcObserved
+                    } elseif ($respObj.PSObject.Properties.Name -contains 'frontendReady') {
+                        $fr = $respObj.frontendReady
                     } elseif ($h.PSObject.Properties.Name -contains 'frontendReady') {
                         $fr = $h.frontendReady
                     }
-                    $respObj = if ($h.PSObject.Properties.Name -contains 'data' -and $h.data) { $h.data } else { $h }
                     if ($respObj.PSObject.Properties.Name -contains 'responsive') { $responsive = [bool]$respObj.responsive }
                 }
                 if ($fr -eq $true) {
-                    Write-Host "Runner is ready (frontendReady:true)."
+                    Write-Host "Runner is ready (UI Bridge IPC round-trip observed)."
                     return
                 }
             }
         } catch {
             # connection refused / not-yet-listening — keep polling.
         }
-        # Shell is up but frontendReady is still false: poke the UI Bridge to
-        # force the first IPC round-trip that flips the flag.
+        # Shell is up but no IPC round-trip has completed yet: poke the UI
+        # Bridge to force the first one, which flips the latch.
         if ($responsive) {
             try {
                 $null = Invoke-WebRequest -Uri $pokeUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
@@ -609,7 +627,7 @@ function Wait-DirectRunnerReady {
         }
         Start-Sleep -Milliseconds 1000
     }
-    throw "direct-exe runner did not report frontendReady:true within ${TimeoutSecs}s"
+    throw "direct-exe runner did not report uiBridgeIpcObserved:true within ${TimeoutSecs}s"
 }
 
 # ---------------------------------------------------------------------------

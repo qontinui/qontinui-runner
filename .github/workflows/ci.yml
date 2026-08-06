@@ -460,7 +460,8 @@ jobs:
       # supervisor-free (`-DirectExe`), walks every UI_BRIDGE_ROUTES entry from
       # the sibling ui-bridge clone, and asserts the shape contracts the offline
       # manifest tests can't see. Windows-only: the runner is Windows-primary
-      # and the WebView2 render `frontendReady:true` needs is a Windows surface.
+      # and the WebView2 render `uiBridgeIpcObserved:true` needs is a Windows
+      # surface.
       # Reuses `target/debug/qontinui-runner.exe` from the step above
       # (built from src-tauri, so `.cargo/config.toml`'s /STACK:8388608 applies
       # — no separate cargo build, no 0xc00000fd stack-overflow). `-Profile ci`

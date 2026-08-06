@@ -352,13 +352,29 @@ pub struct AppState {
     /// Set by `mcp_api::start_server` after successful bind, checked by the
     /// `is_api_ready` Tauri command so the frontend can gate HTTP calls.
     pub api_ready: AtomicBool,
-    /// Flag indicating the React frontend has finished its loading screen and
-    /// is processing UI Bridge IPC. Flips to `true` the first time
+    /// Whether a full UI Bridge request/response round-trip has completed at
+    /// least once since boot. Flips to `true` the first time
     /// `ui_bridge_request_sync` decodes a successful response from the
-    /// frontend; one-way (never flipped back to false). Surfaced in `/health`
-    /// as `frontendReady` so external pollers can distinguish "Tauri shell is
-    /// responsive" from "the React app has actually mounted past `App.tsx`'s
-    /// loading screen branch and is ready for UI Bridge calls".
+    /// frontend; one-way (never flipped back to false).
+    ///
+    /// **This is NOT frontend readiness — do not read it as such.** It used to
+    /// back `/health`'s `frontendReady` and was wrong in both directions
+    /// (2026-08-05):
+    ///
+    /// * **False on a healthy frontend.** Nothing inside the runner drives the
+    ///   `ui-bridge-request` path. The 3s ping/pong loop bypasses it and the
+    ///   startup `ui_bridge_invoke_probe` uses its own invoke store, so an idle
+    ///   runner with a fully-mounted React app reported `false` indefinitely —
+    ///   until some external client happened to call a `/ui-bridge/*` route,
+    ///   at which point it flipped. It measured *usage*, not readiness.
+    /// * **True on a dead frontend.** Being one-way, it survives a WebView2
+    ///   host death unchanged.
+    ///
+    /// `/health` now derives `frontendReady` from
+    /// [`crate::mcp::ui_bridge::request::classify_frontend_state`] and reports
+    /// this latch separately as `uiBridgeIpcObserved`, which is what it
+    /// actually means. It remains useful for that: it is the only signal that
+    /// exercises the full request → handler → response round-trip end to end.
     pub frontend_ready: AtomicBool,
     /// Last frontend pong timestamp (epoch ms), or 0 if no UI has ever
     /// checked in.

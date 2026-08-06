@@ -677,7 +677,16 @@ pub(crate) async fn retrieve_tenant_memory_at(
     });
     if let Some(embedding) = query_embedding {
         body["query_embedding"] = serde_json::json!(embedding);
-        body["embedding_model"] = serde_json::Value::String(EMBEDDING_MODEL_TAG.to_string());
+        // `query_embedding_model`, NOT `embedding_model`. The memory API names
+        // the same tag differently on its two legs — `embedding_model` on the
+        // WRITE leg (`MemoryRecordIn`), `query_embedding_model` on this QUERY
+        // leg (`MemoryQueryRequest`) — and this arm shipped with the write
+        // leg's name. `MemoryQueryRequest` ignores unknown fields, so the tag
+        // simply vanished and the request arrived as "vector present, space
+        // unnamed", which the backend rejects with a 422. The non-2xx branch
+        // below then swallowed it as "degrading to local-only", so THIS ARM
+        // RETURNED ZERO HITS on every query where the local embed succeeded.
+        body["query_embedding_model"] = serde_json::Value::String(EMBEDDING_MODEL_TAG.to_string());
     }
     let resp = client
         .post(&url)
@@ -1751,8 +1760,8 @@ mod tenant_memory_arm_tests {
     }
 
     /// Records what the arm actually PUT ON THE WIRE, so the Phase 1 contract
-    /// (`query_embedding` + `embedding_model`) is asserted against the request
-    /// body rather than inferred from the response.
+    /// (`query_embedding` + `query_embedding_model`) is asserted against the
+    /// request body rather than inferred from the response.
     async fn spawn_body_recorder() -> (String, Arc<TokMutex<Vec<JsonValue>>>) {
         let seen: Arc<TokMutex<Vec<JsonValue>>> = Arc::new(TokMutex::new(Vec::new()));
         let app = Router::new()
@@ -1800,9 +1809,17 @@ mod tenant_memory_arm_tests {
             .as_array()
             .expect("query_embedding must be on the wire");
         assert_eq!(sent.len(), 384);
+        // The QUERY leg's field name. This assertion previously named
+        // `embedding_model` — the WRITE leg's name — which is why the arm
+        // could 422 on every embedded query while its own test stayed green.
         assert_eq!(
-            body["embedding_model"],
+            body["query_embedding_model"],
             crate::database::embedding_client::EMBEDDING_MODEL_TAG
+        );
+        assert!(
+            body.get("embedding_model").is_none(),
+            "the write leg's field name must not appear on the query leg — \
+             MemoryQueryRequest ignores it, which is what hid the 422"
         );
     }
 
@@ -1819,6 +1836,9 @@ mod tenant_memory_arm_tests {
             g[0].get("query_embedding").is_none(),
             "no embedding ⇒ omit the field; never send a placeholder vector"
         );
+        // Neither leg's spelling may appear: a tag without a vector is itself
+        // a 422 ("send both or neither").
+        assert!(g[0].get("query_embedding_model").is_none());
         assert!(g[0].get("embedding_model").is_none());
         assert_eq!(g[0]["query_text"], "login");
     }

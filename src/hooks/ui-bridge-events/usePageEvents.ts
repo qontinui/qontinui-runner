@@ -20,6 +20,7 @@ import {
   getUIBridgeGlobal,
   toTabCanonical,
   awaitWithTimeout,
+  compileEvaluateExpression,
   PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
 } from "./utils";
 
@@ -475,21 +476,15 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
                 `Expression rejected: contains prohibited pattern (${matched.source})`,
               );
             }
-            // Default: wrap as `return <expr>` so simple expressions like
-            // `document.title` evaluate to their value. If that's a SyntaxError
-            // (e.g., the caller passed multiple statements with top-level
-            // `let`/`const` and an explicit `return`), re-run as a raw function
-            // body so modern JS works without forcing IIFE wrappers on callers.
-            let result: unknown;
-            try {
-              result = new Function("return " + expression)();
-            } catch (firstErr) {
-              if (firstErr instanceof SyntaxError) {
-                result = new Function(expression)();
-              } else {
-                throw firstErr;
-              }
-            }
+            // Default: wrap as `return (<expr>\n)` so simple expressions like
+            // `document.title` evaluate to their value AND a leading newline
+            // isn't swallowed by automatic semicolon insertion. If the wrap is
+            // a SyntaxError (e.g., the caller passed multiple statements with
+            // top-level `let`/`const` and an explicit `return`), fall back to a
+            // bare `return` wrap and then to a raw function body so modern JS
+            // works without forcing IIFE wrappers on callers. See
+            // `compileEvaluateExpression` for the full rationale.
+            const result: unknown = compileEvaluateExpression(expression)();
             // Auto-await top-level Promises (and thenables, for cross-realm
             // safety — iframes can produce Promise objects whose constructor
             // is a different realm's Promise, so `instanceof Promise` would
