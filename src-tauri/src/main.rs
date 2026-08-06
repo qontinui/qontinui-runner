@@ -4849,7 +4849,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .build(tauri::generate_context!())?;
 
     info!("Tauri application built successfully");
-    app.run(|_, event| {
+    app.run(|app_handle, event| {
         // The AI-output log is written by a background thread whose sender is a
         // process-lifetime static, so nothing else ever drains it: without this
         // barrier a quit mid-burst silently loses the queued tail — precisely
@@ -4863,16 +4863,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // 2026-08-01-runner-dead-webview-is-invisible-to-health, Phase 2)
             // destroys the main window and immediately rebuilds it. Tauri
             // treats "the last window was destroyed" as an exit request, so
-            // letting this through mid-swap would terminate the process and
-            // every in-flight session — the plan's explicit non-goal. Veto the
-            // exit for exactly the duration of the swap; the flag is cleared by
-            // a Drop guard on every path, including failure.
-            if webview_recovery::window_swap_in_progress() {
-                info!("Exit request vetoed: a webview-recovery window swap is in flight");
+            // letting a swap-provoked request through would terminate the
+            // process and every in-flight session — the plan's explicit
+            // non-goal.
+            //
+            // The decision is state-based, not timing-based: a mid-swap flag
+            // alone loses the race whenever the event is delivered after the
+            // rebuild finishes, which is exactly how the runner killed itself
+            // on 2026-08-06. See `webview_recovery::ExitVeto`.
+            let veto = webview_recovery::should_veto_exit(app_handle);
+            if veto.is_veto() {
+                info!(
+                    reason = veto.as_str(),
+                    "Exit request vetoed: no shutdown was requested and this exit \
+                     is an artifact of a webview-recovery window swap"
+                );
                 api.prevent_exit();
                 return;
             }
-            info!("Application exit requested");
+            info!(reason = veto.as_str(), "Application exit requested");
             // Phase 2: ensure the shutdown flag is set on ANY exit path (incl.
             // a programmatic `app.exit(0)` that didn't route through the main
             // window's close handler), so pop-out teardown preserves records.
