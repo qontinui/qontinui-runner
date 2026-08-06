@@ -121,6 +121,11 @@ fn arbitrary_element() -> impl Strategy<Value = UIBridgeElement> {
                 state: ElementState {
                     visible,
                     enabled,
+                    // Keep the generated state internally consistent with the
+                    // documented fold `enabled == !(disabled || aria_disabled)`:
+                    // a not-enabled element is modelled as natively disabled.
+                    disabled: !enabled,
+                    aria_disabled: false,
                     focused: false,
                     rect: ElementRect {
                         x: 0.0,
