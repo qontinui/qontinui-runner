@@ -52,6 +52,18 @@ pub fn mark_app_quitting() {
     APP_QUITTING.store(true, Ordering::SeqCst);
 }
 
+/// True once a **deliberate** shutdown has been requested — the main window's
+/// `CloseRequested` fired, or some other path explicitly asked the app to quit.
+///
+/// This is the runner's only record of *quit intent*, which is what separates a
+/// real exit from an exit request manufactured by window teardown.
+/// `webview_recovery::decide_exit_veto` reads it to tell the two apart; see the
+/// veto rationale there. Note the ordering contract every quit path must honour:
+/// call [`mark_app_quitting`] **before** `AppHandle::exit`, never after.
+pub fn is_app_quitting() -> bool {
+    APP_QUITTING.load(Ordering::SeqCst)
+}
+
 #[derive(Serialize, Clone)]
 struct SessionAssignmentChanged {
     session_id: String,

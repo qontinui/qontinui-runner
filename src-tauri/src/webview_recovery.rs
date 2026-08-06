@@ -465,6 +465,105 @@ impl Drop for SwapGuard {
     }
 }
 
+/// What to do with an observed `RunEvent::ExitRequested`.
+///
+/// # Why this is not just [`window_swap_in_progress`]
+///
+/// It used to be, and that is precisely how the runner killed itself at
+/// 2026-08-06T01:00:56Z. `WINDOW_SWAP_IN_PROGRESS` is held for the *duration of
+/// the swap* — from `destroy()` to the rebuild returning — but the exit request
+/// the swap provokes is delivered by the event loop **asynchronously**, and on
+/// that incident it arrived 64 ms after the rebuild had already finished and
+/// dropped the guard. The flag was false, the veto never ran, and a runner with
+/// a perfectly good freshly-built window exited 0 and took nine hours of
+/// sessions with it.
+///
+/// A wider time window would only make the race rarer. The durable fix is to
+/// stop asking "*when* is this happening" and ask "*is exiting correct right
+/// now*", which is answerable from state that cannot race:
+///
+/// * **Quit intent wins over everything.** If a deliberate shutdown was
+///   requested, exit — no other condition may override it. This is what keeps
+///   the veto from ever wedging the process un-exitable, the failure mode the
+///   original `SwapGuard` comment was rightly afraid of.
+/// * **A live main window means the request is stale.** Tauri only fires
+///   `ExitRequested` because it saw the window set go empty. If a main window
+///   exists by the time the handler runs, the set was repopulated — a swap
+///   rebuilt it — so the request describes a world that no longer exists.
+/// * **Mid-swap still needs the flag.** During the swap the window is genuinely
+///   gone, so window-liveness cannot distinguish "about to be rebuilt" from
+///   "last window closed". That is the one case `WINDOW_SWAP_IN_PROGRESS`
+///   answers, and it is kept for exactly that case.
+///
+/// The two vetoes are complementary, not redundant: the flag covers the swap's
+/// interior, window-liveness covers everything after it, and together they
+/// leave no gap for a late event to land in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitVeto {
+    /// A deliberate shutdown was requested — always honoured.
+    AllowQuitRequested,
+    /// No main window and no swap in flight: the genuine last-window-closed
+    /// exit.
+    AllowNoWindow,
+    /// The recovery ladder is between `destroy()` and the rebuild.
+    VetoSwapInFlight,
+    /// A live main window exists and nobody asked to quit — a stale request
+    /// left over from a swap's `destroy()`.
+    VetoWindowAlive,
+}
+
+impl ExitVeto {
+    /// True when the exit must be blocked with `api.prevent_exit()`.
+    pub fn is_veto(self) -> bool {
+        matches!(self, Self::VetoSwapInFlight | Self::VetoWindowAlive)
+    }
+
+    /// Stable reason string for the log line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowQuitRequested => "quit_requested",
+            Self::AllowNoWindow => "no_window",
+            Self::VetoSwapInFlight => "swap_in_flight",
+            Self::VetoWindowAlive => "window_alive",
+        }
+    }
+}
+
+/// Pure decision for [`should_veto_exit`], extracted so the priority rules can
+/// be asserted without an event loop or a live window. Priority is intentional
+/// and load-bearing — see [`ExitVeto`].
+const fn decide_exit_veto(
+    quit_requested: bool,
+    swap_in_progress: bool,
+    main_window_alive: bool,
+) -> ExitVeto {
+    if quit_requested {
+        return ExitVeto::AllowQuitRequested;
+    }
+    if swap_in_progress {
+        return ExitVeto::VetoSwapInFlight;
+    }
+    if main_window_alive {
+        return ExitVeto::VetoWindowAlive;
+    }
+    ExitVeto::AllowNoWindow
+}
+
+/// Classify a `RunEvent::ExitRequested`. Called from `main.rs`'s `app.run`
+/// handler, which vetoes when [`ExitVeto::is_veto`] holds.
+pub fn should_veto_exit(app: &tauri::AppHandle) -> ExitVeto {
+    use tauri::Manager;
+
+    // Server mode has no window and no swap, so this reduces to
+    // `AllowQuitRequested`/`AllowNoWindow` — a headless runner is never vetoed.
+    let label = qontinui_runner_lib::get_main_window_label();
+    decide_exit_veto(
+        crate::commands::terminal_windows::is_app_quitting(),
+        window_swap_in_progress(),
+        app.get_webview_window(label).is_some(),
+    )
+}
+
 /// True once recovery gave up on the current incident.
 ///
 /// Read straight off the [`LoopGuard`] rather than mirrored into a second
@@ -1143,6 +1242,57 @@ mod tests {
             ),
             RecoveryAction::None
         );
+    }
+
+    // ── exit veto ──────────────────────────────────────────────────────
+
+    /// The regression this whole decision exists for. On 2026-08-06 the swap
+    /// finished, the guard dropped, and the exit request arrived 64 ms later
+    /// against a live, freshly rebuilt window — and was honoured. Window
+    /// liveness is what makes that request refusable after the fact.
+    #[test]
+    fn late_exit_after_a_completed_swap_is_vetoed() {
+        assert_eq!(
+            decide_exit_veto(false, false, true),
+            ExitVeto::VetoWindowAlive
+        );
+        assert!(decide_exit_veto(false, false, true).is_veto());
+    }
+
+    #[test]
+    fn exit_during_the_swap_is_vetoed() {
+        // Mid-swap the window is genuinely gone, so only the flag can answer.
+        assert_eq!(
+            decide_exit_veto(false, true, false),
+            ExitVeto::VetoSwapInFlight
+        );
+    }
+
+    /// Quit intent outranks both vetoes. Without this the veto could wedge the
+    /// process un-exitable — the failure mode the original guard feared.
+    #[test]
+    fn a_requested_quit_is_never_vetoed() {
+        for &swap in &[false, true] {
+            for &alive in &[false, true] {
+                let d = decide_exit_veto(true, swap, alive);
+                assert_eq!(d, ExitVeto::AllowQuitRequested, "swap={swap} alive={alive}");
+                assert!(!d.is_veto(), "swap={swap} alive={alive}");
+            }
+        }
+    }
+
+    #[test]
+    fn genuine_last_window_closed_exit_is_allowed() {
+        let d = decide_exit_veto(false, false, false);
+        assert_eq!(d, ExitVeto::AllowNoWindow);
+        assert!(!d.is_veto());
+    }
+
+    /// A recreate that FAILED leaves no window and no swap in flight, so the
+    /// process is allowed to exit rather than lingering windowless forever.
+    #[test]
+    fn failed_recreate_does_not_wedge_the_process_alive() {
+        assert!(!decide_exit_veto(false, false, false).is_veto());
     }
 
     // ── loop guard / backoff state machine ─────────────────────────────
