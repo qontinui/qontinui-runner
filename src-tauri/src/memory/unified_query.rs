@@ -686,8 +686,7 @@ pub(crate) async fn retrieve_tenant_memory_at(
         // unnamed", which the backend rejects with a 422. The non-2xx branch
         // below then swallowed it as "degrading to local-only", so THIS ARM
         // RETURNED ZERO HITS on every query where the local embed succeeded.
-        body["query_embedding_model"] =
-            serde_json::Value::String(EMBEDDING_MODEL_TAG.to_string());
+        body["query_embedding_model"] = serde_json::Value::String(EMBEDDING_MODEL_TAG.to_string());
     }
     let resp = client
         .post(&url)

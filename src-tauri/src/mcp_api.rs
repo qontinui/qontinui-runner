@@ -1460,10 +1460,7 @@ fn inject_query_embedding(parsed: &mut serde_json::Value, embedding: Vec<f32>) -
     else {
         return false;
     };
-    args.insert(
-        "query_embedding".to_string(),
-        serde_json::json!(embedding),
-    );
+    args.insert("query_embedding".to_string(), serde_json::json!(embedding));
     args.insert(
         "query_embedding_model".to_string(),
         serde_json::Value::String(
@@ -1494,8 +1491,7 @@ async fn enrich_memory_search_body(body: &[u8]) -> Option<Vec<u8>> {
     // — which is exactly what the 150 ms budget cannot afford.
     static EMBED_CLIENT: std::sync::OnceLock<crate::database::embedding_client::EmbeddingClient> =
         std::sync::OnceLock::new();
-    let client =
-        EMBED_CLIENT.get_or_init(crate::database::embedding_client::EmbeddingClient::new);
+    let client = EMBED_CLIENT.get_or_init(crate::database::embedding_client::EmbeddingClient::new);
     enrich_memory_search_body_with(body, client).await
 }
 
@@ -5578,7 +5574,10 @@ mod memory_search_enrichment_tests {
             args.get("embedding_model").is_none(),
             "the WRITE leg's field name must never appear on the query leg"
         );
-        assert_eq!(args["query_text"], "login", "the query text still rides along");
+        assert_eq!(
+            args["query_text"], "login",
+            "the query text still rides along"
+        );
     }
 
     #[test]
