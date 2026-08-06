@@ -84,6 +84,11 @@ pub fn snapshot_element_from(el: &InstrumentedElement) -> UIBridgeElement {
         state: ElementState {
             visible: true,
             enabled: true,
+            // `InstrumentedElement` carries no disabled/aria-disabled signal
+            // (the generator emits enabled controls), so both legs of the
+            // `enabled` fold are `false` — consistent with `enabled: true`.
+            disabled: false,
+            aria_disabled: false,
             focused: false,
             rect: ElementRect {
                 x: 0.0,
