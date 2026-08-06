@@ -605,7 +605,23 @@ async fn retrieve_tenant_memory(query: &str, limit: usize) -> Vec<MemoryResult> 
     // posture — unlike the WRITE path, where an un-embedded record would be
     // permanently unsearchable and so must be retried instead.
     let query_embedding = match EmbeddingClient::new().compute_text_embedding(query).await {
-        Ok(e) => Some(e),
+        // Width-check before sending. `compute_text_embedding` checks no
+        // length, and the backend rejects a non-`EMBEDDING_DIM` vector with a
+        // 422 — which the non-2xx branch below swallows as "degrading to
+        // local-only", i.e. this arm would return ZERO HITS on every query
+        // where the embed succeeded. That is not hypothetical: this exact arm
+        // already shipped one fail-closed 422 masked by that same swallow (the
+        // `query_embedding_model` key fix below). Degrade to FTS instead.
+        Ok(e) if e.len() == crate::database::embeddings::EMBEDDING_DIM => Some(e),
+        Ok(e) => {
+            tracing::debug!(
+                dims = e.len(),
+                expected = crate::database::embeddings::EMBEDDING_DIM,
+                "Unified memory: local embedder returned an unexpected vector width — \
+                 tenant query degrading to FTS-only"
+            );
+            None
+        }
         Err(e) => {
             tracing::debug!(
                 error = %e,
