@@ -1774,7 +1774,11 @@ async fn enrich_memory_search_body_with(
     };
 
     if !inject_query_embedding(&mut parsed, embedding) {
-        return degraded_body(&mut parsed, needs_cleanup, MemoryEnrichOutcome::SkippedParse);
+        return degraded_body(
+            &mut parsed,
+            needs_cleanup,
+            MemoryEnrichOutcome::SkippedParse,
+        );
     }
     match serde_json::to_vec(&parsed) {
         Ok(bytes) => {
