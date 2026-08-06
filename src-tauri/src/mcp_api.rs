@@ -2022,12 +2022,27 @@ pub(crate) enum MemoryEnrichOutcome {
     /// The caller supplied `query_embedding` themselves — never overwritten.
     SkippedPresent,
     /// The local embedding service errored or was unreachable.
+    ///
+    /// Read this TOGETHER with [`Self::SkippedTimeout`] as "the embedder did
+    /// not answer": which of the two a hard-down service lands in depends on
+    /// whether the OS refuses the connection inside
+    /// [`MEMORY_EMBED_TIMEOUT`], and measurably it does not always — a
+    /// connect to a closed local port exceeded the 150 ms budget under test.
+    /// The split is a latency hint, not a clean up/down signal.
     SkippedUnavailable,
-    /// The embed exceeded [`MEMORY_EMBED_TIMEOUT`].
+    /// The embed exceeded [`MEMORY_EMBED_TIMEOUT`] — a slow embedder, a cold
+    /// start (measured 6.01 s), or a down one whose refusal was slower than
+    /// the budget. See [`Self::SkippedUnavailable`].
     SkippedTimeout,
     /// A `coord_memory_search` call whose shape could not be enriched (a
     /// JSON-RPC batch, or no usable string `params.arguments.query_text`).
     SkippedParse,
+    /// The embedding service answered 200 with a vector of the WRONG WIDTH.
+    /// Its own client does not check length, coord deliberately validates no
+    /// dimension, and the backend rejects a non-`EMBEDDING_DIM` vector with a
+    /// 422 — so injecting one would make every search fail CLOSED, which is
+    /// precisely what this design forbids. Degrade to FTS instead.
+    SkippedDimension,
 }
 
 impl MemoryEnrichOutcome {
@@ -2038,40 +2053,59 @@ impl MemoryEnrichOutcome {
             Self::SkippedUnavailable => "skipped_unavailable",
             Self::SkippedTimeout => "skipped_timeout",
             Self::SkippedParse => "skipped_parse",
+            Self::SkippedDimension => "skipped_dimension",
         }
     }
 
-    pub(crate) const ALL: [Self; 5] = [
+    /// Index into [`memory_enrich_counters`]. An EXHAUSTIVE match, deliberately
+    /// — the obvious `ALL.iter().position(..).unwrap_or(0)` silently folds any
+    /// outcome missing from `ALL` into index 0 (`Enriched`), inflating the one
+    /// series that is supposed to be the positive proof the arm is firing.
+    /// This way the compiler refuses to build until a new variant is mapped.
+    pub(crate) const fn idx(self) -> usize {
+        match self {
+            Self::Enriched => 0,
+            Self::SkippedPresent => 1,
+            Self::SkippedUnavailable => 2,
+            Self::SkippedTimeout => 3,
+            Self::SkippedParse => 4,
+            Self::SkippedDimension => 5,
+        }
+    }
+
+    pub(crate) const ALL: [Self; 6] = [
         Self::Enriched,
         Self::SkippedPresent,
         Self::SkippedUnavailable,
         Self::SkippedTimeout,
         Self::SkippedParse,
+        Self::SkippedDimension,
     ];
 }
 
-/// Per-outcome counters, in declaration order of [`MemoryEnrichOutcome::ALL`].
-fn memory_enrich_counters() -> &'static [std::sync::atomic::AtomicU64; 5] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 5]> =
+/// Per-outcome counters, indexed by [`MemoryEnrichOutcome::idx`].
+fn memory_enrich_counters() -> &'static [std::sync::atomic::AtomicU64; 6] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 6]> =
         std::sync::OnceLock::new();
     COUNTERS.get_or_init(Default::default)
 }
 
 fn record_memory_enrich_outcome(outcome: MemoryEnrichOutcome) {
-    let idx = MemoryEnrichOutcome::ALL
-        .iter()
-        .position(|o| *o == outcome)
-        .unwrap_or(0);
-    memory_enrich_counters()[idx].fetch_add(1, Ordering::Relaxed);
+    memory_enrich_counters()[outcome.idx()].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Snapshot of the enrichment counters for `GET /health`.
 pub(crate) fn memory_enrich_health_snapshot() -> serde_json::Value {
     let mut obj = serde_json::Map::new();
-    for (i, outcome) in MemoryEnrichOutcome::ALL.iter().enumerate() {
+    for outcome in MemoryEnrichOutcome::ALL {
+        // Keyed on `idx()`, NOT on position in `ALL`. Writes go through
+        // `idx()`, so reading by position would silently mislabel every series
+        // the moment someone reorders `ALL` — a plausible cosmetic edit, since
+        // `ALL` also dictates the key order of this JSON. Both sides must agree
+        // via the same function; `all_labels_read_back_their_own_slot` pins it.
         obj.insert(
             outcome.label().to_string(),
-            serde_json::json!(memory_enrich_counters()[i].load(Ordering::Relaxed)),
+            serde_json::json!(memory_enrich_counters()[outcome.idx()].load(Ordering::Relaxed)),
         );
     }
     serde_json::Value::Object(obj)
@@ -2084,7 +2118,18 @@ enum MemorySearchShape<'a> {
     /// identical.
     NotASearch,
     /// Enrichable; carries the query text to embed.
-    Enrichable(&'a str),
+    ///
+    /// `needs_cleanup` marks a body that carries a HALF-PAIR we must remove if
+    /// we end up NOT enriching — a `query_embedding: null`, or a
+    /// `query_embedding_model` with no vector. Coord rejects both shapes
+    /// (`(Some(Null), _)` fails its `is_array` check; `(None, Some(_))` fails
+    /// its pair check), so forwarding such a body "untouched" on a degrade path
+    /// would hard-error the search instead of degrading it to FTS. Byte-identity
+    /// is only owed to bodies coord would actually accept.
+    Enrichable {
+        query_text: &'a str,
+        needs_cleanup: bool,
+    },
     /// A search, but not one we will rewrite. Carries the outcome to record.
     Skip(MemoryEnrichOutcome),
 }
@@ -2115,20 +2160,68 @@ fn classify_memory_search(parsed: &serde_json::Value) -> MemorySearchShape<'_> {
         return MemorySearchShape::NotASearch;
     }
     let args = parsed.pointer("/params/arguments");
-    // A caller who computed their own vector is authoritative over ours; theirs
-    // may be in a deliberately different space, and silently replacing it would
-    // make the response's `vector_arm` describe an arm the caller never asked
-    // for.
-    if args.and_then(|a| a.get("query_embedding")).is_some() {
+    // Hands off ONLY when the caller supplied a real VECTOR: theirs may be in a
+    // deliberately different space, and replacing it would make the response's
+    // `vector_arm` describe an arm they never asked for.
+    //
+    // Deliberately NOT keyed on the model tag as well. A tag without a vector
+    // names a space that has nothing in it — there is no cross-space risk to
+    // protect, the vector can only come from us, and coord rejects that lone
+    // tag outright. Skipping on it would convert a search that works today into
+    // a hard error. An explicit JSON `null` is likewise not a supplied vector;
+    // some MCP clients serialize absent optionals that way.
+    let real_vector = args
+        .and_then(|a| a.get("query_embedding"))
+        .is_some_and(|v| !v.is_null());
+    if real_vector {
         return MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedPresent);
     }
+    // Either leftover key makes the body one coord would REFUSE if we forwarded
+    // it unchanged, so a degrade path has to strip it. See `Enrichable`.
+    let needs_cleanup = args.is_some_and(|a| {
+        a.get("query_embedding").is_some() || a.get("query_embedding_model").is_some()
+    });
     match args
         .and_then(|a| a.get("query_text"))
         .and_then(|t| t.as_str())
     {
-        Some(t) if !t.trim().is_empty() => MemorySearchShape::Enrichable(t),
+        Some(t) if !t.trim().is_empty() => MemorySearchShape::Enrichable {
+            query_text: t,
+            needs_cleanup,
+        },
         _ => MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedParse),
     }
+}
+
+/// Remove a leftover `query_embedding` / `query_embedding_model` half-pair.
+/// Returns whether anything was actually removed.
+fn strip_query_embedding_pair(parsed: &mut serde_json::Value) -> bool {
+    let Some(args) = parsed
+        .pointer_mut("/params/arguments")
+        .and_then(|a| a.as_object_mut())
+    else {
+        return false;
+    };
+    let had_vec = args.remove("query_embedding").is_some();
+    let had_tag = args.remove("query_embedding_model").is_some();
+    had_vec || had_tag
+}
+
+/// Record a non-enriching outcome and produce the body to forward.
+///
+/// `None` means "forward the original bytes". A cleaned body is returned only
+/// when the caller left a half-pair behind that coord would refuse — the whole
+/// point of the degrade path is that the search still returns FTS hits.
+fn degraded_body(
+    parsed: &mut serde_json::Value,
+    needs_cleanup: bool,
+    outcome: MemoryEnrichOutcome,
+) -> Option<Vec<u8>> {
+    record_memory_enrich_outcome(outcome);
+    if !needs_cleanup || !strip_query_embedding_pair(parsed) {
+        return None;
+    }
+    serde_json::to_vec(parsed).ok()
 }
 
 /// Write the computed pair into a parsed `coord_memory_search` body.
@@ -2159,27 +2252,33 @@ fn inject_query_embedding(parsed: &mut serde_json::Value, embedding: Vec<f32>) -
 
 /// Fill in `coord_memory_search`'s query vector, or leave the body alone.
 ///
-/// `Some(bytes)` ONLY when a vector was computed and injected. `None` means
-/// "forward the original bytes unchanged" and covers every non-search request
-/// and every failure path.
+/// `None` means "forward the original bytes unchanged" — every non-search
+/// request and every failure path over a body coord already accepts.
+/// `Some(bytes)` means a rewritten body: usually the enriched one, but also the
+/// CLEANED one on a degrade path when the caller left a half-pair behind.
 ///
 /// **Fail open, always.** Embedder down, embed error, timeout, unexpected
-/// shape — all forward the request untouched, and the caller gets exactly
-/// today's behaviour (`vector_arm: "skipped_no_embedding"`, FTS hits). Recall
-/// must never break because a local service is slow or missing.
+/// shape — the search still reaches coord and still returns FTS hits
+/// (`vector_arm: "skipped_no_embedding"`). Recall must never break because a
+/// local service is slow or missing. Note that "forward untouched" is the
+/// wrong move for a body carrying a lone/`null` half-pair: coord refuses those,
+/// so degrading correctly means stripping them rather than preserving bytes.
 async fn enrich_memory_search_body(body: &[u8]) -> Option<Vec<u8>> {
-    // No `is_available()` pre-check. It is a second round trip AND a TOCTOU
-    // window — the service can die between the probe and the compute, so the
-    // error path has to exist either way. One call, one failure path.
-    //
-    // Shared client (same posture as `COORD_PROXY_CLIENT` below): this runs on
-    // EVERY proxied request, and building a reqwest client per call would both
-    // waste work on the non-search majority and throw away the connection pool
-    // — which is exactly what the 150 ms budget cannot afford.
+    enrich_memory_search_body_with(body, None).await
+}
+
+/// The process-wide embedding client.
+///
+/// Shared (same posture as `COORD_PROXY_CLIENT` below) so the connection pool
+/// survives between searches — which is exactly what the 150 ms budget needs.
+/// Built on FIRST USE by a real search, not on the first proxied request of any
+/// kind: `reqwest::Client::builder().build()` does synchronous backend init
+/// inside a `OnceLock` that parks concurrent callers, and ordinary traffic
+/// should not pay for it.
+fn shared_embed_client() -> &'static crate::database::embedding_client::EmbeddingClient {
     static EMBED_CLIENT: std::sync::OnceLock<crate::database::embedding_client::EmbeddingClient> =
         std::sync::OnceLock::new();
-    let client = EMBED_CLIENT.get_or_init(crate::database::embedding_client::EmbeddingClient::new);
-    enrich_memory_search_body_with(body, client).await
+    EMBED_CLIENT.get_or_init(crate::database::embedding_client::EmbeddingClient::new)
 }
 
 /// Embedder-parameterized core of [`enrich_memory_search_body`], so tests can
@@ -2188,17 +2287,30 @@ async fn enrich_memory_search_body(body: &[u8]) -> Option<Vec<u8>> {
 /// `retrieve_tenant_memory_at`.
 async fn enrich_memory_search_body_with(
     body: &[u8],
-    client: &crate::database::embedding_client::EmbeddingClient,
+    client: Option<&crate::database::embedding_client::EmbeddingClient>,
 ) -> Option<Vec<u8>> {
     let mut parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let query_text = match classify_memory_search(&parsed) {
+    let (query_text, needs_cleanup) = match classify_memory_search(&parsed) {
         MemorySearchShape::NotASearch => return None,
         MemorySearchShape::Skip(outcome) => {
             record_memory_enrich_outcome(outcome);
             return None;
         }
-        MemorySearchShape::Enrichable(t) => t.to_string(),
+        MemorySearchShape::Enrichable {
+            query_text,
+            needs_cleanup,
+        } => (query_text.to_string(), needs_cleanup),
     };
+
+    // Only a real search reaches the client. No `is_available()` pre-check
+    // either: it is a second round trip AND a TOCTOU window — the service can
+    // die between the probe and the compute, so the error path below has to
+    // exist regardless. One call, one failure path.
+    // The closure (rather than passing `shared_embed_client` directly) is
+    // load-bearing: as a bare fn item its `&'static` return unifies the
+    // parameter's lifetime to `'static`, which would forbid a caller — every
+    // test — from passing a borrow of a local client.
+    let client = client.unwrap_or_else(|| shared_embed_client());
 
     let embedding = match tokio::time::timeout(
         MEMORY_EMBED_TIMEOUT,
@@ -2206,28 +2318,55 @@ async fn enrich_memory_search_body_with(
     )
     .await
     {
-        Ok(Ok(e)) => e,
+        // The service can answer 200 with a vector of the wrong width — a model
+        // swap or a misconfigured deployment — and NOTHING between here and the
+        // database catches it: `compute_text_embedding` checks no length, coord
+        // deliberately validates no dimension (it is the backend's call to
+        // make), and the backend then rejects it with a 422. Injecting such a
+        // vector would therefore turn EVERY search into a hard error while the
+        // health series happily reported `enriched`. Degrade instead — the
+        // whole point is that a broken embedder costs a search its semantic
+        // arm, never its response.
+        Ok(Ok(e)) if e.len() == crate::database::embeddings::EMBEDDING_DIM => e,
+        Ok(Ok(e)) => {
+            tracing::debug!(
+                dims = e.len(),
+                expected = crate::database::embeddings::EMBEDDING_DIM,
+                "coord-mcp proxy: embedder returned an unexpected vector width — \
+                 forwarding search FTS-only"
+            );
+            return degraded_body(
+                &mut parsed,
+                needs_cleanup,
+                MemoryEnrichOutcome::SkippedDimension,
+            );
+        }
         Ok(Err(e)) => {
             tracing::debug!(
                 error = %e,
                 "coord-mcp proxy: query embed failed — forwarding search FTS-only"
             );
-            record_memory_enrich_outcome(MemoryEnrichOutcome::SkippedUnavailable);
-            return None;
+            return degraded_body(
+                &mut parsed,
+                needs_cleanup,
+                MemoryEnrichOutcome::SkippedUnavailable,
+            );
         }
         Err(_) => {
             tracing::debug!(
                 timeout_ms = MEMORY_EMBED_TIMEOUT.as_millis() as u64,
                 "coord-mcp proxy: query embed timed out — forwarding search FTS-only"
             );
-            record_memory_enrich_outcome(MemoryEnrichOutcome::SkippedTimeout);
-            return None;
+            return degraded_body(
+                &mut parsed,
+                needs_cleanup,
+                MemoryEnrichOutcome::SkippedTimeout,
+            );
         }
     };
 
     if !inject_query_embedding(&mut parsed, embedding) {
-        record_memory_enrich_outcome(MemoryEnrichOutcome::SkippedParse);
-        return None;
+        return degraded_body(&mut parsed, needs_cleanup, MemoryEnrichOutcome::SkippedParse);
     }
     match serde_json::to_vec(&parsed) {
         Ok(bytes) => {
@@ -2477,9 +2616,11 @@ async fn coord_mcp_proxy_handler(
     // Semantic recall (Phase 2): put a locally-computed query vector into
     // `coord_memory_search`'s existing field. `None` — every other request, and
     // every failure path — forwards the ORIGINAL bytes, byte-identically.
-    let forward_body = match enrich_memory_search_body(&body).await {
-        Some(rewritten) => rewritten,
-        None => body.to_vec(),
+    // `Bytes` clones are refcounted, so the untouched path costs a pointer
+    // bump rather than a full copy of every proxied body.
+    let forward_body: reqwest::Body = match enrich_memory_search_body(&body).await {
+        Some(rewritten) => rewritten.into(),
+        None => body.clone().into(),
     };
 
     // Resolve the upstream once, WITH its source, so every error emitted below
@@ -6561,8 +6702,12 @@ mod memory_search_enrichment_tests {
     fn a_plain_search_is_enrichable() {
         let body = search_call(json!({"query_text": "how does the merge train hold a PR"}));
         match classify_memory_search(&body) {
-            MemorySearchShape::Enrichable(t) => {
-                assert_eq!(t, "how does the merge train hold a PR")
+            MemorySearchShape::Enrichable {
+                query_text,
+                needs_cleanup,
+            } => {
+                assert_eq!(query_text, "how does the merge train hold a PR");
+                assert!(!needs_cleanup, "a clean body needs no stripping");
             }
             _ => panic!("a plain coord_memory_search must be enrichable"),
         }
@@ -6653,11 +6798,183 @@ mod memory_search_enrichment_tests {
         let client =
             crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
         let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
-        let out = super::enrich_memory_search_body_with(&body, &client).await;
+        let out = super::enrich_memory_search_body_with(&body, Some(&client)).await;
         assert!(
             out.is_none(),
             "a dead embedder must forward the original bytes, not fail the search"
         );
+    }
+
+    /// The outcome→series mapping itself, which nothing else covers: a wrong
+    /// `idx()` would silently inflate `enriched` — the one series meant to be
+    /// positive proof the arm is firing. Counters are process-global, so this
+    /// asserts a DELTA rather than an absolute.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skip_lands_in_its_own_series_and_not_in_enriched() {
+        let read = |k: &str| {
+            memory_enrich_health_snapshot()
+                .get(k)
+                .and_then(|v| v.as_u64())
+                .expect("series must exist")
+        };
+        let before_present = read("skipped_present");
+        let before_enriched = read("enriched");
+
+        // Drive the SkippedPresent path deliberately: it is decided by
+        // `classify_memory_search` BEFORE any network call, so this asserts the
+        // outcome→series mapping deterministically. Routing through a dead port
+        // instead would land in either skipped_unavailable OR skipped_timeout
+        // depending on how fast the OS refuses the connect — a real flake, and
+        // the reason this test does not use one.
+        let client =
+            crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
+        let body = serde_json::to_vec(&search_call(json!({
+            "query_text": "login",
+            "query_embedding": [0.1, 0.2],
+        })))
+        .unwrap();
+        let out = super::enrich_memory_search_body_with(&body, Some(&client)).await;
+
+        assert!(out.is_none(), "a caller-supplied vector is left alone");
+        assert!(
+            read("skipped_present") >= before_present + 1,
+            "the skip must land in its OWN series"
+        );
+        assert_eq!(
+            read("enriched"),
+            before_enriched,
+            "a skip must NEVER be counted as enriched — that series is the only \
+             positive proof the semantic arm is firing"
+        );
+    }
+
+    /// Every outcome maps to a distinct slot, and every slot is in range.
+    /// Guards the exhaustive `idx()` against a copy-paste collision.
+    #[test]
+    fn every_outcome_maps_to_a_distinct_in_range_slot() {
+        let mut seen: Vec<usize> = MemoryEnrichOutcome::ALL.iter().map(|o| o.idx()).collect();
+        assert!(
+            seen.iter().all(|i| *i < MemoryEnrichOutcome::ALL.len()),
+            "every index must be in range"
+        );
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "outcome indices must be distinct");
+    }
+
+    /// A LONE model tag must NOT block enrichment. It names a space with
+    /// nothing in it, the vector can only come from us, and coord rejects the
+    /// lone tag outright — so skipping on it would convert a search that works
+    /// today into a hard error. It is flagged for cleanup instead.
+    #[test]
+    fn a_lone_model_tag_is_enrichable_and_flagged_for_cleanup() {
+        let body = search_call(json!({
+            "query_text": "login",
+            "query_embedding_model": "some-other-space@v9",
+        }));
+        match classify_memory_search(&body) {
+            MemorySearchShape::Enrichable {
+                query_text,
+                needs_cleanup,
+            } => {
+                assert_eq!(query_text, "login");
+                assert!(
+                    needs_cleanup,
+                    "a lone tag must be stripped if we end up not enriching"
+                );
+            }
+            _ => panic!("a lone model tag must not block enrichment"),
+        }
+    }
+
+    /// An explicit JSON `null` is ABSENT, not supplied — some MCP clients
+    /// serialize absent optionals that way, and reading it as "caller supplied
+    /// one" would permanently cost them the semantic arm.
+    #[test]
+    fn an_explicit_null_pair_is_still_enrichable() {
+        let body = search_call(json!({
+            "query_text": "login",
+            "query_embedding": serde_json::Value::Null,
+            "query_embedding_model": serde_json::Value::Null,
+        }));
+        match classify_memory_search(&body) {
+            MemorySearchShape::Enrichable {
+                query_text,
+                needs_cleanup,
+            } => {
+                assert_eq!(query_text, "login");
+                assert!(needs_cleanup, "null halves must be stripped on a degrade");
+            }
+            _ => panic!("an explicit null pair must still be enrichable"),
+        }
+    }
+
+    /// THE fail-open case the previous round missed: a caller who left a
+    /// half-pair behind AND an embedder that cannot answer. Forwarding those
+    /// bytes "untouched" would make coord refuse the request outright — so the
+    /// degrade path must hand back a CLEANED body, not the original.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_degrade_strips_a_half_pair_so_coord_still_accepts_the_search() {
+        let client =
+            crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
+
+        for args in [
+            json!({"query_text": "login", "query_embedding": serde_json::Value::Null}),
+            json!({"query_text": "login", "query_embedding_model": "other@v9"}),
+            json!({"query_text": "login",
+                   "query_embedding": serde_json::Value::Null,
+                   "query_embedding_model": serde_json::Value::Null}),
+        ] {
+            let body = serde_json::to_vec(&search_call(args.clone())).unwrap();
+            let out = super::enrich_memory_search_body_with(&body, Some(&client))
+                .await
+                .unwrap_or_else(|| {
+                    panic!("a half-pair body must be CLEANED on degrade, not forwarded: {args}")
+                });
+
+            let sent: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let sent_args = &sent["params"]["arguments"];
+            assert!(
+                sent_args.get("query_embedding").is_none()
+                    && sent_args.get("query_embedding_model").is_none(),
+                "both halves must be gone so coord accepts the body: {sent_args}"
+            );
+            assert_eq!(
+                sent_args["query_text"], "login",
+                "the query itself must survive — this is still a search"
+            );
+        }
+    }
+
+    /// A clean body on a degrade path is forwarded byte-identical: there is
+    /// nothing to strip, so nothing may be rewritten.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_degrade_on_a_clean_body_forwards_the_original_bytes() {
+        let client =
+            crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
+        let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
+        assert!(
+            super::enrich_memory_search_body_with(&body, Some(&client))
+                .await
+                .is_none(),
+            "nothing to clean ⇒ forward the original bytes"
+        );
+    }
+
+    /// Read side and write side must agree on the slot. Reading by position in
+    /// `ALL` while writing via `idx()` mislabels every series the moment `ALL`
+    /// is reordered — and every other test still passes.
+    #[test]
+    fn all_labels_read_back_their_own_slot() {
+        for (i, outcome) in MemoryEnrichOutcome::ALL.iter().enumerate() {
+            assert_eq!(
+                outcome.idx(),
+                i,
+                "ALL[{i}] ({}) must sit at its own idx()",
+                outcome.label()
+            );
+        }
     }
 
     /// The same fail-open path covers non-search traffic without ever dialing
@@ -6670,7 +6987,7 @@ mod memory_search_enrichment_tests {
             "jsonrpc":"2.0","id":1,"method":"tools/list"
         }))
         .unwrap();
-        assert!(super::enrich_memory_search_body_with(&body, &client)
+        assert!(super::enrich_memory_search_body_with(&body, Some(&client))
             .await
             .is_none());
     }
