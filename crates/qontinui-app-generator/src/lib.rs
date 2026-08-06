@@ -84,6 +84,8 @@ pub fn snapshot_element_from(el: &InstrumentedElement) -> UIBridgeElement {
         state: ElementState {
             visible: true,
             enabled: true,
+            disabled: false,
+            aria_disabled: false,
             focused: false,
             rect: ElementRect {
                 x: 0.0,

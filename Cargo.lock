@@ -6798,7 +6798,7 @@ dependencies = [
 
 [[package]]
 name = "qontinui-types"
-version = "1.1.0"
+version = "1.4.0"
 dependencies = [
  "chrono",
  "hex",
