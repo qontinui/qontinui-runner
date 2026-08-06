@@ -200,6 +200,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Kernel",
+    # GlobalMemoryStatusEx — free/total COMMIT, the memory quantity every
+    # build guard on this machine agrees on (supervisor, cargo-guard.sh, and
+    # now ci_node). Physical-available is the wrong number on Windows: builds
+    # die at ~90% commit while free-physical still looks healthy.
+    "Win32_System_SystemInformation",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
 ] }
