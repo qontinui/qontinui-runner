@@ -450,16 +450,28 @@ mod tests {
 
     use super::*;
     use std::collections::HashMap;
-    use std::time::Instant;
 
-    /// Build a `ProcessConfig` that immediately exits non-zero. On Windows we
-    /// use `powershell -c "exit 1"`, on POSIX `sh -c "exit 1"`. `start_process`
-    /// wraps the command in `cmd /C` on Windows already; on POSIX the command
-    /// is invoked directly. Either way the spawned child terminates within a
-    /// few hundred milliseconds.
+    /// Build a `ProcessConfig` for a child that exits non-zero immediately,
+    /// using the cheapest process available on each platform.
+    ///
+    /// `build_command` already wraps the command in `cmd /C` on Windows, so
+    /// `command: "exit"` becomes `cmd /C "exit 1"` — cmd's own builtin, one
+    /// lightweight process. On POSIX the command is invoked directly, so
+    /// `sh -c "exit 1"` is a single fork+exec.
+    ///
+    /// This used to spawn `powershell -c "exit 1"` on Windows, which put a
+    /// second, .NET-hosted process (profile load, module autodiscovery, JIT)
+    /// *behind* that cmd. Measured on a dev box under moderate load, 10 spawns
+    /// each: `cmd /C "exit 1"` averaged 1.2s, `cmd /C "powershell -c exit 1"`
+    /// averaged 6.2s — 5.1x. The `test (windows-latest)` CI leg runs this test
+    /// binary at 4-way test parallelism on a 4-core/16 GB hosted runner that
+    /// ci.yml deliberately gives a 32 GB pagefile to survive link-time OOM, so
+    /// that multiplier lands on an already paging box and the child's exit
+    /// could exceed even a 30s bound. POSIX never had an interpreter to wait
+    /// for, which is why the same tests only ever failed on Windows.
     fn immediate_exit_config() -> ProcessConfig {
         #[cfg(windows)]
-        let (command, args) = ("powershell", vec!["-c".to_string(), "exit 1".to_string()]);
+        let (command, args) = ("exit", vec!["1".to_string()]);
         #[cfg(not(windows))]
         let (command, args) = ("sh", vec!["-c".to_string(), "exit 1".to_string()]);
 
@@ -485,39 +497,53 @@ mod tests {
         }
     }
 
-    /// Poll `handle` until it is populated or `timeout` elapses, returning the
-    /// captured info (`None` on timeout). These tests verify that the
-    /// `early_exit` signal *fires* / re-fires, not how fast — the old fixed
-    /// 1.5s deadline flaked on loaded CI runners where child spawn → exit →
-    /// reader-task detection → mutex population can briefly exceed it. The
-    /// timeout stays bounded so a real regression (signal never fires) still
-    /// fails the test, just more slowly.
-    async fn wait_for_early_exit(
-        handle: &std::sync::Arc<std::sync::Mutex<Option<EarlyExitInfo>>>,
-        timeout: Duration,
-    ) -> Option<EarlyExitInfo> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(info) = *handle.lock().unwrap() {
-                return Some(info);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
+    /// Drain the process channel until the child's `Exited` message lands,
+    /// returning the exit code it carried.
+    ///
+    /// This is a *causal* wait, not a timed one. `start`'s exit-monitor task
+    /// populates `early_exit` and only THEN sends `ProcessMessage::Exited`, so
+    /// receiving `Exited` is a happens-before edge: once it arrives, the
+    /// signal is already written. Callers can therefore assert on `early_exit`
+    /// with no polling and no wall-clock bound.
+    ///
+    /// That ordering is not incidental — it is the whole contract
+    /// `manager.rs::await_ready` relies on (it reads the signal each tick
+    /// precisely so it does not have to wait for the channel to drain). Going
+    /// through `Exited` tests the guarantee instead of racing it: the previous
+    /// version polled the mutex against a 30s deadline, which asserted nothing
+    /// about ordering and failed on Windows CI whenever the child was simply
+    /// slow to exit.
+    ///
+    /// `HANG_GUARD` bounds only a genuine hang (libtest has no per-test
+    /// timeout, so a never-exiting child would wedge the suite instead of
+    /// failing it). No assertion depends on how long the child takes.
+    async fn await_child_exit(rx: &mut mpsc::Receiver<ProcessMessage>) -> Option<i32> {
+        const HANG_GUARD: Duration = Duration::from_secs(120);
 
-    /// Generous, CI-safe upper bound for "did the async signal fire" polls.
-    const EARLY_EXIT_WAIT: Duration = Duration::from_secs(30);
+        let exited = tokio::time::timeout(HANG_GUARD, async {
+            while let Some(msg) = rx.recv().await {
+                if let ProcessMessage::Exited { code } = msg {
+                    return Some(code);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for the child to exit — `Exited` was never published");
+
+        exited.expect("process channel closed before the `Exited` message was published")
+    }
 
     /// Spawn an immediately-exiting child and assert that the `early_exit`
     /// signal fires. This is the test_wait()-equivalent guarantee that
     /// `await_ready` relies on to fail-fast on crashed-spawn children (`'next'
     /// is not recognized`, missing binary, partial `npm install`) instead of
-    /// timing out at 30s. In production the signal lands in ~1s; this test only
-    /// asserts that it *fires* (bounded wait) — a tight wall-clock bound is not
-    /// reliably assertable on loaded CI runners.
+    /// timing out at 30s.
+    ///
+    /// The assertion is on the ORDERING: by the time `Exited` reaches the
+    /// channel, `early_exit` must already carry the same code. A regression
+    /// that drops the write, or moves it after the send, fails here regardless
+    /// of machine speed.
     #[tokio::test]
     async fn early_exit_signal_fires_on_immediate_exit() {
         let mut process = ManagedProcess::new(immediate_exit_config());
@@ -530,15 +556,23 @@ mod tests {
         );
 
         // Spawn the child + reader tasks.
-        let _msg_rx = process
+        let mut msg_rx = process
             .start()
             .expect("start should succeed for valid command");
 
-        let info = wait_for_early_exit(&early_exit, EARLY_EXIT_WAIT)
-            .await
-            .expect("early_exit signal should be populated after an immediate-exit child spawn");
+        let channel_code = await_child_exit(&mut msg_rx).await;
 
-        // PowerShell `exit 1` returns exit code 1. POSIX `sh -c "exit 1"` likewise.
+        let info = early_exit
+            .lock()
+            .unwrap()
+            .expect("early_exit must already be populated when `Exited` is published");
+
+        assert_eq!(
+            info.code, channel_code,
+            "early_exit must carry the same exit code the channel reports"
+        );
+
+        // `cmd /C "exit 1"` returns exit code 1. POSIX `sh -c "exit 1"` likewise.
         // We assert the code is Some (i.e. we captured it) and is non-zero —
         // platforms occasionally normalize 1 → other small ints, so don't pin
         // the exact value beyond "non-zero meaning failure was observed."
@@ -563,11 +597,10 @@ mod tests {
         let early_exit = process.early_exit_handle();
 
         // First spawn: child exits immediately, signal populates.
-        let _ = process.start().expect("first start should succeed");
+        let mut gen1_rx = process.start().expect("first start should succeed");
+        await_child_exit(&mut gen1_rx).await;
         assert!(
-            wait_for_early_exit(&early_exit, EARLY_EXIT_WAIT)
-                .await
-                .is_some(),
+            early_exit.lock().unwrap().is_some(),
             "first generation early_exit should have populated"
         );
 
@@ -576,20 +609,24 @@ mod tests {
         // we're testing `ManagedProcess` directly without the manager).
         process.runtime.state = ProcessState::Stopped;
 
-        // Second spawn: signal should be cleared synchronously by `start()`
-        // BEFORE the second child has had time to exit, so we can observe
-        // the cleared state immediately.
-        let _ = process.start().expect("second start should succeed");
-        // Race window: the new child can exit within microseconds, so we can't
-        // reliably observe the cleared (`None`) state. We instead prove the slot
-        // was reset by confirming it re-populates across the restart boundary —
-        // if `start()` had NOT cleared it, the value would still be the first
-        // generation's; either way the "cleared on start" contract `await_ready`
-        // depends on is exercised by the re-spawn path.
+        let mut gen2_rx = process.start().expect("second start should succeed");
+
+        // The clear is now asserted DIRECTLY, and deterministically. `start()`
+        // resets the slot synchronously before it spawns, and `#[tokio::test]`
+        // builds a current-thread runtime — so no `tokio::spawn`ed task,
+        // including generation 2's exit monitor, can have been polled between
+        // `start()` returning and the next `.await` below. There is no race to
+        // lose. (The earlier version could not make this assertion and said so;
+        // it holds as long as this test is not moved to `multi_thread`.)
         assert!(
-            wait_for_early_exit(&early_exit, EARLY_EXIT_WAIT)
-                .await
-                .is_some(),
+            early_exit.lock().unwrap().is_none(),
+            "start() must clear the prior generation's early_exit signal"
+        );
+
+        // ...and the new generation then re-populates it.
+        await_child_exit(&mut gen2_rx).await;
+        assert!(
+            early_exit.lock().unwrap().is_some(),
             "second generation early_exit should populate after restart"
         );
     }
