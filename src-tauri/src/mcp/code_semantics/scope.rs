@@ -49,24 +49,6 @@ pub fn default_ts_scope() -> Option<Scope> {
     }
 }
 
-/// The workspace root holding the sibling repo checkouts. Resolution order:
-///   1. env `QONTINUI_WORKSPACE_ROOT` (explicit, for non-standard layouts /
-///      deployed binaries),
-///   2. the runner checkout's grandparent (`CARGO_MANIFEST_DIR/../..` — the dir
-///      that contains `qontinui-runner` and its sibling repos, the dev layout).
-pub fn workspace_root() -> Option<PathBuf> {
-    if let Ok(r) = std::env::var("QONTINUI_WORKSPACE_ROOT") {
-        let p = PathBuf::from(r);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent() // qontinui-runner
-        .and_then(Path::parent) // workspace root (contains the sibling repos)
-        .map(Path::to_path_buf)
-}
-
 /// Explicit `repo-name → dir` overrides parsed from `QONTINUI_CODE_GRAPH_ROOTS`
 /// (`name=dir,name=dir,…`). Takes precedence over the sibling convention so a
 /// non-standard checkout layout can still be mapped.
@@ -88,12 +70,23 @@ fn registry_overrides() -> HashMap<String, PathBuf> {
 /// Resolve a repo selector to a local checkout directory for the multi-language
 /// `Ξ_AST` code graph. Accepts a bare repo name (`qontinui-coord`, `coord`) or an
 /// `owner/name` slug (`qontinui/qontinui-coord`). Resolution: the
-/// `QONTINUI_CODE_GRAPH_ROOTS` override, then `<workspace_root>/<name>`, then
-/// `<workspace_root>/qontinui-<name>`. Returns `None` for an unknown repo or any
+/// `QONTINUI_CODE_GRAPH_ROOTS` override, then `<workspace-root>/<name>`, then
+/// `<workspace-root>/qontinui-<name>`. Returns `None` for an unknown repo or any
 /// path-like selector (so the caller resolves real paths as directories and an
 /// unknown selector falls back to the default scope — never an error).
+///
+/// **This module no longer answers "where is the workspace root".** It used to,
+/// with a private `workspace_root()` whose rung 2 was
+/// `env!("CARGO_MANIFEST_DIR")/../..` — the *build* machine's source tree baked
+/// into the shipped binary, invisible to any grep for a `D:` literal. That
+/// function is deleted, not wrapped, and the question now goes to
+/// [`crate::workspace_paths`] (plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 1). Its
+/// `QONTINUI_WORKSPACE_ROOT` env var survives as a recognised alias inside
+/// `qontinui_types::paths`, so anyone who set it is unaffected.
 pub fn repo_dir(selector: &str) -> Option<PathBuf> {
-    repo_dir_with(selector, &registry_overrides(), workspace_root().as_deref())
+    let root = crate::workspace_paths::runner_workspace_root().into_root();
+    repo_dir_with(selector, &registry_overrides(), root.as_deref())
 }
 
 /// Pure core of [`repo_dir`] (the overrides + workspace root are injected so the
