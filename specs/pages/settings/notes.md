@@ -1,3 +1,0 @@
-# Settings
-
-_(notes)_

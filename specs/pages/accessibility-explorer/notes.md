@@ -1,3 +1,0 @@
-# AccessibilityExplorer
-
-_(notes)_
