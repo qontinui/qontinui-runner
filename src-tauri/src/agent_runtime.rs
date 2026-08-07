@@ -4195,23 +4195,14 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
     Ok(())
 }
 
+/// The workspace root holding the runner's canonical checkouts.
+///
+/// One of the four byte-similar copies collapsed in Phase 2 of
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`; its
+/// `D:/qontinui-root` Windows arm shipped the author's machine layout inside an
+/// open-source binary. [`crate::workspace_paths`] is now the single door.
 pub(crate) fn qontinui_root_dir() -> Option<PathBuf> {
-    if let Ok(s) = std::env::var("QONTINUI_ROOT") {
-        let p = PathBuf::from(s);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let p = PathBuf::from("D:/qontinui-root");
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    dirs::home_dir()
-        .map(|h| h.join("qontinui-root"))
-        .filter(|p| p.is_dir())
+    crate::workspace_paths::workspace_root()
 }
 
 /// The local primary-checkout directory NAME for a coord repo slug. Coord uses

@@ -1679,30 +1679,17 @@ fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
 }
 
 /// Resolve the root directory the publisher walks for qontinui-* repos.
-/// `QONTINUI_ROOT` env override → `D:/qontinui-root` on Windows →
-/// `$HOME/qontinui-root` on unix. Returns `None` if neither resolves to
-/// a real directory.
+///
+/// Delegates to [`crate::workspace_paths`], the single door to this question —
+/// this was one of four byte-similar copies, each with a hardcoded
+/// `D:/qontinui-root` Windows arm, collapsed in Phase 2 of
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`.
+///
+/// Still `Option`: a miss means this publish pass finds no repos and says so
+/// (see the "QONTINUI_ROOT to override. Skipping." log below), which is honest
+/// degradation rather than an error.
 fn qontinui_root() -> Option<PathBuf> {
-    if let Ok(s) = std::env::var("QONTINUI_ROOT") {
-        let p = PathBuf::from(s);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let p = PathBuf::from("D:/qontinui-root");
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    if let Some(home) = dirs::home_dir() {
-        let p = home.join("qontinui-root");
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    None
+    crate::workspace_paths::workspace_root()
 }
 
 /// Decide which branch (if any) the `behind_default_count` rev-list should

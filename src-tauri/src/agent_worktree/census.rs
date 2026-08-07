@@ -917,33 +917,22 @@ fn resolve_tenant_id() -> Option<Uuid> {
 }
 
 /// The parent dir under which the runner's canonical checkouts +
-/// sibling worktrees live. `QONTINUI_ROOT` env → `D:/qontinui-root`
-/// (Windows) → `$HOME/qontinui-root`. Mirrors `fleet::qontinui_root`.
+/// sibling worktrees live.
 ///
-/// `pub(crate)` so the Phase 5 fs_backstop poller enumerates governed
-/// canonical checkouts under the SAME workspace root (env → Windows default →
-/// `$HOME`) the census walks — no second root-resolution to drift from.
+/// One of four byte-similar copies of this resolution until Phase 2 of
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`; each carried a
+/// hardcoded `D:/qontinui-root` Windows arm, which shipped the author's machine
+/// layout inside an open-source binary. The resolution now lives once in
+/// [`crate::workspace_paths`], over the shared `qontinui_types::paths`.
+///
+/// Discovery disposition: a miss degrades this sweep (no census rows) and
+/// self-corrects the moment the root appears, so it stays `Option`.
+///
+/// `pub(crate)` so the Phase 5 fs_backstop poller enumerates governed canonical
+/// checkouts under the SAME workspace root the census walks — no second
+/// root-resolution to drift from.
 pub(crate) fn qontinui_root() -> Option<PathBuf> {
-    if let Ok(s) = std::env::var("QONTINUI_ROOT") {
-        let p = PathBuf::from(s);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let p = PathBuf::from("D:/qontinui-root");
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    if let Some(home) = dirs::home_dir() {
-        let p = home.join("qontinui-root");
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    None
+    crate::workspace_paths::workspace_root()
 }
 
 // ---------------------------------------------------------------------------

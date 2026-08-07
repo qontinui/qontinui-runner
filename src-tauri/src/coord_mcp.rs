@@ -2678,27 +2678,17 @@ pub(crate) fn root_reconcile_action(
 }
 
 /// Resolve the `qontinui-root` directory the checked-in repo-root `.mcp.json`
-/// lives in. Mirror of `agent_runtime::qontinui_root_dir`, inlined so this leaf
-/// module does NOT depend on `agent_runtime` (which depends back on us — the
-/// cycle this module was extracted to break). `QONTINUI_ROOT` env first, then
-/// the Windows `D:/qontinui-root` well-known path, then `~/qontinui-root`.
+/// lives in.
+///
+/// This was a hand-inlined mirror of `agent_runtime::qontinui_root_dir`,
+/// duplicated so this leaf module did NOT depend on `agent_runtime` (which
+/// depends back on us — the cycle this module was extracted to break). Phase 2
+/// of `2026-08-04-remove-hardcoded-machine-paths-from-product-code` dedupes it
+/// **without** reintroducing that cycle: [`crate::workspace_paths`] is itself a
+/// leaf, depending only on the settings store and the shared
+/// `qontinui_types::paths` — never on `agent_runtime`.
 fn qontinui_root_dir() -> Option<std::path::PathBuf> {
-    if let Ok(s) = std::env::var("QONTINUI_ROOT") {
-        let p = std::path::PathBuf::from(s);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let p = std::path::PathBuf::from("D:/qontinui-root");
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    dirs::home_dir()
-        .map(|h| h.join("qontinui-root"))
-        .filter(|p| p.is_dir())
+    crate::workspace_paths::workspace_root()
 }
 
 /// Re-register an EXISTING on-disk proxy nonce string into the live registry as
