@@ -817,7 +817,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // It runs FIRST in this block so the initial registration
                 // still happens promptly once coord is reachable, before the
                 // periodic publishers begin their cadences.
-                // No-op on a secondary instance — see `budget_publish_allowed`.
+                // No-op on a secondary instance — see
+                // `fleet::machine_state_publish_allowed`.
                 fleet::publish_on_startup(fleet::MachineRole::Agent).await;
 
                 // Fleet auto-response rules: arm from the on-disk cache first
