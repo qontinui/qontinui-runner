@@ -483,7 +483,44 @@ struct ChunkPoster {
 
 impl ChunkPoster {
     fn new(device_id: Uuid, tenant_id: Option<Uuid>) -> Self {
-        let dest = match coord_http_base() {
+        Self {
+            dest: Self::resolve_dest(device_id),
+            device_id,
+            tenant_id,
+            posted: 0,
+            failed: 0,
+        }
+    }
+
+    /// Where this walk's chunks go, or `None` when they only feed the local
+    /// snapshot.
+    ///
+    /// ## The instance guard lives HERE, not only on the periodic spawn
+    ///
+    /// [`spawn_census`] refuses to start the periodic walk on a secondary,
+    /// but that is a COST decision (don't burn a multi-hour machine-wide walk
+    /// you cannot contribute), and it does not cover every walk trigger:
+    /// [`spawn_census_rebuild`] — the survey endpoint's `?refresh=1` — reaches
+    /// [`build_and_publish`] directly, so a secondary asked to refresh would
+    /// still POST the machine's whole worktree inventory under the shared
+    /// `device_id`. That is the same last-writer-wins clobber the periodic
+    /// guard was added to prevent, by another route.
+    ///
+    /// So the IDENTITY rule is pinned at the single place a census leaves this
+    /// process. Every present and future walk trigger routes through here, and
+    /// a secondary still gets a local snapshot to serve its own survey from —
+    /// it just never speaks for the machine. This is `fleet.rs`'s own stated
+    /// lesson applied to the walk: a rule keyed in one place gets missed by the
+    /// next mechanism that needs it.
+    fn resolve_dest(device_id: Uuid) -> Option<(reqwest::Client, String)> {
+        if !crate::fleet::machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
+            debug!(
+                "worktree_census: SECONDARY instance — walking for the local snapshot only, \
+                 not POSTing the machine's inventory (see `fleet::machine_state_publish_allowed`)"
+            );
+            return None;
+        }
+        match coord_http_base() {
             None => {
                 debug!(
                     "worktree_census: no coord_url configured — census chunks will not be POSTed"
@@ -509,13 +546,6 @@ impl ChunkPoster {
                     }
                 }
             }
-        };
-        Self {
-            dest,
-            device_id,
-            tenant_id,
-            posted: 0,
-            failed: 0,
         }
     }
 
@@ -1569,6 +1599,13 @@ pub fn spawn_census() {
     // machine's worktree inventory with its own view, and the reclaim/reaper
     // path acts on whichever landed last. Same rule as the fleet publishers —
     // see `fleet::machine_state_publish_allowed`.
+    //
+    // This guard is the COST half: no periodic multi-hour walk on an instance
+    // whose result cannot be published. The IDENTITY half — never POST the
+    // machine's inventory from a secondary — is enforced at the chokepoint in
+    // `ChunkPoster::resolve_dest`, because this is not the only walk trigger
+    // (`spawn_census_rebuild` reaches `build_and_publish` directly) and a guard
+    // that only covers the periodic tick can be routed around.
     if !crate::fleet::machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         return;
     }
@@ -1607,6 +1644,61 @@ pub fn spawn_census() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The instance guard must sit on the POST CHOKEPOINT, not only on the
+    /// periodic spawn.
+    ///
+    /// `fleet.rs`'s `every_machine_scoped_writer_consults_the_guard` pins that
+    /// this module has guards at all; it does not pin WHERE. That distinction is
+    /// the whole bug this test exists for: the guard shipped on `spawn_census`
+    /// alone, and `spawn_census_rebuild` — the survey's `?refresh=1` — reaches
+    /// [`build_and_publish`] without passing it, so a secondary asked to refresh
+    /// still POSTed the machine's inventory. Moving both guards back onto spawn
+    /// paths would satisfy the count in `fleet.rs` and re-open that hole; this
+    /// assertion is what refuses it.
+    ///
+    /// Source-level for the same reason `fleet.rs`'s pin is: the predicate reads
+    /// `QONTINUI_PORT`, which other harness threads mutate, so an env-driven
+    /// assertion flakes here (`instance::primary_keeps_the_unscoped_path`).
+    #[test]
+    fn the_census_post_chokepoint_carries_the_guard() {
+        const SRC: &str = include_str!("census.rs");
+        const GUARD: &str =
+            "machine_state_publish_allowed(crate::instance::owns_shared_root_state())";
+
+        let prod = SRC
+            .split_once(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+
+        let dest_fn = prod
+            .split_once("fn resolve_dest(")
+            .map(|(_, after)| after)
+            .expect(
+                "ChunkPoster::resolve_dest is the single place a census leaves this process; \
+                 if it was renamed, move this pin with it rather than deleting it",
+            );
+        // Bound the window to the method itself: its closing brace is the first
+        // one at the method's own indent (every nested closer is deeper), so a
+        // guard sitting in a LATER method cannot satisfy this pin.
+        let body = dest_fn
+            .split_once("\n    }\n")
+            .map(|(b, _)| b)
+            .unwrap_or(dest_fn);
+        let squeezed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            squeezed.contains(GUARD),
+            "the census POST destination is resolved without consulting \
+             `fleet::machine_state_publish_allowed`. Every walk trigger routes through here \
+             (the periodic tick AND `spawn_census_rebuild`), so a guard anywhere else can be \
+             routed around by a caller that reaches `build_and_publish` directly."
+        );
+    }
 
     /// `<root>/<name>` with `.git` as a DIRECTORY — a real clone.
     fn make_clone(root: &Path, name: &str) -> PathBuf {

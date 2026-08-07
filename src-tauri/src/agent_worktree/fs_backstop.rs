@@ -48,6 +48,10 @@
 //! **default off**, best-effort, NEVER blocking. Cadence from
 //! [`FS_BACKSTOP_INTERVAL_ENV`] (default 300s, floor 30s). Runs on the
 //! non-Tauri fleet-publishers runtime (no `AppHandle`) — there is no banner.
+//!
+//! Also gated on [`crate::fleet::machine_state_publish_allowed`]: this scans
+//! SHARED state and POSTs device-keyed, so only the instance that owns the
+//! machine's identity runs it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -371,6 +375,17 @@ async fn post_canonical_drift(coord_base: &str, body: &CanonicalDriftRequest) {
 /// async.
 pub async fn tick_once() -> Result<(), String> {
     if !fs_backstop_enabled() {
+        return Ok(());
+    }
+    // Machine-scoped writer: the scanned set is the SHARED canonical checkouts
+    // (`census::is_canonical_repo_root`, the same governed set the census
+    // walks) and the POST is device-keyed. Every instance on the box sees the
+    // identical drift, so an ungated secondary contributes nothing but a
+    // duplicate alarm attributed to the machine. Re-checked per tick, like the
+    // enabled flag above, so it tracks a runtime change.
+    // See `fleet::machine_state_publish_allowed`.
+    if !crate::fleet::machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
+        debug!("fs_backstop: SECONDARY instance — the primary owns this scan; skipping");
         return Ok(());
     }
     let device_id = match super::census::load_device_id_pub() {

@@ -527,10 +527,21 @@ fn write_last_budget_cache(body: &DeviceBudgetRequest, device_id: &str) {
 ///   machine's inventory with its own view, and reclaim/reaper decisions act on
 ///   whichever landed last. Nothing is lost by gating: the primary's walk sees
 ///   the same filesystem, including worktrees a secondary created.
+/// * the **fs backstop** — `POST /coord/fs/observations` tagged
+///   `source=canonical_drift`, device-keyed. It scans the SHARED canonical
+///   checkouts (the same governed set the census walks), so every instance on
+///   the box observes identical drift and a secondary can only duplicate an
+///   alarm already attributed to the machine.
 ///
 /// Deliberately ONE predicate rather than one per writer. The lesson of the
 /// outage it fixes is that a rule keyed in a single place gets missed by the
 /// next mechanism that needs it.
+///
+/// For the same reason, each writer is gated at the point its state leaves the
+/// process, not merely where its periodic task is spawned. The census makes the
+/// distinction concrete: `spawn_census` is not its only trigger, so its guard
+/// also sits in `ChunkPoster::resolve_dest` — see that function for why a
+/// spawn-only guard was routable-around via the survey's `?refresh=1`.
 pub(crate) fn machine_state_publish_allowed(owns_shared_root_state: bool) -> bool {
     owns_shared_root_state
 }
@@ -2796,7 +2807,16 @@ async fn record_git_op_fleet_feed(
 /// returns `Err` for terminal conditions (no machine identity, no coord
 /// URL, no root dir). Caller (`spawn_tree_publisher`) treats `Err` the
 /// same as it treats heartbeat errors — log + retry next tick.
+///
+/// Guarded HERE as well as in [`spawn_tree_publisher`], because this is `pub`
+/// and the spawn is only today's single caller. The census is the worked
+/// example of why that distinction matters: its guard sat on the spawn alone
+/// and `?refresh=1` reached the walk by another route. A guard on the write
+/// itself cannot be routed around by the next caller that appears.
 pub async fn publish_tree_state() -> Result<(), String> {
+    if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
+        return Ok(());
+    }
     // Phase 3 unified-devices rename: the on-disk file is still
     // `~/.qontinui/machine.json` (legacy filename, kept for tooling
     // back-compat) but the in-memory `DeviceFile` struct now exposes
@@ -3570,18 +3590,36 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
 mod tests {
     use super::*;
 
-    /// Source of THIS file, split so a pin never scans the test module — a
-    /// call site written inside a test would otherwise satisfy "the writer is
-    /// guarded" while production code had none, and a negative assertion would
-    /// match its own string literal.
-    fn prod_src() -> &'static str {
-        const SRC: &str = include_str!("fleet.rs");
-        SRC.split_once(
+    /// The production half of a module's source, with the test module cut off.
+    ///
+    /// A pin must never scan `#[cfg(test)]` code: a call site written inside a
+    /// test would otherwise satisfy "the writer is guarded" while production
+    /// code had none, and a negative assertion would match its own string
+    /// literal. The first version of the pin below failed exactly that way.
+    ///
+    /// Splits on the test MODULE header, not on a bare `#[cfg(test)]`. Several
+    /// of the modules scanned here carry test-only helpers in production
+    /// position — `census.rs`'s `publish_census_for_test` sits ~1200 lines
+    /// above the writers — so splitting on the attribute alone would silently
+    /// truncate the scan to a prefix containing no call sites at all, and the
+    /// pin would then pass or fail for reasons unrelated to the guard.
+    fn prod_part(src: &'static str) -> &'static str {
+        src.split_once(
             "
-#[cfg(test)]",
+#[cfg(test)]
+mod tests {",
         )
         .map(|(before, _)| before)
-        .unwrap_or(SRC)
+        .unwrap_or(src)
+    }
+
+    /// Collapse all whitespace so the pin matches a call site regardless of how
+    /// `rustfmt` wrapped it. The guard call is ~90 columns before indentation,
+    /// so it sits right at the wrap boundary — a pin that required it on one
+    /// physical line would fail the day a writer moved one nesting level in,
+    /// reporting a missing guard that is in fact present.
+    fn squeezed(src: &str) -> String {
+        src.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     /// Every machine-scoped writer must consult the guard.
@@ -3591,17 +3629,54 @@ mod tests {
     /// flake, as `instance::primary_keeps_the_unscoped_path` records. What this
     /// catches is the regression that matters: a writer added or refactored
     /// without the guard travelling with it.
+    ///
+    /// Deliberately ONE pin spanning every module that hosts such a writer,
+    /// rather than a per-module pin. The rule being defended is that the guard
+    /// generalises; a pin that stops at `fleet.rs` re-creates in the TEST layer
+    /// the single-place keying that caused the outage in the first place, and
+    /// the sibling writers (`census`, `fs_backstop`) would be unpinned exactly
+    /// because they live elsewhere.
     #[test]
     fn every_machine_scoped_writer_consults_the_guard() {
-        let src = prod_src();
-        let guarded = src
-            .matches("machine_state_publish_allowed(crate::instance::owns_shared_root_state())")
-            .count();
-        assert!(
-            guarded >= 4,
-            "expected the budget publish, the republisher, the heartbeat and the              tree publisher to be gated in fleet.rs (census is gated in its own              module); found {guarded} guarded call site(s)"
-        );
+        const GUARD: &str =
+            "machine_state_publish_allowed(crate::instance::owns_shared_root_state())";
+
+        // (module, source, minimum guarded call sites, what they are)
+        let modules = [
+            (
+                "fleet.rs",
+                include_str!("fleet.rs"),
+                5,
+                "the boot budget publish, the republisher, the heartbeat, and the tree \
+                 publisher at BOTH its spawn and its write (`publish_tree_state`, which is \
+                 `pub` and so reachable past the spawn guard)",
+            ),
+            (
+                "agent_worktree/census.rs",
+                include_str!("agent_worktree/census.rs"),
+                2,
+                "the periodic walk spawn AND `ChunkPoster::resolve_dest`, the POST chokepoint \
+                 every walk trigger routes through",
+            ),
+            (
+                "agent_worktree/fs_backstop.rs",
+                include_str!("agent_worktree/fs_backstop.rs"),
+                1,
+                "the canonical-drift tick, which scans the shared canonical checkouts and \
+                 POSTs device-keyed",
+            ),
+        ];
+
+        for (name, src, want, what) in modules {
+            let found = squeezed(prod_part(src)).matches(GUARD).count();
+            assert!(
+                found >= want,
+                "{name}: expected at least {want} guarded call site(s) — {what} — but found \
+                 {found}. A machine-scoped writer lost its instance guard."
+            );
+        }
     }
+
     use crate::test_env::{env_lock, EnvVarRestore};
 
     // ---- periodic budget re-publish ----
