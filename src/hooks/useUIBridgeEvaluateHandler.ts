@@ -47,8 +47,10 @@ import { createLogger } from "@/lib/logger";
 import { getErrorMessage } from "@/lib/utils";
 import {
   awaitWithTimeout,
+  boxEvaluateResult,
   checkEvaluateBlocklist,
   compileEvaluateExpression,
+  describeEvaluateResult,
   resolveEvaluateTimeoutMs,
 } from "./ui-bridge-events/utils";
 import { acquireSingletonListener } from "./ui-bridge-events/singleton-listener";
@@ -224,45 +226,24 @@ export async function handleEvaluateRequest(
         resolveEvaluateTimeoutMs(payload.timeout_ms),
       );
       if (unwrap === true) {
-        // Opt-in consistent shape: always `{ value, type }`. Mirrors the
-        // sibling unwrap branch in usePageEvents.ts::page_evaluate. Rust
+        // Opt-in consistent shape: always `{ value, type }`. The SAME shaper
+        // the legacy `usePageEvents.ts::page_evaluate` branch uses, so the two
+        // routes can't report different discriminants for one value. Rust
         // passes this shape through verbatim when unwrap=true so the HTTP
         // caller sees `{success: true, data: {value, type}}`.
-        let valueType: "scalar" | "object" | "undefined" | "function" | "null";
-        let normalizedValue: unknown;
-        if (resolved === null) {
-          valueType = "null";
-          normalizedValue = null;
-        } else if (resolved === undefined) {
-          valueType = "undefined";
-          normalizedValue = undefined;
-        } else if (typeof resolved === "function") {
-          valueType = "function";
-          // Functions aren't structured-clone-safe. Surface the name (or
-          // `<anonymous>`) so the caller gets something useful.
-          normalizedValue = (resolved as { name?: string }).name || "<anonymous>";
-        } else if (typeof resolved === "object") {
-          valueType = "object";
-          normalizedValue = resolved;
-        } else {
-          valueType = "scalar";
-          normalizedValue = resolved;
-        }
         response = {
           request_id,
           ok: true,
-          result: { value: normalizedValue, type: valueType },
+          result: describeEvaluateResult(resolved),
         };
       } else {
         // Match the legacy IPC page_evaluate shape so the Rust
         // `tagged_page_evaluate` helper can pass the `data` field through
         // unchanged: `{ result: object | { value: primitive } }`.
-        const resultField =
-          typeof resolved === "object" && resolved !== null ? resolved : { value: resolved };
         response = {
           request_id,
           ok: true,
-          result: { success: true, result: resultField },
+          result: { success: true, result: boxEvaluateResult(resolved) },
         };
       }
     } catch (err) {

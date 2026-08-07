@@ -397,6 +397,51 @@ export function compileEvaluateExpression(expression: string): () => unknown {
 }
 
 /**
+ * The discriminated `{value, type}` shape returned by `page_evaluate` when the
+ * caller passes `unwrap: true`.
+ */
+export interface UnwrappedEvaluateResult {
+  value: unknown;
+  type: "scalar" | "object" | "undefined" | "function" | "null";
+}
+
+/**
+ * Shape an evaluated result into the opt-in discriminated `{value, type}`
+ * envelope. Shared by both `page_evaluate` entry points so the two routes
+ * cannot report different `type` discriminants for the same value.
+ *
+ * Functions aren't structured-clone-safe, so a function result surfaces its
+ * name (or `<anonymous>`) rather than failing the IPC hop.
+ */
+export function describeEvaluateResult(resolved: unknown): UnwrappedEvaluateResult {
+  if (resolved === null) return { value: null, type: "null" };
+  if (resolved === undefined) return { value: undefined, type: "undefined" };
+  if (typeof resolved === "function") {
+    return { value: (resolved as { name?: string }).name || "<anonymous>", type: "function" };
+  }
+  if (typeof resolved === "object") return { value: resolved, type: "object" };
+  return { value: resolved, type: "scalar" };
+}
+
+/**
+ * Shape an evaluated result into the DEFAULT (non-`unwrap`) envelope, where
+ * objects ride through bare and everything else is boxed as `{value: x}`.
+ *
+ * `null` is boxed, not passed through. The two call sites had drifted on
+ * exactly this point — `typeof null === "object"`, so the legacy IPC branch
+ * returned a bare `result: null` while the tagged handler (which spelled out
+ * `&& resolved !== null`) returned `result: {value: null}`. Same expression,
+ * two different envelopes depending on which route the caller happened to
+ * take, and a driver reading `data.result.value` threw on one of them.
+ * Boxing is the correct arm: it matches how every other non-object result is
+ * reported, and `result: null` carries no more information while breaking the
+ * documented access path.
+ */
+export function boxEvaluateResult(resolved: unknown): unknown {
+  return typeof resolved === "object" && resolved !== null ? resolved : { value: resolved };
+}
+
+/**
  * Duck-typed thenable check. Spec-correct (matches what `await` itself
  * does): "thenable" is "has a callable `.then`". Catches cross-realm
  * Promises (e.g. iframes whose Promise constructor lives in a different

@@ -20,8 +20,10 @@ import {
   getUIBridgeGlobal,
   toTabCanonical,
   awaitWithTimeout,
+  boxEvaluateResult,
   checkEvaluateBlocklist,
   compileEvaluateExpression,
+  describeEvaluateResult,
   PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
 } from "./utils";
 
@@ -445,32 +447,13 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
             );
             if (unwrap) {
-              // Opt-in consistent shape: always `{ value, type }`.
-              let valueType: "scalar" | "object" | "undefined" | "function" | "null";
-              let normalizedValue: unknown;
-              if (resolvedResult === null) {
-                valueType = "null";
-                normalizedValue = null;
-              } else if (resolvedResult === undefined) {
-                valueType = "undefined";
-                normalizedValue = undefined;
-              } else if (typeof resolvedResult === "function") {
-                valueType = "function";
-                // Functions aren't structured-clone-safe. Surface the name
-                // (or `<anonymous>`) so the caller gets something useful.
-                normalizedValue = (resolvedResult as { name?: string }).name || "<anonymous>";
-              } else if (typeof resolvedResult === "object") {
-                valueType = "object";
-                normalizedValue = resolvedResult;
-              } else {
-                valueType = "scalar";
-                normalizedValue = resolvedResult;
-              }
+              // Opt-in consistent shape: always `{ value, type }`. Shared with
+              // the tagged handler so the two routes can't disagree.
               await sendResponse({
                 requestId,
                 type,
                 success: true,
-                data: { value: normalizedValue, type: valueType },
+                data: describeEvaluateResult(resolvedResult),
                 timestamp: Date.now(),
               });
             } else {
@@ -478,10 +461,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
                 requestId,
                 type,
                 success: true,
-                data: {
-                  result:
-                    typeof resolvedResult === "object" ? resolvedResult : { value: resolvedResult },
-                },
+                data: { result: boxEvaluateResult(resolvedResult) },
                 timestamp: Date.now(),
               });
             }
