@@ -28,9 +28,12 @@
 pub(crate) mod admission;
 pub(crate) mod checkout;
 pub(crate) mod executor;
+pub(crate) mod host_sizing;
 pub(crate) mod manifest;
 pub(crate) mod reporting;
+pub(crate) mod sibling;
 pub(crate) mod subscription;
+pub(crate) mod tools;
 
 use serde::Deserialize;
 use tracing::info;
@@ -56,6 +59,23 @@ pub(crate) struct CiDispatchPayload {
     pub fetch_url: String,
     /// `refs/heads/merge-candidate/<proposal_id>`.
     pub candidate_ref: String,
+    /// Pull request this dispatch is validating, when there is one.
+    ///
+    /// This is the ONLY key the sibling declaration rule turns on
+    /// ([`sibling::resolve_declaration`]), and its absence is a real answer,
+    /// not a gap to paper over: coord pushes the SAME
+    /// `refs/heads/merge-candidate/<proposal_id>` into every repo of a
+    /// multi-repo proposal, so a dispatch with no pull request resolves
+    /// siblings to their branch WITHOUT a declaration probe — exactly what
+    /// the Actions composite action does off a `pull_request` event, and for
+    /// the same reason (the candidate ref is force-pushed and deleted as the
+    /// proposal resolves).
+    ///
+    /// Coord does not populate this today; until it does, every dispatch
+    /// takes the branch path. Wiring it is a coord-side change to the
+    /// `events.ci.build_requested.<device_id>` payload.
+    #[serde(default)]
+    pub pr_number: Option<u64>,
     #[serde(default = "default_manifest_path")]
     pub manifest_path: String,
     /// Check-run context coord will publish the verdict under. The runner
@@ -181,6 +201,19 @@ mod tests {
         .expect("pinned contract must parse");
         assert_eq!(full.manifest_path, ".qontinui/ci.toml");
         assert_eq!(full.check_name, "qontinui-ci-node");
+        assert_eq!(full.pr_number, None);
+
+        // The sibling declaration key, when coord grows it.
+        let with_pr: CiDispatchPayload = serde_json::from_value(serde_json::json!({
+            "dispatch_id": "d1",
+            "repo": "r",
+            "head_sha": "s",
+            "fetch_url": "u",
+            "candidate_ref": "refs/heads/merge-candidate/1",
+            "pr_number": 1008,
+        }))
+        .expect("pr_number must parse");
+        assert_eq!(with_pr.pr_number, Some(1008));
 
         let lean: CiDispatchPayload = serde_json::from_value(serde_json::json!({
             "dispatch_id": "d1",

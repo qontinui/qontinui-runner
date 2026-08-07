@@ -13,10 +13,68 @@
 
 version = 1
 
+# ---------------------------------------------------------------------------
+# SIBLING REPOS — the ci_node analogue of ci.yml's "Checkout sibling repos"
+# step, which this section mirrors one-for-one. Declared rather than cloned by
+# a step: the executor materialises each one NEXT TO this repo's worktree
+# inside the dispatch-scoped directory, so `../../qontinui-schemas/rust` (the
+# path deps at src-tauri/Cargo.toml:125-127) resolves, and so cleanup stays a
+# single directory removal. An in-manifest `git clone` would pass validation
+# but would be unpinned and would leak — and .github/workflows/
+# forbid-sibling-clone.yml gates the Actions half against the same shape.
+#
+# Each entry's REASON is ci.yml's, restated so the two lanes stay auditable
+# against each other. When ci.yml's clone list changes, change this list in
+# the same PR.
+# ---------------------------------------------------------------------------
+
+[[siblings]]
+# src-tauri/Cargo.toml's `qontinui-types` / `qontinui-code-graph` /
+# `qontinui-vision-core` path deps. Pinned by DECLARED ADAPTATION PR — the
+# coord dep edge this PR and its qontinui-schemas PR already have to declare
+# for merge ordering — exactly as .github/actions/checkout-sibling does, so a
+# breaking types change can go green as a declared pair instead of
+# deadlocking. A branch NAME resolves nothing: matching on one let an un-PR'd
+# scratch branch satisfy the mirror gate in production on 2026-07-28.
+repo = "qontinui/qontinui-schemas"
+pin = "declared-adaptation"
+
+[[siblings]]
+# src/lib/spec-registry.ts statically imports 14 .spec.uibridge.json files
+# from qontinui-web/frontend/src/app at typecheck/build time. Cross-repo FILE
+# imports, not npm deps, so the cross-repo dep redesign does not migrate them.
+# `default-branch`: this repo is consumed as published content, not co-evolved
+# through adaptation pairs, so there is no declaration protocol to read.
+repo = "qontinui/qontinui-web"
+pin = "default-branch"
+
+[[siblings]]
+# The SDK↔runner manifest diff test (`sdk_manifest_routes_are_exposed_by_runner`
+# in mcp/ui_bridge/mod.rs) reads UI_BRIDGE_ROUTES from
+# ui-bridge/packages/ui-bridge/src/server/types.ts. WITHOUT this checkout the
+# test takes its "file unreadable, skip" branch and silently passes, so
+# SDK-vs-runner drift would go unflagged — a vacuous green, which is why the
+# sibling is declared rather than left to chance.
+repo = "qontinui/ui-bridge"
+pin = "default-branch"
+
 [limits]
+# A CEILING, not an override: the executor exports
+# min(this, host-derived-sizing), so this cannot raise a small host's cap and
+# a large host cannot raise this one.
+#
 # The runner workspace needs CARGO_BUILD_JOBS=1 (+ large pagefile) to
 # compile at all — memory reference_runner_workspace_ci_compile_needs_swap_jobs1.
+# That is a measurement of THIS workspace, which is why it is stated here
+# rather than left to the host sizing (which would hand a 32 GiB box 10).
 cargo_build_jobs = 1
+
+# test_threads is deliberately ABSENT: no measurement of this suite's
+# per-process footprint exists, and the executor's host-derived value
+# (~1 GiB per test process, capped at nproc) is a better answer than a guess.
+# Omitting a limit means "size me from the host" — the executor exports the
+# result as RUST_TEST_THREADS and NEXTEST_TEST_THREADS, so `cargo test` no
+# longer defaults to nproc on a 32-vCPU box.
 
 [[steps]]
 name = "frontend-install"
