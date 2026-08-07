@@ -650,14 +650,52 @@ When you stamp VETTED in the plan file, transition the coord work-unit registry 
 the `unit_ready` predicate above has something to match. Do this BEFORE registering
 the gate, and key the gate on whichever status lands.
 
-**Step A — read the current status first. It may already be past you.**
+**Step A — know the current status first. It may already be past you.**
 
-`GET $COORD_HTTP_URL/coord/work-units/<plan stem>`. If `status` is already
-`vetted`, `ready`, `in_progress` or `shipped`, **write nothing and skip to the gate
-registration**, keying `ready_status` on what you just read. §5.4 is a re-runnable
-refresh path, and a blind write here would DEMOTE a unit a peer already attested —
-destroying the attestation and, with it, the `ready` derivation this whole ordering
-exists to protect.
+**You already have it: step 1's upsert returned it.** That upsert carries no
+`status` field, so coord treats it as metadata-only and echoes the stored status
+back as **`previous_status`** — alongside `new_status` and `transitioned`, the same
+shape from `coord_work_unit_upsert` (MCP) and `POST /coord/work-units/upsert`
+(HTTP) alike. Read it as:
+
+- **`previous_status: null`, `transitioned: true`** — step 1 *created* the row.
+  There is no prior status and nothing to protect: proceed to Step B.
+- **`previous_status: "<status>"`, `transitioned: false`** — the unit already
+  existed at `<status>`. That is the value the rest of this step means by "the
+  current status".
+
+Only if you did not keep the upsert response, re-read it with
+`GET $COORD_HTTP_URL/coord/agent-work-units/<plan stem>` and take
+**`.work_unit.status`** (that response is `{work_unit, recent_history, citations}`,
+not a bare unit).
+
+If the status is already `vetted`, `ready`, `in_progress` or `shipped`, **write
+nothing and skip to the gate registration**, keying `ready_status` on what you just
+read. §5.4 is a re-runnable refresh path, and a blind write here would DEMOTE a
+unit a peer already attested — destroying the attestation and, with it, the `ready`
+derivation this whole ordering exists to protect.
+
+> ⚠️ **The re-read is `agent-work-units`, NOT `GET /coord/work-units/<plan stem>`.**
+> The unprefixed read is the operator dashboard's `TenantId`-tier route and answers
+> a device JWT **403 `tenant_not_resolved`**. The split is by VERB, not by prefix:
+> the `POST` writes under `/coord/work-units/…` (`/upsert`, `/transition`,
+> `/register-gate`, …) *are* device-authed, which is why Steps B and C below keep
+> that path — it is only the `GET`s that moved to `agent-work-units`. (Same
+> operator-vs-`agent-` door split as `/coord/prompt-documents` vs
+> `/coord/agent-prompt-documents`; the `agent-` read doors are the generalization
+> of that pattern to work units.) Getting it wrong is not cosmetic: a 403 yields
+> no status, so the skip rule cannot fire AND Step C has no value for its
+> `from_status` guard — **both** protections against demoting an attested unit
+> fail from one wrong URL, and the failure reads as a credential problem rather
+> than a wrong door.
+>
+> If the status is genuinely unavailable (no upsert response kept, no device JWT,
+> MCP masked), that is **UNKNOWN, not `draft`**. Do not invent a `from_status`: a
+> guessed one CAS-fails against every real row, and omitting it turns Step C into
+> the unconditional write this ordering exists to prevent. Report the registry
+> transition as **not made**, say why, and register the gate on the status you last
+> knew — an unmade transition is recoverable on the next run; a destroyed
+> attestation is not.
 
 **Step B — attempt the real thing.**
 
