@@ -41,19 +41,14 @@ jobs:
       # Same sibling checkouts the matrix `test` job needs: qontinui-schemas
       # for the `qontinui-types` path dep, and (for --all-targets test compile)
       # ui-bridge for the SDK↔runner manifest diff test source.
-      - name: Resolve sibling qontinui-schemas ref
-        id: schemas-ref
-        uses: ./.github/actions/resolve-schemas-ref
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
 
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
-          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
-          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
           git clone --depth 1 https://github.com/qontinui/qontinui-web.git
           git clone --depth 1 https://github.com/qontinui/ui-bridge.git
-        env:
-          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
         shell: bash
 
       - name: Setup pnpm
@@ -193,19 +188,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Resolve sibling qontinui-schemas ref
-        id: schemas-ref
-        uses: ./.github/actions/resolve-schemas-ref
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
 
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
-          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
-          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
           git clone --depth 1 https://github.com/qontinui/qontinui-web.git
           git clone --depth 1 https://github.com/qontinui/ui-bridge.git
-        env:
-          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
         shell: bash
 
       - name: Setup pnpm

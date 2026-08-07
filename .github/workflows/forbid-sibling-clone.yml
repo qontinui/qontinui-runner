@@ -1,0 +1,90 @@
+name: forbid ad-hoc sibling checkouts
+
+# ANTI-REGRESSION for plan 2026-08-05-runner-schemas-ref-declared-adaptation §6.3.
+#
+# WHAT IT FORBIDS: any workflow or composite action under `.github/` that checks
+# qontinui-schemas out for itself — `git clone …/qontinui-schemas.git`, or
+# `actions/checkout` with `repository: qontinui/qontinui-schemas`. The sanctioned
+# route is `.github/actions/checkout-sibling`, which resolves the DECLARED
+# adaptation PR and materialises it SHA-pinned.
+#
+# WHY IT EXISTS: the checkout contract used to be copy-pasted at every consuming
+# site, and the mental model of that surface decayed — the investigation that
+# opened the plan said "three clone sites"; the real answer was ELEVEN, across
+# eight workflows. A twelfth added by hand would silently compile against
+# qontinui-schemas `main` inside a required context, which is precisely the
+# deadlock/vacuity class the plan removes. That failure is silent, so it needs a
+# machine check, not a convention.
+#
+# NOT A REQUIRED STATUS CONTEXT, deliberately — same posture as ci-integrity.yml.
+# It is path-filtered to `.github/**`, and a path-filtered trigger creates no
+# check-run on a non-matching PR, so a required context would sit at "Expected"
+# forever and wedge every unrelated PR (the 2026-06-26 fleet wedge). Red CI is
+# the sanctioned merge-stopper here. Do NOT register this in ruleset 16044811.
+#
+# THE ONE SANCTIONED EXCEPTION is `.github/workflows/release.yml`, allowlisted by
+# name below with its reason. Adding a second exception is a design decision, not
+# a lint fix.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - ".github/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/**"
+
+permissions:
+  contents: read
+
+jobs:
+  forbid-sibling-clone:
+    name: Forbid ad-hoc qontinui-schemas checkouts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Scan .github for sibling checkouts that bypass the action
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Two shapes of bypass. Both are matched on the SAME line as the
+          # sibling repo name, so prose mentioning either in passing does not
+          # trip the gate.
+          #
+          #   1. a shell clone:      git clone [--flags] https://…/qontinui-schemas.git
+          #   2. an action checkout: repository: qontinui/qontinui-schemas
+          PATTERN='git clone[^|]*qontinui-schemas|repository:[[:space:]]*qontinui/qontinui-schemas'
+
+          EXCLUDES=(
+            # The sanctioned materialiser itself. Everything under `.github/`
+            # is supposed to go through this.
+            ':!.github/actions/checkout-sibling/'
+            # release.yml is NOT a consumer and must stay that way (plan §4.2):
+            # a release must be built against LANDED schemas, never an unlanded
+            # PR head. Its triggers are `push: tags` and `workflow_dispatch`, so
+            # it carries no PR number and has no declaration to read either way
+            # — but the exclusion is a POLICY about release provenance, not a
+            # consequence of how the action is keyed. Its clone of the default
+            # branch is correct and deliberate.
+            ':!.github/workflows/release.yml'
+            # Self-reference: this file contains the pattern strings as part of
+            # its own definition.
+            ':!.github/workflows/forbid-sibling-clone.yml'
+          )
+
+          # `git grep` over the `.github/` pathspec only — this gate is about
+          # CI's own checkout contract, not about docs or source that may
+          # legitimately describe a clone.
+          if git grep -nE "$PATTERN" -- '.github/' "${EXCLUDES[@]}"; then
+            echo "::error::A workflow or action under .github/ checks qontinui-schemas out for itself."
+            echo "::error::Use 'uses: ./.github/actions/checkout-sibling' instead — it resolves the DECLARED adaptation PR (a coord dep-edge label) and checks it out SHA-pinned. A hand-rolled clone silently compiles against schemas main inside a required context."
+            echo "::error::If you genuinely need an un-declared, landed-only checkout (the release case), that is a design decision: add the file to the exclude list in .github/workflows/forbid-sibling-clone.yml WITH its reason, and expect it to be reviewed."
+            exit 1
+          fi
+
+          echo "No ad-hoc qontinui-schemas checkouts under .github/ — the sibling contract is intact."

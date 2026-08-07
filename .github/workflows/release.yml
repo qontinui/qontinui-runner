@@ -282,9 +282,12 @@ jobs:
       # `cargo build` (invoked by `tauri build` below) fails to
       # resolve the path. Public org-owned repo, default github.token.
       #
-      # Deliberately NOT using .github/actions/resolve-schemas-ref here, unlike
-      # every other schemas clone in this repo: a release must be built against
-      # LANDED schemas, never against an unlanded PR head.
+      # Deliberately NOT using .github/actions/checkout-sibling here: a release
+      # must be built against LANDED schemas, never against an unlanded PR head.
+      # Every other schemas checkout under .github/ now goes through that action
+      # — this clone is the ONLY survivor, and forbid-sibling-clone.yml
+      # allowlists this file BY NAME so that stays a deliberate exception rather
+      # than the first of a new crop.
       #
       # THE EXCLUSION IS A POLICY ABOUT RELEASE PROVENANCE — NOT a consequence
       # of how the action is keyed. It is worth being precise about that,
