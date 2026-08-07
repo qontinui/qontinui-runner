@@ -18,7 +18,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   awaitWithTimeout,
+  boxEvaluateResult,
   compileEvaluateExpression,
+  describeEvaluateResult,
   isThenable,
   isElementActionAllowed,
   resolveEvaluateTimeoutMs,
@@ -249,6 +251,55 @@ describe("compileEvaluateExpression — page_evaluate wrapping", () => {
     } finally {
       delete (globalThis as Record<string, unknown>).__compileProbe;
     }
+  });
+});
+
+describe("boxEvaluateResult — default (non-unwrap) page/evaluate envelope", () => {
+  it("boxes null instead of passing it through — THE DIVERGENCE", () => {
+    // `typeof null === "object"`, so the legacy IPC branch's bare
+    // `typeof x === "object" ? x : {value: x}` returned `result: null` while
+    // the tagged handler's `&& x !== null` variant returned
+    // `result: {value: null}`. One expression, two envelopes depending on the
+    // route, and `data.result.value` threw on one of them.
+    expect(boxEvaluateResult(null)).toEqual({ value: null });
+  });
+
+  it("passes real objects and arrays through bare", () => {
+    const obj = { a: 1 };
+    expect(boxEvaluateResult(obj)).toBe(obj);
+    const arr = [1, 2];
+    expect(boxEvaluateResult(arr)).toBe(arr);
+  });
+
+  it("boxes every non-object result", () => {
+    expect(boxEvaluateResult(3)).toEqual({ value: 3 });
+    expect(boxEvaluateResult("s")).toEqual({ value: "s" });
+    expect(boxEvaluateResult(false)).toEqual({ value: false });
+    expect(boxEvaluateResult(undefined)).toEqual({ value: undefined });
+  });
+});
+
+describe("describeEvaluateResult — unwrap:true discriminated shape", () => {
+  it.each([
+    [null, { value: null, type: "null" }],
+    [undefined, { value: undefined, type: "undefined" }],
+    [3, { value: 3, type: "scalar" }],
+    ["s", { value: "s", type: "scalar" }],
+    [{ a: 1 }, { value: { a: 1 }, type: "object" }],
+    [[1], { value: [1], type: "object" }],
+  ])("discriminates %s", (input, expected) => {
+    expect(describeEvaluateResult(input)).toEqual(expected);
+  });
+
+  it("surfaces a function's name, since functions aren't clone-safe", () => {
+    expect(describeEvaluateResult(function named() {})).toEqual({
+      value: "named",
+      type: "function",
+    });
+    expect(describeEvaluateResult(Object.defineProperty(() => {}, "name", { value: "" }))).toEqual({
+      value: "<anonymous>",
+      type: "function",
+    });
   });
 });
 
