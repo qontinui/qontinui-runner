@@ -289,12 +289,112 @@ pub(super) fn resolve_state_field(state_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Result of reading one `ElementState` flag off a `get_element` payload.
+///
+/// The distinction is the whole point: "the bridge reports false" and "this
+/// bridge build does not report that signal at all" are different answers,
+/// and collapsing them is how a wait on an unimplemented signal turns into a
+/// silent full-timeout `found:false` that reads exactly like "the element
+/// never got there".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StateProbe {
+    /// The field was present on the wire, or soundly derivable from a field
+    /// that was. Carries the resolved value.
+    Observed(bool),
+    /// The field is absent from this bridge build's `ElementState` and has no
+    /// sound derivation from the fields that ARE present.
+    NotObservable,
+}
+
+/// Coerce one JSON value to a state flag.
+///
+/// Accepts both wire shapes the runner already handles elsewhere: a real JSON
+/// bool, and the `aria-disabled` attribute passthrough that arrives as the
+/// string `"true"` / `"false"`. The string form is not hypothetical — the
+/// `withDisabledOnly` snapshot filter in `elements.rs` reads
+/// `state.ariaDisabled` with `as_str() == Some("true")`, mirroring the SDK's
+/// own `handlers.ts` predicate, and `execute_action`'s disabled pre-check
+/// does the same. A bool-only read here would disagree with both.
+fn coerce_state_flag(value: &serde_json::Value) -> Option<bool> {
+    match value {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::String(s) => match s.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Read a state flag from an element payload, preferring the nested `state`
+/// block and falling back to the top level (some shapes — notably the
+/// `discover()` fallback that `get_element` uses when the registry misses —
+/// expose the flags flat rather than under `state`).
+fn read_state_flag(element: &serde_json::Value, field: &str) -> Option<bool> {
+    element
+        .get("state")
+        .and_then(|s| s.get(field))
+        .and_then(coerce_state_flag)
+        .or_else(|| element.get(field).and_then(coerce_state_flag))
+}
+
+/// Probe one `ElementState` field on a `get_element` payload.
+///
+/// `disabled` / `ariaDisabled` were added to [`ALLOWED_STATES`] ahead of the
+/// bridge that emits them: `@qontinui/ui-bridge@0.22.0` — the version this
+/// repo depends on (`^0.22.0`) — builds element state in `getElementState()`
+/// as `visible` / `enabled` / `focused` only, and its published
+/// `ElementState` type declares no `disabled` or `ariaDisabled` at all. The
+/// ui-bridge commit that splits them is not on that package's release
+/// lineage yet. Reading an absent key as `false` therefore made BOTH new
+/// names permanently unmatchable: accepted at the door, then polled against a
+/// key the bridge never emits until the timeout expired.
+///
+/// So each name gets the honest answer available on the live build:
+///
+/// - present on the wire -> its value (a real post-split build wins outright,
+///   which keeps this forward-compatible),
+/// - `disabled` absent -> derived from `enabled`, the same derivation the
+///   SDK's own predicate runtime uses (`evaluateElementPredicate`'s
+///   `disabled` arm is `state.enabled === false`) and the third arm of the
+///   `withDisabledOnly` snapshot filter. Deriving it keeps the two wait
+///   endpoints answering the same question.
+/// - `ariaDisabled` absent -> [`StateProbe::NotObservable`]. There is no
+///   sound derivation: pre-split `enabled` is the fold
+///   `!(disabled || ariaDisabled)`, so deriving from it would report a
+///   natively-disabled control as ARIA-disabled. Saying "cannot observe"
+///   beats inventing an answer.
+/// - `visible` / `enabled` / `focused` absent -> `false`. These are required
+///   on every build, so an absent key is a genuinely absent signal rather
+///   than a build gap; preserving `false` keeps their behavior unchanged.
+pub(super) fn probe_state_field(element: &serde_json::Value, field: &str) -> StateProbe {
+    if let Some(value) = read_state_flag(element, field) {
+        return StateProbe::Observed(value);
+    }
+    match field {
+        "disabled" => match read_state_flag(element, "enabled") {
+            Some(enabled) => StateProbe::Observed(!enabled),
+            None => StateProbe::NotObservable,
+        },
+        "ariaDisabled" => StateProbe::NotObservable,
+        _ => StateProbe::Observed(false),
+    }
+}
+
 /// POST /ui-bridge/control/wait-for-element-state
 ///
 /// Convenience wrapper around `wait_for_element` for the common case of
 /// "wait until element <id> is visible / enabled / disabled / ariaDisabled /
 /// focused". Polls the element registry every ~100ms until the state matches
 /// or the timeout elapses.
+///
+/// Each tick reads the requested flag through [`probe_state_field`], which
+/// knows which signals the live bridge build can actually report. When the
+/// wait expires on a signal this build does not emit, the `found:false`
+/// envelope carries `reason: "state-not-observable"` plus the
+/// `requested_state`, so a driver can tell "the element never got there" from
+/// "this bridge cannot answer that question" instead of retrying forever.
 pub async fn ui_bridge_wait_for_element_state_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
@@ -359,6 +459,12 @@ pub async fn ui_bridge_wait_for_element_state_handler(
         id, state_name, timeout_ms
     );
 
+    // Whether the MOST RECENT successful lookup could not report the
+    // requested signal at all. Recomputed every poll rather than latched, so
+    // a bridge that starts emitting the field mid-wait is not still reported
+    // as unable to answer.
+    let mut signal_unobservable = false;
+
     loop {
         let lookup = ui_bridge_request_sync(
             &state,
@@ -371,33 +477,37 @@ pub async fn ui_bridge_wait_for_element_state_handler(
             // Element returned — extract the state block (either nested at
             // `data.element.state` or at `data.state` depending on shape).
             let element = data.get("element").cloned().unwrap_or_else(|| data.clone());
-            let matched = element
-                .get("state")
-                .and_then(|s| s.get(state_field))
-                .and_then(|v| v.as_bool())
-                .or_else(|| {
-                    // Some shapes expose `visible`/`enabled`/`focused` at the
-                    // top level rather than under `state`.
-                    element.get(state_field).and_then(|v| v.as_bool())
-                })
-                .unwrap_or(false);
-            if matched {
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                return Ok(Json(ApiResponse::success(serde_json::json!({
-                    "found": true,
-                    "elapsed_ms": elapsed_ms,
-                    "state": element.get("state").cloned().unwrap_or(serde_json::Value::Null),
-                }))));
+            match probe_state_field(&element, state_field) {
+                StateProbe::Observed(true) => {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    return Ok(Json(ApiResponse::success(serde_json::json!({
+                        "found": true,
+                        "elapsed_ms": elapsed_ms,
+                        "state": element.get("state").cloned().unwrap_or(serde_json::Value::Null),
+                    }))));
+                }
+                StateProbe::Observed(false) => signal_unobservable = false,
+                StateProbe::NotObservable => signal_unobservable = true,
             }
         }
 
         if std::time::Instant::now() + std::time::Duration::from_millis(poll_interval_ms) > deadline
         {
             let elapsed_ms = start.elapsed().as_millis() as u64;
-            return Ok(Json(ApiResponse::success(serde_json::json!({
+            let mut payload = serde_json::json!({
                 "found": false,
                 "elapsed_ms": elapsed_ms,
-            }))));
+            });
+            // A timeout on a signal this bridge build cannot report is not
+            // the same answer as "the element never got there", and a driver
+            // that cannot tell them apart will retry forever against a build
+            // that will never say yes. Name the cause instead of letting the
+            // bare `found:false` imply an observation we never made.
+            if signal_unobservable {
+                payload["reason"] = serde_json::Value::from("state-not-observable");
+                payload["requested_state"] = serde_json::Value::from(state_name.clone());
+            }
+            return Ok(Json(ApiResponse::success(payload)));
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
@@ -752,5 +862,201 @@ mod invalid_state_envelope_tests {
             env_json.get("error").and_then(|v| v.as_str()).is_some(),
             "contract: prose `error` field must still be populated for human readers"
         );
+    }
+}
+
+#[cfg(test)]
+mod state_probe_tests {
+    //! `wait-for-element-state` polls `get_element` and asks one question per
+    //! tick: "is <field> true yet?". Accepting a state name is only half the
+    //! contract — the probe has to give an honest answer on the bridge build
+    //! that is actually running.
+    //!
+    //! The regression these lock down: `disabled` / `ariaDisabled` were added
+    //! to `ALLOWED_STATES` ahead of the bridge that emits them.
+    //! `@qontinui/ui-bridge@0.22.0` (this repo depends on `^0.22.0`) builds
+    //! element state as `visible` / `enabled` / `focused` only, so an
+    //! absent-reads-as-`false` probe made both names permanently unmatchable
+    //! — accepted at the door, then silently timed out.
+    use super::{probe_state_field, resolve_state_field, StateProbe, ALLOWED_STATES};
+
+    /// The element shape `@qontinui/ui-bridge@0.22.0` actually serializes:
+    /// `getElementState()` writes exactly these interactivity flags, and the
+    /// published `ElementState` type declares no `disabled`/`ariaDisabled`.
+    fn pre_split_element(enabled: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": "btn",
+            "state": { "visible": true, "enabled": enabled, "focused": false },
+        })
+    }
+
+    /// A post-split bridge, where both signals are on the wire independently.
+    fn post_split_element(disabled: bool, aria_disabled: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": "btn",
+            "state": {
+                "visible": true,
+                "enabled": !(disabled || aria_disabled),
+                "disabled": disabled,
+                "ariaDisabled": aria_disabled,
+                "focused": false,
+            },
+        })
+    }
+
+    #[test]
+    fn plain_bool_flags_are_read_from_the_state_block() {
+        let el = pre_split_element(true);
+        assert_eq!(
+            probe_state_field(&el, "visible"),
+            StateProbe::Observed(true)
+        );
+        assert_eq!(
+            probe_state_field(&el, "enabled"),
+            StateProbe::Observed(true)
+        );
+        assert_eq!(
+            probe_state_field(&el, "focused"),
+            StateProbe::Observed(false)
+        );
+    }
+
+    /// The `discover()` fallback path inside `get_element` returns the match
+    /// verbatim rather than a `serializeElement` result, so the flags can sit
+    /// at the top level. That fallback predates this change and must survive.
+    #[test]
+    fn top_level_flags_are_read_when_there_is_no_state_block() {
+        let el = serde_json::json!({ "id": "btn", "visible": true });
+        assert_eq!(
+            probe_state_field(&el, "visible"),
+            StateProbe::Observed(true)
+        );
+    }
+
+    /// `aria-disabled` is a DOM *attribute*, so it reaches the runner as the
+    /// string `"true"` on the passthrough paths. `elements.rs` already reads
+    /// it that way in the `withDisabledOnly` snapshot filter and in
+    /// `execute_action`'s disabled pre-check; a bool-only probe here would
+    /// disagree with both and never match.
+    #[test]
+    fn string_true_is_accepted_for_the_aria_attribute_passthrough() {
+        let el = serde_json::json!({
+            "state": { "visible": true, "enabled": false, "ariaDisabled": "true" }
+        });
+        assert_eq!(
+            probe_state_field(&el, "ariaDisabled"),
+            StateProbe::Observed(true)
+        );
+        let off = serde_json::json!({
+            "state": { "visible": true, "enabled": true, "ariaDisabled": "false" }
+        });
+        assert_eq!(
+            probe_state_field(&off, "ariaDisabled"),
+            StateProbe::Observed(false)
+        );
+    }
+
+    /// On the shipped bridge `disabled` is not on the wire, but it IS soundly
+    /// derivable from the `enabled` fold — and this is the same derivation
+    /// the SDK's own predicate runtime uses (`evaluateElementPredicate`'s
+    /// `disabled` arm is `state.enabled === false`). Without it, a wait on
+    /// `disabled` could never return `found:true`.
+    #[test]
+    fn disabled_derives_from_enabled_on_a_pre_split_bridge() {
+        assert_eq!(
+            probe_state_field(&pre_split_element(false), "disabled"),
+            StateProbe::Observed(true),
+            "enabled:false must satisfy a wait on `disabled`"
+        );
+        assert_eq!(
+            probe_state_field(&pre_split_element(true), "disabled"),
+            StateProbe::Observed(false),
+        );
+    }
+
+    /// Forward compatibility: once a post-split bridge puts the real field on
+    /// the wire it must win outright, never be masked by the derivation.
+    #[test]
+    fn an_explicit_disabled_field_wins_over_the_derivation() {
+        // Contradictory on purpose — `enabled:true` would derive `false`.
+        let el = serde_json::json!({
+            "state": { "visible": true, "enabled": true, "disabled": true }
+        });
+        assert_eq!(
+            probe_state_field(&el, "disabled"),
+            StateProbe::Observed(true),
+            "the wire field is authoritative when present"
+        );
+        assert_eq!(
+            probe_state_field(&post_split_element(false, true), "ariaDisabled"),
+            StateProbe::Observed(true)
+        );
+        assert_eq!(
+            probe_state_field(&post_split_element(true, false), "ariaDisabled"),
+            StateProbe::Observed(false),
+            "a natively-disabled control is not ARIA-disabled"
+        );
+    }
+
+    /// `ariaDisabled` has no sound pre-split derivation: `enabled` is the
+    /// fold `!(disabled || ariaDisabled)`, so deriving from it would report a
+    /// natively-disabled control as ARIA-disabled. Report "cannot observe"
+    /// rather than inventing an answer or silently timing out on `false`.
+    #[test]
+    fn aria_disabled_is_not_observable_on_a_pre_split_bridge() {
+        assert_eq!(
+            probe_state_field(&pre_split_element(false), "ariaDisabled"),
+            StateProbe::NotObservable,
+            "enabled:false must NOT be reported as ARIA-disabled"
+        );
+        assert_eq!(
+            probe_state_field(&pre_split_element(true), "ariaDisabled"),
+            StateProbe::NotObservable,
+        );
+    }
+
+    /// `visible` / `enabled` / `focused` are required on every bridge build,
+    /// so an absent key there is a genuinely absent signal rather than a
+    /// build gap. They keep reading `false`, exactly as before this change.
+    #[test]
+    fn required_flags_absent_still_read_false_not_unobservable() {
+        let el = serde_json::json!({ "id": "btn", "state": {} });
+        for name in ["visible", "enabled", "focused"] {
+            assert_eq!(
+                probe_state_field(&el, name),
+                StateProbe::Observed(false),
+                "'{name}' must keep its pre-existing absent-reads-false behavior"
+            );
+        }
+    }
+
+    /// The contract that ties the allow-list to reality: on the bridge build
+    /// this repo actually depends on, no accepted state may be silently stuck
+    /// at `false` forever. Either the probe observes it, or it says it cannot
+    /// — the one outcome ruled out is an unmatchable name that looks like a
+    /// normal negative.
+    #[test]
+    fn no_allowed_state_is_silently_unmatchable_on_the_shipped_bridge() {
+        // Between them these two pre-split snapshots drive every emitted flag
+        // to the value a wait is looking for: `visible`/`enabled`/`focused`
+        // true in the first, `enabled:false` (the `disabled` source) in the
+        // second. Nothing else is on the wire on this bridge build.
+        let all_true = serde_json::json!({
+            "state": { "visible": true, "enabled": true, "focused": true }
+        });
+        let disabled_el = pre_split_element(false);
+        for name in ALLOWED_STATES {
+            let field = resolve_state_field(name).expect("allowed state must resolve");
+            let reachable = [&all_true, &disabled_el].iter().any(|el| {
+                matches!(
+                    probe_state_field(el, field),
+                    StateProbe::Observed(true) | StateProbe::NotObservable
+                )
+            });
+            assert!(
+                reachable,
+                "'{name}' can never return found:true and never says why"
+            );
+        }
     }
 }
