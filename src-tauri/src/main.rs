@@ -23,6 +23,12 @@ mod agent_claims;
 // user's own commands.
 mod agent_commands;
 mod agent_daemons;
+// One process-wide pooled `reqwest::Client` for the per-agent coord
+// daemons. Replaces per-request `Client::new()` on the tick paths, which
+// reuses no connection and burned the machine's whole ephemeral port
+// range during the 2026-08-07 refresh storm (Tcpip 4231). See the module
+// doc for the incident.
+mod agent_http;
 mod agent_pusher;
 // Plan `2026-05-19-coordinator-production-readiness.md` Phase 4 —
 // coord-driven Claude Code subprocess runtime. Subscribes to spawn-

@@ -398,13 +398,25 @@ async fn run(
 /// is therefore uncontended — it exists only to mutate through the
 /// `Arc`, not as concurrency control; do not add further locking here.
 pub async fn tick_once(state: &Arc<PusherState>) -> Result<()> {
-    agent_token::maybe_refresh(
+    let refresh = agent_token::maybe_refresh(
         &state.token,
         &state.coord_http_base,
         state.agent_id,
         "agent_pusher",
     )
     .await?;
+    // Coord refused this bearer, and the push targets authenticate with
+    // the same token — every push below would be rejected. Skip rather
+    // than climb the per-target backoff ladder over a cause no target
+    // can fix. Sibling of the `dirty_poller` guard; see
+    // `agent_token::RefreshOutcome`.
+    if refresh.should_skip_work() {
+        debug!(
+            "agent_pusher: agent_id={} skipping tick — token rejected by coord",
+            state.agent_id
+        );
+        return Ok(());
+    }
     let token_clone = {
         let guard = state.token.read().await;
         guard.clone()
@@ -816,6 +828,7 @@ mod tests {
             token: "x".into(),
             jti: uuid::Uuid::nil(),
             exp: now + 4 * 3600,
+            ..Default::default()
         };
         assert!(!t.needs_refresh(now));
         // 10 min left → refresh.
@@ -823,6 +836,7 @@ mod tests {
             token: "x".into(),
             jti: uuid::Uuid::nil(),
             exp: now + 600,
+            ..Default::default()
         };
         assert!(t2.needs_refresh(now));
         // 30 min - 1s left → refresh (just under the margin).
@@ -830,6 +844,7 @@ mod tests {
             token: "x".into(),
             jti: uuid::Uuid::nil(),
             exp: now + TOKEN_REFRESH_MARGIN_SECS - 1,
+            ..Default::default()
         };
         assert!(t3.needs_refresh(now));
     }
@@ -1129,6 +1144,7 @@ mod tests {
             token: "t".into(),
             jti: uuid::Uuid::nil(),
             exp: 0,
+            ..Default::default()
         }));
         let state = PusherState::with_shared_token(&allocate, "http://h:1".into(), token).unwrap();
         assert_eq!(state.targets.len(), state.backoff.lock().await.len());
@@ -1145,6 +1161,7 @@ mod tests {
                 token: "x".into(),
                 jti: uuid::Uuid::nil(),
                 exp: chrono::Utc::now().timestamp() + 4 * 3600,
+                ..Default::default()
             })),
             backoff: tokio::sync::Mutex::new(Vec::new()),
         });

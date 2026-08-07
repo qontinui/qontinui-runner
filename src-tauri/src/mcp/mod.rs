@@ -15,6 +15,10 @@
 pub mod accessibility;
 pub mod action_plan_cache;
 pub mod adb_helper;
+// `GET /agent-tokens/health` — publishes the per-agent JWT refresh loop's
+// own output, so a latched-off refresh (silent by design) is legible
+// somewhere other than the log file.
+pub mod agent_tokens;
 pub mod agent_worktrees;
 pub mod ai_generation;
 pub mod ai_network_probe;
