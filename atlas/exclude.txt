@@ -432,6 +432,8 @@ coord.dev_action_outcomes_id_seq
 coord.dev_action_snapshots
 coord.dev_action_stats
 coord.device_connections
+coord.device_resource_samples
+coord.device_resource_samples_id_seq
 coord.device_status
 coord.devices
 coord.edit_verifications
@@ -444,6 +446,8 @@ coord.findings
 coord.flag_registry
 coord.fleet_runtime_policy
 coord.fleet_runtime_policy_id_seq
+coord.fleet_runtime_policy_versions
+coord.fleet_runtime_policy_versions_id_seq
 coord.footprint_drift_events
 coord.fs_observations
 coord.fs_observations_id_seq
@@ -481,6 +485,7 @@ coord.maintenance_runs
 coord.maintenance_tasks
 coord.memories
 coord.memories_latest
+coord.memory_anchor_observations
 coord.memory_federation_reports
 coord.memory_jobs
 coord.memory_links
@@ -568,6 +573,7 @@ coord.tenant_policies
 coord.tenant_repo_profiles
 coord.tenant_repo_unenrollments
 coord.tenant_repos
+coord.tenant_warm_bytes
 coord.tenants
 coord.test_coverage_map
 coord.test_coverage_map_id_seq
