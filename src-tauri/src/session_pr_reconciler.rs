@@ -494,7 +494,7 @@ async fn read_session_trailers(dir: &str, sha: &str) -> Option<Vec<String>> {
 /// first, then `gh auth token` (the operator's authenticated GitHub CLI — the
 /// same credential the interactive `gh pr create` sessions this feature serves
 /// already use). `None` when no source yields a non-empty token.
-async fn resolve_github_token() -> Option<String> {
+pub(crate) async fn resolve_github_token() -> Option<String> {
     for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
         if let Ok(v) = std::env::var(var) {
             let v = v.trim().to_string();

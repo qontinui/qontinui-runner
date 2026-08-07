@@ -6711,6 +6711,7 @@ dependencies = [
  "subtle",
  "syn 2.0.117",
  "sysinfo",
+ "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",

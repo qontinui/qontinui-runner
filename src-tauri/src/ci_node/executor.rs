@@ -9,11 +9,20 @@
 //!   job-wide committed-memory limit ([`CI_JOB_MEMORY_LIMIT_BYTES`]) — the
 //!   OOM backstop the plan calls load-bearing — plus kill-on-close scoped
 //!   to the dispatch (dropping the handle at dispatch end reaps strays);
-//! - `CARGO_BUILD_JOBS` is exported from the manifest's `[limits]`
-//!   (default 1 — this workspace OOMs above that);
+//! - `CARGO_BUILD_JOBS` **and** the test-concurrency caps are exported by the
+//!   executor, sized from the host and bounded by the manifest's `[limits]`
+//!   (see [`super::host_sizing`]) — the manifest cannot raise them, and it no
+//!   longer has to smuggle them through argv;
 //! - cargo artifacts go to a persistent per-repo CI target dir
 //!   (`<root>/.ci-target/<repo basename>`) — warm across dispatches, never
 //!   contending with the developer's own `target/`.
+//!
+//! Provisioning happens between the manifest read and the first step, in this
+//! order: tools ([`super::tools`]) then siblings ([`super::sibling`]). Both
+//! are declared IN the manifest, so neither can run before it is read and
+//! validated; both abort the dispatch on failure, because a step that
+//! silently ran without its declared tool or sibling produces a verdict that
+//! looks like a code failure and is not.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -22,6 +31,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use super::host_sizing;
 use super::manifest::{CiManifest, CiStep};
 use super::reporting::{self, LinePusher, ProgressSink, StepSummary};
 use super::CiDispatchPayload;
@@ -162,7 +172,7 @@ pub(crate) async fn run_dispatch(
             )
             .await;
             // prepare_worktree may have left a partial worktree behind.
-            super::checkout::cleanup_worktree(&root, &payload.repo, &payload.dispatch_id).await;
+            super::checkout::cleanup_dispatch(&root, &payload.repo, &payload.dispatch_id).await;
             return;
         }
     };
@@ -192,20 +202,68 @@ pub(crate) async fn run_dispatch(
                 &tail,
             )
             .await;
-            super::checkout::cleanup_worktree(&root, &payload.repo, &payload.dispatch_id).await;
+            super::checkout::cleanup_dispatch(&root, &payload.repo, &payload.dispatch_id).await;
             return;
         }
     };
+
+    // Host-derived caps, bounded by the manifest's [limits] (which are
+    // ceilings, never raises). Probed ONCE per dispatch — the answer cannot
+    // change mid-build in any way worth re-reading, and the probe is a
+    // blocking sysinfo refresh.
+    let host = host_sizing::derive(host_sizing::probe());
+    let build_jobs = manifest.limits.effective_cargo_build_jobs(host);
+    let test_threads = manifest.limits.effective_test_threads(host);
     sink.push(&format!(
-        "[ci-node] manifest ok: {} step(s), cargo_build_jobs={}",
+        "[ci-node] manifest ok: {} step(s), {} sibling(s), {} tool(s); \
+         cargo_build_jobs={build_jobs} test_threads={test_threads} \
+         (host sizing: {} / {})",
         manifest.steps.len(),
-        manifest.limits.effective_cargo_build_jobs()
+        manifest.siblings.len(),
+        manifest.tools.len(),
+        host.cargo_build_jobs,
+        host.test_threads
     ));
+
+    // ── Provisioning (tools, then siblings) ──
+    let provisioning = provision(&payload, &root, &worktree, &manifest, &sink).await;
+    let tool_dirs = match provisioning {
+        Ok(dirs) => {
+            steps_summary.push(StepSummary {
+                name: "[setup] provision".to_string(),
+                conclusion: "success".to_string(),
+                duration_secs: 0,
+            });
+            dirs
+        }
+        Err(e) => {
+            sink.push(&format!("[ci-node] provisioning failed: {e}"));
+            steps_summary.push(StepSummary {
+                name: "[setup] provision".to_string(),
+                conclusion: "failure".to_string(),
+                duration_secs: 0,
+            });
+            let tail = sink.finish().await;
+            reporting::post_result(
+                &base,
+                &payload.dispatch_id,
+                "failure",
+                &steps_summary,
+                None,
+                &tail,
+            )
+            .await;
+            super::checkout::cleanup_dispatch(&root, &payload.repo, &payload.dispatch_id).await;
+            return;
+        }
+    };
 
     // Persistent per-repo CI target dir (warm across dispatches).
     let ci_target_dir = root
         .join(".ci-target")
         .join(crate::agent_runtime::local_repo_name(&payload.repo));
+
+    let dispatch_env = DispatchEnv::build(build_jobs, test_threads, &ci_target_dir, &tool_dirs);
 
     // Per-dispatch memory-backstop job (held across all steps; dropping it
     // at dispatch end kill-on-closes any stray build processes).
@@ -225,16 +283,7 @@ pub(crate) async fn run_dispatch(
             step.effective_timeout_secs()
         ));
         let step_started = Instant::now();
-        let outcome = run_step(
-            step,
-            &manifest,
-            &worktree,
-            &ci_target_dir,
-            &ci_job,
-            &sink,
-            &cancel,
-        )
-        .await;
+        let outcome = run_step(step, &dispatch_env, &worktree, &ci_job, &sink, &cancel).await;
         let duration = step_started.elapsed().as_secs();
         sink.push(&format!(
             "[ci-node] step {} → {} in {duration}s",
@@ -277,7 +326,43 @@ pub(crate) async fn run_dispatch(
         &tail,
     )
     .await;
-    super::checkout::cleanup_worktree(&root, &payload.repo, &payload.dispatch_id).await;
+    super::checkout::cleanup_dispatch(&root, &payload.repo, &payload.dispatch_id).await;
+}
+
+/// Provision what the manifest declares. Returns the tool directories to
+/// prepend to the step PATH.
+///
+/// Tools first, siblings second: a sibling fetch is the slower and more
+/// failure-prone half (network, declaration validation), and there is no
+/// reason to pay for it before finding out a declared tool does not exist for
+/// this platform.
+async fn provision(
+    payload: &CiDispatchPayload,
+    root: &Path,
+    worktree: &Path,
+    manifest: &CiManifest,
+    sink: &ProgressSink,
+) -> Result<Vec<PathBuf>, String> {
+    let mut log = |line: String| sink.push(&line);
+
+    let tool_dirs = super::tools::provision(root, &manifest.tools, &mut log).await?;
+
+    let dispatch_root = super::checkout::ci_dispatch_root(root, &payload.dispatch_id);
+    let worktree_dir_name = worktree
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    super::sibling::provision(
+        &dispatch_root,
+        &worktree_dir_name,
+        &manifest.siblings,
+        &payload.repo,
+        payload.pr_number,
+        &mut log,
+    )
+    .await?;
+
+    Ok(tool_dirs)
 }
 
 /// Read + validate the manifest from the checked-out tree. The path is
@@ -409,13 +494,80 @@ async fn kill_step_tree(child: &mut tokio::process::Child) {
     let _ = child.wait().await;
 }
 
+/// The env the executor exports to EVERY step of a dispatch, computed once.
+///
+/// These win over a step's own `env` — the manifest's validation rejects the
+/// keys here outright with a pointer to the manifest key that does control
+/// them, so "the step set it and it was ignored" is not a state this can
+/// reach.
+struct DispatchEnv {
+    exports: Vec<(String, String)>,
+}
+
+impl DispatchEnv {
+    fn build(
+        build_jobs: u32,
+        test_threads: u32,
+        ci_target_dir: &Path,
+        tool_dirs: &[PathBuf],
+    ) -> Self {
+        let mut exports = vec![
+            // The build-phase cap.
+            ("CARGO_BUILD_JOBS".to_string(), build_jobs.to_string()),
+            // The TEST-phase cap, exported for both harnesses. This is the
+            // half that used to be missing: the incident behind these caps
+            // killed the Actions agent in the test phase as well as the build
+            // phase, so bounding only the build leaves half the failure mode
+            // open. `RUST_TEST_THREADS` bounds libtest (`cargo test`);
+            // `NEXTEST_TEST_THREADS` bounds nextest's process-per-test model.
+            // Both are exported unconditionally because a manifest may use
+            // either harness, and the unused one is inert.
+            ("RUST_TEST_THREADS".to_string(), test_threads.to_string()),
+            (
+                "NEXTEST_TEST_THREADS".to_string(),
+                test_threads.to_string(),
+            ),
+            // Keeps cargo out of the developer's own target/.
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                ci_target_dir.to_string_lossy().to_string(),
+            ),
+            // Mark the environment as CI for tools that branch on it.
+            ("CI".to_string(), "true".to_string()),
+        ];
+        if let Some(path) = tool_path(tool_dirs) {
+            // PATH is NOT settable from a manifest — it is the canonical
+            // "redirect binary resolution" sink and stays off the allowlist.
+            // The executor prepends only directories it provisioned itself,
+            // from the closed tool registry, at versions the manifest pinned.
+            // The host's own PATH is preserved after them so cargo, git and
+            // node still resolve.
+            exports.push(("PATH".to_string(), path));
+        }
+        Self { exports }
+    }
+}
+
+/// Build the step PATH: provisioned tool directories first, the runner's own
+/// PATH after. `None` when nothing was provisioned, so the child simply
+/// inherits.
+fn tool_path(tool_dirs: &[PathBuf]) -> Option<String> {
+    if tool_dirs.is_empty() {
+        return None;
+    }
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut entries: Vec<PathBuf> = tool_dirs.to_vec();
+    entries.extend(std::env::split_paths(&inherited));
+    std::env::join_paths(entries)
+        .ok()
+        .map(|s| s.to_string_lossy().to_string())
+}
+
 /// Run one step: spawn, pump output, enforce timeout + cancellation.
-#[allow(clippy::too_many_arguments)]
 async fn run_step(
     step: &CiStep,
-    manifest: &CiManifest,
+    dispatch_env: &DispatchEnv,
     worktree: &Path,
-    ci_target_dir: &Path,
     ci_job: &CiJob,
     sink: &ProgressSink,
     cancel: &CancellationToken,
@@ -428,24 +580,14 @@ async fn run_step(
         }
     };
 
-    // Env: allowlisted step env first, then the machine-safety knobs, which
-    // WIN over the step (`CARGO_BUILD_JOBS` from [limits] is a cap the step
-    // cannot raise; the CI target dir keeps cargo out of the dev's target/).
+    // Env: allowlisted step env first, then the executor's exports, which WIN
+    // over the step.
     let mut envs: Vec<(String, String)> = step
         .env
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    envs.push((
-        "CARGO_BUILD_JOBS".to_string(),
-        manifest.limits.effective_cargo_build_jobs().to_string(),
-    ));
-    envs.push((
-        "CARGO_TARGET_DIR".to_string(),
-        ci_target_dir.to_string_lossy().to_string(),
-    ));
-    // Mark the environment as CI for tools that branch on it.
-    envs.push(("CI".to_string(), "true".to_string()));
+    envs.extend(dispatch_env.exports.iter().cloned());
 
     let mut child = match spawn_step_child(step, &cwd, &envs) {
         Ok(c) => c,
@@ -542,6 +684,61 @@ mod tests {
         assert_eq!(StepOutcome::Failure.as_conclusion(), "failure");
         assert_eq!(StepOutcome::Timeout.as_conclusion(), "failure");
         assert_eq!(StepOutcome::Cancelled.as_conclusion(), "cancelled");
+    }
+
+    fn exports(env: &DispatchEnv, key: &str) -> Option<String> {
+        env.exports
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// The caps the executor owns are exported for BOTH test harnesses, not
+    /// just the build — the failure mode these exist for killed the Actions
+    /// agent in the test phase too.
+    #[test]
+    fn executor_exports_both_phases_of_cap() {
+        let env = DispatchEnv::build(3, 7, Path::new("/ci-target"), &[]);
+        assert_eq!(exports(&env, "CARGO_BUILD_JOBS").as_deref(), Some("3"));
+        assert_eq!(exports(&env, "RUST_TEST_THREADS").as_deref(), Some("7"));
+        assert_eq!(exports(&env, "NEXTEST_TEST_THREADS").as_deref(), Some("7"));
+        assert_eq!(exports(&env, "CI").as_deref(), Some("true"));
+        assert!(exports(&env, "CARGO_TARGET_DIR").is_some());
+        // Nothing provisioned ⇒ the child inherits PATH untouched.
+        assert!(exports(&env, "PATH").is_none());
+    }
+
+    /// A provisioned tool goes on the FRONT of PATH, and the host's own PATH
+    /// survives behind it (cargo/git/node must still resolve).
+    #[test]
+    fn tool_dirs_prepend_without_replacing_the_host_path() {
+        let dir = PathBuf::from("/tools/cargo-nextest/0.9.98");
+        let env = DispatchEnv::build(1, 2, Path::new("/ci-target"), &[dir.clone()]);
+        let path = exports(&env, "PATH").expect("PATH must be exported when a tool is provisioned");
+        let mut entries = std::env::split_paths(&path);
+        assert_eq!(entries.next().as_deref(), Some(dir.as_path()));
+        let inherited: Vec<_> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        let rest: Vec<_> = entries.collect();
+        assert_eq!(rest, inherited);
+    }
+
+    /// The executor's exports are appended AFTER the step's own env, and
+    /// `spawn_step_child` applies them in order, so the executor's value is
+    /// the one the child sees. (The manifest also rejects these keys
+    /// outright — this asserts the second half of that belt-and-braces.)
+    #[test]
+    fn executor_exports_are_applied_last() {
+        let env = DispatchEnv::build(1, 2, Path::new("/ci-target"), &[]);
+        let step_env = vec![("CARGO_BUILD_JOBS".to_string(), "64".to_string())];
+        let mut envs = step_env.clone();
+        envs.extend(env.exports.iter().cloned());
+        let last = envs
+            .iter()
+            .filter(|(k, _)| k == "CARGO_BUILD_JOBS")
+            .next_back()
+            .expect("present");
+        assert_eq!(last.1, "1");
     }
 
     /// The manifest-path structural gate (pre-canonicalize half).

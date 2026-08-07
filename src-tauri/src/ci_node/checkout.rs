@@ -4,8 +4,31 @@
 //! Layout (all under QONTINUI_ROOT):
 //! - primary repo dir: `<root>/<repo basename>` — the fetch target (warm
 //!   objects, warm git config).
-//! - CI worktree: `<root>/.ci-worktrees/<dispatch_id>` — always removed in
-//!   cleanup, success or failure.
+//! - **dispatch root**: `<root>/.ci-worktrees/<dispatch_id>` — the unit of
+//!   cleanup. Always removed, success or failure.
+//! - CI worktree: `<dispatch root>/<repo basename>` — the dispatched tree.
+//! - siblings: `<dispatch root>/<sibling basename>` — materialised by
+//!   [`super::sibling`].
+//!
+//! # Why the worktree gained a level
+//!
+//! It used to be `<root>/.ci-worktrees/<dispatch_id>` directly. That put the
+//! build tree one level DEEPER than the primary clone at `<root>/<repo>`, so a
+//! relative path-dep (`../qontinui-schemas/rust` in Cargo,
+//! `../../qontinui-schemas` from `backend/` in Poetry — different depths, same
+//! resolved location) pointed at `<root>/.ci-worktrees/qontinui-schemas`
+//! rather than anywhere a checkout could be placed. Giving the dispatch its
+//! own parent makes `../<sibling>` land INSIDE that parent, which is
+//! simultaneously:
+//!
+//! - the one layout rule that satisfies both toolchains, and
+//! - a strictly SMALLER cleanup surface than provisioning siblings anywhere
+//!   else would be, because the parent is still a single `remove_dir_all`.
+//!
+//! [`cleanup_dispatch`] therefore keeps its three-step shape — worktree
+//! remove, prune, directory delete — with the delete widened from the worktree
+//! to the dispatch root. Nothing outside `<root>/.ci-worktrees/<dispatch_id>`
+//! is ever touched.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,7 +42,11 @@ const GIT_LOCAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Run git in `repo_dir`, capturing combined output. Err carries a
 /// log-worthy one-liner.
-async fn run_git(repo_dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+pub(super) async fn run_git(
+    repo_dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
     let mut cmd = crate::process_helpers::tokio_no_window("git");
     cmd.current_dir(repo_dir)
         .args(args)
@@ -54,9 +81,17 @@ async fn run_git(repo_dir: &Path, args: &[&str], timeout: Duration) -> Result<St
     }
 }
 
-/// The CI worktree path for a dispatch.
-pub(crate) fn ci_worktree_path(root: &Path, dispatch_id: &str) -> PathBuf {
+/// The dispatch-scoped parent: the dispatched worktree and every provisioned
+/// sibling live under it, and it is the one directory cleanup removes.
+pub(crate) fn ci_dispatch_root(root: &Path, dispatch_id: &str) -> PathBuf {
     root.join(".ci-worktrees").join(dispatch_id)
+}
+
+/// The CI worktree path for a dispatch — a child of [`ci_dispatch_root`]
+/// named after the repo, so `../<sibling>` from inside it resolves to a
+/// sibling of the worktree.
+pub(crate) fn ci_worktree_path(root: &Path, dispatch_id: &str, repo: &str) -> PathBuf {
+    ci_dispatch_root(root, dispatch_id).join(crate::agent_runtime::local_repo_name(repo))
 }
 
 /// Fetch + verify + worktree-add. Returns the worktree path.
@@ -131,18 +166,21 @@ pub(crate) async fn prepare_worktree(
     .await
     .map_err(|e| format!("head_sha {head_sha} not present after fetch from {fetch_url}: {e}"))?;
 
-    let wt_path = ci_worktree_path(root, dispatch_id);
-    if wt_path.exists() {
-        // Stale leftover from a crashed prior attempt — clear it first.
+    let dispatch_root = ci_dispatch_root(root, dispatch_id);
+    let wt_path = ci_worktree_path(root, dispatch_id, repo);
+    if dispatch_root.exists() {
+        // Stale leftover from a crashed prior attempt — clear the WHOLE
+        // dispatch root (not just the worktree), because a half-provisioned
+        // sibling would otherwise trip materialise's "already exists"
+        // refusal.
         warn!(
-            "ci_node: stale CI worktree {} exists; removing before re-add",
-            wt_path.display()
+            "ci_node: stale dispatch dir {} exists; removing before re-add",
+            dispatch_root.display()
         );
-        cleanup_worktree(root, repo, dispatch_id).await;
+        cleanup_dispatch(root, repo, dispatch_id).await;
     }
-    if let Some(parent) = wt_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
+    std::fs::create_dir_all(&dispatch_root)
+        .map_err(|e| format!("create {}: {e}", dispatch_root.display()))?;
 
     let wt_str = wt_path.to_string_lossy().to_string();
     run_git(
@@ -159,11 +197,13 @@ pub(crate) async fn prepare_worktree(
 }
 
 /// Always-run cleanup: `git worktree remove --force` + prune, then a
-/// best-effort directory delete for anything git left behind. Failure is
-/// logged, never propagated (cleanup runs on failure paths too).
-pub(crate) async fn cleanup_worktree(root: &Path, repo: &str, dispatch_id: &str) {
+/// best-effort delete of the whole dispatch root — which sweeps the worktree,
+/// every provisioned sibling, and anything git left behind, in one call.
+/// Failure is logged, never propagated (cleanup runs on failure paths too).
+pub(crate) async fn cleanup_dispatch(root: &Path, repo: &str, dispatch_id: &str) {
     let repo_dir = root.join(crate::agent_runtime::local_repo_name(repo));
-    let wt_path = ci_worktree_path(root, dispatch_id);
+    let wt_path = ci_worktree_path(root, dispatch_id, repo);
+    let dispatch_root = ci_dispatch_root(root, dispatch_id);
     let wt_str = wt_path.to_string_lossy().to_string();
     if let Err(e) = run_git(
         &repo_dir,
@@ -177,11 +217,11 @@ pub(crate) async fn cleanup_worktree(root: &Path, repo: &str, dispatch_id: &str)
     if let Err(e) = run_git(&repo_dir, &["worktree", "prune"], GIT_LOCAL_TIMEOUT).await {
         warn!("ci_node: worktree prune failed: {e}");
     }
-    if wt_path.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&wt_path) {
+    if dispatch_root.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&dispatch_root) {
             warn!(
-                "ci_node: residual worktree dir {} not removable: {e}",
-                wt_path.display()
+                "ci_node: residual dispatch dir {} not removable: {e}",
+                dispatch_root.display()
             );
         }
     }
@@ -193,8 +233,39 @@ mod tests {
 
     #[test]
     fn ci_worktree_path_is_dispatch_scoped_under_root() {
-        let p = ci_worktree_path(Path::new("/root"), "d-123");
+        let p = ci_worktree_path(Path::new("/root"), "d-123", "qontinui/qontinui-coord");
         assert!(p.starts_with("/root"));
-        assert!(p.ends_with(PathBuf::from(".ci-worktrees").join("d-123")));
+        assert!(p.ends_with(
+            PathBuf::from(".ci-worktrees")
+                .join("d-123")
+                .join("qontinui-coord")
+        ));
+    }
+
+    /// The cleanup guarantee, stated as a path fact: everything a dispatch
+    /// creates — its worktree and every sibling — is under the ONE directory
+    /// `cleanup_dispatch` removes.
+    #[test]
+    fn everything_a_dispatch_creates_is_under_the_cleanup_unit() {
+        let root = Path::new("/root");
+        let dispatch_root = ci_dispatch_root(root, "d-123");
+        assert_eq!(
+            dispatch_root,
+            PathBuf::from("/root").join(".ci-worktrees").join("d-123")
+        );
+        let wt = ci_worktree_path(root, "d-123", "qontinui/qontinui-coord");
+        assert!(wt.starts_with(&dispatch_root));
+        // A second dispatch is a disjoint tree, so concurrent builds cannot
+        // clean up each other's siblings.
+        assert!(!ci_dispatch_root(root, "d-124").starts_with(&dispatch_root));
+    }
+
+    /// The worktree is a CHILD of the dispatch root, not the dispatch root
+    /// itself — that extra level is what makes `../<sibling>` resolvable.
+    #[test]
+    fn worktree_has_a_sibling_slot_next_to_it() {
+        let root = Path::new("/root");
+        let wt = ci_worktree_path(root, "d-123", "qontinui/qontinui-coord");
+        assert_eq!(wt.parent(), Some(ci_dispatch_root(root, "d-123").as_path()));
     }
 }
