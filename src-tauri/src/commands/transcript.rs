@@ -6,9 +6,13 @@
 use crate::commands::compartments::{ExecutionCompartment, HealthCompartment, StorageCompartment};
 use crate::commands::CommandResponse;
 use crate::terminal::transcript;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
-use tracing::{info, warn};
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
 /// Collect workspace project paths for scanning (root + immediate child directories).
 fn collect_workspace_project_paths() -> Vec<String> {
@@ -64,6 +68,129 @@ fn collect_all_sessions(
     all_sessions
 }
 
+// ── Scan cache (single-flight + short TTL) ───────────────────────────────────
+//
+// **Why this exists.** Every terminal tab is its own `WebviewWindow`
+// (`commands::terminal_windows`), so each one loads a full app instance with
+// its own `useTranscriptSessions` hook and its own 30s poll. N tabs therefore
+// meant N *independent* full-workspace scans, and because the tabs mount
+// together their timers stay in phase — they fire as one burst.
+//
+// Measured on the fleet box 2026-08-07 with 6 tabs open (Terminal, tio, gmail,
+// hotmail, paktis, qontinui):
+//
+// ```text
+// 10:16:01.383 … .394   6 scans start  (11ms spread)
+// 10:16:01.808 … .816   all 6 finish   (~433ms burst)
+// ```
+//
+// Each scan crosses 624 workspace child directories with 6 Claude config dirs
+// — ~3,744 `list_sessions` calls — so the burst was ~22,000 filesystem probes
+// for six byte-identical answers. Worse, the work ran inline on the async
+// command, occupying a runtime worker for its whole duration.
+//
+// Two independent growth axes made this worth fixing rather than tolerating:
+// tabs open, and workspace child directories (441 of those 624 were leftover
+// worktree/spawn dirs). Both scale the burst linearly.
+//
+// The fix is deliberately not a background refresher: holding the lock across
+// the scan makes the *first* caller do the work while the other five await it
+// and then read the fresh entry — one scan per burst, no staleness window
+// beyond the TTL, and no timer to keep alive when nothing is watching.
+
+/// How long a completed scan stays servable. Must be shorter than the
+/// frontend's 30s poll (so each poll round still sees fresh data) and longer
+/// than one burst's spread (so a burst collapses to a single scan).
+const SCAN_CACHE_TTL: Duration = Duration::from_secs(5);
+
+struct ScanCache {
+    computed_at: Instant,
+    /// Inputs the entry was computed for. A caller asking about different
+    /// paths (e.g. `all_projects: false`) must not be served this entry.
+    project_paths: Vec<String>,
+    config_dirs: Vec<std::path::PathBuf>,
+    sessions: Vec<transcript::TranscriptSession>,
+}
+
+fn scan_cache() -> &'static Mutex<Option<ScanCache>> {
+    static CACHE: OnceLock<Mutex<Option<ScanCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Count of scans actually executed (cache misses). Lets a test prove the
+/// collapse happened rather than inferring it from timing, and is a cheap
+/// operational signal if it is ever surfaced.
+static SCANS_PERFORMED: AtomicU64 = AtomicU64::new(0);
+
+/// Number of real filesystem scans performed since process start.
+pub fn scans_performed() -> u64 {
+    SCANS_PERFORMED.load(Ordering::Relaxed)
+}
+
+/// True when a cache entry may serve a request for these inputs.
+/// Pure — unit-tested without a clock or a filesystem.
+fn entry_is_servable(
+    age: Duration,
+    entry_paths: &[String],
+    entry_dirs: &[std::path::PathBuf],
+    want_paths: &[String],
+    want_dirs: &[std::path::PathBuf],
+) -> bool {
+    age < SCAN_CACHE_TTL && entry_paths == want_paths && entry_dirs == want_dirs
+}
+
+/// [`collect_all_sessions`] behind the single-flight cache, with the blocking
+/// filesystem work moved off the async runtime.
+///
+/// The lock is held across the scan on purpose — that is what makes it
+/// single-flight. Concurrent callers park on the mutex (cheap: no runtime
+/// worker is held, the scan itself is on the blocking pool) and then read the
+/// entry the winner just wrote.
+async fn collect_all_sessions_cached(
+    project_paths: &[String],
+    config_dirs: &[std::path::PathBuf],
+) -> Vec<transcript::TranscriptSession> {
+    let mut guard = scan_cache().lock().await;
+
+    if let Some(entry) = guard.as_ref() {
+        if entry_is_servable(
+            entry.computed_at.elapsed(),
+            &entry.project_paths,
+            &entry.config_dirs,
+            project_paths,
+            config_dirs,
+        ) {
+            debug!(
+                "transcript_list_sessions: served {} sessions from scan cache",
+                entry.sessions.len()
+            );
+            return entry.sessions.clone();
+        }
+    }
+
+    let paths = project_paths.to_vec();
+    let dirs = config_dirs.to_vec();
+    SCANS_PERFORMED.fetch_add(1, Ordering::Relaxed);
+    let sessions =
+        match tokio::task::spawn_blocking(move || collect_all_sessions(&paths, &dirs)).await {
+            Ok(s) => s,
+            Err(e) => {
+                // The blocking pool panicked or was shut down. Report empty rather
+                // than caching the failure — the next tick retries.
+                warn!("transcript_list_sessions: scan task failed: {e}");
+                return Vec::new();
+            }
+        };
+
+    *guard = Some(ScanCache {
+        computed_at: Instant::now(),
+        project_paths: project_paths.to_vec(),
+        config_dirs: config_dirs.to_vec(),
+        sessions: sessions.clone(),
+    });
+    sessions
+}
+
 /// List Claude Code transcript sessions.
 ///
 /// When `all_projects` is true, scans the workspace root **and** all immediate
@@ -104,7 +231,7 @@ pub async fn transcript_list_sessions(
     let all_sessions = if config_dirs.is_empty() {
         Vec::new()
     } else {
-        collect_all_sessions(&project_paths, &config_dirs)
+        collect_all_sessions_cached(&project_paths, &config_dirs).await
     };
 
     // Phase 5.1 of the UI Bridge discoverability/effectiveness plan:
@@ -249,12 +376,26 @@ pub async fn transcript_session_digests(
         });
     }
 
-    let mut all_sessions = collect_all_sessions(&project_paths, &config_dirs);
+    // Shares the single-flight scan cache with `transcript_list_sessions`:
+    // this runs once per tab ON MOUNT, so six tabs previously meant six more
+    // full scans stacked on top of the poll bursts during startup — the
+    // busiest moment the runner has.
+    let mut all_sessions = collect_all_sessions_cached(&project_paths, &config_dirs).await;
     let limit = max_sessions.unwrap_or(50).min(100);
     all_sessions.truncate(limit);
 
-    // Compute digests
-    let digests = transcript::session_digests_batch(&all_sessions);
+    // Digest computation reads the TAIL OF EVERY session file (up to `limit`),
+    // so it is blocking I/O and must not run on an async worker.
+    let digests =
+        match tokio::task::spawn_blocking(move || transcript::session_digests_batch(&all_sessions))
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("transcript_session_digests: digest task failed: {e}");
+                Vec::new()
+            }
+        };
 
     info!(
         "transcript_session_digests: computed {} digests",
@@ -582,4 +723,108 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             generate_workflow_standalone,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dirs(names: &[&str]) -> Vec<std::path::PathBuf> {
+        names.iter().map(std::path::PathBuf::from).collect()
+    }
+
+    #[test]
+    fn fresh_entry_with_matching_inputs_is_servable() {
+        let p = vec!["a".to_string()];
+        let d = dirs(&["cfg"]);
+        assert!(entry_is_servable(Duration::from_millis(1), &p, &d, &p, &d));
+    }
+
+    #[test]
+    fn expired_entry_is_not_servable() {
+        let p = vec!["a".to_string()];
+        let d = dirs(&["cfg"]);
+        assert!(!entry_is_servable(
+            SCAN_CACHE_TTL + Duration::from_millis(1),
+            &p,
+            &d,
+            &p,
+            &d
+        ));
+    }
+
+    /// The cache key must include BOTH inputs. Serving an `all_projects:false`
+    /// caller the workspace-wide entry (or vice-versa) would silently return
+    /// the wrong session set.
+    #[test]
+    fn differing_inputs_are_not_servable() {
+        let d = dirs(&["cfg"]);
+        assert!(
+            !entry_is_servable(
+                Duration::ZERO,
+                &["a".to_string()],
+                &d,
+                &["b".to_string()],
+                &d
+            ),
+            "different project paths must not share an entry"
+        );
+        assert!(
+            !entry_is_servable(
+                Duration::ZERO,
+                &["a".to_string()],
+                &dirs(&["cfg1"]),
+                &["a".to_string()],
+                &dirs(&["cfg2"])
+            ),
+            "different config dirs must not share an entry"
+        );
+    }
+
+    /// The regression this module exists for: six terminal tabs polling in one
+    /// burst must produce ONE scan, not six.
+    ///
+    /// Single test rather than three, because the cache and the scan counter
+    /// are process-global — separate `#[tokio::test]`s would race each other.
+    /// Empty `project_paths` makes the underlying scan a no-op, so this
+    /// measures the caching decision and nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_callers_collapse_to_one_scan() {
+        let paths: Vec<String> = Vec::new();
+        let key_a = dirs(&["scan-cache-test-a"]);
+        let before = scans_performed();
+
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let p = paths.clone();
+            let d = key_a.clone();
+            handles.push(tokio::spawn(async move {
+                collect_all_sessions_cached(&p, &d).await
+            }));
+        }
+        for h in handles {
+            h.await.expect("scan task joined");
+        }
+        assert_eq!(
+            scans_performed() - before,
+            1,
+            "six concurrent callers must collapse to a single scan"
+        );
+
+        // A further poll inside the TTL is served from the entry.
+        let _ = collect_all_sessions_cached(&paths, &key_a).await;
+        assert_eq!(
+            scans_performed() - before,
+            1,
+            "a repeat within the TTL must not rescan"
+        );
+
+        // Different inputs get their own scan — the key is honoured.
+        let _ = collect_all_sessions_cached(&paths, &dirs(&["scan-cache-test-b"])).await;
+        assert_eq!(
+            scans_performed() - before,
+            2,
+            "a different cache key must force its own scan"
+        );
+    }
 }
