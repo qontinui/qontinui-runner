@@ -716,6 +716,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // lib-side `db_schema` collector.
     let publishers_thread_pg = pg_db.clone();
 
+    // Record, once, the workspace root this machine already resolves to. Never
+    // overwrites a configured value and never invents a path. See
+    // `workspace_paths` and
+    // plans/2026-08-04-remove-hardcoded-machine-paths-from-product-code.md.
+    //
+    // MUST stay ABOVE the publisher/census/reclaim/agent-runtime threads spawned
+    // below, all of which resolve the workspace root. Phase 0 could afford to run
+    // after them because the hardcoded `D:/qontinui-root` fallback still answered
+    // for every consumer; Phase 2 deleted that fallback, so a consumer resolving
+    // before this has written would get one boot's worth of unresolved root on an
+    // installed binary. This ordering is the precondition Phase 0's own module
+    // doc named for exactly this phase.
+    //
+    // It is a settings read plus at most one small write — no network, no
+    // subprocess — so it does not reintroduce the boot-path latency the comment
+    // above fights to keep off the `/health` bind.
+    if let Err(e) = workspace_paths::persist_resolved_workspace_root() {
+        warn!("workspace root migration failed (non-fatal): {}", e);
+    }
+
     // fleet heartbeat — see plan §5 and fleet.rs::spawn_heartbeat.
     //
     // Periodic HTTP POST `{device_id, hostname}` to coord's
@@ -1028,15 +1048,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Migrate plaintext API keys to secure keychain storage
     if let Err(e) = config_facade::migrate_api_keys_to_keychain() {
         warn!("API key migration to keychain failed (non-fatal): {}", e);
-    }
-
-    // Record, once, the workspace root this machine already resolves to, so the
-    // hardcoded `D:/qontinui-root` fallbacks can be deleted without changing
-    // behaviour on an existing install. Never overwrites a configured value and
-    // never invents a path. See `workspace_paths` and
-    // plans/2026-08-04-remove-hardcoded-machine-paths-from-product-code.md.
-    if let Err(e) = workspace_paths::persist_resolved_workspace_root() {
-        warn!("workspace root migration failed (non-fatal): {}", e);
     }
 
     // Architecture spec caching removed — all persistence now via PgDb.

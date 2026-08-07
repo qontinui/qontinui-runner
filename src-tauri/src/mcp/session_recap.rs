@@ -276,31 +276,28 @@ fn compute_start_time(
     now - chrono::Duration::hours(3)
 }
 
+/// The workspace root this recap reads repos from.
+///
+/// **A sixth answer to "where is the workspace root", found at Phase 2 and not
+/// in the plan's inventory** — the plan's audit grepped `D:/qontinui-root`, and
+/// this copy spelled the literal with backslashes (`D:\qontinui-root`), so no
+/// forward-slash search could ever have matched it. It was the worst of the six
+/// on three counts, each of which the shared resolver already answers:
+///
+/// - its ancestor-walk predicate was `<dir>/qontinui-runner` **and**
+///   `<dir>/ui-bridge` both being directories — no `.git` check at all, so any
+///   directory happening to hold two same-named children anchored it, while a
+///   perfectly good workspace without a `ui-bridge` checkout did not;
+/// - it fell back to the **inherited cwd**, which `env_agent/collectors.rs`
+///   documents as deliberately-never-correct: it makes resolution a function of
+///   how the process was launched;
+/// - the walk was capped at 10 ancestors for no stated reason.
+///
+/// Fails closed, because the recap's error is surfaced straight to the caller as
+/// a 500 and a fabricated root would silently produce an empty recap that reads
+/// like "nothing changed".
 fn find_qontinui_root() -> Result<PathBuf, String> {
-    // Walk up from the executable or use a known anchor
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut dir = exe.parent().map(|p| p.to_path_buf());
-    // On dev builds the exe is deep inside target/; walk up to find qontinui-root
-    for _ in 0..10 {
-        if let Some(ref d) = dir {
-            if d.join("qontinui-runner").is_dir() && d.join("ui-bridge").is_dir() {
-                return Ok(d.clone());
-            }
-            dir = d.parent().map(|p| p.to_path_buf());
-        } else {
-            break;
-        }
-    }
-    // Fallback: try D:\qontinui-root or the CWD
-    let fallback = PathBuf::from("D:\\qontinui-root");
-    if fallback.join("qontinui-runner").is_dir() {
-        return Ok(fallback);
-    }
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    if cwd.join("qontinui-runner").is_dir() {
-        return Ok(cwd);
-    }
-    Err("Could not locate qontinui-root directory".into())
+    crate::workspace_paths::require_workspace_root()
 }
 
 fn discover_repos(

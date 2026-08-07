@@ -18,32 +18,50 @@
 //! publisher silent, the `.mcp.json` reconcile inert and canonical-checkout
 //! creation fail. That is an outage, not a refactor.
 //!
-//! So the removal ships in two steps, in this order:
+//! So the removal shipped in two steps, in this order:
 //!
-//! 1. **(here, Phase 0)** persist the currently-resolved root into
-//!    `settings.json`. Nothing is deleted yet, and the value comes from the
-//!    machine's own live resolution — never from a literal in this file. That
-//!    resolution deliberately includes the **legacy** resolver as a last resort
-//!    (see [`root_to_bridge`]): on an installed binary the literal is the only
-//!    thing answering today, and a bridge that skipped it would record nothing
-//!    in exactly the case it exists to protect.
-//! 2. **(later phases)** delete the literals; the resolver then reads the
-//!    persisted setting.
+//! 1. **(Phase 0)** persist the currently-resolved root into `settings.json`.
+//!    Nothing was deleted yet, and the value comes from the machine's own live
+//!    resolution — never from a literal in this file.
+//! 2. **(Phase 2, here)** delete the literals; every consumer now reads this
+//!    module, which reads the persisted setting.
+//!
+//! Phase 0's bridge is **confirmed landed and effective**: on the author's
+//! machine `paths.workspace_root` reads `D:\qontinui-root`, recorded by the
+//! migration from the machine's own live resolution. That read-back is what
+//! gates this phase, per the plan's Q2.
 //!
 //! The resolution itself lives in `qontinui_types::paths`, shared with
 //! qontinui-coord, so there is exactly one answer to this question across the
-//! Rust stack.
+//! Rust stack. This module is the runner's **only** door to it: nothing else
+//! in the crate may resolve the workspace root.
 //!
 //! ## Startup ordering
 //!
-//! [`persist_resolved_workspace_root`] runs *after* the background thread that
-//! spawns the census, the fleet heartbeat and the agent runtime — i.e. after
-//! every consumer of the root has started. That is harmless while those
-//! consumers resolve the root themselves (they reach the same answer with or
-//! without the setting), and it is why the setting is a *bridge* rather than a
-//! dependency: **no consumer may require the persisted value to be present
-//! within the first boot.** A consumer that ever needs that guarantee must move
-//! this call above the thread spawn in `main.rs` first.
+//! [`persist_resolved_workspace_root`] runs **before** the background thread
+//! that spawns the census, the fleet heartbeat and the agent runtime. Phase 0
+//! could afford to run after them, because the literal still answered for every
+//! consumer; Phase 2 deletes that literal, so a consumer resolving before the
+//! migration has written would see one boot's worth of unresolved root. Moving
+//! the call above the spawn is exactly the precondition Phase 0's own doc named
+//! for this phase.
+//!
+//! ## Deliberately not memoized
+//!
+//! Phase 0's doc anticipated a `OnceLock` here. Reconciled against the actual
+//! call sites, a process-global memo would be **wrong**, not merely unnecessary:
+//!
+//! - Every caller is a **cycle-level entry point** — one resolution per census
+//!   sweep, per fleet publish, per reconcile pass — never per worktree or per
+//!   repo. The settings read it costs is noise beside the directory walk each
+//!   one then performs.
+//! - `paths.workspace_root` is an operator-editable setting. A memo would
+//!   freeze it for the process lifetime, so correcting a wrong root would need a
+//!   runner restart — and restarting the runner is exactly what fleet policy
+//!   forbids.
+//! - `$QONTINUI_ROOT` outranks the setting and is read live. `coord_mcp`'s
+//!   reconcile tests set it to a temp dir precisely so they never touch the
+//!   operator's real root config; a memo would make those tests order-dependent.
 
 use std::path::{Path, PathBuf};
 
@@ -79,15 +97,51 @@ const RUNNER_REPO_DIR: &str = "qontinui-runner";
 /// that write or execute take [`WorkspaceRoot::require`] and fail closed with an
 /// error naming `$QONTINUI_ROOT`.
 ///
-/// **Not memoized, and not yet on a hot path.** Each call re-reads the settings
-/// file. Phase 0 calls it once, at startup. Before a later phase puts it behind
-/// the census or fleet pollers, resolve it once into a `OnceLock` (or pass the
-/// resolved root down) — `qontinui_types::paths` states that the runner should
-/// resolve this once, not per call site.
+/// **Not memoized** — see the module header for why that is a decision rather
+/// than an omission.
+///
+/// Most callers want [`workspace_root`] (degrade) or [`require_workspace_root`]
+/// (fail closed) instead of this raw form.
 pub fn runner_workspace_root() -> WorkspaceRoot {
     let configured = get_setting::<PathSettings>().workspace_root;
     let exe = std::env::current_exe().ok();
     qontinui_workspace_root(configured.as_deref(), exe_anchor(exe.as_deref()))
+}
+
+/// The workspace root for a **discovery** surface: the census sweep, the fleet
+/// publisher, the `.mcp.json` reconcile, the reclaim and reaper pollers.
+///
+/// Degrades to `None` rather than failing — these surfaces already existence-
+/// check every candidate and return `Option`, a miss costs a feature rather
+/// than corrupting anything, and it self-corrects the moment the root appears.
+/// The fall-through reason is logged so the miss is never silent
+/// (`verification-and-evidence` `silent-empty-is-unknown` applied to path
+/// resolution: an unresolved root is UNKNOWN, not "no repos").
+///
+/// Surfaces that **write or execute** under the root must use
+/// [`require_workspace_root`] instead: materialising a git worktree at a
+/// fabricated location is strictly worse than a loud error.
+pub fn workspace_root() -> Option<PathBuf> {
+    let resolved = runner_workspace_root();
+    if let Some(rejected) = resolved.rejected {
+        warn!(
+            "workspace_paths: {} — continuing with the next resolution rung",
+            rejected.describe()
+        );
+    }
+    resolved.into_root()
+}
+
+/// The workspace root for a surface that **writes or executes** under it, where
+/// a wrong answer materialises a worktree at a fabricated location or runs a
+/// script from one.
+///
+/// The error names the input actually at fault, lists every probe tried, and
+/// names `$QONTINUI_ROOT`. That is the product-code counterpart of the plan's
+/// "ask rather than guess": a resolver running inside a background poller has
+/// no operator to ask, so it refuses loudly instead of guessing.
+pub fn require_workspace_root() -> Result<PathBuf, String> {
+    runner_workspace_root().require()
 }
 
 /// The runner's contribution to the resolution: this executable's path, tagged
@@ -116,37 +170,6 @@ fn migration_write(existing: Option<&str>, resolved: Option<&Path>) -> Option<St
         return None;
     }
     resolved.map(|p| p.to_string_lossy().into_owned())
-}
-
-/// The root to bridge: what this machine resolves to **today**, counting the
-/// resolution that is still live in this build.
-///
-/// The new resolver is tried first. When it misses, the **legacy** resolver is
-/// consulted — the one whose Windows arm is still the hardcoded literal at the
-/// time Phase 0 ships.
-///
-/// **This fallback is the entire point of Phase 0 and is not redundant.** On a
-/// *dev* install the new resolver already succeeds via the executable-ancestor
-/// walk, so the bridge is belt-and-braces there. On an **installed binary**
-/// (`Program Files`, no useful ancestry) with `$QONTINUI_ROOT` unset and no
-/// `$HOME/qontinui-root`, the new resolver returns `None` and the literal is the
-/// only thing answering — which is precisely the install shape that would take
-/// the outage when the literal is deleted. Seeding from the legacy resolver is
-/// what captures that answer before it disappears.
-///
-/// Deleted together with the last legacy copy, once every consumer reads the
-/// setting.
-fn root_to_bridge() -> Option<PathBuf> {
-    let resolved = runner_workspace_root();
-    if let Some(rejected) = resolved.rejected {
-        warn!(
-            "workspace_paths: {} — continuing with the next resolution rung",
-            rejected.describe()
-        );
-    }
-    resolved
-        .into_root()
-        .or_else(crate::agent_worktree::census::qontinui_root)
 }
 
 /// One-time bridge: record the workspace root this machine **already** resolves
@@ -182,7 +205,7 @@ pub fn persist_resolved_workspace_root() -> Result<(), String> {
         return Ok(());
     }
 
-    let Some(value) = migration_write(existing.as_deref(), root_to_bridge().as_deref()) else {
+    let Some(value) = migration_write(existing.as_deref(), workspace_root().as_deref()) else {
         info!(
             "workspace_paths: no workspace root resolves on this machine, so \
              `paths.workspace_root` was left unset. Set $QONTINUI_ROOT (or the \
@@ -348,6 +371,80 @@ mod tests {
         assert_eq!(
             migration_write(None, Some(Path::new("D:/qontinui-root"))),
             Some("D:/qontinui-root".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 2 — the two dispositions the collapsed resolvers call.
+    // -----------------------------------------------------------------
+
+    /// The fail-closed door must name the input at fault, every probe tried, and
+    /// the variable to set. A surface that creates worktrees or runs scripts
+    /// under the root gets a loud, actionable error instead of a fabricated
+    /// path — the product-code counterpart of "ask rather than guess".
+    ///
+    /// Driven through the pure resolver with injected inputs, so the assertion
+    /// does not depend on how the machine running the suite is configured.
+    #[test]
+    fn the_fail_closed_disposition_reports_an_actionable_error() {
+        let err = resolve_workspace_root(None, None, Some("relative/path"), None, None)
+            .require()
+            .expect_err("a relative configured root must not resolve");
+
+        assert!(
+            err.contains("configured workspace-root setting"),
+            "must blame the setting the operator actually set: {err}"
+        );
+        assert!(
+            err.contains("QONTINUI_ROOT"),
+            "must name the variable: {err}"
+        );
+    }
+
+    /// The discovery disposition degrades to `None` rather than erroring, and
+    /// discards nothing an operator needs — the rejection is carried out
+    /// separately for logging. A census sweep that cannot resolve the root skips
+    /// the sweep; it does not take the runner down.
+    #[test]
+    fn the_discovery_disposition_degrades_to_none_but_keeps_the_reason() {
+        let nowhere = std::env::temp_dir().join(format!(
+            "qontinui_workspace_paths_absent_{}",
+            std::process::id()
+        ));
+
+        let got = resolve_workspace_root(None, None, None, None, Some(&nowhere));
+
+        assert_eq!(got.root, None, "nothing resolves, so discovery gets None");
+        assert!(
+            got.rejected.is_some(),
+            "an unresolved root must always carry a reason — the miss is never silent"
+        );
+    }
+
+    /// Phase 2's load-bearing property: with the hardcoded literal deleted, a
+    /// machine whose only answer is the persisted `paths.workspace_root` setting
+    /// still resolves. This is the exact shape Phase 0's bridge was written to
+    /// protect — an installed binary with no useful ancestry, no `$QONTINUI_ROOT`
+    /// and no `$HOME/qontinui-root`.
+    #[test]
+    fn the_persisted_setting_alone_carries_an_install_with_no_other_answer() {
+        let f = fixture();
+        let installed_exe = std::env::temp_dir()
+            .join("qontinui_no_such_install_dir")
+            .join("qontinui-runner.exe");
+
+        let got = resolve_workspace_root(
+            None,
+            None,
+            f.root.to_str(),
+            exe_anchor(Some(&installed_exe)),
+            None,
+        );
+
+        assert_eq!(
+            got.root.as_deref(),
+            Some(f.root.as_path()),
+            "the setting must be sufficient once the literal is gone"
         );
     }
 }
