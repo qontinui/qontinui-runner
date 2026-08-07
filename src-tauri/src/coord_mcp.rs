@@ -403,6 +403,44 @@ pub(crate) fn lookup_agent_token(agent_id: Uuid) -> Option<crate::agent_token::S
         .cloned()
 }
 
+/// Snapshot every registered slot's refresh health, newest problem first.
+///
+/// Two-phase by necessity: the registry is behind a `std::sync::Mutex` but
+/// each slot is behind a `tokio::sync::RwLock`, so the `Arc`s are cloned out
+/// and the registry lock released **before** any `.await`. Holding a blocking
+/// mutex across an await point is how an executor deadlocks.
+///
+/// Ordering puts `Rejected` first, then `Degraded`, then healthy — a reader
+/// scanning the head of the list sees the problems without paging.
+pub(crate) async fn agent_token_health_snapshot() -> Vec<crate::agent_token::AgentTokenHealth> {
+    let slots: Vec<(Uuid, crate::agent_token::SharedToken)> = {
+        agent_tokens()
+            .lock()
+            .expect("agent token map poisoned")
+            .iter()
+            .map(|(id, slot)| (*id, slot.clone()))
+            .collect()
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut out = Vec::with_capacity(slots.len());
+    for (agent_id, slot) in slots {
+        out.push(slot.read().await.health_report(agent_id, now));
+    }
+    out.sort_by(|a, b| {
+        use crate::agent_token::TokenState::*;
+        let rank = |s| match s {
+            Rejected => 0,
+            Degraded => 1,
+            Healthy => 2,
+        };
+        rank(a.state)
+            .cmp(&rank(b.state))
+            .then(b.consecutive_failures.cmp(&a.consecutive_failures))
+            .then(a.agent_id.cmp(&b.agent_id))
+    });
+    out
+}
+
 /// Drop the live-token slot for `agent_id` on teardown so a torn-down agent's
 /// nonce hard-fails closed. Idempotent.
 pub(crate) fn remove_agent_token(agent_id: Uuid) {
@@ -2200,6 +2238,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
             token: jwt.to_string(),
             jti: Uuid::nil(),
             exp,
+            ..Default::default()
         }));
         register_agent_token(agent_id, slot);
         write_coord_mcp_agent_proxy_config(workdir, port, agent_id);
@@ -3630,6 +3669,7 @@ mod tests {
             token: "tok".into(),
             jti: uuid::Uuid::nil(),
             exp: 0,
+            ..Default::default()
         }));
         register_agent_token(agent_id, slot);
         assert!(lookup_agent_token(agent_id).is_some());

@@ -3847,6 +3847,7 @@ async fn run_agent_subprocess(
             // compress it via QONTINUI_AGENT_JWT_EXP_COMPRESS_SECS so the refresh
             // boundary fires in seconds. In release this is always `payload.jwt_exp`.
             exp: compressed_jwt_exp(payload.jwt_exp),
+            ..Default::default()
         }));
         crate::coord_mcp::register_agent_token(payload.agent_id, slot.clone());
         match crate::coord_mcp::resolve_bound_api_port() {

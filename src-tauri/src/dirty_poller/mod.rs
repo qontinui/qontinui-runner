@@ -263,19 +263,45 @@ pub struct DirtyStateReq {
     pub seq: u64,
 }
 
+/// What one poll cycle actually did.
+///
+/// A bare `bool` (the old return type, meaning `heartbeat`) cannot
+/// express "nothing was sent" — the same conflation runner #930 removed
+/// from `agent_worktree::reclaim::TickOutcome`. A skipped tick is
+/// neither a heartbeat nor a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    /// Coord has rejected this agent's bearer, so nothing was collected
+    /// or sent. Not a success and not a failure — posting would only add
+    /// load, and `git status` per target would spawn subprocesses whose
+    /// result could never be delivered.
+    SkippedTokenRejected,
+    /// State was posted. `heartbeat` is true iff nothing changed since
+    /// the prior tick.
+    Posted { heartbeat: bool },
+}
+
 /// One poll cycle. Public so an integration test can drive it without
 /// the spawn machinery (same pattern as `agent_pusher::tick_once`).
-///
-/// Returns the `heartbeat` flag that was sent (true = no change since
-/// the prior tick) so tests can assert change-detection.
-pub async fn tick_once(state: &Arc<DirtyPollerState>) -> Result<bool> {
-    agent_token::maybe_refresh(
+pub async fn tick_once(state: &Arc<DirtyPollerState>) -> Result<TickOutcome> {
+    let refresh = agent_token::maybe_refresh(
         &state.token,
         &state.coord_http_base,
         state.agent_id,
         "dirty_poller",
     )
     .await?;
+    // A rejected token makes every POST below a guaranteed 401. On
+    // 2026-08-07 this path sent 19,790 of them in 55 minutes, each on
+    // its own socket, plus a `git status` per target per tick. Stop at
+    // the top instead.
+    if refresh.should_skip_work() {
+        debug!(
+            "dirty_poller: agent_id={} skipping tick — token rejected by coord",
+            state.agent_id
+        );
+        return Ok(TickOutcome::SkippedTokenRejected);
+    }
 
     let mut worktrees = Vec::with_capacity(state.targets.len());
     let mut new_fps: HashMap<String, u64> = HashMap::new();
@@ -328,7 +354,9 @@ pub async fn tick_once(state: &Arc<DirtyPollerState>) -> Result<bool> {
     };
 
     post_dirty_state(state, &req).await?;
-    Ok(!changed)
+    Ok(TickOutcome::Posted {
+        heartbeat: !changed,
+    })
 }
 
 /// `git status --porcelain` + `git diff --shortstat HEAD` for one
@@ -385,7 +413,10 @@ async fn post_dirty_state(state: &Arc<DirtyPollerState>, req: &DirtyStateReq) ->
         state.coord_http_base.trim_end_matches('/'),
         state.agent_id
     );
-    let resp = reqwest::Client::new()
+    // Shared pooled client — never `Client::new()` here. A per-request
+    // client reuses no connection, and this is a per-tick path across
+    // every agent (see `crate::agent_http` for the 2026-08-07 outage).
+    let resp = crate::agent_http::client()
         .post(&url)
         .bearer_auth(&token)
         .json(req)
@@ -577,12 +608,14 @@ mod tests {
             token: "x".into(),
             jti: uuid::Uuid::nil(),
             exp: now + 4 * 3600,
+            ..Default::default()
         };
         assert!(!fresh.needs_refresh(now));
         let stale = TokenSlot {
             token: "x".into(),
             jti: uuid::Uuid::nil(),
             exp: now + 600,
+            ..Default::default()
         };
         assert!(stale.needs_refresh(now));
     }

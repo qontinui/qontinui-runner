@@ -1250,6 +1250,7 @@ async fn seed_agent_token_handler(
         token: req.jwt.clone(),
         jti: Uuid::nil(),
         exp: req.jwt_exp,
+        ..Default::default()
     }));
     crate::coord_mcp::register_agent_token(req.agent_id, slot);
     let nonce = crate::coord_mcp::register_agent_proxy_nonce(&req.workdir, req.agent_id);
