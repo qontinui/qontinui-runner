@@ -82,7 +82,7 @@ pub struct BackfillResult {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackfillOptions {
-    /// Repos to scan. Empty → use `DEFAULT_REPOS`.
+    /// Repos to scan. Empty → use [`default_repos`].
     #[serde(default)]
     pub repos: Vec<String>,
     /// Lower bound for `git log --since=<this>`. Default `2026-04-01`.
@@ -108,18 +108,47 @@ impl Default for BackfillOptions {
     }
 }
 
-/// Default scan list — the known qontinui ecosystem repos under
-/// `D:/qontinui-root/`. Missing dirs are silently skipped (and surfaced
-/// via `BackfillResult::skipped_repos`) so an incomplete checkout doesn't
-/// fail the call.
-pub const DEFAULT_REPOS: &[&str] = &[
-    "D:/qontinui-root/qontinui-runner",
-    "D:/qontinui-root/qontinui-coord",
-    "D:/qontinui-root/qontinui-web",
-    "D:/qontinui-root/qontinui-mobile",
-    "D:/qontinui-root/qontinui-supervisor",
-    "D:/qontinui-root/ui-bridge",
+/// The known qontinui ecosystem repo **directory names**. Names, not paths —
+/// where the checkouts live is the workspace root's business, and only the
+/// runner's resolver knows that (plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`).
+///
+/// This used to be a list of six absolute `D:/qontinui-root/<repo>` paths. On
+/// any machine but the author's, all six missed, every one landed in
+/// `skipped_repos`, and the backfill silently scanned nothing — the feature
+/// reported success having done no work.
+pub const DEFAULT_REPO_NAMES: &[&str] = &[
+    "qontinui-runner",
+    "qontinui-coord",
+    "qontinui-web",
+    "qontinui-mobile",
+    "qontinui-supervisor",
+    "ui-bridge",
 ];
+
+/// Default scan list: [`DEFAULT_REPO_NAMES`] resolved under this machine's
+/// workspace root. Missing dirs are still silently skipped (and surfaced via
+/// `BackfillResult::skipped_repos`) so an incomplete checkout doesn't fail the
+/// call.
+///
+/// Returns **empty** when no workspace root resolves. That is deliberate: the
+/// caller then reports zero scanned repos, which is honest, rather than probing
+/// six fabricated paths and reporting all six as "skipped" — a distinction that
+/// matters because `skipped_repos` is supposed to mean "you have an incomplete
+/// checkout", not "this build does not know where your checkouts are".
+pub fn default_repos() -> Vec<String> {
+    let Some(root) = crate::workspace_paths::runner_workspace_root().into_root() else {
+        warn!(
+            "productivity.backfill.no_workspace_root — no default repo list; \
+             set $QONTINUI_ROOT or pass an explicit `repos` list"
+        );
+        return Vec::new();
+    };
+    DEFAULT_REPO_NAMES
+        .iter()
+        .map(|name| root.join(name).to_string_lossy().into_owned())
+        .collect()
+}
 
 /// Subject substrings that disqualify a commit from matching (case-
 /// insensitive). The plan calls these out as the obvious false-positive
@@ -212,7 +241,7 @@ pub async fn run_backfill(
 
     // 2. Scan repos.
     let repo_list: Vec<String> = if opts.repos.is_empty() {
-        DEFAULT_REPOS.iter().map(|s| s.to_string()).collect()
+        default_repos()
     } else {
         opts.repos.clone()
     };
@@ -468,18 +497,47 @@ fn is_reformat_subject(subject: &str) -> bool {
 
 /// Normalize a `expected_file_claim` into a repo-relative path.
 ///
-/// Strips leading `D:/qontinui-root/` and the leading `<repo-name>/`
-/// segment if present so a claim like
-/// `D:/qontinui-root/qontinui-runner/src/foo.ts` becomes `src/foo.ts`.
+/// Strips the workspace-root prefix and the leading `<repo-name>/` segment if
+/// present, so a claim like `<workspace-root>/qontinui-runner/src/foo.ts`
+/// becomes `src/foo.ts`.
 pub fn normalize_claim(raw: &str) -> String {
+    let root = crate::workspace_paths::runner_workspace_root().into_root();
+    normalize_claim_under(root.as_deref(), raw)
+}
+
+/// Pure core of [`normalize_claim`] with the workspace root injected, so the
+/// stripping rules are unit-testable against any root without reading this
+/// machine's.
+///
+/// **The prefix this strips used to be a hardcoded `"d:/qontinui-root/"`** — and
+/// note the spelling: **lowercase**. It was therefore invisible to a
+/// case-sensitive grep for `D:/qontinui-root` *and* for `D:\qontinui-root`,
+/// which is how it survived every sweep this plan's lineage ran. Any future
+/// sweep must be case-insensitive as well as separator-agnostic (plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`).
+///
+/// A `None` root simply skips the absolute-prefix strip; the `<repo-name>/`
+/// strip below still applies, so relative claims normalize as before.
+pub fn normalize_claim_under(root: Option<&Path>, raw: &str) -> String {
     // Normalise backslashes → forward slashes so the suffix-match logic
     // below is OS-independent.
     let mut s = raw.replace('\\', "/");
 
-    // Strip the absolute prefix.
-    const ABS_PREFIX_LOWER: &str = "d:/qontinui-root/";
-    if s.to_ascii_lowercase().starts_with(ABS_PREFIX_LOWER) {
-        s = s[ABS_PREFIX_LOWER.len()..].to_string();
+    // Strip the absolute workspace-root prefix. Compared case-insensitively and
+    // separator-normalized, because a claim can arrive spelled either way (a
+    // Windows drive letter is case-insensitive, and `D:\…` is as valid as
+    // `D:/…`).
+    if let Some(root) = root {
+        let prefix = format!(
+            "{}/",
+            root.to_string_lossy()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+        );
+        let prefix_lower = prefix.to_ascii_lowercase();
+        if s.to_ascii_lowercase().starts_with(&prefix_lower) {
+            s = s[prefix.len()..].to_string();
+        }
     }
     // Strip a leading `<repo-name>/` IFF the first segment looks like a
     // known qontinui-prefixed repo. We're deliberately conservative —
@@ -727,6 +785,7 @@ async fn apply_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn task(id: &str, claims: &[&str]) -> StuckTask {
         StuckTask {
@@ -839,14 +898,9 @@ src/a.rs\n\
     fn path_matching_handles_absolute_and_relative_claims() {
         // Table-driven. Each row: (claim, commit_file, expect_match).
         let cases: &[(&str, &str, bool)] = &[
-            // Absolute claim that includes D:/qontinui-root/<repo>/...
-            // After normalize_claim, becomes `src/foo.rs` — matches the
-            // commit file `qontinui-runner/src/foo.rs` via suffix.
-            (
-                "D:/qontinui-root/qontinui-runner/src/foo.rs",
-                "qontinui-runner/src/foo.rs",
-                true,
-            ),
+            // (Absolute claims are asserted AFTER this table — they have to be
+            // built from the injected root, and a literal `D:/qontinui-root/...`
+            // here would only normalise on the author's machine.)
             // Repo-prefixed claim normalises to `src/foo.rs` — matches.
             (
                 "qontinui-runner/src/foo.rs",
@@ -872,13 +926,11 @@ src/a.rs\n\
             ),
             // Different path — must not match by accident.
             ("src/foo.rs", "qontinui-runner/src/bar.rs", false),
-            // Backslash-bearing absolute claim (Windows-shaped) — should
-            // normalise + match.
-            (
-                "D:\\qontinui-root\\qontinui-runner\\src\\foo.rs",
-                "qontinui-runner/src/foo.rs",
-                true,
-            ),
+            // (The backslash-bearing ABSOLUTE claim that used to live here moved
+            // to `normalize_claim_prefix_match_is_separator_and_case_insensitive`.
+            // It named `D:\qontinui-root\...` literally, which only normalised
+            // because the stripped prefix was hardcoded to that path; against a
+            // resolved root it would assert this machine's layout and fail on CI.)
             // ui-bridge prefix is also recognised by the normaliser.
             ("ui-bridge/src/lib.ts", "ui-bridge/src/lib.ts", true),
             // Same-named file in a *different* directory must not match
@@ -892,8 +944,9 @@ src/a.rs\n\
             // slash holds.
             ("components/Foo.tsx", "qontinui-runner/src/lib.rs", false),
         ];
+        let root = test_root();
         for (claim, file, expect) in cases {
-            let normalized = normalize_claim(claim);
+            let normalized = normalize_claim_under(Some(&root), claim);
             let got = claim_matches_file(&normalized, file);
             assert_eq!(
                 got, *expect,
@@ -901,22 +954,95 @@ src/a.rs\n\
                 claim, normalized, file, expect, got
             );
         }
+
+        // The absolute-claim rows, built from the injected root rather than
+        // named literally, in both spellings a claim actually arrives in.
+        for abs in [
+            format!("{}/qontinui-runner/src/foo.rs", root.display()),
+            format!("{}/qontinui-runner/src/foo.rs", root.display()).replace('/', "\\"),
+        ] {
+            let normalized = normalize_claim_under(Some(&root), &abs);
+            assert_eq!(normalized, "src/foo.rs", "absolute claim {abs:?}");
+            assert!(
+                claim_matches_file(&normalized, "qontinui-runner/src/foo.rs"),
+                "absolute claim {abs:?} must match the commit file via suffix"
+            );
+        }
+    }
+
+    /// A synthetic workspace root. These assertions used to name
+    /// `D:/qontinui-root` because the normaliser hardcoded that prefix; now that
+    /// it strips the *resolved* root, naming a real location would assert what
+    /// the machine running the suite happens to resolve to — and would fail
+    /// outright on CI, whose root is `/home/runner/work/qontinui-runner`.
+    fn test_root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) {
+            "Z:/synthetic-workspace-root"
+        } else {
+            "/synthetic-workspace-root"
+        })
     }
 
     #[test]
-    fn normalize_claim_strips_known_repo_prefixes() {
+    fn normalize_claim_strips_the_workspace_root_and_known_repo_prefixes() {
+        let root = test_root();
+        let abs = format!("{}/qontinui-runner/src/a.rs", root.display());
+        assert_eq!(normalize_claim_under(Some(&root), &abs), "src/a.rs");
         assert_eq!(
-            normalize_claim("D:/qontinui-root/qontinui-runner/src/a.rs"),
-            "src/a.rs"
-        );
-        assert_eq!(
-            normalize_claim("qontinui-web/frontend/x.tsx"),
+            normalize_claim_under(Some(&root), "qontinui-web/frontend/x.tsx"),
             "frontend/x.tsx"
         );
-        assert_eq!(normalize_claim("ui-bridge/sdk/index.ts"), "sdk/index.ts");
+        assert_eq!(
+            normalize_claim_under(Some(&root), "ui-bridge/sdk/index.ts"),
+            "sdk/index.ts"
+        );
         // Unknown first segment is preserved (not a qontinui-* / ui-bridge prefix).
-        assert_eq!(normalize_claim("src/foo.rs"), "src/foo.rs");
-        assert_eq!(normalize_claim("notes/x.md"), "notes/x.md");
+        assert_eq!(
+            normalize_claim_under(Some(&root), "src/foo.rs"),
+            "src/foo.rs"
+        );
+        assert_eq!(
+            normalize_claim_under(Some(&root), "notes/x.md"),
+            "notes/x.md"
+        );
+    }
+
+    /// The prefix match must survive the two spellings a claim actually arrives
+    /// in: backslashes, and a different drive-letter case. The old hardcoded
+    /// constant handled case (it was lowercase and compared lowercased); a
+    /// root-derived prefix must not regress that.
+    #[test]
+    fn normalize_claim_prefix_match_is_separator_and_case_insensitive() {
+        let root = test_root();
+        let lower = root
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .replace('/', "\\");
+        let claim = format!("{lower}\\qontinui-runner\\src\\a.rs");
+        assert_eq!(normalize_claim_under(Some(&root), &claim), "src/a.rs");
+    }
+
+    /// No resolved root: the absolute strip is skipped, but relative claims
+    /// still normalize. A miss must degrade, not corrupt.
+    #[test]
+    fn normalize_claim_without_a_root_still_strips_the_repo_segment() {
+        assert_eq!(
+            normalize_claim_under(None, "qontinui-web/frontend/x.tsx"),
+            "frontend/x.tsx"
+        );
+        assert_eq!(normalize_claim_under(None, "src/foo.rs"), "src/foo.rs");
+    }
+
+    /// The default scan list is repo NAMES under the resolved root — never
+    /// absolute paths baked into the binary.
+    #[test]
+    fn default_repo_names_are_bare_names_not_paths() {
+        for name in DEFAULT_REPO_NAMES {
+            assert!(
+                !name.contains('/') && !name.contains('\\') && !name.contains(':'),
+                "{name:?} must be a bare directory name, not a path"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
