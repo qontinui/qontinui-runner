@@ -216,3 +216,10 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+// THROWAWAY — §6.1 compile-matrix fixture. DO NOT MERGE.
+// `qontinui_types::ZZ_61_COMPILE_MATRIX_PROBE` exists ONLY on the
+// qontinui-schemas branch `ci/zz-61-compile-matrix`. Against schemas `main`
+// this is E0425 and the compile legs go RED; against the declared adaptation
+// PR they compile. That difference IS the fixture the negative matrix needs.
+pub const ZZ_61_COMPILE_MATRIX_PROBE: &str = qontinui_types::ZZ_61_COMPILE_MATRIX_PROBE;

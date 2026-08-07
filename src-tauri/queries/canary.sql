@@ -100,3 +100,11 @@ SELECT id, template_id, baseline_version, candidate_version,
 FROM prompt_template_canaries
 WHERE template_id = :template_id AND status = 'active'
 LIMIT 1;
+
+--- THROWAWAY — §6.1 compile-matrix fixture. DO NOT MERGE.
+--- Comment-only edit so `src-tauri/queries/**` is in the diff, which flips
+--- BOTH `clorinde-bindings-fresh.yml`'s `bindings_relevant` and
+--- `schema-pg-sql-fresh.yml`'s `schema_changed` to true, so `clorinde-verify`
+--- and `schema-fresh-verify` actually RUN the sibling-ref resolver instead of
+--- skipping while their aggregators report a vacuous pass. Comments do not
+--- reach the generated clorinde bindings, so this causes no codegen drift.
