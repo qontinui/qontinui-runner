@@ -152,10 +152,33 @@ async fn handle_scan(
 ) -> Result<Json<ApiResponse<ApiSurface>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
     let start = std::time::Instant::now();
 
-    // Resolve the project root: walk up from current exe or CWD to find src-tauri/,
-    // or fall back to the known dev path.
-    let project_root =
-        find_project_root().unwrap_or_else(|| PathBuf::from("D:/qontinui-root/qontinui-runner"));
+    // Resolve the project root: walk up from the current exe or CWD to find
+    // src-tauri/, else derive it from the resolved workspace root.
+    //
+    // This used to `unwrap_or_else` into a hardcoded `D:/qontinui-root/qontinui-runner`
+    // (plan `2026-08-04-remove-hardcoded-machine-paths-from-product-code`). On any
+    // machine that is not the author's, that scanned a directory which does not
+    // exist and answered 200 with an empty surface — a wrong answer wearing a
+    // success code. An unresolvable root is UNKNOWN, so say so.
+    let project_root = find_project_root().ok_or_else(|| {
+        (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(
+                    "Cannot locate the qontinui-runner checkout to scan. Set $QONTINUI_ROOT \
+                     to the directory holding the Qontinui repo checkouts, or run the runner \
+                     from inside a checkout."
+                        .to_string(),
+                ),
+                error_detail: None,
+                hint: None,
+                code: None,
+                suggestions: None,
+            }),
+        )
+    })?;
 
     let src_tauri = project_root.join("src-tauri");
     let src_frontend = project_root.join("src");
@@ -230,15 +253,19 @@ fn find_project_root() -> Option<PathBuf> {
             }
         }
     }
-    // Fallback: check common dev locations
-    for candidate in &[
-        "D:/qontinui-root/qontinui-runner",
-        "/d/qontinui-root/qontinui-runner",
-    ] {
-        let p = PathBuf::from(candidate);
-        if p.join("src-tauri").join("Cargo.toml").exists() {
-            return Some(p);
-        }
+    // Last resort: the resolved workspace root's own runner checkout.
+    //
+    // This replaces a pair of hardcoded candidates (`D:/qontinui-root/qontinui-runner`
+    // and its MSYS spelling `/d/qontinui-root/qontinui-runner`) — the author's
+    // machine layout, baked into a shipped route. `runner_workspace_root` answers
+    // the same question portably: `$QONTINUI_ROOT`, then `$QONTINUI_WORKSPACE_ROOT`,
+    // then the `paths.workspace_root` setting, then this executable's ancestry.
+    // Discovery surface, so it degrades to `None` and the caller reports an
+    // actionable failure rather than scanning a fabricated directory.
+    let root = crate::workspace_paths::runner_workspace_root().into_root()?;
+    let candidate = root.join("qontinui-runner");
+    if candidate.join("src-tauri").join("Cargo.toml").exists() {
+        return Some(candidate);
     }
     None
 }

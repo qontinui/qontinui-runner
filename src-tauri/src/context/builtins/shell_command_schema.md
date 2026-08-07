@@ -37,8 +37,9 @@ The `command` step type executes shell commands, API requests, checks, and MCP c
 **`working_directory`** (recommended)
 
 - Always set this for commands that depend on project structure (npm, cargo, poetry, etc.)
-- Must be a real absolute path — never `/path/to/project` or similar placeholders
-- Example: `D:/qontinui-root/qontinui-web/frontend`
+- Must be a real absolute path on the machine the command will run on — never `/path/to/project` or similar placeholders
+- Derive it from the project you were given (its checkout path, its config, or a path already in the conversation). Do not assume any particular drive, home directory or workspace layout — the same project lives somewhere different on every machine
+- The examples below write the working directory as `<PROJECT_ROOT>`. That is a stand-in for the real absolute path, shown because a schema example cannot know your machine's layout. **Substitute it.** Emitting a literal `<PROJECT_ROOT>` is a malformed command
 
 **`timeout_seconds`** (optional, default: 60)
 
@@ -65,7 +66,7 @@ The `command` step type executes shell commands, API requests, checks, and MCP c
   "name": "Install npm dependencies",
   "phase": "setup",
   "command": "npm install",
-  "working_directory": "D:/qontinui-root/qontinui-web/frontend",
+  "working_directory": "<PROJECT_ROOT>/frontend",
   "timeout_seconds": 120,
   "fail_on_error": true
 }
@@ -80,7 +81,7 @@ The `command` step type executes shell commands, API requests, checks, and MCP c
   "name": "Start dev server",
   "phase": "setup",
   "command": "npm run dev &",
-  "working_directory": "D:/qontinui-root/qontinui-web/frontend",
+  "working_directory": "<PROJECT_ROOT>/frontend",
   "timeout_seconds": 10,
   "fail_on_error": false
 }
@@ -95,7 +96,7 @@ The `command` step type executes shell commands, API requests, checks, and MCP c
   "name": "Production build verification",
   "phase": "completion",
   "command": "npx next build",
-  "working_directory": "D:/qontinui-root/qontinui-web/frontend",
+  "working_directory": "<PROJECT_ROOT>/frontend",
   "timeout_seconds": 300,
   "fail_on_error": true
 }

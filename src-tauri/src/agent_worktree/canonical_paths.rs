@@ -57,25 +57,41 @@ pub fn canonical_segment(repo_slug: &str) -> Result<String, String> {
     Ok(segment)
 }
 
-/// Build the default canonical-checkout path for `repo` on this host.
-/// Windows: `D:/qontinui-root/<name>/`. The slug is normalized via
+/// Build the default canonical-checkout path for `repo` on this host:
+/// `<workspace-root>/<name>/`. The slug is normalized via
 /// [`canonical_segment`], so both `qontinui-runner` and
 /// `qontinui/qontinui-runner` resolve to the same on-disk location.
-#[cfg(target_os = "windows")]
+///
+/// **One arm, not two.** This used to be a pair of `#[cfg]` functions: the
+/// Windows arm hardcoded `D:/qontinui-root` and the POSIX arm read `$HOME` with
+/// an `unwrap_or("/tmp")`. Both are gone (plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 1
+/// Phase 3) — the first because a shipped binary must not carry the author's
+/// drive layout, the second because materializing a canonical checkout under
+/// `/tmp` is the same silent-wrong-place bug with a friendlier face. The
+/// per-platform behaviour they encoded now lives once, in
+/// `qontinui_types::paths`, which probes `<home>/qontinui-root` on every OS.
+///
+/// **Fails closed.** This surface *creates* git checkouts, so an unresolved root
+/// is an error naming `$QONTINUI_ROOT`, never a guess — `WorkspaceRoot::require`
+/// rather than `into_root`. The signature was already `Result`, so every caller
+/// already handles the arm; what changes is that on POSIX it can now actually be
+/// taken instead of silently resolving to `/tmp`.
 pub fn default_canonical_path(repo: &str) -> Result<PathBuf, String> {
+    // Validate the slug BEFORE resolving the root: a malformed slug is a caller
+    // bug that holds on every machine, and answering it with "cannot resolve the
+    // Qontinui workspace root" would name the wrong thing entirely.
     let segment = canonical_segment(repo)?;
-    Ok(PathBuf::from(format!("D:/qontinui-root/{segment}")))
+    let root = crate::workspace_paths::runner_workspace_root().require()?;
+    Ok(root.join(segment))
 }
 
-/// Build the default canonical-checkout path for `repo` on this host.
-/// POSIX: `$HOME/qontinui-root/<name>/`. The slug is normalized via
-/// [`canonical_segment`], so both `qontinui-runner` and
-/// `qontinui/qontinui-runner` resolve to the same on-disk location.
-#[cfg(not(target_os = "windows"))]
-pub fn default_canonical_path(repo: &str) -> Result<PathBuf, String> {
-    let segment = canonical_segment(repo)?;
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    Ok(PathBuf::from(format!("{home}/qontinui-root/{segment}")))
+/// Pure core of [`default_canonical_path`]: the workspace root is injected, so
+/// the layout rule is unit-testable against a synthetic root with no dependency
+/// on the machine the suite runs on. Same wrapper/core split as
+/// [`agent_worktree_root`] / [`agent_worktree_root_inner`] below.
+fn default_canonical_path_in(root: &Path, repo: &str) -> Result<PathBuf, String> {
+    Ok(root.join(canonical_segment(repo)?))
 }
 
 /// Resolve the external root under which all agent worktrees for `canonical`
@@ -147,15 +163,28 @@ fn agent_worktree_root_inner(canonical: &Path, override_val: Option<&str>) -> Pa
 /// used by Layer 3 to resolve a Terminal-PTY session's repo for the coord
 /// worktree-claim lookup.
 pub fn repo_slug_for_path(path: &Path) -> Option<String> {
+    let root = crate::workspace_paths::runner_workspace_root().into_root()?;
+    repo_slug_for_path_in(&root, path)
+}
+
+/// Pure core of [`repo_slug_for_path`], with the workspace root injected.
+///
+/// This one **degrades** rather than failing closed even though
+/// [`default_canonical_path`] does the opposite: answering "which repo owns this
+/// path" neither creates nor executes anything, and its `Option` return already
+/// means "not under a known checkout". A caller that then materializes something
+/// goes through [`default_canonical_path`], which is where the fail-closed
+/// disposition belongs.
+fn repo_slug_for_path_in(root: &Path, path: &Path) -> Option<String> {
     // Lexically normalize `path` to forward slashes + lowercase for a
     // robust, on-disk-independent prefix comparison.
     let norm = normalize_for_compare(&path.to_string_lossy());
 
-    // The first path segment under the workspace root is the candidate
-    // slug. We don't know the workspace root abstractly here, so we lean
-    // on `default_canonical_path` round-tripping: try each leading segment
-    // of `path` as a candidate slug and accept the one whose canonical
-    // path is an ancestor of `path`.
+    // The first path segment under the workspace root is the candidate slug.
+    // The root is now injected, but the walk still earns its keep: it is what
+    // identifies WHICH segment is the slug, for a `path` at arbitrary depth
+    // below the checkout. Try each leading segment as a candidate and accept the
+    // one whose reconstructed canonical path is an ancestor of `path`.
     //
     // In practice the canonical path is `<root>/<seg>`, so the candidate
     // is the single segment immediately following the workspace root. We
@@ -166,7 +195,7 @@ pub fn repo_slug_for_path(path: &Path) -> Option<String> {
     let mut ancestor = Some(path);
     while let Some(a) = ancestor {
         if let Some(name) = a.file_name().and_then(|n| n.to_str()) {
-            if let Ok(canonical) = default_canonical_path(name) {
+            if let Ok(canonical) = default_canonical_path_in(root, name) {
                 let canon_norm = normalize_for_compare(&canonical.to_string_lossy());
                 // `a` is the canonical checkout root for `name` iff its
                 // normalized path equals the reconstructed canonical path,
@@ -264,71 +293,109 @@ mod tests {
         assert!(canonical_segment("qontinui/").is_err());
     }
 
+    /// A synthetic workspace root, never this machine's.
+    ///
+    /// Before slice 1 these assertions pinned `D:/qontinui-root` (and
+    /// `$HOME`-or-`/tmp` on POSIX) because the resolution was hardcoded in the
+    /// function under test. It no longer is, so a test that named a real
+    /// location would only be asserting what this box happens to resolve to —
+    /// which is exactly the machine dependence the plan removes. The layout rule
+    /// (`<root>/<name>`) is what these tests own; *finding* the root is
+    /// `qontinui_types::paths`' job and is tested there.
+    fn test_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from("Z:/synthetic-workspace-root")
+        } else {
+            PathBuf::from("/synthetic-workspace-root")
+        }
+    }
+
     #[test]
     fn default_path_normalizes_both_slug_shapes() {
-        let bare = default_canonical_path("qontinui-runner").unwrap();
-        let owner_name = default_canonical_path("qontinui/qontinui-runner").unwrap();
+        let root = test_root();
+        let bare = default_canonical_path_in(&root, "qontinui-runner").unwrap();
+        let owner_name = default_canonical_path_in(&root, "qontinui/qontinui-runner").unwrap();
         assert_eq!(bare, owner_name);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn default_path_windows_layout() {
+    fn default_path_is_the_repo_name_directly_under_the_root() {
+        let root = test_root();
         assert_eq!(
-            default_canonical_path("qontinui/qontinui-runner").unwrap(),
-            PathBuf::from("D:/qontinui-root/qontinui-runner")
-        );
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn default_path_posix_layout() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        assert_eq!(
-            default_canonical_path("qontinui/qontinui-runner").unwrap(),
-            PathBuf::from(format!("{home}/qontinui-root/qontinui-runner"))
+            default_canonical_path_in(&root, "qontinui/qontinui-runner").unwrap(),
+            root.join("qontinui-runner")
         );
     }
 
     #[test]
     fn default_path_propagates_validation_error() {
-        assert!(default_canonical_path("").is_err());
-        assert!(default_canonical_path("qontinui/").is_err());
+        let root = test_root();
+        assert!(default_canonical_path_in(&root, "").is_err());
+        assert!(default_canonical_path_in(&root, "qontinui/").is_err());
+        // And through the env-reading wrapper, which validates the slug BEFORE
+        // resolving the root so a caller bug is never reported as an
+        // unresolvable workspace root.
+        let err = default_canonical_path("qontinui/").unwrap_err();
+        assert!(
+            err.contains("empty name segment"),
+            "a malformed slug must name the slug, not the workspace root: {err}"
+        );
     }
 
     #[test]
     fn repo_slug_for_checkout_root() {
-        let root = default_canonical_path("qontinui-runner").unwrap();
+        let root = test_root();
+        let checkout = default_canonical_path_in(&root, "qontinui-runner").unwrap();
         assert_eq!(
-            repo_slug_for_path(&root),
+            repo_slug_for_path_in(&root, &checkout),
             Some("qontinui-runner".to_string())
         );
     }
 
     #[test]
     fn repo_slug_for_descendant_path() {
-        let mut p = default_canonical_path("qontinui-runner").unwrap();
+        let root = test_root();
+        let mut p = default_canonical_path_in(&root, "qontinui-runner").unwrap();
         p.push("src-tauri");
         p.push("src");
         p.push("commands");
         p.push("terminal.rs");
-        assert_eq!(repo_slug_for_path(&p), Some("qontinui-runner".to_string()));
+        assert_eq!(
+            repo_slug_for_path_in(&root, &p),
+            Some("qontinui-runner".to_string())
+        );
     }
 
     #[test]
     fn repo_slug_for_another_repo() {
-        let mut p = default_canonical_path("qontinui-coord").unwrap();
+        let root = test_root();
+        let mut p = default_canonical_path_in(&root, "qontinui-coord").unwrap();
         p.push("src");
-        assert_eq!(repo_slug_for_path(&p), Some("qontinui-coord".to_string()));
+        assert_eq!(
+            repo_slug_for_path_in(&root, &p),
+            Some("qontinui-coord".to_string())
+        );
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn repo_slug_is_case_insensitive_on_windows() {
-        // Windows drive paths are case-insensitive; a `d:/` working_dir
-        // must still resolve against the `D:/` canonical path.
-        let p = PathBuf::from("d:/qontinui-root/qontinui-runner/src-tauri");
-        assert_eq!(repo_slug_for_path(&p), Some("qontinui-runner".to_string()));
+        // Windows drive paths are case-insensitive; a lowercase-drive
+        // working_dir must still resolve against the resolved root's casing.
+        let root = test_root();
+        let p = PathBuf::from("z:/synthetic-workspace-root/qontinui-runner/src-tauri");
+        assert_eq!(
+            repo_slug_for_path_in(&root, &p),
+            Some("qontinui-runner".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_slug_for_a_sibling_of_the_root_is_none() {
+        // A path one level too high (the root itself) or beside the workspace
+        // must not match — the slug is the segment DIRECTLY under the root.
+        let root = test_root();
+        assert_eq!(repo_slug_for_path_in(&root, &root), None);
     }
 
     #[test]
@@ -396,9 +463,8 @@ mod tests {
     #[test]
     fn repo_slug_outside_workspace_is_none() {
         // A path that doesn't sit under any `<root>/<name>/` checkout must
-        // not falsely match. Use a path whose segments don't reconstruct
-        // to themselves via `default_canonical_path` (a temp dir).
+        // not falsely match.
         let p = PathBuf::from("/some/unrelated/place/foo/bar");
-        assert_eq!(repo_slug_for_path(&p), None);
+        assert_eq!(repo_slug_for_path_in(&test_root(), &p), None);
     }
 }

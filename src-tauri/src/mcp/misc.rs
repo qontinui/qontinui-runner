@@ -553,24 +553,32 @@ pub async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
 
     match chrome_path {
         Some(path) => {
-            // First, kill all existing Chrome processes
-            // The debug port only works on the FIRST Chrome instance
-            info!("Killing existing Chrome processes...");
-            let _ = crate::process_helpers::no_window("taskkill")
-                .args(["/F", "/IM", "chrome.exe"])
-                .output();
+            // A DEDICATED profile directory is what makes this safe, and it is
+            // the whole mechanism: Chrome treats a distinct `--user-data-dir` as
+            // a separate browser instance, so it starts a fresh process with its
+            // own debug port even while the user's ordinary Chrome is running.
+            //
+            // This used to `taskkill /F /IM chrome.exe` first, on the belief
+            // that "the debug port only works on the FIRST Chrome instance".
+            // That is true only for instances SHARING a profile — and the kill
+            // force-closed every Chrome the user had open, their real browsing
+            // session included, to open a debugger. The separate profile below
+            // already does the job the kill was standing in for.
+            //
+            // The directory lives under the OS temp dir rather than the former
+            // hardcoded `C:\temp\chrome-debug-profile`, which assumed a
+            // directory that exists on no machine by default (plan
+            // `2026-08-04-remove-hardcoded-machine-paths-from-product-code`,
+            // slice 1 Phase 4). Deliberately NOT a new env var: a scratch
+            // profile is not a configuration surface.
+            let profile_dir = std::env::temp_dir().join("qontinui-chrome-debug-profile");
+            if let Err(e) = std::fs::create_dir_all(&profile_dir) {
+                warn!("Could not create Chrome debug profile dir {profile_dir:?}: {e}");
+            }
 
-            // Wait a moment for processes to terminate
-            std::thread::sleep(std::time::Duration::from_millis(1000));
-
-            // Now launch Chrome with debug flag and separate profile
-            // Using a separate user-data-dir ensures the debug port works
-            // even if Chrome would normally restore a previous session
             match crate::process_helpers::no_window(path)
-                .args([
-                    "--remote-debugging-port=9222",
-                    "--user-data-dir=C:\\temp\\chrome-debug-profile",
-                ])
+                .arg("--remote-debugging-port=9222")
+                .arg(format!("--user-data-dir={}", profile_dir.display()))
                 .spawn()
             {
                 Ok(_) => {
@@ -598,7 +606,7 @@ pub async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
             Json(ApiResponse {
                 success: false,
                 data: None,
-                error: Some("Chrome not found. Please close Chrome and launch it manually with: chrome.exe --remote-debugging-port=9222".to_string()),
+                error: Some("Chrome not found at the expected install locations. Launch it manually with: chrome.exe --remote-debugging-port=9222 --user-data-dir=<a scratch directory>. The separate profile directory is what lets the debug port open alongside your existing Chrome session — you do not need to close it.".to_string()),
                 error_detail: None,
                 hint: None,
                 code: None,

@@ -217,12 +217,24 @@ async fn check_and_warn(
 ///      that repo's canonical path (slug = repo name).
 ///   2. Otherwise fall back to `git rev-parse --show-toplevel` and use the
 ///      toplevel path as the key (slug = its basename).
+///
+/// Both branches run the path through
+/// [`worktree_resource_key`](crate::agent_worktree::worktree_resource_key),
+/// which is the form the claim side registers and the coord-guard's
+/// `by-resource` lookup expects (forward slashes, lowercase, no trailing
+/// slash). Sending the raw path instead made this a case-sensitive lookup
+/// against a lowercased key — `D:/…` never matched the registered `d:/…` — and
+/// it would additionally have become separator-sensitive now that the workspace
+/// root comes from a setting rather than a forward-slash literal.
 fn resolve_repo(working_dir: &str) -> Option<(String, String)> {
     let wd = Path::new(working_dir);
     if let Some(slug) = crate::agent_worktree::canonical_paths::repo_slug_for_path(wd) {
         if let Ok(canonical) = crate::agent_worktree::canonical_paths::default_canonical_path(&slug)
         {
-            return Some((slug, canonical.to_string_lossy().to_string()));
+            return Some((
+                slug,
+                crate::agent_worktree::worktree_resource_key(&canonical),
+            ));
         }
     }
     let toplevel = git_toplevel(wd)?;
@@ -231,7 +243,10 @@ fn resolve_repo(working_dir: &str) -> Option<(String, String)> {
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_string();
-    Some((slug, toplevel.to_string_lossy().to_string()))
+    Some((
+        slug,
+        crate::agent_worktree::worktree_resource_key(&toplevel),
+    ))
 }
 
 /// `git -C <dir> rev-parse --show-toplevel`, or `None` if `dir` isn't in a

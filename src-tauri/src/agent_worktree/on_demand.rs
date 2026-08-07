@@ -670,10 +670,48 @@ fn humanize_secs(secs: u64) -> String {
 /// True when `path` IS the canonical checkout of `repo` (not a worktree of
 /// it). The census enumerates the canonical tree too; it is never a reclaim
 /// candidate, so it is filtered out (and counted, so the omission is visible).
+///
+/// **Structural first, root-derived second — because the root can now move.**
+/// Before slice 1 the root was effectively immutable: the hardcoded
+/// `D:/qontinui-root` literal answered on every boot, so comparing against
+/// [`default_canonical_path`] was as good as comparing against the truth. The
+/// root is now resolved (`$QONTINUI_ROOT` → `$QONTINUI_WORKSPACE_ROOT` → the
+/// `paths.workspace_root` setting → the executable's ancestry), which opens two
+/// ways for a *genuine* canonical checkout to slip past a purely root-derived
+/// comparison and into the reclaim candidate list:
+///
+/// 1. the root does not resolve at all, so there is nothing to compare against;
+/// 2. the root resolves *differently* than it did when the census row was taken
+///    — and [`survey`] reads a **cached** census, so rows routinely outlive the
+///    resolution that produced them.
+///
+/// [`is_canonical_repo_root`](census::is_canonical_repo_root) settles both: a
+/// `.git` **directory** (not a worktree's `.git` file) under a `qontinui-*` name
+/// is a canonical clone no matter which root resolved. The root-derived check is
+/// kept as a second chance for a canonical checkout that is not on disk right
+/// now, and the `Err` arm answers `true` — "cannot rule this out" — because this
+/// filter guards against deletion, where the safe answer to an unanswerable
+/// question is to exclude the row, never to expose it.
 fn is_canonical_checkout(repo: &str, path: &str) -> bool {
-    match default_canonical_path(repo) {
-        Ok(canonical) => norm_path(&canonical.to_string_lossy()) == norm_path(path),
-        Err(_) => false,
+    is_canonical_checkout_decision(
+        census::is_canonical_repo_root(Path::new(path)),
+        default_canonical_path(repo).ok().as_deref(),
+        path,
+    )
+}
+
+/// Pure core of [`is_canonical_checkout`]: the structural verdict and the
+/// derived canonical path are injected, so the two dispositions that guard
+/// against deleting a canonical checkout are unit-testable without a workspace
+/// root, a census, or a real directory tree. `canonical` is `None` when the
+/// path could not be derived at all.
+fn is_canonical_checkout_decision(structural: bool, canonical: Option<&Path>, path: &str) -> bool {
+    if structural {
+        return true;
+    }
+    match canonical {
+        Some(c) => norm_path(&c.to_string_lossy()) == norm_path(path),
+        None => true,
     }
 }
 
@@ -1360,6 +1398,61 @@ mod tests {
         assert_eq!(excluded, 1, "the canonical checkout must be filtered out");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].worktree_path, wt);
+    }
+
+    // -----------------------------------------------------------------
+    // The canonical-checkout guard's two non-happy dispositions. Both
+    // became reachable in slice 1 Phase 3, when the workspace root stopped
+    // being a hardcoded literal that answered identically on every boot.
+    // A wrong answer here puts a canonical checkout on the reclaim
+    // candidate list, so each arm gets its own assertion.
+    // -----------------------------------------------------------------
+
+    /// An underivable canonical path is UNKNOWN, not "no". The safe answer for
+    /// a deletion filter is to exclude the row.
+    #[test]
+    fn canonical_guard_excludes_the_row_when_the_path_cannot_be_derived() {
+        assert!(
+            is_canonical_checkout_decision(false, None, "D:/qontinui-root/qontinui-runner"),
+            "an unresolvable workspace root must never expose a row as reclaimable"
+        );
+    }
+
+    /// The regression this guard's structural arm exists for: the census row was
+    /// taken under one root and the survey reads it under another, so the
+    /// root-derived comparison misses a checkout that is genuinely canonical.
+    #[test]
+    fn canonical_guard_survives_a_root_that_moved_between_census_and_survey() {
+        let taken_under = "D:/qontinui-root/qontinui-runner";
+        let derived_now = PathBuf::from("E:/elsewhere/qontinui-runner");
+
+        // Root-derived alone: the mismatch reads as "not canonical" — the row
+        // would enter the candidate list.
+        assert!(!is_canonical_checkout_decision(
+            false,
+            Some(&derived_now),
+            taken_under
+        ));
+
+        // The structural verdict (`.git` is a DIRECTORY under a `qontinui-*`
+        // name) is root-independent, so it rescues exactly that case.
+        assert!(is_canonical_checkout_decision(
+            true,
+            Some(&derived_now),
+            taken_under
+        ));
+    }
+
+    /// The ordinary path still works, and separator/case differences between the
+    /// census row and the derived path do not defeat it.
+    #[test]
+    fn canonical_guard_matches_the_derived_path_across_separator_and_case() {
+        let derived = PathBuf::from("D:\\qontinui-root\\Qontinui-Runner");
+        assert!(is_canonical_checkout_decision(
+            false,
+            Some(&derived),
+            "d:/qontinui-root/qontinui-runner"
+        ));
     }
 
     // -----------------------------------------------------------------
