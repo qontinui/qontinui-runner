@@ -91,6 +91,38 @@ describe("handleEvaluateRequest", () => {
     },
   );
 
+  // The identity check that the two `page_evaluate` entry points gate on ONE
+  // shared blocklist lives in `ui-bridge-events/usePageEvents.test.ts`, which
+  // already imports that module statically. The tests here cover the same
+  // sharing behaviourally, through the tagged handler.
+  it("relaxes ONLY the network blocks under allow_network_requests", async () => {
+    const deps = makeDeps();
+    // Blocked by default…
+    await handleEvaluateRequest({ request_id: "net-off", expression: "fetch('/x')" }, deps);
+    expect(deps.emit.mock.calls[0][1]).toMatchObject({ ok: false });
+
+    // …allowed with the explicit opt-in (the expression itself still throws
+    // in jsdom for want of a real `fetch`, which is fine — what matters is
+    // that the gate no longer rejects it up front).
+    const deps2 = makeDeps();
+    await handleEvaluateRequest(
+      { request_id: "net-on", expression: "fetch('/x')", allow_network_requests: true },
+      deps2,
+    );
+    const [, netOnPayload] = deps2.emit.mock.calls[0];
+    expect((netOnPayload as { error?: string }).error ?? "").not.toMatch(/prohibited pattern/);
+
+    // …while a structural block stays in force regardless.
+    const deps3 = makeDeps();
+    await handleEvaluateRequest(
+      { request_id: "struct-on", expression: "eval('x')", allow_network_requests: true },
+      deps3,
+    );
+    const [, structPayload] = deps3.emit.mock.calls[0];
+    expect(structPayload).toMatchObject({ ok: false });
+    expect((structPayload as { error: string }).error).toMatch(/prohibited pattern/);
+  });
+
   it("still allows location READS like location.pathname", async () => {
     const deps = makeDeps();
     // node env has no `location`; provide one for the evaluated expression.
@@ -145,6 +177,62 @@ describe("handleEvaluateRequest", () => {
       ok: true,
       result: { success: true, result: { a: 1 } },
     });
+  });
+
+  it("awaits a slow Promise for the caller's timeout_ms, not the 30s default cap", async () => {
+    // THE GAP. `timeout_ms` was forwarded on every `ui-bridge:evaluate-request`
+    // (already clamped to [1000, 600000] by the Rust handler) and never read
+    // here — every await was capped at a fixed 30s. A caller who asked for a
+    // longer budget to cover a genuinely slow async expression got
+    // `ok: false, "did not resolve within 30.0s"` at 30s while the Rust side
+    // was still waiting out the rest of its own timeout.
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps();
+      (globalThis as Record<string, unknown>).__slowProbe = () =>
+        new Promise((resolve) => setTimeout(() => resolve({ done: true }), 45_000));
+
+      const pending = handleEvaluateRequest(
+        { request_id: "slow", expression: "globalThis.__slowProbe()", timeout_ms: 60_000 },
+        deps,
+      );
+
+      // Past the old fixed cap: pre-fix this had already rejected.
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(deps.emit).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      await pending;
+      expect(deps.emit).toHaveBeenCalledWith("ui-bridge:evaluate-response", {
+        request_id: "slow",
+        ok: true,
+        result: { success: true, result: { done: true } },
+      });
+    } finally {
+      delete (globalThis as Record<string, unknown>).__slowProbe;
+      vi.useRealTimers();
+    }
+  });
+
+  it("still times out at the caller's budget when the Promise never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps();
+      const pending = handleEvaluateRequest(
+        { request_id: "hang", expression: "new Promise(() => {})", timeout_ms: 5_000 },
+        deps,
+      );
+      await vi.advanceTimersByTimeAsync(5_001);
+      await pending;
+      const [, payload] = deps.emit.mock.calls[0];
+      expect(payload).toMatchObject({ request_id: "hang", ok: false });
+      // The message names the caller's budget (less the 250 ms head start the
+      // frontend takes so its message beats the Rust dispatcher's), not the
+      // fixed 30 s default cap.
+      expect((payload as { error: string }).error).toMatch(/within 4\.8s/);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("still reaches the statement-style fallback for top-level let + explicit return", async () => {

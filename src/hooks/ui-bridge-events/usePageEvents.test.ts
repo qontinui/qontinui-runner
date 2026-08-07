@@ -11,8 +11,20 @@
 import { describe, it, expect } from "vitest";
 
 import { checkEvaluateBlocklist } from "./usePageEvents";
+import { checkEvaluateBlocklist as sharedGate } from "./utils";
 
 describe("checkEvaluateBlocklist", () => {
+  it("is ONE gate shared with the tagged /control/page/evaluate handler", () => {
+    // The legacy IPC branch (this module) and the tagged-event handler
+    // (`useUIBridgeEvaluateHandler.ts`) used to keep hand-maintained copies of
+    // the pattern list under a "any change here MUST be mirrored there"
+    // comment — a drift hazard with a security blast radius, since a pattern
+    // added to one gate would leave the other route open and nothing would
+    // fail. Both now resolve to the same function in `./utils`; this pins that
+    // so a future "helpful" re-inlining is caught here rather than in prod.
+    expect(checkEvaluateBlocklist).toBe(sharedGate);
+  });
+
   describe("location.reload is blocked", () => {
     it.each([
       "location.reload()",

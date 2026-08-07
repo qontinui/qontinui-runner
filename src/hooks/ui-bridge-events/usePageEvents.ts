@@ -20,6 +20,7 @@ import {
   getUIBridgeGlobal,
   toTabCanonical,
   awaitWithTimeout,
+  checkEvaluateBlocklist,
   compileEvaluateExpression,
   PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
 } from "./utils";
@@ -61,71 +62,13 @@ function isPageEventType(type: string): type is PageEventTypes {
   return PAGE_EVENT_TYPES.has(type as PageEventTypes);
 }
 
-// SECURITY: `page_evaluate` blocklist. Block dangerous patterns while
-// allowing diagnostic expressions. Evaluation uses new Function(), which
-// does not have access to local scope.
-//
-// Note: `window.location` read access (pathname, host, port, href,
-// origin, protocol, search, hash, hostname) is allowed for test
-// probes. Only mutating methods (assign/replace/reload) and
-// assignment to window.location are blocked.
-// Block patterns that enable code injection, data exfiltration,
-// or persistent state corruption. Deliberately ALLOW:
-//   - localStorage / sessionStorage (needed for tab navigation)
-//   - globalThis / Reflect / Proxy (useful for deep inspection)
-// The remaining blocklist targets patterns with no legitimate
-// agent-testing use case.
-// Structural patterns — always enforced. Code injection, prototype
-// pollution, cookie exfiltration, redirects, reloads, crypto key access.
-//
-// `location.reload` is blocked for the same reason the `page_refresh`
-// handler below refuses to reload: a full page reload tears down all
-// React state (auth, execution, the terminal tree), orphaning every
-// live PTY session.
-const structuralPatterns = [
-  /\bimport\s*\(/, // dynamic import — can load arbitrary modules
-  /\brequire\s*\(/, // require — same
-  /\b__proto__\b/, // prototype pollution
-  /\bconstructor\s*\[/, // constructor bracket access
-  /\beval\s*\(/, // nested eval — full code execution
-  /\bnew\s+Function\b/, // Function constructor — same
-  /\bdocument\.cookie\b/, // cookie theft
-  /\bwindow\.open\b/, // popup/phishing
-  /\bwindow\.location\.(assign|replace|reload)\b/, // redirect / reload
-  /\bwindow\.location\s*=/, // redirect via assignment
-  /\blocation\.(assign|replace|reload)\b/, // bare redirect / reload
-  /\bhistory\.go\s*\(\s*0?\s*\)/, // history.go(0) / go() — reload synonyms; go(±n) stays allowed
-  /\blocation\s*=\s*["'`]/, // redirect via bare assignment
-  /\bcrypto\.subtle\b/, // key material access
-];
-// Network patterns — disabled only when the caller explicitly
-// sets `allowNetworkRequests: true`. Default is to block them
-// as data-exfiltration / persistent-channel risks.
-const networkPatterns = [
-  /\bfetch\s*\(/, // network requests — data exfiltration
-  /\bXMLHttpRequest\b/, // network requests — same
-  /\bnavigator\.sendBeacon\b/, // data exfiltration beacon
-  /\bWebSocket\b/, // persistent network channel
-];
-
-/**
- * Pure gate for `page_evaluate` expressions. Returns the first prohibited
- * pattern the expression matches, or `null` when the expression is allowed.
- * Exported for unit tests.
- *
- * NOTE: mirrored by `rejectIfDangerous` in `useUIBridgeEvaluateHandler.ts`
- * (the tagged `/control/page/evaluate` flow) — any change here MUST be
- * mirrored there.
- */
-export function checkEvaluateBlocklist(
-  expression: string,
-  allowNetworkRequests: boolean,
-): RegExp | null {
-  const dangerousPatterns = allowNetworkRequests
-    ? structuralPatterns
-    : [...structuralPatterns, ...networkPatterns];
-  return dangerousPatterns.find((p) => p.test(expression)) ?? null;
-}
+// SECURITY: the `page_evaluate` blocklist lives in `./utils` and is shared
+// verbatim with the tagged `/control/page/evaluate` handler
+// (`useUIBridgeEvaluateHandler.ts`) — see
+// `PAGE_EVALUATE_STRUCTURAL_PATTERNS` there for the patterns and their
+// per-entry rationale. Re-exported here because this module is the historical
+// import site for the gate (and for its unit tests).
+export { checkEvaluateBlocklist };
 
 /**
  * Handles: page_refresh, page_navigate, page_go_back, page_go_forward, query_selector, page_evaluate
@@ -466,10 +409,12 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             return true;
           }
           try {
-            // SECURITY: gate the expression through the module-level
-            // blocklist (see `checkEvaluateBlocklist` above for the
-            // patterns and per-entry rationale). `=== true` is deliberate:
-            // only a literal boolean from the wire relaxes network blocks.
+            // SECURITY: gate the expression through the shared blocklist in
+            // `./utils` (see `PAGE_EVALUATE_STRUCTURAL_PATTERNS` there for the
+            // patterns and per-entry rationale) — the same gate the tagged
+            // `/control/page/evaluate` handler applies. `=== true` is
+            // deliberate: only a literal boolean from the wire relaxes the
+            // network blocks.
             const matched = checkEvaluateBlocklist(expression, allowNetworkRequests === true);
             if (matched) {
               throw new Error(

@@ -8,7 +8,8 @@
 //!
 //! Three loose categories live here:
 //!   - JS evaluation plumbing for the Tauri WebView
-//!     (`direct_webview_evaluate*`, `safe_evaluate`, `evaluate_js_expression`)
+//!     (`return_expression_js`, `direct_webview_evaluate_with_result`,
+//!     `safe_evaluate`, `evaluate_js_expression`)
 //!   - Snapshot/diff helpers (`snapshot_signature`, `compute_snapshot_diff`,
 //!     `count_elements_in_discover_payload`)
 //!   - Response-shape extractors and field filters
@@ -238,6 +239,60 @@ pub(super) fn count_elements_in_discover_payload(data: &serde_json::Value) -> us
     0
 }
 
+/// Splice a caller-supplied expression into a JS `return` position without
+/// letting automatic semicolon insertion (ASI) silently swallow it.
+///
+/// Returns the statement `return <expr>\n;`, ready to be embedded as (part of)
+/// a function body.
+///
+/// # Why this exists
+///
+/// Two things go wrong when a caller's expression is spliced raw into
+/// `return {}` :
+///
+/// 1. **A LEADING NEWLINE.** `format!("return {}", "\n({a:1})")` produces
+///
+///    ```js
+///    return
+///    ({a:1})
+///    ```
+///
+///    and ASI terminates the `return` on the first line, so the function
+///    returns `undefined`. Critically this is NOT a `SyntaxError` — the
+///    expression parses and runs, it just yields nothing — so the caller sees
+///    `success: true` with an empty result. That is a SILENT FALSE GREEN: it
+///    corrupts test evidence rather than merely losing it. Any driver writing
+///    a multi-line expression the natural way (heredoc, triple-quoted string,
+///    `--data-binary @file`) hits it. `trim_start()` is the fix, and is the
+///    exact mirror of the `trimStart()` guard on the frontend's bare-`return`
+///    compile arm (`compileEvaluateExpression` in
+///    `src/hooks/ui-bridge-events/utils.ts`), which fixed the same defect for
+///    `POST /control/page/evaluate`.
+///
+/// 2. **A TRAILING LINE COMMENT.** `return 1 // done;` comments out the
+///    terminating `;` and everything the template puts after it on that line,
+///    corrupting the whole generated program (for `evaluate-batch`, every
+///    other expression in the batch with it). Emitting the `;` on its own
+///    line ends the comment first.
+///
+/// # What this deliberately does NOT handle
+///
+/// A LEADING line comment (`"// note\nfoo()"`) still ASI-truncates here. The
+/// frontend fixes that case by wrapping as `return (<expr>\n)` and falling
+/// back to a bare `return` wrap when the parenthesised form is a
+/// `SyntaxError` — a try-compile chain these Rust-built templates cannot use,
+/// because they have no `SyntaxError` to catch (a parse error kills the whole
+/// emitted program) and cannot compile dynamically: `new Function` and `eval`
+/// are both structural blocks in the frontend's `page_evaluate` blocklist, so
+/// any expression containing them is rejected before it runs. Wrapping
+/// unconditionally in parens instead would regress every `;`-terminated
+/// expression (`document.title;`), which works today. Fixing the evidenced
+/// silent failure with zero behavior change for expressions that already work
+/// is the better trade at these two legacy endpoints.
+pub(super) fn return_expression_js(expression: &str) -> String {
+    format!("return {}\n;", expression.trim_start())
+}
+
 /// Evaluate JS in the WebView using the IPC response channel as a callback.
 ///
 /// This wraps the expression in a function that sends the result back via
@@ -387,61 +442,6 @@ pub(super) async fn direct_webview_evaluate_with_result(
             Err(format!("Direct eval timed out after {}s", timeout_secs))
         }
     }
-}
-
-/// Evaluate a JS expression directly in the Tauri WebView using window.eval().
-///
-/// This bypasses the IPC event system entirely, so it works even when the
-/// UI Bridge SDK hasn't initialized. The expression is wrapped in a try/catch
-/// to prevent evaluation errors from crashing the WebView connection.
-///
-/// Returns the stringified result. For structured data, the expression should
-/// return JSON.stringify(...).
-#[allow(dead_code)]
-pub(super) async fn direct_webview_evaluate(
-    app_handle: &tauri::AppHandle,
-    expression: &str,
-) -> Result<String, String> {
-    use tauri::Manager;
-
-    let window = app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
-        .ok_or_else(|| "WebView window 'main' not found".to_string())?;
-
-    // Wrap in try/catch with timeout guard to prevent crashes
-    let safe_js = format!(
-        r#"(function() {{
-            try {{
-                var __result = (function() {{ return {}; }})();
-                if (__result === undefined) return "undefined";
-                if (__result === null) return "null";
-                return String(__result);
-            }} catch(e) {{
-                return "ERROR:" + e.message;
-            }}
-        }})()"#,
-        expression
-    );
-
-    // Tauri's eval() is fire-and-forget (returns Ok(()) on success).
-    // To get a return value, we use a callback pattern via a Tauri event.
-    // However, for simplicity and reliability, we use the IPC response channel
-    // if available, or fall back to a polling approach.
-    //
-    // The most robust approach: use the existing page_evaluate IPC path first,
-    // and only fall back to direct eval for side-effect-only operations.
-    //
-    // For the new endpoints, we'll use a hybrid: construct the full JS inline
-    // and use IPC to get the result back, but with error wrapping.
-
-    // Use the existing IPC path but with our safe-wrapped expression
-    window
-        .eval(&safe_js)
-        .map_err(|e| format!("WebView eval failed: {}", e))?;
-
-    // Since eval() is fire-and-forget in Tauri v2, we can't get a return value
-    // directly. Instead, we'll use the IPC request_sync path with our wrapped expression.
-    Ok("eval_dispatched".to_string())
 }
 
 /// Evaluate a JS expression via IPC with automatic error wrapping.
@@ -879,8 +879,66 @@ where
 
 #[cfg(test)]
 mod helpers_tests {
-    use super::{read_window_label, snapshot_signature};
+    use super::{read_window_label, return_expression_js, snapshot_signature};
     use serde_json::json;
+
+    /// THE REGRESSION. A leading newline used to produce `return\n({a:1})`,
+    /// which ASI truncates to a bare `return` — the function yields
+    /// `undefined` and the caller is told `success: true` with no data.
+    /// Nothing may sit between `return ` and the expression except the space.
+    #[test]
+    fn leading_newline_cannot_be_swallowed_by_asi() {
+        let js = return_expression_js("\n({a:1})");
+        assert!(
+            js.starts_with("return ({a:1})"),
+            "leading newline must be stripped, got {js:?}"
+        );
+    }
+
+    /// `\r\n` line endings (a Windows heredoc / CRLF request body) are the
+    /// same defect — `trim_start` covers all Unicode whitespace, not just LF.
+    #[test]
+    fn leading_crlf_and_repeated_newlines_are_stripped() {
+        for expr in ["\r\n({a:1})", "\n\n\n({a:1})", "   \n\t({a:1})"] {
+            let js = return_expression_js(expr);
+            assert!(
+                js.starts_with("return ({a:1})"),
+                "expected {expr:?} to compile to a same-line return, got {js:?}"
+            );
+        }
+    }
+
+    /// The mirror case: a TRAILING line comment must not comment out the
+    /// terminating `;` (and, at the batch call site, everything the template
+    /// emits after it on that line).
+    #[test]
+    fn trailing_line_comment_cannot_swallow_the_terminator() {
+        let js = return_expression_js("1 + 1 // done");
+        assert_eq!(js, "return 1 + 1 // done\n;");
+        assert!(
+            js.ends_with("\n;"),
+            "terminator must start its own line, got {js:?}"
+        );
+    }
+
+    /// Expressions that already work must be untouched apart from the
+    /// terminator moving to its own line — in particular `;`-terminated ones,
+    /// which an unconditional parenthesised wrap would have broken.
+    #[test]
+    fn ordinary_expressions_are_unchanged() {
+        assert_eq!(
+            return_expression_js("document.title"),
+            "return document.title\n;"
+        );
+        assert_eq!(return_expression_js("2;"), "return 2;\n;");
+        assert_eq!(return_expression_js("({a:1})"), "return ({a:1})\n;");
+    }
+
+    /// A trailing newline was never the bug and stays harmless.
+    #[test]
+    fn trailing_whitespace_is_preserved_harmlessly() {
+        assert_eq!(return_expression_js("1 + 1\n"), "return 1 + 1\n\n;");
+    }
 
     #[test]
     fn absent_window_label_is_main() {

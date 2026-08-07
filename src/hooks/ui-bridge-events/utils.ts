@@ -183,15 +183,146 @@ export function levenshtein(a: string, b: string): number {
 }
 
 /**
- * Cap on auto-awaiting a top-level Promise returned by `page_evaluate`.
- * Without this, a caller passing `(async () => { await new Promise(() => {}) })()`
- * would wedge the eval response forever. 30 s is generous for legitimate
- * async work (network round-trip, batch DOM scan) while still bounding
- * the worst case. Used by both the legacy IPC `page_evaluate` branch
- * (`usePageEvents.ts`) and the tagged Tauri-event evaluate handler
- * (`useUIBridgeEvaluateHandler.ts`).
+ * DEFAULT cap on auto-awaiting a top-level Promise returned by
+ * `page_evaluate`. Without a cap, a caller passing
+ * `(async () => { await new Promise(() => {}) })()` would wedge the eval
+ * response forever. 30 s is generous for legitimate async work (network
+ * round-trip, batch DOM scan) while still bounding the worst case.
+ *
+ * Applies to the legacy IPC `page_evaluate` branch (`usePageEvents.ts`),
+ * whose payload carries no timeout, and to the tagged evaluate handler
+ * (`useUIBridgeEvaluateHandler.ts`) when the request omits `timeout_ms` —
+ * see {@link resolveEvaluateTimeoutMs}.
  */
 export const PAGE_EVALUATE_PROMISE_TIMEOUT_MS = 30_000;
+
+/**
+ * Ceiling for a caller-supplied `timeout_ms` on the tagged
+ * `/control/page/evaluate` flow. Mirrors the Rust-side clamp in
+ * `page.rs::ui_bridge_page_evaluate_handler`
+ * (`request.timeout_ms.map(|ms| ms.clamp(1000, 600_000))`) so the two ends
+ * of the request can't disagree about the maximum. Re-clamped here rather
+ * than trusted: the frontend must never accept an unbounded await from a
+ * payload, whatever produced it.
+ */
+export const PAGE_EVALUATE_MAX_TIMEOUT_MS = 600_000;
+
+/**
+ * Head start the frontend takes over the Rust dispatcher's identical wait.
+ *
+ * Both ends now time the same request out at the same budget, so without a
+ * margin they race and the caller gets whichever message won — either the
+ * frontend's precise "Promise did not resolve within Xs" or the Rust side's
+ * generic "UI Bridge page_evaluate timed out after Xms", varying run to run.
+ * Giving up 250 ms early makes the frontend win deterministically, so the
+ * caller always learns WHY (an unsettled Promise) rather than just that
+ * something took too long. It is negligible against the 1000 ms floor the
+ * Rust handler clamps to, and invisible at the 600 s ceiling.
+ */
+const PAGE_EVALUATE_TIMEOUT_MARGIN_MS = 250;
+
+/**
+ * Resolve the promise-await budget for one tagged evaluate request.
+ *
+ * The Rust dispatcher forwards the caller's `timeoutMs` (already clamped to
+ * [1000, 600000]) on every `ui-bridge:evaluate-request` and waits exactly
+ * that long for the response. The frontend used to ignore the field and
+ * always await {@link PAGE_EVALUATE_PROMISE_TIMEOUT_MS}, which made the
+ * documented ceiling unreachable: a caller asking for `timeoutMs: 600000`
+ * to cover a genuinely long async expression got
+ * `success: false, error: "…did not settle within 30s"` at 30 s, while the
+ * Rust side was still willing to wait another nine and a half minutes.
+ * Honoring the field lines both waits up with the caller's request, less
+ * {@link PAGE_EVALUATE_TIMEOUT_MARGIN_MS}.
+ *
+ * Anything not a positive finite number (absent, `null`, `0`, `NaN`, a
+ * string from a hand-rolled emit) falls back to the default cap rather than
+ * producing an instant or infinite timeout.
+ */
+export function resolveEvaluateTimeoutMs(raw: unknown): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
+    return PAGE_EVALUATE_PROMISE_TIMEOUT_MS;
+  }
+  const budget = Math.min(raw, PAGE_EVALUATE_MAX_TIMEOUT_MS);
+  // Never let the margin push a small budget to zero (or negative), which
+  // would make every await fail instantly.
+  return budget > PAGE_EVALUATE_TIMEOUT_MARGIN_MS
+    ? budget - PAGE_EVALUATE_TIMEOUT_MARGIN_MS
+    : budget;
+}
+
+/**
+ * SECURITY: structural code-injection blocks for `page_evaluate` — ALWAYS
+ * enforced, whatever the caller passes.
+ *
+ * Blocks code injection, prototype pollution, cookie exfiltration, redirects,
+ * reloads and crypto key access. Deliberately ALLOWS:
+ *   - `localStorage` / `sessionStorage` (needed for tab navigation)
+ *   - `globalThis` / `Reflect` / `Proxy` (useful for deep inspection)
+ *   - `window.location` READS (pathname, host, port, href, origin, protocol,
+ *     search, hash, hostname) for test probes — only mutating methods and
+ *     assignment are blocked
+ *
+ * `location.reload` is blocked for the same reason the `page_refresh` handler
+ * refuses to reload: a full page reload tears down all React state (auth,
+ * execution, the terminal tree), orphaning every live PTY session.
+ *
+ * These live here, beside {@link compileEvaluateExpression}, because BOTH
+ * `page_evaluate` entry points gate on them — the legacy IPC branch
+ * (`usePageEvents.ts`) and the tagged-event handler
+ * (`useUIBridgeEvaluateHandler.ts`). They used to be two hand-maintained
+ * copies under a "any change here MUST be mirrored there" comment, which is a
+ * drift hazard with a security blast radius: a pattern added to one gate would
+ * leave the other route wide open, and nothing would fail. One array,
+ * structurally impossible to half-update.
+ */
+export const PAGE_EVALUATE_STRUCTURAL_PATTERNS: readonly RegExp[] = [
+  /\bimport\s*\(/, // dynamic import — can load arbitrary modules
+  /\brequire\s*\(/, // require — same
+  /\b__proto__\b/, // prototype pollution
+  /\bconstructor\s*\[/, // constructor bracket access
+  /\beval\s*\(/, // nested eval — full code execution
+  /\bnew\s+Function\b/, // Function constructor — same
+  /\bdocument\.cookie\b/, // cookie theft
+  /\bwindow\.open\b/, // popup/phishing
+  /\bwindow\.location\.(assign|replace|reload)\b/, // redirect / reload
+  /\bwindow\.location\s*=/, // redirect via assignment
+  /\blocation\.(assign|replace|reload)\b/, // bare redirect / reload
+  /\bhistory\.go\s*\(\s*0?\s*\)/, // history.go(0) / go() — reload synonyms; go(±n) stays allowed
+  /\blocation\s*=\s*["'`]/, // redirect via bare assignment
+  /\bcrypto\.subtle\b/, // key material access
+];
+
+/**
+ * Network-related blocks for `page_evaluate` — relaxed ONLY when the caller
+ * explicitly passes `allowNetworkRequests: true`, so test assertions can hit
+ * runner APIs directly without the brittle `window["fet"+"ch"]` workaround.
+ * Default is to block them as data-exfiltration / persistent-channel risks.
+ */
+export const PAGE_EVALUATE_NETWORK_PATTERNS: readonly RegExp[] = [
+  /\bfetch\s*\(/, // network requests — data exfiltration
+  /\bXMLHttpRequest\b/, // network requests — same
+  /\bnavigator\.sendBeacon\b/, // data exfiltration beacon
+  /\bWebSocket\b/, // persistent network channel
+];
+
+/**
+ * Pure gate for `page_evaluate` expressions. Returns the first prohibited
+ * pattern the expression matches, or `null` when the expression is allowed.
+ *
+ * The returned `RegExp` is shared module state, but every pattern above is
+ * flag-free, so `.test()` keeps no `lastIndex` cursor and concurrent callers
+ * cannot interfere with each other.
+ */
+export function checkEvaluateBlocklist(
+  expression: string,
+  allowNetworkRequests: boolean,
+): RegExp | null {
+  const patterns = allowNetworkRequests
+    ? PAGE_EVALUATE_STRUCTURAL_PATTERNS
+    : [...PAGE_EVALUATE_STRUCTURAL_PATTERNS, ...PAGE_EVALUATE_NETWORK_PATTERNS];
+  return patterns.find((p) => p.test(expression)) ?? null;
+}
 
 /**
  * Compile a caller-supplied `page_evaluate` expression into a zero-arg

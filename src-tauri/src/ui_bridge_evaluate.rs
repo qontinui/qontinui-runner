@@ -32,12 +32,12 @@
 //! 2. Creates a `tokio::sync::oneshot` channel; stashes the sender in the
 //!    [`EvaluateRequestStore`] keyed by `request_id`.
 //! 3. Emits Tauri event `ui-bridge:evaluate-request` with
-//!    `{ request_id, expression, await_promise, timeout_ms }` to the
-//!    React frontend.
+//!    `{ request_id, expression, timeout_ms, unwrap, allow_network_requests,
+//!    windowLabel }` to the React frontend.
 //! 4. The React side runs the expression (via the same security-gated
-//!    `new Function(...)` path used by the legacy `page_evaluate` handler)
-//!    and emits `ui-bridge:evaluate-response` with
-//!    `{ request_id, ok, result, error }`.
+//!    `compileEvaluateExpression` wrapper used by the legacy `page_evaluate`
+//!    handler), auto-awaiting a top-level Promise for `timeout_ms`, and emits
+//!    `ui-bridge:evaluate-response` with `{ request_id, ok, result, error }`.
 //! 5. A global Tauri listener installed at `mcp_api.rs` startup parses the
 //!    response and calls [`EvaluateRequestStore::deliver`] which fires the
 //!    matching oneshot.

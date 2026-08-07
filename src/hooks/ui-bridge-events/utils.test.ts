@@ -21,6 +21,8 @@ import {
   compileEvaluateExpression,
   isThenable,
   isElementActionAllowed,
+  resolveEvaluateTimeoutMs,
+  PAGE_EVALUATE_MAX_TIMEOUT_MS,
   PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
 } from "./utils";
 
@@ -247,5 +249,55 @@ describe("compileEvaluateExpression — page_evaluate wrapping", () => {
     } finally {
       delete (globalThis as Record<string, unknown>).__compileProbe;
     }
+  });
+});
+
+describe("resolveEvaluateTimeoutMs — caller-supplied page/evaluate budget", () => {
+  // The frontend deliberately gives up a small margin ahead of the Rust
+  // dispatcher's identical wait so its more specific timeout message wins the
+  // race deterministically.
+  const MARGIN = 250;
+
+  it("honors a caller timeout above the default cap", () => {
+    // THE GAP. The Rust dispatcher forwards the caller's clamped `timeoutMs`
+    // and waits exactly that long, but the frontend used to ignore the field
+    // and cap every await at 30s — so `timeoutMs: 600000` failed at 30s with
+    // "did not resolve within 30.0s" while Rust was still waiting.
+    expect(resolveEvaluateTimeoutMs(60_000)).toBe(60_000 - MARGIN);
+    expect(resolveEvaluateTimeoutMs(PAGE_EVALUATE_MAX_TIMEOUT_MS)).toBe(
+      PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN,
+    );
+  });
+
+  it("honors a caller timeout below the default cap", () => {
+    // The Rust default is 10s, so awaiting the full 30s just kept a dead
+    // request's expression alive after Rust had already returned 504.
+    expect(resolveEvaluateTimeoutMs(10_000)).toBe(10_000 - MARGIN);
+    expect(resolveEvaluateTimeoutMs(1_000)).toBe(1_000 - MARGIN);
+  });
+
+  it("never lets the margin drive the budget to zero", () => {
+    // Below the Rust clamp floor these can only arrive from a hand-rolled
+    // emit, but an instant-failure budget would be far worse than a short one.
+    expect(resolveEvaluateTimeoutMs(MARGIN)).toBe(MARGIN);
+    expect(resolveEvaluateTimeoutMs(1)).toBe(1);
+  });
+
+  it("clamps above the ceiling rather than trusting the payload", () => {
+    expect(resolveEvaluateTimeoutMs(5_000_000)).toBe(PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN);
+    expect(resolveEvaluateTimeoutMs(Number.POSITIVE_INFINITY)).toBe(
+      PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+    );
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["null", null],
+    ["zero", 0],
+    ["negative", -1],
+    ["NaN", Number.NaN],
+    ["a string", "60000"],
+  ])("falls back to the default cap for %s", (_label, raw) => {
+    expect(resolveEvaluateTimeoutMs(raw)).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
   });
 });
