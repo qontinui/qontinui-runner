@@ -165,7 +165,7 @@ jobs:
         shell: bash
         # Branch name via env, not `${{ }}` splicing: a refname may contain
         # `" $ ( ) ; & |`, which would be executable shell here. Same reason as
-        # .github/actions/resolve-schemas-ref.
+        # .github/actions/checkout-sibling.
         env:
           BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
@@ -198,18 +198,18 @@ jobs:
       # import it; alembic should still load. We skip the optional
       # `ml` poetry group (qontinui-train), keeping the install
       # weight reasonable.
-      - name: Resolve sibling qontinui-schemas ref
-        id: schemas-ref
-        uses: ./qontinui-runner/.github/actions/resolve-schemas-ref
+      # This job checks the runner out under `path: qontinui-runner`, so the
+      # siblings live beside it at the workspace ROOT — not at the action's
+      # default `$GITHUB_WORKSPACE/../<name>`. Hence the explicit `path:`.
+      - name: Check out sibling qontinui-schemas
+        uses: ./qontinui-runner/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/qontinui-schemas
 
-      - name: Checkout sibling repos (qontinui-schemas, qontinui)
+      - name: Checkout sibling repo (qontinui)
         run: |
           cd "$GITHUB_WORKSPACE"
-          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
-          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
           git clone --depth 1 https://github.com/qontinui/qontinui.git
-        env:
-          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
         shell: bash
 
       - name: Set up Python

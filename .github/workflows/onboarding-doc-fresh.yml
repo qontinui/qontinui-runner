@@ -158,22 +158,13 @@ jobs:
       # checkout (`qontinui-types` = ../../qontinui-schemas/rust,
       # `qontinui-code-graph` = ../../qontinui-schemas/code-graph). Without it
       # cargo cannot even load the workspace manifest, so `cargo run` fails
-      # before it ever reaches the doc emit. Pinned to the resolved ref for the
-      # same reason ci.yml does it: a breaking types change must be able to go
-      # green as a DECLARED pair (a coord dep-edge label naming the schemas PR)
-      # rather than deadlock. Branch names resolve nothing.
-      - name: Resolve sibling qontinui-schemas ref
-        id: schemas-ref
-        uses: ./.github/actions/resolve-schemas-ref
-
-      - name: Checkout sibling qontinui-schemas
-        run: |
-          cd "$GITHUB_WORKSPACE/.."
-          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
-          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
-        env:
-          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
-        shell: bash
+      # before it ever reaches the doc emit. Pinned to the DECLARED adaptation
+      # PR's head commit for the same reason ci.yml does it: a breaking types
+      # change must be able to go green as a DECLARED pair (a coord dep-edge
+      # label naming the schemas PR) rather than deadlock. Branch names resolve
+      # nothing.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable

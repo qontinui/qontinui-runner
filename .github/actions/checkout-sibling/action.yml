@@ -1,0 +1,620 @@
+name: Check out the sibling repo this build compiles against
+description: >-
+  Resolve WHICH sibling tree this build should compile against — the DECLARED
+  adaptation PR named by a coord dep-edge label, otherwise the default branch —
+  and materialise it, SHA-pinned, at the path the caller's layout expects.
+
+# Why this exists (the deadlock it breaks):
+#
+# src-tauri/Cargo.toml has a path dep on ../../qontinui-schemas/rust, so runner
+# CI compiles against whatever schemas ref it checks out. A BREAKING types change
+# therefore deadlocks the two repos against each other:
+#
+#   - the schemas PR reds on `consumer-compile` (runner main does not build
+#     against the new type), and
+#   - the runner PR reds on `test` (schemas main still has the OLD type).
+#
+# Neither can land first. An escape hatch is therefore mandatory: a design that
+# removes it makes coordinated breaking changes unlandable, which historically
+# gets "solved" by deleting the gate. Removing the hatch is not an option. The
+# only question is what the hatch is keyed on.
+#
+# WHAT CHANGED, AND WHY (plan 2026-08-05-runner-schemas-ref-declared-adaptation):
+#
+# PHASE A — the hatch stopped being a branch NAME.
+#
+# This action used to resolve a qontinui-schemas branch of the SAME NAME as the
+# PR's head branch, probed with `git ls-remote`. A BRANCH NAME IS NOT AN
+# IDENTITY. `ls-remote` matches ANY branch with that name on qontinui-schemas —
+# it cannot check that the branch has a pull request, that anyone reviewed it,
+# that it is current, or that its base is main.
+#
+# That is not theoretical. The identical mechanism pointed the other way was
+# exploited in production on 2026-07-28: qontinui-schemas#104's consumer gate
+# went GREEN having compiled a qontinui-runner branch with NO PULL REQUEST AT
+# ALL, while the real adaptation sat on a differently-named branch. Sixteen
+# minutes after the land, runner main went red with 11 x E0308 and stayed red
+# 4h38m with 16 PRs stuck behind it. qontinui-schemas deleted its half of the
+# mechanism on 2026-08-04 (.github/workflows/runner-consumer-check.yml, which
+# now resolves a DECLARED adaptation PR). This is that fix, pointed back.
+#
+# The hatch is now a DECLARED ADAPTATION PR, resolved from the coord dep edge
+# the pair already has to declare for merge ordering — so it costs the author
+# nothing they were not already doing. BOTH label forms are accepted, which is
+# what lets ONE declaration serve BOTH gates:
+#
+#   - form 2 (PRIMARY, self-read): `coord:downstream-of=[<owner>/]qontinui-schemas#<n>`
+#     on THIS runner PR. One request against this repo; never paginates.
+#   - form 1 (FALLBACK, reverse search): `coord:upstream-of=[<owner>/]qontinui-runner#<this>`
+#     on the schemas PR — the form qontinui-schemas' own consumer gate REQUIRES.
+#     So a pair created by satisfying that gate satisfies this one for free.
+#
+# The owner part is OPTIONAL in coord's grammar (qontinui-coord
+# src/pr_merge/dep_graph.rs:136-137 — a bare <repo> inherits the labelled PR's
+# owner), so both forms are compared OWNER-STRIPPED. Do NOT "simplify" that to
+# an exact string match: the schemas twin does exactly that at
+# runner-consumer-check.yml:404-405 and silently misses every bare-form label,
+# reddening pairs that ARE properly declared.
+#
+# BOTH forms are evaluated UNCONDITIONALLY, even when the primary hits, and
+# EVERY declaration in each form is collected rather than taking the first or
+# the last. That is not redundant work — it is the only way to detect two
+# declarations naming DIFFERENT sibling PRs. We can check out exactly one tree,
+# so silently preferring one would resolve an ambiguity that is the author's to
+# resolve. There are three ways to be ambiguous and all three hard-fail alike:
+# two `downstream-of` labels on this PR, two sibling PRs declaring
+# `upstream-of` at this PR, or the two forms naming different PRs.
+#
+# Renaming a branch is no longer a way to satisfy anything.
+#
+# PHASE B — this action CHECKS THE SIBLING OUT, and it is SHA-pinned.
+#
+# It used to emit a branch name and leave eleven `uses:` sites to each run their
+# own `git clone --depth 1 --branch "$SCHEMAS_REF"`. Two problems, both closed
+# here:
+#
+#   - `git clone --branch` accepts a branch or a tag, NEVER a SHA. So the ref
+#     was resolved from a VALIDATED PR, but what got cloned was whatever that
+#     BRANCH pointed at by the time the clone ran — a force-push to the declared
+#     PR between resolve and clone silently changed what compiled. This action
+#     now fetches the resolved head SHA, which is the same window
+#     qontinui-schemas' own gate closes at runner-consumer-check.yml:474-476.
+#   - eleven hand-maintained copies of the checkout contract is how the "three
+#     clone sites" mental model that preceded this plan came to be wrong by a
+#     factor of nearly four. `forbid-sibling-clone.yml` now fails the build if a
+#     twelfth reappears.
+#
+# The sibling repo is an INPUT rather than hard-coded, so the three qontinui-web
+# matchers (atlas-exclude-fresh.yml, clorinde-bindings-fresh.yml,
+# schema-pg-sql-fresh.yml — each still doing `git ls-remote --heads … | grep -q
+# .` against qontinui-web) can adopt this resolver as a WIRING change rather
+# than a second rewrite. Three copy-pasted blocks must not become four.
+#
+# ---------------------------------------------------------------------------
+# THREE DELIBERATE PROPERTIES, CARRIED OVER FROM THE BRANCH-NAME VERSION.
+# Each was load-bearing then and is load-bearing now. Do not regress them.
+#
+# 1. NOTHING IS SPLICED WITH ${{ }} INTO A SCRIPT BODY. Every value reaches the
+#    shell through `env:`. A refname may legally contain `" $ ` ( ) ; & |`, so
+#    splicing is a real injection sink on a fork PR, not a theoretical one.
+#    STRONGER NOW: no value derived from a refname is interpolated anywhere,
+#    and the PR number is validated `^[0-9]+$` before it is used in a URL.
+#
+# 2. "ABSENT" AND "UNANSWERED" ARE DIFFERENT ANSWERS, and only the first is a
+#    NO. The old code split `git ls-remote` rc 2 (branch absent -> main) from
+#    rc 128 (probe failed -> hard fail), because treating them alike would
+#    silently check out main on a network blip and surface the result as a TYPE
+#    error in a downstream job — an infra flake wearing a semantic red's
+#    clothes. HTTP carries strictly more information, so that 2-way split is
+#    now FIVE ways (see `api` below):
+#      200                       -> answered, proceed
+#      404 on a declared PR      -> the DECLARATION is invalid: a RED with a
+#                                   legible message, NOT a silent fallback to
+#                                   main, and NOT an infra-fault message
+#      403 / 429                 -> rate-limited: UNKNOWN, hard-fail
+#      5xx / network / non-JSON  -> probe failed: UNKNOWN, hard-fail
+#      200 with an empty list    -> answered, no declaration: a real NO -> main
+#    Never `|| true` a probe: a silently-empty read is UNKNOWN, not "no
+#    declaration". A 200 whose body is not the JSON SHAPE we expect is in the
+#    same class and is checked explicitly, because `jq` on a garbled body would
+#    otherwise abort under `set -e` with a message that reads like a bug here.
+#
+# 3. RESOLUTION IS KEYED ON A pull_request EVENT ONLY — no `github.ref_name`
+#    fallback, EVER. coord's merge scheduler pushes the SAME
+#    `refs/heads/merge-candidate/<proposal_id>` into every repo of a multi-repo
+#    proposal (merge_scheduler.rs `push_merge_candidates`), so on a candidate
+#    push `ref_name` WOULD match a real schemas branch. That is harmful twice
+#    over: the ref is force-pushed and deleted as the proposal resolves, so the
+#    checkout can race the probe and hard-fail a required check; and the build
+#    would go green against a candidate tree that may never land.
+#    STRONGER NOW: the key is `github.event.pull_request.number`, which is empty
+#    off a `pull_request` event BY DEFINITION, where `head_ref` merely happened
+#    to be. Pushes to main, merge-candidate/** pushes, tag pushes, schedule and
+#    workflow_dispatch all resolve to the default branch with NO api call at all.
+#    qontinui-types-drift.yml depends on this explicitly and says so.
+#
+# Requires actions/checkout to have run first (this action is referenced by
+# repo-relative path). In jobs that check the runner out under `path:`,
+# reference it through that path
+# (`./qontinui-runner/.github/actions/checkout-sibling`) AND pass an explicit
+# `path:` input — the default destination is a SIBLING of the runner checkout,
+# which is not where those jobs want it.
+#
+# The calling workflow must grant `pull-requests: read` (and `contents: read`).
+# Every consuming workflow now states that explicitly rather than inheriting the
+# repo-level default, which is an operator-flippable setting invisible in the
+# YAML — see the `permissions:` blocks alongside this action.
+
+inputs:
+  repo:
+    description: >-
+      Sibling repository (`owner/name`) to resolve and check out. Defaults to
+      qontinui-schemas. Parameterised so the qontinui-web sibling matchers can
+      adopt this resolver as a WIRING change rather than a second rewrite —
+      three copy-pasted `git ls-remote | grep -q .` blocks must not become four.
+    required: false
+    default: qontinui/qontinui-schemas
+  path:
+    description: >-
+      Directory to check the sibling out into. Empty (the default) keeps the
+      historical layout — a sibling of the runner checkout,
+      `$GITHUB_WORKSPACE/../<name>` — which is what the Cargo/poetry path deps
+      (`../../qontinui-schemas/rust`) are written relative to. Jobs that check
+      the runner out under a `path:` pass an explicit directory instead — the
+      workspace root, i.e. the `github.workspace` context joined with the
+      sibling name. Do NOT write that example with expression braces here: a
+      value inside an action manifest is TEMPLATED, so the braces are evaluated
+      rather than displayed, and `github` is not a valid context at manifest
+      load time — it fails the whole action with "Unrecognized named-value:
+      'github'" before a single step runs. (Observed live, run 31180585122.)
+    required: false
+    default: ''
+
+outputs:
+  ref:
+    description: Branch of the sibling that was checked out.
+    value: ${{ steps.resolve.outputs.ref }}
+  sha:
+    description: >-
+      Head SHA of the declared adaptation PR, or empty when resolving to the
+      default branch (in which case the checked-out commit is whatever that
+      branch tipped at — see the `Checked out … at <sha>` log line).
+    value: ${{ steps.resolve.outputs.sha }}
+  source:
+    description: >-
+      Which declaration resolved the ref — one of `none`, `downstream-of`,
+      `upstream-of`, `both-agreeing`.
+    value: ${{ steps.resolve.outputs.source }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      # Values via env, never `${{ }}`-spliced into the script body (property 1).
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        THIS_REPO: ${{ github.repository }}
+        SIBLING_REPO: ${{ inputs.repo }}
+      run: |
+        set -euo pipefail
+
+        SIBLING_SHORT="${SIBLING_REPO##*/}"
+        THIS_SHORT="${THIS_REPO##*/}"
+
+        REF="main"
+        SHA=""
+        SOURCE="none"
+        # Counts reads of a PR's DETAIL endpoint. The vacuity assertion at the
+        # end fails the job if a non-main ref was emitted without one: a
+        # resolution that "succeeded" without ever reading the declared PR is a
+        # vacuous green wearing this action's clothes.
+        PR_DETAIL_CALLS=0
+
+        emit() {
+          {
+            echo "ref=${REF}"
+            echo "sha=${SHA}"
+            echo "source=${SOURCE}"
+          } >> "$GITHUB_OUTPUT"
+        }
+
+        # --- The answered / absent / unanswered split (property 2). ----------
+        # Sets API_STATUS and API_BODY. Returns 0 whenever the HTTP exchange
+        # COMPLETED (any status); returns non-zero only when there was no
+        # answer at all (DNS, TLS, connection, timeout). An unanswered probe is
+        # UNKNOWN and every caller hard-fails on it.
+        api() {
+          local path="$1" raw rc
+          set +e
+          raw="$(curl -sS --connect-timeout 10 --max-time 60 --retry 2 --retry-connrefused \
+                   -H "Authorization: Bearer ${GH_TOKEN}" \
+                   -H "Accept: application/vnd.github+json" \
+                   -H "X-GitHub-Api-Version: 2022-11-28" \
+                   -w $'\n%{http_code}' \
+                   "https://api.github.com/${path}" 2>/dev/null)"
+          rc=$?
+          set -e
+          # curl's own rc is about TRANSPORT. An HTTP 4xx/5xx is still an
+          # ANSWER (rc 0 without --fail), so only a missing/garbled status
+          # trailer counts as unanswered.
+          if [ "${rc}" -ne 0 ]; then
+            API_STATUS="000"; API_BODY=""; return 1
+          fi
+          case "${raw:-}" in
+            *$'\n'[0-9][0-9][0-9]) : ;;
+            *) API_STATUS="000"; API_BODY=""; return 1 ;;
+          esac
+          API_STATUS="${raw##*$'\n'}"
+          API_BODY="${raw%$'\n'*}"
+          return 0
+        }
+
+        # Hard-fail helper for every UNKNOWN arm.
+        unknown() {
+          echo "::error::${1} (HTTP ${API_STATUS:-none}). An unanswered probe is UNKNOWN, not 'no declaration' — refusing to guess a ref."
+          exit 1
+        }
+
+        # A 200 carrying a body of the wrong JSON SHAPE is UNKNOWN too, not an
+        # empty answer. Without this, `jq` would abort the script under `set -e`
+        # with a message that reads like a defect in this action.
+        expect_json() {
+          if ! printf '%s' "${API_BODY}" | jq -e "type == \"$1\"" >/dev/null 2>&1; then
+            unknown "$2 did not return a JSON $1"
+          fi
+        }
+
+        # Deduplicate a newline-separated list into UNIQ / UNIQ_N. Pure bash on
+        # purpose — no `sort`/`uniq`/`grep` subprocesses. Process spawn is the
+        # expensive operation on the windows-latest legs, and this runs on every
+        # PR whether or not anything is declared.
+        uniq_list() {
+          local raw="$1" t
+          UNIQ=""; UNIQ_N=0
+          while IFS= read -r t; do
+            [ -z "${t}" ] && continue
+            # Each entry in UNIQ is newline-terminated, so a leading newline
+            # makes "\n<t>\n" an exact-membership test rather than a substring
+            # one (#12 must not match #123).
+            case $'\n'"${UNIQ}" in
+              *$'\n'"${t}"$'\n'*) continue ;;
+            esac
+            UNIQ="${UNIQ}${t}"$'\n'
+            UNIQ_N=$((UNIQ_N + 1))
+          done <<< "${raw}"
+        }
+
+        # Every "you declared two different things" red, in one shape so the
+        # three ways of being ambiguous read alike (§3.2 / §3.7 of the plan).
+        # $1 = what was contradictory, $2 = newline-separated sibling PR numbers.
+        ambiguous() {
+          local t
+          echo "::error::Contradictory declarations — ${1}:"
+          while IFS= read -r t; do
+            [ -n "${t}" ] && echo "  - ${SIBLING_REPO}#${t}"
+          done <<< "${2}"
+          echo ""
+          echo "Exactly one ${SIBLING_SHORT} tree can be checked out, so this is yours to resolve:"
+          echo "  - keep the declaration naming the ${SIBLING_SHORT} PR this PR actually adapts to, and"
+          echo "  - remove the other(s) with the coord-pr-label skill (it validates the"
+          echo "    namespace before sending)."
+          exit 1
+        }
+
+        # --- Property 3: resolve only on a pull_request event. ---------------
+        if [ -z "${PR_NUMBER:-}" ]; then
+          echo "Using ${SIBLING_REPO} ref: main (not a pull_request event — no PR number, no probe, no API call)"
+          emit
+          exit 0
+        fi
+        case "${PR_NUMBER}" in
+          ''|*[!0-9]*)
+            echo "::error::PR number '${PR_NUMBER}' is not numeric; refusing to build a request URL from it."
+            exit 1 ;;
+        esac
+
+        # --- Declaration form 2 (PRIMARY): coord:downstream-of on THIS PR. ---
+        # ALL matching labels are collected, not just the last one seen. A PR
+        # carrying two `coord:downstream-of=<sibling>#…` labels is ambiguous in
+        # exactly the way §3.2 refuses to guess at; "whichever GitHub listed
+        # last" is not a resolution.
+        downs=""
+        if ! api "repos/${THIS_REPO}/issues/${PR_NUMBER}/labels?per_page=100"; then
+          unknown "Could not read labels on ${THIS_REPO}#${PR_NUMBER}"
+        fi
+        case "${API_STATUS}" in
+          200) : ;;
+          403|429) unknown "Rate-limited reading labels on ${THIS_REPO}#${PR_NUMBER}" ;;
+          *) unknown "Unexpected status reading labels on ${THIS_REPO}#${PR_NUMBER}" ;;
+        esac
+        expect_json array "Reading labels on ${THIS_REPO}#${PR_NUMBER}"
+
+        # CRLF: jq on the windows-latest legs terminates EVERY line with \r\n.
+        # Command substitution strips the final newline, so a ONE-line capture
+        # comes back clean — but in a multi-line one every line except the last
+        # keeps a trailing \r, which then rides into `num_part` and fails the
+        # ^[0-9]+$ check. That hard-failed `test (windows-latest)` and
+        # `Clippy (windows)` — two required contexts — on any PR whose
+        # coord:downstream-of label was not the LAST one the API returned, while
+        # the Linux legs of the same attempt resolved and compiled green off the
+        # same labels (runner#1002, run 31168122063 attempt 5). Order-dependent,
+        # so it presented as flake and blamed the author's label.
+        #
+        # Stripped here rather than special-cased per platform. Pure parameter
+        # expansion — no `tr`, no subprocess. VERIFIED: this is a MULTI-value
+        # hazard only; the single-value reads below (`state`, `base.ref`,
+        # `head.*`) come back clean because `$( )` removes their sole trailing
+        # CRLF. Any NEW multi-value capture inherits the trap — strip it too.
+        labels="$(printf '%s' "${API_BODY}" | jq -r '.[].name')"
+        labels="${labels//$'\r'/}"
+        echo "Live labels on ${THIS_REPO}#${PR_NUMBER}:"
+        if [ -n "${labels}" ]; then printf '%s\n' "${labels}" | sed 's/^/  /'; else echo "  (none)"; fi
+
+        while IFS= read -r l; do
+          [ -z "${l}" ] && continue
+          case "$l" in
+            coord:downstream-of=*)
+              spec="${l#coord:downstream-of=}"     # [<owner>/]<repo>#<n>
+              repo_part="${spec%%#*}"
+              num_part="${spec##*#}"
+              # Owner-stripped comparison — the owner is OPTIONAL in coord's
+              # grammar. Exact-matching here is the schemas twin's live bug.
+              if [ "${repo_part##*/}" = "${SIBLING_SHORT}" ]; then
+                case "${num_part}" in
+                  ''|*[!0-9]*)
+                    echo "::error::Malformed label '${l}' — '${num_part}' is not a PR number."
+                    exit 1 ;;
+                esac
+                downs="${downs}${num_part}"$'\n'
+              fi ;;
+          esac
+        done <<< "${labels}"
+
+        uniq_list "${downs}"
+        if [ "${UNIQ_N}" -gt 1 ]; then
+          ambiguous "this PR carries coord:downstream-of labels naming DIFFERENT ${SIBLING_SHORT} PRs" "${UNIQ}"
+        fi
+        target_down="${UNIQ%$'\n'}"
+
+        # --- Declaration form 1 (FALLBACK): coord:upstream-of on a sibling PR.
+        # Evaluated UNCONDITIONALLY, even when the primary hit, so a
+        # contradiction cannot be masked. Every page is scanned to the end and
+        # every match collected — stopping at the first hit would silently pick
+        # one of two sibling PRs that both claim this one. O(open sibling PRs),
+        # so paginate EXPLICITLY rather than silently truncating at one page: a
+        # truncated page reads as "no declaration", which is the wrong answer in
+        # the safe-looking direction.
+        ups=""
+        page=1
+        while : ; do
+          if ! api "repos/${SIBLING_REPO}/pulls?state=open&per_page=100&page=${page}"; then
+            unknown "Could not read open pull requests on ${SIBLING_REPO}"
+          fi
+          case "${API_STATUS}" in
+            200) : ;;
+            403|429) unknown "Rate-limited reading open pull requests on ${SIBLING_REPO}" ;;
+            *) unknown "Unexpected status reading open pull requests on ${SIBLING_REPO}" ;;
+          esac
+          expect_json array "Reading open pull requests on ${SIBLING_REPO}"
+
+          n_on_page="$(printf '%s' "${API_BODY}" | jq -r 'length' 2>/dev/null || true)"
+          case "${n_on_page}" in
+            ''|*[!0-9]*) unknown "Unparseable page length reading open pull requests on ${SIBLING_REPO}" ;;
+          esac
+
+          hits="$(printf '%s' "${API_BODY}" | jq -r --arg short "${THIS_SHORT}" --arg num "${PR_NUMBER}" '
+            [ .[]
+              | . as $pr
+              | .labels[]?.name
+              | select(startswith("coord:upstream-of="))
+              | ltrimstr("coord:upstream-of=")
+              | select((split("#")[0] | split("/") | last) == $short)
+              | select((split("#")[1]) == $num)
+              | $pr.number
+            ] | unique | .[]')"
+          # Multi-value since this stopped taking `first`, so it is now exposed
+          # to the same Windows CRLF trap as the label read above. Without this,
+          # two claimants on one page would come back as "11\r" and "22", and
+          # `11\r` would never dedupe against a `11` seen on another page.
+          hits="${hits//$'\r'/}"
+          [ -n "${hits}" ] && ups="${ups}${hits}"$'\n'
+
+          [ "${n_on_page}" -lt 100 ] && break
+          page=$((page + 1))
+          if [ "${page}" -gt 20 ]; then
+            echo "::error::Refusing to paginate ${SIBLING_REPO} open PRs past 2000 entries — declaration lookup is unbounded."
+            exit 1
+          fi
+        done
+
+        uniq_list "${ups}"
+        if [ "${UNIQ_N}" -gt 1 ]; then
+          ambiguous "several open ${SIBLING_SHORT} PRs declare coord:upstream-of=${THIS_SHORT}#${PR_NUMBER}" "${UNIQ}"
+        fi
+        target_up="${UNIQ%$'\n'}"
+
+        # --- Reconcile the two forms. ----------------------------------------
+        target=""
+        if [ -n "${target_down}" ] && [ -n "${target_up}" ]; then
+          if [ "${target_down}" != "${target_up}" ]; then
+            both="$(printf '%s\n%s' "${target_down}" "${target_up}")"
+            ambiguous "this PR declares coord:downstream-of=${SIBLING_SHORT}#${target_down}, but ${SIBLING_REPO}#${target_up} declares coord:upstream-of=${THIS_SHORT}#${PR_NUMBER}" "${both}"
+          fi
+          target="${target_down}"; SOURCE="both-agreeing"
+          echo "Declared adaptation: ${SIBLING_REPO}#${target} (both label forms agree)"
+        elif [ -n "${target_down}" ]; then
+          target="${target_down}"; SOURCE="downstream-of"
+          echo "Declared adaptation: ${SIBLING_REPO}#${target} (coord:downstream-of on this PR)"
+        elif [ -n "${target_up}" ]; then
+          target="${target_up}"; SOURCE="upstream-of"
+          echo "Declared adaptation: ${SIBLING_REPO}#${target} (coord:upstream-of on ${SIBLING_REPO}#${target})"
+        else
+          echo "Using ${SIBLING_REPO} ref: main (no declaration — 2 API calls, no PR-detail read)"
+          emit
+          exit 0
+        fi
+
+        # --- Validate the declaration. ---------------------------------------
+        # PRESENT is not enough; it must be VERIFIABLE. Every field below comes
+        # from ONE detail read.
+        PR_DETAIL_CALLS=$((PR_DETAIL_CALLS + 1))
+        if ! api "repos/${SIBLING_REPO}/pulls/${target}"; then
+          unknown "Could not read ${SIBLING_REPO}#${target}"
+        fi
+
+        declaration_invalid() {
+          echo "::error::Declared adaptation ${SIBLING_REPO}#${target} is invalid: ${1}"
+          echo ""
+          echo "This is a RED about the DECLARATION, not an infra fault, and it deliberately"
+          echo "does NOT fall back to ${SIBLING_REPO} main: an author who declared something"
+          echo "wrong must see it rather than get a silent main build."
+          echo ""
+          echo "TO FIX — declare the adaptation correctly. Renaming a branch does nothing now."
+          echo "  1. Open the ${SIBLING_SHORT} PR this PR adapts to, BASED ON main."
+          echo "  2. Declare the pair with EITHER form (both are accepted, owner optional):"
+          echo "       on THIS PR:          coord:downstream-of=${SIBLING_SHORT}#<pr-number>"
+          echo "       on the sibling PR:   coord:upstream-of=${THIS_SHORT}#${PR_NUMBER}"
+          echo "     Use the coord-pr-label skill — it validates the namespace before sending."
+          echo "  3. Re-run this workflow. The runner has no 'labeled' trigger, so applying a"
+          echo "     label does not re-fire CI by itself: push a commit or re-run manually."
+          echo ""
+          echo "Do NOT bypass this with an admin merge."
+          exit 1
+        }
+
+        case "${API_STATUS}" in
+          200) : ;;
+          404)
+            # A genuinely-404'd declaration is a RED about the declaration, not
+            # an infra fault. Reporting it as infra would be the same confusion
+            # the rc-2/rc-128 split exists to prevent, inverted.
+            declaration_invalid "no such pull request (HTTP 404). Check the number." ;;
+          403|429) unknown "Rate-limited reading ${SIBLING_REPO}#${target}" ;;
+          *) unknown "Unexpected status reading ${SIBLING_REPO}#${target}" ;;
+        esac
+        expect_json object "Reading ${SIBLING_REPO}#${target}"
+
+        state="$(printf '%s' "${API_BODY}" | jq -r '.state')"
+        base_ref="$(printf '%s' "${API_BODY}" | jq -r '.base.ref')"
+        head_ref="$(printf '%s' "${API_BODY}" | jq -r '.head.ref')"
+        head_sha="$(printf '%s' "${API_BODY}" | jq -r '.head.sha')"
+        head_repo="$(printf '%s' "${API_BODY}" | jq -r '.head.repo.full_name // ""')"
+
+        echo "  state     = ${state}"
+        echo "  base.ref  = ${base_ref}"
+        echo "  head.ref  = ${head_ref}"
+        echo "  head.sha  = ${head_sha}"
+        echo "  head.repo = ${head_repo}"
+
+        if [ "${state}" != "open" ]; then
+          declaration_invalid "it is '${state}', not 'open'. If this ${SIBLING_SHORT} PR has ALREADY LANDED, remove the label — it no longer applies. (coord does not always strip a waiting-side dep label when a parent fast-forward-lands.)"
+        fi
+
+        # A PR based on another feature branch AUTO-CLOSES UNLANDED when its
+        # parent lands, so accepting one would let this gate go green on a
+        # declaration that can silently evaporate.
+        if [ "${base_ref}" != "main" ]; then
+          declaration_invalid "it is based on '${base_ref}', not 'main'. A PR based on a feature branch auto-closes UNLANDED when its parent lands, so the declaration can silently evaporate."
+        fi
+
+        # The schemas twin omits this check and it is a latent fork hole there
+        # too. Fetching a fork's head SHA from the BASE repo does not work: the
+        # object is not reachable from the upstream, so the fetch would fail
+        # (or, under the old clone-by-name contract, silently match an
+        # unrelated same-named upstream branch — the exact defect this action
+        # removes). Relaxing this means fetching from the FORK's remote, which
+        # is a separate, independently reviewable change.
+        if [ "${head_repo}" != "${SIBLING_REPO}" ]; then
+          declaration_invalid "its head is on '${head_repo}', not '${SIBLING_REPO}'. A fork's head commit is not fetchable from the upstream."
+        fi
+
+        REF="${head_ref}"
+        SHA="${head_sha}"
+        echo "Using ${SIBLING_REPO} ref: ${REF} (declared adaptation ${SIBLING_REPO}#${target}, head ${SHA})"
+
+        # --- Vacuity assertion. ----------------------------------------------
+        # A non-main ref emitted without a PR-detail read would mean the
+        # validation above never ran. As the code stands this is UNREACHABLE —
+        # the counter is incremented immediately before the only detail read, on
+        # the only path that can set a non-main REF — so it is a guard against a
+        # future refactor that grows a second way to set REF, not a live check.
+        # Keep it; it costs nothing and it is the assertion that would catch the
+        # refactor going wrong.
+        if [ "${REF}" != "main" ] && [ "${PR_DETAIL_CALLS}" -eq 0 ]; then
+          echo "::error::Emitted a non-main ref without reading the declared PR's detail — refusing a vacuous resolution."
+          exit 1
+        fi
+
+        emit
+
+    # ------------------------------------------------------------------------
+    # Materialise the sibling HERE, rather than leaving 11 consumers to each
+    # `git clone --depth 1 --branch "$SCHEMAS_REF"`. See the PHASE B block in
+    # the header for why the clone-by-branch contract had to go.
+    #
+    # Verified before this was written: Phase 0 probe target 2b proved
+    # `git init` + `fetch --depth 1 origin <sha>` + `checkout FETCH_HEAD`
+    # resolves a PR head SHA from the base repo (PROBE-2B-RC=0).
+    - id: materialise
+      shell: bash
+      env:
+        SIBLING_REPO: ${{ inputs.repo }}
+        TARGET_PATH: ${{ inputs.path }}
+        REF: ${{ steps.resolve.outputs.ref }}
+        SHA: ${{ steps.resolve.outputs.sha }}
+      run: |
+        set -euo pipefail
+
+        name="${SIBLING_REPO##*/}"
+
+        if [ -n "${TARGET_PATH:-}" ]; then
+          dest="${TARGET_PATH}"
+        else
+          # Historical layout: a sibling of the runner checkout. Cargo/poetry
+          # path deps are written relative to it (../../qontinui-schemas/rust).
+          # Resolved through `cd … && pwd` rather than by string concatenation
+          # because GITHUB_WORKSPACE is a BACKSLASHED WINDOWS PATH on the
+          # windows-latest legs (`test`, `Clippy (windows)`, `repro-build`);
+          # `cd "$GITHUB_WORKSPACE/.."` is the idiom every consumer used and is
+          # therefore the one proven to work under Git Bash's path translation.
+          dest="$(cd "${GITHUB_WORKSPACE}/.." && pwd)/${name}"
+        fi
+
+        if [ -e "${dest}" ]; then
+          echo "::error::${dest} already exists — refusing to overwrite a checkout that is already there."
+          echo "This action now checks the sibling out ITSELF. If a consumer step still runs its"
+          echo "own 'git clone …/${name}.git' or an actions/checkout of ${SIBLING_REPO}, delete it —"
+          echo "that is the duplicated contract this action exists to remove."
+          exit 1
+        fi
+
+        # Fetch the SHA when we have one (a validated declared adaptation), the
+        # branch otherwise (the no-declaration path, which resolves to the
+        # default branch and has no PR head SHA to pin to). Both go through
+        # `--depth 1` on an EXPLICIT refspec: nothing is inferred from the
+        # remote's HEAD.
+        target="${SHA:-}"
+        kind="sha"
+        if [ -z "${target}" ]; then target="${REF}"; kind="branch"; fi
+
+        echo "Checking out ${SIBLING_REPO} @ ${target} (${kind}) into ${dest}"
+        mkdir -p "${dest}"
+        git init -q "${dest}"
+        git -C "${dest}" remote add origin "https://github.com/${SIBLING_REPO}.git"
+        # Refname/SHA via env and "$target", never spliced — same injection
+        # discipline the resolve step keeps (property 1).
+        git -C "${dest}" fetch --depth 1 --no-tags origin "${target}"
+        git -C "${dest}" checkout -q FETCH_HEAD
+
+        got="$(git -C "${dest}" rev-parse HEAD)"
+        echo "Checked out ${SIBLING_REPO} at ${got}"
+
+        # If we asked for an exact SHA we must have got exactly it. A mismatch
+        # means the fetch resolved something else, which is precisely the class
+        # of silent substitution this plan removes.
+        if [ "${kind}" = "sha" ] && [ "${got}" != "${SHA}" ]; then
+          echo "::error::Asked for ${SHA} but checked out ${got} — refusing a substituted tree."
+          exit 1
+        fi

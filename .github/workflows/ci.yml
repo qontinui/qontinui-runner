@@ -99,27 +99,23 @@ jobs:
       # qontinui-schemas, qontinui-web, and ui-bridge are public org-owned
       # repos; the default github.token authenticates the clone, no PAT needed.
       #
-      # The schemas clone is pinned to the ref resolved below rather than the
-      # default branch, so a breaking types change can go green as a DECLARED
-      # pair instead of deadlocking: label the coord dep edge between this PR
-      # and its qontinui-schemas PR (either direction) and the resolver checks
-      # that PR out. Branch NAMES no longer resolve anything — a name is not an
-      # identity, and matching on one let an un-PR'd scratch branch satisfy the
-      # mirror gate in production on 2026-07-28. See
-      # .github/actions/resolve-schemas-ref/action.yml for the full rationale.
-      - name: Resolve sibling qontinui-schemas ref
-        id: schemas-ref
-        uses: ./.github/actions/resolve-schemas-ref
+      # qontinui-schemas is NOT cloned here — the action below checks it out
+      # itself, SHA-pinned. It goes to the DECLARED adaptation PR's head commit
+      # rather than the default branch, so a breaking types change can go green
+      # as a DECLARED pair instead of deadlocking: label the coord dep edge
+      # between this PR and its qontinui-schemas PR (either direction) and the
+      # action checks that PR out. Branch NAMES no longer resolve anything — a
+      # name is not an identity, and matching on one let an un-PR'd scratch
+      # branch satisfy the mirror gate in production on 2026-07-28. See
+      # .github/actions/checkout-sibling/action.yml for the full rationale.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
 
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
-          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
-          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
           git clone --depth 1 https://github.com/qontinui/qontinui-web.git
           git clone --depth 1 https://github.com/qontinui/ui-bridge.git
-        env:
-          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
         shell: bash
 
       - name: Setup pnpm
@@ -516,20 +512,15 @@ jobs:
 
       # Rust path-dep on ../../qontinui-schemas/rust + the SDK↔runner manifest
       # diff test read; same rationale as the `test` job's sibling checkout,
-      # including the declared-adaptation resolution for the schemas clone.
-      - name: Resolve sibling qontinui-schemas ref
-        id: schemas-ref
-        uses: ./.github/actions/resolve-schemas-ref
+      # including the declared-adaptation resolution for qontinui-schemas.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
 
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
-          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
-          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
           git clone --depth 1 https://github.com/qontinui/qontinui-web.git
           git clone --depth 1 https://github.com/qontinui/ui-bridge.git
-        env:
-          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
         shell: bash
 
       - name: Setup pnpm
@@ -697,21 +688,14 @@ jobs:
 
       # cargo audit walks the workspace and resolves path: deps. The runner's
       # src-tauri/Cargo.toml depends on `qontinui-types` from a sibling repo.
-      # Same multi-checkout pattern as the test job — including the
+      # Same sibling checkout as the test job — including the
       # declared-adaptation resolution, so `cargo audit` resolves the path dep
       # against the very tree the `test` job compiled. Frontend link: deps have
-      # moved to npm so ui-bridge no longer needs cloning here.
-      - name: Resolve sibling qontinui-schemas ref
-        id: schemas-ref
-        uses: ./.github/actions/resolve-schemas-ref
-
-      - name: Checkout sibling repos
-        run: |
-          cd "$GITHUB_WORKSPACE/.."
-          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
-          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
-        env:
-          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
+      # moved to npm so ui-bridge no longer needs cloning here, and schemas is
+      # the only sibling this job needs — hence no "Checkout sibling repos"
+      # step at all.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
 
       - name: Run security audit on Rust dependencies
         # Cargo.lock lives at the workspace root (./Cargo.lock), not under

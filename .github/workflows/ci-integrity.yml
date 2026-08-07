@@ -82,7 +82,7 @@ jobs:
           .github/workflows/schema-pg-sql-fresh.yml
           .github/workflows/qontinui-types-drift.yml
           .github/workflows/secret-scan.yml
-          .github/actions/resolve-schemas-ref/action.yml
+          .github/actions/checkout-sibling/action.yml
           EOF
 
           # Changed files in this PR (paths only). No checkout of untrusted

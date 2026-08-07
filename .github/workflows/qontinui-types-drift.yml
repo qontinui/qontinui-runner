@@ -41,7 +41,7 @@ on:
   # comment describes exactly this scenario in the opposite direction.
   #
   # Safe by construction — STILL TRUE, now for a stronger reason.
-  # `resolve-schemas-ref` keys on `github.event.pull_request.number`, which is
+  # `checkout-sibling` keys on `github.event.pull_request.number`, which is
   # empty on workflow_dispatch, so a dispatched run resolves the sibling to
   # qontinui-schemas `main` — which is precisely what a post-land status refresh
   # must compare against. This used to rest on `github.head_ref` merely HAPPENING
@@ -71,7 +71,7 @@ on:
       # depends on) never exercises it, so the edit lands unverified — which
       # is exactly how a drift check can rot into a vacuous green unnoticed.
       - ".github/workflows/qontinui-types-drift.yml"
-      - ".github/actions/resolve-schemas-ref/**"
+      - ".github/actions/checkout-sibling/**"
   push:
     branches: [main]
     paths:
@@ -84,7 +84,7 @@ on:
       # depends on) never exercises it, so the edit lands unverified — which
       # is exactly how a drift check can rot into a vacuous green unnoticed.
       - ".github/workflows/qontinui-types-drift.yml"
-      - ".github/actions/resolve-schemas-ref/**"
+      - ".github/actions/checkout-sibling/**"
 
 # Least-privilege, stated explicitly rather than inherited.
 #
@@ -129,16 +129,14 @@ jobs:
       # pair it must read the schemas branch that carries the regenerated
       # artifacts — otherwise it reds against main and tells you to do exactly
       # the coordination it just prevented.
-      - name: Resolve sibling qontinui-schemas ref
-        id: schemas-ref
-        uses: ./qontinui-runner/.github/actions/resolve-schemas-ref
-
-      - name: Checkout qontinui-schemas (sibling)
-        uses: actions/checkout@v5
+      #
+      # This job checks the runner out under `path: qontinui-runner`, so the
+      # sibling lives beside it at the workspace ROOT — not at the action's
+      # default `$GITHUB_WORKSPACE/../<name>`. Hence the explicit `path:`.
+      - name: Check out sibling qontinui-schemas
+        uses: ./qontinui-runner/.github/actions/checkout-sibling
         with:
-          repository: qontinui/qontinui-schemas
-          path: qontinui-schemas
-          ref: ${{ steps.schemas-ref.outputs.ref }}
+          path: ${{ github.workspace }}/qontinui-schemas
 
       # generate_types.sh runs `cargo build --bin export_schemas` which
       # links the runner lib (Tauri-dependent). Tauri 2.x on Linux probes
