@@ -1,3 +1,0 @@
-# LogSourcesSettings
-
-_(notes)_
