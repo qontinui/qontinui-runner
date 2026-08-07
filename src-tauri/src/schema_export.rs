@@ -761,6 +761,7 @@ pub fn export_all_schemas() -> Value {
     // default itself. ──
     add!("AgentCommand", qac::AgentCommand);
     add!("AgentCommandVersion", qac::AgentCommandVersion);
+    add!("AgentCommandError", qac::AgentCommandError);
 
     // ── qontinui-types: git_ops (coord-mediated GitOp federation —
     // plan 2026-05-24-federation-verify-and-gitop.md Phase 5) ──
@@ -878,10 +879,12 @@ mod tests {
         // ProcessStatusLite, SessionSource, SessionLite, GitCommitLite, GitLite,
         // PendingQuestion, HealthLevel, HealthLite) + the 2 agent-command types
         // (AgentCommand, AgentCommandVersion — plan
-        // 2026-07-29-account-versioned-agent-commands).
+        // 2026-07-29-account-versioned-agent-commands) + the 1 agent-command
+        // write-boundary error type (AgentCommandError — qontinui-schemas
+        // commit b6c471ea, "define the agent-command write boundary").
         // Independently corroborated by the codegen, which reports
-        // "Processing 543 top-level types" and emits 543 .d.ts files.
-        assert_eq!(obj.len(), 543, "Expected 543 schema entries");
+        // "Processing 544 top-level types" and emits 544 .d.ts files.
+        assert_eq!(obj.len(), 544, "Expected 544 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
