@@ -21277,6 +21277,20 @@ CREATE INDEX idx_alerts_machine ON coord.alerts USING btree (device_id) WHERE (d
 
 
 --
+-- Name: idx_alerts_paged; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_alerts_paged ON coord.alerts USING btree (paged_at) WHERE (paged_at IS NOT NULL);
+
+
+--
+-- Name: idx_alerts_red_main_flake_healed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_alerts_red_main_flake_healed ON coord.alerts USING btree (kind) WHERE ((kind = 'red_main'::text) AND ((detail ->> 'suspected_flake'::text) = 'true'::text));
+
+
+--
 -- Name: idx_alerts_tenant_id; Type: INDEX; Schema: coord; Owner: -
 --
 
