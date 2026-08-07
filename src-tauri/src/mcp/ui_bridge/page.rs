@@ -23,7 +23,10 @@ use super::types::UiBridgeError;
 use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
-use super::helpers::{direct_webview_evaluate_with_result, evaluate_js_expression, safe_evaluate};
+use super::helpers::{
+    direct_webview_evaluate_with_result, evaluate_js_expression, return_expression_js,
+    safe_evaluate,
+};
 use super::request::{
     multi_window_dispatch_enabled, ui_bridge_request_sync, wrap_ipc_result, MAIN_WINDOW_LABEL,
     TARGET_WINDOW_FIELD,
@@ -157,6 +160,13 @@ pub struct PageEvaluateRequest {
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     /// When true, if the expression returns a Promise the runner awaits it.
+    ///
+    /// Only affects the **direct-eval fallback**
+    /// (`helpers.rs::direct_webview_evaluate_with_result`), which is reached
+    /// when the tagged IPC path fails for the main window. The tagged path
+    /// itself always auto-awaits regardless of this flag, because handing back
+    /// an unresolved Promise there just structured-clones to `{}` — a
+    /// success envelope carrying no data.
     #[serde(default)]
     pub await_promise: bool,
     /// When true, the frontend returns a consistent discriminated
@@ -654,7 +664,6 @@ const DEFAULT_PAGE_EVALUATE_TIMEOUT_MS: u64 = 10_000;
 async fn tagged_page_evaluate(
     state: &Arc<ApiState>,
     expression: &str,
-    await_promise: bool,
     timeout_ms: Option<u64>,
     unwrap: bool,
     allow_network_requests: bool,
@@ -687,7 +696,17 @@ async fn tagged_page_evaluate(
     let mut payload = serde_json::json!({
         "request_id": request_id,
         "expression": expression,
-        "await_promise": await_promise,
+        // `timeout_ms` is the caller's clamped budget and the frontend awaits a
+        // top-level Promise for exactly this long, so neither end gives up
+        // before the other. (It used to ignore the field and cap every await at
+        // a fixed 30 s, which made the documented 600000 ceiling unreachable.)
+        //
+        // `await_promise` is deliberately NOT forwarded: this flow always
+        // auto-awaits, so the frontend never read it. Not awaiting would return
+        // a bare Promise that structured-clones to `{}` — a success envelope
+        // with no data. `awaitPromise` still applies to the direct-eval
+        // fallback in `helpers.rs`, which can legitimately report
+        // `"[object Promise]"`.
         "timeout_ms": timeout_ms,
         // Forward unwrap so the frontend evaluate handler can emit the
         // discriminated {value, type} shape when requested. When unwrap is
@@ -816,10 +835,13 @@ async fn page_evaluate_inner(
         window_label, preview
     );
 
+    // NOTE: `await_promise` is not passed to the tagged path — that flow always
+    // auto-awaits (see the emit payload comment in `tagged_page_evaluate`). It
+    // is still honored by the `direct_webview_evaluate_with_result` fallback
+    // below, which is the only place the flag changes anything.
     let ipc_result = tagged_page_evaluate(
         &state,
         &expression,
-        await_promise,
         timeout_ms,
         unwrap,
         allow_network_requests,
@@ -1132,13 +1154,58 @@ pub async fn ui_bridge_page_evaluate_safe_handler(
     let preview: String = request.expression.chars().take(80).collect();
     info!("UI Bridge API: Safe evaluate ({}...)", preview);
 
-    match safe_evaluate(&state, &format!("return {}", request.expression)).await {
+    // `safe_evaluate` embeds this string as a function BODY, so the expression
+    // has to be spliced into a `return` position. Build that through
+    // `return_expression_js` rather than `format!("return {}", …)`: the naive
+    // concatenation lets automatic semicolon insertion swallow any expression
+    // starting with a newline, answering `success: true` with an empty result.
+    match safe_evaluate(&state, &return_expression_js(&request.expression)).await {
         Ok(data) => Ok(Json(ApiResponse::success(data))),
         Err(e) => Err((
             StatusCode::BAD_REQUEST,
             Json(api_error(format!("JS evaluation error: {}", e))),
         )),
     }
+}
+
+/// Build the single combined JS expression that `evaluate-batch` sends over
+/// the legacy `page_evaluate` IPC: each sub-expression runs inside its own
+/// try/catch IIFE, and the whole set is returned as a JSON string.
+///
+/// Two splice hazards are handled here, both of which used to corrupt results
+/// silently:
+///
+/// - Each sub-expression goes through [`return_expression_js`], so an
+///   expression starting with a newline is no longer truncated by automatic
+///   semicolon insertion (which reported `success: true, value: null` for it)
+///   and one ending in a line comment can no longer swallow the rest of the
+///   generated line — which, in a batch, meant taking EVERY LATER EXPRESSION
+///   in the array down with it.
+/// - Each `id` is emitted via `serde_json::to_string` as a proper JS string
+///   literal instead of a hand-rolled `"` escape, so an id containing a
+///   backslash, newline, or quote can't break out of the literal. JSON
+///   strings are a strict subset of JS strings, so the output is always a
+///   valid literal.
+fn build_batch_expression_js(expressions: &[BatchExpression]) -> String {
+    let js_parts: Vec<String> = expressions
+        .iter()
+        .map(|expr| {
+            // `to_string` on a String only fails for non-UTF-8 / cyclic input,
+            // neither of which a deserialized `String` can be — but avoid the
+            // unwrap anyway and fall back to an empty-string literal.
+            let id_literal =
+                serde_json::to_string(&expr.id).unwrap_or_else(|_| "\"\"".to_string());
+            format!(
+                r#"(() => {{ try {{ var v = (function() {{ {} }})(); return {{ id: {}, success: true, value: v === undefined ? null : v }}; }} catch(e) {{ return {{ id: {}, success: false, error: e.message }}; }} }})()"#,
+                return_expression_js(&expr.expression),
+                id_literal,
+                id_literal,
+            )
+        })
+        .collect();
+
+    let combined = format!("return JSON.stringify([{}])", js_parts.join(","));
+    format!("(() => {{ {} }})()", combined)
 }
 
 /// POST /ui-bridge/control/page/evaluate-batch
@@ -1162,20 +1229,8 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
         ));
     }
 
-    // Build a single JS expression that evaluates all sub-expressions
-    // and returns an array of results.
-    let mut js_parts = Vec::new();
-    for expr in request.expressions.iter() {
-        js_parts.push(format!(
-            r#"(() => {{ try {{ var v = (function() {{ return {}; }})(); return {{ id: "{}", success: true, value: v === undefined ? null : v }}; }} catch(e) {{ return {{ id: "{}", success: false, error: e.message }}; }} }})()"#,
-            expr.expression,
-            expr.id.replace('"', r#"\""#),
-            expr.id.replace('"', r#"\""#),
-        ));
-    }
-
-    let combined = format!("return JSON.stringify([{}])", js_parts.join(","));
-    let payload = serde_json::json!({ "expression": format!("(() => {{ {} }})()", combined) });
+    let payload =
+        serde_json::json!({ "expression": build_batch_expression_js(&request.expressions) });
 
     match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
         Ok(data) => {
@@ -1948,6 +2003,96 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/ai/page-summary"),
         ("POST", "/ui-bridge/ai/page-summary"),
     ]
+}
+
+#[cfg(test)]
+mod batch_expression_js_tests {
+    //! Regression tests for the JS `evaluate-batch` emits.
+    //!
+    //! The frontend fix for `/control/page/evaluate` (`compileEvaluateExpression`)
+    //! could not reach this endpoint: `evaluate-batch` assembles its own JS
+    //! program in Rust and sends the *assembled* program as the expression, so
+    //! each sub-expression is spliced into a `return` position here, before the
+    //! frontend ever sees it. These tests pin the two splice invariants.
+
+    use super::{build_batch_expression_js, BatchExpression};
+
+    fn expr(id: &str, expression: &str) -> BatchExpression {
+        BatchExpression {
+            id: id.to_string(),
+            expression: expression.to_string(),
+        }
+    }
+
+    /// THE REGRESSION, batch flavour. `return\n({a:1})` is ASI-truncated, so
+    /// `v` is `undefined` and the batch entry reports `success: true` with a
+    /// null value — a per-expression silent false green.
+    #[test]
+    fn leading_newline_sub_expression_stays_on_the_return_line() {
+        let js = build_batch_expression_js(&[expr("a", "\n({a:1})")]);
+        assert!(
+            js.contains("return ({a:1})"),
+            "sub-expression must not be pushed onto its own line: {js}"
+        );
+        assert!(
+            !js.contains("return \n"),
+            "no `return` may be left dangling before a newline: {js}"
+        );
+    }
+
+    /// A sub-expression ending in a line comment used to comment out the rest
+    /// of the emitted line — which holds the entry's own `};` AND every later
+    /// expression in the array. One commented expression took the whole batch
+    /// down with it.
+    #[test]
+    fn trailing_line_comment_does_not_swallow_the_rest_of_the_batch() {
+        let js = build_batch_expression_js(&[expr("a", "1 // note"), expr("b", "2")]);
+        // The second entry must still be reachable, i.e. it must not sit on
+        // the same line as the first entry's trailing comment.
+        let comment_line = js
+            .lines()
+            .find(|l| l.contains("// note"))
+            .expect("comment line present");
+        assert!(
+            !comment_line.contains("id: \"b\""),
+            "later batch entries must not be commented out: {comment_line}"
+        );
+        assert!(
+            js.contains("id: \"b\""),
+            "second entry must be emitted: {js}"
+        );
+    }
+
+    /// Ids are emitted as JSON string literals, so a quote/backslash/newline in
+    /// an id can't break out of the literal and corrupt the program.
+    #[test]
+    fn ids_are_emitted_as_json_string_literals() {
+        let js = build_batch_expression_js(&[expr(r#"we"ird\one"#, "1")]);
+        assert!(
+            js.contains(r#"id: "we\"ird\\one""#),
+            "id must be a properly escaped JS literal: {js}"
+        );
+        assert!(
+            !js.contains(r#"id: "we"ird"#),
+            "raw quote must not survive unescaped: {js}"
+        );
+    }
+
+    /// The envelope the response parser expects is unchanged.
+    #[test]
+    fn emitted_program_shape_is_preserved() {
+        let js = build_batch_expression_js(&[expr("a", "1"), expr("b", "2")]);
+        assert!(js.starts_with("(() => { return JSON.stringify(["));
+        assert!(js.ends_with("]) })()"));
+        assert!(js.contains("success: true"));
+        assert!(js.contains("error: e.message"));
+    }
+
+    #[test]
+    fn empty_batch_emits_an_empty_array() {
+        let js = build_batch_expression_js(&[]);
+        assert_eq!(js, "(() => { return JSON.stringify([]) })()");
+    }
 }
 
 #[cfg(test)]

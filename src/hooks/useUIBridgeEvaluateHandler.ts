@@ -14,7 +14,7 @@
  *     v
  * This Hook
  *     | compileEvaluateExpression(expression)()  (security-gated)
- *     | awaitWithTimeout(result, PAGE_EVALUATE_PROMISE_TIMEOUT_MS)
+ *     | awaitWithTimeout(result, resolveEvaluateTimeoutMs(timeout_ms))
  *     v
  * This Hook
  *     | emit("ui-bridge:evaluate-response", { request_id, ok, result, error })
@@ -34,9 +34,10 @@
  * dedicated event pair (`ui-bridge:evaluate-request` / `-response`) so
  * concurrent HTTP callers never observe each other's results.
  *
- * SECURITY: The same expression-pattern allowlist used by the legacy
- * `page_evaluate` handler in `usePageEvents.ts` is applied here. Any change
- * to one handler's blocklist MUST be mirrored in the other.
+ * SECURITY: The expression-pattern blocklist applied here is the SAME
+ * `ui-bridge-events/utils::checkEvaluateBlocklist` the legacy `page_evaluate`
+ * handler in `usePageEvents.ts` gates on — one array, not two copies to keep
+ * in step. A pattern added there covers both routes automatically.
  */
 
 import { useEffect } from "react";
@@ -46,8 +47,9 @@ import { createLogger } from "@/lib/logger";
 import { getErrorMessage } from "@/lib/utils";
 import {
   awaitWithTimeout,
+  checkEvaluateBlocklist,
   compileEvaluateExpression,
-  PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+  resolveEvaluateTimeoutMs,
 } from "./ui-bridge-events/utils";
 import { acquireSingletonListener } from "./ui-bridge-events/singleton-listener";
 import { evaluateRequestDedupe } from "./ui-bridge-events/request-dedupe";
@@ -57,7 +59,22 @@ const log = createLogger("UIBridgeEvaluateHandler");
 interface EvaluateRequestPayload {
   request_id: string;
   expression: string;
-  await_promise?: boolean;
+  /**
+   * The caller's `timeoutMs`, already clamped to [1000, 600000] by
+   * `page.rs::ui_bridge_page_evaluate_handler`, or the Rust-side default
+   * (10 s) when the caller omitted it. This is exactly how long the Rust
+   * dispatcher will wait for the response, so the handler awaits a
+   * top-level Promise for the same budget — see
+   * {@link resolveEvaluateTimeoutMs}. Absent → the 30 s default cap.
+   *
+   * There is deliberately no `await_promise` field. The Rust side used to
+   * forward one and nothing here read it: this flow ALWAYS auto-awaits,
+   * because not awaiting would hand the caller a bare Promise that
+   * structured-clones to `{}` — the same empty-result-with-success failure
+   * the expression compiler exists to prevent. `awaitPromise` still means
+   * something on the direct-eval fallback (`helpers.rs`), which can return
+   * `"[object Promise]"` instead.
+   */
   timeout_ms?: number;
   /**
    * When true, emit the discriminated `{value, type}` shape instead of
@@ -101,52 +118,16 @@ interface EvaluateResponsePayload {
 }
 
 /**
- * Structural code-injection blocks — always enforced. Mirrors the
- * structural set in `usePageEvents.ts::checkEvaluateBlocklist`. See that
- * file for per-entry rationale. Deliberately allows:
- * localStorage/sessionStorage (tab navigation), globalThis/Reflect/Proxy
- * (deep inspection). `location.reload` is blocked for the same reason the
- * `page_refresh` handler refuses to reload: a full page reload tears down
- * all React state (auth, execution, the terminal tree), orphaning every
- * live PTY session.
+ * Throwing wrapper over the shared {@link checkEvaluateBlocklist} gate. The
+ * patterns themselves live in `ui-bridge-events/utils` and are the SAME array
+ * objects the legacy `usePageEvents.ts::page_evaluate` branch gates on — this
+ * file used to keep a hand-maintained copy under a "MUST be mirrored" comment,
+ * which is a drift hazard with a security blast radius.
  */
-const STRUCTURAL_PATTERNS: RegExp[] = [
-  /\bimport\s*\(/,
-  /\brequire\s*\(/,
-  /\b__proto__\b/,
-  /\bconstructor\s*\[/,
-  /\beval\s*\(/,
-  /\bnew\s+Function\b/,
-  /\bdocument\.cookie\b/,
-  /\bwindow\.open\b/,
-  /\bwindow\.location\.(assign|replace|reload)\b/,
-  /\bwindow\.location\s*=/,
-  /\blocation\.(assign|replace|reload)\b/,
-  /\bhistory\.go\s*\(\s*0?\s*\)/,
-  /\blocation\s*=\s*["'`]/,
-  /\bcrypto\.subtle\b/,
-];
-
-/**
- * Network-related blocks — relaxed when the caller passes
- * `allowNetworkRequests: true` so test assertions can hit runner APIs
- * directly without the brittle `window["fet"+"ch"]` workaround.
- */
-const NETWORK_PATTERNS: RegExp[] = [
-  /\bfetch\s*\(/,
-  /\bXMLHttpRequest\b/,
-  /\bnavigator\.sendBeacon\b/,
-  /\bWebSocket\b/,
-];
-
 function rejectIfDangerous(expression: string, allowNetworkRequests: boolean): void {
-  const patterns = allowNetworkRequests
-    ? STRUCTURAL_PATTERNS
-    : [...STRUCTURAL_PATTERNS, ...NETWORK_PATTERNS];
-  for (const pattern of patterns) {
-    if (pattern.test(expression)) {
-      throw new Error(`Expression rejected: contains prohibited pattern (${pattern.source})`);
-    }
+  const matched = checkEvaluateBlocklist(expression, allowNetworkRequests);
+  if (matched) {
+    throw new Error(`Expression rejected: contains prohibited pattern (${matched.source})`);
   }
 }
 
@@ -158,15 +139,19 @@ function rejectIfDangerous(expression: string, allowNetworkRequests: boolean): v
  * automatic semicolon insertion), falling back to a bare `return` wrap and
  * then to a raw function body for statement-style input (top-level
  * `let`/`const` + explicit `return`). Top-level Promises (and any
- * thenable) are auto-awaited with a {@link PAGE_EVALUATE_PROMISE_TIMEOUT_MS}
- * cap so `(async () => ...)()` and `Promise.resolve(...)` patterns return
- * their resolved value rather than the bare Promise object (which would
- * serialize to `{}`). Mirrors the sibling
- * `usePageEvents.ts::page_evaluate` branch.
+ * thenable) are auto-awaited so `(async () => ...)()` and
+ * `Promise.resolve(...)` patterns return their resolved value rather than
+ * the bare Promise object (which would serialize to `{}`). Mirrors the
+ * sibling `usePageEvents.ts::page_evaluate` branch.
+ *
+ * `timeoutMs` is the caller's budget for that await, resolved by
+ * {@link resolveEvaluateTimeoutMs} from the request's `timeout_ms` — the
+ * same value the Rust dispatcher is waiting on, so neither side gives up
+ * before the other.
  */
-async function evaluateExpression(expression: string): Promise<unknown> {
+async function evaluateExpression(expression: string, timeoutMs: number): Promise<unknown> {
   const result = compileEvaluateExpression(expression)();
-  return await awaitWithTimeout(result, PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
+  return await awaitWithTimeout(result, timeoutMs);
 }
 
 /**
@@ -234,7 +219,10 @@ export async function handleEvaluateRequest(
   } else {
     try {
       rejectIfDangerous(expression, allow_network_requests === true);
-      const resolved = await evaluateExpression(expression);
+      const resolved = await evaluateExpression(
+        expression,
+        resolveEvaluateTimeoutMs(payload.timeout_ms),
+      );
       if (unwrap === true) {
         // Opt-in consistent shape: always `{ value, type }`. Mirrors the
         // sibling unwrap branch in usePageEvents.ts::page_evaluate. Rust
