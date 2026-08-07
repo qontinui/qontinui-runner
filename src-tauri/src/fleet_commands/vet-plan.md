@@ -535,8 +535,14 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    UUID, skip the continuation spawn but still register the gate
    (continuation-less) and note it in the report.
 3. **Check for an existing gate** anchored to this work unit
-   (`GET $COORD_HTTP_URL/coord/gates?work_unit_id=<id>` — find an OPEN `unit_ready`
-   gate for this plan). If one exists, **refresh** it (re-register / update the
+   (`GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>` — find an OPEN
+   `unit_ready` gate for this plan). Mind the `agent-` prefix: the unprefixed
+   `GET /coord/gates` is the operator dashboard's `TenantId`-tier route and answers
+   a device JWT **403 `tenant_not_resolved`** — the same wrong-door trap Step A
+   describes below, and the same verb-not-prefix split (the gate `POST`s keep their
+   own paths; only the `GET`s have an `agent-` door). Both run the same
+   `list_gates_core` body and take the same filters, so nothing else here changes.
+   If one exists, **refresh** it (re-register / update the
    continuation) rather than creating a duplicate. **Before refreshing, cancel
    the prior gate's PENDING continuation** so the old queued runner-terminal spawn
    does not fire alongside the new one: for any row in that GET with
@@ -790,7 +796,9 @@ leave it in the report.
   note the gate_id in the report.
 - **Anchor (zero user input):** `work_unit_id` (a UUID) from
   `POST $COORD_HTTP_URL/coord/work-units/upsert` with the plan stem as `slug`
-  (capture the returned `work_unit_id`; or `GET /coord/work-units/<slug>`);
+  (capture the returned `work_unit_id`; or `GET /coord/agent-work-units/<slug>` →
+  `.work_unit.id` — the `agent-` read door, since the unprefixed `GET` is
+  `TenantId`-tier and 403s a device JWT);
   `phase_name` from the relevant phase/section heading. Anchor = (work_unit_id,
   phase_name).
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
@@ -858,7 +866,11 @@ leave it in the report.
   `deploy_healthy`; wait-on-CI → `ci_green`; burn-in → `time_elapsed`; metric →
   `metric_threshold` (explicit `labels` — e.g. `coord_ci_runner_count` MUST filter
   `{status:"idle"}`); a vetted plan that is ready, dispatchable work → `unit_ready`
-  `{work_unit_id, ready_status}` (**NOT** `operator_approval` — `operator_approval`
+  `{work_unit_id, ready_status}` — transition the unit FIRST and set `ready_status`
+  to the status that actually landed (`vetted`, else the Free fallback
+  `vetted_unattested`); a hardcoded Attested value on a unit you own never clears,
+  since an owner may not attest (§5.4 has the full procedure; canonical:
+  `_gate-registration`) — (**NOT** `operator_approval` — `operator_approval`
   is for genuine human decisions, not a work queue); schema/alembic-at-head →
   `migration_at_head` `{schema}`; infra drift cleared → `infra_drift_clear`; a repo
   file/workflow existing → `file_exists` `{repo,path,on_ref?}` (contents, not refs);
@@ -880,14 +892,14 @@ leave it in the report.
   lost on 2026-07-26, four of them `coord_register_gate`), run **`/coord-revive`**
   for a typed verdict naming the door that is live right now, re-issue there, then
   **verify by read** (`coord_gate_inspect(gate_id)`, or the anchor filter
-  `GET .../coord/gates?work_unit_id=<uuid>&phase_name=<name>`). A retry's success is
+  `GET .../coord/agent-gates?work_unit_id=<uuid>&phase_name=<name>`). A retry's success is
   never evidence the original landed. The same applies to `coord_attest_gate` below.
   Canonical: `_gate-registration` → "Dead-transport honesty".
 - The plan-file `## Gates` block is a **local convenience mirror only** — coord is
   the source of truth; never require it, never read it back as authoritative.
 - **Re-registering for the same plan/anchor:** first cancel the prior gate's
   PENDING continuation (the §5.4 refresh-cancel rule applies to any
-  continuation-carrying gate too) — `GET .../coord/gates?work_unit_id=<id>` for rows
+  continuation-carrying gate too) — `GET .../coord/agent-gates?work_unit_id=<id>` for rows
   with `continuation_dispatched_at != null ∧ continuation_consumed_at == null ∧
   continuation_cancelled_at == null`, then
   `POST .../coord/gates/:gate_id/continuation-cancel {cancelled_by, reason}`
@@ -900,7 +912,8 @@ registered gate was watching, it MUST attest that gate (otherwise an agent-fact
 gate rots open until a human clicks it).
 
 - **Find the gate:** by the `gate_id` recorded at registration, or by lookup
-  `GET $COORD_HTTP_URL/coord/gates?work_unit_id=<id>&phase_name=<name>` — the OPEN
+  `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>&phase_name=<name>` (the
+  device-authed read door — the unprefixed `/coord/gates` 403s a device JWT) — the OPEN
   gate whose condition the completed work satisfies.
 - **Attest (unchanged — keyed by `gate_id`):** prefer MCP `coord_attest_gate` (pass
   `gate_id` — works from a device session since attest takes no upsert); fall back to
