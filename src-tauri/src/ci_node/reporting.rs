@@ -5,9 +5,18 @@
 //!   `{"lines": ["..."], "progress_seq": N}` — batched (2s / 50 lines),
 //!   `progress_seq` strictly monotonic per dispatch.
 //! - `POST {coord}/coord/ci/dispatches/{dispatch_id}/result` with
-//!   `{"conclusion", "summary": {"steps": [...]}, "log_tail"}` — retried
-//!   with backoff (the same never-drop-the-verdict discipline as the agent
-//!   log POST retry queue; coord's lease sweeper covers the truly-lost case).
+//!   `{"conclusion", "summary": {"steps": [...]}, "log_tail",
+//!   "test_results": {"format", "raw"}?}` — retried with backoff (the same
+//!   never-drop-the-verdict discipline as the agent log POST retry queue;
+//!   coord's lease sweeper covers the truly-lost case). Coord answers
+//!   `{"state", "test_results": {parsed, persisted, failed} | {rejected} |
+//!   null}`.
+//!
+//! `test_results` carries this dispatch's JUnit report and NOTHING that says
+//! what it is about — no repo, no head sha, no tenant. Coord attributes it
+//! from its own dispatch row. That is what lets this lane use the device JWT
+//! rather than the fleet-wide `COORD_INGEST_TOKEN`, which must never be
+//! shipped to a customer machine; see [`super::junit`] before changing it.
 //!
 //! Auth posture: **device-JWT bearer on every POST** (plan §4.3). Coord
 //! mounts both routes behind `require_jwt` and 403s any caller whose JWT
@@ -370,9 +379,38 @@ async fn flusher_loop(
     }
 }
 
+/// Proof that a dispatch's result POST has been ATTEMPTED to completion —
+/// i.e. coord accepted it, refused it terminally, or the bounded retry
+/// schedule was exhausted.
+///
+/// This is a capability token, not a status: it exists so the dispatch
+/// worktree cannot be deleted before the reporting step has run. The report
+/// carries the JUnit artifact, and the JUnit artifact lives INSIDE the
+/// worktree, so "clean up, then report" silently destroys coord's Tier-7 gate
+/// input — the exact bug this type makes unrepresentable. The only way to mint
+/// one is [`post_result`], and the only consumer is
+/// `executor::DispatchWorkspace::cleanup`.
+///
+/// Do not derive `Default`, `Clone` or `Copy` on this, and do not construct it
+/// outside this module — every one of those would reopen the ordering hole.
+#[must_use = "a dispatch's worktree may only be cleaned up once its result has been reported"]
+pub(crate) struct ResultReported(());
+
 /// POST the final result, retrying on the [`RESULT_RETRY_SECS`] schedule.
-/// `summary_extra_reason` adds a `reason` key next to `steps` (used for
-/// admission rejections).
+/// `reason` adds a `reason` key next to `steps` (used for admission
+/// rejections).
+///
+/// `test_results` is this dispatch's captured JUnit artifact
+/// ([`super::junit::capture`]). It is a REQUIRED parameter — `None` is
+/// spelled explicitly at the call sites that genuinely have no artifact
+/// (admission rejections, pre-checkout failures) — because an optional
+/// parameter with a default is exactly how the artifact went missing before:
+/// the file was emitted, then deleted, and nothing in the type system noticed.
+///
+/// The artifact carries NO attribution (`{format, raw}` only). Coord derives
+/// repo/head-sha/tenant from its own dispatch row, which is why this lane can
+/// use the device JWT instead of the fleet-wide `COORD_INGEST_TOKEN` — see
+/// [`super::junit`].
 pub(crate) async fn post_result(
     coord_base: &str,
     dispatch_id: &str,
@@ -380,7 +418,8 @@ pub(crate) async fn post_result(
     steps: &[StepSummary],
     reason: Option<&str>,
     log_tail: &str,
-) {
+    test_results: Option<&super::junit::TestArtifact>,
+) -> ResultReported {
     let url = format!(
         "{}/coord/ci/dispatches/{}/result",
         coord_base.trim_end_matches('/'),
@@ -390,29 +429,40 @@ pub(crate) async fn post_result(
     if let Some(r) = reason {
         summary["reason"] = serde_json::Value::String(r.to_string());
     }
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "conclusion": conclusion,
         "summary": summary,
         "log_tail": log_tail,
     });
+    if let Some(artifact) = test_results {
+        // Serialization of a `{format: &'static str, raw: String}` cannot fail;
+        // the `if let` is belt-and-braces so a future field can never turn a
+        // reportable verdict into a dropped one.
+        if let Ok(v) = serde_json::to_value(artifact) {
+            body["test_results"] = v;
+        }
+    }
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
     else {
         warn!("ci_node: reqwest client build failed; result POST skipped");
-        return;
+        return ResultReported(());
     };
     let mut attempts = 0usize;
     loop {
+        let mut ok_body: Option<String> = None;
         let status = match device_bearer().await {
-            Some(bearer) => client
-                .post(&url)
-                .bearer_auth(bearer)
-                .json(&body)
-                .send()
-                .await
-                .ok()
-                .map(|r| r.status().as_u16()),
+            Some(bearer) => match client.post(&url).bearer_auth(bearer).json(&body).send().await {
+                Ok(resp) => {
+                    let code = resp.status().as_u16();
+                    if (200..300).contains(&code) {
+                        ok_body = resp.text().await.ok();
+                    }
+                    Some(code)
+                }
+                Err(_) => None,
+            },
             None => {
                 warn!("ci_node: no device JWT for result POST (dispatch {dispatch_id})");
                 None
@@ -421,7 +471,14 @@ pub(crate) async fn post_result(
         match result_post_disposition(status) {
             PostDisposition::Done => {
                 debug!("ci_node: result POST ok dispatch={dispatch_id} conclusion={conclusion}");
-                return;
+                // Coord echoes what it did with the artifact. Surfaced at WARN
+                // when it rejected one: a runner that captured a report and a
+                // coord that stored nothing must be visible HERE, not inferred
+                // days later from a fail-closed credibility tier.
+                if let Some(note) = test_results_note(ok_body.as_deref(), test_results.is_some()) {
+                    warn!("ci_node: dispatch {dispatch_id} {note}");
+                }
+                return ResultReported(());
             }
             PostDisposition::TerminalConflict => {
                 // Coord already holds a terminal state (e.g. the lease
@@ -432,14 +489,14 @@ pub(crate) async fn post_result(
                     "ci_node: result POST for dispatch {dispatch_id} conflicted (409) — \
                      coord already recorded a terminal state; dropping"
                 );
-                return;
+                return ResultReported(());
             }
             PostDisposition::GiveUp => {
                 warn!(
                     "ci_node: result POST for dispatch {dispatch_id} rejected \
                      (status {status:?}) — non-retryable; dropping"
                 );
-                return;
+                return ResultReported(());
             }
             PostDisposition::Retry => {}
         }
@@ -450,7 +507,7 @@ pub(crate) async fn post_result(
                 attempts + 1,
                 dispatch_id
             );
-            return;
+            return ResultReported(());
         }
         let delay = RESULT_RETRY_SECS[attempts];
         warn!(
@@ -462,6 +519,55 @@ pub(crate) async fn post_result(
     }
 }
 
+/// Turn coord's result-POST response into a WARN-worthy note about the test
+/// artifact, or `None` when there is nothing worth saying.
+///
+/// PURE over the response body so the "did the artifact land?" reporting is
+/// unit-testable without a coord. Three cases matter:
+/// - we sent an artifact and coord REJECTED it (`{"rejected": reason}`) — loud;
+/// - we sent an artifact and coord parsed it into ZERO rows — loud, because a
+///   zero-row ingest leaves the credibility tier fail-closed just as an absent
+///   artifact would, and the two look identical downstream;
+/// - we sent an artifact and coord persisted rows — silent (the happy path).
+pub(crate) fn test_results_note(body: Option<&str>, sent_artifact: bool) -> Option<String> {
+    if !sent_artifact {
+        return None;
+    }
+    let Some(body) = body else {
+        return Some(
+            "sent a test-results artifact but coord's response was unreadable — \
+             cannot confirm the Tier-7 gate input landed"
+                .to_string(),
+        );
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Some(
+            "sent a test-results artifact but coord's response was not JSON — \
+             cannot confirm the Tier-7 gate input landed"
+                .to_string(),
+        );
+    };
+    let Some(tr) = v.get("test_results") else {
+        return Some(
+            "sent a test-results artifact but coord's response carried no `test_results` key — \
+             the coord on the other end predates artifact transport"
+                .to_string(),
+        );
+    };
+    if let Some(reason) = tr.get("rejected").and_then(|r| r.as_str()) {
+        return Some(format!("test-results artifact REJECTED by coord: {reason}"));
+    }
+    let persisted = tr.get("persisted").and_then(|p| p.as_u64()).unwrap_or(0);
+    if persisted == 0 {
+        let parsed = tr.get("parsed").and_then(|p| p.as_u64()).unwrap_or(0);
+        return Some(format!(
+            "test-results artifact ingested but persisted 0 of {parsed} parsed rows — \
+             coord's credibility tier will still fail closed for this head"
+        ));
+    }
+    None
+}
+
 /// Fire-and-forget a `cancelled` result with a reason and no steps — the
 /// admission-rejection path (hard reject / disk floor / cancelled-while-
 /// queued).
@@ -471,13 +577,16 @@ pub(crate) fn post_cancelled_result_detached(
     reason: String,
 ) {
     tokio::spawn(async move {
-        post_result(
+        // No artifact by construction: admission rejects BEFORE any checkout
+        // exists, so there is no worktree that could have produced a report.
+        let _reported = post_result(
             &coord_base,
             &dispatch_id,
             "cancelled",
             &[],
             Some(&reason),
             "",
+            None,
         )
         .await;
     });
@@ -564,6 +673,73 @@ mod tests {
             assert_eq!(result_post_disposition(Some(s)), PostDisposition::Retry);
         }
         assert_eq!(result_post_disposition(None), PostDisposition::Retry);
+    }
+
+    /// Coord's echo is the runner's only confirmation that the Tier-7 gate
+    /// input actually landed. Silence is reserved for the happy path.
+    #[test]
+    fn coord_artifact_echo_is_loud_on_every_non_happy_path() {
+        // Nothing sent ⇒ nothing to say (the log already carries the capture
+        // outcome via `junit::CaptureOutcome::log_line`).
+        assert_eq!(test_results_note(Some(r#"{"state":"succeeded"}"#), false), None);
+
+        // Happy path: rows landed ⇒ silent.
+        assert_eq!(
+            test_results_note(
+                r#"{"state":"succeeded","test_results":{"parsed":42,"persisted":42,"failed":0}}"#
+                    .into(),
+                true
+            ),
+            None
+        );
+
+        // Rejected ⇒ names the reason.
+        let note = test_results_note(
+            r#"{"state":"succeeded","test_results":{"rejected":"artifact_too_large"}}"#.into(),
+            true,
+        )
+        .expect("a rejection must be reported");
+        assert!(note.contains("artifact_too_large"), "{note}");
+
+        // Parsed but persisted nothing ⇒ the gate still fails closed, so loud.
+        let note = test_results_note(
+            r#"{"state":"succeeded","test_results":{"parsed":7,"persisted":0,"failed":7}}"#.into(),
+            true,
+        )
+        .expect("a zero-persist ingest must be reported");
+        assert!(note.contains("fail closed"), "{note}");
+
+        // A coord with no artifact support, an unreadable body, and non-JSON
+        // are all distinguishable from success.
+        assert!(test_results_note(Some(r#"{"state":"succeeded"}"#), true).is_some());
+        assert!(test_results_note(None, true).is_some());
+        assert!(test_results_note(Some("<html>502</html>"), true).is_some());
+    }
+
+    /// The result body pins the artifact under `test_results` with exactly the
+    /// two keys coord's `validate_test_artifact` reads — and the artifact is
+    /// absent from the body entirely when there is none.
+    #[test]
+    fn result_body_carries_the_artifact_under_test_results() {
+        let artifact = super::super::junit::TestArtifact {
+            format: super::super::junit::FORMAT_JUNIT_XML,
+            raw: "<testsuites/>".to_string(),
+        };
+        let mut body = serde_json::json!({
+            "conclusion": "success",
+            "summary": {"steps": []},
+            "log_tail": "",
+        });
+        body["test_results"] = serde_json::to_value(&artifact).unwrap();
+        assert_eq!(body["test_results"]["format"], "junit_xml");
+        assert_eq!(body["test_results"]["raw"], "<testsuites/>");
+
+        let without = serde_json::json!({
+            "conclusion": "success",
+            "summary": {"steps": []},
+            "log_tail": "",
+        });
+        assert!(without.get("test_results").is_none());
     }
 
     #[test]

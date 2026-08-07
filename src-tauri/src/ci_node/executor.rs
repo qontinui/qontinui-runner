@@ -23,6 +23,28 @@
 //! validated; both abort the dispatch on failure, because a step that
 //! silently ran without its declared tool or sibling produces a verdict that
 //! looks like a code failure and is not.
+//!
+//! ## Capture-before-cleanup (type-enforced, not conventional)
+//!
+//! The steps' JUnit report lives INSIDE the dispatch worktree that
+//! [`super::checkout::cleanup_dispatch`] deletes, and it is coord's Tier-7
+//! credibility-gate input. "Clean up, then report" therefore destroys the
+//! artifact before anything can send it — which is precisely what happened
+//! before this seam existed, and it was invisible because the dispatch itself
+//! still went green.
+//!
+//! So the ordering is expressed in the types rather than in the statement
+//! order of one function:
+//!
+//! 1. [`super::junit::capture`] returns a value;
+//! 2. [`super::reporting::post_result`] takes that value as a REQUIRED
+//!    parameter and is the only minter of [`reporting::ResultReported`];
+//! 3. [`DispatchWorkspace::cleanup`] CONSUMES a `ResultReported` and is the
+//!    only caller of `cleanup_dispatch`.
+//!
+//! There is no way to reach cleanup without having gone through reporting, and
+//! no way to report without having been handed the capture slot. Re-breaking
+//! this requires deleting a type, not reordering two lines.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -81,6 +103,37 @@ impl CiJob {
     }
 }
 
+/// The on-disk footprint of one dispatch, and the ONLY thing that may remove
+/// it.
+///
+/// [`cleanup`](DispatchWorkspace::cleanup) consumes a
+/// [`reporting::ResultReported`] receipt, which only
+/// [`reporting::post_result`] can mint. That makes "reported, then cleaned up"
+/// the only expressible order — see the module docs for why the reverse order
+/// is a silent, green-looking data-loss bug.
+struct DispatchWorkspace {
+    root: PathBuf,
+    repo: String,
+    dispatch_id: String,
+}
+
+impl DispatchWorkspace {
+    fn new(root: &Path, repo: &str, dispatch_id: &str) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            repo: repo.to_string(),
+            dispatch_id: dispatch_id.to_string(),
+        }
+    }
+
+    /// Remove the dispatch's worktree and dispatch root. Consumes both `self`
+    /// and the reporting receipt, so it can run at most once per dispatch and
+    /// never before the result (with its JUnit artifact) has been POSTed.
+    async fn cleanup(self, _reported: reporting::ResultReported) {
+        super::checkout::cleanup_dispatch(&self.root, &self.repo, &self.dispatch_id).await;
+    }
+}
+
 /// Outcome of one step.
 #[derive(Debug, PartialEq, Eq)]
 enum StepOutcome {
@@ -136,6 +189,10 @@ pub(crate) async fn run_dispatch(
 
     let mut steps_summary: Vec<StepSummary> = Vec::new();
     let started = Instant::now();
+    // Everything on disk this dispatch owns. Only `workspace.cleanup(receipt)`
+    // may remove it, and a receipt only exists after `post_result` — so no
+    // path out of this function can delete the JUnit before it is sent.
+    let workspace = DispatchWorkspace::new(&root, &payload.repo, &payload.dispatch_id);
 
     // ── Checkout ──
     sink.push(&format!(
@@ -162,17 +219,19 @@ pub(crate) async fn run_dispatch(
                 duration_secs: checkout_started.elapsed().as_secs(),
             });
             let tail = sink.finish().await;
-            reporting::post_result(
+            // No artifact: the checkout never completed, so no step ever ran.
+            let reported = reporting::post_result(
                 &base,
                 &payload.dispatch_id,
                 "failure",
                 &steps_summary,
                 None,
                 &tail,
+                None,
             )
             .await;
             // prepare_worktree may have left a partial worktree behind.
-            super::checkout::cleanup_dispatch(&root, &payload.repo, &payload.dispatch_id).await;
+            workspace.cleanup(reported).await;
             return;
         }
     };
@@ -193,16 +252,18 @@ pub(crate) async fn run_dispatch(
                 duration_secs: 0,
             });
             let tail = sink.finish().await;
-            reporting::post_result(
+            // No artifact: the manifest was rejected, so no step ever ran.
+            let reported = reporting::post_result(
                 &base,
                 &payload.dispatch_id,
                 "failure",
                 &steps_summary,
                 None,
                 &tail,
+                None,
             )
             .await;
-            super::checkout::cleanup_dispatch(&root, &payload.repo, &payload.dispatch_id).await;
+            workspace.cleanup(reported).await;
             return;
         }
     };
@@ -244,16 +305,20 @@ pub(crate) async fn run_dispatch(
                 duration_secs: 0,
             });
             let tail = sink.finish().await;
-            reporting::post_result(
+            // No artifact: provisioning aborts BEFORE the first step, so any
+            // JUnit under the warm `.ci-target` cache belongs to a PREVIOUS
+            // dispatch and must never be attributed to this head.
+            let reported = reporting::post_result(
                 &base,
                 &payload.dispatch_id,
                 "failure",
                 &steps_summary,
                 None,
                 &tail,
+                None,
             )
             .await;
-            super::checkout::cleanup_dispatch(&root, &payload.repo, &payload.dispatch_id).await;
+            workspace.cleanup(reported).await;
             return;
         }
     };
@@ -316,17 +381,29 @@ pub(crate) async fn run_dispatch(
         payload.dispatch_id
     );
 
+    // ── Capture the JUnit BEFORE the worktree can be removed ──
+    //
+    // Ordered here, ahead of `sink.finish()`, so the capture outcome reaches
+    // coord in this dispatch's own progress stream AND its log_tail. Unconditional
+    // on `conclusion`: a RED suite's report is exactly the evidence the
+    // credibility gate needs, and a cancelled/timed-out step may still have
+    // written a partial one worth ingesting.
+    let capture = super::junit::capture(&worktree, &ci_target_dir, &manifest.steps);
+    sink.push(&capture.log_line());
+
     let tail = sink.finish().await;
-    reporting::post_result(
+    let reported = reporting::post_result(
         &base,
         &payload.dispatch_id,
         conclusion,
         &steps_summary,
         None,
         &tail,
+        capture.artifact(),
     )
     .await;
-    super::checkout::cleanup_dispatch(&root, &payload.repo, &payload.dispatch_id).await;
+    // The receipt is the only key to cleanup; the artifact is already sent.
+    workspace.cleanup(reported).await;
 }
 
 /// Provision what the manifest declares. Returns the tool directories to
@@ -739,6 +816,61 @@ mod tests {
             .next_back()
             .expect("present");
         assert_eq!(last.1, "1");
+    }
+
+    /// Capture-before-cleanup, asserted on the observable consequence rather
+    /// than on statement order: cleanup really does destroy the JUnit, so if
+    /// the two ever swap back the report is gone.
+    ///
+    /// (The compile-time half of this guarantee is `DispatchWorkspace::cleanup`
+    /// consuming a `reporting::ResultReported`, which only `post_result` mints
+    /// and which `post_result` cannot be called without passing the capture
+    /// slot. This test covers the runtime half: that the file is genuinely
+    /// inside what cleanup removes.)
+    #[test]
+    fn cleanup_destroys_the_junit_so_capture_must_precede_it() {
+        let base = std::env::temp_dir().join(format!("ci-order-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dispatch_id = "0198f2b4-1111-7aaa-bbbb-cccccccccccc";
+        let repo = "qontinui/qontinui-coord";
+
+        let worktree = super::super::checkout::ci_worktree_path(&base, dispatch_id, repo);
+        let dispatch_root = super::super::checkout::ci_dispatch_root(&base, dispatch_id);
+        let profile = worktree.join("target").join("nextest").join("ci-pr");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(
+            profile.join("junit.xml"),
+            "<testsuites><testcase name=\"t\" classname=\"c\"/></testsuites>",
+        )
+        .unwrap();
+
+        // The report is INSIDE the tree `cleanup_dispatch` removes — this is
+        // the whole reason the ordering is load-bearing.
+        assert!(
+            profile.join("junit.xml").starts_with(&dispatch_root),
+            "the JUnit must live inside the dispatch root cleanup deletes"
+        );
+
+        // Capture (the step that must come first) finds it.
+        let ci_target = base.join(".ci-target").join("qontinui-coord");
+        let captured = super::super::junit::capture(&worktree, &ci_target, &[]);
+        let artifact = captured
+            .artifact()
+            .expect("capture must find the report while the worktree exists");
+        assert!(artifact.raw.contains("<testcase"));
+
+        // After the dispatch root is gone, capture finds nothing — i.e. the
+        // reversed order yields an empty artifact and a silently fail-closed
+        // credibility tier.
+        std::fs::remove_dir_all(&dispatch_root).unwrap();
+        assert!(
+            super::super::junit::capture(&worktree, &ci_target, &[])
+                .artifact()
+                .is_none(),
+            "post-cleanup capture must find nothing — proving order matters"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The manifest-path structural gate (pre-canonicalize half).

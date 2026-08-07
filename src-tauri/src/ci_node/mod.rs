@@ -13,7 +13,16 @@
 //!   `tenant_id` claims against the dispatch row's assignee):
 //!   `POST {coord}/coord/ci/dispatches/{id}/progress` (batched log lines +
 //!   monotonic `progress_seq`) and `POST .../result` (`conclusion` +
-//!   per-step `summary` + ~32 KB `log_tail`).
+//!   per-step `summary` + ~32 KB `log_tail` + the optional `test_results`
+//!   JUnit artifact).
+//!
+//! That device-JWT binding is why the `test_results` artifact rides the
+//! RESULT route rather than coord's `/coord/test-results/ingest`: the latter
+//! is gated on `COORD_INGEST_TOKEN`, a fleet secret, and this lane runs on
+//! customers' machines. The result route proves WHICH device is reporting for
+//! WHICH dispatch, and coord already knows that dispatch's repo, sha and
+//! tenant — so the artifact carries no attribution at all and a runner cannot
+//! spoof another tenant's merge-gate inputs. See [`junit`].
 //!
 //! The executed commands come EXCLUSIVELY from the repo's own
 //! `.qontinui/ci.toml` at the dispatched SHA (coord supplies no commands —
@@ -29,6 +38,7 @@ pub(crate) mod admission;
 pub(crate) mod checkout;
 pub(crate) mod executor;
 pub(crate) mod host_sizing;
+pub(crate) mod junit;
 pub(crate) mod manifest;
 pub(crate) mod reporting;
 pub(crate) mod sibling;
