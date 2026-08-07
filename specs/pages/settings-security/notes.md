@@ -1,3 +1,0 @@
-# SecuritySettings
-
-_(notes)_
