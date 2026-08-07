@@ -1,3 +1,0 @@
-# CheckGroupsPage
-
-_(notes)_
