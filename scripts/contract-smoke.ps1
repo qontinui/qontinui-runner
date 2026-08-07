@@ -1056,9 +1056,20 @@ try {
 # ---------------------------------------------------------------------------
 # Summary.
 # ---------------------------------------------------------------------------
-$pass = ($results | Where-Object { $_.Status -eq "PASS" }).Count
-$fail = ($results | Where-Object { $_.Status -eq "FAIL" }).Count
-$skip = ($results | Where-Object { $_.Status -eq "SKIP" }).Count
+# @() around each filter is load-bearing, not style. `Where-Object` returns a
+# SCALAR when exactly one object matches, and `.Count` on a scalar PSCustomObject
+# yields $null here -- so a run with exactly ONE failure printed
+#   Smoke: 193 pass / 193 total, 8 skip
+#   SMOKE-COMPLETE exit=1 pass=193 fail= skip=8
+# i.e. a blank fail count and a total that EXCLUDED the failure, reading as fully
+# green while a probe had failed (observed on runner#1008, job 92967302466, where
+# POST /debug/highlight/:id failed on a dropped keep-alive). Two or more failures
+# happened to report correctly because that path returns an array. The exit code
+# was right throughout; it is the human-readable summary that lied, which is worse
+# -- that is the line a reader trusts. @() forces an array in every arity.
+$pass = @($results | Where-Object { $_.Status -eq "PASS" }).Count
+$fail = @($results | Where-Object { $_.Status -eq "FAIL" }).Count
+$skip = @($results | Where-Object { $_.Status -eq "SKIP" }).Count
 $total = $pass + $fail
 Write-Host ""
 Write-Host ("Smoke: {0} pass / {1} total, {2} skip" -f $pass, $total, $skip)
