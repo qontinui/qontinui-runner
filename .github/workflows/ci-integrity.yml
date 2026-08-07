@@ -20,9 +20,25 @@
 # the PR's changed-file LIST via the API. Permissions are read-only.
 #
 # Maintaining GATING_WORKFLOWS: list only files that exist and that actually
-# gate merges (the original guarded a non-existent `secret-scan.yml` — useless).
+# gate merges. Both halves of that rule bite, in opposite directions. The
+# original listed a `secret-scan.yml` that did not exist — a guard over nothing.
+# It was removed for that reason, the file later came BACK carrying the required
+# `Gitleaks Secret Detection` context, and the entry was never restored: from
+# then until 2026-08-06 the repo's secret-scanning gate was the one merge-gate an
+# agent PR could weaken with this guard staying green. So when a listed file is
+# dropped as non-existent, leave a note to re-add it if it returns — a removal
+# justified by "does not exist" is only correct while that stays true.
 # ci-integrity.yml guards itself, so removing a gate from this list is itself a
 # guarded edit (goes red -> operator review).
+#
+# Cross-check against the ruleset rather than intuition, since a workflow's own
+# header comment can drift:
+#   gh api repos/qontinui/qontinui-runner/rulesets/16044811 \
+#     --jq '.rules[]|select(.type=="required_status_checks")
+#           .parameters.required_status_checks[].context'
+# (`/branches/main/protection` 404s on this repo — gates are a RULESET, and that
+# 404 reads misleadingly like "no gates at all".) Every required context should
+# trace back to a workflow file listed below.
 name: CI Integrity
 
 on:
@@ -65,6 +81,7 @@ jobs:
           .github/workflows/clorinde-bindings-fresh.yml
           .github/workflows/schema-pg-sql-fresh.yml
           .github/workflows/qontinui-types-drift.yml
+          .github/workflows/secret-scan.yml
           .github/actions/resolve-schemas-ref/action.yml
           EOF
 
