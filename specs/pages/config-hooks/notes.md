@@ -1,3 +1,0 @@
-# HooksManagerPanel
-
-_(notes)_

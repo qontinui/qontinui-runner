@@ -274,35 +274,20 @@ pub fn materialize(
 /// reaper now actually runs ([`maybe_sweep_stale`]), and staleness across a
 /// runner update is an explicit check ([`identity_build_tag`]).
 pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
-<<<<<<< HEAD
-=======
     // Q5(b): the orphan reaper used to be invoked ONLY from `materialize`, the
     // flag-gated install-intercept path — dark by default — so identity dirs
     // leaked forever. It now hangs off THIS always-on path (rate-limited), which
     // is the only one every terminal actually takes.
     maybe_sweep_stale(base_dir);
 
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
     let dir = base_dir.join(format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag()));
     let marker = dir.join(IDENTITY_MARKER);
 
     // FAST PATH — a complete dir for THIS build already exists. Zero writes:
     // no scripts, no exe copies, no hardlink. This is what every spawn after the
     // first one costs.
-<<<<<<< HEAD
-    //
-    // The orphan sweep runs AFTER this, never before it: liveness is refreshed
-    // here, so sweeping first would let the very dir this call is about to
-    // PATH-prepend be reaped in the same call — the "no new terminal for >24h,
-    // then the operator opens one" case, where every live pane's PATH suddenly
-    // names a directory being `remove_dir_all`'d. See [`maybe_sweep_stale`].
     if let Ok(md) = std::fs::metadata(&marker) {
         refresh_identity_liveness(&marker, &md);
-        maybe_sweep_stale(base_dir);
-=======
-    if let Ok(md) = std::fs::metadata(&marker) {
-        refresh_identity_liveness(&marker, &md);
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         return Some(dir);
     }
 
@@ -350,44 +335,9 @@ pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
         dir = %dir.display(),
         "session-restore: materialized the shared identity shim dir for this runner build"
     );
-<<<<<<< HEAD
-    // Q5(b): the orphan reaper used to be invoked ONLY from `materialize`, the
-    // flag-gated install-intercept path — dark by default — so identity dirs
-    // leaked forever. It now hangs off THIS always-on path (rate-limited), which
-    // is the only one every terminal actually takes. Deliberately LAST: the dir
-    // we just wrote must exist and be current before anything sweeps.
-    maybe_sweep_stale(base_dir);
     Some(dir)
 }
 
-/// Re-touch THIS runner build's shared identity dir so the orphan sweeper can
-/// see that it is in use, driven by the runner's liveness poll rather than by a
-/// terminal spawn.
-///
-/// [`materialize_identity`] is the only other liveness source, and it only runs
-/// when a NEW terminal spawns. On a long-lived automation box — 20 panes open,
-/// no new pane opened for over [`STALE_SHIM_MAX_AGE`] — that made "in use" mean
-/// "someone spawned recently", which is not the same thing at all: the dir every
-/// live pane has PATH-prepended would age out and be reaped, and any `claude`
-/// launched afterwards would resolve the real binary instead of the shim and
-/// lose its `--session-id` pin, silently making that session unrestorable.
-/// Called from the 45s poll whenever ANY terminal is alive, so "in use" is a
-/// real signal. Costs one `stat` per tick and (at most) one marker write per
-/// [`IDENTITY_TOUCH_INTERVAL`].
-pub fn touch_identity_liveness(base_dir: &Path) {
-    let marker = base_dir
-        .join(format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag()))
-        .join(IDENTITY_MARKER);
-    if let Ok(md) = std::fs::metadata(&marker) {
-        refresh_identity_liveness(&marker, &md);
-    }
-}
-
-=======
-    Some(dir)
-}
-
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
 /// Content/version tag for the identity shim dir — the Q5(c) staleness check
 /// that had NO equivalent before.
 ///
@@ -854,13 +804,6 @@ pub fn sweep_stale(base_dir: &Path, max_age: std::time::Duration) {
         Ok(e) => e,
         Err(_) => return,
     };
-    // THIS process's own shared identity dir — never a sweep candidate, at any
-    // age. Belt-and-braces beside the ordering fix in [`materialize_identity`]:
-    // mtime liveness is a heuristic (a partial `remove_dir_all` on Windows can
-    // leave the dir present but missing files, with no marker, and the dir is
-    // shared by every live pane), whereas "this is the directory I am currently
-    // handing out on PATH" is a fact this process knows for certain.
-    let own_identity_dir = format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag());
     let mut removed = 0usize;
     for entry in entries.flatten() {
         if removed >= STALE_SWEEP_CAP {
@@ -869,9 +812,12 @@ pub fn sweep_stale(base_dir: &Path, max_age: std::time::Duration) {
         let path = entry.path();
         // Only our own per-terminal dirs (install-intercept OR always-on
         // identity).
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let is_ours = name.starts_with(SHIM_DIR_PREFIX) || name.starts_with(IDENTITY_DIR_PREFIX);
-        if !is_ours || name == own_identity_dir || !path.is_dir() {
+        let is_ours = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(SHIM_DIR_PREFIX) || n.starts_with(IDENTITY_DIR_PREFIX))
+            .unwrap_or(false);
+        if !is_ours || !path.is_dir() {
             continue;
         }
         // Age by the NEWEST mtime the dir carries — its own, or any file
@@ -1201,113 +1147,9 @@ mod tests {
              still running its shims"
         );
 
-<<<<<<< HEAD
-        // The sweep owns the identity dir's end-of-life, but never THIS
-        // process's own — see `sweep_never_reaps_this_builds_own_identity_dir`.
-        // A foreign build's identity dir at zero max-age still goes.
-        let foreign = tmp.path().join(format!("{IDENTITY_DIR_PREFIX}0ldbu1ld"));
-        std::fs::create_dir_all(&foreign).unwrap();
-        sweep_stale(tmp.path(), Duration::from_secs(0));
-        assert!(
-            !foreign.exists(),
-            "a previous build's identity dir is swept"
-        );
-        assert!(
-            identity.exists(),
-            "this build's own dir is never a candidate"
-        );
-    }
-
-    /// G2(3). The sweeper must never reap the identity dir THIS process is
-    /// handing out on every terminal's PATH — at any age.
-    ///
-    /// mtime liveness is a heuristic: the dir has no per-terminal owner, a
-    /// partial `remove_dir_all` on Windows (sharing violation on a running
-    /// `claude.exe`) can leave it present but missing files with no marker, and
-    /// a busy sibling runner instance sweeping the SHARED system temp dir would
-    /// otherwise age out an idle instance's dir. "This is the directory I am
-    /// currently PATH-prepending" is a fact, not a heuristic — so it wins.
-    #[test]
-    fn sweep_never_reaps_this_builds_own_identity_dir() {
-        use std::time::Duration;
-        let tmp = tempfile::tempdir().unwrap();
-        let own = materialize_identity(tmp.path()).expect("identity materialize");
-        // Zero max-age = "everything is stale". The own dir still survives.
-        sweep_stale(tmp.path(), Duration::from_secs(0));
-        assert!(
-            own.exists(),
-            "the dir every live pane has on its PATH must never be swept out from under them"
-        );
-        assert!(
-            own.join(IDENTITY_MARKER).exists(),
-            "and it must survive intact, not as a hollowed-out shell"
-        );
-    }
-
-    /// G2(1). The sweep must not run BEFORE the fast path that refreshes
-    /// liveness — on a box where no new terminal has spawned for longer than
-    /// `STALE_SHIM_MAX_AGE`, sweeping first would make the very dir this call is
-    /// about to return a candidate in the same call. Asserted end-to-end: even
-    /// with the rate limiter forced open and a zero-age policy in play, a
-    /// `materialize_identity` always returns a dir that EXISTS and is complete.
-    #[test]
-    fn materialize_identity_never_returns_a_dir_it_just_swept() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Force the rate limiter open so the sweep really runs in this call.
-        if let Ok(mut last) = LAST_SWEEP.lock() {
-            *last = None;
-        }
-        let dir = materialize_identity(tmp.path()).expect("first materialize");
-        assert!(dir.join(IDENTITY_MARKER).exists());
-
-        if let Ok(mut last) = LAST_SWEEP.lock() {
-            *last = None;
-        }
-        let again = materialize_identity(tmp.path()).expect("cached materialize");
-        assert_eq!(dir, again);
-        assert!(
-            again.join(IDENTITY_MARKER).exists(),
-            "the returned dir must still be complete after the in-call sweep"
-        );
-        for tool in IDENTITY_TOOLS {
-            assert!(again.join(tool).exists(), "{tool} shim must survive");
-        }
-    }
-
-    /// G2(2). Liveness is refreshable WITHOUT a terminal spawn — the runner's
-    /// 45s poll drives it whenever any terminal is alive, so "in use" stops
-    /// meaning "someone spawned recently".
-    #[test]
-    fn poll_driven_touch_refreshes_identity_liveness() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = materialize_identity(tmp.path()).expect("materialize");
-        let marker = dir.join(IDENTITY_MARKER);
-        // Backdate past the touch interval by rewriting the marker through a
-        // path that leaves an OLD mtime is not portable; instead assert the
-        // contract that matters: the touch is safe, idempotent, and leaves the
-        // marker in place (the write itself is gated by IDENTITY_TOUCH_INTERVAL).
-        touch_identity_liveness(tmp.path());
-        assert!(marker.exists(), "touch must never remove the marker");
-        let before = std::fs::read(&marker).unwrap();
-        touch_identity_liveness(tmp.path());
-        assert_eq!(std::fs::read(&marker).unwrap(), before, "idempotent");
-
-        // An absent dir (nothing materialized yet) is a silent no-op — the poll
-        // runs on every tick, including before the first terminal spawn.
-        let empty = tempfile::tempdir().unwrap();
-        touch_identity_liveness(empty.path());
-        assert!(
-            !empty
-                .path()
-                .join(format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag()))
-                .exists(),
-            "the touch must never CREATE the dir — materialize owns that"
-        );
-=======
         // sweep_stale still owns its end-of-life at zero max-age.
         sweep_stale(tmp.path(), Duration::from_secs(0));
         assert!(!identity.exists(), "stale identity dir swept");
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
     }
 
     /// Every terminal of one runner build reuses ONE content-addressed identity

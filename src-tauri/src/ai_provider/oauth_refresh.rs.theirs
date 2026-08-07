@@ -23,7 +23,6 @@ const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const REFRESH_LEAD_MS: i64 = 10 * 60 * 1000;
 
 /// Minimum spacing between background refresh ATTEMPTS for one credentials
-<<<<<<< HEAD
 /// file. A refresh that fails transiently (offline, 5xx) must not turn every
 /// subsequent spawn into another token POST.
 const REFRESH_RETRY_BACKOFF: Duration = Duration::from_secs(60);
@@ -36,20 +35,12 @@ const REFRESH_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 /// otherwise strand the account until restart. 6 hours.
 const REFRESH_HARD_FAIL_BACKOFF_CAP: Duration = Duration::from_secs(6 * 60 * 60);
 
-=======
-/// file. A refresh that fails (offline, revoked grant, 5xx) must not turn every
-/// subsequent spawn into another token POST.
-#[cfg_attr(test, allow(dead_code))]
-const REFRESH_RETRY_BACKOFF: Duration = Duration::from_secs(60);
-
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
 /// Per-credentials-file background-refresh bookkeeping.
 #[cfg_attr(test, allow(dead_code))]
 #[derive(Debug, Default)]
 struct RefreshState {
     in_flight: bool,
     last_attempt: Option<Instant>,
-<<<<<<< HEAD
     /// Fingerprint ([`token_fingerprint`]) of the refresh token the token
     /// endpoint rejected with a hard `invalid_grant`-class failure (400/401).
     ///
@@ -177,15 +168,6 @@ fn is_hard_grant_failure(status_code: u16, body: &str) -> bool {
     status_code == 401
 }
 
-=======
-}
-
-/// Background refresh state, keyed by credentials path.
-#[cfg_attr(test, allow(dead_code))]
-static REFRESH_STATE: once_cell::sync::Lazy<Mutex<HashMap<PathBuf, RefreshState>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
-
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
 /// Ask for a background OAuth refresh of `creds_path` and return IMMEDIATELY.
 ///
 /// This is the whole point of the module's redesign: the refresh used to run
@@ -233,18 +215,11 @@ fn spawn_background_refresh(creds_path: &Path) {
         if entry.in_flight {
             return;
         }
-<<<<<<< HEAD
         // Escalating spacing: flat 60s while failures look transient, doubling
         // per consecutive HARD failure so a permanently revoked grant stops
         // hammering the token endpoint once a minute forever.
         let backoff = retry_backoff(entry.hard_failures);
         if entry.last_attempt.is_some_and(|t| t.elapsed() < backoff) {
-=======
-        if entry
-            .last_attempt
-            .is_some_and(|t| t.elapsed() < REFRESH_RETRY_BACKOFF)
-        {
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
             return;
         }
         entry.in_flight = true;
@@ -470,11 +445,7 @@ pub(crate) fn refresh_credentials_blocking(creds_path: &Path) -> Option<String> 
 pub(crate) fn try_ensure_valid_credentials(config_dir: Option<&str>) {
     if let Some(path) = find_creds_path(config_dir) {
         let snap = read_creds_snapshot(&path);
-<<<<<<< HEAD
         if snap.needs_refresh(now_ms()) && snap.refreshable(&path) {
-=======
-        if snap.needs_refresh(now_ms()) && snap.has_refresh_token {
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
             debug!("OAuth token expiring — requesting background refresh (spawn is not blocked)");
             request_background_refresh(&path);
         }
@@ -564,7 +535,6 @@ fn macos_keychain_has_claude_credentials() -> bool {
 /// PROACTIVELY within [`REFRESH_LEAD_MS`] of expiry so a live account is
 /// normally refreshed long before any spawn could care.
 ///
-<<<<<<< HEAD
 /// The verdict, relative to the pre-Phase-6 blocking predicate:
 /// - unexpired → valid (as before);
 /// - expired with NO `refreshToken` → invalid, deterministically and with no
@@ -584,23 +554,12 @@ fn macos_keychain_has_claude_credentials() -> bool {
 ///   gated on `default_location_has_valid_credentials` would march into a 401
 ///   loop. The rejection is observed by the BACKGROUND refresh, so the spawn
 ///   path still never touches the network.
-=======
-/// The verdict is unchanged in both directions that matter:
-/// - unexpired → valid (as before);
-/// - expired with NO `refreshToken` → invalid, deterministically and with no
-///   network call (as before — the old inline refresh returned `None` there);
-/// - expired WITH a `refreshToken` → valid, where before it was "valid iff the
-///   inline refresh succeeded". The account is the one the operator has, the
-///   refresh is already in flight, and a lost race surfaces the provider's own
-///   auth prompt instead of an "no authenticated Claude account" abort.
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
 fn creds_path_is_valid(creds_path: &Path) -> bool {
     if !creds_path.exists() {
         return false;
     }
     let snap = read_creds_snapshot(creds_path);
     let now = now_ms();
-<<<<<<< HEAD
     let refreshable = snap.refreshable(creds_path);
     if snap.needs_refresh(now) && refreshable {
         request_background_refresh(creds_path);
@@ -609,15 +568,6 @@ fn creds_path_is_valid(creds_path: &Path) -> bool {
 }
 
 /// The facts every credential decision here needs, read in ONE parse.
-=======
-    if snap.needs_refresh(now) && snap.has_refresh_token {
-        request_background_refresh(creds_path);
-    }
-    !snap.is_expired(now) || snap.has_refresh_token
-}
-
-/// The two facts every credential decision here needs, read in ONE parse.
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
 ///
 /// Deliberately lenient: an unreadable or unparsable file, or one with no
 /// `expiresAt`, yields `expires_at_ms == 0` — "expiry unknown", treated as NOT
@@ -628,13 +578,10 @@ fn creds_path_is_valid(creds_path: &Path) -> bool {
 struct CredsSnapshot {
     expires_at_ms: i64,
     has_refresh_token: bool,
-<<<<<<< HEAD
     /// Fingerprint of the refresh token currently on disk (`0` = none). Lets
     /// the hard-failure verdict be keyed to the exact grant that was rejected,
     /// so a re-login self-heals — see [`RefreshState::hard_failed_token`].
     refresh_token_fp: u64,
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
 }
 
 impl CredsSnapshot {
@@ -646,7 +593,6 @@ impl CredsSnapshot {
     fn needs_refresh(&self, now_ms: i64) -> bool {
         self.expires_at_ms != 0 && now_ms >= self.expires_at_ms - REFRESH_LEAD_MS
     }
-<<<<<<< HEAD
 
     /// Is there a refresh token that could actually bring this account back?
     /// A token the server has already rejected cannot — see
@@ -654,8 +600,6 @@ impl CredsSnapshot {
     fn refreshable(&self, creds_path: &Path) -> bool {
         self.has_refresh_token && !grant_hard_failed(creds_path, self.refresh_token_fp)
     }
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
 }
 
 fn read_creds_snapshot(creds_path: &Path) -> CredsSnapshot {
@@ -666,7 +610,6 @@ fn read_creds_snapshot(creds_path: &Path) -> CredsSnapshot {
         return CredsSnapshot::default();
     };
     let oauth = &json["claudeAiOauth"];
-<<<<<<< HEAD
     let refresh_token_fp = oauth["refreshToken"]
         .as_str()
         .map(token_fingerprint)
@@ -675,13 +618,6 @@ fn read_creds_snapshot(creds_path: &Path) -> CredsSnapshot {
         expires_at_ms: oauth["expiresAt"].as_i64().unwrap_or(0),
         has_refresh_token: refresh_token_fp != 0,
         refresh_token_fp,
-=======
-    CredsSnapshot {
-        expires_at_ms: oauth["expiresAt"].as_i64().unwrap_or(0),
-        has_refresh_token: oauth["refreshToken"]
-            .as_str()
-            .is_some_and(|t| !t.is_empty()),
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
     }
 }
 
@@ -726,7 +662,6 @@ mod tests {
     /// (see [`request_background_refresh`]).
     pub(super) static REFRESH_REQUESTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-<<<<<<< HEAD
     /// Serializes every test that touches [`REFRESH_REQUESTS`]. The log is
     /// process-global while `cargo test` runs tests in parallel threads, so
     /// without this a peer test's queued refresh lands inside another test's
@@ -740,8 +675,6 @@ mod tests {
         REFRESH_LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
     /// Drain the recorded refresh requests.
     fn taken_refresh_requests() -> Vec<PathBuf> {
         std::mem::take(&mut *REFRESH_REQUESTS.lock().expect("refresh log"))
@@ -797,10 +730,7 @@ mod tests {
 
     #[test]
     fn has_valid_credentials_false_when_expired_and_no_refresh_token() {
-<<<<<<< HEAD
         let _log = refresh_log_guard();
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         // Empty refreshToken → nothing can bring the account back, so an
         // expired, unrefreshable account is rejected deterministically and no
         // refresh is even requested (no live HTTP in this unit test).
@@ -819,10 +749,7 @@ mod tests {
     /// inline token POST whose result decided the verdict.
     #[test]
     fn expired_but_refreshable_is_valid_and_only_queues_a_background_refresh() {
-<<<<<<< HEAD
         let _log = refresh_log_guard();
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         let _ = taken_refresh_requests();
         let (guard, path) = dir_with_creds(past_ms(), "rt-present");
         assert!(
@@ -843,10 +770,7 @@ mod tests {
     /// a spawn never meets a hard-expired token in the first place.
     #[test]
     fn near_expiry_token_is_valid_and_queues_a_proactive_refresh() {
-<<<<<<< HEAD
         let _log = refresh_log_guard();
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         let _ = taken_refresh_requests();
         let soon = now_ms() + REFRESH_LEAD_MS / 2;
         let (guard, path) = dir_with_creds(soon, "rt-present");
@@ -860,10 +784,7 @@ mod tests {
     /// A comfortably-live token must not generate any refresh traffic at all.
     #[test]
     fn healthy_token_queues_no_refresh() {
-<<<<<<< HEAD
         let _log = refresh_log_guard();
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         let _ = taken_refresh_requests();
         let (_guard, path) = dir_with_creds(future_ms(), "rt-present");
         assert!(has_valid_credentials(&path));
@@ -874,16 +795,12 @@ mod tests {
     /// UNKNOWN, which is not "expired", so the account is not demoted.
     #[test]
     fn unparsable_credentials_are_not_treated_as_expired() {
-<<<<<<< HEAD
         let _log = refresh_log_guard();
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         let _ = taken_refresh_requests();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".credentials.json"), b"{not json").expect("write");
         assert!(has_valid_credentials(&dir.path().to_string_lossy()));
         assert!(taken_refresh_requests().is_empty());
-<<<<<<< HEAD
     }
 
     /// G1 REGRESSION. A refresh token the server has REVOKED (logout
@@ -999,8 +916,6 @@ mod tests {
             prev = cur;
         }
         assert_eq!(retry_backoff(u32::MAX), REFRESH_HARD_FAIL_BACKOFF_CAP);
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
     }
 
     #[test]

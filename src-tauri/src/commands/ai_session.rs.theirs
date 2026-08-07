@@ -621,14 +621,11 @@ pub async fn create_ai_session(
                 );
             }
         }
-<<<<<<< HEAD
         teardown_coord_session_for_failed_task_run(
             &ai_coord_registrar,
             emitter_for_teardown.as_ref(),
             &task_run_id,
         );
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         return Ok(CommandResponse {
             success: false,
             message: Some("Failed to create task run record".to_string()),

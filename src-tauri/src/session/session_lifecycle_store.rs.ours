@@ -27,26 +27,6 @@
 //! `claude_session_id -> record`), rewritten atomically via temp-file +
 //! rename. Missing / corrupt file → empty map (a fresh registry is the safe
 //! default; the poll re-discovers live sessions).
-//!
-//! Durability is a **write-ahead log of per-record deltas** compacted into that
-//! snapshot — see [`LifecycleDelta`] and [`SessionLifecycleStore::compact`].
-//!
-//! ## Durability scope — PROCESS crash, not power loss
-//!
-//! The WAL survives the runner process dying: an appended line is one
-//! `write_all` into an append-mode handle, so a crash can only truncate the
-//! tail (which [`replay_wal`] drops), and compaction writes the snapshot before
-//! truncating the log, so a crash in between replays deltas the snapshot
-//! already holds — idempotent.
-//!
-//! It is deliberately NOT power-loss durable. Appends are **not `fsync`ed**:
-//! they sit in the OS page cache, so a host power cut or kernel panic can lose
-//! recently appended deltas even though the `write_all` returned. That is the
-//! accepted trade — an `fsync` per mutation would put a disk flush back on the
-//! terminal spawn path, which is exactly the cost this design removed, and the
-//! failure mode is bounded (a session record loses at most its latest state and
-//! the liveness poll re-discovers live sessions). Do not read the crash-safety
-//! ordering above as a power-loss guarantee.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -338,20 +318,6 @@ struct WalWriter {
     file: Option<std::fs::File>,
     /// Deltas appended since the last successful compaction.
     appends: usize,
-<<<<<<< HEAD
-    /// A mutation landed in the in-memory map but did NOT reach the WAL
-    /// (serialize failure, open failure, `write_all` failure, poisoned lock).
-    ///
-    /// Without this the store would be silently dirty-but-uncounted: the map is
-    /// already mutated, `appends` never moved, and `compact_if_dirty` gates on
-    /// `appends > 0` — so if that mutation were the LAST one before a crash it
-    /// would be lost outright. (The whole-map rewrite this replaced had no such
-    /// hole: the next mutation's rewrite carried the earlier one along.) Cleared
-    /// by a successful [`SessionLifecycleStore::compact`], which writes the
-    /// whole map and therefore captures it.
-    dirty: bool,
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
 }
 
 /// Durable map of `claude_session_id -> TerminalSessionRecord`.
@@ -1754,13 +1720,7 @@ impl SessionLifecycleStore {
     ///
     /// Best-effort exactly like the whole-map rewrite it replaces: a write
     /// failure is logged, not propagated — the in-memory map still reflects the
-<<<<<<< HEAD
-    /// mutation for this process. EVERY such failure sets
-    /// [`WalWriter::dirty`], so the idle compaction still folds the map to disk
-    /// rather than leaving the mutation dirty-but-uncounted.
-=======
     /// mutation for this process.
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
     #[must_use = "a full WAL must be compacted once the map lock is released"]
     fn wal_append(
         &self,
@@ -1773,12 +1733,6 @@ impl SessionLifecycleStore {
         let mut w = match self.wal.lock() {
             Ok(w) => w,
             Err(e) => {
-<<<<<<< HEAD
-                // A poisoned WAL lock is unrecoverable for BOTH the append and
-                // the compaction that would rescue it, so there is no dirty flag
-                // to usefully set here — the map stays authoritative in memory.
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
                 warn!(error = %e, "session_lifecycle_store: WAL lock poisoned — mutation kept in memory only");
                 return false;
             }
@@ -1792,10 +1746,6 @@ impl SessionLifecycleStore {
                 Ok(()) => buf.push(b'\n'),
                 Err(e) => {
                     warn!(error = %e, "session_lifecycle_store: WAL serialize failed — delta dropped");
-<<<<<<< HEAD
-                    w.dirty = true;
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
                     return false;
                 }
             }
@@ -1813,28 +1763,13 @@ impl SessionLifecycleStore {
                         path = %self.wal_path.display(),
                         "session_lifecycle_store: WAL open failed — mutation kept in memory only"
                     );
-<<<<<<< HEAD
-                    w.dirty = true;
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
                     return false;
                 }
             }
         }
-<<<<<<< HEAD
-        if w.file.is_none() {
-            // Unreachable in practice (the block above either opened the file or
-            // returned), but the dirty flag makes the impossible case honest
-            // rather than silently uncounted.
-            w.dirty = true;
-            return false;
-        }
-        let file = w.file.as_mut().expect("WAL handle present (checked above)");
-=======
         let Some(file) = w.file.as_mut() else {
             return false;
         };
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         if let Err(e) = file.write_all(&buf) {
             warn!(
                 error = %e,
@@ -1844,10 +1779,6 @@ impl SessionLifecycleStore {
             // Drop the handle so the next append re-opens rather than keeping
             // writing through a broken descriptor.
             w.file = None;
-<<<<<<< HEAD
-            w.dirty = true;
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
             return false;
         }
         w.appends += deltas.len();
@@ -1887,14 +1818,7 @@ impl SessionLifecycleStore {
             return; // keep the WAL: it is still the durable record
         }
         // Snapshot is on disk and renamed into place — the WAL is now redundant.
-<<<<<<< HEAD
-        // The rewrite serialized the WHOLE map, so it also captured any mutation
-        // that failed to reach the WAL (see [`WalWriter::dirty`]).
         w.file = None;
-        w.dirty = false;
-=======
-        w.file = None;
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         match std::fs::File::create(&self.wal_path) {
             Ok(_) => w.appends = 0,
             Err(e) => warn!(
@@ -1905,23 +1829,11 @@ impl SessionLifecycleStore {
         }
     }
 
-<<<<<<< HEAD
-    /// Fold the WAL into the snapshot when there is anything to fold. Called
-    /// from the liveness poll's heartbeat so an idle runner converges on a
-    /// compact snapshot without any mutation ever paying an O(N) rewrite.
-    ///
-    /// "Anything to fold" is appended deltas OR a mutation that never reached
-    /// the WAL at all ([`WalWriter::dirty`]) — gating on `appends` alone would
-    /// silently drop the latter.
-    fn compact_if_dirty(&self) {
-        let dirty = matches!(self.wal.lock(), Ok(w) if w.appends > 0 || w.dirty);
-=======
     /// Fold the WAL into the snapshot when it has anything in it. Called from
     /// the liveness poll's heartbeat so an idle runner converges on a compact
     /// snapshot without any mutation ever paying an O(N) rewrite.
     fn compact_if_dirty(&self) {
         let dirty = matches!(self.wal.lock(), Ok(w) if w.appends > 0);
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         if dirty {
             self.compact();
         }
@@ -2362,36 +2274,6 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
-    /// Age fields on the persisted registry that no public mutator can reach
-    /// (`closed_at`, `last_seen_at`), the WAL-model-correct way.
-    ///
-    /// Under the write-ahead log a mutation lands as ONE appended delta and the
-    /// JSON snapshot is only rewritten on compaction, so the pre-WAL idiom —
-    /// read the snapshot, edit it, write it back — read a stale (or, on a store
-    /// that has never compacted, an absent) file and then had the un-folded
-    /// deltas replayed straight back over the edit on the next `open`.
-    /// [`SessionLifecycleStore::compact`] first makes the snapshot the
-    /// authoritative copy and truncates the WAL, so the edit is the last word:
-    /// reopening the path afterwards loads exactly the tampered map.
-    ///
-    /// Callers must reopen the store afterwards — `store`'s in-memory map is
-    /// deliberately NOT updated, matching the "aged on disk, then restarted"
-    /// scenario every caller is reproducing.
-    fn age_persisted_records(
-        store: &SessionLifecycleStore,
-        path: &Path,
-        edit: impl FnOnce(&mut HashMap<String, TerminalSessionRecord>),
-    ) {
-        store.compact();
-        let raw = std::fs::read(path).unwrap();
-        let mut m: HashMap<String, TerminalSessionRecord> = serde_json::from_slice(&raw).unwrap();
-        edit(&mut m);
-        std::fs::write(path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
-    }
-
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
     // ── Write-ahead log (Phase 6, B1) ───────────────────────────────────────
     //
     // A mutation costs ONE appended delta line instead of a whole-map JSON
@@ -3540,10 +3422,15 @@ mod tests {
         let now = Utc::now().timestamp_millis();
 
         // Age the stale pty-exit record's closed_at past the grace window.
-        age_persisted_records(&store, &path, |m| {
+        {
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
             m.get_mut("stale-pty-exit-sess").unwrap().closed_at =
                 Some(now - RESTORABLE_PTY_EXIT_MS - 1000);
-        });
+            let bytes = serde_json::to_vec_pretty(&m).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let mut ids: Vec<String> = store
@@ -3722,15 +3609,29 @@ mod tests {
         store.record_close("recent-closed", "done");
         store.record_close("old-closed", "done");
 
+        // Hand-tamper timestamps via reload-mutate-rewrite would require
+        // internals; instead choose a `now` far in the future so the
+        // "old-closed" (closed_at ~ real now) is > 24h old, but tune the
+        // fresh ones to survive. We set last_seen far enough back below by
+        // re-recording with a manual now. Simpler: drive prune with a `now`
+        // chosen relative to the real timestamps we just wrote.
         let now = Utc::now().timestamp_millis();
 
-        // No public mutator can push `last_seen_at`/`closed_at` into the past,
-        // so age `stale-open` and `old-closed` past their thresholds on disk
-        // and let the reopen below load them.
-        age_persisted_records(&store, &path, |m| {
+        // Push the records we want pruned into the past by re-writing the
+        // file directly through the store's open/close round-trip is awkward;
+        // instead assert behavior with synthetic far-future `now` after
+        // forcibly aging two records.
+        // Age `stale-open` and `old-closed` beyond their thresholds.
+        {
+            // Reload, mutate ages in-place, persist via a fresh store write.
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
             m.get_mut("stale-open").unwrap().last_seen_at = now - OPEN_STALE_MS - 1000;
             m.get_mut("old-closed").unwrap().closed_at = Some(now - CLOSED_RETENTION_MS - 1000);
-        });
+            let bytes = serde_json::to_vec_pretty(&m).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
 
         // Reopen so the store loads the aged timestamps, then prune. No
         // terminal is live, so retention alone decides.
@@ -3782,7 +3683,10 @@ mod tests {
 
         let now = Utc::now().timestamp_millis();
         // Age both closed rows past retention and the open row past stale.
-        age_persisted_records(&store, &path, |m| {
+        {
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
             m.get_mut("closed-live-term").unwrap().closed_at =
                 Some(now - CLOSED_RETENTION_MS - 1_000);
             // An OLDER closed sibling under the same live terminal — only the
@@ -3792,7 +3696,8 @@ mod tests {
             m.get_mut("closed-gone-term").unwrap().closed_at =
                 Some(now - CLOSED_RETENTION_MS - 1_000);
             m.get_mut("open-live-term").unwrap().last_seen_at = now - OPEN_STALE_MS - 1_000;
-        });
+            std::fs::write(&path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+        }
 
         let store = SessionLifecycleStore::open(&path).unwrap();
         let live: HashSet<String> = ["term-live".to_string()].into_iter().collect();
@@ -4686,11 +4591,16 @@ mod tests {
 
         // Age `poll-dead-fresh` to now-30s (well inside grace) and
         // `poll-dead-stale` past the grace window.
-        age_persisted_records(&store, &path, |m| {
+        {
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
             m.get_mut("poll-dead-fresh").unwrap().closed_at = Some(now - 30_000);
             m.get_mut("poll-dead-stale").unwrap().closed_at =
                 Some(now - RESTORABLE_POLL_DEAD_MS - 1000);
-        });
+            let bytes = serde_json::to_vec_pretty(&m).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let ids: Vec<String> = store
@@ -4923,9 +4833,13 @@ mod tests {
 
         // Age `last_seen_at` so a refresh would be unmistakable.
         let aged = before.last_seen_at - 600_000;
-        age_persisted_records(&store, &path, |m| {
+        {
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
             m.get_mut("s1").unwrap().last_seen_at = aged;
-        });
+            std::fs::write(&path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+        }
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         store.rebind_terminal("s1", "term-fresh", 5);
