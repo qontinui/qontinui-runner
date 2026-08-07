@@ -1475,8 +1475,8 @@ supersedes unit_ready for the dependency-gated case".)
 - **Predicate choice:** wait-on-PR (non-coord repo) → `pr_merged`; work landing
   on a **coord-orchestrated repo** → `commit_live` `{repo, commit_sha}` with a
   **post-land main SHA** (NEVER a pre-land branch-head SHA — rebase-land rewrites
-  SHAs so the gate rots open, gate `c14d103c` 2026-07-11; or anchor `file_exists`/
-  `unit_status` instead); wait-on-deploy →
+  SHAs so the gate rots open, gate `c14d103c` 2026-07-11; or anchor `unit_status`
+  instead — **NOT `file_exists`, which is broken, see below**); wait-on-deploy →
   `deploy_healthy`; wait-on-CI → `ci_green`; burn-in / wait-N-days →
   `time_elapsed`; metric condition → `metric_threshold` (explicit `labels` — e.g.
   `coord_ci_runner_count` MUST filter `{status:"idle"}`); a vetted plan that is
@@ -1487,8 +1487,10 @@ supersedes unit_ready for the dependency-gated case".)
   (canonical: `_gate-registration`) — (**NOT**
   `operator_approval` — `operator_approval` is for genuine human decisions, not a
   work queue); schema/alembic-at-head → `migration_at_head` `{schema}`; infra drift
-  cleared → `infra_drift_clear`; a repo file/workflow existing → `file_exists`
-  `{repo,path,on_ref?}` (contents, not refs); a coord data count crossing a bound
+  cleared → `infra_drift_clear`; a repo file/workflow existing → ⛔ `file_exists`
+  is **KNOWN BROKEN (2026-08-05): 403s fleet-wide on the contents API, so the gate
+  can never clear — use `commit_live` (post-land SHA) or `unit_status`**;
+  a coord data count crossing a bound
   → `sql_count` `{query_id,op,n}` (whitelisted `query_id`, never raw SQL); an
   umbrella plan reaching a status → `unit_status` `{work_unit_id,status}`; another
   cross-anchor gate clearing → `gate_cleared` `{gate_id}`;
