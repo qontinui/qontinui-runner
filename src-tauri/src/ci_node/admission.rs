@@ -48,6 +48,20 @@ pub(crate) struct Headroom {
     /// [`MIN_FREE_COMMIT_GB`] rejects on, and the same one the A1 snapshot
     /// publishes as `commit_available_bytes`.
     pub(crate) commit_available_bytes: Option<u64>,
+    /// The machine owner's live-session WARN floor
+    /// ([`crate::settings::SessionGuardSettings::warn_free_commit_bytes`]), or
+    /// `None` when the session guard is switched off — the same "no readable
+    /// opinion" the other fields express when their sensor is dark.
+    ///
+    /// It is a **floor**, not a reading: the other fields say what the box has,
+    /// this one says what the box's owner has declared it needs to keep. See
+    /// [`MAX_SESSION_DEFER_FLOOR_GB`] for why a floor that protects interactive
+    /// sessions gets a vote on whether this box accepts CI work, and
+    /// [`defer_commit_floor_gb`] for how it is combined and clamped. It arrives
+    /// as an injected field rather than being read inside
+    /// [`headroom_defers`] so both that function and [`admission_decision`] stay
+    /// pure over their inputs.
+    pub(crate) session_warn_floor_bytes: Option<u64>,
 }
 
 impl Headroom {
@@ -104,6 +118,94 @@ pub(crate) const SWAP_DEFER_RATIO: f64 = 0.5;
 /// with an alternative should be the first to step back.
 pub(crate) const DEFER_FREE_COMMIT_GB: u64 = MIN_FREE_COMMIT_GB * 2;
 
+/// Ceiling (GiB) on how far the live-session warn floor may push
+/// [`DEFER_FREE_COMMIT_GB`] up.
+///
+/// ## Why a session floor may raise the CI defer band at all
+///
+/// `session_guard.warn_free_commit_bytes` is the level below which starting
+/// another **interactive** session on this box is unsafe (plan
+/// `2026-08-07-runner-resource-guard-and-session-protection`, Part C item 1;
+/// the overnight 2026-08-06→07 incident, where Claude Code sessions died inside
+/// runner-spawned terminals as commit charge was exhausted and nothing local
+/// was watching). Once the box is under that level, admitting a fresh CI
+/// dispatch spends precisely the headroom a live session needs — and it spends
+/// it on the lane that has an alternative. A deferred dispatch is one coord can
+/// hand to the other host; the human's session in front of the operator cannot
+/// be re-homed anywhere. That is the argument [`DEFER_FREE_COMMIT_GB`] already
+/// makes against the supervisor's 5 GiB build floor ("the lane with an
+/// alternative should be the first to step back"), carried one rung further
+/// out: CI steps back for a *session*, not only for another build.
+///
+/// The term can only ever RAISE the threshold, never lower it. A machine owner
+/// who sets a *low* warn floor is saying "warn me later about my own spawns";
+/// they are not authorising CI to run this box further down than
+/// [`DEFER_FREE_COMMIT_GB`] already allows. And it stays in the DEFER arm:
+/// memory pressure is transient, so a node that rejected on it would make coord
+/// re-home work that would have run fine in a minute (see this module's header
+/// and [`admission_decision`]).
+///
+/// ## Why it is bounded — and why the bound is 12, not the shell lane's 8
+///
+/// The setting has no server-side upper bound; the runner validates only
+/// `critical <= warn`. So an operator can set a warn floor no box on this fleet
+/// ever reaches — 16 GiB is an entirely reasonable thing to type after an
+/// incident whose top consumer was `vmmemWSL` at ~17 GB. `cargo-guard.sh` caps
+/// its own session term for exactly this reason, but the *consequence* of an
+/// unreachable floor differs per lane, so the numbers must too:
+///
+/// - In the shell lane it **fails open by time**: the wait loop sleeps out
+///   `MEM_WAIT_MAX` and then builds anyway. It costs one stall. Its cap is this
+///   lane's `DEFER_FREE_COMMIT_GB` (8) on the reasoning that a local build
+///   should not be made to wait past the point CI already defers.
+/// - Here there is no timeout to fail open through. An unreachable threshold
+///   makes [`headroom_defers`] true at *every* reading: every dispatch defers,
+///   [`spawn_headroom_waker`] re-tests every [`HEADROOM_RETRY_SECS`] forever,
+///   and coord keeps re-homing work away from a perfectly healthy box. This
+///   lane fails CLOSED, which is the worse failure and argues for a tight
+///   bound.
+///
+/// Copying the shell lane's 8 here would not be tight, it would be **empty**:
+/// this lane's defer band already *is* 8, so `max(8, min(x, 8))` is 8 for every
+/// setting and the session term could never do anything. The bound has to sit
+/// above [`DEFER_FREE_COMMIT_GB`] to exist at all, and the ladder's own unit is
+/// [`MIN_FREE_COMMIT_GB`] — 4 GiB, one rung, the same unit
+/// `DEFER_FREE_COMMIT_GB` is built from. So the most a session floor may buy is
+/// one rung above the shipped band: 12 GiB. The worst thing an operator can
+/// then express is "this node behaves as though its defer band were one rung
+/// wider" — never "this node is unreachable by construction". 12 also stays
+/// inside the headroom any box that can host this fleet's ~14 GB `rust-ci` job
+/// has while idle, so a machine healthy enough to want the work can still clear
+/// the raised bar.
+pub(crate) const MAX_SESSION_DEFER_FLOOR_GB: u64 = DEFER_FREE_COMMIT_GB + MIN_FREE_COMMIT_GB;
+
+/// The free-commit level (GiB) below which this node defers, given the machine
+/// owner's session warn floor: `max(DEFER_FREE_COMMIT_GB, min(floor, cap))`.
+///
+/// Pure over the injected floor, and split out of [`headroom_defers`] for the
+/// same reason `headroom_defers` is split out of [`admission_decision`]: the
+/// clamp is the part with an argument in it, so it should be assertable on its
+/// own rather than only through a whole admission verdict.
+///
+/// `None` contributes no term at all and leaves [`DEFER_FREE_COMMIT_GB`]
+/// exactly as it was. That is the same posture every other [`Headroom`] field
+/// takes, and it is the right reading of a disabled guard specifically: an
+/// owner who switched the session guard off has said this box does not police
+/// interactive headroom, and synthesising a CI floor out of a switch they
+/// turned off would be inventing an opinion from its absence.
+///
+/// The byte→GiB conversion rounds UP, matching `cargo-guard.sh`'s
+/// `session_warn_floor_gb`. Truncating a 3.5 GiB floor to 3 would enforce
+/// something weaker than what was configured, and the shipped critical default
+/// (1.5 GiB) shows fractional-GiB values are ordinary here, not hypothetical.
+pub(crate) fn defer_commit_floor_gb(session_warn_floor_bytes: Option<u64>) -> u64 {
+    let Some(floor_bytes) = session_warn_floor_bytes else {
+        return DEFER_FREE_COMMIT_GB;
+    };
+    let session_gb = floor_bytes.div_ceil(1024 * 1024 * 1024);
+    DEFER_FREE_COMMIT_GB.max(session_gb.min(MAX_SESSION_DEFER_FLOOR_GB))
+}
+
 /// Pure admission decision over injected inputs (no globals — unit-tested
 /// without settings files or live state).
 ///
@@ -149,7 +251,10 @@ pub(crate) fn headroom_defers(headroom: Headroom) -> bool {
         }
     }
     if let Some(free) = headroom.commit_available_bytes {
-        if free / (1024 * 1024 * 1024) < DEFER_FREE_COMMIT_GB {
+        // The band is `DEFER_FREE_COMMIT_GB`, widened by the machine owner's
+        // live-session floor when they have declared one above it — see
+        // `defer_commit_floor_gb` and `MAX_SESSION_DEFER_FLOOR_GB`.
+        if free / (1024 * 1024 * 1024) < defer_commit_floor_gb(headroom.session_warn_floor_bytes) {
             return true;
         }
     }
@@ -193,10 +298,21 @@ fn probe_headroom() -> Headroom {
         )
     };
 
+    // The live-session floor is read HERE, not inside the decision, so
+    // `admission_decision` / `headroom_defers` stay pure over injected inputs.
+    // A disabled guard yields `None` rather than the floor it happens to have
+    // stored: the switch is the owner's statement that this box does not police
+    // interactive headroom, and `None` is how every other field in this struct
+    // spells "no opinion".
+    let session_guard = crate::settings::get_session_guard_settings();
+
     Headroom {
         swap_total_bytes,
         swap_used_bytes,
         commit_available_bytes: crate::fleet::resource_sample::available_commit_bytes(),
+        session_warn_floor_bytes: session_guard
+            .enabled
+            .then_some(session_guard.warn_free_commit_bytes),
     }
 }
 
@@ -674,6 +790,7 @@ mod tests {
             swap_total_bytes: Some(8 * GIB),
             swap_used_bytes: Some(3 * GIB), // 37.5%
             commit_available_bytes: Some(24 * GIB),
+            session_warn_floor_bytes: None,
         };
         assert_eq!(
             admission_decision(&s, "qontinui/qontinui-runner", 0, calm),
@@ -701,6 +818,7 @@ mod tests {
             swap_total_bytes: Some(8 * GIB),
             swap_used_bytes: Some(0),
             commit_available_bytes: Some(6 * GIB),
+            session_warn_floor_bytes: None,
         };
         assert_eq!(
             admission_decision(&s, "qontinui/qontinui-runner", 0, squeezed),
@@ -734,6 +852,7 @@ mod tests {
             swap_total_bytes: Some(8 * GIB),
             swap_used_bytes: Some(8 * GIB),
             commit_available_bytes: Some(0),
+            session_warn_floor_bytes: None,
         };
         for running in [0usize, 1, 9] {
             assert!(
@@ -766,6 +885,7 @@ mod tests {
             swap_total_bytes: Some(0),
             swap_used_bytes: Some(0),
             commit_available_bytes: Some(24 * GIB),
+            session_warn_floor_bytes: None,
         };
         assert_eq!(no_swap.swap_used_ratio(), None);
         assert_eq!(
@@ -778,6 +898,7 @@ mod tests {
                 swap_total_bytes: None,
                 swap_used_bytes: Some(9 * GIB),
                 commit_available_bytes: None,
+                session_warn_floor_bytes: None,
             }
             .swap_used_ratio(),
             None
@@ -795,9 +916,178 @@ mod tests {
             swap_total_bytes: Some(8 * GIB),
             swap_used_bytes: Some(7 * GIB),
             commit_available_bytes: Some(64 * GIB), // "plenty of memory"
+            session_warn_floor_bytes: None,
         };
         assert!(headroom_defers(saturating));
         assert_eq!(SWAP_DEFER_RATIO, 0.5);
+    }
+
+    // ---- §Part C item 1: the live-session floor widens the CI defer band ----
+
+    /// A box below the floor its owner declared for interactive sessions stops
+    /// accepting new CI work — and the third assertion is what makes this a
+    /// test of the session term rather than of the shipped band: the SAME
+    /// reading with no session floor proceeds.
+    #[test]
+    fn the_session_floor_widens_the_defer_band() {
+        let s = settings(true, &["qontinui-runner"], 4);
+        let guarded = Headroom {
+            swap_total_bytes: Some(8 * GIB),
+            swap_used_bytes: Some(0),
+            // 9 GiB clears the shipped 8 GiB band on its own …
+            commit_available_bytes: Some(9 * GIB),
+            // … but the owner says a live session needs 10.
+            session_warn_floor_bytes: Some(10 * GIB),
+        };
+        assert_eq!(
+            admission_decision(&s, "qontinui/qontinui-runner", 0, guarded),
+            Admission::Defer,
+            "below the session floor, the lane with somewhere else to go steps back"
+        );
+        assert_eq!(
+            admission_decision(
+                &s,
+                "qontinui/qontinui-runner",
+                0,
+                Headroom {
+                    commit_available_bytes: Some(10 * GIB),
+                    ..guarded
+                }
+            ),
+            Admission::Proceed,
+            "at the raised threshold the box is admitting work again"
+        );
+        assert_eq!(
+            admission_decision(
+                &s,
+                "qontinui/qontinui-runner",
+                0,
+                Headroom {
+                    session_warn_floor_bytes: None,
+                    ..guarded
+                }
+            ),
+            Admission::Proceed,
+            "identical reading, no session floor — so the defer above came from \
+             the session term and nothing else"
+        );
+        // DEFER, never reject: a session floor is transient pressure, and the
+        // module header's ordering ("a node that rejects on a transient reading
+        // makes coord re-home work that would have run fine in a minute") holds
+        // for this term exactly as for the others.
+        for running in [0usize, 1, 9] {
+            assert!(!matches!(
+                admission_decision(&s, "qontinui/qontinui-runner", running, guarded),
+                Admission::Reject(_)
+            ));
+        }
+    }
+
+    /// FAIL OPEN: `None` — a disabled session guard, or settings that could not
+    /// be read — contributes no term at all.
+    #[test]
+    fn a_session_guard_with_no_opinion_leaves_the_band_alone() {
+        assert_eq!(defer_commit_floor_gb(None), DEFER_FREE_COMMIT_GB);
+        // `probe_headroom` maps `enabled == false` to `None`, not to the stored
+        // floor and not to zero. Pin the zero case anyway: it must land on the
+        // shipped band by INTENT (`max`), not by arithmetic luck.
+        assert_eq!(defer_commit_floor_gb(Some(0)), DEFER_FREE_COMMIT_GB);
+
+        let s = settings(true, &["qontinui-runner"], 4);
+        assert_eq!(
+            admission_decision(
+                &s,
+                "qontinui/qontinui-runner",
+                0,
+                Headroom {
+                    commit_available_bytes: Some(9 * GIB),
+                    session_warn_floor_bytes: None,
+                    ..Headroom::default()
+                }
+            ),
+            Admission::Proceed,
+            "an owner who turned the guard off has not authorised a CI floor \
+             inferred from the switch they turned off"
+        );
+        assert!(!headroom_defers(blind()));
+    }
+
+    /// The session term is RAISE-only. The shipped default (3 GiB) sits below
+    /// this lane's band deliberately — `settings.rs` pins warn < `ci_node`'s
+    /// 4 GiB reject floor — and must never drag the band down to meet it.
+    #[test]
+    fn the_session_term_can_only_raise_never_lower() {
+        for floor_gb in 0..=DEFER_FREE_COMMIT_GB {
+            assert_eq!(
+                defer_commit_floor_gb(Some(floor_gb * GIB)),
+                DEFER_FREE_COMMIT_GB,
+                "a session floor at or under the defer band must leave it alone \
+                 (asked for {floor_gb} GiB)"
+            );
+        }
+        // Concretely: 5 GiB free still defers under the shipped 3 GiB session
+        // floor, because `DEFER_FREE_COMMIT_GB` still applies underneath it.
+        let s = settings(true, &["qontinui-runner"], 4);
+        assert_eq!(
+            admission_decision(
+                &s,
+                "qontinui/qontinui-runner",
+                0,
+                Headroom {
+                    commit_available_bytes: Some(5 * GIB),
+                    session_warn_floor_bytes: Some(3 * GIB),
+                    ..Headroom::default()
+                }
+            ),
+            Admission::Defer
+        );
+    }
+
+    /// The sanity bound. Unclamped, an over-set floor would defer EVERY
+    /// dispatch forever while the 60 s waker re-tested a healthy box — this
+    /// lane has no `MEM_WAIT_MAX` to fail open through, unlike `cargo-guard.sh`.
+    #[test]
+    fn an_unreachable_session_floor_is_clamped_to_the_cap() {
+        assert!(
+            MAX_SESSION_DEFER_FLOOR_GB > DEFER_FREE_COMMIT_GB,
+            "a cap at or below the defer band would make the session term a \
+             no-op — which is why this lane cannot reuse the shell lane's 8"
+        );
+        // 16 GiB is the plausible over-set: the incident's top consumer was
+        // ~17 GB, so it is the number an operator types afterwards.
+        assert_eq!(
+            defer_commit_floor_gb(Some(16 * GIB)),
+            MAX_SESSION_DEFER_FLOOR_GB
+        );
+        assert_eq!(
+            defer_commit_floor_gb(Some(1024 * GIB)),
+            MAX_SESSION_DEFER_FLOOR_GB
+        );
+        // Anything under the cap is honoured verbatim.
+        assert_eq!(
+            defer_commit_floor_gb(Some((MAX_SESSION_DEFER_FLOOR_GB - 1) * GIB)),
+            MAX_SESSION_DEFER_FLOOR_GB - 1
+        );
+        // Fractional floors round UP — 9.5 GiB is 10, not 9. Rounding down
+        // would enforce something weaker than what was configured.
+        assert_eq!(defer_commit_floor_gb(Some(19 * GIB / 2)), 10);
+
+        // The point of the cap: a healthy box can still clear the raised bar.
+        let s = settings(true, &["qontinui-runner"], 4);
+        assert_eq!(
+            admission_decision(
+                &s,
+                "qontinui/qontinui-runner",
+                0,
+                Headroom {
+                    commit_available_bytes: Some(MAX_SESSION_DEFER_FLOOR_GB * GIB),
+                    session_warn_floor_bytes: Some(64 * GIB),
+                    ..Headroom::default()
+                }
+            ),
+            Admission::Proceed,
+            "a floor no box can reach must not brick this node's admission"
+        );
     }
 
     #[test]
