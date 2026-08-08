@@ -48,9 +48,11 @@ pub(crate) struct Headroom {
     /// [`MIN_FREE_COMMIT_GB`] rejects on, and the same one the A1 snapshot
     /// publishes as `commit_available_bytes`.
     pub(crate) commit_available_bytes: Option<u64>,
-    /// The machine owner's live-session WARN floor
-    /// ([`crate::settings::SessionGuardSettings::warn_free_commit_bytes`]), or
-    /// `None` when the session guard is switched off — the same "no readable
+    /// This machine's EFFECTIVE live-session WARN floor —
+    /// `max(local override, cached fleet default, hardcoded default)` as
+    /// computed by [`crate::resource_guard::effective_session_floors`] over
+    /// [`crate::settings::SessionGuardSettings::warn_free_commit_bytes`] — or
+    /// `None` when the session guard is switched off, the same "no readable
     /// opinion" the other fields express when their sensor is dark.
     ///
     /// It is a **floor**, not a reading: the other fields say what the box has,
@@ -304,7 +306,25 @@ fn probe_headroom() -> Headroom {
     // stored: the switch is the owner's statement that this box does not police
     // interactive headroom, and `None` is how every other field in this struct
     // spells "no opinion".
-    let session_guard = crate::settings::get_session_guard_settings();
+    //
+    // It is the EFFECTIVE floor — `max(local override, cached fleet default,
+    // hardcoded default)`, `resource_guard::effective_session_floors` — not the
+    // raw local setting. There is one live-session floor on this machine, and
+    // the spawn gate and this lane must read the same one; a tenant-wide
+    // tightening that reached the spawn gate but not CI admission would leave
+    // coord dispatching builds into exactly the headroom the fleet just declared
+    // it wants kept for sessions. The `host` lane specifically, because
+    // `commit_available_bytes` above IS the host-lane reading — never judge one
+    // lane's reading against another lane's floor.
+    //
+    // An unreachable floor cannot wedge this lane: `defer_commit_floor_gb`
+    // clamps whatever arrives at `MAX_SESSION_DEFER_FLOOR_GB`, which is the
+    // whole reason that clamp exists.
+    let local_guard = crate::settings::get_session_guard_settings();
+    let session_guard = crate::resource_guard::effective_session_floors(
+        &local_guard,
+        crate::fleet::resource_sample::Lane::Host.as_str(),
+    );
 
     Headroom {
         swap_total_bytes,
