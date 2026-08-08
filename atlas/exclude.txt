@@ -173,6 +173,8 @@ project.patterns
 project.patterns_id_seq
 project.pending_discoveries
 project.performance_drift_signals
+project.pg_stat_statements
+project.pg_stat_statements_info
 project.phase_model_routing
 project.phase_results
 project.phase_results_id_seq
