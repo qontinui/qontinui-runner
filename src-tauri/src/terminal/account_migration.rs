@@ -486,6 +486,17 @@ pub fn migrate_session(
             None,
             capture_hint,
             Some(record.page_id.clone()),
+            // OVERRIDE — the one call site that passes `true`, and the only one
+            // that should. An account migration is not the creation of a new
+            // session: the operator's session already existed, this function has
+            // ALREADY torn down its old PTY, and this respawn is the second half
+            // of a move that is mid-flight. Refusing here would not protect a
+            // live session — it would destroy one, which inverts the whole point
+            // of the guard (plan §Part D step 5: never touch an already-running
+            // session; this gate fires only when something NEW is created). The
+            // migration is also commit-neutral by construction: one `claude`
+            // goes away, one comes back.
+            true,
         )?;
 
     // The lifecycle row was re-opened synchronously by the pinned-id capture

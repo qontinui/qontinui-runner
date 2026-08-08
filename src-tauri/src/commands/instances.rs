@@ -188,6 +188,10 @@ pub async fn launch_runner_instance(
     app: tauri::AppHandle,
     id: String,
     instance_manager: State<'_, Arc<InstanceManager>>,
+    // Part D — the operator's "Start anyway" answer to a CRITICAL resource-guard
+    // refusal, replayed by `src/lib/resourceGuard.ts` on the retry invoke.
+    // `None` (first attempt, and any caller predating the gate) = no override.
+    resource_override: Option<bool>,
 ) -> Result<CommandResponse, String> {
     let configs = settings::get_runner_instances();
     let config = configs
@@ -195,8 +199,10 @@ pub async fn launch_runner_instance(
         .find(|c| c.id == id)
         .ok_or_else(|| format!("Instance '{}' not found in settings", id))?;
 
+    // ATTENDED spawn — the operator clicked Launch in the Instances panel, so a
+    // CRITICAL refusal has a human to answer it.
     let pid = instance_manager
-        .launch_instance_with_app(config, Some(&app))
+        .launch_instance_with_app(config, Some(&app), resource_override.unwrap_or(false))
         .await?;
     Ok(CommandResponse {
         success: true,

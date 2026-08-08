@@ -3267,6 +3267,16 @@ async fn run_continuation_terminal(
         ctx,
         capture_hint,
         Some(target_page),
+        // UNATTENDED spawn — resource_override: false, i.e. this path RESPECTS
+        // the critical floor. A gate continuation is brand-new autonomous work
+        // with nobody at the keyboard to answer a dialog, and it is exactly the
+        // class of spawn that piled `claude` + `rustc` onto an already-starved
+        // box on the night of the incident. Refusing here is NOT a silent
+        // forever-refusal: the `Err` arm below calls `report_spawn_failed`, so
+        // coord learns the continuation did not start and can re-dispatch it
+        // once the box breathes — the same defer-don't-reject posture
+        // `ci_node::admission` takes for CI work.
+        false,
     );
 
     match result {
@@ -3530,6 +3540,13 @@ async fn run_condition_check_terminal(
         None, // isolated_ctx — no worktree acquired
         capture_hint,
         Some(target_page),
+        // UNATTENDED spawn — respect the critical floor (see the gate-
+        // continuation site above for the full rationale). A condition check is
+        // the *cheapest* thing to drop when the box is out of commit: it edits
+        // nothing, commits nothing, and coord re-issues the check on its next
+        // pass, so a refusal here costs one deferred probe rather than a lost
+        // session.
+        false,
     );
 
     match result {

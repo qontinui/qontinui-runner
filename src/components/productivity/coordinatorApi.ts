@@ -8,6 +8,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { spawnWithResourceGuard } from "@/lib/resourceGuard";
 
 /** Discriminator strings written to `coordinator_decisions.rule`. */
 export type CoordinatorRule = "A" | "B" | "C" | "D" | "E" | "LLM" | "idle" | string;
@@ -140,7 +141,13 @@ export async function launchCoordinatorSession(args: {
   planPath?: string | null;
   titleHint?: string | null;
 }): Promise<LaunchResult> {
-  return invoke<LaunchResult>("launch_coordinator_session", args);
+  // Attended spawn — routed through the resource gate's override flow so a
+  // CRITICAL refusal becomes the "Start anyway" dialog instead of a raw error
+  // string in a panel. `mode: "rust"` opens no pty and never reaches the gate;
+  // `mode: "claude_skill"` does.
+  return spawnWithResourceGuard((resourceOverride) =>
+    invoke<LaunchResult>("launch_coordinator_session", { ...args, resourceOverride }),
+  );
 }
 
 /** Stop the in-process Rust coordinator scheduler — flips the
@@ -157,7 +164,12 @@ export async function stopCoordinatorSession(): Promise<boolean> {
 export async function spawnWorkerSession(args: {
   titleHint?: string | null;
 }): Promise<LaunchResult> {
-  return invoke<LaunchResult>("spawn_worker_session", args);
+  // Attended spawn — see `launchCoordinatorSession`. A worker is the most
+  // memory-hungry thing this app creates (a `claude` CLI that immediately starts
+  // cargo builds), so this is the spawn the gate most often has an opinion on.
+  return spawnWithResourceGuard((resourceOverride) =>
+    invoke<LaunchResult>("spawn_worker_session", { ...args, resourceOverride }),
+  );
 }
 
 // ---------------------------------------------------------------------------

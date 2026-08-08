@@ -29,6 +29,7 @@ import { NotificationSettings } from "./NotificationSettings";
 import { OtelSettings } from "./OtelSettings";
 import { ContainerSettings } from "./ContainerSettings";
 import { LockYieldPolicySettings } from "./LockYieldPolicySettings";
+import { ResourceGuardSettings } from "./ResourceGuardSettings";
 import { SecuritySettings } from "./SecuritySettings";
 import { AccountSettings } from "./AccountSettings";
 import { CiRunnerSettings } from "./CiRunnerSettings";
@@ -233,6 +234,8 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         return <SecuritySettings onLog={onLog} />;
       case "lock-yield":
         return <LockYieldPolicySettings onLog={onLog} />;
+      case "resource-guard":
+        return <ResourceGuardSettings onLog={onLog} />;
       case "advanced":
         return <AdvancedSettings onLog={onLog} onDebugModeChange={onDebugModeChange} />;
       case "updates":

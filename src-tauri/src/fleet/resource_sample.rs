@@ -251,7 +251,11 @@ fn commit_status() -> Option<(u64, u64)> {
 
 /// Collect the `host` lane. Blocking (sysinfo refresh + a disk enumeration), so
 /// callers run it on a blocking pool.
-fn collect_host_lane() -> ResourceSample {
+///
+/// `pub(crate)` for [`host_snapshot`]'s synchronous callers (plan
+/// `2026-08-07-runner-resource-guard-and-session-protection.md` §Part A); the
+/// publisher still reaches it through [`collect`].
+pub(crate) fn collect_host_lane() -> ResourceSample {
     use sysinfo::System;
 
     let mut s = ResourceSample::empty(Lane::Host, None);
@@ -319,6 +323,43 @@ fn collect_host_lane() -> ResourceSample {
     s.ci_jobs_running = Some(running.min(i32::MAX as usize) as i32);
 
     s
+}
+
+/// One synchronous host-lane reading, for callers that must decide *now*.
+///
+/// Plan `2026-08-07-runner-resource-guard-and-session-protection.md` §Part A.
+/// The terminal-spawn gate needs a verdict before it opens a PTY: the ~30 s
+/// publish cadence plus a coord round-trip is far too slow for that decision,
+/// and the gate has to keep working when coord is unreachable — which is
+/// exactly when the box is most likely to be under load.
+///
+/// ## It is the SAME struct the publisher sends
+///
+/// This returns [`collect_host_lane`]'s [`ResourceSample`] verbatim, the row
+/// [`publish_once`] POSTs as the `host` lane. So the number a gate trips on and
+/// the number the fleet dashboard renders are literally one reading, not two
+/// probes that agree today and drift tomorrow — the same property
+/// [`crate::ci_node::admission::probe_volume_for`]'s doc comment argues for on
+/// the disk figure.
+///
+/// ## Host lane ONLY, deliberately
+///
+/// No WSL lane here, and adding one would be a regression. The WSL probe forks
+/// `wsl.exe` under [`WSL_PROBE_TIMEOUT`] (5 s); a pre-PTY gate that can stall
+/// five seconds on a wedged or cold-starting WSL VM is a worse user-facing
+/// failure than the one it prevents. The host lane is also the *correct* lane
+/// for the question: `pageReporting=true` means the host free-commit figure
+/// already nets out WSL's live usage (see this module's "Lanes are not
+/// summable" docs above), so a host reading is not blind to `vmmemWSL` — it is
+/// precisely the quantity that collapsed to 7.25 GB during the 2026-08-06→07
+/// incident. The WSL figure still reaches coord in the published sample, where
+/// cross-machine ranking can afford the subprocess.
+///
+/// Still blocking in the sysinfo/disk-enumeration sense (milliseconds, no
+/// network, no subprocess); from async contexts prefer [`collect`], which
+/// already offloads to a blocking pool.
+pub(crate) fn host_snapshot() -> ResourceSample {
+    collect_host_lane()
 }
 
 /// Which WSL distro to probe: `QONTINUI_WSL_DISTRO` if set, else the first
@@ -579,6 +620,37 @@ mod tests {
             let d = jittered_sleep(10).as_secs();
             assert!((8..=12).contains(&d), "jittered 10s tick out of band: {d}");
         }
+    }
+
+    #[test]
+    fn host_snapshot_is_the_host_lane_and_only_the_host_lane() {
+        // The spawn gate compares against this reading, so it must be the same
+        // shape the publisher sends — `lane: "host"`, `source: "runner"` — and
+        // it must never carry a `wsl` row: a pre-PTY gate cannot afford the
+        // `wsl.exe` fork behind WSL_PROBE_TIMEOUT.
+        let s = host_snapshot();
+        assert_eq!(s.lane, "host");
+        assert_eq!(s.source, "runner");
+        assert_eq!(
+            s.lane_instance, None,
+            "the host lane has exactly one publisher and names no instance"
+        );
+        // Same reading as the publisher's host row, field for field.
+        assert_eq!(s.lane, collect_host_lane().lane);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_snapshot_carries_the_commit_figure_the_gate_reads() {
+        // On Windows the guard ladder's one memory quantity is free COMMIT
+        // (`available_commit_bytes`, plan §A3). If the snapshot did not carry
+        // it, the gate would silently have nothing to compare against.
+        let s = host_snapshot();
+        assert!(
+            s.commit_available_bytes.is_some(),
+            "GlobalMemoryStatusEx must populate commit_available_bytes on Windows"
+        );
+        assert!(s.commit_total_bytes.unwrap_or(0) > 0);
     }
 
     #[test]

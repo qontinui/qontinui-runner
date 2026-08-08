@@ -998,6 +998,10 @@ pub async fn launch_coordinator_session(
     // below to preserve the historical hardcode. Lets a caller root the
     // coordinator in a different repo's worktree without a code change.
     intent_repo: Option<String>,
+    // Part D — the operator's "Start anyway" answer to a CRITICAL resource-guard
+    // refusal, replayed by `src/lib/resourceGuard.ts` on the retry invoke.
+    // `None` (every first attempt, and every legacy caller) means "no override".
+    resource_override: Option<bool>,
 ) -> Result<LaunchResult, String> {
     let app_state = require_app_state(&app_handle)?;
     let mode = mode.unwrap_or_else(|| "rust".to_string());
@@ -1103,6 +1107,12 @@ pub async fn launch_coordinator_session(
         app_handle.clone(),
         None,
         extra_env,
+        // ATTENDED spawn — the operator pressed "Launch Coordinator" and is
+        // watching the window, so a CRITICAL refusal reaches a human who can
+        // free memory or override. `resource_override` is threaded from the
+        // command argument: absent on the first attempt, `true` on the retry
+        // the "Start anyway" dialog issues.
+        resource_override.unwrap_or(false),
     )?;
 
     if let Some(ctx) = isolated_ctx {
@@ -1163,6 +1173,8 @@ pub async fn spawn_worker_session(
     // preserve the historical hardcode. Lets a coordinator dispatch a
     // worker rooted in a different repo's worktree without a code change.
     intent_repo: Option<String>,
+    // Part D — see `launch_coordinator_session`.
+    resource_override: Option<bool>,
 ) -> Result<LaunchResult, String> {
     let app_state = require_app_state(&app_handle)?;
 
@@ -1261,6 +1273,12 @@ pub async fn spawn_worker_session(
         app_handle.clone(),
         None,
         extra_env,
+        // ATTENDED spawn — same reasoning as `launch_coordinator_session`: the
+        // operator pressed "Spawn Worker" and can answer the dialog. Note that
+        // a worker is the single most memory-hungry thing this app creates (a
+        // `claude` CLI that will immediately start `cargo` builds), so the warn
+        // notice on this path is the one most likely to earn its keep.
+        resource_override.unwrap_or(false),
     )?;
 
     // Phase 2 — park the isolated edit context on the TerminalSession

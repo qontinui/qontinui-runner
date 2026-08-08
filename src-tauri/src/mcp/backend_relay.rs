@@ -2565,6 +2565,14 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             api_state.app_handle.clone(),
             None,
             extra_env,
+            // UNATTENDED spawn — respect the critical floor. This is
+            // qontinui-web asking the runner to open a terminal over the relay
+            // WebSocket: the request originates on another machine, so the
+            // memory it is about to consume is this machine's and the person
+            // who could approve the risk is not here. The refusal travels back
+            // over the relay as this frame's error, naming lane/headroom/floor,
+            // which is what lets the web UI tell the user why.
+            false,
         ) {
             Ok(info) => {
                 if let Some(ctx) = isolated_ctx {

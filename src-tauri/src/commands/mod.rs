@@ -222,6 +222,7 @@ pub mod project_preview; // Projects dashboard §7.1 — the per-project Preview
 pub mod rag;
 pub mod recap; // Session recap overview
 pub mod regression; // UI Bridge regression suite + run + diagnosis + per-assertion exercise log persistence (Section 11 Phase A2)
+pub mod resource_guard_settings; // Settings > Resource Guard: session-protection floors + the ci_node floors (plan 2026-08-07-runner-resource-guard-and-session-protection Part B)
 pub mod saved_projects; // User-curated project registry (wizard-populated, consumed by UI Bridge panel)
 pub mod screenshot;
 pub mod screenshots;

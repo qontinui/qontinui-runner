@@ -287,6 +287,13 @@ pub async fn steward_start_handler(
         // is omitted exactly as before — but the steward is an agent session and
         // must still learn where the plans live. See `agent_worktree::session_env`.
         crate::agent_worktree::session_env::session_extra_env(None),
+        // UNATTENDED spawn — respect the critical floor. The merge-train steward
+        // is a long-running autonomous agent session; starting one on a box
+        // that is already out of commit is how the incident's `claude`-inside-a-
+        // terminal deaths happened. The refusal returns as this endpoint's error
+        // body (with lane/headroom/floor), and the steward is explicitly
+        // restartable, so a refusal defers the steward rather than losing it.
+        false,
     ) {
         Ok(info) => {
             info!("HTTP: Created merge-train-steward terminal: {}", info.id);

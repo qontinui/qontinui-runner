@@ -1866,6 +1866,78 @@ mod ci_node_tests {
     }
 }
 
+#[cfg(test)]
+mod session_guard_tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Contract: a fresh install and an empty settings.json both land on the
+    /// LIVE conservative default — enabled, 3 GiB warn, 1.5 GiB critical.
+    /// Unlike `ci_node`, "no key present" must NOT mean "no protection": the
+    /// unguarded state is the one the fleet was in on the night of the
+    /// 2026-08-06→07 incident.
+    #[test]
+    fn session_guard_defaults_are_live_not_inert() {
+        for s in [
+            Settings::default(),
+            serde_json::from_str::<Settings>("{}").expect("empty object must deserialize"),
+        ] {
+            assert!(s.session_guard.enabled);
+            assert_eq!(s.session_guard.warn_free_commit_bytes, 3 * GIB);
+            assert_eq!(s.session_guard.critical_free_commit_bytes, 3 * GIB / 2);
+        }
+    }
+
+    /// The ladder's ordering, pinned. `critical < warn` (the heavier verdict
+    /// fires later) and `warn < ci_node`'s 4 GiB hard-reject floor — the
+    /// ordering `ci_node::admission::MIN_FREE_COMMIT_GB`'s doc comment argues
+    /// for. A default that inverted this would make the mildest consequence
+    /// the first to fire.
+    #[test]
+    fn default_floors_sit_below_the_ci_node_reject_floor() {
+        let g = SessionGuardSettings::default();
+        assert!(
+            g.critical_free_commit_bytes < g.warn_free_commit_bytes,
+            "critical must be the lower floor — it is the heavier verdict"
+        );
+        assert!(
+            g.warn_free_commit_bytes
+                < crate::ci_node::admission::MIN_FREE_COMMIT_GB * GIB,
+            "a warn is lighter than ci_node's hard reject, so it must sit below it"
+        );
+    }
+
+    /// Explicit values round-trip untouched.
+    #[test]
+    fn session_guard_explicit_values_round_trip() {
+        let parsed: Settings = serde_json::from_str(
+            r#"{"session_guard": {"warn_free_commit_bytes": 8589934592,
+                 "critical_free_commit_bytes": 4294967296, "enabled": false}}"#,
+        )
+        .expect("must deserialize");
+        assert_eq!(parsed.session_guard.warn_free_commit_bytes, 8 * GIB);
+        assert_eq!(parsed.session_guard.critical_free_commit_bytes, 4 * GIB);
+        assert!(!parsed.session_guard.enabled);
+        let json = serde_json::to_string(&parsed).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_guard, parsed.session_guard);
+    }
+
+    /// A partial object fills the missing keys from the serde defaults —
+    /// tightening the warn floor alone must not silently zero (i.e. disable)
+    /// the critical floor.
+    #[test]
+    fn session_guard_partial_object_fills_defaults() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"session_guard": {"warn_free_commit_bytes": 6442450944}}"#)
+                .unwrap();
+        assert_eq!(parsed.session_guard.warn_free_commit_bytes, 6 * GIB);
+        assert_eq!(parsed.session_guard.critical_free_commit_bytes, 3 * GIB / 2);
+        assert!(parsed.session_guard.enabled);
+    }
+}
+
 // ============================================================================
 // Cloud Relay Settings
 // ============================================================================
@@ -2085,6 +2157,107 @@ impl Default for CiNodeSettings {
     }
 }
 
+// ============================================================================
+// Session Guard Settings (plan
+// 2026-08-07-runner-resource-guard-and-session-protection, Part B item 2)
+// ============================================================================
+
+/// Machine-owner floors that protect **live interactive sessions** from being
+/// killed by Windows commit exhaustion.
+///
+/// This answers a different question from [`CiNodeSettings`]: not "may coord
+/// send this box more CI work" but "is this box safe enough to keep letting the
+/// user start new sessions at all" — a question that must be answerable
+/// locally, immediately, and with nothing dispatched by anyone. Overnight
+/// 2026-08-06→07 Windows' Resource-Exhaustion-Detector fired 12 times naming
+/// `vmmemWSL` plus concurrent `rustc.exe`, and several Claude Code sessions
+/// died inside runner-spawned terminals while the terminal windows stayed open.
+/// The runner never saw it because nothing local was watching.
+///
+/// ## Bytes, not GiB
+///
+/// Every floor here is in **bytes**, deliberately, even though the neighbouring
+/// [`CiNodeSettings::min_free_disk_gb`] and
+/// [`crate::ci_node::admission::MIN_FREE_COMMIT_GB`] are in GiB. The critical
+/// floor is 1.5 GiB, which has no integer-GiB spelling, and coord's own
+/// fleet-policy floors are `*_bytes` columns
+/// (`min_free_mem_bytes_host` / `_wsl`, `min_free_disk_bytes`) — so bytes is
+/// both the only unit that can express the value and the unit the fleet default
+/// will arrive in when Part B item 3 wires the poller up. One unit across the
+/// local override and the fleet default is what keeps `max(local, fleet,
+/// hardcoded)` a comparison rather than a conversion.
+///
+/// ## Why the warn floor sits BELOW ci_node's 4 GiB
+///
+/// The lanes on this machine deliberately differ by **verdict**, not by
+/// quantity — they all read Windows free commit
+/// ([`crate::fleet::resource_sample::available_commit_bytes`], plan §A3).
+/// `cargo-guard.sh` defers at 5 GiB, the supervisor's build pool defers at
+/// 5 GiB, and `ci_node` hard-**rejects** at 4 GiB. The doc comment on
+/// [`crate::ci_node::admission::MIN_FREE_COMMIT_GB`] (`ci_node/admission.rs`,
+/// "The number, and why it is LOWER than the supervisor's 5") argues exactly
+/// this ordering: a rejecting lane must sit below a deferring one or it turns
+/// away work the deferring lane would have run a minute later.
+///
+/// A **warn** is lighter than all three verdicts, so it sits lowest of all:
+/// 3 GiB. The **critical** floor is the heaviest verdict in the whole ladder —
+/// it blocks a human's own spawn — which is why it gets the lowest number
+/// (1.5 GiB) and an explicit override at the point of refusal. Raising the warn
+/// floor above `ci_node`'s 4 GiB would invert the ladder and make the mildest
+/// consequence the first to fire.
+///
+/// A missing `session_guard` key in an existing `settings.json` loads with
+/// these defaults via the per-field `#[serde(default = …)]`s, exactly like
+/// [`CiNodeSettings`] — so an upgrade gets the conservative floors without a
+/// migration, and a hand-edit that names only one field keeps the defaults for
+/// the rest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionGuardSettings {
+    /// Free **commit** (bytes) below which spawning a new session is still
+    /// allowed but the user is warned, naming the current headroom and this
+    /// floor. Default 3 GiB.
+    #[serde(default = "default_session_guard_warn_free_commit_bytes")]
+    pub warn_free_commit_bytes: u64,
+    /// Free **commit** (bytes) below which a new spawn is refused by default.
+    /// The refusal is always overridable — a false positive here blocks the
+    /// user's actual work, which is a worse failure than an occasional missed
+    /// warning. Default 1.5 GiB.
+    #[serde(default = "default_session_guard_critical_free_commit_bytes")]
+    pub critical_free_commit_bytes: u64,
+    /// Master switch for the whole guard. Default **TRUE**, unlike
+    /// [`CiNodeSettings::enabled`]: `ci_node` opts a machine INTO accepting
+    /// remote work, so off is the safe default there; this guard only ever
+    /// warns the owner about their own machine, so off is the *unsafe* default
+    /// — it is the state the fleet was already in on the night of the incident.
+    #[serde(default = "default_session_guard_enabled")]
+    pub enabled: bool,
+}
+
+/// 3 GiB — see [`SessionGuardSettings`] on why the warn floor sits below
+/// `ci_node`'s 4 GiB reject floor.
+fn default_session_guard_warn_free_commit_bytes() -> u64 {
+    3 * 1024 * 1024 * 1024
+}
+
+/// 1.5 GiB — the heaviest verdict in the ladder gets the lowest number.
+fn default_session_guard_critical_free_commit_bytes() -> u64 {
+    3 * 1024 * 1024 * 1024 / 2
+}
+
+fn default_session_guard_enabled() -> bool {
+    true
+}
+
+impl Default for SessionGuardSettings {
+    fn default() -> Self {
+        Self {
+            warn_free_commit_bytes: default_session_guard_warn_free_commit_bytes(),
+            critical_free_commit_bytes: default_session_guard_critical_free_commit_bytes(),
+            enabled: default_session_guard_enabled(),
+        }
+    }
+}
+
 // `Clone` exists so [`read_settings_from_disk`] can serve a cached parse
 // instead of re-reading and re-parsing the file on every call (twice — once to
 // `Settings`, once to `serde_json::Value` for the migration check). Handing a
@@ -2297,6 +2470,15 @@ pub struct Settings {
     /// play for this field.
     #[serde(default)]
     pub ci_node: CiNodeSettings,
+    /// Live-session protection floors (plan
+    /// `2026-08-07-runner-resource-guard-and-session-protection`, Part B).
+    /// Distinct from [`ci_node`](Settings::ci_node): those floors decide
+    /// whether coord may send this box CI work, these decide whether the box is
+    /// safe enough to start another interactive session on. Defaults are live
+    /// (`enabled = true`, 3 GiB warn / 1.5 GiB critical) — see
+    /// [`SessionGuardSettings`].
+    #[serde(default)]
+    pub session_guard: SessionGuardSettings,
     /// Ask the cloud memory endpoint (`POST /api/v1/memory/query`) for the
     /// link-expansion retrieval arm — the third RRF arm that one-hop-expands
     /// over `coord.memory_links` (plan
@@ -4179,6 +4361,36 @@ pub fn get_lock_yield_policy_settings() -> LockYieldPolicySettings {
 /// Save the lock-yield policy settings.
 pub fn save_lock_yield_policy_settings(policy: LockYieldPolicySettings) -> Result<(), String> {
     update_settings(|settings| settings.lock_yield_policy = policy)
+}
+
+// ============================================================================
+// Session Guard accessors (plan
+// 2026-08-07-runner-resource-guard-and-session-protection, Part B item 2)
+// ============================================================================
+
+/// Get the live-session protection floors.
+///
+/// Read at the moment a decision needs them (the spawn gate, the Settings
+/// panel), like [`get_ci_node_settings`] — so a save through
+/// [`save_session_guard_settings`] is live for the *next* spawn with no
+/// restart. Deliberately NOT process-cached the way
+/// [`get_performance_settings`] is: this is one settings read per new terminal,
+/// not per emitted output chunk, and a stale floor is a guard that protects the
+/// machine the operator used to have.
+pub fn get_session_guard_settings() -> SessionGuardSettings {
+    load_settings().session_guard
+}
+
+/// Persist the live-session protection floors.
+///
+/// Built on [`update_settings`] for the same reason
+/// [`save_ci_node_settings`] is: that path starts from the RAW on-disk
+/// document rather than the env-overlaid view, refuses to write at all when the
+/// existing file could not be read or parsed, writes atomically, and drops the
+/// parse cache afterwards. A secondary runner must never persist its in-memory
+/// overlays over the primary's document as a side effect of saving a floor.
+pub fn save_session_guard_settings(session_guard: SessionGuardSettings) -> Result<(), String> {
+    update_settings(|settings| settings.session_guard = session_guard)
 }
 
 #[cfg(test)]

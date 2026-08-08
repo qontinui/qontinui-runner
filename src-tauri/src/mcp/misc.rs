@@ -1620,10 +1620,13 @@ async fn spawn_instance(
         )
     })?;
 
-    // Launch
+    // Launch. UNATTENDED spawn — respect the critical floor: this is the HTTP
+    // `POST /instances` door (scripts, the supervisor, peer runners), and the
+    // refusal comes back in the 500 body naming the lane, the headroom and the
+    // floor, so the caller can retry rather than being left guessing.
     let pid = state
         .instance_manager
-        .launch_instance_with_app(&config, Some(&state.app_handle))
+        .launch_instance_with_app(&config, Some(&state.app_handle), false)
         .await
         .map_err(|e| {
             (
@@ -1713,9 +1716,11 @@ async fn launch_instance(
         )
     })?;
 
+    // UNATTENDED spawn — respect the critical floor (same reasoning as
+    // `POST /instances`: no webview on the far end of an HTTP call).
     let pid = state
         .instance_manager
-        .launch_instance_with_app(config, Some(&state.app_handle))
+        .launch_instance_with_app(config, Some(&state.app_handle), false)
         .await
         .map_err(|e| {
             (

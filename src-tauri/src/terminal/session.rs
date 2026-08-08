@@ -533,6 +533,16 @@ impl TerminalSession {
     /// argv. When `None` (every operator-opened / frontend terminal), the session
     /// falls back to [`Self::build_shell_command`] byte-for-byte, so the
     /// interactive-terminal path is untouched.
+    ///
+    /// `resource_override` carries the operator's explicit "start it anyway"
+    /// past the spawn-time resource gate (plan
+    /// `2026-08-07-runner-resource-guard-and-session-protection` §Part D). The
+    /// gate lives HERE, in the PTY seam, and not in the React handler, because
+    /// this function is reachable from the gate-continuation branch (via its
+    /// `command` override) and from every backend/HTTP spawn surface — a guard
+    /// that only runs in the frontend is not a guard for the paths that spawn
+    /// unattended. See [`crate::resource_guard`] for the verdict ladder and for
+    /// why it fails open.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: TerminalId,
@@ -545,7 +555,20 @@ impl TerminalSession {
         interceptor: Arc<OutputInterceptor>,
         command: Option<Vec<String>>,
         extra_env: Option<Vec<(String, String)>>,
+        resource_override: bool,
     ) -> Result<Self, String> {
+        // Spawn-time resource gate — BEFORE the PTY is opened, so a refusal
+        // leaves no half-built session behind and nothing already running is
+        // touched. Below the warn floor this emits a notice and returns
+        // `Ok(())`; below the critical floor it returns the typed refusal that
+        // `src/lib/resourceGuard.ts` turns into the "Start anyway" dialog. Any
+        // unreadable sensor proceeds silently.
+        crate::resource_guard::admit_spawn(
+            "terminal session",
+            resource_override,
+            Some(&app_handle),
+        )?;
+
         let pty_system = native_pty_system();
 
         let pair = pty_system

@@ -75,6 +75,14 @@ pub async fn terminal_create(
     // typo'd `/spawn-ai --tenant` can never bind the session to the wrong
     // tenant.
     tenant_id: Option<String>,
+    // Part D — the operator's "Start anyway" answer to a CRITICAL resource-guard
+    // refusal. Absent/`false` on every FIRST attempt: the frontend
+    // (`src/lib/resourceGuard.ts`) invokes without it, catches the typed
+    // refusal, shows the blocking `ConfirmDialog`, and only then re-invokes with
+    // `true`. Modelled `Option<bool>` rather than `bool` so pre-existing callers
+    // that omit the argument keep working — Tauri/serde pass a missing arg as
+    // `None`, which resolves to "no override", the safe answer.
+    resource_override: Option<bool>,
 ) -> Result<CommandResponse, String> {
     let spawn_tenant_id: Option<uuid::Uuid> = match tenant_id.as_deref().map(str::trim) {
         None | Some("") => None,
@@ -158,6 +166,10 @@ pub async fn terminal_create(
     let create_manager = terminal_manager.inner().clone();
     let create_title = title.clone();
     let create_working_dir = working_dir.clone();
+    // ATTENDED spawn: an operator is looking at the window that invoked this,
+    // so a CRITICAL refusal has somewhere to go — the frontend re-invokes with
+    // `resource_override: true` once they pick "Start anyway".
+    let create_resource_override = resource_override.unwrap_or(false);
     let info = tokio::task::spawn_blocking(move || {
         let _create_span = tracing::debug_span!("terminal_spawn.manager_create").entered();
         create_manager.create(
@@ -169,6 +181,7 @@ pub async fn terminal_create(
             app_handle,
             command,
             extra_env,
+            create_resource_override,
         )
     })
     .await
@@ -1494,6 +1507,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
     isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
     capture_hint: SessionCaptureHint,
     page_id: Option<String>,
+    resource_override: bool,
 ) -> Result<(String, Option<uuid::Uuid>), String> {
     create_terminal_session_backend(
         terminal_manager,
@@ -1508,6 +1522,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
         isolated_ctx,
         Some(capture_hint),
         page_id,
+        resource_override,
     )
 }
 
@@ -1544,6 +1559,13 @@ pub(crate) fn create_terminal_session_backend(
     isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
     capture_hint: Option<SessionCaptureHint>,
     page_id: Option<String>,
+    // Part D — forwarded to the spawn-time resource gate. Threaded through
+    // rather than hardcoded here because the four callers of the tracked
+    // variant answer this question differently: a gate continuation and a
+    // condition check are NEW autonomous work and must respect the floor,
+    // while an account-migration respawn is the continuation of a session that
+    // already existed a moment ago. See each call site.
+    resource_override: bool,
 ) -> Result<(String, Option<uuid::Uuid>), String> {
     warn_untracked_backend_spawn(&capture_hint, &title, &working_dir);
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` from
@@ -1590,6 +1612,7 @@ pub(crate) fn create_terminal_session_backend(
         app_handle,
         command,
         extra_env,
+        resource_override,
     )?;
 
     // Park the pre-acquired isolated edit context on the session so its

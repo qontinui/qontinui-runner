@@ -52,9 +52,11 @@ import { useObservationServices } from "./hooks/useObservationServices";
 import { useToast } from "./hooks/useToast";
 import { useErrorNotifications } from "./hooks/useErrorNotifications";
 import { useAccountMigrationNotifications } from "./hooks/useAccountMigrationNotifications";
+import { useResourceGuardNotifications } from "./hooks/useResourceGuardNotifications";
 import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration";
 
 import { ToastContainer } from "./components/ToastContainer";
+import { ResourceGuardDialog } from "./components/ResourceGuardDialog";
 import { AutoUpdateChecker } from "./components/AutoUpdateChecker";
 import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
@@ -325,6 +327,13 @@ function AppContent() {
               title: terminal?.title ?? "Terminal",
               workingDir: null,
               pageId: targetPageId,
+              // OVERRIDE the spawn-time resource gate. This is a MOVE, not a
+              // new session: the terminal was closed two statements above and
+              // this recreates it on the target page. A refusal here would not
+              // protect a live session, it would finish destroying one — the
+              // same reasoning as the account-migration respawn in
+              // `terminal/account_migration.rs`. Net commit is unchanged.
+              resourceOverride: true,
             });
           } catch {
             console.warn(`Failed to create terminal on page ${group.name}`);
@@ -402,6 +411,12 @@ function AppContent() {
   const { toasts, showToast, dismissToast } = useToast();
   useErrorNotifications(showToast);
   useAccountMigrationNotifications(showToast);
+  // Spawn-time resource gate — WARN notices (and overridden CRITICAL spawns)
+  // arrive as Tauri events and become toasts that link into
+  // `Settings > Resource Guard`. The CRITICAL *refusal* is not an event; it
+  // comes back as the spawn's typed error and is answered by
+  // `<ResourceGuardDialog />` below.
+  useResourceGuardNotifications(showToast);
 
   // Legacy dev email/password auto-login (and its `test-auto-login-failed`
   // toast) was removed in the Cognito-legacy-auth teardown — sign-in is now
@@ -932,6 +947,10 @@ function AppContent() {
 
             <ApprovalDialog />
             <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+            {/* Blocking "Start anyway?" for a CRITICAL spawn-time resource
+              refusal. Prop-less and rendered once — it subscribes to
+              `lib/resourceGuard`'s queue, which any spawn surface can fill. */}
+            <ResourceGuardDialog />
             {/* Surfaces incoming cross-machine session handoffs as toasts.
               Listens for `session-event` with kind=handoff_request — PR #258. */}
             <IncomingHandoffToastBridge />
