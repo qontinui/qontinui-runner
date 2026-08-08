@@ -1759,13 +1759,22 @@ mod tests {
     /// `unwrap_or` would triple the fleet's nudge rate with a green suite.
     #[test]
     fn an_absent_max_attempts_defaults_to_one() {
-        assert_eq!(ComplianceConfig::from_body(&json!({})).max_attempts, 1);
         assert_eq!(
-            ComplianceConfig::from_body(&json!({"max_attempts": null})).max_attempts,
+            ComplianceConfig::from_body(&json!({}))
+                .expect("parsed")
+                .max_attempts,
             1
         );
         assert_eq!(
-            ComplianceConfig::from_body(&json!({"max_attempts": "3"})).max_attempts,
+            ComplianceConfig::from_body(&json!({"max_attempts": null}))
+                .expect("parsed")
+                .max_attempts,
+            1
+        );
+        assert_eq!(
+            ComplianceConfig::from_body(&json!({"max_attempts": "3"}))
+                .expect("parsed")
+                .max_attempts,
             1,
             "a non-numeric value is not a cap"
         );
@@ -1774,7 +1783,9 @@ mod tests {
     #[test]
     fn an_absurd_max_attempts_is_clamped() {
         assert_eq!(
-            ComplianceConfig::from_body(&json!({"max_attempts": 999_999})).max_attempts,
+            ComplianceConfig::from_body(&json!({"max_attempts": 999_999}))
+                .expect("parsed")
+                .max_attempts,
             MAX_NUDGE_ATTEMPTS_CEILING as u32
         );
     }
