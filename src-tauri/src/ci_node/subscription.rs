@@ -5,17 +5,38 @@
 //! subscription's glob. Coord's `/ws` is a Redis PSUBSCRIBE bridge (one
 //! pattern per connection), so widening the existing pattern would change
 //! the agent-runtime connection's URL and delivery set — this keeps the
-//! spawn path byte-for-byte unchanged and lets the CI socket exist only
-//! while the `ci_node` setting is enabled (checked before every connect, so
-//! toggling requires no restart and a disabled fleet runner holds no extra
-//! socket).
+//! spawn path byte-for-byte unchanged and gives the CI channel family its
+//! own independently-reconnecting socket.
 //!
-//! The Redis glob `events.ci.*.<device_id>` matches BOTH
-//! `events.ci.build_requested.<device_id>` and
-//! `events.ci.build_cancelled.<device_id>` (`*` in Redis patterns crosses
-//! word boundaries but the trailing `.<device_id>` still anchors the
-//! device), so one pattern covers the whole CI channel family; exact-match
-//! routing in [`route_ci_channel`] decides what each frame is.
+//! The Redis glob `events.ci.*.<device_id>` matches the whole CI channel
+//! family — `build_requested`, `build_cancelled` and `settings_requested`
+//! (`*` in Redis patterns crosses word boundaries but the trailing
+//! `.<device_id>` still anchors the device), so one pattern covers all
+//! three; exact-match routing in [`route_ci_channel`] decides what each
+//! frame is.
+//!
+//! # Why the socket is now held even when `ci_node` is DISABLED
+//!
+//! It used to be gated: the loop checked `ci_node.enabled` before every
+//! connect so a disabled fleet runner held no extra socket. That gate had
+//! to go, and the reason is not a preference — it made the feature it was
+//! protecting unreachable.
+//!
+//! `events.ci.settings_requested.<device_id>` is how qontinui-web turns
+//! this lane ON (plan `2026-08-07-...`, Phase 4). A device with
+//! `enabled = false` is EXACTLY the device that needs to receive that
+//! directive, and a disabled device holding no socket can never receive
+//! it — the owner's only remaining door would be hand-editing
+//! `settings.json` on the machine, which is the thing the web surface
+//! exists to replace. A configuration channel that only reaches
+//! already-configured devices is not a configuration channel.
+//!
+//! Holding the socket costs one idle WS connection per runner (coord's
+//! `/ws` already carries the agent-runtime socket per runner, so this is
+//! proportionate), and it grants nothing: `admission::submit` still reads
+//! `ci_node.enabled` per dispatch, so a disabled device that receives a
+//! `build_requested` frame refuses it. The socket is a mailbox, not a
+//! capability.
 
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -33,8 +54,9 @@ const CI_HEALTHY_PUMP_THRESHOLD_SECS: u64 = 30;
 /// Unsolicited-Ping cadence keeping the quiet subscription alive through
 /// the ALB's ~60s idle reaper.
 const CI_KEEPALIVE_INTERVAL_SECS: u64 = 20;
-/// Re-check cadence for the `ci_node.enabled` setting while disabled.
-const CI_DISABLED_RECHECK_SECS: u64 = 60;
+/// Retry cadence when the profile carries no `coord_url` — there is no
+/// socket to hold, so poll for one at a lazy interval.
+const CI_NO_COORD_URL_RETRY_SECS: u64 = 60;
 
 /// Pure builder for the CI-dispatch WS subscription URL. Same
 /// normalization rules as `agent_runtime::build_coord_ws_url` (scheme swap,
@@ -66,21 +88,31 @@ fn ci_ws_url(device_id: uuid::Uuid) -> Option<String> {
     Some(build_ci_ws_url(&coord_url, device_id))
 }
 
-/// The two CI channels this device consumes.
+/// The CI channels this device consumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CiChannel {
     BuildRequested,
     BuildCancelled,
+    /// The owner reconfigured this device's CI lane from qontinui-web —
+    /// see [`super::settings_directive`].
+    SettingsRequested,
 }
 
 /// Exact-match routing for an inbound frame's channel. `None` for anything
 /// that is not this device's CI traffic — including the agent-spawn
 /// channels, other devices' CI channels, and future `events.ci.*` kinds.
+///
+/// Exact match, never prefix match: the device id is the whole of the
+/// addressing, so `events.ci.settings_requested.<other-device>` must be
+/// inert here even though the PSUBSCRIBE glob would never have delivered
+/// it. Coord's fanout is the wrong place to put that trust.
 pub(crate) fn route_ci_channel(channel: &str, device_id: uuid::Uuid) -> Option<CiChannel> {
     if channel == format!("events.ci.build_requested.{device_id}") {
         Some(CiChannel::BuildRequested)
     } else if channel == format!("events.ci.build_cancelled.{device_id}") {
         Some(CiChannel::BuildCancelled)
+    } else if channel == format!("events.ci.settings_requested.{device_id}") {
+        Some(CiChannel::SettingsRequested)
     } else {
         None
     }
@@ -99,21 +131,19 @@ pub(crate) fn parse_envelope_json(envelope: &serde_json::Value) -> Option<serde_
     }
 }
 
-/// Subscribe loop: while the `ci_node` setting is enabled, hold a WS
-/// subscription for this device's CI channels, reconnecting with capped
-/// exponential back-off; while disabled, poll the setting instead of
-/// holding a socket.
+/// Subscribe loop: hold a WS subscription for this device's CI channels,
+/// reconnecting with capped exponential back-off.
+///
+/// Unconditional on `ci_node.enabled` — see the module doc. The setting
+/// gates ADMISSION (`admission::submit`), not delivery, because the
+/// settings directive that flips the setting has to be able to arrive
+/// while it is off.
 pub(crate) async fn subscribe_loop(device_id: uuid::Uuid) {
     let mut backoff_ms: u64 = CI_BACKOFF_BASE_MS;
     loop {
-        if !crate::settings::get_ci_node_settings().enabled {
-            tokio::time::sleep(Duration::from_secs(CI_DISABLED_RECHECK_SECS)).await;
-            backoff_ms = CI_BACKOFF_BASE_MS;
-            continue;
-        }
         let Some(ws_url) = ci_ws_url(device_id) else {
-            warn!("ci_node: no coord_url in profile; retrying in {CI_DISABLED_RECHECK_SECS}s");
-            tokio::time::sleep(Duration::from_secs(CI_DISABLED_RECHECK_SECS)).await;
+            warn!("ci_node: no coord_url in profile; retrying in {CI_NO_COORD_URL_RETRY_SECS}s");
+            tokio::time::sleep(Duration::from_secs(CI_NO_COORD_URL_RETRY_SECS)).await;
             continue;
         };
         let started = std::time::Instant::now();
@@ -219,6 +249,12 @@ fn handle_ci_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
             Ok(cancel) => super::admission::cancel(&cancel.dispatch_id),
             Err(e) => warn!("ci_node: build_cancelled payload did not parse: {e}"),
         },
+        CiChannel::SettingsRequested => {
+            match serde_json::from_value::<super::settings_directive::CiSettingsDirective>(inner) {
+                Ok(directive) => super::settings_directive::apply(directive),
+                Err(e) => warn!("ci_node: settings_requested payload did not parse: {e}"),
+            }
+        }
     }
     Ok(())
 }
@@ -272,6 +308,10 @@ mod tests {
             route_ci_channel(&format!("events.ci.build_cancelled.{device}"), device),
             Some(CiChannel::BuildCancelled)
         );
+        assert_eq!(
+            route_ci_channel(&format!("events.ci.settings_requested.{device}"), device),
+            Some(CiChannel::SettingsRequested)
+        );
         // Another device's CI traffic: not ours.
         assert_eq!(
             route_ci_channel(&format!("events.ci.build_requested.{other}"), device),
@@ -291,6 +331,45 @@ mod tests {
             route_ci_channel(&format!("events.ci.build_paused.{device}"), device),
             None
         );
+    }
+
+    /// The settings arm is DEVICE-SCOPED, and that is the whole of its
+    /// addressing: a directive aimed at another device must be inert here
+    /// even if coord's fanout ever mis-delivered it. Reconfiguring which
+    /// repos a machine will execute code for is the last thing that should
+    /// route on a near-miss.
+    #[test]
+    fn settings_arm_matches_only_this_device_and_this_channel() {
+        let device = uuid::Uuid::now_v7();
+        let other = uuid::Uuid::now_v7();
+
+        assert_eq!(
+            route_ci_channel(&format!("events.ci.settings_requested.{device}"), device),
+            Some(CiChannel::SettingsRequested)
+        );
+        // Another device's settings directive: never ours.
+        assert_eq!(
+            route_ci_channel(&format!("events.ci.settings_requested.{other}"), device),
+            None
+        );
+        // Coord's sanitized audit fan-out (no device suffix) must not route.
+        assert_eq!(
+            route_ci_channel("events.ci.lifecycle.settings_requested", device),
+            None
+        );
+        // Near-miss channel names must not route either — exact match only.
+        for near in [
+            format!("events.ci.settings_requested.{device}.extra"),
+            format!("events.ci.settings.{device}"),
+            format!("events.ci.settings_requested{device}"),
+            format!("events.devenv.settings_requested.{device}"),
+        ] {
+            assert_eq!(
+                route_ci_channel(&near, device),
+                None,
+                "{near} must not route to the settings arm"
+            );
+        }
     }
 
     /// Envelope tolerance: payload-as-string (coord's real fanout shape),

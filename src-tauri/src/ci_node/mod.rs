@@ -8,6 +8,11 @@
 //!   `{dispatch_id, repo, head_sha, fetch_url, candidate_ref, manifest_path,
 //!   check_name, coord_http_url}`
 //! - inbound `events.ci.build_cancelled.<device_id>` — payload `{dispatch_id}`
+//! - inbound `events.ci.settings_requested.<device_id>` — the owner's
+//!   CI-node configuration from qontinui-web, published by coord's
+//!   `POST /devenv/ci-node-dispatch` and applied by [`settings_directive`]
+//!   (which re-validates every field; coord is not this machine's security
+//!   boundary)
 //! - outbound REST, **device-JWT authenticated** (coord mounts the ingest
 //!   routes behind `require_jwt` and matches the JWT's `device_id`/
 //!   `tenant_id` claims against the dispatch row's assignee):
@@ -28,7 +33,8 @@
 //! `.qontinui/ci.toml` at the dispatched SHA (coord supplies no commands —
 //! plan §4.1), gated by the local per-repo allowlist in
 //! [`crate::settings::CiNodeSettings`]. Everything is off by default; with
-//! `ci_node.enabled = false` this module never opens a socket.
+//! `ci_node.enabled = false` this module admits nothing (it still listens,
+//! so the owner can turn it on from the web — see [`settings_directive`]).
 //!
 //! Deliberately NOT on the local `:9876` surface: CI is driven only from the
 //! coord WS (plan §7.6 — no new capability on the unauthenticated loopback
@@ -41,6 +47,7 @@ pub(crate) mod host_sizing;
 pub(crate) mod junit;
 pub(crate) mod manifest;
 pub(crate) mod reporting;
+pub(crate) mod settings_directive;
 pub(crate) mod sibling;
 pub(crate) mod subscription;
 pub(crate) mod tools;
@@ -137,10 +144,12 @@ pub(crate) fn coord_http_base() -> Option<String> {
 }
 
 /// Spawn the CI-node runtime. Mirrors `agent_runtime::spawn_runtime`:
-/// no device identity or coord base ⇒ inert. The subscribe loop itself
-/// re-checks the `ci_node.enabled` setting before every connect, so the
-/// opt-in can be flipped without a restart and a disabled runner holds no
-/// extra socket.
+/// no device identity or coord base ⇒ inert.
+///
+/// The subscription is held regardless of `ci_node.enabled` — the setting
+/// gates ADMISSION, not delivery, because `settings_requested` is how the
+/// opt-in gets flipped from qontinui-web and a disabled device holding no
+/// socket could never receive it. See `subscription`'s module doc.
 pub fn spawn_ci_node_runtime() {
     let Some(device_id) = crate::agent_runtime::load_local_device_id() else {
         info!(

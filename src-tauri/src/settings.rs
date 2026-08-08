@@ -2035,7 +2035,15 @@ impl Default for HelperTasksSettings {
 /// even when enabled.
 ///
 /// Default is fully OFF; a missing key in an existing settings.json loads as
-/// the inert default. There is no Settings UI yet — hand-edit settings.json.
+/// the inert default.
+///
+/// Two ways to change it: hand-edit `settings.json`, or configure the machine
+/// in qontinui-web (`/environments/machines`), which reaches this struct via
+/// coord's `POST /devenv/ci-node-dispatch` →
+/// `events.ci.settings_requested.<device_id>` →
+/// [`crate::ci_node::settings_directive`]. The remote door re-validates every
+/// field locally and can only ever write values a hand-edit could also write —
+/// notably it CANNOT write a wildcard allowlist or a `min_free_disk_gb` of 0.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CiNodeSettings {
     /// Master opt-in. Default FALSE — the runner never advertises CI
@@ -3610,12 +3618,30 @@ pub fn get_ai_settings() -> AiSettings {
 }
 
 /// Get the current CI-node settings (plan
-/// `2026-07-15-runner-as-ci-node-migration`). Read-only accessor — the
-/// heartbeat, budget publish, and `ci_node` executor read it; nothing
-/// writes it back (the setting is hand-edited JSON until a Settings UI
-/// ships), so the secondary-runner persist guard is not implicated.
+/// `2026-07-15-runner-as-ci-node-migration`). The heartbeat, budget publish,
+/// and `ci_node` executor all read it at the moment they need it, so a write
+/// through [`save_ci_node_settings`] is visible to the next reader without a
+/// restart.
 pub fn get_ci_node_settings() -> CiNodeSettings {
     load_settings().ci_node
+}
+
+/// Persist CI-node settings.
+///
+/// THE ONLY writer for `ci_node`, and deliberately built on [`update_settings`]
+/// rather than a bespoke one: that path starts from the RAW on-disk document
+/// (never the env-overlaid view), refuses to write at all when the existing
+/// file could not be read or parsed, writes atomically, and drops the parse
+/// cache afterwards. Hand-rolling a second writer here would have reintroduced
+/// exactly the bug that comment describes — a secondary runner persisting its
+/// in-memory overlays over the primary's document as a side effect of an
+/// unrelated save.
+///
+/// Callers: the qontinui-web configuration directive
+/// (`ci_node::settings_directive::apply`). The values are validated BEFORE they
+/// reach this function — this is a writer, not a gate.
+pub fn save_ci_node_settings(ci_node: CiNodeSettings) -> Result<(), String> {
+    update_settings(|settings| settings.ci_node = ci_node)
 }
 
 /// Save AI settings.
