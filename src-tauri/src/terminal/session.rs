@@ -2806,8 +2806,8 @@ mod tests {
             state.report("main", tier);
             let ring = Arc::new(Mutex::new(VecDeque::new()));
             let produced = Arc::new(AtomicU64::new(0));
-            let first = tee_into_scrollback(&ring, &produced, b"alpha");
-            let second = tee_into_scrollback(&ring, &produced, b"beta");
+            let first = tee_into_scrollback(&ring, &produced, b"alpha", SCROLLBACK_CAPACITY);
+            let second = tee_into_scrollback(&ring, &produced, b"beta", SCROLLBACK_CAPACITY);
             assert_eq!((first, second), (0, 5), "{tier:?}");
             assert_eq!(produced.load(Ordering::Relaxed), 9, "{tier:?}");
             let bytes: Vec<u8> = ring.lock().unwrap().iter().copied().collect();
