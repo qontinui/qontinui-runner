@@ -321,7 +321,7 @@ at each row's `continuation_spawn` / `continuation_dispatched_at` /
 
 | Row state | What it means | What to do |
 |---|---|---|
-| `continuation_spawn != null` ∧ `dispatched_at == null` | **PRE-DISPATCH — the net is ARMED.** At this stamp, moments after §5.4 registered the gate, **this is the EXPECTED state.** | **Mute or reject the GATE** (coord skips muted gates when evaluating, so muting genuinely suppresses the dispatch); once `coord_withdraw_gate` lands, withdraw it. Do **NOT** POST `continuation-cancel` — see below. |
+| `continuation_spawn != null` ∧ `dispatched_at == null` | **PRE-DISPATCH — the net is ARMED.** At this stamp, moments after §5.4 registered the gate, **this is the EXPECTED state.** | **Mute or reject the GATE** (coord skips muted gates when evaluating, so muting genuinely suppresses the dispatch), or `coord_withdraw_gate` — LIVE. Do **NOT** POST `continuation-cancel` — see below. |
 | `dispatched_at != null` ∧ `consumed_at == null` ∧ `cancelled_at == null` | Dispatched, not yet consumed. | `POST $COORD_HTTP_URL/coord/gates/<gate_id>/continuation-cancel` `{cancelled_by, reason}` — the Step 0.6 call, with the response handling below. |
 | no row carries a `continuation_spawn` | Genuinely nothing pending — e.g. a standalone `/implement-plan` whose gate was registered continuation-less. | Say so and proceed. **Do not mute anything.** |
 
@@ -1420,7 +1420,7 @@ supersedes unit_ready for the dependency-gated case".)
   `POST $COORD_HTTP_URL/coord/work-units/upsert {slug, title?, status?}` →
   **capture `work_unit_id`**; (2)
   `POST $COORD_HTTP_URL/coord/work-units/<slug>/register-gate`
-  `{predicate, phase_name (required), continuation_spawn?, clearance_audience?}` —
+  `{predicate, phase_name (required), continuation_spawn?, clearance_audience?, gate_class?}` —
   `register-gate` does NOT upsert (404s `work_unit_not_found` if you skip step 1).
   Reach the two routes over a held device JWT, the `/coord-mcp` proxy (injects a
   device JWT), or the acting-user-service token (`coord-acting-bearer.sh`); MCP
@@ -1472,6 +1472,20 @@ supersedes unit_ready for the dependency-gated case".)
   session that completes the work can attest the gate itself; set `operator` for
   business/judgment/strategy or on-page-human-verification gates. Default is
   `operator` if omitted; the sensitive-work rule always forces `operator`.
+- **`gate_class`:** classify the gate so coord's per-tenant `gate_clearance`
+  matrix can resolve who may clear it. `security-surface` when the deferred work
+  this gate guards would itself fire a `security-and-autonomy` glob or content
+  trigger (name the trigger in `phase_name` so it stays auditable — a
+  CLAIM-anchored gate has no `phase_name`, so name it in the plan or report
+  instead);
+  `ops-confirm` for deploy/sweep/migration/config confirmations;
+  `routine-review` for mechanical follow-ups. **Omit when none applies** —
+  omitting is safe and never a loophole, and a guessed class is worse than none.
+  ⚠️ Do not ask for the `agent_non_author` authority on this fleet: it is a
+  ONE-DEVICE fleet and no gate carries an agent id, so the device floor
+  (`reg_dev == cal_dev`) treats every caller as the author and it resolves to
+  "nobody may attest". A second paired device would also lift it.
+  (Canonical: `_gate-registration` → "`gate_class`".)
 - **Predicate choice:** wait-on-PR (non-coord repo) → `pr_merged`; work landing
   on a **coord-orchestrated repo** → `commit_live` `{repo, commit_sha}` with a
   **post-land main SHA** (NEVER a pre-land branch-head SHA — rebase-land rewrites
@@ -1502,6 +1516,16 @@ supersedes unit_ready for the dependency-gated case".)
   unknown/method-not-found, report **"gate NOT registered — coord_register_gate
   not in this session's tool allow-set"** and fall back to HTTP (or surface to the
   operator). NEVER report a gate registered without a returned `gate_id`.
+- **Warnings honesty — a `gate_id` is necessary, NOT sufficient**
+  [policy: `coordination` `gate-warnings-mean-not-usable`]. A non-empty
+  `warnings[]`, or an `initial_verdict_reason` containing **"cannot evaluate"**,
+  means **REGISTERED-BUT-NOT-USABLE**: the row was written and the gate can never
+  clear. Do NOT report the deferred item gated. Re-check with
+  `coord_check_gate_predicate {predicate}` **against a control whose answer you
+  already know** (identical output on the control proves the predicate is dead,
+  not your anchor), re-register on a predicate coord can evaluate, withdraw the
+  unusable one (`coord_withdraw_gate`), and quote the NEW `gate_id`. Canonical:
+  `_gate-registration` → "Registration warnings".
 - **Dead-transport honesty (the OTHER mask):** a call that returns **`"Command
   failed with no output"`** is a *dead cached transport*, not a masked tool — the
   tool is present and listed, so the fallback above never fires. Presume the
