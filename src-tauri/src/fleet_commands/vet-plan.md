@@ -655,8 +655,9 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      `warnings[]` or a "cannot evaluate" `initial_verdict_reason` means the row
      exists and the gate can never clear. Re-check the predicate against a
      control, re-register on one coord can evaluate, withdraw the unusable one,
-     and quote the NEW `gate_id`. Canonical: `_gate-registration` →
-     "Registration warnings".
+     and quote the NEW `gate_id`. Full procedure and the tool names: the
+     **Warnings honesty** bullet in the flagged-items section below. Canonical:
+     `_gate-registration` → "Registration warnings".
 
 (If coord doesn't yet accept `unit_ready` — e.g. the deploy that ships the
 work-unit surface hasn't landed — report the gate as NOT registered with the
@@ -913,6 +914,16 @@ leave it in the report.
   **"gate NOT registered — coord_register_gate not in this session's tool
   allow-set"** and fall back to HTTP (or surface to the operator). NEVER report a
   gate registered without a returned `gate_id`.
+- **Warnings honesty — a `gate_id` is necessary, NOT sufficient**
+  [policy: `coordination` `gate-warnings-mean-not-usable`]. A non-empty
+  `warnings[]`, or an `initial_verdict_reason` containing **"cannot evaluate"**,
+  means **REGISTERED-BUT-NOT-USABLE**: the row was written and the gate can never
+  clear. Do NOT report the flagged item gated. Re-check with
+  `coord_check_gate_predicate {predicate}` **against a control whose answer you
+  already know** (identical output on the control proves the predicate is dead,
+  not your anchor), re-register on a predicate coord can evaluate, withdraw the
+  unusable one (`coord_withdraw_gate`), and quote the NEW `gate_id`. Canonical:
+  `_gate-registration` → "Registration warnings".
 - **Dead-transport honesty (the OTHER mask):** a call that returns **`"Command
   failed with no output"`** is a *dead cached transport*, not a masked tool — the
   tool is present and listed, so the fallback above never fires. Presume the
