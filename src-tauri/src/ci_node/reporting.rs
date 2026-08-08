@@ -453,7 +453,13 @@ pub(crate) async fn post_result(
     loop {
         let mut ok_body: Option<String> = None;
         let status = match device_bearer().await {
-            Some(bearer) => match client.post(&url).bearer_auth(bearer).json(&body).send().await {
+            Some(bearer) => match client
+                .post(&url)
+                .bearer_auth(bearer)
+                .json(&body)
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     let code = resp.status().as_u16();
                     if (200..300).contains(&code) {
@@ -681,7 +687,10 @@ mod tests {
     fn coord_artifact_echo_is_loud_on_every_non_happy_path() {
         // Nothing sent ⇒ nothing to say (the log already carries the capture
         // outcome via `junit::CaptureOutcome::log_line`).
-        assert_eq!(test_results_note(Some(r#"{"state":"succeeded"}"#), false), None);
+        assert_eq!(
+            test_results_note(Some(r#"{"state":"succeeded"}"#), false),
+            None
+        );
 
         // Happy path: rows landed ⇒ silent.
         assert_eq!(

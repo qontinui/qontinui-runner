@@ -214,9 +214,9 @@ pub(crate) fn resolve_declaration(
         if short_name(repo_part) != sibling_short {
             continue;
         }
-        let n: u64 = num_part.parse().map_err(|_| {
-            format!("malformed label {label:?} — {num_part:?} is not a PR number")
-        })?;
+        let n: u64 = num_part
+            .parse()
+            .map_err(|_| format!("malformed label {label:?} — {num_part:?} is not a PR number"))?;
         downs.push(n);
     }
     let downs = dedup(downs);
@@ -410,7 +410,9 @@ fn expect_ok(what: &str, answer: Option<ApiAnswer>) -> Result<ApiAnswer, String>
             a.status
         )),
         404 => Ok(a),
-        s => Err(format!("{what}: unexpected HTTP {s}. UNKNOWN — refusing to guess.")),
+        s => Err(format!(
+            "{what}: unexpected HTTP {s}. UNKNOWN — refusing to guess."
+        )),
     }
 }
 
@@ -634,7 +636,14 @@ async fn materialise(dest: &Path, resolved: &ResolvedSibling) -> Result<(), Stri
     run_git(dest, &["remote", "add", "origin", &url], GIT_LOCAL_TIMEOUT).await?;
     run_git(
         dest,
-        &["fetch", "--depth", "1", "--no-tags", "origin", &resolved.sha],
+        &[
+            "fetch",
+            "--depth",
+            "1",
+            "--no-tags",
+            "origin",
+            &resolved.sha,
+        ],
         SIBLING_FETCH_TIMEOUT,
     )
     .await
@@ -779,24 +788,24 @@ mod tests {
         // Cargo's `../qontinui-schemas/rust` from <dispatch>/qontinui-coord
         // and Poetry's `../../qontinui-schemas` from
         // <dispatch>/qontinui-web/backend both name this same directory.
-        let from_cargo = dispatch_root.join("qontinui-coord").join("../qontinui-schemas");
+        let from_cargo = dispatch_root
+            .join("qontinui-coord")
+            .join("../qontinui-schemas");
         let from_poetry = dispatch_root
             .join("qontinui-web")
             .join("backend")
             .join("../../qontinui-schemas");
         for p in [from_cargo, from_poetry] {
-            let normalised: PathBuf = p
-                .components()
-                .fold(PathBuf::new(), |mut acc, c| match c {
-                    std::path::Component::ParentDir => {
-                        acc.pop();
-                        acc
-                    }
-                    other => {
-                        acc.push(other);
-                        acc
-                    }
-                });
+            let normalised: PathBuf = p.components().fold(PathBuf::new(), |mut acc, c| match c {
+                std::path::Component::ParentDir => {
+                    acc.pop();
+                    acc
+                }
+                other => {
+                    acc.push(other);
+                    acc
+                }
+            });
             assert_eq!(normalised, dest);
         }
         // Nothing escapes the cleanup unit.

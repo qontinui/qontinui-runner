@@ -411,7 +411,11 @@ mod tests {
         // Nothing anywhere ⇒ Absent (a legitimate, non-fatal state).
         assert_eq!(capture(&wt, &target, &[]), CaptureOutcome::Absent);
 
-        let profile_dir = wt.join("src-tauri").join("target").join("nextest").join("ci");
+        let profile_dir = wt
+            .join("src-tauri")
+            .join("target")
+            .join("nextest")
+            .join("ci");
         std::fs::create_dir_all(&profile_dir).unwrap();
         std::fs::write(
             profile_dir.join("junit.xml"),

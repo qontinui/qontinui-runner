@@ -123,9 +123,9 @@ impl DirectiveRejection {
             Self::EntryTooLong(len) => {
                 format!("repo_allowlist entry of length {len} exceeds {MAX_ALLOWLIST_ENTRY_LEN}")
             }
-            Self::MalformedEntry(entry) => format!(
-                "repo_allowlist entry {entry:?} is not `owner/name` or a bare repo name"
-            ),
+            Self::MalformedEntry(entry) => {
+                format!("repo_allowlist entry {entry:?} is not `owner/name` or a bare repo name")
+            }
             Self::TooManyEntries(n) => {
                 format!("repo_allowlist has {n} entries, above the {MAX_ALLOWLIST_ENTRIES} limit")
             }
@@ -438,7 +438,9 @@ mod tests {
             DirectiveRejection::EntryTooLong(MAX_ALLOWLIST_ENTRY_LEN + 1)
         );
 
-        d.repo_allowlist = (0..=MAX_ALLOWLIST_ENTRIES).map(|i| format!("r{i}")).collect();
+        d.repo_allowlist = (0..=MAX_ALLOWLIST_ENTRIES)
+            .map(|i| format!("r{i}"))
+            .collect();
         assert_eq!(
             validate(&d).unwrap_err(),
             DirectiveRejection::TooManyEntries(MAX_ALLOWLIST_ENTRIES + 1)

@@ -405,7 +405,9 @@ fn validate_branch(branch: &str) -> Result<(), String> {
         return Err(format!("branch {branch:?} must be 1..=200 chars"));
     }
     if branch.starts_with('-') || branch.starts_with('/') || branch.ends_with('/') {
-        return Err(format!("branch {branch:?} has an invalid leading/trailing character"));
+        return Err(format!(
+            "branch {branch:?} has an invalid leading/trailing character"
+        ));
     }
     if branch.contains("..") || branch.contains("//") || branch.contains("@{") {
         return Err(format!("branch {branch:?} contains a forbidden sequence"));
@@ -739,15 +741,15 @@ timeout_secs = 7200
     #[test]
     fn sibling_repo_slug_rejections() {
         for bad in [
-            "qontinui-schemas",              // no owner — would need a guess
-            "qontinui/schemas/rust",         // three segments
-            "qontinui/../secret",            // traversal
-            "../qontinui-schemas",           // traversal
-            "qontinui/",                     // empty name
-            "/qontinui-schemas",             // empty owner
-            "qontinui/qontinui schemas",     // space
-            "qontinui/-leading",             // reads as an option
-            "qontinui/repo;rm",              // punctuation
+            "qontinui-schemas",          // no owner — would need a guess
+            "qontinui/schemas/rust",     // three segments
+            "qontinui/../secret",        // traversal
+            "../qontinui-schemas",       // traversal
+            "qontinui/",                 // empty name
+            "/qontinui-schemas",         // empty owner
+            "qontinui/qontinui schemas", // space
+            "qontinui/-leading",         // reads as an option
+            "qontinui/repo;rm",          // punctuation
         ] {
             let text = format!(
                 "version = 1\n[[siblings]]\nrepo = {bad:?}\n\

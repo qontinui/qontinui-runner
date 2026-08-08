@@ -600,10 +600,7 @@ impl DispatchEnv {
             // Both are exported unconditionally because a manifest may use
             // either harness, and the unused one is inert.
             ("RUST_TEST_THREADS".to_string(), test_threads.to_string()),
-            (
-                "NEXTEST_TEST_THREADS".to_string(),
-                test_threads.to_string(),
-            ),
+            ("NEXTEST_TEST_THREADS".to_string(), test_threads.to_string()),
             // Keeps cargo out of the developer's own target/.
             (
                 "CARGO_TARGET_DIR".to_string(),

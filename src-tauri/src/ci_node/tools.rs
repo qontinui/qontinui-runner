@@ -355,8 +355,8 @@ fn extract_binary(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    let mut out = std::fs::File::create(dest)
-        .map_err(|e| format!("create {}: {e}", dest.display()))?;
+    let mut out =
+        std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
     let found = match kind {
         ArchiveKind::Zip => {
             let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
@@ -465,7 +465,9 @@ async fn verify(bin: &Path, spec: &ToolSpec, version: &str) -> Result<(), String
 /// wrong-version case is testable without a download.
 pub(crate) fn version_is_reported(output: &str, version: &str) -> bool {
     output
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+' || c == '_'))
+        .split(|c: char| {
+            !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+' || c == '_')
+        })
         .any(|tok| tok == version)
 }
 
@@ -558,7 +560,10 @@ mod tests {
         assert!(!version_is_reported(real, "0.9.97"));
         assert!(!version_is_reported("", "0.9.98"));
         // A build-metadata version is one token, not three.
-        assert!(version_is_reported("tool 1.2.3-rc.1+build", "1.2.3-rc.1+build"));
+        assert!(version_is_reported(
+            "tool 1.2.3-rc.1+build",
+            "1.2.3-rc.1+build"
+        ));
     }
 
     /// The host triple is whatever this build targets; it must be one the
