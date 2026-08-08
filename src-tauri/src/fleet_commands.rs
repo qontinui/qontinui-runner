@@ -208,6 +208,105 @@ mod tests {
         assert_ne!(on_disk, default_body);
     }
 
+    /// The gate-registration mechanics every bundled command that teaches
+    /// registration must carry, as `(token, why it is load-bearing)`.
+    ///
+    /// These reached the bundle late (2026-08-08) and only after a lint in a
+    /// DIFFERENT repository — `qontinui-claude-config`'s
+    /// `lint-command-frontmatter.py` check #15b — was pointed at this tree by
+    /// hand. That guard cannot hold the line here: it needs a
+    /// `qontinui-claude-config` checkout to exist and be current, and no job in
+    /// this repo's CI runs it. Since these bodies are what actually ship (see
+    /// the module doc), the invariant is asserted where the files live.
+    const GATE_REGISTRATION_MECHANICS: &[(&str, &str)] = &[
+        (
+            "gate_class",
+            "decides WHO MAY CLEAR the gate (coord's per-tenant `gate_clearance` \
+             matrix); a copy that omits it teaches sessions to register \
+             unclassified gates, which is how the matrix stayed dark fleet-wide",
+        ),
+        (
+            "initial_verdict_reason",
+            "how a session tells a REGISTERED-BUT-NOT-USABLE gate from a usable \
+             one; without it a returned `gate_id` reads as sufficient and an \
+             unevaluable gate rots `open` with nothing escalating on it",
+        ),
+    ];
+
+    /// Every bundled command that documents gate registration must teach the
+    /// mechanics in [`GATE_REGISTRATION_MECHANICS`].
+    ///
+    /// Scoped by CONTENT, not by filename, so the guard covers whatever the
+    /// bundle grows into — the module doc's "nothing may assume the bundle is
+    /// two commands" applies to its tests too. A command that never registers a
+    /// gate is simply not in scope.
+    #[test]
+    fn bundled_gate_registration_commands_teach_the_mechanics() {
+        let mut checked = 0usize;
+        for (name, contents) in FLEET_COMMANDS {
+            if !contents.contains("coord_register_gate") {
+                continue;
+            }
+            checked += 1;
+            for (token, why) in GATE_REGISTRATION_MECHANICS {
+                assert!(
+                    contents.contains(token),
+                    "bundled agent command {name} documents gate registration but never \
+                     mentions {token:?} — {why}. This file is provisioned into every \
+                     spawned session and on a device with no qontinui-claude-config \
+                     checkout it is the ONLY copy, so a mechanic missing here is a \
+                     mechanic the fleet does not have; add it in \
+                     src-tauri/src/fleet_commands/{name}.md"
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "no bundled command mentions `coord_register_gate` — either the bundle lost \
+             its gate-registration procedures or this guard's content probe went stale"
+        );
+    }
+
+    /// Token presence is a floor, not proof of coverage: a file can mention a
+    /// mechanic once and still leave a whole registration path teaching the
+    /// superseded rule. That is exactly what happened — the 2026-08-08 carry
+    /// satisfied a token-presence lint with a single mention while `vet-plan`'s
+    /// flagged-items path still said a returned `gate_id` was the test.
+    ///
+    /// So assert it structurally: each "Masked-tool honesty" block that is
+    /// about REGISTRATION must also carry the warnings rule. The two are the
+    /// same class of false positive — a call that looks like it registered a
+    /// gate and did not — and a path that teaches one without the other tells a
+    /// session to report an unclearable gate as gated.
+    ///
+    /// Blocks are delimited by the next such bullet so an attest-side block
+    /// (`coord_attest_gate`, which has no registration warnings) stays out of
+    /// scope on its own content.
+    #[test]
+    fn every_registration_honesty_block_carries_the_warnings_rule() {
+        const HONESTY: &str = "**Masked-tool honesty";
+        for (name, contents) in FLEET_COMMANDS {
+            let starts: Vec<usize> = contents.match_indices(HONESTY).map(|(i, _)| i).collect();
+            for (n, &start) in starts.iter().enumerate() {
+                let end = starts.get(n + 1).copied().unwrap_or(contents.len());
+                let block = &contents[start..end];
+                if !block.contains("coord_register_gate") {
+                    continue; // attest-side, or some other honesty block
+                }
+                assert!(
+                    block.contains("initial_verdict_reason"),
+                    "bundled agent command {name}: the registration \"Masked-tool honesty\" \
+                     block at byte {start} teaches that a returned `gate_id` is the test, \
+                     but never says a `gate_id` carrying `warnings[]` / a \"cannot evaluate\" \
+                     `initial_verdict_reason` is a REGISTERED-BUT-NOT-USABLE gate. Every \
+                     registration path needs both rules, not just the file as a whole; add \
+                     the Warnings-honesty bullet to this path in \
+                     src-tauri/src/fleet_commands/{name}.md"
+                );
+            }
+        }
+    }
+
     /// The bundled commands must never acquire the operator's absolute plan
     /// paths. Scope to the specific hardcode patterns that were neutralized —
     /// NOT bare `qontinui-dev-notes`, which legitimately appears as a repo name.
