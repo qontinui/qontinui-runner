@@ -1007,6 +1007,14 @@ async fn spawn_looping_agent_terminal(
             None,
             capture_hint,
             Some(target_page),
+            // UNATTENDED spawn — respect the critical floor. A looping agent is
+            // by construction the one caller that will ask again: the supervisor
+            // re-evaluates its definitions on every tick, so a refusal now is a
+            // deferral, not a cancellation, and the next tick starts the agent
+            // as soon as the box has commit to spare. Overriding here would let
+            // a loop hammer a starved machine with new `claude` processes
+            // indefinitely — the exact shape of the 2026-08-06→07 incident.
+            false,
         )?;
     Ok((terminal_id, pinned_session_id))
 }

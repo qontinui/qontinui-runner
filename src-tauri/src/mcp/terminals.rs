@@ -257,6 +257,14 @@ pub async fn create_terminal_handler(
         app_handle,
         None,
         extra_env,
+        // UNATTENDED spawn — respect the critical floor. This is the runner's
+        // HTTP `POST /terminals` door: the caller is a script, an MCP tool or a
+        // peer runner, and there is no dialog to show it. The refusal is not
+        // silent — it comes back as the request's error body with the lane, the
+        // live headroom and the floor in it, so the caller can retry when the
+        // box has room. A door that quietly overrode the floor would let any
+        // remote caller undo the machine owner's own protection.
+        false,
     ) {
         Ok(info) => {
             if let Some(ctx) = isolated_ctx {

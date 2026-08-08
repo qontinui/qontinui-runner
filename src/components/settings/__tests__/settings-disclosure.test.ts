@@ -59,6 +59,10 @@ describe("settings sub-nav disclosure gating", () => {
       "otel",
       "containers",
       "ci-runner",
+      // Ungated on purpose: the session-protection floors guard the
+      // Terminal-first user's own sessions against commit exhaustion, which is
+      // the most default-path failure this app has.
+      "resource-guard",
       "security",
       "lock-yield",
       "advanced",

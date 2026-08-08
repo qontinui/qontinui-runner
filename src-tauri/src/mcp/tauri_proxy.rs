@@ -238,6 +238,14 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 state.app_handle.clone(),
                 None,
                 extra_env,
+                // UNATTENDED spawn — respect the critical floor. This is the
+                // HTTP proxy for the `terminal_create` Tauri command, used by
+                // external tooling that has no webview to show a dialog in. The
+                // typed refusal is returned verbatim as the invoke response's
+                // error, so a caller that *is* fronted by a UI can still
+                // recognise the `resource_guard:critical:` prefix and offer its
+                // own override — it just cannot have one assumed for it here.
+                false,
             ) {
                 Ok(info) => {
                     if let Some(ctx) = isolated_ctx {

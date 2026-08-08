@@ -310,8 +310,16 @@ impl InstanceManager {
     }
 
     /// Launch a new runner instance with the given configuration.
-    pub async fn launch_instance(&self, config: &RunnerInstanceConfig) -> Result<u32, String> {
-        self.launch_instance_with_app(config, None).await
+    ///
+    /// `resource_override` is forwarded to the spawn-time resource gate — see
+    /// [`Self::launch_instance_with_app`].
+    pub async fn launch_instance(
+        &self,
+        config: &RunnerInstanceConfig,
+        resource_override: bool,
+    ) -> Result<u32, String> {
+        self.launch_instance_with_app(config, None, resource_override)
+            .await
     }
 
     /// Launch a new runner instance, optionally resolving spawn
@@ -321,10 +329,19 @@ impl InstanceManager {
     /// Tauri handle (e.g. session-restore on startup before the
     /// AppHandle is shared with us) can pass `None` and the OS picks
     /// the position.
+    ///
+    /// `resource_override` carries an explicit "start it anyway" past the
+    /// spawn-time resource gate (plan
+    /// `2026-08-07-runner-resource-guard-and-session-protection` §Part D). A
+    /// secondary runner is a whole second copy of this application — its own
+    /// webview, its own embedded services, its own PTYs — so it is exactly the
+    /// kind of new process the incident showed at risk, and it gets the same
+    /// gate the PTY seam does. See [`crate::resource_guard`].
     pub async fn launch_instance_with_app(
         &self,
         config: &RunnerInstanceConfig,
         app: Option<&tauri::AppHandle>,
+        resource_override: bool,
     ) -> Result<u32, String> {
         let mut instances = self.instances.lock().await;
 
@@ -335,6 +352,25 @@ impl InstanceManager {
             }
             // Dead process — remove stale handle
             instances.remove(&config.id);
+        }
+
+        // Spawn-time resource gate (§Part D). Placed AFTER the already-running
+        // check so a redundant launch of a live instance cannot produce a
+        // spurious low-memory notice, and BEFORE anything is created so a
+        // refusal leaves no half-launched process and touches nothing that is
+        // already running. Off the async worker: the probe refreshes sysinfo and
+        // enumerates volumes, which is milliseconds but is still blocking work.
+        {
+            let app_for_gate = app.cloned();
+            tokio::task::spawn_blocking(move || {
+                crate::resource_guard::admit_spawn(
+                    "runner instance",
+                    resource_override,
+                    app_for_gate.as_ref(),
+                )
+            })
+            .await
+            .map_err(|e| format!("resource guard task failed: {e}"))??;
         }
 
         let exe_path = std::env::current_exe()

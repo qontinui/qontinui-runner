@@ -80,6 +80,12 @@ impl Transport for PtyTransport {
                 self.app_handle.clone(),
                 None,
                 None,
+                // UNATTENDED spawn — respect the critical floor, same as the
+                // sibling `claude_cli` transport: `Transport::start` is called
+                // by `SessionRegistry`, not by a button, and the refusal
+                // surfaces as `TransportError::Runtime` with the lane, the
+                // headroom and the floor in it.
+                false,
             )
             .map_err(TransportError::Runtime)?;
 

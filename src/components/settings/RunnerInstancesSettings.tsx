@@ -16,6 +16,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Monitor, Plus, Trash2, Play, Square, ChevronDown, ChevronRight, Info } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { getApiPort } from "@/lib/runner-api";
+import { spawnWithResourceGuard } from "@/lib/resourceGuard";
 import type { LogFunction } from "./types";
 import { HandoffPanel } from "@/components/session/HandoffPanel";
 
@@ -977,7 +978,13 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
   const handleLaunch = async (instance: InstanceStatus) => {
     setActionInProgress(instance.id);
     try {
-      await invoke("launch_runner_instance", { id: instance.id });
+      // Attended spawn — a secondary runner is a whole second copy of this app,
+      // so it goes through the same spawn-time resource gate the PTY seam uses.
+      // A CRITICAL refusal becomes the "Start anyway" dialog; declining
+      // re-throws and lands in the catch below as a normal launch failure.
+      await spawnWithResourceGuard((resourceOverride) =>
+        invoke("launch_runner_instance", { id: instance.id, resourceOverride }),
+      );
       onLog("success", `Instance '${instance.name}' launched on port ${instance.port}`);
       await loadInstances();
     } catch (err) {

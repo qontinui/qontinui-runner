@@ -74,6 +74,7 @@ export type MainTabId =
   | "settings-ci-runner"
   | "settings-app-freshness"
   | "settings-lock-yield"
+  | "settings-resource-guard"
   | "accessibility-explorer"
   | "settings-updates"
   | "orchestration-loop"
@@ -178,6 +179,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-ci-runner",
   "settings-app-freshness",
   "settings-lock-yield",
+  "settings-resource-guard",
   "accessibility-explorer",
   "settings-updates",
   "orchestration-loop",
@@ -326,6 +328,7 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   "settings-ci-runner": "CI Runner Settings",
   "settings-app-freshness": "App Freshness Settings",
   "settings-lock-yield": "Lock-yield Policy Settings",
+  "settings-resource-guard": "Resource Guard Settings",
   "accessibility-explorer": "Accessibility Explorer",
   "settings-updates": "Updates Settings",
   "orchestration-loop": "Orchestration Loop",

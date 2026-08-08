@@ -168,6 +168,12 @@ mod recording;
 mod reflection;
 mod regression_api;
 mod repo_detection;
+/// Spawn-time resource gate (plan
+/// `2026-08-07-runner-resource-guard-and-session-protection` §Part D). Top-level
+/// rather than under `terminal::` because both spawn seams it guards — the PTY
+/// (`terminal::session`) and the secondary runner process (`instance_manager`) —
+/// sit in different subtrees.
+mod resource_guard;
 mod restate;
 mod rework;
 mod routing;
@@ -2002,6 +2008,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::regression::record_regression_diagnosis,
             commands::regression::record_regression_run,
             commands::regression::save_regression_suite,
+            commands::resource_guard_settings::get_ci_node_settings,
+            commands::resource_guard_settings::get_session_guard_settings,
+            commands::resource_guard_settings::save_ci_node_settings,
+            commands::resource_guard_settings::save_session_guard_settings,
             repo_detection::register_repo_with_coord,
             repo_detection::tenant_for_repo,
             commands::project_preview::close_project_preview,
@@ -4392,7 +4402,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             match im
-                                .launch_instance_with_app(config, Some(&app_handle_for_restore))
+                                .launch_instance_with_app(
+                                    config,
+                                    Some(&app_handle_for_restore),
+                                    // UNATTENDED spawn — respect the critical
+                                    // floor. Boot-time restore is the single
+                                    // worst moment to override it: it launches
+                                    // EVERY previously-active instance in a
+                                    // loop, so on a box that is already out of
+                                    // commit an override would reproduce the
+                                    // incident's pile-up by design. A refusal
+                                    // is loud and recoverable — the `Err` arm
+                                    // below logs at ERROR naming the lane, the
+                                    // headroom and the floor, and the operator
+                                    // can relaunch any instance from the
+                                    // Instances panel (which IS attended) once
+                                    // the box has room.
+                                    false,
+                                )
                                 .await
                             {
                                 Ok(pid) => {

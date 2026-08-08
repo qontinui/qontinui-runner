@@ -40,6 +40,13 @@ impl TerminalManager {
     /// exported onto the PTY child in addition to the built-in runner vars —
     /// the launch surfaces use it to carry `QONTINUI_SESSION_WORKTREES` (the
     /// agent-agnostic pointer to every materialized sibling worktree).
+    ///
+    /// `resource_override` is forwarded verbatim to [`TerminalSession::spawn`]'s
+    /// spawn-time resource gate. It is a required parameter rather than a
+    /// defaulted one on purpose: every spawn surface has to state whether it is
+    /// an attended spawn (an operator who can be shown a dialog and asked) or an
+    /// unattended one, and a default would let the next surface inherit an
+    /// answer nobody chose. See [`crate::resource_guard`].
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
@@ -51,6 +58,7 @@ impl TerminalManager {
         app_handle: AppHandle,
         command: Option<Vec<String>>,
         extra_env: Option<Vec<(String, String)>>,
+        resource_override: bool,
     ) -> Result<TerminalInfo, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
@@ -96,6 +104,7 @@ impl TerminalManager {
             self.interceptor.clone(),
             command,
             extra_env,
+            resource_override,
         )?;
 
         let info = session.info();

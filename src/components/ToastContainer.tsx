@@ -29,7 +29,23 @@ export function ToastContainer({ toasts, onDismiss }: ToastContainerProps) {
           key={toast.id}
           className={`flex items-start gap-2 rounded-lg border px-4 py-3 shadow-lg bg-surface-primary text-text-primary text-sm animate-in slide-in-from-right-5 fade-in duration-200 ${typeStyles[toast.type]}`}
         >
-          <span className="flex-1">{toast.message}</span>
+          <div className="flex-1 min-w-0">
+            <span className="block">{toast.message}</span>
+            {/* Optional deep link (see `ToastAction`). Rendered as a button
+                rather than an anchor because every destination inside this app
+                is a tab switch, not a URL. */}
+            {toast.action && (
+              <button
+                onClick={() => {
+                  toast.action?.onClick();
+                  onDismiss(toast.id);
+                }}
+                className="mt-1.5 text-xs font-medium underline underline-offset-2 hover:opacity-80 transition-opacity"
+              >
+                {toast.action.label}
+              </button>
+            )}
+          </div>
           <button
             onClick={() => onDismiss(toast.id)}
             className="shrink-0 rounded p-0.5 hover:bg-surface-secondary transition-colors"

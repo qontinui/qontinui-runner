@@ -55,6 +55,7 @@ export type SettingsTab =
   | "ci-runner"
   | "app-freshness"
   | "lock-yield"
+  | "resource-guard"
   | "advanced"
   | "updates";
 
@@ -141,6 +142,12 @@ export const SETTINGS_TABS: readonly SettingsTabDef[] = [
   { id: "otel", label: "OpenTelemetry" },
   { id: "containers", label: "Container Isolation" },
   { id: "ci-runner", label: "CI Runner" },
+  // Live-session protection floors + the `ci_node` build-admission floors
+  // (plan 2026-08-07-runner-resource-guard-and-session-protection, Part B).
+  // Deliberately NOT behind a disclosure: it protects the Terminal-first
+  // user's own sessions from being killed by commit exhaustion, which is the
+  // most default-path failure this app has.
+  { id: "resource-guard", label: "Resource Guard" },
   // Per-app build/start commands for the auto-fresh engine. Behind the
   // `advanced` disclosure: it configures the fleet-fresh routing machinery,
   // which a Terminal-first user has never seen.
@@ -263,6 +270,7 @@ export const SETTINGS_SUB_TAB_TO_MAIN_TAB = {
   "app-freshness": "settings-app-freshness",
   security: "settings-security",
   "lock-yield": "settings-lock-yield",
+  "resource-guard": "settings-resource-guard",
   advanced: "settings-debug",
   updates: "settings-updates",
 } as const satisfies Record<SettingsTab, MainTabId>;

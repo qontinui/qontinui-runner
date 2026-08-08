@@ -100,6 +100,14 @@ impl Transport for ClaudeCliTransport {
                         self.app_handle.clone(),
                         None,
                         None,
+                        // UNATTENDED spawn — respect the critical floor. The
+                        // transport seam is driven programmatically by
+                        // `SessionRegistry`, so there is no operator in this
+                        // call stack to answer a dialog. The refusal is not
+                        // lost: it becomes `TransportError::Runtime` carrying
+                        // the lane, the headroom and the floor, which is what
+                        // the requester sees and can retry on.
+                        false,
                     )
                     .map_err(TransportError::Runtime)?;
 
