@@ -608,7 +608,7 @@ pub struct VerdictResponse {
 /// enforcement.md` §A4) deliberately does NOT rebuild the guards: it inherits
 /// the rolling hourly cap here, and the `stop_hook_active` short-circuit
 /// inside [`crate::mcp::session_compliance::observe_turn_end`]. The
-/// once-per-session marker is consumed only on actual DELIVERY — a candidate
+/// per-session counter is incremented only on actual DELIVERY — a candidate
 /// the cap swallowed stays eligible for a later turn.
 ///
 /// `None` = do not nudge; the caller falls through to its own verdict.
@@ -619,7 +619,16 @@ fn deliver_compliance_nudge(
 ) -> Option<VerdictResponse> {
     let nudge = nudge?;
     let now = Instant::now();
-    if cap_registry().would_exceed(session_key, now, effective_cap()) {
+    // Compliance gets its OWN key in the shared registry rather than sharing
+    // the continuation arm's. Under the old hard-coded once-per-session cap it
+    // could consume at most 1 of the 5 hourly slots; with a configurable cap
+    // it could consume all 5 and silently starve session-continuation for an
+    // hour. The two also count different key spaces — the hourly cap keys on
+    // the runner session_key, `mark_nudged` on the Claude session id, and one
+    // runner session can span several — so sharing a budget was never
+    // measuring one thing.
+    let cap_key = format!("compliance:{session_key}");
+    if cap_registry().would_exceed(&cap_key, now, effective_cap()) {
         info!(
             session = %session_key,
             "continuation-verdict: session-compliance nudge suppressed — hourly cap reached"
@@ -631,10 +640,17 @@ fn deliver_compliance_nudge(
     if !crate::mcp::session_compliance::mark_nudged(&nudge.session_id, nudge.max_attempts) {
         return None;
     }
-    cap_registry().record(session_key, now);
-    let reason = "session-compliance: verdict `unverified` with a non-empty coord footprint \
-                  — nudging once"
-        .to_string();
+    cap_registry().record(&cap_key, now);
+    // Names the attempt, because the string is operator-visible in both the
+    // verdict log and `VerdictResponse.reason` — "nudging once" on attempt 3
+    // of 3 is exactly the kind of confidently-wrong line this whole feature
+    // exists to stop producing.
+    let attempt = crate::mcp::session_compliance::nudge_attempts_reported(&nudge.session_id);
+    let reason = format!(
+        "session-compliance: verdict `unverified` with a non-empty coord footprint \
+         — nudge {attempt} of {}",
+        nudge.max_attempts
+    );
     // The same one-line-per-Stop verdict log the continuation arm writes, so
     // the soak sample is not blind on exactly the turns that blocked.
     info!(
@@ -1055,10 +1071,10 @@ mod tests {
 
     // ── Session-compliance nudge delivery ────────────────────────────────
     //
-    // These pin the three §A4 invariants that live on THIS side of the seam:
-    // the cap is inherited (not rebuilt), the nudge is independent of
-    // `FLAG_ENV`, and the once-per-session claim is only consumed on real
-    // delivery.
+    // These pin the §A4 invariants that live on THIS side of the seam: the
+    // hourly cap is inherited (not rebuilt) but namespaced, the nudge is
+    // independent of `FLAG_ENV`, and the per-session claim is only counted on
+    // real delivery.
 
     use crate::mcp::session_compliance::ComplianceNudge;
 
@@ -1077,6 +1093,33 @@ mod tests {
         assert!(deliver_compliance_nudge("cv-none", None, Mode::On).is_none());
     }
 
+    /// Compliance must not spend the continuation arm's hourly budget.
+    ///
+    /// Under a shared key a configurable cap could consume all 5 slots and
+    /// starve session-continuation for an hour — a cross-feature outage caused
+    /// by an unrelated setting. Exhausting one namespace must leave the other
+    /// untouched, in both directions.
+    #[test]
+    fn compliance_and_continuation_do_not_share_an_hourly_budget() {
+        let key = "cv-budget-isolation";
+        let now = Instant::now();
+
+        // Drain the CONTINUATION namespace completely.
+        for _ in 0..effective_cap() {
+            cap_registry().record(key, now);
+        }
+        assert!(
+            cap_registry().would_exceed(key, now, effective_cap()),
+            "the continuation budget really is exhausted"
+        );
+
+        // Compliance still delivers — different key, untouched budget.
+        assert!(
+            deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On).is_some(),
+            "a drained continuation budget must not suppress the compliance nudge"
+        );
+    }
+
     #[test]
     fn a_candidate_blocks_even_when_the_continuation_flag_is_off() {
         // The compliance feature is switched by coord's per-tenant config, NOT
@@ -1088,7 +1131,7 @@ mod tests {
         assert_eq!(v.source, "compliance");
         assert_eq!(v.mode, "off");
         assert_eq!(v.prompt.as_deref(), Some("produce the block"));
-        // Delivery consumed the session's single claim.
+        // Delivery consumed the session's only claim at max_attempts=1.
         assert!(!crate::mcp::session_compliance::mark_nudged(key, 1));
     }
 
@@ -1096,11 +1139,14 @@ mod tests {
     fn an_exhausted_cap_suppresses_the_nudge_and_leaves_it_eligible() {
         let key = "cv-cap-exhausted";
         let now = Instant::now();
+        // Exhaust compliance's OWN namespace in the shared registry — the
+        // continuation arm's budget is a different key and no longer gates
+        // this path.
         for _ in 0..effective_cap() {
-            cap_registry().record(key, now);
+            cap_registry().record(&format!("compliance:{key}"), now);
         }
         assert!(deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On).is_none());
-        // The once-per-session claim must NOT have been burned by a nudge the
+        // The per-session claim must NOT have been burned by a nudge the
         // cap swallowed — a later turn is still allowed to deliver it.
         assert!(
             crate::mcp::session_compliance::mark_nudged(key, 1),
