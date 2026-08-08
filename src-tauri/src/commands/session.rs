@@ -28,8 +28,20 @@ pub struct StartSessionArgs {
     pub repo: Option<String>,
     #[serde(default)]
     pub branch: Option<String>,
-    #[serde(default)]
-    pub plan_slug: Option<String>,
+    /// The work unit this session is working on. A plain `#[serde(alias)]`
+    /// here, unlike [`Intent`]'s two real fields (see `session/intent.rs`).
+    ///
+    /// The alias hazard is not "is this struct serialized" — it is "can a body
+    /// carrying BOTH spellings arrive", since serde treats an alias and the
+    /// canonical name as the same field and rejects such a body with
+    /// `duplicate field`. It cannot arrive here: `session_start`'s only caller
+    /// is this runner's own frontend (`src/contexts/SessionContext.tsx`, whose
+    /// TS `Intent` declares no slug field at all), and the command is exposed
+    /// by neither `mcp::tauri_proxy`'s allow-list nor `mcp::backend_relay`'s
+    /// dispatch table. If a door is ever opened onto `session_start` from
+    /// coord — which dual-emits — this alias must become two real fields.
+    #[serde(default, alias = "plan_slug")]
+    pub work_unit_slug: Option<String>,
     #[serde(default)]
     pub correlation_topic: Option<String>,
     #[serde(default)]
@@ -52,7 +64,9 @@ impl From<StartSessionArgs> for Intent {
             purpose: a.purpose,
             repo: a.repo,
             branch: a.branch,
-            plan_slug: a.plan_slug,
+            work_unit_slug: a.work_unit_slug,
+            // Accept-only on `Intent`; the runner never emits the legacy key.
+            plan_slug: None,
             correlation_topic: a.correlation_topic,
             // Not exposed on `session_start` — page placement is only
             // meaningful on the gate-continuation terminal create path.
@@ -230,4 +244,91 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             session_handoff,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `session_start` accept side, wire-key retirement (plan
+    /// `2026-07-30-coord-web-plan-slug-wire-key-retirement` Phase 1 step 6).
+    /// A body from a pre-retirement caller carries the deprecated spelling;
+    /// the alias must still bind it. Without this, dropping the alias would
+    /// fail silently — `#[serde(default)]` yields `None` and the session is
+    /// simply recorded with no work unit.
+    #[test]
+    fn start_session_args_accepts_the_legacy_plan_slug_key() {
+        let args: StartSessionArgs = serde_json::from_value(serde_json::json!({
+            "kind": "terminal_shell",
+            "purpose": "fix the thing",
+            "plan_slug": "2026-07-28-some-unit",
+        }))
+        .unwrap();
+        assert_eq!(args.work_unit_slug.as_deref(), Some("2026-07-28-some-unit"));
+    }
+
+    #[test]
+    fn start_session_args_accepts_the_canonical_key() {
+        let args: StartSessionArgs = serde_json::from_value(serde_json::json!({
+            "kind": "terminal_shell",
+            "purpose": "fix the thing",
+            "work_unit_slug": "2026-07-28-some-unit",
+        }))
+        .unwrap();
+        assert_eq!(args.work_unit_slug.as_deref(), Some("2026-07-28-some-unit"));
+    }
+
+    /// The EMIT side, through a real production constructor. Whichever
+    /// spelling came in, the `Intent` this command builds must serialize the
+    /// canonical key ALONE — re-emitting `plan_slug` would re-seed the very
+    /// key this plan retires, and coord's accept side already binds the new
+    /// one.
+    #[test]
+    fn start_session_intent_emits_only_the_canonical_key() {
+        for incoming in ["plan_slug", "work_unit_slug"] {
+            let mut body = serde_json::json!({
+                "kind": "terminal_shell",
+                "purpose": "fix the thing",
+            });
+            body.as_object_mut().unwrap().insert(
+                incoming.to_string(),
+                serde_json::json!("2026-07-28-some-unit"),
+            );
+            let args: StartSessionArgs = serde_json::from_value(body).unwrap();
+            let intent = Intent::from(args);
+            assert_eq!(
+                intent.work_unit_slug.as_deref(),
+                Some("2026-07-28-some-unit"),
+                "incoming key {incoming} must land on the canonical field"
+            );
+            assert_eq!(
+                intent.plan_slug, None,
+                "the deprecated field is accept-only on `Intent`"
+            );
+            let json = serde_json::to_value(&intent).unwrap();
+            assert_eq!(
+                json.get("work_unit_slug").and_then(|v| v.as_str()),
+                Some("2026-07-28-some-unit")
+            );
+            assert!(
+                json.get("plan_slug").is_none(),
+                "incoming key {incoming} produced a legacy key on the wire: {json}"
+            );
+        }
+    }
+
+    /// A caller that sends no slug still produces a slug-less intent — the
+    /// alias must not manufacture one.
+    #[test]
+    fn start_session_args_without_a_slug_stays_none() {
+        let args: StartSessionArgs = serde_json::from_value(serde_json::json!({
+            "kind": "terminal_shell",
+            "purpose": "fix the thing",
+        }))
+        .unwrap();
+        assert_eq!(args.work_unit_slug, None);
+        let json = serde_json::to_value(Intent::from(args)).unwrap();
+        assert!(json.get("work_unit_slug").is_none(), "{json}");
+        assert!(json.get("plan_slug").is_none(), "{json}");
+    }
 }

@@ -1157,6 +1157,7 @@ mod tests {
             purpose: "smoke test".into(),
             repo: None,
             branch: None,
+            work_unit_slug: None,
             plan_slug: None,
             correlation_topic: None,
             page_id: None,

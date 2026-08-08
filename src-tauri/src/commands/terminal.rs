@@ -60,7 +60,7 @@ pub async fn terminal_create(
     cols: Option<u16>,
     rows: Option<u16>,
     intent_repo: Option<String>,
-    plan_slug: Option<String>,
+    work_unit_slug: Option<String>,
     correlation_topic: Option<String>,
     command: Option<Vec<String>>,
     // Phase 2 (pop-out windows): the label of the window creating this pane.
@@ -196,7 +196,9 @@ pub async fn terminal_create(
         purpose,
         repo: effective_intent_repo,
         branch: None,
-        plan_slug,
+        work_unit_slug,
+        // Accept-only on `Intent`; the runner never emits the legacy key.
+        plan_slug: None,
         correlation_topic,
         // Deliberately None on the interactive create path — a PRESENT
         // `page_id` is the coord-side "this is a gate continuation" marker.
@@ -1487,7 +1489,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
     app_handle: tauri::AppHandle,
     title: String,
     working_dir: String,
-    plan_slug: Option<String>,
+    work_unit_slug: Option<String>,
     correlation_topic: Option<String>,
     intent_repo: Option<String>,
     command: Option<Vec<String>>,
@@ -1501,7 +1503,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
         app_handle,
         title,
         working_dir,
-        plan_slug,
+        work_unit_slug,
         correlation_topic,
         intent_repo,
         command,
@@ -1537,7 +1539,7 @@ pub(crate) fn create_terminal_session_backend(
     app_handle: tauri::AppHandle,
     title: String,
     working_dir: String,
-    plan_slug: Option<String>,
+    work_unit_slug: Option<String>,
     correlation_topic: Option<String>,
     intent_repo: Option<String>,
     command: Option<Vec<String>>,
@@ -1615,7 +1617,9 @@ pub(crate) fn create_terminal_session_backend(
         purpose,
         repo: intent_repo,
         branch: None,
-        plan_slug,
+        work_unit_slug,
+        // Accept-only on `Intent`; the runner never emits the legacy key.
+        plan_slug: None,
         correlation_topic,
         // Gate-continuation create path — carry the chosen page tab into
         // `coord.sessions.intent` so coord learns the placement.

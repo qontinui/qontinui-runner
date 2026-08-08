@@ -1328,6 +1328,7 @@ pub async fn spawn_worker_session(
                 // allocation above.
                 repo: Some(intent_repo.clone()),
                 branch: None,
+                work_unit_slug: None,
                 plan_slug: None,
                 correlation_topic: None,
                 page_id: None,
