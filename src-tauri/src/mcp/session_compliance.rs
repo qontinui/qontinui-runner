@@ -102,7 +102,9 @@
 //! Delivered by returning `{"decision":"block","prompt":…}` from the existing
 //! continuation-verdict path — no new spawn, and the two loop guards already
 //! there (`stop_hook_active` short-circuit, rolling hourly cap) are inherited,
-//! not rebuilt. It fires **at most once per session**, and only when ALL of:
+//! not rebuilt. It fires **at most `max_attempts` times per session** (the
+//! served config's value, defaulting to 1 and clamped to
+//! [`MAX_NUDGE_ATTEMPTS_CEILING`]), and only when ALL of:
 //!
 //! 1. enforcement is `enabled` AND `applicable`, and
 //! 2. the stored verdict is `unverified`, and
@@ -123,7 +125,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, Weak};
+use std::sync::{Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -165,6 +167,14 @@ const TRANSCRIPT_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 /// TTL for the process-global enforcement-config cache. Mirrors
 /// [`crate::mcp::continuation_verdict`]'s 45 s cache posture.
 const CONFIG_TTL: Duration = Duration::from_secs(45);
+
+/// Upper bound on the per-session nudge cap, whatever coord serves.
+///
+/// The nudge shares an hourly delivery budget with session-continuation, so an
+/// unbounded cap does not merely nag one session — it can drain that budget
+/// and starve the other feature. Ten is far above any plausible setting and
+/// far below anything that could do that.
+const MAX_NUDGE_ATTEMPTS_CEILING: u64 = 10;
 
 // ===========================================================================
 // Enforcement config (coord contract, §B2)
@@ -230,11 +240,17 @@ impl ComplianceConfig {
                 .unwrap_or("nudge")
                 .trim()
                 .to_string(),
+            // Clamped to a sane ceiling, not just to `u32::MAX`. This value
+            // now drives real delivery, so a fat-fingered `max_attempts:
+            // 999999` would make the per-session cap meaningless and leave
+            // only the shared hourly budget between the fleet and a nag loop.
+            // Absent or unparseable reads as 1 — the pre-existing hard-coded
+            // behaviour, so an untouched config changes nothing.
             max_attempts: obj
                 .get("max_attempts")
                 .and_then(Value::as_u64)
                 .unwrap_or(1)
-                .min(u32::MAX as u64) as u32,
+                .min(MAX_NUDGE_ATTEMPTS_CEILING) as u32,
             enforced_clause_ref: obj
                 .get("enforced_clause_ref")
                 .and_then(Value::as_str)
@@ -604,6 +620,34 @@ fn string_list(v: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
+/// The compliance POST body.
+///
+/// Extracted from `post_compliance` so the OMISSION rule is testable without a
+/// live coord: the nudge fields are present only when this run actually has a
+/// record for the session. Sending `nudge_attempts: 0` for a session this run
+/// never saw would overwrite a real count in coord's last-write-wins store —
+/// see [`nudge_state_for`]. Older coord builds ignore unknown fields, so
+/// sending these before the coord side lands is inert rather than an error.
+fn compliance_body(
+    report: Option<&Value>,
+    absent_reason: Option<&str>,
+    nudges: Option<(u32, Option<String>)>,
+) -> Value {
+    let mut body = serde_json::json!({
+        "report": report.cloned().unwrap_or(Value::Null),
+        "absent_reason": absent_reason.map(Value::from).unwrap_or(Value::Null),
+    });
+    if let (Some((attempts, last_at)), Some(map)) = (nudges, body.as_object_mut()) {
+        map.insert("nudge_attempts".into(), Value::from(attempts));
+        // A recorded session with no timestamp is still a recorded COUNT, so
+        // the count goes even when the stamp cannot.
+        if let Some(at) = last_at {
+            map.insert("last_nudged_at".into(), Value::from(at));
+        }
+    }
+    body
+}
+
 /// POST the (possibly absent) report to coord and return its verdict. `None`
 /// on every failure path — unreachable coord, 404/501 (the route does not
 /// exist on production coord yet), non-2xx, undecodable body.
@@ -615,19 +659,7 @@ async fn post_compliance(
     let (base, jwt) = coord_client_parts().ok()?;
     let client = http_client().ok()?;
     let url = format!("{base}/coord/sessions/{claude_session_id}/compliance");
-    // The nudge count is the runner's to report: coord cannot see a nudge, only
-    // the POST that follows one. It is the count as of THIS post, so a nudge
-    // delivered later in the same turn lands in the next post — and the
-    // session-close post carries the final total. Older coord builds ignore
-    // unknown fields, so sending these before the coord side lands is inert
-    // rather than an error.
-    let (nudge_attempts, last_nudged_at) = nudge_state_for(claude_session_id);
-    let body = serde_json::json!({
-        "report": report.cloned().unwrap_or(Value::Null),
-        "absent_reason": absent_reason.map(Value::from).unwrap_or(Value::Null),
-        "nudge_attempts": nudge_attempts,
-        "last_nudged_at": last_nudged_at.map(Value::from).unwrap_or(Value::Null),
-    });
+    let body = compliance_body(report, absent_reason, nudge_state_for(claude_session_id));
     let resp = client
         .post(&url)
         .bearer_auth(&jwt)
@@ -654,7 +686,7 @@ async fn post_compliance(
 /// A corrective prompt the continuation-verdict handler may deliver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComplianceNudge {
-    /// Claude session id — the key [`mark_nudged`] consumes on delivery.
+    /// Claude session id — the key [`mark_nudged`] counts against on delivery.
     pub session_id: String,
     pub prompt: String,
     /// The cap this candidate was authorised against, carried so the delivery
@@ -703,28 +735,44 @@ fn nudged() -> &'static Mutex<HashMap<String, NudgeState>> {
     NUDGED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// How many nudges this run has delivered to the session. A poisoned lock
-/// reads as `u32::MAX` — fail-safe, since every caller compares it against a
-/// cap and the saturated value can never be under one.
-fn nudge_attempts_for(session_id: &str) -> u32 {
-    match nudged().lock() {
-        Ok(g) => g.get(session_id).map_or(0, |s| s.attempts),
-        Err(_) => u32::MAX,
-    }
+/// Take the guard, recovering from poisoning rather than propagating it.
+///
+/// `NudgeState` is a counter plus a timestamp with no cross-field invariant a
+/// panic could leave half-applied, so the data behind a poisoned guard is
+/// still sound. Propagating instead would disable nudging for the whole
+/// process lifetime after a single unrelated panic — silently, since every
+/// caller's poison arm looks exactly like "this session was never nudged".
+fn nudged_guard() -> std::sync::MutexGuard<'static, HashMap<String, NudgeState>> {
+    nudged().lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The state to report to coord: attempts so far, and when the last one went
-/// out. Poisoned reads as `(0, None)` rather than the saturated sentinel —
-/// this feeds an operator-visible count, and `u32::MAX` nudges is a lie where
-/// "we cannot tell" should read as the default.
-fn nudge_state_for(session_id: &str) -> (u32, Option<String>) {
-    match nudged().lock() {
-        Ok(g) => g
-            .get(session_id)
-            .map(|s| (s.attempts, s.last_at.clone()))
-            .unwrap_or((0, None)),
-        Err(_) => (0, None),
-    }
+/// How many nudges this run has delivered to the session.
+fn nudge_attempts_for(session_id: &str) -> u32 {
+    nudged_guard().get(session_id).map_or(0, |s| s.attempts)
+}
+
+/// The same count, for the delivery site's operator-visible reason string.
+pub fn nudge_attempts_reported(session_id: &str) -> u32 {
+    nudge_attempts_for(session_id)
+}
+
+/// The state to report to coord, or `None` when THIS RUN has no record of the
+/// session.
+///
+/// `None` is not `(0, None)`, and conflating them corrupts coord's store. The
+/// map is rebuilt empty on every restart, so after one, `finalize_on_close`
+/// re-posts every stale session — and coord's compliance store is
+/// last-write-wins. Reporting a fabricated `0` there would OVERWRITE a correct
+/// non-zero count coord recorded mid-session, erasing exactly the evidence
+/// this field exists to carry, in exactly the scenario it exists to explain.
+///
+/// So callers must OMIT the fields on `None` rather than send a zero. Omission
+/// is right in both directions: coord keeps `0` if it never had anything, and
+/// keeps `3` if it did.
+fn nudge_state_for(session_id: &str) -> Option<(u32, Option<String>)> {
+    nudged_guard()
+        .get(session_id)
+        .map(|s| (s.attempts, s.last_at.clone()))
 }
 
 /// Claim one nudge against `max_attempts`. Returns `true` when THIS caller won
@@ -738,18 +786,20 @@ fn nudge_state_for(session_id: &str) -> (u32, Option<String>) {
 /// never nudge, which the old set-based cap could not express.
 #[must_use]
 pub fn mark_nudged(session_id: &str, max_attempts: u32) -> bool {
-    match nudged().lock() {
-        Ok(mut g) => {
-            let entry = g.entry(session_id.to_string()).or_default();
-            if entry.attempts >= max_attempts {
-                return false;
-            }
-            entry.attempts += 1;
-            entry.last_at = Some(chrono::Utc::now().to_rfc3339());
-            true
-        }
-        Err(_) => false,
+    let mut g = nudged_guard();
+    let entry = g.entry(session_id.to_string()).or_default();
+    if entry.attempts >= max_attempts {
+        return false;
     }
+    entry.attempts += 1;
+    // Fixed-width milliseconds with a `Z` suffix, not bare `to_rfc3339()`.
+    // That helper uses `AutoSi`, which emits 0/3/6/9 fractional digits
+    // depending on what the clock happened to read — so a nanosecond reading
+    // produces a value some RFC3339 parsers reject (Python `%f` caps at 6) and
+    // that Postgres rounds on insert, intermittently and only sometimes, which
+    // is the worst shape a wire-format bug can take.
+    entry.last_at = Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    true
 }
 
 /// Refs coord could not reconcile, for the "contradicted" arm of the nudge.
@@ -1662,20 +1712,135 @@ mod tests {
         assert!(unreconciled_refs(&Value::Null).is_empty());
     }
 
-    // ── once-per-session guard ───────────────────────────────────────────
+    // ── counted per-session cap ──────────────────────────────────────────
+    //
+    // `NUDGED` is process-global across the whole test binary, so every test
+    // below uses a session key unique to itself.
 
     #[test]
-    fn mark_nudged_is_a_once_per_session_compare_and_set() {
+    fn mark_nudged_is_a_counted_compare_and_set() {
         let a = "session-compliance-test-marker-a";
         let b = "session-compliance-test-marker-b";
-        assert!(!already_nudged(a));
-        assert!(mark_nudged(a), "first claim wins");
+        assert_eq!(nudge_attempts_for(a), 0);
+        assert!(mark_nudged(a, 1), "first claim wins");
         assert!(
-            !mark_nudged(a),
-            "second claim must lose — one nudge per session"
+            !mark_nudged(a, 1),
+            "second claim must lose at max_attempts=1"
         );
-        assert!(already_nudged(a));
-        assert!(!already_nudged(b));
+        assert_eq!(nudge_attempts_for(a), 1);
+        assert_eq!(nudge_attempts_for(b), 0, "the cap is per session");
+    }
+
+    /// The headline behaviour of the change: the cap is the OPERATOR's number.
+    /// Under the old set-based guard this test was unwritable — delivery
+    /// stopped at one no matter what `max_attempts` said.
+    #[test]
+    fn a_higher_cap_allows_exactly_that_many() {
+        let s = "session-compliance-test-cap-three";
+        for i in 1..=3 {
+            assert!(mark_nudged(s, 3), "attempt {i} of 3 must be granted");
+            assert_eq!(nudge_attempts_for(s), i);
+        }
+        assert!(!mark_nudged(s, 3), "the fourth is refused");
+        assert_eq!(nudge_attempts_for(s), 3, "and does not increment");
+    }
+
+    /// `max_attempts: 0` means never nudge — a setting the old cap could not
+    /// express at all.
+    #[test]
+    fn a_zero_cap_never_nudges() {
+        let s = "session-compliance-test-cap-zero";
+        assert!(!mark_nudged(s, 0));
+        assert_eq!(nudge_attempts_for(s), 0);
+    }
+
+    /// The entire backward-compatibility argument for this change: an
+    /// untouched config still nudges exactly once. Without this, flipping the
+    /// `unwrap_or` would triple the fleet's nudge rate with a green suite.
+    #[test]
+    fn an_absent_max_attempts_defaults_to_one() {
+        assert_eq!(ComplianceConfig::from_body(&json!({})).max_attempts, 1);
+        assert_eq!(
+            ComplianceConfig::from_body(&json!({"max_attempts": null})).max_attempts,
+            1
+        );
+        assert_eq!(
+            ComplianceConfig::from_body(&json!({"max_attempts": "3"})).max_attempts,
+            1,
+            "a non-numeric value is not a cap"
+        );
+    }
+
+    #[test]
+    fn an_absurd_max_attempts_is_clamped() {
+        assert_eq!(
+            ComplianceConfig::from_body(&json!({"max_attempts": 999_999})).max_attempts,
+            MAX_NUDGE_ATTEMPTS_CEILING as u32
+        );
+    }
+
+    /// The timestamp goes on the wire, so its SHAPE is part of the contract.
+    /// `to_rfc3339()` would emit 0/3/6/9 fractional digits depending on the
+    /// clock reading; the 9-digit form is rejected by some RFC3339 parsers and
+    /// rounded by Postgres.
+    #[test]
+    fn the_nudge_timestamp_is_fixed_width_utc() {
+        let s = "session-compliance-test-stamp";
+        assert!(mark_nudged(s, 1));
+        let (attempts, last_at) = nudge_state_for(s).expect("a nudged session has state");
+        assert_eq!(attempts, 1);
+        let at = last_at.expect("a delivered nudge stamps its time");
+        assert!(at.ends_with('Z'), "UTC as Z, not +00:00: {at}");
+        assert_eq!(at.len(), 24, "fixed-width milliseconds: {at}");
+        assert!(chrono::DateTime::parse_from_rfc3339(&at).is_ok());
+    }
+
+    /// The restart bug, pinned at the seam it actually broke.
+    ///
+    /// A session this run never saw reads `None`, and `None` must OMIT the
+    /// fields — not send `0`. Coord's store is last-write-wins, so a
+    /// fabricated zero at session close would erase a real count recorded
+    /// before the restart.
+    #[test]
+    fn an_unknown_session_omits_the_nudge_fields_rather_than_sending_zero() {
+        assert!(nudge_state_for("session-compliance-test-never-seen").is_none());
+
+        let body = compliance_body(None, Some(ABSENT_NO_BLOCK), None);
+        assert!(
+            body.get("nudge_attempts").is_none(),
+            "a fabricated 0 would overwrite coord's real count: {body}"
+        );
+        assert!(body.get("last_nudged_at").is_none());
+        // The report half of the post is unaffected.
+        assert_eq!(body["absent_reason"], json!(ABSENT_NO_BLOCK));
+
+        let carried = compliance_body(
+            None,
+            None,
+            Some((2, Some("2026-08-08T10:00:00.000Z".into()))),
+        );
+        assert_eq!(carried["nudge_attempts"], json!(2));
+        assert_eq!(carried["last_nudged_at"], json!("2026-08-08T10:00:00.000Z"));
+
+        // A recorded count with no stamp still carries the count.
+        let stampless = compliance_body(None, None, Some((1, None)));
+        assert_eq!(stampless["nudge_attempts"], json!(1));
+        assert!(stampless.get("last_nudged_at").is_none());
+    }
+
+    /// Two Stops racing the same session must not both deliver — the stated
+    /// reason `mark_nudged` is a compare-and-set rather than check-then-set.
+    #[test]
+    fn concurrent_claims_yield_exactly_one_winner() {
+        let s = "session-compliance-test-race";
+        let winners: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(move || usize::from(mark_nudged(s, 1))))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+        });
+        assert_eq!(winners, 1, "exactly one of eight racing claims may win");
+        assert_eq!(nudge_attempts_for(s), 1);
     }
 
     // ── coverage bound ───────────────────────────────────────────────────
