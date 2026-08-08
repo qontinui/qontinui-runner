@@ -1,22 +1,38 @@
-//! Device-scoped poller for the fleet-policy `install_interception` domain
-//! (P3 + P4 of `2026-06-08-fleet-policy-channel-redesign.md`).
+//! Device-scoped poller for the fleet-policy domains this runner consumes:
+//! `install_interception` (P3 + P4 of
+//! `2026-06-08-fleet-policy-channel-redesign.md`) and `fleet_resources` (Part B
+//! item 3 of `2026-08-07-runner-resource-guard-and-session-protection.md`).
 //!
-//! Coord exposes `GET /coord/fleet-policy?domain=install_interception`
-//! (FleetPrincipal / device-JWT gated) which returns the EFFECTIVE
-//! interception level resolved for THIS device's tenant/fleet:
+//! Coord exposes `GET /coord/fleet-policy?domain=<d>` (FleetPrincipal /
+//! device-JWT gated) which returns the EFFECTIVE interception level resolved
+//! for THIS device's tenant/fleet, alongside the tenant's §D1 fleet-resource
+//! `controls` object:
 //!
 //! ```json
 //! {"domain":"install_interception","effective_level":"off|observe|gate",
-//!  "master_enabled":true,"resolved_scope":"..."}
+//!  "master_enabled":true,"resolved_scope":"...",
+//!  "controls_available":true,
+//!  "controls":{"min_free_bytes_sessions_host":3221225472, "...":null}}
 //! ```
 //!
-//! This module owns a process-global cache of that `effective_level` and a
-//! supervised background loop that refreshes it every [`POLL_INTERVAL`]. The
-//! cache is read SYNCHRONOUSLY (no app state, no async) by
-//! `install_effects_producer::run_with_base` via
-//! [`effective_install_intercept_mode`] so the interception pre-call can make
-//! the per-install mode DYNAMIC (P4) rather than trusting the shim's
-//! spawn-time `QONTINUI_INSTALL_INTERCEPT_MODE` env.
+//! This module owns TWO process-global caches and one supervised background
+//! loop that refreshes both every [`POLL_INTERVAL`]:
+//!
+//! 1. The `effective_level`, read SYNCHRONOUSLY (no app state, no async) by
+//!    `install_effects_producer::run_with_base` via
+//!    [`effective_install_intercept_mode`] so the interception pre-call can make
+//!    the per-install mode DYNAMIC (P4) rather than trusting the shim's
+//!    spawn-time `QONTINUI_INSTALL_INTERCEPT_MODE` env.
+//! 2. The tenant-wide **session-protection floors** ([`SessionFloors`], one set
+//!    per lane), read just as synchronously by
+//!    [`crate::resource_guard::effective_session_floors`] — which is on the
+//!    spawn path, and therefore must never make a network call. The floors reach
+//!    the gate as the *fleet default* term of
+//!    `max(local override, fleet default, hardcoded default)`; the spawn path
+//!    reads this cache and nothing else, so it produces a correct verdict with
+//!    zero coord connectivity (the plan's local-first requirement, §Dependencies
+//!    "Local-first requirement, restated"). A cache that is empty because coord
+//!    was unreachable simply contributes no term.
 //!
 //! ## Lifecycle parallel to `device_jwt_refresher`
 //!
@@ -25,12 +41,14 @@
 //!
 //! - [`PollerState`] holds the `watch` shutdown channel + join handle.
 //! - [`start_poller`] spawns the loop via `task_supervisor::spawn_supervised`
-//!   so a panic self-heals (a dead poller would silently freeze the cached
-//!   mode — see the refresher's supervisor rationale).
+//!   so a panic self-heals (a dead poller would silently freeze BOTH caches —
+//!   see the refresher's supervisor rationale).
 //! - [`commands::auto_start_fleet_policy_poller`] is the idempotent boot entry
 //!   wired beside `auto_start_device_jwt_refresher` in `mcp_api`.
 //!
 //! ## Fail-safe contract (D7)
+//!
+//! For the interception mode:
 //!
 //! - Before the FIRST successful poll, the cache reads **`off`** (NEVER gate).
 //! - A poll ERROR (network / decode / non-2xx) keeps the LAST-GOOD value.
@@ -39,6 +57,25 @@
 //! - If there is no device JWT yet (unpaired) the poll is SKIPPED quietly —
 //!   no log spam — like the other daemons that no-op without a token.
 //! - Degradation is logged ONCE (a level transition), not every tick.
+//!
+//! For the session floors, the SAME posture, with "no fleet opinion" playing
+//! the role `off` plays above — it is the value that cannot make the runner do
+//! anything it would not have done without this poller at all:
+//!
+//! - Before the FIRST successful poll the cache holds **no floors**, so the
+//!   effective floor is `max(local override, hardcoded default)` exactly as it
+//!   was before this poller existed.
+//! - A poll ERROR keeps the LAST-GOOD floors.
+//! - A coord **404 / 401 / auth-required** resets the cache to **no floors**.
+//! - Unpaired ⇒ SKIPPED quietly, cache untouched.
+//! - Degradation is logged ONCE, on a transition.
+//! - An ABSENT control field (coord predates the columns, or the tenant never
+//!   set one) contributes **NOTHING** — it is UNKNOWN, and UNKNOWN is not a
+//!   value. It is never folded in as a confident `0`, because a zero floor
+//!   disables the guard it names. This is the arm that runs TODAY: the columns
+//!   ship in qontinui-web `sess_guard_01` and coord reads them in its own later
+//!   PR, so until both land `controls` simply carries the six older §D1 fields
+//!   and the four floor fields decode to `None`.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -56,8 +93,22 @@ use crate::mcp::types::ApiState;
 /// already-injected terminals within a minute.
 const POLL_INTERVAL: Duration = Duration::from_secs(45);
 
-/// The fleet-policy domain this poller tracks.
+/// The fleet-policy domain carrying the install-interception level.
 const DOMAIN: &str = "install_interception";
+
+/// The fleet-policy domain that OWNS the §D1 fleet-resource `controls` object,
+/// including the four session-protection floors this poller caches
+/// (`qontinui-coord/src/fleet_policy.rs`, `CONTROLS_DOMAIN`).
+///
+/// Polled as a SECOND request per tick rather than read off the
+/// `install_interception` response. Coord's `read_controls` today answers with
+/// the tenant's controls row whichever domain was asked for — but that is a
+/// property of coord's current implementation, not of the wire contract, and it
+/// is not something a cache on the spawn path should depend on. Asking the
+/// domain that owns the columns keeps the request self-describing and keeps this
+/// cache correct if coord ever scopes the controls read to its own domain. The
+/// cost is one extra GET per [`POLL_INTERVAL`].
+const CONTROLS_DOMAIN: &str = "fleet_resources";
 
 /// The fail-safe default: every read before the first success, and every
 /// reset on a 404/401/auth-required, collapses to this. NEVER `gate`.
@@ -107,6 +158,92 @@ pub(crate) fn set_mode_for_test(mode: &str) {
 }
 
 // ===========================================================================
+// Process-global cache #2 — the tenant-wide session-protection floors
+// ===========================================================================
+
+/// The fleet's session-protection floors for ONE lane, in bytes.
+///
+/// Both fields are `Option` and the `None` arm is the whole point: it means the
+/// fleet has **no opinion**, which is what an absent column, an unprovisioned
+/// coord, an unreachable coord and an unpaired runner all produce. `None` folds
+/// into [`crate::resource_guard::merge_floors`] as *nothing*, never as `0` — a
+/// zero floor disables the guard it names, so rendering UNKNOWN as zero would
+/// turn a missing fleet term into a silently disabled protection.
+///
+/// The quantity is lane-specific and the lanes are NEVER summed or substituted
+/// for one another (`fleet::resource_sample`'s module docs): the host figure is
+/// Windows free commit, the WSL figure is that VM's available memory. A gate
+/// judging a host reading must compare it against the host floor or against
+/// nothing at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionFloors {
+    /// Warn floor — below this, starting another interactive session is
+    /// discouraged but allowed.
+    pub(crate) warn_free_bytes: Option<u64>,
+    /// Critical floor — below this, a new spawn is refused by default (always
+    /// overridable at the point of refusal).
+    pub(crate) critical_free_bytes: Option<u64>,
+}
+
+/// Both lanes' floors, as one cached value so a poll swaps them atomically and
+/// a reader can never see the host lane from one poll beside the WSL lane from
+/// another.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SessionFloorsByLane {
+    host: SessionFloors,
+    wsl: SessionFloors,
+}
+
+impl SessionFloorsByLane {
+    /// The floors for `lane`, or NO floors for a lane name this runner does not
+    /// know. Fail-safe: an unrecognised lane is UNKNOWN, and the one thing that
+    /// must never happen is judging one lane's reading against another lane's
+    /// floor. The names come from [`crate::fleet::resource_sample::Lane`] rather
+    /// than from literals here so the vocabulary has exactly one home.
+    fn for_lane(&self, lane: &str) -> SessionFloors {
+        use crate::fleet::resource_sample::Lane;
+        if lane == Lane::Host.as_str() {
+            self.host
+        } else if lane == Lane::Wsl.as_str() {
+            self.wsl
+        } else {
+            SessionFloors::default()
+        }
+    }
+}
+
+/// The cached fleet floors. Resting value is `Default` — every field `None`,
+/// i.e. "the fleet has said nothing", which is the fail-safe value in exactly
+/// the sense [`DEFAULT_MODE`] is: it cannot make the runner do anything it
+/// would not do with this poller switched off entirely.
+static SESSION_FLOORS: OnceLock<RwLock<SessionFloorsByLane>> = OnceLock::new();
+
+fn floors_cache() -> &'static RwLock<SessionFloorsByLane> {
+    SESSION_FLOORS.get_or_init(|| RwLock::new(SessionFloorsByLane::default()))
+}
+
+/// Read the fleet's cached session floors for `lane`.
+///
+/// SYNCHRONOUS + lock-only, like [`effective_install_intercept_mode`] — this is
+/// called from [`crate::resource_guard::probe_for_spawn`], which runs
+/// immediately before a PTY is opened and must not do I/O of any kind. A
+/// poisoned lock degrades to "no floors", the same fail-safe the initial value
+/// carries.
+pub(crate) fn fleet_session_floors(lane: &str) -> SessionFloors {
+    floors_cache()
+        .read()
+        .map(|g| g.for_lane(lane))
+        .unwrap_or_default()
+}
+
+/// Overwrite the cached floors. Internal — only the poll loop calls this.
+fn set_floors(floors: SessionFloorsByLane) {
+    if let Ok(mut g) = floors_cache().write() {
+        *g = floors;
+    }
+}
+
+// ===========================================================================
 // Wire type (coord response subset)
 // ===========================================================================
 
@@ -118,6 +255,111 @@ pub(crate) fn set_mode_for_test(mode: &str) {
 struct FleetPolicyResponse {
     #[serde(default)]
     effective_level: Option<String>,
+    /// Coord's own "I could not read the control columns" flag. `Some(false)`
+    /// means the §D1 columns are not provisioned on that deployment yet, which
+    /// is NOT the same statement as "the tenant set no floors" — but both
+    /// produce the same, correct behaviour here (no fleet term), so the flag is
+    /// read for the explicitness rather than for a different outcome.
+    #[serde(default)]
+    controls_available: Option<bool>,
+    /// The §D1 controls object, `null` when coord cannot read the columns.
+    #[serde(default)]
+    controls: Option<ControlsPayload>,
+}
+
+/// The subset of coord's `controls` object this poller reads: the four
+/// session-protection byte floors from the plan's Part B item 1
+/// (qontinui-web alembic revision `sess_guard_01`, coord's `CONTROL_COLS`
+/// widening in its companion PR).
+///
+/// Deliberately NOT `#[serde(deny_unknown_fields)]` — coord's own
+/// `FleetPolicyControls` denies unknown fields because it is a REQUEST type
+/// where a typo'd control name must be rejected at the door; this is a RESPONSE
+/// subset, where the six older §D1 controls (`min_free_mem_bytes_host`,
+/// `sample_interval_secs`, …) and anything coord adds later must decode past us
+/// untouched.
+///
+/// Every field is `Option<i64>` with a `#[serde(default)]`, which is what makes
+/// the pre-migration wire — a `controls` object that carries the six older
+/// fields and none of these four — decode cleanly to "no fleet opinion" rather
+/// than to a decode error. `i64` rather than `u64` because the columns are
+/// `BIGINT` and coord types them `Option<i64>`; the sign is dealt with in
+/// [`floor_bytes`], not by a lossy cast.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ControlsPayload {
+    #[serde(default)]
+    min_free_bytes_sessions_host: Option<i64>,
+    #[serde(default)]
+    min_free_bytes_sessions_wsl: Option<i64>,
+    #[serde(default)]
+    min_free_bytes_sessions_critical_host: Option<i64>,
+    #[serde(default)]
+    min_free_bytes_sessions_critical_wsl: Option<i64>,
+}
+
+/// One control column → a floor this runner will honour. PURE.
+///
+/// - Absent / SQL NULL ⇒ `None`. "No override, never zero" is what the column
+///   comment on the migration says, and it is the whole reason this returns an
+///   `Option` instead of a `u64` with a zero default.
+/// - NEGATIVE ⇒ `None`. Coord's `validate()` rejects a negative byte floor at
+///   the door, so this can only arrive from a hand-edited row — and the failure
+///   mode of `as u64` on a negative is a floor of ~18 exabytes, which would
+///   block every spawn on every machine in the tenant. An impossible value is
+///   UNKNOWN, and UNKNOWN contributes nothing.
+/// - Zero ⇒ `Some(0)`, preserved rather than folded into `None`: the fleet is
+///   entitled to say zero, and saying it changes nothing, because the effective
+///   floor is a `max` that already contains the hardcoded default.
+fn floor_bytes(v: Option<i64>) -> Option<u64> {
+    v.and_then(|b| u64::try_from(b).ok())
+}
+
+/// Fold a decoded response into the lane-separated floors to cache. PURE.
+///
+/// Every path that is not "coord handed us a controls object with these fields
+/// populated" yields `SessionFloorsByLane::default()` — no floors — because
+/// that is the value with no consequence. That includes the path that runs
+/// today, before coord ships its half: `controls` present, the four fields
+/// absent.
+fn session_floors_from(body: &FleetPolicyResponse) -> SessionFloorsByLane {
+    // Coord explicitly said it cannot read the columns. `controls` is `null` in
+    // that case anyway; reading the flag makes the intent legible instead of
+    // inferring it from a null.
+    if body.controls_available == Some(false) {
+        return SessionFloorsByLane::default();
+    }
+    let Some(controls) = body.controls.as_ref() else {
+        return SessionFloorsByLane::default();
+    };
+    SessionFloorsByLane {
+        host: SessionFloors {
+            warn_free_bytes: floor_bytes(controls.min_free_bytes_sessions_host),
+            critical_free_bytes: floor_bytes(controls.min_free_bytes_sessions_critical_host),
+        },
+        wsl: SessionFloors {
+            warn_free_bytes: floor_bytes(controls.min_free_bytes_sessions_wsl),
+            critical_free_bytes: floor_bytes(controls.min_free_bytes_sessions_critical_wsl),
+        },
+    }
+}
+
+/// Compact, log-friendly rendering of the cached floors.
+///
+/// An absent floor prints `unset`, never `0`. The log line is the only place an
+/// operator can see whether a fleet floor is missing or genuinely zero, and
+/// printing UNKNOWN as `0` in the one surface that exists to answer that
+/// question would be the same lie the type system is arranged to prevent.
+fn describe_floors(floors: &SessionFloorsByLane) -> String {
+    fn one(v: Option<u64>) -> String {
+        v.map_or_else(|| "unset".to_string(), |b| b.to_string())
+    }
+    format!(
+        "host warn={} critical={}, wsl warn={} critical={}",
+        one(floors.host.warn_free_bytes),
+        one(floors.host.critical_free_bytes),
+        one(floors.wsl.warn_free_bytes),
+        one(floors.wsl.critical_free_bytes),
+    )
 }
 
 /// Subset of coord's `GET /health` response we read for the capability probe.
@@ -179,10 +421,11 @@ pub fn start_poller(api_state: Arc<ApiState>) -> Arc<PollerState> {
 
     // SUPERVISOR. Same rationale as `device_jwt_refresher::start_refresher`:
     // `poller_loop` is long-lived and should only RETURN on shutdown. A bare
-    // panic would PERMANENTLY freeze the cached mode at its last value (which,
+    // panic would PERMANENTLY freeze BOTH caches at their last values (which,
     // worse, could be a stale `gate` after the operator turned the policy off
-    // — leaving every terminal blocking installs). Supervise it so a
-    // panic/wedge self-heals instead of requiring a runner restart.
+    // — leaving every terminal blocking installs — or a stale session floor the
+    // fleet has since lowered). Supervise it so a panic/wedge self-heals
+    // instead of requiring a runner restart.
     let shutdown_rx_loop = shutdown_rx.clone();
     let task_handle = crate::mcp::task_supervisor::spawn_supervised(
         "Fleet-policy poller",
@@ -208,6 +451,40 @@ enum PollOutcome {
     ResetOff(u16),
     /// Network / decode / other non-2xx error — LAST-GOOD value kept.
     Kept(String),
+}
+
+/// Outcome of a single poll of the [`CONTROLS_DOMAIN`]. Same four arms as
+/// [`PollOutcome`], carrying the floors instead of a level — the two caches
+/// share one fail-safe contract, and sharing the SHAPE of the outcome is what
+/// keeps them from drifting apart the next time one of them is edited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlsOutcome {
+    /// Coord returned 2xx — cache replaced with these floors (possibly "none",
+    /// which is a legitimate answer, not an error).
+    Updated(SessionFloorsByLane),
+    /// No device JWT yet (unpaired) — poll skipped, cache untouched.
+    SkippedNoJwt,
+    /// Coord said 401 / 404 — cache RESET to no floors (fail-safe).
+    Reset(u16),
+    /// Network / decode / other non-2xx error — LAST-GOOD floors kept.
+    Kept(String),
+}
+
+/// Why a fetch produced no body.
+///
+/// Factored out so both domains map coord's answers onto their caches through
+/// ONE decision: a 401 resets, an error keeps, an absent JWT skips. The two
+/// caches are allowed to hold different values; they are not allowed to disagree
+/// about what a 404 means.
+#[derive(Debug)]
+enum FetchError {
+    /// No device JWT yet — this runner is unpaired.
+    NoJwt,
+    /// Coord said 401 / 404: the policy is absent, or this device isn't
+    /// authorized.
+    AuthOrAbsent(u16),
+    /// Network / decode / other non-2xx, with the operator-readable detail.
+    Failed(String),
 }
 
 /// Outcome of the one-shot capability probe done at poller start.
@@ -294,14 +571,20 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     }
 
     info!(
-        "Fleet-policy poller started (domain={DOMAIN}, interval={}s, fail-safe default={DEFAULT_MODE})",
+        "Fleet-policy poller started (domains={DOMAIN},{CONTROLS_DOMAIN}, interval={}s, \
+         fail-safe defaults: mode={DEFAULT_MODE}, session floors unset)",
         POLL_INTERVAL.as_secs()
     );
 
     // Edge-trigger degradation logs: remember the LAST outcome class we logged
     // so a steady-state (e.g. repeated SkippedNoJwt while unpaired, or repeated
-    // network errors) emits exactly one line, not one per tick.
+    // network errors) emits exactly one line, not one per tick. One per cache:
+    // the two domains fail independently (coord can serve the interception level
+    // from a deployment whose control columns are not provisioned), so a shared
+    // marker would suppress one cache's transition because the other's had
+    // already been logged.
     let mut last_logged: Option<PollOutcome> = None;
+    let mut last_logged_controls: Option<ControlsOutcome> = None;
 
     loop {
         if *shutdown_rx.borrow() {
@@ -349,6 +632,52 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
             last_logged = Some(outcome);
         }
 
+        // Second domain: the tenant-wide session-protection floors. Polled after
+        // the interception level and applied to its own cache, so neither
+        // domain's failure can withhold the other's answer.
+        let controls_outcome = poll_controls_once().await;
+
+        match &controls_outcome {
+            ControlsOutcome::Updated(floors) => set_floors(*floors),
+            ControlsOutcome::Reset(_) => set_floors(SessionFloorsByLane::default()),
+            // Skipped / Kept leave the cache as-is (last-good or "no floors").
+            ControlsOutcome::SkippedNoJwt | ControlsOutcome::Kept(_) => {}
+        }
+
+        let controls_changed = last_logged_controls.as_ref() != Some(&controls_outcome);
+        if controls_changed {
+            match &controls_outcome {
+                ControlsOutcome::Updated(floors) => {
+                    info!(
+                        "fleet_policy_poller: fleet session floors ({}) = {}",
+                        CONTROLS_DOMAIN,
+                        describe_floors(floors)
+                    );
+                }
+                ControlsOutcome::SkippedNoJwt => {
+                    info!(
+                        "fleet_policy_poller: no device JWT yet (unpaired) — skipping the \
+                         {CONTROLS_DOMAIN} poll, session floors stay unset (the runner's own \
+                         local + hardcoded floors still apply)"
+                    );
+                }
+                ControlsOutcome::Reset(status) => {
+                    warn!(
+                        "fleet_policy_poller: coord returned {status} for {CONTROLS_DOMAIN} \
+                         (auth/absent) — clearing the cached fleet session floors (fail-safe: \
+                         no fleet term, never a zero floor)"
+                    );
+                }
+                ControlsOutcome::Kept(err) => {
+                    warn!(
+                        "fleet_policy_poller: {CONTROLS_DOMAIN} poll failed ({err}) — keeping \
+                         last-good fleet session floors"
+                    );
+                }
+            }
+            last_logged_controls = Some(controls_outcome);
+        }
+
         // Sleep until the next tick, waking early on shutdown.
         tokio::select! {
             _ = shutdown_rx.changed() => {
@@ -360,7 +689,7 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     }
 }
 
-/// One poll against coord. Resolves the coord base the SAME way the
+/// One GET against coord for `domain`. Resolves the coord base the SAME way the
 /// install-effects producer does (`agent_worktrees::coord_http_base()`) and
 /// presents the device JWT from `AuthManager::get_access_token()` as the
 /// `Authorization: Bearer` — the exact accessor `backend_relay` uses
@@ -368,22 +697,26 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
 ///
 /// NET-NEW coord client (D4): the existing `device_jwt_refresher` talks to the
 /// WEB-BACKEND proxy, not coord, so we issue our own GET here.
-async fn poll_once() -> PollOutcome {
+///
+/// Parameterised by domain rather than duplicated per cache: the auth, the base
+/// resolution and the 401/404-versus-error classification are the parts a second
+/// copy would eventually get subtly wrong.
+async fn fetch_fleet_policy(domain: &str) -> Result<FleetPolicyResponse, FetchError> {
     // Device JWT — same slot the relay reads as its Bearer (REPLACE-not-REVOKE
     // lifecycle owned by the refresher). Empty ⇒ unpaired ⇒ skip quietly.
     let device_jwt = match crate::auth::AuthManager::new().get_access_token() {
         Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-        _ => return PollOutcome::SkippedNoJwt,
+        _ => return Err(FetchError::NoJwt),
     };
 
     // coord base — identical source-of-truth chain to the producer's
     // `coord_base()` (env COORD_HTTP_URL → profile coord_url → default).
     let base = match crate::mcp::agent_worktrees::coord_http_base() {
         Ok(b) => b,
-        Err(e) => return PollOutcome::Kept(format!("coord base unresolved: {e}")),
+        Err(e) => return Err(FetchError::Failed(format!("coord base unresolved: {e}"))),
     };
     let url = format!(
-        "{}/coord/fleet-policy?domain={DOMAIN}",
+        "{}/coord/fleet-policy?domain={domain}",
         base.trim_end_matches('/')
     );
 
@@ -392,44 +725,75 @@ async fn poll_once() -> PollOutcome {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return PollOutcome::Kept(format!("client build: {e}")),
+        Err(e) => return Err(FetchError::Failed(format!("client build: {e}"))),
     };
 
     let resp = match client.get(&url).bearer_auth(&device_jwt).send().await {
         Ok(r) => r,
-        Err(e) => return PollOutcome::Kept(format!("request: {e}")),
+        Err(e) => return Err(FetchError::Failed(format!("request: {e}"))),
     };
 
     let status = resp.status();
-    // Auth / absent ⇒ fail-safe reset to off (NEVER gate on a 401/404).
+    // Auth / absent ⇒ the caller's fail-safe reset (NEVER gate, NEVER a floor).
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::NOT_FOUND {
-        return PollOutcome::ResetOff(status.as_u16());
+        return Err(FetchError::AuthOrAbsent(status.as_u16()));
     }
     if !status.is_success() {
-        return PollOutcome::Kept(format!("coord status {}", status.as_u16()));
+        return Err(FetchError::Failed(format!(
+            "coord status {}",
+            status.as_u16()
+        )));
     }
 
-    let body: FleetPolicyResponse = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => return PollOutcome::Kept(format!("decode: {e}")),
-    };
+    resp.json()
+        .await
+        .map_err(|e| FetchError::Failed(format!("decode: {e}")))
+}
 
-    // `effective_level` absent / null ⇒ coord's documented "off when absent"
-    // contract — treat as off (cache update, not an error).
-    let level = body
-        .effective_level
+/// Normalize coord's `effective_level` onto the three levels this runner acts
+/// on. PURE.
+///
+/// Absent / null / empty ⇒ coord's documented "off when absent" contract — off,
+/// as a cache update rather than an error. Anything unrecognised ⇒ off too:
+/// never honor a level we cannot identify as a gate trigger.
+fn normalize_level(raw: Option<&str>) -> String {
+    let level = raw
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_MODE.to_string());
-
-    // Normalize anything unexpected to off (fail-safe: never honor a level we
-    // don't recognize as a gate trigger).
-    let level = match level.as_str() {
+    match level.as_str() {
         "off" | "observe" | "gate" => level,
         _ => DEFAULT_MODE.to_string(),
+    }
+}
+
+/// One poll of the [`DOMAIN`] (install-interception) cache.
+async fn poll_once() -> PollOutcome {
+    let body = match fetch_fleet_policy(DOMAIN).await {
+        Ok(b) => b,
+        Err(FetchError::NoJwt) => return PollOutcome::SkippedNoJwt,
+        Err(FetchError::AuthOrAbsent(status)) => return PollOutcome::ResetOff(status),
+        Err(FetchError::Failed(e)) => return PollOutcome::Kept(e),
     };
 
-    PollOutcome::Updated(level)
+    PollOutcome::Updated(normalize_level(body.effective_level.as_deref()))
+}
+
+/// One poll of the [`CONTROLS_DOMAIN`] (session-protection floors) cache.
+///
+/// A 2xx with no usable floors — which is what coord returns until BOTH the
+/// qontinui-web migration and coord's `CONTROL_COLS` widening land — is
+/// [`ControlsOutcome::Updated`] carrying no floors, NOT an error. That
+/// distinction is the fail-safe: `Updated(none)` publishes "the fleet has no
+/// opinion", while an error arm would preserve floors that are no longer
+/// current.
+async fn poll_controls_once() -> ControlsOutcome {
+    match fetch_fleet_policy(CONTROLS_DOMAIN).await {
+        Ok(body) => ControlsOutcome::Updated(session_floors_from(&body)),
+        Err(FetchError::NoJwt) => ControlsOutcome::SkippedNoJwt,
+        Err(FetchError::AuthOrAbsent(status)) => ControlsOutcome::Reset(status),
+        Err(FetchError::Failed(e)) => ControlsOutcome::Kept(e),
+    }
 }
 
 // ===========================================================================
@@ -510,22 +874,13 @@ mod tests {
     #[test]
     fn unknown_level_is_normalized_off_via_response_shape() {
         // The decode + normalize path collapses an unrecognized level to off.
-        // We exercise the pure normalization the loop relies on.
-        let normalize = |raw: Option<&str>| -> String {
-            let level = raw
-                .map(|s| s.trim().to_ascii_lowercase())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_MODE.to_string());
-            match level.as_str() {
-                "off" | "observe" | "gate" => level,
-                _ => DEFAULT_MODE.to_string(),
-            }
-        };
-        assert_eq!(normalize(Some("GATE")), "gate");
-        assert_eq!(normalize(Some(" observe ")), "observe");
-        assert_eq!(normalize(Some("bogus")), DEFAULT_MODE);
-        assert_eq!(normalize(None), DEFAULT_MODE);
-        assert_eq!(normalize(Some("")), DEFAULT_MODE);
+        // Calls the SHIPPING normalizer rather than a copy of it, so the test
+        // cannot keep passing against logic the loop no longer runs.
+        assert_eq!(normalize_level(Some("GATE")), "gate");
+        assert_eq!(normalize_level(Some(" observe ")), "observe");
+        assert_eq!(normalize_level(Some("bogus")), DEFAULT_MODE);
+        assert_eq!(normalize_level(None), DEFAULT_MODE);
+        assert_eq!(normalize_level(Some("")), DEFAULT_MODE);
     }
 
     #[test]
@@ -564,5 +919,208 @@ mod tests {
         assert_eq!(decide(r#"{"status":"ok"}"#), CapabilityCheck::Capable);
         // Empty body ⇒ capable.
         assert_eq!(decide(r#"{}"#), CapabilityCheck::Capable);
+    }
+
+    // =======================================================================
+    // Session-protection floors (plan Part B item 3)
+    // =======================================================================
+
+    /// Decode helper: the tests speak in coord's wire JSON, not in the struct,
+    /// because the whole risk being tested is what an unfamiliar body decodes
+    /// to.
+    fn floors_of(json: &str) -> SessionFloorsByLane {
+        let body: FleetPolicyResponse = serde_json::from_str(json).expect("decode");
+        session_floors_from(&body)
+    }
+
+    #[test]
+    fn controls_domain_is_the_one_that_owns_the_columns() {
+        // Pinned against coord's `fleet_policy::CONTROLS_DOMAIN`. If coord
+        // renames the domain, the poller silently caches nothing — a test that
+        // states the name is the cheapest place for that to be noticed.
+        assert_eq!(CONTROLS_DOMAIN, "fleet_resources");
+        // …and the interception domain is untouched by this generalization:
+        // `install_effects_producer::run_with_base` reads its cache
+        // synchronously and must keep working byte-for-byte.
+        assert_eq!(DOMAIN, "install_interception");
+    }
+
+    #[test]
+    fn fresh_floor_cache_holds_no_fleet_opinion() {
+        // Exercise the OnceLock init value directly (a private throwaway, not
+        // the shared global) so this is race-free. Before the first poll the
+        // fleet term must contribute NOTHING on either lane.
+        let fresh = SessionFloorsByLane::default();
+        assert_eq!(fresh.host, SessionFloors::default());
+        assert_eq!(fresh.wsl, SessionFloors::default());
+        assert_eq!(fresh.host.warn_free_bytes, None);
+        assert_eq!(fresh.host.critical_free_bytes, None);
+    }
+
+    #[test]
+    fn all_four_floors_decode_onto_their_own_lanes() {
+        // The lanes must not be crossed: the host warn floor is host-lane free
+        // commit, the WSL warn floor is that VM's available memory, and a gate
+        // judging one against the other is the failure mode
+        // `fleet::resource_sample`'s docs exist to prevent.
+        let floors = floors_of(
+            r#"{"domain":"fleet_resources","controls_available":true,
+                "controls":{"min_free_bytes_sessions_host":3221225472,
+                            "min_free_bytes_sessions_wsl":2147483648,
+                            "min_free_bytes_sessions_critical_host":1610612736,
+                            "min_free_bytes_sessions_critical_wsl":1073741824}}"#,
+        );
+        assert_eq!(floors.host.warn_free_bytes, Some(3 * 1024 * 1024 * 1024));
+        assert_eq!(
+            floors.host.critical_free_bytes,
+            Some(3 * 1024 * 1024 * 1024 / 2)
+        );
+        assert_eq!(floors.wsl.warn_free_bytes, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(floors.wsl.critical_free_bytes, Some(1024 * 1024 * 1024));
+    }
+
+    /// THE PATH THAT RUNS TODAY. qontinui-web's `sess_guard_01` revision and
+    /// coord's `CONTROL_COLS` widening are both still open, so coord answers
+    /// with a `controls` object carrying the SIX older §D1 controls and none of
+    /// the four floor columns. That must decode cleanly to "no fleet opinion" —
+    /// not to a decode error (which would spam the log and keep stale floors)
+    /// and not to zeros (which would name a floor of zero, disabling the guard).
+    #[test]
+    fn controls_without_the_floor_columns_yields_no_floors() {
+        let floors = floors_of(
+            r#"{"domain":"fleet_resources","effective_level":"off",
+                "controls_available":true,
+                "controls":{"min_free_mem_bytes_host":8589934592,
+                            "min_free_mem_bytes_wsl":null,
+                            "min_free_disk_bytes":21474836480,
+                            "max_concurrent_builds_override":2,
+                            "sample_interval_secs":30,
+                            "sample_retention_days":14}}"#,
+        );
+        assert_eq!(floors, SessionFloorsByLane::default());
+    }
+
+    /// A partially-populated controls object contributes only what it stated.
+    /// The unstated fields stay UNKNOWN rather than inheriting their sibling.
+    #[test]
+    fn a_partial_controls_object_contributes_only_what_it_states() {
+        let floors = floors_of(
+            r#"{"controls_available":true,
+                "controls":{"min_free_bytes_sessions_host":4294967296}}"#,
+        );
+        assert_eq!(floors.host.warn_free_bytes, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(floors.host.critical_free_bytes, None);
+        assert_eq!(floors.wsl, SessionFloors::default());
+    }
+
+    #[test]
+    fn an_unprovisioned_or_absent_controls_object_yields_no_floors() {
+        // Coord could not read the columns at all (pre-migration deployment).
+        assert_eq!(
+            floors_of(r#"{"controls_available":false,"controls":null}"#),
+            SessionFloorsByLane::default()
+        );
+        // Explicit null with no flag.
+        assert_eq!(
+            floors_of(r#"{"controls":null}"#),
+            SessionFloorsByLane::default()
+        );
+        // The key absent entirely (an older coord that predates §D1).
+        assert_eq!(
+            floors_of(r#"{"domain":"fleet_resources","effective_level":"off"}"#),
+            SessionFloorsByLane::default()
+        );
+        // An empty body — the degenerate case that must still be harmless.
+        assert_eq!(floors_of(r#"{}"#), SessionFloorsByLane::default());
+        // `controls_available:false` WINS over a populated object: coord saying
+        // it cannot read the columns is not a reading.
+        assert_eq!(
+            floors_of(
+                r#"{"controls_available":false,
+                    "controls":{"min_free_bytes_sessions_host":3221225472}}"#
+            ),
+            SessionFloorsByLane::default()
+        );
+    }
+
+    /// A negative floor can only arrive from a hand-edited row (coord's
+    /// `validate()` rejects it), and `as u64` would turn it into ~18 exabytes —
+    /// a floor no machine can clear, blocking every spawn in the tenant. An
+    /// impossible value is UNKNOWN.
+    #[test]
+    fn a_negative_floor_is_unknown_not_an_exabyte() {
+        let floors = floors_of(
+            r#"{"controls_available":true,
+                "controls":{"min_free_bytes_sessions_host":-1,
+                            "min_free_bytes_sessions_critical_host":-9223372036854775808}}"#,
+        );
+        assert_eq!(floors.host.warn_free_bytes, None);
+        assert_eq!(floors.host.critical_free_bytes, None);
+        assert_eq!(floor_bytes(Some(-1)), None);
+        assert_eq!(floor_bytes(None), None);
+        assert_eq!(
+            floor_bytes(Some(i64::MAX)),
+            Some(9_223_372_036_854_775_807_u64)
+        );
+    }
+
+    /// Zero is preserved rather than collapsed to `None`: the fleet may state
+    /// it, and stating it changes nothing, because the effective floor is a
+    /// `max` that already contains the hardcoded default. Collapsing it would
+    /// hide a real (if inert) fleet statement from the log line.
+    #[test]
+    fn a_zero_floor_is_kept_as_a_stated_zero() {
+        let floors = floors_of(
+            r#"{"controls_available":true,
+                "controls":{"min_free_bytes_sessions_host":0}}"#,
+        );
+        assert_eq!(floors.host.warn_free_bytes, Some(0));
+    }
+
+    #[test]
+    fn floors_are_selected_by_lane_and_an_unknown_lane_gets_none() {
+        use crate::fleet::resource_sample::Lane;
+
+        let floors = SessionFloorsByLane {
+            host: SessionFloors {
+                warn_free_bytes: Some(7),
+                critical_free_bytes: Some(3),
+            },
+            wsl: SessionFloors {
+                warn_free_bytes: Some(11),
+                critical_free_bytes: None,
+            },
+        };
+        assert_eq!(floors.for_lane(Lane::Host.as_str()).warn_free_bytes, Some(7));
+        assert_eq!(floors.for_lane(Lane::Wsl.as_str()).warn_free_bytes, Some(11));
+        // An unrecognised lane must get NO floors rather than a neighbouring
+        // lane's — never compare one lane's reading to another lane's floor.
+        assert_eq!(floors.for_lane("hyperv"), SessionFloors::default());
+        assert_eq!(floors.for_lane(""), SessionFloors::default());
+    }
+
+    #[test]
+    fn the_log_line_says_unset_never_zero() {
+        // An operator reading the log must be able to tell "the fleet set no
+        // floor" from "the fleet set a floor of 0" — printing both as `0` is
+        // exactly the confusion the `Option` exists to prevent.
+        let none = describe_floors(&SessionFloorsByLane::default());
+        assert_eq!(
+            none,
+            "host warn=unset critical=unset, wsl warn=unset critical=unset"
+        );
+
+        let zeroed = SessionFloorsByLane {
+            host: SessionFloors {
+                warn_free_bytes: Some(0),
+                critical_free_bytes: None,
+            },
+            wsl: SessionFloors::default(),
+        };
+        assert!(
+            describe_floors(&zeroed).starts_with("host warn=0 critical=unset"),
+            "a stated zero must print as 0: {}",
+            describe_floors(&zeroed)
+        );
     }
 }

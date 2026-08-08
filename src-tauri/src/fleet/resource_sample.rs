@@ -97,7 +97,14 @@ pub(crate) enum Lane {
 }
 
 impl Lane {
-    fn as_str(self) -> &'static str {
+    /// The wire name, and the name that lands in [`ResourceSample::lane`].
+    ///
+    /// `pub(crate)` so the lane vocabulary has exactly ONE home: the spawn
+    /// gate's fleet-floor cache (`mcp::fleet_policy_poller`) selects a lane's
+    /// floors by this string, and a second literal `"host"` somewhere else is
+    /// how a renamed lane turns into a silently empty lookup rather than a
+    /// compile error.
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Lane::Host => "host",
             Lane::Wsl => "wsl",

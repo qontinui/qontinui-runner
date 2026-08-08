@@ -33,6 +33,24 @@
 //! "Split out from `admission_decision` so the threshold policy can be exercised
 //! on its own").
 //!
+//! ## Three terms, and only tightening
+//!
+//! The floors [`evaluate`] compares against are
+//! `max(local override, cached fleet default, hardcoded default)` — see
+//! [`merge_floors`]. A machine owner can only ever TIGHTEN their own protection,
+//! never loosen it, which is the same non-loosening discipline this fleet
+//! applies to policy-clause edits.
+//!
+//! The fleet term is a **cached, best-effort refinement**: it comes from
+//! [`crate::mcp::fleet_policy_poller`]'s 45 s background loop, read
+//! synchronously out of a process-global cache. **The spawn path never calls
+//! coord.** That is not an optimisation, it is the requirement — this gate
+//! exists to protect sessions on a machine under load, which is exactly when a
+//! coord round-trip is least likely to answer, and a guard that degraded to "no
+//! warning" when coord was unreachable would be missing on precisely the nights
+//! it is for. With an empty cache the effective floor is
+//! `max(local, hardcoded)`, exactly as it was before the poller existed.
+//!
 //! ## Fail OPEN, always
 //!
 //! `commit_available_bytes()` returns `Option`. `None` means the sensor is
@@ -58,6 +76,7 @@
 use tauri::{AppHandle, Emitter};
 use tracing::warn;
 
+use crate::mcp::fleet_policy_poller::SessionFloors;
 use crate::settings::SessionGuardSettings;
 
 /// Tauri event carrying a resource-guard observation to the webview.
@@ -165,6 +184,90 @@ pub(crate) fn evaluate(
     SpawnGate::Proceed
 }
 
+/// The floors actually enforced: `max(local override, cached fleet default,
+/// hardcoded default)`, per field. PURE over the two injected terms.
+///
+/// ## Why a max, and only a max
+///
+/// The three terms are not a precedence chain where the most specific wins —
+/// they are three parties who may each raise the bar and none of whom may lower
+/// it. A tenant admin setting a fleet-wide floor is protecting fleet machines
+/// they do not sit at; a machine owner who needs MORE headroom (a box that also
+/// hosts a WSL build runner, say) must be able to say so; and the hardcoded
+/// default is the floor below which nobody, local or remote, gets to take this
+/// machine's session protection away. `max` is the only fold that gives all
+/// three of those at once.
+///
+/// An UNKNOWN fleet term contributes **nothing** and the floor falls back to
+/// `max(local, hardcoded)` — see [`tighten`]. That is the poller's fail-safe
+/// contract read through to its consumer: before the first successful poll, and
+/// after a 401/404, there is no fleet term at all.
+///
+/// ## `enabled` is NOT part of the max
+///
+/// The master switch stays the machine owner's, and is copied through
+/// untouched. The non-loosening rule is a statement about *floors*, and coord
+/// publishes floors — four byte columns, no enable flag. Synthesising "the
+/// fleet turns your guard back on" out of a byte value would be inventing an
+/// opinion coord never expressed, which is the same reasoning
+/// [`crate::ci_node::admission::defer_commit_floor_gb`] gives for treating a
+/// disabled guard as `None` rather than as the floor it happens to have stored.
+pub(crate) fn merge_floors(
+    local: &SessionGuardSettings,
+    fleet: SessionFloors,
+) -> SessionGuardSettings {
+    let hardcoded = SessionGuardSettings::default();
+    SessionGuardSettings {
+        warn_free_commit_bytes: tighten(
+            local.warn_free_commit_bytes,
+            hardcoded.warn_free_commit_bytes,
+            fleet.warn_free_bytes,
+        ),
+        critical_free_commit_bytes: tighten(
+            local.critical_free_commit_bytes,
+            hardcoded.critical_free_commit_bytes,
+            fleet.critical_free_bytes,
+        ),
+        enabled: local.enabled,
+    }
+}
+
+/// `max` over the two floors that always exist and the one that may not.
+///
+/// The `None` arm is spelled out rather than folded in as `unwrap_or(0)`, which
+/// would be the same arithmetic and the wrong statement: an absent fleet floor
+/// is UNKNOWN, and a future edit that starts treating UNKNOWN as a value has to
+/// delete this arm to do it. A zero floor disables the guard it names, so the
+/// distinction is worth a branch.
+fn tighten(local: u64, hardcoded: u64, fleet: Option<u64>) -> u64 {
+    let known = local.max(hardcoded);
+    match fleet {
+        Some(fleet_floor) => known.max(fleet_floor),
+        None => known,
+    }
+}
+
+/// The effective floors for `lane`: [`merge_floors`] over the caller's local
+/// settings and the fleet's cached floors for that lane.
+///
+/// This is the IMPURE seam — the one place the process-global fleet cache is
+/// read — exactly as `probe_headroom` is the only settings reader in
+/// `ci_node/admission.rs`. It does no I/O: the read is a lock on a cache the
+/// poller fills in the background, so it is safe on the spawn path.
+///
+/// The lane is passed in rather than assumed because the floors are
+/// lane-separated and must never be crossed: a host-lane free-commit reading is
+/// judged against the host floor or against nothing.
+pub(crate) fn effective_session_floors(
+    local: &SessionGuardSettings,
+    lane: &str,
+) -> SessionGuardSettings {
+    merge_floors(
+        local,
+        crate::mcp::fleet_policy_poller::fleet_session_floors(lane),
+    )
+}
+
 /// Live verdict: read the floors, take one host-lane snapshot, [`evaluate`].
 ///
 /// The settings read happens FIRST and short-circuits when the guard is
@@ -178,13 +281,17 @@ pub(crate) fn evaluate(
 /// that is the reading the A1 publisher sends to coord: the number this gate
 /// trips on and the number the fleet dashboard renders are then literally one
 /// reading, not two probes that agree today and drift tomorrow.
+///
+/// The fleet term is folded in AFTER the snapshot, because the lane to look the
+/// fleet floors up under comes from the reading itself.
 pub(crate) fn probe_for_spawn() -> SpawnGate {
-    let guard = crate::settings::get_session_guard_settings();
-    if !guard.enabled {
+    let local = crate::settings::get_session_guard_settings();
+    if !local.enabled {
         return SpawnGate::Proceed;
     }
     let sample = crate::fleet::resource_sample::host_snapshot();
-    evaluate(&sample.lane, sample.commit_available_bytes, &guard)
+    let floors = effective_session_floors(&local, &sample.lane);
+    evaluate(&sample.lane, sample.commit_available_bytes, &floors)
 }
 
 /// `bytes` as `"1.42 GiB"`. Two decimals because the shipped critical floor is
@@ -453,5 +560,178 @@ mod tests {
     fn format_gib_keeps_the_fractional_default_floor_honest() {
         assert_eq!(format_gib(3 * GIB_U64 / 2), "1.50 GiB");
         assert_eq!(format_gib(3 * GIB_U64), "3.00 GiB");
+    }
+
+    // =======================================================================
+    // The three-term effective floor (plan Part B: max(local, fleet, hardcoded))
+    // =======================================================================
+
+    /// No fleet term at all — before the first poll, after a 401/404, on an
+    /// unpaired runner, or on a coord that predates the columns. The floors must
+    /// be EXACTLY what they were before the poller existed. This is the arm that
+    /// runs today, and the one that has to keep running when coord is
+    /// unreachable, which is when this gate matters most.
+    #[test]
+    fn an_absent_fleet_term_changes_nothing() {
+        let local = defaults();
+        assert_eq!(merge_floors(&local, SessionFloors::default()), local);
+
+        // …including for an owner who tightened locally: their own floors
+        // survive an empty cache untouched.
+        let tightened = SessionGuardSettings {
+            warn_free_commit_bytes: 8 * GIB_U64,
+            critical_free_commit_bytes: 4 * GIB_U64,
+            enabled: true,
+        };
+        assert_eq!(
+            merge_floors(&tightened, SessionFloors::default()),
+            tightened
+        );
+    }
+
+    /// A fleet floor ABOVE the local one wins: the tenant may tighten a machine
+    /// it does not sit at.
+    #[test]
+    fn a_higher_fleet_floor_tightens_the_local_one() {
+        let merged = merge_floors(
+            &defaults(),
+            SessionFloors {
+                warn_free_bytes: Some(6 * GIB_U64),
+                critical_free_bytes: Some(3 * GIB_U64),
+            },
+        );
+        assert_eq!(merged.warn_free_commit_bytes, 6 * GIB_U64);
+        assert_eq!(merged.critical_free_commit_bytes, 3 * GIB_U64);
+    }
+
+    /// A fleet floor BELOW the local one loses. The fleet default is a default,
+    /// not a ceiling — it can never talk a machine owner down out of protection
+    /// they asked for.
+    #[test]
+    fn a_lower_fleet_floor_never_loosens_a_local_one() {
+        let tightened = SessionGuardSettings {
+            warn_free_commit_bytes: 10 * GIB_U64,
+            critical_free_commit_bytes: 5 * GIB_U64,
+            enabled: true,
+        };
+        let merged = merge_floors(
+            &tightened,
+            SessionFloors {
+                warn_free_bytes: Some(4 * GIB_U64),
+                critical_free_bytes: Some(GIB_U64),
+            },
+        );
+        assert_eq!(merged.warn_free_commit_bytes, 10 * GIB_U64);
+        assert_eq!(merged.critical_free_commit_bytes, 5 * GIB_U64);
+    }
+
+    /// The hardcoded default is the last line: neither a low local value nor a
+    /// low fleet value can take this machine's protection below it. A
+    /// hand-edited `settings.json` naming a 1 MiB warn floor is the case that
+    /// matters — that file is not validated on read.
+    #[test]
+    fn neither_local_nor_fleet_can_go_below_the_hardcoded_default() {
+        let loosened = SessionGuardSettings {
+            warn_free_commit_bytes: 1024 * 1024,
+            critical_free_commit_bytes: 1,
+            enabled: true,
+        };
+        let hardcoded = SessionGuardSettings::default();
+
+        let merged = merge_floors(&loosened, SessionFloors::default());
+        assert_eq!(
+            merged.warn_free_commit_bytes,
+            hardcoded.warn_free_commit_bytes
+        );
+        assert_eq!(
+            merged.critical_free_commit_bytes,
+            hardcoded.critical_free_commit_bytes
+        );
+
+        // A fleet ZERO is the same story: the fleet is entitled to say zero, and
+        // saying it cannot disable the guard, because the hardcoded default is
+        // still a term in the max.
+        let with_fleet_zero = merge_floors(
+            &loosened,
+            SessionFloors {
+                warn_free_bytes: Some(0),
+                critical_free_bytes: Some(0),
+            },
+        );
+        assert_eq!(
+            with_fleet_zero.warn_free_commit_bytes,
+            hardcoded.warn_free_commit_bytes
+        );
+        assert_eq!(
+            with_fleet_zero.critical_free_commit_bytes,
+            hardcoded.critical_free_commit_bytes
+        );
+    }
+
+    /// The two floors are folded INDEPENDENTLY: a fleet that states only the
+    /// warn floor must not drag the critical floor with it, in either direction.
+    #[test]
+    fn the_two_floors_fold_independently() {
+        let merged = merge_floors(
+            &defaults(),
+            SessionFloors {
+                warn_free_bytes: Some(9 * GIB_U64),
+                critical_free_bytes: None,
+            },
+        );
+        assert_eq!(merged.warn_free_commit_bytes, 9 * GIB_U64);
+        assert_eq!(
+            merged.critical_free_commit_bytes,
+            defaults().critical_free_commit_bytes
+        );
+    }
+
+    /// The master switch is the machine owner's and is copied through: coord
+    /// publishes byte floors, not an enable flag, so a fleet floor must never be
+    /// read as "turn the guard back on".
+    #[test]
+    fn the_fleet_term_never_re_enables_a_disabled_guard() {
+        let off = SessionGuardSettings {
+            enabled: false,
+            ..defaults()
+        };
+        let merged = merge_floors(
+            &off,
+            SessionFloors {
+                warn_free_bytes: Some(32 * GIB_U64),
+                critical_free_bytes: Some(16 * GIB_U64),
+            },
+        );
+        assert!(!merged.enabled);
+        // And the pure verdict still proceeds at every reading.
+        assert_eq!(evaluate("host", Some(0), &merged), SpawnGate::Proceed);
+    }
+
+    /// End to end over the pure parts: a fleet floor that the local machine is
+    /// under changes the VERDICT, not just the number. This is the whole point
+    /// of the term — a tenant-wide tightening has to be able to produce a
+    /// warning the local settings alone would not have produced.
+    #[test]
+    fn a_fleet_floor_can_change_the_verdict() {
+        let local = defaults();
+        let reading = Some(4 * GIB_U64);
+
+        // Local floors alone: 4 GiB is above the 3 GiB warn floor. No opinion.
+        let local_only = merge_floors(&local, SessionFloors::default());
+        assert_eq!(evaluate("host", reading, &local_only), SpawnGate::Proceed);
+
+        // The tenant declares a 6 GiB warn floor; the same reading now warns.
+        let fleet = SessionFloors {
+            warn_free_bytes: Some(6 * GIB_U64),
+            critical_free_bytes: None,
+        };
+        assert_eq!(
+            evaluate("host", reading, &merge_floors(&local, fleet)),
+            SpawnGate::Warn {
+                lane: "host".to_string(),
+                free_bytes: 4 * GIB_U64,
+                floor_bytes: 6 * GIB_U64,
+            }
+        );
     }
 }
