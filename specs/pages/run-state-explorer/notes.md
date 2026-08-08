@@ -1,3 +1,0 @@
-# StateExplorerTab
-
-_(notes)_
