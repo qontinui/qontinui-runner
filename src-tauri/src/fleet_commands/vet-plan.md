@@ -636,6 +636,11 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    - **`clearance_audience`:** `unit_ready` auto-clears by predicate, so audience
      is moot for *clearing*; register consistently with the model (default
      `operator`) — the typed predicate, not a human, is what clears it.
+   - **`gate_class`:** the body shape above accepts it. A routine `unit_ready`
+     gate is `routine-review`, or omit it — omitting is safe and never a
+     loophole. Full vocabulary and the "when to classify" rule: the `gate_class`
+     bullet in the flagged-items section below, canonical
+     `_gate-registration` → "`gate_class`".
 6. **Masked-tool honesty + verification:** if `coord_register_gate` reads as
    unknown/method-not-found (per-agent allow-set masking) fall back to the
    device-authed HTTP routes (upsert → register-gate), and NEVER report a gate
@@ -645,6 +650,13 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      fallback above never fires. Presume the registration **LOST**, run
      **`/coord-revive`**, re-issue over the door it reports LIVE, and verify by
      read. Canonical: `_gate-registration` → "Dead-transport honesty".
+   - **A `gate_id` with WARNINGS is not a registered gate**
+     [policy: `coordination` `gate-warnings-mean-not-usable`]. A non-empty
+     `warnings[]` or a "cannot evaluate" `initial_verdict_reason` means the row
+     exists and the gate can never clear. Re-check the predicate against a
+     control, re-register on one coord can evaluate, withdraw the unusable one,
+     and quote the NEW `gate_id`. Canonical: `_gate-registration` →
+     "Registration warnings".
 
 (If coord doesn't yet accept `unit_ready` — e.g. the deploy that ships the
 work-unit surface hasn't landed — report the gate as NOT registered with the
@@ -813,7 +825,7 @@ leave it in the report.
   `POST $COORD_HTTP_URL/coord/work-units/upsert {slug, title?, status?}` →
   **capture `work_unit_id`**; (2)
   `POST $COORD_HTTP_URL/coord/work-units/<slug>/register-gate`
-  `{predicate, phase_name (required), continuation_spawn?, clearance_audience?}` —
+  `{predicate, phase_name (required), continuation_spawn?, clearance_audience?, gate_class?}` —
   `register-gate` does NOT upsert (404s `work_unit_not_found` if you skip step 1).
   Reach the two routes over a held device JWT, the `/coord-mcp` proxy (injects a
   device JWT), or the acting-user-service token; MCP `coord_register_gate` now works
@@ -858,6 +870,20 @@ leave it in the report.
   session that completes the work can attest the gate itself; set `operator` for
   business/judgment/strategy or on-page-human-verification gates. Default is
   `operator` if omitted; the sensitive-work rule always forces `operator`.
+- **`gate_class`:** classify the gate so coord's per-tenant `gate_clearance`
+  matrix can resolve who may clear it. `security-surface` when the deferred work
+  this gate guards would itself fire a `security-and-autonomy` glob or content
+  trigger (name the trigger in `phase_name` so it stays auditable — a
+  CLAIM-anchored gate has no `phase_name`, so name it in the plan or report
+  instead);
+  `ops-confirm` for deploy/sweep/migration/config confirmations;
+  `routine-review` for mechanical follow-ups. **Omit when none applies** —
+  omitting is safe and never a loophole, and a guessed class is worse than none.
+  ⚠️ Do not ask for the `agent_non_author` authority on this fleet: it is a
+  ONE-DEVICE fleet and no gate carries an agent id, so the device floor
+  (`reg_dev == cal_dev`) treats every caller as the author and it resolves to
+  "nobody may attest". A second paired device would also lift it.
+  (Canonical: `_gate-registration` → "`gate_class`".)
 - **Predicate choice:** wait-on-PR (non-coord repo) → `pr_merged`; work landing
   on a **coord-orchestrated repo** → `commit_live` `{repo, commit_sha}` with a
   **post-land main SHA** (NEVER a pre-land branch-head SHA — rebase-land rewrites
