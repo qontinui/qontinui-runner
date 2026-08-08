@@ -1,3 +1,0 @@
-# KnowledgeExplorerPage
-
-_(notes)_
