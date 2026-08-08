@@ -1458,6 +1458,7 @@ mod tests {
             purpose: "coord-sync test".into(),
             repo: Some("qontinui-runner".into()),
             branch: Some("feat/coord-sync".into()),
+            work_unit_slug: None,
             plan_slug: None,
             correlation_topic: None,
             page_id: None,

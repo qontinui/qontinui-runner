@@ -935,8 +935,11 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
     // Dual-read: coord renamed the wire key `plan_slug` → `work_unit_slug`.
     // Read the new name first and fall back to the legacy one so a source
     // intent written by EITHER coord release materializes.
-    // (`Intent::plan_slug` — what the runner WRITES — is deliberately not
-    // renamed here; the writer leg switches in a later stage.)
+    // (The writer leg has since switched: `Intent` now carries the canonical
+    // `work_unit_slug` and emits ONLY that key — plan
+    // `2026-07-30-coord-web-plan-slug-wire-key-retirement` Phase 1 step 6.
+    // That makes this fallback the ONLY thing standing between a pre-rename
+    // blob and a lost slug.)
     //
     // ** THE `plan_slug` FALLBACK IS PERMANENT. DO NOT "CLEAN IT UP". **
     // This is not a migration window that eventually closes. `src` is a
@@ -955,7 +958,7 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
     // nulls on exactly this shape — its autonomous-dispatch metadata is built
     // with `json!({"plan_slug": slug, "work_unit_slug": slug})`, which
     // serializes `None` as `null` rather than omitting the key.
-    let plan_slug = src
+    let work_unit_slug = src
         .get("work_unit_slug")
         .and_then(|v| v.as_str())
         .or_else(|| src.get("plan_slug").and_then(|v| v.as_str()))
@@ -979,7 +982,10 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
         purpose,
         repo: state.repo.clone(),
         branch: state.branch.clone(),
-        plan_slug,
+        // The child intent is re-serialized under the canonical key alone —
+        // the dual-read above is what folds a legacy blob into it.
+        work_unit_slug,
+        plan_slug: None,
         correlation_topic,
         page_id: None,
         declared_paths,
@@ -1135,7 +1141,22 @@ mod tests {
         // Un-renamed coord (every coord shipping today) writes `plan_slug`.
         let state = state_with_intent_key("plan_slug", "2026-07-28-some-unit");
         let intent = build_child_intent(&state).unwrap();
-        assert_eq!(intent.plan_slug.as_deref(), Some("2026-07-28-some-unit"));
+        assert_eq!(
+            intent.work_unit_slug.as_deref(),
+            Some("2026-07-28-some-unit")
+        );
+        // …and the child re-emits it under the CANONICAL key alone: the
+        // legacy blob is folded forward, never propagated.
+        assert_eq!(
+            intent.plan_slug, None,
+            "the deprecated field is accept-only; the child must not re-emit it"
+        );
+        let json = serde_json::to_value(&intent).unwrap();
+        assert_eq!(
+            json.get("work_unit_slug").and_then(|v| v.as_str()),
+            Some("2026-07-28-some-unit")
+        );
+        assert!(json.get("plan_slug").is_none(), "{json}");
     }
 
     #[test]
@@ -1143,7 +1164,10 @@ mod tests {
         // Post-rename coord writes `work_unit_slug`.
         let state = state_with_intent_key("work_unit_slug", "2026-07-28-some-unit");
         let intent = build_child_intent(&state).unwrap();
-        assert_eq!(intent.plan_slug.as_deref(), Some("2026-07-28-some-unit"));
+        assert_eq!(
+            intent.work_unit_slug.as_deref(),
+            Some("2026-07-28-some-unit")
+        );
     }
 
     #[test]
@@ -1156,13 +1180,13 @@ mod tests {
             .unwrap()
             .insert("work_unit_slug".to_string(), json!("new-name"));
         let intent = build_child_intent(&state).unwrap();
-        assert_eq!(intent.plan_slug.as_deref(), Some("new-name"));
+        assert_eq!(intent.work_unit_slug.as_deref(), Some("new-name"));
     }
 
     #[test]
     fn build_child_intent_absent_slug_is_none() {
         let intent = build_child_intent(&make_state("terminal_shell")).unwrap();
-        assert_eq!(intent.plan_slug, None);
+        assert_eq!(intent.work_unit_slug, None);
     }
 
     #[test]
@@ -1180,7 +1204,7 @@ mod tests {
         obj.insert("plan_slug".to_string(), json!("2026-07-28-some-unit"));
         let intent = build_child_intent(&state).unwrap();
         assert_eq!(
-            intent.plan_slug.as_deref(),
+            intent.work_unit_slug.as_deref(),
             Some("2026-07-28-some-unit"),
             "an explicit null on the new key must fall back to the legacy key"
         );
@@ -1193,7 +1217,7 @@ mod tests {
         obj.insert("work_unit_slug".to_string(), serde_json::Value::Null);
         obj.insert("plan_slug".to_string(), serde_json::Value::Null);
         let intent = build_child_intent(&state).unwrap();
-        assert_eq!(intent.plan_slug, None);
+        assert_eq!(intent.work_unit_slug, None);
     }
 
     #[test]

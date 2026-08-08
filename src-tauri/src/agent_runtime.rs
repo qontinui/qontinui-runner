@@ -3523,7 +3523,7 @@ async fn run_condition_check_terminal(
         app.clone(),
         title,
         workdir,
-        None, // plan_slug — a condition check is not plan-scoped
+        None, // work_unit_slug — a condition check is not work-unit-scoped
         None, // correlation_topic
         None, // intent_repo — no repo edited
         command,
