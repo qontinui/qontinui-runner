@@ -259,10 +259,14 @@ fn commit_status() -> Option<(u64, u64)> {
 /// Collect the `host` lane. Blocking (sysinfo refresh + a disk enumeration), so
 /// callers run it on a blocking pool.
 ///
-/// `pub(crate)` for [`host_snapshot`]'s synchronous callers (plan
-/// `2026-08-07-runner-resource-guard-and-session-protection.md` §Part A); the
-/// publisher still reaches it through [`collect`].
-pub(crate) fn collect_host_lane() -> ResourceSample {
+/// **Not for the spawn gate.** The disk enumeration walks every volume the OS
+/// reports — including disconnected network and removable drives, which block
+/// until the OS gives up — and this also reads the `ci_node` settings and
+/// computes build occupancy. That is the right cost for a 30 s publish and the
+/// wrong cost immediately before a PTY opens on a tokio worker, so the gate
+/// takes [`spawn_gate_reading`] instead (plan
+/// `2026-08-07-runner-resource-guard-and-session-protection.md` §Part A).
+fn collect_host_lane() -> ResourceSample {
     use sysinfo::System;
 
     let mut s = ResourceSample::empty(Lane::Host, None);
@@ -332,7 +336,8 @@ pub(crate) fn collect_host_lane() -> ResourceSample {
     s
 }
 
-/// One synchronous host-lane reading, for callers that must decide *now*.
+/// The `(lane, free commit)` pair the spawn gate decides on — the whole reading,
+/// nothing else.
 ///
 /// Plan `2026-08-07-runner-resource-guard-and-session-protection.md` §Part A.
 /// The terminal-spawn gate needs a verdict before it opens a PTY: the ~30 s
@@ -340,14 +345,25 @@ pub(crate) fn collect_host_lane() -> ResourceSample {
 /// and the gate has to keep working when coord is unreachable — which is
 /// exactly when the box is most likely to be under load.
 ///
-/// ## It is the SAME struct the publisher sends
+/// ## Why not [`collect_host_lane`]'s whole sample
 ///
-/// This returns [`collect_host_lane`]'s [`ResourceSample`] verbatim, the row
-/// [`publish_once`] POSTs as the `host` lane. So the number a gate trips on and
-/// the number the fleet dashboard renders are literally one reading, not two
-/// probes that agree today and drift tomorrow — the same property
-/// [`crate::ci_node::admission::probe_volume_for`]'s doc comment argues for on
-/// the disk figure.
+/// [`crate::resource_guard::evaluate`] consults exactly two things: which lane
+/// the reading is from, and how much commit is free. The publisher's sample
+/// additionally refreshes sysinfo, enumerates EVERY volume on the box (network
+/// and removable drives included — a disconnected mount blocks until the OS
+/// gives up), reads the `ci_node` settings and computes build occupancy. None of
+/// that reaches the verdict, and `TerminalSession::spawn` is called
+/// SYNCHRONOUSLY on a tokio worker from every unattended spawn seam, so a stalled
+/// mount would park a runtime worker on the way to opening a PTY. This is one
+/// [`available_commit_bytes`] call: microseconds, no allocation, no volume probe,
+/// no settings read — the "a few milliseconds, no I/O" the plan's §Part D step 1
+/// actually asks for.
+///
+/// The gate and the fleet dashboard still agree on the QUANTITY: both read free
+/// commit through this same [`available_commit_bytes`], plan §A3's converged
+/// number. They are two instants of one metric rather than one instant shared,
+/// which is all a spawn-time verdict can honestly claim anyway — the published
+/// row is up to [`SAMPLE_DEFAULT_SECS`] old by the time a PTY opens.
 ///
 /// ## Host lane ONLY, deliberately
 ///
@@ -361,12 +377,8 @@ pub(crate) fn collect_host_lane() -> ResourceSample {
 /// precisely the quantity that collapsed to 7.25 GB during the 2026-08-06→07
 /// incident. The WSL figure still reaches coord in the published sample, where
 /// cross-machine ranking can afford the subprocess.
-///
-/// Still blocking in the sysinfo/disk-enumeration sense (milliseconds, no
-/// network, no subprocess); from async contexts prefer [`collect`], which
-/// already offloads to a blocking pool.
-pub(crate) fn host_snapshot() -> ResourceSample {
-    collect_host_lane()
+pub(crate) fn spawn_gate_reading() -> (&'static str, Option<u64>) {
+    (Lane::Host.as_str(), available_commit_bytes())
 }
 
 /// Which WSL distro to probe: `QONTINUI_WSL_DISTRO` if set, else the first
@@ -630,34 +642,38 @@ mod tests {
     }
 
     #[test]
-    fn host_snapshot_is_the_host_lane_and_only_the_host_lane() {
-        // The spawn gate compares against this reading, so it must be the same
-        // shape the publisher sends — `lane: "host"`, `source: "runner"` — and
-        // it must never carry a `wsl` row: a pre-PTY gate cannot afford the
-        // `wsl.exe` fork behind WSL_PROBE_TIMEOUT.
-        let s = host_snapshot();
-        assert_eq!(s.lane, "host");
-        assert_eq!(s.source, "runner");
-        assert_eq!(
-            s.lane_instance, None,
-            "the host lane has exactly one publisher and names no instance"
-        );
-        // Same reading as the publisher's host row, field for field.
-        assert_eq!(s.lane, collect_host_lane().lane);
+    fn the_spawn_gate_reading_is_the_host_lane_and_only_the_host_lane() {
+        // The gate looks its fleet floors up by this exact string
+        // (`mcp::fleet_policy_poller::SessionFloorsByLane::for_lane`), and an
+        // unrecognised lane there yields NO floors — a renamed lane must break
+        // here rather than silently disable the fleet term. It must also never
+        // be the `wsl` lane: a pre-PTY gate cannot afford the `wsl.exe` fork
+        // behind WSL_PROBE_TIMEOUT.
+        let (lane, _) = spawn_gate_reading();
+        assert_eq!(lane, "host");
+        assert_eq!(lane, Lane::Host.as_str());
+        // Same lane the publisher labels its host row with, so the gate and the
+        // dashboard are talking about the same pool.
+        assert_eq!(lane, collect_host_lane().lane);
     }
 
     #[cfg(windows)]
     #[test]
-    fn host_snapshot_carries_the_commit_figure_the_gate_reads() {
+    fn the_spawn_gate_reading_carries_the_commit_figure_the_gate_reads() {
         // On Windows the guard ladder's one memory quantity is free COMMIT
-        // (`available_commit_bytes`, plan §A3). If the snapshot did not carry
-        // it, the gate would silently have nothing to compare against.
-        let s = host_snapshot();
+        // (`available_commit_bytes`, plan §A3). If the reading did not carry
+        // it, the gate would silently have nothing to compare against — and
+        // because the gate fails OPEN on `None`, that failure would be invisible
+        // rather than loud.
+        let (_, commit) = spawn_gate_reading();
         assert!(
-            s.commit_available_bytes.is_some(),
-            "GlobalMemoryStatusEx must populate commit_available_bytes on Windows"
+            commit.is_some(),
+            "GlobalMemoryStatusEx must populate the free-commit figure on Windows"
         );
-        assert!(s.commit_total_bytes.unwrap_or(0) > 0);
+        // It is the SAME probe the publisher's sample carries, which is the
+        // property that keeps the gate's number and the dashboard's comparable.
+        assert_eq!(commit.is_some(), available_commit_bytes().is_some());
+        assert!(collect_host_lane().commit_total_bytes.unwrap_or(0) > 0);
     }
 
     #[test]

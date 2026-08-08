@@ -1902,8 +1902,7 @@ mod session_guard_tests {
             "critical must be the lower floor — it is the heavier verdict"
         );
         assert!(
-            g.warn_free_commit_bytes
-                < crate::ci_node::admission::MIN_FREE_COMMIT_GB * GIB,
+            g.warn_free_commit_bytes < crate::ci_node::admission::MIN_FREE_COMMIT_GB * GIB,
             "a warn is lighter than ci_node's hard reject, so it must sit below it"
         );
     }

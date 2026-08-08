@@ -33,13 +33,29 @@
 //! "Split out from `admission_decision` so the threshold policy can be exercised
 //! on its own").
 //!
-//! ## Three terms, and only tightening
+//! ## Three terms, only tightening, and two clamps
 //!
 //! The floors [`evaluate`] compares against are
 //! `max(local override, cached fleet default, hardcoded default)` — see
 //! [`merge_floors`]. A machine owner can only ever TIGHTEN their own protection,
 //! never loosen it, which is the same non-loosening discipline this fleet
 //! applies to policy-clause edits.
+//!
+//! A `max` of three independently-authored terms can, however, produce a
+//! configuration none of the three asked for, so the fold is followed by two
+//! clamps that bound what the composition may say:
+//!
+//! - [`SESSION_FLOOR_MAX_BYTES`] caps every effective floor. This lane fails
+//!   CLOSED on eight of its ten seams (no override, no timeout to fail open
+//!   through), so an unreachable floor is not a stricter guard — it is a machine,
+//!   or a whole tenant, that can never start a session again.
+//! - [`coerce_ladder`] then forces `critical <= warn`. Folding the two floors
+//!   independently lets a fleet row that states only the critical column invert
+//!   the ladder — every warn becomes a refusal and the warn band ceases to exist
+//!   — which is exactly the state
+//!   [`crate::commands::resource_guard_settings`] refuses to persist locally
+//!   ("a machine would block a spawn it had never warned about"). What a local
+//!   writer refuses to store, a remote term must not be able to synthesise.
 //!
 //! The fleet term is a **cached, best-effort refinement**: it comes from
 //! [`crate::mcp::fleet_policy_poller`]'s 45 s background loop, read
@@ -62,16 +78,38 @@
 //! negatives — a missed warning — never a false positive that blocks the
 //! operator's actual work on a telemetry gap.
 //!
-//! ## Host lane only
+//! ## Host lane only, and the smallest reading that answers the question
 //!
-//! The reading comes from [`crate::fleet::resource_sample::host_snapshot`],
-//! which is host-lane-only by construction (§Part A step 3): the WSL probe forks
-//! `wsl.exe` under a 5 s timeout, and a pre-PTY gate that can stall five seconds
-//! on a cold-starting WSL VM is a worse user-facing failure than the one it
-//! prevents. It is also the *correct* lane — with `pageReporting=true` the host
-//! free-commit figure already nets out WSL's live usage, so it is not blind to
-//! `vmmemWSL`; it is precisely the quantity that collapsed to 7.25 GB during the
-//! incident.
+//! The reading comes from
+//! [`crate::fleet::resource_sample::spawn_gate_reading`]: the host lane's name
+//! and its free-commit figure, and nothing else. Those are the only two values
+//! [`evaluate`] consults, and taking only them is not a micro-optimisation — it
+//! is a property this seam needs. `TerminalSession::spawn` is called
+//! SYNCHRONOUSLY on a tokio worker from every unattended spawn seam
+//! (`mcp::terminals`, `mcp::steward`, `mcp::tauri_proxy`, `mcp::backend_relay`,
+//! and both `session::transport` seams), so whatever this gate touches, a
+//! runtime worker waits for. The publisher's full
+//! `collect_host_lane()` additionally refreshes sysinfo, enumerates EVERY volume
+//! on the box (including disconnected network and removable drives, which block
+//! for as long as the OS takes to give up), reads the `ci_node` settings and
+//! computes build occupancy — none of which this verdict reads, and any of which
+//! can park a worker on a stalled mount. `available_commit_bytes()` is one
+//! `GlobalMemoryStatusEx` call: microseconds, no allocation, no volume probe.
+//!
+//! The publisher still sends the full sample, so the gate and the fleet
+//! dashboard still agree on the *quantity* — plan §A3's converged free-commit
+//! number, read through the same function — taken at two instants. Two instants
+//! is all a spawn-time verdict could honestly claim anyway: the published row is
+//! up to 30 s old by the time a PTY opens.
+//!
+//! The host lane is also the *correct* lane (§Part A step 3): the WSL probe
+//! forks `wsl.exe` under a 5 s timeout, and a pre-PTY gate that can stall five
+//! seconds on a cold-starting WSL VM is a worse user-facing failure than the one
+//! it prevents. With `pageReporting=true` the host free-commit figure already
+//! nets out WSL's live usage, so it is not blind to `vmmemWSL`; it is precisely
+//! the quantity that collapsed to 7.25 GB during the incident.
+
+use std::sync::Mutex;
 
 use tauri::{AppHandle, Emitter};
 use tracing::warn;
@@ -105,6 +143,57 @@ pub(crate) const CRITICAL_REFUSAL_PREFIX: &str = "resource_guard:critical:";
 
 /// One gibibyte, the unit the floors are quoted in.
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Ceiling on every effective session floor, in bytes (12 GiB).
+///
+/// ## Why this lane needs an upper bound at all
+///
+/// [`merge_floors`] is a `max` over three terms, none of which is bounded at its
+/// source: the local override is any `u64` a hand-edited `settings.json` cares
+/// to name, the panel's own input accepts up to 128 GiB, and the fleet column is
+/// a `BIGINT` whose only validation is its sign — coord's `validate()` rejects a
+/// negative, not an absurd positive, so `i64::MAX` decodes straight through
+/// [`crate::mcp::fleet_policy_poller`]'s `floor_bytes`.
+///
+/// An unreachable floor here does not make the guard stricter, it makes the
+/// machine unusable. [`crate::ci_node::admission::MAX_SESSION_DEFER_FLOOR_GB`]
+/// argues the same point for the CI lane and this lane is the worse of the two:
+/// CI *defers*, retries on a 60 s waker and can be re-homed to another host,
+/// whereas an un-overridden CRITICAL verdict is a hard refusal with no timeout to
+/// fail open through, and eight of this gate's ten seams are unattended
+/// (`resource_override = false`) with nobody to press "Start anyway". Via the
+/// fleet column one bad row would do it to every machine in the tenant, forever.
+///
+/// ## Why 12 GiB, and not 8 or 16
+///
+/// The bound has to be wide enough that an operator can still express "this box
+/// needs a lot of headroom", and narrow enough that nothing they can express
+/// makes the box unreachable:
+///
+/// - **Not lower than 12.** The effective floor computed here is ALSO what
+///   `ci_node` admission consumes (`probe_headroom` reads
+///   [`effective_session_floors`], and [`crate::ci_node::admission::defer_commit_floor_gb`]
+///   clamps it at `MAX_SESSION_DEFER_FLOOR_GB` = 12 GiB). Capping below that
+///   would silently delete a shipped behaviour: with an 8 GiB cap,
+///   `max(DEFER_FREE_COMMIT_GB, min(floor, 12))` is 8 for every setting, and the
+///   session term could never widen the CI defer band at all — the exact
+///   "not tight, but empty" failure `MAX_SESSION_DEFER_FLOOR_GB`'s own doc
+///   rejects. One rung of this ladder is [`crate::ci_node::admission::MIN_FREE_COMMIT_GB`]
+///   (4 GiB), so 12 GiB is also 4× the shipped warn default and 8× the shipped
+///   critical default.
+/// - **Not higher than 12.** These boxes have 32 GB of physical RAM and
+///   `.wslconfig memory=16GB`, so a single resident WSL VM can hold half the
+///   machine on its own. A floor at or above 16 GiB could therefore be
+///   unclearable while WSL is merely *resident* — not busy — which is a
+///   permanently-closed gate rather than a strict one. At 12 GiB the box always
+///   recovers when the build that ate the headroom finishes: the 2026-08-06→07
+///   incident bottomed out at 7.25 GB free commit with `rustc` and `vmmemWSL`
+///   both live, and idle free commit here sits in the tens of GB.
+///
+/// The panel's `SESSION_FLOOR_MAX_GIB = 128` is a *typing* bound, not a policy
+/// one — 128 GiB is above the entire commit limit of every box on this fleet
+/// (71.71 GB here) — which is why the enforcing side needs its own.
+pub(crate) const SESSION_FLOOR_MAX_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 
 /// Verdict of the spawn gate.
 ///
@@ -155,6 +244,14 @@ pub(crate) enum SpawnGate {
 /// (`critical > warn`, which the settings command refuses to persist but a
 /// hand-edited `settings.json` can still contain) resolves to the heavier
 /// verdict rather than silently degrading to a warning.
+///
+/// Testing critical first is also *why* [`coerce_ladder`] exists: it makes an
+/// inverted ladder swallow the warn band whole, so the live path
+/// ([`probe_for_spawn`] → [`effective_session_floors`]) clamps the pair before
+/// it gets here and this function never sees an inversion in production. The arm
+/// stays because `evaluate` is public to any caller with a settings struct, and
+/// a pure function should be total over its inputs rather than correct only for
+/// the ones its current callers happen to produce.
 pub(crate) fn evaluate(
     lane: &str,
     free_commit_bytes: Option<u64>,
@@ -203,6 +300,19 @@ pub(crate) fn evaluate(
 /// contract read through to its consumer: before the first successful poll, and
 /// after a 401/404, there is no fleet term at all.
 ///
+/// ## …but a `max` alone can compose something nobody wrote
+///
+/// Three independent authors folded field-by-field can produce a pair neither of
+/// them stated, so the fold is bounded on both ends:
+/// [`tighten`] caps each floor at [`SESSION_FLOOR_MAX_BYTES`] (an unreachable
+/// floor refuses every unattended spawn forever — this lane has no timeout to
+/// fail open through), and [`coerce_ladder`] then forces `critical <= warn` (a
+/// fleet row that states only the critical column would otherwise delete the
+/// warn band entirely). Both clamps are the weakest correction that restores the
+/// invariant, and both are reported: the cap through the number the panel
+/// renders, the coercion through the `Option<`[`LadderCoercion`]`>` this
+/// function's [`merge_floors_reporting`] form returns.
+///
 /// ## `enabled` is NOT part of the max
 ///
 /// The master switch stays the machine owner's, and is copied through
@@ -216,35 +326,118 @@ pub(crate) fn merge_floors(
     local: &SessionGuardSettings,
     fleet: SessionFloors,
 ) -> SessionGuardSettings {
-    let hardcoded = SessionGuardSettings::default();
-    SessionGuardSettings {
-        warn_free_commit_bytes: tighten(
-            local.warn_free_commit_bytes,
-            hardcoded.warn_free_commit_bytes,
-            fleet.warn_free_bytes,
-        ),
-        critical_free_commit_bytes: tighten(
-            local.critical_free_commit_bytes,
-            hardcoded.critical_free_commit_bytes,
-            fleet.critical_free_bytes,
-        ),
-        enabled: local.enabled,
-    }
+    merge_floors_reporting(local, fleet).0
 }
 
-/// `max` over the two floors that always exist and the one that may not.
+/// [`merge_floors`], plus the ladder coercion it had to apply — still PURE.
+///
+/// The coercion is REPORTED rather than logged in here so this function keeps
+/// the property its whole design rests on: it probes nothing, reads no globals
+/// and emits nothing, so every threshold argument is settleable in a test. The
+/// one impure seam ([`effective_session_floors`]) decides what to do with the
+/// report, exactly as `ci_node::admission` keeps `headroom_defers` pure and does
+/// the reading in `probe_headroom`.
+pub(crate) fn merge_floors_reporting(
+    local: &SessionGuardSettings,
+    fleet: SessionFloors,
+) -> (SessionGuardSettings, Option<LadderCoercion>) {
+    let hardcoded = SessionGuardSettings::default();
+    let warn = tighten(
+        local.warn_free_commit_bytes,
+        hardcoded.warn_free_commit_bytes,
+        fleet.warn_free_bytes,
+    );
+    let requested_critical = tighten(
+        local.critical_free_commit_bytes,
+        hardcoded.critical_free_commit_bytes,
+        fleet.critical_free_bytes,
+    );
+    let (critical, coercion) = coerce_ladder(warn, requested_critical);
+    (
+        SessionGuardSettings {
+            warn_free_commit_bytes: warn,
+            critical_free_commit_bytes: critical,
+            enabled: local.enabled,
+        },
+        coercion,
+    )
+}
+
+/// A `critical > warn` ladder the three-term fold produced, and what it was
+/// clamped to. Reported by [`merge_floors_reporting`], logged (once, on a
+/// transition) by [`effective_session_floors`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LadderCoercion {
+    /// The critical floor the fold produced, before clamping.
+    pub(crate) requested_critical_bytes: u64,
+    /// The warn floor it was clamped down to.
+    pub(crate) warn_bytes: u64,
+}
+
+/// Force `critical <= warn`, returning the clamped critical floor and the
+/// coercion if one was needed. PURE.
+///
+/// ## Why the fold can invert the ladder at all
+///
+/// The two floors are folded independently, and they have three independent
+/// authors. A tenant that sets `min_free_bytes_sessions_critical_host = 6 GiB`
+/// and leaves the warn column NULL states one number; the merge then reads the
+/// other from the hardcoded default (3 GiB) and produces a ladder — warn 3,
+/// critical 6 — that nobody wrote. [`evaluate`] tests critical first, so on that
+/// machine every reading under 6 GiB becomes a REFUSAL and the warn band ceases
+/// to exist, on all eight unattended seams at once. That is precisely the state
+/// `commands::resource_guard_settings::save_session_guard_settings` refuses to
+/// persist locally ("a machine would block a spawn it had never warned about"),
+/// so the remote path must not be able to synthesise it.
+///
+/// ## Why clamp critical DOWN, and never raise warn UP
+///
+/// Raising warn to meet critical would also restore the ordering, and it would
+/// be the wrong repair: it enforces a warn floor of 6 GiB that neither the
+/// tenant nor the machine owner asked for, silently tightening past both inputs
+/// on the strength of an arithmetic accident. Clamping critical down keeps the
+/// heaviest verdict no heavier than the lightest one's floor, which is the
+/// weakest correction that restores the invariant. The tenant's intent is not
+/// discarded either — their 6 GiB still raises the *warn* floor whenever they
+/// state the warn column, which is the column that means "warn at 6 GiB".
+///
+/// Equal floors are the fixed point and are legal, exactly as the local writer's
+/// `session_floors_are_inverted` treats them: "warn and block at the same point"
+/// is blunt, but it is a coherent thing to mean.
+fn coerce_ladder(warn: u64, critical: u64) -> (u64, Option<LadderCoercion>) {
+    if critical <= warn {
+        return (critical, None);
+    }
+    (
+        warn,
+        Some(LadderCoercion {
+            requested_critical_bytes: critical,
+            warn_bytes: warn,
+        }),
+    )
+}
+
+/// `max` over the two floors that always exist and the one that may not, capped
+/// at [`SESSION_FLOOR_MAX_BYTES`].
 ///
 /// The `None` arm is spelled out rather than folded in as `unwrap_or(0)`, which
 /// would be the same arithmetic and the wrong statement: an absent fleet floor
 /// is UNKNOWN, and a future edit that starts treating UNKNOWN as a value has to
 /// delete this arm to do it. A zero floor disables the guard it names, so the
 /// distinction is worth a branch.
+///
+/// The cap is applied AFTER the `max`, not to each term before it, so no source
+/// can escape it: a local override is bounded by exactly the same ceiling as a
+/// fleet column, and neither can walk this machine past the point where it can
+/// no longer start a session. See [`SESSION_FLOOR_MAX_BYTES`] for why an
+/// unreachable floor is the worse failure on this lane.
 fn tighten(local: u64, hardcoded: u64, fleet: Option<u64>) -> u64 {
     let known = local.max(hardcoded);
-    match fleet {
+    let raised = match fleet {
         Some(fleet_floor) => known.max(fleet_floor),
         None => known,
-    }
+    };
+    raised.min(SESSION_FLOOR_MAX_BYTES)
 }
 
 /// The effective floors for `lane`: [`merge_floors`] over the caller's local
@@ -262,36 +455,83 @@ pub(crate) fn effective_session_floors(
     local: &SessionGuardSettings,
     lane: &str,
 ) -> SessionGuardSettings {
-    merge_floors(
+    let (floors, coercion) = merge_floors_reporting(
         local,
         crate::mcp::fleet_policy_poller::fleet_session_floors(lane),
-    )
+    );
+    note_ladder_coercion(lane, coercion);
+    floors
 }
 
-/// Live verdict: read the floors, take one host-lane snapshot, [`evaluate`].
+/// The last ladder coercion logged, so the line is emitted on a TRANSITION and
+/// not on every spawn.
+static LAST_COERCION: Mutex<Option<(String, LadderCoercion)>> = Mutex::new(None);
+
+/// Log a [`LadderCoercion`] once, edge-triggered.
+///
+/// [`effective_session_floors`] runs on every spawn and on every `ci_node`
+/// headroom probe, so an unconditional line would put the same warning in the
+/// log dozens of times an hour while telling the operator nothing new. This is
+/// the same discipline `mcp::fleet_policy_poller`'s loop uses for its own
+/// degradations: remember the last state logged, emit only when it changes. A
+/// coercion that STOPS (the tenant fixed the row, or the operator raised their
+/// warn floor) clears the marker, so if it ever comes back it is reported again
+/// rather than swallowed as "already said that".
+///
+/// The lane is part of the remembered state because the floors are
+/// lane-separated: a host-lane inversion and a WSL-lane inversion are two
+/// different misconfigurations and both deserve their own line.
+fn note_ladder_coercion(lane: &str, coercion: Option<LadderCoercion>) {
+    let mut last = LAST_COERCION.lock().unwrap_or_else(|e| e.into_inner());
+    let now = coercion.map(|c| (lane.to_string(), c));
+    if *last == now {
+        return;
+    }
+    *last = now;
+    if let Some(c) = coercion {
+        warn!(
+            lane = %lane,
+            requested_critical_bytes = c.requested_critical_bytes,
+            warn_bytes = c.warn_bytes,
+            "resource_guard: the effective {lane} critical floor ({}) was above the warn floor \
+             ({}) — clamping it to the warn floor. Left as folded, every reading below the \
+             critical floor would be a refusal and nothing would ever warn. Check the tenant's \
+             fleet-policy row: setting only the critical column leaves the warn column on the \
+             hardcoded default.",
+            format_gib(c.requested_critical_bytes),
+            format_gib(c.warn_bytes),
+        );
+    }
+}
+
+/// Live verdict: read the floors, take one host-lane reading, [`evaluate`].
 ///
 /// The settings read happens FIRST and short-circuits when the guard is
 /// disabled, so a machine owner who turned the guard off pays nothing at all —
-/// not even the snapshot's sysinfo refresh — on every spawn. [`evaluate`] also
-/// honours `enabled` so the pure function is complete on its own; the check here
-/// is about cost, not correctness.
+/// not even the one `GlobalMemoryStatusEx` call — on every spawn. [`evaluate`]
+/// also honours `enabled` so the pure function is complete on its own; the check
+/// here is about cost, not correctness.
 ///
-/// The snapshot is [`crate::fleet::resource_sample::host_snapshot`] rather than
-/// a bare [`crate::fleet::resource_sample::available_commit_bytes`] call because
-/// that is the reading the A1 publisher sends to coord: the number this gate
-/// trips on and the number the fleet dashboard renders are then literally one
-/// reading, not two probes that agree today and drift tomorrow.
+/// The reading is [`crate::fleet::resource_sample::spawn_gate_reading`] — the
+/// lane name and the free-commit figure, and nothing else. It is deliberately
+/// NOT the publisher's full host-lane sample: that one enumerates every volume
+/// on the box, reads settings and computes build occupancy, none of which this
+/// verdict consults, and this function runs synchronously on a tokio worker
+/// under every unattended spawn seam. See this module's "Host lane only" section
+/// for the full argument. Both paths read free commit through the same
+/// `available_commit_bytes()`, so the gate and the fleet dashboard still agree on
+/// the quantity.
 ///
-/// The fleet term is folded in AFTER the snapshot, because the lane to look the
+/// The fleet term is folded in AFTER the reading, because the lane to look the
 /// fleet floors up under comes from the reading itself.
 pub(crate) fn probe_for_spawn() -> SpawnGate {
     let local = crate::settings::get_session_guard_settings();
     if !local.enabled {
         return SpawnGate::Proceed;
     }
-    let sample = crate::fleet::resource_sample::host_snapshot();
-    let floors = effective_session_floors(&local, &sample.lane);
-    evaluate(&sample.lane, sample.commit_available_bytes, &floors)
+    let (lane, free_commit_bytes) = crate::fleet::resource_sample::spawn_gate_reading();
+    let floors = effective_session_floors(&local, lane);
+    evaluate(lane, free_commit_bytes, &floors)
 }
 
 /// `bytes` as `"1.42 GiB"`. Two decimals because the shipped critical floor is
@@ -394,6 +634,56 @@ pub(crate) fn admit_spawn(
             );
             Err(critical_refusal(what, &lane, free_bytes, floor_bytes))
         }
+    }
+}
+
+/// Early-out for callers that do expensive, side-effecting work BEFORE they
+/// reach the spawn seam.
+///
+/// [`admit_spawn`] at `TerminalSession::spawn` remains the authority — it is the
+/// gate every unattended path goes through, and this one is not a replacement
+/// for it. It exists because `commands::terminal::terminal_create` allocates an
+/// isolated git worktree first: under `QONTINUI_AGENT_WORKTREE_MODE`,
+/// `acquire_for_terminal` runs a `git worktree add`, takes a coord claim, starts
+/// a heartbeat task and shells out to `git config` for the credential helper. On
+/// a CRITICAL refusal all of that is thrown away, and `IsolatedEditContext::Drop`
+/// releases the claim but does NOT remove the materialized worktree — so every
+/// refusal leaks a directory, and the operator's "Start anyway" retry materializes
+/// a second one. Refusing before the acquisition costs one
+/// `GlobalMemoryStatusEx` call and leaks nothing.
+///
+/// Returns exactly what [`admit_spawn`] would: the same
+/// [`CRITICAL_REFUSAL_PREFIX`]-tagged string, so the frontend's dialog and the
+/// unattended callers' error handling cannot tell which of the two gates
+/// answered.
+///
+/// **Silent on WARN, deliberately.** The warn notice is emitted once, by
+/// [`admit_spawn`], at the seam the spawn actually happens on. Emitting here too
+/// would put two toasts on screen for one spawn, and emitting here INSTEAD would
+/// mean a caller that never reaches this pre-check gets no notice at all.
+/// Deciding twice is fine — the verdict is a pure function of a reading either
+/// way — but *telling the operator* twice is not.
+pub(crate) fn precheck_spawn(what: &str, resource_override: bool) -> Result<(), String> {
+    if resource_override {
+        return Ok(());
+    }
+    match probe_for_spawn() {
+        SpawnGate::Critical {
+            lane,
+            free_bytes,
+            floor_bytes,
+        } => {
+            warn!(
+                lane = %lane,
+                free_bytes,
+                floor_bytes,
+                what = %what,
+                "resource_guard: refusing a {what} before its worktree/claim acquisition \
+                 (pre-check; the spawn seam would refuse it too)"
+            );
+            Err(critical_refusal(what, &lane, free_bytes, floor_bytes))
+        }
+        SpawnGate::Proceed | SpawnGate::Warn { .. } => Ok(()),
     }
 }
 
@@ -541,6 +831,15 @@ mod tests {
         }
     }
 
+    /// An explicit override short-circuits the pre-check BEFORE it probes
+    /// anything: the operator has already answered the only question this arm
+    /// asks, and a retry that re-probed could refuse the very spawn they just
+    /// authorised (the reading moves between the dialog and the retry).
+    #[test]
+    fn an_override_short_circuits_the_precheck() {
+        assert!(precheck_spawn("terminal session", true).is_ok());
+    }
+
     /// The refusal string is what the operator reads and what
     /// `src/lib/resourceGuard.ts` matches on: prefix first, then the lane, the
     /// live headroom and the configured floor.
@@ -668,11 +967,15 @@ mod tests {
         );
     }
 
-    /// The two floors are folded INDEPENDENTLY: a fleet that states only the
-    /// warn floor must not drag the critical floor with it, in either direction.
+    /// The two floors fold independently AS FAR AS THE LADDER ALLOWS: a fleet
+    /// that states only the warn floor must not drag the critical floor with it
+    /// in either direction — but the fold is not free to invert the ladder,
+    /// which is what the coercion tests below pin. Here the ordering survives
+    /// the fold (9 GiB warn is above the 1.5 GiB critical default), so nothing
+    /// is coerced and independence is visible in the result.
     #[test]
-    fn the_two_floors_fold_independently() {
-        let merged = merge_floors(
+    fn the_two_floors_fold_independently_while_the_ladder_holds() {
+        let (merged, coercion) = merge_floors_reporting(
             &defaults(),
             SessionFloors {
                 warn_free_bytes: Some(9 * GIB_U64),
@@ -684,6 +987,208 @@ mod tests {
             merged.critical_free_commit_bytes,
             defaults().critical_free_commit_bytes
         );
+        assert_eq!(coercion, None, "an ordered fold coerces nothing");
+    }
+
+    // =======================================================================
+    // The ladder invariant: `critical <= warn`, whatever the three terms say
+    // =======================================================================
+
+    /// THE CASE THIS EXISTS FOR. A tenant sets ONLY the critical column — a
+    /// perfectly ordinary thing to do after an incident — and leaves the warn
+    /// column NULL. Folded independently that yields warn 3 GiB (hardcoded) and
+    /// critical 6 GiB (fleet), and since `evaluate` tests critical first, every
+    /// reading under 6 GiB becomes a REFUSAL on every unattended seam of every
+    /// machine in the tenant, with no warn band left at all. The merge must
+    /// clamp it instead.
+    #[test]
+    fn a_fleet_critical_floor_with_a_null_warn_column_cannot_invert_the_ladder() {
+        let (merged, coercion) = merge_floors_reporting(
+            &defaults(),
+            SessionFloors {
+                warn_free_bytes: None,
+                critical_free_bytes: Some(6 * GIB_U64),
+            },
+        );
+
+        // The warn floor is NOT raised to meet the critical one: that would
+        // enforce 6 GiB of warn nobody asked for.
+        assert_eq!(
+            merged.warn_free_commit_bytes,
+            defaults().warn_free_commit_bytes
+        );
+        // The critical floor is clamped down to it.
+        assert_eq!(
+            merged.critical_free_commit_bytes,
+            merged.warn_free_commit_bytes
+        );
+        assert_eq!(
+            coercion,
+            Some(LadderCoercion {
+                requested_critical_bytes: 6 * GIB_U64,
+                warn_bytes: 3 * GIB_U64,
+            })
+        );
+
+        // And the verdict that would have been a refusal is a refusal only
+        // below the warn floor now — 4 GiB proceeds instead of being blocked.
+        assert_eq!(
+            evaluate("host", Some(4 * GIB_U64), &merged),
+            SpawnGate::Proceed
+        );
+    }
+
+    /// The invariant holds however the inversion is assembled — from a local
+    /// override, from the fleet, or from the two of them crossing.
+    #[test]
+    fn every_source_of_an_inversion_is_coerced() {
+        // Local only: a hand-edited `settings.json` (the save command refuses
+        // this, the file does not).
+        let local_inverted = SessionGuardSettings {
+            warn_free_commit_bytes: 4 * GIB_U64,
+            critical_free_commit_bytes: 9 * GIB_U64,
+            enabled: true,
+        };
+        let merged = merge_floors(&local_inverted, SessionFloors::default());
+        assert_eq!(merged.warn_free_commit_bytes, 4 * GIB_U64);
+        assert_eq!(merged.critical_free_commit_bytes, 4 * GIB_U64);
+
+        // Crossed terms: the machine owner states the warn floor, the tenant
+        // states a critical floor above it. Neither party wrote an inverted
+        // ladder; the `max` composed one.
+        let merged = merge_floors(
+            &SessionGuardSettings {
+                warn_free_commit_bytes: 5 * GIB_U64,
+                critical_free_commit_bytes: 2 * GIB_U64,
+                enabled: true,
+            },
+            SessionFloors {
+                warn_free_bytes: None,
+                critical_free_bytes: Some(7 * GIB_U64),
+            },
+        );
+        assert_eq!(merged.warn_free_commit_bytes, 5 * GIB_U64);
+        assert_eq!(merged.critical_free_commit_bytes, 5 * GIB_U64);
+    }
+
+    /// Equal floors are the fixed point, not an inversion — the same rule the
+    /// local writer's `session_floors_are_inverted` applies. Coercing them
+    /// would report a misconfiguration on every spawn of a machine that has
+    /// none.
+    #[test]
+    fn equal_floors_are_not_a_coercion() {
+        let equal = SessionGuardSettings {
+            warn_free_commit_bytes: 5 * GIB_U64,
+            critical_free_commit_bytes: 5 * GIB_U64,
+            enabled: true,
+        };
+        let (merged, coercion) = merge_floors_reporting(&equal, SessionFloors::default());
+        assert_eq!(merged, equal);
+        assert_eq!(coercion, None);
+        assert_eq!(coerce_ladder(5, 5), (5, None));
+    }
+
+    /// The merged floors always satisfy the invariant `evaluate` depends on,
+    /// across the whole cross-product of plausible terms. `evaluate` tests
+    /// critical first, so this is the property that keeps a warn band from
+    /// silently disappearing.
+    #[test]
+    fn the_merged_ladder_is_always_ordered() {
+        let locals = [0, GIB_U64 / 2, GIB_U64, 3 * GIB_U64, 9 * GIB_U64, u64::MAX];
+        let fleets = [None, Some(0), Some(6 * GIB_U64), Some(u64::MAX)];
+        for lw in locals {
+            for lc in locals {
+                for fw in fleets {
+                    for fc in fleets {
+                        let merged = merge_floors(
+                            &SessionGuardSettings {
+                                warn_free_commit_bytes: lw,
+                                critical_free_commit_bytes: lc,
+                                enabled: true,
+                            },
+                            SessionFloors {
+                                warn_free_bytes: fw,
+                                critical_free_bytes: fc,
+                            },
+                        );
+                        assert!(
+                            merged.critical_free_commit_bytes <= merged.warn_free_commit_bytes,
+                            "inverted: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
+                        );
+                        assert!(
+                            merged.warn_free_commit_bytes <= SESSION_FLOOR_MAX_BYTES,
+                            "uncapped: local({lw},{lc}) fleet({fw:?},{fc:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // =======================================================================
+    // The upper clamp (this lane fails CLOSED — an unreachable floor is fatal)
+    // =======================================================================
+
+    /// A fleet column is a `BIGINT` whose only validation is its sign, so
+    /// `i64::MAX` reaches the fold intact. Uncapped it would make every spawn on
+    /// every machine in the tenant refuse forever, with no timeout to fail open
+    /// through and no override on eight of the ten seams.
+    #[test]
+    fn an_absurd_fleet_floor_is_capped_not_honoured() {
+        let merged = merge_floors(
+            &defaults(),
+            SessionFloors {
+                warn_free_bytes: Some(u64::MAX),
+                critical_free_bytes: Some(u64::MAX),
+            },
+        );
+        assert_eq!(merged.warn_free_commit_bytes, SESSION_FLOOR_MAX_BYTES);
+        assert_eq!(merged.critical_free_commit_bytes, SESSION_FLOOR_MAX_BYTES);
+    }
+
+    /// The cap is applied AFTER the max, so a LOCAL override cannot escape it
+    /// either — the panel accepts up to 128 GiB and `settings.json` accepts any
+    /// `u64`, neither of which is a reachable floor on a 32 GB box.
+    #[test]
+    fn a_local_override_cannot_escape_the_cap() {
+        let absurd = SessionGuardSettings {
+            warn_free_commit_bytes: 128 * GIB_U64,
+            critical_free_commit_bytes: 64 * GIB_U64,
+            enabled: true,
+        };
+        let merged = merge_floors(&absurd, SessionFloors::default());
+        assert_eq!(merged.warn_free_commit_bytes, SESSION_FLOOR_MAX_BYTES);
+        assert_eq!(merged.critical_free_commit_bytes, SESSION_FLOOR_MAX_BYTES);
+    }
+
+    /// The cap bounds the ceiling and nothing else: everything under it passes
+    /// through untouched, so the clamp cannot be mistaken for a second floor.
+    #[test]
+    fn the_cap_leaves_every_reachable_floor_alone() {
+        let reachable = SessionGuardSettings {
+            warn_free_commit_bytes: SESSION_FLOOR_MAX_BYTES,
+            critical_free_commit_bytes: SESSION_FLOOR_MAX_BYTES - 1,
+            enabled: true,
+        };
+        let merged = merge_floors(&reachable, SessionFloors::default());
+        assert_eq!(merged, reachable);
+    }
+
+    /// Cross-lane pin. This cap also feeds `ci_node` admission, whose own
+    /// `defer_commit_floor_gb` clamps at `MAX_SESSION_DEFER_FLOOR_GB`. Capping
+    /// below that would make the CI lane's session term inert for every setting
+    /// — `max(DEFER_FREE_COMMIT_GB, min(floor, 12))` would be a constant — so
+    /// the two bounds have to be changed together, and this test is where that
+    /// gets noticed.
+    #[test]
+    fn the_cap_matches_the_ci_lanes_own_session_floor_bound() {
+        assert_eq!(
+            SESSION_FLOOR_MAX_BYTES / GIB_U64,
+            crate::ci_node::admission::MAX_SESSION_DEFER_FLOOR_GB
+        );
+        // …and it must sit above the shipped defaults, or the setting the panel
+        // offers could never do anything.
+        assert!(SESSION_FLOOR_MAX_BYTES > defaults().warn_free_commit_bytes);
     }
 
     /// The master switch is the machine owner's and is copied through: coord

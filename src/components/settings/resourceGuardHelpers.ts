@@ -31,6 +31,22 @@ export const DISK_FLOOR_MAX_GIB = 2000;
 export const MAX_CONCURRENT_BUILDS_MIN = 1;
 export const MAX_CONCURRENT_BUILDS_MAX = 16;
 
+/**
+ * The runner's own hardcoded floors and ceiling — the terms that decide what a
+ * configured value actually ENFORCES.
+ *
+ * Mirrors `settings::SessionGuardSettings::default()` (3 GiB warn / 1.5 GiB
+ * critical) and `resource_guard::SESSION_FLOOR_MAX_BYTES` (12 GiB). They are
+ * duplicated here rather than fetched because the panel needs them to render a
+ * number BEFORE any invoke resolves, and because a settings panel that could
+ * only explain itself when the backend answered would be silent in exactly the
+ * case the operator is trying to debug. `effectiveSessionFloorsGib` is the one
+ * place they are used, and its tests pin the arithmetic against the Rust rules.
+ */
+export const SESSION_FLOOR_DEFAULT_WARN_GIB = 3;
+export const SESSION_FLOOR_DEFAULT_CRITICAL_GIB = 1.5;
+export const SESSION_FLOOR_CAP_GIB = 12;
+
 /** Bytes → GiB, rounded to 2 decimals so 1.5 GiB round-trips as `1.5`. */
 export function bytesToGib(bytes: number): number {
   if (!Number.isFinite(bytes) || bytes <= 0) return 0;
@@ -73,6 +89,45 @@ export function clampInt(n: number, min: number, max: number, fallback: number):
  */
 export function sessionFloorsAreInverted(warnGib: number, criticalGib: number): boolean {
   return criticalGib > warnGib;
+}
+
+/**
+ * What the runner will ACTUALLY enforce for a pair of configured floors.
+ *
+ * Mirrors `resource_guard::merge_floors` minus its fleet term, in order:
+ *
+ *   1. `max(configured, hardcoded default)` — the local value can only ever
+ *      TIGHTEN, so the whole 0.25–3 GiB warn range and the 0.25–1.5 GiB critical
+ *      range are inert. That is the discrepancy this helper exists to surface:
+ *      the input accepts them, the runner discards them, and until now nothing
+ *      on the page said so.
+ *   2. `min(…, SESSION_FLOOR_CAP_GIB)` — an unreachable floor would refuse every
+ *      unattended spawn on this machine forever, so the enforcing side caps it.
+ *   3. `critical = min(critical, warn)` — the warn verdict is the lighter one
+ *      and must fire first, so the ladder is coerced rather than inverted.
+ *
+ * The FLEET term is deliberately absent: a tenant-wide floor can only raise
+ * these further, the panel has no cache of it, and inventing a zero for an
+ * unknown would be the one lie the whole guard is arranged to avoid. The panel
+ * says so in words beside the numbers.
+ */
+export function effectiveSessionFloorsGib(
+  warnGib: number,
+  criticalGib: number,
+): { warnGib: number; criticalGib: number } {
+  const warn = clampGib(
+    Math.max(warnGib, SESSION_FLOOR_DEFAULT_WARN_GIB),
+    SESSION_FLOOR_DEFAULT_WARN_GIB,
+    SESSION_FLOOR_CAP_GIB,
+    SESSION_FLOOR_DEFAULT_WARN_GIB,
+  );
+  const critical = clampGib(
+    Math.max(criticalGib, SESSION_FLOOR_DEFAULT_CRITICAL_GIB),
+    SESSION_FLOOR_DEFAULT_CRITICAL_GIB,
+    SESSION_FLOOR_CAP_GIB,
+    SESSION_FLOOR_DEFAULT_CRITICAL_GIB,
+  );
+  return { warnGib: warn, criticalGib: Math.min(critical, warn) };
 }
 
 /**

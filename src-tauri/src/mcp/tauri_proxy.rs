@@ -184,6 +184,27 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 /// holders. Absent → None.
                 #[serde(default)]
                 agent_session_id: Option<uuid::Uuid>,
+                /// The caller's explicit "start it anyway" past a CRITICAL
+                /// resource-guard verdict (plan
+                /// `2026-08-07-runner-resource-guard-and-session-protection`
+                /// §Part D). Mirrors the `resource_override` argument on the
+                /// `terminal_create` Tauri command this route proxies, and
+                /// defaults to `false`, so every existing caller keeps the
+                /// unattended posture it has today: the floor is respected and
+                /// the typed refusal comes back as the invoke error.
+                ///
+                /// It exists so the refusal is actually overridable from here.
+                /// A caller that IS fronted by a UI (an external tool that can
+                /// show its own dialog) recognises the
+                /// `resource_guard:critical:` prefix, asks its operator, and
+                /// re-invokes with `resourceOverride: true` — the same
+                /// refuse-ask-retry loop `src/lib/resourceGuard.ts` runs in the
+                /// webview. Without the field that loop had nowhere to land:
+                /// the second attempt would have been refused identically, and
+                /// the comment promising an override would have been describing
+                /// a path that did not exist.
+                #[serde(default)]
+                resource_override: bool,
             }
             let a = match serde_json::from_value::<Args>(req.args) {
                 Ok(v) => v,
@@ -238,14 +259,16 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 state.app_handle.clone(),
                 None,
                 extra_env,
-                // UNATTENDED spawn — respect the critical floor. This is the
-                // HTTP proxy for the `terminal_create` Tauri command, used by
-                // external tooling that has no webview to show a dialog in. The
-                // typed refusal is returned verbatim as the invoke response's
-                // error, so a caller that *is* fronted by a UI can still
-                // recognise the `resource_guard:critical:` prefix and offer its
-                // own override — it just cannot have one assumed for it here.
-                false,
+                // UNATTENDED by default — respect the critical floor. This is
+                // the HTTP proxy for the `terminal_create` Tauri command, used
+                // by external tooling that has no webview to show a dialog in,
+                // so an absent `resourceOverride` is `false` and the typed
+                // refusal is returned verbatim as the invoke response's error.
+                // A caller that IS fronted by a UI recognises the
+                // `resource_guard:critical:` prefix, asks its own operator, and
+                // re-invokes with `resourceOverride: true` — see the field's
+                // doc. Nothing is ever assumed on the caller's behalf here.
+                a.resource_override,
             ) {
                 Ok(info) => {
                     if let Some(ctx) = isolated_ctx {
