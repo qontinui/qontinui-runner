@@ -1,3 +1,0 @@
-# ContextsPage
-
-_(notes)_

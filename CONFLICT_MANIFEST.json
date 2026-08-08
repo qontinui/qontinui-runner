@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "base_sha": "9460b7faaae2d2e6906339c9ccf0100556be6749",
+  "ours_sha": "be32084ac7b2a0f34868520232a7ce7bd4364876",
+  "theirs_sha": "0349e7eb0e6c754ea3ff60e970b799f5fc0c36c8",
+  "entries": [
+    {
+      "path": "src-tauri/src/terminal/session.rs",
+      "base_oid": "ebdbad5ebb4d408241aaefcf4c98659696356511",
+      "ours_oid": "d3318268f15ed419bc38e551c94a4afc139689cb",
+      "theirs_oid": "585aa9e99df9b74aa660de67cde359ef9030992e",
+      "base_path": "src-tauri/src/terminal/session.rs.base",
+      "ours_path": "src-tauri/src/terminal/session.rs.ours",
+      "theirs_path": "src-tauri/src/terminal/session.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n        {\n            // Phase 0 instrumentation: `.mcp.json` read+parse and, on the\n            // provisioning branch, a nonce registration that re-encrypts the\n            // WHOLE secure-storage token store (B2).\n            let _span =\n                tracing::debug_span!(\"terminal_spawn.coord_mcp_provision\", terminal_id = %terminal_id)\n                    .entered();\n            if crate::coord_mcp::workdir_declares_coord_mcp(cwd) {\n                info!(\n                    terminal_id = %terminal_id,\n                    \"coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection\"\n                );\n            } else if let Some(cfg_path) = crate::coord_mcp::provision_coord_mcp_config_file(cwd) {\n                cmd.env(\n                    crate::coord_mcp::MCP_CONFIG_ENV,\n                    cfg_path.to_string_lossy().as_ref(),\n                );\n                info!(\n                    terminal_id = %terminal_id,\n                    path = %cfg_path.display(),\n                    \"coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery\"\n                );\n            }\n=======\n        //\n        // THIS terminal's id is passed through: it keys both the app-data\n        // filename and the minted nonce binding, so two terminals sharing one\n        // cwd get two config files and two live nonces instead of racing a\n        // single per-workdir one. That is what makes coord-caller\n        // self-identification resolvable — the proxy maps `nonce → terminal_id\n        // → the open lifecycle record → claude_session_id`, all 1:1, where the\n        // workdir leg is 1:N and could only ever guess.\n        if crate::coord_mcp::workdir_declares_coord_mcp(cwd) {\n            info!(\n                terminal_id = %terminal_id,\n                \"coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection\"\n            );\n        } else if let Some(cfg_path) =\n            crate::coord_mcp::provision_coord_mcp_config_file(cwd, Some(terminal_id))\n        {\n            cmd.env(\n                crate::coord_mcp::MCP_CONFIG_ENV,\n                cfg_path.to_string_lossy().as_ref(),\n            );\n            info!(\n                terminal_id = %terminal_id,\n                path = %cfg_path.display(),\n                \"coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery\"\n            );\n>>>>>>> 9c9d1ea5 (feat(coord-mcp): key the proxy nonce binding on terminal_id, not workdir alone)\n"
+      ]
+    }
+  ]
+}
