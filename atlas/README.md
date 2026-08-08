@@ -11,8 +11,41 @@ alembic chain and coord — **not** Atlas.
 |------|---------|
 | `atlas.hcl` | Atlas project config. The `runner_pilot` env scopes Atlas to `schemas = ["project","coord"]` minus the `exclude.txt` list. |
 | `schema.hcl` | The desired-state HCL for the Atlas-owned pilot tables. |
-| `exclude.txt` | The `--exclude` list. Atlas Community can't `--include` (Pro-only), so every *non*-pilot table/sequence/view/MV/enum in `project`/`coord` is listed here so Atlas ignores it. |
-| `scripts/regen_exclude.ps1` | Regenerates `exclude.txt` from the live schema. |
+| `exclude.txt` | The `--exclude` list. Atlas Community can't `--include` (Pro-only), so every *non*-pilot table/sequence/view/MV/enum in `project`/`coord`/`orchestration` is listed here so Atlas ignores it. |
+| `scripts/regen_exclude.ps1` | Regenerates `exclude.txt` from the live schema. Also the single declaration of the pilot set (`$PilotTables`). |
+| `scripts/check_pilot_consistency.ps1` | DB-free guard that the four files above agree about who owns what. |
+| `scripts/tests/` | Stubbed-psql regression test for the regen script's exit-code contract. |
+
+## Who owns which table
+
+Four files encode "which tables does Atlas manage?", and they must agree:
+
+| | Says |
+|---|---|
+| `schema.hcl` | the desired state — the tables Atlas **manages** |
+| `atlas.hcl` (`schemas`) | which schemas Atlas is **scoped** to |
+| `exclude.txt` | what Atlas **ignores** |
+| `regen_exclude.ps1` (`$PilotTables`) | what the regen **carves out** of `exclude.txt` |
+
+A table declared in `schema.hcl` must **not** appear in `exclude.txt` — that
+combination means Atlas silently ignores a table the HCL claims to own, and the
+declaration is dead. The reverse (carved out but never declared) leaves a table
+neither managed nor excluded.
+
+`scripts/check_pilot_consistency.ps1` asserts all of this without a database, so
+it runs on every trigger and its verdict does **not** depend on qontinui-web's
+migration state:
+
+```bash
+pwsh atlas/scripts/check_pilot_consistency.ps1
+```
+
+One deliberate exception is recorded by name in `$ExcludedDeclarations`:
+**`project.apps`** is declared in `schema.hcl` but stays excluded, because
+qontinui-web's alembic chain co-authors it and the runner's own self-heal adds
+six columns the HCL does not declare. See the block comment above `table "apps"`
+in `schema.hcl`. The checker fails if it ever leaves `exclude.txt` while that is
+still true.
 
 ## The exclude-list footgun — regenerate after every schema change
 
@@ -38,8 +71,18 @@ Two guards exist:
    pwsh atlas/scripts/regen_exclude.ps1 -Check
    ```
 
-   Exit 0 = the list is fresh, safe to apply. Exit 1 = a table was added or
-   removed since the list was last regenerated — regenerate and commit first:
+   | Exit | Meaning |
+   |------|---------|
+   | `0` | the list is fresh — safe to apply |
+   | `2` | **drift** — a table was added or removed since the last regen |
+   | `1` | **failure** — DB unreachable, a query failed, or the zero-pattern guard tripped. Nothing was established; do **not** apply |
+
+   The 1-vs-2 split is a contract, not a detail: CI self-heals (auto-commits a
+   refreshed list) on `2` and must never do so on `1`, since a list built from a
+   failed read is exactly the data-loss footgun this guard exists to prevent. It
+   is pinned by `scripts/tests/test_regen_exit_contract.ps1`.
+
+   On drift, regenerate and commit first:
 
    ```bash
    pwsh atlas/scripts/regen_exclude.ps1        # rewrites atlas/exclude.txt
@@ -50,7 +93,8 @@ Two guards exist:
 
 ```
 pwsh atlas/scripts/regen_exclude.ps1            # rewrite exclude.txt in place
-pwsh atlas/scripts/regen_exclude.ps1 -Check     # diff vs committed; exit 1 on drift
+pwsh atlas/scripts/regen_exclude.ps1 -Check     # diff vs committed; 0 fresh / 2 drift / 1 failed
+pwsh atlas/scripts/regen_exclude.ps1 -PrintPilotSet   # the pilot set, no DB
 ```
 
 DB transport:
