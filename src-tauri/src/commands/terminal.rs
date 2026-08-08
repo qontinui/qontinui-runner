@@ -84,6 +84,22 @@ pub async fn terminal_create(
     // `None`, which resolves to "no override", the safe answer.
     resource_override: Option<bool>,
 ) -> Result<CommandResponse, String> {
+    // Spawn-time resource gate, EARLY-OUT arm (§Part D). The authority is still
+    // the gate inside `TerminalSession::spawn` — every unattended seam reaches
+    // that one and this one is not a replacement for it — but by the time this
+    // command gets there it has already run `acquire_for_terminal`, which under
+    // `QONTINUI_AGENT_WORKTREE_MODE` does a `git worktree add`, takes a coord
+    // claim, starts a heartbeat task and shells out to `git config`. A CRITICAL
+    // refusal would throw all of that away, and `IsolatedEditContext::Drop`
+    // releases the claim but does NOT remove the materialized worktree — so each
+    // refusal would leak a directory and the "Start anyway" retry would
+    // materialize a second one. The most allocation-heavy step in the spawn must
+    // not be the one that runs unguarded. Costs one `GlobalMemoryStatusEx` call;
+    // returns the same typed refusal the seam would, so the frontend's dialog
+    // cannot tell which gate answered. Silent on WARN — the notice is emitted
+    // once, at the seam.
+    crate::resource_guard::precheck_spawn("terminal session", resource_override.unwrap_or(false))?;
+
     let spawn_tenant_id: Option<uuid::Uuid> = match tenant_id.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(raw) => Some(

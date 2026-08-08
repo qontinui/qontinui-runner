@@ -310,6 +310,14 @@ struct ControlsPayload {
 /// - Zero ⇒ `Some(0)`, preserved rather than folded into `None`: the fleet is
 ///   entitled to say zero, and saying it changes nothing, because the effective
 ///   floor is a `max` that already contains the hardcoded default.
+///
+/// The SIGN is all this checks. An absurd *positive* — the column is a `BIGINT`
+/// and coord's `validate()` rejects only negatives, so `i64::MAX` is a legal row
+/// — is not filtered here, because this function's job is decoding one column
+/// and "how high may a floor be?" is a policy question about the *effective*
+/// floor, which is composed of three terms. It is answered once, downstream, by
+/// [`crate::resource_guard::SESSION_FLOOR_MAX_BYTES`], which caps the fold and
+/// therefore bounds a local override and a fleet column with the same number.
 fn floor_bytes(v: Option<i64>) -> Option<u64> {
     v.and_then(|b| u64::try_from(b).ok())
 }
@@ -1091,8 +1099,14 @@ mod tests {
                 critical_free_bytes: None,
             },
         };
-        assert_eq!(floors.for_lane(Lane::Host.as_str()).warn_free_bytes, Some(7));
-        assert_eq!(floors.for_lane(Lane::Wsl.as_str()).warn_free_bytes, Some(11));
+        assert_eq!(
+            floors.for_lane(Lane::Host.as_str()).warn_free_bytes,
+            Some(7)
+        );
+        assert_eq!(
+            floors.for_lane(Lane::Wsl.as_str()).warn_free_bytes,
+            Some(11)
+        );
         // An unrecognised lane must get NO floors rather than a neighbouring
         // lane's — never compare one lane's reading to another lane's floor.
         assert_eq!(floors.for_lane("hyperv"), SessionFloors::default());

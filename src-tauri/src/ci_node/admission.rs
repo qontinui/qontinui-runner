@@ -149,12 +149,18 @@ pub(crate) const DEFER_FREE_COMMIT_GB: u64 = MIN_FREE_COMMIT_GB * 2;
 ///
 /// ## Why it is bounded — and why the bound is 12, not the shell lane's 8
 ///
-/// The setting has no server-side upper bound; the runner validates only
-/// `critical <= warn`. So an operator can set a warn floor no box on this fleet
-/// ever reaches — 16 GiB is an entirely reasonable thing to type after an
-/// incident whose top consumer was `vmmemWSL` at ~17 GB. `cargo-guard.sh` caps
-/// its own session term for exactly this reason, but the *consequence* of an
-/// unreachable floor differs per lane, so the numbers must too:
+/// The setting has no server-side upper bound, and an operator can set a warn
+/// floor no box on this fleet ever reaches — 16 GiB is an entirely reasonable
+/// thing to type after an incident whose top consumer was `vmmemWSL` at ~17 GB.
+/// [`crate::resource_guard::SESSION_FLOOR_MAX_BYTES`] now caps the *effective*
+/// floor at this same 12 GiB before it ever gets here (that lane needs its own
+/// bound for a harder reason: an unreachable spawn floor refuses every
+/// unattended session with no timeout to fail open through). This clamp still
+/// stands on its own: the two lanes must be able to move independently, and a
+/// pure function that trusts an injected bound it does not enforce is a
+/// property one edit away from being false. `cargo-guard.sh` caps its own
+/// session term for the same reason, but the *consequence* of an unreachable
+/// floor differs per lane, so the numbers must too:
 ///
 /// - In the shell lane it **fails open by time**: the wait loop sleeps out
 ///   `MEM_WAIT_MAX` and then builds anyway. It costs one stall. Its cap is this
@@ -317,9 +323,16 @@ fn probe_headroom() -> Headroom {
     // `commit_available_bytes` above IS the host-lane reading — never judge one
     // lane's reading against another lane's floor.
     //
-    // An unreachable floor cannot wedge this lane: `defer_commit_floor_gb`
-    // clamps whatever arrives at `MAX_SESSION_DEFER_FLOOR_GB`, which is the
-    // whole reason that clamp exists.
+    // An unreachable floor cannot wedge this lane: `effective_session_floors`
+    // already caps what it returns at `resource_guard::SESSION_FLOOR_MAX_BYTES`,
+    // and `defer_commit_floor_gb` clamps whatever arrives at
+    // `MAX_SESSION_DEFER_FLOOR_GB` regardless — belt and braces, deliberately,
+    // because this lane's clamp must not depend on the other lane keeping a
+    // bound it is free to change.
+    //
+    // The floors also arrive with the ladder already coerced (`critical <=
+    // warn`), so the warn floor read below is never the transposed one — but
+    // only the warn floor is read here anyway, and only as a raise.
     let local_guard = crate::settings::get_session_guard_settings();
     let session_guard = crate::resource_guard::effective_session_floors(
         &local_guard,

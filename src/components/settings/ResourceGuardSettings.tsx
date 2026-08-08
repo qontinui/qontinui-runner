@@ -38,11 +38,15 @@ import {
   DISK_FLOOR_MIN_GIB,
   MAX_CONCURRENT_BUILDS_MAX,
   MAX_CONCURRENT_BUILDS_MIN,
+  SESSION_FLOOR_CAP_GIB,
+  SESSION_FLOOR_DEFAULT_CRITICAL_GIB,
+  SESSION_FLOOR_DEFAULT_WARN_GIB,
   SESSION_FLOOR_MAX_GIB,
   SESSION_FLOOR_MIN_GIB,
   bytesToGib,
   clampGib,
   clampInt,
+  effectiveSessionFloorsGib,
   gibToBytes,
   parseRepoAllowlist,
   sessionFloorsAreInverted,
@@ -168,12 +172,41 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
   const invertedFloors = sessionFloorsAreInverted(warnGib, criticalGib);
   const warnAboveCiNodeReject = warnGib > CI_NODE_REJECT_FLOOR_GIB;
 
+  // What the runner will actually enforce, beside what is configured. The
+  // enforced floor is `max(configured, built-in default)`, capped, with the
+  // ladder coerced — so the bottom of each input's range is inert and a value
+  // above the cap is discarded. Rendering only the configured number made the
+  // page state something the runner does not do.
+  const effective = effectiveSessionFloorsGib(warnGib, criticalGib);
+  const warnIsClamped = effective.warnGib !== warnGib;
+  const criticalIsClamped = effective.criticalGib !== criticalGib;
+
+  /**
+   * Save both groups INDEPENDENTLY and report per group.
+   *
+   * The page writes two settings groups through two commands, and either can be
+   * refused on its own: the session floors on an inverted ladder, the CI-node
+   * group on a `"*"` allowlist or a zero disk floor (both refused by
+   * `commands::resource_guard_settings`, deliberately, to match what coord's
+   * remote door refuses). A single try/catch reported "Failed to save settings"
+   * for that — hiding both WHICH group failed and, worse, that the other group
+   * HAD been persisted. An operator who then reloads the page sees floors they
+   * were told did not save.
+   *
+   * So each group gets its own attempt and its own verdict, and a failure in one
+   * no longer skips the other: they are independent settings with independent
+   * validation, and there is no ordering between them to preserve.
+   */
   const saveSettings = async () => {
     setSaving(true);
     setError(null);
     setSaveSuccess(false);
+
+    const allowlist = parseRepoAllowlist(allowlistText);
+    const saved: string[] = [];
+    const failures: string[] = [];
+
     try {
-      const allowlist = parseRepoAllowlist(allowlistText);
       const guardResult = await invoke<TauriResult<null>>("save_session_guard_settings", {
         enabled: guardEnabled,
         warnFreeCommitBytes: gibToBytes(warnGib),
@@ -182,7 +215,13 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
       if (!guardResult?.success) {
         throw new Error(guardResult?.message || "Unknown error saving session-guard settings");
       }
+      saved.push("session floors");
+    } catch (err) {
+      console.error("Failed to save session-guard settings:", err);
+      failures.push(`session floors — ${String(err)}`);
+    }
 
+    try {
       const ciResult = await invoke<TauriResult<null>>("save_ci_node_settings", {
         enabled: ciNode.enabled,
         maxConcurrentBuilds: ciNode.max_concurrent_builds,
@@ -192,21 +231,34 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
       if (!ciResult?.success) {
         throw new Error(ciResult?.message || "Unknown error saving CI-node settings");
       }
-
       // Normalize the textarea to what was actually persisted, so a trailing
-      // comma the parser dropped does not linger as unsaved-looking text.
+      // comma the parser dropped does not linger as unsaved-looking text. Only
+      // on success: rewriting the box after a REFUSED save would make the page
+      // agree with a value the runner never stored.
       setCiNode((c) => ({ ...c, repo_allowlist: allowlist }));
       setAllowlistText(allowlist.join("\n"));
+      saved.push("CI-node settings");
+    } catch (err) {
+      console.error("Failed to save CI-node settings:", err);
+      failures.push(`CI-node settings — ${String(err)}`);
+    }
+
+    setSaving(false);
+
+    if (failures.length === 0) {
       setSaveSuccess(true);
       onLog("success", "Resource guard settings saved");
       setTimeout(() => setSaveSuccess(false), 3000);
-    } catch (err) {
-      console.error("Failed to save resource-guard settings:", err);
-      setError(`Failed to save settings: ${String(err)}`);
-      onLog("error", `Failed to save resource-guard settings: ${String(err)}`);
-    } finally {
-      setSaving(false);
+      return;
     }
+
+    // Name what did NOT save first (it is what the operator has to act on), and
+    // then what DID — a partial write the operator does not know about is the
+    // failure this reporting exists to prevent.
+    const savedNote = saved.length > 0 ? ` Saved: ${saved.join(", ")}.` : "";
+    const message = `Not saved: ${failures.join("; ")}.${savedNote}`;
+    setError(message);
+    onLog("error", `Resource guard settings partially saved — ${message}`);
   };
 
   if (loading) {
@@ -293,6 +345,17 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             The spawn still proceeds; you get a notification naming the current headroom and this
             floor. Range {SESSION_FLOOR_MIN_GIB}-{SESSION_FLOOR_MAX_GIB} GiB.
           </p>
+          <EffectiveFloor
+            uiBridgeId="settings.resource-guard-warn-floor-effective"
+            configuredGib={warnGib}
+            effectiveGib={effective.warnGib}
+            clamped={warnIsClamped}
+            reason={
+              warnGib < SESSION_FLOOR_DEFAULT_WARN_GIB
+                ? `below the runner's built-in ${SESSION_FLOOR_DEFAULT_WARN_GIB} GiB warn floor, which nothing can lower`
+                : `above the ${SESSION_FLOOR_CAP_GIB} GiB ceiling, past which a floor is unreachable and every unattended spawn would refuse forever`
+            }
+          />
         </div>
 
         <div className="space-y-1.5">
@@ -324,6 +387,19 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             The heaviest verdict in the ladder — a spawn is refused by default, always with an
             explicit override. Keep it below the warn floor.
           </p>
+          <EffectiveFloor
+            uiBridgeId="settings.resource-guard-critical-floor-effective"
+            configuredGib={criticalGib}
+            effectiveGib={effective.criticalGib}
+            clamped={criticalIsClamped}
+            reason={
+              criticalGib < SESSION_FLOOR_DEFAULT_CRITICAL_GIB
+                ? `below the runner's built-in ${SESSION_FLOOR_DEFAULT_CRITICAL_GIB} GiB block floor, which nothing can lower`
+                : criticalGib > SESSION_FLOOR_CAP_GIB
+                  ? `above the ${SESSION_FLOOR_CAP_GIB} GiB ceiling, past which a floor is unreachable and every unattended spawn would refuse forever`
+                  : "above the effective warn floor, and the lighter verdict has to fire first — so it is clamped down to it rather than blocking spawns that were never warned about"
+            }
+          />
         </div>
 
         {invertedFloors && (
@@ -362,6 +438,17 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             <code>ci_node</code> rejects at {CI_NODE_REJECT_FLOOR_GIB} GiB, the supervisor and{" "}
             <code>cargo-guard.sh</code> defer at 5 GiB. The host reading already nets out WSL usage
             (<code>pageReporting=true</code>), so <code>vmmemWSL</code> pressure is visible here.
+            <br />
+            <br />
+            What gets enforced is{" "}
+            <code>
+              max(this machine, your tenant&apos;s fleet floor, the built-in{" "}
+              {SESSION_FLOOR_DEFAULT_WARN_GIB}/{SESSION_FLOOR_DEFAULT_CRITICAL_GIB} GiB defaults)
+            </code>
+            , capped at {SESSION_FLOOR_CAP_GIB} GiB and with the block floor never above the warn
+            floor. You can only ever tighten. The &quot;Enforced&quot; lines above leave the fleet
+            term out — it is cached in the background and can only raise these further, and showing
+            an unknown as a zero is the one thing this guard must never do.
           </p>
         </div>
       </div>
@@ -497,6 +584,44 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         </button>
       </div>
     </div>
+  );
+}
+
+// ── Configured vs. enforced ─────────────────────────────────────────────────
+interface EffectiveFloorProps {
+  uiBridgeId: string;
+  configuredGib: number;
+  effectiveGib: number;
+  /** `true` when the runner will enforce something other than the typed value. */
+  clamped: boolean;
+  /** Why it was clamped — rendered only when it was. */
+  reason: string;
+}
+
+/**
+ * The floor the runner will ACTUALLY enforce, beside the one that was typed.
+ *
+ * The panel used to display only the configured value while enforcement was
+ * `max(configured, hardcoded default)` — so the entire bottom of the input's
+ * range was inert and nothing on the page said so. Showing the enforced number
+ * always (not only when it differs) also makes the two new clamps visible: the
+ * `SESSION_FLOOR_CAP_GIB` ceiling, and the `critical <= warn` ladder coercion.
+ */
+function EffectiveFloor({
+  uiBridgeId,
+  configuredGib,
+  effectiveGib,
+  clamped,
+  reason,
+}: EffectiveFloorProps) {
+  return (
+    <p
+      data-ui-bridge-id={uiBridgeId}
+      className={`text-[10px] ${clamped ? getAccentColors("amber").text : "text-muted-foreground"}`}
+    >
+      Enforced: <strong>{effectiveGib} GiB</strong>
+      {clamped ? ` — your ${configuredGib} GiB is ${reason}.` : "."}
+    </p>
   );
 }
 

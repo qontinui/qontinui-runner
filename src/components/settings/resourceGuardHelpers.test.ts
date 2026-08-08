@@ -17,9 +17,13 @@ import {
   bytesToGib,
   clampGib,
   clampInt,
+  effectiveSessionFloorsGib,
   gibToBytes,
   parseRepoAllowlist,
   sessionFloorsAreInverted,
+  SESSION_FLOOR_CAP_GIB,
+  SESSION_FLOOR_DEFAULT_CRITICAL_GIB,
+  SESSION_FLOOR_DEFAULT_WARN_GIB,
   SESSION_FLOOR_MAX_GIB,
   SESSION_FLOOR_MIN_GIB,
 } from "./resourceGuardHelpers";
@@ -74,6 +78,55 @@ describe("floor ordering", () => {
     expect(sessionFloorsAreInverted(1, 3)).toBe(true);
     expect(sessionFloorsAreInverted(2, 2)).toBe(false);
     expect(sessionFloorsAreInverted(3, 1.5)).toBe(false);
+  });
+});
+
+describe("effective (enforced) floors", () => {
+  it("shows the built-in default for every value the runner would discard", () => {
+    // The whole 0.25–3 GiB warn range is inert — enforcement is
+    // `max(configured, hardcoded)` — which is exactly what the panel now says
+    // out loud instead of displaying a floor that never applies.
+    expect(effectiveSessionFloorsGib(SESSION_FLOOR_MIN_GIB, SESSION_FLOOR_MIN_GIB)).toEqual({
+      warnGib: SESSION_FLOOR_DEFAULT_WARN_GIB,
+      criticalGib: SESSION_FLOOR_DEFAULT_CRITICAL_GIB,
+    });
+    expect(effectiveSessionFloorsGib(1, 0.5)).toEqual({
+      warnGib: SESSION_FLOOR_DEFAULT_WARN_GIB,
+      criticalGib: SESSION_FLOOR_DEFAULT_CRITICAL_GIB,
+    });
+  });
+
+  it("passes a tightened floor through untouched", () => {
+    expect(effectiveSessionFloorsGib(8, 4)).toEqual({ warnGib: 8, criticalGib: 4 });
+  });
+
+  it("caps an unreachable floor at the runner's ceiling", () => {
+    // `resource_guard::SESSION_FLOOR_MAX_BYTES`. The input accepts up to 128
+    // GiB; a floor no box can clear would refuse every unattended spawn
+    // forever, so the runner clamps it and the panel must not claim otherwise.
+    expect(effectiveSessionFloorsGib(SESSION_FLOOR_MAX_GIB, SESSION_FLOOR_MAX_GIB)).toEqual({
+      warnGib: SESSION_FLOOR_CAP_GIB,
+      criticalGib: SESSION_FLOOR_CAP_GIB,
+    });
+  });
+
+  it("clamps the block floor down to the warn floor, never the reverse", () => {
+    // Mirrors `resource_guard::coerce_ladder`: raising warn to meet critical
+    // would enforce a warn floor nobody asked for.
+    expect(effectiveSessionFloorsGib(4, 9)).toEqual({ warnGib: 4, criticalGib: 4 });
+  });
+
+  it("never returns an inverted ladder or a non-numeric floor", () => {
+    for (const warn of [Number.NaN, 0, 0.25, 1.5, 3, 7, 12, 128, 1e9]) {
+      for (const critical of [Number.NaN, 0, 0.25, 1.5, 3, 7, 12, 128, 1e9]) {
+        const eff = effectiveSessionFloorsGib(warn, critical);
+        expect(Number.isFinite(eff.warnGib)).toBe(true);
+        expect(Number.isFinite(eff.criticalGib)).toBe(true);
+        expect(eff.criticalGib).toBeLessThanOrEqual(eff.warnGib);
+        expect(eff.warnGib).toBeLessThanOrEqual(SESSION_FLOOR_CAP_GIB);
+        expect(eff.warnGib).toBeGreaterThanOrEqual(SESSION_FLOOR_DEFAULT_WARN_GIB);
+      }
+    }
   });
 });
 

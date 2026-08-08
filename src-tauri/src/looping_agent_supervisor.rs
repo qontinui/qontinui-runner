@@ -866,6 +866,26 @@ async fn do_spawn(
                 crate::agent_runtime::emit_terminal_focus_request(app, &terminal_id);
             }
         }
+        Err(e) if e.starts_with(crate::resource_guard::CRITICAL_REFUSAL_PREFIX) => {
+            // The spawn-time resource guard refused (plan
+            // `2026-08-07-runner-resource-guard-and-session-protection` §Part D).
+            // Deliberately NOT recorded as a spawn failure, for the same reason
+            // the registry-authorization refusal above is not: this is a POLICY
+            // VERDICT on the machine's headroom, not evidence of a broken agent.
+            // Feeding it into the escalating backoff (30 s doubling to a 900 s
+            // cap) would misreport it and, worse, would keep the agent down for
+            // up to 15 minutes AFTER the box recovered — the supervisor
+            // re-evaluates every tick, so leaving the streak untouched is what
+            // makes "as soon as there is commit to spare" true. Nothing hammers
+            // the machine either: the next tick re-probes and gets refused again
+            // for as long as the box is still under the critical floor.
+            warn!(
+                agent = %def.id,
+                error = %e,
+                "looping_agent_supervisor: spawn refused by the resource guard — \
+                 retrying on the next tick, no backoff"
+            );
+        }
         Err(e) => {
             warn!(
                 agent = %def.id,
@@ -900,6 +920,18 @@ async fn spawn_looping_agent_terminal(
     if let Some(refusal) = authz.refusal() {
         return Err(refusal);
     }
+
+    // Spawn-time resource gate, EARLY-OUT arm — the same pre-check
+    // `commands::terminal::terminal_create` runs, for the same reason and one
+    // extra one. Below the critical floor the PTY seam will refuse this spawn
+    // anyway; without this, every refused attempt would first create the agent's
+    // home dir, rewrite its coord-MCP + fleet-command provisioning and probe the
+    // Claude accounts. That matters here specifically because `do_spawn` does
+    // NOT put a resource refusal into the escalating backoff (a policy verdict is
+    // not a broken agent), so the supervisor re-attempts on EVERY tick while the
+    // box is starved. Retrying every tick is what makes the agent restart the
+    // moment there is commit to spare; this is what keeps that retry cheap.
+    crate::resource_guard::precheck_spawn("looping-agent session", false)?;
 
     let terminal_manager = app
         .try_state::<Arc<crate::terminal::TerminalManager>>()
@@ -1010,10 +1042,16 @@ async fn spawn_looping_agent_terminal(
             // UNATTENDED spawn — respect the critical floor. A looping agent is
             // by construction the one caller that will ask again: the supervisor
             // re-evaluates its definitions on every tick, so a refusal now is a
-            // deferral, not a cancellation, and the next tick starts the agent
-            // as soon as the box has commit to spare. Overriding here would let
-            // a loop hammer a starved machine with new `claude` processes
-            // indefinitely — the exact shape of the 2026-08-06→07 incident.
+            // deferral, not a cancellation. `do_spawn` classifies the refusal by
+            // its `resource_guard:critical:` prefix and does NOT feed it to
+            // `note_spawn_failure`, so the agent restarts on the first tick after
+            // the box has commit to spare rather than sitting out an escalating
+            // backoff it did nothing to earn — a resource verdict is not a broken
+            // agent. (Without that arm the refusal would land in the generic
+            // `Err` arm and the fifth one would delay the restart by up to
+            // 15 minutes past recovery.) Overriding here would instead let a loop
+            // hammer a starved machine with new `claude` processes indefinitely —
+            // the exact shape of the 2026-08-06→07 incident.
             false,
         )?;
     Ok((terminal_id, pinned_session_id))
