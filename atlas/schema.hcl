@@ -18,21 +18,25 @@
 // autogenerate runs exclude these tables via the env.py include_object
 // filter so the two systems can't drift.
 //
-// To apply against live PG:
-//   docker run --rm --network host -v "${PWD}:/workspace" -w /workspace \
-//     arigaio/atlas:latest schema apply \
-//     --url 'postgres://qontinui_user:PASSWORD@localhost:5433/qontinui_db?sslmode=disable' \
-//     --to file:///workspace/atlas/schema.hcl \
-//     --schema project --schema coord --schema orchestration \
-//     --dev-url 'docker://postgres/16/dev'
+// ALWAYS go through `--env runner_pilot` (defined in atlas.hcl). That env is
+// what binds the `exclude.txt` list; a bare `--schema project --schema coord
+// --schema orchestration` invocation carries NO exclusions, so Atlas compares
+// every alembic- and coord-owned table in those schemas against this file and
+// proposes to DROP each one. That is the data-loss footgun the exclude list
+// exists to prevent -- an earlier version of this header spelled out exactly
+// such a command, which is why it is called out here.
 //
-// To verify zero-diff:
-//   docker run --rm --network host -v "${PWD}:/workspace" -w /workspace \
-//     arigaio/atlas:latest schema diff \
-//     --from 'postgres://...?sslmode=disable' \
-//     --to file:///workspace/atlas/schema.hcl \
-//     --schema project --schema coord --schema orchestration \
-//     --dev-url 'docker://postgres/16/dev'
+// Run the freshness guard first (see atlas/README.md):
+//   pwsh atlas/scripts/regen_exclude.ps1 -Check    # 0 fresh / 2 drift / 1 failed
+//
+// To preview the diff, then apply, against live PG (ATLAS_LIVE_URL and
+// ATLAS_DEV_URL supply the two urls -- see atlas.hcl):
+//   docker run --rm --network host -v "${PWD}/atlas:/atlas" -w /atlas \
+//     -e ATLAS_LIVE_URL -e ATLAS_DEV_URL \
+//     arigaio/atlas:latest schema diff --env runner_pilot
+//   docker run --rm --network host -v "${PWD}/atlas:/atlas" -w /atlas \
+//     -e ATLAS_LIVE_URL -e ATLAS_DEV_URL \
+//     arigaio/atlas:latest schema apply --env runner_pilot
 
 schema "project" {}
 schema "coord" {}
@@ -472,6 +476,35 @@ table "coordinator_shadow_decisions" {
 // CLI / dashboard can show recently-touched apps. Updates are best-effort —
 // `touch_app` failures are logged at `warn!` but never fail the calling
 // storage operation.
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ NOT CURRENTLY ATLAS-MANAGED — this declaration is INCOMPLETE.           │
+// └─────────────────────────────────────────────────────────────────────────┘
+//
+// `project.apps` is listed in `exclude.txt`, so `atlas schema apply` ignores
+// it and the block below is inert. That is deliberate, and it must stay that
+// way until the block is completed, because the table really has SIX more
+// columns than are declared here — added by the runner's own self-heal in
+// `database/pg/mod.rs` and mirrored by qontinui-web's alembic revision
+// `project_apps_p1a_auto_fresh_fields`:
+//
+//   auth_required, red_threshold, yellow_threshold,
+//   update_strategy, build_command, start_command
+//
+// Un-excluding it against THIS block would make Atlas drop all six — live
+// fleet-fresh configuration. Completing it is not a mechanical edit either:
+// the table's two creators disagree on nullability (the `CREATE TABLE`
+// declares `auth_required BOOLEAN DEFAULT false`, the follow-up
+// `ADD COLUMN IF NOT EXISTS` declares it `NOT NULL`), so the live shape
+// depends on which ran first and there is no single correct desired state to
+// write down yet.
+//
+// Resolving it properly means (1) reconciling that nullability split, and
+// (2) a matching `ATLAS_OWNED_TABLES` entry in qontinui-web's alembic
+// `env.py` — a cross-repo change. Until then the exception is recorded by
+// name in `$ExcludedDeclarations` in `scripts/regen_exclude.ps1`, and
+// `scripts/check_pilot_consistency.ps1` fails CI if the table ever leaves
+// `exclude.txt` while this block is still the desired state.
 // ---------------------------------------------------------------
 
 table "apps" {

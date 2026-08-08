@@ -58,9 +58,19 @@ name: atlas/exclude.txt freshness
 # the refreshed exclude.txt still lands on `chore/atlas-exclude-refresh` and the
 # step fails with both remediations spelled out.
 #
+# TWO JOBS, split by what they depend on:
+#   - `pilot-consistency`: four files in THIS repo, no DB. Asserts schema.hcl,
+#     atlas.hcl, exclude.txt and regen_exclude.ps1 agree about which tables
+#     Atlas owns. Its verdict never depends on qontinui-web, so it is the one
+#     signal an atlas PR can actually act on.
+#   - `verify`: the DB-backed freshness check + self-heal described above. Red
+#     whenever web has drifted, by design.
+# They are independent (no `needs:`) so a web-drift red on `verify` never hides
+# a runner-side ownership mistake, and vice versa.
+#
 # This workflow is intentionally NOT registered as a required status check, so
 # it needs none of the detect/aggregator ghost-check scaffolding that
-# schema-pg-sql-fresh.yml carries -- a single `verify` job suffices.
+# schema-pg-sql-fresh.yml carries.
 
 on:
   schedule:
@@ -85,7 +95,8 @@ on:
 # file. Flipping it to `restricted` would have broken sibling resolution across
 # six workflows at once, with nothing in any diff to explain it. State it here.
 #
-# This block is the workflow DEFAULT only. The single `verify` job overrides
+# This block is the workflow DEFAULT only, and is what `pilot-consistency`
+# runs on (it only ever checks out and reads files). The `verify` job overrides
 # it and widens to exactly the two scopes the self-heal path needs
 # (`contents: write` + `pull-requests: write`) and nothing else. A job-level
 # block REPLACES this one wholesale rather than merging with it, so on the
@@ -99,6 +110,42 @@ permissions:
   pull-requests: read
 
 jobs:
+  # DB-free, seconds-long, and deliberately a SEPARATE job from `verify`.
+  #
+  # `verify` needs Postgres + qontinui-web's alembic chain, so its verdict is a
+  # function of a PEER REPO's migration state: while web has drifted, `verify`
+  # is red on every atlas PR and no runner-side change can green it. That is
+  # precisely why PR #955 had to avoid touching `atlas/**` at all. A guard that
+  # can only speak when an unrelated repo is quiet is not a usable guard for
+  # runner-side atlas edits.
+  #
+  # This job reads four files in this repo and nothing else, so it is green or
+  # red purely on the diff in front of it -- the signal an atlas PR actually
+  # needs. It catches the failure class `verify` structurally cannot see:
+  # schema.hcl and exclude.txt disagreeing about who owns a table (see the
+  # script's header for the two live instances that motivated it).
+  pilot-consistency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      # pwsh is preinstalled on ubuntu-latest. The script shells back into the
+      # same host to read regen_exclude.ps1's exported sets, so nothing here
+      # re-parses PowerShell source.
+      - name: Check schema.hcl / atlas.hcl / exclude.txt / regen script agree
+        shell: bash
+        run: pwsh atlas/scripts/check_pilot_consistency.ps1
+
+      # Pins the exit-code contract the `verify` job's self-heal decision is
+      # built on (2 = drift, 1 = failure) plus the pilot carve-out, against a
+      # stubbed psql. Both are things `verify` cannot test: it only ever
+      # exercises whichever single path the live schema happens to produce, and
+      # never the DB-failure path at all.
+      - name: Test regen_exclude.ps1's exit contract (stubbed psql, no DB)
+        shell: bash
+        run: pwsh atlas/scripts/tests/test_regen_exit_contract.ps1
+
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -234,7 +281,8 @@ jobs:
 
       # -Container "" selects the script's native-psql path (no docker exec);
       # -Check regenerates against the fresh schema and diffs vs the committed
-      # atlas/exclude.txt, exiting 1 on drift. -Out writes the freshly-regen'd
+      # atlas/exclude.txt, exiting 2 on drift, 1 on failure, 0 when fresh.
+      # -Out writes the freshly-regen'd
       # list once (for the on-drift artifact upload) so we never regen twice.
       # pwsh is preinstalled on ubuntu-latest. The password is passed as
       # -PgPassword (the script re-exports it to PGPASSWORD itself), so no
@@ -292,14 +340,31 @@ jobs:
           fi
 
           # A non-zero exit is NOT proof of drift: the script also throws when
-          # the DB is unreachable or when its zero-pattern guard trips. Require
-          # the STALE marker AND a non-empty regenerated file before treating
-          # this as drift -- otherwise a broken DB would silently self-heal the
-          # nightly to green (or, worse, "refresh" exclude.txt from a bad read).
-          if ! grep -q 'is STALE relative to a fresh regen' "$log" || [ ! -s "$fresh" ]; then
+          # the DB is unreachable or when its zero-pattern guard trips, and a
+          # broken DB that read as drift would "refresh" exclude.txt from a bad
+          # read. The script therefore reserves exit 2 for drift and leaves
+          # every failure path on 1 (see its EXIT CODES block) -- so the
+          # classification is a number, not a phrase.
+          #
+          # This used to `grep -q 'is STALE relative to a fresh regen'` on the
+          # captured log, because drift and DB failure both exited 1. That
+          # coupled a data-loss-adjacent decision to a human-readable sentence
+          # in a script humans also run by hand: reword the message and the
+          # nightly silently stops self-healing forever. It failed safe, but it
+          # was untested and invisible. Keep the contract numeric.
+          if [ "$rc" -ne 2 ]; then
             cat "$log"
             echo "::error::regen_exclude.ps1 failed for a reason other than drift (exit $rc). Not self-healing."
             exit "$rc"
+          fi
+
+          # Independent of the exit code: drift means the regenerated list is
+          # about to become a commit, so it must actually exist and be
+          # non-empty before anything downstream trusts it.
+          if [ ! -s "$fresh" ]; then
+            cat "$log"
+            echo "::error::regen_exclude.ps1 reported drift (exit 2) but wrote no regenerated list to '$fresh'. Not self-healing."
+            exit 1
           fi
 
           # SHAPE GUARD -- the difference between "a migration moved a table" and

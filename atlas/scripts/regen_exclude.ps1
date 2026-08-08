@@ -1,8 +1,8 @@
 # Regenerate atlas/exclude.txt from the live canonical PG.
 #
 # Runs every existing non-Atlas-managed table/sequence/view/MV/enum in the
-# project and coord schemas through `--exclude` so Atlas only diffs the
-# pilot set (project.regression_* + coord.coordinator_shadow_decisions).
+# project, coord and orchestration schemas through `--exclude` so Atlas only
+# diffs the pilot set (the tables `atlas/schema.hcl` declares).
 #
 # Re-run after alembic adds a new table; otherwise next `atlas schema apply`
 # tries to drop it.
@@ -10,12 +10,32 @@
 # Modes:
 #   (default)  regenerate and rewrite atlas/exclude.txt in place.
 #   -Check     regenerate to memory and DIFF against the committed
-#              atlas/exclude.txt; exit 1 on drift (nothing is rewritten),
+#              atlas/exclude.txt; exit 2 on drift (nothing is rewritten),
 #              exit 0 when fresh. This is what CI runs -- see
 #              .github/workflows/atlas-exclude-fresh.yml -- and what a human
 #              should run before `atlas schema apply`.
 #   -Out <p>   (with -Check) also write the freshly-regenerated list to <p>,
 #              so CI can upload it as an artifact without a second full regen.
+#   -PrintPilotSet
+#              print the pilot set as `<schema>.<table>` lines and exit 0
+#              WITHOUT touching the DB. This is the machine-readable export
+#              `check_pilot_consistency.ps1` diffs against schema.hcl, so the
+#              pilot set is declared in exactly one place.
+#
+# EXIT CODES (-Check) -- the contract CI keys on:
+#   0  the committed list is fresh.
+#   2  DRIFT: the committed list disagrees with a fresh regen. The regenerated
+#      list is trustworthy; -Out (if given) holds it.
+#   1  FAILURE: DB unreachable, a query failed, or the zero-pattern guard
+#      tripped. NOTHING about the schema was established and -Out may be
+#      absent or garbage.
+#
+# The 1-vs-2 split exists so callers never have to classify by grepping this
+# script's human-readable prose. The freshness workflow self-heals (opens a
+# refresh PR) on 2 and must NEVER self-heal on 1 -- a DB failure that read as
+# drift would auto-author a PR dropping real exclusions, the exact data-loss
+# footgun this script guards. Keep the split intact: a new failure mode must
+# exit 1 (or throw), never 2.
 #
 # DB transport:
 #   -Container <name>  (default "qontinui-canonical-postgres") runs psql via
@@ -38,8 +58,73 @@ param(
     [string]$PgPassword = "qontinui_dev_password",
     [string]$Container = "qontinui-canonical-postgres",
     [switch]$Check,
-    [string]$Out = ""
+    [string]$Out = "",
+    [switch]$PrintPilotSet,
+    [switch]$PrintPilotSchemas,
+    [switch]$PrintExcludedDeclarations
 )
+
+# ---------------------------------------------------------------------------
+# THE PILOT SET -- the tables `atlas/schema.hcl` declares, and which Atlas
+# therefore MANAGES. Everything else in these schemas is alembic/coord-owned
+# and gets excluded.
+#
+# This list used to be encoded as SQL predicates (`relname NOT LIKE
+# 'regression_%'`, `relname <> 'coordinator_shadow_decisions'`) that were never
+# updated as schema.hcl grew, so schema.hcl's spec_proposals / proposal_events
+# / orchestration.* declarations were silently listed as EXCLUSIONS by any
+# regen run against a DB where the runner had self-healed them -- i.e. against
+# this script's own DEFAULT transport, the local canonical PG. Atlas would then
+# ignore four tables it is supposed to own. CI never caught it because its
+# schema comes from `alembic upgrade head` alone, where those runner-authored
+# tables do not exist.
+#
+# `check_pilot_consistency.ps1` now diffs this list against schema.hcl on every
+# CI run, so the two cannot drift apart again. Keep them in lockstep.
+$PilotTables = [ordered]@{
+    project       = @(
+        'regression_suites',
+        'regression_runs',
+        'regression_diagnoses',
+        'regression_assertion_executions',
+        'spec_proposals',
+        'proposal_events'
+    )
+    coord         = @('coordinator_shadow_decisions')
+    orchestration = @('runs', 'subtasks')
+}
+
+# Declared in schema.hcl but deliberately NOT pilot-owned, so it stays in the
+# exclude list. qontinui-web's alembic chain co-authors `project.apps`
+# (`project_apps_p1a_auto_fresh_fields` CREATEs it and adds fleet-fresh
+# columns), and the runner's own `pg/mod.rs` self-heal adds six columns beyond
+# what schema.hcl declares. Letting Atlas manage it against today's HCL would
+# DROP those six columns. Resolving the ownership properly is a cross-repo
+# change (it needs a matching `ATLAS_OWNED_TABLES` entry in qontinui-web's
+# alembic `env.py`), so it is tracked rather than silently half-done.
+# `check_pilot_consistency.ps1` knows about this exception by name.
+$ExcludedDeclarations = @('project.apps')
+
+# The schemas Atlas is scoped to. Must match `schemas` on the `runner_pilot`
+# env in atlas.hcl -- check_pilot_consistency.ps1 asserts that too.
+$PilotSchemas = @('project', 'coord', 'orchestration')
+
+if ($PrintPilotSet) {
+    foreach ($schema in $PilotTables.Keys) {
+        foreach ($table in $PilotTables[$schema]) { "$schema.$table" }
+    }
+    exit 0
+}
+
+if ($PrintPilotSchemas) {
+    $PilotSchemas | ForEach-Object { $_ }
+    exit 0
+}
+
+if ($PrintExcludedDeclarations) {
+    $ExcludedDeclarations | ForEach-Object { $_ }
+    exit 0
+}
 
 $env:PGPASSWORD = $PgPassword
 
@@ -60,43 +145,66 @@ function Invoke-PgQuery {
     return $result
 }
 
-$projectTables = Invoke-PgQuery @"
+# Relations (tables, sequences, views, materialized views) in one schema.
+# A schema that does not exist yields zero rows and exit 0 -- correct, and the
+# normal case for `orchestration` in CI, whose DB comes from alembic alone.
+function Get-SchemaRelations {
+    param([Parameter(Mandatory = $true)][string]$Schema)
+    # $Schema is always one of $PilotSchemas (literals in this file), never
+    # user input, but keep the shape assertion so that stays true.
+    if ($Schema -notmatch '^[a-z_]+$') { throw "Refusing to query unexpected schema name '$Schema'." }
+    return Invoke-PgQuery @"
 SELECT relname FROM pg_class c
   JOIN pg_namespace n ON n.oid = c.relnamespace
- WHERE n.nspname = 'project'
+ WHERE n.nspname = '$Schema'
    AND c.relkind IN ('r','S','v','m')
-   AND relname NOT LIKE 'regression_%'
  ORDER BY 1;
 "@
+}
 
-$coordTables = Invoke-PgQuery @"
-SELECT relname FROM pg_class c
-  JOIN pg_namespace n ON n.oid = c.relnamespace
- WHERE n.nspname = 'coord'
-   AND c.relkind IN ('r','S','v','m')
-   AND relname <> 'coordinator_shadow_decisions'
- ORDER BY 1;
-"@
-
-$projectEnums = Invoke-PgQuery @"
+function Get-SchemaEnums {
+    param([Parameter(Mandatory = $true)][string]$Schema)
+    if ($Schema -notmatch '^[a-z_]+$') { throw "Refusing to query unexpected schema name '$Schema'." }
+    return Invoke-PgQuery @"
 SELECT t.typname FROM pg_type t
   JOIN pg_namespace n ON n.oid = t.typnamespace
- WHERE n.nspname = 'project' AND t.typtype = 'e'
+ WHERE n.nspname = '$Schema' AND t.typtype = 'e'
  ORDER BY 1;
 "@
+}
 
-$coordEnums = Invoke-PgQuery @"
-SELECT t.typname FROM pg_type t
-  JOIN pg_namespace n ON n.oid = t.typnamespace
- WHERE n.nspname = 'coord' AND t.typtype = 'e'
- ORDER BY 1;
-"@
+# Fast membership set for the pilot carve-out.
+$pilotSet = @{}
+foreach ($schema in $PilotTables.Keys) {
+    foreach ($table in $PilotTables[$schema]) { $pilotSet["$schema.$table"] = $true }
+}
 
+# Serialization order is part of the file's identity (a reordering would read
+# as drift), so it is fixed here: all relations schema-by-schema, then all
+# enums schema-by-schema -- which reproduces the original
+# project/coord/project-enums/coord-enums order, with the two orchestration
+# groups appended inside their halves.
 $patterns = @()
-$projectTables | ForEach-Object { if ($_) { $patterns += "project.$_" } }
-$coordTables   | ForEach-Object { if ($_) { $patterns += "coord.$_" } }
-$projectEnums  | ForEach-Object { if ($_) { $patterns += "project.$_" } }
-$coordEnums    | ForEach-Object { if ($_) { $patterns += "coord.$_" } }
+foreach ($schema in $PilotSchemas) {
+    foreach ($relname in (Get-SchemaRelations -Schema $schema)) {
+        if (-not $relname) { continue }
+        # Filtered here rather than in SQL so the pilot set is declared exactly
+        # once, above, instead of being smeared across per-schema predicates
+        # that nobody remembers to update.
+        if ($pilotSet.ContainsKey("$schema.$relname")) { continue }
+        $patterns += "$schema.$relname"
+    }
+}
+foreach ($schema in $PilotSchemas) {
+    foreach ($typname in (Get-SchemaEnums -Schema $schema)) {
+        if (-not $typname) { continue }
+        # schema.hcl declares no enums, so every enum is alembic-owned. If that
+        # ever changes, the enum belongs in $PilotTables and the consistency
+        # checker will say so.
+        if ($pilotSet.ContainsKey("$schema.$typname")) { continue }
+        $patterns += "$schema.$typname"
+    }
+}
 
 # Zero patterns is never legitimate -- the project/coord schemas always contain
 # non-pilot objects. An empty set means the queries returned nothing (silent
@@ -140,7 +248,7 @@ if ($Check) {
     # `::error::` is the GitHub Actions error-annotation prefix (harmless plain
     # text locally). Use Write-Host, not Write-Error: writing to the error
     # stream makes powershell.exe -File override the exit code, masking our
-    # explicit `exit 1`.
+    # explicit `exit 2`.
     Write-Host "::error::atlas/exclude.txt is STALE relative to a fresh regen against the live schema."
     Write-Host "A qontinui-web alembic migration likely added or removed a project/coord table."
     Write-Host "Regenerate + commit locally:"
@@ -167,7 +275,9 @@ if ($Check) {
         Write-Host "  (no line-set difference -- delta is case/whitespace/newline only;"
         Write-Host "   compare the committed file against the 'atlas-exclude-fresh' artifact byte-for-byte)"
     }
-    exit 1
+    # 2, not 1: DRIFT, distinct from the failure paths above which throw (or
+    # exit 1). See the EXIT CODES block at the top of this file.
+    exit 2
 }
 
 [System.IO.File]::WriteAllText($outFile, $content)
