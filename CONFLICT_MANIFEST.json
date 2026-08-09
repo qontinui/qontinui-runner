@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "base_sha": "44ed7358865a277545f79f3b697abd0bedea8a38",
+  "ours_sha": "c4cfa726128f5a618fc87d49172317c8d0aca3f6",
+  "theirs_sha": "443ca3d715b5c36bfa16f83b3641b1572f92afa6",
+  "entries": [
+    {
+      "path": "Cargo.lock",
+      "base_oid": "e1012b03aa68c7b7b6c5dc6d204f5e9f4a521ae4",
+      "ours_oid": "5d4ee620bb14a0942eb5449fadde0a115067e307",
+      "theirs_oid": "6487f11995e8dd178528e01549e2cde1f0f5131d",
+      "base_path": "Cargo.lock.base",
+      "ours_path": "Cargo.lock.ours",
+      "theirs_path": "Cargo.lock.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\nversion = \"1.5.0\"\n=======\nversion = \"1.4.0\"\n>>>>>>> c4cfa726 (chore: adapt Cargo.lock to qontinui-types 1.4.0)\n"
+      ]
+    }
+  ]
+}

@@ -6633,7 +6633,7 @@ dependencies = [
 
 [[package]]
 name = "qontinui-runner"
-version = "1.0.8"
+version = "1.0.7"
 dependencies = [
  "adb_client",
  "aes-gcm",
@@ -6711,7 +6711,6 @@ dependencies = [
  "subtle",
  "syn 2.0.117",
  "sysinfo",
- "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -6781,11 +6780,7 @@ dependencies = [
 
 [[package]]
 name = "qontinui-types"
-<<<<<<< HEAD
-version = "1.5.0"
-=======
-version = "1.4.0"
->>>>>>> c4cfa726 (chore: adapt Cargo.lock to qontinui-types 1.4.0)
+version = "1.2.0"
 dependencies = [
  "chrono",
  "hex",

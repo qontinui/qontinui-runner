@@ -6781,11 +6781,7 @@ dependencies = [
 
 [[package]]
 name = "qontinui-types"
-<<<<<<< HEAD
 version = "1.5.0"
-=======
-version = "1.4.0"
->>>>>>> c4cfa726 (chore: adapt Cargo.lock to qontinui-types 1.4.0)
 dependencies = [
  "chrono",
  "hex",
