@@ -821,6 +821,35 @@ impl RunnerObservableBridge for GitOpBridge {
         // (1) Stale-hook self-heal FIRST — idempotent crash recovery.
         self_heal_hook(&hooks_dir);
 
+        // (1b) The `git_op` kill switch, read HERE — per dispatch, after the
+        // self-heal, before anything is installed or watched.
+        //
+        // Read per-session rather than once at startup because this fleet
+        // never restarts runners (`production-and-cost` `runner-lifecycle`);
+        // a startup-read flag would be a control nobody could actually
+        // operate. The resolver re-reads settings on every call, so editing
+        // `settings.json` takes effect on the next session with no restart.
+        //
+        // Deliberately NOT gating `build_federation_ctx` or the registry:
+        // both are shared by every observable bridge, and gating a shared
+        // layer with a category-named flag is exactly the bug that left this
+        // category switchless when `memory_federation_enabled` was deleted.
+        //
+        // Ordered AFTER `self_heal_hook` on purpose: a leaked hook from an
+        // earlier crash is a mess to clean up regardless of whether
+        // federation is currently wanted. Returning before the self-heal
+        // would strand that hook permanently the moment someone set the flag
+        // to false.
+        //
+        // Plan: `2026-07-28-git-op-federation-lost-its-kill-switch`.
+        if !super::git_op_federation_enabled() {
+            debug!(
+                "observable_bridge::git_op: git_op_federation_enabled=false; \
+                 git federation skipped this session (leaked-hook self-heal still ran)"
+            );
+            return Ok(());
+        }
+
         let mut guard = self.watchers.lock().await;
         if let Some(prev) = guard.remove(&session_id) {
             prev.cancel.cancel();
