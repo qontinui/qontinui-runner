@@ -184,6 +184,12 @@ pub fn save_ai_settings(
         interactive_sessions_enabled: interactive_sessions_enabled
             .unwrap_or(existing_settings.interactive_sessions_enabled),
         ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+        // PRESERVE — no frontend surface sends this yet, so a save that
+        // reconstructed it from the default would silently re-enable git-op
+        // federation for anyone who had opted out, every time they touched an
+        // unrelated AI setting. Plan:
+        // `2026-07-28-git-op-federation-lost-its-kill-switch`.
+        git_op_federation_enabled: existing_settings.git_op_federation_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {
@@ -278,6 +284,9 @@ pub fn save_gemini_settings(
         routing: existing_settings.routing,
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
         ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+        // Preserve — see the note in `save_ai_settings`; reconstructing this
+        // from the default would silently re-enable federation on every save.
+        git_op_federation_enabled: existing_settings.git_op_federation_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {
@@ -964,6 +973,9 @@ pub fn save_agentic_settings(
         routing: routing_config,
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
         ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+        // Preserve — see the note in `save_ai_settings`; reconstructing this
+        // from the default would silently re-enable federation on every save.
+        git_op_federation_enabled: existing_settings.git_op_federation_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {

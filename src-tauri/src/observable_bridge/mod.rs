@@ -59,6 +59,43 @@ pub fn global_registry() -> &'static [Arc<dyn RunnerObservableBridge>] {
     GLOBAL_REGISTRY.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
+/// Resolves the `git_op` category's kill switch, per call.
+///
+/// This indirection exists for a crate-boundary reason, not a stylistic
+/// one: `GitOpBridge` lives in the **lib** crate (`qontinui_runner_lib`)
+/// while `settings` lives in the **bin** crate, so the bridge cannot call
+/// `settings::load_settings()` directly. The bin installs a closure here at
+/// startup; the lib invokes it at dispatch.
+///
+/// Storing a **function** rather than a `bool` is the whole point. The
+/// closure re-reads settings on every invocation, so the flag stays
+/// hot-swappable — edit `settings.json` and the next session honours it,
+/// with no runner restart. A cached `bool` would silently turn this back
+/// into the startup-read control the plan rejected, and this fleet never
+/// restarts runners, so that control could never be exercised.
+///
+/// Plan: `2026-07-28-git-op-federation-lost-its-kill-switch`.
+static GIT_OP_ENABLED_PROVIDER: OnceCell<Box<dyn Fn() -> bool + Send + Sync>> = OnceCell::new();
+
+/// Install the `git_op` kill-switch resolver. Called once from the bin's
+/// Tauri `.setup`, alongside [`init_registry`]. Idempotent — a second call
+/// is silently ignored, matching [`init_registry`]'s contract.
+pub fn init_git_op_enabled_provider(resolver: Box<dyn Fn() -> bool + Send + Sync>) {
+    let _ = GIT_OP_ENABLED_PROVIDER.set(resolver);
+}
+
+/// Is `git_op` federation currently enabled?
+///
+/// **Defaults to `true` when no provider is installed** — matching the
+/// setting's own `default ON` contract. The uninstalled case is the lib
+/// used without the bin (unit tests, the `wrappers_mcp` helper binary),
+/// never a signed-out or misconfigured runner, so defaulting off here
+/// would disable federation in exactly the situations where nobody asked
+/// for it to be off.
+pub fn git_op_federation_enabled() -> bool {
+    GIT_OP_ENABLED_PROVIDER.get().map(|f| f()).unwrap_or(true)
+}
+
 /// Per-session context every bridge receives.
 ///
 /// `tenant_id` is carried for local bookkeeping + UI surfacing only —

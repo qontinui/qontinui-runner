@@ -2407,6 +2407,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
+                // Install the `git_op` kill-switch resolver BEFORE publishing
+                // the registry, so a bridge is never reachable without the
+                // switch that governs it. (Both calls sit in the same
+                // synchronous `.setup` closure, so no spawn can interleave
+                // today — this ordering just refuses to depend on that.)
+                //
+                // The bridge lives in the lib crate and `settings` lives here
+                // in the bin, so the lib cannot read the setting itself; it
+                // calls back through this closure instead.
+                //
+                // Registration happens once; the RESOLUTION happens per
+                // session, because this closure re-reads settings on every
+                // call. That is what keeps the flag flippable without a
+                // runner restart — this fleet never restarts runners, so a
+                // value cached here would make the switch inoperable.
+                //
+                // Plan: `2026-07-28-git-op-federation-lost-its-kill-switch`.
+                qontinui_runner_lib::observable_bridge::init_git_op_enabled_provider(Box::new(
+                    || settings::load_settings().ai.git_op_federation_enabled,
+                ));
                 qontinui_runner_lib::observable_bridge::init_registry(bridges);
             }
 

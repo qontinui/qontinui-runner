@@ -446,9 +446,33 @@ pub struct AiSettings {
     /// regex extractor is always on regardless of this flag.
     #[serde(default = "default_ai_path_prediction_enabled")]
     pub ai_path_prediction_enabled: bool,
+    /// Federate git ops (branch/commit/push/rebase) to coord's
+    /// `/coord/git-ops/record` feed. Default ON.
+    ///
+    /// Scoped to the `git_op` category ONLY, and read at DISPATCH time in
+    /// `GitOpBridge::start_watching` — never at the shared
+    /// `build_federation_ctx` layer, and never once at startup.
+    ///
+    /// Both halves of that are deliberate. Gating the shared context layer is
+    /// what left this category switchless when the memory-named flag was
+    /// deleted: `memory_federation_enabled` was named for one capability but
+    /// wired at a layer common to every observable bridge, so removing the
+    /// memory bridge silently removed git-op's off switch too. And reading it
+    /// once at startup would make the flag unusable in practice — this fleet
+    /// never restarts runners, so a startup-read control cannot be exercised
+    /// at all. Per-dispatch is cheap here by the codebase's own standard:
+    /// `load_settings()` already runs on hot paths (see `record_settings_fault`).
+    ///
+    /// Plan: `2026-07-28-git-op-federation-lost-its-kill-switch`.
+    #[serde(default = "default_git_op_federation_enabled")]
+    pub git_op_federation_enabled: bool,
 }
 
 fn default_interactive_sessions_enabled() -> bool {
+    true
+}
+
+fn default_git_op_federation_enabled() -> bool {
     true
 }
 
@@ -477,6 +501,7 @@ impl Default for AiSettings {
             routing: RoutingConfig::default(),
             interactive_sessions_enabled: default_interactive_sessions_enabled(),
             ai_path_prediction_enabled: default_ai_path_prediction_enabled(),
+            git_op_federation_enabled: default_git_op_federation_enabled(),
         }
     }
 }
@@ -1019,6 +1044,64 @@ pub struct PathSettings {
     /// Default: false (permissive). Individual workflows can override via `strict_cwd`.
     #[serde(default)]
     pub strict_mode: bool,
+}
+
+#[cfg(test)]
+mod git_op_federation_flag_tests {
+    use super::*;
+
+    /// The `git_op` kill switch defaults ON, and — critically — an
+    /// AiSettings blob that predates the field must still load, taking that
+    /// default rather than failing the whole settings read.
+    ///
+    /// This test is the durable guard against the failure that produced this
+    /// plan. `memory_federation_enabled` was deleted and nothing noticed,
+    /// because nothing asserted the switch existed or worked. A UI toggle was
+    /// considered as the fix for that class and rejected as the weaker one: a
+    /// toggle can be removed as silently as the setting. A test cannot.
+    ///
+    /// Plan: `2026-07-28-git-op-federation-lost-its-kill-switch`.
+    #[test]
+    fn git_op_federation_defaults_on_and_old_configs_still_load() {
+        assert!(
+            AiSettings::default().git_op_federation_enabled,
+            "git_op federation must default ON — a default-off kill switch \
+             would silently disable federation on every existing install"
+        );
+
+        // A pre-field config: no `git_op_federation_enabled` key at all, and
+        // carrying the long-deleted `memory_federation_enabled` key that real
+        // settings.json files on this fleet still hold. Both must be tolerated
+        // — the unknown key because AiSettings has no `deny_unknown_fields`,
+        // the missing one because of `#[serde(default = ...)]`.
+        let legacy = serde_json::json!({
+            "provider": AiSettings::default().provider,
+            "claude_cli": AiSettings::default().claude_cli,
+            "claude_api": AiSettings::default().claude_api,
+            "memory_federation_enabled": false,
+        });
+        let parsed: AiSettings =
+            serde_json::from_value(legacy).expect("a pre-field AiSettings blob must still load");
+        assert!(
+            parsed.git_op_federation_enabled,
+            "a config written before this field existed must take the ON default"
+        );
+
+        // And an explicit opt-out must actually round-trip, or the switch is
+        // decorative.
+        let disabled = serde_json::json!({
+            "provider": AiSettings::default().provider,
+            "claude_cli": AiSettings::default().claude_cli,
+            "claude_api": AiSettings::default().claude_api,
+            "git_op_federation_enabled": false,
+        });
+        let parsed: AiSettings =
+            serde_json::from_value(disabled).expect("an explicit opt-out must parse");
+        assert!(
+            !parsed.git_op_federation_enabled,
+            "an explicit `false` must survive deserialization"
+        );
+    }
 }
 
 #[cfg(test)]
