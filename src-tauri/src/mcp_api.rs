@@ -1857,6 +1857,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_layering_triage",
     "coord_list_prompt_documents",
     "coord_list_worktrees",
+    "coord_memory_overview",
     "coord_memory_record",
     "coord_memory_search",
     "coord_merge_order",
@@ -1905,6 +1906,107 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
         || COORD_MCP_ALLOWED_TOOL_PREFIXES
             .iter()
             .any(|p| name.starts_with(p))
+}
+
+/// Is this request body a `tools/list` (single or anywhere in a batch)?
+///
+/// Deliberately permissive about the batch case: only a `tools/list` response
+/// carries `result.tools`, so a batch that contains one is enough to justify
+/// walking the response.
+fn coord_mcp_request_is_tools_list(body: &[u8]) -> bool {
+    // Cheap pre-check first. This runs on EVERY proxied request, and the gate
+    // has already parsed the body once; a substring miss rules out `tools/list`
+    // without a second full parse. A hit still falls through to the real parse,
+    // so the literal appearing inside an argument string proves nothing on its
+    // own.
+    const NEEDLE: &[u8] = b"tools/list";
+    if !body.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+        return false;
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let is_list =
+        |v: &serde_json::Value| v.get("method").and_then(|m| m.as_str()) == Some("tools/list");
+    match &parsed {
+        serde_json::Value::Array(elems) => elems.iter().any(is_list),
+        other => is_list(other),
+    }
+}
+
+/// Drop non-allowlisted entries from ONE response object's `result.tools`,
+/// recording each dropped name in `removed`. An entry without a string `name`
+/// is removed too: it can never satisfy [`coord_mcp_tool_is_allowed`], so it is
+/// exactly as uncallable as a refused one; it is recorded as `(unnamed)`.
+///
+/// The names are collected rather than merely counted so the caller can LOG
+/// them. A capability this door subtracts silently is the exact failure this
+/// whole function exists to stop being invisible.
+fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Vec<String>) {
+    let tools = match resp
+        .pointer_mut("/result/tools")
+        .and_then(|t| t.as_array_mut())
+    {
+        Some(t) => t,
+        None => return,
+    };
+    tools.retain(|t| match t.get("name").and_then(|n| n.as_str()) {
+        Some(name) if coord_mcp_tool_is_allowed(name) => true,
+        Some(name) => {
+            removed.push(name.to_string());
+            false
+        }
+        None => {
+            removed.push("(unnamed)".to_string());
+            false
+        }
+    });
+}
+
+/// Filter a `tools/list` RESPONSE through the SAME allowlist that gates
+/// `tools/call` ([`coord_mcp_tool_is_allowed`]).
+///
+/// Without this the two gates disagree. The request gate ([`coord_mcp_body_gate`])
+/// refuses a `tools/call` for a tool missing from [`COORD_MCP_ALLOWED_TOOLS`],
+/// but the response was forwarded verbatim — so `tools/list` advertised every
+/// tool coord grants the device, including ones this proxy will never forward.
+/// A session could see such a tool, load its schema, and get -32601 only on
+/// use. Verified 2026-08-10 with `coord_memory_overview`: landed and deployed
+/// in coord's device grant, listed here, uncallable through this door.
+///
+/// Absence from `tools/list` is the signal sessions already read this door with
+/// (a tool that is not there is understood as not available). Making the list
+/// agree with the gate is what keeps that signal honest — and it is why adding
+/// a name to [`COORD_MCP_ALLOWED_TOOLS`] is the ONE place that now controls
+/// both visibility and callability.
+///
+/// Returns `None` when nothing was removed, so the untouched upstream bytes are
+/// forwarded byte-identically — the overwhelmingly common case, and the one
+/// where re-serialising would be pure risk for no gain. `Some((bytes, removed))`
+/// carries the dropped tool NAMES so the caller can log them.
+fn coord_mcp_filter_tools_list_response(
+    request: &[u8],
+    response: &[u8],
+) -> Option<(Vec<u8>, Vec<String>)> {
+    if !coord_mcp_request_is_tools_list(request) {
+        return None;
+    }
+    let mut parsed: serde_json::Value = serde_json::from_slice(response).ok()?;
+    let mut removed: Vec<String> = Vec::new();
+    match &mut parsed {
+        serde_json::Value::Array(elems) => {
+            for elem in elems.iter_mut() {
+                coord_mcp_retain_allowed_tools(elem, &mut removed);
+            }
+        }
+        other => coord_mcp_retain_allowed_tools(other, &mut removed),
+    }
+    if removed.is_empty() {
+        return None;
+    }
+    let bytes = serde_json::to_vec(&parsed).ok()?;
+    Some((bytes, removed))
 }
 
 /// A gate rejection: the JSON-RPC `id` to echo (Null when unparseable) plus a
@@ -2768,8 +2870,33 @@ async fn coord_mcp_proxy_handler(
             .into_response();
     }
 
+    // Keep the two gates in agreement: a `tools/list` answer is filtered
+    // through the same allowlist that gates `tools/call`, so this door never
+    // advertises a tool it would refuse to forward. See
+    // [`coord_mcp_filter_tools_list_response`]. `None` = nothing removed =
+    // forward the upstream bytes untouched.
+    let out_body = match coord_mcp_filter_tools_list_response(&body, &bytes) {
+        Some((filtered, removed)) => {
+            // INFO, not debug: this is a capability coord granted that this
+            // door withholds. It is usually correct (privileged families), but
+            // when it is NOT — a tool added to coord's grant and missed here —
+            // this line is the only thing standing between the next engineer
+            // and an hour of "why is it listed but -32601?".
+            info!(
+                removed_count = removed.len(),
+                removed = %removed.join(","),
+                "coord-mcp proxy: withheld non-allowlisted tools from a tools/list response"
+            );
+            axum::body::Body::from(filtered)
+        }
+        None => axum::body::Body::from(bytes),
+    };
+
     let mut builder = axum::http::Response::builder().status(status_code);
     for (name, value) in upstream_headers.iter() {
+        // `content-length` is dropped here anyway, which is also what makes the
+        // tools/list filter above safe: the forwarded body may be shorter than
+        // upstream's.
         if matches!(
             name.as_str(),
             "content-length" | "transfer-encoding" | "connection"
@@ -2778,25 +2905,23 @@ async fn coord_mcp_proxy_handler(
         }
         builder = builder.header(name.as_str(), value.as_bytes());
     }
-    builder
-        .body(axum::body::Body::from(bytes))
-        .unwrap_or_else(|e| {
-            warn!(
-                "coord-mcp proxy: response build failed \
+    builder.body(out_body).unwrap_or_else(|e| {
+        warn!(
+            "coord-mcp proxy: response build failed \
                  (upstream_url={url}, coord_base_source={coord_base_source}): {e}"
-            );
-            (
-                axum::http::StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": format!("coord /mcp response build failed: {e}"),
-                    "code": "COORD_MCP_PROXY_RESPONSE_BUILD_FAILED",
-                    "upstream_url": url,
-                    "coord_base_source": coord_base_source.as_str(),
-                })),
-            )
-                .into_response()
-        })
+        );
+        (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!("coord /mcp response build failed: {e}"),
+                "code": "COORD_MCP_PROXY_RESPONSE_BUILD_FAILED",
+                "upstream_url": url,
+                "coord_base_source": coord_base_source.as_str(),
+            })),
+        )
+            .into_response()
+    })
 }
 
 /// The ONLY coord READ routes the nonce-gated read passthrough may reach:
@@ -7049,8 +7174,8 @@ mod memory_search_enrichment_tests {
 #[cfg(test)]
 mod coord_mcp_body_gate_tests {
     use super::{
-        coord_mcp_body_gate, coord_mcp_tool_is_allowed, COORD_MCP_ALLOWED_METHODS,
-        COORD_MCP_ALLOWED_TOOLS,
+        coord_mcp_body_gate, coord_mcp_filter_tools_list_response, coord_mcp_tool_is_allowed,
+        COORD_MCP_ALLOWED_METHODS, COORD_MCP_ALLOWED_TOOLS,
     };
 
     fn gate(v: serde_json::Value) -> Result<(), (serde_json::Value, String)> {
@@ -7115,6 +7240,14 @@ mod coord_mcp_body_gate_tests {
             // the registry confers no authority to spawn; that stays with
             // `agent-spawn-authorization`.
             "coord_agent_registry_effective",
+            // The corpus-orientation read. THIRD instance of the same silent
+            // capability subtraction as the two above: it landed in coord's
+            // device grant (`DEVICE_DEFAULT_TOOLS`) and deployed, but this
+            // list was not updated, so every device session could SEE it in
+            // `tools/list` and got -32601 on use. Blind `coord_memory_search`
+            // is exactly what it exists to prevent, so withholding it here
+            // re-opened the gap it closed.
+            "coord_memory_overview",
         ] {
             assert!(
                 gate(serde_json::json!({
@@ -7123,6 +7256,163 @@ mod coord_mcp_body_gate_tests {
                 }))
                 .is_ok(),
                 "{tool} must pass the gate"
+            );
+        }
+    }
+
+    /// Build a `tools/list` response advertising `names`.
+    fn tools_list_response(names: &[&str]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": names
+                    .iter()
+                    .map(|n| serde_json::json!({"name": n, "description": "x"}))
+                    .collect::<Vec<_>>()
+            }
+        }))
+        .unwrap()
+    }
+
+    const TOOLS_LIST_REQ: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+    /// Names surviving the filter, plus the names it reported removing.
+    fn filtered_names(request: &str, response: &[u8]) -> Option<(Vec<String>, Vec<String>)> {
+        let (out, removed) = coord_mcp_filter_tools_list_response(request.as_bytes(), response)?;
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let kept = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        Some((kept, removed))
+    }
+
+    /// THE REGRESSION. `tools/list` must not advertise a tool `tools/call`
+    /// would refuse — the two gates share `coord_mcp_tool_is_allowed`, so a
+    /// tool is visible if and only if it is callable.
+    #[test]
+    fn tools_list_never_advertises_an_uncallable_tool() {
+        let advertised = [
+            "coord_orient",          // allowlisted
+            "coord_memory_overview", // allowlisted (the 2026-08-10 fix)
+            "coord_query_health",    // prefix family
+            "coord_request_merge",   // privileged — must be hidden
+            "coord_create_pr",       // privileged — must be hidden
+            "totally_made_up_tool",  // unknown — must be hidden
+        ];
+        let (names, removed) = filtered_names(TOOLS_LIST_REQ, &tools_list_response(&advertised))
+            .expect("privileged tools were advertised, so something must be removed");
+        assert_eq!(
+            names,
+            vec![
+                "coord_orient",
+                "coord_memory_overview",
+                "coord_query_health"
+            ]
+        );
+        // The withheld names are reported so the caller can log them by name.
+        assert_eq!(
+            removed,
+            vec![
+                "coord_request_merge",
+                "coord_create_pr",
+                "totally_made_up_tool"
+            ]
+        );
+        // The property, stated directly: everything still listed passes the
+        // very gate that guards `tools/call`.
+        for n in &names {
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":n,"arguments":{}}
+                }))
+                .is_ok(),
+                "{n} is listed but would be refused on call"
+            );
+        }
+    }
+
+    /// Nothing to remove → `None` → the upstream bytes are forwarded
+    /// byte-identically. Re-serialising a clean response would be risk for no
+    /// gain, and this is the common case.
+    #[test]
+    fn tools_list_untouched_when_every_tool_is_allowed() {
+        let clean = tools_list_response(&["coord_orient", "coord_query_health"]);
+        assert!(coord_mcp_filter_tools_list_response(TOOLS_LIST_REQ.as_bytes(), &clean).is_none());
+    }
+
+    /// The filter is scoped to `tools/list`. A different method carrying a
+    /// `result.tools`-shaped payload must pass through untouched — the filter
+    /// must not become a general response rewriter.
+    #[test]
+    fn filter_only_applies_to_tools_list_requests() {
+        let resp = tools_list_response(&["coord_request_merge"]);
+        for req in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_orient"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "not json at all",
+            // The literal "tools/list" inside an ARGUMENT must not be mistaken
+            // for the method — the cheap substring pre-check in
+            // `coord_mcp_request_is_tools_list` hits here, so this pins that it
+            // still falls through to the real parse and answers on `method`.
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_send_message","arguments":{"body":"see tools/list output"}}}"#,
+        ] {
+            assert!(
+                coord_mcp_filter_tools_list_response(req.as_bytes(), &resp).is_none(),
+                "{req} must not trigger response filtering"
+            );
+        }
+    }
+
+    /// Batch bodies: a `tools/list` anywhere in the batch filters every
+    /// element that carries `result.tools`.
+    #[test]
+    fn filter_handles_batch_bodies() {
+        let req = format!("[{TOOLS_LIST_REQ}]");
+        let resp = serde_json::to_vec(&serde_json::json!([{
+            "jsonrpc":"2.0","id":1,
+            "result":{"tools":[{"name":"coord_orient"},{"name":"coord_create_pr"}]}
+        }]))
+        .unwrap();
+        let (out, _removed) =
+            coord_mcp_filter_tools_list_response(req.as_bytes(), &resp).expect("filtered");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let tools = v[0]["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "coord_orient");
+    }
+
+    /// A malformed entry with no string `name` is uncallable by construction
+    /// (the gate needs a name), so it is removed rather than advertised.
+    #[test]
+    fn filter_drops_entries_without_a_name() {
+        let resp = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{"tools":[{"name":"coord_orient"},{"description":"nameless"}]}
+        }))
+        .unwrap();
+        let (names, removed) =
+            filtered_names(TOOLS_LIST_REQ, &resp).expect("the nameless entry is removed");
+        assert_eq!(names, vec!["coord_orient"]);
+        assert_eq!(removed, vec!["(unnamed)"]);
+    }
+
+    /// A response that is not JSON, or has no `result.tools`, is forwarded
+    /// untouched — the filter never turns an upstream body into an error.
+    #[test]
+    fn filter_tolerates_unparseable_and_shapeless_responses() {
+        for resp in [
+            b"<html>gateway error</html>".as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}}"#.as_slice(),
+        ] {
+            assert!(
+                coord_mcp_filter_tools_list_response(TOOLS_LIST_REQ.as_bytes(), resp).is_none(),
+                "unparseable/shapeless responses must forward untouched"
             );
         }
     }
