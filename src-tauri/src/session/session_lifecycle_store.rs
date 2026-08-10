@@ -2374,6 +2374,22 @@ mod tests {
     /// nowhere in this file as a contiguous literal, deliberately: a
     /// grep-shaped guard that writes its own needle in prose flags ITSELF, which
     /// is how the first draft of this test failed.
+    ///
+    /// ## What this guard does NOT cover
+    ///
+    /// It catches the NAMED shape, not all re-derivation. Two known gaps, stated
+    /// so nobody reads a green here as broader assurance than it is:
+    /// - Assertion 1 is satisfied by a *mention* of `snapshot_history_path()`
+    ///   anywhere in the file, including inside a doc comment. A reader that
+    ///   keeps the comment while re-deriving the path elsewhere still passes.
+    /// - Assertion 3's needle is the co-occurrence of `session_restore_dir` and
+    ///   `session-snapshots`. A path hand-rolled without naming the helper is
+    ///   invisible to it. That evasion shape already exists in-tree:
+    ///   `instance.rs` composes
+    ///   `base.join("session-restore").join("session-snapshots.jsonl")` and this
+    ///   guard does not see it. That instance is benign — it is a pure
+    ///   path-composition test with no runtime reader behind it — but it proves
+    ///   the gap is reachable rather than theoretical.
     #[test]
     fn readers_must_not_re_derive_the_snapshot_history_path() {
         // Split so this file does not contain the literal it searches for.
@@ -2381,9 +2397,14 @@ mod tests {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         collect_rs_files(&src, &mut files);
+        // Anchored to the real tree size (1486 files at the time of writing).
+        // A low floor is worse than none: it lets a whole subtree drop out of
+        // the walk while the assert still passes — `src/mcp/` alone is 152
+        // files and `src/commands/` 112.
         assert!(
-            files.len() > 100,
-            "sanity: expected to walk the whole src tree, found {} files",
+            files.len() > 1_000,
+            "sanity: expected to walk the whole src tree, found only {} files — \
+             a subtree is missing and this guard has scanned less than it thinks",
             files.len()
         );
 
@@ -2398,25 +2419,36 @@ mod tests {
             );
         }
 
-        // 2 + 3.
-        const OWNS_THE_PAIRING: &[&str] = &["session_lifecycle_store.rs", "snapshot_history.rs"];
+        // 2 + 3. Exempt by RELATIVE PATH, never by basename: a future
+        // `src/mcp/snapshot_history.rs` or `src/diagnostics/session_lifecycle_store.rs`
+        // would otherwise be silently exempt from assertion 3 — precisely the
+        // "new reader in a new file" case this guard exists for, defeated by
+        // choice of filename.
+        const OWNS_THE_PAIRING: &[&str] = &[
+            "session/session_lifecycle_store.rs",
+            "session/snapshot_history.rs",
+        ];
         for path in &files {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let body = match std::fs::read_to_string(path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
+            let rel = path
+                .strip_prefix(&src)
+                .unwrap_or_else(|e| {
+                    panic!("{} is not under {}: {e}", path.display(), src.display())
+                })
+                .to_string_lossy()
+                .replace('\\', "/");
+            let body = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
             assert!(
                 !body.contains(DELETED_HELPER),
-                "{name} references the DELETED port-keyed reader helper ({DELETED_HELPER}) — \
+                "{rel} references the DELETED port-keyed reader helper ({DELETED_HELPER}) — \
                  it WAS the read/write divergence; resolve through snapshot_history_path()"
             );
-            if OWNS_THE_PAIRING.contains(&name.as_str()) {
+            if OWNS_THE_PAIRING.contains(&rel.as_str()) {
                 continue;
             }
             assert!(
                 !(body.contains("session_restore_dir") && body.contains("session-snapshots")),
-                "{name} mentions BOTH `session_restore_dir` and `session-snapshots`, which is \
+                "{rel} mentions BOTH `session_restore_dir` and `session-snapshots`, which is \
                  how the Phase 4 divergence was written: the hook dir is deliberately UNSCOPED \
                  (it is the Claude SessionStart materialization target), so a snapshot path \
                  built from it points at a file nothing writes on every secondary. Resolve \
@@ -2427,12 +2459,19 @@ mod tests {
 
     /// Recursively collect `*.rs` under `dir` (test helper for the grep-shaped
     /// guard above).
+    ///
+    /// PANICS on any walk error rather than skipping the subtree. Returning
+    /// early on `Err` would drop a whole directory from the scan while the
+    /// caller's file-count floor still passed — the guard would report green
+    /// having examined less than it thinks (`verification-and-evidence`
+    /// `silent-empty-is-unknown`). A Windows long-path or transient permission
+    /// error on `src/mcp/` alone would hide 152 files.
     fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("walking {}: {e}", dir.display()));
+        for entry in entries {
+            let entry =
+                entry.unwrap_or_else(|e| panic!("reading an entry of {}: {e}", dir.display()));
             let path = entry.path();
             if path.is_dir() {
                 collect_rs_files(&path, out);

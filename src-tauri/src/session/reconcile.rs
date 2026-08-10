@@ -1167,12 +1167,32 @@ pub fn disk_only_restore_candidates(
     )
 }
 
+/// TEST-ONLY invocation counter for [`scan_every_claude_config_dir`], so
+/// `production_wiring_uses_the_fail_closed_primary_predicate` can assert the
+/// property the guard actually encodes — that the machine-global scan NEVER
+/// RUNS on a secondary — instead of inferring it from an empty return value.
+///
+/// Inference from the output is vacuous on a clean CI runner: all four
+/// [`crate::terminal::transcript::find_claude_config_dirs`] sources are empty
+/// there (`CLAUDE_CONFIG_DIR` unset, no persisted settings, no
+/// `C:\claude\.claude-*`, no `%USERPROFILE%\.claude` — and on Linux
+/// `USERPROFILE` is not even set), so a runner whose guard had been swapped for
+/// the fail-OPEN `!is_secondary()` would still return `[]` and the test would
+/// pass. Counting invocations is red under that mutant on ANY machine.
+///
+/// Compiled out entirely in release (`#[cfg(test)]`).
+#[cfg(test)]
+pub(crate) static SCAN_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// The real machine-global scan behind [`disk_only_restore_candidates`]: every
 /// Claude config dir on the box (see
 /// [`crate::terminal::transcript::find_claude_config_dirs`] — including its
 /// hardcoded `C:\claude\.claude-*` sweep), each walked for transcripts active
 /// within [`DISK_ONLY_RESTORE_WINDOW_MS`].
 fn scan_every_claude_config_dir(now_ms: i64) -> Vec<crate::terminal::transcript::RecentTranscript> {
+    #[cfg(test)]
+    SCAN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
     let mut recent = Vec::new();
     for dir in &config_dirs {
@@ -2145,20 +2165,45 @@ mod tests {
     /// returns before any I/O, so this never touches the filesystem despite
     /// calling the production entry point.
     ///
+    /// **The load-bearing assertion is the [`SCAN_CALLS`] delta, NOT
+    /// `is_empty()`.** Asserting emptiness alone is VACUOUS on a clean CI
+    /// runner: all four `find_claude_config_dirs` sources are absent there, so a
+    /// build whose guard had been swapped for the fail-OPEN `!is_secondary()`
+    /// would scan, find nothing, return `[]`, and pass — catching the mutant
+    /// only on a dev box that happens to hold transcripts, i.e. the machine
+    /// where you would have noticed anyway. Counting real scan invocations is
+    /// red under that mutant everywhere. (`now_ms = 0` deliberately defeats the
+    /// window filter — `0.saturating_sub(mtime) > WINDOW` is false for any
+    /// positive mtime — so age can never be the reason the result is empty.)
+    ///
     /// Sets ONLY `QONTINUI_INSTANCE_NAME` — `resolve_data_subdir` answers on its
     /// first branch from the name alone, so this cannot flake on the
-    /// `QONTINUI_PORT` that `scheduler_service`'s tests mutate concurrently.
+    /// `QONTINUI_PORT` that `scheduler_service`'s tests mutate concurrently. The
+    /// counter delta is likewise race-free: `disk_only_restore_candidates` has
+    /// exactly one production caller (`terminal_session_list_open`, a
+    /// `#[tauri::command]` no unit test invokes) and one test caller — this one,
+    /// which holds the shared env lock throughout.
     #[test]
     fn production_wiring_uses_the_fail_closed_primary_predicate() {
+        use std::sync::atomic::Ordering;
+
         let _env = crate::test_env::env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_INSTANCE_NAME"]);
         std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6faa3bf8-0");
-        assert!(
-            disk_only_restore_candidates(0, &HashSet::new()).is_empty(),
-            "the production adapter must gate on a predicate that reports FALSE \
-             for a named secondary — if this fails, the guard is inert and the \
-             machine-global scan is live on every temp runner again"
+
+        let before = SCAN_CALLS.load(Ordering::Relaxed);
+        let out = disk_only_restore_candidates(0, &HashSet::new());
+        assert_eq!(
+            SCAN_CALLS.load(Ordering::Relaxed),
+            before,
+            "the production adapter must gate on a predicate that reports FALSE for a named \
+             secondary, BEFORE the machine-global scan runs. A non-zero delta means the guard \
+             is inert (predicate inverted, hardcoded `true`, or swapped for the fail-OPEN \
+             `!is_secondary()`) and every temp runner is sweeping the whole box again."
         );
+        // Consequence of the above; on its own this is satisfiable by an empty
+        // machine, which is why it is not the gate.
+        assert!(out.is_empty(), "…so a named secondary is offered nothing");
     }
 
     /// Identity helper: the injected scan returns its corpus verbatim (the real
