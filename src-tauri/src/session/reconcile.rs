@@ -1040,12 +1040,25 @@ pub fn session_bound_payloads(actions: &[ReconcileAction]) -> Vec<SessionBoundPa
 /// 6h is a defensible middle ground: comfortably longer than any plausible
 /// crash→reboot gap (a genuine capture-miss during an active work session is
 /// still caught after a lunch-break-length outage), yet short enough that
-/// yesterday's finished sessions do not re-surface. The window only bounds how
-/// much is OFFERED; it never auto-resumes anything. The backstop for a stale
-/// candidate that slips through is the VERIFIED-RESUME handshake: a disk-only
-/// candidate is `origin=reconciled`+unconfirmed, so the frontend quarantines it
-/// behind a one-click operator confirm that TYPES the resume and verifies the
-/// handshake (parking on failure), never a blind `--resume`.
+/// yesterday's finished sessions do not re-surface.
+///
+/// **What the window and the quarantine actually bound (corrected 2026-08-10).**
+/// This doc used to claim the window "only bounds how much is OFFERED; it never
+/// auto-resumes anything". The second half is true only of the `--resume`
+/// TYPING, and that is not the cost that matters. A disk-only candidate is
+/// `origin=reconciled`+unconfirmed, so the frontend quarantines it behind a
+/// one-click operator confirm that types the resume and verifies the handshake
+/// (parking on failure), never a blind `--resume` — that part holds. But
+/// [`disk_only_record`] stamps `terminal_id: ""`, meaning the frontend creates a
+/// FRESH TERMINAL per candidate, and `useTerminalInitialization.ts`'s
+/// `recordBelongsToRestore` short-circuits on a same-page match (`pageId ==
+/// "default"`) BEFORE any classification runs. So every offered candidate
+/// materializes a PTY whether or not it is ever resumed. The quarantine gates
+/// the resume; nothing gated the admission. On the primary that is bounded (the
+/// operator has real pages, so `"default"` records fall through to the orphan
+/// path); on a secondary — whose only page IS `"default"` — it was unbounded,
+/// which is why the net is now primary-only (see
+/// [`disk_only_restore_candidates`]).
 pub const DISK_ONLY_RESTORE_WINDOW_MS: i64 = 6 * 60 * 60 * 1000;
 
 /// Build the quarantine-tier [`TerminalSessionRecord`] for one disk-only
@@ -1124,12 +1137,42 @@ pub fn select_disk_only_candidates(
 /// registry is still restorable — under the correct account, derived
 /// DYNAMICALLY from the config dir that holds its transcript.
 ///
+/// **PRIMARY-ONLY.** On any non-primary instance this returns an empty `Vec`
+/// without scanning at all. The net recovers sessions that were live when THIS
+/// runner crashed; a freshly spawned secondary has none, so its recovery value
+/// is exactly zero while its cost is the machine's entire recent transcript
+/// corpus — and its only filter is `registry_ids`, which on a fresh temp runner
+/// is EMPTY, so nothing is filtered and every in-window transcript on the box is
+/// offered (each materializing a PTY — see [`DISK_ONLY_RESTORE_WINDOW_MS`]).
+/// Removing a capability that cannot fire is not a tradeoff. The predicate is
+/// [`crate::instance::owns_shared_root_state`], which fails CLOSED for a
+/// nameless secondary; see [`disk_only_restore_candidates_with`].
+///
+/// Note this does NOT gate the machine-global transcript INDEX
+/// ([`DiskTranscriptIndex`], the [`crate::session::snapshot_history::TranscriptProbe`]):
+/// that answers "does this id have a conversation on disk" for rows the instance
+/// already owns, a read that stays correct and cheap on a secondary.
+///
 /// Fail-open: any scan failure yields fewer (or zero) candidates, so the caller
 /// degrades to exactly today's registry-only restorable set — never worse.
 pub fn disk_only_restore_candidates(
     now_ms: i64,
     registry_ids: &HashSet<String>,
 ) -> Vec<TerminalSessionRecord> {
+    disk_only_restore_candidates_with(
+        crate::instance::owns_shared_root_state(),
+        now_ms,
+        registry_ids,
+        scan_every_claude_config_dir,
+    )
+}
+
+/// The real machine-global scan behind [`disk_only_restore_candidates`]: every
+/// Claude config dir on the box (see
+/// [`crate::terminal::transcript::find_claude_config_dirs`] — including its
+/// hardcoded `C:\claude\.claude-*` sweep), each walked for transcripts active
+/// within [`DISK_ONLY_RESTORE_WINDOW_MS`].
+fn scan_every_claude_config_dir(now_ms: i64) -> Vec<crate::terminal::transcript::RecentTranscript> {
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
     let mut recent = Vec::new();
     for dir in &config_dirs {
@@ -1141,6 +1184,43 @@ pub fn disk_only_restore_candidates(
             ),
         );
     }
+    recent
+}
+
+/// Gate + scan + select, with both the primary-ness verdict and the scan
+/// INJECTED so the gate is testable without disk or process-global env.
+///
+/// `owns_shared_root_state` is [`crate::instance::owns_shared_root_state`] in
+/// production — deliberately NOT `instance::is_secondary`, which is
+/// `instance_name().is_some()` and therefore fails OPEN: a secondary the
+/// supervisor spawned without `QONTINUI_INSTANCE_NAME` would read as PRIMARY
+/// and re-open the machine-global net. `owns_shared_root_state` routes through
+/// `resolve_data_subdir`, which also detects a secondary by
+/// `QONTINUI_PRIMARY_PORT` or a non-default API port, so a nameless secondary
+/// fails CLOSED.
+fn disk_only_restore_candidates_with(
+    owns_shared_root_state: bool,
+    now_ms: i64,
+    registry_ids: &HashSet<String>,
+    scan: impl FnOnce(i64) -> Vec<crate::terminal::transcript::RecentTranscript>,
+) -> Vec<TerminalSessionRecord> {
+    if !owns_shared_root_state {
+        // BEFORE the scan, deliberately: the multi-config-dir walk plus a stat
+        // per row is the cost, and it runs synchronously on the IPC thread on
+        // EVERY `terminal_session_list_open`. Filtering its output would leave
+        // the saturation in place.
+        tracing::info!(
+            instance = crate::instance::instance_name()
+                .as_deref()
+                .unwrap_or("<unnamed>"),
+            "disk-only restore net SKIPPED: this runner is not the primary, so the machine-global \
+             transcript scan is disabled by design (a secondary has no crashed sessions of its own \
+             to recover — every candidate it could produce belongs to another instance). This is \
+             not a failure; the registry-backed restorable set is unaffected."
+        );
+        return Vec::new();
+    }
+    let recent = scan(now_ms);
     select_disk_only_candidates(&recent, registry_ids, now_ms)
 }
 
@@ -1929,5 +2009,109 @@ mod tests {
             Some("C:/cfg-A"),
             "first-seen account wins"
         );
+    }
+
+    /// The machine-global disk-only net must be PRIMARY-ONLY (plan
+    /// `2026-08-10-temp-runner-session-restore-isolation`, Phase 2 / mechanism 1).
+    ///
+    /// The net (G3) exists to recover sessions that were live when THIS runner
+    /// crashed but that the registry never captured. A freshly spawned secondary
+    /// has, by construction, no crashed sessions of its own — so every candidate
+    /// it can produce belongs to another instance. Worse, its only filter is
+    /// `registry_ids`, and a fresh temp runner's registry is EMPTY, so NOTHING is
+    /// filtered: every in-window transcript on the machine is offered, each
+    /// materializing a PTY (`disk_only_record` leaves `terminal_id` empty, so the
+    /// frontend creates a fresh terminal per candidate). Measured 2026-08-08: 136
+    /// candidates / 283 live PTYs on one temp runner; re-measured 2026-08-10 in a
+    /// QUIET window: 37 candidates / 35 PTYs, the log line appearing 3× in ~3
+    /// minutes because the sweep re-runs on every frontend mount.
+    ///
+    /// Two properties, and the second is the one that matters for load:
+    /// - a secondary gets ZERO candidates even with an EMPTY `registry_ids`
+    ///   (the fresh-temp-runner case, where the exclusion set filters nothing);
+    /// - the SCAN ITSELF never runs on a secondary. The scan is the cost — it
+    ///   walks every account's transcript tree synchronously on the IPC thread —
+    ///   so the guard must PRECEDE it, not filter its output.
+    ///
+    /// Pure: both the primary-ness verdict and the scan are injected, so no
+    /// tempdir, no disk, and no dependence on how much Claude activity this box
+    /// happened to see in the last 6 hours.
+    #[test]
+    fn disk_only_net_is_primary_only_and_skips_the_scan_entirely_on_a_secondary() {
+        let now = 10 * DISK_ONLY_RESTORE_WINDOW_MS;
+        // The fresh-temp-runner exclusion set: EMPTY, so it filters nothing.
+        let registry_ids: HashSet<String> = HashSet::new();
+        let corpus = || {
+            vec![
+                recent("foreign-1", "C:/claude/.claude-a", "D:/coord", now - 1_000),
+                recent("foreign-2", "C:/claude/.claude-b", "D:/web", now - 2_000),
+                recent("foreign-3", "C:/cfg-C", "D:/runner", now - 3_000),
+            ]
+        };
+
+        // SECONDARY: zero candidates, and the scan is never even called.
+        let mut scanned = false;
+        let out = disk_only_restore_candidates_with(false, now, &registry_ids, |n| {
+            scanned = true;
+            corpus_at(&corpus(), n)
+        });
+        assert!(
+            out.is_empty(),
+            "a secondary must be offered ZERO machine-global candidates, got {}",
+            out.len()
+        );
+        assert!(
+            !scanned,
+            "the guard must PRECEDE the scan — the multi-config-dir walk is the cost, \
+             so filtering its output would not fix the saturation"
+        );
+
+        // PRIMARY: byte-identical to the pre-guard behaviour — the scan runs and
+        // every registry-absent in-window transcript is still offered. The
+        // primary is the one instance whose capture-miss recovery is real, and
+        // silently losing it is the one outcome that costs the operator sessions.
+        let mut scanned = false;
+        let out = disk_only_restore_candidates_with(true, now, &registry_ids, |n| {
+            scanned = true;
+            corpus_at(&corpus(), n)
+        });
+        assert!(scanned, "the primary still scans");
+        let ids: HashSet<&str> = out.iter().map(|r| r.claude_session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["foreign-1", "foreign-2", "foreign-3"]
+                .into_iter()
+                .collect(),
+            "the primary keeps the full disk-only net"
+        );
+        // …and it is exactly the unchanged pure selection core's output
+        // (`TerminalSessionRecord` has no `PartialEq`, so compare the tuple that
+        // identifies each candidate).
+        let key = |rs: &[TerminalSessionRecord]| -> Vec<(String, Option<String>, i64)> {
+            rs.iter()
+                .map(|r| {
+                    (
+                        r.claude_session_id.clone(),
+                        r.config_dir.clone(),
+                        r.last_seen_at,
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            key(&out),
+            key(&select_disk_only_candidates(&corpus(), &registry_ids, now)),
+            "the primary path is exactly the unchanged pure selection core"
+        );
+    }
+
+    /// Identity helper: the injected scan returns its corpus verbatim (the real
+    /// scan already window-filters, and `select_disk_only_candidates` re-applies
+    /// the window regardless).
+    fn corpus_at(
+        corpus: &[crate::terminal::transcript::RecentTranscript],
+        _now_ms: i64,
+    ) -> Vec<crate::terminal::transcript::RecentTranscript> {
+        corpus.to_vec()
     }
 }

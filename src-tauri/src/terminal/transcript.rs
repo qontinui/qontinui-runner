@@ -127,7 +127,16 @@ static SESSION_CACHE: once_cell::sync::Lazy<Mutex<HashMap<PathBuf, CachedSession
 /// Checks (in order):
 /// 1. `CLAUDE_CONFIG_DIR` env var
 /// 2. User-configured dirs from settings (validated for `projects/` subfolder)
-/// 3. `~/.claude` fallback (standard location)
+/// 3. A hardcoded sweep of `C:\claude\.claude-*\` — EVERY multi-account Claude
+///    config dir on the box, not just this session's
+/// 4. `~/.claude` fallback (standard location)
+///
+/// Step 3 was missing from this list until 2026-08-10, which made the function
+/// read as session-scoped when it is in fact MACHINE-scoped: it enumerates every
+/// account's transcript tree. That is load-bearing for callers that then scan
+/// each returned dir — see
+/// [`crate::session::reconcile::disk_only_restore_candidates`], whose cost and
+/// blast radius are exactly "every account on this machine".
 pub fn find_claude_config_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
