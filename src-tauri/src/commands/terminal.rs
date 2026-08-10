@@ -1232,6 +1232,17 @@ pub fn terminal_session_list_open(
     // NOT a hardcoded account list) for recently-active transcripts and offers
     // the registry-ABSENT ones under the account that holds each transcript.
     //
+    // PRIMARY-ONLY since 2026-08-10 (plan
+    // `2026-08-10-temp-runner-session-restore-isolation`, Phase 2). On any
+    // SECONDARY — temp or named — `disk_only_restore_candidates` returns empty
+    // WITHOUT scanning, so everything below about the machine-global scan and
+    // the exclusion set describes the primary's behaviour only. If you are
+    // asking "why is the restore set empty on my temp runner?", that is why,
+    // and it is deliberate: a secondary's candidates are overwhelmingly other
+    // instances', and offering them materialized a PTY apiece (measured: 283
+    // live PTYs on one temp runner). The registry-backed restorable set above
+    // is unaffected on every instance.
+    //
     // Exclusion set (P3 fix): the restorable-set ids UNION every CLOSED row's
     // id — deliberately NOT `all_ids()`. `all_ids()` also excluded registry
     // rows that are `open` yet DROPPED by the restorable grace gate (the

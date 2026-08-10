@@ -1209,15 +1209,32 @@ fn disk_only_restore_candidates_with(
         // per row is the cost, and it runs synchronously on the IPC thread on
         // EVERY `terminal_session_list_open`. Filtering its output would leave
         // the saturation in place.
-        tracing::info!(
-            instance = crate::instance::instance_name()
-                .as_deref()
-                .unwrap_or("<unnamed>"),
-            "disk-only restore net SKIPPED: this runner is not the primary, so the machine-global \
-             transcript scan is disabled by design (a secondary has no crashed sessions of its own \
-             to recover — every candidate it could produce belongs to another instance). This is \
-             not a failure; the registry-backed restorable set is unaffected."
-        );
+        // Emitted at info! ONCE per process, then debug!. This runs on every
+        // `terminal_session_list_open` — i.e. every frontend mount, observed 3×
+        // in ~3 minutes — so an unconditional multi-line info! would itself
+        // become log noise in the file an operator reads to diagnose load.
+        static SKIP_LOGGED: std::sync::Once = std::sync::Once::new();
+        let instance = crate::instance::instance_name();
+        let instance = instance.as_deref().unwrap_or("<unnamed>");
+        // Deliberately hedged. It is NOT true that a secondary can never have
+        // capture-miss candidates of its own: a NAMED secondary up for days
+        // that then crashes genuinely does, and this branch knowingly drops
+        // that backstop for it. Claiming otherwise would mislead exactly the
+        // operator debugging such a lost session (`ux-priorities` — honesty
+        // about uncertainty).
+        let msg = "disk-only restore net SKIPPED: this runner is not the primary, so the \
+                   machine-global transcript scan is disabled by design — a secondary's \
+                   candidates are overwhelmingly other instances'. The registry-backed \
+                   restorable set is unaffected. Note a long-lived NAMED secondary can have \
+                   genuine capture-miss candidates of its own; those are not recovered here.";
+        let mut first = false;
+        SKIP_LOGGED.call_once(|| {
+            first = true;
+            tracing::info!(instance, "{msg}");
+        });
+        if !first {
+            tracing::debug!(instance, "{msg}");
+        }
         return Vec::new();
     }
     let recent = scan(now_ms);
@@ -2026,16 +2043,34 @@ mod tests {
     /// QUIET window: 37 candidates / 35 PTYs, the log line appearing 3× in ~3
     /// minutes because the sweep re-runs on every frontend mount.
     ///
-    /// Two properties, and the second is the one that matters for load:
-    /// - a secondary gets ZERO candidates even with an EMPTY `registry_ids`
-    ///   (the fresh-temp-runner case, where the exclusion set filters nothing);
-    /// - the SCAN ITSELF never runs on a secondary. The scan is the cost — it
-    ///   walks every account's transcript tree synchronously on the IPC thread —
-    ///   so the guard must PRECEDE it, not filter its output.
+    /// The load-bearing assertion here is `assert!(!scanned)` on the secondary
+    /// arm: the SCAN ITSELF is the cost — it walks every account's transcript
+    /// tree synchronously on the IPC thread — so the guard must PRECEDE it, not
+    /// filter its output. That the returned vec is empty when `false` is
+    /// injected is true by construction and proves nothing on its own; it is
+    /// asserted only to name the user-visible consequence.
+    ///
+    /// The primary arm is a change-detector for the non-secondary path: it
+    /// pins that the guard did not narrow what a primary is offered.
     ///
     /// Pure: both the primary-ness verdict and the scan are injected, so no
     /// tempdir, no disk, and no dependence on how much Claude activity this box
     /// happened to see in the last 6 hours.
+    ///
+    /// **Which predicate production actually supplies is NOT covered here** —
+    /// this test injects a bool. That wiring is
+    /// [`production_wiring_uses_the_fail_closed_primary_predicate`], and without
+    /// it this test stays green while the guard is inert.
+    ///
+    /// Honest note on the plan's "must be RED first" gate: this test cannot
+    /// satisfy it literally. It names `disk_only_restore_candidates_with`, which
+    /// does not exist on the base, so against pre-change code it is a COMPILE
+    /// error — exactly what that gate excludes. It was confirmed red
+    /// behaviourally against an intermediate build carrying this signature with
+    /// the guard body omitted ("a secondary must be offered ZERO machine-global
+    /// candidates, got 3"), which is the closest a signature-changing refactor
+    /// can get. `production_wiring_uses_the_fail_closed_primary_predicate` below
+    /// has the same limitation for the same reason.
     #[test]
     fn disk_only_net_is_primary_only_and_skips_the_scan_entirely_on_a_secondary() {
         let now = 10 * DISK_ONLY_RESTORE_WINDOW_MS;
@@ -2049,22 +2084,22 @@ mod tests {
             ]
         };
 
-        // SECONDARY: zero candidates, and the scan is never even called.
+        // SECONDARY. THE assertion is `!scanned`: the guard must PRECEDE the
+        // scan, because the multi-config-dir walk is the cost that saturates the
+        // runner — filtering its output would leave the load in place.
         let mut scanned = false;
         let out = disk_only_restore_candidates_with(false, now, &registry_ids, |n| {
             scanned = true;
             corpus_at(&corpus(), n)
         });
         assert!(
-            out.is_empty(),
-            "a secondary must be offered ZERO machine-global candidates, got {}",
-            out.len()
-        );
-        assert!(
             !scanned,
             "the guard must PRECEDE the scan — the multi-config-dir walk is the cost, \
              so filtering its output would not fix the saturation"
         );
+        // Consequence of the above, stated for the reader (not independent
+        // evidence — an injected `false` makes this true by construction).
+        assert!(out.is_empty(), "…so a secondary is offered nothing");
 
         // PRIMARY: byte-identical to the pre-guard behaviour — the scan runs and
         // every registry-absent in-window transcript is still offered. The
@@ -2084,24 +2119,45 @@ mod tests {
                 .collect(),
             "the primary keeps the full disk-only net"
         );
-        // …and it is exactly the unchanged pure selection core's output
-        // (`TerminalSessionRecord` has no `PartialEq`, so compare the tuple that
-        // identifies each candidate).
-        let key = |rs: &[TerminalSessionRecord]| -> Vec<(String, Option<String>, i64)> {
-            rs.iter()
-                .map(|r| {
-                    (
-                        r.claude_session_id.clone(),
-                        r.config_dir.clone(),
-                        r.last_seen_at,
-                    )
-                })
-                .collect()
+        // The account attribution survives the guard — a disk-only candidate is
+        // only resumable under the config dir that holds its transcript, and
+        // that is the property the primary's recovery actually depends on.
+        let by_id = |id: &str| -> Option<String> {
+            out.iter()
+                .find(|r| r.claude_session_id == id)
+                .and_then(|r| r.config_dir.clone())
         };
-        assert_eq!(
-            key(&out),
-            key(&select_disk_only_candidates(&corpus(), &registry_ids, now)),
-            "the primary path is exactly the unchanged pure selection core"
+        assert_eq!(by_id("foreign-1").as_deref(), Some("C:/claude/.claude-a"));
+        assert_eq!(by_id("foreign-3").as_deref(), Some("C:/cfg-C"));
+    }
+
+    /// Finding 2 (code review 2026-08-10): the whole fix is the six-line adapter
+    /// [`disk_only_restore_candidates`], which supplies
+    /// `instance::owns_shared_root_state()` to
+    /// [`disk_only_restore_candidates_with`]. The test above injects that bool,
+    /// so nothing else in the suite pins WHICH predicate is really wired in — a
+    /// later refactor could swap in the fail-OPEN `!instance::is_secondary()`
+    /// (explicitly rejected by the plan), drop the `!`, or hardcode `true` while
+    /// debugging, and the suite would stay green while the next temp runner
+    /// spawned hundreds of PTYs. An inert guard reporting healthy.
+    ///
+    /// Cheap and disk-free precisely BECAUSE the fix works: the secondary arm
+    /// returns before any I/O, so this never touches the filesystem despite
+    /// calling the production entry point.
+    ///
+    /// Sets ONLY `QONTINUI_INSTANCE_NAME` — `resolve_data_subdir` answers on its
+    /// first branch from the name alone, so this cannot flake on the
+    /// `QONTINUI_PORT` that `scheduler_service`'s tests mutate concurrently.
+    #[test]
+    fn production_wiring_uses_the_fail_closed_primary_predicate() {
+        let _env = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_INSTANCE_NAME"]);
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6faa3bf8-0");
+        assert!(
+            disk_only_restore_candidates(0, &HashSet::new()).is_empty(),
+            "the production adapter must gate on a predicate that reports FALSE \
+             for a named secondary — if this fails, the guard is inert and the \
+             machine-global scan is live on every temp runner again"
         );
     }
 

@@ -66,6 +66,31 @@ pub struct ShutdownMarker {
 /// runner, so no such inheritance is possible. Mirrors
 /// [`crate::session::session_lifecycle_store::store_path`]: scope the
 /// DIRECTORY, keep the filename plain.
+///
+/// ## One-time transition cost (2026-08-10)
+///
+/// The PRIMARY is unaffected — its path is byte-identical before and after, so
+/// its boot classification carries over untouched.
+///
+/// An already-running NAMED secondary's marker moves from
+/// `~/.qontinui/runner/last-shutdown-<port>.json` to
+/// `~/.qontinui/runner/instance-<name>/last-shutdown.json`. Its first boot after
+/// this change therefore finds NO marker, and [`classify_prior_marker`] maps an
+/// absent marker to `crash_recovery: true` / `prior_marker_at: None`. So a named
+/// secondary that shut down CLEANLY right before the upgrade gets ONE spurious
+/// crash classification. That is the safe direction by this module's design
+/// (over-report a crash rather than hide one) and it self-heals on the next
+/// clean shutdown, but it is a real one-off, recorded here rather than left for
+/// someone to rediscover from a confusing banner.
+///
+/// ## Orphaned files
+///
+/// The old `last-shutdown-<port>.json` files are now unreferenced, as are the
+/// `session-snapshots-<port>.jsonl` files the same plan's Phase 4 stopped
+/// reading. Nothing collects either — this extends the orphaned-`-<port>`-file
+/// janitor that `2026-07-20-runner-port-keyed-state-inheritance` §7 already
+/// deferred, from one file class to three. They are small, inert, and confined
+/// to `~/.qontinui/runner/`; no code path can resurrect them.
 pub fn marker_path() -> PathBuf {
     let runner_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))

@@ -532,8 +532,12 @@ fn compact_file(
 // `terminal_session_list_open`, or reconcile — doing so would resurrect the
 // split-brain the write-only invariant exists to prevent.
 //
-// **There is no `snapshot_path_for_port` any more, and no reader may invent
-// one.** It resolved `session-snapshots[-<port>].jsonl` under the deliberately
+// **The port-keyed `snapshot_path_for_<port>` reader helper is GONE, and no
+// reader may invent another.** (Its exact former name is spelled out only in
+// `session_lifecycle_store.rs`'s
+// `readers_must_not_re_derive_the_snapshot_history_path`, which greps the tree
+// for it — naming it here in prose would make that guard flag this comment.)
+// It resolved `session-snapshots[-<port>].jsonl` under the deliberately
 // UNSCOPED `claude_hook::session_restore_dir()`, while the writer
 // (`session_lifecycle_store::snapshot_history_path`) had already moved to an
 // instance-scoped dir with a plain filename. Those coincide for the primary on

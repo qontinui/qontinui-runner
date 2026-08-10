@@ -449,16 +449,28 @@ mod tests {
     /// becomes `boot_was_clean`. A foreign runner's "last moment of life"
     /// therefore decided which of THIS runner's records counted as restorable.
     ///
-    /// Two arms, deliberately:
+    /// Two arms, and only the second gates this change:
     /// (a) the pure path-composition contract, asserted through
-    ///     `resolve_data_subdir` rather than the env (`QONTINUI_PORT` is mutated
-    ///     concurrently by `scheduler_service`'s tests, so an env-based port
-    ///     assertion here would flake); and
+    ///     `resolve_data_subdir`. **This arm passed before the change too** —
+    ///     `resolve_data_subdir` was already instance-scoped on `origin/main`;
+    ///     it never mentions `marker_path`. It is kept as a readable statement
+    ///     of the composition the fix relies on, not as evidence.
     /// (b) that production's `marker_path()` actually routes through that
-    ///     scoping. Arm (b) sets only `QONTINUI_INSTANCE_NAME`, which
-    ///     `resolve_data_subdir` answers on its FIRST branch without consulting
-    ///     the port at all — the same env-safe shape
-    ///     `scope_path_isolates_outbox_dir_for_secondary` already uses.
+    ///     scoping. THIS is the real test. It sets only
+    ///     `QONTINUI_INSTANCE_NAME`, which `resolve_data_subdir` answers on its
+    ///     FIRST branch without consulting the port at all — the same env-safe
+    ///     shape `scope_path_isolates_outbox_dir_for_secondary` already uses.
+    ///
+    /// Honest note on the plan's "must be RED first" gate: this test names the
+    /// ZERO-ARG `marker_path()`, which does not exist on the base, so against
+    /// pre-change code it is a COMPILE error — which that gate excludes. A
+    /// signature-changing refactor cannot satisfy it literally. Arm (b) WAS
+    /// confirmed behaviourally red against an intermediate build (both instance
+    /// names resolved to the identical
+    /// `~/.qontinui/runner/last-shutdown-9877.json`). The shape that would be
+    /// genuinely red against the base is `marker_path(9877)` called twice under
+    /// two different `QONTINUI_INSTANCE_NAME` values asserting distinct paths;
+    /// it is not written that way here because the port parameter is gone.
     #[test]
     fn shutdown_marker_path_cannot_be_inherited_across_instances() {
         // (a) Pure composition: two runners reusing the SAME recycled port must

@@ -2302,20 +2302,25 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// The snapshot-history READ path must resolve through this WRITE-side
-    /// helper, never through the unscoped
-    /// [`crate::session::claude_hook::session_restore_dir`] (plan
-    /// `2026-08-10-temp-runner-session-restore-isolation`, Phase 4).
+    /// Characterization of the WRITE side, which
+    /// `2026-08-10-temp-runner-session-restore-isolation` Phase 4 did NOT change
+    /// — [`snapshot_history_path`] was already instance-scoped, so this test
+    /// passes verbatim against pre-Phase-4 code and does NOT gate that phase.
+    /// It is kept as a contract pin for the property the readers now depend on:
+    /// a secondary's history is not under the unscoped hook dir at all, and two
+    /// spawns on one recycled port do not share a file.
     ///
-    /// The readers (`terminal_session_list_history`, `GET /sessions/history`)
-    /// used to derive `session-snapshots[-<port>].jsonl` under that unscoped
-    /// dir. For the primary on 9876 the two coincide, which is why the
-    /// divergence stayed invisible; for ANY secondary they are a different
-    /// DIRECTORY *and* a different FILENAME, so the readers opened a file
-    /// nothing wrote — and on a recycled temp-runner port, a prior temp's
-    /// history. This pins the property that makes such a reader impossible to
-    /// write correctly by re-deriving: for a secondary the written file is NOT
-    /// under the hook dir at all.
+    /// **The test that actually gates Phase 4 is
+    /// [`readers_must_not_re_derive_the_snapshot_history_path`].** Phase 4's
+    /// change was entirely in the two READERS
+    /// (`commands/terminal.rs:terminal_session_list_history`,
+    /// `mcp/sessions.rs:list_history`), which used to derive
+    /// `session-snapshots[-<port>].jsonl` under
+    /// [`crate::session::claude_hook::session_restore_dir`]. For the primary on
+    /// 9876 the two coincide, which is why the divergence stayed invisible; for
+    /// ANY secondary they are a different DIRECTORY *and* a different FILENAME,
+    /// so the readers opened a file nothing wrote — and on a recycled
+    /// temp-runner port, a prior temp's history.
     ///
     /// Sets only `QONTINUI_INSTANCE_NAME`, which `resolve_data_subdir` answers
     /// on its first branch without reading the port that `scheduler_service`'s
@@ -2342,6 +2347,99 @@ mod tests {
         // Two spawns on one recycled port must not share the file.
         std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6fd50c26-2");
         assert_ne!(secondary, snapshot_history_path());
+    }
+
+    /// Finding 3 (code review 2026-08-10): grep-shaped guard for what Phase 4
+    /// ACTUALLY changed — the two readers. Follows the precedent the plan cites,
+    /// `qontinui-supervisor` `process/claude_env.rs:every_known_spawn_site_file_still_calls_the_strip`.
+    ///
+    /// The failure it exists to catch: a future reader (a new MCP route, a
+    /// diagnostic command) re-derives `session_restore_dir().join("session-snapshots…")`
+    /// — which is exactly the shape the neighbouring [`crate::session::snapshot_history::tree_reset_path_for_port`]
+    /// still legitimately uses — and silently re-introduces the divergence for
+    /// every secondary. Silent because the wrong file simply does not exist, so
+    /// it reads as "no history" rather than as a bug. Until this test, the only
+    /// thing preventing that was a comment.
+    ///
+    /// Three assertions:
+    /// 1. Both readers resolve through [`snapshot_history_path`].
+    /// 2. The deleted port-keyed reader helper has not come back.
+    /// 3. Outside the two modules that legitimately own this pairing (this file,
+    ///    the writer; and `snapshot_history.rs`, which documents it and hosts
+    ///    the port-keyed tree-reset sibling), no source file mentions BOTH
+    ///    `session_restore_dir` and the `session-snapshots` filename — a reader
+    ///    re-deriving the path has to name both.
+    ///
+    /// The needle for assertion 2 is assembled with `concat!` and appears
+    /// nowhere in this file as a contiguous literal, deliberately: a
+    /// grep-shaped guard that writes its own needle in prose flags ITSELF, which
+    /// is how the first draft of this test failed.
+    #[test]
+    fn readers_must_not_re_derive_the_snapshot_history_path() {
+        // Split so this file does not contain the literal it searches for.
+        const DELETED_HELPER: &str = concat!("snapshot_path", "_for_port");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src, &mut files);
+        assert!(
+            files.len() > 100,
+            "sanity: expected to walk the whole src tree, found {} files",
+            files.len()
+        );
+
+        // 1. Both readers go through the write-side helper.
+        for reader in ["commands/terminal.rs", "mcp/sessions.rs"] {
+            let body = std::fs::read_to_string(src.join(reader))
+                .unwrap_or_else(|e| panic!("reading {reader}: {e}"));
+            assert!(
+                body.contains("snapshot_history_path()"),
+                "{reader} must resolve the snapshot history through \
+                 session_lifecycle_store::snapshot_history_path()"
+            );
+        }
+
+        // 2 + 3.
+        const OWNS_THE_PAIRING: &[&str] = &["session_lifecycle_store.rs", "snapshot_history.rs"];
+        for path in &files {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let body = match std::fs::read_to_string(path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            assert!(
+                !body.contains(DELETED_HELPER),
+                "{name} references the DELETED port-keyed reader helper ({DELETED_HELPER}) — \
+                 it WAS the read/write divergence; resolve through snapshot_history_path()"
+            );
+            if OWNS_THE_PAIRING.contains(&name.as_str()) {
+                continue;
+            }
+            assert!(
+                !(body.contains("session_restore_dir") && body.contains("session-snapshots")),
+                "{name} mentions BOTH `session_restore_dir` and `session-snapshots`, which is \
+                 how the Phase 4 divergence was written: the hook dir is deliberately UNSCOPED \
+                 (it is the Claude SessionStart materialization target), so a snapshot path \
+                 built from it points at a file nothing writes on every secondary. Resolve \
+                 through session_lifecycle_store::snapshot_history_path() instead."
+            );
+        }
+    }
+
+    /// Recursively collect `*.rs` under `dir` (test helper for the grep-shaped
+    /// guard above).
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
     }
 
     fn rec(id: &str) -> TerminalSessionRecord {
