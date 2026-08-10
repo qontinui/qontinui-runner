@@ -23,11 +23,12 @@
 //! ## Storage
 //!
 //! A single JSON file co-located with the lifecycle store + pane store under
-//! `~/.qontinui/runner/last-shutdown.json` (object `{clean, at}`), namespaced
-//! by API port exactly like the lifecycle store so a temp runner (9877+) does
-//! not read/write the primary's marker. Atomic temp-file + rename. A missing
-//! / corrupt file is treated as "not clean" (the safe default — we would
-//! rather over-report a crash banner than silently hide a real crash).
+//! `~/.qontinui/runner/last-shutdown.json` (object `{clean, at}`),
+//! INSTANCE-scoped exactly like the lifecycle store
+//! ([`crate::session::session_lifecycle_store::store_path`]) so a secondary
+//! does not read/write the primary's marker. Atomic temp-file + rename. A
+//! missing / corrupt file is treated as "not clean" (the safe default — we
+//! would rather over-report a crash banner than silently hide a real crash).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -46,20 +47,31 @@ pub struct ShutdownMarker {
     pub at: i64,
 }
 
-/// Resolve the marker path for this runner instance, namespaced by API port
-/// (mirrors the lifecycle store: 9876 → base name, every other port →
-/// `-<port>` suffix). Co-located under `~/.qontinui/runner/`.
-pub fn marker_path(api_port: u16) -> PathBuf {
-    let file_name = if api_port == 9876 {
-        "last-shutdown.json".to_string()
-    } else {
-        format!("last-shutdown-{api_port}.json")
-    };
-    dirs::home_dir()
+/// Resolve the marker path for this runner instance — INSTANCE-scoped via
+/// [`crate::instance::scope_path`], the same helper (and the same fail-closed
+/// `instance-unnamed-<port>` quarantine) the lifecycle store resolves through:
+///
+/// - Primary → the legacy UNSCOPED `~/.qontinui/runner/last-shutdown.json`,
+///   byte-for-byte the pre-fix path, so its boot classification is unchanged.
+/// - Secondary → `~/.qontinui/runner/instance-<name>/last-shutdown.json`.
+///
+/// This replaces API-PORT keying (`last-shutdown-<port>.json`). Temp-runner
+/// ports 9877-9899 are RECYCLED across unrelated spawns, so a fresh runner on a
+/// reused port read the PREVIOUS occupant's marker — and the marker is not
+/// cosmetic: [`classify_boot`] turns it into [`BootClassification`], whose
+/// `prior_marker_at` is `terminal_session_list_open`'s cohort anchor and whose
+/// `crash_recovery` becomes its `boot_was_clean`. A foreign runner's last
+/// moment of life therefore decided which of THIS runner's records were
+/// restorable. Instance identity is unique per spawn and stable per named
+/// runner, so no such inheritance is possible. Mirrors
+/// [`crate::session::session_lifecycle_store::store_path`]: scope the
+/// DIRECTORY, keep the filename plain.
+pub fn marker_path() -> PathBuf {
+    let runner_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".qontinui")
-        .join("runner")
-        .join(file_name)
+        .join("runner");
+    crate::instance::scope_path(&runner_dir).join("last-shutdown.json")
 }
 
 /// Read the prior marker from disk. `None` when absent, unreadable, or
@@ -287,12 +299,50 @@ mod tests {
         assert_eq!(crashed.prior_marker_at, Some(2_000));
     }
 
+    /// Replaces `marker_path_namespaces_by_port`, which pinned the OLD
+    /// API-PORT keying (`last-shutdown.json` for 9876, `last-shutdown-<port>.json`
+    /// otherwise). That contract was the defect: temp-runner ports 9877-9899 are
+    /// RECYCLED, so two unrelated temp runners shared one marker and the second
+    /// inherited the first's boot classification. The contract is now INSTANCE
+    /// scoping — see [`marker_path`] and the sibling regression test
+    /// `instance::tests::shutdown_marker_path_cannot_be_inherited_across_instances`,
+    /// which additionally pins the primary's unscoped path through the pure
+    /// `resolve_data_subdir` core.
+    ///
+    /// Only `QONTINUI_INSTANCE_NAME` is set here: `resolve_data_subdir` answers
+    /// on its FIRST branch from the name alone, so this cannot flake on the
+    /// `QONTINUI_PORT` that `scheduler_service`'s tests mutate concurrently.
     #[test]
-    fn marker_path_namespaces_by_port() {
-        let primary = marker_path(9876);
-        let temp = marker_path(9877);
-        assert!(primary.ends_with("last-shutdown.json"));
-        assert!(temp.ends_with("last-shutdown-9877.json"));
-        assert_ne!(primary, temp);
+    fn marker_path_is_instance_scoped_not_port_keyed() {
+        let _env = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_INSTANCE_NAME"]);
+
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6faa3bf8-0");
+        let first = marker_path();
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6fd50c26-2");
+        let recycled = marker_path();
+
+        assert_ne!(
+            first, recycled,
+            "two spawns on the same recycled port must not share one marker"
+        );
+        for path in [&first, &recycled] {
+            // The FILENAME stays plain — the instance lives in the DIRECTORY,
+            // exactly like `session_lifecycle_store::store_path`.
+            assert!(
+                path.ends_with("last-shutdown.json"),
+                "filename must stay plain, got {}",
+                path.display()
+            );
+            let shown = path.to_string_lossy().replace('\\', "/");
+            assert!(
+                shown.contains("/instance-test-19f6f"),
+                "a secondary's marker must sit under its instance dir, got {shown}"
+            );
+            assert!(
+                !shown.contains("last-shutdown-"),
+                "the port suffix must be gone, got {shown}"
+            );
+        }
     }
 }

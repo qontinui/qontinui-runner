@@ -2302,6 +2302,48 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// The snapshot-history READ path must resolve through this WRITE-side
+    /// helper, never through the unscoped
+    /// [`crate::session::claude_hook::session_restore_dir`] (plan
+    /// `2026-08-10-temp-runner-session-restore-isolation`, Phase 4).
+    ///
+    /// The readers (`terminal_session_list_history`, `GET /sessions/history`)
+    /// used to derive `session-snapshots[-<port>].jsonl` under that unscoped
+    /// dir. For the primary on 9876 the two coincide, which is why the
+    /// divergence stayed invisible; for ANY secondary they are a different
+    /// DIRECTORY *and* a different FILENAME, so the readers opened a file
+    /// nothing wrote — and on a recycled temp-runner port, a prior temp's
+    /// history. This pins the property that makes such a reader impossible to
+    /// write correctly by re-deriving: for a secondary the written file is NOT
+    /// under the hook dir at all.
+    ///
+    /// Sets only `QONTINUI_INSTANCE_NAME`, which `resolve_data_subdir` answers
+    /// on its first branch without reading the port that `scheduler_service`'s
+    /// tests mutate concurrently.
+    #[test]
+    fn snapshot_history_path_is_instance_scoped_and_outside_the_hook_dir() {
+        let _env = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_INSTANCE_NAME"]);
+
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6faa3bf8-0");
+        let secondary = snapshot_history_path();
+        let hook_dir = crate::session::claude_hook::session_restore_dir();
+        assert!(
+            !secondary.starts_with(&hook_dir),
+            "a secondary's snapshot history must not live in the UNSCOPED hook dir {} (got {})",
+            hook_dir.display(),
+            secondary.display()
+        );
+        assert!(
+            secondary.ends_with("session-snapshots.jsonl"),
+            "the filename stays plain — the instance lives in the directory"
+        );
+
+        // Two spawns on one recycled port must not share the file.
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6fd50c26-2");
+        assert_ne!(secondary, snapshot_history_path());
+    }
+
     fn rec(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
             claude_session_id: id.to_string(),

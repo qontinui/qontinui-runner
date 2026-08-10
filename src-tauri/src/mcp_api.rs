@@ -4851,8 +4851,7 @@ pub fn create_router(
             // classification synchronously at boot; this call is idempotent
             // and simply reads the stash (OnceLock) — re-reading the marker
             // file here would ALWAYS classify "crash" post-`mark_running`.
-            let marker_path =
-                crate::session::shutdown_marker::marker_path(crate::mcp::types::get_mcp_api_port());
+            let marker_path = crate::session::shutdown_marker::marker_path();
             let crash_recovery =
                 crate::session::shutdown_marker::classify_boot(&marker_path).crash_recovery;
             if crash_recovery {

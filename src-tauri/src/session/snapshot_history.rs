@@ -16,10 +16,11 @@
 //! A durable audit trail DERIVED from the same registry: every meaningful
 //! registry change (session open / close / move / rename / confirm) and a
 //! periodic heartbeat append one COMPLETE snapshot of the full session set —
-//! one JSON line per snapshot — to
-//! `~/.qontinui/runner/session-restore/session-snapshots[-<port>].jsonl`
-//! (the runner's own app-data, next to
-//! [`crate::session::claude_hook::session_restore_dir`]), so recovery works
+//! one JSON line per snapshot — to the INSTANCE-scoped path resolved by
+//! [`crate::session::session_lifecycle_store::snapshot_history_path`]
+//! (primary: `~/.qontinui/runner/session-restore/session-snapshots.jsonl`;
+//! secondary: `…/instance-<name>/session-restore/session-snapshots.jsonl`),
+//! in the runner's own app-data, so recovery works
 //! even when the app won't start. Each session entry carries the full
 //! recovery tuple: `configDir` (account), `claudeSessionId`, `provider`,
 //! `pageId`, `zoneIndex`, `title`, `workingDir`, and alive-state
@@ -530,20 +531,18 @@ fn compact_file(
 // them for 14 days). It MUST NOT be wired into `restorable_records`,
 // `terminal_session_list_open`, or reconcile — doing so would resurrect the
 // split-brain the write-only invariant exists to prevent.
-
-/// Resolve the production snapshot-history path for a runner lifecycle `port`,
-/// mirroring main.rs's port-scoped naming (`session-snapshots.jsonl` for the
-/// primary 9876, else `session-snapshots-<port>.jsonl`) under the runner's
-/// session-restore app-data dir. Pure — display callers/tests may pass an
-/// explicit path instead.
-pub fn snapshot_path_for_port(port: u16) -> PathBuf {
-    let file = if port == 9876 {
-        "session-snapshots.jsonl".to_string()
-    } else {
-        format!("session-snapshots-{}.jsonl", port)
-    };
-    crate::session::claude_hook::session_restore_dir().join(file)
-}
+//
+// **There is no `snapshot_path_for_port` any more, and no reader may invent
+// one.** It resolved `session-snapshots[-<port>].jsonl` under the deliberately
+// UNSCOPED `claude_hook::session_restore_dir()`, while the writer
+// (`session_lifecycle_store::snapshot_history_path`) had already moved to an
+// instance-scoped dir with a plain filename. Those coincide for the primary on
+// 9876 and are a different DIRECTORY *and* a different FILENAME for every
+// secondary — so `terminal_session_list_history` and `GET /sessions/history`
+// read a file nothing writes, and on a recycled temp-runner port they read a
+// PRIOR temp's history. Every reader now resolves through
+// [`crate::session::session_lifecycle_store::snapshot_history_path`], the
+// single write-side source of truth.
 
 /// **Display-only** reader: the LATEST [`SnapshotSession`] per
 /// `claude_session_id` across the whole history (a session appears in many
@@ -650,9 +649,19 @@ pub struct TreeResetRecord {
     pub report: TreeResetReport,
 }
 
-/// Resolve the tree-reset history path for a runner lifecycle `port`,
-/// mirroring [`snapshot_path_for_port`]'s port-scoped naming
-/// (`tree-resets.jsonl` for the primary 9876, else `tree-resets-<port>.jsonl`).
+/// Resolve the tree-reset history path for a runner lifecycle `port`:
+/// `tree-resets.jsonl` for the primary 9876, else `tree-resets-<port>.jsonl`,
+/// under the unscoped session-restore app-data dir.
+///
+/// Deliberately still PORT-keyed, and deliberately NOT migrated alongside the
+/// session-snapshots path. Tree-resets are SYMMETRIC: the write side
+/// (`commands/terminal.rs:terminal_report_tree_reset`) and the read side
+/// (`mcp/sessions.rs:list_tree_resets`) both resolve through this one helper,
+/// so the two ends agree by construction. The session-snapshots defect was a
+/// read/write DIVERGENCE, not the port-keying itself — unifying only one end
+/// here would introduce exactly the bug that was removed there. A row records
+/// that a remount happened, never what to restore, so a recycled port at worst
+/// mingles two runners' observability rows.
 pub fn tree_reset_path_for_port(port: u16) -> PathBuf {
     let file = if port == 9876 {
         "tree-resets.jsonl".to_string()

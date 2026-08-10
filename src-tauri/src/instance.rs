@@ -436,6 +436,78 @@ mod tests {
         assert_eq!(resolve_data_subdir(None, None, PRIMARY), None);
     }
 
+    /// Sibling to `lifecycle_store_and_snapshot_paths_cannot_be_inherited_across_instances`
+    /// for the clean-vs-crash SHUTDOWN MARKER (plan
+    /// `2026-08-10-temp-runner-session-restore-isolation`, mechanism 3). The
+    /// marker was the one piece of restore state the 2026-07-20 instance-scoping
+    /// never touched: it stayed keyed by API PORT (`last-shutdown.json` for
+    /// 9876, `last-shutdown-<port>.json` otherwise). Temp-runner ports
+    /// (9877-9899) are RECYCLED, so a fresh temp runner read the PRIOR
+    /// occupant's marker — and that marker is not cosmetic: it feeds
+    /// `shutdown_marker::boot_classification()`, whose `prior_marker_at` is
+    /// `terminal_session_list_open`'s cohort anchor and whose `crash_recovery`
+    /// becomes `boot_was_clean`. A foreign runner's "last moment of life"
+    /// therefore decided which of THIS runner's records counted as restorable.
+    ///
+    /// Two arms, deliberately:
+    /// (a) the pure path-composition contract, asserted through
+    ///     `resolve_data_subdir` rather than the env (`QONTINUI_PORT` is mutated
+    ///     concurrently by `scheduler_service`'s tests, so an env-based port
+    ///     assertion here would flake); and
+    /// (b) that production's `marker_path()` actually routes through that
+    ///     scoping. Arm (b) sets only `QONTINUI_INSTANCE_NAME`, which
+    ///     `resolve_data_subdir` answers on its FIRST branch without consulting
+    ///     the port at all — the same env-safe shape
+    ///     `scope_path_isolates_outbox_dir_for_secondary` already uses.
+    #[test]
+    fn shutdown_marker_path_cannot_be_inherited_across_instances() {
+        // (a) Pure composition: two runners reusing the SAME recycled port must
+        // resolve to distinct markers, and the primary keeps the unscoped one.
+        let base = Path::new(".qontinui").join("runner");
+        let marker_for = |name: &str, port: u16| {
+            base.join(resolve_data_subdir(Some(name), None, port).unwrap())
+                .join("last-shutdown.json")
+        };
+        assert_ne!(
+            marker_for("test-19f6faa3bf8-0", 9877),
+            marker_for("test-19f6fd50c26-2", 9877),
+            "a recycled port must not hand a fresh runner a prior occupant's boot classification"
+        );
+        let primary_marker = base.join("last-shutdown.json");
+        assert_ne!(marker_for("test-19f6faa3bf8-0", 9877), primary_marker);
+        assert_ne!(marker_for("test-19f6fd50c26-2", 9877), primary_marker);
+        assert_eq!(
+            resolve_data_subdir(None, None, PRIMARY),
+            None,
+            "the primary keeps the legacy UNSCOPED last-shutdown.json"
+        );
+
+        // (b) The production resolver honours it.
+        let _env = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_INSTANCE_NAME"]);
+        use crate::session::shutdown_marker::marker_path;
+
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6faa3bf8-0");
+        let first = marker_path();
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6fd50c26-2");
+        let recycled = marker_path();
+
+        assert_ne!(
+            first, recycled,
+            "marker_path must be keyed on the per-spawn instance identity, not the recycled port"
+        );
+        for (name, path) in [
+            ("test-19f6faa3bf8-0", &first),
+            ("test-19f6fd50c26-2", &recycled),
+        ] {
+            let shown = path.to_string_lossy().replace('\\', "/");
+            assert!(
+                shown.ends_with(&format!("instance-{name}/last-shutdown.json")),
+                "expected an instance-scoped marker for {name}, got {shown}"
+            );
+        }
+    }
+
     /// An explicit instance name always wins — the normal supervised path is
     /// unchanged by the fail-closed guard, on any port.
     #[test]

@@ -262,8 +262,7 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
     // match the resume-path reader. Best-effort: a marker write failure only
     // degrades the next boot to "treated as crash", which is the safe
     // direction.
-    let marker_path =
-        crate::session::shutdown_marker::marker_path(crate::mcp::types::get_mcp_api_port());
+    let marker_path = crate::session::shutdown_marker::marker_path();
     crate::session::shutdown_marker::mark_clean_shutdown(&marker_path);
 
     // Retract the out-of-process port advertisement (plan 2026-07-17 §4): a

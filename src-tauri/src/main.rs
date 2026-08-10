@@ -2367,9 +2367,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // a command-time file read would ALWAYS see `clean:false` after
             // this point and permanently classify "crash".
             {
-                let marker_path = session::shutdown_marker::marker_path(
-                    crate::mcp::types::get_mcp_api_port(),
-                );
+                let marker_path = session::shutdown_marker::marker_path();
                 let boot = session::shutdown_marker::classify_boot(&marker_path);
                 if boot.crash_recovery {
                     warn!(
@@ -4750,9 +4748,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // so the next boot's resume classifies a quiet (planned)
                     // restart. `drain()` also stamps it on a fresh pass; this is
                     // the idempotent backstop for the no-op / zero-session case.
-                    let marker_path = session::shutdown_marker::marker_path(
-                        crate::mcp::types::get_mcp_api_port(),
-                    );
+                    let marker_path = session::shutdown_marker::marker_path();
                     session::shutdown_marker::mark_clean_shutdown(&marker_path);
 
                     // Retract the out-of-process port advertisement (plan

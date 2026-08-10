@@ -1318,10 +1318,13 @@ pub fn terminal_session_list_history(
     opts: Option<crate::session::past_sessions::PastSessionsOpts>,
 ) -> Result<CommandResponse, String> {
     let opts = opts.unwrap_or_default();
-    // Port-scoped snapshot file, matching main.rs's write-side derivation
-    // (`get_mcp_api_port`) so we read the same history that was written.
-    let port = crate::mcp::types::get_mcp_api_port();
-    let snapshot_path = crate::session::snapshot_history::snapshot_path_for_port(port);
+    // Resolve through the WRITE-side helper so this reads the same file
+    // main.rs opened. It used to derive a port-keyed path under the unscoped
+    // session-restore dir, which for any secondary was a different directory
+    // AND a different filename from the instance-scoped file actually written
+    // — so this read a file nothing wrote, and on a recycled temp-runner port,
+    // a PRIOR temp runner's history.
+    let snapshot_path = crate::session::session_lifecycle_store::snapshot_history_path();
     let sessions =
         crate::session::past_sessions::build_past_sessions(store.inner(), &snapshot_path, &opts);
     Ok(CommandResponse {

@@ -627,9 +627,11 @@ async fn list_history(
             StatusCode::SERVICE_UNAVAILABLE,
             "session lifecycle store unavailable".to_string(),
         ))?;
-    // Port-scoped snapshot file, matching main.rs's write-side derivation.
-    let port = crate::mcp::types::get_mcp_api_port();
-    let snapshot_path = crate::session::snapshot_history::snapshot_path_for_port(port);
+    // Resolve through the WRITE-side helper so this reads the same file
+    // main.rs opened — see `terminal_session_list_history` and the note above
+    // `read_all_snapshot_sessions`: the old port-keyed derivation pointed at a
+    // different directory AND filename than the writer for every secondary.
+    let snapshot_path = crate::session::session_lifecycle_store::snapshot_history_path();
     let opts = crate::session::past_sessions::PastSessionsOpts {
         since_ms: q.since_ms,
         page_id: q.page_id,
