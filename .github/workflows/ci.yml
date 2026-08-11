@@ -478,6 +478,25 @@ jobs:
       # surfaces, so no database is provisioned here at all. Prod is unaffected:
       # without the flag the runner still fail-fasts on an unreachable PG.
       # See plans/2026-06-07-runner-degraded-no-db-boot-and-dbless-ci.md.
+      # Guards the smoke's own REPORTING before we trust a word of it. The
+      # summary once printed "193 pass / 193 total, 8 skip" + "fail=" on a run
+      # with a genuinely failing probe (runner#1008, job 92967302466): PS 5.1's
+      # scalar `Count` adapter does not cover PSCustomObject, so a Where-Object
+      # matching exactly ONE row yielded $null. Only the exit code told the
+      # truth, and the summary is the half a human reads.
+      #
+      # `powershell -File`, NOT `pwsh`, and deliberately so: the bug is specific
+      # to Windows PowerShell 5.1, which is the interpreter the smoke step below
+      # actually runs under. On pwsh 7 these assertions would pass against code
+      # that still breaks the real gate.
+      #
+      # Ordered BEFORE the smoke: it takes ~1s and needs no runner, so a broken
+      # harness fails here instead of after a full exe boot + 198 route probes.
+      - name: Contract-smoke summary invariants (PS 5.1)
+        if: matrix.platform == 'windows-latest'
+        run: powershell -File scripts/tests/test-smoke-summary.ps1
+        shell: bash
+
       - name: SDK↔runner contract smoke (direct-exe)
         if: matrix.platform == 'windows-latest'
         env:

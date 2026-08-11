@@ -52,6 +52,19 @@ param(
 $ErrorActionPreference = "Stop"
 
 # ---------------------------------------------------------------------------
+# Summary accounting + reporting invariants (Get-SmokeSummary / Write-SmokeSummary).
+# Dot-sourced rather than inlined so the tally can be unit-tested without booting
+# a runner -- see scripts/tests/test-smoke-summary.ps1. $PSScriptRoot, not a
+# relative path: CI invokes this as `powershell -File scripts/contract-smoke.ps1`
+# from the repo root, dev runs it from elsewhere.
+$SmokeSummaryLib = Join-Path $PSScriptRoot "lib/smoke-summary.ps1"
+if (-not (Test-Path $SmokeSummaryLib)) {
+    Write-Host "ERROR: missing $SmokeSummaryLib -- contract-smoke cannot report its own results." -ForegroundColor Red
+    exit 1
+}
+. $SmokeSummaryLib
+
+# ---------------------------------------------------------------------------
 # Routes that need a real WS-transport setup, live UI state, or otherwise
 # can't be smoke-tested with placeholder fixtures. SKIP_ROUTES is keyed by
 # "<METHOD> <PATH>" exactly as it appears in UI_BRIDGE_ROUTES.
@@ -1055,33 +1068,18 @@ try {
 
 # ---------------------------------------------------------------------------
 # Summary.
+#
+# The tally, the four reporting invariants and the rendering all live in
+# scripts/lib/smoke-summary.ps1 so they can be unit-tested without booting a
+# runner (scripts/tests/test-smoke-summary.ps1, wired as a CI gate). That file
+# carries the full write-up of the PS 5.1 scalar-collapse bug this guards -- the
+# short version is that a run with exactly ONE failing probe used to print
+# "193 pass / 193 total, 8 skip" and "fail=" while exiting 1.
+#
+# Get-SmokeSummary may only RAISE the exit code (0 -> 2 when the harness's own
+# accounting is unsound); it can never turn a failing run green.
 # ---------------------------------------------------------------------------
-# @() around each filter is load-bearing, not style. `Where-Object` returns a
-# SCALAR when exactly one object matches, and `.Count` on a scalar PSCustomObject
-# yields $null here -- so a run with exactly ONE failure printed
-#   Smoke: 193 pass / 193 total, 8 skip
-#   SMOKE-COMPLETE exit=1 pass=193 fail= skip=8
-# i.e. a blank fail count and a total that EXCLUDED the failure, reading as fully
-# green while a probe had failed (observed on runner#1008, job 92967302466, where
-# POST /debug/highlight/:id failed on a dropped keep-alive). Two or more failures
-# happened to report correctly because that path returns an array. The exit code
-# was right throughout; it is the human-readable summary that lied, which is worse
-# -- that is the line a reader trusts. @() forces an array in every arity.
-$pass = @($results | Where-Object { $_.Status -eq "PASS" }).Count
-$fail = @($results | Where-Object { $_.Status -eq "FAIL" }).Count
-$skip = @($results | Where-Object { $_.Status -eq "SKIP" }).Count
-$total = $pass + $fail
-Write-Host ""
-Write-Host ("Smoke: {0} pass / {1} total, {2} skip" -f $pass, $total, $skip)
-if ($fail -gt 0) {
-    Write-Host ("FAIL count: {0}" -f $fail) -ForegroundColor Red
-}
-
-# Completion sentinel. A caller (CI, a harness, a human reading a captured log)
-# can distinguish "the smoke ran to the end and this is its verdict" from "the
-# process died somewhere upstream" only if the script says so explicitly -- a
-# bare exit code cannot carry that. Absence of this line means the run did NOT
-# complete, whatever the exit code says.
-Write-Host ("SMOKE-COMPLETE exit={0} pass={1} fail={2} skip={3}" -f $exitCode, $pass, $fail, $skip)
+$summary = Get-SmokeSummary -Results $results -ExitCode $exitCode
+$exitCode = Write-SmokeSummary -Summary $summary
 
 exit $exitCode
