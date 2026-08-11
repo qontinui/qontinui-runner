@@ -58,11 +58,21 @@
 //!   is not an identity, and the same name-matching mechanism was exploited in
 //!   production on 2026-07-28 when a consumer gate went green against a branch
 //!   with no pull request at all.
-//! * BOTH label forms are read, ALWAYS, and every match is collected rather
-//!   than taking the first or the last — that is the only way two declarations
-//!   naming DIFFERENT sibling PRs can be detected. Exactly one tree can be
-//!   checked out, so an ambiguity is the author's to resolve, not ours to
-//!   guess.
+//! * ALL FOUR label forms are read, ALWAYS, and every match is collected
+//!   rather than taking the first or the last — that is the only way two
+//!   declarations naming DIFFERENT sibling PRs can be detected. Exactly one
+//!   tree can be checked out, so an ambiguity is the author's to resolve, not
+//!   ours to guess.
+//! * A dep-edge label names the PAIR; its DIRECTION names the merge order,
+//!   and merge order is orthogonal to which tree to compile against. Both
+//!   directions are therefore read. Reading only the sibling-leads pair
+//!   ("`downstream-of` here" / "`upstream-of` there") silently assumed the
+//!   sibling always leads — false whenever the type is authored HERE and the
+//!   sibling carries only generated bindings, which is a whole standing class
+//!   of change, not an edge case. See [`DeclarationForm`].
+//! * A pair declared in BOTH directions is a dependency CYCLE and hard-fails
+//!   rather than resolving: coord would hold both PRs forever, and a green
+//!   check here would hide that.
 //! * Comparison is **owner-stripped**, because the owner is optional in
 //!   coord's dep-edge grammar.
 //! * "Absent" and "unanswered" are different answers and only the first is a
@@ -123,12 +133,53 @@ pub(crate) struct DeclarationInputs {
     pub sibling_open_prs: Vec<SiblingPrLabels>,
 }
 
-/// Which declaration form resolved the target.
+/// Which declaration form named the target.
+///
+/// All FOUR forms name the SAME thing — the paired sibling pull request. They
+/// differ only in WHO CARRIES the label and in which side coord's dep graph
+/// orders first, and **merge order is orthogonal to which tree this build must
+/// compile against**. Reading only the two sibling-leads forms was an unstated
+/// assumption that the sibling always leads, which is false for a whole class
+/// of change: when the Rust type is authored HERE and the sibling carries only
+/// the generated bindings, THIS side must land first, so the pair's only
+/// correct dep-edge direction is one the resolver could not see. That made
+/// such a pair mutually unlandable — each side's drift gate demanding the
+/// other land first (runner#1019 / schemas#136, open 2026-08-08).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeclarationSource {
+pub(crate) enum DeclarationForm {
+    /// `coord:downstream-of=<sibling>#n` on THIS pull request. Sibling leads.
     DownstreamOf,
+    /// `coord:upstream-of=<this>#<this_pr>` on a sibling PR. Sibling leads.
     UpstreamOf,
-    BothAgreeing,
+    /// `coord:upstream-of=<sibling>#n` on THIS pull request. This side leads.
+    SelfUpstreamOf,
+    /// `coord:downstream-of=<this>#<this_pr>` on a sibling PR. This side leads.
+    SiblingDownstreamOf,
+}
+
+impl DeclarationForm {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DownstreamOf => "downstream-of",
+            Self::UpstreamOf => "upstream-of",
+            Self::SelfUpstreamOf => "self-upstream-of",
+            Self::SiblingDownstreamOf => "sibling-downstream-of",
+        }
+    }
+
+    /// True when this declaration orders the SIBLING before this side.
+    fn sibling_leads(self) -> bool {
+        matches!(self, Self::DownstreamOf | Self::UpstreamOf)
+    }
+}
+
+/// Join the forms that named a target, for the dispatch log's provenance line.
+pub(crate) fn forms_label(forms: &[DeclarationForm]) -> String {
+    forms
+        .iter()
+        .map(|f| f.as_str())
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 /// Outcome of the declaration rule.
@@ -136,9 +187,21 @@ pub(crate) enum DeclarationSource {
 pub(crate) enum DeclaredTarget {
     /// No declaration — resolve to the sibling's branch.
     None,
+    /// A declaration exists and is unambiguous, but it orders the sibling
+    /// AFTER this side and this step did not opt in
+    /// ([`CiSibling::accept_trailing_sibling`]). Resolve to the branch — but
+    /// as a DECIDED outcome that names itself in the log, never as a silent
+    /// fallback that is indistinguishable from "nobody declared anything".
+    TrailingSiblingDeclined {
+        number: u64,
+        forms: Vec<DeclarationForm>,
+    },
     Pr {
         number: u64,
-        source: DeclarationSource,
+        /// Every form that named this target, in a stable order. More than one
+        /// is the common case: a single dep-edge declaration satisfies BOTH
+        /// repos' gates, so it is visible from both ends.
+        forms: Vec<DeclarationForm>,
     },
 }
 
@@ -186,29 +249,44 @@ fn ambiguous(what: &str, sibling_repo: &str, numbers: &[u64]) -> String {
 
 /// The declaration rule, in full and pure.
 ///
-/// Both forms are evaluated unconditionally even when the primary hits, and
-/// every match in each form is collected. There are three ways to be
-/// ambiguous and all three hard-fail alike: two `downstream-of` labels on the
-/// dispatched PR, two sibling PRs declaring `upstream-of` at it, or the two
-/// forms naming different PRs.
+/// All FOUR forms are evaluated unconditionally even when an earlier one hits,
+/// and every match in each form is collected. Stopping early would mask a
+/// contradiction, and exactly one tree can be checked out — so an ambiguity is
+/// the author's to resolve, never ours to guess. Ways to be ambiguous, all
+/// hard-failing alike:
+///
+/// * two same-direction labels on the dispatched PR naming different siblings,
+/// * two sibling PRs declaring the same form at this one,
+/// * any two forms naming DIFFERENT sibling PRs,
+/// * both merge ORDERS declared for the same pair — a cycle in coord's dep
+///   graph, which holds BOTH pull requests forever. Compiling against the
+///   right tree would hide that behind a green check, so it reds here.
 pub(crate) fn resolve_declaration(
     sibling_repo: &str,
     this_repo: &str,
     this_pr: u64,
+    accept_trailing_sibling: bool,
     inputs: &DeclarationInputs,
 ) -> Result<DeclaredTarget, String> {
     let sibling_short = short_name(sibling_repo);
     let this_short = short_name(this_repo);
 
-    // Form 2 (PRIMARY, self-read): coord:downstream-of on the dispatched PR.
+    // SELF-READ: both dep-edge directions on the dispatched pull request.
+    //   coord:downstream-of=<sibling>#n -> sibling leads
+    //   coord:upstream-of=<sibling>#n   -> this side leads
     let mut downs: Vec<u64> = Vec::new();
+    let mut self_ups: Vec<u64> = Vec::new();
     for label in &inputs.this_pr_labels {
-        let Some(spec) = label.strip_prefix(DOWNSTREAM_PREFIX) else {
+        let (spec, prefix, bucket) = if let Some(s) = label.strip_prefix(DOWNSTREAM_PREFIX) {
+            (s, DOWNSTREAM_PREFIX, &mut downs)
+        } else if let Some(s) = label.strip_prefix(UPSTREAM_PREFIX) {
+            (s, UPSTREAM_PREFIX, &mut self_ups)
+        } else {
             continue;
         };
         let Some((repo_part, num_part)) = parse_dep_spec(spec) else {
             return Err(format!(
-                "malformed label {label:?} — expected {DOWNSTREAM_PREFIX}[<owner>/]<repo>#<n>"
+                "malformed label {label:?} — expected {prefix}[<owner>/]<repo>#<n>"
             ));
         };
         if short_name(repo_part) != sibling_short {
@@ -217,8 +295,32 @@ pub(crate) fn resolve_declaration(
         let n: u64 = num_part
             .parse()
             .map_err(|_| format!("malformed label {label:?} — {num_part:?} is not a PR number"))?;
-        downs.push(n);
+        bucket.push(n);
     }
+
+    // REVERSE SEARCH: both dep-edge directions on the sibling's open PRs.
+    //   coord:upstream-of=<this>#<this_pr>   -> sibling leads
+    //   coord:downstream-of=<this>#<this_pr> -> this side leads
+    let mut ups: Vec<u64> = Vec::new();
+    let mut sib_downs: Vec<u64> = Vec::new();
+    for pr in &inputs.sibling_open_prs {
+        for label in &pr.labels {
+            let (spec, bucket) = if let Some(s) = label.strip_prefix(UPSTREAM_PREFIX) {
+                (s, &mut ups)
+            } else if let Some(s) = label.strip_prefix(DOWNSTREAM_PREFIX) {
+                (s, &mut sib_downs)
+            } else {
+                continue;
+            };
+            let Some((repo_part, num_part)) = parse_dep_spec(spec) else {
+                continue; // a malformed label on someone ELSE's PR is not ours to red.
+            };
+            if short_name(repo_part) == this_short && num_part.parse::<u64>() == Ok(this_pr) {
+                bucket.push(pr.number);
+            }
+        }
+    }
+
     let downs = dedup(downs);
     if downs.len() > 1 {
         return Err(ambiguous(
@@ -230,23 +332,16 @@ pub(crate) fn resolve_declaration(
             &downs,
         ));
     }
-
-    // Form 1 (FALLBACK, reverse search): coord:upstream-of on a sibling PR.
-    // Evaluated even when the primary hit, so a contradiction cannot be
-    // masked by ordering.
-    let mut ups: Vec<u64> = Vec::new();
-    for pr in &inputs.sibling_open_prs {
-        for label in &pr.labels {
-            let Some(spec) = label.strip_prefix(UPSTREAM_PREFIX) else {
-                continue;
-            };
-            let Some((repo_part, num_part)) = parse_dep_spec(spec) else {
-                continue; // a malformed label on someone ELSE's PR is not ours to red.
-            };
-            if short_name(repo_part) == this_short && num_part.parse::<u64>() == Ok(this_pr) {
-                ups.push(pr.number);
-            }
-        }
+    let self_ups = dedup(self_ups);
+    if self_ups.len() > 1 {
+        return Err(ambiguous(
+            &format!(
+                "this pull request carries {UPSTREAM_PREFIX} labels naming DIFFERENT \
+                 {sibling_short} pull requests"
+            ),
+            sibling_repo,
+            &self_ups,
+        ));
     }
     let ups = dedup(ups);
     if ups.len() > 1 {
@@ -259,30 +354,86 @@ pub(crate) fn resolve_declaration(
             &ups,
         ));
     }
-
-    match (downs.first().copied(), ups.first().copied()) {
-        (Some(d), Some(u)) if d != u => Err(ambiguous(
+    let sib_downs = dedup(sib_downs);
+    if sib_downs.len() > 1 {
+        return Err(ambiguous(
             &format!(
-                "this pull request declares {DOWNSTREAM_PREFIX}{sibling_short}#{d}, but \
-                 {sibling_repo}#{u} declares {UPSTREAM_PREFIX}{this_short}#{this_pr}"
+                "several open {sibling_short} pull requests declare \
+                 {DOWNSTREAM_PREFIX}{this_short}#{this_pr}"
             ),
             sibling_repo,
-            &[d, u],
-        )),
-        (Some(d), Some(_)) => Ok(DeclaredTarget::Pr {
-            number: d,
-            source: DeclarationSource::BothAgreeing,
-        }),
-        (Some(d), None) => Ok(DeclaredTarget::Pr {
-            number: d,
-            source: DeclarationSource::DownstreamOf,
-        }),
-        (None, Some(u)) => Ok(DeclaredTarget::Pr {
-            number: u,
-            source: DeclarationSource::UpstreamOf,
-        }),
-        (None, None) => Ok(DeclaredTarget::None),
+            &sib_downs,
+        ));
     }
+
+    // Reconcile the four forms. Order is stable so the provenance string and
+    // the tests do not depend on hash iteration order.
+    let mut forms: Vec<DeclarationForm> = Vec::new();
+    let mut targets: Vec<u64> = Vec::new();
+    for (hit, form) in [
+        (downs.first().copied(), DeclarationForm::DownstreamOf),
+        (ups.first().copied(), DeclarationForm::UpstreamOf),
+        (self_ups.first().copied(), DeclarationForm::SelfUpstreamOf),
+        (
+            sib_downs.first().copied(),
+            DeclarationForm::SiblingDownstreamOf,
+        ),
+    ] {
+        if let Some(n) = hit {
+            targets.push(n);
+            forms.push(form);
+        }
+    }
+    if forms.is_empty() {
+        return Ok(DeclaredTarget::None);
+    }
+
+    let distinct = dedup(targets);
+    if distinct.len() > 1 {
+        return Err(ambiguous(
+            &format!(
+                "the coord dep labels on this pull request and on {sibling_repo}'s open pull \
+                 requests name DIFFERENT {sibling_short} pull requests"
+            ),
+            sibling_repo,
+            &distinct,
+        ));
+    }
+    let number = distinct[0];
+
+    // A pair declared in BOTH directions is a cycle: each side waits for the
+    // other and coord proposes neither, forever. It is not our business which
+    // direction is right, but it IS our business not to paper over it.
+    let leads: Vec<DeclarationForm> = forms
+        .iter()
+        .copied()
+        .filter(|f| f.sibling_leads())
+        .collect();
+    let trails: Vec<DeclarationForm> = forms
+        .iter()
+        .copied()
+        .filter(|f| !f.sibling_leads())
+        .collect();
+    if !leads.is_empty() && !trails.is_empty() {
+        return Err(format!(
+            "contradictory merge ORDER declared for the pair {this_short}#{this_pr} / \
+             {sibling_repo}#{number}: {} order {sibling_short} first, while {} order \
+             {this_short} first. That is a cycle in coord's dependency graph — it would hold \
+             BOTH pull requests forever. Keep exactly one direction.",
+            forms_label(&leads),
+            forms_label(&trails),
+        ));
+    }
+
+    // The sibling TRAILS. Following it would compile against a tree that is
+    // not this repo's main yet and will not be until after this change lands,
+    // so only a step that opted in gets it. See
+    // [`CiSibling::accept_trailing_sibling`] for why that is the safe default.
+    if leads.is_empty() && !accept_trailing_sibling {
+        return Ok(DeclaredTarget::TrailingSiblingDeclined { number, forms });
+    }
+
+    Ok(DeclaredTarget::Pr { number, forms })
 }
 
 /// The fields of a sibling PR the declaration validation reads. Flattened
@@ -594,20 +745,41 @@ async fn resolve_one(
         this_pr_labels: this_labels,
         sibling_open_prs: sibling_prs,
     };
-    match resolve_declaration(&sibling.repo, this_repo, pr, &inputs)? {
+    match resolve_declaration(
+        &sibling.repo,
+        this_repo,
+        pr,
+        sibling.accept_trailing_sibling,
+        &inputs,
+    )? {
         DeclaredTarget::None => {
             let sha = ls_remote_branch_sha(cwd, &sibling.repo, &sibling.branch).await?;
             Ok(branch_fallback(sha, "no declaration"))
         }
-        DeclaredTarget::Pr { number, source } => {
+        DeclaredTarget::TrailingSiblingDeclined { number, forms } => {
+            let sha = ls_remote_branch_sha(cwd, &sibling.repo, &sibling.branch).await?;
+            Ok(branch_fallback(
+                sha,
+                &format!(
+                    "declaration {}#{number} (via {}) orders {} AFTER this side; \
+                     this step does not accept a trailing sibling",
+                    sibling.repo,
+                    forms_label(&forms),
+                    short_name(&sibling.repo),
+                ),
+            ))
+        }
+        DeclaredTarget::Pr { number, forms } => {
             let detail = fetch_sibling_pr_detail(client, token, &sibling.repo, number).await?;
             let sha = validate_declared_pr(&sibling.repo, number, &detail)?;
             Ok(ResolvedSibling {
                 repo: sibling.repo.clone(),
                 sha,
                 provenance: format!(
-                    "declared adaptation {}#{number} (via {source:?}, head {})",
-                    sibling.repo, detail.head_ref
+                    "declared adaptation {}#{number} (via {}, head {})",
+                    sibling.repo,
+                    forms_label(&forms),
+                    detail.head_ref
                 ),
             })
         }
@@ -745,6 +917,21 @@ pub(crate) async fn provision(
 mod tests {
     use super::*;
 
+    /// Shim shadowing [`super::resolve_declaration`] with the SAFE default —
+    /// trailing siblings declined. Every case that predates the
+    /// trailing-sibling opt-in exercises that default and reads unchanged;
+    /// the cases that are ABOUT the opt-in call `super::resolve_declaration`
+    /// directly with an explicit flag, so the flag is never implicit in a test
+    /// whose subject it is.
+    fn resolve_declaration(
+        sibling_repo: &str,
+        this_repo: &str,
+        this_pr: u64,
+        inputs: &DeclarationInputs,
+    ) -> Result<DeclaredTarget, String> {
+        super::resolve_declaration(sibling_repo, this_repo, this_pr, false, inputs)
+    }
+
     fn sib(repo: &str) -> CiSibling {
         let text = format!(
             "version = 1\n[[siblings]]\nrepo = {repo:?}\n\
@@ -834,7 +1021,7 @@ mod tests {
             got,
             DeclaredTarget::Pr {
                 number: 104,
-                source: DeclarationSource::DownstreamOf
+                forms: vec![DeclarationForm::DownstreamOf]
             }
         );
     }
@@ -875,9 +1062,154 @@ mod tests {
             got,
             DeclaredTarget::Pr {
                 number: 104,
-                source: DeclarationSource::UpstreamOf
+                forms: vec![DeclarationForm::UpstreamOf]
             }
         );
+    }
+
+    /// THE RUNNER-LEADS DIRECTION — the case the two-form resolver could not
+    /// see, and the reason runner#1019 / schemas#136 deadlocked from
+    /// 2026-08-08. The Rust type is authored HERE and the sibling carries only
+    /// the regenerated bindings, so THIS side must land first; the pair's only
+    /// correct dep-edge direction is `coord:downstream-of=<this>#<n>` on the
+    /// SIBLING PR. Both runner-leads forms must resolve the same tree the
+    /// sibling-leads forms would.
+    #[test]
+    fn runner_leads_declarations_resolve_when_accepted() {
+        // Form 4 (reverse search): coord:downstream-of on the sibling PR.
+        // This is the label qontinui-schemas#136 actually carried.
+        let got = super::resolve_declaration(
+            SCHEMAS,
+            RUNNER,
+            7,
+            true,
+            &inputs(
+                &[],
+                &[(104, &["coord:downstream-of=qontinui/qontinui-runner#7"])],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            DeclaredTarget::Pr {
+                number: 104,
+                forms: vec![DeclarationForm::SiblingDownstreamOf]
+            }
+        );
+
+        // Form 3 (self-read): coord:upstream-of on THIS PR.
+        let got = super::resolve_declaration(
+            SCHEMAS,
+            RUNNER,
+            7,
+            true,
+            &inputs(&["coord:upstream-of=qontinui-schemas#104"], &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            DeclaredTarget::Pr {
+                number: 104,
+                forms: vec![DeclarationForm::SelfUpstreamOf]
+            }
+        );
+
+        // And the two runner-leads forms agreeing is not a contradiction.
+        let got = super::resolve_declaration(
+            SCHEMAS,
+            RUNNER,
+            7,
+            true,
+            &inputs(
+                &["coord:upstream-of=qontinui-schemas#104"],
+                &[(104, &["coord:downstream-of=qontinui-runner#7"])],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            DeclaredTarget::Pr {
+                number: 104,
+                forms: vec![
+                    DeclarationForm::SelfUpstreamOf,
+                    DeclarationForm::SiblingDownstreamOf
+                ]
+            }
+        );
+    }
+
+    /// The safe default. A compile step must NOT build against a tree that
+    /// lands after it — but the outcome must still name itself, so a declined
+    /// trailing sibling is distinguishable in the log from "nobody declared
+    /// anything". Same inputs as the test above, flag off.
+    #[test]
+    fn a_trailing_sibling_is_declined_by_default_and_says_so() {
+        let got = super::resolve_declaration(
+            SCHEMAS,
+            RUNNER,
+            7,
+            false,
+            &inputs(
+                &[],
+                &[(104, &["coord:downstream-of=qontinui/qontinui-runner#7"])],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            DeclaredTarget::TrailingSiblingDeclined {
+                number: 104,
+                forms: vec![DeclarationForm::SiblingDownstreamOf]
+            }
+        );
+
+        let got = super::resolve_declaration(
+            SCHEMAS,
+            RUNNER,
+            7,
+            false,
+            &inputs(&["coord:upstream-of=qontinui-schemas#104"], &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            DeclaredTarget::TrailingSiblingDeclined {
+                number: 104,
+                forms: vec![DeclarationForm::SelfUpstreamOf]
+            }
+        );
+
+        // A LEADING sibling is unaffected by the flag — it is what main will
+        // contain when this change lands, in either setting.
+        let got = super::resolve_declaration(
+            SCHEMAS,
+            RUNNER,
+            7,
+            false,
+            &inputs(&["coord:downstream-of=qontinui-schemas#104"], &[]),
+        )
+        .unwrap();
+        assert!(matches!(got, DeclaredTarget::Pr { number: 104, .. }));
+    }
+
+    /// Declaring BOTH merge orders for one pair is a cycle in coord's dep
+    /// graph — both PRs are held forever. Resolving the (unambiguous) tree and
+    /// going green would hide it, so it reds instead.
+    #[test]
+    fn both_merge_orders_declared_is_a_cycle_and_hard_fails() {
+        let err = resolve_declaration(
+            SCHEMAS,
+            RUNNER,
+            7,
+            &inputs(
+                &["coord:downstream-of=qontinui-schemas#104"],
+                &[(104, &["coord:downstream-of=qontinui-runner#7"])],
+            ),
+        )
+        .unwrap_err();
+        assert!(err.contains("merge ORDER"), "got: {err}");
+        assert!(err.contains("cycle"), "got: {err}");
+        assert!(err.contains("#104"), "got: {err}");
     }
 
     /// One declaration satisfies both repos' gates, so both forms agreeing is
@@ -898,16 +1230,19 @@ mod tests {
             got,
             DeclaredTarget::Pr {
                 number: 104,
-                source: DeclarationSource::BothAgreeing
+                forms: vec![DeclarationForm::DownstreamOf, DeclarationForm::UpstreamOf]
             }
         );
     }
 
-    /// Three ways to be ambiguous; all three hard-fail alike, because exactly
-    /// one tree can be checked out and picking one would resolve an ambiguity
-    /// that is the author's to resolve.
+    /// Ways to be ambiguous; all hard-fail alike, because exactly one tree can
+    /// be checked out and picking one would resolve an ambiguity that is the
+    /// author's to resolve. (Declaring both merge ORDERS is a fourth failure,
+    /// covered separately by
+    /// `both_merge_orders_declared_is_a_cycle_and_hard_fails` — it is a cycle
+    /// rather than an ambiguity about WHICH tree.)
     #[test]
-    fn all_three_ambiguities_hard_fail() {
+    fn ambiguities_hard_fail() {
         // (1) two downstream-of labels on this PR.
         let err = resolve_declaration(
             SCHEMAS,

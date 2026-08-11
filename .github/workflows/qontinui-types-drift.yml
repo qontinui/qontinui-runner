@@ -133,10 +133,27 @@ jobs:
       # This job checks the runner out under `path: qontinui-runner`, so the
       # sibling lives beside it at the workspace ROOT — not at the action's
       # default `$GITHUB_WORKSPACE/../<name>`. Hence the explicit `path:`.
+      #
+      # `accept-trailing-sibling: 'true'` — THE ONLY SITE THAT SETS IT, and the
+      # only one that should. Every other consumer of this action is a COMPILE
+      # site: it asks "does this tree build against what qontinui-runner's main
+      # will contain when I land", so it must only ever follow a declaration
+      # that orders schemas FIRST. This job asks a different question — "do
+      # qontinui-schemas' checked-in bindings match what THIS tree generates" —
+      # which is a property of the PAIR and is the same question in either
+      # merge order.
+      #
+      # Without it, the runner-leads pair is unlandable in both directions at
+      # once: this gate reds against schemas main (regen produces bindings that
+      # are not checked in there), and schemas' own `check-drift` reds against
+      # runner main (regen DELETES the bindings its PR adds, because that
+      # workflow checks the runner out with no ref resolution at all). See
+      # PHASE C in the action's header — runner#1019 / schemas#136, 2026-08-08.
       - name: Check out sibling qontinui-schemas
         uses: ./qontinui-runner/.github/actions/checkout-sibling
         with:
           path: ${{ github.workspace }}/qontinui-schemas
+          accept-trailing-sibling: 'true'
 
       # generate_types.sh runs `cargo build --bin export_schemas` which
       # links the runner lib (Tauri-dependent). Tauri 2.x on Linux probes
