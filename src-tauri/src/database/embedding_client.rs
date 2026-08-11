@@ -29,6 +29,34 @@ const DEFAULT_EMBEDDING_URL: &str = "http://127.0.0.1:8001/api/embeddings/comput
 /// pooling) so stored vectors stay attributable to the space that made them.
 pub const EMBEDDING_MODEL_TAG: &str = "minilm-l6-v2-256@sentence-transformers";
 
+/// Why a width-checked embed did not yield a usable vector.
+///
+/// The two arms are kept apart because a caller must be able to tell them
+/// apart: "the service did not answer" and "the service answered with
+/// something that is not a vector in our space" call for different reporting,
+/// and folding the second into the first is what let a model swap look like an
+/// outage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbedFailure {
+    /// The service errored, was unreachable, or answered non-2xx.
+    Unavailable(String),
+    /// It answered 200 with a vector of the WRONG WIDTH.
+    WrongWidth { got: usize },
+}
+
+impl std::fmt::Display for EmbedFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(e) => write!(f, "{e}"),
+            Self::WrongWidth { got } => write!(
+                f,
+                "embedding service returned a {got}-dim vector, expected {}",
+                crate::database::embeddings::EMBEDDING_DIM
+            ),
+        }
+    }
+}
+
 /// Request payload for the embedding API.
 #[derive(Serialize)]
 struct EmbeddingRequest {
@@ -196,6 +224,62 @@ impl EmbeddingClient {
         Ok(embeddings)
     }
 
+    /// [`Self::compute_text_embedding`], refusing a vector of the wrong width.
+    ///
+    /// **Every producer that ships a vector OFF this machine must come through
+    /// here.** Nothing downstream checks the width: this client does not, coord
+    /// deliberately validates no dimension (the space is the backend's to own),
+    /// and the backend then rejects a non-[`EMBEDDING_DIM`] vector with a 422.
+    /// So an embedding service that answers 200 with a foreign-width vector — a
+    /// model swap, a misconfigured deployment — fails CLOSED at the far end of
+    /// a call chain that has already forgotten where the vector came from.
+    ///
+    /// Keeping the check in the client rather than at each call site is the
+    /// point: the guard shipped at two of the three producers named in
+    /// [`EMBEDDING_MODEL_TAG`]'s own doc comment, and a fourth producer would
+    /// have had nothing to remind it.
+    ///
+    /// [`EMBEDDING_DIM`]: crate::database::embeddings::EMBEDDING_DIM
+    pub async fn compute_text_embedding_checked(
+        &self,
+        text: &str,
+    ) -> Result<Vec<f32>, EmbedFailure> {
+        let embedding = self
+            .compute_text_embedding(text)
+            .await
+            .map_err(EmbedFailure::Unavailable)?;
+        match width_error(&embedding) {
+            Some(e) => Err(e),
+            None => Ok(embedding),
+        }
+    }
+
+    /// [`Self::compute_batch_embeddings`], refusing the batch if ANY vector is
+    /// the wrong width.
+    ///
+    /// All-or-nothing deliberately. The batch's consumers zip the vectors back
+    /// onto their inputs positionally, so handing back a partial batch would
+    /// mis-attribute every vector after the dropped one — far worse than
+    /// declining the whole job and letting it be retried.
+    ///
+    /// The vector COUNT is not checked here: the callers that care compare it
+    /// against their own inputs and have their own reporting for it.
+    pub async fn compute_batch_embeddings_checked(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, EmbedFailure> {
+        let embeddings = self
+            .compute_batch_embeddings(texts)
+            .await
+            .map_err(EmbedFailure::Unavailable)?;
+        for e in &embeddings {
+            if let Some(err) = width_error(e) {
+                return Err(err);
+            }
+        }
+        Ok(embeddings)
+    }
+
     /// Check if the embedding API is available.
     pub async fn is_available(&self) -> bool {
         // Quick health check with a short text
@@ -215,8 +299,123 @@ impl EmbeddingClient {
     }
 }
 
+/// The one place the width is enforced — `None` when the vector is in our
+/// space. Free rather than inline at each checked method so the single- and
+/// batch-vector paths cannot drift.
+fn width_error(embedding: &[f32]) -> Option<EmbedFailure> {
+    let got = embedding.len();
+    (got != crate::database::embeddings::EMBEDDING_DIM).then_some(EmbedFailure::WrongWidth { got })
+}
+
 impl Default for EmbeddingClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The width guard, which nothing downstream re-checks.
+///
+/// These assert against a service that ANSWERS — the failure mode the guard
+/// exists for. A dead service is already covered elsewhere; a live one handing
+/// back a foreign-width vector is the one that used to travel all the way to a
+/// backend 422 while every local signal said "fine".
+#[cfg(test)]
+mod width_guard_tests {
+    use super::*;
+    use crate::database::embeddings::EMBEDDING_DIM;
+    use axum::{routing::post, Json, Router};
+    use serde_json::json;
+
+    /// A fake embedding service that answers every shape with vectors of
+    /// `dims` width — both the single and the batch endpoint, since
+    /// `compute_batch_embeddings` derives the batch URL from this one.
+    async fn spawn_embedder(dims: usize) -> String {
+        let app = Router::new()
+            .route(
+                "/api/embeddings/compute-text",
+                post(move || async move { Json(json!({ "embedding": vec![0.1f32; dims] })) }),
+            )
+            .route(
+                "/api/embeddings/compute-batch",
+                post(move |Json(body): Json<serde_json::Value>| async move {
+                    let n = body
+                        .get("texts")
+                        .and_then(|t| t.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    Json(json!({ "embeddings": vec![vec![0.1f32; dims]; n] }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/api/embeddings/compute-text")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_right_width_vector_passes_through_unchanged() {
+        let url = spawn_embedder(EMBEDDING_DIM).await;
+        let got = EmbeddingClient::with_url(&url)
+            .compute_text_embedding_checked("login")
+            .await
+            .expect("a correctly-sized vector must pass the guard");
+        assert_eq!(got.len(), EMBEDDING_DIM);
+    }
+
+    /// The whole reason this method exists: a 200 with a foreign width is a
+    /// FAILURE here, not a vector to be shipped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wrong_width_vector_is_refused_and_named_as_such() {
+        let url = spawn_embedder(EMBEDDING_DIM / 2).await;
+        let err = EmbeddingClient::with_url(&url)
+            .compute_text_embedding_checked("login")
+            .await
+            .expect_err("a foreign-width vector must never reach a caller");
+        assert_eq!(
+            err,
+            EmbedFailure::WrongWidth {
+                got: EMBEDDING_DIM / 2
+            },
+            "a width failure must be distinguishable from an outage — callers \
+             report and count the two differently"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_service_is_unavailable_not_a_width_failure() {
+        let err = EmbeddingClient::with_url("http://127.0.0.1:1/api/embeddings/compute-text")
+            .compute_text_embedding_checked("login")
+            .await
+            .expect_err("a dead service cannot yield a vector");
+        assert!(
+            matches!(err, EmbedFailure::Unavailable(_)),
+            "an outage must not be reported as an off-spec vector: {err:?}"
+        );
+    }
+
+    /// All-or-nothing: the batch's consumers zip positionally, so one bad
+    /// vector poisons the whole batch rather than just its own slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_wrong_width_vector_refuses_the_whole_batch() {
+        let texts = vec!["a".to_string(), "b".to_string()];
+
+        let ok_url = spawn_embedder(EMBEDDING_DIM).await;
+        let ok = EmbeddingClient::with_url(&ok_url)
+            .compute_batch_embeddings_checked(&texts)
+            .await
+            .expect("a right-width batch must pass");
+        assert_eq!(ok.len(), 2);
+        assert!(ok.iter().all(|e| e.len() == EMBEDDING_DIM));
+
+        let bad_url = spawn_embedder(7).await;
+        assert_eq!(
+            EmbeddingClient::with_url(&bad_url)
+                .compute_batch_embeddings_checked(&texts)
+                .await
+                .expect_err("an off-spec batch must be refused whole"),
+            EmbedFailure::WrongWidth { got: 7 }
+        );
     }
 }

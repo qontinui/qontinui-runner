@@ -45,6 +45,15 @@
 //!    - **No LLM credentials** (headless / temp runner: no keychain API key
 //!      and no Claude CLI OAuth token) — the warm provider returns `Disabled`.
 //!    - **Local embedding service unavailable** — the embed call errors.
+//!    - **Local embedding service off-spec** — it ANSWERS, but with a vector
+//!      that is not [`EMBEDDING_DIM`] wide, so it is not in the space
+//!      [`EMBEDDING_MODEL_TAG`] names. Posting it would tag a foreign space as
+//!      ours and earn a backend 422 that the best-effort result POST swallows,
+//!      spinning claim → embed → 422 → reap forever. An embedder answering
+//!      wrong is an embedder not working, so it shares this branch — under its
+//!      own reason string, because unlike an outage it will not fix itself.
+//!
+//!      [`EMBEDDING_DIM`]: crate::database::embeddings::EMBEDDING_DIM
 //! 4. **Bad job** (empty input, LLM error, empty/oversize output, unservable
 //!    kind) ⇒ a `failure` POST so the job doesn't wedge, then the loop
 //!    continues. The distinction from (3) is the whole failure taxonomy: (3)
@@ -65,7 +74,7 @@ use serde_json::{json, Value as JsonValue};
 use tracing::{debug, info, warn};
 
 use super::tenant_sync::{resolve_web_base, BearerProvider, ConsentGate};
-use crate::database::embedding_client::{EmbeddingClient, EMBEDDING_MODEL_TAG};
+use crate::database::embedding_client::{EmbedFailure, EmbeddingClient, EMBEDDING_MODEL_TAG};
 
 /// Number of jobs to claim per request (server accepts 1..4).
 const CLAIM_LIMIT: u32 = 4;
@@ -78,6 +87,16 @@ const CLAIM_KINDS: [&str; 2] = ["synthesis", "embedding"];
 const DISABLED_NO_LLM: &str = "warm provider has no credentials";
 /// Reason string for the "local embedder down" arm of [`PollOutcome::Disabled`].
 const DISABLED_NO_EMBEDDER: &str = "local embedding service unavailable";
+/// Reason string for the "local embedder is UP and wrong" arm of
+/// [`PollOutcome::Disabled`] — it answered 200 with a vector that is not in
+/// this machine's embedding space.
+///
+/// Kept apart from [`DISABLED_NO_EMBEDDER`] because the operator action
+/// differs: an outage resolves itself when the service comes back, an off-spec
+/// vector is a misconfiguration that will keep answering wrong until someone
+/// fixes it. Both leave the job for the reaper; only one of them is worth
+/// waiting on.
+const DISABLED_EMBEDDER_OFF_SPEC: &str = "local embedding service returned an off-spec vector";
 
 /// Model for synthesis calls. Haiku-class — cheap + fast for a
 /// distill-N-into-one summarization. Mirrors the emitter / coordinator
@@ -397,12 +416,26 @@ impl MemoryJobPoller {
             ));
         }
 
+        // `_checked`: the count check below already treats a broken embedder
+        // contract as "leave it for the reaper", and a vector of the wrong
+        // WIDTH is the same class of break — one the backend, not this runner,
+        // would otherwise be the first to notice (with a 422 `post_result`
+        // swallows).
         let embeddings = match self
             .embedder
-            .compute_batch_embeddings(&job.input_texts)
+            .compute_batch_embeddings_checked(&job.input_texts)
             .await
         {
             Ok(e) => e,
+            Err(EmbedFailure::WrongWidth { got }) => {
+                warn!(
+                    job_id = %job.job_id,
+                    got,
+                    want = crate::database::embeddings::EMBEDDING_DIM,
+                    "memory_jobs: local embedder returned an off-spec vector width"
+                );
+                return Err(JobHalt::Disabled(DISABLED_EMBEDDER_OFF_SPEC));
+            }
             Err(e) => {
                 debug!(job_id = %job.job_id, error = %e, "memory_jobs: local embed failed");
                 return Err(JobHalt::Disabled(DISABLED_NO_EMBEDDER));
@@ -431,9 +464,26 @@ impl MemoryJobPoller {
 
     /// Embed one text, mapping a local-embedder outage onto the leave-it-for-
     /// the-reaper branch rather than a `failure`.
+    ///
+    /// `_checked` because this vector LEAVES the machine, tagged with
+    /// [`EMBEDDING_MODEL_TAG`]: the backend rejects a non-`EMBEDDING_DIM`
+    /// vector with a 422, and `post_result` swallows a rejected POST
+    /// best-effort — so an off-spec embedder would spin claim → embed → 422 →
+    /// reap forever, with a debug line as the only trace. An off-spec vector is
+    /// the embedder not working, so it takes the same branch as one that is
+    /// down.
     async fn embed_one(&self, job_id: &str, text: &str) -> Result<Vec<f32>, JobHalt> {
-        match self.embedder.compute_text_embedding(text).await {
+        match self.embedder.compute_text_embedding_checked(text).await {
             Ok(e) => Ok(e),
+            Err(EmbedFailure::WrongWidth { got }) => {
+                warn!(
+                    job_id,
+                    got,
+                    want = crate::database::embeddings::EMBEDDING_DIM,
+                    "memory_jobs: local embedder returned an off-spec vector width"
+                );
+                Err(JobHalt::Disabled(DISABLED_EMBEDDER_OFF_SPEC))
+            }
             Err(e) => {
                 debug!(job_id, error = %e, "memory_jobs: local embed failed");
                 Err(JobHalt::Disabled(DISABLED_NO_EMBEDDER))
@@ -1111,6 +1161,98 @@ mod tests {
         assert!(
             rec.lock().await.result_calls.is_empty(),
             "every claimed job in the batch is left un-resulted"
+        );
+    }
+
+    /// A fake embedding service that is UP and answering with vectors of
+    /// `dims` width, on both endpoints (`compute_batch_embeddings`
+    /// derives the batch URL from the single one).
+    async fn spawn_embedder_of_width(dims: usize) -> String {
+        let app: Router = Router::new()
+            .route(
+                "/api/embeddings/compute-text",
+                post(move || async move { Json(json!({ "embedding": vec![0.1f32; dims] })) }),
+            )
+            .route(
+                "/api/embeddings/compute-batch",
+                post(move |Json(body): Json<JsonValue>| async move {
+                    let n = body
+                        .get("texts")
+                        .and_then(|t| t.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    Json(json!({ "embeddings": vec![vec![0.1f32; dims]; n] }))
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/api/embeddings/compute-text")
+    }
+
+    /// An embedder that ANSWERS but in the wrong space is the embedder not
+    /// working. Posting its vectors would tag a foreign space as
+    /// `EMBEDDING_MODEL_TAG` and earn a backend 422 that `post_result`
+    /// swallows — claim → embed → 422 → reap, forever. Leave it for the reaper
+    /// under its own reason instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_off_spec_embedder_leaves_the_embedding_job_unresulted() {
+        let (base, rec) = spawn_fake_jobs_web(vec![embed_job("e1", &["a", "b"])]).await;
+        let url = spawn_embedder_of_width(crate::database::embeddings::EMBEDDING_DIM / 2).await;
+        let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), &url);
+
+        assert_eq!(
+            p.poll_once(&reqwest::Client::new(), &base).await,
+            PollOutcome::Disabled(DISABLED_EMBEDDER_OFF_SPEC),
+            "an up-but-wrong embedder must be named as such, NOT as an outage — \
+             the operator action differs"
+        );
+        assert!(
+            rec.lock().await.result_calls.is_empty(),
+            "an off-spec vector must never be POSTed, and the job must not be \
+             failed either (that would burn `attempt`)"
+        );
+    }
+
+    /// Same on the synthesis path, where the vector is computed after the LLM
+    /// has already run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_off_spec_embedder_leaves_the_synthesis_job_unresulted() {
+        let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["a"])]).await;
+        let url = spawn_embedder_of_width(7).await;
+        let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), &url);
+
+        assert_eq!(
+            p.poll_once(&reqwest::Client::new(), &base).await,
+            PollOutcome::Disabled(DISABLED_EMBEDDER_OFF_SPEC)
+        );
+        assert!(
+            rec.lock().await.result_calls.is_empty(),
+            "a synthesized text we cannot embed IN OUR SPACE must not be posted"
+        );
+    }
+
+    /// The positive control for both tests above: a right-width embedder
+    /// posts its result as usual, so the guard is proven to reject the wrong
+    /// width rather than everything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_right_width_embedder_still_posts_its_result() {
+        let (base, rec) = spawn_fake_jobs_web(vec![embed_job("e1", &["a"])]).await;
+        let url = spawn_embedder_of_width(crate::database::embeddings::EMBEDDING_DIM).await;
+        let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), &url);
+
+        assert_eq!(
+            p.poll_once(&reqwest::Client::new(), &base).await,
+            PollOutcome::Processed(1)
+        );
+        let g = rec.lock().await;
+        let (_, body) = g.result_calls.first().expect("the result must be posted");
+        assert_eq!(body["result"]["embedding_model"], EMBEDDING_MODEL_TAG);
+        assert_eq!(
+            body["result"]["embeddings"][0].as_array().unwrap().len(),
+            crate::database::embeddings::EMBEDDING_DIM
         );
     }
 
