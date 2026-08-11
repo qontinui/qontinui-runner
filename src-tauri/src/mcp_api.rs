@@ -1812,6 +1812,37 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// still governs that, and a genuine user deselection remains a never — this only
 /// lets a session find out which it is.
 ///
+/// `coord_session_worktrees` and `coord_reevaluate_dry` are IN, found by finally
+/// doing the comparison mechanically instead of one `-32601` at a time. Diffing
+/// coord's `mcp::agent_tool_access::DEVICE_DEFAULT_TOOLS` (45 names, coord
+/// `origin/main` 16850b9) against this list turned up FIVE names coord grants a
+/// device and this door refuses. Two are the merge-authority and code-publication
+/// exclusions above, deliberate and documented. The other three — these two plus
+/// `coord_reevaluate` — appear nowhere in that rationale, so they were drift.
+///
+/// The evidence is that SOURCE diff, deliberately, and not a live `-32601`. A
+/// denial from this door reports the allowlist compiled into the RUNNING binary,
+/// which on the primary was 83 commits behind `origin/main` when this was written
+/// — stale enough that `coord_agent_registry_effective` also answered `-32601`
+/// despite having been allowlisted here since `9679a4649`. A refusal observed
+/// live is a rebuild question until `/health` `buildDrift` says otherwise; it can
+/// corroborate this list's contents but can never establish them.
+///
+/// Both earn the grant on their own terms. `coord_session_worktrees` is a
+/// read-only join answering "what did my finished sessions leave behind?" — it
+/// reaps nothing and stamps nothing, and it is how a session satisfies the
+/// worktree-cleanup half of its own closeout. `coord_reevaluate_dry` is the
+/// no-side-effect READ twin of `coord_reevaluate`; coord's own note on granting it
+/// is that withholding a free confirmation step only pushes a caller toward the
+/// destructive rung below it, which is precisely the effect this list was having.
+///
+/// `coord_reevaluate` — the WRITE twin — stays OUT, and is named here so it stops
+/// reading as more drift. It re-runs the merge predicate for a PR, which sits
+/// inside the merge-authority family already excluded above; the dry read is the
+/// part a session needs to decide, and the act belongs to the train. That is a
+/// judgement, not a mechanical consequence, and it is the one entry here worth an
+/// operator's second opinion.
+///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
@@ -1869,6 +1900,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_recent_errors",
     "coord_recent_findings",
     "coord_record_decision",
+    "coord_reevaluate_dry",
     "coord_register_gate",
     "coord_report_status",
     "coord_request_handoff",
@@ -1877,6 +1909,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_resolve_session",
     "coord_secret_presence",
     "coord_send_message",
+    "coord_session_worktrees",
     "coord_signature",
     "coord_slo_metrics",
     "coord_symbol_lookup",
@@ -1904,6 +1937,59 @@ const COORD_MCP_ALLOWED_TOOL_PREFIXES: &[&str] = &["coord_query_"];
 fn coord_mcp_tool_is_allowed(name: &str) -> bool {
     COORD_MCP_ALLOWED_TOOLS.binary_search(&name).is_ok()
         || COORD_MCP_ALLOWED_TOOL_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// The tools this door withholds ON PURPOSE — the "DELIBERATELY EXCLUDED"
+/// families from [`COORD_MCP_ALLOWED_TOOLS`]'s note, restated as data.
+///
+/// The note has been the only record of that intent, which left withholding
+/// with two indistinguishable causes: a security decision someone made, or this
+/// list quietly falling behind coord's grant. The first three instances of the
+/// latter — `coord_write_prompt_document`, `coord_agent_registry_effective`,
+/// `coord_memory_overview` — were each found by a human hitting `-32601` and
+/// going looking, which is why they arrived one at a time over months. Diffing
+/// coord's grant against this list found the remaining two in one pass, which
+/// is the argument for a check that runs on its own.
+///
+/// Naming the intended exclusions makes the remainder meaningful: a tool coord
+/// grants this device that is neither allowed nor listed here is, by
+/// construction, drift. [`coord_mcp_filter_tools_list_response`] sees exactly
+/// that set on every `tools/list`, so the next instance announces itself at the
+/// door instead of waiting for someone to trip over it.
+///
+/// This grants nothing and refuses nothing — [`coord_mcp_tool_is_allowed`]
+/// remains the sole gate. Membership here only changes how a withholding is
+/// REPORTED.
+///
+/// MUST stay sorted — membership is a `binary_search`.
+const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
+    "coord_attest_escalate_override",
+    "coord_cancel_merge",
+    "coord_create_pr",
+    "coord_flag_state",
+    "coord_flag_states",
+    "coord_migration_reserve",
+    "coord_pr_merge_profile",
+    "coord_pr_merge_verdict",
+    "coord_push_to_branch",
+    "coord_reevaluate",
+    "coord_request_merge",
+    "coord_request_policy",
+    "coord_reserve_resource",
+];
+
+/// Deliberately-excluded FAMILIES by prefix. `coord_onboard` is deliberately
+/// short of a trailing underscore so it covers both the `coord_onboard_*` calls
+/// and `coord_onboarding_doctor`, which the exclusion note treats as one family.
+const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
+
+/// Was withholding this tool a DECISION (see [`COORD_MCP_DELIBERATE_EXCLUSIONS`])
+/// rather than this list drifting behind coord's grant?
+fn coord_mcp_withholding_is_deliberate(name: &str) -> bool {
+    COORD_MCP_DELIBERATE_EXCLUSIONS.binary_search(&name).is_ok()
+        || COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES
             .iter()
             .any(|p| name.starts_with(p))
 }
@@ -1964,6 +2050,33 @@ fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Ve
     });
 }
 
+/// The outcome is TYPED rather than an `Option` because three of its four cases
+/// forward the upstream bytes unchanged for entirely different reasons, and one
+/// of them is a failure. Collapsing them loses the only distinction that
+/// matters: "there was nothing to withhold" and "this door could not tell" look
+/// identical on the wire and are opposites in the log.
+enum CoordMcpToolsListFilter {
+    /// Not a `tools/list` request; the response is none of this filter's
+    /// business. Forward untouched.
+    NotApplicable,
+    /// A `tools/list` answer in which every advertised tool is callable — the
+    /// overwhelmingly common case. Forward the upstream bytes byte-identically;
+    /// re-serialising a clean response is pure risk for no gain.
+    Unchanged,
+    /// Non-allowlisted entries were dropped. Carries the shortened body and the
+    /// dropped NAMES, so the caller can say which capabilities it withheld.
+    Filtered { body: Vec<u8>, removed: Vec<String> },
+    /// A `tools/list` answer this door could not filter. The upstream bytes are
+    /// still forwarded — a filter must never turn a response into an error —
+    /// but this is the pre-fix bug transiently back, so it is never silent.
+    Uninspectable {
+        reason: &'static str,
+        /// Tools known to be uncallable and advertised anyway. Empty when the
+        /// response could not be parsed at all, i.e. when nothing is known.
+        leaked: Vec<String>,
+    },
+}
+
 /// Filter a `tools/list` RESPONSE through the SAME allowlist that gates
 /// `tools/call` ([`coord_mcp_tool_is_allowed`]).
 ///
@@ -1972,27 +2085,36 @@ fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Ve
 /// but the response was forwarded verbatim — so `tools/list` advertised every
 /// tool coord grants the device, including ones this proxy will never forward.
 /// A session could see such a tool, load its schema, and get -32601 only on
-/// use. Verified 2026-08-10 with `coord_memory_overview`: landed and deployed
-/// in coord's device grant, listed here, uncallable through this door.
+/// use. `coord_memory_overview` was the worked example: granted in coord's
+/// device grant, listed here, uncallable through this door. (That example was
+/// originally cited as a live observation. Treat it as read off the two
+/// sources instead — a `-32601` reports the allowlist compiled into the RUNNING
+/// binary, so it proves nothing about this file until `/health` `buildDrift`
+/// says the binary is current. See [`COORD_MCP_DELIBERATE_EXCLUSIONS`].)
 ///
 /// Absence from `tools/list` is the signal sessions already read this door with
 /// (a tool that is not there is understood as not available). Making the list
 /// agree with the gate is what keeps that signal honest — and it is why adding
 /// a name to [`COORD_MCP_ALLOWED_TOOLS`] is the ONE place that now controls
 /// both visibility and callability.
-///
-/// Returns `None` when nothing was removed, so the untouched upstream bytes are
-/// forwarded byte-identically — the overwhelmingly common case, and the one
-/// where re-serialising would be pure risk for no gain. `Some((bytes, removed))`
-/// carries the dropped tool NAMES so the caller can log them.
 fn coord_mcp_filter_tools_list_response(
     request: &[u8],
     response: &[u8],
-) -> Option<(Vec<u8>, Vec<String>)> {
+) -> CoordMcpToolsListFilter {
     if !coord_mcp_request_is_tools_list(request) {
-        return None;
+        return CoordMcpToolsListFilter::NotApplicable;
     }
-    let mut parsed: serde_json::Value = serde_json::from_slice(response).ok()?;
+    let mut parsed: serde_json::Value = match serde_json::from_slice(response) {
+        Ok(v) => v,
+        // A `tools/list` answer that is not JSON. Nothing can be said about
+        // WHICH tools it advertises, only that this door did not check them.
+        Err(_) => {
+            return CoordMcpToolsListFilter::Uninspectable {
+                reason: "response body is not JSON",
+                leaked: Vec::new(),
+            }
+        }
+    };
     let mut removed: Vec<String> = Vec::new();
     match &mut parsed {
         serde_json::Value::Array(elems) => {
@@ -2003,10 +2125,19 @@ fn coord_mcp_filter_tools_list_response(
         other => coord_mcp_retain_allowed_tools(other, &mut removed),
     }
     if removed.is_empty() {
-        return None;
+        return CoordMcpToolsListFilter::Unchanged;
     }
-    let bytes = serde_json::to_vec(&parsed).ok()?;
-    Some((bytes, removed))
+    match serde_json::to_vec(&parsed) {
+        Ok(body) => CoordMcpToolsListFilter::Filtered { body, removed },
+        // Effectively unreachable — this re-serialises a `Value` that was just
+        // parsed from JSON — but the failure mode if it ever fires is the sharp
+        // one: the uncallable tools in `removed` are known to be there and get
+        // advertised regardless. Named, not swallowed.
+        Err(_) => CoordMcpToolsListFilter::Uninspectable {
+            reason: "filtered response could not be re-serialised",
+            leaked: removed,
+        },
+    }
 }
 
 /// A gate rejection: the JSON-RPC `id` to echo (Null when unparseable) plus a
@@ -2873,23 +3004,67 @@ async fn coord_mcp_proxy_handler(
     // Keep the two gates in agreement: a `tools/list` answer is filtered
     // through the same allowlist that gates `tools/call`, so this door never
     // advertises a tool it would refuse to forward. See
-    // [`coord_mcp_filter_tools_list_response`]. `None` = nothing removed =
-    // forward the upstream bytes untouched.
+    // [`coord_mcp_filter_tools_list_response`]. Only the `Filtered` outcome
+    // rewrites anything; the other three forward the upstream bytes untouched,
+    // and they are kept distinct because one of them is a failure to check.
     let out_body = match coord_mcp_filter_tools_list_response(&body, &bytes) {
-        Some((filtered, removed)) => {
-            // INFO, not debug: this is a capability coord granted that this
-            // door withholds. It is usually correct (privileged families), but
-            // when it is NOT — a tool added to coord's grant and missed here —
-            // this line is the only thing standing between the next engineer
-            // and an hour of "why is it listed but -32601?".
-            info!(
-                removed_count = removed.len(),
-                removed = %removed.join(","),
-                "coord-mcp proxy: withheld non-allowlisted tools from a tools/list response"
-            );
+        CoordMcpToolsListFilter::NotApplicable | CoordMcpToolsListFilter::Unchanged => {
+            axum::body::Body::from(bytes)
+        }
+        CoordMcpToolsListFilter::Filtered {
+            body: filtered,
+            removed,
+        } => {
+            // Split the withheld names by WHY they were withheld. Both halves
+            // are capabilities coord granted and this door refused, but they
+            // want opposite reactions, and a single line mixing them is how the
+            // drift stayed invisible for three instances: the deliberate
+            // exclusions are numerous and fire on every single `tools/list`, so
+            // a drifted tool sitting among them reads as more of the same.
+            let (drifted, deliberate): (Vec<&str>, Vec<&str>) = removed
+                .iter()
+                .map(String::as_str)
+                .partition(|n| !coord_mcp_withholding_is_deliberate(n));
+            if !deliberate.is_empty() {
+                // Working as intended. INFO, not debug — it is still a
+                // capability subtraction, and the bug this whole path fixes was
+                // one being invisible.
+                info!(
+                    withheld_count = deliberate.len(),
+                    withheld = %deliberate.join(","),
+                    "coord-mcp proxy: withheld deliberately-excluded tools from a tools/list response"
+                );
+            }
+            if !drifted.is_empty() {
+                // NOT working as intended, as far as anything here can tell.
+                // coord grants these to this principal, this list neither
+                // allows them nor names them in COORD_MCP_DELIBERATE_EXCLUSIONS
+                // — so either the allowlist fell behind coord's grant, or the
+                // exclusion is real and was never written down. Both are
+                // one-line fixes in this file; neither can be made from a
+                // -32601 an hour later.
+                warn!(
+                    drifted_count = drifted.len(),
+                    drifted = %drifted.join(","),
+                    "coord-mcp proxy: withheld tools coord grants that are NOT deliberate \
+                     exclusions — COORD_MCP_ALLOWED_TOOLS has drifted from coord's grant; \
+                     add them there, or name them in COORD_MCP_DELIBERATE_EXCLUSIONS"
+                );
+            }
             axum::body::Body::from(filtered)
         }
-        None => axum::body::Body::from(bytes),
+        CoordMcpToolsListFilter::Uninspectable { reason, leaked } => {
+            // The upstream bytes still go out — this filter never turns a
+            // response into an error — but for this one answer the two gates
+            // are back to disagreeing, which is precisely the bug. Say so.
+            warn!(
+                reason,
+                leaked = %leaked.join(","),
+                "coord-mcp proxy: could not filter a tools/list response — it is forwarded \
+                 unfiltered and may advertise tools this door will refuse"
+            );
+            axum::body::Body::from(bytes)
+        }
     };
 
     let mut builder = axum::http::Response::builder().status(status_code);
@@ -7175,7 +7350,8 @@ mod memory_search_enrichment_tests {
 mod coord_mcp_body_gate_tests {
     use super::{
         coord_mcp_body_gate, coord_mcp_filter_tools_list_response, coord_mcp_tool_is_allowed,
-        COORD_MCP_ALLOWED_METHODS, COORD_MCP_ALLOWED_TOOLS,
+        coord_mcp_withholding_is_deliberate, CoordMcpToolsListFilter, COORD_MCP_ALLOWED_METHODS,
+        COORD_MCP_ALLOWED_TOOLS, COORD_MCP_DELIBERATE_EXCLUSIONS,
     };
 
     fn gate(v: serde_json::Value) -> Result<(), (serde_json::Value, String)> {
@@ -7278,8 +7454,13 @@ mod coord_mcp_body_gate_tests {
     const TOOLS_LIST_REQ: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
 
     /// Names surviving the filter, plus the names it reported removing.
+    /// `None` for any outcome that did not rewrite the body.
     fn filtered_names(request: &str, response: &[u8]) -> Option<(Vec<String>, Vec<String>)> {
-        let (out, removed) = coord_mcp_filter_tools_list_response(request.as_bytes(), response)?;
+        let (out, removed) =
+            match coord_mcp_filter_tools_list_response(request.as_bytes(), response) {
+                CoordMcpToolsListFilter::Filtered { body, removed } => (body, removed),
+                _ => return None,
+            };
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let kept = v["result"]["tools"]
             .as_array()
@@ -7342,7 +7523,10 @@ mod coord_mcp_body_gate_tests {
     #[test]
     fn tools_list_untouched_when_every_tool_is_allowed() {
         let clean = tools_list_response(&["coord_orient", "coord_query_health"]);
-        assert!(coord_mcp_filter_tools_list_response(TOOLS_LIST_REQ.as_bytes(), &clean).is_none());
+        assert!(matches!(
+            coord_mcp_filter_tools_list_response(TOOLS_LIST_REQ.as_bytes(), &clean),
+            CoordMcpToolsListFilter::Unchanged
+        ));
     }
 
     /// The filter is scoped to `tools/list`. A different method carrying a
@@ -7362,7 +7546,10 @@ mod coord_mcp_body_gate_tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_send_message","arguments":{"body":"see tools/list output"}}}"#,
         ] {
             assert!(
-                coord_mcp_filter_tools_list_response(req.as_bytes(), &resp).is_none(),
+                matches!(
+                    coord_mcp_filter_tools_list_response(req.as_bytes(), &resp),
+                    CoordMcpToolsListFilter::NotApplicable
+                ),
                 "{req} must not trigger response filtering"
             );
         }
@@ -7378,8 +7565,10 @@ mod coord_mcp_body_gate_tests {
             "result":{"tools":[{"name":"coord_orient"},{"name":"coord_create_pr"}]}
         }]))
         .unwrap();
-        let (out, _removed) =
-            coord_mcp_filter_tools_list_response(req.as_bytes(), &resp).expect("filtered");
+        let out = match coord_mcp_filter_tools_list_response(req.as_bytes(), &resp) {
+            CoordMcpToolsListFilter::Filtered { body, .. } => body,
+            _ => panic!("the batch element carried a privileged tool, so it must be filtered"),
+        };
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let tools = v[0]["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
@@ -7401,38 +7590,151 @@ mod coord_mcp_body_gate_tests {
         assert_eq!(removed, vec!["(unnamed)"]);
     }
 
-    /// A response that is not JSON, or has no `result.tools`, is forwarded
-    /// untouched — the filter never turns an upstream body into an error.
+    /// A well-formed answer carrying no `result.tools` — an error reply, or a
+    /// result with no tools key — advertises nothing, so there is nothing to
+    /// withhold and the upstream bytes go out byte-identically.
     #[test]
-    fn filter_tolerates_unparseable_and_shapeless_responses() {
+    fn filter_leaves_shapeless_responses_unchanged() {
         for resp in [
-            b"<html>gateway error</html>".as_slice(),
             br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.as_slice(),
             br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}}"#.as_slice(),
         ] {
             assert!(
-                coord_mcp_filter_tools_list_response(TOOLS_LIST_REQ.as_bytes(), resp).is_none(),
-                "unparseable/shapeless responses must forward untouched"
+                matches!(
+                    coord_mcp_filter_tools_list_response(TOOLS_LIST_REQ.as_bytes(), resp),
+                    CoordMcpToolsListFilter::Unchanged
+                ),
+                "a response advertising no tools must forward untouched"
             );
         }
+    }
+
+    /// A `tools/list` answer that is not JSON is still forwarded — the filter
+    /// never turns an upstream body into an error — but it must NOT be reported
+    /// as clean. For that one answer the two gates are back to disagreeing, and
+    /// "nothing to withhold" and "could not tell" are opposites.
+    #[test]
+    fn filter_reports_an_uninspectable_tools_list_response() {
+        match coord_mcp_filter_tools_list_response(
+            TOOLS_LIST_REQ.as_bytes(),
+            b"<html>gateway error</html>",
+        ) {
+            CoordMcpToolsListFilter::Uninspectable { reason, leaked } => {
+                assert!(
+                    reason.contains("not JSON"),
+                    "reason names the cause: {reason}"
+                );
+                // Nothing parsed, so nothing is known about what it advertises.
+                assert!(leaked.is_empty());
+            }
+            _ => panic!("an unparseable tools/list answer must be reported, not passed as clean"),
+        }
+    }
+
+    /// Every deliberate exclusion must actually BE excluded. If a name here
+    /// were also allowlisted, the exclusion note would document a refusal that
+    /// does not happen — and the drift warning would go quiet about a tool this
+    /// door forwards.
+    #[test]
+    fn deliberate_exclusions_are_sorted_and_actually_excluded() {
+        assert!(
+            COORD_MCP_DELIBERATE_EXCLUSIONS
+                .windows(2)
+                .all(|w| w[0] < w[1]),
+            "COORD_MCP_DELIBERATE_EXCLUSIONS must be sorted + deduped"
+        );
+        for tool in COORD_MCP_DELIBERATE_EXCLUSIONS {
+            assert!(
+                !coord_mcp_tool_is_allowed(tool),
+                "{tool} is documented as deliberately excluded but is allowlisted"
+            );
+            assert!(coord_mcp_withholding_is_deliberate(tool));
+        }
+        // The onboarding/enrollment family is covered by prefix, including the
+        // `coord_onboarding_*` spelling that has no trailing underscore.
+        for tool in [
+            "coord_onboard_enroll_installation",
+            "coord_onboarding_doctor",
+        ] {
+            assert!(!coord_mcp_tool_is_allowed(tool));
+            assert!(coord_mcp_withholding_is_deliberate(tool));
+        }
+    }
+
+    /// THE DRIFT ALARM. A withheld tool is either a decision someone recorded
+    /// or this list falling behind coord's grant, and the two want opposite
+    /// reactions. Mixing them into one log line is how three instances of the
+    /// drift went unnoticed among the routinely-withheld privileged families.
+    #[test]
+    fn withheld_tools_separate_deliberate_exclusions_from_drift() {
+        let (_names, removed) = filtered_names(
+            TOOLS_LIST_REQ,
+            &tools_list_response(&[
+                "coord_orient",
+                "coord_request_merge",  // deliberate — merge authority
+                "coord_onboard_enroll", // deliberate — enrollment family
+                "coord_brand_new_tool", // drift — coord grants it, we never learned
+            ]),
+        )
+        .expect("three tools must be withheld");
+        let (drifted, deliberate): (Vec<&str>, Vec<&str>) = removed
+            .iter()
+            .map(String::as_str)
+            .partition(|n| !coord_mcp_withholding_is_deliberate(n));
+        assert_eq!(
+            deliberate,
+            vec!["coord_request_merge", "coord_onboard_enroll"]
+        );
+        assert_eq!(
+            drifted,
+            vec!["coord_brand_new_tool"],
+            "a tool that is neither allowed nor a recorded exclusion is drift and must be \
+             distinguishable"
+        );
+    }
+
+    /// The sweep: the tools found by diffing coord's device grant against this
+    /// list, rather than by a human hitting `-32601` months later. Pinned so a
+    /// later edit cannot re-open the gap silently.
+    #[test]
+    fn device_granted_reads_found_by_the_allowlist_sweep_are_callable() {
+        for tool in [
+            // Read-only worktree census — how a session answers "what did my
+            // finished sessions leave behind?" during its own closeout.
+            "coord_session_worktrees",
+            // The no-side-effect READ twin of `coord_reevaluate`. Withholding a
+            // free confirmation step only pushes a caller toward the
+            // destructive rung below it.
+            "coord_reevaluate_dry",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool));
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
+        }
+        // The WRITE twin stays out — it re-runs the merge predicate, which is
+        // inside the already-excluded merge-authority family. It is a recorded
+        // decision now, not drift.
+        assert!(!coord_mcp_tool_is_allowed("coord_reevaluate"));
+        assert!(coord_mcp_withholding_is_deliberate("coord_reevaluate"));
     }
 
     /// Non-allowlisted tools are refused with the request's id echoed —
     /// including the deliberately-excluded privileged families.
     #[test]
     fn rejects_privileged_and_unknown_tools() {
-        for tool in [
-            "coord_onboard_enroll_installation",
-            "coord_attest_escalate_override",
-            "coord_request_merge",
-            "coord_cancel_merge",
-            "coord_create_pr",
-            "coord_push_to_branch",
-            "coord_migration_reserve",
-            "coord_request_policy",
-            "coord_flag_state",
-            "totally_made_up_tool",
-        ] {
+        // Driven off the recorded exclusions rather than a second hand-kept
+        // copy of them, so the list and the test cannot drift apart.
+        for tool in COORD_MCP_DELIBERATE_EXCLUSIONS
+            .iter()
+            .copied()
+            .chain(["coord_onboard_enroll_installation", "totally_made_up_tool"])
+        {
             let (id, msg) = gate(serde_json::json!({
                 "jsonrpc":"2.0","id":7,"method":"tools/call",
                 "params":{"name":tool,"arguments":{}}
