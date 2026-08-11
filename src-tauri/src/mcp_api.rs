@@ -2037,11 +2037,16 @@ pub(crate) enum MemoryEnrichOutcome {
     /// A `coord_memory_search` call whose shape could not be enriched (a
     /// JSON-RPC batch, or no usable string `params.arguments.query_text`).
     SkippedParse,
-    /// The embedding service answered 200 with a vector of the WRONG WIDTH.
-    /// Its own client does not check length, coord deliberately validates no
-    /// dimension, and the backend rejects a non-`EMBEDDING_DIM` vector with a
-    /// 422 — so injecting one would make every search fail CLOSED, which is
-    /// precisely what this design forbids. Degrade to FTS instead.
+    /// The embedding service answered 200 with a vector of the WRONG WIDTH,
+    /// caught by `EmbeddingClient::compute_text_embedding_checked`. Coord
+    /// deliberately validates no dimension and the backend rejects a
+    /// non-`EMBEDDING_DIM` vector with a 422, so injecting one would make every
+    /// search fail CLOSED — precisely what this design forbids. Degrade to FTS
+    /// instead.
+    ///
+    /// Distinct from [`Self::SkippedUnavailable`] on purpose: this one says the
+    /// embedder is UP and wrong, which is a misconfiguration to go fix, not an
+    /// outage to wait out.
     SkippedDimension,
 }
 
@@ -2264,7 +2269,7 @@ fn inject_query_embedding(parsed: &mut serde_json::Value, embedding: Vec<f32>) -
 /// wrong move for a body carrying a lone/`null` half-pair: coord refuses those,
 /// so degrading correctly means stripping them rather than preserving bytes.
 async fn enrich_memory_search_body(body: &[u8]) -> Option<Vec<u8>> {
-    enrich_memory_search_body_with(body, None).await
+    enrich_memory_search_body_with(body, None, None).await
 }
 
 /// The process-wide embedding client.
@@ -2285,9 +2290,16 @@ fn shared_embed_client() -> &'static crate::database::embedding_client::Embeddin
 /// point it at an unreachable (or slow) service without depending on whether
 /// this machine happens to be running the real one. Same shape as the sibling
 /// `retrieve_tenant_memory_at`.
+///
+/// `budget` overrides [`MEMORY_EMBED_TIMEOUT`]. Production always passes
+/// `None`; a test that drives a REAL local service needs a generous one,
+/// because asserting the injected vector under a 150 ms ceiling would be
+/// asserting the machine's load, not the code — the same latency-flake class
+/// that made the earlier counter-delta test unreliable.
 async fn enrich_memory_search_body_with(
     body: &[u8],
     client: Option<&crate::database::embedding_client::EmbeddingClient>,
+    budget: Option<std::time::Duration>,
 ) -> Option<Vec<u8>> {
     let mut parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
     let (query_text, needs_cleanup) = match classify_memory_search(&parsed) {
@@ -2312,25 +2324,25 @@ async fn enrich_memory_search_body_with(
     // test — from passing a borrow of a local client.
     let client = client.unwrap_or_else(|| shared_embed_client());
 
+    // `_checked`, not the raw embed: the service can answer 200 with a vector of
+    // the wrong width — a model swap or a misconfigured deployment — and NOTHING
+    // between here and the database would catch it. Coord deliberately validates
+    // no dimension (it is the backend's call to make), and the backend then
+    // rejects it with a 422, so injecting one would turn EVERY search into a
+    // hard error while the health series happily reported `enriched`. The guard
+    // lives in the client so that every producer shipping a vector off this
+    // machine gets it; here it just needs its own series.
+    let budget = budget.unwrap_or(MEMORY_EMBED_TIMEOUT);
     let embedding = match tokio::time::timeout(
-        MEMORY_EMBED_TIMEOUT,
-        client.compute_text_embedding(&query_text),
+        budget,
+        client.compute_text_embedding_checked(&query_text),
     )
     .await
     {
-        // The service can answer 200 with a vector of the wrong width — a model
-        // swap or a misconfigured deployment — and NOTHING between here and the
-        // database catches it: `compute_text_embedding` checks no length, coord
-        // deliberately validates no dimension (it is the backend's call to
-        // make), and the backend then rejects it with a 422. Injecting such a
-        // vector would therefore turn EVERY search into a hard error while the
-        // health series happily reported `enriched`. Degrade instead — the
-        // whole point is that a broken embedder costs a search its semantic
-        // arm, never its response.
-        Ok(Ok(e)) if e.len() == crate::database::embeddings::EMBEDDING_DIM => e,
-        Ok(Ok(e)) => {
+        Ok(Ok(e)) => e,
+        Ok(Err(crate::database::embedding_client::EmbedFailure::WrongWidth { got })) => {
             tracing::debug!(
-                dims = e.len(),
+                dims = got,
                 expected = crate::database::embeddings::EMBEDDING_DIM,
                 "coord-mcp proxy: embedder returned an unexpected vector width — \
                  forwarding search FTS-only"
@@ -2354,7 +2366,7 @@ async fn enrich_memory_search_body_with(
         }
         Err(_) => {
             tracing::debug!(
-                timeout_ms = MEMORY_EMBED_TIMEOUT.as_millis() as u64,
+                timeout_ms = budget.as_millis() as u64,
                 "coord-mcp proxy: query embed timed out — forwarding search FTS-only"
             );
             return degraded_body(
@@ -6648,10 +6660,16 @@ mod self_id_chain_tests {
 /// `2026-07-30-semantic-recall-query-embedding-via-runner`, Phases 2-3).
 ///
 /// The classifier and the injector are pure, so the whole trigger matrix is
-/// asserted here without an HTTP server or a live embedding service. The
+/// asserted without an HTTP server or a live embedding service. The
 /// load-bearing guarantee is the NEGATIVE one — every request that is not an
 /// enrichable `coord_memory_search` must reach coord byte-identical — so the
 /// non-trigger cases get as much attention as the trigger case.
+///
+/// Two behaviours are NOT reachable that way and have their own fake embedder
+/// (`spawn_embedder`): what an ANSWERING service gets injected, and what a
+/// wrong-width answer does. Both were unasserted while every async test here
+/// pointed at a dead port — including the width guard, whose comparison could
+/// have been inverted with all tests still green.
 #[cfg(test)]
 mod memory_search_enrichment_tests {
     use super::{
@@ -6802,7 +6820,7 @@ mod memory_search_enrichment_tests {
         let client =
             crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
         let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
-        let out = super::enrich_memory_search_body_with(&body, Some(&client)).await;
+        let out = super::enrich_memory_search_body_with(&body, Some(&client), None).await;
         assert!(
             out.is_none(),
             "a dead embedder must forward the original bytes, not fail the search"
@@ -6837,7 +6855,7 @@ mod memory_search_enrichment_tests {
             "query_embedding": [0.1, 0.2],
         })))
         .unwrap();
-        let out = super::enrich_memory_search_body_with(&body, Some(&client)).await;
+        let out = super::enrich_memory_search_body_with(&body, Some(&client), None).await;
 
         assert!(out.is_none(), "a caller-supplied vector is left alone");
         assert!(
@@ -6931,7 +6949,7 @@ mod memory_search_enrichment_tests {
                    "query_embedding_model": serde_json::Value::Null}),
         ] {
             let body = serde_json::to_vec(&search_call(args.clone())).unwrap();
-            let out = super::enrich_memory_search_body_with(&body, Some(&client))
+            let out = super::enrich_memory_search_body_with(&body, Some(&client), None)
                 .await
                 .unwrap_or_else(|| {
                     panic!("a half-pair body must be CLEANED on degrade, not forwarded: {args}")
@@ -6959,7 +6977,7 @@ mod memory_search_enrichment_tests {
             crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
         let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
         assert!(
-            super::enrich_memory_search_body_with(&body, Some(&client))
+            super::enrich_memory_search_body_with(&body, Some(&client), None)
                 .await
                 .is_none(),
             "nothing to clean ⇒ forward the original bytes"
@@ -6981,6 +6999,132 @@ mod memory_search_enrichment_tests {
         }
     }
 
+    /// A fake embedding service that answers 200 with a vector of `dims`
+    /// width.
+    ///
+    /// Every other async test here points at a dead port, which reaches only
+    /// the failure arms. The two behaviours that actually define this feature —
+    /// what an ANSWERING embedder gets injected, and what a wrong-width answer
+    /// does — are unreachable without a service that responds, so they went
+    /// unasserted until this server existed.
+    async fn spawn_embedder(dims: usize) -> String {
+        let app = axum::Router::new().route(
+            "/api/embeddings/compute-text",
+            axum::routing::post(move || async move {
+                axum::Json(json!({ "embedding": vec![0.1f32; dims] }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/api/embeddings/compute-text")
+    }
+
+    /// The budget the live-server tests below run under. Production's 150 ms is
+    /// sized for a warm service on an idle machine; asserting an injected
+    /// vector under it would assert the CI box's load instead of the code, and
+    /// a lost race would read as "the guard rejected a good vector". The
+    /// production default stays pinned by
+    /// `the_embed_budget_is_far_below_the_clients_own_timeout`.
+    const LIVE_BUDGET: Option<std::time::Duration> = Some(std::time::Duration::from_secs(5));
+
+    fn read_series(k: &str) -> u64 {
+        memory_enrich_health_snapshot()
+            .get(k)
+            .and_then(|v| v.as_u64())
+            .expect("series must exist")
+    }
+
+    /// (d) The success path end-to-end: an answering embedder produces a body
+    /// carrying a full-width vector under the QUERY leg's field names and the
+    /// exact model tag — the plan's Phase 2 gate, which until now was only
+    /// asserted on `inject_query_embedding` in isolation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answering_embedder_injects_the_pair_and_counts_it_enriched() {
+        let url = spawn_embedder(crate::database::embeddings::EMBEDDING_DIM).await;
+        let client = crate::database::embedding_client::EmbeddingClient::with_url(&url);
+        let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
+        let before = read_series("enriched");
+
+        let out = super::enrich_memory_search_body_with(&body, Some(&client), LIVE_BUDGET)
+            .await
+            .expect("an answering embedder must rewrite the body");
+
+        let sent: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let args = &sent["params"]["arguments"];
+        assert_eq!(
+            args["query_embedding"].as_array().unwrap().len(),
+            crate::database::embeddings::EMBEDDING_DIM
+        );
+        assert_eq!(
+            args["query_embedding_model"],
+            crate::database::embedding_client::EMBEDDING_MODEL_TAG
+        );
+        assert_eq!(args["query_text"], "login", "the query itself survives");
+        assert!(
+            read_series("enriched") >= before + 1,
+            "the one series that is positive proof the arm fired must move"
+        );
+    }
+
+    /// THE critical guard, which no test reached before: an embedder that is UP
+    /// and answers with a foreign width. Injecting that vector would 422 at the
+    /// backend — every search a hard error — while `enriched` reported the arm
+    /// healthy. It must degrade, and land in its OWN series.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wrong_width_answer_degrades_instead_of_being_injected() {
+        let url = spawn_embedder(crate::database::embeddings::EMBEDDING_DIM / 2).await;
+        let client = crate::database::embedding_client::EmbeddingClient::with_url(&url);
+        let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
+        let before_dim = read_series("skipped_dimension");
+        let before_enriched = read_series("enriched");
+
+        assert!(
+            super::enrich_memory_search_body_with(&body, Some(&client), LIVE_BUDGET)
+                .await
+                .is_none(),
+            "a foreign-width vector must NOT be injected; a clean body degrades \
+             by forwarding its original bytes"
+        );
+        assert!(
+            read_series("skipped_dimension") >= before_dim + 1,
+            "the width refusal must be visible as its own series"
+        );
+        assert_eq!(
+            read_series("enriched"),
+            before_enriched,
+            "counting a width refusal as `enriched` is the exact lie this \
+             series exists to prevent"
+        );
+    }
+
+    /// The two fixes compose: a wrong-width answer AND a caller half-pair. The
+    /// body must come back cleaned, or coord refuses the search outright
+    /// instead of degrading it to FTS.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wrong_width_answer_still_cleans_a_half_pair() {
+        let url = spawn_embedder(3).await;
+        let client = crate::database::embedding_client::EmbeddingClient::with_url(&url);
+        let body = serde_json::to_vec(&search_call(json!({
+            "query_text": "login",
+            "query_embedding_model": "other@v9",
+        })))
+        .unwrap();
+
+        let out = super::enrich_memory_search_body_with(&body, Some(&client), LIVE_BUDGET)
+            .await
+            .expect("a half-pair body must be cleaned on the dimension degrade too");
+        let sent: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let args = &sent["params"]["arguments"];
+        assert!(
+            args.get("query_embedding").is_none() && args.get("query_embedding_model").is_none(),
+            "both halves must be gone so coord accepts the body: {args}"
+        );
+        assert_eq!(args["query_text"], "login");
+    }
+
     /// The same fail-open path covers non-search traffic without ever dialing
     /// the embedder at all.
     #[tokio::test(flavor = "multi_thread")]
@@ -6991,9 +7135,11 @@ mod memory_search_enrichment_tests {
             "jsonrpc":"2.0","id":1,"method":"tools/list"
         }))
         .unwrap();
-        assert!(super::enrich_memory_search_body_with(&body, Some(&client))
-            .await
-            .is_none());
+        assert!(
+            super::enrich_memory_search_body_with(&body, Some(&client), None)
+                .await
+                .is_none()
+        );
     }
 
     /// (e) The budget must stay far under the embedding client's OWN 30 s
