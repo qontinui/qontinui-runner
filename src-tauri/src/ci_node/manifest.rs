@@ -175,6 +175,26 @@ pub(crate) struct CiSibling {
     /// [`SiblingPin::DefaultBranch`].
     #[serde(default = "default_sibling_branch")]
     pub branch: String,
+    /// Follow a declaration that orders the sibling AFTER this side.
+    ///
+    /// OFF by default, and the default is the safety property. A dep-edge
+    /// label names the pair; its direction names the merge order. When the
+    /// sibling LEADS, its tree is what this repo's `main` will contain by the
+    /// time this change lands, so compiling against it predicts main. When the
+    /// sibling TRAILS, it does not: following the declaration would compile
+    /// against a tree that is not main yet and will not be until AFTER this
+    /// change lands. A step that mis-declared the direction would then go
+    /// green here and red `main` on landing — the exact vacuous green the
+    /// declared-adaptation rule exists to prevent, arriving from the other
+    /// side.
+    ///
+    /// Turn it on ONLY for a step whose question is genuinely about the PAIR
+    /// rather than about what main will look like: a codegen-drift check,
+    /// which asks "do the sibling's checked-in artifacts match what this tree
+    /// generates" and must therefore read the paired tree in EITHER order. A
+    /// compile step must leave this off.
+    #[serde(default)]
+    pub accept_trailing_sibling: bool,
 }
 
 fn default_sibling_branch() -> String {

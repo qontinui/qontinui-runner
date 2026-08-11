@@ -40,14 +40,66 @@ description: >-
 #
 # The hatch is now a DECLARED ADAPTATION PR, resolved from the coord dep edge
 # the pair already has to declare for merge ordering — so it costs the author
-# nothing they were not already doing. BOTH label forms are accepted, which is
-# what lets ONE declaration serve BOTH gates:
+# nothing they were not already doing. ALL FOUR label forms are accepted, which
+# is what lets ONE declaration serve BOTH gates:
 #
-#   - form 2 (PRIMARY, self-read): `coord:downstream-of=[<owner>/]qontinui-schemas#<n>`
+#   SIBLING LEADS (the sibling PR merges first):
+#   - form 2 (self-read): `coord:downstream-of=[<owner>/]qontinui-schemas#<n>`
 #     on THIS runner PR. One request against this repo; never paginates.
-#   - form 1 (FALLBACK, reverse search): `coord:upstream-of=[<owner>/]qontinui-runner#<this>`
+#   - form 1 (reverse search): `coord:upstream-of=[<owner>/]qontinui-runner#<this>`
 #     on the schemas PR — the form qontinui-schemas' own consumer gate REQUIRES.
 #     So a pair created by satisfying that gate satisfies this one for free.
+#
+#   THIS SIDE LEADS (this runner PR merges first) — see PHASE C:
+#   - form 3 (self-read): `coord:upstream-of=[<owner>/]qontinui-schemas#<n>`
+#     on THIS runner PR.
+#   - form 4 (reverse search): `coord:downstream-of=[<owner>/]qontinui-runner#<this>`
+#     on the schemas PR.
+#
+# PHASE C — WHY THE OTHER TWO FORMS EXIST (added 2026-08-11).
+#
+# A dep-edge label names the PAIR; its DIRECTION names the MERGE ORDER. Those
+# are orthogonal: which tree to compile against is a question about the pair,
+# not about who lands first. Reading only forms 1 and 2 silently assumed the
+# sibling always leads. That is false for a whole standing class of change —
+# when the Rust type is authored HERE (`src-tauri/src/schema_export.rs`) and
+# qontinui-schemas carries only the REGENERATED BINDINGS, the type must exist
+# before the bindings can be generated, so the runner PR MUST land first and
+# the pair's only correct declaration is form 3 or form 4.
+#
+# Such a pair was therefore UNDECLARABLE to this resolver, and both halves
+# deadlocked: qontinui-runner#1019 red on `check-drift` because it regenerated
+# against schemas main (which lacks the type, so the regen produced untracked
+# files), and qontinui-schemas#136 red on ITS `check-drift` because that
+# workflow regenerates against runner main (which lacks the type, so the regen
+# DELETED the very bindings #136 adds). Neither could go green alone, and
+# neither of the two accepted forms could be applied without declaring the
+# WRONG merge order — which coord reads as a dependency cycle and holds both
+# PRs on forever. Open from 2026-08-08.
+#
+# THE TRAILING-SIBLING OPT-IN, AND WHY IT IS NOT OPTIONAL.
+#
+# Forms 3 and 4 are gated behind `accept-trailing-sibling`, which defaults to
+# FALSE, and the default is the safety property. When the sibling LEADS, its
+# tree is what this repo compiles against once this change lands, so building
+# against it PREDICTS main. When the sibling TRAILS it does not: the declared
+# tree is not main yet and will not be until AFTER this PR lands. A compile
+# gate that followed a trailing declaration would go green against code that
+# is not there yet, land, and red main — the same vacuous green the
+# declared-adaptation rule exists to prevent, arriving from the other side. So
+# a trailing declaration is DECLINED (build the default branch) and SAID SO in
+# the log — never silently, because "declined" and "nobody declared anything"
+# are different answers.
+#
+# Only a step whose question is genuinely about the PAIR opts in. Today that is
+# exactly one: `qontinui-types-drift.yml`'s `check-drift`, which asks "do the
+# sibling's checked-in artifacts match what this tree generates" and must
+# therefore read the paired tree in EITHER merge order. Every compile site
+# (ci.yml, clippy-tiers.yml, reproducibility-gate.yml, …) leaves it off.
+#
+# And a pair declared in BOTH directions now HARD-FAILS rather than resolving:
+# that is a cycle in coord's dep graph which holds both PRs forever, and going
+# green on the correct tree would hide it.
 #
 # The owner part is OPTIONAL in coord's grammar (qontinui-coord
 # src/pr_merge/dep_graph.rs:136-137 — a bare <repo> inherits the labelled PR's
@@ -169,6 +221,20 @@ inputs:
       'github'" before a single step runs. (Observed live, run 31180585122.)
     required: false
     default: ''
+  accept-trailing-sibling:
+    description: >-
+      Follow a declaration that orders the sibling AFTER this side (forms 3 and
+      4 — see PHASE C in the header). OFF by default, and the default is the
+      safety property: a trailing sibling's tree is NOT what this repo compiles
+      against when this change lands, so a compile gate that followed it would
+      go green against code that is not there yet and red main on landing. Set
+      it ONLY on a step whose question is about the PAIR rather than about what
+      main will look like — today that is exactly `check-drift` in
+      qontinui-types-drift.yml. A declined trailing declaration resolves to the
+      default branch and SAYS SO; it is never silently indistinguishable from
+      "no declaration".
+    required: false
+    default: 'false'
 
 outputs:
   ref:
@@ -182,8 +248,13 @@ outputs:
     value: ${{ steps.resolve.outputs.sha }}
   source:
     description: >-
-      Which declaration resolved the ref — one of `none`, `downstream-of`,
-      `upstream-of`, `both-agreeing`.
+      Which declaration form(s) named the target, `+`-joined in a stable order
+      — any of `downstream-of`, `upstream-of`, `self-upstream-of`,
+      `sibling-downstream-of`; `none` when nothing was declared; or
+      `trailing-declined` when an unambiguous declaration was found but orders
+      the sibling after this side and this step did not opt in. More than one
+      form is the COMMON case: a single dep-edge declaration is visible from
+      both ends, which is what lets it serve both repos' gates.
     value: ${{ steps.resolve.outputs.source }}
 
 runs:
@@ -197,6 +268,7 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         THIS_REPO: ${{ github.repository }}
         SIBLING_REPO: ${{ inputs.repo }}
+        ACCEPT_TRAILING: ${{ inputs.accept-trailing-sibling }}
       run: |
         set -euo pipefail
 
@@ -315,12 +387,25 @@ runs:
             exit 1 ;;
         esac
 
-        # --- Declaration form 2 (PRIMARY): coord:downstream-of on THIS PR. ---
+        # `accept-trailing-sibling` is a STRING here (action inputs always are).
+        # Validate it rather than truthiness-testing: `[ -n "false" ]` is true,
+        # which would silently invert the safe default on every consumer.
+        case "${ACCEPT_TRAILING:-false}" in
+          true|false) : ;;
+          *)
+            echo "::error::accept-trailing-sibling must be 'true' or 'false', got '${ACCEPT_TRAILING}'."
+            exit 1 ;;
+        esac
+
+        # --- Self-read: BOTH dep-edge directions on THIS PR. -----------------
         # ALL matching labels are collected, not just the last one seen. A PR
         # carrying two `coord:downstream-of=<sibling>#…` labels is ambiguous in
         # exactly the way §3.2 refuses to guess at; "whichever GitHub listed
         # last" is not a resolution.
+        #   coord:downstream-of=<sibling>#n -> `downs`    (sibling leads)
+        #   coord:upstream-of=<sibling>#n   -> `self_ups` (this side leads)
         downs=""
+        self_ups=""
         if ! api "repos/${THIS_REPO}/issues/${PR_NUMBER}/labels?per_page=100"; then
           unknown "Could not read labels on ${THIS_REPO}#${PR_NUMBER}"
         fi
@@ -355,21 +440,25 @@ runs:
         while IFS= read -r l; do
           [ -z "${l}" ] && continue
           case "$l" in
-            coord:downstream-of=*)
-              spec="${l#coord:downstream-of=}"     # [<owner>/]<repo>#<n>
-              repo_part="${spec%%#*}"
-              num_part="${spec##*#}"
-              # Owner-stripped comparison — the owner is OPTIONAL in coord's
-              # grammar. Exact-matching here is the schemas twin's live bug.
-              if [ "${repo_part##*/}" = "${SIBLING_SHORT}" ]; then
-                case "${num_part}" in
-                  ''|*[!0-9]*)
-                    echo "::error::Malformed label '${l}' — '${num_part}' is not a PR number."
-                    exit 1 ;;
-                esac
-                downs="${downs}${num_part}"$'\n'
-              fi ;;
+            coord:downstream-of=*) dir=down; spec="${l#coord:downstream-of=}" ;;  # [<owner>/]<repo>#<n>
+            coord:upstream-of=*)   dir=up;   spec="${l#coord:upstream-of=}" ;;
+            *) continue ;;
           esac
+          repo_part="${spec%%#*}"
+          num_part="${spec##*#}"
+          # Owner-stripped comparison — the owner is OPTIONAL in coord's
+          # grammar. Exact-matching here is the schemas twin's live bug.
+          [ "${repo_part##*/}" = "${SIBLING_SHORT}" ] || continue
+          case "${num_part}" in
+            ''|*[!0-9]*)
+              echo "::error::Malformed label '${l}' — '${num_part}' is not a PR number."
+              exit 1 ;;
+          esac
+          if [ "${dir}" = down ]; then
+            downs="${downs}${num_part}"$'\n'
+          else
+            self_ups="${self_ups}${num_part}"$'\n'
+          fi
         done <<< "${labels}"
 
         uniq_list "${downs}"
@@ -378,15 +467,26 @@ runs:
         fi
         target_down="${UNIQ%$'\n'}"
 
-        # --- Declaration form 1 (FALLBACK): coord:upstream-of on a sibling PR.
-        # Evaluated UNCONDITIONALLY, even when the primary hit, so a
+        uniq_list "${self_ups}"
+        if [ "${UNIQ_N}" -gt 1 ]; then
+          ambiguous "this PR carries coord:upstream-of labels naming DIFFERENT ${SIBLING_SHORT} PRs" "${UNIQ}"
+        fi
+        target_selfup="${UNIQ%$'\n'}"
+
+        # --- Reverse search: BOTH dep-edge directions on the sibling's PRs. ---
+        # Evaluated UNCONDITIONALLY, even when the self-read hit, so a
         # contradiction cannot be masked. Every page is scanned to the end and
         # every match collected — stopping at the first hit would silently pick
         # one of two sibling PRs that both claim this one. O(open sibling PRs),
         # so paginate EXPLICITLY rather than silently truncating at one page: a
         # truncated page reads as "no declaration", which is the wrong answer in
         # the safe-looking direction.
+        #   coord:upstream-of=<this>#<this>   -> `ups`       (sibling leads)
+        #   coord:downstream-of=<this>#<this> -> `sib_downs` (this side leads)
+        # Both come off the SAME page body, so the second direction costs a
+        # second `jq` and not a second API call.
         ups=""
+        sib_downs=""
         page=1
         while : ; do
           if ! api "repos/${SIBLING_REPO}/pulls?state=open&per_page=100&page=${page}"; then
@@ -421,6 +521,24 @@ runs:
           hits="${hits//$'\r'/}"
           [ -n "${hits}" ] && ups="${ups}${hits}"$'\n'
 
+          # Same query, opposite direction. Kept as a separate `jq` rather than
+          # one pass emitting "form:number" pairs: the two lists are checked for
+          # ambiguity independently, and a combined capture would need splitting
+          # back apart right here — for no saved subprocess on the page that
+          # matters (the first).
+          hits="$(printf '%s' "${API_BODY}" | jq -r --arg short "${THIS_SHORT}" --arg num "${PR_NUMBER}" '
+            [ .[]
+              | . as $pr
+              | .labels[]?.name
+              | select(startswith("coord:downstream-of="))
+              | ltrimstr("coord:downstream-of=")
+              | select((split("#")[0] | split("/") | last) == $short)
+              | select((split("#")[1]) == $num)
+              | $pr.number
+            ] | unique | .[]')"
+          hits="${hits//$'\r'/}"
+          [ -n "${hits}" ] && sib_downs="${sib_downs}${hits}"$'\n'
+
           [ "${n_on_page}" -lt 100 ] && break
           page=$((page + 1))
           if [ "${page}" -gt 20 ]; then
@@ -435,23 +553,66 @@ runs:
         fi
         target_up="${UNIQ%$'\n'}"
 
-        # --- Reconcile the two forms. ----------------------------------------
-        target=""
-        if [ -n "${target_down}" ] && [ -n "${target_up}" ]; then
-          if [ "${target_down}" != "${target_up}" ]; then
-            both="$(printf '%s\n%s' "${target_down}" "${target_up}")"
-            ambiguous "this PR declares coord:downstream-of=${SIBLING_SHORT}#${target_down}, but ${SIBLING_REPO}#${target_up} declares coord:upstream-of=${THIS_SHORT}#${PR_NUMBER}" "${both}"
-          fi
-          target="${target_down}"; SOURCE="both-agreeing"
-          echo "Declared adaptation: ${SIBLING_REPO}#${target} (both label forms agree)"
-        elif [ -n "${target_down}" ]; then
-          target="${target_down}"; SOURCE="downstream-of"
-          echo "Declared adaptation: ${SIBLING_REPO}#${target} (coord:downstream-of on this PR)"
-        elif [ -n "${target_up}" ]; then
-          target="${target_up}"; SOURCE="upstream-of"
-          echo "Declared adaptation: ${SIBLING_REPO}#${target} (coord:upstream-of on ${SIBLING_REPO}#${target})"
-        else
+        uniq_list "${sib_downs}"
+        if [ "${UNIQ_N}" -gt 1 ]; then
+          ambiguous "several open ${SIBLING_SHORT} PRs declare coord:downstream-of=${THIS_SHORT}#${PR_NUMBER}" "${UNIQ}"
+        fi
+        target_sibdown="${UNIQ%$'\n'}"
+
+        # --- Reconcile the four forms. ---------------------------------------
+        # All four name the SAME thing — the paired sibling PR — so they are
+        # unioned and any disagreement about WHICH PR is one ambiguity, reported
+        # once. The direction each form implies is tracked separately below,
+        # because that is a different question with a different answer.
+        SOURCE=""
+        add_form() { if [ -z "${SOURCE}" ]; then SOURCE="$1"; else SOURCE="${SOURCE}+$1"; fi; }
+        leads=""   # forms saying the SIBLING merges first
+        trails=""  # forms saying THIS side merges first
+        [ -n "${target_down}" ]    && { add_form "downstream-of";         leads="${leads}downstream-of "; }
+        [ -n "${target_up}" ]      && { add_form "upstream-of";           leads="${leads}upstream-of "; }
+        [ -n "${target_selfup}" ]  && { add_form "self-upstream-of";      trails="${trails}self-upstream-of "; }
+        [ -n "${target_sibdown}" ] && { add_form "sibling-downstream-of"; trails="${trails}sibling-downstream-of "; }
+
+        if [ -z "${SOURCE}" ]; then
+          SOURCE="none"
           echo "Using ${SIBLING_REPO} ref: main (no declaration — 2 API calls, no PR-detail read)"
+          emit
+          exit 0
+        fi
+
+        uniq_list "${target_down}"$'\n'"${target_up}"$'\n'"${target_selfup}"$'\n'"${target_sibdown}"
+        if [ "${UNIQ_N}" -gt 1 ]; then
+          ambiguous "the coord dep labels on this PR and on ${SIBLING_REPO}'s open PRs name DIFFERENT ${SIBLING_SHORT} PRs" "${UNIQ}"
+        fi
+        target="${UNIQ%$'\n'}"
+
+        echo "Declared adaptation: ${SIBLING_REPO}#${target} (via ${SOURCE})"
+
+        # A pair declared in BOTH directions is a cycle in coord's dep graph:
+        # each side waits for the other and neither is ever proposed. Which
+        # direction is right is the author's call — but resolving the tree and
+        # going green would hide the cycle behind a passing check.
+        if [ -n "${leads}" ] && [ -n "${trails}" ]; then
+          echo "::error::Contradictory merge ORDER declared for the pair ${THIS_SHORT}#${PR_NUMBER} / ${SIBLING_REPO}#${target}:"
+          echo "  ${leads% } order ${SIBLING_SHORT} first"
+          echo "  ${trails% } order ${THIS_SHORT} first"
+          echo ""
+          echo "That is a cycle in coord's dependency graph — it would hold BOTH pull requests"
+          echo "forever. Keep exactly one direction; remove the other with the coord-pr-label"
+          echo "skill (it validates the namespace before sending)."
+          exit 1
+        fi
+
+        # The sibling TRAILS and this step did not opt in. Resolve to the
+        # default branch — but as a DECIDED outcome that names itself, never a
+        # silent fallback indistinguishable from "nobody declared anything".
+        if [ -z "${leads}" ] && [ "${ACCEPT_TRAILING:-false}" != "true" ]; then
+          echo "Declaration ${SIBLING_REPO}#${target} (via ${SOURCE}) orders ${SIBLING_SHORT} AFTER"
+          echo "${THIS_SHORT}#${PR_NUMBER}, and this step does not accept a trailing sibling."
+          echo "Its tree is not what ${THIS_SHORT} compiles against when this change lands, so"
+          echo "following it would go green against code that is not there yet."
+          echo "Using ${SIBLING_REPO} ref: main (trailing declaration declined)"
+          SOURCE="trailing-declined"
           emit
           exit 0
         fi
@@ -473,9 +634,16 @@ runs:
           echo ""
           echo "TO FIX — declare the adaptation correctly. Renaming a branch does nothing now."
           echo "  1. Open the ${SIBLING_SHORT} PR this PR adapts to, BASED ON main."
-          echo "  2. Declare the pair with EITHER form (both are accepted, owner optional):"
+          echo "  2. Declare the pair with ANY ONE form. All four are accepted and the owner"
+          echo "     is optional; pick the pair whose DIRECTION is the merge order you want."
+          echo "     If ${SIBLING_SHORT} must land FIRST (it defines what this PR consumes):"
           echo "       on THIS PR:          coord:downstream-of=${SIBLING_SHORT}#<pr-number>"
           echo "       on the sibling PR:   coord:upstream-of=${THIS_SHORT}#${PR_NUMBER}"
+          echo "     If THIS PR must land FIRST (e.g. it defines the type and ${SIBLING_SHORT}"
+          echo "     only carries the regenerated bindings):"
+          echo "       on THIS PR:          coord:upstream-of=${SIBLING_SHORT}#<pr-number>"
+          echo "       on the sibling PR:   coord:downstream-of=${THIS_SHORT}#${PR_NUMBER}"
+          echo "     Declaring BOTH directions is a dependency cycle and is refused."
           echo "     Use the coord-pr-label skill — it validates the namespace before sending."
           echo "  3. Re-run this workflow. The runner has no 'labeled' trigger, so applying a"
           echo "     label does not re-fire CI by itself: push a commit or re-run manually."
