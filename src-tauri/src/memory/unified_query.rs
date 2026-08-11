@@ -438,20 +438,33 @@ async fn retrieve_embeddings(pg: &PgDb, query: &str, limit: usize) -> Vec<Memory
     use crate::database::embedding_client::EmbeddingClient;
     use crate::database::hybrid_search::HybridSearchConfig;
 
-    // 1. Create EmbeddingClient and check availability
+    // Compute the query embedding, under an explicit ceiling.
+    //
+    // No `is_available()` pre-check. It embedded the literal text "test"
+    // against the same service, so it cost a full extra round trip to learn
+    // something the compute below reports anyway — and it was a TOCTOU window
+    // besides, since the service can die in between. Worse, both calls ran
+    // under `EmbeddingClient`'s own 30 s ceiling and neither was capped by the
+    // `tokio::join!` fan-out, so a wedged embedder could stall this arm — and
+    // with it the whole unified query — for a full minute. One call, one
+    // failure path, one budget.
     let client = EmbeddingClient::new();
-    if !client.is_available().await {
-        return Vec::new();
-    }
-
-    // 2. Compute query embedding (async)
-    let embedding = match client.compute_text_embedding(query).await {
-        Ok(e) => e,
-        Err(e) => {
-            warn!("Unified memory: embedding computation failed: {}", e);
-            return Vec::new();
-        }
-    };
+    let embedding =
+        match tokio::time::timeout(LOCAL_EMBED_TIMEOUT, client.compute_text_embedding(query)).await
+        {
+            Ok(Ok(e)) => e,
+            Ok(Err(e)) => {
+                warn!("Unified memory: embedding computation failed: {}", e);
+                return Vec::new();
+            }
+            Err(_) => {
+                warn!(
+                "Unified memory: embedding computation exceeded {}ms — skipping the semantic arm",
+                LOCAL_EMBED_TIMEOUT.as_millis()
+            );
+                return Vec::new();
+            }
+        };
 
     let config = HybridSearchConfig {
         limit,
@@ -580,8 +593,14 @@ fn retrieve_graph(graph: &KnowledgeGraph, query: &str, limit: usize) -> Vec<Memo
 ///
 /// Degrades silently to an empty result set on ANY failure — consent gate
 /// off, no web base configured, unpaired (no device JWT), timeout, non-2xx,
-/// or an unparseable body. The unified query must never fail (or slow past
-/// [`TENANT_QUERY_TIMEOUT`]) because the tenant arm is unavailable.
+/// or an unparseable body. The unified query must never fail, or hang, because
+/// the tenant arm is unavailable.
+///
+/// The arm is bounded by [`LOCAL_EMBED_TIMEOUT`] on the local embed and then
+/// [`TENANT_QUERY_TIMEOUT`] on the request — two sequential budgets, so the
+/// honest worst case is their SUM, not either one. Stated explicitly because
+/// the embed leg previously carried no ceiling at all while this comment
+/// claimed `TENANT_QUERY_TIMEOUT` bounded the arm.
 async fn retrieve_tenant_memory(query: &str, limit: usize) -> Vec<MemoryResult> {
     use crate::database::embedding_client::EmbeddingClient;
 
@@ -613,15 +632,35 @@ async fn retrieve_tenant_memory(query: &str, limit: usize) -> Vec<MemoryResult> 
     // that same swallow (the `query_embedding_model` key fix). Both failure
     // shapes degrade to FTS here; the guard itself is pinned by tests on the
     // client, which is the only seam this wrapper's callers can reach.
-    let query_embedding = match EmbeddingClient::new()
-        .compute_text_embedding_checked(query)
-        .await
+    //
+    // Bound the embed OUT HERE as well — the width guard says nothing about how
+    // long the call may take. `EmbeddingClient` builds its own reqwest client
+    // with a 30 s timeout, and nothing else on this path caps it:
+    // `TENANT_QUERY_TIMEOUT` is on `tenant_query_client`, so it covers the
+    // request to the backend and not the embed that precedes it, and the
+    // `tokio::join!` fan-out in `query_unified_memory` has no ceiling of its
+    // own. A wedged local embedder therefore stalled the WHOLE unified query
+    // for up to half a minute — the arm this function's own contract says must
+    // never slow the query past `TENANT_QUERY_TIMEOUT`. Losing the vector half
+    // is the designed degradation; losing thirty seconds is not.
+    let query_embedding = match tokio::time::timeout(
+        LOCAL_EMBED_TIMEOUT,
+        EmbeddingClient::new().compute_text_embedding_checked(query),
+    )
+    .await
     {
-        Ok(e) => Some(e),
-        Err(e) => {
+        Ok(Ok(e)) => Some(e),
+        Ok(Err(e)) => {
             tracing::debug!(
                 error = %e,
                 "Unified memory: no usable query vector — tenant query degrading to FTS-only"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::debug!(
+                timeout_ms = LOCAL_EMBED_TIMEOUT.as_millis() as u64,
+                "Unified memory: local embed timed out — tenant query degrading to FTS-only"
             );
             None
         }
@@ -647,6 +686,23 @@ async fn retrieve_tenant_memory(query: &str, limit: usize) -> Vec<MemoryResult> 
 /// Hard latency ceiling for the tenant-memory arm — the fan-out must not
 /// stall the local query on a slow network.
 const TENANT_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Hard ceiling on a call to the LOCAL embedding service, for every arm of the
+/// unified fan-out that makes one.
+///
+/// Distinct from [`TENANT_QUERY_TIMEOUT`], which lives on the reqwest client and
+/// so only ever covered the request to the backend. Without this the embed ran
+/// under `EmbeddingClient`'s own **30 s** ceiling, uncapped by the `tokio::join!`
+/// fan-out — which has no ceiling of its own — so a wedged embedding service
+/// stalled every unified query.
+///
+/// Sized against the measurement the proxy arm used: the local service answers
+/// in ~10 ms warm and 6.01 s cold. Two seconds clears the warm path by orders of
+/// magnitude and deliberately drops the cold one — a query that waits out a cold
+/// start is worse than a query that returns FTS hits now. It coincides with
+/// [`TENANT_QUERY_TIMEOUT`] but is not derived from it: they bound different
+/// hops and should move independently.
+const LOCAL_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Shared client for the tenant arm (connection-pooled, 2s timeout).
 fn tenant_query_client() -> &'static reqwest::Client {

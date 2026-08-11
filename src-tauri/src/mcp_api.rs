@@ -2380,11 +2380,22 @@ impl MemoryEnrichOutcome {
 }
 
 /// Per-outcome counters, indexed by [`MemoryEnrichOutcome::idx`].
-fn memory_enrich_counters() -> &'static [std::sync::atomic::AtomicU64; 6] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 6]> =
+///
+/// Sized from `ALL` rather than a repeated literal. Adding a variant already
+/// fails to compile twice over (the exhaustive `idx()` match, the `[Self; N]`
+/// literal), but a hand-written length here would still compile at the OLD
+/// size and then panic on `counters()[idx()]` — index-out-of-bounds, inside the
+/// proxy's request path, i.e. a 500 on a memory search. That is the one failure
+/// this whole arm is built to make impossible. Deriving the length turns it
+/// back into a compile error.
+fn memory_enrich_counters() -> &'static [std::sync::atomic::AtomicU64; MEMORY_ENRICH_SERIES] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; MEMORY_ENRICH_SERIES]> =
         std::sync::OnceLock::new();
     COUNTERS.get_or_init(Default::default)
 }
+
+/// Number of enrichment counter slots — one per [`MemoryEnrichOutcome`].
+const MEMORY_ENRICH_SERIES: usize = MemoryEnrichOutcome::ALL.len();
 
 fn record_memory_enrich_outcome(outcome: MemoryEnrichOutcome) {
     memory_enrich_counters()[outcome.idx()].fetch_add(1, Ordering::Relaxed);
@@ -2427,7 +2438,18 @@ enum MemorySearchShape<'a> {
         needs_cleanup: bool,
     },
     /// A search, but not one we will rewrite. Carries the outcome to record.
-    Skip(MemoryEnrichOutcome),
+    ///
+    /// `needs_cleanup` means the same thing it does on [`Self::Enrichable`] —
+    /// a half-pair coord would REFUSE, which we must strip rather than forward.
+    /// It is carried here too because "we are not enriching" is the condition
+    /// that makes the half-pair fatal, and that condition is reached from the
+    /// classifier as well as from an embedder failure. It is deliberately
+    /// FALSE for [`MemoryEnrichOutcome::SkippedPresent`]: that body carries the
+    /// caller's own real vector, which is theirs to keep.
+    Skip {
+        outcome: MemoryEnrichOutcome,
+        needs_cleanup: bool,
+    },
 }
 
 fn is_memory_search_call(req: &serde_json::Value) -> bool {
@@ -2447,7 +2469,12 @@ fn classify_memory_search(parsed: &serde_json::Value) -> MemorySearchShape<'_> {
     // mean reasoning about partial-batch enrichment for no caller that exists.
     if let Some(elems) = parsed.as_array() {
         return if elems.iter().any(is_memory_search_call) {
-            MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedParse)
+            // No cleanup: a batch has no `/params/arguments` to strip, and
+            // rewriting one is the thing this branch exists to refuse.
+            MemorySearchShape::Skip {
+                outcome: MemoryEnrichOutcome::SkippedParse,
+                needs_cleanup: false,
+            }
         } else {
             MemorySearchShape::NotASearch
         };
@@ -2470,7 +2497,14 @@ fn classify_memory_search(parsed: &serde_json::Value) -> MemorySearchShape<'_> {
         .and_then(|a| a.get("query_embedding"))
         .is_some_and(|v| !v.is_null());
     if real_vector {
-        return MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedPresent);
+        // Never `needs_cleanup`: stripping here would delete the caller's own
+        // vector and silently downgrade a semantic search they explicitly
+        // asked for. Their pair is theirs — including the risk that it is
+        // malformed, which is coord's to answer, not ours to paper over.
+        return MemorySearchShape::Skip {
+            outcome: MemoryEnrichOutcome::SkippedPresent,
+            needs_cleanup: false,
+        };
     }
     // Either leftover key makes the body one coord would REFUSE if we forwarded
     // it unchanged, so a degrade path has to strip it. See `Enrichable`.
@@ -2485,7 +2519,17 @@ fn classify_memory_search(parsed: &serde_json::Value) -> MemorySearchShape<'_> {
             query_text: t,
             needs_cleanup,
         },
-        _ => MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedParse),
+        // A half-pair is fatal here for exactly the reason it is fatal on an
+        // embedder failure: we are not enriching, so nothing will overwrite it,
+        // and coord refuses the shape. The unusable `query_text` is a SEPARATE
+        // question — a blank or whitespace query is still a string coord may
+        // answer FTS-only, so leaving the half-pair on would convert a search
+        // coord might serve into one it is guaranteed to reject. Carry the flag
+        // through instead of dropping it.
+        _ => MemorySearchShape::Skip {
+            outcome: MemoryEnrichOutcome::SkippedParse,
+            needs_cleanup,
+        },
     }
 }
 
@@ -2595,10 +2639,10 @@ async fn enrich_memory_search_body_with(
     let mut parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
     let (query_text, needs_cleanup) = match classify_memory_search(&parsed) {
         MemorySearchShape::NotASearch => return None,
-        MemorySearchShape::Skip(outcome) => {
-            record_memory_enrich_outcome(outcome);
-            return None;
-        }
+        MemorySearchShape::Skip {
+            outcome,
+            needs_cleanup,
+        } => return degraded_body(&mut parsed, needs_cleanup, outcome),
         MemorySearchShape::Enrichable {
             query_text,
             needs_cleanup,
@@ -7078,7 +7122,10 @@ mod memory_search_enrichment_tests {
         }));
         assert!(matches!(
             classify_memory_search(&body),
-            MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedPresent)
+            MemorySearchShape::Skip {
+                outcome: MemoryEnrichOutcome::SkippedPresent,
+                needs_cleanup: false,
+            }
         ));
     }
 
@@ -7111,7 +7158,10 @@ mod memory_search_enrichment_tests {
             assert!(
                 matches!(
                     classify_memory_search(&body),
-                    MemorySearchShape::Skip(MemoryEnrichOutcome::SkippedParse)
+                    MemorySearchShape::Skip {
+                        outcome: MemoryEnrichOutcome::SkippedParse,
+                        ..
+                    }
                 ),
                 "expected a parse skip for {body}"
             );
@@ -7344,6 +7394,97 @@ mod memory_search_enrichment_tests {
                 .is_none(),
             "nothing to clean ⇒ forward the original bytes"
         );
+    }
+
+    /// The half-pair must be stripped on the CLASSIFIER's skip too, not only on
+    /// an embedder failure. A client that serializes absent optionals as `null`
+    /// (the very client class the null handling exists for) can also send a
+    /// blank `query_text`; that lands in `SkippedParse`, which used to forward
+    /// the body untouched — half-pair intact — so coord refused a search it
+    /// might otherwise have answered FTS-only. Never enriching is exactly what
+    /// makes the leftover fatal, and this path never enriches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_classifier_skip_also_strips_a_half_pair() {
+        // Never reached: the skip is decided before any embed.
+        let client =
+            crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
+
+        for args in [
+            json!({"query_text": "   ", "query_embedding": serde_json::Value::Null}),
+            json!({"query_text": "   ", "query_embedding_model": "other@v9"}),
+            json!({"query_text": 42, "query_embedding": serde_json::Value::Null}),
+            json!({"query_embedding": serde_json::Value::Null}),
+        ] {
+            let body = serde_json::to_vec(&search_call(args.clone())).unwrap();
+            let out = super::enrich_memory_search_body_with(&body, Some(&client), None)
+                .await
+                .unwrap_or_else(|| {
+                    panic!("an unenrichable body must still be CLEANED, not forwarded: {args}")
+                });
+
+            let sent: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let sent_args = &sent["params"]["arguments"];
+            assert!(
+                sent_args.get("query_embedding").is_none()
+                    && sent_args.get("query_embedding_model").is_none(),
+                "both halves must be gone so coord can still accept the body: {sent_args}"
+            );
+        }
+    }
+
+    /// The mirror of the above: a caller's OWN vector is never stripped. It is
+    /// the one skip that must forward byte-identical — deleting it would
+    /// silently downgrade a semantic search they explicitly asked for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_caller_supplied_vector_survives_the_skip() {
+        let client =
+            crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
+        let body = serde_json::to_vec(&search_call(json!({
+            "query_text": "login",
+            "query_embedding": [0.1, 0.2],
+            "query_embedding_model": "their-space@v1",
+        })))
+        .unwrap();
+        assert!(
+            super::enrich_memory_search_body_with(&body, Some(&client), None)
+                .await
+                .is_none(),
+            "the caller's own pair is theirs — forward the original bytes"
+        );
+    }
+
+    /// An unenrichable body with NOTHING to strip is still forwarded
+    /// byte-identical: the cleanup is keyed on the half-pair, not on the skip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_classifier_skip_with_nothing_to_strip_forwards_the_original() {
+        let client =
+            crate::database::embedding_client::EmbeddingClient::with_url("http://127.0.0.1:1/none");
+        for args in [json!({"limit": 5}), json!({"query_text": "   "})] {
+            let body = serde_json::to_vec(&search_call(args.clone())).unwrap();
+            assert!(
+                super::enrich_memory_search_body_with(&body, Some(&client), None)
+                    .await
+                    .is_none(),
+                "nothing to clean ⇒ forward the original bytes: {args}"
+            );
+        }
+    }
+
+    /// Every counter slot is addressable. Pins the counter array's length to
+    /// `ALL`: a variant added without widening the array would index out of
+    /// bounds inside the proxy's request path — a 500 on a memory search, the
+    /// one outcome this arm exists to rule out.
+    #[test]
+    fn every_outcome_has_a_counter_slot() {
+        assert_eq!(
+            super::memory_enrich_counters().len(),
+            MemoryEnrichOutcome::ALL.len(),
+            "one counter per outcome"
+        );
+        for outcome in MemoryEnrichOutcome::ALL {
+            let _ = super::memory_enrich_counters()[outcome.idx()]
+                .load(std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Read side and write side must agree on the slot. Reading by position in
