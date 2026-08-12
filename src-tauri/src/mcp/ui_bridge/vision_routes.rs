@@ -494,18 +494,20 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
         .app_handle
         .get_webview_window(qontinui_runner_lib::get_main_window_label())
         .ok_or_else(|| "Runner window not found".to_string())?;
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let pos = window
-        .inner_position()
-        .map_err(|e| format!("inner_position failed: {}", e))?;
-    let size = window
-        .inner_size()
-        .map_err(|e| format!("inner_size failed: {}", e))?;
+    // BOUNDED (see `window_probe`): `scale_factor` / `inner_position` /
+    // `inner_size` are blocking event-loop round-trips. Bare, from this
+    // `async fn`, they parked a tokio WORKER thread whenever the UI thread
+    // was wedged — and this is the vision capture path, which agents hit
+    // continuously, so it was the highest-traffic route into that hang.
+    let geometry = super::window_probe::geometry(&window)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let x = pos.x;
-    let y = pos.y;
-    let w = size.width;
-    let h = size.height;
+    let scale = geometry.scale;
+    let x = geometry.x;
+    let y = geometry.y;
+    let w = geometry.width;
+    let h = geometry.height;
 
     let _permit = state
         .vision_capture_semaphore
@@ -534,7 +536,12 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
         match capture_result {
             Ok(png) => match image::load_from_memory(&png) {
                 Ok(img) => {
-                    let scale_factor = window.scale_factor().unwrap_or(scale);
+                    // Was a second `scale_factor()` event-loop round-trip.
+                    // `scale` above already came from the bounded probe in
+                    // this same function microseconds earlier, so re-asking
+                    // bought nothing and added one more unbounded blocking
+                    // call to the hot vision path.
+                    let scale_factor = scale;
                     state
                         .vision_capture_preview_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

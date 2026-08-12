@@ -52,6 +52,7 @@ pub mod types;
 pub mod vision_ai;
 pub mod vision_frame_source;
 pub mod vision_routes;
+pub mod window_probe;
 
 // Re-export all public symbols so every currently-used path like
 // `crate::mcp::ui_bridge::UiBridgeError`, `::ui_bridge_request_sync`,

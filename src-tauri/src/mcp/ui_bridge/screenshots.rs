@@ -40,6 +40,14 @@ use crate::screen;
 
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 
+/// Bound on the native monitor-crop capture.
+///
+/// A full-screen grab of a large display is real work — hundreds of ms is
+/// normal — so this is generous compared to
+/// [`super::window_probe::WINDOW_GETTER_TIMEOUT`]. It exists to stop an
+/// indefinite hang, not to police latency.
+const NATIVE_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 // ============================================================================
 // Screenshot helper types
 // ============================================================================
@@ -202,7 +210,21 @@ pub(super) async fn capture_webview_contents(state: &Arc<ApiState>) -> Result<Ve
 
     // Physical inner size — logged against the CapturePreview dims on first
     // capture so hardware verification can confirm the surface-size contract.
-    let inner = window.inner_size().ok();
+    //
+    // BOUNDED (see `window_probe`): `inner_size()` is a blocking event-loop
+    // round-trip. Called bare from this `async fn` it parked a tokio WORKER
+    // thread indefinitely whenever the UI thread was wedged — i.e. precisely
+    // when a diagnostic capture is requested — so `num_cpus` concurrent
+    // captures could silence the entire HTTP surface. It is diagnostic-only
+    // here, so an unresponsive loop degrades to `None` and the capture
+    // continues rather than aborting.
+    let inner = match super::window_probe::inner_size(&window).await {
+        Ok(size) => size,
+        Err(e) => {
+            warn!("inner_size probe failed before CapturePreview: {e}");
+            None
+        }
+    };
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<Vec<u8>, String>>();
 
@@ -367,27 +389,53 @@ pub async fn capture_runner_window_base64(state: &Arc<ApiState>) -> Option<(Stri
     let window = state
         .app_handle
         .get_webview_window(qontinui_runner_lib::get_main_window_label())?;
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let pos = window.inner_position().unwrap_or_default();
-    let size = window.inner_size().unwrap_or_default();
-    let x = pos.x;
-    let y = pos.y;
-    let w = size.width;
-    let h = size.height;
-    let title = window
-        .title()
-        .unwrap_or_else(|_| "Qontinui Runner".to_string());
 
-    match tokio::task::spawn_blocking(move || capture_runner_window(x, y, w, h, scale, &title))
-        .await
-    {
-        Ok(Ok(data)) => Some((data.screenshot, data.width, data.height)),
-        Ok(Err(e)) => {
+    // BOUNDED (see `window_probe`): these four getters are blocking
+    // event-loop round-trips, batched behind ONE timeout. Unbounded and
+    // called bare from this `async fn`, they parked a tokio WORKER thread —
+    // and this is the fallback arm, reached exactly when the UI thread is
+    // already suspect. If the loop is wedged there is no geometry to crop
+    // to, so give up on the capture instead of guessing at coordinates.
+    let geometry = match super::window_probe::geometry(&window).await {
+        Ok(geometry) => geometry,
+        Err(e) => {
+            warn!("Native capture fallback skipped — {e}");
+            return None;
+        }
+    };
+    let super::window_probe::WindowGeometry {
+        scale,
+        x,
+        y,
+        width: w,
+        height: h,
+        title,
+    } = geometry;
+
+    // The blocking capture itself is bounded too. Its sibling CapturePreview
+    // arm has carried a 5s timeout since it was written; this arm never got
+    // the same treatment, so an unbounded `spawn_blocking` join sat here.
+    // Unlike the getters above this one only ever parked a blocking-pool
+    // thread (an awaited JoinHandle yields its worker), so it is correctness
+    // hygiene rather than the wedge fix — but an unbounded await is still an
+    // unbounded await.
+    let capture =
+        tokio::task::spawn_blocking(move || capture_runner_window(x, y, w, h, scale, &title));
+    match tokio::time::timeout(NATIVE_CAPTURE_TIMEOUT, capture).await {
+        Ok(Ok(Ok(data))) => Some((data.screenshot, data.width, data.height)),
+        Ok(Ok(Err(e))) => {
             warn!("Native capture fallback failed: {}", e);
             None
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!("Native capture task join error: {}", e);
+            None
+        }
+        Err(_elapsed) => {
+            warn!(
+                "Native capture fallback timed out after {:?}",
+                NATIVE_CAPTURE_TIMEOUT
+            );
             None
         }
     }

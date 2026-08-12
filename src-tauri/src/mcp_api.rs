@@ -418,6 +418,60 @@ fn pr_credential_health() -> serde_json::Value {
     }
 }
 
+/// Dependency-free liveness probe.
+///
+/// This is the endpoint anything should probe to answer "is the runner's
+/// async runtime still turning?" — and the *only* one that can answer it
+/// honestly, because it is the only one that touches nothing.
+///
+/// **The exclusions are the feature, so do not add to this handler.** No
+/// shared lock, no PG, no screen capture, no `spawn_blocking`, no embedding
+/// probe — and above all **no Tauri window getter**. Every one of those can
+/// block, and a liveness probe that can block reports "dead" for a runner
+/// whose runtime is fine, or hangs alongside everything else and reports
+/// nothing at all. `/health` exists for rich diagnostics; this exists to be
+/// unable to fail for any reason except the one it is testing for.
+///
+/// Answering this while `/health` hangs is the discriminator between "one
+/// handler is stuck" and "the runtime is starved" (plan
+/// `2026-08-07-runner-wedge-and-supervisor-hung-blindness`, Phase 0.1).
+async fn livez() -> impl axum::response::IntoResponse {
+    (axum::http::StatusCode::OK, "ok")
+}
+
+/// Explicit diagnostic capture, moved off `/health` (Phase 1.2).
+///
+/// Kept as a separate route precisely because it is expensive and can fail:
+/// it reaches the webview capture ladder, which depends on the tao event
+/// loop. Bounded end-to-end by `window_probe` + the native capture timeout,
+/// so a wedged UI thread yields a fast 503 instead of a hung request.
+async fn diagnostic_screenshot(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> impl axum::response::IntoResponse {
+    match crate::mcp::ui_bridge::capture_runner_window_base64(&state).await {
+        Some((screenshot, width, height)) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "screenshot": screenshot,
+                    "width": width,
+                    "height": height,
+                }
+            })),
+        ),
+        None => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "capture unavailable — the window geometry probe or the \
+                          capture itself timed out, which usually means the UI \
+                          thread is wedged",
+            })),
+        ),
+    }
+}
+
 /// Health check endpoint (also served at `/ui-bridge/health` and
 /// `/ui-bridge/status` — all three share this handler).
 /// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
@@ -465,14 +519,19 @@ async fn health(
             })
             .collect();
 
-    // When the frontend has not connected after 30s of uptime, auto-attach a
-    // native window screenshot so health consumers (agents, supervisor) can see
-    // what the webview is actually showing (e.g., ERR_CONNECTION_REFUSED).
-    let diagnostic_screenshot = if last_pong == 0 && uptime_secs >= 30 {
-        crate::mcp::ui_bridge::capture_runner_window_base64(&state).await
-    } else {
-        None
-    };
+    // A liveness endpoint must not do work it can outlive.
+    //
+    // This used to take a native window screenshot inline, gated on
+    // `last_pong == 0 && uptime_secs >= 30`. That put the process's most
+    // expensive and most failure-prone operation on the health path,
+    // triggered precisely when the process was sickest — a health check that
+    // got heavier the sicker you were. Worse, the capture path blocks on the
+    // tao event loop, which is the very thing a dead webview has stopped.
+    //
+    // The screenshot now lives behind an explicit diagnostic route
+    // (`/health/diagnostic-screenshot`). `/health` only ADVERTISES that the
+    // diagnostic is worth fetching; consumers that want pixels ask for them.
+    let diagnostic_screenshot_available = last_pong == 0 && uptime_secs >= 30;
 
     // Embedding service health probe (cached, refreshed every 30s).
     let embedding_health = embedding_service_health().await;
@@ -788,13 +847,12 @@ async fn health(
         );
     }
 
-    if let Some((screenshot, width, height)) = diagnostic_screenshot {
+    if diagnostic_screenshot_available {
         data.as_object_mut().unwrap().insert(
             "diagnosticScreenshot".to_string(),
             serde_json::json!({
-                "screenshot": screenshot,
-                "width": width,
-                "height": height,
+                "available": true,
+                "fetchFrom": "/health/diagnostic-screenshot",
                 "reason": "Frontend SDK has not connected after 30s of uptime"
             }),
         );
@@ -5818,9 +5876,14 @@ pub fn create_router(
             GraphQLSubscription::new(graphql_schema.clone()),
         )
         // Local routes
+        // Dependency-free liveness. Probe THIS for "is the runtime alive";
+        // `/health` answers a much richer and much more blockable question.
+        .route("/livez", get(livez))
         .route("/health", get(health))
         .route("/ui-bridge/health", get(health))
         .route("/ui-bridge/status", get(health))
+        // The capture that used to run inline inside `/health` (Phase 1.2).
+        .route("/health/diagnostic-screenshot", get(diagnostic_screenshot))
         // Phase 2 — graceful drain on planned restart. The supervisor POSTs
         // here before its hard taskkill so in-flight turns flush, dirty
         // worktrees are stashed to refs/wip/*, and coord claims persist.
