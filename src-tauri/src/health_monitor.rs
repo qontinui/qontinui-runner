@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Interval between health checks in seconds
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 60;
@@ -21,8 +21,188 @@ const MEMORY_WARNING_THRESHOLD_MB: u64 = 1024; // 1 GB
 /// threads during normal operation (tokio runtime, bridges, background tasks).
 const THREAD_WARNING_THRESHOLD: usize = 150;
 
+/// How often the monitor self-probes `/livez`.
+const SELF_PROBE_INTERVAL_SECS: u64 = 5;
+
+/// Per-probe timeout. Generous for a handler that returns a literal 200 —
+/// anything slower than this is already a symptom, not latency.
+const SELF_PROBE_TIMEOUT_SECS: u64 = 5;
+
+/// Consecutive failed probes before declaring the backend wedged.
+///
+/// 3 × 5s ≈ 15s of continuous silence. Above the noise floor of a single
+/// dropped connection or a GC pause; far below the 7 hours the 2026-08-08
+/// incident went unnoticed.
+const WEDGE_FAILURE_THRESHOLD: u32 = 3;
+
+/// Re-escalate every N further consecutive failures (≈5 min at a 5s probe)
+/// so a long wedge stays visible without flooding the log.
+const WEDGE_REESCALATION_EVERY: u32 = 60;
+
 /// Flag to control the health monitor
 static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Set while the backend is believed wedged, so other in-process surfaces can
+/// read it without waiting on the monitor thread.
+static BACKEND_WEDGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the monitor currently believes the HTTP surface is wedged.
+///
+/// Read by the UI/status surfaces; never blocks.
+pub fn backend_wedged() -> bool {
+    BACKEND_WEDGED.load(Ordering::SeqCst)
+}
+
+/// Blocking `/livez` probe.
+///
+/// Deliberately a plain blocking HTTP call on this OS thread, NOT a
+/// `block_on` against the app runtime: routing the probe through the runtime
+/// under test would make it hang exactly when it needs to report, and would
+/// consume a worker from the pool it is trying to measure.
+fn probe_livez_blocking() -> bool {
+    let port = crate::mcp::types::get_mcp_api_port();
+    let url = format!("http://127.0.0.1:{port}/livez");
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(SELF_PROBE_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            // Cannot build a client: report UNKNOWN as "not a failure" rather
+            // than manufacturing a wedge out of our own defect.
+            warn!("livez self-probe client build failed: {e}");
+            return true;
+        }
+    };
+    match client.get(&url).send() {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Escalation state machine for consecutive `/livez` failures.
+///
+/// Pure and side-effect free apart from the escalation callbacks, so the
+/// thresholds can be tested without a runtime, a socket, or a clock.
+#[derive(Debug, Default)]
+struct WedgeDetector {
+    consecutive_failures: u32,
+    escalated: bool,
+}
+
+/// What the caller should do about this observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WedgeAction {
+    /// Healthy, or not yet past the threshold.
+    None,
+    /// Cross the threshold for the first time in this incident.
+    Escalate { consecutive_failures: u32 },
+    /// Still wedged — periodic reminder.
+    ReEscalate { consecutive_failures: u32 },
+    /// Recovered after having escalated.
+    Recovered { was_failing_for: u32 },
+}
+
+impl WedgeDetector {
+    /// Fold one probe result into the state machine and return the action.
+    fn step(&mut self, alive: bool) -> WedgeAction {
+        if alive {
+            let was = self.consecutive_failures;
+            let had_escalated = self.escalated;
+            self.consecutive_failures = 0;
+            self.escalated = false;
+            return if had_escalated {
+                WedgeAction::Recovered {
+                    was_failing_for: was,
+                }
+            } else {
+                WedgeAction::None
+            };
+        }
+
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let n = self.consecutive_failures;
+
+        if n == WEDGE_FAILURE_THRESHOLD {
+            self.escalated = true;
+            WedgeAction::Escalate {
+                consecutive_failures: n,
+            }
+        } else if self.escalated
+            && n > WEDGE_FAILURE_THRESHOLD
+            && (n - WEDGE_FAILURE_THRESHOLD).is_multiple_of(WEDGE_REESCALATION_EVERY)
+        {
+            WedgeAction::ReEscalate {
+                consecutive_failures: n,
+            }
+        } else {
+            WedgeAction::None
+        }
+    }
+
+    /// Fold in an observation and perform the escalation side effects.
+    fn observe(&mut self, alive: bool) {
+        match self.step(alive) {
+            WedgeAction::None => {}
+            WedgeAction::Escalate {
+                consecutive_failures,
+            }
+            | WedgeAction::ReEscalate {
+                consecutive_failures,
+            } => {
+                BACKEND_WEDGED.store(true, Ordering::SeqCst);
+                let secs = consecutive_failures as u64 * SELF_PROBE_INTERVAL_SECS;
+                error!(
+                    consecutive_failures,
+                    unresponsive_for_secs = secs,
+                    "BACKEND WEDGED: /livez has not answered for {secs}s. The HTTP surface is \
+                     not serving — every agent session on this box is affected, and coord-mcp \
+                     writes issued through this runner are being LOST. Not restarting: a \
+                     process restart destroys in-flight sessions and is an explicit non-goal.",
+                );
+                write_wedge_breadcrumb(secs);
+            }
+            WedgeAction::Recovered { was_failing_for } => {
+                BACKEND_WEDGED.store(false, Ordering::SeqCst);
+                let secs = was_failing_for as u64 * SELF_PROBE_INTERVAL_SECS;
+                warn!(
+                    was_failing_for_secs = secs,
+                    "Backend recovered: /livez is answering again after {secs}s of silence"
+                );
+            }
+        }
+    }
+}
+
+/// Append a durable on-disk record of the wedge.
+///
+/// **This is the load-bearing half of the escalation, not the log line.** The
+/// monitor already logged a thread-leak warning every 60s for days before
+/// 2026-08-11 and nobody saw it; a WARN in a 12,000-line/hour file is not a
+/// signal. This breadcrumb survives the process, sits in a file whose only
+/// content is incidents, and is the first thing to read after an unexplained
+/// outage.
+///
+/// Best-effort by contract: the process is already sick, so a failure to
+/// write must never make it worse.
+fn write_wedge_breadcrumb(unresponsive_for_secs: u64) {
+    let dir = crate::paths::get_dev_logs_dir();
+    let path = dir.join("wedge-incidents.log");
+    let line = format!(
+        "{} runner backend wedged — /livez silent for {}s (pid {})\n",
+        chrono::Utc::now().to_rfc3339(),
+        unresponsive_for_secs,
+        std::process::id()
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
 
 /// Health metrics snapshot
 #[derive(Debug, Clone)]
@@ -197,21 +377,40 @@ pub fn start_health_monitor() {
     }
 
     info!(
-        "Starting health monitor (interval: {}s, memory_threshold: {}MB, thread_threshold: {})",
-        HEALTH_CHECK_INTERVAL_SECS, MEMORY_WARNING_THRESHOLD_MB, THREAD_WARNING_THRESHOLD
+        "Starting health monitor (interval: {}s, memory_threshold: {}MB, thread_threshold: {}, \
+         livez_probe_every: {}s)",
+        HEALTH_CHECK_INTERVAL_SECS,
+        MEMORY_WARNING_THRESHOLD_MB,
+        THREAD_WARNING_THRESHOLD,
+        SELF_PROBE_INTERVAL_SECS
     );
 
-    // Spawn the background task
+    // Spawn the background task.
+    //
+    // A DEDICATED OS THREAD, not a tokio task — and that is load-bearing, not
+    // incidental. This thread is the only thing that keeps observing when the
+    // async runtime it is watching is starved, which is exactly the condition
+    // it exists to detect. Measured on 2026-08-08: during a 25-minute wedge
+    // that silenced the entire HTTP surface, this loop kept its 60s cadence
+    // throughout. Never move it onto the runtime it monitors.
     std::thread::spawn(|| {
-        let interval = Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS);
+        let mut wedge = WedgeDetector::default();
+        // Probe several times per metrics tick: 60s is a fine cadence for a
+        // leak trend and far too coarse for an outage clock.
+        let probes_per_metrics_tick =
+            (HEALTH_CHECK_INTERVAL_SECS / SELF_PROBE_INTERVAL_SECS).max(1);
 
         while MONITOR_RUNNING.load(Ordering::SeqCst) {
-            // Collect and log metrics
             let metrics = collect_metrics();
             log_metrics(&metrics);
 
-            // Sleep until next check
-            std::thread::sleep(interval);
+            for _ in 0..probes_per_metrics_tick {
+                if !MONITOR_RUNNING.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(SELF_PROBE_INTERVAL_SECS));
+                wedge.observe(probe_livez_blocking());
+            }
         }
 
         info!("Health monitor stopped");
@@ -289,5 +488,97 @@ mod tests {
         let status = get_health_status();
         assert!(status.memory_mb > 0);
         assert!(status.thread_count >= 1);
+    }
+
+    // ---- Phase 2: wedge escalation state machine ----
+    //
+    // Pure `step()` tests: no socket, no runtime, no clock. The thresholds are
+    // the whole contract, so they get pinned rather than eyeballed.
+
+    #[test]
+    fn healthy_probes_never_escalate() {
+        let mut d = WedgeDetector::default();
+        for _ in 0..100 {
+            assert_eq!(d.step(true), WedgeAction::None);
+        }
+    }
+
+    #[test]
+    fn escalates_exactly_once_at_the_threshold() {
+        let mut d = WedgeDetector::default();
+        for _ in 1..WEDGE_FAILURE_THRESHOLD {
+            assert_eq!(d.step(false), WedgeAction::None, "escalated too early");
+        }
+        assert_eq!(
+            d.step(false),
+            WedgeAction::Escalate {
+                consecutive_failures: WEDGE_FAILURE_THRESHOLD
+            }
+        );
+        // Immediately after, it must go quiet rather than firing every probe.
+        assert_eq!(d.step(false), WedgeAction::None);
+    }
+
+    #[test]
+    fn a_single_success_resets_the_streak() {
+        // The failure count must be CONSECUTIVE. An intermittently-accepting
+        // runner (the observed 401 -> TIMEOUT -> REFUSED -> 401 fingerprint)
+        // must not accumulate scattered failures into a false wedge.
+        let mut d = WedgeDetector::default();
+        for _ in 0..(WEDGE_FAILURE_THRESHOLD - 1) {
+            d.step(false);
+        }
+        assert_eq!(d.step(true), WedgeAction::None);
+        for _ in 0..(WEDGE_FAILURE_THRESHOLD - 1) {
+            assert_eq!(d.step(false), WedgeAction::None, "streak did not reset");
+        }
+    }
+
+    #[test]
+    fn re_escalates_periodically_while_still_wedged() {
+        let mut d = WedgeDetector::default();
+        for _ in 0..WEDGE_FAILURE_THRESHOLD {
+            d.step(false);
+        }
+        let mut reescalations = 0;
+        for _ in 0..(WEDGE_REESCALATION_EVERY * 2) {
+            if matches!(d.step(false), WedgeAction::ReEscalate { .. }) {
+                reescalations += 1;
+            }
+        }
+        assert_eq!(reescalations, 2, "expected one reminder per period");
+    }
+
+    #[test]
+    fn recovery_is_reported_only_if_we_had_escalated() {
+        // Recovering from a sub-threshold blip is not an incident and must
+        // not produce a "recovered" line for an outage nobody saw.
+        let mut d = WedgeDetector::default();
+        d.step(false);
+        assert_eq!(d.step(true), WedgeAction::None);
+
+        for _ in 0..WEDGE_FAILURE_THRESHOLD {
+            d.step(false);
+        }
+        assert_eq!(
+            d.step(true),
+            WedgeAction::Recovered {
+                was_failing_for: WEDGE_FAILURE_THRESHOLD
+            }
+        );
+        // And the next healthy probe is silent again.
+        assert_eq!(d.step(true), WedgeAction::None);
+    }
+
+    #[test]
+    fn detection_latency_stays_under_a_minute() {
+        // The point of the phase is that an outage surfaces in seconds, not
+        // the 7 hours the 2026-08-08 incident took. Guard the arithmetic so a
+        // later interval bump cannot quietly restore a coarse clock.
+        let latency = WEDGE_FAILURE_THRESHOLD as u64 * SELF_PROBE_INTERVAL_SECS;
+        assert!(
+            latency <= 60,
+            "wedge detection latency regressed to {latency}s"
+        );
     }
 }
