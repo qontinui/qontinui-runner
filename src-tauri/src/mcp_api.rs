@@ -3582,10 +3582,20 @@ enum CoordWriteTarget {
     WorkUnitSetDeps { slug: String },
 }
 
-/// A coord plan slug stem: lowercase alphanumeric + hyphens, must start with an
-/// alphanumeric (`^[a-z0-9][a-z0-9-]*$`). Rejects `/`, `.`, `%`, whitespace, and
-/// uppercase, so a slug can never carry a path separator or escape sequence into
-/// the fixed coord route template.
+/// A coord **work-unit** slug stem: lowercase alphanumeric + hyphens, must start
+/// with an alphanumeric (`^[a-z0-9][a-z0-9-]*$`). Rejects `/`, `.`, `%`,
+/// whitespace, and uppercase, so a slug can never carry a path separator or
+/// escape sequence into the fixed coord route template.
+///
+/// Every caller is now a work-unit anchor — [`ClaimsReadTarget::WorkUnitDeps`]
+/// and the three slug-carrying [`CoordWriteTarget`] work-unit writes. This was
+/// written against coord's *plan* slugs, but the last plan-anchored target went
+/// away with coord's `/coord/plans*` surface (plan
+/// 2026-08-03-gate-class-producers-and-clearance-rules-inert, P4). The charset
+/// is unchanged — coord derives both slug forms the same way, so the validator
+/// needed no loosening, only its name-in-prose corrected: calling it a "plan
+/// slug" re-implies the two anchors are interchangeable, which is the exact
+/// confusion that P4 deletion existed to remove.
 fn slug_is_valid(slug: &str) -> bool {
     let mut chars = slug.chars();
     match chars.next() {
@@ -8416,33 +8426,119 @@ mod coord_write_proxy_tests {
     use axum::{body::Body, http::Request, routing::post, Router};
     use tower::ServiceExt;
 
-    // Concrete route templates (axum 0.8 `{param}` form) registered in the real router.
-    const WRITE_ROUTES: &[&str] = &[
-        "/coord-mcp/gates/register",
-        "/coord-mcp/gates/{gate_id}/attest",
-        "/coord-mcp/work-units/upsert",
-        "/coord-mcp/work-units/{slug}/transition",
-        "/coord-mcp/work-units/{slug}/register-gate",
-        "/coord-mcp/work-units/{slug}/deps",
-    ];
-    // Concrete request paths used to hit those routes in tests.
-    const WRITE_REQUEST_PATHS: &[&str] = &[
-        "/coord-mcp/gates/register",
-        "/coord-mcp/gates/123e4567-e89b-12d3-a456-426614174000/attest",
-        "/coord-mcp/work-units/upsert",
-        "/coord-mcp/work-units/2026-07-03-some-unit/transition",
-        "/coord-mcp/work-units/2026-07-03-some-unit/register-gate",
-        "/coord-mcp/work-units/2026-07-03-some-unit/deps",
-    ];
+    /// The write forwarder's route table: for each `/coord-mcp` write route the
+    /// real router registers, the axum 0.8 template, a concrete request path
+    /// that reaches it, and the handler it must bind to — one row, so the three
+    /// cannot drift apart.
+    ///
+    /// This replaced two parallel `&[&str]` consts plus a `write_router()` that
+    /// bound handlers by POSITIONAL INDEX (`WRITE_ROUTES[0]`, `[1]`, …). Under
+    /// that shape, deleting a variant meant hand-renumbering every arm — which
+    /// plan 2026-08-03-gate-class-producers-and-clearance-rules-inert (P4) had
+    /// to do when it removed the plan-anchored register — and binding a handler
+    /// to the wrong template was UNDETECTABLE: the only tests that exercise this
+    /// router assert a 401, and the nonce gate returns that before the handler
+    /// ever runs, so every arm passes no matter which path it sits on.
+    fn write_route_table() -> Vec<(&'static str, &'static str, axum::routing::MethodRouter)> {
+        vec![
+            (
+                "/coord-mcp/gates/register",
+                "/coord-mcp/gates/register",
+                post(coord_register_gate_handler),
+            ),
+            (
+                "/coord-mcp/gates/{gate_id}/attest",
+                "/coord-mcp/gates/123e4567-e89b-12d3-a456-426614174000/attest",
+                post(coord_attest_gate_handler),
+            ),
+            (
+                "/coord-mcp/work-units/upsert",
+                "/coord-mcp/work-units/upsert",
+                post(coord_work_unit_upsert_handler),
+            ),
+            (
+                "/coord-mcp/work-units/{slug}/transition",
+                "/coord-mcp/work-units/2026-07-03-some-unit/transition",
+                post(coord_work_unit_transition_handler),
+            ),
+            (
+                "/coord-mcp/work-units/{slug}/register-gate",
+                "/coord-mcp/work-units/2026-07-03-some-unit/register-gate",
+                post(coord_work_unit_register_gate_handler),
+            ),
+            (
+                "/coord-mcp/work-units/{slug}/deps",
+                "/coord-mcp/work-units/2026-07-03-some-unit/deps",
+                post(coord_work_unit_set_deps_handler),
+            ),
+        ]
+    }
+
+    /// Concrete request paths used to hit those routes in tests.
+    fn write_request_paths() -> Vec<&'static str> {
+        write_route_table()
+            .into_iter()
+            .map(|(_, path, _)| path)
+            .collect()
+    }
 
     fn write_router() -> Router {
-        Router::new()
-            .route(WRITE_ROUTES[0], post(coord_register_gate_handler))
-            .route(WRITE_ROUTES[1], post(coord_attest_gate_handler))
-            .route(WRITE_ROUTES[2], post(coord_work_unit_upsert_handler))
-            .route(WRITE_ROUTES[3], post(coord_work_unit_transition_handler))
-            .route(WRITE_ROUTES[4], post(coord_work_unit_register_gate_handler))
-            .route(WRITE_ROUTES[5], post(coord_work_unit_set_deps_handler))
+        write_route_table()
+            .into_iter()
+            .fold(Router::new(), |router, (template, _, method_router)| {
+                router.route(template, method_router)
+            })
+    }
+
+    /// The `/coord-mcp` route template that reaches each [`CoordWriteTarget`].
+    ///
+    /// EXHAUSTIVE BY CONSTRUCTION — no wildcard arm, so adding a variant is a
+    /// COMPILE ERROR here. That is the forcing function this module was missing.
+    /// `CoordWriteTarget::validate()` and `write_upstream_url()` are already
+    /// compile-protected the same way, so a new variant cannot ship without
+    /// segment validation or an upstream URL — but the TEST surface was not, so
+    /// a seventh variant could have shipped routed, validated and forwarded with
+    /// zero nonce-gate coverage.
+    ///
+    /// The arm you are forced to add here is the prompt to also add a sample to
+    /// [`all_write_targets`] and a row to [`write_route_table`];
+    /// [`every_write_target_has_exactly_one_registered_route`] then fails unless
+    /// those two agree. Be precise about what that does and does not buy: axum
+    /// exposes no route introspection, so [`write_route_table`] mirrors
+    /// `create_router` BY HAND. A variant added to the real router but to
+    /// neither list here still escapes — the compile error is a signpost, not a
+    /// closed loop. Closing it fully would need the real router to be the single
+    /// source both sides read.
+    fn proxy_route_for(target: &CoordWriteTarget) -> &'static str {
+        match target {
+            CoordWriteTarget::RegisterGate => "/coord-mcp/gates/register",
+            CoordWriteTarget::AttestGate { .. } => "/coord-mcp/gates/{gate_id}/attest",
+            CoordWriteTarget::WorkUnitUpsert => "/coord-mcp/work-units/upsert",
+            CoordWriteTarget::WorkUnitTransition { .. } => {
+                "/coord-mcp/work-units/{slug}/transition"
+            }
+            CoordWriteTarget::WorkUnitRegisterGate { .. } => {
+                "/coord-mcp/work-units/{slug}/register-gate"
+            }
+            CoordWriteTarget::WorkUnitSetDeps { .. } => "/coord-mcp/work-units/{slug}/deps",
+        }
+    }
+
+    /// One sample of every `CoordWriteTarget` variant, kept beside
+    /// [`proxy_route_for`] so the compile error there lands the author next to
+    /// the row they also have to add.
+    fn all_write_targets() -> Vec<CoordWriteTarget> {
+        let slug = "2026-07-03-some-unit".to_string();
+        vec![
+            CoordWriteTarget::RegisterGate,
+            CoordWriteTarget::AttestGate {
+                gate_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            },
+            CoordWriteTarget::WorkUnitUpsert,
+            CoordWriteTarget::WorkUnitTransition { slug: slug.clone() },
+            CoordWriteTarget::WorkUnitRegisterGate { slug: slug.clone() },
+            CoordWriteTarget::WorkUnitSetDeps { slug },
+        ]
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -8452,13 +8548,81 @@ mod coord_write_proxy_tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// The slug validator: accepts a real plan stem, rejects path-smuggling and
-    /// out-of-charset shapes.
+    /// Every `CoordWriteTarget` maps to exactly one registered `/coord-mcp`
+    /// write route, and every registered write route is reached by exactly one
+    /// target. This is the 1:1 mapping the forwarder's security argument rests
+    /// on — "no orphaned handler, nothing reachable without validation" — now
+    /// enforced instead of asserted in a doc comment.
     #[test]
-    fn slug_validator_accepts_plan_stems_rejects_path_smuggling() {
-        assert!(slug_is_valid("2026-06-15-some-plan"));
+    fn every_write_target_has_exactly_one_registered_route() {
+        let mut registered: Vec<&str> = write_route_table().iter().map(|(t, _, _)| *t).collect();
+        registered.sort_unstable();
+        let with_dupes = registered.len();
+        registered.dedup();
+        assert_eq!(
+            with_dupes,
+            registered.len(),
+            "a route template is registered twice in write_route_table()"
+        );
+
+        let targets = all_write_targets();
+        let mut reached: Vec<&str> = targets.iter().map(proxy_route_for).collect();
+        reached.sort_unstable();
+        let with_dupes = reached.len();
+        reached.dedup();
+        assert_eq!(
+            with_dupes,
+            reached.len(),
+            "two CoordWriteTarget variants claim the same route"
+        );
+
+        assert_eq!(
+            reached, registered,
+            "CoordWriteTarget variants and registered /coord-mcp write routes must correspond 1:1"
+        );
+
+        // The samples must be ones `validate()` accepts, so the set above
+        // exercises the real segment-validation path rather than a shape that
+        // could never reach coord.
+        for target in &targets {
+            assert!(
+                target.validate().is_ok(),
+                "{target:?} sample must pass validate()"
+            );
+        }
+    }
+
+    /// Each table row's concrete request path must actually match that row's own
+    /// template (same arity; literal segments equal; `{param}` segments filled).
+    /// Without this a row could pair its path with a sibling's template and the
+    /// 401 sweeps would still pass, since every registered route 401s alike.
+    #[test]
+    fn write_route_table_paths_match_their_templates() {
+        for (template, path, _) in write_route_table() {
+            let t: Vec<&str> = template.split('/').collect();
+            let p: Vec<&str> = path.split('/').collect();
+            assert_eq!(
+                t.len(),
+                p.len(),
+                "{path} has a different segment count than {template}"
+            );
+            for (seg_t, seg_p) in t.iter().zip(p.iter()) {
+                if seg_t.starts_with('{') && seg_t.ends_with('}') {
+                    assert!(!seg_p.is_empty(), "{path}: empty value for {seg_t}");
+                } else {
+                    assert_eq!(seg_t, seg_p, "{path} diverges from {template}");
+                }
+            }
+        }
+    }
+
+    /// The slug validator: accepts a real work-unit stem, rejects path-smuggling
+    /// and out-of-charset shapes.
+    #[test]
+    fn slug_validator_accepts_work_unit_stems_rejects_path_smuggling() {
+        assert!(slug_is_valid("2026-07-03-some-unit"));
         assert!(slug_is_valid("a"));
-        assert!(slug_is_valid("plan-1"));
+        assert!(slug_is_valid("unit-1"));
         // Rejections: path separators, dot-dot, uppercase, percent-encoding,
         // whitespace, empty, leading hyphen.
         assert!(!slug_is_valid("../etc"));
@@ -8613,12 +8777,12 @@ mod coord_write_proxy_tests {
     /// forwarded.
     #[tokio::test]
     async fn write_routes_missing_nonce_is_401_never_forwarded() {
-        for path in WRITE_REQUEST_PATHS {
+        for path in write_request_paths() {
             let resp = write_router()
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri(*path)
+                        .uri(path)
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -8635,12 +8799,12 @@ mod coord_write_proxy_tests {
     /// route.
     #[tokio::test]
     async fn write_routes_wrong_nonce_is_401() {
-        for path in WRITE_REQUEST_PATHS {
+        for path in write_request_paths() {
             let resp = write_router()
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri(*path)
+                        .uri(path)
                         .header("X-Coord-Mcp-Proxy-Key", "not-a-registered-nonce")
                         .body(Body::empty())
                         .unwrap(),
