@@ -2530,7 +2530,9 @@ mod tests {
             Duration::from_secs(10),
         );
         let id = Uuid::new_v4();
-        let probe = coord.probe_resume(id).await;
+        // `None` = the default binding, which is what an unpaired test box
+        // holds; the tenant argument is the caller's to supply now.
+        let probe = coord.probe_resume(id, None).await;
         assert_eq!(probe, ResumeProbe::Found);
         let g = rec.lock().await;
         assert_eq!(g.patches.len(), 1, "probe issues exactly one PATCH");
@@ -2554,7 +2556,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_secs(10),
         );
-        let probe = coord.probe_resume(Uuid::new_v4()).await;
+        let probe = coord.probe_resume(Uuid::new_v4(), None).await;
         assert_eq!(probe, ResumeProbe::NotFound);
     }
 
@@ -2571,7 +2573,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_secs(10),
         );
-        let probe = coord.probe_resume(Uuid::new_v4()).await;
+        let probe = coord.probe_resume(Uuid::new_v4(), None).await;
         assert_eq!(probe, ResumeProbe::Unreachable);
     }
 

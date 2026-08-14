@@ -4066,84 +4066,17 @@ mod tests {",
     }
 
     // ---- coord data-plane authentication ----
-
-    /// Every coord call the fleet publishers make must route through
-    /// `attach_device_auth`.
-    ///
-    /// These were the last unauthenticated coord calls among the FLEET
-    /// publishers — the set plan `2026-08-03-per-instance-device-identity` §4
-    /// Phase 3(a) names, whose `git grep -n "Authorization\|Bearer"` over
-    /// `fleet.rs` returned nothing. **They are not the last in the runner.**
-    /// Bare coord callers still live in `agent_worktree/census.rs`,
-    /// `agent_worktree/edit_effect_loop.rs`, `agent_runtime.rs`'s
-    /// continuation/dispatch posts, `commands/claims.rs::claims_steal`,
-    /// `coord_questions.rs`, `repo_detection.rs` and
-    /// `session_attribution.rs`; scoping this pin to `fleet.rs` is a scope
-    /// statement, not a claim that the repo is covered.
-    ///
-    /// The helper degrades gracefully — it attaches a bearer only when one is
-    /// held — so its real job here is enrolment in the `DATA_PLANE_TOTAL` /
-    /// `DATA_PLANE_AUTHED` coverage readout that Phase 3(b) enforcement is
-    /// gated on. A call site added WITHOUT it is invisible to that readout:
-    /// coverage reads 100% while an anonymous publisher is still writing,
-    /// which is the failure mode the readout exists to catch.
-    ///
-    /// Pinned at the SOURCE level for the same reason the guard pins above are
-    /// — the alternative needs a live coord and a credential — and scanning
-    /// only `prod_part` so this test's own doc text cannot satisfy it.
-    ///
-    /// **Known blind spot:** the bare-vs-authed equality below only
-    /// recognises the `client.post(&url)` / `client.get(&url)` spellings. A
-    /// call built as `client.post(format!(…))`, or through a differently-named
-    /// binding, escapes it. That is the cost of a source-level pin; the
-    /// alternative is a network-level assertion this module cannot make.
-    #[test]
-    fn every_fleet_coord_writer_attaches_device_auth() {
-        // (module, source, authed-call marker, minimum authed sites, what they are)
-        let cases = [
-            (
-                "fleet.rs",
-                include_str!("fleet.rs"),
-                "crate::auth::attach_device_auth(client.",
-                6,
-                "the budget POST, the device register/heartbeat POST, both \
-                 tree pull-decision POSTs, the tree upsert POST, and the \
-                 test-targets GET",
-            ),
-            (
-                "bin/qontinui_profile.rs",
-                include_str!("bin/qontinui_profile.rs"),
-                "qontinui_runner_lib::auth::attach_device_auth_blocking(client.",
-                1,
-                "`device init`'s register POST, on the blocking client",
-            ),
-        ];
-
-        for (name, src, marker, want, what) in cases {
-            let prod = squeezed(prod_part(src));
-            let found = prod.matches(marker).count();
-            assert!(
-                found >= want,
-                "{name}: expected at least {want} authenticated coord call site(s) — {what} \
-                 — but found {found}. A fleet coord writer lost its device-JWT attachment."
-            );
-            // …and nothing may go out the bare way. Counted rather than merely
-            // "absent" so this stays honest if a NON-coord call ever needs a
-            // raw builder here: the numbers must move together. Both verbs,
-            // because the reads carry the same bearer as the writes
-            // (`coord_http`'s module doc: one token source for both).
-            for verb in ["post", "get"] {
-                let bare = prod.matches(&format!("client.{verb}(&url)")).count();
-                let authed = prod.matches(&format!("{marker}{verb}(&url)")).count();
-                assert_eq!(
-                    bare,
-                    authed,
-                    "{name}: {} coord {verb} builder(s) are not wrapped in the auth helper",
-                    bare - authed
-                );
-            }
-        }
-    }
+    //
+    // `every_fleet_coord_writer_attaches_device_auth` used to live here,
+    // scoped to `fleet.rs` + `bin/qontinui_profile.rs`. It has been WIDENED,
+    // not deleted: `src-tauri/tests/coord_auth_pin.rs` runs the same predicate
+    // over every coord-touching file in `src-tauri/src`, so the publishers
+    // below are still pinned — along with the ~24 bare coord writers that the
+    // file-scoped version explicitly disclaimed covering.
+    //
+    // One predicate, one allowlist, one place to review. A second test with
+    // overlapping scope would mean two allowlists that can disagree, and the
+    // narrower one going green is exactly the false comfort this plan is about.
 
     // ---- repo-freshness Layer 1 — fetch interval gate ----
 

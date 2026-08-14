@@ -589,3 +589,65 @@ fn exempt_kinds_are_a_closed_distinct_set() {
         );
     }
 }
+
+/// Files whose coord **reads** are pinned, and how many authed `.get(` builders
+/// each must hold.
+///
+/// Inherited from `fleet.rs`'s `every_fleet_coord_writer_attaches_device_auth`
+/// (runner#1035), which this file replaced. That test's write half is subsumed
+/// by the repo-wide predicate above; its READ half is not, and dropping it on
+/// the merge would have been a silent coverage regression, so it moves here
+/// instead — one file, one place to review.
+///
+/// Deliberately a short explicit list rather than the repo-wide sweep the
+/// writes get. `.get(` is not a discriminating token: `map.get(&k)`,
+/// `body.get("token")` and `v.get("result")` are everywhere, and the
+/// builder-shape filter cannot separate them from `client.get(&url)` reliably
+/// enough to carry a whole-tree assertion. Widening reads properly is a
+/// follow-up (plan §9); until then this pins what was already pinned rather
+/// than pretending to more.
+const PINNED_READ_FILES: &[(&str, usize)] = &[("fleet.rs", 1)];
+
+/// Coord reads in the fleet publishers keep their device-JWT bearer.
+///
+/// Same reasoning as the write pin: `coord_http`'s module doc records that reads
+/// and writes share one token source, so a read that drops the helper both loses
+/// its bearer and vanishes from the `DATA_PLANE_TOTAL` / `DATA_PLANE_AUTHED`
+/// readout.
+#[test]
+fn pinned_coord_reads_attach_device_auth() {
+    let root = src_root();
+    for (rel, want) in PINNED_READ_FILES {
+        let path = root.join(rel);
+        let body = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let lines: Vec<&str> = body.lines().collect();
+        let test_ranges = cfg_test_ranges(&lines);
+
+        let mut bare = 0usize;
+        let mut authed = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains(".get(&url)") {
+                continue;
+            }
+            if test_ranges.iter().any(|(a, b)| i >= *a && i <= *b) {
+                continue;
+            }
+            let start = statement_start(&lines, i);
+            if code_only(&lines, start, i).contains("attach_device_auth") {
+                authed += 1;
+            } else if code_only(&lines, start, i).contains("client.get(&url)") {
+                bare += 1;
+            }
+        }
+        assert_eq!(
+            bare, 0,
+            "{rel}: {bare} coord GET builder(s) are not wrapped in the auth helper"
+        );
+        assert!(
+            authed >= *want,
+            "{rel}: expected at least {want} authenticated coord GET(s), found {authed} — \
+             a fleet coord reader lost its device-JWT attachment (or was renamed, in which \
+             case update PINNED_READ_FILES deliberately)"
+        );
+    }
+}
