@@ -48,6 +48,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
+use qontinui_runner_lib::env_agent::{
+    config::EnvAgentConfig,
+    enroll::{self, EnrollParams},
+};
 use serde_json::Value;
 use tauri::Manager;
 use tokio::sync::{broadcast, watch, Mutex};
@@ -896,6 +900,54 @@ fn build_ws_request(ws_url: &str, device_jwt: &str) -> Result<HttpRequest, Strin
     Ok(req)
 }
 
+/// Build the `devenv` block carried inside `runner_info`.
+///
+/// Wire contract (qontinui-web `devices_ws.py` parses it; plan
+/// `2026-08-05-devenv-auto-enrollment-on-connection` decision 2):
+///
+/// ```json
+/// {"enrolled": bool, "machine_id": string|null,
+///  "environment_id": string|null, "instance_role": "primary"|"secondary"}
+/// ```
+///
+/// **The block is ALWAYS emitted**, including for a box that has never enrolled
+/// (`cfg == None` — no/unreadable `~/.qontinui/env-agent.json`). Omitting it
+/// would be indistinguishable server-side from an older runner that predates
+/// this field, and "unenrolled" vs "unknown" is exactly the distinction the
+/// auto-enroll engine acts on. Same reasoning as
+/// `verification-and-evidence`'s absence-is-not-zero rule.
+///
+/// This is a CLIENT-ASSERTED hint. Per decision 2 the server may let it
+/// *suppress* enrollment (a secondary declines on its own behalf) but must never
+/// let it *name* the machine row, the environment or the owner — those come from
+/// the verified device identity. The ids here are therefore diagnostic only.
+///
+/// Pure (both inputs injected) so the shape is testable without a real config
+/// file or a real secondary spawn.
+fn devenv_runner_info_block(cfg: Option<EnvAgentConfig>, is_secondary: bool) -> Value {
+    /// Blank ids are the half-written-config case; report them as absent rather
+    /// than as an empty string, matching `EnvAgentConfig::is_enrolled`.
+    fn non_blank(s: String) -> Option<String> {
+        Some(s.trim().to_string()).filter(|t| !t.is_empty())
+    }
+
+    let (enrolled, machine_id, environment_id) = match cfg {
+        Some(c) => (
+            c.is_enrolled(),
+            non_blank(c.machine_id),
+            non_blank(c.environment_id),
+        ),
+        None => (false, None, None),
+    };
+
+    serde_json::json!({
+        "enrolled": enrolled,
+        "machine_id": machine_id,
+        "environment_id": environment_id,
+        "instance_role": if is_secondary { "secondary" } else { "primary" },
+    })
+}
+
 /// Send the initial `runner_info` payload. The backend uses this to upsert
 /// the `runners` row keyed by (user_id, name) and replies with `connected`.
 async fn send_runner_info<S>(
@@ -920,6 +972,12 @@ where
         "restate".to_string(),
     ];
 
+    // Devenv enrollment self-report (plan
+    // `2026-08-05-devenv-auto-enrollment-on-connection`, decision 2). Read from
+    // the on-disk env-agent config plus this process's instance identity — see
+    // `devenv_runner_info_block` for why the block is always present.
+    let devenv = devenv_runner_info_block(EnvAgentConfig::load(), crate::instance::is_secondary());
+
     // Payload field names are camelCase to match the backend contract.
     let runner_info = serde_json::json!({
         "type": "runner_info",
@@ -930,6 +988,7 @@ where
         "os": std::env::consts::OS,
         "osVersion": std::env::consts::ARCH,
         "capabilities": capabilities,
+        "devenv": devenv,
     });
 
     let info_text =
@@ -1410,6 +1469,8 @@ async fn sleep_with_kick(
 /// - `chat_*` — legacy chat session commands (kept for mobile relay).
 /// - `terminal_*` — legacy terminal commands (kept for mobile relay).
 /// - `heartbeat` — server pong; reply with `heartbeat_ack`.
+/// - `devenv_enroll` — server-pushed devenv enrollment; reply with
+///   `devenv_enroll_ack`.
 async fn handle_relay_command(
     api_state: &Arc<ApiState>,
     msg_type: &str,
@@ -1486,6 +1547,19 @@ async fn handle_relay_command(
         "heartbeat" => Some(serde_json::json!({"type": "heartbeat_ack"})),
 
         // --------------------------------------------------------------
+        // Server-pushed devenv enrollment (plan
+        // `2026-08-05-devenv-auto-enrollment-on-connection`, Phase 2). The web
+        // backend, inside the handler for THIS socket, has already verified who
+        // we are from the device JWT; it mints the machine row + one-time code
+        // and pushes:
+        //   {"type":"devenv_enroll","enrollment_code":"...",
+        //    "machine_id":"<uuid>?","environment_id":"<uuid>?"}
+        // We reply on the same socket with a `devenv_enroll_ack`, which
+        // `devices_ws.py::_route_device_message` routes.
+        // --------------------------------------------------------------
+        "devenv_enroll" => handle_devenv_enroll(data).await,
+
+        // --------------------------------------------------------------
         // Terminal-output flow control. The backend opens/closes interest
         // in terminal frames so the runner can suppress the
         // `terminal-output` / `terminal-exit` WS flood when nobody is
@@ -1535,6 +1609,184 @@ async fn handle_relay_command(
                 "Unknown relay command type"
             );
             None
+        }
+    }
+}
+
+// ======================================================================
+// devenv_enroll — server-pushed devenv enrollment over the device socket.
+// ======================================================================
+
+/// Local kill switch for server-pushed devenv enrollment. Set it to `0` (or any
+/// falsey spelling, see [`devenv_auto_enroll_disabled`]) to make this box refuse
+/// every `devenv_enroll` frame.
+const DEVENV_AUTO_ENROLL_ENV: &str = "QONTINUI_DEVENV_AUTO_ENROLL";
+
+/// Whether an env value reads as "off". `0` is the documented spelling; the
+/// usual falsey synonyms are honoured too, so an operator who writes `false`
+/// gets the kill switch they asked for instead of a silent no-op.
+fn devenv_auto_enroll_disabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// Why this runner declines a server-pushed `devenv_enroll`, or `None` when it
+/// accepts. Both inputs are injected, so every refusal case is unit-testable
+/// without a live enroll or a real secondary spawn.
+///
+/// Refusing is the ONE thing the client is unilaterally allowed to do here (plan
+/// decision 2: "a client hint may suppress enrollment freely" — declining on
+/// one's own behalf needs no server permission, whereas asserting an identity
+/// does). Two reasons:
+///
+/// - the local kill switch, an operator's explicit opt-out for this box;
+/// - a secondary instance. The supervisor spawns temp/named runners routinely
+///   and each may hold its own device identity; letting them enroll would mint
+///   a devenv machine row per ephemeral spawn.
+fn devenv_enroll_refusal(kill_switch: Option<&str>, is_secondary: bool) -> Option<&'static str> {
+    if kill_switch.is_some_and(devenv_auto_enroll_disabled) {
+        return Some("devenv auto-enrollment disabled locally (QONTINUI_DEVENV_AUTO_ENROLL)");
+    }
+    if is_secondary {
+        return Some("secondary runner instance declines devenv enrollment");
+    }
+    None
+}
+
+/// The fields the runner reads off a `devenv_enroll` frame.
+///
+/// Deliberately NOT a `backend` override: unlike coord's `EnrollDirective`
+/// (`env_agent/directive.rs`), which arrives on a channel keyed to this device,
+/// this frame would let whatever holds the socket redirect the enroll POST — and
+/// that POST carries the one-time code and receives the machine key. The backend
+/// base stays locally resolved (`enroll::resolve_backend_base(None)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DevenvEnrollRequest {
+    /// The one-time enrollment code minted by the web backend.
+    enrollment_code: String,
+    /// The SERVER-minted devenv `machine_id` to enroll AS. Optional; there is
+    /// deliberately no local fallback — see [`handle_devenv_enroll`].
+    machine_id: Option<String>,
+    /// Environment binding echoed from the dispatch (diagnostic; the enroll
+    /// response's `environment_id` still wins — `enroll::run_enroll`).
+    environment_id: Option<String>,
+}
+
+/// Read `key` as a non-blank string, or `None`. Never panics on a wrong-typed
+/// or missing field — the relay must survive any frame the server sends.
+fn optional_frame_str(data: &Value, key: &str) -> Option<String> {
+    data.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Parse a `devenv_enroll` frame. `Err` carries the reason string that goes
+/// straight into the `ok:false` ack. Total — no `unwrap`, no panic, whatever the
+/// frame looks like.
+fn parse_devenv_enroll_frame(data: &Value) -> Result<DevenvEnrollRequest, String> {
+    let enrollment_code = optional_frame_str(data, "enrollment_code")
+        .ok_or_else(|| "devenv_enroll frame carried no enrollment_code".to_string())?;
+    Ok(DevenvEnrollRequest {
+        enrollment_code,
+        machine_id: optional_frame_str(data, "machine_id"),
+        environment_id: optional_frame_str(data, "environment_id"),
+    })
+}
+
+/// The success ack. `machine_id`/`environment_id` are the ENROLL RESPONSE's
+/// values, not the frame's, so the server learns what actually got persisted.
+fn devenv_enroll_ack_ok(machine_id: &str, environment_id: &str) -> Value {
+    serde_json::json!({
+        "type": "devenv_enroll_ack",
+        "ok": true,
+        "machine_id": machine_id,
+        "environment_id": environment_id,
+    })
+}
+
+/// The failure ack. EVERY error path returns one of these: a dropped frame is
+/// the exact silent-hole failure mode this plan exists to close, so "refused",
+/// "malformed" and "enroll failed" are all reported, never swallowed.
+fn devenv_enroll_ack_err(reason: impl Into<String>) -> Value {
+    serde_json::json!({
+        "type": "devenv_enroll_ack",
+        "ok": false,
+        "reason": reason.into(),
+    })
+}
+
+/// Handle a `devenv_enroll` frame: refuse, or enroll THIS machine through the
+/// shared [`enroll::run_enroll`] core and kick an immediate capture.
+///
+/// Always returns an ack and never panics the relay — a panic here would take
+/// the whole device socket down with it.
+async fn handle_devenv_enroll(data: &Value) -> Option<Value> {
+    let kill_switch = std::env::var(DEVENV_AUTO_ENROLL_ENV).ok();
+    if let Some(reason) =
+        devenv_enroll_refusal(kill_switch.as_deref(), crate::instance::is_secondary())
+    {
+        info!("devenv_enroll: declined — {reason}");
+        return Some(devenv_enroll_ack_err(reason));
+    }
+
+    let request = match parse_devenv_enroll_frame(data) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("devenv_enroll: {e}");
+            return Some(devenv_enroll_ack_err(e));
+        }
+    };
+    let DevenvEnrollRequest {
+        enrollment_code,
+        machine_id,
+        environment_id,
+    } = request;
+
+    let outcome = tokio::task::spawn_blocking(move || {
+        let backend = enroll::resolve_backend_base(None)?;
+        // Only the SERVER-minted machine_id from the frame may be asserted — it
+        // is a devenv `devenv_machines.id`. There is deliberately no local
+        // fallback: `machine.json` holds coord's device_id, a different identity
+        // space, and asserting it produced `409 machine_id_mismatch`. The local
+        // file still supplies the hostname and the coord device_id (twin
+        // bridge). Byte-for-byte the rule at `env_agent/directive.rs`.
+        let identity = enroll::local_machine_identity();
+        enroll::run_enroll(EnrollParams {
+            code: enrollment_code,
+            backend,
+            machine_id,
+            hostname: identity.hostname,
+            coord_device_id: identity.coord_device_id,
+            environment_override: environment_id,
+        })
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(o)) => {
+            info!(
+                "devenv_enroll: enrolled machine_id={} environment_id={} backend={}",
+                o.machine_id, o.environment_id, o.backend_url
+            );
+            // Immediate capture so the drift view populates without waiting for
+            // the periodic tick. Best-effort — a capture failure does not make
+            // the enrollment itself un-successful.
+            if let Err(e) = qontinui_runner_lib::env_agent::capture_and_push().await {
+                warn!("devenv_enroll: post-enroll capture failed (will retry on tick): {e}");
+            }
+            Some(devenv_enroll_ack_ok(&o.machine_id, &o.environment_id))
+        }
+        Ok(Err(e)) => {
+            warn!("devenv_enroll: enroll failed: {e}");
+            Some(devenv_enroll_ack_err(e))
+        }
+        Err(e) => {
+            warn!("devenv_enroll: enroll task panicked: {e}");
+            Some(devenv_enroll_ack_err(format!("enroll task panicked: {e}")))
         }
     }
 }
@@ -2822,6 +3074,7 @@ mod tests {
     //! shape so a tungstenite bump can't silently break it.
 
     use super::*;
+    use crate::test_env::{env_lock, EnvVarRestore};
     use tokio_tungstenite::tungstenite::{
         http::{self, Response, StatusCode},
         Error,
@@ -3198,5 +3451,227 @@ mod tests {
             kick_clone_2.has_changed().expect("sender alive"),
             "a NEW kick must still force exactly one reconnect"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // `devenv_enroll` arm + the `runner_info` devenv block (plan
+    // `2026-08-05-devenv-auto-enrollment-on-connection`, Phase 2).
+    //
+    // These are wire-contract tests in the style of
+    // `env_agent/directive.rs`'s: the server (qontinui-web `devices_ws.py` and
+    // the auto-enroll engine) parses these exact shapes, so a rename here is a
+    // cross-repo break that no compiler catches. The refusal predicate is pure
+    // precisely so the "we declined" paths can be pinned without a live enroll.
+    // ------------------------------------------------------------------
+
+    fn enrolled_cfg() -> EnvAgentConfig {
+        EnvAgentConfig {
+            backend_url: "http://localhost:8000".to_string(),
+            machine_id: "machine-abc".to_string(),
+            environment_id: "env-123".to_string(),
+            enrolled_at: Some("2026-08-15T00:00:00Z".to_string()),
+            scope_root: None,
+        }
+    }
+
+    #[test]
+    fn devenv_kill_switch_refuses_and_names_itself() {
+        for off in ["0", "false", "NO", " off "] {
+            let reason = devenv_enroll_refusal(Some(off), false)
+                .unwrap_or_else(|| panic!("{off:?} must read as the kill switch being set"));
+            assert!(
+                reason.contains("QONTINUI_DEVENV_AUTO_ENROLL"),
+                "the refusal must name the switch the operator flipped: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn devenv_secondary_instance_refuses() {
+        let reason = devenv_enroll_refusal(None, true).expect("a secondary must decline");
+        assert!(
+            reason.contains("secondary"),
+            "the refusal must say which gate fired: {reason}"
+        );
+    }
+
+    #[test]
+    fn devenv_primary_without_kill_switch_accepts() {
+        assert!(devenv_enroll_refusal(None, false).is_none());
+        // A SET-but-truthy value is not a kill switch — `=1` must not disable.
+        for on in ["1", "true", "yes", "on", ""] {
+            assert!(
+                devenv_enroll_refusal(Some(on), false).is_none(),
+                "{on:?} must not read as disabled"
+            );
+        }
+    }
+
+    /// The refusal arms must return the ack WITHOUT reaching `run_enroll`. The
+    /// proof is the reason string: a call that got as far as the enroll core
+    /// would fail on backend resolution or the network and report THAT instead.
+    /// (No socket is opened either — this test runs with no backend at all.)
+    #[tokio::test]
+    async fn devenv_enroll_refusals_ack_false_without_enrolling() {
+        let _env = env_lock();
+        let _restore = EnvVarRestore::capture(&[
+            "QONTINUI_DEVENV_AUTO_ENROLL",
+            "QONTINUI_INSTANCE_NAME",
+            "QONTINUI_WEB_BASE",
+        ]);
+        // A real-looking frame: if anything but the refusal fired, this code
+        // would be POSTed somewhere.
+        let frame = json!({
+            "type": "devenv_enroll",
+            "enrollment_code": "ENR-SHOULD-NEVER-BE-SENT",
+            "machine_id": "11111111-2222-3333-4444-555555555555",
+        });
+
+        // (a) kill switch set, primary instance.
+        std::env::set_var("QONTINUI_DEVENV_AUTO_ENROLL", "0");
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        let ack = handle_devenv_enroll(&frame).await.expect("must ack");
+        assert_eq!(ack["type"], "devenv_enroll_ack");
+        assert_eq!(ack["ok"], false);
+        assert!(
+            ack["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("QONTINUI_DEVENV_AUTO_ENROLL"),
+            "kill-switch refusal expected, got: {ack}"
+        );
+
+        // (b) secondary instance, kill switch unset.
+        std::env::remove_var("QONTINUI_DEVENV_AUTO_ENROLL");
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-runner-7");
+        let ack = handle_devenv_enroll(&frame).await.expect("must ack");
+        assert_eq!(ack["ok"], false);
+        assert!(
+            ack["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("secondary"),
+            "secondary refusal expected, got: {ack}"
+        );
+    }
+
+    /// A malformed frame is answered, not dropped and not panicked on — the
+    /// relay carries every other command on this socket.
+    #[tokio::test]
+    async fn devenv_enroll_without_code_acks_false_rather_than_panicking() {
+        let _env = env_lock();
+        let _restore =
+            EnvVarRestore::capture(&["QONTINUI_DEVENV_AUTO_ENROLL", "QONTINUI_INSTANCE_NAME"]);
+        std::env::remove_var("QONTINUI_DEVENV_AUTO_ENROLL");
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+
+        for bad in [
+            json!({"type": "devenv_enroll"}),
+            json!({"type": "devenv_enroll", "enrollment_code": "   "}),
+            json!({"type": "devenv_enroll", "enrollment_code": 42}),
+        ] {
+            let ack = handle_devenv_enroll(&bad).await.expect("must ack");
+            assert_eq!(ack["type"], "devenv_enroll_ack");
+            assert_eq!(ack["ok"], false, "got: {ack}");
+            assert!(
+                ack["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("enrollment_code"),
+                "got: {ack}"
+            );
+        }
+    }
+
+    /// The devenv `machine_id` may come ONLY from the frame (it is server-minted
+    /// and lives in a different identity space than coord's `device_id` — see
+    /// `env_agent/enroll.rs`). Nothing is invented when the server omits it.
+    #[test]
+    fn devenv_enroll_frame_takes_machine_id_only_from_the_wire() {
+        let parsed = parse_devenv_enroll_frame(&json!({
+            "type": "devenv_enroll",
+            "enrollment_code": " ENR-ABC ",
+            "machine_id": "11111111-2222-3333-4444-555555555555",
+            "environment_id": "env-9",
+        }))
+        .expect("valid frame");
+        assert_eq!(
+            parsed,
+            DevenvEnrollRequest {
+                enrollment_code: "ENR-ABC".to_string(),
+                machine_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+                environment_id: Some("env-9".to_string()),
+            }
+        );
+
+        let minimal =
+            parse_devenv_enroll_frame(&json!({"enrollment_code": "ONLY-CODE"})).expect("valid");
+        assert!(
+            minimal.machine_id.is_none() && minimal.environment_id.is_none(),
+            "absent server fields must stay absent, never locally invented"
+        );
+    }
+
+    #[test]
+    fn devenv_enroll_ack_shapes_are_stable() {
+        let ok = devenv_enroll_ack_ok("machine-abc", "env-123");
+        assert_eq!(ok["type"], "devenv_enroll_ack");
+        assert_eq!(ok["ok"], true);
+        assert_eq!(ok["machine_id"], "machine-abc");
+        assert_eq!(ok["environment_id"], "env-123");
+        assert!(
+            ok.get("reason").is_none(),
+            "a success ack carries no reason: {ok}"
+        );
+
+        let err = devenv_enroll_ack_err("backend unreachable");
+        assert_eq!(err["type"], "devenv_enroll_ack");
+        assert_eq!(err["ok"], false);
+        assert_eq!(err["reason"], "backend unreachable");
+    }
+
+    #[test]
+    fn devenv_runner_info_block_reports_an_enrolled_box() {
+        let block = devenv_runner_info_block(Some(enrolled_cfg()), false);
+        assert_eq!(block["enrolled"], true);
+        assert_eq!(block["machine_id"], "machine-abc");
+        assert_eq!(block["environment_id"], "env-123");
+        assert_eq!(block["instance_role"], "primary");
+    }
+
+    /// The unenrolled states — no config file at all, and a config whose ids are
+    /// blank — must both report `enrolled:false` with NULL ids, and the block
+    /// must still be PRESENT. An omitted block reads server-side as "old runner,
+    /// unknown", which is a different fact than "this box is not enrolled".
+    #[test]
+    fn devenv_runner_info_block_is_present_and_null_when_unenrolled() {
+        for cfg in [
+            None,
+            Some(EnvAgentConfig {
+                backend_url: "http://localhost:8000".to_string(),
+                machine_id: "  ".to_string(),
+                environment_id: "".to_string(),
+                enrolled_at: None,
+                scope_root: None,
+            }),
+        ] {
+            let block = devenv_runner_info_block(cfg, false);
+            assert_eq!(block["enrolled"], false, "got: {block}");
+            assert!(block["machine_id"].is_null(), "got: {block}");
+            assert!(block["environment_id"].is_null(), "got: {block}");
+            assert_eq!(block["instance_role"], "primary");
+        }
+    }
+
+    /// `instance_role` is the client hint the server uses to skip temp/named
+    /// runners entirely — the supervisor spawns those routinely, and each could
+    /// otherwise mint its own devenv machine row.
+    #[test]
+    fn devenv_runner_info_block_marks_a_secondary_instance() {
+        let block = devenv_runner_info_block(Some(enrolled_cfg()), true);
+        assert_eq!(block["instance_role"], "secondary");
+        // A secondary still reports its own enrollment state honestly — the
+        // suppression is the server's decision, made from `instance_role`.
+        assert_eq!(block["enrolled"], true);
     }
 }
