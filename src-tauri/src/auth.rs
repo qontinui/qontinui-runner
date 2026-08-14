@@ -1031,7 +1031,14 @@ pub fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilde
 
 /// Tenant-selecting variant of [`attach_device_auth`] (Phase 8b, plan §D4):
 /// `Some(tenant)` presents that binding's device-JWT slot, `None` the default
-/// binding's. Slot-miss posture is [`device_bearer_for`]'s (never another
+/// binding's.
+///
+/// **`None` is not "anonymous".** It selects the DEFAULT binding's JWT, so a
+/// caller that cannot resolve its request's tenant and passes `None` presents
+/// the default tenant's credential — on a route where coord derives the row's
+/// tenant from the verified bearer, that is a cross-tenant write. Session-scoped
+/// callers must therefore obtain the owning session's tenant from a source that
+/// can actually answer, not pass `None` and hope. Slot-miss posture is [`device_bearer_for`]'s (never another
 /// tenant's credential — degrade to unauthenticated). Session-scoped callers
 /// pass the owning session's tenant; device-scoped callers use the plain
 /// [`attach_device_auth`] and keep the default slot by construction.

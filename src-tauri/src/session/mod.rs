@@ -455,9 +455,14 @@ impl SessionRegistry {
         // Phase 8 (plan §D10/§D11) — opt-in PTY output streaming. Only when
         // the session declared `share_output`: tap the transport's output
         // broadcast and spawn the publish pipe. Off by default → no tap, no
-        // task, zero overhead. coord resolves the session's tenant
-        // server-side, so the pipe only needs the session id + coord
-        // client (held by `coord_sync`).
+        // task, zero overhead.
+        //
+        // The tenant is handed to the pipe rather than looked up by it: this
+        // runs BEFORE `sessions.insert(id, record)` below, so a pipe that
+        // resolved its own tenant would race the record it reads and publish
+        // early chunks under the DEFAULT binding — which, on the route where
+        // coord derives the row's tenant from the verified bearer, files
+        // another tenant's transcript.
         let output_pipe = if intent.share_output {
             match transport.tap_output(&transport_handle) {
                 Some(rx) => Some(output_pipe::spawn(
@@ -465,6 +470,7 @@ impl SessionRegistry {
                     id,
                     rx,
                     intent.effective_redact_secrets(),
+                    intent.tenant_id,
                 )),
                 None => {
                     tracing::debug!(
@@ -668,8 +674,23 @@ impl SessionRegistry {
         intent: Intent,
     ) -> Result<Uuid, SessionError> {
         intent.validate()?;
+        // Stamp before the probe, for the same reason `start_inner` and
+        // `register_external` stamp: the resumed record must carry a tenant, and
+        // the probe's bearer is selected from it. Unstamped, a resumed session
+        // was the one session shape whose in-memory record held `tenant_id:
+        // None`, which also made `record_session_tenant`'s registry arm return
+        // `None` for it on every later drain.
+        let intent = stamp_session_tenant(intent);
 
-        let probe = self.coord_sync.probe_resume(persisted_id).await;
+        // The probe runs BEFORE `insert_resumed_record`, so the registry cannot
+        // answer this — the tenant has to come from the intent. `None` selects
+        // the DEFAULT binding, not an anonymous send, so resolving it here is
+        // what keeps a non-default tenant's resume off the default tenant's
+        // credential.
+        let probe = self
+            .coord_sync
+            .probe_resume(persisted_id, intent.tenant_id)
+            .await;
 
         match probe {
             ResumeProbe::Found => {
@@ -899,7 +920,15 @@ impl SessionRegistry {
         rx: tokio::sync::broadcast::Receiver<String>,
         redact: bool,
     ) {
-        let handle = output_pipe::spawn(self.coord_sync.clone(), id, rx, redact);
+        // Resolved BEFORE taking the `sessions` lock: `session_tenant` locks the
+        // coord-sync registry slot and then `sessions` itself, so calling it
+        // while holding `sessions` would invert the order.
+        //
+        // Unlike `start_inner`'s pipe, this one runs after the record is
+        // inserted (its callers register an external session first), so the
+        // registry is the right source here.
+        let tenant = self.coord_sync.session_tenant(id);
+        let handle = output_pipe::spawn(self.coord_sync.clone(), id, rx, redact, tenant);
         let mut sessions = self.sessions.lock().expect("session registry poisoned");
         if let Some(rec) = sessions.get_mut(&id) {
             // If there was already a pipe (shouldn't happen for external

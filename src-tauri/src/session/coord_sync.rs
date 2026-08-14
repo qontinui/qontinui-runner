@@ -246,9 +246,14 @@ impl CoordSync {
     }
 
     /// The tenant that owns `session_id`, for per-session credential
-    /// selection by callers outside this module (the output pipe). Same
-    /// resolution and same `None` semantics as [`session_tenant_by_id`] —
-    /// `None` selects the default binding, never another tenant's slot.
+    /// selection by callers outside this module.
+    ///
+    /// Only for callers that KNOW the registry already holds the session —
+    /// `SessionRegistry::attach_output_pipe`, which runs after the record is
+    /// inserted. Callers on a pre-insert path must pass the intent's tenant
+    /// down instead (see [`CoordSync::probe_resume`]), because `None` here is
+    /// indistinguishable from "unknown" and resolves to the DEFAULT binding,
+    /// not to an anonymous send.
     pub fn session_tenant(&self, session_id: Uuid) -> Option<Uuid> {
         session_tenant_by_id(&self.inner, session_id)
     }
@@ -339,7 +344,17 @@ impl CoordSync {
     ///   optimistically and the drain loop retries).
     ///
     /// Called by [`SessionRegistry::resume_external`].
-    pub async fn probe_resume(&self, session_id: Uuid) -> ResumeProbe {
+    ///
+    /// `tenant` is the OWNING session's tenant and must be supplied by the
+    /// caller — it cannot be resolved here. This probe runs *before*
+    /// `insert_resumed_record`, so the registry provably does not hold
+    /// `session_id` yet; a [`session_tenant_by_id`] lookup would return `None`
+    /// on every call. And `None` does not mean "send anonymously" — it selects
+    /// the DEFAULT binding's JWT, so a self-resolving version would present the
+    /// default tenant's credential for another tenant's session on a route
+    /// where coord derives the row's tenant from the verified bearer. The
+    /// caller has the intent; it passes the tenant down.
+    pub async fn probe_resume(&self, session_id: Uuid, tenant: Option<Uuid>) -> ResumeProbe {
         let base = self.inner.coord_url.trim_end_matches('/');
         let url = format!("{base}/sessions/{session_id}");
         let body = json!({ "state": SessionState::Active.as_str(), "heartbeat": true });
@@ -350,7 +365,6 @@ impl CoordSync {
         // that asymmetry — `probe_resume` was added later, for a different
         // reason, and the auth was attached per-function rather than by a
         // predicate over all of them.
-        let tenant = session_tenant_by_id(&self.inner, session_id);
         match crate::auth::attach_device_auth_for(
             self.inner.http.patch(&url).json(&body),
             tenant.as_ref(),

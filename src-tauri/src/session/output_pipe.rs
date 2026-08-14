@@ -77,13 +77,23 @@ const MAX_BUFFER_BYTES: usize = 512 * 1024;
 ///
 /// `redact` is the resolved [`Intent::effective_redact_secrets`] value.
 /// `rx` is the transport's output broadcast receiver.
+///
+/// `tenant` is the OWNING session's tenant, supplied by the caller. It is not
+/// resolved here on purpose: `start_inner` spawns this pipe *before* inserting
+/// the session record, so a self-resolving pipe would race the registry and
+/// publish early chunks under the DEFAULT binding — and on this route coord
+/// derives the row's tenant from the verified bearer, so that files another
+/// tenant's transcript with no observable. `None` still means the default
+/// binding (never another tenant's slot), which is why the caller must be the
+/// one to decide.
 pub fn spawn(
     coord_sync: CoordSync,
     session_id: Uuid,
     rx: broadcast::Receiver<String>,
     redact: bool,
+    tenant: Option<Uuid>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_pipe(coord_sync, session_id, rx, redact))
+    tokio::spawn(run_pipe(coord_sync, session_id, rx, redact, tenant))
 }
 
 /// The pipe loop. Coalesces decoded (+ optionally redacted) output and
@@ -94,24 +104,11 @@ async fn run_pipe(
     session_id: Uuid,
     mut rx: broadcast::Receiver<String>,
     redact: bool,
+    tenant: Option<Uuid>,
 ) {
     let http = coord_sync.http_client();
     let base = coord_sync.coord_url().trim_end_matches('/').to_string();
     let url = format!("{base}/sessions/{session_id}/output");
-
-    // Per-session credential selection (Phase 8b §D4): output chunks belong to
-    // the SESSION, so they present the owning session's device-JWT slot rather
-    // than the device default. This matters more here than on a device-scoped
-    // route precisely because coord resolves this row's tenant from the
-    // VERIFIED BEARER (see the module doc) — the wrong slot would file another
-    // tenant's transcript, with no observable.
-    //
-    // Resolved lazily and retried while `None` because the pipe is spawned
-    // during session registration and can race the registry entry it reads
-    // from. `None` keeps the default slot, which is exactly the pre-change
-    // behaviour; a non-default tenant with no slot sends unauthenticated —
-    // never another tenant's credential (`auth::select_device_bearer`).
-    let mut tenant: Option<Uuid> = coord_sync.session_tenant(session_id);
 
     tracing::info!(
         session = %session_id,
@@ -128,13 +125,6 @@ async fn run_pipe(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        // Make good on the lazy resolution above: until a tenant is known,
-        // re-read it each iteration. Costs one registry lookup per iteration
-        // while unresolved and a single `is_none()` afterwards, so a pipe that
-        // won the race pays nothing.
-        if tenant.is_none() {
-            tenant = coord_sync.session_tenant(session_id);
-        }
         tokio::select! {
             // New output chunk (base64 string) from the transport.
             recv = rx.recv() => {

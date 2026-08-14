@@ -36,10 +36,16 @@
 //! 3. looks like a reqwest builder chain (a `.send()` / `.json()` /
 //!    `.bearer_auth()` / … nearby),
 //!
-//! there must be **either** an `attach_device_auth` within the preceding
-//! [`AUTH_LOOKBACK`] source lines (comments stripped — see that constant),
-//! **or** a `coord-auth-exempt(<kind>): <reason>` annotation somewhere in the
-//! comment block immediately above the statement ([`annotation_block`]).
+//! there must be **either** an `attach_device_auth` somewhere in the SAME
+//! STATEMENT ([`statement_start`]), **or** a
+//! `coord-auth-exempt(<kind>): <reason>` annotation in the comment block
+//! immediately above that statement ([`annotation_block`]).
+//!
+//! Both scans run with **comments stripped** ([`code_only`]) where they are
+//! deciding about code, because prose must never satisfy a code-level check.
+//! Two false-greens of exactly that shape were found and fixed while building
+//! this file: annotation text containing `attach_device_auth` scored a site as
+//! ROUTED, and a comment quoting `#[cfg(test)]` opened a skip range.
 //!
 //! ## Why the coord predicate is per-FILE and not per-function
 //!
@@ -112,17 +118,6 @@ const BUILDER_TOKENS: &[&str] = &[
     ".timeout(",
 ];
 
-/// Lines of lookback for the auth helper. A wrapped call puts the helper on
-/// the same line as the verb; rustfmt may split a long one across two.
-///
-/// Scanned with **comments stripped** ([`code_only`]). That is not tidiness:
-/// the first draft of this guard read the annotation prose
-/// "Routing it through `attach_device_auth` would hide…" in `coord_doctor.rs`
-/// and scored the site as ROUTED. A guard that its own excuse text can satisfy
-/// is the "green having verified nothing" failure mode, and it is the one this
-/// file is least allowed to have.
-const AUTH_LOOKBACK: usize = 3;
-
 /// The marker an exemption annotation must carry.
 const EXEMPT_MARKER: &str = "coord-auth-exempt(";
 
@@ -164,8 +159,6 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("agent_token/mod.rs", "agent-jwt", 1),
     ("bin/qontinui_cli.rs", "not-coord", 1),
     ("ci_node/reporting.rs", "device-jwt-required", 2),
-    ("claude_session/coord_register.rs", "device-jwt-required", 1),
-    ("claude_session/session_handle.rs", "device-jwt-required", 1),
     ("commands/ai_settings.rs", "not-coord", 3),
     ("commands/productivity.rs", "user-jwt", 1),
     ("commands/web_integration.rs", "not-coord", 2),
@@ -206,8 +199,7 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
 const MIN_SITES_SCANNED: usize = 70;
 
 /// Floor on the number of sites found routed through the helper. Guards the
-/// mirror-image vacuity: a broken [`AUTH_LOOKBACK`] scan that thinks
-/// everything is exempt.
+/// mirror-image vacuity: a broken auth scan that thinks everything is exempt.
 const MIN_SITES_ROUTED: usize = 45;
 
 #[derive(Debug)]
@@ -221,12 +213,38 @@ fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
+/// How far past a `#[cfg(test)]` attribute the item's opening brace may sit.
+///
+/// `#[cfg(test)]` also decorates BRACELESS items — a `static`, a `const`, a
+/// `use`, and (in `claude_session/coord_register.rs`) a struct FIELD. An
+/// unbounded search for the next `{` sails past those and latches onto the
+/// following braced item, which is PRODUCTION code: at the time this bound was
+/// added, the field at `coord_register.rs:148` made the scanner skip 590
+/// contiguous lines of a coord-writing file, including the `impl` holding its
+/// `POST /agents/{id}/log` batcher. Nothing in that span was a write site, so
+/// the guard was green — by luck, not by predicate.
+///
+/// A real `#[cfg(test)] mod`/`fn`/`impl` opens on the attribute line or the one
+/// after it (other attributes stack above, not between). Anything further away
+/// is a braceless item, and is treated as one.
+const CFG_TEST_BRACE_WINDOW: usize = 1;
+
 /// Line index ranges (inclusive) covered by `#[cfg(test)]` items.
+///
+/// Everything here fails toward **scanning more**. A range that is too small
+/// costs a spurious finding someone must look at; a range that is too large
+/// silently hides an anonymous coord writer forever. Those are not comparable,
+/// so every ambiguous case collapses to `(i, i)` — skip the attribute line only.
 fn cfg_test_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if !lines[i].contains("#[cfg(test)]") {
+        // Comment-stripped, for the same reason the auth scan is: prose must
+        // never drive a code-level decision. `plan_workunit_adapter/mod.rs`
+        // has a comment quoting `#[cfg(test)]`, and on the raw text that starts
+        // a range — the same class as the annotation-prose false-green already
+        // fixed one layer down, except this one blanks whole functions.
+        if !code_only(lines, i, i).contains("#[cfg(test)]") {
             i += 1;
             continue;
         }
@@ -235,28 +253,24 @@ fn cfg_test_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
         //
         // NOT brace counting. A `{` inside a string literal — `format!("{")`,
         // a JSON fixture, a raw string — unbalances a counter and silently
-        // extends the skipped region, which SKIPS REAL CODE. Every `#[cfg(test)]`
-        // item in this tree is rustfmt-formatted, so its closing brace sits alone
-        // at the item's own indentation; matching on that is immune to anything
-        // inside a literal.
-        let Some(open) = (i..lines.len()).find(|&j| lines[j].contains('{')) else {
-            // No opening brace at all: skip only the attribute line. Failing
-            // toward scanning MORE is the safe direction — the cost is a
-            // spurious finding someone must look at, where the cost of failing
-            // the other way is an anonymous coord writer nobody ever sees.
-            out.push((i, i));
-            i += 1;
-            continue;
-        };
-        let indent_len = lines[open].len() - lines[open].trim_start().len();
-        let closer = format!("{}}}", &lines[open][..indent_len]);
-        match (open + 1..lines.len()).find(|&k| lines[k].trim_end() == closer) {
+        // extends the skipped region. Every `#[cfg(test)]` item in this tree is
+        // rustfmt-formatted, so its closing brace sits alone at the item's own
+        // indentation; matching on that is immune to anything inside a literal.
+        let last = lines.len().saturating_sub(1);
+        let end = (i..=(i + CFG_TEST_BRACE_WINDOW).min(last))
+            .find(|&j| lines[j].contains('{'))
+            .and_then(|open| {
+                let indent_len = lines[open].len() - lines[open].trim_start().len();
+                let closer = format!("{}}}", &lines[open][..indent_len]);
+                (open + 1..lines.len()).find(|&k| lines[k].trim_end() == closer)
+            });
+        match end {
             Some(end) => {
                 out.push((i, end));
                 i = end + 1;
             }
+            // Braceless item, or unclosed at this indentation.
             None => {
-                // Unclosed at this indentation — same safe direction as above.
                 out.push((i, i));
                 i += 1;
             }
@@ -304,17 +318,76 @@ fn code_only(lines: &[&str], lo: usize, hi: usize) -> String {
 /// exemption carry a real, multi-line reason. A fixed window silently rejects
 /// the sites whose justification runs long — which are exactly the sites whose
 /// justification most needs reading.
-fn annotation_block(lines: &[&str], i: usize) -> String {
-    // Back up over builder-chain continuation lines to the statement start.
+fn annotation_block(lines: &[&str], i: usize) -> (String, usize) {
+    let start = statement_start(lines, i);
+    // Then over the contiguous comment block above the statement.
+    let mut top = start;
+    while top > 0 && lines[top - 1].trim_start().starts_with("//") {
+        top -= 1;
+    }
+    (lines[top..start].join("\n"), start)
+}
+
+/// How far back the statement walk will look before giving up. Bounds the work
+/// and, on the rare statement longer than this, fails toward "not routed" —
+/// a visible finding rather than a silent pass.
+const STATEMENT_LOOKBACK: usize = 10;
+
+/// First line of the statement containing the call on line `i`.
+///
+/// Walks back until a **statement boundary** — a code line whose trimmed form
+/// ends in `;`, `{` or `}`, or a blank line. Everything after that boundary is
+/// one statement with the call, whatever its shape:
+///
+/// ```ignore
+/// let resp = crate::auth::attach_device_auth(   // included
+///     client                                    // included
+///         .post(&url)                           // the call
+/// ```
+///
+/// Boundary-walking rather than "back up over lines starting with `.`", because
+/// the wrapped-argument shape — the call sitting as an ARGUMENT to the helper,
+/// on its own line — is the most common form in this tree and does not start
+/// with `.`:
+///
+/// ```ignore
+/// match crate::auth::attach_device_auth_for(
+///     client.post(url).json(&body),             // ← does not start with `.`
+///     self.tenant_id.as_ref(),
+/// )
+/// ```
+///
+/// And boundary-walking is what makes the scan reject the adjacency false-green
+/// a fixed lookback window admits, since the preceding statement's `;` stops
+/// the walk:
+///
+/// ```ignore
+/// let a = crate::auth::attach_device_auth(client.post(&u1)).send().await;
+/// let c = client.post(&u2).send().await;   // anonymous — walk stops at the `;`
+/// ```
+///
+/// Comment lines are skipped, not treated as boundaries: an annotation block
+/// sits between a statement and the code above it, and a multi-line wrapped
+/// call is frequently preceded by one.
+fn statement_start(lines: &[&str], i: usize) -> usize {
     let mut start = i;
-    while start > 0 && lines[start].trim_start().starts_with('.') {
+    let floor = i.saturating_sub(STATEMENT_LOOKBACK);
+    while start > floor {
+        let prev = lines[start - 1];
+        let trimmed = prev.trim();
+        if trimmed.starts_with("//") {
+            // A comment never joins or ends a statement; look past it without
+            // pulling it into the statement span.
+            break;
+        }
+        let code = code_only(lines, start - 1, start - 1);
+        let code = code.trim_end();
+        if code.is_empty() || code.ends_with(';') || code.ends_with('{') || code.ends_with('}') {
+            break;
+        }
         start -= 1;
     }
-    // Then over the contiguous comment block above it.
-    while start > 0 && lines[start - 1].trim_start().starts_with("//") {
-        start -= 1;
-    }
-    lines[start..=i].join("\n")
+    start
 }
 
 /// Extract the kind from `coord-auth-exempt(<kind>):`.
@@ -379,13 +452,19 @@ fn every_coord_write_is_authenticated_or_annotated() {
             }
             scanned += 1;
 
-            let auth_lo = i.saturating_sub(AUTH_LOOKBACK);
-            if code_only(&lines, auth_lo, i).contains("attach_device_auth") {
+            let (ex_window, stmt_start) = annotation_block(&lines, i);
+
+            // Scoped to THIS statement, not a fixed window. A fixed lookback
+            // scores a bare `client.post(&url)` as ROUTED whenever a wrapped
+            // call happens to sit on the line above — and because it then
+            // counts as routed rather than exempt, `EXPECTED_EXEMPTIONS` never
+            // changes and the equality below, the main anti-drift device, never
+            // fires. That is precisely "a new writer joins the gap silently".
+            if code_only(&lines, stmt_start, i).contains("attach_device_auth") {
                 routed += 1;
                 continue;
             }
 
-            let ex_window = annotation_block(&lines, i);
             let site = Site {
                 file: rel.clone(),
                 line: i + 1,
@@ -399,9 +478,17 @@ fn every_coord_write_is_authenticated_or_annotated() {
                         continue;
                     }
                     // A kind with no prose after the colon excuses nothing.
+                    //
+                    // Measured over the COMMENT BLOCK only — `ex_window` no
+                    // longer carries the statement's own source lines. It used
+                    // to, which made this check inert: a bare
+                    // `// coord-auth-exempt(not-coord):` passed because the
+                    // `let resp = client.post(&url)` underneath supplied the
+                    // characters. A guard that reports green having verified
+                    // nothing is the failure mode this file is least allowed
+                    // to have.
                     let at = ex_window.find(EXEMPT_MARKER).expect("marker present");
-                    let after = &ex_window[at..];
-                    let reason = after
+                    let reason = ex_window[at..]
                         .split_once("):")
                         .map(|(_, r)| r.trim())
                         .unwrap_or_default();

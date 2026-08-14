@@ -317,19 +317,16 @@ fn register_blocking(req: &HandleRegisterRequest) -> Option<String> {
         .timeout(REGISTER_TIMEOUT)
         .build()
         .ok()?;
-    let token = crate::auth::AuthManager::new()
-        .get_access_token()
-        .ok()
-        .filter(|t| !t.is_empty());
-
     let url = format!("{base}/coord/session-handles/register");
-    // coord-auth-exempt(device-jwt-required): blocking registrar, presenting the
-    // device JWT already resolved above. Same posture as `coord_register`'s
-    // batch flush.
-    let mut r = client.post(&url).json(req);
-    if let Some(t) = token {
-        r = r.bearer_auth(t);
-    }
+    // Blocking sibling of the async helper. This function's own doc records the
+    // posture — "a missing token sends anonymously and lets coord 401" — which
+    // is fail-SOFT, exactly what `attach_device_auth_blocking` provides, off a
+    // tokio runtime, from the same default slot this used to read by hand. The
+    // gain is that the call finally reaches the coverage counters.
+    //
+    // `None`: coord resolves this row's tenant from the registered handle, and
+    // the hand-rolled read was always the default slot's.
+    let r = crate::auth::attach_device_auth_blocking(client.post(&url).json(req), None);
 
     match r.send() {
         Ok(resp) if resp.status().is_success() => {

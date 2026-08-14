@@ -191,22 +191,31 @@ struct TriggerBody {
 /// dashboard's "Continue elsewhere" button via the web backend proxy —
 /// the dashboard hits coord directly through the proxy, this exists for
 /// a runner-initiated handoff and is exercised by the unit test).
+///
+/// `tenant` is the SOURCE session's tenant. `/sessions/{id}/…` is a
+/// per-session route, so it presents that session's device-JWT slot rather than
+/// the device default — the same rule the drain loop and the output pipe
+/// follow. `None` falls back to the default binding (never another tenant's
+/// slot), which is what a caller that cannot resolve the session should pass.
 pub async fn trigger_handoff(
     http: &reqwest::Client,
     coord_url: &str,
     source_session_id: Uuid,
     target_device_id: Uuid,
+    tenant: Option<Uuid>,
 ) -> Result<(), HandoffError> {
     let url = format!(
         "{}/sessions/{}/handoff",
         coord_url.trim_end_matches('/'),
         source_session_id
     );
-    let resp =
-        crate::auth::attach_device_auth(http.post(&url).json(&TriggerBody { target_device_id }))
-            .send()
-            .await
-            .map_err(|e| HandoffError::Http(format!("POST {url}: {e}")))?;
+    let resp = crate::auth::attach_device_auth_for(
+        http.post(&url).json(&TriggerBody { target_device_id }),
+        tenant.as_ref(),
+    )
+    .send()
+    .await
+    .map_err(|e| HandoffError::Http(format!("POST {url}: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();

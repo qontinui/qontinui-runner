@@ -216,13 +216,25 @@ pub async fn session_handoff(
     session_id: Uuid,
     target_device_id: Uuid,
 ) -> Result<CommandResponse, String> {
-    let (http, coord_url) = {
+    let (http, coord_url, tenant) = {
         let cs = registry.inner().coord_sync();
-        (cs.http_client(), cs.coord_url().to_string())
+        (
+            cs.http_client(),
+            cs.coord_url().to_string(),
+            // The session is registered by the time a handoff can be asked
+            // for, so the registry is the right source for its tenant.
+            cs.session_tenant(session_id),
+        )
     };
-    crate::session::handoff::trigger_handoff(&http, &coord_url, session_id, target_device_id)
-        .await
-        .map_err(|e| format!("session:handoff_failed: {e}"))?;
+    crate::session::handoff::trigger_handoff(
+        &http,
+        &coord_url,
+        session_id,
+        target_device_id,
+        tenant,
+    )
+    .await
+    .map_err(|e| format!("session:handoff_failed: {e}"))?;
     Ok(CommandResponse {
         success: true,
         message: None,

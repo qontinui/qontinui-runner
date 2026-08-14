@@ -1020,23 +1020,18 @@ fn flush_batch(
     let take = queue.len().min(MAX_AGENT_LOG_BATCH);
     let batch: Vec<LogEntry> = queue.drain(..take).collect();
 
-    // Best-effort bearer auth (mirrors the git-op record path). The ingest
-    // route resolves the tenant from the body `device_id`, so a missing token
-    // is non-fatal — we just omit the header.
-    let token = crate::auth::AuthManager::new()
-        .get_access_token()
-        .ok()
-        .filter(|t| !t.is_empty());
-
     let url = format!("{base}/agents/{agent_id}/log");
-    // coord-auth-exempt(device-jwt-required): blocking client on a thread with no
-    // tokio runtime, presenting the device JWT the batcher already holds. The
-    // route resolves the tenant from the body `device_id`, so the token is
-    // optional here by design and re-reading it per batch would be pure cost.
-    let mut req = client.post(&url).json(&batch);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
+    // Blocking sibling of the async helper — same token source (the default
+    // device-JWT slot this function was already reading by hand), same
+    // never-fatal posture, and now the same `DATA_PLANE_TOTAL`/`AUTHED`
+    // counters. This is a per-tick agent-log batcher, i.e. one of the highest-
+    // rate coord writers in the process; hand-rolling the header kept it out of
+    // the coverage readout entirely, which is the exact defect that readout
+    // exists to expose.
+    //
+    // `None`: the route resolves the row's tenant from the body `device_id`,
+    // and the token read here was always the default slot's.
+    let req = crate::auth::attach_device_auth_blocking(client.post(&url).json(&batch), None);
 
     match req.send() {
         Ok(resp) if resp.status().is_success() => {

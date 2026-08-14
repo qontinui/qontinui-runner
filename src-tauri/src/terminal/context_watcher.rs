@@ -417,8 +417,15 @@ async fn run_trigger(terminal_id: &str, origin: &'static str) {
             // re-acquired, scrollback replayed, source closed.
             let http = reg.coord_sync().http_client();
             let coord_url = reg.coord_sync().coord_url().to_string();
-            match crate::session::handoff::trigger_handoff(&http, &coord_url, cid, reg.machine_id())
-                .await
+            let tenant = reg.coord_sync().session_tenant(cid);
+            match crate::session::handoff::trigger_handoff(
+                &http,
+                &coord_url,
+                cid,
+                reg.machine_id(),
+                tenant,
+            )
+            .await
             {
                 Ok(()) => {
                     info!(
