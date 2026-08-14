@@ -573,6 +573,7 @@ impl TenantMemorySync {
             })
             .collect();
         let url = format!("{}/api/v1/memory/records", base.trim_end_matches('/'));
+        // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/memory/records`.
         let resp = client
             .post(&url)
             .header("Authorization", format!("Bearer {bearer}"))

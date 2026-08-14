@@ -398,6 +398,8 @@ async fn delete_probe_runner(
     runner_id: &str,
 ) {
     let del_url = format!("{}/api/v1/runners/{}", backend_url, runner_id);
+    // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/runners/*`, with the
+    // web backend's own token.
     match client.delete(&del_url).bearer_auth(token).send().await {
         Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {
             // 404 is fine — it means the entry was already cleaned up by the
@@ -484,6 +486,8 @@ pub async fn test_web_integration_connection(
     };
 
     let register_url = format!("{}/api/v1/runners/register", trimmed_backend);
+    // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/runners/register`,
+    // with the web backend's own token.
     let resp = client
         .post(&register_url)
         .bearer_auth(&trimmed_token)

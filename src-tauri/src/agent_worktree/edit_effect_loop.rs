@@ -232,7 +232,10 @@ async fn post_predict_and_check(
             return None;
         }
     };
-    match client.post(&url).json(body).send().await {
+    match crate::auth::attach_device_auth(client.post(&url).json(body))
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = resp.status();
             if !status.is_success() {
@@ -287,7 +290,10 @@ async fn post_verify(coord_http_base: &str, body: &VerifyRequest) {
             return;
         }
     };
-    match client.post(&url).json(body).send().await {
+    match crate::auth::attach_device_auth(client.post(&url).json(body))
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = resp.status();
             if !status.is_success() {

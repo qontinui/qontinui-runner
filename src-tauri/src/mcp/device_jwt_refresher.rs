@@ -447,7 +447,15 @@ async fn publish_coord_credential_status(
             return;
         }
     };
-    match client.post(&url).json(&body).send().await {
+    // Tenant-scoped: when `tenant_id` made it onto the body the status row is
+    // written under that tenant, so the bearer comes from that tenant's slot.
+    // `None` keeps the default binding, which is byte-identical to what this
+    // call did before. A non-default slot miss sends unauthenticated rather
+    // than presenting another tenant's JWT (`auth::select_device_bearer`).
+    match crate::auth::attach_device_auth_for(client.post(&url).json(&body), tenant_id.as_ref())
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {}
         Ok(resp) => {
             warn!(
@@ -777,6 +785,10 @@ pub(crate) async fn try_device_self_refresh(
             return None;
         }
     };
+    // coord-auth-exempt(self-refresh): presents the EXPIRING device JWT itself —
+    // coord authenticates the refresh against the very token being replaced.
+    // Re-resolving through the helper would read the same slot back and buy
+    // nothing but a counter tick.
     let resp = match client.post(&url).bearer_auth(current.trim()).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -963,6 +975,9 @@ pub(crate) async fn refresh_tenant_slots(
             continue;
         };
         // Present THIS slot's token — coord re-mints for the claim's tenant.
+        // coord-auth-exempt(self-refresh): presents THIS tenant slot's own JWT so
+        // coord re-mints for that slot's tenant. The default binding's token would
+        // refresh the wrong slot.
         let resp = match client.post(&url).bearer_auth(&token).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -1063,6 +1078,9 @@ pub(crate) async fn try_device_machine_key_exchange(
             return None;
         }
     };
+    // coord-auth-exempt(not-coord): `qontinui-web`
+    // `/api/v1/devices/{id}/machine-credential/exchange`, authenticated by the
+    // device machine key. This is one of the paths that MINTS the device JWT.
     let resp = match client
         .post(&url)
         .header("X-Device-Machine-Key", dmk.trim())

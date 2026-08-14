@@ -1017,8 +1017,14 @@ fn default_binding_tenant() -> Option<Uuid> {
 /// auth-coverage metric (the dogfood signal Phase 1 gates on): every call is
 /// counted in `DATA_PLANE_TOTAL`, and calls that carried the header in
 /// `DATA_PLANE_AUTHED`. A coverage summary is emitted at info level every 25th
-/// call so an operator can watch the unpaired→paired transition without a new
-/// dependency.
+/// call (rate-floored to one per minute by [`coverage_log_due`]) so an operator
+/// can watch the unpaired→paired transition without a new dependency.
+///
+/// **Scope.** The counters cover calls routed through this module. Coord writes
+/// that deliberately present a different credential are annotated
+/// `coord-auth-exempt(<kind>)` at the call site and pinned by `coord_auth_pin`;
+/// they are counted by neither term, which is why the summary line names its
+/// own scope.
 pub fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     attach_device_auth_for(rb, None)
 }
@@ -1039,9 +1045,9 @@ pub fn attach_device_auth_for(
     }
 }
 
-/// Blocking-client sibling of [`attach_device_auth_for`], for the CLI targets
-/// that run without a tokio runtime (`qontinui_profile device init` →
-/// `register_with_coord`).
+/// Blocking-client sibling of [`attach_device_auth_for`], for the targets that
+/// run without a tokio runtime (`qontinui_profile device init` →
+/// `register_with_coord`, and the blocking session/log registrars).
 ///
 /// Deliberately a thin transport adapter over the SAME
 /// [`count_and_resolve_bearer`] core rather than a second implementation: the
@@ -1057,7 +1063,7 @@ pub fn attach_device_auth_for(
 /// takes the identical header pair, so the adapter is one match arm.
 ///
 /// Takes `tenant` for the same reason [`attach_device_auth_for`] does, and NOT
-/// as a convenience: its one caller posts a body declaring an explicit
+/// as a convenience: its callers post bodies declaring an explicit
 /// `tenant_id`, and [`select_device_bearer`]'s fail-soft invariant is that a
 /// request for tenant X must never carry tenant Y's credential. A
 /// tenant-less blocking helper could not honour that on a multi-bound box —
@@ -1092,7 +1098,21 @@ fn count_and_resolve_bearer(tenant: Option<&Uuid>) -> Option<String> {
     if total.is_multiple_of(25) && coverage_log_due() {
         let authed = DATA_PLANE_AUTHED.load(std::sync::atomic::Ordering::Relaxed);
         let pct = (authed as f64 / total as f64) * 100.0;
-        info!("coord data-plane auth coverage: {authed}/{total} ({pct:.0}%)");
+        // The scope qualifier is not decoration. This counter measures calls
+        // that pass through THIS module, and the runner also makes coord
+        // writes that present a credential this module never resolves — the
+        // per-agent JWT, a forwarded acting bearer, the pairing bootstrap
+        // (see the `coord-auth-exempt(...)` annotations, pinned by
+        // `coord_auth_pin`). Those are counted by NEITHER term. Calling the
+        // ratio "coord data-plane auth coverage" claimed the fleet and
+        // measured a subset, which is the same defect one level up as the
+        // omission this plan closed: a metric whose name overstates its
+        // scope reads as 100% of something it never looked at.
+        info!(
+            "coord data-plane device-JWT coverage: {authed}/{total} ({pct:.0}%) \
+             (device-JWT-eligible coord calls only; agent-JWT, forwarded-bearer \
+             and pair-bootstrap sites are out of scope by design)"
+        );
     }
     bearer
 }

@@ -1068,6 +1068,11 @@ fn coord_reachable_check() -> (bool, String) {
         Ok(c) => c,
         Err(e) => return (false, format!("could not build HTTP client: {e}")),
     };
+    // coord-auth-exempt(diagnostic): the doctor's job is to REPORT on the raw
+    // credential chain, so it reads the access_token slot itself and says whether
+    // it found one. Routing it through `attach_device_auth` would hide the very
+    // state it exists to diagnose, and would bill a diagnostic probe to the
+    // coverage counter as if it were data-plane traffic.
     let mut rb = client.post(&url).json(&body);
     if let Some(bearer) = crate::auth::AuthManager::new()
         .get_access_token()

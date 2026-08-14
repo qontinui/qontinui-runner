@@ -148,9 +148,7 @@ pub async fn claims_acquire(args: AcquireArgs) -> Result<AcquireResultDto, Strin
     });
 
     let client = http_client()?;
-    let resp = client
-        .post(&url)
-        .json(&body)
+    let resp = crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -198,9 +196,7 @@ pub async fn claims_release(args: ReleaseArgs) -> Result<ReleaseResultDto, Strin
     });
 
     let client = http_client()?;
-    let resp = client
-        .post(&url)
-        .json(&body)
+    let resp = crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -255,11 +251,16 @@ pub async fn claims_steal(args: StealArgs) -> Result<StealResultDto, String> {
     });
 
     let client = http_client()?;
-    let mut req = client.post(&url).json(&body);
+    let mut req = crate::auth::attach_device_auth(client.post(&url).json(&body));
     // If the admin secret is exposed via env on the runner host
     // (operator-managed runner deploys), forward it. Most production
-    // runners won't have this set, in which case coord falls back to
-    // the JWT-originator path and we hit 401 unless a JWT is presented.
+    // runners won't have this set, in which case coord falls back to the
+    // JWT-originator path — which now has a JWT to work with, since the
+    // builder above attaches the device bearer. It previously did not, and
+    // the resulting 401 is what the second half of this comment used to
+    // describe as unavoidable. Distinct headers, so the two never collide:
+    // `Authorization` carries the device JWT, `X-Coord-Admin-Secret` the
+    // operator override.
     if let Ok(secret) = std::env::var("COORD_ADMIN_SECRET") {
         if !secret.is_empty() {
             req = req.header("X-Coord-Admin-Secret", secret);

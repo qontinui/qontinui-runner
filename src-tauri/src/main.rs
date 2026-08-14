@@ -4607,6 +4607,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                                 "http://127.0.0.1:{}/instances/{}/stop",
                                                 pp, id
                                             );
+                                            // coord-auth-exempt(not-coord): 127.0.0.1 loopback to the PRIMARY runner
+                                            // instance's own API, telling it this secondary is stopping. Same box, no
+                                            // coord involvement.
                                             let _ = client.post(&url).send().await;
                                         }
                                     }

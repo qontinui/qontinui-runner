@@ -277,6 +277,10 @@ async fn flusher_loop(
             lines: batch,
             progress_seq: seq,
         };
+        // coord-auth-exempt(device-jwt-required): resolves the device JWT through
+        // `coord_mcp::read_usable_device_jwt` + `await_device_jwt_remint`, which can
+        // AWAIT a re-mint. The synchronous helper cannot, so routing this through it
+        // would drop progress lines during a token rotation.
         match client
             .post(url)
             .bearer_auth(bearer)
@@ -453,6 +457,9 @@ pub(crate) async fn post_result(
     loop {
         let mut ok_body: Option<String> = None;
         let status = match device_bearer().await {
+            // coord-auth-exempt(device-jwt-required): same remint-awaiting resolver as
+            // `post_progress`, and fails closed — a dispatch result must never be filed
+            // anonymously, since coord authorises it against the assignee.
             Some(bearer) => match client
                 .post(&url)
                 .bearer_auth(bearer)

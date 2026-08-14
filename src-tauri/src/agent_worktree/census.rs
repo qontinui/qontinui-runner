@@ -570,7 +570,20 @@ impl ChunkPoster {
             volumes,
             worktrees: chunk.rows,
         };
-        match client.post(url).json(&body).send().await {
+        // Tenant-scoped: the census row this POST carries declares
+        // `tenant_id`, so the bearer must come from THAT binding's slot and
+        // not the device default. `attach_device_auth_for` degrades to
+        // unauthenticated on a slot miss rather than presenting another
+        // tenant's credential (`auth::select_device_bearer`), so the worst
+        // case is the pre-existing anonymous send — never a cross-tenant
+        // attribution, which would be worse than the status quo.
+        match crate::auth::attach_device_auth_for(
+            client.post(url).json(&body),
+            self.tenant_id.as_ref(),
+        )
+        .send()
+        .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 self.posted += 1;
                 // R3 boot ordering: the first successful chunk POST of this

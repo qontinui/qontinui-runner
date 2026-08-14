@@ -68,6 +68,9 @@ pub async fn record(
     req: &RecordGitOpRequest,
 ) -> Result<()> {
     let url = format!("{base}/coord/git-ops/record");
+    // coord-auth-exempt(device-jwt-required): the device token is a PARAMETER —
+    // the caller owns credential selection for the tenant it names in the header,
+    // and this function must not silently substitute a different slot.
     let resp = client
         .post(&url)
         // coord resolves the tenant from the verified bearer (FleetPrincipal);

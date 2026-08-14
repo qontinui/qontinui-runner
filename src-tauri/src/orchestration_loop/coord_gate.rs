@@ -458,6 +458,9 @@ impl LiveCoordGateClient {
             "method": "tools/call",
             "params": { "name": tool_name, "arguments": arguments },
         });
+        // coord-auth-exempt(device-jwt-required): fails closed — `device_jwt()`
+        // returning `None` aborts the call, because a coord `/mcp` JSON-RPC hop has
+        // no anonymous mode to degrade into.
         let resp = client
             .post(&url)
             .bearer_auth(&jwt)

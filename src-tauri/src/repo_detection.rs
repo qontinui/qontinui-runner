@@ -243,9 +243,7 @@ pub async fn register_repo_with_coord(repo: String) -> Result<serde_json::Value,
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
 
-    let resp = client
-        .post(&url)
-        .json(&json!({ "repo": repo }))
+    let resp = crate::auth::attach_device_auth(client.post(&url).json(&json!({ "repo": repo })))
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;

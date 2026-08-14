@@ -323,6 +323,9 @@ fn register_blocking(req: &HandleRegisterRequest) -> Option<String> {
         .filter(|t| !t.is_empty());
 
     let url = format!("{base}/coord/session-handles/register");
+    // coord-auth-exempt(device-jwt-required): blocking registrar, presenting the
+    // device JWT already resolved above. Same posture as `coord_register`'s
+    // batch flush.
     let mut r = client.post(&url).json(req);
     if let Some(t) = token {
         r = r.bearer_auth(t);

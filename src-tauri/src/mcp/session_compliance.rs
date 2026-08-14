@@ -660,6 +660,9 @@ async fn post_compliance(
     let client = http_client().ok()?;
     let url = format!("{base}/coord/sessions/{claude_session_id}/compliance");
     let body = compliance_body(report, absent_reason, nudge_state_for(claude_session_id));
+    // coord-auth-exempt(device-jwt-required): `coord_client_parts` fails closed
+    // when unpaired, so the turn-end hook goes inert rather than filing a
+    // compliance verdict anonymously.
     let resp = client
         .post(&url)
         .bearer_auth(&jwt)

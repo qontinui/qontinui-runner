@@ -245,6 +245,14 @@ impl CoordSync {
         self.inner.http.clone()
     }
 
+    /// The tenant that owns `session_id`, for per-session credential
+    /// selection by callers outside this module (the output pipe). Same
+    /// resolution and same `None` semantics as [`session_tenant_by_id`] —
+    /// `None` selects the default binding, never another tenant's slot.
+    pub fn session_tenant(&self, session_id: Uuid) -> Option<Uuid> {
+        session_tenant_by_id(&self.inner, session_id)
+    }
+
     /// Heartbeat interval. Surfaced for tests + tracing.
     #[allow(dead_code)]
     pub fn heartbeat_interval(&self) -> Duration {
@@ -335,7 +343,21 @@ impl CoordSync {
         let base = self.inner.coord_url.trim_end_matches('/');
         let url = format!("{base}/sessions/{session_id}");
         let body = json!({ "state": SessionState::Active.as_str(), "heartbeat": true });
-        match self.inner.http.patch(&url).json(&body).send().await {
+        // Per-session credential selection, same as every other write in this
+        // module. This one was anonymous: it lands the identical body on the
+        // identical route as the drain loop's `state_change` push, which has
+        // presented the owning session's slot since Phase 8b. Nobody chose
+        // that asymmetry — `probe_resume` was added later, for a different
+        // reason, and the auth was attached per-function rather than by a
+        // predicate over all of them.
+        let tenant = session_tenant_by_id(&self.inner, session_id);
+        match crate::auth::attach_device_auth_for(
+            self.inner.http.patch(&url).json(&body),
+            tenant.as_ref(),
+        )
+        .send()
+        .await
+        {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -962,13 +984,25 @@ fn record_session_tenant(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> Opt
     if from_payload.is_some() {
         return from_payload;
     }
+    session_tenant_by_id(inner, rec.session_id)
+}
+
+/// The tenant that OWNS a session, read from the live registry.
+///
+/// The registry arm of [`record_session_tenant`], split out because two
+/// callers need a tenant from a bare `session_id` with no outbox record in
+/// hand: [`CoordSync::probe_resume`] and the output pipe. `None` whenever the
+/// registry is gone (post-restart), the session is unknown, or its intent
+/// carries no tenant — which selects the default binding, the pre-8b
+/// behaviour.
+fn session_tenant_by_id(inner: &Arc<CoordSyncInner>, session_id: Uuid) -> Option<Uuid> {
     inner
         .registry
         .lock()
         .expect("coord_sync registry slot poisoned")
         .as_ref()
         .and_then(Weak::upgrade)
-        .and_then(|reg| reg.describe_by_id(rec.session_id).ok())
+        .and_then(|reg| reg.describe_by_id(session_id).ok())
         .and_then(|d| d.intent.tenant_id)
 }
 

@@ -271,6 +271,8 @@ fn pr_create(args: &[String]) -> ExitCode {
         }
     };
     let url = format!("http://127.0.0.1:{port}/vcs/pull-requests");
+    // coord-auth-exempt(not-coord): 127.0.0.1 loopback to this runner's own
+    // `/vcs/pull-requests`, authenticated by the session proxy nonce.
     let resp = match client
         .post(&url)
         .header(PROXY_KEY_HEADER, &session.nonce)

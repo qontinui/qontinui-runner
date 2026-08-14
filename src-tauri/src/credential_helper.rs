@@ -95,6 +95,11 @@ async fn fetch_push_token(coord_base: &str, session_id: &str) -> Result<String, 
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
 
+    // coord-auth-exempt(device-jwt-required): fails CLOSED — the push-token mint
+    // is refused outright when no device-JWT is held, because an anonymous
+    // push-token request cannot be attributed to a device. `attach_device_auth`
+    // is fail-SOFT by contract, so routing this through it would convert
+    // 'refuse until paired' into 'ask anonymously'.
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {device_token}"))

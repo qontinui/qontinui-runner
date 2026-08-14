@@ -377,7 +377,18 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
                 file,
                 tenant_id,
             };
-            match client.post(&url).json(&payload).send().await {
+            // Tenant-scoped: `payload.tenant_id` is this device's resolved
+            // binding and coord attributes the row under it, so the bearer is
+            // selected from the same tenant's slot. A slot miss sends
+            // unauthenticated (never another tenant's JWT) — see
+            // `auth::select_device_bearer`.
+            match crate::auth::attach_device_auth_for(
+                client.post(&url).json(&payload),
+                tenant_id.as_ref(),
+            )
+            .send()
+            .await
+            {
                 Ok(resp) if resp.status().is_success() => {
                     posted += 1;
                 }

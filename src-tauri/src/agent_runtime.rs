@@ -2220,8 +2220,7 @@ async fn post_continuation_poll_report(device_id: uuid::Uuid, counts: PollRunCou
         return;
     };
     let body = ContinuationPollReportBody::new(device_id, counts);
-    match client
-        .post(&url)
+    match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
         .send()
@@ -2380,8 +2379,7 @@ async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> 
         };
     };
     let body = ContinuationConsumedBody::claim(device_id);
-    match client
-        .post(&url)
+    match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
         .send()
@@ -2419,8 +2417,7 @@ async fn post_continuation_outcome(
         return;
     };
     let body = ContinuationConsumedBody::outcome(device_id, spawned, detail);
-    match client
-        .post(&url)
+    match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
         .send()
@@ -2511,8 +2508,7 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
         return;
     };
     let body = ContinuationDeferredBody { device_id, reason };
-    match client
-        .post(&url)
+    match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
         .send()
@@ -2573,8 +2569,7 @@ async fn post_unit_dispatch_consumed(dispatch_id: uuid::Uuid, device_id: uuid::U
         return;
     };
     let body = UnitDispatchConsumedBody { device_id };
-    match client
-        .post(&url)
+    match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
         .send()
@@ -4527,8 +4522,7 @@ async fn post_log_line(agent_id: uuid::Uuid, line: &LogLine) -> bool {
     let Some(client) = crate::coord_http::coord_client() else {
         return false;
     };
-    match client
-        .post(&url)
+    match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(3))
         .json(line)
         .send()
@@ -4578,8 +4572,7 @@ async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
     };
     let client = crate::coord_http::coord_client()
         .ok_or_else(|| anyhow::anyhow!("no shared coord client"))?;
-    let resp = client
-        .post(format!("{base}/claims/heartbeat"))
+    let resp = crate::auth::attach_device_auth(client.post(format!("{base}/claims/heartbeat")))
         .timeout(Duration::from_secs(5))
         .json(&body)
         .send()
@@ -4620,8 +4613,7 @@ async fn report_spawn_complete(
     let Some(client) = crate::coord_http::coord_client() else {
         return;
     };
-    match client
-        .post(&url)
+    match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
         .send()
@@ -4669,8 +4661,7 @@ async fn report_spawn_failed(
     let Some(client) = crate::coord_http::coord_client() else {
         return;
     };
-    match client
-        .post(&url)
+    match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
         .send()

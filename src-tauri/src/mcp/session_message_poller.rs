@@ -392,6 +392,8 @@ async fn surface_blocked_delivery(
         "reason": reason.as_str(),
         "blocked_since": blocked_since.to_rfc3339(),
     });
+    // coord-auth-exempt(device-jwt-required): `token` is the device JWT the
+    // caller already verified is present; the tick is skipped when it is not.
     match client
         .post(&url)
         .bearer_auth(token)
@@ -946,6 +948,8 @@ async fn deliver_once(
         tracker.clear_message(&msg.message_id);
 
         let mark_url = format!("{base}/coord/session-messages/mark-delivered");
+        // coord-auth-exempt(device-jwt-required): same device JWT as the pending GET
+        // above, read once per tick and skipped entirely when unpaired.
         if let Err(e) = client
             .post(&mark_url)
             .bearer_auth(&token)

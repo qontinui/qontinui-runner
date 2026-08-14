@@ -576,6 +576,9 @@ pub(crate) async fn publish_once() {
         }
     };
 
+    // coord-auth-exempt(device-jwt-required): resolves through
+    // `coord_mcp::read_usable_device_jwt` and returns early without one, so a
+    // sample is skipped rather than published anonymously.
     match client
         .post(&url)
         .bearer_auth(bearer)

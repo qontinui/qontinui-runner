@@ -174,6 +174,8 @@ async fn deliver_once() -> anyhow::Result<()> {
             msg.kind, msg.priority, msg.message_id, msg.body
         );
         let inject_url = format!("{self_base}/terminals/{}/submit-prompt", rec.terminal_id);
+        // coord-auth-exempt(not-coord): 127.0.0.1 loopback to this runner's own
+        // terminal submit-prompt route — the delivery leg, not the coord leg.
         match client
             .post(&inject_url)
             .json(&serde_json::json!({ "message": framed }))
@@ -183,6 +185,10 @@ async fn deliver_once() -> anyhow::Result<()> {
             Ok(r) if r.status().is_success() => {
                 // 4. Mark delivered so we don't re-inject.
                 let mark_url = format!("{base}/coord/session-messages/mark-delivered");
+                // coord-auth-exempt(device-jwt-required): fails CLOSED — the tick returns
+                // early when no device-JWT is held, and `token` is that same JWT already read
+                // for the pending GET. Reusing it keeps one read per tick and preserves the
+                // skip-until-paired posture that fail-soft attachment would erase.
                 if let Err(e) = client
                     .post(&mark_url)
                     .bearer_auth(&token)

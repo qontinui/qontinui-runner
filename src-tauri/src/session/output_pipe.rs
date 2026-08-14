@@ -29,7 +29,9 @@
 //!    `POST /sessions/:id/output {chunk_offset, payload_b64}`. The
 //!    `chunk_offset` is a monotonic per-session byte counter, giving the
 //!    warm tier a stable FIFO order + idempotency key. coord resolves the
-//!    session's tenant server-side, so the runner sends no tenant here.
+//!    session's tenant server-side, so the runner sends no tenant in the
+//!    PAYLOAD — but it does present the owning session's device-JWT slot as
+//!    the bearer, which is what coord resolves that tenant FROM.
 //!
 //! ## Transport coupling
 //!
@@ -97,6 +99,20 @@ async fn run_pipe(
     let base = coord_sync.coord_url().trim_end_matches('/').to_string();
     let url = format!("{base}/sessions/{session_id}/output");
 
+    // Per-session credential selection (Phase 8b §D4): output chunks belong to
+    // the SESSION, so they present the owning session's device-JWT slot rather
+    // than the device default. This matters more here than on a device-scoped
+    // route precisely because coord resolves this row's tenant from the
+    // VERIFIED BEARER (see the module doc) — the wrong slot would file another
+    // tenant's transcript, with no observable.
+    //
+    // Resolved lazily and retried while `None` because the pipe is spawned
+    // during session registration and can race the registry entry it reads
+    // from. `None` keeps the default slot, which is exactly the pre-change
+    // behaviour; a non-default tenant with no slot sends unauthenticated —
+    // never another tenant's credential (`auth::select_device_bearer`).
+    let mut tenant: Option<Uuid> = coord_sync.session_tenant(session_id);
+
     tracing::info!(
         session = %session_id,
         redact,
@@ -112,6 +128,13 @@ async fn run_pipe(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        // Make good on the lazy resolution above: until a tenant is known,
+        // re-read it each iteration. Costs one registry lookup per iteration
+        // while unresolved and a single `is_none()` afterwards, so a pipe that
+        // won the race pays nothing.
+        if tenant.is_none() {
+            tenant = coord_sync.session_tenant(session_id);
+        }
         tokio::select! {
             // New output chunk (base64 string) from the transport.
             recv = rx.recv() => {
@@ -128,8 +151,11 @@ async fn run_pipe(
                                 };
                                 buffer.extend_from_slice(&processed);
                                 if buffer.len() >= FLUSH_BYTES {
-                                    flush(&http, &url, session_id, &mut buffer, &mut next_offset)
-                                        .await;
+                                    flush(
+                                        &http, &url, session_id, &mut buffer,
+                                        &mut next_offset, tenant.as_ref(),
+                                    )
+                                    .await;
                                 }
                                 if buffer.len() > MAX_BUFFER_BYTES {
                                     // Should never happen (we flush at
@@ -139,8 +165,11 @@ async fn run_pipe(
                                         len = buffer.len(),
                                         "session output_pipe: buffer over hard cap — force flush"
                                     );
-                                    flush(&http, &url, session_id, &mut buffer, &mut next_offset)
-                                        .await;
+                                    flush(
+                                        &http, &url, session_id, &mut buffer,
+                                        &mut next_offset, tenant.as_ref(),
+                                    )
+                                    .await;
                                 }
                             }
                             Err(e) => {
@@ -166,7 +195,11 @@ async fn run_pipe(
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Terminal closed. Final flush + exit.
-                        flush(&http, &url, session_id, &mut buffer, &mut next_offset).await;
+                        flush(
+                            &http, &url, session_id, &mut buffer, &mut next_offset,
+                            tenant.as_ref(),
+                        )
+                        .await;
                         tracing::info!(
                             session = %session_id,
                             "session output_pipe: transport closed — pipe exiting"
@@ -179,7 +212,11 @@ async fn run_pipe(
             // stays low even on a trickle of output.
             _ = ticker.tick() => {
                 if !buffer.is_empty() {
-                    flush(&http, &url, session_id, &mut buffer, &mut next_offset).await;
+                    flush(
+                        &http, &url, session_id, &mut buffer, &mut next_offset,
+                        tenant.as_ref(),
+                    )
+                    .await;
                 }
             }
         }
@@ -199,6 +236,7 @@ async fn flush(
     session_id: Uuid,
     buffer: &mut Vec<u8>,
     next_offset: &mut i64,
+    tenant: Option<&Uuid>,
 ) {
     if buffer.is_empty() {
         return;
@@ -211,7 +249,10 @@ async fn flush(
         "payload_b64": payload_b64,
     });
 
-    match http.post(url).json(&body).send().await {
+    match crate::auth::attach_device_auth_for(http.post(url).json(&body), tenant)
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {

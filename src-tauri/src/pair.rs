@@ -952,6 +952,8 @@ pub fn pair_with_auth_token_with_ids(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("reqwest client build failed: {}", e))?;
+    // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/devices/pair-cli`,
+    // authenticated by the operator's OAuth token. Not a coord route.
     let resp = client
         .post(&url)
         .bearer_auth(oauth_token)
@@ -1061,6 +1063,8 @@ pub fn pair_with_pair_code(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("reqwest client build failed: {}", e))?;
+    // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/devices/pair-codes/
+    // {code}/redeem`. Not a coord route; the pair CODE is the credential.
     let resp = client
         .post(&url)
         .json(&body)
@@ -1157,6 +1161,10 @@ pub fn pair_via_browser(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("reqwest client build failed: {e}"))?;
+    // coord-auth-exempt(bootstrap): `POST /coord/devices/pair-start` is the call
+    // that MINTS this device's credential. It is anonymous by design, permanently
+    // — requiring a device-JWT here would make pairing unreachable on a fresh
+    // box. This is the template every other exemption is measured against.
     let resp = client
         .post(&pair_start_url)
         .json(&pair_start_body)

@@ -2153,6 +2153,10 @@ pub async fn spawn_from_plan(
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
 
+    // coord-auth-exempt(user-jwt): a spawn is attributed to the OPERATOR, so it
+    // presents the Cognito session token, not the device credential. Coord
+    // authorises the spawn against the human, and the device JWT would name the
+    // wrong principal.
     let resp = client
         .post(&url)
         .header("Content-Type", "application/json")

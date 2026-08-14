@@ -416,6 +416,8 @@ async fn post_dirty_state(state: &Arc<DirtyPollerState>, req: &DirtyStateReq) ->
     // Shared pooled client — never `Client::new()` here. A per-request
     // client reuses no connection, and this is a per-tick path across
     // every agent (see `crate::agent_http` for the 2026-08-07 outage).
+    // coord-auth-exempt(agent-jwt): presents the per-agent coord JWT this poller
+    // was handed; the route is scoped to that agent, not to the device.
     let resp = crate::agent_http::client()
         .post(&url)
         .bearer_auth(&token)

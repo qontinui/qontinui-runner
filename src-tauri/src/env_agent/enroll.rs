@@ -117,6 +117,9 @@ pub fn run_enroll(params: EnrollParams) -> Result<EnrollOutcome, String> {
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("reqwest client build failed: {e}"))?;
+    // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/devenv/agent/enroll`.
+    // The enrollment CODE is the credential; this runs before any device JWT
+    // exists.
     let resp = client
         .post(&url)
         .json(&body)

@@ -335,6 +335,9 @@ pub async fn maybe_refresh(
         agent_id
     );
     let current = token.read().await.token.clone();
+    // coord-auth-exempt(agent-jwt): presents the PER-AGENT coord JWT being
+    // refreshed, not the device JWT. Coord's refresh route authenticates the
+    // token against itself; the device credential would be rejected.
     let resp = match agent_http::client()
         .post(&url)
         .bearer_auth(&current)

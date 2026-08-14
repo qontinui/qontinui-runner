@@ -526,6 +526,8 @@ async fn test_claude_api_connection(settings: &ClaudeApiSettings) -> Result<Stri
 
     // Make a minimal API request to test the connection
     let client = reqwest::Client::new();
+    // coord-auth-exempt(not-coord): Anthropic's API. A coord bearer here would be
+    // a credential leak to a third party.
     let response = client
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", &api_key)
@@ -743,6 +745,7 @@ async fn test_gemini_api_connection(settings: &GeminiApiSettings) -> Result<Stri
         settings.model, api_key
     );
 
+    // coord-auth-exempt(not-coord): Google's Gemini API.
     let response = client
         .post(&url)
         .header("content-type", "application/json")
@@ -1224,6 +1227,8 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
     // `x-api-key`. `anthropic_auth::apply_async` dispatches on token prefix.
     let client = reqwest::Client::new();
     let request = crate::ai_provider::anthropic_auth::apply_async(
+        // coord-auth-exempt(not-coord): Anthropic's API, authenticated by the
+        // operator's own OAuth/API credential via `anthropic_auth::apply_async`.
         client.post("https://api.anthropic.com/v1/messages"),
         &token,
     )

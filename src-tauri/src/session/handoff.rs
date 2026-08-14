@@ -202,12 +202,11 @@ pub async fn trigger_handoff(
         coord_url.trim_end_matches('/'),
         source_session_id
     );
-    let resp = http
-        .post(&url)
-        .json(&TriggerBody { target_device_id })
-        .send()
-        .await
-        .map_err(|e| HandoffError::Http(format!("POST {url}: {e}")))?;
+    let resp =
+        crate::auth::attach_device_auth(http.post(&url).json(&TriggerBody { target_device_id }))
+            .send()
+            .await
+            .map_err(|e| HandoffError::Http(format!("POST {url}: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -1009,9 +1008,7 @@ async fn reacquire_claim(
         "resource_key": claim.resource_key,
         "machine_id": device_id.to_string(),
     });
-    let resp = http
-        .post(&url)
-        .json(&body)
+    let resp = crate::auth::attach_device_auth(http.post(&url).json(&body))
         .send()
         .await
         .map_err(|e| HandoffError::Http(format!("POST {url}: {e}")))?;
@@ -1037,8 +1034,7 @@ async fn close_source(
         coord_url.trim_end_matches('/'),
         source_session_id
     );
-    let resp = http
-        .delete(&url)
+    let resp = crate::auth::attach_device_auth(http.delete(&url))
         .send()
         .await
         .map_err(|e| HandoffError::Http(format!("DELETE {url}: {e}")))?;

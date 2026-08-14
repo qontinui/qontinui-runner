@@ -2159,6 +2159,9 @@ pub(crate) fn probe_and_breadcrumb_proxy(workdir: &str, port: u16) {
             Ok(c) => c,
             Err(_) => return, // can't build a client — skip silently (best-effort)
         };
+        // coord-auth-exempt(not-coord): 127.0.0.1 loopback to THIS runner's own
+        // coord-mcp proxy, authenticated by the per-process proxy nonce. Never leaves
+        // the box; the device-JWT is what the proxy attaches upstream, not here.
         let reachable = client
             .post(&url)
             .header(COORD_MCP_PROXY_KEY_HEADER, &nonce)

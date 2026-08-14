@@ -290,6 +290,8 @@ impl MemoryJobPoller {
 
         let base = base.trim_end_matches('/');
         let claim_url = format!("{base}/api/v1/memory/jobs/claim");
+        // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/memory/jobs/claim`.
+        // It carries the device JWT, but the peer is the web backend, not coord.
         let resp = client
             .post(&claim_url)
             .header("Authorization", format!("Bearer {bearer}"))
@@ -519,6 +521,8 @@ impl MemoryJobPoller {
             }),
             ResultBody::Failure(reason) => json!({ "failure": reason }),
         };
+        // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/memory/jobs/*`
+        // result publish.
         match client
             .post(&url)
             .header("Authorization", format!("Bearer {bearer}"))

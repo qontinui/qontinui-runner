@@ -660,6 +660,8 @@ async fn spawn_continuation(
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("client build: {e}"))?;
+    // coord-auth-exempt(not-coord): 127.0.0.1 loopback to this runner's own
+    // `/sessions/spawn` handler — the same path agents use.
     let resp = client
         .post(&url)
         .json(&body)

@@ -1029,6 +1029,10 @@ fn flush_batch(
         .filter(|t| !t.is_empty());
 
     let url = format!("{base}/agents/{agent_id}/log");
+    // coord-auth-exempt(device-jwt-required): blocking client on a thread with no
+    // tokio runtime, presenting the device JWT the batcher already holds. The
+    // route resolves the tenant from the body `device_id`, so the token is
+    // optional here by design and re-reading it per batch would be pure cost.
     let mut req = client.post(&url).json(&batch);
     if let Some(t) = token {
         req = req.bearer_auth(t);

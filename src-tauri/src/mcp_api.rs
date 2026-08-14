@@ -2979,6 +2979,10 @@ async fn coord_mcp_proxy_handler(
     // 2026-07-16-runner-prod-coord-base-default-and-502-self-diagnosis, D3) —
     // a bare 502 that names neither cost real diagnostic time in the incident.
     let (url, coord_base_source) = crate::coord_mcp::coord_mcp_url_with_source();
+    // coord-auth-exempt(forwarder): a proxy hop. The bearer is the CALLING
+    // session's acting credential, selected for that session's tenant just above;
+    // substituting the device default would forward one session's request under
+    // another principal's identity.
     let mut req = client.post(&url).bearer_auth(&bearer).body(forward_body);
     for (name, value) in headers.iter() {
         let n = name.as_str();
@@ -3822,6 +3826,8 @@ async fn forward_coord_write_post(
             .expect("coord write proxy reqwest client")
     });
 
+    // coord-auth-exempt(forwarder): write-forwarder hop — `bearer` is the
+    // caller-resolved credential passed in by the handler, not this device's.
     let upstream = match client
         .post(url)
         .bearer_auth(bearer)
@@ -4453,6 +4459,8 @@ async fn forward_vcs_pr_post(
             .expect("vcs pr proxy reqwest client")
     });
 
+    // coord-auth-exempt(forwarder): VCS-PR forwarder hop — same posture as
+    // `forward_coord_write_post`; the caller owns the bearer.
     let upstream = match client.post(url).bearer_auth(bearer).json(body).send().await {
         Ok(resp) => resp,
         Err(e) => {
