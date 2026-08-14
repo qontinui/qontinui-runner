@@ -355,7 +355,8 @@ fn last_budget_cache_path() -> Option<PathBuf> {
 /// | Column | Owner | This struct |
 /// |--------|-------|-------------|
 /// | `role` | supervisor (publishes `build`) | **absent — see below** |
-/// | `max_concurrent_builds` | supervisor | sent only when this runner opted in as a CI node |
+/// | `max_concurrent_builds` | supervisor | **absent — see the capacity split below** |
+/// | `max_concurrent_ci_jobs` | runner | always sent |
 /// | `max_concurrent_agents` | runner | always sent |
 /// | `cpu_cores`, `memory_gb`, `disk_*` | neither — they describe the BOX | always sent by both |
 ///
@@ -425,18 +426,25 @@ struct DeviceBudgetRequest {
     disk_total_gb: i64,
     disk_reserved_gb: i64,
     max_concurrent_agents: i32,
-    /// `None` ⇒ omitted from the wire ⇒ "the runner does not own this
-    /// column, leave whatever the supervisor published". Populated only when
-    /// this runner opted in as a CI node and therefore has a real opinion.
+    /// CI job slots — the column this runner unambiguously owns, read only by
+    /// coord's `ci_dispatch` for devices advertising the `ci_node` capability.
     ///
-    /// `default` pairs with `skip_serializing_if` deliberately: this struct
-    /// also derives `Deserialize` and is what `write_last_budget_cache` writes
-    /// to `~/.qontinui/last_budget.json`. Without it, serde treats the omitted
-    /// field as a `missing field` error and the operator's offline lifeline
-    /// stops round-tripping through the type that produced it — in the DEFAULT
-    /// non-CI-node case.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_concurrent_builds: Option<i32>,
+    /// Always sent, never omitted, because this publisher is the column's SOLE
+    /// authority and therefore has an opinion in both directions. When
+    /// `ci_node` is disabled that opinion is an explicit `0`.
+    ///
+    /// That `0` is a RECORD, not a control, and the distinction is worth
+    /// keeping straight: coord floors its capacity read at 1
+    /// (`GREATEST(COALESCE(…), 1)`, the 2026-07-28 mitigation), so a zero does
+    /// not itself remove this box from CI dispatch — the heartbeat-carried
+    /// `ci_node` capability does that, and it is the live signal by design.
+    /// What the `0` buys is legibility: an operator reading `GET /coord/fleet`
+    /// can tell "the runner shipped and asserts zero" from "the runner has not
+    /// shipped yet", which a NULL cannot express.
+    ///
+    /// No `skip_serializing_if`, deliberately: omission is the vocabulary of
+    /// NON-ownership, which does not apply to a column this process owns.
+    max_concurrent_ci_jobs: i32,
 }
 
 /// Render an error with its full `source()` chain. `Display` on
@@ -663,13 +671,16 @@ pub(crate) fn machine_state_publish_allowed(owns_shared_root_state: bool) -> boo
 /// and an env-driven assertion would flake against the parallel harness (see
 /// `instance::primary_keeps_the_unscoped_path`).
 ///
-/// The one decision it makes: **`ci_node` disabled ⇒ `max_concurrent_builds`
-/// is `None` ⇒ omitted from the wire.** A runner that has not opted in as a CI
-/// node has no opinion about build capacity — the supervisor owns that column
-/// — and under the pending `COALESCE($n, column)` semantics omission is how a
-/// publisher says so. It previously sent `0`, which coord wrote, which is the
-/// outage. When `ci_node` IS enabled the runner does have an opinion and sends
-/// it, including a deliberate `0` if the owner configured zero builds.
+/// The one decision it makes: **`ci_node` disabled ⇒ `max_concurrent_ci_jobs`
+/// is `0`.** That is an assertion of zero CI slots, not a placeholder, and it
+/// is sent — this runner is the sole authority on that column, so silence would
+/// leave a stale non-zero standing.
+///
+/// Note the asymmetry with `max_concurrent_builds`, which this payload no
+/// longer carries at all: omission is the vocabulary of NON-ownership. A
+/// publisher that owns a column speaks in both directions; one that does not
+/// own it stays silent, because under `COALESCE($n, column)` a value on the
+/// wire overwrites and a `0` is a write of zero — the 2026-07-28 mechanism.
 ///
 /// `role` is consumed here (it decides the agent cap) but deliberately never
 /// reaches the payload — see [`DeviceBudgetRequest`] for why the supervisor
@@ -691,9 +702,17 @@ fn build_budget_request(
             MachineRole::Agent => derive_max_agents(resources.memory_gb) as i32,
             MachineRole::Build => 0,
         },
-        max_concurrent_builds: ci
-            .enabled
-            .then(|| ci.max_concurrent_builds.min(i32::MAX as u32) as i32),
+        // `ci.max_concurrent_builds` is the RUNNER-LOCAL settings key
+        // (`ci_node.max_concurrent_builds`, default 1) — the same value
+        // `ci_node/admission.rs` admits against — and it is deliberately not
+        // renamed. It is operator-visible, and the split is about which coord
+        // COLUMN carries the number, not about what the node calls its own
+        // capacity.
+        max_concurrent_ci_jobs: if ci.enabled {
+            ci.max_concurrent_builds.min(i32::MAX as u32) as i32
+        } else {
+            0
+        },
     }
 }
 
@@ -777,24 +796,22 @@ pub async fn publish_budget(
 
     match post_budget_with_retry(&coord_base, &device_id_str, &body).await {
         Ok(()) => {
-            // `max_concurrent_builds` is rendered as `omitted` when this runner
-            // does not own the column, so the ownership split is visible in the
-            // log rather than inferable only from the wire. Silence about which
-            // fields were sent is what made 2026-07-28 opaque.
-            let builds = match body.max_concurrent_builds {
-                Some(n) => n.to_string(),
-                None => "omitted".to_string(),
-            };
+            // Columns this runner does NOT own are named as `not published`,
+            // so the ownership split is visible in the log rather than
+            // inferable only from the wire. Silence about which fields were
+            // sent is what made 2026-07-28 opaque.
             info!(
                 "fleet::publish_budget: device_id={device_id_str} hostname={} \
                  local_role={}(not published) cpu_cores={} memory_gb={} disk_total_gb={} \
-                 max_concurrent_agents={} max_concurrent_builds={builds}",
+                 max_concurrent_agents={} max_concurrent_ci_jobs={} \
+                 max_concurrent_builds=(not published, supervisor-owned)",
                 device.hostname,
                 role.as_str(),
                 body.cpu_cores,
                 body.memory_gb,
                 body.disk_total_gb,
-                body.max_concurrent_agents
+                body.max_concurrent_agents,
+                body.max_concurrent_ci_jobs
             );
             Ok(())
         }
@@ -3991,6 +4008,16 @@ mod tests {",
             "a non-CI runner must OMIT the build column it does not own — \
              sending 0 (or null) is the 2026-07-28 clobber. Payload: {json}"
         );
+        // Post capacity-split: the runner's own CI slot count is a SEPARATE
+        // column, and a disabled ci_node asserts an explicit zero into it
+        // rather than going silent. Silence is how this payload says "not
+        // mine", and that column IS this publisher's.
+        assert_eq!(
+            json.get("max_concurrent_ci_jobs").and_then(|v| v.as_i64()),
+            Some(0),
+            "a disabled ci_node OWNS its CI slot count and must assert zero, \
+             not omit it — omission would leave a stale non-zero standing: {json}"
+        );
         // The columns the runner DOES own must still be on the wire, or the
         // fix inverts into the mirror-image outage.
         assert_eq!(
@@ -4043,26 +4070,68 @@ mod tests {",
         }
     }
 
-    /// The other direction: an opted-in CI node DOES own build capacity and
+    /// The other direction: an opted-in CI node DOES own its CI slot count and
     /// must send it, including a deliberate `0`. An omission-always change
     /// would leave a CI node unable to advertise (or to withdraw) capacity —
     /// the same outage with the sign flipped.
+    ///
+    /// Post capacity-split this reads `max_concurrent_ci_jobs`. The VALUE is
+    /// unchanged — still the runner's `ci_node.max_concurrent_builds` setting —
+    /// but it now lands in a column with ONE consumer (`ci_dispatch`) and ONE
+    /// publisher, instead of sharing `max_concurrent_builds` with
+    /// `build_dispatcher` and the supervisor. That sharing is the defect: two
+    /// consumers meaning two different things by one column, two publishers
+    /// each correct about their own, alternating. Caught live on 2026-08-14 at
+    /// 08:51Z — `spaceship` read `max_concurrent_builds = 1` (this runner's
+    /// number) on a box where the supervisor derives 8.
     #[test]
-    fn budget_payload_includes_max_concurrent_builds_when_ci_node_enabled() {
+    fn budget_payload_includes_max_concurrent_ci_jobs_when_ci_node_enabled() {
         let json = budget_json(&ci_settings(true, 3));
         assert_eq!(
-            json.get("max_concurrent_builds").and_then(|v| v.as_i64()),
+            json.get("max_concurrent_ci_jobs").and_then(|v| v.as_i64()),
             Some(3),
-            "an enabled ci_node owns the build column and must publish it: {json}"
+            "an enabled ci_node owns its CI slot count and must publish it: {json}"
         );
 
         let zero = budget_json(&ci_settings(true, 0));
         assert_eq!(
-            zero.get("max_concurrent_builds").and_then(|v| v.as_i64()),
+            zero.get("max_concurrent_ci_jobs").and_then(|v| v.as_i64()),
             Some(0),
             "an enabled ci_node configured to 0 is an OPINION of zero and must \
              reach the wire — omission would make capacity un-withdrawable"
         );
+    }
+
+    /// **The capacity split's wire guard.** The runner must NEVER put
+    /// `max_concurrent_builds` on the wire again — not a value, not a zero, not
+    /// a `null` — whatever the ci_node setting.
+    ///
+    /// Before the split this publisher wrote its CI slot count into that column
+    /// whenever `ci_node` was enabled, because that is what coord's
+    /// `ci_dispatch` read. The same column carries build-POOL slots for
+    /// `build_dispatcher`, whose publisher is the supervisor (deriving
+    /// `min(memory_gb/4, cpu_cores/4)` = 8 on this box). So the two alternated,
+    /// each writing a number that was correct for its own consumer.
+    ///
+    /// Asserted across BOTH ci_node states and several capacities, because the
+    /// pre-split write was conditional on exactly that flag: a partial revert
+    /// would re-arm it on the enabled branch only, which is the branch that
+    /// matters. This is the runner-side counterpart to the sibling assertion
+    /// that `role` never reaches the wire — same ownership rule, second column.
+    #[test]
+    fn budget_payload_never_publishes_the_supervisor_owned_build_column() {
+        for enabled in [true, false] {
+            for capacity in [0, 1, 8] {
+                let json = budget_json(&ci_settings(enabled, capacity));
+                assert!(
+                    json.get("max_concurrent_builds").is_none(),
+                    "the supervisor owns coord.devices.max_concurrent_builds; \
+                     this runner writing its CI slot count there is the \
+                     alternation the capacity split exists to end \
+                     (enabled={enabled}, capacity={capacity}): {json}"
+                );
+            }
+        }
     }
 
     // ---- coord data-plane authentication ----
