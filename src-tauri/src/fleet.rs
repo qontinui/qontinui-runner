@@ -9,10 +9,11 @@
 //!    via `sysinfo`.
 //! 3. Derives the agent-side budget per §3.2:
 //!    `max_concurrent_agents = floor((memory_gb - 4) / 4)`.
-//! 4. POSTs role + budget columns to `POST /coord/devices/{device_id}/budget`
-//!    via coord HTTP — Phase 3 (Unified Devices Registry) replaces the
-//!    direct-PG UPSERT path so the runner no longer needs PG credentials
-//!    to coord's database.
+//! 4. POSTs the budget columns it OWNS — not `role`, which the supervisor
+//!    owns; see [`DeviceBudgetRequest`] — to
+//!    `POST /coord/devices/{device_id}/budget` via coord HTTP. Phase 3
+//!    (Unified Devices Registry) replaces the direct-PG UPSERT path so the
+//!    runner no longer needs PG credentials to coord's database.
 //!
 //! ## Runner-bootable-when-coord-down property
 //!
@@ -344,16 +345,98 @@ fn last_budget_cache_path() -> Option<PathBuf> {
 /// Mirrors `qontinui_profile::register_with_coord`; both go through coord
 /// HTTP, replacing the prior split between direct-PG fleet writes and
 /// HTTP identity registration.
+///
+/// ## Ownership split: omission means "not mine"
+///
+/// `coord.devices` is ONE row per machine with TWO publishers writing it —
+/// this runner and `qontinui-supervisor`, from separate processes. Each must
+/// omit the columns it does not own:
+///
+/// | Column | Owner | This struct |
+/// |--------|-------|-------------|
+/// | `role` | supervisor (publishes `build`) | **absent — see below** |
+/// | `max_concurrent_builds` | supervisor | sent only when this runner opted in as a CI node |
+/// | `max_concurrent_agents` | runner | always sent |
+/// | `cpu_cores`, `memory_gb`, `disk_*` | neither — they describe the BOX | always sent by both |
+///
+/// Scoped to THIS payload. `ci_runner_labels` is also supervisor-owned but
+/// travels on [`HeartbeatPayload`] to a different route with its own write
+/// semantics, so it is governed elsewhere, not by this table.
+///
+/// The machine-resource fields are deliberately NOT omitted: both publishers
+/// observe the same hardware and mean the same thing by it, so there is
+/// nothing to disagree about. Omit only where the two writers disagree about a
+/// field's *meaning*.
+///
+/// Omission is the only way to say "not mine", once coord's `upsert_budget`
+/// writes `COALESCE($n, column)`: a value present on the wire overwrites, a
+/// field ABSENT from the wire leaves the column alone. Sending a placeholder
+/// `0` for a column you do not own is not "leave it alone" — it is a write of
+/// zero, and that is exactly the 2026-07-28 outage mechanism (a `test-*`
+/// runner published `max_concurrent_builds = 0` meaning "I have no opinion"
+/// and un-elected the machine from the shadow lane for six days). The
+/// supervisor carries the mirror-image bug on `max_concurrent_agents`.
+///
+/// ## Why `role` is not a field here at all
+///
+/// `coord.devices.role` is a single scalar, and on a dev workstation the
+/// runner (`agent`) and the supervisor (`build`) alternate on it,
+/// last-writer-wins — coord's own `fleet.rs` module doc records exactly this
+/// collapse. Whenever the runner's `agent` is the most recent write, coord's
+/// `build_dispatcher` (`WHERE role = 'build'`, two query sites) cannot see
+/// this box as a build machine. Scoped precisely: this does NOT affect
+/// `ci_dispatch`, which elects on capabilities + `max_concurrent_builds`, not
+/// on `role`.
+///
+/// So the runner stops asserting `role` into the shared row. It is DELETED
+/// rather than made `Option`-always-`None`, because a field with one reachable
+/// value is dead weight that a future edit can silently re-arm. The local
+/// [`MachineRole`] argument stays — it still drives `derive_max_agents` — it
+/// simply no longer reaches the wire. Nothing in coord selects devices by
+/// `role = 'agent'` (verified against `qontinui-coord` `ca46b12d`: the only
+/// role predicates are `build_dispatcher`'s two `= 'build'` sites, and
+/// `FLEET_COLUMNS` renders a NULL role as `'unknown'` for display), so the
+/// runner gives up no capability by going silent here.
+///
+/// ## ⚠ Ordering constraint — this payload is AHEAD of coord
+///
+/// At `qontinui-coord` `ca46b12d`, `BudgetPublishRequest` declares **both**
+/// `role: MachineRole` and `max_concurrent_builds: u32` as MANDATORY (its
+/// `hostname` is the sole `#[serde(default)] Option`), and `upsert_budget`'s
+/// SET clause `COALESCE`s only `hostname`. An axum `Json<T>` extractor
+/// rejects a payload missing a mandatory field with **HTTP 422 before the
+/// handler runs** — so against today's coord this struct 422s on every
+/// publish, [`post_budget_with_retry`] burns all six attempts, and the device
+/// falls out of the budget path entirely.
+///
+/// The coord-side prerequisite is therefore **two fields, not one**: `role`
+/// AND `max_concurrent_builds` must each become optional-with-default and
+/// `COALESCE($n, column)`. Making only `max_concurrent_builds` nullable still
+/// 422s on the missing `role`. That change lands FIRST; this PR carries the
+/// `coord:downstream-of` edge. Plan
+/// `2026-08-03-per-instance-device-identity` §4 Phase 2. The coord side is
+/// `qontinui-coord#1489`, which Option-izes every field of
+/// `BudgetPublishRequest` and `COALESCE`s every corresponding `SET`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeviceBudgetRequest {
     hostname: String,
-    role: String,
     cpu_cores: i32,
     memory_gb: i32,
     disk_total_gb: i64,
     disk_reserved_gb: i64,
     max_concurrent_agents: i32,
-    max_concurrent_builds: i32,
+    /// `None` ⇒ omitted from the wire ⇒ "the runner does not own this
+    /// column, leave whatever the supervisor published". Populated only when
+    /// this runner opted in as a CI node and therefore has a real opinion.
+    ///
+    /// `default` pairs with `skip_serializing_if` deliberately: this struct
+    /// also derives `Deserialize` and is what `write_last_budget_cache` writes
+    /// to `~/.qontinui/last_budget.json`. Without it, serde treats the omitted
+    /// field as a `missing field` error and the operator's offline lifeline
+    /// stops round-tripping through the type that produced it — in the DEFAULT
+    /// non-CI-node case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_concurrent_builds: Option<i32>,
 }
 
 /// Render an error with its full `source()` chain. `Display` on
@@ -414,7 +497,10 @@ async fn post_budget_with_retry(
     let mut last_err = String::new();
     let backoff_ms: [u64; 6] = [2_000, 4_000, 8_000, 16_000, 32_000, 60_000];
     for (attempt, delay_ms) in backoff_ms.iter().enumerate() {
-        match client.post(&url).json(body).send().await {
+        match crate::auth::attach_device_auth(client.post(&url).json(body))
+            .send()
+            .await
+        {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -424,6 +510,12 @@ async fn post_budget_with_retry(
                     .text()
                     .await
                     .unwrap_or_else(|_| "<unable to read response body>".to_string());
+                // Truncated like every sibling coord call site. A rejected
+                // payload (e.g. a 422 from a coord that still declares a field
+                // this runner now omits — see `DeviceBudgetRequest`) returns a
+                // verbose body, and this error is re-logged on all six retry
+                // attempts.
+                let body_text: String = body_text.chars().take(200).collect();
                 last_err = format!("POST {url} -> HTTP {status}: {body_text}");
             }
             Err(e) => {
@@ -485,6 +577,16 @@ fn write_last_budget_cache(body: &DeviceBudgetRequest, device_id: &str) {
 /// budget publish does not describe a second device, it OVERWRITES the row
 /// describing the machine, and coord's `upsert_budget` does
 /// `SET max_concurrent_builds = $8` unconditionally — no COALESCE, no guard.
+///
+/// A pending coord change makes that column `COALESCE($n, column)`, which is
+/// why [`DeviceBudgetRequest::max_concurrent_builds`] is an `Option` here (see
+/// that struct's ordering constraint — it has NOT landed yet). **It will not
+/// retire this guard.** COALESCE only protects a column a publisher
+/// OMITS; a secondary still sends real values for every column it believes it
+/// owns (`cpu_cores`, `max_concurrent_agents`, and — if `ci_node` is
+/// enabled in its own instance settings — `max_concurrent_builds` too). The
+/// two defences are complementary: omission says "not my column", the guard
+/// says "not my row".
 ///
 /// That is not hypothetical. On 2026-07-28T08:31:18Z a `test-9877` runner,
 /// spawned for a verification job, read `ci_node.enabled` as false in its own
@@ -552,9 +654,55 @@ pub(crate) fn machine_state_publish_allowed(owns_shared_root_state: bool) -> boo
     owns_shared_root_state
 }
 
-/// Publish role + budget to `coord.devices` via `POST
-/// /coord/devices/{device_id}/budget`. Best-effort: failures log a
-/// warning and return Ok(()) so they don't break startup.
+/// Build the budget payload from explicit inputs.
+///
+/// Pure over its arguments — no env, no settings read, no clock — so the
+/// ownership split it encodes is assertable on `serde_json::to_value` without
+/// a live request. That matters here specifically: the field this decides is
+/// the one whose wrong value caused the 2026-07-28 six-day shadow-lane outage,
+/// and an env-driven assertion would flake against the parallel harness (see
+/// `instance::primary_keeps_the_unscoped_path`).
+///
+/// The one decision it makes: **`ci_node` disabled ⇒ `max_concurrent_builds`
+/// is `None` ⇒ omitted from the wire.** A runner that has not opted in as a CI
+/// node has no opinion about build capacity — the supervisor owns that column
+/// — and under the pending `COALESCE($n, column)` semantics omission is how a
+/// publisher says so. It previously sent `0`, which coord wrote, which is the
+/// outage. When `ci_node` IS enabled the runner does have an opinion and sends
+/// it, including a deliberate `0` if the owner configured zero builds.
+///
+/// `role` is consumed here (it decides the agent cap) but deliberately never
+/// reaches the payload — see [`DeviceBudgetRequest`] for why the supervisor
+/// owns that column.
+fn build_budget_request(
+    hostname: &str,
+    role: MachineRole,
+    resources: Resources,
+    disk_reserved_gb: u64,
+    ci: &crate::settings::CiNodeSettings,
+) -> DeviceBudgetRequest {
+    DeviceBudgetRequest {
+        hostname: hostname.to_string(),
+        cpu_cores: resources.cpu_cores.min(i32::MAX as u32) as i32,
+        memory_gb: resources.memory_gb.min(i32::MAX as u32) as i32,
+        disk_total_gb: resources.disk_total_gb.min(i64::MAX as u64) as i64,
+        disk_reserved_gb: disk_reserved_gb.min(i64::MAX as u64) as i64,
+        max_concurrent_agents: match role {
+            MachineRole::Agent => derive_max_agents(resources.memory_gb) as i32,
+            MachineRole::Build => 0,
+        },
+        max_concurrent_builds: ci
+            .enabled
+            .then(|| ci.max_concurrent_builds.min(i32::MAX as u32) as i32),
+    }
+}
+
+/// Publish this runner's owned budget columns to `coord.devices` via `POST
+/// /coord/devices/{device_id}/budget`. The `role` argument shapes the agent
+/// cap but is NOT published — see [`DeviceBudgetRequest`].
+///
+/// Best-effort: failures log a warning and return Ok(()) so they don't break
+/// startup.
 ///
 /// `disk_reserved_gb` defaults to 0 in Phase 1 — Phase 5 of the
 /// fleet plan will add per-device overrides for system + non-fleet
@@ -610,37 +758,8 @@ pub async fn publish_budget(
     };
     let device_id_str = device_id_uuid.to_string();
 
-    let max_concurrent_agents: i32 = match role {
-        MachineRole::Agent => derive_max_agents(resources.memory_gb) as i32,
-        MachineRole::Build => 0,
-    };
-    // Runner is Agent role — historically leaves build slots to the
-    // supervisor on dev workstations (the supervisor publisher overwrites
-    // the build-side fields when it starts). Phase 0 of the runner-as-CI-
-    // node plan: when the owner opts in via the `ci_node` setting, advertise
-    // its `max_concurrent_builds`; disabled keeps the historical 0.
     let ci = crate::settings::get_ci_node_settings();
-    let max_concurrent_builds: i32 = if ci.enabled {
-        ci.max_concurrent_builds.min(i32::MAX as u32) as i32
-    } else {
-        0
-    };
-    let cpu_cores_i: i32 = resources.cpu_cores.min(i32::MAX as u32) as i32;
-    let memory_gb_i: i32 = resources.memory_gb.min(i32::MAX as u32) as i32;
-    let disk_total_i: i64 = resources.disk_total_gb.min(i64::MAX as u64) as i64;
-    let disk_reserved_i: i64 = disk_reserved_gb.min(i64::MAX as u64) as i64;
-    let role_str = role.as_str().to_string();
-
-    let body = DeviceBudgetRequest {
-        hostname: device.hostname.clone(),
-        role: role_str.clone(),
-        cpu_cores: cpu_cores_i,
-        memory_gb: memory_gb_i,
-        disk_total_gb: disk_total_i,
-        disk_reserved_gb: disk_reserved_i,
-        max_concurrent_agents,
-        max_concurrent_builds,
-    };
+    let body = build_budget_request(&device.hostname, role, resources, disk_reserved_gb, &ci);
 
     // Cache the payload regardless of whether the POST succeeds — this is
     // the operator's lifeline when coord is unreachable.
@@ -658,11 +777,24 @@ pub async fn publish_budget(
 
     match post_budget_with_retry(&coord_base, &device_id_str, &body).await {
         Ok(()) => {
+            // `max_concurrent_builds` is rendered as `omitted` when this runner
+            // does not own the column, so the ownership split is visible in the
+            // log rather than inferable only from the wire. Silence about which
+            // fields were sent is what made 2026-07-28 opaque.
+            let builds = match body.max_concurrent_builds {
+                Some(n) => n.to_string(),
+                None => "omitted".to_string(),
+            };
             info!(
-                "fleet::publish_budget: device_id={device_id_str} hostname={} role={role_str} \
-                 cpu_cores={cpu_cores_i} memory_gb={memory_gb_i} disk_total_gb={disk_total_i} \
-                 max_concurrent_agents={max_concurrent_agents}",
-                device.hostname
+                "fleet::publish_budget: device_id={device_id_str} hostname={} \
+                 local_role={}(not published) cpu_cores={} memory_gb={} disk_total_gb={} \
+                 max_concurrent_agents={} max_concurrent_builds={builds}",
+                device.hostname,
+                role.as_str(),
+                body.cpu_cores,
+                body.memory_gb,
+                body.disk_total_gb,
+                body.max_concurrent_agents
             );
             Ok(())
         }
@@ -709,9 +841,11 @@ fn budget_republish_secs() -> u64 {
 /// touches the budget columns — so whatever `coord.devices` held after startup
 /// was frozen for the process's lifetime. Two properties made that fragile:
 /// coord's `upsert_budget` does `SET max_concurrent_builds = $8`
-/// unconditionally (no COALESCE, no guard), and every runner instance on this
-/// machine — including the `test-*`/`named-*` ones the supervisor spawns —
-/// shares one `~/.qontinui/machine.json`, hence one `device_id`.
+/// unconditionally (no COALESCE, no guard — a pending coord change makes it
+/// `COALESCE`d, but only against OMISSION, see [`DeviceBudgetRequest`]), and
+/// every runner instance on this machine — including the `test-*`/`named-*`
+/// ones the supervisor spawns — shares one `~/.qontinui/machine.json`, hence
+/// one `device_id`.
 ///
 /// On 2026-07-28T08:31:18Z those combined: a test runner spawned for a
 /// verification job read `ci_node.enabled` as false in its own instance
@@ -1258,9 +1392,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
 
-    let resp = client
-        .post(&url)
-        .json(&payload)
+    let resp = crate::auth::attach_device_auth(client.post(&url).json(&payload))
         .send()
         .await
         .map_err(|e| format!("POST {url}: {}", error_chain(&e)))?;
@@ -2587,7 +2719,10 @@ async fn request_and_apply_pull(
         body["tenant_id"] = serde_json::json!(t);
     }
     let url = format!("{base}/coord/trees/pull-decision");
-    let resp = match client.post(&url).json(&body).send().await {
+    let resp = match crate::auth::attach_device_auth(client.post(&url).json(&body))
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             let status = r.status();
@@ -2790,7 +2925,10 @@ async fn record_pull_outcome(
         "reasoning": reasoning,
     });
     let url = format!("{base}/coord/trees/pull-decision/record");
-    if let Err(e) = client.post(&url).json(&body).send().await {
+    if let Err(e) = crate::auth::attach_device_auth(client.post(&url).json(&body))
+        .send()
+        .await
+    {
         debug!("fleet::pull_executor: record outcome failed: {e}");
     }
 }
@@ -3016,7 +3154,17 @@ pub async fn publish_tree_state() -> Result<(), String> {
             .ok()
             .and_then(|p| app_by_root.get(&p).cloned());
 
-        let upsert_ok = match client.post(&url).json(&payload).send().await {
+        // Per-repo, so this resolves the device-JWT once per repo per cycle
+        // (`attach_device_auth` deliberately does not cache — the JWT has a
+        // ~4h TTL and is refreshed in place). That is a local encrypted-file
+        // read sitting next to `capture_tree`'s git SUBPROCESS for the same
+        // repo, which dominates it by orders of magnitude; the coverage-log
+        // rate floor in `auth::coverage_log_due` handles the one effect that
+        // did scale badly here (a summary line every 25 calls).
+        let upsert_ok = match crate::auth::attach_device_auth(client.post(&url).json(&payload))
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 posted += 1;
                 true
@@ -3165,8 +3313,7 @@ async fn run_auto_fresh_cycle() -> Result<(), String> {
     );
 
     let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
+    let response = crate::auth::attach_device_auth(client.get(&url))
         .send()
         .await
         .map_err(|e| format!("GET {}: {e}", url))?;
@@ -3790,6 +3937,211 @@ mod tests {",
                 owns,
                 "both call sites must gate on shared-state ownership alone"
             );
+        }
+    }
+
+    // ---- who owns which budget column ----
+
+    /// `ci_node` settings for the tests below. Written out field-by-field
+    /// rather than via a `..Default::default()` so a future field addition
+    /// surfaces here as a compile error instead of being silently defaulted
+    /// into a payload assertion.
+    fn ci_settings(enabled: bool, max_concurrent_builds: u32) -> crate::settings::CiNodeSettings {
+        crate::settings::CiNodeSettings {
+            enabled,
+            max_concurrent_builds,
+            repo_allowlist: Vec::new(),
+            min_free_disk_gb: 50,
+        }
+    }
+
+    fn budget_json(ci: &crate::settings::CiNodeSettings) -> serde_json::Value {
+        serde_json::to_value(build_budget_request(
+            "test-host",
+            MachineRole::Agent,
+            Resources {
+                cpu_cores: 8,
+                memory_gb: 32,
+                disk_total_gb: 1000,
+            },
+            0,
+            ci,
+        ))
+        .expect("budget payload must serialize")
+    }
+
+    /// The 2026-07-28 outage, retired at its root.
+    ///
+    /// A runner that has not opted in as a CI node has no opinion about build
+    /// capacity — the SUPERVISOR owns that column. Under coord's
+    /// `COALESCE($n, column)` write semantics the only way to say "not mine"
+    /// is to leave the field OFF the wire; a `0` is a write of zero, which is
+    /// precisely the value that un-elected this machine from the shadow lane
+    /// for six days.
+    ///
+    /// Asserted on `serde_json::to_value` rather than through a live request
+    /// because `skip_serializing_if` is the mechanism under test: an
+    /// `Option::None` that still serializes as `null` would satisfy a
+    /// struct-level assertion and STILL clobber the column.
+    #[test]
+    fn budget_payload_omits_max_concurrent_builds_when_ci_node_disabled() {
+        let json = budget_json(&ci_settings(false, 4));
+        assert!(
+            json.get("max_concurrent_builds").is_none(),
+            "a non-CI runner must OMIT the build column it does not own — \
+             sending 0 (or null) is the 2026-07-28 clobber. Payload: {json}"
+        );
+        // The columns the runner DOES own must still be on the wire, or the
+        // fix inverts into the mirror-image outage.
+        assert_eq!(
+            json.get("max_concurrent_agents").and_then(|v| v.as_i64()),
+            Some(derive_max_agents(32) as i64),
+            "the runner owns the agent cap and must keep publishing it"
+        );
+        // Machine-resource fields describe the BOX, not this process — both
+        // publishers mean the same thing by them, so there is nothing to
+        // disagree about and nothing to omit.
+        for owned in ["hostname", "cpu_cores", "memory_gb", "disk_total_gb"] {
+            assert!(
+                json.get(owned).is_some(),
+                "{owned} describes the machine and must stay on the wire: {json}"
+            );
+        }
+    }
+
+    /// `role` must never leave this process, whatever the CI-node setting or
+    /// the declared [`MachineRole`].
+    ///
+    /// `coord.devices.role` is one scalar shared with the supervisor, which
+    /// publishes `build`. Every `agent` the runner sent overwrote that and hid
+    /// the box from `build_dispatcher`'s `WHERE role = 'build'`. Asserted for
+    /// BOTH roles and both CI settings so a future edit cannot re-arm the
+    /// write through some conditional branch.
+    #[test]
+    fn budget_payload_never_publishes_role() {
+        for role in [MachineRole::Agent, MachineRole::Build] {
+            for enabled in [true, false] {
+                let json = serde_json::to_value(build_budget_request(
+                    "test-host",
+                    role,
+                    Resources {
+                        cpu_cores: 8,
+                        memory_gb: 32,
+                        disk_total_gb: 1000,
+                    },
+                    0,
+                    &ci_settings(enabled, 2),
+                ))
+                .expect("budget payload must serialize");
+                assert!(
+                    json.get("role").is_none(),
+                    "the supervisor owns coord.devices.role; the runner asserting \
+                     {:?} into it is what hides this box from build_dispatcher: {json}",
+                    role
+                );
+            }
+        }
+    }
+
+    /// The other direction: an opted-in CI node DOES own build capacity and
+    /// must send it, including a deliberate `0`. An omission-always change
+    /// would leave a CI node unable to advertise (or to withdraw) capacity —
+    /// the same outage with the sign flipped.
+    #[test]
+    fn budget_payload_includes_max_concurrent_builds_when_ci_node_enabled() {
+        let json = budget_json(&ci_settings(true, 3));
+        assert_eq!(
+            json.get("max_concurrent_builds").and_then(|v| v.as_i64()),
+            Some(3),
+            "an enabled ci_node owns the build column and must publish it: {json}"
+        );
+
+        let zero = budget_json(&ci_settings(true, 0));
+        assert_eq!(
+            zero.get("max_concurrent_builds").and_then(|v| v.as_i64()),
+            Some(0),
+            "an enabled ci_node configured to 0 is an OPINION of zero and must \
+             reach the wire — omission would make capacity un-withdrawable"
+        );
+    }
+
+    // ---- coord data-plane authentication ----
+
+    /// Every coord call the fleet publishers make must route through
+    /// `attach_device_auth`.
+    ///
+    /// These were the last unauthenticated coord calls among the FLEET
+    /// publishers — the set plan `2026-08-03-per-instance-device-identity` §4
+    /// Phase 3(a) names, whose `git grep -n "Authorization\|Bearer"` over
+    /// `fleet.rs` returned nothing. **They are not the last in the runner.**
+    /// Bare coord callers still live in `agent_worktree/census.rs`,
+    /// `agent_worktree/edit_effect_loop.rs`, `agent_runtime.rs`'s
+    /// continuation/dispatch posts, `commands/claims.rs::claims_steal`,
+    /// `coord_questions.rs`, `repo_detection.rs` and
+    /// `session_attribution.rs`; scoping this pin to `fleet.rs` is a scope
+    /// statement, not a claim that the repo is covered.
+    ///
+    /// The helper degrades gracefully — it attaches a bearer only when one is
+    /// held — so its real job here is enrolment in the `DATA_PLANE_TOTAL` /
+    /// `DATA_PLANE_AUTHED` coverage readout that Phase 3(b) enforcement is
+    /// gated on. A call site added WITHOUT it is invisible to that readout:
+    /// coverage reads 100% while an anonymous publisher is still writing,
+    /// which is the failure mode the readout exists to catch.
+    ///
+    /// Pinned at the SOURCE level for the same reason the guard pins above are
+    /// — the alternative needs a live coord and a credential — and scanning
+    /// only `prod_part` so this test's own doc text cannot satisfy it.
+    ///
+    /// **Known blind spot:** the bare-vs-authed equality below only
+    /// recognises the `client.post(&url)` / `client.get(&url)` spellings. A
+    /// call built as `client.post(format!(…))`, or through a differently-named
+    /// binding, escapes it. That is the cost of a source-level pin; the
+    /// alternative is a network-level assertion this module cannot make.
+    #[test]
+    fn every_fleet_coord_writer_attaches_device_auth() {
+        // (module, source, authed-call marker, minimum authed sites, what they are)
+        let cases = [
+            (
+                "fleet.rs",
+                include_str!("fleet.rs"),
+                "crate::auth::attach_device_auth(client.",
+                6,
+                "the budget POST, the device register/heartbeat POST, both \
+                 tree pull-decision POSTs, the tree upsert POST, and the \
+                 test-targets GET",
+            ),
+            (
+                "bin/qontinui_profile.rs",
+                include_str!("bin/qontinui_profile.rs"),
+                "qontinui_runner_lib::auth::attach_device_auth_blocking(client.",
+                1,
+                "`device init`'s register POST, on the blocking client",
+            ),
+        ];
+
+        for (name, src, marker, want, what) in cases {
+            let prod = squeezed(prod_part(src));
+            let found = prod.matches(marker).count();
+            assert!(
+                found >= want,
+                "{name}: expected at least {want} authenticated coord call site(s) — {what} \
+                 — but found {found}. A fleet coord writer lost its device-JWT attachment."
+            );
+            // …and nothing may go out the bare way. Counted rather than merely
+            // "absent" so this stays honest if a NON-coord call ever needs a
+            // raw builder here: the numbers must move together. Both verbs,
+            // because the reads carry the same bearer as the writes
+            // (`coord_http`'s module doc: one token source for both).
+            for verb in ["post", "get"] {
+                let bare = prod.matches(&format!("client.{verb}(&url)")).count();
+                let authed = prod.matches(&format!("{marker}{verb}(&url)")).count();
+                assert_eq!(
+                    bare,
+                    authed,
+                    "{name}: {} coord {verb} builder(s) are not wrapped in the auth helper",
+                    bare - authed
+                );
+            }
         }
     }
 
