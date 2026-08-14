@@ -1033,20 +1033,109 @@ pub fn attach_device_auth_for(
     rb: reqwest::RequestBuilder,
     tenant: Option<&Uuid>,
 ) -> reqwest::RequestBuilder {
-    let total = DATA_PLANE_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let rb = match device_bearer_for(tenant) {
-        Some(token) => {
-            DATA_PLANE_AUTHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            rb.header("Authorization", format!("Bearer {token}"))
-        }
+    match count_and_resolve_bearer(tenant) {
+        Some(token) => rb.header("Authorization", format!("Bearer {token}")),
         None => rb,
-    };
-    if total.is_multiple_of(25) {
+    }
+}
+
+/// Blocking-client sibling of [`attach_device_auth_for`], for the CLI targets
+/// that run without a tokio runtime (`qontinui_profile device init` →
+/// `register_with_coord`).
+///
+/// Deliberately a thin transport adapter over the SAME
+/// [`count_and_resolve_bearer`] core rather than a second implementation: the
+/// token source, the never-fatal posture and the `DATA_PLANE_TOTAL` /
+/// `DATA_PLANE_AUTHED` counters are shared by construction. A duplicated
+/// resolver would under-report coverage, and coverage is precisely the signal
+/// the plan `2026-08-03-per-instance-device-identity` Phase 3(b) enforcement
+/// flip is gated on — a metric that silently omits a caller is worse than no
+/// metric, because it reads as 100%.
+///
+/// The alternative — dragging the CLI onto an async runtime just to reuse the
+/// async builder — buys nothing: `reqwest::blocking::RequestBuilder::header`
+/// takes the identical header pair, so the adapter is one match arm.
+///
+/// Takes `tenant` for the same reason [`attach_device_auth_for`] does, and NOT
+/// as a convenience: its one caller posts a body declaring an explicit
+/// `tenant_id`, and [`select_device_bearer`]'s fail-soft invariant is that a
+/// request for tenant X must never carry tenant Y's credential. A
+/// tenant-less blocking helper could not honour that on a multi-bound box —
+/// it would silently present the default binding's JWT against a request
+/// declaring another tenant. There is no unparameterized twin here precisely
+/// so that door cannot be opened by accident.
+pub fn attach_device_auth_blocking(
+    rb: reqwest::blocking::RequestBuilder,
+    tenant: Option<&Uuid>,
+) -> reqwest::blocking::RequestBuilder {
+    match count_and_resolve_bearer(tenant) {
+        Some(token) => rb.header("Authorization", format!("Bearer {token}")),
+        None => rb,
+    }
+}
+
+/// Count one outbound data-plane call and resolve the bearer to present on it.
+///
+/// The transport-independent core of [`attach_device_auth_for`] and
+/// [`attach_device_auth_blocking`]. Returns `None` when no credential is held
+/// (unpaired runner, non-default tenant slot miss) — the caller then sends the
+/// request unauthenticated, which coord still accepts.
+///
+/// The returned token is only ever moved into a request header; it must never
+/// reach a log line or a process argument.
+fn count_and_resolve_bearer(tenant: Option<&Uuid>) -> Option<String> {
+    let total = DATA_PLANE_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let bearer = device_bearer_for(tenant);
+    if bearer.is_some() {
+        DATA_PLANE_AUTHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if total.is_multiple_of(25) && coverage_log_due() {
         let authed = DATA_PLANE_AUTHED.load(std::sync::atomic::Ordering::Relaxed);
         let pct = (authed as f64 / total as f64) * 100.0;
         info!("coord data-plane auth coverage: {authed}/{total} ({pct:.0}%)");
     }
-    rb
+    bearer
+}
+
+/// Minimum wall-clock gap between two coverage summaries, in seconds.
+const COVERAGE_LOG_MIN_GAP_SECS: u64 = 60;
+
+/// Epoch-seconds of the last emitted coverage summary. `0` = never.
+static COVERAGE_LOG_LAST_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Rate floor under the every-25th-call coverage summary.
+///
+/// The every-25th trigger alone was calibrated for a low-rate data plane. The
+/// tree publisher walks every governed repo on the box on a 60s cadence and
+/// posts one request each, so on this machine it alone drives hundreds of
+/// data-plane calls per cycle — which would emit the summary a dozen times a
+/// minute and bury the signal it exists to provide. Both conditions must hold,
+/// so the summary stays a per-25-calls sample on a quiet runner and becomes a
+/// per-minute one on a busy one.
+///
+/// Deliberately NOT a "reset the counter" scheme: `DATA_PLANE_TOTAL` /
+/// `DATA_PLANE_AUTHED` are cumulative for the process, because the Phase 3(b)
+/// flip predicate is "coverage reached 100%", which a windowed counter cannot
+/// answer.
+fn coverage_log_due() -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = COVERAGE_LOG_LAST_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < COVERAGE_LOG_MIN_GAP_SECS {
+        return false;
+    }
+    // Compare-exchange so concurrent callers cannot both pass the gap check
+    // and double-log; the loser simply skips this summary.
+    COVERAGE_LOG_LAST_SECS
+        .compare_exchange(
+            last,
+            now,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
 }
 
 /// Returns true if `s` looks like a JWS Compact Serialization

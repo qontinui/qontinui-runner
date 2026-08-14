@@ -961,7 +961,7 @@ fn register_with_coord(
         uuid::Uuid::parse_str(uid)
             .map_err(|e| format!("paired user_id is not a valid UUID: {}", e))?;
     }
-    let _ = uuid::Uuid::parse_str(tenant_id)
+    let tenant_uuid = uuid::Uuid::parse_str(tenant_id)
         .map_err(|e| format!("tenant_id is not a valid UUID: {}", e))?;
     let base = coord_http_base()?;
     let url = format!("{}/coord/devices/register", base);
@@ -989,11 +989,24 @@ fn register_with_coord(
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("reqwest client build failed: {}", e))?;
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .map_err(|e| format!("POST {} failed (coord unreachable?): {}", url, e))?;
+    // Present the device-JWT when this box already holds one. Blocking-client
+    // sibling of the async `attach_device_auth_for` every other coord writer
+    // uses; both share one token source and one coverage counter (see
+    // `auth::count_and_resolve_bearer`). Never fatal — a box registering for
+    // the FIRST time necessarily holds no credential yet, and coord still
+    // accepts anonymous register; the header is what lets the Phase 3(b)
+    // enforcement flip see this caller at all.
+    //
+    // The tenant is the one this very request declares in its body, so the
+    // bearer comes from THAT binding's JWT slot. On a slot miss the helper
+    // sends unauthenticated rather than presenting another tenant's
+    // credential, which is `auth::select_device_bearer`'s documented posture.
+    let resp = qontinui_runner_lib::auth::attach_device_auth_blocking(
+        client.post(&url).json(&body),
+        Some(&tenant_uuid),
+    )
+    .send()
+    .map_err(|e| format!("POST {} failed (coord unreachable?): {}", url, e))?;
     let status = resp.status();
     if status.is_success() {
         return Ok(());
