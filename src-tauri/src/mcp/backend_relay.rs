@@ -1791,7 +1791,10 @@ const _: () = assert!(DEVENV_ENROLL_ACK_BUDGET.as_secs() < STALE_INBOUND_TIMEOUT
 /// Both parameters are the SAME bools advertised in
 /// [`devenv_runner_info_block`], deliberately: the refusal and the advertised
 /// hint cannot drift, because there is only one expression behind each.
-fn devenv_enroll_refusal(auto_enroll_optout: bool, owns_shared_state: bool) -> Option<&'static str> {
+fn devenv_enroll_refusal(
+    auto_enroll_optout: bool,
+    owns_shared_state: bool,
+) -> Option<&'static str> {
     if auto_enroll_optout {
         return Some("devenv auto-enrollment disabled locally (QONTINUI_DEVENV_AUTO_ENROLL)");
     }
@@ -1890,12 +1893,18 @@ type DevenvEnrollJoin = Result<Result<enroll::EnrollOutcome, String>, tokio::tas
 /// still allowed 30s, and dropping a `spawn_blocking` `JoinHandle` does not
 /// cancel the task. So there is a ≥10s window in which the loop is free to
 /// dispatch a second `devenv_enroll` while the first is still writing. The real
-/// serialization is `enroll::with_enroll_slot`, a process-wide guard inside
-/// `run_enroll` itself: a second concurrent enroll — from this transport, from
-/// coord's `directive::handle_enroll_directive`, from the CLI or the Tauri
-/// command — returns `enroll::ENROLL_ALREADY_IN_FLIGHT` without touching secure
-/// storage or the config, and that reason lands in this handler's `ok:false`
-/// ack via the `Ok(Err(e))` arm below.
+/// serialization is `enroll::with_enroll_slot`, a guard inside `run_enroll`
+/// itself: a second concurrent enroll from any IN-PROCESS caller — this
+/// transport, coord's `directive::handle_enroll_directive`, or the Settings
+/// panel's `commands::devenv_enroll` — returns
+/// `enroll::ENROLL_ALREADY_IN_FLIGHT` without touching secure storage or the
+/// config, and that reason lands in this handler's `ok:false` ack via the
+/// `Ok(Err(e))` arm below.
+///
+/// It does NOT cover the `qontinui_profile` CLI (a separate binary, hence a
+/// separate process) or a secondary runner instance (nothing outside this
+/// handler checks `owns_shared_root_state()`). Both remain open and need a
+/// machine-wide lock file — see `enroll::with_enroll_slot`.
 ///
 /// The enroll is still not DETACHED here, for a different reason than
 /// serialization: detaching would mean acking before the outcome is known, and
@@ -1977,23 +1986,22 @@ where
     // ahead of the spawn — a config read, a DNS lookup — would sit OUTSIDE the
     // liveness budget, and no test would catch it: the injected test closure is
     // `std::future::pending`, whose eager region is empty.
-    let outcome = match tokio::time::timeout(budget, async move { spawn_enroll(request).await })
-        .await
-    {
-        Ok(o) => o,
-        Err(_) => {
-            let secs = budget.as_secs();
-            warn!(
+    let outcome =
+        match tokio::time::timeout(budget, async move { spawn_enroll(request).await }).await {
+            Ok(o) => o,
+            Err(_) => {
+                let secs = budget.as_secs();
+                warn!(
                 "devenv_enroll: enroll timed out after {secs}s — acking ok:false and releasing \
                  the relay read loop. The enroll task is still running; if it succeeds, the next \
                  connect's runner_info reports enrolled:true."
             );
-            return Some(devenv_enroll_ack_err(
-                format!("enroll timed out after {secs}s"),
-                frame_machine_id.as_deref(),
-            ));
-        }
-    };
+                return Some(devenv_enroll_ack_err(
+                    format!("enroll timed out after {secs}s"),
+                    frame_machine_id.as_deref(),
+                ));
+            }
+        };
 
     match outcome {
         Ok(Ok(o)) => {
@@ -3937,14 +3945,8 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "the handler must return on its own budget, not the enroll's — took {elapsed:?}"
         );
-
-        // And the shipped budget must stay comfortably under the drop threshold
-        // the read loop is measured against.
-        assert!(
-            DEVENV_ENROLL_ACK_BUDGET < STALE_INBOUND_TIMEOUT,
-            "the ack budget ({DEVENV_ENROLL_ACK_BUDGET:?}) must expire BEFORE the \
-             keepalive pinger force-drops the socket at {STALE_INBOUND_TIMEOUT:?}"
-        );
+        // The budget-vs-drop-threshold relation is asserted at COMPILE time
+        // beside `DEVENV_ENROLL_ACK_BUDGET`; no runtime copy here.
     }
 
     /// The success path is untouched by the budget: a fast enroll acks `ok:true`
@@ -4008,7 +4010,8 @@ mod tests {
 
         assert_eq!(ack["ok"], false);
         assert_eq!(
-            ack["reason"], enroll::ENROLL_ALREADY_IN_FLIGHT,
+            ack["reason"],
+            enroll::ENROLL_ALREADY_IN_FLIGHT,
             "the guard's reason must reach the wire verbatim: {ack}"
         );
         assert_eq!(ack["machine_id"], "frame-machine");

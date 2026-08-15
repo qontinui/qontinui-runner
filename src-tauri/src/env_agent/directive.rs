@@ -119,6 +119,15 @@ pub async fn handle_enroll_directive(directive: EnrollDirective) {
                 warn!("env_agent::directive: post-enroll capture failed (will retry on tick): {e}");
             }
         }
+        // An in-flight refusal is NOT a failure — a peer caller (the relay's
+        // `devenv_enroll` frame, or the Settings-panel button) is already
+        // enrolling this machine, and its outcome is the real one. Logged
+        // distinctly at info so it cannot be mistaken for a broken dispatch
+        // while triaging; `enroll::with_enroll_slot` explains the guard.
+        Ok(Err(e)) if e.contains(enroll::ENROLL_ALREADY_IN_FLIGHT) => info!(
+            "env_agent::directive: skipped — another enroll is already in flight \
+             in this process; deferring to it ({e})"
+        ),
         Ok(Err(e)) => warn!("env_agent::directive: dispatched enroll failed: {e}"),
         Err(e) => warn!("env_agent::directive: enroll task panicked: {e}"),
     }

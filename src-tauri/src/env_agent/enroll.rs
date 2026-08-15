@@ -91,15 +91,22 @@ pub struct EnrollOutcome {
     pub backend_url: String,
 }
 
-/// The reason a caller gets when another enroll is already running. Callers
-/// surface it verbatim (the relay's `devenv_enroll_ack.reason`, the CLI's
-/// stderr), so it is a wire-visible string — treat a change as a contract
-/// change.
-pub const ENROLL_ALREADY_IN_FLIGHT: &str = "enroll already in flight";
+/// The reason a caller gets when another enroll is already running IN THIS
+/// PROCESS. Surfaced verbatim by the relay's `devenv_enroll_ack.reason` and by
+/// the Settings-panel Enroll button (`commands::devenv_enroll`), so it is both a
+/// wire-visible string and operator-facing UI text — treat a change as a
+/// contract change.
+///
+/// It names the likely cause and a retry horizon because the interactive path
+/// can genuinely hit it: an operator clicking Enroll while the relay's
+/// automatic enrollment is mid-flight would otherwise see four bare words with
+/// no indication that waiting fixes it. ~30s is `run_enroll`'s own POST timeout
+/// (the longest the holder can legitimately run), not a guess.
+pub const ENROLL_ALREADY_IN_FLIGHT: &str =
+    "enroll already in flight (an automatic enrollment is running — retry in ~30s)";
 
 /// Process-wide "an enroll is running" flag. See [`with_enroll_slot`].
-static ENROLL_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static ENROLL_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// RAII release for [`ENROLL_IN_FLIGHT`]. Drop-based so the slot is freed on
 /// EVERY exit from the critical section, including the `?` early-returns
@@ -118,10 +125,8 @@ impl Drop for EnrollInFlightGuard {
 /// [`ENROLL_ALREADY_IN_FLIGHT`] when one is already running.
 ///
 /// **Why this exists.** [`run_enroll`] performs two unguarded writes in order —
-/// `store_agent_machine_key` and then `EnvAgentConfig::save` — and there are
-/// four independent callers (the CLI, the Tauri command, coord's
-/// `directive::handle_enroll_directive`, and the relay's `devenv_enroll` frame).
-/// Two overlapping enrolls interleave as:
+/// `store_agent_machine_key` and then `EnvAgentConfig::save`. Two overlapping
+/// enrolls interleave as:
 ///
 /// ```text
 /// A: store_agent_machine_key(key_A)
@@ -143,11 +148,34 @@ impl Drop for EnrollInFlightGuard {
 /// exists to enforce, re-introducing the connection drop. A refused enroll is
 /// also cheap to recover from — the server re-dispatches on the next connect.
 ///
-/// **Process-wide, not machine-wide.** Two runner PROCESSES could still race.
-/// That is out of scope by construction: only the instance owning shared root
-/// state may enroll at all (see the relay's refusal gate), so there is at most
-/// one enrolling process per box.
-pub fn with_enroll_slot<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+/// # Scope: IN-PROCESS ONLY — two cross-process races remain OPEN
+///
+/// `ENROLL_IN_FLIGHT` is a process-global atomic, so it serializes only callers
+/// that share this process image: `commands::devenv_enroll` (the Settings-panel
+/// button), `directive::handle_enroll_directive` (coord's dispatch channel), and
+/// `mcp::backend_relay`'s `devenv_enroll` frame. Those three are the ones that
+/// fire automatically, so this closes the races that actually recur. It does NOT
+/// close:
+///
+/// - **CLI vs. runner.** `qontinui_profile env enroll` (`profile_cli.rs`
+///   `cmd_env_enroll`) runs in `src/bin/qontinui_profile.rs`, a SEPARATE binary
+///   and therefore a separate process, with its own `ENROLL_IN_FLIGHT` that is
+///   always `false`. An operator pasting the enroll one-liner while the relay
+///   reconnects hits exactly the interleave diagrammed above.
+/// - **Secondary vs. primary.** Nothing outside the relay's own refusal gate
+///   checks `instance::owns_shared_root_state()` —
+///   `directive::spawn_enroll_directive_subscriber()` is spawned
+///   unconditionally at runner boot, so a secondary instance subscribes and
+///   enrolls too, against the machine-global `~/.qontinui/env-agent.json`.
+///
+/// Closing either needs a MACHINE-wide lock — a lock file beside
+/// `env-agent.json` — not a bigger atomic. That is deliberately deferred: stale-
+/// lock recovery and Windows file-locking semantics are their own phase, and a
+/// stale lock that bricks enrollment on a box would be a worse failure than the
+/// race it replaced. Tracked as follow-up on plan
+/// `2026-08-05-devenv-auto-enrollment-on-connection`. Until then, treat "an
+/// enroll cannot overlap" as true only within one process.
+pub(crate) fn with_enroll_slot<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     use std::sync::atomic::Ordering;
     if ENROLL_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -164,11 +192,16 @@ pub fn with_enroll_slot<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, S
 /// directly from the sync CLI, or via `spawn_blocking` from an async Tauri
 /// command. Writes NOTHING on any failure (returns `Err`).
 ///
-/// Serialized process-wide by [`with_enroll_slot`]: a second concurrent call
-/// returns [`ENROLL_ALREADY_IN_FLIGHT`] without touching secure storage or the
-/// config. Guarding HERE rather than at any one call site is deliberate — all
-/// four callers get it, including the two that can genuinely overlap (coord's
-/// dispatched directive and the relay's socket-pushed frame).
+/// Serialized by [`with_enroll_slot`]: a second concurrent call returns
+/// [`ENROLL_ALREADY_IN_FLIGHT`] without touching secure storage or the config.
+/// Guarding HERE rather than at any one call site is deliberate — every
+/// IN-PROCESS caller gets it, including the two that overlap in practice
+/// (coord's dispatched directive and the relay's socket-pushed frame).
+///
+/// **The guard is in-process only.** The `qontinui_profile` CLI is a separate
+/// binary, so a CLI enroll and a runner enroll can still interleave and corrupt
+/// the key/config pair. See [`with_enroll_slot`] for both open races and why
+/// the machine-wide lock is deferred rather than built here.
 pub fn run_enroll(params: EnrollParams) -> Result<EnrollOutcome, String> {
     with_enroll_slot(move || run_enroll_locked(params))
 }
@@ -482,7 +515,9 @@ mod tests {
             })
         });
 
-        entered_rx.recv().expect("the first enroll must reach its body");
+        entered_rx
+            .recv()
+            .expect("the first enroll must reach its body");
 
         // …and now, with the first still in flight, a second arrives.
         let written_b = Arc::clone(&written);
@@ -496,7 +531,9 @@ mod tests {
             "the refusal must name itself so the ack's reason is actionable: {err}"
         );
 
-        release_tx.send(()).expect("the first enroll must still be parked");
+        release_tx
+            .send(())
+            .expect("the first enroll must still be parked");
         first
             .join()
             .expect("the first enroll thread must not panic")
@@ -570,7 +607,9 @@ mod tests {
             "run_enroll must refuse before validating: {err}"
         );
 
-        release_tx.send(()).expect("the holder must still be parked");
+        release_tx
+            .send(())
+            .expect("the holder must still be parked");
         held.join().expect("holder thread").expect("holder body");
     }
 
