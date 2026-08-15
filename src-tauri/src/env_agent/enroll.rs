@@ -91,11 +91,90 @@ pub struct EnrollOutcome {
     pub backend_url: String,
 }
 
+/// The reason a caller gets when another enroll is already running. Callers
+/// surface it verbatim (the relay's `devenv_enroll_ack.reason`, the CLI's
+/// stderr), so it is a wire-visible string — treat a change as a contract
+/// change.
+pub const ENROLL_ALREADY_IN_FLIGHT: &str = "enroll already in flight";
+
+/// Process-wide "an enroll is running" flag. See [`with_enroll_slot`].
+static ENROLL_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII release for [`ENROLL_IN_FLIGHT`]. Drop-based so the slot is freed on
+/// EVERY exit from the critical section, including the `?` early-returns
+/// scattered through [`run_enroll`] and an unwinding panic — a leaked flag would
+/// wedge enrollment for the life of the process, which is a worse failure than
+/// the race it guards.
+struct EnrollInFlightGuard;
+
+impl Drop for EnrollInFlightGuard {
+    fn drop(&mut self) {
+        ENROLL_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Run `f` as THE enroll for this process, or refuse with
+/// [`ENROLL_ALREADY_IN_FLIGHT`] when one is already running.
+///
+/// **Why this exists.** [`run_enroll`] performs two unguarded writes in order —
+/// `store_agent_machine_key` and then `EnvAgentConfig::save` — and there are
+/// four independent callers (the CLI, the Tauri command, coord's
+/// `directive::handle_enroll_directive`, and the relay's `devenv_enroll` frame).
+/// Two overlapping enrolls interleave as:
+///
+/// ```text
+/// A: store_agent_machine_key(key_A)
+/// B: store_agent_machine_key(key_B)   // overwrites A's key
+/// B: cfg.save() -> machine_id_B
+/// A: cfg.save() -> machine_id_A       // overwrites B's config
+/// ```
+///
+/// leaving `env-agent.json` naming machine A while secure storage holds machine
+/// B's key. Every later PUT then authenticates as the wrong machine — a box that
+/// looks enrolled and reports nothing, forever, with no error anywhere. It is
+/// the same silent-forever class the instance gate guards, reached by a
+/// different route.
+///
+/// **Refuse, don't queue.** A second caller returns immediately rather than
+/// blocking. The relay's `devenv_enroll` handler runs on a liveness budget
+/// (`DEVENV_ENROLL_ACK_BUDGET`) because it is awaited serially in the WS read
+/// loop; queueing here would push that handler back over the budget the timeout
+/// exists to enforce, re-introducing the connection drop. A refused enroll is
+/// also cheap to recover from — the server re-dispatches on the next connect.
+///
+/// **Process-wide, not machine-wide.** Two runner PROCESSES could still race.
+/// That is out of scope by construction: only the instance owning shared root
+/// state may enroll at all (see the relay's refusal gate), so there is at most
+/// one enrolling process per box.
+pub fn with_enroll_slot<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    use std::sync::atomic::Ordering;
+    if ENROLL_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(ENROLL_ALREADY_IN_FLIGHT.to_string());
+    }
+    let _guard = EnrollInFlightGuard;
+    f()
+}
+
 /// Perform the enroll POST, store the minted machine key in secure storage, and
 /// write `~/.qontinui/env-agent.json`. Blocking (`reqwest::blocking`) — call
 /// directly from the sync CLI, or via `spawn_blocking` from an async Tauri
 /// command. Writes NOTHING on any failure (returns `Err`).
+///
+/// Serialized process-wide by [`with_enroll_slot`]: a second concurrent call
+/// returns [`ENROLL_ALREADY_IN_FLIGHT`] without touching secure storage or the
+/// config. Guarding HERE rather than at any one call site is deliberate — all
+/// four callers get it, including the two that can genuinely overlap (coord's
+/// dispatched directive and the relay's socket-pushed frame).
 pub fn run_enroll(params: EnrollParams) -> Result<EnrollOutcome, String> {
+    with_enroll_slot(move || run_enroll_locked(params))
+}
+
+/// [`run_enroll`]'s body, running under the in-flight slot.
+fn run_enroll_locked(params: EnrollParams) -> Result<EnrollOutcome, String> {
     let code = params.code.trim();
     if code.is_empty() {
         return Err("enrollment code is empty".to_string());
@@ -326,8 +405,20 @@ mod tests {
         );
     }
 
+    /// `ENROLL_IN_FLIGHT` is process-global, so any two tests that enter the
+    /// slot race in the parallel harness — one would see the other's hold and
+    /// get `ENROLL_ALREADY_IN_FLIGHT` instead of the error it asserts. Every
+    /// test that reaches [`with_enroll_slot`] (directly or via [`run_enroll`])
+    /// holds this for its whole body. Poison-recovering so a panicking test
+    /// cannot cascade-fail the rest (the panic-path test panics BY DESIGN).
+    fn slot_lock() -> std::sync::MutexGuard<'static, ()> {
+        static SLOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SLOT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn run_enroll_rejects_empty_code() {
+        let _slot = slot_lock();
         let err = run_enroll(EnrollParams {
             code: "   ".to_string(),
             backend: "https://qontinui.io".to_string(),
@@ -342,6 +433,7 @@ mod tests {
 
     #[test]
     fn run_enroll_rejects_empty_backend() {
+        let _slot = slot_lock();
         let err = run_enroll(EnrollParams {
             code: "ENR-ABC".to_string(),
             backend: "  ".to_string(),
@@ -352,6 +444,134 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("backend base URL is empty"), "got: {err}");
+    }
+
+    // ------------------------------------------------------------------
+    // In-flight guard. `run_enroll` writes the machine key and then the config,
+    // unguarded, from four independent callers — two of which (coord's
+    // dispatched directive and the relay's socket-pushed frame) can genuinely
+    // overlap. An interleave leaves the config naming machine A while storage
+    // holds machine B's key, so every later PUT authenticates as the wrong
+    // machine, forever, with no error anywhere.
+    // ------------------------------------------------------------------
+
+    /// Two OVERLAPPING enrolls: the second is refused, and exactly ONE body
+    /// runs — so exactly one key/config pair is ever written. The overlap is
+    /// deterministic (channel rendezvous), not timing-dependent: the second
+    /// attempt is made while the first is provably parked inside its body.
+    #[test]
+    fn overlapping_enrolls_refuse_the_second_and_write_exactly_one_pair() {
+        let _slot = slot_lock();
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+
+        // Stands in for the (key, config) pair `run_enroll` persists.
+        let written: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let written_a = Arc::clone(&written);
+        let first = std::thread::spawn(move || {
+            with_enroll_slot(move || {
+                // Park INSIDE the critical section, exactly where the real body
+                // sits between `store_agent_machine_key` and `cfg.save()`.
+                entered_tx.send(()).expect("test harness alive");
+                release_rx.recv().expect("test harness alive");
+                written_a.lock().expect("not poisoned").push("A");
+                Ok(())
+            })
+        });
+
+        entered_rx.recv().expect("the first enroll must reach its body");
+
+        // …and now, with the first still in flight, a second arrives.
+        let written_b = Arc::clone(&written);
+        let second = with_enroll_slot(move || {
+            written_b.lock().expect("not poisoned").push("B");
+            Ok(())
+        });
+        let err = second.expect_err("a concurrent enroll must be REFUSED, not queued");
+        assert!(
+            err.contains(ENROLL_ALREADY_IN_FLIGHT),
+            "the refusal must name itself so the ack's reason is actionable: {err}"
+        );
+
+        release_tx.send(()).expect("the first enroll must still be parked");
+        first
+            .join()
+            .expect("the first enroll thread must not panic")
+            .expect("the FIRST enroll must succeed — the guard refuses the late one");
+
+        assert_eq!(
+            *written.lock().expect("not poisoned"),
+            vec!["A"],
+            "exactly one key/config pair may be written; the refused enroll must \
+             not have reached its body at all"
+        );
+    }
+
+    /// The slot is a guard, not a latch: it must be released on the error and
+    /// panic paths too, or one failed enroll wedges enrollment for the life of
+    /// the process — a worse failure than the race being guarded.
+    #[test]
+    fn enroll_slot_is_released_after_success_error_and_panic() {
+        let _slot = slot_lock();
+        assert!(with_enroll_slot(|| Ok::<_, String>(1)).is_ok());
+        assert_eq!(
+            with_enroll_slot(|| Err::<(), String>("boom".to_string())).unwrap_err(),
+            "boom",
+            "an inner error passes through untouched, not masked by the guard"
+        );
+
+        let panicked = std::panic::catch_unwind(|| {
+            let _ = with_enroll_slot(|| -> Result<(), String> { panic!("inner panic") });
+        });
+        assert!(panicked.is_err(), "sanity: the panic must propagate");
+
+        // Still acquirable after all three exits.
+        assert!(
+            with_enroll_slot(|| Ok::<_, String>(())).is_ok(),
+            "the slot leaked — enrollment is now wedged for the process lifetime"
+        );
+    }
+
+    /// Every caller inherits the guard because it lives in `run_enroll` itself,
+    /// not at a call site. This pins that the entry point really is wrapped: the
+    /// validation error can only be reached from INSIDE the slot.
+    #[test]
+    fn run_enroll_refuses_while_another_is_in_flight() {
+        let _slot = slot_lock();
+        use std::sync::mpsc;
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let held = std::thread::spawn(move || {
+            with_enroll_slot(move || {
+                entered_tx.send(()).expect("test harness alive");
+                release_rx.recv().expect("test harness alive");
+                Ok::<(), String>(())
+            })
+        });
+        entered_rx.recv().expect("the holder must reach its body");
+
+        // An enroll that would otherwise fail validation instantly instead
+        // reports the in-flight refusal — proof the guard wraps the whole fn.
+        let err = run_enroll(EnrollParams {
+            code: "   ".to_string(),
+            backend: "https://qontinui.io".to_string(),
+            machine_id: None,
+            hostname: None,
+            coord_device_id: None,
+            environment_override: None,
+        })
+        .unwrap_err();
+        assert!(
+            err.contains(ENROLL_ALREADY_IN_FLIGHT),
+            "run_enroll must refuse before validating: {err}"
+        );
+
+        release_tx.send(()).expect("the holder must still be parked");
+        held.join().expect("holder thread").expect("holder body");
     }
 
     #[test]
