@@ -21,8 +21,8 @@
 //!
 //! The `secret_safety_*` unit tests below pin this invariant.
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -590,14 +590,48 @@ pub fn probe_scope_root() -> Option<std::path::PathBuf> {
     probe_scope().root
 }
 
-/// Wall-clock budget for one `<cmd> --version` probe during CAPTURE.
+/// Wall-clock budget for the FIRST `<cmd> --version` probe during CAPTURE.
 ///
 /// Deliberately tight: capture runs on a 15-minute loop against three tools, and
 /// a wedged shim must cost the runner seconds, not minutes. The budget itself is
 /// NOT the thing to relax — what a box under load needs is for *exceeding* it to
 /// be represented honestly (see [`ProbeOutcome::TimedOut`]), not for the runner
 /// to sit on a wedged shim for minutes.
+///
+/// Exceeding it is no longer a verdict on its own: it opens the confirmation
+/// ladder in [`version_of_confirmed`], and only a key that survives the whole
+/// ladder is reported unmeasured.
 const CAPTURE_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Budget for the SECOND, confirming `<cmd> --version` attempt, made only after
+/// the first one timed out and the resolved binary did not prove itself a stub.
+///
+/// **Composition — this pair, not [`CAPTURE_PROBE_BUDGET`] alone, is what bounds
+/// a capture.** A key is probed at most twice and only the timeout arm retries,
+/// so the worst case for one key is `CAPTURE_PROBE_BUDGET + this` = 13s, and for
+/// the whole `versions` section (three keys, by construction — see
+/// [`super::apply_versions::APPLIABLE_TOOLS`]) 39s. That is still firmly
+/// "seconds, not minutes" against a 15-minute capture loop, which is the
+/// property this module's probe budget exists to hold.
+///
+/// Why a longer budget rather than a second one at 3s: the observed failure is a
+/// box under load, where `rustc --version` has been measured between 173 ms and
+/// 6858 ms at 14% CPU idle. A repeat at the same budget would re-lose the same
+/// races; a genuinely-present-but-slow tool answers inside 10s, while a wedged
+/// shim does not answer at any budget worth paying on a 15-minute loop.
+const CAPTURE_PROBE_RETRY_BUDGET: Duration = Duration::from_secs(10);
+
+/// After this many CONSECUTIVE captures reporting the same key unmeasured, the
+/// per-capture warn escalates from "the box was busy" to "this probe is wedged
+/// and will not self-resolve". Four captures is ~1 hour of the 15-minute loop —
+/// long enough that transient load has had every chance to clear.
+///
+/// It deliberately does NOT decay to [`ProbeOutcome::Failed`]: "we still cannot
+/// read it" never becomes "you do not have it", because the action that
+/// classification unlocks is installing over a toolchain nobody measured — the
+/// exact defect this whole path exists to prevent. The escalation is louder, not
+/// more permissive.
+const UNKNOWN_STREAK_ALARM: u32 = 4;
 
 /// What one bounded `<cmd> --version` probe actually established.
 ///
@@ -612,6 +646,12 @@ const CAPTURE_PROBE_BUDGET: Duration = Duration::from_secs(3);
 ///   version; it says the box was busy. `rustc --version` has been measured on
 ///   this fleet between 173 ms and 6858 ms at 14% CPU idle, so this arm is a
 ///   routine outcome, not a pathological one.
+///
+/// From [`version_of_within`] this is a CANDIDATE verdict, not a finding:
+/// [`version_of_confirmed`] must rule out a stub binary and spend a second,
+/// longer attempt before it stands. "We do not know" is the answer with the
+/// widest blast radius here (it suppresses an apply), so it is the one that has
+/// to be earned rather than defaulted into.
 ///
 /// Callers that genuinely do not care (the apply's post-install re-probe, which
 /// treats "no answer" as "verification failed" either way) collapse it with
@@ -638,14 +678,156 @@ impl ProbeOutcome {
     }
 }
 
-/// Run a bounded `<cmd> --version` and report what it established. Mirrors
+/// Run a bounded `<cmd> --version` and report what it established, taking every
+/// cheap step available to keep [`ProbeOutcome::TimedOut`] an ESTABLISHED FACT
+/// rather than the residue left when nothing else matched. Mirrors
 /// `fleet::detect_claude_code_now`'s bounded subprocess pattern.
 ///
 /// `cwd` is the declared capture scope (see [`probe_scope_root`]). `None`
 /// inherits the parent's cwd — reserved for the no-home-directory case, since
 /// an inherited cwd is exactly what makes this probe non-deterministic.
 fn version_of(cmd: &str, args: &[&str], cwd: Option<&Path>) -> ProbeOutcome {
-    version_of_within(cmd, args, cwd, CAPTURE_PROBE_BUDGET)
+    version_of_confirmed(
+        cmd,
+        args,
+        cwd,
+        CAPTURE_PROBE_BUDGET,
+        CAPTURE_PROBE_RETRY_BUDGET,
+    )
+}
+
+/// The confirmation ladder behind [`version_of`], with explicit budgets so the
+/// whole ladder is testable in milliseconds instead of seconds.
+///
+/// `TimedOut` is the ONLY outcome that says "we do not know", and an outcome
+/// that means "we do not know" must be earned, not defaulted into. Three things
+/// stand between a slow first probe and that verdict:
+///
+/// 1. [`version_of_within`] drains both pipes concurrently, so a shim that
+///    writes more than a pipe buffer (~4 KB) before exiting — an nvm-windows
+///    "no version selected" dump, a corepack/volta banner — exits normally and
+///    classifies on its exit status instead of blocking on its own write.
+/// 2. A resolved binary that is a 0-byte stub is POSITIVE evidence the tool is
+///    absent, not unknown: the `WindowsApps` App Execution Alias spawns cleanly
+///    and then hangs forever, which is indistinguishable from a busy box by the
+///    clock alone. See [`is_non_executable_stub`].
+/// 3. Anything left gets ONE more attempt at `retry_budget`. A
+///    present-but-slow tool answers there; a wedged one does not.
+///
+/// Only a key that survives all three is reported unmeasured.
+fn version_of_confirmed(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    budget: Duration,
+    retry_budget: Duration,
+) -> ProbeOutcome {
+    let first = version_of_within(cmd, args, cwd, budget);
+    if first != ProbeOutcome::TimedOut {
+        return first;
+    }
+
+    if let Some(path) = resolve_executable(cmd) {
+        if is_non_executable_stub(&path) {
+            warn!(
+                "env_agent: `{cmd}` resolves to {} — a non-executable stub (0 bytes / an App \
+                 Execution Alias), which spawns and then never answers. Classifying it as ABSENT \
+                 (a definite negative), not as unmeasured.",
+                path.display(),
+            );
+            return ProbeOutcome::Failed;
+        }
+    }
+
+    version_of_within(cmd, args, cwd, retry_budget)
+}
+
+/// Resolve a command to the file the loader would actually execute, walking
+/// `PATH` (and `PATHEXT` on Windows) the same way. Used ONLY to inspect a
+/// binary after its probe timed out — a bare `Command::spawn` tells us nothing
+/// about WHAT it spawned, and that is exactly what separates "absent tool
+/// wearing an alias" from "busy box".
+///
+/// Uses `symlink_metadata` throughout: a Windows App Execution Alias is a
+/// reparse point whose target does not resolve, so `Path::is_file` (which
+/// follows) can report `false` for the very file we need to look at.
+fn resolve_executable(cmd: &str) -> Option<PathBuf> {
+    fn is_existing_file(path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .map(|m| !m.is_dir())
+            .unwrap_or(false)
+    }
+
+    let raw = Path::new(cmd);
+    // Already a path, not a name to look up.
+    if raw.components().count() > 1 {
+        return is_existing_file(raw).then(|| raw.to_path_buf());
+    }
+
+    let path_var = std::env::var_os("PATH")?;
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    for dir in std::env::split_paths(&path_var) {
+        let bare = dir.join(cmd);
+        if is_existing_file(&bare) {
+            return Some(bare);
+        }
+        for ext in &extensions {
+            let candidate = dir.join(format!("{cmd}{ext}"));
+            if is_existing_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// True when this file CANNOT be a working executable — positive evidence of an
+/// absent tool, cheap enough to check after every timeout.
+///
+/// The motivating case: on a box with no real Python, `python` resolves to
+/// `%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe`, a 0-byte App Execution
+/// Alias that spawns fine and then hangs. By the clock that is
+/// indistinguishable from a slow tool, and classifying it unmeasured would leave
+/// a box that genuinely needs Python installed permanently un-installable.
+///
+/// A 0-byte executable is a known silent-green hazard on this fleet, so it is
+/// treated as a DEFINITE NEGATIVE, never an unknown. The Windows reparse-point
+/// arm is belt-and-braces for the same file: it fires only for a reparse point
+/// under a `WindowsApps` directory, so a genuinely Store-installed tool (a real
+/// file, not a link) is never caught by it.
+fn is_non_executable_stub(path: &Path) -> bool {
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if md.is_dir() {
+        return false;
+    }
+    if md.len() == 0 {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            && path
+                .components()
+                .any(|c| c.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// [`version_of`] with an explicit budget.
@@ -666,7 +848,6 @@ fn version_of_within(
     cwd: Option<&Path>,
     budget: Duration,
 ) -> ProbeOutcome {
-    use std::io::Read;
     use std::process::Stdio;
     use std::time::Instant;
 
@@ -686,22 +867,42 @@ fn version_of_within(
         return ProbeOutcome::Failed;
     };
 
+    // Drain BOTH pipes from the moment the child exists, not after it exits.
+    //
+    // This is load-bearing, not tidiness. Both streams are `piped()`, the pipe
+    // buffer is small (~4 KB on Windows), and a child that fills it BLOCKS in
+    // `write` until someone reads. Reading only after `try_wait` observes an
+    // exit therefore deadlocks against any shim that is chatty before it exits —
+    // an nvm-windows "no version selected" dump, a corepack/volta banner — and
+    // the deadlock expires as a timeout, i.e. as "we could not measure this
+    // box's toolchain" when in truth the tool answered at length. Draining
+    // concurrently turns that entire class back into an ordinary exit.
+    let mut stdout_reader = drain_pipe(child.stdout.take());
+    let mut stderr_reader = drain_pipe(child.stderr.take());
+
     let deadline = started + budget;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // Join FIRST: the readers own the only handles to the pipes, and
+                // a reader still holding data is the difference between an empty
+                // probe (→ `Failed`) and a measured one.
+                let stdout = stdout_reader
+                    .take()
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_default();
+                let stderr = stderr_reader
+                    .take()
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_default();
                 if !status.success() {
                     return ProbeOutcome::Failed;
                 }
-                let mut out = String::new();
-                if let Some(mut so) = child.stdout.take() {
-                    let _ = so.read_to_string(&mut out);
-                }
-                if out.trim().is_empty() {
-                    if let Some(mut se) = child.stderr.take() {
-                        let _ = se.read_to_string(&mut out);
-                    }
-                }
+                let out = if stdout.trim().is_empty() {
+                    stderr
+                } else {
+                    stdout
+                };
                 let first = out.lines().next().unwrap_or("").trim().to_string();
                 return if first.is_empty() {
                     ProbeOutcome::Failed
@@ -713,8 +914,17 @@ fn version_of_within(
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // The readers are DETACHED rather than joined: killing the
+                    // child closes the write ends, so each thread's
+                    // `read_to_string` returns on its own and the thread exits.
+                    // Joining here would make the caller wait on a child we have
+                    // already given up on.
+                    drop(stdout_reader.take());
+                    drop(stderr_reader.take());
                     // THE distinguished arm: we killed a live child, so we
-                    // learned nothing about the installed version.
+                    // learned nothing about the installed version. It is a
+                    // candidate verdict only — `version_of_confirmed` must
+                    // rule out the stub and the retry before it stands.
                     return ProbeOutcome::TimedOut;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -724,6 +934,23 @@ fn version_of_within(
             Err(_) => return ProbeOutcome::Failed,
         }
     }
+}
+
+/// Read one child pipe to EOF on its own thread. See [`version_of_within`] for
+/// why the read cannot wait for the child to exit.
+fn drain_pipe<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> Option<std::thread::JoinHandle<String>> {
+    pipe.map(|mut p| {
+        std::thread::spawn(move || {
+            // Lossy on purpose: a shim emitting non-UTF-8 must not be able to
+            // turn a successful probe into an empty one. Whatever arrived before
+            // an error is still kept, for the same reason.
+            let mut raw = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut p, &mut raw);
+            String::from_utf8_lossy(&raw).into_owned()
+        })
+    })
 }
 
 /// Re-run the EXACT probe [`collect_versions`] uses, with an explicit budget.
@@ -2042,7 +2269,7 @@ fn put_python_installed(section: &mut Section, scope: &ProbeScope) {
 /// `"<unknown>"`, and the diff yields `Differs`, which is also actionable. It
 /// mirrors the server's `derived_keys` set instead, which the plan already knows
 /// how to report-but-never-act-on.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug)]
 pub struct VersionsCapture {
     /// The section, exactly as before: string values only, absent keys allowed.
     pub section: Section,
@@ -2064,10 +2291,13 @@ pub struct VersionsCapture {
 /// `python_dep__source` and `python_installed_probe`, written on every rung
 /// precisely so "measured nothing" cannot look like "found no difference".
 ///
-/// A toolchain probe that exceeds `CAPTURE_PROBE_BUDGET` still omits its key
-/// (the section's value contract has no room to say otherwise) but now also
-/// RECORDS it in [`VersionsCapture::unknown_keys`], so the consumer can tell
-/// "we could not measure this" from "this box does not have it".
+/// A toolchain probe that survives the whole confirmation ladder in
+/// [`version_of_confirmed`] without answering still omits its key (the section's
+/// value contract has no room to say otherwise) but also RECORDS it in
+/// [`VersionsCapture::unknown_keys`], so the consumer can tell "we could not
+/// measure this" from "this box does not have it". Only a probe that ran to a
+/// definite answer — or a resolved binary that proved itself a stub — puts a key
+/// on the missing side of that line.
 pub fn collect_versions() -> VersionsCapture {
     let mut section = Section::new();
     let mut unknown_keys = BTreeSet::new();
@@ -2091,13 +2321,20 @@ pub fn collect_versions() -> VersionsCapture {
     // one that agrees with canonical. See the section header above.
     put_python_declared_deps(&mut section, root.as_deref());
 
-    // ---- bounded `--version` shells (optional, 3s budget each) ----
+    // ---- bounded `--version` shells (optional; see the budget constants) ----
     //
-    // These three are the ONLY keys in this section that describe the box rather
-    // than the source tree the binary was built from, and (post web #808 /
-    // runner #818 derived-key filtering) the only ones a P2b apply can move. All
-    // three run in the DECLARED scope root so the answer does not depend on how
-    // the runner process was launched.
+    // These are the ONLY keys in this section that describe the box rather than
+    // the source tree the binary was built from, and (post web #808 / runner
+    // #818 derived-key filtering) the only ones a P2b apply can move. They all
+    // run in the DECLARED scope root so the answer does not depend on how the
+    // runner process was launched.
+    //
+    // The tool list is NOT re-spelled here. `apply_versions::APPLIABLE_TOOLS` is
+    // the existing owner of "which keys does this runner treat as observed
+    // toolchain versions", and it already supplies both halves this loop needs
+    // (`key()` and `command()`). A fourth hardcoded copy would drift, and drift
+    // here means a probed tool whose timeout is never recorded as unmeasured —
+    // i.e. a silent regression to the very defect this path fixes.
     let scope = probe_scope();
     // Capture PROVENANCE. The three keys below are only comparable across boxes
     // that measured the same KIND of scope; without this the drift oracle
@@ -2118,25 +2355,19 @@ pub fn collect_versions() -> VersionsCapture {
 
     let scope = scope.root;
     let scope_ref = scope.as_deref();
-    for tool in ["rustc", "node", "python"] {
-        match version_of(tool, &["--version"], scope_ref) {
-            ProbeOutcome::Measured(v) => put(&mut section, tool, v),
-            // Key still absent — but recorded as UNMEASURED, not as missing.
+    for tool in super::apply_versions::APPLIABLE_TOOLS {
+        let key = tool.key();
+        let outcome = version_of(tool.command(), &["--version"], scope_ref);
+        if record_probe_outcome(&mut section, &mut unknown_keys, key, outcome) {
             // WARN rather than debug: a box that routinely lands here is a box
             // whose `versions` drift report is partly blind, and the only other
             // trace of it is the (additive, easily-ignored) envelope field.
-            ProbeOutcome::TimedOut => {
-                warn!(
-                    "env_agent: `{tool} --version` exceeded the {}s capture budget — reporting \
-                     it as UNMEASURED rather than missing, so `env apply` will not try to \
-                     install over a version it never read",
-                    CAPTURE_PROBE_BUDGET.as_secs(),
-                );
-                unknown_keys.insert(tool.to_string());
-            }
-            // Genuinely not usable here: leave the key absent and say nothing —
-            // this is the case the pull is SUPPOSED to classify as missing.
-            ProbeOutcome::Failed => {}
+            warn!(
+                "{}",
+                unknown_streak_message(key, record_unknown_streak(key))
+            );
+        } else {
+            clear_unknown_streak(key);
         }
     }
 
@@ -2370,6 +2601,97 @@ pub fn collect_repos() -> Option<Section> {
     // stated observation rather than a dropped section.
     put(&mut section, REPOS_SCOPE_KEY, kind.wire());
     Some(section)
+}
+
+/// Route one probe outcome into the capture, and report whether it landed in the
+/// unmeasured set. **Pure — unit-tested.**
+///
+/// The single writer of both halves, so they can never contradict each other: a
+/// key lands in the section (Measured), in `unknown_keys` (TimedOut), or in
+/// NEITHER (Failed — genuinely absent, and therefore still installable), and
+/// never in both. Extracted so that invariant is testable synthetically, without
+/// a box that happens to be slow enough to produce a timeout.
+fn record_probe_outcome(
+    section: &mut Section,
+    unknown_keys: &mut BTreeSet<String>,
+    key: &str,
+    outcome: ProbeOutcome,
+) -> bool {
+    match outcome {
+        ProbeOutcome::Measured(v) => {
+            put(section, key, v);
+            false
+        }
+        // Key still absent from the section — but recorded as UNMEASURED, not
+        // as missing.
+        ProbeOutcome::TimedOut => {
+            unknown_keys.insert(key.to_string());
+            true
+        }
+        // Genuinely not usable here: leave the key absent and say nothing — this
+        // is the case the pull is SUPPOSED to classify as missing.
+        ProbeOutcome::Failed => false,
+    }
+}
+
+/// Consecutive captures in which a key came back unmeasured, keyed by section
+/// key.
+///
+/// PROCESS-LOCAL and in-memory: no file, no schema, nothing to migrate or clean
+/// up, and a runner restart simply starts counting again. That is the right
+/// trade for its only job — turning a per-capture warn that reads identically on
+/// its 1st and its 40th occurrence into a signal an operator can act on.
+static UNKNOWN_STREAKS: std::sync::Mutex<BTreeMap<String, u32>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Count one more consecutive unmeasured capture for `key` and return the new
+/// streak. A poisoned lock degrades to "1" rather than panicking — a warn
+/// counter must never be able to take the capture loop down.
+fn record_unknown_streak(key: &str) -> u32 {
+    let Ok(mut streaks) = UNKNOWN_STREAKS.lock() else {
+        return 1;
+    };
+    let entry = streaks.entry(key.to_string()).or_insert(0);
+    *entry = entry.saturating_add(1);
+    *entry
+}
+
+/// Reset `key`'s streak — any DEFINITE outcome ends it, measured or failed.
+fn clear_unknown_streak(key: &str) {
+    if let Ok(mut streaks) = UNKNOWN_STREAKS.lock() {
+        streaks.remove(key);
+    }
+}
+
+/// The warn text for one unmeasured key. **Pure — unit-tested.**
+///
+/// Past [`UNKNOWN_STREAK_ALARM`] it stops describing a busy box and starts
+/// naming a wedged probe, because those are different operator actions: the
+/// first resolves itself, the second never will, and a key that is unmeasured on
+/// every pass of a 15-minute loop is otherwise reported-and-never-acted-on
+/// indefinitely with nothing to distinguish it from the transient case.
+fn unknown_streak_message(key: &str, streak: u32) -> String {
+    let head = format!(
+        "env_agent: `{key} --version` exceeded both the {}s capture budget and the {}s confirming \
+         retry — reporting it as UNMEASURED rather than missing, so `env apply` will not install \
+         over a version it never read",
+        CAPTURE_PROBE_BUDGET.as_secs(),
+        CAPTURE_PROBE_RETRY_BUDGET.as_secs(),
+    );
+    if streak < UNKNOWN_STREAK_ALARM {
+        format!("{head} (consecutive unmeasured captures: {streak})")
+    } else {
+        format!(
+            "{head}. THIS KEY HAS NOW BEEN UNMEASURED FOR {streak} CONSECUTIVE CAPTURES (~{} \
+             minutes): it is a WEDGED probe, not a slow one, and it will not resolve on its own. \
+             `versions` drift for `{key}` on this box is BLIND until it does — run `{key} \
+             --version` by hand in the capture scope and fix or remove the shim. The runner will \
+             keep refusing to act on the key in the meantime; it will NOT start treating it as \
+             absent, because installing over a version nobody read is the failure this refusal \
+             exists to prevent.",
+            u64::from(streak) * 15,
+        )
+    }
 }
 
 /// The `package.json` this capture reports: **this repo's own**, at
@@ -4057,30 +4379,254 @@ dependencies = [
             TEST_PROBE_BUDGET > CAPTURE_PROBE_BUDGET,
             "the generous TEST budget must never be the one the capture path uses"
         );
+        // The retry does not relax the first budget — it composes with it, and
+        // the COMPOSITION is what the 15-minute loop actually pays. Pinned as a
+        // ceiling on the whole section: at most one retry per key, over the keys
+        // `APPLIABLE_TOOLS` owns.
+        let worst_case = (CAPTURE_PROBE_BUDGET + CAPTURE_PROBE_RETRY_BUDGET)
+            * u32::try_from(super::super::apply_versions::APPLIABLE_TOOLS.len()).unwrap();
+        assert!(
+            worst_case <= Duration::from_secs(60),
+            "a whole `versions` capture must stay seconds, not minutes; got {worst_case:?}"
+        );
     }
 
-    /// `collect_versions` still yields a well-formed, string-only section, and
-    /// every key it reports as unmeasured is genuinely ABSENT from the section —
-    /// the two halves can never contradict each other.
+    /// Every key reported unmeasured is genuinely ABSENT from the section, and
+    /// the section keeps its string-only value contract — the two halves can
+    /// never contradict each other.
+    ///
+    /// Constructed SYNTHETICALLY, from the one function that writes both halves.
+    /// The previous form called `collect_versions()` and looped over
+    /// `capture.unknown_keys`, which is empty on any healthy box: the loop body
+    /// never ran, so the test asserted nothing about the feature while still
+    /// spawning three real subprocesses at the PRODUCTION budget — exactly what
+    /// `version_of_within`'s own doc says tests must not do. A test that passes
+    /// green without exercising its feature is worse than no test.
     #[test]
-    fn collect_versions_unknown_keys_are_absent_from_the_section() {
-        let capture = collect_versions();
+    fn a_probe_outcome_lands_in_the_section_or_the_unknown_set_but_never_both() {
+        let mut section = Section::new();
+        let mut unknown = BTreeSet::new();
+
         assert!(
-            capture.section.values().all(Value::is_string),
+            !record_probe_outcome(
+                &mut section,
+                &mut unknown,
+                "node",
+                ProbeOutcome::Measured("v22.1.0".to_string())
+            ),
+            "a measured probe is not unmeasured"
+        );
+        assert!(
+            record_probe_outcome(&mut section, &mut unknown, "rustc", ProbeOutcome::TimedOut),
+            "a timed-out probe IS the unmeasured case"
+        );
+        assert!(
+            !record_probe_outcome(&mut section, &mut unknown, "python", ProbeOutcome::Failed),
+            "a failed probe is genuinely absent, not unmeasured"
+        );
+
+        // Measured → section only.
+        assert_eq!(section.get("node").and_then(Value::as_str), Some("v22.1.0"));
+        assert!(!unknown.contains("node"));
+        // Timed out → unknown set only. THE invariant every consumer leans on:
+        // an unmeasured key diffs as `Missing`, and `compute_plan` re-derives
+        // that from the section rather than trusting the set.
+        assert!(unknown.contains("rustc"));
+        assert!(!section.contains_key("rustc"));
+        // Failed → neither, so it still classifies as missing and stays
+        // installable.
+        assert!(!unknown.contains("python"));
+        assert!(!section.contains_key("python"));
+
+        assert!(
+            section.values().all(Value::is_string),
             "envelope contract: every section value is a string"
         );
-        // Baked keys can never go absent, so the section is never empty.
-        assert!(capture.section.contains_key("runner_crate_version"));
-        for key in &capture.unknown_keys {
-            assert!(
-                !capture.section.contains_key(key),
-                "{key} was reported unmeasured but still carries a value"
-            );
-            assert!(
-                ["rustc", "node", "python"].contains(&key.as_str()),
-                "only the three host-probed keys can be unmeasured, got {key}"
-            );
-        }
+        assert!(
+            unknown.iter().all(|k| !section.contains_key(k)),
+            "no key may be reported unmeasured while carrying a value"
+        );
+    }
+
+    /// A shim that writes more than a pipe buffer before exiting must classify
+    /// on its EXIT, not on the clock. Reading the pipes only after `try_wait`
+    /// saw an exit deadlocked against exactly this: the child blocks in `write`,
+    /// never exits, and the probe reports "we could not measure this box's
+    /// toolchain" about a tool that answered at length.
+    #[test]
+    fn a_chatty_probe_is_measured_not_timed_out() {
+        // ~40 KB of banner on stdout — an order of magnitude past the ~4 KB
+        // Windows pipe buffer — with the version line FIRST, the way a real
+        // shim's `--version` output starts.
+        #[cfg(windows)]
+        let (cmd, args) = (
+            "cmd",
+            [
+                "/c",
+                "echo 1.2.3 & for /L %i in (1,1,900) do @echo \
+                 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ],
+        );
+        #[cfg(not(windows))]
+        let (cmd, args) = (
+            "sh",
+            [
+                "-c",
+                "echo 1.2.3; i=0; while [ $i -lt 900 ]; do echo \
+                 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; i=$((i+1)); done",
+            ],
+        );
+        assert_eq!(
+            version_of_within(cmd, &args, None, TEST_PROBE_BUDGET),
+            ProbeOutcome::Measured("1.2.3".to_string()),
+            "a chatty-but-healthy shim must be MEASURED — a blocked pipe is a deadlock, not a \
+             slow tool"
+        );
+    }
+
+    /// A 0-byte executable is positive evidence of an absent tool — the
+    /// `WindowsApps` App Execution Alias shape, which spawns fine and then hangs
+    /// forever. It is a DEFINITE NEGATIVE, never an unknown, because
+    /// classifying it unknown leaves a box that genuinely needs the tool
+    /// permanently un-installable.
+    #[test]
+    fn a_zero_byte_binary_is_a_definite_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("python.exe");
+        std::fs::write(&stub, b"").unwrap();
+        assert!(is_non_executable_stub(&stub));
+
+        // A real binary is NOT a stub, so a slow one keeps its unknown verdict.
+        let real = dir.path().join("rustc.exe");
+        std::fs::write(&real, b"MZ not really a binary but not empty either").unwrap();
+        assert!(!is_non_executable_stub(&real));
+
+        // Neither is a directory, nor a path that does not exist at all — an
+        // unresolvable command must fall through to the retry, not be declared
+        // absent by the stub check.
+        assert!(!is_non_executable_stub(dir.path()));
+        assert!(!is_non_executable_stub(&dir.path().join("nope.exe")));
+    }
+
+    /// The stub check is only reachable if the binary can be FOUND, so
+    /// resolution has to work on the two shapes a probe command actually takes.
+    #[test]
+    fn resolve_executable_finds_a_path_and_refuses_a_name_that_is_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("python.exe");
+        std::fs::write(&stub, b"").unwrap();
+
+        // Already a path: taken as given, existence still checked.
+        assert_eq!(resolve_executable(&stub.to_string_lossy()), Some(stub));
+        assert_eq!(
+            resolve_executable(&dir.path().join("absent.exe").to_string_lossy()),
+            None
+        );
+
+        // A bare name nothing on PATH provides resolves to nothing — which is
+        // the fall-through that must leave the verdict to the retry rather than
+        // declaring the tool absent.
+        assert_eq!(
+            resolve_executable("qontinui_no_such_binary_probe_test"),
+            None
+        );
+
+        // …and the shell every platform ships DOES resolve, so a `None` above
+        // means "not there", not "resolution is broken".
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(
+            resolve_executable(shell).is_some(),
+            "PATH resolution itself must work, or the stub check is dead code"
+        );
+    }
+
+    /// The confirmation ladder: a first timeout is a CANDIDATE, and a
+    /// genuinely-slow-but-present tool that answers inside the longer budget is
+    /// MEASURED, not unmeasured. Without the retry, every key on a loaded box
+    /// that lost one race stayed unknown until some future capture got lucky.
+    #[test]
+    fn a_slow_tool_that_answers_on_the_retry_is_measured() {
+        // Answers in ~1s: past a 200ms first budget, inside a 30s retry.
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd", ["/c", "ping -n 2 127.0.0.1 >nul & echo 1.2.3"]);
+        #[cfg(not(windows))]
+        let (cmd, args) = ("sh", ["-c", "sleep 1; echo 1.2.3"]);
+
+        assert_eq!(
+            version_of_confirmed(
+                cmd,
+                &args,
+                None,
+                Duration::from_millis(200),
+                TEST_PROBE_BUDGET,
+            ),
+            ProbeOutcome::Measured("1.2.3".to_string()),
+            "the retry exists so a present-but-slow tool is not reported unmeasured"
+        );
+    }
+
+    /// …and a tool that answers at NO budget still ends up unmeasured. The
+    /// ladder narrows the unknown arm; it must not close it, because refusing to
+    /// install over a version nobody read is the safer failure.
+    #[test]
+    fn a_wedged_probe_survives_the_ladder_as_unmeasured() {
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd", ["/c", "ping -n 30 127.0.0.1 >nul"]);
+        #[cfg(not(windows))]
+        let (cmd, args) = ("sh", ["-c", "sleep 30"]);
+
+        assert_eq!(
+            version_of_confirmed(
+                cmd,
+                &args,
+                None,
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+            ),
+            ProbeOutcome::TimedOut,
+        );
+    }
+
+    /// A key that is unmeasured on EVERY pass of the 15-minute capture loop is
+    /// otherwise reported-and-never-acted-on with nothing to distinguish it from
+    /// a one-off. The streak escalates the warn — and deliberately never decays
+    /// to `Failed`, which would install over a version nobody read on a timer.
+    #[test]
+    fn a_persistent_unknown_escalates_its_warning() {
+        let transient = unknown_streak_message("rustc", 1);
+        assert!(transient.contains("consecutive unmeasured captures: 1"));
+        assert!(!transient.contains("WEDGED"));
+
+        let wedged = unknown_streak_message("rustc", UNKNOWN_STREAK_ALARM);
+        assert!(
+            wedged.contains("CONSECUTIVE CAPTURES"),
+            "a perpetually-unknown key must read differently from a one-off: {wedged}"
+        );
+        assert!(wedged.contains("WEDGED"));
+        // It names an operator action, not just a fact.
+        assert!(wedged.contains("rustc --version"));
+        // And it never promises to start treating the key as absent.
+        assert!(wedged.contains("will NOT start treating it as absent"));
+    }
+
+    /// The streak counts CONSECUTIVE captures: any definite outcome — measured
+    /// or failed — resets it, so a key that flaps never accumulates its way to
+    /// the wedged wording.
+    #[test]
+    fn a_definite_outcome_resets_the_unknown_streak() {
+        // A key of its own, so parallel tests cannot collide on the process
+        // -global counter.
+        let key = "qontinui_streak_probe_test_key";
+        clear_unknown_streak(key);
+        assert_eq!(record_unknown_streak(key), 1);
+        assert_eq!(record_unknown_streak(key), 2);
+        clear_unknown_streak(key);
+        assert_eq!(
+            record_unknown_streak(key),
+            1,
+            "a measured or failed capture must end the streak, not extend it"
+        );
+        clear_unknown_streak(key);
     }
 
     /// The load-bearing property: the probe runs in the directory it is GIVEN,
