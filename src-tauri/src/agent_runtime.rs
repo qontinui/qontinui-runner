@@ -5047,6 +5047,11 @@ mod tests {
     /// briefing and assert the `--append-system-prompt` value starts with it.
     #[test]
     fn continuation_command_system_prompt_carries_source_marker() {
+        // `runner_context` reads the process-global plan-capture level, so pin
+        // it through the shared guard rather than racing the `terminal` tests
+        // that pin it too. The marker is line 1 at either level; the pin is
+        // about running in a DEFINED state, not about the assertion.
+        let _pin = crate::mcp::fleet_policy_poller::pin_plan_capture_level_for_test("off");
         let briefing = crate::terminal::runner_context(9876);
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
