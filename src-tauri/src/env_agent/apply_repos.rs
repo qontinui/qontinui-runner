@@ -410,20 +410,31 @@ mod tests {
     /// computed from the wrong volume is worse than no floor.
     #[test]
     fn pick_volume_prefers_the_longest_matching_mount() {
+        // Forward slashes deliberately: they separate on BOTH Windows and Unix,
+        // whereas a backslash is an ORDINARY CHARACTER on Unix - so `D:\data\x`
+        // parses there as ONE component and every `starts_with` returns false.
+        // That is a test-only trap (production takes real mount points from
+        // `sysinfo`, which are platform-correct), but it made this test pass on
+        // Windows and fail on Linux - worse than failing everywhere.
         let mounts = vec![
-            (PathBuf::from("D:\\"), 500),
-            (PathBuf::from("D:\\data"), 9),
-            (PathBuf::from("C:\\"), 999),
+            (PathBuf::from("/"), 500),
+            (PathBuf::from("/mnt/data"), 9),
+            (PathBuf::from("/other"), 999),
         ];
         assert_eq!(
-            pick_volume(&mounts, Path::new("D:\\data\\qontinui-root")).map(|(_, a)| *a),
-            Some(9)
+            pick_volume(&mounts, Path::new("/mnt/data/qontinui-root")).map(|(_, a)| *a),
+            Some(9),
+            "the nested mount must win over the root it sits inside"
         );
         assert_eq!(
-            pick_volume(&mounts, Path::new("D:\\qontinui-root")).map(|(_, a)| *a),
-            Some(500)
+            pick_volume(&mounts, Path::new("/mnt/elsewhere")).map(|(_, a)| *a),
+            Some(500),
+            "a path under no nested mount falls back to the root"
         );
-        assert!(pick_volume(&mounts, Path::new("Z:\\nope")).is_none());
+        assert!(
+            pick_volume(&[], Path::new("/mnt/data")).is_none(),
+            "no mounts at all yields None, which the caller treats as REFUSE"
+        );
     }
 
     #[test]

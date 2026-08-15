@@ -1619,15 +1619,32 @@ mod tests {
         r.remote("origin", "git@github.com:qontinui/qontinui-runner.git")
             .unwrap();
 
-        // A LINKED WORKTREE of it: `.git` is a FILE, not a directory. On the
-        // operator box these outnumber canonical checkouts 239 to 37.
-        let wt = root.join("qontinui-runner-wt-something");
-        std::fs::create_dir_all(&wt).unwrap();
-        std::fs::write(
-            wt.join(".git"),
-            format!("gitdir: {}\n", repo.join(".git").display()),
-        )
-        .unwrap();
+        // A LINKED WORKTREE of it — created through git's own worktree API, not
+        // by hand-writing a `.git` file. On the operator box these outnumber
+        // canonical checkouts 242 to 37, so this is the common case.
+        //
+        // The hand-written form is worse than useless here: pointing the marker
+        // at the MAIN `.git` makes `Repository::open` return the main repo, so
+        // `is_worktree()` is false and the entry is reported — with the same key
+        // and value as the real checkout, which dedupes to one key and makes the
+        // assertion below pass for entirely the wrong reason. A worktree needs a
+        // commit to be created from, hence the empty initial commit.
+        {
+            let sig = git2::Signature::now("t", "t@t").unwrap();
+            let tree = r.find_tree(r.index().unwrap().write_tree().unwrap()).unwrap();
+            r.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+        let wt_path = root.join("qontinui-runner-wt-something");
+        let mut opts = git2::WorktreeAddOptions::new();
+        r.worktree("wt-something", &wt_path, Some(&mut opts))
+            .unwrap();
+        // Guard the guard: if this ever stops being a worktree, the exclusion
+        // test below is vacuous and must fail loudly rather than quietly pass.
+        assert!(
+            git2::Repository::open(&wt_path).unwrap().is_worktree(),
+            "the fixture must produce a genuine linked worktree"
+        );
 
         // Not a repository at all — the majority case under a real root.
         std::fs::create_dir_all(root.join("_cargo-targets")).unwrap();
