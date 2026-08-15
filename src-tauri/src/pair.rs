@@ -233,7 +233,9 @@ pub fn ensure_device_id_persisted_at(path: &std::path::Path) {
 /// Idempotent + fail-open (never panics; safe to call on every launch):
 /// - Existing file → keep the UUID, delegate to [`ensure_device_id_persisted`]
 ///   to backfill the canonical `device_id` key. Never overwrites an identity.
-/// - Missing file → mint `{device_id, hostname}` and write it.
+/// - Missing file → mint `{device_id, hostname}` and publish it EXCLUSIVELY
+///   (`fs_atomic::atomic_create_new`). Concurrent minters are safe: exactly one
+///   wins and the losers adopt the winner's id rather than replacing it.
 /// - Any error (no home dir, mkdir / write / rename failure) → logged and
 ///   swallowed; the caller proceeds and, if the mint genuinely failed, the
 ///   downstream read still surfaces the original clear error.
@@ -277,20 +279,41 @@ pub fn ensure_device_initialized_at(path: &std::path::Path) {
             return;
         }
     }
-    // Unique-temp atomic write — see the note in `ensure_device_id_persisted_at`.
-    if let Err(e) = crate::fs_atomic::atomic_write(path, &pretty) {
-        tracing::warn!(
-            "ensure_device_initialized: atomic write {} failed: {e}",
-            path.display()
-        );
-        return;
+    // EXCLUSIVE publish. `path.exists()` above plus a replacing `atomic_write`
+    // here is a TOCTOU window across processes: `dev-start.ps1 -All` brings up
+    // the primary runner and a supervisor temp runner together, and on a fresh
+    // machine both reach this branch, both mint, and the loser's rename would
+    // silently overwrite the winner's file — after the winner may already have
+    // registered its id with coord (`ON CONFLICT (device_id)` → a second row
+    // for one machine). `atomic_create_new` fails with `AlreadyExists` instead
+    // of replacing, so the loser DISCARDS its mint and adopts the winner's.
+    match crate::fs_atomic::atomic_create_new(path, &pretty) {
+        Ok(()) => {
+            tracing::info!(
+                "machine.json: minted device identity {} (host={}) at {}",
+                device_id,
+                hostname,
+                path.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A concurrent process won the mint. Its identity is now THE
+            // identity: drop ours unused and take the same path an existing
+            // file would have taken.
+            tracing::info!(
+                "machine.json: another process minted the device identity first at {} — \
+                 discarding this process's candidate and adopting the stored one",
+                path.display()
+            );
+            ensure_device_id_persisted_at(path);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "ensure_device_initialized: exclusive create {} failed: {e}",
+                path.display()
+            );
+        }
     }
-    tracing::info!(
-        "machine.json: minted device identity {} (host={}) at {}",
-        device_id,
-        hostname,
-        path.display()
-    );
 }
 
 /// Path to the paired-user JSON written by `device pair` and read by
@@ -1633,22 +1656,141 @@ mod device_identity_invariant_tests {
         );
     }
 
-    /// Source-level pin: this module may contain exactly ONE UUID-v4 mint —
-    /// the first-launch mint in `ensure_device_initialized_at`. A second one is
-    /// how "one machine, one device row" regresses into one row per pairing
-    /// attempt, and a behavioural test cannot see a mint that only fires on a
-    /// path the test does not exercise.
+    /// Mint-once is EXCLUSIVE, not merely idempotent-per-process.
+    ///
+    /// `if path.exists() { return } … atomic_write(...)` is a TOCTOU window
+    /// across processes: `dev-start.ps1 -All` starts the primary runner and a
+    /// supervisor temp runner together, and on a fresh machine both pass the
+    /// `exists()` check, both mint, and `atomic_write`'s `fs::rename` replaces
+    /// unconditionally — so the loser could overwrite an id the winner had
+    /// already presented to coord (`ON CONFLICT (device_id)` → two rows).
+    ///
+    /// Honest about what this test is: the interleave is NOT deterministic —
+    /// there is no hook to park one caller inside the window — so a barrier +
+    /// N threads is the closest expressible form. What IS deterministic is the
+    /// assertion: with an exclusive publish every caller MUST agree on one id,
+    /// so this test never fails spuriously on correct code, and it fails on the
+    /// replacing implementation whenever the race actually lands. The
+    /// deterministic half of the property is pinned separately and directly on
+    /// the primitive, in `fs_atomic`'s own tests: a pre-existing target must
+    /// yield `AlreadyExists` with its bytes untouched, and a barrier race must
+    /// have exactly one winner.
+    #[test]
+    fn concurrent_mints_converge_on_a_single_identity() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("machine.json"));
+        let threads = 8;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_device_initialized_at(&path);
+                    read_device_id_at(&path)
+                })
+            })
+            .collect();
+
+        let ids: Vec<String> = handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .expect("mint thread panicked")
+                    .expect("id readable")
+            })
+            .collect();
+
+        let on_disk = read_device_id_at(&path).expect("the file must exist afterwards");
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(
+                id, &on_disk,
+                "thread {i} observed a DIFFERENT device_id than the one that survived on disk — \
+                 a losing minter replaced the winner's identity"
+            );
+        }
+        assert!(uuid::Uuid::parse_str(&on_disk).is_ok());
+
+        // And no candidate temp file is left lying around.
+        let debris: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "machine.json")
+            .collect();
+        assert!(debris.is_empty(), "temp files left behind: {debris:?}");
+    }
+
+    /// The loser branch, exercised deterministically: a file that appears
+    /// between the `exists()` check and the publish must be ADOPTED, not
+    /// replaced. Pre-creating it is the same state the losing process sees.
+    #[test]
+    fn a_mint_that_loses_the_race_adopts_the_winners_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "device_id": STORED_ID,
+                "hostname": "winner",
+                "active_tenant_id": "c231d9da-0000-4000-8000-000000000002",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        ensure_device_initialized_at(&path);
+
+        assert_eq!(
+            read_device_id_at(&path).unwrap(),
+            STORED_ID,
+            "the winner's identity must survive"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            v.get("active_tenant_id").and_then(|x| x.as_str()),
+            Some("c231d9da-0000-4000-8000-000000000002"),
+            "and so must its siblings"
+        );
+    }
+
+    /// Source-level pin: the NON-TEST body of this module may contain exactly
+    /// ONE UUID-v4 mint — the first-launch mint in
+    /// `ensure_device_initialized_at`. A second one is how "one machine, one
+    /// device row" regresses into one row per pairing attempt, and a
+    /// behavioural test cannot see a mint that only fires on a path the test
+    /// does not exercise.
+    ///
+    /// Scope: only the prefix BEFORE the first `#[cfg(test)]` attribute. The
+    /// test modules below are ~1200 lines and any of them may legitimately need
+    /// a throwaway UUID; scanning the whole file made that trip this pin.
+    ///
+    /// Limits, stated so nobody mistakes this for a complete guarantee: it is a
+    /// literal source scan, so it sees neither `Uuid::now_v7()` nor any other
+    /// generator spelling (`Uuid::new_v8`, a `uuid::Uuid::new_v4` written out in
+    /// full, a helper that mints on your behalf). It pins the ONE spelling that
+    /// has actually sprawled here.
     #[test]
     fn pair_module_has_exactly_one_mint_site() {
         let src = include_str!("pair.rs");
-        // Split so this needle does not match itself in the source scan.
+        // Split so these needles do not match themselves in the source scan.
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = match src.find(test_marker) {
+            Some(i) => &src[..i],
+            None => src,
+        };
         let needle = concat!("Uuid::new_", "v4()");
-        let mints = src.matches(needle).count();
+        let mints = production.matches(needle).count();
         assert_eq!(
             mints, 1,
-            "pair.rs must mint a device_id in exactly one place \
-             (ensure_device_initialized_at, absent-file branch); found {mints}. \
-             If you added a mint, you re-opened the sprawl this test pins shut."
+            "pair.rs gained a `{needle}` outside its test modules; found {mints}, expected 1. \
+             If it is not a device_id mint, extend this pin to exclude it. If it IS one, \
+             don't — the machine's identity is minted exactly once, in \
+             `ensure_device_initialized_at`'s absent-file branch."
         );
     }
 

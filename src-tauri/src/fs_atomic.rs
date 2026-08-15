@@ -149,6 +149,90 @@ pub fn atomic_write_owner_only(path: &Path, data: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Atomically CREATE `path` with `data`, failing with
+/// [`io::ErrorKind::AlreadyExists`] if it is already there.
+///
+/// [`atomic_write`] is atomic but not exclusive: its `fs::rename` replaces the
+/// target unconditionally, so "check `path.exists()`, then write" is a TOCTOU
+/// window — two processes racing a first-launch mint both see no file, both
+/// generate a value, and the loser's rename overwrites the winner's. For
+/// `~/.qontinui/machine.json` that means the loser can hand coord a different
+/// `device_id` than the winner already registered (coord UPSERTs
+/// `ON CONFLICT (device_id)` → two rows for one machine). This function closes
+/// that window: exactly one caller can win, and the loser learns it lost.
+///
+/// Two-stage, so the published file is never observed half-written:
+///
+/// 1. Write + fsync a unique temp (same naming as [`atomic_write`]).
+/// 2. `fs::hard_link(tmp, path)` — an atomic, fail-if-exists publish on both
+///    POSIX and NTFS (unlike `fs::rename`, which replaces). Then unlink the
+///    temp, leaving one name for the inode.
+///
+/// If the filesystem does not support hard links at all (exFAT/FAT32 home
+/// directory, some network mounts) step 2 fails with something other than
+/// `AlreadyExists`; we then fall back to `create_new` directly on the target.
+/// That fallback keeps exclusivity — the property that matters here — and
+/// gives up only the no-torn-read guarantee, which costs at most a transient
+/// parse error in a reader (no reader of `machine.json` mints on a read).
+pub fn atomic_create_new(path: &Path, data: &[u8]) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic_create_new: path has no parent directory",
+        )
+    })?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic_create_new: path has no UTF-8 file name",
+        )
+    })?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        "{}.new.{}.{}.{}",
+        file_name,
+        std::process::id(),
+        seq,
+        nanos
+    ));
+
+    let write_tmp = (|| -> io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.flush()?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_tmp {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    let published = match fs::hard_link(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => {
+            // Hard links unsupported/denied — publish by exclusive create.
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .and_then(|mut f| {
+                    f.write_all(data)?;
+                    f.flush()?;
+                    f.sync_all()
+                })
+        }
+    };
+
+    let _ = fs::remove_file(&tmp);
+    published
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +337,94 @@ mod tests {
             .filter(|n| n.contains(".tmp."))
             .collect();
         assert!(debris.is_empty(), "temp files left behind: {debris:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // `atomic_create_new` — atomic AND exclusive.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn create_new_writes_an_absent_file_and_leaves_no_debris() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        atomic_create_new(&path, b"minted").expect("an absent target must be created");
+        assert_eq!(fs::read(&path).unwrap(), b"minted");
+
+        let entries: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries, vec!["machine.json".to_string()]);
+    }
+
+    /// THE property: a second caller must LOSE, and must not have touched the
+    /// winner's bytes. This is what `atomic_write` (whose `fs::rename` replaces
+    /// unconditionally) could not give the first-launch `device_id` mint —
+    /// two processes past the same `path.exists()` check both minted, and the
+    /// loser's rename overwrote an id the winner may already have registered
+    /// with coord.
+    #[test]
+    fn create_new_refuses_an_existing_file_and_preserves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        fs::write(&path, b"winner").unwrap();
+
+        let err = atomic_create_new(&path, b"loser").expect_err("an existing target must lose");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::AlreadyExists,
+            "the loser must be able to DETECT that it lost, got: {err}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"winner",
+            "the winner's bytes must be untouched"
+        );
+
+        let debris: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "machine.json")
+            .collect();
+        assert!(debris.is_empty(), "temp files left behind: {debris:?}");
+    }
+
+    /// Under a real thread race, EXACTLY ONE caller wins and every loser sees
+    /// `AlreadyExists` — never a partial or mixed payload.
+    #[test]
+    fn create_new_has_exactly_one_winner_under_contention() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("machine.json"));
+        let barrier = Arc::new(Barrier::new(8));
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let payload = format!("candidate-{i}");
+                    barrier.wait();
+                    atomic_create_new(&path, payload.as_bytes()).map(|()| payload)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners: Vec<&String> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(winners.len(), 1, "exactly one caller may create the file");
+        for r in &results {
+            if let Err(e) = r {
+                assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "unexpected: {e}");
+            }
+        }
+        assert_eq!(
+            fs::read(path.as_path()).unwrap(),
+            winners[0].as_bytes(),
+            "the published file must be the winner's payload, whole"
+        );
     }
 }

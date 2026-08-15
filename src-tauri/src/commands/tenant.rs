@@ -74,6 +74,13 @@ fn read_active_tenant_id(path: &Path) -> Option<String> {
 /// UUID, i.e. a brand-new `coord.devices` row for the same physical machine.
 /// Refusing to write is strictly better: the existing identity file (if any)
 /// is left intact and the operator gets guidance that does not re-mint.
+///
+/// The refusal messages distinguish **recoverable** from **unrecoverable**.
+/// An ABSENT file has nothing to lose, so `device init` is the right advice.
+/// A file that is present but corrupt / non-object may still hold this
+/// machine's real UUID, so the advice is "inspect and repair by hand" and
+/// explicitly NOT `rm` — `rm` + `device init` mints a fresh id, which is the
+/// very outcome this function exists to prevent.
 /// Plan `2026-08-06-device-identity-is-per-profile-not-per-machine` §0.3 H4.
 fn write_active_tenant_id(path: &Path, tenant_id: &str) -> Result<(), String> {
     // Read the existing JSON object so we preserve sibling fields — and
@@ -88,24 +95,41 @@ fn write_active_tenant_id(path: &Path, tenant_id: &str) -> Result<(), String> {
                 path.display()
             ))
         }
+        // `read_machine_file` collapses "absent" and "present but unreadable"
+        // into one `None`, and the two need OPPOSITE guidance: `rm` is harmless
+        // on an absent file and DESTRUCTIVE on a corrupt one (which may still
+        // carry the machine's real UUID). Split on `path.exists()` so the
+        // operator is not funnelled into a re-mint.
+        None if path.exists() => {
+            return Err(format!(
+                "tenant: refusing to write {} — it EXISTS but is unreadable (I/O error or \
+                 invalid JSON), so a write here would replace it with a machine.json that \
+                 has no device_id and wedge this machine's identity. The file may still \
+                 contain this machine's real device_id: inspect and repair it by hand; do \
+                 NOT `rm` it (that mints a NEW device identity and a new coord.devices \
+                 row). Then switch tenant again.",
+                path.display()
+            ))
+        }
         None => {
             return Err(format!(
-                "tenant: refusing to write {} — it is missing or unreadable, so a write \
-                 here would produce a machine.json with no device_id and wedge this \
-                 machine's identity. Run `qontinui_profile device init` first (it re-uses \
-                 any existing device_id), then switch tenant again.",
+                "tenant: refusing to write {} — it does not exist, so a write here would \
+                 produce a machine.json with no device_id and wedge this machine's \
+                 identity. Nothing is at risk: run `qontinui_profile device init` (it \
+                 mints only when there is genuinely no file, and re-uses any existing \
+                 device_id), then switch tenant again.",
                 path.display()
             ))
         }
     };
     // `machine_id` is the pre-rename spelling every reader still aliases, so a
     // legacy-shaped file counts as having an identity.
-    let has_identity = ["device_id", "machine_id"].iter().any(|k| {
+    let identity_key = ["device_id", "machine_id"].into_iter().find(|k| {
         obj.get(*k)
             .and_then(|v| v.as_str())
             .is_some_and(|s| !s.trim().is_empty())
     });
-    if !has_identity {
+    let Some(identity_key) = identity_key else {
         return Err(format!(
             "tenant: refusing to write {} — it carries no device_id. Writing would \
              permanently wedge this machine's identity (the minter skips an existing \
@@ -113,6 +137,18 @@ fn write_active_tenant_id(path: &Path, tenant_id: &str) -> Result<(), String> {
              tenant again.",
             path.display()
         ));
+    };
+    // Normalize surrounding whitespace on the identity we are about to
+    // re-serialize. Every READER trims (`machine_identity::read_device_id_at`),
+    // so an on-disk `" abc "` and the id presented to coord would otherwise
+    // differ by exactly the padding — two `coord.devices` rows for one machine.
+    // Writing the trimmed form makes disk and wire agree.
+    let trimmed_identity = obj
+        .get(identity_key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string());
+    if let Some(trimmed) = trimmed_identity {
+        obj.insert(identity_key.to_string(), serde_json::Value::String(trimmed));
     }
     obj.insert(
         "active_tenant_id".to_string(),
@@ -283,6 +319,16 @@ mod tests {
         let err = write_active_tenant_id(&path, "tenant-uuid")
             .expect_err("a missing machine.json must be refused");
         assert!(err.contains("refusing to write"), "got: {err}");
+        // An ABSENT file is the one case where `device init` is right and `rm`
+        // is harmless — the guidance must say exactly that.
+        assert!(
+            err.contains("does not exist"),
+            "the absent case must name itself as absent, got: {err}"
+        );
+        assert!(
+            err.contains("qontinui_profile device init"),
+            "the absent case must point at `device init`, got: {err}"
+        );
         assert!(
             !path.exists(),
             "the refusal must not leave a device_id-less machine.json behind"
@@ -290,15 +336,48 @@ mod tests {
     }
 
     /// FAIL CLOSED on an unparseable, non-object, or `device_id`-less file —
-    /// and leave it byte-identical for inspection.
+    /// leave it byte-identical for inspection, AND give guidance specific to
+    /// that case.
+    ///
+    /// Asserting only `contains("refusing to write")` is what let the original
+    /// defect through: `read_machine_file` returns `None` for BOTH an absent
+    /// and a corrupt file, and the single shared message told the operator to
+    /// run `device init` — which itself refuses on a corrupt file and used to
+    /// say `rm`. `rm` + `device init` mints a fresh UUID, i.e. the second
+    /// `coord.devices` row this whole change exists to prevent. So the pin is
+    /// per-case: does the message name THIS file's class, and does it give the
+    /// right (non-re-minting) recovery for it?
     #[test]
-    fn write_refuses_when_there_is_no_device_id_to_preserve() {
+    fn write_refuses_with_guidance_specific_to_each_bad_file() {
         let dir = tempdir().unwrap();
-        for (label, contents) in [
-            ("corrupt", &b"{ not json"[..]),
-            ("not an object", &b"[1,2,3]"[..]),
-            ("no device_id", &br#"{"hostname":"spaceship"}"#[..]),
-            ("blank device_id", &br#"{"device_id":"   "}"#[..]),
+        for (label, contents, must_contain, must_not_contain) in [
+            // Present but unreadable: the bytes may still hold the real UUID,
+            // so the advice is hand-repair and an explicit "do NOT rm".
+            (
+                "corrupt",
+                &b"{ not json"[..],
+                &["EXISTS but is unreadable", "do NOT `rm`"][..],
+                &["device init"][..],
+            ),
+            (
+                "not an object",
+                &b"[1,2,3]"[..],
+                &["not a JSON object", "do NOT `rm`"][..],
+                &["device init"][..],
+            ),
+            // Parsed fine and provably carries no identity: nothing to lose.
+            (
+                "no device_id",
+                &br#"{"hostname":"spaceship"}"#[..],
+                &["carries no device_id"][..],
+                &[][..],
+            ),
+            (
+                "blank device_id",
+                &br#"{"device_id":"   "}"#[..],
+                &["carries no device_id"][..],
+                &[][..],
+            ),
         ] {
             let path = dir.path().join(format!("{}.json", label.replace(' ', "_")));
             std::fs::write(&path, contents).unwrap();
@@ -310,12 +389,80 @@ mod tests {
                 err.contains("refusing to write"),
                 "{label}: expected a refusal, got: {err}"
             );
+            for needle in must_contain {
+                assert!(
+                    err.contains(needle),
+                    "{label}: refusal must mention {needle:?}, got: {err}"
+                );
+            }
+            for needle in must_not_contain {
+                assert!(
+                    !err.contains(needle),
+                    "{label}: refusal must NOT mention {needle:?} (that path re-mints), got: {err}"
+                );
+            }
             assert_eq!(
                 std::fs::read(&path).unwrap(),
                 contents,
                 "{label}: the file must be left byte-identical for inspection"
             );
         }
+    }
+
+    /// The absent and the present-but-corrupt refusals must not be the SAME
+    /// message. They came from one `None` arm and therefore were, which is how
+    /// a corrupt file's operator got told to run `device init` → which refuses
+    /// → whose message said `rm` → which mints a new identity.
+    #[test]
+    fn absent_and_corrupt_refusals_are_not_the_same_message() {
+        let dir = tempdir().unwrap();
+        let absent = dir.path().join("absent.json");
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, b"{ not json").unwrap();
+
+        let absent_err = write_active_tenant_id(&absent, "t").expect_err("absent must refuse");
+        let corrupt_err = write_active_tenant_id(&corrupt, "t").expect_err("corrupt must refuse");
+        assert_ne!(
+            absent_err.replace("absent.json", "X").as_str(),
+            corrupt_err.replace("corrupt.json", "X").as_str(),
+            "absent and corrupt need OPPOSITE guidance, so they cannot share a message"
+        );
+    }
+
+    /// A padded on-disk `device_id` is normalized on write. Every READER trims
+    /// (`machine_identity::read_device_id_at`), so leaving `" abc "` on disk
+    /// means disk and the coord-facing value disagree by exactly the padding —
+    /// and coord UPSERTs `ON CONFLICT (device_id)`, so that is two rows.
+    #[test]
+    fn write_trims_a_padded_device_id() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        std::fs::write(&path, br#"{"device_id":"  padded-id  ","hostname":"x"}"#).unwrap();
+
+        write_active_tenant_id(&path, "tenant-uuid").unwrap();
+
+        let v = read_machine_file(&path).unwrap();
+        assert_eq!(
+            v.get("device_id").and_then(|x| x.as_str()),
+            Some("padded-id"),
+            "the identity must be written back TRIMMED, matching what readers see"
+        );
+    }
+
+    /// Same normalization for the legacy `machine_id` spelling.
+    #[test]
+    fn write_trims_a_padded_legacy_machine_id() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        std::fs::write(&path, br#"{"machine_id":"  legacy-id  "}"#).unwrap();
+
+        write_active_tenant_id(&path, "tenant-uuid").unwrap();
+
+        let v = read_machine_file(&path).unwrap();
+        assert_eq!(
+            v.get("machine_id").and_then(|x| x.as_str()),
+            Some("legacy-id")
+        );
     }
 
     /// A legacy `machine_id`-spelled file still HAS an identity, so a tenant

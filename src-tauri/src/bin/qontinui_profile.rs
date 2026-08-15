@@ -467,10 +467,19 @@ fn atomic_write(path: &Path, file: &ProfilesFile) -> std::io::Result<()> {
 ///
 /// `device_id` is serde-aliased to `machine_id` so a pre-Phase-3 machine.json
 /// (which writes `"machine_id": "..."`) deserializes without manual migration.
+///
+/// `hostname` is `#[serde(default)]` because it is NOT part of the identity —
+/// it is re-detected on every `device init` run. Without the default, a
+/// hand-written or partially-migrated `{"device_id":"…"}` file (readable by
+/// [`qontinui_runner_lib::machine_identity`] and by every other runtime
+/// consumer) made `device init` call the file "unreadable" and point the
+/// operator at `rm`, i.e. refusing to repair a file that carries a perfectly
+/// good identity — and destroying that identity if the advice was taken.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeviceFile {
     #[serde(alias = "machine_id")]
     device_id: String,
+    #[serde(default)]
     hostname: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
@@ -478,6 +487,42 @@ struct DeviceFile {
 
 fn device_file_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
+}
+
+/// Refusal advice for a file that MIGHT still carry this machine's real
+/// `device_id` (unreadable bytes, invalid JSON, a non-object, or a
+/// well-formed identity next to some other malformed field).
+///
+/// `rm` is the wrong advice here and used to be the only advice given: it
+/// destroys the identity, and the follow-up `device init` then mints a fresh
+/// UUID — a second `coord.devices` row for the same physical machine, which is
+/// exactly what this command exists to prevent.
+const RECOVERABLE_ADVICE: &str = "this file may still hold this machine's device_id. \
+     Inspect and repair it by hand (it only needs to be a JSON object with a non-blank \
+     string `device_id`), then re-run. Do NOT `rm` it: that DESTROYS the identity, and \
+     the next `device init` mints a new one — a second coord.devices row for this machine.";
+
+/// Refusal advice for a file that provably carries NO identity (no
+/// `device_id`/`machine_id` key at all, or a blank one). There is nothing to
+/// preserve, so `rm` + `device init` is correct and safe.
+const UNRECOVERABLE_ADVICE: &str = "this file carries no device_id, so there is no identity \
+     to preserve. Check first that it holds no other state you want (e.g. `active_tenant_id`), \
+     then `rm` it and re-run `qontinui_profile device init` to mint one.";
+
+/// Does this raw `machine.json` object carry a usable identity — a non-blank
+/// STRING under `device_id` or the legacy `machine_id` spelling?
+///
+/// Used to pick between [`RECOVERABLE_ADVICE`] and [`UNRECOVERABLE_ADVICE`]
+/// when the strict [`DeviceFile`] deserialize fails: the failure may be about
+/// some entirely different field (a wrongly-typed `hostname`, say) while the
+/// identity itself is perfectly good, and telling the operator to `rm` THAT is
+/// how one machine grows two `coord.devices` rows.
+fn object_has_usable_identity(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    ["device_id", "machine_id"].iter().any(|k| {
+        obj.get(*k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    })
 }
 
 fn read_device_file(path: &Path) -> std::io::Result<DeviceFile> {
@@ -504,6 +549,14 @@ fn read_device_file(path: &Path) -> std::io::Result<DeviceFile> {
 /// **Never mints when the file exists.** An unreadable/invalid file is an
 /// error, not an excuse to overwrite: overwriting would mint a fresh
 /// `device_id` and therefore a fresh `coord.devices` row for the same machine.
+///
+/// The refusals split on whether the identity is RECOVERABLE
+/// ([`RECOVERABLE_ADVICE`] — the bytes may still hold a real UUID, so hand
+/// repair, never `rm`) or UNRECOVERABLE ([`UNRECOVERABLE_ADVICE`] — there is
+/// provably no identity, so `rm` + `device init` is the correct fix). Telling
+/// the operator to `rm` a recoverable file is not a cosmetic error: the
+/// follow-up `device init` mints, which is the exact outcome this refusal
+/// exists to prevent.
 /// Plan `2026-08-06-device-identity-is-per-profile-not-per-machine` Phase 2.
 fn device_init_write_at(
     path: &Path,
@@ -513,25 +566,28 @@ fn device_init_write_at(
     let (mut obj, existing, was_new) = if path.exists() {
         let bytes = std::fs::read(path).map_err(|e| {
             format!(
-                "machine.json at {} is unreadable ({}). \
-                 Refusing to overwrite — inspect or `rm` and re-run.",
+                "machine.json at {} exists but could not be READ ({}). \
+                 Refusing to overwrite — {}",
                 path.display(),
-                e
+                e,
+                RECOVERABLE_ADVICE
             )
         })?;
         let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
             format!(
-                "machine.json at {} is unreadable ({}). \
-                 Refusing to overwrite — inspect or `rm` and re-run.",
+                "machine.json at {} is not valid JSON ({}). \
+                 Refusing to overwrite — {}",
                 path.display(),
-                e
+                e,
+                RECOVERABLE_ADVICE
             )
         })?;
         let serde_json::Value::Object(obj) = value else {
             return Err(format!(
-                "machine.json at {} is not a JSON object. \
-                 Refusing to overwrite — inspect or `rm` and re-run.",
-                path.display()
+                "machine.json at {} is valid JSON but not an object. \
+                 Refusing to overwrite — {}",
+                path.display(),
+                RECOVERABLE_ADVICE
             ));
         };
         // Validate that a usable identity is actually in there before we
@@ -539,17 +595,22 @@ fn device_init_write_at(
         let existing: DeviceFile = serde_json::from_value(serde_json::Value::Object(obj.clone()))
             .map_err(|e| {
             format!(
-                "machine.json at {} is unreadable ({}). \
-                     Refusing to overwrite — inspect or `rm` and re-run.",
+                "machine.json at {} did not deserialize ({}). Refusing to overwrite — {}",
                 path.display(),
-                e
+                e,
+                if object_has_usable_identity(&obj) {
+                    RECOVERABLE_ADVICE
+                } else {
+                    UNRECOVERABLE_ADVICE
+                }
             )
         })?;
         if existing.device_id.trim().is_empty() {
             return Err(format!(
-                "machine.json at {} has an empty device_id. \
-                 Refusing to overwrite — inspect or `rm` and re-run.",
-                path.display()
+                "machine.json at {} has a BLANK device_id. \
+                 Refusing to overwrite — {}",
+                path.display(),
+                UNRECOVERABLE_ADVICE
             ));
         }
         (obj, existing, false)
@@ -568,8 +629,14 @@ fn device_init_write_at(
     let name = name_arg
         .map(|s| s.to_string())
         .or_else(|| existing.name.clone());
+    // TRIM the identity before it is written or presented to coord. The
+    // blank-check above already trims, and so does every reader
+    // (`machine_identity::read_device_id_at`) — so an on-disk `" abc "` used to
+    // be registered by THIS command as `" abc "` while every other path
+    // registered `"abc"`. Coord UPSERTs `ON CONFLICT (device_id)`: two spellings
+    // are two rows for one machine.
     let file = DeviceFile {
-        device_id: existing.device_id.clone(),
+        device_id: existing.device_id.trim().to_string(),
         hostname: hostname_now.to_string(),
         name,
     };
@@ -1335,6 +1402,131 @@ mod tests {
             second.device_id, first.device_id,
             "the second run must RE-USE, not re-mint"
         );
+    }
+
+    /// A PADDED on-disk `device_id` must be trimmed before it is written back
+    /// or handed to coord.
+    ///
+    /// `cmd_device_init` registers `file.device_id` (the value this function
+    /// returns) while `machine_identity::read_device_id_at` — every other
+    /// path's reader — trims. So a stored `"  abc  "` used to be registered as
+    /// `"  abc  "` here and as `"abc"` everywhere else, and coord UPSERTs
+    /// `ON CONFLICT (device_id)`: two rows, one machine. The written file and
+    /// the coord-facing value must agree, and both must be the trimmed form.
+    #[test]
+    fn device_init_trims_a_padded_device_id_on_disk_and_on_the_wire() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("machine.json");
+        std::fs::write(&path, format!(r#"{{"device_id":"  {PINNED_ID}  "}}"#)).expect("seed");
+
+        // The value `cmd_device_init` hands to `register_with_coord`.
+        let (file, was_new) = device_init_write_at(&path, None, "spaceship").expect("init");
+        assert!(!was_new);
+        assert_eq!(
+            file.device_id, PINNED_ID,
+            "the coord-facing id must be trimmed"
+        );
+
+        // The value on disk, and the value every other reader resolves.
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("json");
+        assert_eq!(
+            v.get("device_id").and_then(|x| x.as_str()),
+            Some(PINNED_ID),
+            "the on-disk id must be trimmed"
+        );
+        assert_eq!(
+            qontinui_runner_lib::machine_identity::read_device_id_at(&path).unwrap(),
+            file.device_id,
+            "disk and wire must agree — a padding-only difference is two coord.devices rows"
+        );
+    }
+
+    /// A `{"device_id": "…"}` file with NO `hostname` is readable by every
+    /// runtime consumer, so `device init` must REPAIR it (re-detecting the
+    /// hostname), not call it unreadable and point at `rm`. Before
+    /// `#[serde(default)]` on `DeviceFile::hostname` this refused, and the
+    /// refusal's own advice destroyed a perfectly good identity.
+    #[test]
+    fn device_init_repairs_a_file_missing_only_the_hostname() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("machine.json");
+        std::fs::write(&path, format!(r#"{{"device_id":"{PINNED_ID}"}}"#)).expect("seed");
+
+        let (file, was_new) = device_init_write_at(&path, None, "spaceship")
+            .expect("a hostname-less file carries a good identity and must be repaired");
+        assert!(!was_new, "repair is not a mint");
+        assert_eq!(file.device_id, PINNED_ID);
+        assert_eq!(file.hostname, "spaceship");
+        assert_eq!(read_device_file(&path).unwrap().hostname, "spaceship");
+    }
+
+    /// The refusals must distinguish RECOVERABLE (the file may still hold the
+    /// real UUID → inspect by hand, never `rm`) from UNRECOVERABLE (no identity
+    /// present → `rm` + `device init` is correct).
+    ///
+    /// Four messages used to say `rm` for all four classes, and for the
+    /// recoverable ones taking that advice mints a fresh identity — a second
+    /// `coord.devices` row for the same machine, i.e. precisely the failure
+    /// this command's refusal exists to prevent.
+    #[test]
+    fn device_init_refusals_distinguish_recoverable_from_unrecoverable() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        for (label, contents, recoverable) in [
+            ("corrupt json", &b"{ not json at all"[..], true),
+            ("not an object", &b"[1,2,3]"[..], true),
+            // A good identity beside a malformed sibling: still recoverable.
+            (
+                "bad hostname type",
+                &br#"{"device_id":"c79a07d5-0000-4000-8000-000000000001","hostname":42}"#[..],
+                true,
+            ),
+            (
+                "missing device_id",
+                &br#"{"hostname":"spaceship"}"#[..],
+                false,
+            ),
+            (
+                "blank device_id",
+                &br#"{"device_id":"  ","hostname":"h"}"#[..],
+                false,
+            ),
+        ] {
+            let path = dir.path().join(format!("{}.json", label.replace(' ', "_")));
+            std::fs::write(&path, contents).expect("seed");
+            let err = match device_init_write_at(&path, None, "spaceship") {
+                Ok(_) => panic!("{label} must be refused, not written"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("Refusing to overwrite"),
+                "{label}: expected a refusal, got: {err}"
+            );
+            if recoverable {
+                assert!(
+                    err.contains("Do NOT `rm` it"),
+                    "{label}: a file that may hold the identity must forbid `rm`, got: {err}"
+                );
+                assert!(
+                    err.contains("Inspect and repair it by hand"),
+                    "{label}: must offer hand repair, got: {err}"
+                );
+            } else {
+                assert!(
+                    err.contains("no identity to preserve"),
+                    "{label}: must state there is nothing to lose, got: {err}"
+                );
+                assert!(
+                    err.contains("`rm` it and re-run"),
+                    "{label}: `rm` + init is the CORRECT advice here, got: {err}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                contents,
+                "{label}: the file must be left byte-identical for inspection"
+            );
+        }
     }
 
     /// Defect 4: the machine.json writers must not use the single shared
