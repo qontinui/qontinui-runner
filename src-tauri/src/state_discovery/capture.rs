@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use tokio::sync::OnceCell;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -124,15 +125,24 @@ fn resolve_app_id(snapshot: &serde_json::Value) -> Option<String> {
 /// registry does not know collapses to `NULL`, preserving "absent or unknown
 /// writes NULL and logs, never fabricate".
 ///
-/// **Dependency worth naming:** the subquery references `project.apps`, so if
-/// that relation is missing the *whole INSERT fails* and the observation is
-/// silently lost — strictly worse than not attributing it. That is safe only
-/// because the runner is the canonical author of that table and self-heals it
-/// with `CREATE TABLE IF NOT EXISTS project.apps` at pool init
-/// (`crate::database::pg` pool bootstrap) on the very pool that runs this
-/// statement. **If that self-heal is ever removed, this design must change**
-/// to the `table_exists`-guarded form `validate_app_filter` uses in
-/// `bin/qontinui_specs.rs`.
+/// **Two hard schema preconditions, and they are guarded.** This statement
+/// names `co_occurrence_observations.app_id` (added by qontinui-web migration
+/// `appid_01_co_occurrence_app_id`) and subqueries `project.apps`. If *either*
+/// is absent the **whole INSERT fails** and the observation is discarded — a
+/// total capture loss, strictly worse than recording the row un-attributed.
+/// Neither precondition is guaranteed: `project.apps` is self-healed by the
+/// runner at PG pool init (`CREATE TABLE IF NOT EXISTS`, `crate::database::pg`)
+/// but the column is authored elsewhere, and a real dev database in this fleet
+/// was measured with `project.apps` present and the column missing.
+///
+/// So this const is **not used unconditionally**. [`observation_app_id_supported`]
+/// probes both preconditions once per process
+/// ([`OBSERVATION_SCHEMA_PROBE_SQL`]) and `enqueue_observation` falls back to
+/// [`OBSERVATION_INSERT_SQL_LEGACY`] — byte-for-byte the pre-app-scoping
+/// five-column statement — when they do not hold. That is the
+/// `table_exists`-guarded shape `validate_app_filter` uses in
+/// `bin/qontinui_specs.rs`: keep full attribution where the schema supports it,
+/// degrade to exactly the previous behaviour where it does not, never fail.
 ///
 /// `RETURNING app_id` is what makes the reject case observable, which is why
 /// the call below is `query_opt` and not `execute` — `execute` returns a row
@@ -143,6 +153,132 @@ const OBSERVATION_INSERT_SQL: &str = r#"INSERT INTO co_occurrence_observations
                        (SELECT a.app_id FROM project.apps a WHERE a.app_id = $6))
                RETURNING app_id"#;
 
+/// The pre-app-scoping observation INSERT, kept verbatim as the fallback for
+/// databases that cannot satisfy [`OBSERVATION_INSERT_SQL`]'s preconditions.
+///
+/// This is not a degraded variant someone tuned — it is the exact statement the
+/// runner shipped before app scoping (`git show 41569ea90 -- this file`),
+/// character for character including the `::text::uuid` and `::jsonb` casts.
+/// Keeping it identical is the whole point: on an un-migrated database this
+/// path must behave *exactly* as the old code did, so the app-scoping change is
+/// strictly non-regressive rather than "mostly works".
+///
+/// No `app_id` column and no `project.apps` subquery, so it depends on nothing
+/// beyond the table that has always existed. The row lands un-attributed, which
+/// is the same nullable-column "app unknown" outcome `resolve_app_id`
+/// documents — attribution is missing, not fabricated, and no observation is
+/// lost. Run with `execute`, not `query_opt`: there is no `RETURNING` to read.
+const OBSERVATION_INSERT_SQL_LEGACY: &str = r#"INSERT INTO co_occurrence_observations
+               (id, spec_id, runner_instance, fingerprints, snapshot_metadata)
+               VALUES ($1::text::uuid, $2, $3, $4::jsonb, $5::jsonb)"#;
+
+/// One statement answering **both** of [`OBSERVATION_INSERT_SQL`]'s schema
+/// preconditions: does `project.apps` exist, and does
+/// `project.co_occurrence_observations` have an `app_id` column.
+///
+/// `pg_catalog`, not `information_schema`: `information_schema.columns` hides
+/// columns the calling role holds no privilege on, so a grant quirk would read
+/// as "column absent" and pin an otherwise-migrated database to the legacy path
+/// for the life of the process. That is the same reason `table_exists` in
+/// `bin/qontinui_specs.rs` reaches for `to_regclass`.
+///
+/// Both names are schema-qualified, so the answer does not depend on the pool's
+/// `search_path` (`project, public`). `to_regclass` *returns NULL* rather than
+/// erroring for a missing relation or a missing schema, so when the
+/// observations table itself is absent the second expression compares
+/// `attrelid = NULL`, matches nothing, and correctly yields `false`.
+///
+/// Verified against a live dev PG (`qontinui_db`) that has `project.apps` but
+/// no `app_id` column: returns `(true, false)`, and on that same database the
+/// six-column INSERT errors with `column "app_id" ... does not exist` while the
+/// five-column one succeeds.
+const OBSERVATION_SCHEMA_PROBE_SQL: &str = r#"SELECT to_regclass('project.apps') IS NOT NULL,
+                      EXISTS (SELECT 1 FROM pg_attribute
+                               WHERE attrelid = to_regclass('project.co_occurrence_observations')
+                                 AND attname = 'app_id'
+                                 AND attnum > 0
+                                 AND NOT attisdropped)"#;
+
+/// Process-wide cache of the [`OBSERVATION_SCHEMA_PROBE_SQL`] answer.
+///
+/// Deliberately once per *process*, not once per observation: the reason
+/// `app_id` is validated inside the INSERT at all is that capture must not pay
+/// an extra round trip per snapshot, and a catalog query per observation would
+/// give back exactly the cost that design avoids. Schema shape does not change
+/// under a running runner without a migration, and a migration is followed by a
+/// restart, which re-probes.
+static OBSERVATION_APP_ID_SUPPORTED: OnceCell<bool> = OnceCell::const_new();
+
+/// Resolve — once per process — whether the six-column
+/// [`OBSERVATION_INSERT_SQL`] is safe on this database, warning exactly once
+/// when it is not.
+///
+/// **Fails toward the legacy path.** A probe that errors returns `false`, so a
+/// probe malfunction can only cost attribution, never capture; it can never
+/// leave the runner worse off than having no probe at all. The `false` is
+/// cached like any other answer, so a transient probe failure pins the legacy
+/// path until restart — the safe direction to be wrong in, and it is stated in
+/// the warning so nobody has to guess.
+///
+/// The warning lives inside the `OnceCell` initializer rather than at the call
+/// site, which is what makes it fire once instead of once per snapshot on a
+/// fire-and-forget path that could otherwise flood the log.
+async fn observation_app_id_supported(client: &tokio_postgres::Client) -> bool {
+    *OBSERVATION_APP_ID_SUPPORTED
+        .get_or_init(|| async {
+            let (has_apps, has_column) =
+                match client.query_one(OBSERVATION_SCHEMA_PROBE_SQL, &[]).await {
+                    Ok(row) => (
+                        // `try_get`, not `get`: `get` panics on a type mismatch,
+                        // and this runs under a fire-and-forget capture task.
+                        row.try_get::<_, bool>(0).unwrap_or(false),
+                        row.try_get::<_, bool>(1).unwrap_or(false),
+                    ),
+                    Err(e) => {
+                        warn!(
+                            "state_discovery::capture: could not probe the database for app \
+                             attribution support ({}) — falling back to the pre-app-scoping \
+                             five-column INSERT for the life of this process. Observations are \
+                             still being recorded, but with no app_id. Remedy: fix the error \
+                             above, then restart the runner to re-probe.",
+                            e
+                        );
+                        return false;
+                    }
+                };
+
+            if has_apps && has_column {
+                return true;
+            }
+
+            let missing = if !has_column && !has_apps {
+                "column project.co_occurrence_observations.app_id is missing, AND table \
+                 project.apps is missing"
+            } else if !has_column {
+                "column project.co_occurrence_observations.app_id is missing"
+            } else {
+                "table project.apps is missing"
+            };
+            let remedy = if !has_column {
+                "apply qontinui-web migration `appid_01_co_occurrence_app_id` (it adds \
+                 project.co_occurrence_observations.app_id), then restart the runner to re-probe"
+            } else {
+                "project.apps is created by the runner's own CREATE TABLE IF NOT EXISTS at PG \
+                 pool init, so its absence means that bootstrap did not run against this \
+                 database — check the pool startup logs for the failure, then restart the runner \
+                 to re-probe"
+            };
+            warn!(
+                "state_discovery::capture: app attribution DISABLED for this process — {}. \
+                 Observations are still being recorded, via the pre-app-scoping five-column \
+                 INSERT, so no capture is lost — the rows simply carry no app_id. Remedy: {}.",
+                missing, remedy
+            );
+            false
+        })
+        .await
+}
+
 /// Enqueue a single observation derived from a UI Bridge snapshot.
 ///
 /// Extracts a fingerprint per element, resolves the page label (see
@@ -150,6 +286,12 @@ const OBSERVATION_INSERT_SQL: &str = r#"INSERT INTO co_occurrence_observations
 /// records minimal page metadata, and inserts one row into
 /// `co_occurrence_observations`. All errors downgrade to WARN logs — the
 /// snapshot path must never fail because of observation capture.
+///
+/// Which statement runs depends on what this database can support: the
+/// six-column [`OBSERVATION_INSERT_SQL`] when
+/// [`observation_app_id_supported`] says both preconditions hold, otherwise the
+/// verbatim pre-app-scoping [`OBSERVATION_INSERT_SQL_LEGACY`]. Recording the
+/// row un-attributed always beats losing it.
 ///
 /// Takes no `app_id` parameter on purpose: the id is read off the snapshot,
 /// which keeps the call site's invariant that the caller carries no scope
@@ -245,10 +387,40 @@ pub async fn enqueue_observation(
         }
     };
 
+    // Which statement this database can actually run. Cached after the first
+    // call, so this is a bool read per observation, not a catalog query.
+    if !observation_app_id_supported(&conn).await {
+        // Un-migrated database: the six-column statement would fail outright
+        // and the observation would be dropped. Record it exactly as the runner
+        // did before app scoping instead — un-attributed, but not lost. The
+        // reason was already logged once by the probe, so stay quiet here
+        // beyond the shared insert-failure warning.
+        if let Err(e) = conn
+            .execute(
+                OBSERVATION_INSERT_SQL_LEGACY,
+                &[
+                    &id,
+                    &spec_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &runner_instance,
+                    &fingerprints_json,
+                    &snapshot_metadata,
+                ],
+            )
+            .await
+        {
+            warn!(
+                "state_discovery::capture: failed to insert observation ({} elements): {}",
+                element_count, e
+            );
+        }
+        return;
+    }
+
     // See `OBSERVATION_INSERT_SQL` for why each cast is there and why the
-    // `project.apps` subquery is safe. `query_opt` rather than `execute`
-    // because `execute` returns a row count, which would discard the
-    // `RETURNING app_id` that makes an unknown id observable.
+    // `project.apps` subquery is safe on this database (the probe above is
+    // what makes it so). `query_opt` rather than `execute` because `execute`
+    // returns a row count, which would discard the `RETURNING app_id` that
+    // makes an unknown id observable.
     let res = conn
         .query_opt(
             OBSERVATION_INSERT_SQL,
@@ -487,6 +659,112 @@ mod tests {
             !OBSERVATION_INSERT_SQL.contains("$6::"),
             "project.apps.app_id and co_occurrence_observations.app_id are both TEXT — $6 \
              needs no cast"
+        );
+    }
+
+    #[test]
+    fn legacy_observation_insert_depends_on_nothing_the_migration_adds() {
+        // The fallback's entire value is that it runs on a database that cannot
+        // run `OBSERVATION_INSERT_SQL`. If either precondition leaks back into
+        // it, the fallback fails on exactly the databases it exists to serve
+        // and capture is lost there — the regression this guard prevents.
+        assert!(
+            OBSERVATION_INSERT_SQL_LEGACY
+                .contains("(id, spec_id, runner_instance, fingerprints, snapshot_metadata)"),
+            "the legacy statement must list exactly five columns, matching its five binds. \
+             Got: {OBSERVATION_INSERT_SQL_LEGACY}"
+        );
+        assert!(
+            !OBSERVATION_INSERT_SQL_LEGACY.contains("app_id"),
+            "the legacy statement must not name app_id anywhere — the column does not exist on \
+             databases that have not applied qontinui-web migration \
+             `appid_01_co_occurrence_app_id`. Got: {OBSERVATION_INSERT_SQL_LEGACY}"
+        );
+        assert!(
+            !OBSERVATION_INSERT_SQL_LEGACY.contains("project.apps"),
+            "the legacy statement must not reference the project.apps registry — a missing \
+             relation there fails the whole INSERT. Got: {OBSERVATION_INSERT_SQL_LEGACY}"
+        );
+        assert!(
+            !OBSERVATION_INSERT_SQL_LEGACY.contains("RETURNING"),
+            "nothing to return without app_id, which is why the legacy path runs `execute` \
+             rather than `query_opt`"
+        );
+        assert!(
+            !OBSERVATION_INSERT_SQL_LEGACY.contains("$6"),
+            "a sixth bind would not match the five parameters the legacy call site passes"
+        );
+    }
+
+    #[test]
+    fn the_two_observation_inserts_agree_on_their_shared_five_columns() {
+        // Same row, two schemas — the five shared columns and their casts must
+        // stay identical, or an un-migrated database starts writing subtly
+        // different rows from a migrated one and the corpus stops being
+        // comparable across environments. Pins them as one unit so a future
+        // edit to either cannot silently drift.
+        for shared in [
+            "INSERT INTO co_occurrence_observations",
+            "id, spec_id, runner_instance, fingerprints, snapshot_metadata",
+            "VALUES ($1::text::uuid, $2, $3, $4::jsonb, $5::jsonb",
+        ] {
+            assert!(
+                OBSERVATION_INSERT_SQL.contains(shared)
+                    && OBSERVATION_INSERT_SQL_LEGACY.contains(shared),
+                "both statements must contain {shared:?}; six-column: \
+                 {OBSERVATION_INSERT_SQL}; legacy: {OBSERVATION_INSERT_SQL_LEGACY}"
+            );
+        }
+        // And the six-column form must be the legacy form *extended*, not a
+        // reworded one. Compute the actual common prefix rather than asserting
+        // a hand-copied literal, so whitespace can't make this pass or fail for
+        // the wrong reason: the two must stay byte-identical right through the
+        // fifth column name, diverging only at `, app_id)` vs `)`.
+        let common_len = OBSERVATION_INSERT_SQL
+            .as_bytes()
+            .iter()
+            .zip(OBSERVATION_INSERT_SQL_LEGACY.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let common = OBSERVATION_INSERT_SQL.get(..common_len).unwrap_or("");
+        assert!(
+            common.ends_with("snapshot_metadata"),
+            "the two statements must be byte-identical through the fifth column and diverge only \
+             there; they instead share only {common:?}"
+        );
+    }
+
+    #[test]
+    fn schema_probe_answers_both_preconditions_without_information_schema() {
+        // The probe is the only thing standing between an un-migrated database
+        // and total capture loss, so pin what it actually asks.
+        assert!(
+            OBSERVATION_SCHEMA_PROBE_SQL.contains("to_regclass('project.apps')"),
+            "precondition 1 (the registry table the subquery reads) must be probed. Got: \
+             {OBSERVATION_SCHEMA_PROBE_SQL}"
+        );
+        assert!(
+            OBSERVATION_SCHEMA_PROBE_SQL.contains("'app_id'")
+                && OBSERVATION_SCHEMA_PROBE_SQL
+                    .contains("to_regclass('project.co_occurrence_observations')"),
+            "precondition 2 (the column migration `appid_01_co_occurrence_app_id` adds) must be \
+             probed. Got: {OBSERVATION_SCHEMA_PROBE_SQL}"
+        );
+        assert!(
+            !OBSERVATION_SCHEMA_PROBE_SQL.contains("information_schema"),
+            "information_schema.columns hides columns the role lacks privilege on, so a grant \
+             quirk would read as `column absent` and pin a migrated database to the legacy path. \
+             Use pg_catalog, as `table_exists` in bin/qontinui_specs.rs does"
+        );
+        assert!(
+            OBSERVATION_SCHEMA_PROBE_SQL.contains("NOT attisdropped"),
+            "a dropped column still has a pg_attribute row; it must not count as present"
+        );
+        // Both relation names are schema-qualified so the answer cannot depend
+        // on the pool's `SET search_path TO project, public`.
+        assert!(
+            !OBSERVATION_SCHEMA_PROBE_SQL.contains("to_regclass('apps')"),
+            "probe names must stay schema-qualified, independent of search_path"
         );
     }
 }
