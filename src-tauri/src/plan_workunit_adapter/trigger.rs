@@ -335,10 +335,12 @@ pub fn newly_disappeared_slugs(
 async fn run_loop<S: WorkUnitSink + ?Sized>(
     dir: PathBuf,
     archive_dir: Option<PathBuf>,
+    body_sync: Option<BodySync>,
     sink: &S,
     interval_secs: u64,
 ) {
     let conv = PlanConvention::operator_default();
+    let mut body_sync = body_sync;
     let metrics = adapter_metrics();
     let mut last_applied: HashMap<String, String> = HashMap::new();
     let mut last_deps: HashMap<String, Vec<String>> = HashMap::new();
@@ -384,6 +386,11 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
                 "plan adapter: archive scan complete (metadata-only)"
             );
         }
+        // Plan & prompt library body sync — opt-in, see `BodySync`.
+        if let Some(bs) = body_sync.as_mut() {
+            bs.run_cycle(&conv).await;
+        }
+
         let active_slugs: HashSet<String> = units.iter().map(|u| u.slug.clone()).collect();
         let archive_slugs: HashSet<String> = archived.iter().map(|u| u.slug.clone()).collect();
         for slug in newly_disappeared_slugs(
@@ -405,6 +412,101 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
 /// Per-machine override for the active plans directory. Wins over the
 /// runner's `PathSettings::plans_dir` setting when set to a non-empty value.
 pub const PLAN_ADAPTER_DIR_ENV: &str = "QONTINUI_PLAN_ADAPTER_DIR";
+
+/// Opt-in switch for the plan & prompt **library body sync** riding along with
+/// the reconcile loop (plan `2026-08-10-plan-and-prompt-library-in-web`
+/// Phase 2). Enabled only on an exact `"1"`.
+///
+/// **Why opt-in rather than on-by-default.** The push authenticates with the
+/// runner's coord-issued *device* JWT, and the qontinui-web plan-library routes
+/// currently depend on `current_active_user`, which is Cognito-only — see
+/// [`super::body_push`]'s 401 diagnostic. Until the web side accepts a device
+/// bearer, an on-by-default sync would emit ~1,100 failed requests every 60s on
+/// every runner in the fleet. The one-shot
+/// `qontinui-pr plan-library-backfill` subcommand is the supported path in the
+/// meantime, and flipping this to `1` turns the continuous sync on the moment
+/// the web side is ready — without a runner rebuild.
+pub const PLAN_LIBRARY_SYNC_ENV: &str = "QONTINUI_PLAN_LIBRARY_SYNC";
+
+/// Whether the library body sync is enabled for this process. Read once at
+/// spawn (unlike the write-door capability flag, which must be flippable
+/// per-request): this one decides whether a long-lived loop *has* a sync at
+/// all, and a mid-flight change of that shape has no meaning.
+pub fn body_sync_enabled() -> bool {
+    std::env::var(PLAN_LIBRARY_SYNC_ENV)
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// The library body-sync half of a reconcile cycle: re-scan the three roots and
+/// push any artifact whose body digest moved.
+///
+/// Holds its own [`super::body_push::ArtifactSyncState`], so steady state costs
+/// one directory walk and zero HTTP calls — the whole point of the digest
+/// memory. Kept in the same tick as the work-unit reconcile rather than on its
+/// own timer so the two can never observe different filesystem states.
+pub struct BodySync {
+    roots: Vec<super::body_push::ScanRoot>,
+    sink: super::body_push::HttpArtifactSink,
+    state: super::body_push::ArtifactSyncState,
+    /// Set after a cycle in which EVERY push errored, which in practice means a
+    /// systemic problem (backend down, bearer rejected) rather than 1,100
+    /// individually broken files. The sync then stops until the runner
+    /// restarts, so a misconfiguration costs one noisy cycle, not a permanent
+    /// log flood at 60-second intervals.
+    disabled_after_total_failure: bool,
+}
+
+impl BodySync {
+    pub fn new(
+        roots: Vec<super::body_push::ScanRoot>,
+        sink: super::body_push::HttpArtifactSink,
+    ) -> Self {
+        Self {
+            roots,
+            sink,
+            state: super::body_push::ArtifactSyncState::new(),
+            disabled_after_total_failure: false,
+        }
+    }
+
+    pub async fn run_cycle(&mut self, conv: &PlanConvention) {
+        if self.disabled_after_total_failure {
+            return;
+        }
+        let (artifacts, skipped) = super::body_push::scan_all_roots(&self.roots, conv);
+        if artifacts.is_empty() {
+            return;
+        }
+        let summary =
+            super::body_push::backfill_once(&self.sink, &artifacts, &mut self.state).await;
+        let attempted =
+            summary.created + summary.updated + summary.unchanged_remote + summary.errors;
+        tracing::info!(
+            scanned = artifacts.len(),
+            skipped = skipped.len(),
+            created = summary.created,
+            updated = summary.updated,
+            unchanged = summary.unchanged_remote,
+            skipped_local = summary.skipped_local,
+            kind_forks = summary.ambiguous_kind,
+            errors = summary.errors,
+            edges_set = summary.edges_set,
+            "plan library: body sync cycle complete"
+        );
+        if attempted > 0 && summary.errors == attempted {
+            self.disabled_after_total_failure = true;
+            tracing::error!(
+                errors = summary.errors,
+                env_var = PLAN_LIBRARY_SYNC_ENV,
+                "plan library: every push in this cycle failed — disabling the body sync for \
+                 this process rather than retrying the same failures every tick. Fix the \
+                 backend/credential and restart the runner, or use \
+                 `qontinui-pr plan-library-backfill` for a one-shot run."
+            );
+        }
+    }
+}
 
 /// Where a resolved active plans directory came from — so the caller can log
 /// the env override at `info` without duplicating the precedence logic.
@@ -452,6 +554,26 @@ pub fn resolve_plans_archive_dir(configured: Option<String>) -> Option<String> {
     configured.filter(|s| !s.trim().is_empty())
 }
 
+/// Resolve the **prompts** directory (plan `2026-08-10-plan-and-prompt-library-in-web`
+/// Phase 2): the third scan root, and the value exported to agent sessions as
+/// `QONTINUI_PROMPTS_DIR`.
+///
+/// Like [`resolve_plans_archive_dir`] and unlike [`resolve_plans_dir`], there is
+/// deliberately **no env override**. The active plans dir carries one only
+/// because `QONTINUI_PLAN_ADAPTER_DIR` predates the setting and machines have it
+/// `setx`-persisted; a brand-new directory has no such legacy to stay
+/// compatible with, and a second precedence chain is a second thing that can
+/// silently disagree with the settings UI. A blank setting counts as unset, so
+/// `""` disables the prompts scan rather than scanning a directory named `""`.
+///
+/// It is also **not derivable from the plans dir**. `/create-plan` currently
+/// *guesses* `$QONTINUI_PLANS_DIR/../prompts/*.md`, which is exactly the guess
+/// this setting exists to replace — the operator's prompts live in more than one
+/// repo and the sibling-of-plans relationship does not hold in general.
+pub fn resolve_prompts_dir(configured: Option<String>) -> Option<String> {
+    configured.filter(|s| !s.trim().is_empty())
+}
+
 /// Spawn the reconcile loop iff the adapter is configured for this runner: a
 /// plans directory resolvable via [`resolve_plans_dir`] (the runner's
 /// `PathSettings::plans_dir`, or the [`PLAN_ADAPTER_DIR_ENV`] override) AND a
@@ -467,6 +589,8 @@ pub fn resolve_plans_archive_dir(configured: Option<String>) -> Option<String> {
 pub fn spawn_if_configured(
     configured_plans_dir: Option<String>,
     configured_archive_dir: Option<String>,
+    configured_prompts_dir: Option<String>,
+    configured_backend_url: Option<String>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let (dir, source) = resolve_plans_dir_with_source(configured_plans_dir)?;
     if source == PlansDirSource::Env {
@@ -476,7 +600,41 @@ pub fn spawn_if_configured(
             "plan adapter: plans dir taken from env override (settings value ignored)"
         );
     }
-    let archive_dir = resolve_plans_archive_dir(configured_archive_dir).map(PathBuf::from);
+    let resolved_archive = resolve_plans_archive_dir(configured_archive_dir);
+    let resolved_prompts = resolve_prompts_dir(configured_prompts_dir);
+    let archive_dir = resolved_archive.clone().map(PathBuf::from);
+
+    // Plan & prompt library body sync: needs the opt-in flag AND a resolvable
+    // web backend. Either missing is a silent no-op — the work-unit reconcile
+    // below is unaffected, exactly as the archive scan is optional.
+    let body_sync = if body_sync_enabled() {
+        match super::body_push::HttpArtifactSink::from_env(configured_backend_url) {
+            Some(sink) => {
+                let roots = super::body_push::scan_roots(
+                    Some(dir.clone()),
+                    resolved_archive,
+                    resolved_prompts,
+                );
+                tracing::info!(
+                    roots = roots.len(),
+                    backend = %sink.base(),
+                    "plan library: body sync enabled"
+                );
+                Some(BodySync::new(roots, sink))
+            }
+            None => {
+                tracing::warn!(
+                    env_var = PLAN_LIBRARY_SYNC_ENV,
+                    "plan library: body sync requested but no qontinui-web backend is \
+                     configured; not syncing"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let sink = match super::push::HttpWorkUnitSink::from_profile() {
         Some(s) => s,
         None => {
@@ -492,7 +650,14 @@ pub fn spawn_if_configured(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(60);
     Some(tokio::spawn(async move {
-        run_loop(PathBuf::from(dir), archive_dir, &sink, interval_secs).await;
+        run_loop(
+            PathBuf::from(dir),
+            archive_dir,
+            body_sync,
+            &sink,
+            interval_secs,
+        )
+        .await;
     }))
 }
 

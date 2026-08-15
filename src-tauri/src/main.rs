@@ -1078,9 +1078,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `plan_workunit_adapter::trigger`.
                 {
                     let paths = config_facade::get_setting::<settings::PathSettings>();
+                    // The same call also carries the plan & prompt library body
+                    // sync (plan 2026-08-10-plan-and-prompt-library-in-web
+                    // Phase 2), which adds the prompts dir as a third scan root
+                    // and needs the qontinui-web base. That half is opt-in on
+                    // QONTINUI_PLAN_LIBRARY_SYNC=1 and no-ops otherwise.
                     qontinui_runner_lib::plan_workunit_adapter::trigger::spawn_if_configured(
                         paths.plans_dir,
                         paths.plans_archive_dir,
+                        paths.prompts_dir,
+                        Some(api_config::get_api_base_url()),
                     );
                 }
                 // Park this thread's runtime forever so the spawned

@@ -34,6 +34,7 @@
 //! and the periodic trigger) slot in as siblings of [`parser`] under this
 //! module; they are deliberately absent until the P1 work-unit API lands.
 
+pub mod body_push;
 pub mod parser;
 pub mod push;
 pub mod trigger;
@@ -42,12 +43,18 @@ pub mod trigger;
 #[cfg(test)]
 mod parity;
 
+pub use body_push::{
+    backfill_once, build_artifact, build_report, classify_kind, extract_repos, push_artifact,
+    render_report, scan_all_roots, scan_roots, ArtifactKind, ArtifactSink, ArtifactSyncState,
+    ArtifactUpsert, BackfillReport, BackfillSummary, BodyPushOutcome, HttpArtifactSink, ScanRoot,
+    ScanRootKind, ScannedArtifact,
+};
 pub use parser::{
     parse_work_unit, slug_from_filename, ParsedPhase, ParsedWorkUnit, PlanConvention,
 };
 pub use push::{push_work_unit, HttpWorkUnitSink, PushOutcome, WorkUnitSink};
 pub use trigger::{
     adapter_metrics, newly_disappeared_slugs, reconcile_archive_once, resolve_plans_archive_dir,
-    resolve_plans_dir, resolve_plans_dir_with_source, spawn_if_configured, ArchiveSummary,
-    MetricsSnapshot, PlansDirSource, ReconcileSummary, PLAN_ADAPTER_DIR_ENV,
+    resolve_plans_dir, resolve_plans_dir_with_source, resolve_prompts_dir, spawn_if_configured,
+    ArchiveSummary, MetricsSnapshot, PlansDirSource, ReconcileSummary, PLAN_ADAPTER_DIR_ENV,
 };
