@@ -59,15 +59,61 @@ fn read_active_tenant_id(path: &Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Atomic rewrite: read → patch `active_tenant_id` → write to `.tmp` →
+/// Atomic rewrite: read → patch `active_tenant_id` → unique-temp write →
 /// rename. Other top-level fields (`device_id`, `hostname`, `name`) are
 /// preserved verbatim. Returns an error string fit for the frontend.
+///
+/// **FAILS CLOSED on a machine.json that has no device identity.** This used
+/// to fall back to an EMPTY `serde_json::Map` whenever the file was missing,
+/// unparseable, or not a JSON object — so a tenant switch wrote
+/// `{"active_tenant_id": …}` with no `device_id`. That file is worse than no
+/// file: the minter (`pair::ensure_device_initialized_at`) sees
+/// `path.exists()` and delegates to the preserving backfill, which finds no
+/// key to preserve, so the identity is permanently wedged; and the only
+/// documented recovery — `rm machine.json` + `device init` — MINTS A FRESH
+/// UUID, i.e. a brand-new `coord.devices` row for the same physical machine.
+/// Refusing to write is strictly better: the existing identity file (if any)
+/// is left intact and the operator gets guidance that does not re-mint.
+/// Plan `2026-08-06-device-identity-is-per-profile-not-per-machine` §0.3 H4.
 fn write_active_tenant_id(path: &Path, tenant_id: &str) -> Result<(), String> {
-    // Read existing JSON object (if any) so we preserve sibling fields.
+    // Read the existing JSON object so we preserve sibling fields — and
+    // REFUSE outright if there is no device identity to preserve.
     let mut obj = match read_machine_file(path) {
         Some(serde_json::Value::Object(map)) => map,
-        Some(_) | None => serde_json::Map::new(),
+        Some(_) => {
+            return Err(format!(
+                "tenant: refusing to write {} — it is not a JSON object, so it holds no \
+                 device_id to preserve. Inspect it by hand; do NOT `rm` it (that mints a \
+                 NEW device identity and a new coord.devices row).",
+                path.display()
+            ))
+        }
+        None => {
+            return Err(format!(
+                "tenant: refusing to write {} — it is missing or unreadable, so a write \
+                 here would produce a machine.json with no device_id and wedge this \
+                 machine's identity. Run `qontinui_profile device init` first (it re-uses \
+                 any existing device_id), then switch tenant again.",
+                path.display()
+            ))
+        }
     };
+    // `machine_id` is the pre-rename spelling every reader still aliases, so a
+    // legacy-shaped file counts as having an identity.
+    let has_identity = ["device_id", "machine_id"].iter().any(|k| {
+        obj.get(*k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    });
+    if !has_identity {
+        return Err(format!(
+            "tenant: refusing to write {} — it carries no device_id. Writing would \
+             permanently wedge this machine's identity (the minter skips an existing \
+             file). Restore the file or run `qontinui_profile device init`, then switch \
+             tenant again.",
+            path.display()
+        ));
+    }
     obj.insert(
         "active_tenant_id".to_string(),
         serde_json::Value::String(tenant_id.to_string()),
@@ -78,11 +124,10 @@ fn write_active_tenant_id(path: &Path, tenant_id: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("tenant: create ~/.qontinui dir failed: {e}"))?;
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &pretty)
-        .map_err(|e| format!("tenant: write machine.json.tmp failed: {e}"))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("tenant: rename machine.json.tmp failed: {e}"))?;
+    // Unique-temp atomic write. The fixed `machine.json.tmp` this used to
+    // share with the three other writers is raced by every runner instance.
+    qontinui_runner_lib::fs_atomic::atomic_write(path, &pretty)
+        .map_err(|e| format!("tenant: atomic write machine.json failed: {e}"))?;
     Ok(())
 }
 
@@ -180,18 +225,128 @@ mod tests {
     }
 
     #[test]
-    fn write_creates_missing_file() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("machine.json");
-        write_active_tenant_id(&path, "tenant-uuid").unwrap();
-        let got = read_active_tenant_id(&path).unwrap();
-        assert_eq!(got, "tenant-uuid");
-    }
-
-    #[test]
     fn read_missing_returns_none() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nope.json");
         assert!(read_active_tenant_id(&path).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Identity preservation + fail-closed — plan
+    // `2026-08-06-device-identity-is-per-profile-not-per-machine` Phase 2.
+    // ------------------------------------------------------------------
+
+    /// A tenant switch preserves `device_id`, `hostname` and `name` verbatim.
+    /// This is the invariant that keeps one machine to one `coord.devices`
+    /// row: coord UPSERTs `ON CONFLICT (device_id)`, so losing the id here
+    /// means the next `device init` mints a new one and a new row.
+    #[test]
+    fn write_preserves_device_id_hostname_and_name() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        std::fs::write(
+            &path,
+            br#"{"device_id":"c79a07d5-0000-4000-8000-000000000001","hostname":"spaceship","name":"primary","extra":7}"#,
+        )
+        .unwrap();
+
+        write_active_tenant_id(&path, "c231d9da-0000-4000-8000-000000000002").unwrap();
+
+        let v = read_machine_file(&path).unwrap();
+        assert_eq!(
+            v.get("device_id").and_then(|x| x.as_str()),
+            Some("c79a07d5-0000-4000-8000-000000000001"),
+            "device_id must survive a tenant switch"
+        );
+        assert_eq!(
+            v.get("hostname").and_then(|x| x.as_str()),
+            Some("spaceship")
+        );
+        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("primary"));
+        assert_eq!(v.get("extra").and_then(|x| x.as_i64()), Some(7));
+        assert_eq!(
+            read_active_tenant_id(&path).as_deref(),
+            Some("c231d9da-0000-4000-8000-000000000002")
+        );
+    }
+
+    /// FAIL CLOSED: a missing machine.json must NOT be created here. The old
+    /// empty-map fallback wrote a `device_id`-less file, which permanently
+    /// blocks the minter (`ensure_device_initialized_at` sees `path.exists()`
+    /// and delegates to the preserving backfill, which finds nothing to
+    /// preserve) — and the only documented recovery mints a fresh UUID, i.e.
+    /// a new `coord.devices` row for the same machine.
+    #[test]
+    fn write_refuses_when_machine_json_is_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        let err = write_active_tenant_id(&path, "tenant-uuid")
+            .expect_err("a missing machine.json must be refused");
+        assert!(err.contains("refusing to write"), "got: {err}");
+        assert!(
+            !path.exists(),
+            "the refusal must not leave a device_id-less machine.json behind"
+        );
+    }
+
+    /// FAIL CLOSED on an unparseable, non-object, or `device_id`-less file —
+    /// and leave it byte-identical for inspection.
+    #[test]
+    fn write_refuses_when_there_is_no_device_id_to_preserve() {
+        let dir = tempdir().unwrap();
+        for (label, contents) in [
+            ("corrupt", &b"{ not json"[..]),
+            ("not an object", &b"[1,2,3]"[..]),
+            ("no device_id", &br#"{"hostname":"spaceship"}"#[..]),
+            ("blank device_id", &br#"{"device_id":"   "}"#[..]),
+        ] {
+            let path = dir.path().join(format!("{}.json", label.replace(' ', "_")));
+            std::fs::write(&path, contents).unwrap();
+            let err = match write_active_tenant_id(&path, "tenant-uuid") {
+                Ok(()) => panic!("{label} must be refused, not written"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("refusing to write"),
+                "{label}: expected a refusal, got: {err}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                contents,
+                "{label}: the file must be left byte-identical for inspection"
+            );
+        }
+    }
+
+    /// A legacy `machine_id`-spelled file still HAS an identity, so a tenant
+    /// switch on it is allowed (every reader aliases the old spelling).
+    #[test]
+    fn write_accepts_the_legacy_machine_id_spelling() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        std::fs::write(&path, br#"{"machine_id":"legacy-id","hostname":"x"}"#).unwrap();
+        write_active_tenant_id(&path, "tenant-uuid").unwrap();
+        let v = read_machine_file(&path).unwrap();
+        assert_eq!(
+            v.get("machine_id").and_then(|x| x.as_str()),
+            Some("legacy-id")
+        );
+        assert_eq!(read_active_tenant_id(&path).as_deref(), Some("tenant-uuid"));
+    }
+
+    /// Defect 4: this writer must not use the single shared
+    /// `machine.json.tmp` path, which every runner instance races.
+    #[test]
+    fn write_does_not_use_the_shared_fixed_temp_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        std::fs::write(&path, br#"{"device_id":"abc","hostname":"x"}"#).unwrap();
+        let squatted = path.with_extension("json.tmp");
+        std::fs::create_dir(&squatted).unwrap();
+
+        write_active_tenant_id(&path, "tenant-uuid")
+            .expect("write must succeed despite the squatted legacy tmp path");
+        assert_eq!(read_active_tenant_id(&path).as_deref(), Some("tenant-uuid"));
+        assert!(squatted.is_dir(), "the squatted path must be untouched");
     }
 }

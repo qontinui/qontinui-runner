@@ -108,6 +108,11 @@ fn keychain_enabled() -> bool {
 pub struct AuthManager {
     secure_storage: SecureStorage,
     service_name: String,
+    /// The machine's canonical identity file (`~/.qontinui/machine.json`),
+    /// consulted by [`Self::get_device_id`] BEFORE the encrypted cache and
+    /// before any mint. `None` only when the home directory is unresolvable
+    /// (and, in tests, to exercise the no-machine.json fallback).
+    machine_file: Option<std::path::PathBuf>,
 }
 
 impl AuthManager {
@@ -121,6 +126,7 @@ impl AuthManager {
         Self {
             secure_storage,
             service_name: SERVICE_NAME.to_string(),
+            machine_file: crate::machine_identity::machine_file_path(),
         }
     }
 
@@ -137,11 +143,32 @@ impl AuthManager {
     /// `needs_refresh_when_no_token` / `test_token_storage` cross-test
     /// pollution). A per-test service name makes the keychain backup as isolated
     /// as the file store.
+    ///
+    /// `machine_file` is `None`, i.e. "this box has no `machine.json`" — tests
+    /// must never read (let alone write) the real `~/.qontinui/machine.json`.
+    /// Use [`Self::with_storage_and_machine_file`] to exercise the canonical
+    /// identity path against a tempdir.
     #[cfg(test)]
     pub fn with_storage(secure_storage: SecureStorage) -> Self {
         Self {
             secure_storage,
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
+            machine_file: None,
+        }
+    }
+
+    /// [`Self::with_storage`] with an explicit `machine.json` path, so the
+    /// canonical-identity branch of [`Self::get_device_id`] is testable
+    /// against a tempdir.
+    #[cfg(test)]
+    pub fn with_storage_and_machine_file(
+        secure_storage: SecureStorage,
+        machine_file: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            secure_storage,
+            service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
+            machine_file: Some(machine_file),
         }
     }
 
@@ -600,16 +627,60 @@ impl AuthManager {
         Ok(())
     }
 
-    /// Retrieves or generates a device ID.
+    /// Retrieves the machine's device ID.
     ///
-    /// If a device ID is already stored, it is returned. Otherwise, a new UUID v4
-    /// is generated, stored, and returned.
+    /// Resolution order — **`machine.json` is canonical and wins outright**:
+    ///
+    /// 1. `~/.qontinui/machine.json` — the machine's one durable identity,
+    ///    minted once at first launch and re-presented forever after.
+    /// 2. `auth_tokens.enc` (the encrypted store) — a **cache** of (1), and
+    ///    the answer when the machine has no `machine.json` at all.
+    /// 3. OS keychain — legacy, migrated into (2) on read.
+    /// 4. A fresh UUID v4, minted and stored.
+    ///
+    /// Step 1 is the fix for a real defect: this method used to start at step
+    /// 2 and never read `machine.json`, so the runner carried **two
+    /// independent device identities** that converged only after a successful
+    /// pair (`pair::persist_pairing` → `store_device_id_fresh`). The
+    /// secure-store id is shipped to the web backend by `commands/clipboard`,
+    /// `commands/workflow_events` and `commands/auth`, and the store's AES key
+    /// derives from hostname+username — so a rename or disk move made it
+    /// unreadable and step 4 minted *again*, producing another
+    /// `coord.devices` row for the same physical machine. Plan
+    /// `2026-08-06-device-identity-is-per-profile-not-per-machine` §0.1.
     ///
     /// # Errors
     ///
     /// Returns an error if storage operations fail.
     pub fn get_device_id(&self) -> Result<String> {
-        // Try file storage first
+        // 1. Canonical machine identity. Read-only; never mints, never writes
+        //    machine.json.
+        if let Some(path) = &self.machine_file {
+            match crate::machine_identity::read_device_id_at(path) {
+                Ok(id) => {
+                    // Keep the encrypted store as a CACHE of the canonical id
+                    // (best effort — a stale cache must never fail the read).
+                    if self.secure_storage.get_device_id().ok().as_deref() != Some(id.as_str()) {
+                        info!(
+                            "Device ID cache re-pointed at canonical machine.json identity: {}",
+                            id
+                        );
+                        if let Err(e) = self.store_device_id(&id) {
+                            warn!("Failed to cache canonical device ID: {}", e);
+                        }
+                    }
+                    return Ok(id);
+                }
+                Err(e) => {
+                    debug!(
+                        "machine.json unavailable ({}); falling back to the encrypted device-ID store",
+                        e
+                    );
+                }
+            }
+        }
+
+        // 2. Encrypted file storage (cache / no-machine.json fallback).
         if let Ok(id) = self.secure_storage.get_device_id() {
             info!("Retrieved existing device ID from secure storage: {}", id);
             return Ok(id);
@@ -1317,6 +1388,147 @@ mod tests {
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();
         AuthManager::with_storage(storage)
+    }
+
+    /// As [`create_test_auth_manager`], but with an explicit `machine.json`
+    /// path so the canonical-identity branch is exercised WITHOUT touching the
+    /// real `~/.qontinui/machine.json`.
+    fn create_test_auth_manager_with_machine_file(
+        test_name: &str,
+        machine_file: std::path::PathBuf,
+    ) -> AuthManager {
+        let temp_dir = env::temp_dir().join("qontinui_test_auth");
+        let storage_path = temp_dir.join(format!("{}.enc", test_name));
+        let _ = fs::remove_file(&storage_path);
+        let storage = SecureStorage::with_path(storage_path).unwrap();
+        AuthManager::with_storage_and_machine_file(storage, machine_file)
+    }
+
+    // ------------------------------------------------------------------
+    // ONE device identity per machine — plan
+    // `2026-08-06-device-identity-is-per-profile-not-per-machine` Phase 2(c).
+    //
+    // `get_device_id` used to keep its OWN id in `auth_tokens.enc` and never
+    // read `machine.json`, so the runner shipped two unreconciled identities
+    // to two different backends and minted a third whenever the encrypted
+    // store became unreadable (its AES key derives from hostname+username).
+    // ------------------------------------------------------------------
+
+    /// `machine.json` is consulted BEFORE minting: an empty encrypted store
+    /// plus a present `machine.json` must yield the machine.json id, not a
+    /// fresh UUID.
+    #[test]
+    fn device_id_reads_machine_json_before_minting() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine_file = dir.path().join("machine.json");
+        fs::write(
+            &machine_file,
+            br#"{"device_id":"c79a07d5-0000-4000-8000-00000000000a","hostname":"spaceship"}"#,
+        )
+        .unwrap();
+        let mgr = create_test_auth_manager_with_machine_file(
+            "device_id_reads_machine_json_before_minting",
+            machine_file,
+        );
+        assert_eq!(
+            mgr.get_device_id().unwrap(),
+            "c79a07d5-0000-4000-8000-00000000000a"
+        );
+    }
+
+    /// A DIVERGENT cached id in `auth_tokens.enc` must lose to `machine.json`
+    /// and be re-pointed at it — this is the exact "two identities" state the
+    /// old code produced before a successful pair converged them.
+    #[test]
+    fn machine_json_overrides_a_divergent_secure_storage_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine_file = dir.path().join("machine.json");
+        fs::write(
+            &machine_file,
+            br#"{"device_id":"c79a07d5-0000-4000-8000-00000000000b","hostname":"spaceship"}"#,
+        )
+        .unwrap();
+        let mgr = create_test_auth_manager_with_machine_file(
+            "machine_json_overrides_a_divergent_secure_storage_cache",
+            machine_file.clone(),
+        );
+        // Seed the cache with a DIFFERENT identity (the second-identity bug).
+        mgr.store_device_id("deadbeef-0000-4000-8000-00000000ffff")
+            .unwrap();
+
+        let id = mgr.get_device_id().unwrap();
+        assert_eq!(
+            id, "c79a07d5-0000-4000-8000-00000000000b",
+            "machine.json is canonical; the encrypted store is only a cache"
+        );
+        // The cache was re-pointed, so subsequent reads agree even offline.
+        assert_eq!(
+            mgr.secure_storage.get_device_id().unwrap(),
+            "c79a07d5-0000-4000-8000-00000000000b"
+        );
+        // And the canonical file was NOT rewritten by the read.
+        let raw = fs::read_to_string(&machine_file).unwrap();
+        assert!(raw.contains("c79a07d5-0000-4000-8000-00000000000b"));
+        assert!(!raw.contains("deadbeef"));
+    }
+
+    /// A legacy `machine_id`-spelled file is still the canonical identity.
+    #[test]
+    fn device_id_accepts_legacy_machine_id_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine_file = dir.path().join("machine.json");
+        fs::write(
+            &machine_file,
+            br#"{"machine_id":"c79a07d5-0000-4000-8000-00000000000c","hostname":"spaceship"}"#,
+        )
+        .unwrap();
+        let mgr = create_test_auth_manager_with_machine_file(
+            "device_id_accepts_legacy_machine_id_spelling",
+            machine_file,
+        );
+        assert_eq!(
+            mgr.get_device_id().unwrap(),
+            "c79a07d5-0000-4000-8000-00000000000c"
+        );
+    }
+
+    /// Genuinely absent `machine.json` → previous behaviour is preserved: mint
+    /// into the encrypted store, and stay stable across calls.
+    #[test]
+    fn device_id_falls_back_to_mint_when_machine_json_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine_file = dir.path().join("machine.json"); // never created
+        let mgr = create_test_auth_manager_with_machine_file(
+            "device_id_falls_back_to_mint_when_machine_json_absent",
+            machine_file.clone(),
+        );
+        let first = mgr.get_device_id().unwrap();
+        assert!(Uuid::parse_str(&first).is_ok());
+        assert_eq!(mgr.get_device_id().unwrap(), first, "must not re-mint");
+        assert!(
+            !machine_file.exists(),
+            "the auth path must never create machine.json"
+        );
+    }
+
+    /// An unreadable/corrupt `machine.json` must not wedge sign-in: fall back
+    /// to the cache rather than erroring, but never overwrite the file.
+    #[test]
+    fn corrupt_machine_json_falls_back_without_overwriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine_file = dir.path().join("machine.json");
+        fs::write(&machine_file, b"{ this is not json").unwrap();
+        let mgr = create_test_auth_manager_with_machine_file(
+            "corrupt_machine_json_falls_back_without_overwriting_it",
+            machine_file.clone(),
+        );
+        let id = mgr.get_device_id().unwrap();
+        assert!(Uuid::parse_str(&id).is_ok());
+        assert_eq!(
+            fs::read_to_string(&machine_file).unwrap(),
+            "{ this is not json",
+            "the corrupt file must be left exactly as found for inspection"
+        );
     }
 
     #[test]
