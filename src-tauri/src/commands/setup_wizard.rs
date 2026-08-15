@@ -1145,8 +1145,15 @@ pub async fn suggest_dev_services_for_setup(
 ) -> Result<Vec<Value>, String> {
     info!("Setup wizard: suggesting dev services");
 
-    let workspace = crate::dev_services::find_workspace_root()
-        .ok_or_else(|| "Could not find qontinui workspace root".to_string())?;
+    // Fail-CLOSED, via the crate's one workspace-root door. The deleted
+    // `dev_services::find_workspace_root` answered from the inherited cwd and a
+    // `.git`-less predicate; this is a first-run surface, so a wrong root means
+    // a broken install rather than a degraded background sweep (plan
+    // `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
+    // Phase 8). `require_workspace_root`'s error names the input at fault, every
+    // probe tried, and `$QONTINUI_ROOT` — it surfaces in the wizard where the old
+    // "Could not find qontinui workspace root" string did, but is actionable.
+    let workspace = crate::workspace_paths::require_workspace_root()?;
 
     let mut existing = settings::get_managed_process_configs();
 

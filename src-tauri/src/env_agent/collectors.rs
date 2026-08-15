@@ -601,44 +601,140 @@ fn cargo_toml_value(contents: &str, table: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Resolve the directory of THIS crate's `Cargo.toml`. Prefer the compile-time
-/// `CARGO_MANIFEST_DIR`; that points at `.../qontinui-runner/src-tauri` where
-/// the runner's Cargo.toml lives.
-fn runner_manifest_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+// ============================================================================
+// Workspace-root bridge (lib ↔ binary)
+// ============================================================================
+//
+// [`collect_versions`] reaches into a SIBLING repo checkout (`qontinui-web`)
+// for its python key, and into this repo's own checkout for the node keys, so
+// it needs the answer to "where do the Qontinui repo checkouts live on this
+// box?".
+//
+// The runner's ONE door to that question is `crate::workspace_paths` (plan
+// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 1) — but
+// that module lives in the BINARY crate and `env_agent` lives in the LIB crate,
+// so this module cannot call it. Same crate boundary the PG pool already
+// crosses; same bridge shape, deliberately (see `super::publish_pg_pool`): the
+// binary publishes the one door here at boot.
+//
+// What is published is the DOOR ITSELF — a function pointer — not the answer it
+// gave at boot. `workspace_paths`'s module header records that a process-global
+// memo of the root would be **wrong**, not merely unnecessary: `paths.workspace_root`
+// is operator-editable and fleet policy forbids restarting the runner to pick up
+// a correction, so a cached value would stay frozen for the process lifetime
+// while every other consumer self-corrected on its next cycle. Publishing the
+// function keeps this collector on exactly the same resolution the rest of the
+// crate sees, re-read per capture. It also removes the second failure a value
+// bridge had: with a value, a boot on which nothing resolved published NOTHING,
+// permanently, so an operator who then set the setting would never see the
+// sibling-tree keys appear.
+//
+// Until published, resolution falls back to the SHARED resolver in
+// `qontinui_types::paths` that the one door itself wraps, minus the single rung
+// the lib crate provably cannot read (the runner's `paths.workspace_root`
+// setting, which lives behind the bin-crate settings facade). That covers the
+// standalone `qontinui_profile env capture` CLI, which has no settings store of
+// its own — exactly the reason `publish_pg_pool_from_url` exists next door. An
+// unresolved root simply omits the repo-tree keys, which is this section's
+// stated contract: missing inputs → key absent, never an error.
+
+/// This repo's checkout directory name. Mirrors
+/// `workspace_paths::RUNNER_REPO_DIR`; used both for the fallback anchor walk
+/// (whose predicate looks for `<candidate>/qontinui-runner/.git`) and for the
+/// `node_*` keys' `<root>/qontinui-runner/package.json` anchor.
+const RUNNER_REPO_DIR: &str = "qontinui-runner";
+
+/// The sibling checkout the python constraint key is read from.
+const WEB_REPO_DIR: &str = "qontinui-web";
+
+/// The bin crate's workspace-root door, published as a FUNCTION so it is
+/// re-evaluated on every capture. See the section header for why a published
+/// value would be wrong.
+pub type WorkspaceRootFn = fn() -> Option<std::path::PathBuf>;
+
+static WORKSPACE_ROOT_DOOR: std::sync::OnceLock<WorkspaceRootFn> = std::sync::OnceLock::new();
+
+/// Publish the runner's one workspace-root door
+/// (`crate::workspace_paths::workspace_root`) so [`collect_versions`] can read
+/// the repo checkouts. Called unconditionally by the binary at boot, next to
+/// [`super::publish_pg_pool`]. Idempotent — a second call is ignored.
+///
+/// Takes the door, not its answer: the door re-reads the operator-editable
+/// `paths.workspace_root` setting each call, so a correction made while the
+/// runner is up is picked up on the next capture rather than at the next
+/// restart — which fleet policy forbids anyway. Publishing unconditionally also
+/// means a boot on which nothing resolves does not permanently silence the
+/// repo-tree keys.
+pub fn publish_workspace_root(door: WorkspaceRootFn) {
+    let _ = WORKSPACE_ROOT_DOOR.set(door);
 }
 
-/// Collect the `versions` section: rust/tauri from this crate's Cargo.toml,
-/// node deps from the nearest package.json, python from the web-backend
-/// pyproject.toml, plus bounded `--version` shells where the tools resolve.
-/// Missing inputs → key absent, never an error.
-pub fn collect_versions() -> Section {
-    let mut section = Section::new();
-
-    // ---- Cargo.toml (this crate) ----
-    let manifest_dir = runner_manifest_dir();
-    let cargo_toml = manifest_dir.join("Cargo.toml");
-    if let Ok(contents) = std::fs::read_to_string(&cargo_toml) {
-        if let Some(v) = cargo_toml_value(&contents, "package", "version") {
-            put(&mut section, "runner_crate_version", v);
-        }
-        // tauri dependency line: `tauri = { version = "2.5", ... }` — pull the
-        // version substring out of the dependency value.
-        if let Some(tauri_ver) = dependency_version(&contents, "tauri") {
-            put(&mut section, "tauri", tauri_ver);
-        }
+/// Where the Qontinui repo checkouts live — the published door's answer when
+/// the binary supplied one, else the shared resolver's answer with the settings
+/// rung unavailable. See the section header for why there are two arms rather
+/// than one.
+fn workspace_root() -> Option<std::path::PathBuf> {
+    if let Some(&door) = WORKSPACE_ROOT_DOOR.get() {
+        return door();
     }
+    // Standalone `qontinui_profile env capture`: no bin crate booted, so no
+    // door. This arm provably CANNOT read `paths.workspace_root` (the setting
+    // lives behind the bin-crate settings facade), which is why it passes
+    // `configured: None` rather than pretending to have looked.
+    let exe = std::env::current_exe().ok();
+    qontinui_types::paths::qontinui_workspace_root(
+        None,
+        exe.as_deref()
+            .map(|e| qontinui_types::paths::WorkspaceAnchor::new(e, RUNNER_REPO_DIR)),
+    )
+    .into_root()
+}
 
-    // ---- nearest package.json (walk up from the qontinui-web frontend if
-    // present, else from the runner dir) ----
-    if let Some(pkg) = nearest_package_json(&manifest_dir) {
+/// The two versions that are properties of THIS BINARY, baked at compile time.
+///
+/// Both used to be read at RUNTIME out of
+/// `env!("CARGO_MANIFEST_DIR")/Cargo.toml` — the manifest of the source tree the
+/// binary was BUILT from, on the BUILD host, at a path that need not exist (or,
+/// worse, may exist with *different* contents) on the box actually running the
+/// binary. That is the hardcoded machine path wearing a macro's clothes, exactly
+/// as this module's own `resolve_probe_scope` doc already says; it was invisible
+/// to any grep for a `D:` literal. Plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
+/// Phase 8.
+///
+/// - `runner_crate_version` ← `CARGO_PKG_VERSION`. A genuinely correct bake: it
+///   is a property of the binary, not of the box.
+/// - `tauri` ← [`tauri::VERSION`], the version of the tauri crate this binary is
+///   actually LINKED against. Strictly better than the old value, which was the
+///   *declared range* (`"2.5"`) parsed out of the build host's manifest — a
+///   constraint, not a fact about the running binary.
+///
+/// Neither key can go absent, so both are `put` unconditionally.
+fn put_binary_versions(section: &mut Section) {
+    put(section, "runner_crate_version", env!("CARGO_PKG_VERSION"));
+    put(section, "tauri", tauri::VERSION);
+}
+
+/// The keys read out of repo checkouts under `workspace_root`: the `node_*` set
+/// from this repo's own `package.json` ([`workspace_package_json`]) and
+/// `python_constraint` from the sibling `qontinui-web` backend
+/// ([`web_backend_pyproject`]).
+///
+/// The walk origin used to be `env!("CARGO_MANIFEST_DIR")` — see
+/// [`put_binary_versions`] for why that was wrong. It now comes from the
+/// workspace-root resolution, injected here so the lookup rules are testable
+/// against a synthetic tree with no environment read (plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
+/// Phase 8).
+fn put_sibling_tree_versions(section: &mut Section, workspace_root: &Path) {
+    if let Some(pkg) = workspace_package_json(workspace_root) {
         if let Ok(contents) = std::fs::read_to_string(&pkg) {
             if let Ok(json) = serde_json::from_str::<Value>(&contents) {
                 if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
-                    put(&mut section, "node_package_name", name.to_string());
+                    put(section, "node_package_name", name.to_string());
                 }
                 if let Some(ver) = json.get("version").and_then(|v| v.as_str()) {
-                    put(&mut section, "node_package_version", ver.to_string());
+                    put(section, "node_package_version", ver.to_string());
                 }
                 // A couple of high-signal deps if present (names + declared
                 // ranges — these are public version constraints, not secrets).
@@ -649,21 +745,36 @@ pub fn collect_versions() -> Section {
                         .or_else(|| json.get("devDependencies").and_then(|d| d.get(dep)))
                         .and_then(|v| v.as_str())
                     {
-                        put(&mut section, &format!("node_dep_{dep}"), range.to_string());
+                        put(section, &format!("node_dep_{dep}"), range.to_string());
                     }
                 }
             }
         }
     }
 
-    // ---- web-backend pyproject.toml ----
-    if let Some(pyproject) = web_backend_pyproject(&manifest_dir) {
+    if let Some(pyproject) = web_backend_pyproject(workspace_root) {
         if let Ok(contents) = std::fs::read_to_string(&pyproject) {
             // `[tool.poetry.dependencies]` carries `python = "^3.12"`.
             if let Some(py) = cargo_toml_value(&contents, "tool.poetry.dependencies", "python") {
-                put(&mut section, "python_constraint", py);
+                put(section, "python_constraint", py);
             }
         }
+    }
+}
+
+/// Collect the `versions` section: this binary's own crate + tauri versions,
+/// node deps from this repo's own `package.json` under the workspace root,
+/// python from the web-backend pyproject.toml, plus bounded `--version` shells
+/// where the tools resolve. Missing inputs → key absent, never an error.
+pub fn collect_versions() -> Section {
+    let mut section = Section::new();
+
+    put_binary_versions(&mut section);
+
+    // An unresolved workspace root omits the sibling-tree keys rather than
+    // guessing at a layout — see the workspace-root bridge above.
+    if let Some(root) = workspace_root() {
+        put_sibling_tree_versions(&mut section, &root);
     }
 
     // ---- bounded `--version` shells (optional, 3s budget each) ----
@@ -697,86 +808,43 @@ pub fn collect_versions() -> Section {
     section
 }
 
-/// Extract a `version = "x"` substring from a Cargo dependency line of the form
-/// `name = { version = "x", ... }` or `name = "x"`. Best-effort.
-fn dependency_version(contents: &str, dep: &str) -> Option<String> {
-    let mut in_deps = false;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_deps = trimmed == "[dependencies]";
-            continue;
-        }
-        if in_deps && trimmed.starts_with(dep) {
-            // Match `dep =` (avoid prefix collisions like `tauri-build`).
-            let after = trimmed[dep.len()..].trim_start();
-            if !after.starts_with('=') {
-                continue;
-            }
-            // Inline-table form: find `version = "..."`.
-            if let Some(idx) = trimmed.find("version") {
-                let tail = &trimmed[idx..];
-                if let Some(eq) = tail.find('=') {
-                    let v = tail[eq + 1..].trim();
-                    let v = v.trim_start_matches('"');
-                    if let Some(end) = v.find('"') {
-                        return Some(v[..end].to_string());
-                    }
-                }
-            }
-            // Bare-string form: `dep = "x"`.
-            let v = after.trim_start_matches('=').trim().trim_matches('"');
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
+/// The `package.json` this capture reports: **this repo's own**, at
+/// `<workspace-root>/qontinui-runner/package.json`.
+///
+/// It resolves the runner's node package because that is what the `node_*` keys
+/// have always described. The old form's doc claimed it preferred the
+/// `qontinui-web` frontend manifest, but that branch was **unreachable**: the
+/// walk started at `env!("CARGO_MANIFEST_DIR")` (`<root>/qontinui-runner/src-tauri`)
+/// and probed `dir/package.json` FIRST on each iteration, so it hit
+/// `<root>/qontinui-runner/package.json` on the second step and returned. Reading
+/// the frontend manifest instead would silently retarget five keys
+/// (`node_package_name`, `node_package_version`, `node_dep_*`) at a sibling repo,
+/// leaving `node_package_name` describing a different package from the
+/// `runner_crate_version` sitting beside it in the same section. Both must
+/// describe THIS binary.
+///
+/// Anchored AT the resolved workspace root with **no upward walk**. The old form
+/// walked up to 6 ancestors only because its origin was deep inside the
+/// checkout; starting at the root, a climb can only leave the workspace and
+/// report a stranger's `package.json` as this machine's — the same loose-anchor
+/// class the plan's resolver predicate exists to kill (plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
+/// Phase 8).
+fn workspace_package_json(workspace_root: &Path) -> Option<std::path::PathBuf> {
+    let own = workspace_root.join(RUNNER_REPO_DIR).join("package.json");
+    own.is_file().then_some(own)
 }
 
-/// Walk up from `start` looking for a `package.json`. Bounded to 6 ancestors to
-/// avoid scanning the whole filesystem. Returns the first hit.
-fn nearest_package_json(start: &std::path::Path) -> Option<std::path::PathBuf> {
-    // Prefer the qontinui-web frontend if reachable from a known root layout.
-    // Otherwise walk up from the runner manifest dir.
-    let mut cur = Some(start);
-    for _ in 0..6 {
-        let dir = cur?;
-        let candidate = dir.join("package.json");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        // Try a sibling qontinui-web/frontend/package.json under the parent
-        // (covers the monorepo-root layout).
-        let web_pkg = dir
-            .join("qontinui-web")
-            .join("frontend")
-            .join("package.json");
-        if web_pkg.is_file() {
-            return Some(web_pkg);
-        }
-        cur = dir.parent();
-    }
-    None
-}
-
-/// Locate the web-backend `pyproject.toml` by walking up to a monorepo root and
-/// probing `qontinui-web/backend/pyproject.toml`. Returns `None` when not
-/// reachable (e.g. a production machine without the source checkout).
-fn web_backend_pyproject(start: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut cur = Some(start);
-    for _ in 0..6 {
-        let dir = cur?;
-        let candidate = dir
-            .join("qontinui-web")
-            .join("backend")
-            .join("pyproject.toml");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        cur = dir.parent();
-    }
-    None
+/// The web-backend `pyproject.toml` under the resolved workspace root. `None`
+/// when not present (e.g. a production machine without the source checkout) —
+/// the key is then simply absent. Anchored, not walked; see
+/// [`workspace_package_json`].
+fn web_backend_pyproject(workspace_root: &Path) -> Option<std::path::PathBuf> {
+    let candidate = workspace_root
+        .join(WEB_REPO_DIR)
+        .join("backend")
+        .join("pyproject.toml");
+    candidate.is_file().then_some(candidate)
 }
 
 /// Allowlisted env-var name prefixes. We keep ONLY names matching one of these;
@@ -1088,16 +1156,190 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dependency_version_inline_table() {
-        let toml = "[dependencies]\ntauri = { version = \"2.5\", features = [] }\n";
-        assert_eq!(dependency_version(toml, "tauri").as_deref(), Some("2.5"));
+    // -----------------------------------------------------------------
+    // `versions` — the build-host manifest read is gone (plan
+    // `2026-08-04-remove-hardcoded-machine-paths-from-product-code`,
+    // slice 5 Phase 8).
+    // -----------------------------------------------------------------
+
+    /// A synthetic workspace root holding this repo's checkout and a
+    /// `qontinui-web` sibling tree.
+    ///
+    /// Never the real machine layout, and pid/counter-scoped because this fleet
+    /// runs `cargo test` from several worktrees at once. Cleanup is a `Drop`
+    /// guard so a failing assertion does not leak the tree.
+    struct WorkspaceFixture {
+        root: std::path::PathBuf,
     }
 
+    impl Drop for WorkspaceFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn workspace_fixture() -> WorkspaceFixture {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "qontinui_env_agent_versions_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        WorkspaceFixture { root }
+    }
+
+    impl WorkspaceFixture {
+        /// This repo's own checkout, carrying the `package.json` the `node_*`
+        /// keys describe.
+        fn with_runner_tree(self) -> Self {
+            let runner = self.root.join(RUNNER_REPO_DIR);
+            std::fs::create_dir_all(&runner).unwrap();
+            std::fs::write(
+                runner.join("package.json"),
+                r#"{"name":"synthetic-runner","version":"9.9.9",
+                    "dependencies":{"next":"^15.0.0"},
+                    "devDependencies":{"typescript":"^5.4.0"}}"#,
+            )
+            .unwrap();
+            self
+        }
+
+        /// The `qontinui-web` sibling, carrying the backend pyproject the
+        /// `python_constraint` key is read from — and a frontend `package.json`
+        /// that must NOT be picked up for the `node_*` keys.
+        fn with_web_tree(self) -> Self {
+            let frontend = self.root.join(WEB_REPO_DIR).join("frontend");
+            let backend = self.root.join(WEB_REPO_DIR).join("backend");
+            std::fs::create_dir_all(&frontend).unwrap();
+            std::fs::create_dir_all(&backend).unwrap();
+            std::fs::write(
+                frontend.join("package.json"),
+                r#"{"name":"synthetic-frontend","version":"0.0.1",
+                    "dependencies":{"next":"^99.0.0"}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                backend.join("pyproject.toml"),
+                "[tool.poetry.dependencies]\npython = \"^3.12\"\n",
+            )
+            .unwrap();
+            self
+        }
+    }
+
+    /// `runner_crate_version` and `tauri` are properties of the BINARY, baked at
+    /// compile time. They used to be parsed at runtime out of the build host's
+    /// `Cargo.toml` — a path that need not exist on the box running the binary.
+    /// Neither key may go absent, and neither may depend on any file.
     #[test]
-    fn dependency_version_bare_string() {
-        let toml = "[dependencies]\nserde_json = \"1\"\n";
-        assert_eq!(dependency_version(toml, "serde_json").as_deref(), Some("1"));
+    fn binary_versions_are_baked_and_never_read_from_a_manifest_on_disk() {
+        let mut section = Section::new();
+        put_binary_versions(&mut section);
+
+        let crate_version = section
+            .get("runner_crate_version")
+            .and_then(|v| v.as_str())
+            .expect("runner_crate_version must always be present");
+        assert!(
+            crate_version.contains('.'),
+            "expected a semver-ish crate version, got {crate_version:?}"
+        );
+
+        let tauri_version = section
+            .get("tauri")
+            .and_then(|v| v.as_str())
+            .expect("tauri must always be present");
+        assert!(
+            tauri_version.contains('.'),
+            "expected the LINKED tauri version, got {tauri_version:?}"
+        );
+        // The old value was the declared RANGE out of the build host's manifest
+        // (`"2.5"` — two components). The linked crate always reports a concrete
+        // major.minor.patch.
+        assert!(
+            tauri_version.split('.').count() >= 3,
+            "must be the linked crate's version, not a declared range: {tauri_version:?}"
+        );
+    }
+
+    /// The repo-tree keys come from the INJECTED workspace root, never from
+    /// the tree the binary was built in.
+    #[test]
+    fn sibling_tree_versions_read_the_injected_workspace_root() {
+        let f = workspace_fixture().with_runner_tree().with_web_tree();
+        let mut section = Section::new();
+        put_sibling_tree_versions(&mut section, &f.root);
+
+        assert_eq!(
+            section.get("node_package_name").and_then(|v| v.as_str()),
+            Some("synthetic-runner")
+        );
+        assert_eq!(
+            section.get("node_package_version").and_then(|v| v.as_str()),
+            Some("9.9.9")
+        );
+        assert_eq!(
+            section.get("node_dep_next").and_then(|v| v.as_str()),
+            Some("^15.0.0")
+        );
+        assert_eq!(
+            section.get("node_dep_typescript").and_then(|v| v.as_str()),
+            Some("^5.4.0"),
+            "devDependencies are a fallback source for the high-signal deps"
+        );
+        assert_eq!(
+            section.get("python_constraint").and_then(|v| v.as_str()),
+            Some("^3.12")
+        );
+    }
+
+    /// A machine with no source checkout under the root omits every
+    /// sibling-tree key — the section's contract is "missing inputs → key
+    /// absent, never an error".
+    ///
+    /// This also pins the no-upward-walk property: the fixture root lives inside
+    /// the system temp dir, so a walk would happily report some ancestor's
+    /// `package.json` as this machine's.
+    #[test]
+    fn sibling_tree_versions_omit_every_key_when_the_root_has_no_checkouts() {
+        let f = workspace_fixture();
+        let mut section = Section::new();
+        put_sibling_tree_versions(&mut section, &f.root);
+        assert!(
+            section.is_empty(),
+            "an empty workspace root must contribute nothing, got {section:?}"
+        );
+    }
+
+    /// The `node_*` keys describe THIS binary's node package, so the manifest is
+    /// this repo's own — never the `qontinui-web` frontend's (whose values would
+    /// leave `node_package_name` naming a different package from the
+    /// `runner_crate_version` beside it) and never a `package.json` sitting at
+    /// the workspace root. Neither probe ever leaves the root.
+    #[test]
+    fn workspace_package_json_is_this_repos_own_and_never_walks_up() {
+        let f = workspace_fixture().with_runner_tree().with_web_tree();
+        std::fs::write(f.root.join("package.json"), r#"{"name":"root-level"}"#).unwrap();
+        assert_eq!(
+            workspace_package_json(&f.root),
+            Some(f.root.join(RUNNER_REPO_DIR).join("package.json"))
+        );
+
+        // A workspace with the web sibling but NO runner checkout yields no
+        // manifest at all — the frontend's is never a substitute.
+        let web_only = workspace_fixture().with_web_tree();
+        assert_eq!(workspace_package_json(&web_only.root), None);
+
+        let bare = workspace_fixture();
+        assert_eq!(
+            workspace_package_json(&bare.root),
+            None,
+            "no manifest under the root means no key — never an ancestor's"
+        );
+        assert_eq!(web_backend_pyproject(&bare.root), None);
     }
 
     /// Secret-safety: a secret-bearing env var contributes only its NAME, never

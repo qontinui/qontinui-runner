@@ -33,23 +33,51 @@ pub enum HelperAvailability {
     Unavailable(String),
 }
 
-/// Resolve the helper script path: env override, then the dev path under
-/// `CARGO_MANIFEST_DIR/resources/code-semantics/ts-language-service.mjs`.
-pub fn resolve_helper_script() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("QONTINUI_CODE_SEM_HELPER") {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return Some(pb);
-        }
-    }
-    let dev = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("resources")
+/// The helper script's location relative to the crate root — the same relative
+/// path in the shipped bundle (`bundle.resources` preserves it) and in a
+/// checkout, so one constant serves both rungs.
+fn helper_script_relpath() -> PathBuf {
+    Path::new("resources")
         .join("code-semantics")
-        .join("ts-language-service.mjs");
-    if dev.exists() {
-        return Some(dev);
-    }
-    None
+        .join("ts-language-service.mjs")
+}
+
+/// Resolve the helper script path.
+///
+/// Three rungs, each existence-checked, first hit wins:
+///
+/// 1. `$QONTINUI_CODE_SEM_HELPER` — the operator's explicit override;
+/// 2. the **bundled** copy, resolved through Tauri's `BaseDirectory::Resource`;
+/// 3. the dev-checkout copy under the resolved workspace root
+///    (`<root>/qontinui-runner/src-tauri/resources/...`), which is what keeps a
+///    `cargo run` / `cargo test` session working with no bundle present.
+///
+/// A total miss returns `None` and the sidecar degrades to the code_graph
+/// fallback / `engine_unavailable` — unchanged. Fail-soft is deliberate: the
+/// Node language service is an accelerator, not a correctness dependency.
+///
+/// Rungs 2 and 3 replace a single `env!("CARGO_MANIFEST_DIR")/resources/...`
+/// join (plan `2026-08-04-remove-hardcoded-machine-paths-from-product-code`,
+/// slice 5 Phase 6). `CARGO_MANIFEST_DIR` is a **compile-time** constant: it
+/// named the source tree the binary was BUILT from, so it baked the build
+/// host's absolute layout into a shipped open-source binary and pointed at a
+/// directory that exists on no other machine. Note the swap only works because
+/// the same phase added `resources/code-semantics/**/*` to `bundle.resources` in
+/// `tauri.conf.json` — before that the bundle shipped no `resources/` at all,
+/// so rung 2 would have named a path present on **no** host.
+pub fn resolve_helper_script() -> Option<PathBuf> {
+    let relative = helper_script_relpath();
+    let env_override = std::env::var("QONTINUI_CODE_SEM_HELPER")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from);
+    let bundled = crate::bundled_resources::resolve(&relative);
+    let dev = crate::bundled_resources::dev_checkout(&relative);
+    crate::bundled_resources::first_existing([
+        env_override.as_deref(),
+        bundled.as_deref(),
+        dev.as_deref(),
+    ])
 }
 
 /// Locate a `node` binary. Honors `QONTINUI_NODE_PATH`, else `node` on PATH.
@@ -183,10 +211,25 @@ impl NodeBridge {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Run with cwd at the frontend root (two levels above src-tauri) so the
-        // helper's frontend-node_modules resolution works in dev.
-        if let Some(frontend_root) = self.script.ancestors().nth(3) {
-            cmd.current_dir(frontend_root);
+        // Run with cwd at the script's THIRD ancestor. From
+        // `<X>/resources/code-semantics/ts-language-service.mjs` that is `<X>`,
+        // which in a dev checkout is **`src-tauri`** — not the repo root. The
+        // index is deliberate, not off by one: Node resolves `node_modules` by
+        // walking UP from the cwd, so starting at `src-tauri` finds the repo
+        // root's `node_modules/typescript` on the next step. Do not "fix" this
+        // to `nth(4)`; that would change which tree the helper resolves from.
+        //
+        // **Existence-checked** (slice 5 Phase 6). Until this phase the script
+        // only ever resolved to the dev-checkout path, where that ancestor
+        // always existed. Now it can also resolve into Tauri's unpacked resource
+        // directory, whose third ancestor is not guaranteed to be a directory —
+        // and `current_dir` on a non-existent path makes the SPAWN fail rather
+        // than degrade. Skipping the `current_dir` instead lets the helper start
+        // and fall through its own documented resolution order
+        // (`$QONTINUI_TS_PATH`, then the global require), which ends in an
+        // actionable message rather than "spawn failed".
+        if let Some(src_tauri_dir) = self.script.ancestors().nth(3).filter(|p| p.is_dir()) {
+            cmd.current_dir(src_tauri_dir);
         }
 
         let mut child = cmd
@@ -424,5 +467,124 @@ impl NodeBridge {
             let _ = child.start_kill();
         }
         inner.initialized = false;
+    }
+}
+
+#[cfg(test)]
+mod helper_script_tests {
+    use super::*;
+    // The existence rule itself is owned and tested by `crate::bundled_resources`;
+    // what these tests pin is THIS site's rung ORDER (override → bundle → dev).
+    use crate::bundled_resources::first_existing;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    /// A throwaway tree to hang candidate paths off. pid/counter-scoped because
+    /// several worktrees on this box run `cargo test` at once, and torn down by
+    /// a `Drop` guard so a failing assertion does not leak it. Mirrors the
+    /// `Fixture` in `crate::workspace_paths`.
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl Fixture {
+        /// Create `<root>/<name>` as a file and return its path.
+        fn file(&self, name: &str) -> PathBuf {
+            let p = self.root.join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"// fixture").unwrap();
+            p
+        }
+
+        /// A path under the fixture that is deliberately never created.
+        fn absent(&self, name: &str) -> PathBuf {
+            self.root.join(name)
+        }
+    }
+
+    fn fixture() -> Fixture {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "qontinui_code_sem_helper_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Fixture { root }
+    }
+
+    /// The operator's `$QONTINUI_CODE_SEM_HELPER` override outranks both the
+    /// bundled resource and the dev checkout. Unchanged from before Phase 6 —
+    /// asserted so the rung order cannot silently drift.
+    #[test]
+    fn the_env_override_wins_over_the_bundle_and_the_dev_checkout() {
+        let f = fixture();
+        let over = f.file("override.mjs");
+        let bundled = f.file("bundled.mjs");
+        let dev = f.file("dev.mjs");
+
+        let got = first_existing([Some(&over), Some(&bundled), Some(&dev)]);
+
+        assert_eq!(got.as_deref(), Some(over.as_path()));
+    }
+
+    /// An override pointing at a path that does not exist is skipped rather
+    /// than short-circuiting to `None` — a stale env var must not disable a
+    /// perfectly good bundled helper.
+    #[test]
+    fn a_nonexistent_override_falls_through_to_the_bundle() {
+        let f = fixture();
+        let over = f.absent("no-such-override.mjs");
+        let bundled = f.file("bundled.mjs");
+
+        let got = first_existing([Some(&over), Some(&bundled), None]);
+
+        assert_eq!(got.as_deref(), Some(bundled.as_path()));
+    }
+
+    /// The dev rung is what a `cargo run` / `cargo test` session hits: no
+    /// `AppHandle` is set, so the bundled candidate is `None`, and resolution
+    /// must continue past it instead of stopping.
+    #[test]
+    fn an_absent_app_handle_falls_through_to_the_dev_checkout() {
+        let f = fixture();
+        let dev = f.file("src-tauri/resources/code-semantics/ts-language-service.mjs");
+
+        let got = first_existing([None, None, Some(&dev)]);
+
+        assert_eq!(got.as_deref(), Some(dev.as_path()));
+    }
+
+    /// Nothing resolving is `None`, never a fabricated path — the sidecar then
+    /// degrades to the code_graph fallback / `engine_unavailable`.
+    #[test]
+    fn nothing_resolving_yields_none_rather_than_a_fabricated_path() {
+        let f = fixture();
+        let missing = f.absent("gone.mjs");
+
+        assert_eq!(first_existing([Some(&missing), None, None]), None);
+
+        let all_absent: [Option<&Path>; 3] = [None, None, None];
+        assert_eq!(first_existing(all_absent), None);
+    }
+
+    /// The bundle rung and the dev rung must agree on the relative path, or one
+    /// of them silently resolves to nothing. `bundle.resources` preserves a
+    /// resource's path relative to the crate root, so this literal is also what
+    /// `resources/code-semantics/**/*` produces inside the installer.
+    #[test]
+    fn the_relative_path_matches_the_bundled_layout() {
+        assert_eq!(
+            helper_script_relpath(),
+            Path::new("resources")
+                .join("code-semantics")
+                .join("ts-language-service.mjs")
+        );
     }
 }

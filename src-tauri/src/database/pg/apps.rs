@@ -14,7 +14,7 @@
 //! returned to callers, because the calling code path is a hot
 //! `/apps/<app_id>/spec/*` read and a flaky `UPDATE` must not poison it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tracing::{debug, info, warn};
 
@@ -333,64 +333,44 @@ impl PgDb {
 /// Idempotent: an `AlreadyRegistered` error is swallowed at debug level so
 /// the call is safe to invoke on every boot.
 ///
-/// Paths are resolved at compile time via `CARGO_MANIFEST_DIR` (the runner's
-/// `src-tauri/` dir), then walked up to the qontinui-root layout. The
-/// `qontinui-web` and `qontinui-supervisor` siblings are registered ONLY when
-/// their `frontend/` directories actually exist on disk — a partial checkout
-/// is not an error.
+/// Paths come from the workspace root resolved by
+/// [`crate::workspace_paths::workspace_root`]. They used to be resolved at
+/// **compile time** from `CARGO_MANIFEST_DIR` and walked up two levels — which
+/// baked the *build* machine's sibling-repo layout into the shipped binary, the
+/// exact thing the "no-op unless `QONTINUI_DEV_BOOTSTRAP=1`" note above says we
+/// do not want registered (plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
+/// Phase 7 — class 2).
+///
+/// The `qontinui-web` and `qontinui-supervisor` siblings are registered ONLY
+/// when their `frontend/` directories actually exist on disk — a partial
+/// checkout is not an error.
 pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
     if std::env::var("QONTINUI_DEV_BOOTSTRAP").unwrap_or_default() != "1" {
         return Ok(());
     }
 
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    // <manifest_dir> = .../qontinui-runner/src-tauri
-    // runner_root    = .../qontinui-runner
-    let runner_root = PathBuf::from(manifest_dir)
-        .join("..")
+    // Opt-in dev convenience, so an unresolved root is a skip, not an error: a
+    // developer who set the flag on a machine with no discoverable workspace
+    // gets a line saying why, and boot continues.
+    let Some(qontinui_root) = crate::workspace_paths::workspace_root() else {
+        info!(
+            "bootstrap: QONTINUI_DEV_BOOTSTRAP=1 but no Qontinui workspace root \
+             resolved, so no dev apps were registered. Set $QONTINUI_ROOT (or the \
+             `paths.workspace_root` setting) to the directory holding the repo \
+             checkouts."
+        );
+        return Ok(());
+    };
+
+    let runner_dir = qontinui_root.join("qontinui-runner");
+    let runner_root = runner_dir
         .canonicalize()
         .map_err(|_| AppError::InvalidRepoRoot {
-            repo_root: manifest_dir.into(),
+            repo_root: runner_dir.to_string_lossy().into_owned(),
         })?;
 
-    let qontinui_root = runner_root.join("..");
-    let web_root = qontinui_root
-        .join("qontinui-web")
-        .join("frontend")
-        .canonicalize()
-        .ok();
-    let supervisor_root = qontinui_root
-        .join("qontinui-supervisor")
-        .join("frontend")
-        .canonicalize()
-        .ok();
-
-    let mut registrations = vec![RegisterAppRequest::new(
-        "qontinui-runner",
-        runner_root.to_string_lossy(),
-        "http://localhost:9876",
-        "Qontinui Runner (self)",
-    )];
-
-    if let Some(root) = web_root {
-        registrations.push(RegisterAppRequest::new(
-            "qontinui-web",
-            root.to_string_lossy(),
-            "http://localhost:3001",
-            "Qontinui Web (Next.js)",
-        ));
-    }
-
-    if let Some(root) = supervisor_root {
-        registrations.push(RegisterAppRequest::new(
-            "qontinui-supervisor",
-            root.to_string_lossy(),
-            "http://localhost:9875",
-            "Qontinui Supervisor (dashboard)",
-        ));
-    }
-
-    for req in registrations {
+    for req in dev_app_registrations(&qontinui_root, &runner_root) {
         match pg.insert_app(&req).await {
             Ok(_) => {
                 info!(app_id = %req.app_id, repo_root = %req.repo_root, "bootstrap: registered app")
@@ -402,6 +382,56 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+/// The sibling apps registered alongside the runner itself, as
+/// `(app_id + directory name, UI Bridge URL, display name)`. Each is registered
+/// only when `<workspace-root>/<dir>/frontend/` exists.
+const DEV_SIBLING_APPS: [(&str, &str, &str); 2] = [
+    (
+        "qontinui-web",
+        "http://localhost:3001",
+        "Qontinui Web (Next.js)",
+    ),
+    (
+        "qontinui-supervisor",
+        "http://localhost:9875",
+        "Qontinui Supervisor (dashboard)",
+    ),
+];
+
+/// Pure core of [`bootstrap_dev_apps`]'s path layout: which apps get registered
+/// for a given workspace root and an already-canonicalized runner checkout.
+///
+/// The workspace root is injected rather than resolved here, so the layout rule
+/// (`<workspace-root>/<app>/frontend`, and "absent sibling ⇒ omitted, not an
+/// error") is unit-testable against a synthetic tree instead of the operator's
+/// own sibling-repo layout — which is what the `CARGO_MANIFEST_DIR` version
+/// baked in. Same wrapper/core split as
+/// `agent_worktree::canonical_paths::default_canonical_path_in`.
+///
+/// The runner registers itself unconditionally: its checkout is the one that is
+/// guaranteed to exist, having just been canonicalized by the caller.
+fn dev_app_registrations(qontinui_root: &Path, runner_root: &Path) -> Vec<RegisterAppRequest> {
+    let mut registrations = vec![RegisterAppRequest::new(
+        "qontinui-runner",
+        runner_root.to_string_lossy(),
+        "http://localhost:9876",
+        "Qontinui Runner (self)",
+    )];
+
+    for (app_id, ui_bridge_url, display_name) in DEV_SIBLING_APPS {
+        if let Ok(root) = qontinui_root.join(app_id).join("frontend").canonicalize() {
+            registrations.push(RegisterAppRequest::new(
+                app_id,
+                root.to_string_lossy(),
+                ui_bridge_url,
+                display_name,
+            ));
+        }
+    }
+
+    registrations
 }
 
 #[cfg(test)]
@@ -731,5 +761,96 @@ mod tests {
             AppError::NotRegistered { app_id } => assert_eq!(app_id, ghost_id),
             other => panic!("expected NotRegistered; got {:?}", other),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Dev-bootstrap path layout (slice 5 Phase 7). No PG involved — these assert
+    // the LAYOUT rule against a synthetic workspace root, so they hold on a
+    // fresh checkout and on a non-operator machine.
+    // -------------------------------------------------------------------------
+
+    /// A synthetic workspace root with a runner checkout and, optionally, the
+    /// sibling `frontend/` dirs. Never this machine's layout; pid + counter
+    /// scoped because several worktrees run `cargo test` here concurrently, and
+    /// cleaned up by `Drop` even when an assertion fails. Same shape as
+    /// `workspace_paths::tests::Fixture`.
+    struct BootstrapFixture {
+        root: std::path::PathBuf,
+    }
+
+    impl Drop for BootstrapFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn bootstrap_fixture(siblings: &[&str]) -> BootstrapFixture {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "qontinui_dev_bootstrap_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("qontinui-runner")).unwrap();
+        for sibling in siblings {
+            std::fs::create_dir_all(root.join(sibling).join("frontend")).unwrap();
+        }
+        BootstrapFixture { root }
+    }
+
+    fn app_ids(reqs: &[RegisterAppRequest]) -> Vec<&str> {
+        reqs.iter().map(|r| r.app_id.as_str()).collect()
+    }
+
+    /// The full layout: every sibling's `frontend/` exists under the workspace
+    /// root, so all three apps register, and each repo root sits under the
+    /// injected root — never under a compile-time path.
+    #[test]
+    fn dev_bootstrap_registers_every_sibling_whose_frontend_exists() {
+        let f = bootstrap_fixture(&["qontinui-web", "qontinui-supervisor"]);
+        let runner_root = f.root.join("qontinui-runner").canonicalize().unwrap();
+
+        let reqs = dev_app_registrations(&f.root, &runner_root);
+
+        assert_eq!(
+            app_ids(&reqs),
+            vec!["qontinui-runner", "qontinui-web", "qontinui-supervisor"]
+        );
+        let canonical_root = f.root.canonicalize().unwrap();
+        for req in &reqs {
+            assert!(
+                Path::new(&req.repo_root).starts_with(&canonical_root),
+                "every registered repo root must sit under the injected workspace root: {}",
+                req.repo_root
+            );
+        }
+    }
+
+    /// A partial checkout is not an error: a sibling without a `frontend/` dir
+    /// is simply omitted, and the runner still registers itself.
+    #[test]
+    fn dev_bootstrap_omits_siblings_without_a_frontend_dir() {
+        let f = bootstrap_fixture(&["qontinui-web"]);
+        let runner_root = f.root.join("qontinui-runner").canonicalize().unwrap();
+
+        let reqs = dev_app_registrations(&f.root, &runner_root);
+
+        assert_eq!(app_ids(&reqs), vec!["qontinui-runner", "qontinui-web"]);
+    }
+
+    /// The minimum: no siblings at all still registers the runner, whose
+    /// checkout the caller has already canonicalized.
+    #[test]
+    fn dev_bootstrap_registers_the_runner_alone_when_no_siblings_exist() {
+        let f = bootstrap_fixture(&[]);
+        let runner_root = f.root.join("qontinui-runner").canonicalize().unwrap();
+
+        let reqs = dev_app_registrations(&f.root, &runner_root);
+
+        assert_eq!(app_ids(&reqs), vec!["qontinui-runner"]);
+        assert_eq!(reqs[0].repo_root, runner_root.to_string_lossy());
+        assert_eq!(reqs[0].ui_bridge_url, "http://localhost:9876");
     }
 }
