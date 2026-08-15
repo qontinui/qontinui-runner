@@ -181,6 +181,17 @@ pub struct SectionPlan {
     /// Keys in this section whose value is repo-derived (from the server's
     /// `derived_keys`). Reported, never acted on.
     pub derived_keys: BTreeSet<String>,
+    /// Keys THIS BOX could not MEASURE — from the local capture's
+    /// `unknown_keys`, not from the server. Today that means a toolchain probe
+    /// that exceeded the capture budget: the key is absent from the local
+    /// section, so it diffs as [`Change::Missing`], but "we could not read it"
+    /// is not "you do not have it" and must never become an install action.
+    ///
+    /// A parallel per-key set, exactly like `derived_keys`, and deliberately not
+    /// a value-shape change — see `collectors::VersionsCapture` for why a
+    /// `{value, status}` value or a `"<unknown>"` sentinel would each relocate
+    /// the bug rather than fix it.
+    pub unknown_keys: BTreeSet<String>,
 }
 
 impl SectionPlan {
@@ -195,10 +206,27 @@ impl SectionPlan {
         self.derived_keys.contains(key)
     }
 
+    /// True when this box could not MEASURE this key's local value. The drift
+    /// row is real and is still shown; what it means is "unknown", not "missing".
+    pub fn is_unknown(&self, key: &str) -> bool {
+        self.unknown_keys.contains(key)
+    }
+
+    /// How many reported changes in this section are about an unmeasured key.
+    /// Drives the operator-facing summary — an unknown that produced no change
+    /// (canonical lacks the key too) is not worth a line.
+    pub fn unknown_change_count(&self) -> usize {
+        self.changes
+            .iter()
+            .filter(|c| self.is_unknown(c.key()))
+            .count()
+    }
+
     /// Changes this runner would actually act on, given the policy. Only
-    /// `Applyable` sections yield actions; `Extra` keys never do, and neither do
-    /// repo-derived keys **regardless of policy** — applying one would fight the
-    /// repo rather than reconcile the box.
+    /// `Applyable` sections yield actions; `Extra` keys never do; repo-derived
+    /// keys never do **regardless of policy** (applying one would fight the repo
+    /// rather than reconcile the box); and neither do keys this box could not
+    /// measure — acting on one would install over a version nobody ever read.
     pub fn actionable(&self) -> Vec<&Change> {
         if self.policy != Applyable {
             return Vec::new();
@@ -207,6 +235,7 @@ impl SectionPlan {
             .iter()
             .filter(|c| !matches!(c, Change::Extra { .. }))
             .filter(|c| !self.is_derived(c.key()))
+            .filter(|c| !self.is_unknown(c.key()))
             .collect()
     }
 }
@@ -238,6 +267,15 @@ impl ApplyPlan {
     pub fn actionable_count(&self) -> usize {
         self.sections.iter().map(|s| s.actionable().len()).sum()
     }
+
+    /// Total count of reported changes that are about a key this box could not
+    /// measure. Never overlaps [`actionable_count`](Self::actionable_count).
+    pub fn unknown_count(&self) -> usize {
+        self.sections
+            .iter()
+            .map(SectionPlan::unknown_change_count)
+            .sum()
+    }
 }
 
 /// Read a section map into sorted `(key, value)` pairs, keeping only string
@@ -254,6 +292,24 @@ fn string_pairs(section: Option<&Value>) -> Vec<(String, String)> {
         .unwrap_or_default();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// Read a per-section key list (`derived_keys` / `unknown_keys`) into a set.
+///
+/// An absent entry, an explicit null, a non-array value and non-string members
+/// ALL degrade to the empty set — i.e. to the behavior that existed before the
+/// field did. Both callers suppress an apply action, so a malformed list must
+/// never be able to suppress one by accident.
+fn string_list(value: Option<&Value>) -> BTreeSet<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Diff canonical against local for one section. **Pure — unit-tested.**
@@ -298,9 +354,17 @@ fn diff_section(canonical: Option<&Value>, local: Option<&Value>) -> Vec<Change>
 /// The union of both sides' section names is walked, so a section present only
 /// locally still surfaces (as `Extra` keys under its policy) rather than being
 /// silently dropped.
+///
+/// `local_unknown_keys` is the LOCAL capture's `unknown_keys` (section name →
+/// key list, straight off [`super::ConfigEnvelope`]) — the keys this box failed
+/// to MEASURE. It is a required parameter rather than an optional setter
+/// precisely because forgetting it is the defect: an unmeasured key looks
+/// exactly like an absent one, and an absent one is an install action. Pass an
+/// empty map only where there genuinely is no capture to speak of.
 pub fn compute_plan(
     canonical: &CanonicalConfig,
     local_sections: &Map<String, Value>,
+    local_unknown_keys: &Map<String, Value>,
     environment_id: &str,
     local_machine_id: &str,
 ) -> ApplyPlan {
@@ -333,23 +397,18 @@ pub fn compute_plan(
             // Absent field / absent section / non-array value all degrade to
             // "nothing derived here" — i.e. exactly the pre-`derived_keys`
             // behavior, never to a wrongly-suppressed action.
-            let derived_keys: BTreeSet<String> = canonical
-                .derived_keys
-                .get(name)
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
+            let derived_keys: BTreeSet<String> = string_list(canonical.derived_keys.get(name));
+            // Same degradation rule, same reason: a malformed/absent list means
+            // "nothing unmeasured here", i.e. exactly the pre-`unknown_keys`
+            // behavior — never a wrongly-suppressed action.
+            let unknown_keys: BTreeSet<String> = string_list(local_unknown_keys.get(name));
             SectionPlan {
                 section: name.clone(),
                 policy,
                 changes: diff_section(can, loc),
                 local_section_absent: can.is_some() && loc.is_none(),
                 derived_keys,
+                unknown_keys,
             }
         })
         .collect();
@@ -473,6 +532,7 @@ pub async fn pull_and_plan() -> Result<ApplyPlan, String> {
     Ok(compute_plan(
         &canonical,
         &local.sections,
+        &local.unknown_keys,
         &cfg.environment_id,
         &cfg.machine_id,
     ))
@@ -536,14 +596,25 @@ pub fn render_plan(plan: &ApplyPlan) -> String {
             );
         }
         for c in &s.changes {
-            // A derived key is shown (the drift is real and worth knowing) but
-            // marked, so nobody reads it as something an apply could fix.
-            let mark = if s.is_derived(c.key()) {
+            // A derived or unmeasured key is shown (the drift is real and worth
+            // knowing) but marked, so nobody reads it as something an apply
+            // could fix. `unknown` wins when both would apply: it is the
+            // stronger statement — we did not read this value at all.
+            let unknown = s.is_unknown(c.key());
+            let mark = if unknown {
+                " [unknown - the local probe exceeded its budget; NOT measured, NOT missing]"
+            } else if s.is_derived(c.key()) {
                 " [derived - converges by pulling the repo, not by an apply]"
             } else {
                 ""
             };
             match c {
+                // Distinct glyph AND distinct verb: an operator scanning this
+                // must be able to tell "we could not measure it" from "you do
+                // not have it", because only the second is something to install.
+                Change::Missing { key, canonical } if unknown => out.push_str(&format!(
+                    "    ? {key}: could not be measured here (canonical: {canonical}){mark}\n"
+                )),
                 Change::Missing { key, canonical } => out.push_str(&format!(
                     "    - {key}: missing here (canonical: {canonical}){mark}\n"
                 )),
@@ -570,6 +641,15 @@ pub fn render_plan(plan: &ApplyPlan) -> String {
             );
         }
         out.push('\n');
+    }
+
+    let unknown = plan.unknown_count();
+    if unknown > 0 {
+        out.push_str(&format!(
+            "{unknown} key(s) could NOT be measured on this box (the probe exceeded its \
+             budget).\nThey are reported as UNKNOWN, never as missing, and `env apply` will \
+             not act on them — re-run `env capture` on a less busy box to resolve them.\n\n",
+        ));
     }
 
     let n = plan.actionable_count();
@@ -599,10 +679,23 @@ pub fn plan_to_json(plan: &ApplyPlan) -> Value {
                 .iter()
                 .map(|c| {
                     let derived = s.is_derived(c.key());
+                    let unknown = s.is_unknown(c.key());
                     match c {
+                        // The wire word: `kind: "unknown"`. An unmeasured key is
+                        // absent locally, so it reaches here as `Missing` — but
+                        // emitting it as `"missing"` is precisely the confusion
+                        // this branch removes, and a `--json` consumer must not
+                        // have to cross-reference a flag to avoid it. The
+                        // `unknown` boolean is emitted on EVERY change too, so a
+                        // consumer that switches on `kind` and one that reads
+                        // flags both get the truth.
+                        Change::Missing { key, canonical } if unknown => serde_json::json!({
+                            "kind": "unknown", "key": key, "canonical": canonical,
+                            "derived": derived, "unknown": true,
+                        }),
                         Change::Missing { key, canonical } => serde_json::json!({
                             "kind": "missing", "key": key, "canonical": canonical,
-                            "derived": derived,
+                            "derived": derived, "unknown": unknown,
                         }),
                         Change::Differs {
                             key,
@@ -610,10 +703,11 @@ pub fn plan_to_json(plan: &ApplyPlan) -> Value {
                             canonical,
                         } => serde_json::json!({
                             "kind": "differs", "key": key, "local": local,
-                            "canonical": canonical, "derived": derived,
+                            "canonical": canonical, "derived": derived, "unknown": unknown,
                         }),
                         Change::Extra { key, local } => serde_json::json!({
                             "kind": "extra", "key": key, "local": local, "derived": derived,
+                            "unknown": unknown,
                         }),
                     }
                 })
@@ -625,6 +719,8 @@ pub fn plan_to_json(plan: &ApplyPlan) -> Value {
                 "in_sync": s.is_clean(),
                 "actionable_count": s.actionable().len(),
                 "derived_keys": s.derived_keys.iter().collect::<Vec<_>>(),
+                "unknown_keys": s.unknown_keys.iter().collect::<Vec<_>>(),
+                "unknown_count": s.unknown_change_count(),
                 "process_scoped": s.section == ENV_CONTRACT_SECTION,
                 "changes": changes,
             })
@@ -642,6 +738,9 @@ pub fn plan_to_json(plan: &ApplyPlan) -> Value {
         })),
         "in_sync": plan.is_in_sync(),
         "actionable_count": plan.actionable_count(),
+        // Disjoint from `actionable_count` by construction — `actionable()`
+        // filters unknown keys out.
+        "unknown_count": plan.unknown_count(),
         "sections": sections,
     })
 }
@@ -657,6 +756,33 @@ mod tests {
             m.insert((*k).to_string(), json!(*v));
         }
         Value::Object(m)
+    }
+
+    /// [`compute_plan`] for a capture that measured everything it attempted —
+    /// the case almost every test below is about. The unmeasured-key tests call
+    /// [`compute_plan`] directly with a real `unknown_keys` map, so the
+    /// parameter is never invisible in the tests that exist to exercise it.
+    fn plan_of(
+        canonical: &CanonicalConfig,
+        local_sections: &Map<String, Value>,
+        environment_id: &str,
+        local_machine_id: &str,
+    ) -> ApplyPlan {
+        compute_plan(
+            canonical,
+            local_sections,
+            &Map::new(),
+            environment_id,
+            local_machine_id,
+        )
+    }
+
+    /// A local `unknown_keys` map: section name → key list, exactly the shape
+    /// [`super::super::ConfigEnvelope::unknown_keys`] puts on the wire.
+    fn unknown(section: &str, keys: &[&str]) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert(section.to_string(), json!(keys));
+        m
     }
 
     fn canonical_with(sections: Value, policy: Value) -> CanonicalConfig {
@@ -707,7 +833,7 @@ mod tests {
 
     #[test]
     fn plan_to_json_emits_wire_policy_and_change_kinds() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with(
                 json!({"env_contract": {"QONTINUI_TOKEN": "present"}}),
                 json!({"env_contract": "secret_report_only"}),
@@ -758,7 +884,7 @@ mod tests {
     /// never an action (an extra key is not automatically wrong).
     #[test]
     fn actionable_respects_policy_and_skips_extras() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with(
                 json!({
                     "versions": {"node": "22.1.0"},
@@ -815,7 +941,7 @@ mod tests {
     /// A section the server sent no policy for must not be treated as applyable.
     #[test]
     fn section_without_server_policy_defaults_to_report_only() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with(json!({"mystery": {"k": "v"}}), json!({})),
             json!({"mystery": {"k": "other"}}).as_object().unwrap(),
             "env-1",
@@ -828,7 +954,7 @@ mod tests {
 
     #[test]
     fn canonical_self_is_detected_and_renders_nothing_to_pull() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with(json!({"versions": {"node": "22.1.0"}}), json!({})),
             json!({"versions": {"node": "20.0.0"}}).as_object().unwrap(),
             "env-1",
@@ -843,7 +969,7 @@ mod tests {
     /// An empty local machine_id must not accidentally match canonical.
     #[test]
     fn empty_local_machine_id_is_not_canonical_self() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with(json!({}), json!({})),
             &Map::new(),
             "env-1",
@@ -854,7 +980,7 @@ mod tests {
 
     #[test]
     fn in_sync_plan_renders_nothing_to_do() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with(
                 json!({"versions": {"node": "22.1.0"}}),
                 json!({"versions": "applyable"}),
@@ -871,7 +997,7 @@ mod tests {
     /// distinct from "in sync" — an empty changes list alone would hide it.
     #[test]
     fn absent_local_section_is_flagged_not_reported_in_sync() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with(
                 json!({"db_schema": {}}),
                 json!({"db_schema": "destructive_confirm"}),
@@ -891,7 +1017,7 @@ mod tests {
     /// property end-to-end.
     #[test]
     fn secret_safety_render_never_emits_a_secret_value() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with(
                 json!({"env_contract": {"QONTINUI_API_TOKEN": "present"}}),
                 json!({"env_contract": "secret_report_only"}),
@@ -916,7 +1042,7 @@ mod tests {
             json!({"versions": "applyable"}),
         );
         can.schema_version = Some(super::super::SCHEMA_VERSION + 1);
-        let plan = compute_plan(
+        let plan = plan_of(
             &can,
             json!({"versions": {"node": "20.0.0"}}).as_object().unwrap(),
             "env-1",
@@ -936,7 +1062,7 @@ mod tests {
     /// must not raise a false mismatch.
     #[test]
     fn matching_or_absent_schema_version_is_not_flagged() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with(json!({}), json!({})),
             &Map::new(),
             "env-1",
@@ -946,7 +1072,7 @@ mod tests {
 
         let mut can = canonical_with(json!({}), json!({}));
         can.schema_version = None; // field absent/null on the wire
-        let plan = compute_plan(&can, &Map::new(), "env-1", "other");
+        let plan = plan_of(&can, &Map::new(), "env-1", "other");
         assert_eq!(plan.schema_mismatch, None);
     }
 
@@ -1006,7 +1132,7 @@ mod tests {
     /// suppression is key-scoped and not section-scoped.
     #[test]
     fn derived_key_is_reported_but_never_actionable() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with_derived(
                 json!({"versions": {"runner_crate_version": "0.9.0", "node": "22.1.0"}}),
                 json!({"versions": "applyable"}),
@@ -1044,7 +1170,7 @@ mod tests {
     /// ZERO actionable changes — the acceptance oracle for the canonical box.
     #[test]
     fn all_derived_section_reports_zero_actionable() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with_derived(
                 json!({"versions": {
                     "runner_crate_version": "0.9.0",
@@ -1071,7 +1197,7 @@ mod tests {
     /// not suppress anything. This is the contract's distinguishable case.
     #[test]
     fn empty_derived_list_suppresses_nothing() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with_derived(
                 json!({"versions": {"node": "22.1.0"}}),
                 json!({"versions": "applyable"}),
@@ -1102,8 +1228,8 @@ mod tests {
         .expect("payload without derived_keys parses");
         assert!(parsed.derived_keys.is_empty());
 
-        let from_wire = compute_plan(&parsed, local.as_object().unwrap(), "env-1", "other");
-        let reference = compute_plan(
+        let from_wire = plan_of(&parsed, local.as_object().unwrap(), "env-1", "other");
+        let reference = plan_of(
             &canonical_with(sections, policy),
             local.as_object().unwrap(),
             "env-1",
@@ -1133,7 +1259,7 @@ mod tests {
     /// "nothing derived" — never to a wrongly-suppressed action.
     #[test]
     fn malformed_derived_keys_degrades_to_nothing_derived() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with_derived(
                 json!({"versions": {"node": "22.1.0"}}),
                 json!({"versions": "applyable"}),
@@ -1151,7 +1277,7 @@ mod tests {
     /// actionable_count must already exclude it.
     #[test]
     fn plan_to_json_marks_derived_changes() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with_derived(
                 json!({"versions": {"node": "22.1.0", "runner_crate_version": "0.9.0"}}),
                 json!({"versions": "applyable"}),
@@ -1178,24 +1304,18 @@ mod tests {
     // unmeasured (probe-budget) keys
     // ------------------------------------------------------------------
 
-    /// **Pins the DEFECT.** A `versions` probe that exceeds the capture budget
-    /// omits its key entirely (`collectors::collect_versions` has no `else`
-    /// arm), so the pull sees the key as absent LOCALLY and diffs it as
-    /// `Change::Missing`. `Missing` in an applyable, non-derived section is
-    /// ACTIONABLE — `env apply` would drive a real toolchain install for a
-    /// version this box very likely already has, purely because the box was
-    /// busy for three seconds.
+    /// **The INVERSION of the defect this branch fixes.** The predecessor,
+    /// `unmeasured_version_key_is_actionable_documents_the_defect` (commit
+    /// "test: pin the capture-probe-budget defect in the env pull plan"),
+    /// asserted `actionable_count() == 1` on exactly this input: a `versions`
+    /// probe that exceeded the capture budget omits its key, the pull diffs the
+    /// omission as `Change::Missing`, and `Missing` in an applyable, non-derived
+    /// section is an install action — for a toolchain version nobody ever read.
     ///
-    /// Nothing in this suite covered it: the neighbouring cases use `Differs`
-    /// (`actionable_respects_policy_and_skips_extras`,
-    /// `derived_key_is_reported_but_never_actionable`) or a non-applyable
-    /// section (`plan_to_json_emits_wire_policy_and_change_kinds`), which is
-    /// exactly how the defect slipped through.
-    ///
-    /// INVERTED by the fix into
-    /// [`unmeasured_version_key_is_reported_but_never_actionable`].
+    /// Same input, opposite verdict: the key is still REPORTED (the operator
+    /// should know the reading is missing) and is no longer ACTIONABLE.
     #[test]
-    fn unmeasured_version_key_is_actionable_documents_the_defect() {
+    fn unmeasured_version_key_is_reported_but_never_actionable() {
         let plan = compute_plan(
             &canonical_with(
                 json!({"versions": {"rustc": "rustc 1.82.0 (f6e511eec 2024-10-15)"}}),
@@ -1206,19 +1326,259 @@ mod tests {
             json!({"versions": {"probe_scope_kind": "declared"}})
                 .as_object()
                 .unwrap(),
+            &unknown("versions", &["rustc"]),
             "env-1",
             "other",
         );
         let s = &plan.sections[0];
         assert_eq!(s.policy, Applyable);
         assert!(!s.is_derived("rustc"));
+        assert!(s.is_unknown("rustc"));
+        // Still REPORTED, and still as a diff row.
         assert!(matches!(
             s.changes.iter().find(|c| c.key() == "rustc"),
             Some(Change::Missing { .. })
         ));
-        // THE DEFECT: "we could not measure it" is indistinguishable from
-        // "you do not have it", so it becomes an install action.
+        assert_eq!(s.unknown_change_count(), 1);
+        // Never ACTIONABLE — this is the fix.
+        assert!(s.actionable().is_empty());
+        assert_eq!(plan.actionable_count(), 0);
+        assert_eq!(plan.unknown_count(), 1);
+    }
+
+    /// The over-suppression guard, and the reason `version_of_within` returns a
+    /// three-armed outcome rather than a bool. A tool that genuinely is not
+    /// installed produces `ProbeOutcome::Failed`, which records NO unknown key —
+    /// so its `Missing` must stay actionable. Without this, "never act on an
+    /// unknown" could quietly become "never act on `versions` at all", and the
+    /// apply would stop fixing the boxes it exists to fix.
+    #[test]
+    fn a_genuinely_failed_probe_still_counts_as_actionable() {
+        let plan = compute_plan(
+            &canonical_with(
+                json!({"versions": {
+                    "rustc": "rustc 1.82.0 (f6e511eec 2024-10-15)",
+                    "node": "v22.1.0",
+                }}),
+                json!({"versions": "applyable"}),
+            ),
+            // Neither key captured — but only `rustc` timed out. `node` simply
+            // is not installed on this box.
+            json!({"versions": {"probe_scope_kind": "declared"}})
+                .as_object()
+                .unwrap(),
+            &unknown("versions", &["rustc"]),
+            "env-1",
+            "other",
+        );
+        let s = &plan.sections[0];
+        assert!(s.is_unknown("rustc"));
+        assert!(!s.is_unknown("node"));
+        let actionable: Vec<&str> = s.actionable().iter().map(|c| c.key()).collect();
+        assert_eq!(
+            actionable,
+            vec!["node"],
+            "a genuinely-absent tool must still be installable"
+        );
         assert_eq!(plan.actionable_count(), 1);
+        assert_eq!(plan.unknown_count(), 1);
+    }
+
+    /// Suppression is key-scoped, not section-scoped: a real drift sitting
+    /// beside an unmeasured key stays actionable. Same property
+    /// `derived_key_is_reported_but_never_actionable` pins for derived keys.
+    #[test]
+    fn unknown_key_does_not_suppress_its_measured_siblings() {
+        let plan = compute_plan(
+            &canonical_with(
+                json!({"versions": {"rustc": "rustc 1.82.0", "node": "v22.1.0"}}),
+                json!({"versions": "applyable"}),
+            ),
+            json!({"versions": {"node": "v20.9.0"}})
+                .as_object()
+                .unwrap(),
+            &unknown("versions", &["rustc"]),
+            "env-1",
+            "other",
+        );
+        let s = &plan.sections[0];
+        assert_eq!(s.changes.len(), 2);
+        let actionable: Vec<&str> = s.actionable().iter().map(|c| c.key()).collect();
+        assert_eq!(actionable, vec!["node"]);
+    }
+
+    /// An operator must be able to tell "we could not measure this" from "you
+    /// are missing this" by READING the plan — so the two get different glyphs,
+    /// different verbs, and only one gets the budget explanation.
+    #[test]
+    fn render_distinguishes_unmeasured_from_missing() {
+        let plan = compute_plan(
+            &canonical_with(
+                json!({"versions": {"rustc": "rustc 1.82.0", "node": "v22.1.0"}}),
+                json!({"versions": "applyable"}),
+            ),
+            json!({"versions": {}}).as_object().unwrap(),
+            &unknown("versions", &["rustc"]),
+            "env-1",
+            "other",
+        );
+        let text = render_plan(&plan);
+        let rustc_line = text
+            .lines()
+            .find(|l| l.contains("rustc:"))
+            .expect("rustc row rendered");
+        let node_line = text
+            .lines()
+            .find(|l| l.contains("node:"))
+            .expect("node row rendered");
+
+        assert!(
+            rustc_line.contains("could not be measured here"),
+            "{rustc_line}"
+        );
+        assert!(rustc_line.trim_start().starts_with('?'), "{rustc_line}");
+        assert!(rustc_line.contains("[unknown"), "{rustc_line}");
+        // The genuinely-missing sibling keeps the old wording and glyph.
+        assert!(node_line.contains("missing here"), "{node_line}");
+        assert!(node_line.trim_start().starts_with('-'), "{node_line}");
+        assert!(!node_line.contains("[unknown"), "{node_line}");
+
+        assert!(text.contains("1 key(s) could NOT be measured on this box"));
+        // …and the unknown one did not inflate the applyable count.
+        assert!(text.contains("1 change(s) are in applyable sections"));
+    }
+
+    /// `--json` consumers get the distinction as a first-class `kind`, not as a
+    /// flag they have to remember to read — plus the per-section key list and
+    /// the plan-level total.
+    #[test]
+    fn plan_to_json_emits_the_unknown_kind_and_counts() {
+        let plan = compute_plan(
+            &canonical_with(
+                json!({"versions": {"rustc": "rustc 1.82.0", "node": "v22.1.0"}}),
+                json!({"versions": "applyable"}),
+            ),
+            json!({"versions": {}}).as_object().unwrap(),
+            &unknown("versions", &["rustc"]),
+            "env-1",
+            "other",
+        );
+        let v = plan_to_json(&plan);
+        let changes = v["sections"][0]["changes"].as_array().unwrap();
+        let rustc = changes.iter().find(|c| c["key"] == "rustc").unwrap();
+        let node = changes.iter().find(|c| c["key"] == "node").unwrap();
+
+        assert_eq!(rustc["kind"], "unknown");
+        assert_eq!(rustc["unknown"], true);
+        // The canonical value is still carried — the row is informative, just
+        // not actionable.
+        assert_eq!(rustc["canonical"], "rustc 1.82.0");
+        assert_eq!(node["kind"], "missing");
+        assert_eq!(node["unknown"], false);
+
+        assert_eq!(v["sections"][0]["unknown_keys"][0], "rustc");
+        assert_eq!(v["sections"][0]["unknown_count"], 1);
+        assert_eq!(v["sections"][0]["actionable_count"], 1);
+        assert_eq!(v["unknown_count"], 1);
+        assert_eq!(v["actionable_count"], 1);
+    }
+
+    /// An unmeasured key that canonical ALSO lacks produces no diff row at all,
+    /// so it must not inflate the unknown counter — the counter describes rows
+    /// an operator can see, not set membership.
+    #[test]
+    fn unknown_key_absent_from_canonical_reports_nothing() {
+        let plan = compute_plan(
+            &canonical_with(
+                json!({"versions": {"node": "v22.1.0"}}),
+                json!({"versions": "applyable"}),
+            ),
+            json!({"versions": {"node": "v22.1.0"}})
+                .as_object()
+                .unwrap(),
+            &unknown("versions", &["rustc"]),
+            "env-1",
+            "other",
+        );
+        assert!(plan.sections[0].is_unknown("rustc"));
+        assert_eq!(plan.unknown_count(), 0);
+        assert!(plan.is_in_sync());
+        assert!(!render_plan(&plan).contains("could NOT be measured"));
+    }
+
+    /// An empty / absent / malformed local `unknown_keys` must behave EXACTLY
+    /// like the pre-`unknown_keys` runner — a suppression that can be triggered
+    /// by a malformed payload is a worse bug than the one it fixes.
+    #[test]
+    fn absent_or_malformed_unknown_keys_suppresses_nothing() {
+        let canonical = || {
+            canonical_with(
+                json!({"versions": {"rustc": "rustc 1.82.0"}}),
+                json!({"versions": "applyable"}),
+            )
+        };
+        let local = json!({"versions": {}});
+
+        for (label, unknown_map) in [
+            ("absent", Map::new()),
+            (
+                "empty list",
+                json!({"versions": []}).as_object().unwrap().clone(),
+            ),
+            ("wrong section", unknown("services", &["rustc"])),
+            // Not an array.
+            (
+                "not a list",
+                json!({"versions": "rustc"}).as_object().unwrap().clone(),
+            ),
+            // Non-string members.
+            (
+                "non-string members",
+                json!({"versions": [7]}).as_object().unwrap().clone(),
+            ),
+        ] {
+            let plan = compute_plan(
+                &canonical(),
+                local.as_object().unwrap(),
+                &unknown_map,
+                "env-1",
+                "other",
+            );
+            let versions = plan
+                .sections
+                .iter()
+                .find(|s| s.section == "versions")
+                .unwrap();
+            assert!(
+                !versions.is_unknown("rustc"),
+                "{label}: must not mark rustc unmeasured"
+            );
+            assert_eq!(
+                plan.actionable_count(),
+                1,
+                "{label}: must stay actionable, exactly as before the field existed"
+            );
+        }
+    }
+
+    /// Unmeasured never becomes actionable by borrowing a policy either: the
+    /// suppression sits inside `actionable()`, which already short-circuits on
+    /// a non-`Applyable` policy, so the two rules compose rather than race.
+    #[test]
+    fn unknown_key_in_a_report_only_section_is_still_never_actionable() {
+        let plan = compute_plan(
+            &canonical_with(
+                json!({"versions": {"rustc": "rustc 1.82.0"}}),
+                json!({"versions": "report_only"}),
+            ),
+            json!({"versions": {}}).as_object().unwrap(),
+            &unknown("versions", &["rustc"]),
+            "env-1",
+            "other",
+        );
+        assert_eq!(plan.sections[0].policy, ReportOnly);
+        assert_eq!(plan.actionable_count(), 0);
+        assert_eq!(plan.unknown_count(), 1);
     }
 
     // ------------------------------------------------------------------
@@ -1229,7 +1589,7 @@ mod tests {
     /// suppressed, because a genuinely missing secret must still show.
     #[test]
     fn env_contract_caveat_renders_when_it_has_changes() {
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with(
                 json!({"env_contract": {"QONTINUI_API_URL": "present"}}),
                 json!({"env_contract": "secret_report_only"}),
@@ -1250,7 +1610,7 @@ mod tests {
     #[test]
     fn env_contract_caveat_absent_without_env_contract_changes() {
         // env_contract in sync, a different section drifting.
-        let plan = compute_plan(
+        let plan = plan_of(
             &canonical_with(
                 json!({
                     "env_contract": {"QONTINUI_API_URL": "present"},
@@ -1272,7 +1632,7 @@ mod tests {
         assert!(!text.contains("process-scope artifacts"));
 
         // And a fully in-sync plan never renders it either.
-        let synced = compute_plan(
+        let synced = plan_of(
             &canonical_with(
                 json!({"env_contract": {"QONTINUI_API_URL": "present"}}),
                 json!({"env_contract": "secret_report_only"}),

@@ -21,7 +21,7 @@
 //!
 //! The `secret_safety_*` unit tests below pin this invariant.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
@@ -593,19 +593,58 @@ pub fn probe_scope_root() -> Option<std::path::PathBuf> {
 /// Wall-clock budget for one `<cmd> --version` probe during CAPTURE.
 ///
 /// Deliberately tight: capture runs on a 15-minute loop against three tools, and
-/// a wedged shim must cost the runner seconds, not minutes. A probe that exceeds
-/// it simply omits its key — the collectors are fail-open.
+/// a wedged shim must cost the runner seconds, not minutes. The budget itself is
+/// NOT the thing to relax — what a box under load needs is for *exceeding* it to
+/// be represented honestly (see [`ProbeOutcome::TimedOut`]), not for the runner
+/// to sit on a wedged shim for minutes.
 const CAPTURE_PROBE_BUDGET: Duration = Duration::from_secs(3);
 
-/// Run a bounded `<cmd> --version` and return the trimmed first line of stdout
-/// (falling back to stderr). Returns `None` on spawn failure, timeout, or
-/// non-zero exit. Mirrors `fleet::detect_claude_code_now`'s bounded subprocess
-/// pattern.
+/// What one bounded `<cmd> --version` probe actually established.
+///
+/// The two failure arms are NOT interchangeable, and collapsing them into a
+/// single `None` is what made a busy box look like a box missing its toolchain:
+///
+/// - [`Failed`](Self::Failed) — spawn error, non-zero exit, or empty output. The
+///   tool is genuinely not usable here, so a canonical key this box lacks really
+///   IS missing and really IS something an apply should install.
+/// - [`TimedOut`](Self::TimedOut) — the child was still running when the budget
+///   expired and was killed. This says nothing whatsoever about the installed
+///   version; it says the box was busy. `rustc --version` has been measured on
+///   this fleet between 173 ms and 6858 ms at 14% CPU idle, so this arm is a
+///   routine outcome, not a pathological one.
+///
+/// Callers that genuinely do not care (the apply's post-install re-probe, which
+/// treats "no answer" as "verification failed" either way) collapse it with
+/// [`into_version`](Self::into_version).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    /// The probe finished inside its budget; carries the trimmed first line.
+    Measured(String),
+    /// The probe was still running at the deadline and was killed. The value is
+    /// UNKNOWN — never treat this as "the tool is absent".
+    TimedOut,
+    /// Spawn failure, non-zero exit, or no output: genuinely not usable here.
+    Failed,
+}
+
+impl ProbeOutcome {
+    /// The measured version, discarding WHY there wasn't one. Only for callers
+    /// that treat both failure arms identically.
+    pub(crate) fn into_version(self) -> Option<String> {
+        match self {
+            Self::Measured(v) => Some(v),
+            Self::TimedOut | Self::Failed => None,
+        }
+    }
+}
+
+/// Run a bounded `<cmd> --version` and report what it established. Mirrors
+/// `fleet::detect_claude_code_now`'s bounded subprocess pattern.
 ///
 /// `cwd` is the declared capture scope (see [`probe_scope_root`]). `None`
 /// inherits the parent's cwd — reserved for the no-home-directory case, since
 /// an inherited cwd is exactly what makes this probe non-deterministic.
-fn version_of(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Option<String> {
+fn version_of(cmd: &str, args: &[&str], cwd: Option<&Path>) -> ProbeOutcome {
     version_of_within(cmd, args, cwd, CAPTURE_PROBE_BUDGET)
 }
 
@@ -626,7 +665,7 @@ fn version_of_within(
     args: &[&str],
     cwd: Option<&Path>,
     budget: Duration,
-) -> Option<String> {
+) -> ProbeOutcome {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::Instant;
@@ -641,14 +680,18 @@ fn version_of_within(
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
-    let mut child = command.spawn().ok()?;
+    // A spawn failure is a genuine "not usable here" — the shim does not exist,
+    // or is not executable. Nothing about it is a measurement problem.
+    let Ok(mut child) = command.spawn() else {
+        return ProbeOutcome::Failed;
+    };
 
     let deadline = started + budget;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    return None;
+                    return ProbeOutcome::Failed;
                 }
                 let mut out = String::new();
                 if let Some(mut so) = child.stdout.take() {
@@ -660,17 +703,25 @@ fn version_of_within(
                     }
                 }
                 let first = out.lines().next().unwrap_or("").trim().to_string();
-                return if first.is_empty() { None } else { Some(first) };
+                return if first.is_empty() {
+                    ProbeOutcome::Failed
+                } else {
+                    ProbeOutcome::Measured(first)
+                };
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    // THE distinguished arm: we killed a live child, so we
+                    // learned nothing about the installed version.
+                    return ProbeOutcome::TimedOut;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(_) => return None,
+            // `try_wait` failing is an OS-level problem with the child handle,
+            // not a slow tool — the box did answer, badly.
+            Err(_) => return ProbeOutcome::Failed,
         }
     }
 }
@@ -683,12 +734,17 @@ fn version_of_within(
 /// resolution — so it goes through this one function rather than a lookalike.
 /// The budget is a parameter because an apply can afford to wait longer than a
 /// 15-minute capture loop can.
+///
+/// Collapses [`ProbeOutcome`] to an `Option` on purpose: the apply's
+/// verification treats "no answer" as "not verified" whichever arm produced it,
+/// and it runs on a budget generous enough that the timeout arm carries no extra
+/// information there.
 pub(crate) fn probe_tool_version(
     cmd: &str,
     cwd: Option<&Path>,
     budget: Duration,
 ) -> Option<String> {
-    version_of_within(cmd, &["--version"], cwd, budget)
+    version_of_within(cmd, &["--version"], cwd, budget).into_version()
 }
 
 /// Pull a `name = "x.y.z"` value out of a `[section]` of a Cargo.toml string.
@@ -1974,6 +2030,28 @@ fn put_python_installed(section: &mut Section, scope: &ProbeScope) {
     }
 }
 
+/// [`collect_versions`]'s result: the section, plus the keys in it this capture
+/// could not MEASURE.
+///
+/// The unknown set is a PARALLEL per-key set, deliberately not a value-shape
+/// change. Every section value is a `Value::String` by envelope contract (see
+/// this module's header), and the pull's diff drops any non-string value
+/// silently — so promoting a value to `{value, status}` would make the key
+/// vanish from the diff entirely, turning a loud bug into a quiet one. A
+/// sentinel string is no better: canonical holds `1.82.0`, this box would hold
+/// `"<unknown>"`, and the diff yields `Differs`, which is also actionable. It
+/// mirrors the server's `derived_keys` set instead, which the plan already knows
+/// how to report-but-never-act-on.
+#[derive(Debug, Default, Clone)]
+pub struct VersionsCapture {
+    /// The section, exactly as before: string values only, absent keys allowed.
+    pub section: Section,
+    /// Keys whose probe timed out (`ProbeOutcome::TimedOut`). NOT the keys that
+    /// failed — a spawn error or a non-zero exit is a genuine "not installed
+    /// here" and must keep classifying as missing, so an apply can still fix it.
+    pub unknown_keys: BTreeSet<String>,
+}
+
 /// Collect the `versions` section: this binary's own crate + tauri versions,
 /// node deps from this repo's own `package.json` under the workspace root,
 /// python from the web-backend pyproject.toml, the `python_dep_*` DECLARED
@@ -1985,8 +2063,14 @@ fn put_python_installed(section: &mut Section, scope: &ProbeScope) {
 /// never an error — with the stated exception of the two provenance keys
 /// `python_dep__source` and `python_installed_probe`, written on every rung
 /// precisely so "measured nothing" cannot look like "found no difference".
-pub fn collect_versions() -> Section {
+///
+/// A toolchain probe that exceeds `CAPTURE_PROBE_BUDGET` still omits its key
+/// (the section's value contract has no room to say otherwise) but now also
+/// RECORDS it in [`VersionsCapture::unknown_keys`], so the consumer can tell
+/// "we could not measure this" from "this box does not have it".
+pub fn collect_versions() -> VersionsCapture {
     let mut section = Section::new();
+    let mut unknown_keys = BTreeSet::new();
 
     put_binary_versions(&mut section);
 
@@ -2034,17 +2118,32 @@ pub fn collect_versions() -> Section {
 
     let scope = scope.root;
     let scope_ref = scope.as_deref();
-    if let Some(v) = version_of("rustc", &["--version"], scope_ref) {
-        put(&mut section, "rustc", v);
-    }
-    if let Some(v) = version_of("node", &["--version"], scope_ref) {
-        put(&mut section, "node", v);
-    }
-    if let Some(v) = version_of("python", &["--version"], scope_ref) {
-        put(&mut section, "python", v);
+    for tool in ["rustc", "node", "python"] {
+        match version_of(tool, &["--version"], scope_ref) {
+            ProbeOutcome::Measured(v) => put(&mut section, tool, v),
+            // Key still absent — but recorded as UNMEASURED, not as missing.
+            // WARN rather than debug: a box that routinely lands here is a box
+            // whose `versions` drift report is partly blind, and the only other
+            // trace of it is the (additive, easily-ignored) envelope field.
+            ProbeOutcome::TimedOut => {
+                warn!(
+                    "env_agent: `{tool} --version` exceeded the {}s capture budget — reporting \
+                     it as UNMEASURED rather than missing, so `env apply` will not try to \
+                     install over a version it never read",
+                    CAPTURE_PROBE_BUDGET.as_secs(),
+                );
+                unknown_keys.insert(tool.to_string());
+            }
+            // Genuinely not usable here: leave the key absent and say nothing —
+            // this is the case the pull is SUPPOSED to classify as missing.
+            ProbeOutcome::Failed => {}
+        }
     }
 
-    section
+    VersionsCapture {
+        section,
+        unknown_keys,
+    }
 }
 
 // ============================================================================
@@ -3881,7 +3980,107 @@ dependencies = [
         let (cmd, args) = ("cmd", ["/c", "cd"]);
         #[cfg(not(windows))]
         let (cmd, args) = ("sh", ["-c", "pwd"]);
-        version_of_within(cmd, &args, cwd, TEST_PROBE_BUDGET)
+        version_of_within(cmd, &args, cwd, TEST_PROBE_BUDGET).into_version()
+    }
+
+    /// The whole distinction, at the source: a probe that CANNOT run is
+    /// [`ProbeOutcome::Failed`], a probe that runs too long is
+    /// [`ProbeOutcome::TimedOut`]. Collapsing them (as the old `Option` return
+    /// did) is what let a busy box read as a box missing its toolchain.
+    #[test]
+    fn probe_outcome_separates_a_missing_tool_from_a_slow_one() {
+        // Spawn failure — no such executable anywhere on PATH.
+        assert_eq!(
+            version_of_within(
+                "qontinui_no_such_binary_probe_test",
+                &["--version"],
+                None,
+                TEST_PROBE_BUDGET,
+            ),
+            ProbeOutcome::Failed,
+            "a tool that cannot be spawned must stay FAILED (= genuinely absent)"
+        );
+
+        // Non-zero exit — the tool ran and said no.
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd", ["/c", "exit 3"]);
+        #[cfg(not(windows))]
+        let (cmd, args) = ("sh", ["-c", "exit 3"]);
+        assert_eq!(
+            version_of_within(cmd, &args, None, TEST_PROBE_BUDGET),
+            ProbeOutcome::Failed,
+            "a non-zero exit must stay FAILED, not become UNKNOWN"
+        );
+
+        // Over budget — the child was alive at the deadline and got killed.
+        #[cfg(windows)]
+        let (slow_cmd, slow_args) = ("cmd", ["/c", "ping -n 6 127.0.0.1 >nul"]);
+        #[cfg(not(windows))]
+        let (slow_cmd, slow_args) = ("sh", ["-c", "sleep 5"]);
+        assert_eq!(
+            version_of_within(slow_cmd, &slow_args, None, Duration::from_millis(300)),
+            ProbeOutcome::TimedOut,
+            "a probe killed at its deadline must be TIMED OUT, never FAILED"
+        );
+
+        // And a healthy probe still measures.
+        #[cfg(windows)]
+        let (ok_cmd, ok_args) = ("cmd", ["/c", "echo 1.2.3"]);
+        #[cfg(not(windows))]
+        let (ok_cmd, ok_args) = ("sh", ["-c", "echo 1.2.3"]);
+        assert_eq!(
+            version_of_within(ok_cmd, &ok_args, None, TEST_PROBE_BUDGET),
+            ProbeOutcome::Measured("1.2.3".to_string()),
+        );
+    }
+
+    /// `into_version` is the collapse the APPLY's re-probe uses — it must lose
+    /// the distinction on purpose, and only there.
+    #[test]
+    fn probe_outcome_into_version_collapses_both_failure_arms() {
+        assert_eq!(
+            ProbeOutcome::Measured("1.82.0".to_string()).into_version(),
+            Some("1.82.0".to_string())
+        );
+        assert_eq!(ProbeOutcome::TimedOut.into_version(), None);
+        assert_eq!(ProbeOutcome::Failed.into_version(), None);
+    }
+
+    /// The capture budget is a PRODUCTION latency choice and this branch does
+    /// not move it — only the representation of exceeding it changed. Pinned so
+    /// a future "just make it bigger" cannot land unnoticed: capture runs on a
+    /// 15-minute loop against three tools, so a wedged shim must cost seconds.
+    #[test]
+    fn capture_probe_budget_is_unchanged_at_three_seconds() {
+        assert_eq!(CAPTURE_PROBE_BUDGET, Duration::from_secs(3));
+        assert!(
+            TEST_PROBE_BUDGET > CAPTURE_PROBE_BUDGET,
+            "the generous TEST budget must never be the one the capture path uses"
+        );
+    }
+
+    /// `collect_versions` still yields a well-formed, string-only section, and
+    /// every key it reports as unmeasured is genuinely ABSENT from the section —
+    /// the two halves can never contradict each other.
+    #[test]
+    fn collect_versions_unknown_keys_are_absent_from_the_section() {
+        let capture = collect_versions();
+        assert!(
+            capture.section.values().all(Value::is_string),
+            "envelope contract: every section value is a string"
+        );
+        // Baked keys can never go absent, so the section is never empty.
+        assert!(capture.section.contains_key("runner_crate_version"));
+        for key in &capture.unknown_keys {
+            assert!(
+                !capture.section.contains_key(key),
+                "{key} was reported unmeasured but still carries a value"
+            );
+            assert!(
+                ["rustc", "node", "python"].contains(&key.as_str()),
+                "only the three host-probed keys can be unmeasured, got {key}"
+            );
+        }
     }
 
     /// The load-bearing property: the probe runs in the directory it is GIVEN,

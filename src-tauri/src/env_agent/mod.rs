@@ -29,11 +29,17 @@
 //!     "env_contract": { "<VAR_NAME>": "present" },
 //!     "claude_accounts": { "<key>": "<string>" },
 //!     "repos":        { "repo_<owner>_<name>": "<canonical clone url>" }
-//!   }
+//!   },
+//!   "unknown_keys": { "versions": ["rustc"] }
 //! }
 //! ```
 //!
 //! Every section value MUST be a string. A failing/empty section is OMITTED.
+//!
+//! `unknown_keys` is an ADDITIVE sibling of `sections`: section name → the keys
+//! this capture could not MEASURE (a probe that blew its budget), as distinct
+//! from keys this box genuinely lacks. It is never a change to a section's value
+//! shape — see [`ConfigEnvelope::unknown_keys`].
 //!
 //! ## Fail-open posture (mirrors `fleet.rs`)
 //!
@@ -77,6 +83,22 @@ pub struct ConfigEnvelope {
     /// Section name → section map (each value a string). Failing/empty sections
     /// are omitted by the isolation driver.
     pub sections: Map<String, Value>,
+    /// Section name → the keys in that section this capture could not MEASURE,
+    /// as opposed to keys this box genuinely lacks. Today only `versions`
+    /// contributes (a toolchain probe that blew the capture probe budget — see
+    /// [`collectors::VersionsCapture`]).
+    ///
+    /// An ADDITIVE sibling of `sections`, never a change to a section's value
+    /// shape: every section value must stay a `Value::String`, and the pull's
+    /// diff silently drops non-string values, so a `{value, status}` value would
+    /// make the key disappear from the diff altogether.
+    ///
+    /// Always emitted, including as `{}`. The backend's envelope model ignores
+    /// unknown fields (pydantic's default), so this is inert until the web side
+    /// grows a reader for it — and an explicit `{}` lets that later reader tell
+    /// "this runner measured everything" from "this runner predates the field",
+    /// which a skipped-when-empty field could not.
+    pub unknown_keys: Map<String, Value>,
 }
 
 // ============================================================================
@@ -199,6 +221,7 @@ fn add_section(sections: &mut Map<String, Value>, name: &str, section: Option<Se
 /// best-effort; a failing/empty one is omitted (never aborts the others).
 pub async fn build_envelope() -> ConfigEnvelope {
     let mut sections = Map::new();
+    let mut unknown_keys = Map::new();
 
     add_section(
         &mut sections,
@@ -212,11 +235,28 @@ pub async fn build_envelope() -> ConfigEnvelope {
     );
     // Synchronous collectors — wrap in Some so the isolation driver still drops
     // an (unlikely) empty result.
+    let versions = collectors::collect_versions();
     add_section(
         &mut sections,
-        "versions",
-        Some(collectors::collect_versions()),
+        apply_versions::VERSIONS_SECTION,
+        Some(versions.section),
     );
+    // Keyed by SECTION so the field generalizes; gated on the section having
+    // actually survived the isolation driver, so the envelope can never carry an
+    // unknown-key list for a section that isn't there.
+    if sections.contains_key(apply_versions::VERSIONS_SECTION) && !versions.unknown_keys.is_empty()
+    {
+        unknown_keys.insert(
+            apply_versions::VERSIONS_SECTION.to_string(),
+            Value::Array(
+                versions
+                    .unknown_keys
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
     add_section(
         &mut sections,
         "env_contract",
@@ -240,6 +280,7 @@ pub async fn build_envelope() -> ConfigEnvelope {
         schema_version: SCHEMA_VERSION,
         captured_at: chrono::Utc::now().to_rfc3339(),
         sections,
+        unknown_keys,
     }
 }
 
@@ -498,6 +539,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             captured_at: chrono::Utc::now().to_rfc3339(),
             sections,
+            unknown_keys: Map::new(),
         };
         let json = serde_json::to_string(&envelope).expect("serialize envelope");
 
@@ -530,10 +572,14 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             captured_at: "2026-06-22T00:00:00+00:00".to_string(),
             sections,
+            unknown_keys: Map::new(),
         };
         let v = serde_json::to_value(&envelope).unwrap();
         assert_eq!(v.get("schema_version").and_then(|x| x.as_u64()), Some(1));
         assert!(v.get("sections").and_then(|s| s.get("versions")).is_some());
+        // Additive sibling of `sections` — present even when empty, so a reader
+        // can tell "measured everything" from "runner predates the field".
+        assert_eq!(v.get("unknown_keys"), Some(&Value::Object(Map::new())));
         // Every section value is a string.
         let versions = v
             .get("sections")
@@ -541,6 +587,35 @@ mod tests {
             .and_then(|x| x.as_object())
             .unwrap();
         assert!(versions.values().all(|val| val.is_string()));
+    }
+
+    /// The wire shape a later web-side phase reads: section name → key list,
+    /// beside `sections` and never inside it. The section's own values stay
+    /// strings, and the unmeasured key stays ABSENT from the section — the
+    /// whole point of a parallel set rather than a value-shape change.
+    #[test]
+    fn envelope_carries_unknown_keys_beside_sections_not_inside_them() {
+        let mut sections = Map::new();
+        let mut s = Section::new();
+        s.insert("node".to_string(), Value::String("v22.1.0".to_string()));
+        add_section(&mut sections, "versions", Some(s));
+        let mut unknown_keys = Map::new();
+        unknown_keys.insert(
+            "versions".to_string(),
+            Value::Array(vec![Value::String("rustc".to_string())]),
+        );
+        let envelope = ConfigEnvelope {
+            schema_version: SCHEMA_VERSION,
+            captured_at: "2026-08-14T00:00:00+00:00".to_string(),
+            sections,
+            unknown_keys,
+        };
+        let v = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(v["unknown_keys"]["versions"][0], "rustc");
+        // The section is untouched: still string-only, still without the key.
+        let versions = v["sections"]["versions"].as_object().unwrap();
+        assert!(versions.values().all(Value::is_string));
+        assert!(!versions.contains_key("rustc"));
     }
 
     #[test]

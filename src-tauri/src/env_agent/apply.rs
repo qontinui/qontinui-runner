@@ -435,6 +435,9 @@ mod tests {
         compute_plan(
             &canonical,
             local.as_object().unwrap(),
+            // Nothing unmeasured: these driver tests are about the apply
+            // dispatch, not about capture-probe outcomes.
+            &Map::new(),
             "env-1",
             local_machine,
         )
