@@ -153,6 +153,21 @@ const OBSERVATION_INSERT_SQL: &str = r#"INSERT INTO co_occurrence_observations
                        (SELECT a.app_id FROM project.apps a WHERE a.app_id = $6))
                RETURNING app_id"#;
 
+/// Number of parameters [`OBSERVATION_INSERT_SQL`] binds.
+///
+/// The call site builds its params as a fixed-size array of this length, so
+/// adding or dropping a bind without changing this constant is a **compile**
+/// error, and `observation_insert_binds_match_their_sql` pins the constant
+/// against the highest `$N` actually present in the SQL. Between them the two
+/// halves cannot drift: a string-shape assertion alone never sees the params
+/// array, and arity drift on a runtime-parsed statement compiles clean and
+/// surfaces only as a `warn!` on a fire-and-forget path.
+const OBSERVATION_INSERT_BINDS: usize = 6;
+
+/// Number of parameters [`OBSERVATION_INSERT_SQL_LEGACY`] binds. Same
+/// compile-time-array + test pinning as [`OBSERVATION_INSERT_BINDS`].
+const OBSERVATION_INSERT_LEGACY_BINDS: usize = 5;
+
 /// The pre-app-scoping observation INSERT, kept verbatim as the fallback for
 /// databases that cannot satisfy [`OBSERVATION_INSERT_SQL`]'s preconditions.
 ///
@@ -199,6 +214,49 @@ const OBSERVATION_SCHEMA_PROBE_SQL: &str = r#"SELECT to_regclass('project.apps')
                                  AND attnum > 0
                                  AND NOT attisdropped)"#;
 
+/// Second half of the probe: the catalog answers **"exists"**, this answers
+/// **"readable"**.
+///
+/// `to_regclass(...) IS NOT NULL` and a `pg_attribute` lookup are both true for
+/// a relation the calling role holds no `SELECT` privilege on, and column-level
+/// grants can hide `app_id` specifically. Without this half, such a role caches
+/// `true`, every six-column INSERT fails with `permission denied`, and the
+/// legacy fallback is never selected — **total capture loss**, precisely what the
+/// guard exists to prevent. It is the one case where the "the probe fails toward
+/// the legacy path, so it can never make things worse" claim did not hold.
+///
+/// So actually read: one row (at most) from each relation, naming `app_id`
+/// explicitly on the observations side so a column-level grant is exercised too.
+/// A privilege failure — or a relation that vanished between the two probes —
+/// surfaces as a query error, which the initializer already turns into `false`
+/// and the legacy path.
+///
+/// Cost is bounded and paid once per process: `LIMIT 1` on each side, no join,
+/// no aggregate. The values are discarded; only success or failure matters, so
+/// an empty table (both scalar subqueries NULL) is a pass.
+const OBSERVATION_READ_PROBE_SQL: &str = r#"SELECT (SELECT o.app_id FROM project.co_occurrence_observations o LIMIT 1),
+                      (SELECT a.app_id FROM project.apps a LIMIT 1)"#;
+
+/// How long the once-per-process probe may take before capture gives up on it.
+///
+/// Not a deadlock guard — there is none to guard against: the initializer
+/// queries the connection its caller already holds (no pool re-entry) and
+/// `tokio::sync::OnceCell` releases its permit on cancellation. It bounds a
+/// **stall**. Every capture task that arrives while the initializer is running
+/// waits on the `OnceCell`'s semaphore *while holding a pooled connection*, and
+/// the pool is `max_size(8)` with no per-statement timeout — so a PG that
+/// accepts connections but stops answering would let 8 capture tasks pin all 8
+/// connections indefinitely and starve every other PG consumer in the runner.
+/// Before app scoping each task held its connection only for its own INSERT.
+///
+/// 5s because that is the bound the pool already chose for itself
+/// (`create_timeout`/`wait_timeout`/`recycle_timeout` in `database::pg`): a
+/// catalog read that outlives the pool's own patience is a stalled server, not a
+/// slow one, and capture is fire-and-forget — waiting longer buys nothing and
+/// costs the connection. Bounding the *initializer* is what bounds the waiters,
+/// since they are queued behind exactly it.
+const OBSERVATION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Process-wide cache of the [`OBSERVATION_SCHEMA_PROBE_SQL`] answer.
 ///
 /// Deliberately once per *process*, not once per observation: the reason
@@ -207,15 +265,35 @@ const OBSERVATION_SCHEMA_PROBE_SQL: &str = r#"SELECT to_regclass('project.apps')
 /// give back exactly the cost that design avoids. Schema shape does not change
 /// under a running runner without a migration, and a migration is followed by a
 /// restart, which re-probes.
+///
+/// **Constraint, recorded rather than engineered around: this cache is keyed on
+/// nothing.** It is correct in production because the runner constructs exactly
+/// one `PgDb` (from `main.rs`) and has no reconnect-to-a-different-database
+/// path, so "this process" and "this database" are the same thing. They are not
+/// the same thing under `cargo test`: `PgDb::new_blocking_for_test()` appears in
+/// ~20 test modules, so the first test to drive `enqueue_observation` against
+/// one database would pin the answer for a second, differently-migrated one.
+/// Nothing does that today (no test reaches this function against PG). If one
+/// ever does — or if the runner gains a reconnect path that can land on another
+/// database — key this per-`PgDb` instead of per-process rather than adding a
+/// reset hook.
 static OBSERVATION_APP_ID_SUPPORTED: OnceCell<bool> = OnceCell::const_new();
 
 /// Resolve — once per process — whether the six-column
 /// [`OBSERVATION_INSERT_SQL`] is safe on this database, warning exactly once
 /// when it is not.
 ///
-/// **Fails toward the legacy path.** A probe that errors returns `false`, so a
-/// probe malfunction can only cost attribution, never capture; it can never
-/// leave the runner worse off than having no probe at all. The `false` is
+/// Two questions, both of which the six-column statement needs answered `true`:
+/// does the schema have the shapes ([`OBSERVATION_SCHEMA_PROBE_SQL`], catalog),
+/// and can this role actually *read* them ([`OBSERVATION_READ_PROBE_SQL`]).
+/// The second is not redundant: the catalog says a relation exists even when the
+/// caller holds no `SELECT` privilege on it, and caching `true` there would fail
+/// every INSERT and never select the fallback. Both run under one
+/// [`OBSERVATION_PROBE_TIMEOUT`] deadline.
+///
+/// **Fails toward the legacy path.** A probe that errors *or times out* returns
+/// `false`, so a probe malfunction can only cost attribution, never capture; it
+/// can never leave the runner worse off than having no probe at all. The `false` is
 /// cached like any other answer, so a transient probe failure pins the legacy
 /// path until restart — the safe direction to be wrong in, and it is stated in
 /// the warning so nobody has to guess.
@@ -226,26 +304,58 @@ static OBSERVATION_APP_ID_SUPPORTED: OnceCell<bool> = OnceCell::const_new();
 async fn observation_app_id_supported(client: &tokio_postgres::Client) -> bool {
     *OBSERVATION_APP_ID_SUPPORTED
         .get_or_init(|| async {
-            let (has_apps, has_column) =
-                match client.query_one(OBSERVATION_SCHEMA_PROBE_SQL, &[]).await {
-                    Ok(row) => (
-                        // `try_get`, not `get`: `get` panics on a type mismatch,
-                        // and this runs under a fire-and-forget capture task.
-                        row.try_get::<_, bool>(0).unwrap_or(false),
-                        row.try_get::<_, bool>(1).unwrap_or(false),
-                    ),
-                    Err(e) => {
-                        warn!(
-                            "state_discovery::capture: could not probe the database for app \
-                             attribution support ({}) — falling back to the pre-app-scoping \
-                             five-column INSERT for the life of this process. Observations are \
-                             still being recorded, but with no app_id. Remedy: fix the error \
-                             above, then restart the runner to re-probe.",
-                            e
-                        );
-                        return false;
-                    }
-                };
+            // Both probes run under one shared deadline. See
+            // `OBSERVATION_PROBE_TIMEOUT`: waiters queue on this initializer
+            // holding pooled connections, so an unbounded probe is an unbounded
+            // stall of the whole pool, not just of this task.
+            let probed = tokio::time::timeout(OBSERVATION_PROBE_TIMEOUT, async {
+                let row = client.query_one(OBSERVATION_SCHEMA_PROBE_SQL, &[]).await?;
+                // `try_get`, not `get`: `get` panics on a type mismatch, and
+                // this runs under a fire-and-forget capture task.
+                let has_apps = row.try_get::<_, bool>(0).unwrap_or(false);
+                let has_column = row.try_get::<_, bool>(1).unwrap_or(false);
+
+                // "Exists" is not "readable". Only ask once the catalog says
+                // both relations are there, so a genuine missing-column
+                // database still gets the precise diagnosis below instead of a
+                // generic query error.
+                if has_apps && has_column {
+                    client.query_one(OBSERVATION_READ_PROBE_SQL, &[]).await?;
+                }
+                Ok::<_, tokio_postgres::Error>((has_apps, has_column))
+            })
+            .await;
+
+            let (has_apps, has_column) = match probed {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(e)) => {
+                    warn!(
+                        "state_discovery::capture: could not probe the database for app \
+                         attribution support ({}) — falling back to the pre-app-scoping \
+                         five-column INSERT for the life of this process. Observations are \
+                         still being recorded, but with no app_id. A `permission denied` here \
+                         means this role cannot read project.apps or \
+                         co_occurrence_observations.app_id, so the six-column INSERT would have \
+                         failed on every observation. Remedy: fix the error above, then restart \
+                         the runner to re-probe.",
+                        e
+                    );
+                    return false;
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        "state_discovery::capture: the app-attribution schema probe did not \
+                         answer within {:?} — falling back to the pre-app-scoping five-column \
+                         INSERT for the life of this process. Observations are still being \
+                         recorded, but with no app_id. A database that accepts connections and \
+                         then does not answer a catalog read is stalled, and capture tasks wait \
+                         on this probe holding pooled connections, so it is bounded rather than \
+                         retried. Remedy: fix the database, then restart the runner to re-probe.",
+                        OBSERVATION_PROBE_TIMEOUT
+                    );
+                    return false;
+                }
+            };
 
             if has_apps && has_column {
                 return true;
@@ -277,6 +387,61 @@ async fn observation_app_id_supported(client: &tokio_postgres::Client) -> bool {
             false
         })
         .await
+}
+
+/// Pick the INSERT this database can actually run, with the number of
+/// parameters it binds.
+///
+/// Split out as a pure function so the *selection* is testable without PG. The
+/// branch it replaces was an `if !supported { …; return; }` early exit whose
+/// `return` nothing verified — dropping it would have double-inserted every
+/// observation, silently, on the un-migrated databases the fallback exists to
+/// serve. Here the two statements are mutually exclusive by construction: one
+/// expression, one value, no path that runs both.
+fn observation_insert_statement(app_id_supported: bool) -> (&'static str, usize) {
+    if app_id_supported {
+        (OBSERVATION_INSERT_SQL, OBSERVATION_INSERT_BINDS)
+    } else {
+        (
+            OBSERVATION_INSERT_SQL_LEGACY,
+            OBSERVATION_INSERT_LEGACY_BINDS,
+        )
+    }
+}
+
+/// Did the INSERT's `RETURNING app_id` reject the id the snapshot claimed?
+///
+/// This — and only this — is why the six-column path runs `query_opt` with a
+/// `RETURNING` clause instead of `execute`. We supplied a candidate and the
+/// registry subquery collapsed it to `NULL`, i.e. `project.apps` does not know
+/// that id: a producer/consumer key disagreement, the exact defect class this
+/// subsystem has been bitten by twice.
+///
+/// `(None, _)` is not a rejection — no id was claimed, so `NULL` is the
+/// deliberate "app unknown" the column is documented to mean. `(Some, Some)` is
+/// the success case. `(None, Some)` cannot happen (nothing can invent an id) and
+/// is pinned as a non-rejection so a future edit that makes it possible has to
+/// decide what it means rather than inheriting a warning.
+fn app_id_was_rejected(candidate: Option<&str>, stored: Option<&str>) -> bool {
+    matches!((candidate, stored), (Some(_), None))
+}
+
+/// One-shot gate for the unknown-app warning: `true` exactly once per process.
+///
+/// The rejection is a *configuration* fact, not an event — the same snapshot
+/// producer claims the same unregistered id on every read. The warning sits on a
+/// path that runs once per UI Bridge snapshot with `SAMPLE_RATE == 1` and
+/// nothing else throttling it, so leaving it ungated emitted one identical WARN
+/// per snapshot — roughly 3600 lines an hour at 1 Hz, burying every other
+/// warning in the log. Same cadence the probe warning above already has by
+/// living inside the `OnceCell` initializer; this is the equivalent for a
+/// warning that cannot live there.
+fn should_warn_unknown_app_once() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    WARNED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 /// Enqueue a single observation derived from a UI Bridge snapshot.
@@ -389,60 +554,59 @@ pub async fn enqueue_observation(
 
     // Which statement this database can actually run. Cached after the first
     // call, so this is a bool read per observation, not a catalog query.
-    if !observation_app_id_supported(&conn).await {
-        // Un-migrated database: the six-column statement would fail outright
-        // and the observation would be dropped. Record it exactly as the runner
-        // did before app scoping instead — un-attributed, but not lost. The
-        // reason was already logged once by the probe, so stay quiet here
-        // beyond the shared insert-failure warning.
-        if let Err(e) = conn
-            .execute(
-                OBSERVATION_INSERT_SQL_LEGACY,
-                &[
-                    &id,
-                    &spec_id as &(dyn tokio_postgres::types::ToSql + Sync),
-                    &runner_instance,
-                    &fingerprints_json,
-                    &snapshot_metadata,
-                ],
-            )
-            .await
-        {
-            warn!(
-                "state_discovery::capture: failed to insert observation ({} elements): {}",
-                element_count, e
-            );
-        }
-        return;
-    }
+    let app_id_supported = observation_app_id_supported(&conn).await;
+    let (sql, binds) = observation_insert_statement(app_id_supported);
 
+    // One expression, one statement, no early return: the two paths are
+    // mutually exclusive by construction rather than by a `return` nothing
+    // checks. `Ok(Some(row))` = the six-column statement ran and its
+    // `RETURNING app_id` is readable; `Ok(None)` = the legacy statement ran and
+    // there is no attribution to inspect (the probe already said why, once).
+    //
     // See `OBSERVATION_INSERT_SQL` for why each cast is there and why the
-    // `project.apps` subquery is safe on this database (the probe above is
-    // what makes it so). `query_opt` rather than `execute` because `execute`
-    // returns a row count, which would discard the `RETURNING app_id` that
-    // makes an unknown id observable.
-    let res = conn
-        .query_opt(
-            OBSERVATION_INSERT_SQL,
-            &[
-                &id,
-                &spec_id as &(dyn tokio_postgres::types::ToSql + Sync),
-                &runner_instance,
-                &fingerprints_json,
-                &snapshot_metadata,
-                &app_id,
-            ],
-        )
-        .await;
+    // `project.apps` subquery is safe when the probe says so. `query_opt`
+    // rather than `execute` on that path because `execute` returns a row count,
+    // which would discard the `RETURNING app_id` that makes an unknown id
+    // observable; the legacy statement has no `RETURNING`, so it uses `execute`.
+    //
+    // The params arrays are sized by the bind constants, so SQL/param arity can
+    // only drift past a compile error plus
+    // `observation_insert_binds_match_their_sql`.
+    let inserted = if app_id_supported {
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); OBSERVATION_INSERT_BINDS] = [
+            &id,
+            &spec_id,
+            &runner_instance,
+            &fingerprints_json,
+            &snapshot_metadata,
+            &app_id,
+        ];
+        conn.query_opt(sql, &params).await.map(Some)
+    } else {
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); OBSERVATION_INSERT_LEGACY_BINDS] = [
+            &id,
+            &spec_id,
+            &runner_instance,
+            &fingerprints_json,
+            &snapshot_metadata,
+        ];
+        conn.execute(sql, &params).await.map(|_| None)
+    };
 
-    match res {
+    match inserted {
         Err(e) => {
+            // The bind count names which statement ran (6 = app-scoped,
+            // 5 = the pre-app-scoping fallback) without dumping the SQL.
             warn!(
-                "state_discovery::capture: failed to insert observation ({} elements): {}",
-                element_count, e
+                "state_discovery::capture: failed to insert observation ({} elements, \
+                 {}-bind statement): {}",
+                element_count, binds, e
             );
         }
-        Ok(row) => {
+        // Legacy path: un-attributed by design, nothing to inspect. The reason
+        // was already logged once by the probe, so stay quiet here.
+        Ok(None) => {}
+        Ok(Some(row)) => {
             // The stamped id came back NULL while we supplied one: the app is
             // not registered in `project.apps`. The row is kept and recorded
             // un-attributed rather than dropped — it still carries
@@ -454,12 +618,16 @@ pub async fn enqueue_observation(
             let stored: Option<String> = row
                 .and_then(|r| r.try_get::<_, Option<String>>(0).ok())
                 .flatten();
-            if let (Some(candidate), None) = (app_id.as_deref(), stored.as_deref()) {
+            if app_id_was_rejected(app_id.as_deref(), stored.as_deref())
+                && should_warn_unknown_app_once()
+            {
                 warn!(
                     "state_discovery::capture: snapshot claimed appId {:?}, which is not \
                      registered in project.apps — observation recorded with app_id NULL \
-                     (un-attributed). Register the app or fix the producer's id.",
-                    candidate
+                     (un-attributed). Register the app or fix the producer's id. This warning \
+                     is emitted ONCE per process: the condition repeats on every snapshot, so \
+                     it is a configuration fact, not a stream of events.",
+                    app_id.as_deref().unwrap_or_default()
                 );
             }
         }
@@ -765,6 +933,221 @@ mod tests {
         assert!(
             !OBSERVATION_SCHEMA_PROBE_SQL.contains("to_regclass('apps')"),
             "probe names must stay schema-qualified, independent of search_path"
+        );
+    }
+
+    /// Highest `$N` placeholder in a statement, and the set of numbers used.
+    ///
+    /// Deliberately derived from the SQL rather than hand-copied: the point of
+    /// the bind tests is that nobody has to keep two lists in their head.
+    fn placeholders(sql: &str) -> (usize, std::collections::BTreeSet<usize>) {
+        let mut used = std::collections::BTreeSet::new();
+        let bytes = sql.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'$' {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > start {
+                    if let Ok(n) = sql[start..end].parse::<usize>() {
+                        used.insert(n);
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        (used.iter().copied().max().unwrap_or(0), used)
+    }
+
+    #[test]
+    fn observation_insert_binds_match_their_sql() {
+        // THE gap the string-shape assertions above do not close: they inspect
+        // the SQL only, never the `&[…]` params array, so SQL/param arity drift
+        // compiles clean and fails at runtime on a `warn!`-only fire-and-forget
+        // path. Tying each statement's highest placeholder to the constant that
+        // *sizes the call site's params array* makes the two inseparable — the
+        // array is `[&(dyn ToSql + Sync); OBSERVATION_INSERT_BINDS]`, so
+        // changing the constant to satisfy this test breaks compilation until
+        // the params list is changed to match, and vice versa.
+        for (label, sql, declared) in [
+            (
+                "OBSERVATION_INSERT_SQL",
+                OBSERVATION_INSERT_SQL,
+                OBSERVATION_INSERT_BINDS,
+            ),
+            (
+                "OBSERVATION_INSERT_SQL_LEGACY",
+                OBSERVATION_INSERT_SQL_LEGACY,
+                OBSERVATION_INSERT_LEGACY_BINDS,
+            ),
+        ] {
+            let (max, used) = placeholders(sql);
+            assert_eq!(
+                max, declared,
+                "{label} binds $1..=${max} but its bind constant says {declared}; the call \
+                 site passes exactly {declared} parameters, so this is a runtime failure \
+                 waiting on a fire-and-forget path. SQL: {sql}"
+            );
+            let expected: std::collections::BTreeSet<usize> = (1..=declared).collect();
+            assert_eq!(
+                used, expected,
+                "{label} must use every placeholder from $1 to ${declared} exactly once — a \
+                 gap means a parameter is passed and silently ignored. SQL: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_answer_selects_the_statement_and_its_bind_count() {
+        // The plan's load-bearing claim — "the probe fails toward the legacy
+        // path, so it can never make things worse" — was verified by nothing:
+        // only the probe SQL's *text* was asserted. This pins the behaviour the
+        // claim is about, and pins it to the bind constants so the pairing
+        // cannot drift either.
+        assert_eq!(
+            observation_insert_statement(false),
+            (
+                OBSERVATION_INSERT_SQL_LEGACY,
+                OBSERVATION_INSERT_LEGACY_BINDS
+            ),
+            "a false probe answer (missing column, missing table, probe error, or probe \
+             timeout) MUST select the pre-app-scoping statement — that is the whole \
+             fails-toward-legacy guarantee"
+        );
+        assert_eq!(
+            observation_insert_statement(true),
+            (OBSERVATION_INSERT_SQL, OBSERVATION_INSERT_BINDS),
+            "a true probe answer must select the app-scoped statement, or the feature is a \
+             silent no-op on a perfectly capable database"
+        );
+    }
+
+    #[test]
+    fn the_two_statements_are_mutually_exclusive() {
+        // The branch this replaces was `if !supported { …; return; }`. An edit
+        // dropping that `return` would have run BOTH inserts and duplicated
+        // every observation, silently. The selector returns one statement, so
+        // the only way to run both is to call it twice — but pin that the two
+        // arms are genuinely different statements, so a copy-paste that returns
+        // the same one from both arms (silently losing the fallback, or
+        // silently losing attribution) fails here.
+        let (legacy, _) = observation_insert_statement(false);
+        let (scoped, _) = observation_insert_statement(true);
+        assert_ne!(
+            legacy, scoped,
+            "the two arms must be different statements; identical arms mean one of the two \
+             behaviours has been silently deleted"
+        );
+    }
+
+    #[test]
+    fn a_claimed_but_unregistered_app_id_is_a_rejection() {
+        // The reject path is the entire reason the six-column INSERT uses
+        // `query_opt` + `RETURNING` rather than `execute`: we supplied an id and
+        // the registry subquery collapsed it to NULL.
+        assert!(
+            app_id_was_rejected(Some("qontinui-web"), None),
+            "a claimed id that came back NULL is a producer/consumer key disagreement and must \
+             be reported"
+        );
+    }
+
+    #[test]
+    fn a_stored_or_absent_app_id_is_not_a_rejection() {
+        assert!(
+            !app_id_was_rejected(Some("qontinui-runner"), Some("qontinui-runner")),
+            "the id was accepted by the registry — nothing to report"
+        );
+        assert!(
+            !app_id_was_rejected(None, None),
+            "no id was claimed, so NULL is the deliberate `app unknown` the column means — \
+             warning here would fire on every snapshot from a producer that does not stamp"
+        );
+        assert!(
+            !app_id_was_rejected(None, Some("qontinui-runner")),
+            "cannot happen (the INSERT cannot invent an id); pinned so a future edit that makes \
+             it possible has to decide what it means"
+        );
+    }
+
+    #[test]
+    fn the_unknown_app_warning_fires_once_per_process() {
+        // Cadence, not text. With SAMPLE_RATE == 1 and nothing else throttling,
+        // an ungated warning on this path emits one identical line per UI Bridge
+        // snapshot (~3600/hour at 1 Hz) and buries every other warning.
+        //
+        // NOTE: the gate is process-global, so this test consumes it. It is the
+        // only test that touches it, and it must stay that way — a second
+        // consumer would make both order-dependent.
+        assert!(
+            should_warn_unknown_app_once(),
+            "the first rejection in a process must be reported"
+        );
+        for _ in 0..1000 {
+            assert!(
+                !should_warn_unknown_app_once(),
+                "every subsequent rejection must be silent — the condition is a configuration \
+                 fact that repeats on every snapshot, not a stream of events"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_probe_also_proves_readability_not_just_existence() {
+        // `to_regclass(...) IS NOT NULL` is true for a relation the calling role
+        // cannot SELECT from, and a column-level grant can hide `app_id`
+        // specifically. Caching `true` there fails every six-column INSERT and
+        // never selects the fallback: total capture loss, the one hole in
+        // "the probe can never make things worse".
+        assert!(
+            OBSERVATION_READ_PROBE_SQL.contains("FROM project.co_occurrence_observations")
+                && OBSERVATION_READ_PROBE_SQL.contains("o.app_id"),
+            "the read probe must actually read the target column, so a column-level privilege \
+             failure surfaces as a probe error. Got: {OBSERVATION_READ_PROBE_SQL}"
+        );
+        assert!(
+            OBSERVATION_READ_PROBE_SQL.contains("FROM project.apps"),
+            "the read probe must also read the registry the INSERT subqueries. Got: \
+             {OBSERVATION_READ_PROBE_SQL}"
+        );
+        assert_eq!(
+            OBSERVATION_READ_PROBE_SQL.matches("LIMIT 1").count(),
+            2,
+            "each side must stay bounded to one row — the probe proves readability, it does not \
+             scan. Got: {OBSERVATION_READ_PROBE_SQL}"
+        );
+        assert_eq!(
+            placeholders(OBSERVATION_READ_PROBE_SQL).0,
+            0,
+            "the read probe takes no parameters; it is run with an empty bind slice"
+        );
+        assert_eq!(
+            placeholders(OBSERVATION_SCHEMA_PROBE_SQL).0,
+            0,
+            "the catalog probe takes no parameters; it is run with an empty bind slice"
+        );
+    }
+
+    #[test]
+    fn the_probe_timeout_is_bounded_and_matches_the_pool() {
+        // Not a deadlock guard — a stall bound. Capture tasks queue on the
+        // OnceCell initializer *holding pooled connections* (max_size 8, no
+        // per-statement timeout), so an unbounded probe can pin the whole pool
+        // and starve every other PG consumer in the runner.
+        assert!(
+            OBSERVATION_PROBE_TIMEOUT > std::time::Duration::ZERO,
+            "a zero timeout would make the probe unable to ever answer true"
+        );
+        assert_eq!(
+            OBSERVATION_PROBE_TIMEOUT,
+            std::time::Duration::from_secs(5),
+            "the bound tracks the pool's own create/wait/recycle timeout in database::pg — a \
+             catalog read that outlives the pool's patience is a stalled server, not a slow one"
         );
     }
 }
