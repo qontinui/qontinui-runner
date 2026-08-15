@@ -1004,6 +1004,25 @@ pub struct PathSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plans_archive_dir: Option<String>,
 
+    /// Directory holding the operator's markdown **prompts** — the third scan
+    /// root of the plan & prompt library, and the value exported to agent
+    /// sessions as `QONTINUI_PROMPTS_DIR`.
+    ///
+    /// Default (when None): **unset — sessions are told nothing about a prompts
+    /// directory and the prompt scan does not run.** Deliberately *not*
+    /// derivable from `plans_dir`: `/create-plan` currently guesses
+    /// `$QONTINUI_PLANS_DIR/../prompts/*.md`, and that guess is what this
+    /// setting exists to replace — prompts live in more than one repo and the
+    /// sibling-of-plans relationship does not hold in general.
+    ///
+    /// Unlike `plans_dir` there is **no environment override**: that variable
+    /// exists only for backward compatibility with a pre-settings deployment,
+    /// and a new field has none to keep.
+    ///
+    /// Override example: `D:\qontinui-root\prompts`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts_dir: Option<String>,
+
     /// The **workspace root**: the directory holding the Qontinui repo
     /// checkouts (`<root>/qontinui-runner`, `<root>/qontinui-coord`, …). The
     /// census, the fleet publisher, the `.mcp.json` reconcile and canonical
@@ -1117,6 +1136,7 @@ mod path_settings_tests {
         let defaults = PathSettings::default();
         assert_eq!(defaults.plans_dir, None);
         assert_eq!(defaults.plans_archive_dir, None);
+        assert_eq!(defaults.prompts_dir, None);
 
         let json = serde_json::to_value(&defaults).expect("PathSettings must serialize");
         let obj = json.as_object().expect("serializes as an object");
@@ -1128,6 +1148,10 @@ mod path_settings_tests {
             !obj.contains_key("plans_archive_dir"),
             "unset plans_archive_dir must be absent, got {json}"
         );
+        assert!(
+            !obj.contains_key("prompts_dir"),
+            "unset prompts_dir must be absent, got {json}"
+        );
     }
 
     /// Round-trip with both fields set: they serialize and come back verbatim.
@@ -1137,6 +1161,7 @@ mod path_settings_tests {
             dev_logs_dir: Some("/w/.dev-logs".to_string()),
             plans_dir: Some("/w/plans".to_string()),
             plans_archive_dir: Some("/w/dev-notes/plans".to_string()),
+            prompts_dir: Some("/w/prompts".to_string()),
             workspace_root: Some("/w".to_string()),
             strict_mode: false,
         };
@@ -1149,6 +1174,7 @@ mod path_settings_tests {
             parsed.plans_archive_dir.as_deref(),
             Some("/w/dev-notes/plans")
         );
+        assert_eq!(parsed.prompts_dir.as_deref(), Some("/w/prompts"));
         assert_eq!(parsed.dev_logs_dir.as_deref(), Some("/w/.dev-logs"));
         assert_eq!(parsed.workspace_root.as_deref(), Some("/w"));
     }
@@ -1162,6 +1188,7 @@ mod path_settings_tests {
                 .expect("legacy PathSettings JSON must still deserialize");
         assert_eq!(parsed.plans_dir, None);
         assert_eq!(parsed.plans_archive_dir, None);
+        assert_eq!(parsed.prompts_dir, None);
         assert!(parsed.strict_mode);
     }
 

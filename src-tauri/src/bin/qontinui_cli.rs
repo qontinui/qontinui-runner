@@ -49,6 +49,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("create") => pr_create(&args[1..]),
+        Some("plan-library-backfill") => plan_library_backfill(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -61,10 +62,11 @@ fn main() -> ExitCode {
 }
 
 const USAGE: &str = "\
-qontinui-pr — Qontinui Runner session PR CLI
+qontinui-pr — Qontinui Runner session CLI
 
 USAGE:
   qontinui-pr create --title <title> [options]
+  qontinui-pr plan-library-backfill [options]
 
 OPTIONS (create):
   --repo <owner/name>   Target repo (default: inferred from `git remote get-url origin`)
@@ -75,10 +77,24 @@ OPTIONS (create):
   --body-file <path>    Read the PR body from a file
   --draft               Open as a draft PR
 
+OPTIONS (plan-library-backfill):
+  --dry-run             Scan and report only — no network call whatsoever
+  --plans-dir <path>    Active plans dir      (default: $QONTINUI_PLANS_DIR)
+  --archive-dir <path>  Plans archive dir     (default: $QONTINUI_PLANS_ARCHIVE_DIR)
+  --prompts-dir <path>  Prompts dir           (default: $QONTINUI_PROMPTS_DIR)
+  --backend <url>       qontinui-web base URL (default: $QONTINUI_WEB_BACKEND_URL,
+                        then $QONTINUI_API_URL)
+  --limit <n>           Push at most N artifacts (ordering is the scan order)
+
 Values that themselves begin with `--` must use the `--flag=value` form.
 
-Opens the PR through the runner's coord-brokered loopback proxy — no personal
-`gh auth login` required. On success prints the PR URL to stdout.";
+`create` opens the PR through the runner's coord-brokered loopback proxy — no
+personal `gh auth login` required. On success prints the PR URL to stdout.
+
+`plan-library-backfill` walks the three scan roots, classifies each markdown
+file to an artifact kind, and upserts it into the qontinui-web plan & prompt
+library with the runner's own device JWT. `--dry-run` prints the per-kind counts
+and the duplicated/divergent stem list without contacting anything.";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PrCreateArgs {
@@ -305,6 +321,214 @@ fn pr_create(args: &[String]) -> ExitCode {
     }
 }
 
+// ===========================================================================
+// `qontinui-pr plan-library-backfill`
+//
+// Plan `2026-08-10-plan-and-prompt-library-in-web` Phase 2: the one-shot
+// backfill, so the ~1,100-file corpus lands without waiting for a reconcile
+// tick.
+//
+// It reads the three scan roots from flags, falling back to the environment the
+// runner already exports into every session (`QONTINUI_PLANS_DIR`,
+// `QONTINUI_PLANS_ARCHIVE_DIR`, `QONTINUI_PROMPTS_DIR`) — so inside a
+// runner-provisioned terminal the bare command already knows where to look.
+// ===========================================================================
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct BackfillArgs {
+    dry_run: bool,
+    plans_dir: Option<String>,
+    archive_dir: Option<String>,
+    prompts_dir: Option<String>,
+    backend: Option<String>,
+    limit: Option<usize>,
+}
+
+fn parse_backfill_args(args: &[String]) -> Result<BackfillArgs, String> {
+    let mut out = BackfillArgs::default();
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if arg.starts_with("--") => (f, Some(v)),
+            _ => (arg, None),
+        };
+        let mut consumed = 1usize;
+        // Same value-taking discipline as `create`: a next element that looks
+        // like a flag is an error, so `--plans-dir --dry-run` cannot silently
+        // scan a directory named "--dry-run".
+        let mut value = |consumed: &mut usize| -> Result<String, String> {
+            if let Some(v) = inline {
+                return Ok(v.to_string());
+            }
+            match args.get(i + 1) {
+                Some(v) if v.starts_with("--") => Err(format!(
+                    "{flag} requires a value but got the flag-like {v:?} — \
+                     use {flag}=<value> if the value really starts with --"
+                )),
+                Some(v) => {
+                    *consumed = 2;
+                    Ok(v.clone())
+                }
+                None => Err(format!("{flag} requires a value")),
+            }
+        };
+        match flag {
+            "--dry-run" => out.dry_run = true,
+            "--plans-dir" => out.plans_dir = Some(value(&mut consumed)?),
+            "--archive-dir" => out.archive_dir = Some(value(&mut consumed)?),
+            "--prompts-dir" => out.prompts_dir = Some(value(&mut consumed)?),
+            "--backend" => out.backend = Some(value(&mut consumed)?),
+            "--limit" => {
+                let raw = value(&mut consumed)?;
+                out.limit = Some(
+                    raw.parse::<usize>()
+                        .map_err(|_| format!("--limit expects a number, got {raw:?}"))?,
+                );
+            }
+            other => return Err(format!("unknown option {other:?}")),
+        }
+        i += consumed;
+    }
+    Ok(out)
+}
+
+/// A non-empty env var, or `None`. A blank value is *unset* everywhere in this
+/// tree; keep that here so `QONTINUI_PROMPTS_DIR=""` disables the prompt scan
+/// rather than scanning a directory named `""`.
+fn env_dir(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.trim().is_empty())
+}
+
+fn plan_library_backfill(args: &[String]) -> ExitCode {
+    use qontinui_runner_lib::plan_workunit_adapter::body_push as bp;
+    use qontinui_runner_lib::plan_workunit_adapter::PlanConvention;
+
+    let parsed = match parse_backfill_args(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("qontinui-pr: {e}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let roots = bp::scan_roots(
+        parsed.plans_dir.or_else(|| env_dir("QONTINUI_PLANS_DIR")),
+        parsed
+            .archive_dir
+            .or_else(|| env_dir("QONTINUI_PLANS_ARCHIVE_DIR")),
+        parsed
+            .prompts_dir
+            .or_else(|| env_dir("QONTINUI_PROMPTS_DIR")),
+    );
+    if roots.is_empty() {
+        eprintln!(
+            "qontinui-pr: no scan root configured. Pass --plans-dir/--archive-dir/--prompts-dir, \
+             or run inside a runner-provisioned terminal where $QONTINUI_PLANS_DIR and friends \
+             are exported."
+        );
+        return ExitCode::from(2);
+    }
+
+    // The push path reports per-artifact failures through `tracing::warn!`, and
+    // a bin with no subscriber SWALLOWS them — the operator would see
+    // `errors=1` with no reason, which is the exact silent-failure shape this
+    // tree argues against everywhere else. Install a minimal stderr subscriber
+    // so the diagnosis (a 401 naming the dependency mismatch, a 422 naming the
+    // field) actually reaches the terminal. `RUST_LOG` still wins if set.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .try_init();
+
+    let conv = PlanConvention::operator_default();
+    let mut per_root: Vec<(String, usize)> = Vec::new();
+    let mut all: Vec<bp::ScannedArtifact> = Vec::new();
+    let mut skipped: Vec<bp::SkippedFile> = Vec::new();
+    for root in &roots {
+        let found = bp::scan_one_root(root, &conv, &mut skipped);
+        let label = format!(
+            "{} [{}]",
+            root.label,
+            root.source_repo.as_deref().unwrap_or("no repo")
+        );
+        per_root.push((label, found.len()));
+        all.extend(found);
+    }
+
+    let report = bp::build_report(&all, skipped, per_root);
+    println!("{}", bp::render_report(&report));
+
+    if parsed.dry_run {
+        println!("dry run: nothing was pushed.");
+        return ExitCode::SUCCESS;
+    }
+
+    let base = match bp::backend_base_from_env(parsed.backend) {
+        Some(b) => b,
+        None => {
+            eprintln!(
+                "qontinui-pr: no qontinui-web backend configured — pass --backend <url> or set \
+                 $QONTINUI_WEB_BACKEND_URL. Refusing to guess a host for a {}-artifact push.",
+                report.scanned
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let sink = bp::HttpArtifactSink::new(&base);
+    let to_push: &[bp::ScannedArtifact] = match parsed.limit {
+        Some(n) if n < all.len() => &all[..n],
+        _ => &all,
+    };
+    println!("pushing {} artifact(s) to {base} …", to_push.len());
+
+    // The push path is async (it shares `reqwest`'s async client with the
+    // runner's own adapter); this bin has no ambient runtime, so give it a
+    // single-threaded one rather than duplicating the client as blocking.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("qontinui-pr: build tokio runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut state = bp::ArtifactSyncState::new();
+    let summary = runtime.block_on(bp::backfill_once(&sink, to_push, &mut state));
+
+    println!(
+        "created={} updated={} unchanged={} skipped={} kind_forks={} errors={}",
+        summary.created,
+        summary.updated,
+        summary.unchanged_remote,
+        summary.skipped_local,
+        summary.ambiguous_kind,
+        summary.errors
+    );
+    println!(
+        "edges: set={} unresolved={} errors={}",
+        summary.edges_set, summary.edges_unresolved, summary.edge_errors
+    );
+    if summary.ambiguous_kind > 0 {
+        println!(
+            "note: {} artifact(s) hit a kind fork — several rows share (slug, source_repo) with \
+             no locked kind. Nothing was written for those; resolve with \
+             PATCH /api/v1/plan-library/<id>/kind and re-run.",
+            summary.ambiguous_kind
+        );
+    }
+    if summary.errors > 0 {
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
 /// First line of stdin (for `--title -`).
 fn first_stdin_line() -> Option<String> {
     let stdin = std::io::stdin();
@@ -442,6 +666,81 @@ fn resolve_port(session: &SessionMcpConfig, env_override: Option<&str>) -> Optio
         return Some(p);
     }
     session.port
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_the_full_backfill_flag_set() {
+        let parsed = parse_backfill_args(&argv(&[
+            "--dry-run",
+            "--plans-dir",
+            "D:/qontinui-root/plans",
+            "--archive-dir=D:/qontinui-root/plans/archive",
+            "--prompts-dir",
+            "D:/qontinui-root/prompts",
+            "--backend",
+            "http://127.0.0.1:8000",
+            "--limit",
+            "25",
+        ]))
+        .expect("must parse");
+        assert!(parsed.dry_run);
+        assert_eq!(parsed.plans_dir.as_deref(), Some("D:/qontinui-root/plans"));
+        assert_eq!(
+            parsed.archive_dir.as_deref(),
+            Some("D:/qontinui-root/plans/archive")
+        );
+        assert_eq!(
+            parsed.prompts_dir.as_deref(),
+            Some("D:/qontinui-root/prompts")
+        );
+        assert_eq!(parsed.backend.as_deref(), Some("http://127.0.0.1:8000"));
+        assert_eq!(parsed.limit, Some(25));
+    }
+
+    #[test]
+    fn no_flags_is_a_valid_env_driven_invocation() {
+        assert_eq!(parse_backfill_args(&[]).unwrap(), BackfillArgs::default());
+    }
+
+    /// A flag-shaped value is an error, not a directory named `--dry-run`.
+    #[test]
+    fn a_flag_like_value_is_rejected() {
+        let err = parse_backfill_args(&argv(&["--plans-dir", "--dry-run"])).unwrap_err();
+        assert!(err.contains("--plans-dir"), "got {err}");
+        assert!(err.contains("flag-like"), "got {err}");
+        // …unless spelled with `=`.
+        assert_eq!(
+            parse_backfill_args(&argv(&["--plans-dir=--weird"]))
+                .unwrap()
+                .plans_dir
+                .as_deref(),
+            Some("--weird")
+        );
+    }
+
+    #[test]
+    fn unknown_flags_and_bad_limits_are_rejected() {
+        assert!(parse_backfill_args(&argv(&["--nope"])).is_err());
+        assert!(parse_backfill_args(&argv(&["--limit", "many"])).is_err());
+        assert!(parse_backfill_args(&argv(&["--plans-dir"])).is_err());
+    }
+
+    /// The new subcommand must be reachable AND documented — a hand-rolled
+    /// dispatch and a hand-written USAGE string can drift silently.
+    #[test]
+    fn the_subcommand_is_documented_in_usage() {
+        assert!(USAGE.contains("plan-library-backfill"));
+        assert!(USAGE.contains("--dry-run"));
+        assert!(USAGE.contains("QONTINUI_PROMPTS_DIR"));
+    }
 }
 
 #[cfg(test)]
