@@ -55,7 +55,7 @@ use super::parser::{parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanCon
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// `captured_by` stamped on every scan-originated upsert. One of the web side's
@@ -161,11 +161,14 @@ pub fn classify_kind(root_kind: ScanRootKind, stem: &str, body: &str) -> Artifac
         return ArtifactKind::Plan;
     }
 
-    let lower_body = body.to_lowercase();
-    if lower_body.contains(MARKER_INVESTIGATE_THEN_PLAN) {
+    // Scanned case-insensitively IN PLACE rather than over a `body.to_lowercase()`
+    // copy: this runs on every file of a ~1,100-file corpus every 60s, and the
+    // copy allocated (and immediately dropped) the entire corpus — megabytes of
+    // pure churn per cycle — to serve two `contains` checks.
+    if contains_ignore_ascii_case(body, MARKER_INVESTIGATE_THEN_PLAN) {
         return ArtifactKind::InvestigationPrompt;
     }
-    if lower_body.contains(MARKER_AUTHOR_A_PLAN_FROM) {
+    if contains_ignore_ascii_case(body, MARKER_AUTHOR_A_PLAN_FROM) {
         return ArtifactKind::PlanAuthoringPrompt;
     }
 
@@ -190,6 +193,27 @@ pub fn classify_kind(root_kind: ScanRootKind, stem: &str, body: &str) -> Artifac
     }
 
     ArtifactKind::ImplementationPrompt
+}
+
+/// ASCII-case-insensitive substring search that allocates nothing.
+///
+/// `needle` must already be ASCII lowercase (every caller here passes a `const`
+/// marker, so that is a compile-time-visible property, not a runtime promise).
+/// Only the ASCII case folding matters: the markers are plain English, and a
+/// full Unicode fold would need the allocation this exists to avoid.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    debug_assert!(
+        needle.bytes().all(|b| !b.is_ascii_uppercase()),
+        "needle must be ASCII lowercase"
+    );
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 /// The first `# ` H1 of a body, trimmed. Shared by [`classify_kind`] and the
@@ -646,12 +670,28 @@ pub fn scan_one_root(
     let mut out = Vec::new();
     // `read_dir` order is filesystem-dependent; sort so a dry-run report is
     // reproducible across runs and machines.
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md") && p.is_file())
-        .collect();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    // Subdirectories are NOT descended into (the roots are flat, matching
+    // `super::trigger::read_plan_dir`) — but they are RECORDED, because a
+    // dry-run that silently omits them reads as "there is nothing there" when
+    // the truth is "this was never looked at". Absence of a report is not a
+    // report of absence.
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.is_dir() {
+            subdirs.push(path);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") && path.is_file() {
+            paths.push(path);
+        }
+    }
     paths.sort();
+    subdirs.sort();
+    for dir in subdirs {
+        skipped.push(SkippedFile {
+            path: dir.to_string_lossy().to_string(),
+            reason: "subdirectory_not_scanned",
+        });
+    }
 
     for path in paths {
         let path_str = path.to_string_lossy().to_string();
@@ -872,8 +912,23 @@ pub trait ArtifactSink: Send + Sync {
     ) -> Result<()>;
 }
 
+/// One provenance edge, as the server identifies it: the route is idempotent on
+/// `(from_id, to_id, relation)`, so that triple is exactly the right memo key.
+type EdgeKey = (String, String, String);
+
+/// How many times one edge may fail before this process stops retrying it.
+///
+/// Bounds the wasted traffic from a systemically broken edges route: five
+/// attempts spread over five cycles (~5 minutes at the default tick) is ample
+/// for a transient, and after that the triple is abandoned for the process
+/// rather than re-POSTed forever. Deliberately NOT wired into
+/// [`super::trigger::BodySync`]'s breaker: edges are additive best-effort, and
+/// a broken edge route must not stop bodies from being captured.
+const MAX_EDGE_ATTEMPTS: u32 = 5;
+
 /// Client-side memory: the digest last successfully pushed per
-/// `(slug, source_repo)`, plus the artifact ids the edge pass needs.
+/// `(slug, source_repo)`, plus the artifact ids the edge pass needs and the
+/// edges already applied.
 ///
 /// Keyed kind-agnostically because that is exactly how the server resolves a
 /// `kind_is_heuristic` upsert — if the classifier changes its mind about a
@@ -883,6 +938,22 @@ pub trait ArtifactSink: Send + Sync {
 pub struct ArtifactSyncState {
     last_sha: HashMap<(String, String), String>,
     ids: HashMap<(String, String), String>,
+    /// Edges this process has already applied. Without it the edge pass is
+    /// unconditional, so ~200 `Depends-On:` stems become ~200 POSTs every tick
+    /// forever — flatly contradicting the "steady state costs one directory
+    /// walk and zero HTTP calls" contract the digest memory exists to provide.
+    ///
+    /// Memoizing the **applied triple** rather than skipping the edge pass for
+    /// unchanged artifacts is the stronger of the two shapes. It is keyed on
+    /// what the server is idempotent on, so it is correct whatever made the
+    /// artifact skip (a local digest hit, a server-side no-op, or nothing at
+    /// all); and because only *successes* are recorded here, an edge whose POST
+    /// failed is naturally retried next cycle — which the artifact-level skip
+    /// would have suppressed forever, since the artifact stays unchanged.
+    applied_edges: HashSet<EdgeKey>,
+    /// Consecutive failures per edge, so a permanently broken edge route is
+    /// abandoned after [`MAX_EDGE_ATTEMPTS`] rather than retried every tick.
+    edge_failures: HashMap<EdgeKey, u32>,
 }
 
 impl ArtifactSyncState {
@@ -901,6 +972,10 @@ impl ArtifactSyncState {
     }
     pub fn is_empty(&self) -> bool {
         self.last_sha.is_empty()
+    }
+    /// How many edges this process has successfully applied.
+    pub fn applied_edge_count(&self) -> usize {
+        self.applied_edges.len()
     }
 }
 
@@ -961,6 +1036,11 @@ pub struct BackfillSummary {
     pub edges_set: u64,
     pub edges_unresolved: u64,
     pub edge_errors: u64,
+    /// Edges this process already applied, so no HTTP call was made. In steady
+    /// state this is the whole `Depends-On:` corpus and `edges_set` is 0.
+    pub edges_skipped_applied: u64,
+    /// Edges abandoned after [`MAX_EDGE_ATTEMPTS`] consecutive failures.
+    pub edges_given_up: u64,
 }
 
 /// Push every scanned artifact, then wire the `depends_on` edges.
@@ -974,6 +1054,11 @@ pub struct BackfillSummary {
 /// Resolution prefers a target in the SAME `source_repo`, so a dep declared in a
 /// dev-notes plan binds to the dev-notes copy of a duplicated stem rather than
 /// crossing repos arbitrarily.
+///
+/// The edge pass is **memoized** in [`ArtifactSyncState::applied_edges`], so a
+/// second cycle over an unchanged corpus makes zero edge calls — without that,
+/// the digest memory short-circuits pass 1 only and pass 2 re-POSTs every
+/// `depends_on` edge on every tick forever.
 pub async fn backfill_once<S: ArtifactSink + ?Sized>(
     sink: &S,
     artifacts: &[ScannedArtifact],
@@ -1039,16 +1124,41 @@ pub async fn backfill_once<S: ArtifactSink + ?Sized>(
                 summary.edges_unresolved += 1;
                 continue;
             };
+            // The server is idempotent on this triple, so re-POSTing one it
+            // already accepted buys nothing and costs a request per artifact
+            // per tick.
+            let key: EdgeKey = (
+                from_id.clone(),
+                to_id.clone(),
+                RELATION_DEPENDS_ON.to_string(),
+            );
+            if state.applied_edges.contains(&key) {
+                summary.edges_skipped_applied += 1;
+                continue;
+            }
+            if state.edge_failures.get(&key).copied().unwrap_or(0) >= MAX_EDGE_ATTEMPTS {
+                summary.edges_given_up += 1;
+                continue;
+            }
             match sink
                 .link(&from_id, &to_id, RELATION_DEPENDS_ON, Some("Depends-On:"))
                 .await
             {
-                Ok(()) => summary.edges_set += 1,
+                Ok(()) => {
+                    summary.edges_set += 1;
+                    state.edge_failures.remove(&key);
+                    state.applied_edges.insert(key);
+                }
                 Err(e) => {
                     summary.edge_errors += 1;
+                    let attempts = state.edge_failures.entry(key).or_insert(0);
+                    *attempts += 1;
+                    let giving_up = *attempts >= MAX_EDGE_ATTEMPTS;
                     tracing::warn!(
                         slug = %a.upsert.slug,
                         dep = %dep,
+                        attempt = *attempts,
+                        giving_up,
                         error = %format!("{e:#}"),
                         "plan library: depends_on edge failed (non-fatal)"
                     );
@@ -1099,6 +1209,40 @@ pub fn backend_base_from_env(configured: Option<String>) -> Option<String> {
     )
 }
 
+/// Resolve the backend base for a caller carrying an **explicit override** —
+/// the `qontinui-pr plan-library-backfill --backend <url>` flag.
+///
+/// Precedence is `flag → env_primary → env_alt`, i.e. the flag WINS. That is
+/// the opposite of [`backend_base_from_env`]'s `configured` slot, and the
+/// difference is not cosmetic: a runner-provisioned terminal exports
+/// [`WEB_BACKEND_URL_ENV_ALT`] into every session, so threading `--backend`
+/// into the lowest-precedence slot means the flag is silently ignored exactly
+/// where an operator is most likely to reach for it — and a
+/// `--backend http://127.0.0.1:8000` intended to keep a 1,100-artifact backfill
+/// local would instead go wherever the ambient env points, plausibly
+/// production. A flag the caller typed always outranks ambient environment.
+///
+/// Pure over its inputs; [`backend_base_from_flag_or_env`] supplies the env.
+pub fn resolve_backend_base_with_flag(
+    flag: Option<String>,
+    env_primary: Option<String>,
+    env_alt: Option<String>,
+) -> Option<String> {
+    // The three slots of `resolve_backend_base` are a plain precedence chain,
+    // so reusing it here also reuses the blank-is-unset and trailing-slash
+    // rules rather than re-deriving them.
+    resolve_backend_base(flag, env_primary, env_alt)
+}
+
+/// [`resolve_backend_base_with_flag`] reading the two env vars itself.
+pub fn backend_base_from_flag_or_env(flag: Option<String>) -> Option<String> {
+    resolve_backend_base_with_flag(
+        flag,
+        std::env::var(WEB_BACKEND_URL_ENV).ok(),
+        std::env::var(WEB_BACKEND_URL_ENV_ALT).ok(),
+    )
+}
+
 /// Production [`ArtifactSink`]: HTTP against qontinui-web with the runner's
 /// device-JWT bearer.
 ///
@@ -1109,11 +1253,35 @@ pub struct HttpArtifactSink {
     client: reqwest::Client,
 }
 
+/// Per-request ceiling on a plan-library call.
+///
+/// A body push carries up to a couple of megabytes of markdown, so this is
+/// looser than `fleet_policy_poller`'s 10s — but it must exist: the sync runs
+/// inside the reconcile tick, so a black-holing backend with no timeout parks
+/// the whole plan-adapter loop indefinitely rather than failing one cycle.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl HttpArtifactSink {
     pub fn new(base: impl Into<String>) -> Self {
         Self {
             base: base.into().trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            // One long-lived client per sink: `reqwest::Client` owns the
+            // connection pool and the TLS config, so building one per call
+            // would defeat connection reuse entirely.
+            client: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                // `build()` only fails on a broken TLS backend, which a default
+                // client would hit too — fall back rather than panic on the
+                // runner's boot path.
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "plan library: could not build a timeout-bearing HTTP client; \
+                         falling back to the default (no timeout)"
+                    );
+                    reqwest::Client::new()
+                }),
         }
     }
 
@@ -1716,6 +1884,62 @@ mod tests {
         assert_eq!(alpha.depends_on, vec!["2026-01-01-beta".to_string()]);
     }
 
+    /// The scan is non-recursive, and a subdirectory must be RECORDED as
+    /// not-looked-at rather than silently omitted. Omitting it makes the
+    /// dry-run read "there is nothing there" when the truth is "this was never
+    /// scanned" — the silent-empty-is-unknown shape.
+    #[test]
+    fn a_subdirectory_is_recorded_as_skipped_not_silently_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plans = tmp.path().join("plans");
+        let nested = plans.join("2026-q3");
+        std::fs::create_dir_all(&nested).unwrap();
+        write(&plans, "2026-01-01-top.md", "# Top\n");
+        write(&nested, "2026-01-02-buried.md", "# Buried\n");
+
+        let root = ScanRoot::new(&plans, ScanRootKind::Plans, "plans");
+        let mut skipped = Vec::new();
+        let found = scan_one_root(&root, &PlanConvention::operator_default(), &mut skipped);
+
+        assert_eq!(found.len(), 1, "the nested file is NOT scanned");
+        let subdir: Vec<&SkippedFile> = skipped
+            .iter()
+            .filter(|s| s.reason == "subdirectory_not_scanned")
+            .collect();
+        assert_eq!(
+            subdir.len(),
+            1,
+            "but the directory IS reported: {skipped:?}"
+        );
+        assert!(subdir[0].path.ends_with("2026-q3"));
+
+        // And it reaches the operator-facing report.
+        let report = build_report(&found, skipped, vec![("plans".into(), 1)]);
+        assert!(render_report(&report).contains("subdirectory_not_scanned"));
+    }
+
+    /// The marker match is case-insensitive without allocating a lowercase copy
+    /// of every body on every tick.
+    #[test]
+    fn the_body_markers_match_in_any_case() {
+        for body in [
+            "# X\n\nINVESTIGATE, THEN AUTHOR A PLAN\n",
+            "# X\n\ninvestigate, then author a plan\n",
+            "# X\n\nInVeStIgAtE, ThEn AuThOr A pLaN\n",
+        ] {
+            assert_eq!(
+                classify_kind(ScanRootKind::Prompts, "x", body),
+                ArtifactKind::InvestigationPrompt,
+                "failed for {body:?}"
+            );
+        }
+        assert!(contains_ignore_ascii_case("AbC", "abc"));
+        assert!(!contains_ignore_ascii_case("ab", "abc"));
+        assert!(contains_ignore_ascii_case("", ""));
+        // Non-ASCII bytes must not confuse the window scan.
+        assert!(contains_ignore_ascii_case("héllo WORLD", "world"));
+    }
+
     #[test]
     fn the_report_flags_a_duplicated_stem_only_when_the_bodies_differ() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1788,6 +2012,67 @@ mod tests {
         );
     }
 
+    /// The `--backend` flag OUTRANKS the environment.
+    ///
+    /// The shipped wiring threaded the flag into the lowest-precedence slot, so
+    /// inside a runner terminal — where `QONTINUI_API_URL` is exported into
+    /// every session — `--backend http://127.0.0.1:8000` was silently ignored
+    /// and the whole 1,100-artifact corpus went wherever the env pointed,
+    /// plausibly production. A flag the operator typed always wins.
+    #[test]
+    fn an_explicit_backend_flag_beats_both_env_layers() {
+        assert_eq!(
+            resolve_backend_base_with_flag(
+                Some("http://127.0.0.1:8000".into()),
+                Some("https://api.qontinui.io".into()),
+                Some("https://also-not-this".into()),
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+        // No flag ⇒ the env layers keep their own order.
+        assert_eq!(
+            resolve_backend_base_with_flag(
+                None,
+                Some("https://primary".into()),
+                Some("https://alt".into()),
+            )
+            .as_deref(),
+            Some("https://primary")
+        );
+        // A blank flag is unset, not an empty base — it must not shadow the env.
+        assert_eq!(
+            resolve_backend_base_with_flag(Some("  ".into()), Some("https://primary".into()), None)
+                .as_deref(),
+            Some("https://primary")
+        );
+        assert_eq!(resolve_backend_base_with_flag(None, None, None), None);
+    }
+
+    /// The same precedence through the wrapper that reads the real env vars —
+    /// the shape the CLI actually calls.
+    #[test]
+    fn the_flag_beats_the_env_through_the_env_reading_wrapper() {
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            WEB_BACKEND_URL_ENV,
+            WEB_BACKEND_URL_ENV_ALT,
+        ]);
+        std::env::remove_var(WEB_BACKEND_URL_ENV);
+        std::env::set_var(WEB_BACKEND_URL_ENV_ALT, "https://api.qontinui.io");
+
+        assert_eq!(
+            backend_base_from_flag_or_env(Some("http://127.0.0.1:8000".into())).as_deref(),
+            Some("http://127.0.0.1:8000"),
+            "a typed --backend must not be overridden by the terminal's exported env"
+        );
+        assert_eq!(
+            backend_base_from_flag_or_env(None).as_deref(),
+            Some("https://api.qontinui.io"),
+            "with no flag the env is still the default"
+        );
+    }
+
     // ---- push behaviour --------------------------------------------------
 
     #[derive(Default)]
@@ -1800,6 +2085,8 @@ mod tests {
         unchanged: bool,
         /// When true, every upsert answers the 409 kind-fork refusal.
         ambiguous: bool,
+        /// When true, every `link` call errors — a broken edges route.
+        fail_links: bool,
     }
 
     #[async_trait::async_trait]
@@ -1841,6 +2128,9 @@ mod tests {
                 to_id.to_string(),
                 relation.to_string(),
             ));
+            if self.fail_links {
+                anyhow::bail!("simulated edges-route failure");
+            }
             Ok(())
         }
     }
@@ -2005,6 +2295,103 @@ mod tests {
                  on EVERY run, not whichever HashMap iteration reached first"
             );
         }
+    }
+
+    /// The contract `trigger.rs` advertises — "steady state costs one directory
+    /// walk and zero HTTP calls" — applied to pass 2, which the digest memory
+    /// does NOT cover. Before the edge memo the second cycle re-POSTed every
+    /// `depends_on` edge, so ~200 stems became ~200 POSTs every 60s forever.
+    #[tokio::test]
+    async fn a_second_cycle_over_unchanged_artifacts_makes_zero_edge_calls() {
+        let sink = FakeSink::default();
+        let mut state = ArtifactSyncState::new();
+        let artifacts = vec![
+            artifact("dep", Some("repo-a"), "# Dep\n", &[]),
+            artifact("child", Some("repo-a"), "# Child\n", &["dep"]),
+            artifact("other", Some("repo-a"), "# Other\n", &["dep"]),
+        ];
+
+        let first = backfill_once(&sink, &artifacts, &mut state).await;
+        assert_eq!(first.created, 3);
+        assert_eq!(first.edges_set, 2);
+        assert_eq!(first.edges_skipped_applied, 0);
+        assert_eq!(sink.links.lock().unwrap().len(), 2);
+
+        let second = backfill_once(&sink, &artifacts, &mut state).await;
+        assert_eq!(
+            second.skipped_local, 3,
+            "pass 1 is short-circuited by the digest memory"
+        );
+        assert_eq!(
+            second.edges_set, 0,
+            "pass 2 must not re-POST an edge the server already accepted"
+        );
+        assert_eq!(second.edges_skipped_applied, 2);
+        assert_eq!(
+            sink.links.lock().unwrap().len(),
+            2,
+            "ZERO edge calls on the second cycle — the whole point of the memo"
+        );
+
+        // And a third, to show it is memoized rather than merely alternating.
+        backfill_once(&sink, &artifacts, &mut state).await;
+        assert_eq!(sink.links.lock().unwrap().len(), 2);
+        assert_eq!(state.applied_edge_count(), 2);
+    }
+
+    /// A FAILED edge is not memoized, so it retries — but only up to
+    /// [`MAX_EDGE_ATTEMPTS`], after which this process abandons it instead of
+    /// re-POSTing a doomed request every tick forever.
+    #[tokio::test]
+    async fn a_failing_edge_retries_then_is_given_up_on() {
+        let sink = FakeSink {
+            fail_links: true,
+            ..Default::default()
+        };
+        let mut state = ArtifactSyncState::new();
+        let artifacts = vec![
+            artifact("dep", Some("r"), "# Dep\n", &[]),
+            artifact("child", Some("r"), "# Child\n", &["dep"]),
+        ];
+
+        for cycle in 1..=MAX_EDGE_ATTEMPTS {
+            let s = backfill_once(&sink, &artifacts, &mut state).await;
+            assert_eq!(s.edge_errors, 1, "cycle {cycle} must still be trying");
+            assert_eq!(s.edges_given_up, 0);
+        }
+        assert_eq!(
+            sink.links.lock().unwrap().len(),
+            MAX_EDGE_ATTEMPTS as usize,
+            "exactly the retry budget, no more"
+        );
+
+        // Budget exhausted: no further HTTP, counted as given up.
+        let after = backfill_once(&sink, &artifacts, &mut state).await;
+        assert_eq!(after.edge_errors, 0);
+        assert_eq!(after.edges_given_up, 1);
+        assert_eq!(
+            sink.links.lock().unwrap().len(),
+            MAX_EDGE_ATTEMPTS as usize,
+            "a permanently broken edge route stops costing a request per tick"
+        );
+    }
+
+    /// A dep whose target only appears in a LATER cycle still links — the memo
+    /// records successes, so it cannot suppress an edge that was never applied.
+    #[tokio::test]
+    async fn an_edge_that_becomes_resolvable_later_is_still_applied() {
+        let sink = FakeSink::default();
+        let mut state = ArtifactSyncState::new();
+        let child = artifact("child", Some("r"), "# Child\n", &["dep"]);
+
+        let first = backfill_once(&sink, std::slice::from_ref(&child), &mut state).await;
+        assert_eq!(first.edges_unresolved, 1);
+        assert!(sink.links.lock().unwrap().is_empty());
+
+        let both = vec![artifact("dep", Some("r"), "# Dep\n", &[]), child];
+        let second = backfill_once(&sink, &both, &mut state).await;
+        assert_eq!(second.edges_set, 1);
+        assert_eq!(sink.links.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

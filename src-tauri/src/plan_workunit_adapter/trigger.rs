@@ -346,6 +346,13 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
     let mut last_deps: HashMap<String, Vec<String>> = HashMap::new();
     let mut warned_disappeared: HashSet<String> = HashSet::new();
     let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+    // A cycle can legitimately outrun the interval (the first one walks and
+    // pushes ~1,100 files). The default `Burst` behaviour then fires every
+    // missed tick back to back, so a 5-minute first cycle is followed by four
+    // immediate no-gap cycles — the opposite of what a periodic reconcile
+    // wants. `Delay` drops the missed ticks and simply restarts the interval
+    // from now.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tracing::info!(
         dir = %dir.display(),
         archive_dir = archive_dir.as_ref().map(|d| d.display().to_string()),
@@ -438,48 +445,190 @@ pub fn body_sync_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the tenant's fleet dial currently authorizes plan capture.
+///
+/// A callback rather than a direct read because the dial's cache lives in the
+/// runner **binary** (`crate::mcp::fleet_policy_poller`) while this adapter
+/// lives in the lib crate, which cannot see it. The binary supplies the reader
+/// at spawn time; the lib stays free of the poller.
+pub type CaptureGate = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// How many **consecutive** entirely-failed cycles pause the sync.
+///
+/// The axis is consecutive cycles, not a sample-size floor on one cycle. A
+/// floor cannot work here: in steady state the digest memory skips almost
+/// everything, so a cycle in which the operator edited one plan legitimately
+/// attempts exactly ONE push — a floor of, say, 10 would make the breaker
+/// unreachable in precisely the state it has to protect, while a floor of 1
+/// (the shipped behaviour) lets a single transient 500, a 30-second network
+/// blip or a mid-rotation 401 latch the sync off. Requiring the failure to
+/// persist across five cycles (~5 minutes at the default tick) distinguishes
+/// "this backend is down" from "one request was unlucky" without reference to
+/// how many files happened to change.
+const TOTAL_FAILURE_CYCLES_BEFORE_PAUSE: u32 = 5;
+
+/// How many cycles a tripped breaker sits out before trying again.
+///
+/// ~30 minutes at the default 60s tick. The breaker is a **pause that
+/// re-arms**, never the one-way latch it started as: the latch's own error
+/// message prescribed restarting the runner, which served policy
+/// `production-and-cost` `runner-lifecycle` forbids outright — so a tripped
+/// latch was unrecoverable for the process's whole life, which on this fleet
+/// means indefinitely. A pause costs one cycle's worth of failed requests per
+/// half hour while the backend is down, and resumes on its own the moment it
+/// comes back.
+const PAUSE_CYCLES: u32 = 30;
+
+/// The body sync's failure breaker, as a pure state machine.
+///
+/// Factored out of [`BodySync`] so the property that matters — a single
+/// transient failure must NOT disable the sync — is a unit test over the
+/// shipping logic rather than a claim about it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FailureBreaker {
+    consecutive_total_failures: u32,
+    pause_cycles_remaining: u32,
+}
+
+impl FailureBreaker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consume one cycle of the current pause, if any. Returns `true` when the
+    /// caller should SKIP this cycle entirely.
+    pub fn should_skip_cycle(&mut self) -> bool {
+        if self.pause_cycles_remaining == 0 {
+            return false;
+        }
+        self.pause_cycles_remaining -= 1;
+        if self.pause_cycles_remaining == 0 {
+            tracing::info!(
+                "plan library: body-sync pause elapsed — retrying one cycle. If the backend \
+                 or credential is still broken it will pause again; no restart is needed \
+                 either way."
+            );
+        }
+        true
+    }
+
+    /// Record a completed cycle. `attempted` counts only the pushes that
+    /// actually reached the network (a locally-skipped unchanged file is not
+    /// an attempt and cannot fail). Returns `true` when this call TRIPPED the
+    /// breaker.
+    pub fn record_cycle(&mut self, attempted: u64, errors: u64) -> bool {
+        let totally_failed = attempted > 0 && errors == attempted;
+        if !totally_failed {
+            self.consecutive_total_failures = 0;
+            return false;
+        }
+        self.consecutive_total_failures += 1;
+        if self.consecutive_total_failures < TOTAL_FAILURE_CYCLES_BEFORE_PAUSE {
+            return false;
+        }
+        self.consecutive_total_failures = 0;
+        self.pause_cycles_remaining = PAUSE_CYCLES;
+        true
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.pause_cycles_remaining > 0
+    }
+
+    pub fn consecutive_total_failures(&self) -> u32 {
+        self.consecutive_total_failures
+    }
+}
+
 /// The library body-sync half of a reconcile cycle: re-scan the three roots and
 /// push any artifact whose body digest moved.
 ///
 /// Holds its own [`super::body_push::ArtifactSyncState`], so steady state costs
 /// one directory walk and zero HTTP calls — the whole point of the digest
-/// memory. Kept in the same tick as the work-unit reconcile rather than on its
-/// own timer so the two can never observe different filesystem states.
+/// memory (pass 2's edge memo is what makes the "zero HTTP calls" half true;
+/// without it the edge pass re-POSTed every `depends_on` edge every tick).
+/// Kept in the same tick as the work-unit reconcile rather than on its own
+/// timer so the two can never observe different filesystem states.
+///
+/// ## The fleet dial governs this, not just the briefing
+///
+/// `run_cycle` consults [`CaptureGate`] — the tenant's `plan_capture` level —
+/// on every cycle, and does nothing at `off`. Without that the dial would be
+/// advisory for everything except the system-prompt clause: a runner with
+/// `QONTINUI_PLAN_LIBRARY_SYNC=1` would keep pushing the whole corpus at fleet
+/// level `off`. Capture is now two independent authorizations in the same
+/// direction — a per-machine opt-in env flag AND a tenant-wide dial — so the
+/// dial is a real fleet kill switch that does not require touching env on
+/// every machine (and cannot, since restarting runners is forbidden).
 pub struct BodySync {
     roots: Vec<super::body_push::ScanRoot>,
     sink: super::body_push::HttpArtifactSink,
     state: super::body_push::ArtifactSyncState,
-    /// Set after a cycle in which EVERY push errored, which in practice means a
-    /// systemic problem (backend down, bearer rejected) rather than 1,100
-    /// individually broken files. The sync then stops until the runner
-    /// restarts, so a misconfiguration costs one noisy cycle, not a permanent
-    /// log flood at 60-second intervals.
-    disabled_after_total_failure: bool,
+    capture_gate: CaptureGate,
+    breaker: FailureBreaker,
+    /// Last gate verdict observed, so a flip is logged ONCE rather than every
+    /// tick. `None` until the first cycle.
+    last_gate_open: Option<bool>,
 }
 
 impl BodySync {
     pub fn new(
         roots: Vec<super::body_push::ScanRoot>,
         sink: super::body_push::HttpArtifactSink,
+        capture_gate: CaptureGate,
     ) -> Self {
         Self {
             roots,
             sink,
             state: super::body_push::ArtifactSyncState::new(),
-            disabled_after_total_failure: false,
+            capture_gate,
+            breaker: FailureBreaker::new(),
+            last_gate_open: None,
         }
     }
 
     pub async fn run_cycle(&mut self, conv: &PlanConvention) {
-        if self.disabled_after_total_failure {
+        let gate_open = (self.capture_gate)();
+        if self.last_gate_open != Some(gate_open) {
+            tracing::info!(
+                capture_enabled = gate_open,
+                "plan library: tenant plan_capture level changed the body sync's authorization"
+            );
+            self.last_gate_open = Some(gate_open);
+        }
+        if !gate_open {
             return;
         }
-        let (artifacts, skipped) = super::body_push::scan_all_roots(&self.roots, conv);
+        if self.breaker.should_skip_cycle() {
+            return;
+        }
+
+        // `scan_all_roots` does ~1,100 synchronous `read_to_string` calls. On
+        // the async path that blocks a tokio worker thread for the whole walk,
+        // starving every other task sharing it — so it runs on the blocking
+        // pool and the result comes back by value.
+        let roots = self.roots.clone();
+        let conv = conv.clone();
+        let scanned =
+            tokio::task::spawn_blocking(move || super::body_push::scan_all_roots(&roots, &conv))
+                .await;
+        let (artifacts, skipped) = match scanned {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "plan library: scan task failed to join; skipping this cycle"
+                );
+                return;
+            }
+        };
         if artifacts.is_empty() {
             return;
         }
         let summary =
             super::body_push::backfill_once(&self.sink, &artifacts, &mut self.state).await;
+        // Only pushes that reached the network count as attempts — a file the
+        // digest memory skipped made no call and cannot have failed.
         let attempted =
             summary.created + summary.updated + summary.unchanged_remote + summary.errors;
         tracing::info!(
@@ -492,17 +641,22 @@ impl BodySync {
             kind_forks = summary.ambiguous_kind,
             errors = summary.errors,
             edges_set = summary.edges_set,
+            edges_skipped = summary.edges_skipped_applied,
+            edges_given_up = summary.edges_given_up,
             "plan library: body sync cycle complete"
         );
-        if attempted > 0 && summary.errors == attempted {
-            self.disabled_after_total_failure = true;
+        if self.breaker.record_cycle(attempted, summary.errors) {
             tracing::error!(
                 errors = summary.errors,
+                consecutive_cycles = TOTAL_FAILURE_CYCLES_BEFORE_PAUSE,
+                pause_cycles = PAUSE_CYCLES,
                 env_var = PLAN_LIBRARY_SYNC_ENV,
-                "plan library: every push in this cycle failed — disabling the body sync for \
-                 this process rather than retrying the same failures every tick. Fix the \
-                 backend/credential and restart the runner, or use \
-                 `qontinui-pr plan-library-backfill` for a one-shot run."
+                "plan library: every push failed for {TOTAL_FAILURE_CYCLES_BEFORE_PAUSE} \
+                 consecutive cycles — pausing the body sync for {PAUSE_CYCLES} cycles rather \
+                 than retrying the same failures every tick. It RE-ARMS on its own; no restart \
+                 is needed (and restarting a runner is forbidden by fleet policy). Fix the \
+                 backend/credential, or use `qontinui-pr plan-library-backfill` for a one-shot \
+                 run."
             );
         }
     }
@@ -586,11 +740,22 @@ pub fn resolve_prompts_dir(configured: Option<String>) -> Option<String> {
 /// store lives in the runner binary, not this lib crate). The archive dir is
 /// optional and gates only the metadata-only archive scan (D4) — the adapter
 /// still starts, and still reconciles the active dir, when it is unset.
+///
+/// `configured_backend_url` must be the **persisted** web-integration URL (and
+/// `None` when web integration is disabled or unset), NOT an already-defaulted
+/// one: [`super::body_push::resolve_backend_base`] promises to answer `None`
+/// rather than guess a host, and a caller that pre-substitutes a build default
+/// turns that promise into "always configured, possibly at production".
+///
+/// `capture_gate` reads the tenant's `plan_capture` fleet dial — see
+/// [`CaptureGate`]. It is consulted every cycle, so flipping the dial takes
+/// effect without a restart.
 pub fn spawn_if_configured(
     configured_plans_dir: Option<String>,
     configured_archive_dir: Option<String>,
     configured_prompts_dir: Option<String>,
     configured_backend_url: Option<String>,
+    capture_gate: CaptureGate,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let (dir, source) = resolve_plans_dir_with_source(configured_plans_dir)?;
     if source == PlansDirSource::Env {
@@ -618,9 +783,10 @@ pub fn spawn_if_configured(
                 tracing::info!(
                     roots = roots.len(),
                     backend = %sink.base(),
-                    "plan library: body sync enabled"
+                    "plan library: body sync enabled (still gated per-cycle on the tenant's \
+                     plan_capture fleet dial)"
                 );
-                Some(BodySync::new(roots, sink))
+                Some(BodySync::new(roots, sink, capture_gate))
             }
             None => {
                 tracing::warn!(
@@ -728,6 +894,97 @@ mod tests {
     fn blank_setting_resolves_to_none() {
         let resolved = with_plan_dir_env(None, || resolve_plans_dir(Some("  ".to_string())));
         assert_eq!(resolved, None);
+    }
+
+    // ---- the body-sync failure breaker ----------------------------------
+
+    /// THE regression this breaker was rewritten for.
+    ///
+    /// In steady state the digest memory skips ~everything, so a cycle in which
+    /// the operator edited one plan attempts exactly ONE push. The shipped
+    /// predicate was `attempted > 0 && errors == attempted`, latched
+    /// permanently — so that single push hitting a transient 500, a 30-second
+    /// blip or a mid-rotation 401 killed the body sync for the whole process,
+    /// and the error message prescribed restarting the runner, which fleet
+    /// policy forbids.
+    #[test]
+    fn a_single_transient_failure_does_not_disable_the_sync() {
+        let mut b = FailureBreaker::new();
+        assert!(!b.record_cycle(1, 1), "one bad cycle must not trip");
+        assert!(!b.is_paused());
+        assert!(!b.should_skip_cycle(), "the next cycle still runs");
+        // And the very next success clears the count entirely.
+        assert!(!b.record_cycle(1, 0));
+        assert_eq!(b.consecutive_total_failures(), 0);
+        assert!(!b.is_paused());
+    }
+
+    /// A failure run BROKEN by one good cycle never trips, however long it is.
+    #[test]
+    fn non_consecutive_failures_never_trip_the_breaker() {
+        let mut b = FailureBreaker::new();
+        for _ in 0..20 {
+            for _ in 0..(TOTAL_FAILURE_CYCLES_BEFORE_PAUSE - 1) {
+                assert!(!b.record_cycle(3, 3));
+            }
+            // One partial success resets the run.
+            assert!(!b.record_cycle(3, 1));
+        }
+        assert!(!b.is_paused());
+    }
+
+    /// A genuinely persistent failure DOES pause — the breaker still does its
+    /// original job of not flooding the log every 60s forever.
+    #[test]
+    fn consecutive_total_failures_pause_the_sync() {
+        let mut b = FailureBreaker::new();
+        for cycle in 1..TOTAL_FAILURE_CYCLES_BEFORE_PAUSE {
+            assert!(!b.record_cycle(5, 5), "cycle {cycle} is too early to trip");
+        }
+        assert!(
+            b.record_cycle(5, 5),
+            "the {TOTAL_FAILURE_CYCLES_BEFORE_PAUSE}th consecutive total failure trips it"
+        );
+        assert!(b.is_paused());
+    }
+
+    /// And the pause RE-ARMS. The old latch was one-way, and its own remedy
+    /// (restart the runner) is forbidden by served policy
+    /// `production-and-cost` `runner-lifecycle` — so a tripped sync was dead
+    /// for the process's life. This one resumes on its own.
+    #[test]
+    fn the_pause_re_arms_rather_than_latching_forever() {
+        let mut b = FailureBreaker::new();
+        for _ in 0..TOTAL_FAILURE_CYCLES_BEFORE_PAUSE {
+            b.record_cycle(2, 2);
+        }
+        assert!(b.is_paused());
+
+        // It sits out exactly PAUSE_CYCLES cycles…
+        for cycle in 0..PAUSE_CYCLES {
+            assert!(b.should_skip_cycle(), "cycle {cycle} is still paused");
+        }
+        // …then runs again, with a clean failure count.
+        assert!(!b.should_skip_cycle(), "the sync must resume by itself");
+        assert!(!b.is_paused());
+        assert_eq!(b.consecutive_total_failures(), 0);
+
+        // A recovered backend then just works.
+        assert!(!b.record_cycle(10, 0));
+        assert!(!b.should_skip_cycle());
+    }
+
+    /// A cycle that made no network call at all is not a failure — otherwise a
+    /// steady state in which every file is locally skipped would look like a
+    /// total failure.
+    #[test]
+    fn a_cycle_with_no_attempts_is_not_a_failure() {
+        let mut b = FailureBreaker::new();
+        for _ in 0..(TOTAL_FAILURE_CYCLES_BEFORE_PAUSE * 3) {
+            assert!(!b.record_cycle(0, 0));
+        }
+        assert!(!b.is_paused());
+        assert_eq!(b.consecutive_total_failures(), 0);
     }
 
     fn unit(slug: &str, status: &str) -> ParsedWorkUnit {
