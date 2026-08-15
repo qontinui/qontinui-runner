@@ -656,6 +656,27 @@ impl PgDb {
         .await
         .map_err(|e| format!("Phase 1 orchestration schema self-heal failed: {}", e))?;
 
+        // spec-multi-app / F1: register THIS runner in `project.apps`.
+        //
+        // Unconditional, and deliberately not the dev bootstrap: capture's
+        // observation INSERT validates `app_id` with a subquery against this
+        // table, so a runner with no row of its own writes every observation
+        // un-attributed forever — silently, since there is no FK. The row was
+        // previously created only by `apps::bootstrap_dev_apps`, which is gated
+        // on `QONTINUI_DEV_BOOTSTRAP=1` (set only by `dev-start.ps1`), so
+        // production installs, supervisor-spawned temp runners and CI runners
+        // had none. Registering the runner's own identity in a table the runner
+        // already self-heals two blocks up is the same class of self-heal.
+        //
+        // Runs here rather than in `main.rs` so the degraded-boot reconnect path
+        // (`spawn_reconnect_probe` → `verify_and_provision`) gets it too. Never
+        // fatal: `ensure_self_registered` logs and returns on every failure.
+        //
+        // `conn` is released first — `ensure_self_registered` checks out its own
+        // pooled connection and there is no reason to hold two.
+        drop(conn);
+        apps::ensure_self_registered(self).await;
+
         info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 
         Ok(())

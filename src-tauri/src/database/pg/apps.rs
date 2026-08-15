@@ -22,6 +22,8 @@ use qontinui_types::apps::{
     validate_app_id, validate_update_strategy, App, AppError, RegisterAppRequest, UpdateAppRequest,
 };
 
+use crate::spec_api::storage::RUNNER_APP_ID;
+
 use super::PgDb;
 
 fn now_ms() -> i64 {
@@ -319,6 +321,143 @@ impl PgDb {
 }
 
 // -----------------------------------------------------------------------------
+// Self-registration — the runner's OWN identity row (unconditional)
+// -----------------------------------------------------------------------------
+
+/// The `repo_root` this runner should register for itself.
+///
+/// `repo_root` is `NOT NULL` and [`PgDb::insert_app`] additionally requires it
+/// to be an existing directory, so this must return a real path — but it must
+/// **never fabricate a developer's directory layout** (that is exactly why
+/// [`bootstrap_dev_apps`] is env-gated: it hardcodes *sibling*-repo paths for
+/// apps other than this one). Two candidates, both verified on disk before use:
+///
+/// 1. **The checkout this binary was built from** (`CARGO_MANIFEST_DIR/..`,
+///    i.e. the `qontinui-runner` repo root), used **only when it still exists
+///    on this machine** — true on a developer box, false on any production
+///    install, where the build path does not exist. It is checked, not assumed.
+///    Preferring it matters for correctness, not cosmetics: `bootstrap_dev_apps`
+///    registers this same `app_id` with exactly this value, and whichever writer
+///    lands first owns the row forever (the loser's `AlreadyRegistered` is
+///    swallowed). Self-registration runs first (PG pool init), so returning a
+///    *different* root here would pin a weaker `repo_root` on a fresh dev
+///    database and break `resolve_specs_root` for the runner's own specs.
+/// 2. Otherwise **the directory this executable runs from** — the only root a
+///    production runner genuinely knows about itself. `<that>/specs` will not
+///    normally exist, so spec reads for this app stay in exactly the state they
+///    are in today on such a box (an error/embedded-fallback), which is no worse
+///    than the un-registered status quo. The row's *existence* is the load-
+///    bearing part: without it every observation's `app_id` subquery resolves to
+///    NULL and attribution is silently lost.
+///
+/// Returns `None` when neither candidate resolves, in which case
+/// [`ensure_self_registered`] does nothing rather than inventing a path.
+fn self_repo_root() -> Option<PathBuf> {
+    // 1. The runner checkout this binary was compiled from, IF it is present
+    //    on this machine. `canonicalize` is the existence check.
+    if let Ok(built_from) = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .canonicalize()
+    {
+        return Some(built_from);
+    }
+    // 2. The install directory of the running executable.
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .filter(|dir| dir.is_dir())
+}
+
+/// Ensure `project.apps` carries **this runner's own identity row**, on every
+/// startup, on every database, independent of `QONTINUI_DEV_BOOTSTRAP`.
+///
+/// Why this is not optional. `state_discovery::capture` validates an
+/// observation's `app_id` inside its INSERT with
+/// `(SELECT a.app_id FROM project.apps a WHERE a.app_id = $6)`. If no row for
+/// `qontinui-runner` exists, that subquery yields NULL and **every observation
+/// is written un-attributed, permanently** — there is no FK and no error, so
+/// nothing else catches it. Before this, the only writer of that row was
+/// [`bootstrap_dev_apps`], which returns early unless `QONTINUI_DEV_BOOTSTRAP=1`
+/// — a variable only `dev-start.ps1` sets. Production installs,
+/// supervisor-spawned temp runners that do not inherit the env, and CI runners
+/// therefore had no row at all, and the whole app-scoping feature was a silent
+/// no-op there.
+///
+/// This is the same class of self-heal the runner already performs for the table
+/// itself (`CREATE TABLE IF NOT EXISTS project.apps` at PG pool init): the
+/// runner is the canonical author of `project.apps`, so registering its own
+/// identity in it belongs to the same owner.
+///
+/// **Not a widening of [`bootstrap_dev_apps`]**, which stays exactly as it is:
+/// that function registers *three* apps — including two siblings whose paths are
+/// a developer-layout guess — and is correctly dev-only. This registers one app,
+/// the one whose values this process actually knows: its own.
+///
+/// Idempotent by construction: `insert_app`'s `AlreadyRegistered` is the
+/// expected outcome from the second boot onward, and it is answered with
+/// [`PgDb::touch_app`] so `last_seen_at_ms` still advances. Nothing on an
+/// existing row is overwritten — a row authored by the dev bootstrap, or edited
+/// by an operator through `PATCH /apps/<id>`, survives untouched.
+///
+/// Failure never breaks startup: every arm logs and returns, matching the
+/// surrounding self-heal error handling.
+pub async fn ensure_self_registered(pg: &PgDb) {
+    let repo_root = match self_repo_root() {
+        Some(p) => p,
+        None => {
+            warn!(
+                app_id = RUNNER_APP_ID,
+                "self-registration skipped: could not resolve any real directory for repo_root. \
+                 Observations will be recorded with app_id NULL (un-attributed) until this app \
+                 is registered."
+            );
+            return;
+        }
+    };
+
+    // The port this runner is *configured* to serve its UI Bridge on
+    // (`QONTINUI_PORT`, default 9876). Read here rather than from
+    // `AppState.api_port` because self-registration runs at PG pool init, before
+    // the HTTP server binds; on the rare fallback bind (configured port already
+    // taken) the stored URL is the configured one, which is why an existing row
+    // is never overwritten and an operator can correct it via `PATCH /apps/<id>`.
+    // `127.0.0.1`, not `localhost`: the runner binds the IPv4 loopback only, and
+    // Windows resolves `localhost` to `::1` first, paying a doomed connect.
+    let ui_bridge_url = format!("http://127.0.0.1:{}", crate::mcp::types::get_mcp_api_port());
+
+    // Same name `/health` already reports as `uiBridge.appName`.
+    let req = RegisterAppRequest::new(
+        RUNNER_APP_ID,
+        repo_root.to_string_lossy(),
+        ui_bridge_url,
+        "Qontinui Runner",
+    );
+
+    match pg.insert_app(&req).await {
+        Ok(_) => info!(
+            app_id = %req.app_id,
+            repo_root = %req.repo_root,
+            ui_bridge_url = %req.ui_bridge_url,
+            "self-registration: registered this runner in project.apps"
+        ),
+        Err(AppError::AlreadyRegistered { .. }) => {
+            // Steady state from the second boot onward. Bump `last_seen_at_ms`
+            // (best-effort, swallows its own errors) and leave every other
+            // column exactly as its author wrote it.
+            debug!(app_id = %req.app_id, "self-registration: already registered (idempotent)");
+            pg.touch_app(&req.app_id).await;
+        }
+        Err(e) => warn!(
+            app_id = %req.app_id,
+            repo_root = %req.repo_root,
+            ?e,
+            "self-registration FAILED (non-fatal) — observations from this runner will be \
+             recorded with app_id NULL (un-attributed) until it succeeds"
+        ),
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Dev bootstrap (spec-multi-app Stream F.1)
 // -----------------------------------------------------------------------------
 
@@ -329,6 +468,12 @@ impl PgDb {
 /// **No-op unless `QONTINUI_DEV_BOOTSTRAP=1`** — production runners reach this
 /// path too, and we do not want them auto-registering the developer's
 /// hard-coded sibling-repo layout.
+///
+/// This gate is deliberately kept: it is no longer the only writer of the
+/// `qontinui-runner` row. [`ensure_self_registered`] registers *that one app*
+/// unconditionally at PG pool init, so app attribution for observations works on
+/// production/CI/temp runners; this function still owns the two sibling apps,
+/// whose paths only a developer checkout can supply.
 ///
 /// Idempotent: an `AlreadyRegistered` error is swallowed at debug level so
 /// the call is safe to invoke on every boot.
@@ -366,7 +511,9 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
         .ok();
 
     let mut registrations = vec![RegisterAppRequest::new(
-        "qontinui-runner",
+        // Same constant `ensure_self_registered` uses — one source of truth for
+        // this id, never a second literal.
+        RUNNER_APP_ID,
         runner_root.to_string_lossy(),
         "http://localhost:9876",
         "Qontinui Runner (self)",
