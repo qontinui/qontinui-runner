@@ -1631,7 +1631,9 @@ mod tests {
         // commit to be created from, hence the empty initial commit.
         {
             let sig = git2::Signature::now("t", "t@t").unwrap();
-            let tree = r.find_tree(r.index().unwrap().write_tree().unwrap()).unwrap();
+            let tree = r
+                .find_tree(r.index().unwrap().write_tree().unwrap())
+                .unwrap();
             r.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
                 .unwrap();
         }
