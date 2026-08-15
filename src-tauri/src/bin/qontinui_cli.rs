@@ -82,8 +82,9 @@ OPTIONS (plan-library-backfill):
   --plans-dir <path>    Active plans dir      (default: $QONTINUI_PLANS_DIR)
   --archive-dir <path>  Plans archive dir     (default: $QONTINUI_PLANS_ARCHIVE_DIR)
   --prompts-dir <path>  Prompts dir           (default: $QONTINUI_PROMPTS_DIR)
-  --backend <url>       qontinui-web base URL (default: $QONTINUI_WEB_BACKEND_URL,
-                        then $QONTINUI_API_URL)
+  --backend <url>       qontinui-web base URL. OVERRIDES the environment
+                        ($QONTINUI_WEB_BACKEND_URL, then $QONTINUI_API_URL),
+                        which is what a runner terminal exports by default.
   --limit <n>           Push at most N artifacts (ordering is the scan order)
 
 Values that themselves begin with `--` must use the `--flag=value` form.
@@ -468,7 +469,13 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let base = match bp::backend_base_from_env(parsed.backend) {
+    // Flag-first: an explicit `--backend` OUTRANKS the ambient environment.
+    // The env vars are exported into every runner-provisioned terminal, so
+    // threading the flag into the lowest-precedence slot (the shipped bug)
+    // meant `--backend http://127.0.0.1:8000` was silently ignored exactly
+    // where an operator would type it — sending the whole corpus wherever
+    // $QONTINUI_API_URL happened to point, plausibly production.
+    let base = match bp::backend_base_from_flag_or_env(parsed.backend) {
         Some(b) => b,
         None => {
             eprintln!(
@@ -512,8 +519,8 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
         summary.errors
     );
     println!(
-        "edges: set={} unresolved={} errors={}",
-        summary.edges_set, summary.edges_unresolved, summary.edge_errors
+        "edges: set={} unresolved={} errors={} gave_up={}",
+        summary.edges_set, summary.edges_unresolved, summary.edge_errors, summary.edges_given_up
     );
     if summary.ambiguous_kind > 0 {
         println!(

@@ -60,7 +60,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use qontinui_runner_lib::plan_workunit_adapter::body_push::ArtifactUpsert;
@@ -70,10 +71,50 @@ type ApiResult = Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<
 /// `captured_by` for every write through this door.
 const CAPTURED_BY_AGENT: &str = "agent";
 
-/// Largest `source_path` file this door will read and forward. Bodies are
-/// markdown documents; anything past this is a mistake (a log, a binary, a
-/// generated dump) and shipping it into the corpus helps nobody.
+/// Largest artifact body this door will accept, by **either** route — a
+/// `source_path` file read or an inline `body`. Bodies are markdown documents;
+/// anything past this is a mistake (a log, a binary, a generated dump) and
+/// shipping it into the corpus helps nobody.
+///
+/// The cap applies to both paths because the rationale is identical for both:
+/// an inline body bounded only by the router's global 100 MB limit lets exactly
+/// the same 50 MB log into the corpus that the file path refuses.
 const MAX_SOURCE_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Per-request ceiling on an upstream call. Without one a black-holing backend
+/// parks the axum handler — and the connection behind it — indefinitely;
+/// `fleet_policy_poller::fetch_fleet_policy` sets a timeout for exactly this
+/// reason. Looser than the poller's 10s because a body push carries up to
+/// [`MAX_SOURCE_FILE_BYTES`] of markdown.
+const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The one long-lived HTTP client every upstream call shares.
+///
+/// `reqwest::Client` owns the connection pool and the TLS configuration, so
+/// building one per request — as this module did — rebuilds both every time and
+/// makes connection reuse impossible; an artifact with *k* edges built `1 + k`
+/// of them. Both siblings already do this correctly
+/// (`plan_workunit_adapter::push::HttpWorkUnitSink`,
+/// `plan_workunit_adapter::body_push::HttpArtifactSink`), each holding a single
+/// client for the process.
+fn upstream_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(UPSTREAM_TIMEOUT)
+            .build()
+            // `build()` only fails on a broken TLS backend, which the default
+            // client would hit too. Degrade rather than panic in a handler.
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "plan-library door: could not build a timeout-bearing HTTP client; \
+                     falling back to the default (no timeout)"
+                );
+                reqwest::Client::new()
+            })
+    })
+}
 
 // ===========================================================================
 // Capability flag
@@ -89,12 +130,20 @@ const MAX_SOURCE_FILE_BYTES: u64 = 2 * 1024 * 1024;
 ///    gates the *qontinui-web relay*, not this server, so it is a false premise
 ///    here.) Without a flag, any local process could write into the operator's
 ///    plan corpus using the runner's own credential.
-/// 2. **Without it the `plan_capture` fleet toggle would be advisory only.**
-///    Phase 4 refuses to inject the write-door clause into the system prompt at
-///    level `off`, on the principle that an instruction with no live
-///    authorization must not appear in a system prompt — but the door would
-///    still accept writes at `off`. The flag makes `off` mean the clause is
-///    absent *and* the door is shut.
+/// 2. **It is the per-machine half of a two-key authorization.** Phase 4
+///    refuses to inject the write-door clause into the system prompt at
+///    `plan_capture=off`, on the principle that an instruction with no live
+///    authorization must not appear in a system prompt — but the door itself
+///    would still accept writes at `off`. This flag shuts it.
+///
+///    Note precisely what each key governs, because the two are NOT the same
+///    switch. The env flag is machine-local and gates *this door*; the
+///    tenant-wide `plan_capture` dial gates *the briefing clause* and — since
+///    the pre-PR review — *the scan-driven body sync* as well
+///    (`plan_workunit_adapter::trigger::BodySync::run_cycle` consults it every
+///    cycle). What the dial deliberately does NOT gate is this door, so that
+///    the fleet-wide dial and a single machine's escape hatch stay independent
+///    and an operator can always shut one without the other.
 pub const PLAN_LIBRARY_WRITE_FLAG: &str = "QONTINUI_PLAN_LIBRARY_WRITE";
 
 /// Whether the write door is enabled for this process.
@@ -139,8 +188,34 @@ fn write_capability() -> serde_json::Map<String, Value> {
         Value::String(PLAN_LIBRARY_WRITE_FLAG.to_string()),
     );
     m.insert("writeInstruction".to_string(), Value::String(instruction));
+    // The two contract facts a driver would otherwise learn by taking an error
+    // (or worse, by NOT taking one). This block exists precisely so it does not
+    // have to.
+    m.insert(
+        "writeContract".to_string(),
+        Value::String(WRITE_CONTRACT.to_string()),
+    );
     m
 }
+
+/// The advertised write contract: the two rules a driver cannot infer from the
+/// request shape, and whose violation is silent rather than loud.
+///
+/// `source_repo` is the one that used to be undiscoverable in the damaging
+/// direction — nothing in the briefing clause or these read routes said it was
+/// part of the identity, so an agent omitting it did not get an error, it got a
+/// SECOND row shadowing the one it meant to update.
+const WRITE_CONTRACT: &str = "\
+POST /plan-library/artifacts identity is (organization, kind, slug, source_repo) — \
+`source_repo` is part of the key, so omitting it does NOT update an artifact that has \
+one, it creates a second row. Pass the same `source_repo` the artifact was captured \
+with (a runner scan uses `<repo>/<dir>`, e.g. `qontinui-dev-notes/prompts`). \
+`title`, `status` and `repos` are REQUIRED: the upstream upsert is a full replace and \
+cannot tell an omitted field from an empty one, so omitting them would blank the \
+stored values — send `\"\"` / `[]` explicitly to mean empty. \
+`work_unit_slug`, `authored_at` and `source_path` are replaced the same way (null clears). \
+`source_path` is read only from the runner's configured plans/prompts/workspace \
+directories; anything else must be sent inline as `body`.";
 
 /// Fold [`write_capability`] into an upstream payload without disturbing its
 /// own keys. A bare array is wrapped rather than lost.
@@ -196,13 +271,36 @@ pub struct EdgeSpec {
 ///
 /// **No `organization_id`** — see the module docs. `session_id` is optional
 /// provenance only.
+///
+/// ## `title` / `status` / `repos` are REQUIRED, and that is not an oversight
+///
+/// The upstream upsert is a **full replace**, not a partial update. Verified
+/// against the web side rather than assumed:
+///
+/// * `schemas/plan_library.py` declares `title: str = Field("")`,
+///   `status: str = ""`, `repos: list[str] = Field(default_factory=list)` — so
+///   an omitted key and an explicit `""`/`[]` arrive **identical** at the
+///   server, and nothing in the plan-library path uses `exclude_unset` /
+///   `model_fields_set` to tell them apart.
+/// * `crud/work_artifact.py`'s `upsert_artifact` then assigns
+///   `existing.title = title`, `existing.status = status`,
+///   `existing.repos = list(repos)` unconditionally on any body-changing write.
+///
+/// So a `skip_serializing_if` on the runner side would NOT have helped: leaving
+/// the key out produces the pydantic default, which clobbers exactly the same.
+/// The only way this door can avoid silently blanking an operator's metadata is
+/// to refuse a request that leaves those fields implicit — which is what
+/// [`missing_replace_fields`] does. Send `""` / `[]` explicitly to mean empty.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArtifactWriteRequest {
     pub kind: String,
     pub slug: String,
+    /// Required — see the struct docs. `Option` only so an omission is
+    /// distinguishable from an explicit `""`.
     #[serde(default)]
     pub title: Option<String>,
-    /// Opaque. Never validated here or upstream.
+    /// Opaque. Never validated here or upstream. Required — see the struct
+    /// docs.
     #[serde(default)]
     pub status: Option<String>,
     /// The markdown body. Supply this **or** `source_path`.
@@ -216,8 +314,10 @@ pub struct ArtifactWriteRequest {
     pub source_repo: Option<String>,
     #[serde(default)]
     pub work_unit_slug: Option<String>,
+    /// Required — see the struct docs. `Option` only so an omission is
+    /// distinguishable from an explicit `[]`.
     #[serde(default)]
-    pub repos: Vec<String>,
+    pub repos: Option<Vec<String>>,
     #[serde(default)]
     pub authored_at: Option<String>,
     #[serde(default)]
@@ -313,8 +413,7 @@ async fn upstream_get(
         url.push('?');
         url.push_str(&qs.join("&"));
     }
-    let client = reqwest::Client::new();
-    let resp = crate::auth::attach_device_auth(client.get(&url))
+    let resp = crate::auth::attach_device_auth(upstream_client().get(&url))
         .send()
         .await
         .map_err(|e| transport_failure(path, e))?;
@@ -337,8 +436,7 @@ async fn upstream_post(
     body: &Value,
 ) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
     let url = format!("{}{}", web_base(), path);
-    let client = reqwest::Client::new();
-    let resp = crate::auth::attach_device_auth(client.post(&url).json(body))
+    let resp = crate::auth::attach_device_auth(upstream_client().post(&url).json(body))
         .send()
         .await
         .map_err(|e| transport_failure(path, e))?;
@@ -382,6 +480,10 @@ pub fn provenance_note(
 ///
 /// Pure, so the two properties that matter are unit tests rather than claims:
 /// the payload carries no organization, and `kind_is_heuristic` is `false`.
+///
+/// The `unwrap_or_default()`s below are safe only because
+/// [`missing_replace_fields`] has already refused a request that left any of
+/// them implicit — they render an *explicit* empty, never an omission.
 pub fn build_agent_upsert(req: &ArtifactWriteRequest, body: String) -> ArtifactUpsert {
     ArtifactUpsert {
         kind: req.kind.clone(),
@@ -396,7 +498,7 @@ pub fn build_agent_upsert(req: &ArtifactWriteRequest, body: String) -> ArtifactU
         source_path: req.source_path.clone(),
         source_repo: req.source_repo.clone(),
         work_unit_slug: req.work_unit_slug.clone(),
-        repos: req.repos.clone(),
+        repos: req.repos.clone().unwrap_or_default(),
         authored_at: req.authored_at.clone(),
         captured_by: CAPTURED_BY_AGENT.to_string(),
         change_description: provenance_note(
@@ -410,25 +512,119 @@ pub fn build_agent_upsert(req: &ArtifactWriteRequest, body: String) -> ArtifactU
     }
 }
 
+/// The directories a `source_path` may be read from.
+///
+/// The configured scan roots (active plans, plans archive, prompts) plus the
+/// configured workspace root. Read from settings on every call rather than
+/// cached, matching [`write_enabled`]'s per-request contract: an operator who
+/// adds a prompts dir should not have to restart a runner (which fleet policy
+/// forbids) for this door to see it.
+///
+/// Returns an empty vec when nothing is configured, and the caller then refuses
+/// every `source_path` — **fail closed**. An unconfigured runner having no
+/// confinement set must mean "no file reads", never "all file reads".
+fn source_path_roots() -> Vec<PathBuf> {
+    let paths = crate::config_facade::get_setting::<crate::settings::PathSettings>();
+    // The active plans dir goes through the adapter's own precedence
+    // (`QONTINUI_PLAN_ADAPTER_DIR` env override → setting) so this door and the
+    // scan can never disagree about which directory is "the plans dir".
+    let plans = qontinui_runner_lib::plan_workunit_adapter::trigger::resolve_plans_dir(
+        paths.plans_dir.clone(),
+    );
+    [
+        plans,
+        paths.plans_archive_dir.clone(),
+        paths.prompts_dir.clone(),
+        paths.workspace_root.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|s| !s.trim().is_empty())
+    // Canonicalized so the comparison in `confine_source_path` is between two
+    // fully-resolved paths. A root that does not exist is dropped rather than
+    // compared textually — a non-existent root can confine nothing.
+    .filter_map(|s| std::fs::canonicalize(s.trim()).ok())
+    .collect()
+}
+
+/// Confine `candidate` to one of `roots`, or explain the refusal.
+///
+/// **Why this exists.** `source_path` used to name any path on the machine, and
+/// the door would read it and persist the contents into the tenant-wide corpus
+/// under the runner's own device JWT — visible to every operator of the org.
+/// `~/.qontinui/coord-device-jwt`, `.env` files and the settings store were all
+/// in range, so a single POST turned "write a prompt into the library" into
+/// "exfiltrate any local file into shared storage". The flag authorizes writing
+/// to the corpus; it must not silently also authorize reading the disk.
+///
+/// This is defence in depth — the flag is off by default, and a local caller
+/// could read the file itself — but the widening was invisible and unbounded,
+/// and the advertised use case ("a prompt the agent wrote into an ad-hoc
+/// worktree directory") is far narrower than what was permitted.
+///
+/// Both sides are canonicalized first, which is what makes the check hold
+/// against `..` traversal *and* against a symlink planted inside a root that
+/// points outside it: canonicalization resolves the link, so the comparison
+/// sees where the bytes actually come from rather than where the name sits.
+fn confine_source_path(candidate: &str, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    if roots.is_empty() {
+        return Err(
+            "`source_path` is refused: this runner has no plans/prompts/workspace directory \
+             configured, so there is no directory a source file could legitimately come from. \
+             Read the file yourself and send its contents as `body` instead."
+                .to_string(),
+        );
+    }
+    let resolved = std::fs::canonicalize(candidate)
+        .map_err(|e| format!("cannot resolve source_path {candidate:?}: {e}"))?;
+    if roots.iter().any(|r| resolved.starts_with(r)) {
+        return Ok(resolved);
+    }
+    Err(format!(
+        "source_path {candidate:?} resolves to {resolved:?}, which is outside every configured \
+         plans/prompts/workspace directory. This door reads files only from the directories the \
+         runner is configured to capture from; anything else must be sent inline as `body`."
+    ))
+}
+
+/// Reject a body over [`MAX_SOURCE_FILE_BYTES`], naming which route it came in
+/// by so the message is actionable.
+fn check_body_size(len: u64, what: &str) -> Result<(), String> {
+    if len > MAX_SOURCE_FILE_BYTES {
+        return Err(format!(
+            "{what} is {len} bytes, over the {MAX_SOURCE_FILE_BYTES}-byte limit for an artifact \
+             body"
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the artifact body: the literal `body`, else the contents of
 /// `source_path`. Exactly one must be supplied.
-fn resolve_body(req: &ArtifactWriteRequest) -> Result<String, String> {
+///
+/// `roots` is the confinement set from [`source_path_roots`], passed in so the
+/// security property is testable without touching the settings store.
+fn resolve_body_within(req: &ArtifactWriteRequest, roots: &[PathBuf]) -> Result<String, String> {
     match (&req.body, &req.source_path) {
-        (Some(b), _) => Ok(b.clone()),
+        (Some(b), _) => {
+            // The same ceiling as the file path: an inline body was previously
+            // bounded only by the router's global 100 MB limit, so the cap the
+            // file route enforced was trivially sidestepped by inlining.
+            check_body_size(b.len() as u64, "`body`")?;
+            Ok(b.clone())
+        }
         (None, Some(path)) => {
-            let meta = std::fs::metadata(path)
+            let resolved = confine_source_path(path, roots)?;
+            let meta = std::fs::metadata(&resolved)
                 .map_err(|e| format!("cannot stat source_path {path:?}: {e}"))?;
             if !meta.is_file() {
                 return Err(format!("source_path {path:?} is not a file"));
             }
-            if meta.len() > MAX_SOURCE_FILE_BYTES {
-                return Err(format!(
-                    "source_path {path:?} is {} bytes, over the {MAX_SOURCE_FILE_BYTES}-byte \
-                     limit for an artifact body",
-                    meta.len()
-                ));
-            }
-            std::fs::read_to_string(path)
+            check_body_size(meta.len(), &format!("source_path {path:?}"))?;
+            // Read the CANONICALIZED path, not the caller's string: reading the
+            // original would re-traverse the symlinks the check just resolved,
+            // reintroducing the TOCTOU the canonicalization closed.
+            std::fs::read_to_string(&resolved)
                 .map_err(|e| format!("cannot read source_path {path:?}: {e}"))
         }
         (None, None) => Err(
@@ -437,27 +633,89 @@ fn resolve_body(req: &ArtifactWriteRequest) -> Result<String, String> {
     }
 }
 
-/// Validate one [`EdgeSpec`] and render it as the web edge route's
-/// anchor-relative payload, returning `(anchor_id, body)`.
+/// [`resolve_body_within`] against the runner's configured roots.
 ///
-/// `default_anchor` is the artifact just written, used when the spec names only
-/// the far end.
-fn edge_payload(spec: &EdgeSpec, default_anchor: &str) -> Result<(String, Value), String> {
+/// The confinement set is resolved only when a `source_path` is actually in
+/// play. An inline `body` reads no file, so it must not depend on the settings
+/// store — neither for its behaviour nor for its cost.
+fn resolve_body(req: &ArtifactWriteRequest) -> Result<String, String> {
+    match (&req.body, &req.source_path) {
+        (Some(_), _) | (None, None) => resolve_body_within(req, &[]),
+        (None, Some(_)) => resolve_body_within(req, &source_path_roots()),
+    }
+}
+
+/// Pull the written artifact's id out of a 2xx upsert response.
+///
+/// A 2xx with no `artifact.id` is a **broken contract, not an empty anchor**.
+/// The shipped `unwrap_or_default()` turned it into `""`, which then rendered
+/// `/api/v1/plan-library//edges` and produced N opaque 404s — one per edge —
+/// instead of one sentence naming the real problem.
+/// `body_push::HttpArtifactSink::upsert` already errors on a missing id, and
+/// two readers of the same contract must not disagree about whether it is
+/// optional.
+fn artifact_id_from_upstream(upstream: &Value) -> Result<String, String> {
+    upstream
+        .get("artifact")
+        .and_then(|a| a.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            "the plan-library upsert answered 2xx but its body carried no `artifact.id`; the \
+             artifact may have been written, but no edge can be anchored to it"
+                .to_string()
+        })
+}
+
+/// The fields the upstream upsert REPLACES that this door will not leave
+/// implicit — see [`ArtifactWriteRequest`]'s docs. Returns the missing names.
+fn missing_replace_fields(req: &ArtifactWriteRequest) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if req.title.is_none() {
+        missing.push("title");
+    }
+    if req.status.is_none() {
+        missing.push("status");
+    }
+    if req.repos.is_none() {
+        missing.push("repos");
+    }
+    missing
+}
+
+/// Validate one [`EdgeSpec`] and render it as the web edge route's
+/// anchor-relative payload.
+///
+/// Returns only the **body**: every arm anchored on the artifact just written,
+/// so returning the anchor was returning the caller's own argument back to it —
+/// a second value that could never differ from the first and only invited a
+/// reader to wonder when it might.
+fn edge_payload(spec: &EdgeSpec) -> Result<Value, String> {
+    // Checked HERE rather than in the handler so it cannot be checked in only
+    // one of the two places the handler calls this. A blank relation used to
+    // pass the pre-upsert validation (which tested only the exactly-one-end
+    // rule) and then 422 at the edge call — leaving behind precisely the
+    // half-written artifact-without-its-edges state the pre-validation exists
+    // to prevent.
+    if spec.relation.trim().is_empty() {
+        return Err(
+            "`relation` is required on every edge (produced_report | feeds | authored_plan | \
+             supersedes | depends_on)"
+                .to_string(),
+        );
+    }
     match (&spec.to_id, &spec.from_id) {
-        (Some(_), Some(_)) => Err(
+        (Some(_), Some(_)) | (None, None) => Err(
             "supply exactly one of `to_id` (outgoing) or `from_id` (incoming) per edge".to_string(),
         ),
-        (None, None) => Err(
-            "supply exactly one of `to_id` (outgoing) or `from_id` (incoming) per edge".to_string(),
-        ),
-        (Some(to), None) => Ok((
-            default_anchor.to_string(),
-            serde_json::json!({"to_id": to, "relation": spec.relation, "note": spec.note}),
-        )),
-        (None, Some(from)) => Ok((
-            default_anchor.to_string(),
-            serde_json::json!({"from_id": from, "relation": spec.relation, "note": spec.note}),
-        )),
+        (Some(to), None) => {
+            Ok(serde_json::json!({"to_id": to, "relation": spec.relation, "note": spec.note}))
+        }
+        (None, Some(from)) => {
+            Ok(serde_json::json!({"from_id": from, "relation": spec.relation, "note": spec.note}))
+        }
     }
 }
 
@@ -479,6 +737,25 @@ pub async fn write_artifact_handler(Json(req): Json<ArtifactWriteRequest>) -> Ap
             )),
         ));
     }
+    // The upstream upsert REPLACES these fields and cannot tell an omitted key
+    // from an explicit empty one, so leaving them implicit silently blanks
+    // whatever an operator (or an earlier scan) had stored. See
+    // `ArtifactWriteRequest`'s docs for the verification.
+    let missing = missing_replace_fields(&req);
+    if !missing.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "missing required field(s): {}. The upstream upsert is a FULL REPLACE and \
+                 cannot distinguish an omitted field from an empty one, so omitting these \
+                 would blank the stored values of an existing artifact rather than leave them \
+                 alone. Send them explicitly — `\"\"` for title/status and `[]` for repos if \
+                 you really mean empty.",
+                missing.join(", ")
+            ))),
+        ));
+    }
+
     let body = resolve_body(&req).map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
 
     // Validate every edge BEFORE the upsert, so a malformed edge cannot leave a
@@ -486,8 +763,7 @@ pub async fn write_artifact_handler(Json(req): Json<ArtifactWriteRequest>) -> Ap
     // the edges, and the cheapest way to keep the two consistent is to refuse
     // the whole request up front.
     for spec in &req.edges {
-        edge_payload(spec, "placeholder")
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+        edge_payload(spec).map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
     }
 
     let payload = serde_json::to_value(build_agent_upsert(&req, body)).map_err(|e| {
@@ -498,12 +774,8 @@ pub async fn write_artifact_handler(Json(req): Json<ArtifactWriteRequest>) -> Ap
     })?;
     let upstream = upstream_post("/api/v1/plan-library", &payload).await?;
 
-    let artifact_id = upstream
-        .get("artifact")
-        .and_then(|a| a.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let artifact_id = artifact_id_from_upstream(&upstream)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(api_error(e))))?;
 
     // Edges, one call each — the web route takes one edge per request and is
     // idempotent on `(from_id, to_id, relation)`. Reported per edge rather than
@@ -511,14 +783,14 @@ pub async fn write_artifact_handler(Json(req): Json<ArtifactWriteRequest>) -> Ap
     // edge failed, not just that something did.
     let mut edge_results: Vec<Value> = Vec::new();
     for spec in &req.edges {
-        let (anchor, edge_body) = match edge_payload(spec, &artifact_id) {
+        let edge_body = match edge_payload(spec) {
             Ok(v) => v,
             Err(e) => {
                 edge_results.push(serde_json::json!({"ok": false, "error": e}));
                 continue;
             }
         };
-        let path = format!("/api/v1/plan-library/{anchor}/edges");
+        let path = format!("/api/v1/plan-library/{artifact_id}/edges");
         match upstream_post(&path, &edge_body).await {
             Ok(v) => edge_results.push(serde_json::json!({"ok": true, "edge": v})),
             Err((code, err)) => edge_results.push(serde_json::json!({
@@ -650,7 +922,7 @@ mod tests {
             source_path: None,
             source_repo: Some("qontinui-dev-notes/prompts".to_string()),
             work_unit_slug: None,
-            repos: vec!["qontinui-runner".to_string()],
+            repos: Some(vec!["qontinui-runner".to_string()]),
             authored_at: None,
             change_description: None,
             session_id: Some("db54260f".to_string()),
@@ -806,40 +1078,272 @@ mod tests {
 
     // ---- body resolution -------------------------------------------------
 
+    /// A canonicalized confinement set rooted at `dir` — what
+    /// [`source_path_roots`] would return if `dir` were the configured prompts
+    /// directory.
+    fn roots_of(dir: &std::path::Path) -> Vec<PathBuf> {
+        vec![std::fs::canonicalize(dir).unwrap()]
+    }
+
     #[test]
     fn body_wins_and_source_path_is_read_when_body_is_absent() {
-        let mut r = req("plan", "s");
-        assert_eq!(resolve_body(&r).unwrap(), "# T\n");
-
         let tmp = tempfile::tempdir().unwrap();
+        let roots = roots_of(tmp.path());
+        let mut r = req("plan", "s");
+        assert_eq!(resolve_body_within(&r, &roots).unwrap(), "# T\n");
+
         let path = tmp.path().join("p.md");
         std::fs::write(&path, "# From disk\n").unwrap();
         r.body = None;
         r.source_path = Some(path.to_string_lossy().to_string());
-        assert_eq!(resolve_body(&r).unwrap(), "# From disk\n");
+        assert_eq!(resolve_body_within(&r, &roots).unwrap(), "# From disk\n");
     }
 
     #[test]
     fn neither_body_nor_source_path_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
         let mut r = req("plan", "s");
         r.body = None;
         r.source_path = None;
-        let err = resolve_body(&r).unwrap_err();
+        let err = resolve_body_within(&r, &roots_of(tmp.path())).unwrap_err();
         assert!(err.contains("body"), "got {err}");
         assert!(err.contains("source_path"), "got {err}");
     }
 
     #[test]
     fn a_missing_or_non_file_source_path_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots_of(tmp.path());
         let mut r = req("plan", "s");
         r.body = None;
         r.source_path = Some("Z:/definitely/not/here.md".to_string());
-        assert!(resolve_body(&r).is_err());
+        assert!(resolve_body_within(&r, &roots).is_err());
 
-        let tmp = tempfile::tempdir().unwrap();
-        r.source_path = Some(tmp.path().to_string_lossy().to_string());
-        let err = resolve_body(&r).unwrap_err();
+        // A directory inside the root: confined, but not a file.
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        r.source_path = Some(sub.to_string_lossy().to_string());
+        let err = resolve_body_within(&r, &roots).unwrap_err();
         assert!(err.contains("not a file"), "got {err}");
+    }
+
+    // ---- source_path confinement (the security fix) -----------------------
+
+    /// The finding this exists for: `source_path` used to name ANY path on the
+    /// machine, so `{"source_path": "C:/Users/…/.qontinui/coord-device-jwt"}`
+    /// read the runner's credential and published it into the tenant-wide
+    /// corpus. A path outside every configured root is refused.
+    #[test]
+    fn a_source_path_outside_every_root_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let secret = elsewhere.path().join("coord-device-jwt");
+        std::fs::write(&secret, "eyJhbGciOi.SECRET.value").unwrap();
+
+        let mut r = req("plan", "s");
+        r.body = None;
+        r.source_path = Some(secret.to_string_lossy().to_string());
+        let err = resolve_body_within(&r, &roots_of(root.path())).unwrap_err();
+        assert!(err.contains("outside every configured"), "got {err}");
+        assert!(
+            !err.contains("SECRET"),
+            "the refusal must not echo the file's contents: {err}"
+        );
+    }
+
+    /// `..` traversal out of a legitimate root is refused — the check
+    /// canonicalizes before comparing, so a prefix test cannot be fooled by a
+    /// path that merely STARTS inside the root.
+    #[test]
+    fn a_traversal_out_of_a_root_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("prompts");
+        std::fs::create_dir(&root).unwrap();
+        let outside = base.path().join("secrets.env");
+        std::fs::write(&outside, "TOKEN=abc").unwrap();
+
+        let mut r = req("plan", "s");
+        r.body = None;
+        r.source_path = Some(
+            root.join("..")
+                .join("secrets.env")
+                .to_string_lossy()
+                .to_string(),
+        );
+        let err = resolve_body_within(&r, &roots_of(&root)).unwrap_err();
+        assert!(err.contains("outside every configured"), "got {err}");
+    }
+
+    /// A symlink PLANTED INSIDE a root but pointing out of it is refused too:
+    /// canonicalization resolves the link, so the check sees where the bytes
+    /// actually come from rather than where the name sits.
+    ///
+    /// Creating a symlink on Windows needs Developer Mode or elevation, so the
+    /// test SKIPS (rather than fails) when the OS refuses — and says so, so a
+    /// skip is never mistaken for a pass.
+    #[test]
+    fn a_symlink_pointing_out_of_a_root_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("prompts");
+        std::fs::create_dir(&root).unwrap();
+        let outside = base.path().join("secrets.env");
+        std::fs::write(&outside, "TOKEN=abc").unwrap();
+        let link = root.join("innocent.md");
+
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&outside, &link).is_ok();
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        if !made {
+            eprintln!(
+                "SKIPPED a_symlink_pointing_out_of_a_root_is_refused: this OS/account cannot \
+                 create symlinks (Windows needs Developer Mode or elevation)"
+            );
+            return;
+        }
+
+        let mut r = req("plan", "s");
+        r.body = None;
+        r.source_path = Some(link.to_string_lossy().to_string());
+        let err = resolve_body_within(&r, &roots_of(&root)).unwrap_err();
+        assert!(err.contains("outside every configured"), "got {err}");
+    }
+
+    /// A file genuinely inside a configured root still works — the confinement
+    /// must not break the door's advertised use case.
+    #[test]
+    fn a_source_path_inside_a_root_is_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("2026-08-15-a-prompt.md");
+        std::fs::write(&file, "# A prompt\n").unwrap();
+        let mut r = req("plan", "s");
+        r.body = None;
+        r.source_path = Some(file.to_string_lossy().to_string());
+        assert_eq!(
+            resolve_body_within(&r, &roots_of(root.path())).unwrap(),
+            "# A prompt\n"
+        );
+    }
+
+    /// FAIL CLOSED: a runner with nothing configured has no directory a source
+    /// file could legitimately come from, so every `source_path` is refused —
+    /// never "no confinement set, therefore anything goes".
+    #[test]
+    fn no_configured_roots_refuses_every_source_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("p.md");
+        std::fs::write(&file, "# P\n").unwrap();
+        let mut r = req("plan", "s");
+        r.body = None;
+        r.source_path = Some(file.to_string_lossy().to_string());
+        let err = resolve_body_within(&r, &[]).unwrap_err();
+        assert!(err.contains("no plans/prompts/workspace"), "got {err}");
+    }
+
+    /// The 2 MB ceiling applies to an INLINE body too. It previously guarded
+    /// only `source_path`, so the same 50 MB log the file route refused walked
+    /// straight in as `body` under the router's 100 MB global limit.
+    #[test]
+    fn the_size_cap_applies_to_an_inline_body_as_well_as_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = roots_of(root.path());
+        let mut r = req("plan", "s");
+        r.body = Some("x".repeat(MAX_SOURCE_FILE_BYTES as usize + 1));
+        let err = resolve_body_within(&r, &roots).unwrap_err();
+        assert!(err.contains("`body`"), "got {err}");
+        assert!(err.contains("limit for an artifact body"), "got {err}");
+
+        // The file route enforces the same ceiling, with the same wording.
+        let big = root.path().join("big.md");
+        std::fs::write(&big, "y".repeat(MAX_SOURCE_FILE_BYTES as usize + 1)).unwrap();
+        r.body = None;
+        r.source_path = Some(big.to_string_lossy().to_string());
+        let err = resolve_body_within(&r, &roots).unwrap_err();
+        assert!(err.contains("limit for an artifact body"), "got {err}");
+    }
+
+    // ---- the full-replace guard (cross-repo contract) ----------------------
+
+    /// Settled by reading the web side, not assumed:
+    /// `schemas/plan_library.py` defaults `title`/`status`/`repos` to `""`/`[]`
+    /// and `crud/work_artifact.py`'s `upsert_artifact` assigns them
+    /// unconditionally on a body-changing write — so an omission is
+    /// indistinguishable from an empty value and BLANKS the stored one. The
+    /// door refuses rather than silently destroying an operator's metadata.
+    #[test]
+    fn omitting_a_replaced_field_is_refused_rather_than_blanking_it() {
+        let raw = serde_json::json!({
+            "kind": "plan", "slug": "s", "source_repo": "r", "body": "# T\n",
+        });
+        let parsed: ArtifactWriteRequest = serde_json::from_value(raw).unwrap();
+        let missing = missing_replace_fields(&parsed);
+        assert_eq!(missing, vec!["title", "status", "repos"]);
+    }
+
+    /// An EXPLICIT empty is honoured — the caller said so. This is the half
+    /// that makes the rule usable rather than merely strict.
+    #[test]
+    fn explicit_empties_are_accepted_and_reach_the_wire() {
+        let raw = serde_json::json!({
+            "kind": "plan", "slug": "s", "title": "", "status": "", "repos": [],
+            "body": "# T\n",
+        });
+        let parsed: ArtifactWriteRequest = serde_json::from_value(raw).unwrap();
+        assert!(missing_replace_fields(&parsed).is_empty());
+        let payload = build_agent_upsert(&parsed, "# T\n".to_string());
+        assert_eq!(payload.title, "");
+        assert_eq!(payload.status, "");
+        assert!(payload.repos.is_empty());
+    }
+
+    /// A fully-populated request has nothing missing.
+    #[test]
+    fn a_complete_request_passes_the_replace_check() {
+        assert!(missing_replace_fields(&req("plan", "s")).is_empty());
+    }
+
+    /// The contract block advertises what a driver would otherwise learn by
+    /// forking a duplicate row — `source_repo` is part of the identity — and
+    /// the full-replace rule. It is carried on the UNGATED reads, in both flag
+    /// states, so it is discoverable without a 403.
+    #[test]
+    fn the_reads_advertise_the_identity_and_replace_contract() {
+        for flag in [None, Some("1")] {
+            let v = with_flag(flag, || with_write_capability(serde_json::json!({})));
+            let contract = v["writeContract"].as_str().unwrap();
+            assert!(contract.contains("source_repo"), "{contract}");
+            assert!(contract.contains("second row"), "{contract}");
+            assert!(contract.contains("full replace"), "{contract}");
+        }
+    }
+
+    // ---- upstream id extraction -------------------------------------------
+
+    /// A 2xx with no `artifact.id` is a hard error, not an empty anchor. The
+    /// shipped `unwrap_or_default()` rendered `/api/v1/plan-library//edges` and
+    /// returned N opaque 404s instead of one clear diagnosis.
+    #[test]
+    fn a_missing_artifact_id_is_an_error_not_an_empty_anchor() {
+        assert_eq!(
+            artifact_id_from_upstream(&serde_json::json!({"artifact": {"id": "abc"}})).unwrap(),
+            "abc"
+        );
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"artifact": {}}),
+            serde_json::json!({"artifact": {"id": ""}}),
+            serde_json::json!({"artifact": {"id": "   "}}),
+            serde_json::json!({"artifact": {"id": 7}}),
+        ] {
+            let err = artifact_id_from_upstream(&bad).unwrap_err();
+            assert!(err.contains("no `artifact.id`"), "got {err} for {bad}");
+        }
+        // The failure mode this prevents, spelled out: an empty id would build
+        // a double-slashed edge URL.
+        assert_eq!(
+            format!("/api/v1/plan-library/{}/edges", ""),
+            "/api/v1/plan-library//edges"
+        );
     }
 
     // ---- edges -----------------------------------------------------------
@@ -852,7 +1356,7 @@ mod tests {
             relation: "feeds".into(),
             note: None,
         };
-        assert!(edge_payload(&both, "anchor").is_err());
+        assert!(edge_payload(&both).is_err());
 
         let neither = EdgeSpec {
             to_id: None,
@@ -860,34 +1364,51 @@ mod tests {
             relation: "feeds".into(),
             note: None,
         };
-        assert!(edge_payload(&neither, "anchor").is_err());
+        assert!(edge_payload(&neither).is_err());
+    }
+
+    /// A blank `relation` used to pass the handler's pre-upsert validation
+    /// (which tested only the exactly-one-end rule) and then 422 at the edge
+    /// call — leaving exactly the half-written artifact-without-its-edges state
+    /// the pre-validation exists to prevent. The check lives in `edge_payload`
+    /// now, so BOTH call sites get it.
+    #[test]
+    fn a_blank_relation_is_refused_by_the_payload_builder_itself() {
+        for relation in ["", "   ", "\t"] {
+            let spec = EdgeSpec {
+                to_id: Some("peer".into()),
+                from_id: None,
+                relation: relation.to_string(),
+                note: None,
+            };
+            let err = edge_payload(&spec).unwrap_err();
+            assert!(err.contains("`relation` is required"), "got {err}");
+        }
     }
 
     #[test]
-    fn an_outgoing_edge_anchors_on_the_written_artifact() {
+    fn an_outgoing_edge_carries_only_the_far_end() {
         let spec = EdgeSpec {
             to_id: Some("peer".into()),
             from_id: None,
             relation: "authored_plan".into(),
             note: Some("chain".into()),
         };
-        let (anchor, body) = edge_payload(&spec, "me").unwrap();
-        assert_eq!(anchor, "me");
+        let body = edge_payload(&spec).unwrap();
         assert_eq!(body["to_id"], serde_json::json!("peer"));
         assert_eq!(body["relation"], serde_json::json!("authored_plan"));
         assert!(body.get("from_id").is_none());
     }
 
     #[test]
-    fn an_incoming_edge_still_anchors_on_the_written_artifact() {
+    fn an_incoming_edge_carries_only_the_far_end() {
         let spec = EdgeSpec {
             to_id: None,
             from_id: Some("producer".into()),
             relation: "produced_report".into(),
             note: None,
         };
-        let (anchor, body) = edge_payload(&spec, "me").unwrap();
-        assert_eq!(anchor, "me");
+        let body = edge_payload(&spec).unwrap();
         assert_eq!(body["from_id"], serde_json::json!("producer"));
         assert!(body.get("to_id").is_none());
     }
@@ -1036,6 +1557,66 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(PLAN_LIBRARY_WRITE_FLAG));
+    }
+
+    /// The full-replace guard, driven over real HTTP with the door **OPEN** —
+    /// the state that actually matters, and still hermetic because the refusal
+    /// happens before `resolve_body` and before any upstream call.
+    ///
+    /// This is the request the review found: an agent refreshing a body with
+    /// `{kind, slug, source_repo, body}`, which used to send `title: ""`,
+    /// `status: ""`, `repos: []` and blank all three server-side.
+    #[tokio::test]
+    async fn a_body_only_refresh_is_refused_over_http_rather_than_blanking_metadata() {
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::set_var(PLAN_LIBRARY_WRITE_FLAG, "1");
+
+        let (status, body) = post_json(
+            "/plan-library/artifacts",
+            serde_json::json!({
+                "kind": "plan",
+                "slug": "2026-08-10-plan-and-prompt-library-in-web",
+                "source_repo": "qontinui-root/plans",
+                "body": "# Refreshed\n",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("title"), "{msg}");
+        assert!(msg.contains("status"), "{msg}");
+        assert!(msg.contains("repos"), "{msg}");
+        assert!(msg.contains("FULL REPLACE"), "{msg}");
+    }
+
+    /// A blank `relation` is refused BEFORE the artifact upsert, so it cannot
+    /// leave a written artifact with none of its edges. Also hermetic: the
+    /// refusal precedes the first upstream call.
+    #[tokio::test]
+    async fn a_blank_edge_relation_is_refused_before_the_artifact_is_written() {
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::set_var(PLAN_LIBRARY_WRITE_FLAG, "1");
+
+        let (status, body) = post_json(
+            "/plan-library/artifacts",
+            serde_json::json!({
+                "kind": "plan", "slug": "s", "title": "T", "status": "", "repos": [],
+                "body": "# T\n",
+                "edges": [{"to_id": "11111111-1111-1111-1111-111111111111", "relation": ""}],
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a blank relation must not reach the upsert"
+        );
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("`relation` is required"));
     }
 
     /// The gate runs FIRST — before body/edge validation. A request that is

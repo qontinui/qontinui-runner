@@ -1083,11 +1083,37 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // Phase 2), which adds the prompts dir as a third scan root
                     // and needs the qontinui-web base. That half is opt-in on
                     // QONTINUI_PLAN_LIBRARY_SYNC=1 and no-ops otherwise.
+                    //
+                    // The backend URL passed here is the PERSISTED one, and only
+                    // when web integration is enabled — deliberately NOT
+                    // `api_config::get_api_base_url()`. That getter can never
+                    // answer "unconfigured": it falls through to
+                    // `http://127.0.0.1:8000` in debug and PROD_API_BASE_URL in
+                    // release, and it already suppresses the persisted URL when
+                    // web integration is OFF, so it lands on the build default
+                    // precisely when the operator has said not to reach web.
+                    // Feeding that into `resolve_backend_base` would defeat its
+                    // "return None rather than guess" guard and point a release
+                    // runner's 1,100-artifact sync at production.
+                    let settings = settings::load_settings();
+                    let persisted_backend_url = settings
+                        .web_integration
+                        .enabled
+                        .then(|| settings.web_integration.backend_url.clone());
+                    // The tenant-wide `plan_capture` dial. Read per cycle (a
+                    // closure, not a snapshot) so an operator flipping it takes
+                    // effect on the next tick rather than needing a restart.
+                    let capture_gate: qontinui_runner_lib::plan_workunit_adapter::trigger::CaptureGate =
+                        std::sync::Arc::new(|| {
+                            mcp::fleet_policy_poller::effective_plan_capture_level()
+                                == mcp::fleet_policy_poller::PLAN_CAPTURE_RECORD
+                        });
                     qontinui_runner_lib::plan_workunit_adapter::trigger::spawn_if_configured(
                         paths.plans_dir,
                         paths.plans_archive_dir,
                         paths.prompts_dir,
-                        Some(api_config::get_api_base_url()),
+                        persisted_backend_url,
+                        capture_gate,
                     );
                 }
                 // Park this thread's runtime forever so the spawned
