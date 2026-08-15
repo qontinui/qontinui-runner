@@ -592,11 +592,14 @@ pub fn probe_scope_root() -> Option<std::path::PathBuf> {
 
 /// Wall-clock budget for the FIRST `<cmd> --version` probe during CAPTURE.
 ///
-/// Deliberately tight: capture runs on a 15-minute loop against three tools, and
-/// a wedged shim must cost the runner seconds, not minutes. The budget itself is
-/// NOT the thing to relax — what a box under load needs is for *exceeding* it to
-/// be represented honestly (see [`ProbeOutcome::TimedOut`]), not for the runner
-/// to sit on a wedged shim for minutes.
+/// Deliberately tight: capture runs on a loop against three tools (interval from
+/// `QONTINUI_ENV_CAPTURE_INTERVAL_SECS`, default 900s but **floored at 60s**, so
+/// the tick this has to fit inside is operator-configurable and can be one
+/// minute — see [`super::capture_interval_secs`]), and a wedged shim must cost
+/// the runner seconds, not minutes. The budget itself is NOT the thing to relax
+/// — what a box under load needs is for *exceeding* it to be represented
+/// honestly (see [`ProbeOutcome::TimedOut`]), not for the runner to sit on a
+/// wedged shim for minutes.
 ///
 /// Exceeding it is no longer a verdict on its own: it opens the confirmation
 /// ladder in [`version_of_confirmed`], and only a key that survives the whole
@@ -610,21 +613,31 @@ const CAPTURE_PROBE_BUDGET: Duration = Duration::from_secs(3);
 /// a capture.** A key is probed at most twice and only the timeout arm retries,
 /// so the worst case for one key is `CAPTURE_PROBE_BUDGET + this` = 13s, and for
 /// the whole `versions` section (three keys, by construction — see
-/// [`super::apply_versions::APPLIABLE_TOOLS`]) 39s. That is still firmly
-/// "seconds, not minutes" against a 15-minute capture loop, which is the
-/// property this module's probe budget exists to hold.
+/// [`super::apply_versions::APPLIABLE_TOOLS`]) 39s.
+///
+/// **Where that 39s actually lands.** At the 900s default interval it is 4% of a
+/// tick; at the 60s FLOOR an operator can configure
+/// (`QONTINUI_ENV_CAPTURE_INTERVAL_SECS`) it is 65% of one. So the honest claim
+/// is bounded-and-known, not negligible: the capture is a `spawn_blocking` task
+/// (see `super::build_envelope`) precisely because 39s is long enough to matter,
+/// and an operator who shortens the interval towards the floor is choosing to
+/// spend most of a tick on probes in the worst case. The prose this replaced
+/// said "seconds, not minutes against a 15-minute loop", which was true only of
+/// the default and only if nobody ever set the variable.
 ///
 /// Why a longer budget rather than a second one at 3s: the observed failure is a
 /// box under load, where `rustc --version` has been measured between 173 ms and
 /// 6858 ms at 14% CPU idle. A repeat at the same budget would re-lose the same
 /// races; a genuinely-present-but-slow tool answers inside 10s, while a wedged
-/// shim does not answer at any budget worth paying on a 15-minute loop.
+/// shim does not answer at any budget worth paying on a periodic loop.
 const CAPTURE_PROBE_RETRY_BUDGET: Duration = Duration::from_secs(10);
 
 /// After this many CONSECUTIVE captures reporting the same key unmeasured, the
 /// per-capture warn escalates from "the box was busy" to "this probe is wedged
-/// and will not self-resolve". Four captures is ~1 hour of the 15-minute loop —
-/// long enough that transient load has had every chance to clear.
+/// and will not self-resolve". Four captures spans three intervals — ~45 minutes
+/// at the 900s default, ~3 at the 60s floor — long enough at the default that
+/// transient load has had every chance to clear. The warn carries the REAL
+/// elapsed time rather than a hardcoded one; see [`unknown_streak_message`].
 ///
 /// It deliberately does NOT decay to [`ProbeOutcome::Failed`]: "we still cannot
 /// read it" never becomes "you do not have it", because the action that
@@ -707,12 +720,23 @@ fn version_of(cmd: &str, args: &[&str], cwd: Option<&Path>) -> ProbeOutcome {
 ///    writes more than a pipe buffer (~4 KB) before exiting — an nvm-windows
 ///    "no version selected" dump, a corepack/volta banner — exits normally and
 ///    classifies on its exit status instead of blocking on its own write.
-/// 2. A resolved binary that is a 0-byte stub is POSITIVE evidence the tool is
-///    absent, not unknown: the `WindowsApps` App Execution Alias spawns cleanly
-///    and then hangs forever, which is indistinguishable from a busy box by the
-///    clock alone. See [`is_non_executable_stub`].
-/// 3. Anything left gets ONE more attempt at `retry_budget`. A
+/// 2. Anything that timed out gets ONE more attempt at `retry_budget`. A
 ///    present-but-slow tool answers there; a wedged one does not.
+/// 3. ONLY THEN is the resolved binary inspected: an App Execution Alias
+///    placeholder spawns cleanly and hangs forever, which is indistinguishable
+///    from a busy box by the clock alone, so proving one is POSITIVE evidence of
+///    absence. See [`is_non_executable_stub`].
+///
+/// **Step 3 runs LAST, and that ordering is the fix for a live regression.** It
+/// used to sit between steps 1 and 2, so a tool the stub check misjudged never
+/// got its confirming attempt at all — the single mechanism that rescues a
+/// slow-but-present tool was spent nowhere on exactly the boxes where the check
+/// misfires. `rustc --version` has been measured on this fleet at 6858 ms, well
+/// past the 3s first budget, so reaching step 3 is routine rather than
+/// pathological and a wrong answer there installs over a live toolchain. Every
+/// probe now gets its confirming attempt before ANY negative verdict; a check
+/// that needs to pre-empt the retry to be useful is a check that is deciding on
+/// too little.
 ///
 /// Only a key that survives all three is reported unmeasured.
 fn version_of_confirmed(
@@ -722,31 +746,80 @@ fn version_of_confirmed(
     budget: Duration,
     retry_budget: Duration,
 ) -> ProbeOutcome {
+    version_of_confirmed_with(
+        cmd,
+        args,
+        cwd,
+        budget,
+        retry_budget,
+        &is_non_executable_stub,
+    )
+}
+
+/// [`version_of_confirmed`] with an injectable stub check, so the LADDER ORDER
+/// is testable without an App Execution Alias — a shape no test can create.
+///
+/// Injecting a check that condemns everything and still getting `Measured` out
+/// of a tool that answers on the retry is the direct pin on step 3 running last.
+fn version_of_confirmed_with(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    budget: Duration,
+    retry_budget: Duration,
+    is_stub: &dyn Fn(&Path) -> bool,
+) -> ProbeOutcome {
     let first = version_of_within(cmd, args, cwd, budget);
     if first != ProbeOutcome::TimedOut {
         return first;
     }
 
+    let second = version_of_within(cmd, args, cwd, retry_budget);
+    if second != ProbeOutcome::TimedOut {
+        return second;
+    }
+
     if let Some(path) = resolve_executable(cmd) {
-        if is_non_executable_stub(&path) {
+        if is_stub(&path) {
             warn!(
-                "env_agent: `{cmd}` resolves to {} — a non-executable stub (0 bytes / an App \
-                 Execution Alias), which spawns and then never answers. Classifying it as ABSENT \
-                 (a definite negative), not as unmeasured.",
+                "env_agent: `{cmd}` resolves to {} — a Windows App Execution Alias placeholder, \
+                 which spawns cleanly and then never answers. It answered at neither budget, so \
+                 classifying it as ABSENT (a definite negative), not as unmeasured.",
                 path.display(),
             );
             return ProbeOutcome::Failed;
         }
     }
 
-    version_of_within(cmd, args, cwd, retry_budget)
+    second
 }
 
-/// Resolve a command to the file the loader would actually execute, walking
-/// `PATH` (and `PATHEXT` on Windows) the same way. Used ONLY to inspect a
-/// binary after its probe timed out — a bare `Command::spawn` tells us nothing
-/// about WHAT it spawned, and that is exactly what separates "absent tool
-/// wearing an alias" from "busy box".
+/// Resolve a command to the file [`std::process::Command::spawn`] would
+/// actually execute. Used ONLY to inspect a binary after its probe timed out —
+/// a bare `Command::spawn` tells us nothing about WHAT it spawned, and that is
+/// exactly what separates "absent tool wearing an alias" from "busy box".
+///
+/// **It must mirror `spawn`, not PATH folklore.** Inspecting a DIFFERENT file
+/// from the one that ran is worse than not inspecting at all: the verdict it
+/// feeds ([`is_non_executable_stub`] → `Failed` → installable) is then a
+/// statement about a file that never executed. Rust std's Windows `resolve_exe`
+/// is the spec here, and it is narrower than PATH+PATHEXT lore in three ways
+/// this function used to get wrong:
+///
+/// - **`.exe` only, and only when the name carries no dot of its own.** std does
+///   NOT consult `PATHEXT`, so a `python.cmd` / `.bat` / `.com` on PATH is
+///   something `spawn` will refuse to run — returning it meant stubbing-out a
+///   file the probe never touched.
+/// - **No bare-name candidate on Windows.** An extensionless `python` (a
+///   Git-for-Windows `usr/bin` shell script, say) sitting ahead of the real
+///   `python.exe` was tried FIRST and returned, though std would never run it.
+/// - **The running EXE's own directory is searched BEFORE PATH.** That is where
+///   std looks first, so a name shadowed there resolves to the runner's copy.
+///
+/// Empty `PATH` entries (a `;;` or a trailing `;`) are dropped: `split_paths`
+/// yields an empty `PathBuf` for them, and `dir.join(cmd)` would then produce a
+/// RELATIVE path resolved against the runner process's cwd — a silent second cwd
+/// in a module whose whole scope story is that the probe runs where it was told.
 ///
 /// Uses `symlink_metadata` throughout: a Windows App Execution Alias is a
 /// reparse point whose target does not resolve, so `Path::is_file` (which
@@ -764,25 +837,34 @@ fn resolve_executable(cmd: &str) -> Option<PathBuf> {
         return is_existing_file(raw).then(|| raw.to_path_buf());
     }
 
-    let path_var = std::env::var_os("PATH")?;
-    let extensions: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-            .split(';')
-            .filter(|e| !e.is_empty())
-            .map(str::to_string)
-            .collect()
+    // The candidate FILE NAMES, in the order the loader tries them.
+    let names: Vec<String> = if cfg!(windows) {
+        if cmd.contains('.') {
+            vec![cmd.to_string()]
+        } else {
+            vec![format!("{cmd}.exe")]
+        }
     } else {
-        Vec::new()
+        vec![cmd.to_string()]
     };
 
-    for dir in std::env::split_paths(&path_var) {
-        let bare = dir.join(cmd);
-        if is_existing_file(&bare) {
-            return Some(bare);
+    // The DIRECTORIES, in the order the loader searches them.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if cfg!(windows) {
+        if let Some(own_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+        {
+            dirs.push(own_dir);
         }
-        for ext in &extensions {
-            let candidate = dir.join(format!("{cmd}{ext}"));
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path_var).filter(|d| !d.as_os_str().is_empty()));
+    }
+
+    for dir in dirs {
+        for name in &names {
+            let candidate = dir.join(name);
             if is_existing_file(&candidate) {
                 return Some(candidate);
             }
@@ -791,42 +873,219 @@ fn resolve_executable(cmd: &str) -> Option<PathBuf> {
     None
 }
 
-/// True when this file CANNOT be a working executable — positive evidence of an
-/// absent tool, cheap enough to check after every timeout.
+/// `IO_REPARSE_TAG_APPEXECLINK` — a Windows App Execution Alias. THE positive
+/// fact this check is built on.
+const IO_REPARSE_TAG_APPEXECLINK: u32 = 0x8000_001B;
+/// `IO_REPARSE_TAG_SYMLINK` — an ordinary NTFS symbolic link, to be FOLLOWED.
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+/// `IO_REPARSE_TAG_MOUNT_POINT` — a junction; also a thing to follow.
+const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+
+/// The on-disk shape of one resolved path, as far as the filesystem can tell.
+/// Split out from the filesystem so [`stub_verdict`] can be unit-tested over
+/// shapes this box may not be able to CREATE (a symlink needs Developer Mode or
+/// admin; an App Execution Alias cannot be forged at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileShape {
+    is_dir: bool,
+    len: u64,
+    /// The Windows reparse tag, when this file is a reparse point AND the tag
+    /// could be read. `None` covers both "an ordinary file" and "we could not
+    /// find out" — see [`stub_verdict`] for why those fold together safely.
+    reparse_tag: Option<u32>,
+    /// True when the OS reports a reparse point, whatever its tag. Lets the
+    /// fallback arm fire when the tag read itself failed.
+    is_reparse_point: bool,
+    /// Whether the path sits under a `WindowsApps` directory. Only ever used to
+    /// NARROW the tagless fallback, never to condemn on its own.
+    under_windows_apps: bool,
+}
+
+/// What [`stub_verdict`] concluded about one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StubVerdict {
+    /// Positive evidence the tool is absent: this file cannot be a working
+    /// executable.
+    Stub,
+    /// This file says nothing that would justify a negative verdict.
+    NotStub,
+    /// A link: it says nothing ITSELF. Follow it and judge the target.
+    FollowLink,
+}
+
+/// Classify one file's shape. **Pure — unit-tested, including over shapes this
+/// box cannot create.**
 ///
-/// The motivating case: on a box with no real Python, `python` resolves to
-/// `%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe`, a 0-byte App Execution
-/// Alias that spawns fine and then hangs. By the clock that is
-/// indistinguishable from a slow tool, and classifying it unmeasured would leave
-/// a box that genuinely needs Python installed permanently un-installable.
+/// **A 0-byte file is NOT evidence of absence, and treating it as such was a
+/// live regression.** On NTFS a symlink is a 0-byte reparse point, so
+/// `symlink_metadata().len()` reports 0 for ANY symlinked exe — and every rustup
+/// proxy is exactly that (`~/.cargo/bin/rustc.exe` → `rustup.exe`, measured 0
+/// bytes on this fleet). Condemning 0-byte files therefore condemned a working,
+/// current toolchain: the probe would time out under load, the stub check would
+/// call it `Failed`, the key would diff as `Missing`, and `env apply` would
+/// install over it. That is the exact harm this whole path exists to prevent,
+/// re-entered from the other side.
 ///
-/// A 0-byte executable is a known silent-green hazard on this fleet, so it is
-/// treated as a DEFINITE NEGATIVE, never an unknown. The Windows reparse-point
-/// arm is belt-and-braces for the same file: it fires only for a reparse point
-/// under a `WindowsApps` directory, so a genuinely Store-installed tool (a real
-/// file, not a link) is never caught by it.
-fn is_non_executable_stub(path: &Path) -> bool {
-    let Ok(md) = std::fs::symlink_metadata(path) else {
-        return false;
+/// The 0-byte-ness is also not what makes an App Execution Alias a stub — the
+/// same directory holds ~34 WORKING 0-byte aliases on this box (`wsl.exe`,
+/// `winget.exe`, `wt.exe`, `bash.exe`). What makes the placeholder a stub is its
+/// reparse TAG plus the fact that it answered at neither budget, so that is what
+/// is checked, in that order:
+///
+/// - a symlink or junction is FOLLOWED and its target judged instead;
+/// - an `IO_REPARSE_TAG_APPEXECLINK` is a stub;
+/// - a reparse point whose tag could not be read, 0 bytes, under `WindowsApps`,
+///   is a stub too — the same file seen through a failed tag read, and narrow
+///   enough that an ordinary file can never land there;
+/// - everything else, 0 bytes or not, is NOT a stub. A plain 0-byte exe cannot
+///   be `CreateProcess`d at all, so it fails to SPAWN and is reported `Failed`
+///   long before this check is reached.
+///
+/// Fail-safe direction is NotStub: an unknown shape must fall through to
+/// "unmeasured", which suppresses an apply, never to "absent", which triggers
+/// one.
+///
+/// **Residual, stated rather than hidden:** an INSTALLED Store app wears the
+/// same `IO_REPARSE_TAG_APPEXECLINK` as an uninstalled one — the difference
+/// lives inside the reparse buffer, not in the tag or the file shape. What
+/// separates them for us is the CLOCK, and only because this runs last: an
+/// installed app's alias launches the app, which answers, so reaching here means
+/// the alias produced nothing at 3s AND nothing at 10s. That is the whole of the
+/// evidence, and it is why the check may not move earlier in the ladder.
+fn stub_verdict(shape: &FileShape) -> StubVerdict {
+    if shape.is_dir {
+        return StubVerdict::NotStub;
+    }
+    match shape.reparse_tag {
+        Some(IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_MOUNT_POINT) => {
+            return StubVerdict::FollowLink
+        }
+        Some(IO_REPARSE_TAG_APPEXECLINK) => return StubVerdict::Stub,
+        _ => {}
+    }
+    if shape.is_reparse_point
+        && shape.reparse_tag.is_none()
+        && shape.len == 0
+        && shape.under_windows_apps
+    {
+        return StubVerdict::Stub;
+    }
+    StubVerdict::NotStub
+}
+
+/// Read one path's [`FileShape`]. `None` when the path cannot be stat'd at all.
+///
+/// `symlink_metadata` on purpose: an App Execution Alias is a reparse point
+/// whose target does not resolve, so anything that FOLLOWS reports `false`/error
+/// for the very file we need to look at.
+fn file_shape(path: &Path) -> Option<FileShape> {
+    let md = std::fs::symlink_metadata(path).ok()?;
+    let mut shape = FileShape {
+        is_dir: md.is_dir(),
+        len: md.len(),
+        reparse_tag: None,
+        is_reparse_point: false,
+        under_windows_apps: path
+            .components()
+            .any(|c| c.as_os_str().eq_ignore_ascii_case("WindowsApps")),
     };
-    if md.is_dir() {
-        return false;
-    }
-    if md.len() == 0 {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            && path
-                .components()
-                .any(|c| c.as_os_str().eq_ignore_ascii_case("WindowsApps"))
-        {
-            return true;
+        shape.is_reparse_point = md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        if shape.is_reparse_point {
+            // The tag is the whole discriminator, so read it from the OS rather
+            // than inferring it. `FileType::is_symlink` is the std fallback: it
+            // is true for exactly the two tags std knows how to follow, and
+            // false for an App Execution Alias.
+            shape.reparse_tag =
+                reparse_tag_of(path).or_else(|| md.is_symlink().then_some(IO_REPARSE_TAG_SYMLINK));
         }
     }
+    #[cfg(not(windows))]
+    {
+        shape.is_reparse_point = md.is_symlink();
+        if md.is_symlink() {
+            shape.reparse_tag = Some(IO_REPARSE_TAG_SYMLINK);
+        }
+    }
+    Some(shape)
+}
+
+/// The reparse tag of `path`, via `FindFirstFileW`'s `dwReserved0` — the
+/// documented way to read a tag without opening (and thus following) the file.
+/// `None` when the path cannot be enumerated or is not a reparse point.
+#[cfg(windows)]
+fn reparse_tag_of(path: &Path) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut data: WIN32_FIND_DATAW = std::mem::zeroed();
+        let handle = FindFirstFileW(wide.as_ptr(), &mut data);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        FindClose(handle);
+        (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0).then_some(data.dwReserved0)
+    }
+}
+
+/// How many links [`is_non_executable_stub`] will follow before giving up.
+/// Bounded so a link cycle costs a handful of `stat`s rather than the capture.
+const MAX_LINK_HOPS: usize = 8;
+
+/// True when this file CANNOT be a working executable — positive evidence of an
+/// absent tool, cheap enough to check after both probe attempts have failed.
+///
+/// The motivating case: on a box with no real Python, `python` resolves to
+/// `%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe`, an App Execution Alias
+/// placeholder that spawns fine and then hangs. By the clock that is
+/// indistinguishable from a slow tool, and classifying it unmeasured would leave
+/// a box that genuinely needs Python installed permanently un-installable.
+///
+/// A LINK is followed to its target and the target judged, which is what keeps a
+/// rustup proxy (`rustc.exe` → `rustup.exe`, a 0-byte reparse point on NTFS)
+/// out of the stub arm. A dangling link resolves to nothing and returns `false`
+/// — it cannot spawn either, but it would have failed at spawn time and been
+/// reported `Failed` there, so there is nothing for this check to add.
+///
+/// See [`stub_verdict`] for the classification itself.
+fn is_non_executable_stub(path: &Path) -> bool {
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_LINK_HOPS {
+        let Some(shape) = file_shape(&current) else {
+            return false;
+        };
+        match stub_verdict(&shape) {
+            StubVerdict::Stub => return true,
+            StubVerdict::NotStub => return false,
+            StubVerdict::FollowLink => {
+                let Ok(target) = std::fs::read_link(&current) else {
+                    return false;
+                };
+                // A link target may be relative TO THE LINK, not to any cwd —
+                // rustup writes exactly that (`rustc.exe` → `rustup.exe`).
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    match current.parent() {
+                        Some(dir) => dir.join(target),
+                        None => return false,
+                    }
+                };
+            }
+        }
+    }
+    // A cycle, or a chain longer than anything real: we established nothing.
     false
 }
 
@@ -867,6 +1126,14 @@ fn version_of_within(
         return ProbeOutcome::Failed;
     };
 
+    // Reap the whole TREE, not just the child. `Child::kill` is
+    // `TerminateProcess` on ONE process, and a shim (a rustup proxy, a
+    // volta/pyenv-win shim, `cmd /c …`) runs the real tool as a GRANDCHILD
+    // holding inherited duplicates of both pipe write ends — so killing the
+    // child alone orphans a process AND leaves the pipes without an EOF. The
+    // guard drops on every return path below.
+    let _tree = crate::process_helpers::ChildTreeGuard::attach(&child);
+
     // Drain BOTH pipes from the moment the child exists, not after it exits.
     //
     // This is load-bearing, not tidiness. Both streams are `piped()`, the pipe
@@ -877,24 +1144,25 @@ fn version_of_within(
     // the deadlock expires as a timeout, i.e. as "we could not measure this
     // box's toolchain" when in truth the tool answered at length. Draining
     // concurrently turns that entire class back into an ordinary exit.
-    let mut stdout_reader = drain_pipe(child.stdout.take());
-    let mut stderr_reader = drain_pipe(child.stderr.take());
+    let stdout_reader = PipeDrain::spawn(child.stdout.take());
+    let stderr_reader = PipeDrain::spawn(child.stderr.take());
 
     let deadline = started + budget;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Join FIRST: the readers own the only handles to the pipes, and
-                // a reader still holding data is the difference between an empty
-                // probe (→ `Failed`) and a measured one.
-                let stdout = stdout_reader
-                    .take()
-                    .and_then(|h| h.join().ok())
-                    .unwrap_or_default();
-                let stderr = stderr_reader
-                    .take()
-                    .and_then(|h| h.join().ok())
-                    .unwrap_or_default();
+                // Wait for the readers on a BOUNDED clock, and never by joining.
+                // A join here has no timeout: if a grandchild outlived the
+                // parent (a corepack/volta background update check is the
+                // realistic shape) it still holds the write ends, the pipes
+                // never EOF, and `collect_versions` hangs FOREVER — bypassing
+                // every budget in this module and stalling the capture loop,
+                // whose `MissedTickBehavior::Skip` never advances past a task
+                // that does not return. The readers publish into a shared
+                // buffer instead, so a partial answer is still readable.
+                let drained = wait_for_drain(&stdout_reader, &stderr_reader, READER_DRAIN_GRACE);
+                let stdout = stdout_reader.snapshot();
+                let stderr = stderr_reader.snapshot();
                 if !status.success() {
                     return ProbeOutcome::Failed;
                 }
@@ -904,27 +1172,36 @@ fn version_of_within(
                     stdout
                 };
                 let first = out.lines().next().unwrap_or("").trim().to_string();
-                return if first.is_empty() {
+                return if !first.is_empty() {
+                    ProbeOutcome::Measured(first)
+                } else if drained {
+                    // Both pipes reached EOF with nothing in them: the tool ran
+                    // and said nothing. A definite negative.
                     ProbeOutcome::Failed
                 } else {
-                    ProbeOutcome::Measured(first)
+                    // We gave up on a reader that never reached EOF. The empty
+                    // output is OUR gap, not the box's — "we do not know" is the
+                    // only honest verdict, and it is the one that suppresses an
+                    // apply rather than triggering one.
+                    ProbeOutcome::TimedOut
                 };
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    // The readers are DETACHED rather than joined: killing the
-                    // child closes the write ends, so each thread's
-                    // `read_to_string` returns on its own and the thread exits.
-                    // Joining here would make the caller wait on a child we have
-                    // already given up on.
-                    drop(stdout_reader.take());
-                    drop(stderr_reader.take());
+                    // The readers are left running rather than joined or
+                    // awaited: we have given up on this child, and the caller
+                    // must not wait on it. They own nothing of ours (the buffer
+                    // is an `Arc`), and dropping `_tree` on the way out kills
+                    // the grandchildren that would otherwise hold the pipes
+                    // open, so they see EOF and exit instead of blocking
+                    // forever.
+                    //
                     // THE distinguished arm: we killed a live child, so we
                     // learned nothing about the installed version. It is a
                     // candidate verdict only — `version_of_confirmed` must
-                    // rule out the stub and the retry before it stands.
+                    // spend the retry and rule out the stub before it stands.
                     return ProbeOutcome::TimedOut;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -936,21 +1213,102 @@ fn version_of_within(
     }
 }
 
-/// Read one child pipe to EOF on its own thread. See [`version_of_within`] for
-/// why the read cannot wait for the child to exit.
-fn drain_pipe<R: std::io::Read + Send + 'static>(
-    pipe: Option<R>,
-) -> Option<std::thread::JoinHandle<String>> {
-    pipe.map(|mut p| {
+/// How much of each pipe is KEPT. Only the first line is ever used, so anything
+/// past this is read-and-discarded: the deadlock a chatty shim causes is broken
+/// by DRAINING, not by keeping, and a cap that stopped reading would re-create
+/// it for any tool that prints more than the cap.
+const PIPE_KEEP_BYTES: usize = 64 * 1024;
+
+/// How long the EXIT path will wait for the readers to reach EOF before
+/// reporting on what it already has.
+///
+/// A child that has exited has closed its own write ends, so this is normally
+/// consumed in microseconds. It is only ever spent when something ELSE still
+/// holds a duplicate — precisely the case that used to hang forever.
+const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// One child pipe, drained on its own thread into a bounded shared buffer.
+///
+/// Shared rather than returned-on-join for two reasons: the parent must be able
+/// to give up on a reader that will never finish, and a reader blocked on a
+/// grandchild's copy of the write end has usually ALREADY read the version line
+/// — a partial answer here is a measured probe rather than an unknown one.
+struct PipeDrain {
+    /// The first [`PIPE_KEEP_BYTES`] read so far.
+    kept: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// Set when the reader has seen EOF (or given up). The parent polls this
+    /// instead of joining.
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PipeDrain {
+    fn spawn<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Self {
+        use std::sync::atomic::Ordering;
+
+        let kept = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let Some(mut p) = pipe else {
+            // No pipe is the same as an immediately-empty one.
+            finished.store(true, Ordering::Release);
+            return Self { kept, finished };
+        };
+        let (kept_w, finished_w) = (kept.clone(), finished.clone());
         std::thread::spawn(move || {
-            // Lossy on purpose: a shim emitting non-UTF-8 must not be able to
-            // turn a successful probe into an empty one. Whatever arrived before
-            // an error is still kept, for the same reason.
-            let mut raw = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut p, &mut raw);
-            String::from_utf8_lossy(&raw).into_owned()
-        })
-    })
+            let mut chunk = [0u8; 8192];
+            let mut seen: usize = 0;
+            loop {
+                match std::io::Read::read(&mut p, &mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if seen < PIPE_KEEP_BYTES {
+                            let room = PIPE_KEEP_BYTES - seen;
+                            if let Ok(mut buf) = kept_w.lock() {
+                                buf.extend_from_slice(&chunk[..n.min(room)]);
+                            }
+                        }
+                        seen = seen.saturating_add(n);
+                        // Deliberately keep READING past the cap and throw the
+                        // rest away: a child blocked in `write` never exits.
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            finished_w.store(true, Ordering::Release);
+        });
+        Self { kept, finished }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whatever has been read so far. Lossy on purpose: a shim emitting non-UTF-8
+    /// must not be able to turn a successful probe into an empty one.
+    fn snapshot(&self) -> String {
+        match self.kept.lock() {
+            Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+            // A panicking reader thread cannot be allowed to poison the probe
+            // into a false negative either.
+            Err(poisoned) => String::from_utf8_lossy(&poisoned.into_inner()).into_owned(),
+        }
+    }
+}
+
+/// Wait until both readers have reached EOF, or `grace` expires. Returns whether
+/// they finished — the caller needs that to tell "the tool printed nothing" from
+/// "we stopped reading".
+fn wait_for_drain(a: &PipeDrain, b: &PipeDrain, grace: Duration) -> bool {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if a.is_finished() && b.is_finished() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Re-run the EXACT probe [`collect_versions`] uses, with an explicit budget.
@@ -959,8 +1317,9 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(
 /// driving a version manager. That verification is only worth anything if it
 /// asks the same question the capture asks — same command, same args, same cwd
 /// resolution — so it goes through this one function rather than a lookalike.
-/// The budget is a parameter because an apply can afford to wait longer than a
-/// 15-minute capture loop can.
+/// The budget is a parameter because an operator-invoked apply can afford to
+/// wait longer than a periodic capture loop can (whose interval is itself
+/// configurable — see [`super::capture_interval_secs`]).
 ///
 /// Collapses [`ProbeOutcome`] to an `Option` on purpose: the apply's
 /// verification treats "no answer" as "not verified" whichever arm produced it,
@@ -2279,6 +2638,22 @@ pub struct VersionsCapture {
     pub unknown_keys: BTreeSet<String>,
 }
 
+impl VersionsCapture {
+    /// A capture that measured NOTHING — the degrade for a collector that did
+    /// not complete at all.
+    ///
+    /// Deliberately empty on BOTH halves: the empty section is dropped by the
+    /// envelope's isolation driver, so the pull sees "no local data for this
+    /// section" (un-comparable) rather than a section full of absent keys, and
+    /// an empty `unknown_keys` cannot claim we established anything either.
+    pub fn empty() -> Self {
+        Self {
+            section: Section::new(),
+            unknown_keys: BTreeSet::new(),
+        }
+    }
+}
+
 /// Collect the `versions` section: this binary's own crate + tauri versions,
 /// node deps from this repo's own `package.json` under the workspace root,
 /// python from the web-backend pyproject.toml, the `python_dep_*` DECLARED
@@ -2364,7 +2739,11 @@ pub fn collect_versions() -> VersionsCapture {
             // trace of it is the (additive, easily-ignored) envelope field.
             warn!(
                 "{}",
-                unknown_streak_message(key, record_unknown_streak(key))
+                unknown_streak_message(
+                    key,
+                    record_unknown_streak(key),
+                    super::capture_interval_secs()
+                )
             );
         } else {
             clear_unknown_streak(key);
@@ -2645,22 +3024,33 @@ static UNKNOWN_STREAKS: std::sync::Mutex<BTreeMap<String, u32>> =
     std::sync::Mutex::new(BTreeMap::new());
 
 /// Count one more consecutive unmeasured capture for `key` and return the new
-/// streak. A poisoned lock degrades to "1" rather than panicking — a warn
-/// counter must never be able to take the capture loop down.
+/// streak. A warn counter must never be able to take the capture loop down, so
+/// it never panics.
+///
+/// **Poisoning is recovered from, not degraded to a constant.** A `Mutex` stays
+/// poisoned for the PROCESS LIFETIME, so an `Err` arm that returned `1` did not
+/// degrade one capture — it silently disabled the escalation permanently, and a
+/// genuinely wedged probe would then warn in its "the box was busy" wording
+/// forever. `into_inner` keeps the counter: the data behind it is a
+/// `BTreeMap<String, u32>` that cannot be left in a broken invariant by a panic
+/// between two of its own statements.
 fn record_unknown_streak(key: &str) -> u32 {
-    let Ok(mut streaks) = UNKNOWN_STREAKS.lock() else {
-        return 1;
-    };
+    let mut streaks = UNKNOWN_STREAKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let entry = streaks.entry(key.to_string()).or_insert(0);
     *entry = entry.saturating_add(1);
     *entry
 }
 
 /// Reset `key`'s streak — any DEFINITE outcome ends it, measured or failed.
+/// Recovers from poisoning for the same reason [`record_unknown_streak`] does:
+/// a streak that can never be CLEARED would eventually escalate every key.
 fn clear_unknown_streak(key: &str) {
-    if let Ok(mut streaks) = UNKNOWN_STREAKS.lock() {
-        streaks.remove(key);
-    }
+    UNKNOWN_STREAKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
 }
 
 /// The warn text for one unmeasured key. **Pure — unit-tested.**
@@ -2668,9 +3058,17 @@ fn clear_unknown_streak(key: &str) {
 /// Past [`UNKNOWN_STREAK_ALARM`] it stops describing a busy box and starts
 /// naming a wedged probe, because those are different operator actions: the
 /// first resolves itself, the second never will, and a key that is unmeasured on
-/// every pass of a 15-minute loop is otherwise reported-and-never-acted-on
+/// every pass of the capture loop is otherwise reported-and-never-acted-on
 /// indefinitely with nothing to distinguish it from the transient case.
-fn unknown_streak_message(key: &str, streak: u32) -> String {
+///
+/// `interval_secs` is the loop's REAL interval (see
+/// [`super::capture_interval_secs`]), passed in rather than assumed. This
+/// message's entire job is telling an operator "this has been broken long enough
+/// to act on", and it used to compute that from a hardcoded 15 minutes — wrong
+/// twice over: the interval is configurable and floored at 60s (where it claimed
+/// "~60 minutes" for ~3 minutes of elapsed time), and even at the default, N
+/// captures span N-1 intervals, so four of them are 45 minutes and not 60.
+fn unknown_streak_message(key: &str, streak: u32, interval_secs: u64) -> String {
     let head = format!(
         "env_agent: `{key} --version` exceeded both the {}s capture budget and the {}s confirming \
          retry — reporting it as UNMEASURED rather than missing, so `env apply` will not install \
@@ -2681,15 +3079,17 @@ fn unknown_streak_message(key: &str, streak: u32) -> String {
     if streak < UNKNOWN_STREAK_ALARM {
         format!("{head} (consecutive unmeasured captures: {streak})")
     } else {
+        // N captures span N-1 intervals, at THIS runner's interval — not at a
+        // hardcoded one.
+        let elapsed_minutes = u64::from(streak.saturating_sub(1)) * interval_secs / 60;
         format!(
-            "{head}. THIS KEY HAS NOW BEEN UNMEASURED FOR {streak} CONSECUTIVE CAPTURES (~{} \
-             minutes): it is a WEDGED probe, not a slow one, and it will not resolve on its own. \
-             `versions` drift for `{key}` on this box is BLIND until it does — run `{key} \
-             --version` by hand in the capture scope and fix or remove the shim. The runner will \
-             keep refusing to act on the key in the meantime; it will NOT start treating it as \
-             absent, because installing over a version nobody read is the failure this refusal \
-             exists to prevent.",
-            u64::from(streak) * 15,
+            "{head}. THIS KEY HAS NOW BEEN UNMEASURED FOR {streak} CONSECUTIVE CAPTURES \
+             (~{elapsed_minutes} minutes, at this runner's {interval_secs}s capture interval): it \
+             is a WEDGED probe, not a slow one, and it will not resolve on its own. `versions` \
+             drift for `{key}` on this box is BLIND until it does — run `{key} --version` by hand \
+             in the capture scope and fix or remove the shim. The runner will keep refusing to act \
+             on the key in the meantime; it will NOT start treating it as absent, because \
+             installing over a version nobody read is the failure this refusal exists to prevent."
         )
     }
 }
@@ -4371,7 +4771,8 @@ dependencies = [
     /// The capture budget is a PRODUCTION latency choice and this branch does
     /// not move it — only the representation of exceeding it changed. Pinned so
     /// a future "just make it bigger" cannot land unnoticed: capture runs on a
-    /// 15-minute loop against three tools, so a wedged shim must cost seconds.
+    /// periodic loop against three tools — an interval an operator can set as
+    /// low as 60s — so a wedged shim must cost seconds.
     #[test]
     fn capture_probe_budget_is_unchanged_at_three_seconds() {
         assert_eq!(CAPTURE_PROBE_BUDGET, Duration::from_secs(3));
@@ -4380,9 +4781,11 @@ dependencies = [
             "the generous TEST budget must never be the one the capture path uses"
         );
         // The retry does not relax the first budget — it composes with it, and
-        // the COMPOSITION is what the 15-minute loop actually pays. Pinned as a
-        // ceiling on the whole section: at most one retry per key, over the keys
-        // `APPLIABLE_TOOLS` owns.
+        // the COMPOSITION is what each tick actually pays. Pinned as a ceiling
+        // on the whole section: at most one retry per key, over the keys
+        // `APPLIABLE_TOOLS` owns. 39s is 65% of the 60s interval floor, which is
+        // why this ceiling is pinned at all and why the caller runs it on the
+        // blocking pool rather than a runtime worker.
         let worst_case = (CAPTURE_PROBE_BUDGET + CAPTURE_PROBE_RETRY_BUDGET)
             * u32::try_from(super::super::apply_versions::APPLIABLE_TOOLS.len()).unwrap();
         assert!(
@@ -4484,28 +4887,172 @@ dependencies = [
         );
     }
 
-    /// A 0-byte executable is positive evidence of an absent tool — the
-    /// `WindowsApps` App Execution Alias shape, which spawns fine and then hangs
-    /// forever. It is a DEFINITE NEGATIVE, never an unknown, because
-    /// classifying it unknown leaves a box that genuinely needs the tool
-    /// permanently un-installable.
+    /// Build a [`FileShape`] for the classifier tests. Named fields at the call
+    /// site would drown the one bit each case is about.
+    fn shape(
+        len: u64,
+        reparse_tag: Option<u32>,
+        is_reparse_point: bool,
+        under_windows_apps: bool,
+    ) -> FileShape {
+        FileShape {
+            is_dir: false,
+            len,
+            reparse_tag,
+            is_reparse_point,
+            under_windows_apps,
+        }
+    }
+
+    /// THE regression: **a 0-byte file is not evidence of absence.** On NTFS a
+    /// symlink is a 0-byte reparse point, so the old unconditional
+    /// `md.len() == 0 → stub` arm condemned every symlinked exe — including
+    /// every rustup proxy on this fleet (`~/.cargo/bin/rustc.exe` → `rustup.exe`,
+    /// measured at 0 bytes). A timed-out probe on a busy box then read as
+    /// "rustc is absent" and `env apply` would install over a working toolchain.
+    ///
+    /// Runs over synthetic shapes on purpose: an App Execution Alias cannot be
+    /// forged in a test at all, and a symlink needs privileges this box may
+    /// lack, so the SHAPES are what the classifier is pinned against.
     #[test]
-    fn a_zero_byte_binary_is_a_definite_negative() {
+    fn stub_verdict_condemns_the_alias_and_never_the_symlink() {
+        // A symlink says nothing itself — follow it and judge the target.
+        assert_eq!(
+            stub_verdict(&shape(0, Some(IO_REPARSE_TAG_SYMLINK), true, false)),
+            StubVerdict::FollowLink,
+            "a 0-byte symlink is the rustup-proxy shape; condemning it installs over a live \
+             toolchain"
+        );
+        assert_eq!(
+            stub_verdict(&shape(0, Some(IO_REPARSE_TAG_MOUNT_POINT), true, false)),
+            StubVerdict::FollowLink,
+        );
+        // …even under WindowsApps, where the old belt-and-braces arm fired on
+        // any reparse point at all.
+        assert_eq!(
+            stub_verdict(&shape(0, Some(IO_REPARSE_TAG_SYMLINK), true, true)),
+            StubVerdict::FollowLink,
+        );
+
+        // The App Execution Alias placeholder — the tag IS the positive fact.
+        assert_eq!(
+            stub_verdict(&shape(0, Some(IO_REPARSE_TAG_APPEXECLINK), true, true)),
+            StubVerdict::Stub,
+        );
+
+        // A plain 0-byte file is NOT a stub. It cannot be `CreateProcess`d
+        // either, so it fails at SPAWN and is reported `Failed` there — this
+        // check has nothing to add, and guessing here is what broke rustc.
+        assert_eq!(
+            stub_verdict(&shape(0, None, false, false)),
+            StubVerdict::NotStub
+        );
+        assert_eq!(
+            stub_verdict(&shape(0, None, false, true)),
+            StubVerdict::NotStub,
+            "0 bytes under WindowsApps is not enough either: this box holds 34 WORKING 0-byte \
+             aliases there (wsl.exe, winget.exe, wt.exe, bash.exe)"
+        );
+
+        // An ordinary binary, and a directory.
+        assert_eq!(
+            stub_verdict(&shape(4096, None, false, false)),
+            StubVerdict::NotStub
+        );
+        assert_eq!(
+            stub_verdict(&FileShape {
+                is_dir: true,
+                ..shape(0, Some(IO_REPARSE_TAG_APPEXECLINK), true, true)
+            }),
+            StubVerdict::NotStub,
+        );
+    }
+
+    /// The tagless fallback exists for a failed tag read, and must stay narrow
+    /// enough that only the alias shape can land in it.
+    #[test]
+    fn stub_verdict_fallback_needs_reparse_and_zero_bytes_and_windowsapps() {
+        // All three: the alias, seen through a tag read that failed.
+        assert_eq!(stub_verdict(&shape(0, None, true, true)), StubVerdict::Stub);
+        // Drop any one of them and the verdict is NOT a negative.
+        assert_eq!(
+            stub_verdict(&shape(0, None, true, false)),
+            StubVerdict::NotStub
+        );
+        assert_eq!(
+            stub_verdict(&shape(12, None, true, true)),
+            StubVerdict::NotStub
+        );
+        assert_eq!(
+            stub_verdict(&shape(0, None, false, true)),
+            StubVerdict::NotStub
+        );
+    }
+
+    /// The end-to-end shape the regression was found on: a 0-byte SYMLINK whose
+    /// target is a real file must never be classified a stub.
+    ///
+    /// Creating a symlink on Windows needs Developer Mode or admin. If that
+    /// fails the test says so LOUDLY and explains what went uncovered rather
+    /// than printing the same `ok` as a real pass — the classifier itself is
+    /// covered unconditionally by the two tests above, which is why a skip here
+    /// is tolerable at all.
+    #[test]
+    fn a_symlink_to_a_real_binary_is_never_a_stub() {
         let dir = tempfile::tempdir().unwrap();
-        let stub = dir.path().join("python.exe");
-        std::fs::write(&stub, b"").unwrap();
-        assert!(is_non_executable_stub(&stub));
+        let real = dir.path().join("rustup.exe");
+        std::fs::write(&real, b"MZ not really a binary but not empty either").unwrap();
+        let link = dir.path().join("rustc.exe");
+
+        // Relative target, on purpose: that is what rustup writes.
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file("rustup.exe", &link);
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink("rustup.exe", &link);
+
+        if let Err(e) = made {
+            eprintln!(
+                "\n!! SKIPPED a_symlink_to_a_real_binary_is_never_a_stub: could not create a \
+                 symlink here ({e}).\n!! On Windows this needs Developer Mode or an elevated \
+                 shell. UNCOVERED by this run: that `is_non_executable_stub` FOLLOWS a real \
+                 on-disk 0-byte symlink to its target.\n!! The classifier itself IS covered — see \
+                 stub_verdict_condemns_the_alias_and_never_the_symlink.\n"
+            );
+            return;
+        }
+
+        // The precondition that makes this the real shape: the LINK itself
+        // reports 0 bytes, which is exactly what the old check condemned.
+        assert_eq!(
+            std::fs::symlink_metadata(&link).unwrap().len(),
+            0,
+            "precondition: a symlink is a 0-byte reparse point"
+        );
+        assert!(
+            !is_non_executable_stub(&link),
+            "a rustup-style 0-byte symlink to a real binary must NOT be a stub — classifying it \
+             one is what made `env apply` reinstall a working toolchain"
+        );
+    }
+
+    /// A directory and a path that does not exist at all must both fall through
+    /// to the retry's verdict, not be declared absent by the stub check.
+    #[test]
+    fn the_stub_check_declares_nothing_about_what_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_non_executable_stub(dir.path()));
+        assert!(!is_non_executable_stub(&dir.path().join("nope.exe")));
 
         // A real binary is NOT a stub, so a slow one keeps its unknown verdict.
         let real = dir.path().join("rustc.exe");
         std::fs::write(&real, b"MZ not really a binary but not empty either").unwrap();
         assert!(!is_non_executable_stub(&real));
 
-        // Neither is a directory, nor a path that does not exist at all — an
-        // unresolvable command must fall through to the retry, not be declared
-        // absent by the stub check.
-        assert!(!is_non_executable_stub(dir.path()));
-        assert!(!is_non_executable_stub(&dir.path().join("nope.exe")));
+        // And a plain 0-byte file — the shape the old check condemned — is no
+        // longer a negative verdict on its own.
+        let empty = dir.path().join("python.exe");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!is_non_executable_stub(&empty));
     }
 
     /// The stub check is only reachable if the binary can be FOUND, so
@@ -4540,6 +5087,78 @@ dependencies = [
         );
     }
 
+    /// Resolution must answer the question `Command::spawn` answers, because the
+    /// file it returns is the one the stub check condemns. Every divergence here
+    /// means inspecting a file that never ran.
+    ///
+    /// Windows-only: all three divergences are Windows loader rules (std appends
+    /// `.exe` and consults no `PATHEXT`; the running exe's directory is searched
+    /// first; an extensionless file is never executed).
+    #[cfg(windows)]
+    #[test]
+    fn resolve_executable_mirrors_what_spawn_would_run() {
+        let _env_lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let early = dir.path().join("early");
+        let late = dir.path().join("late");
+        std::fs::create_dir_all(&early).unwrap();
+        std::fs::create_dir_all(&late).unwrap();
+
+        // The Git-for-Windows shape: an EXTENSIONLESS `python` ahead of the real
+        // `python.exe` on PATH. std would never run the former.
+        let name = "qontinui_resolve_probe_tool";
+        std::fs::write(early.join(name), b"#!/bin/sh\n").unwrap();
+        let real = late.join(format!("{name}.exe"));
+        std::fs::write(&real, b"MZ").unwrap();
+
+        let prior = std::env::var_os("PATH");
+        // Leading, doubled and trailing separators — `split_paths` yields an
+        // EMPTY PathBuf for each, and `dir.join(name)` on one produces a
+        // RELATIVE path resolved against the process cwd.
+        std::env::set_var("PATH", format!(";{};;{};", early.display(), late.display()));
+        let resolved = resolve_executable(name);
+        if let Some(p) = prior {
+            std::env::set_var("PATH", p);
+        }
+
+        let resolved = resolved.expect("the .exe on PATH must resolve");
+        assert_eq!(
+            resolved, real,
+            "the extensionless file was returned though `spawn` would never run it"
+        );
+        assert!(
+            resolved.is_absolute(),
+            "an empty PATH entry must never yield a cwd-relative path: {}",
+            resolved.display()
+        );
+    }
+
+    /// `PATHEXT` is broader than what std will execute: a `.cmd` / `.bat` /
+    /// `.com` on PATH is NOT something `Command::spawn` can run, so returning
+    /// one pointed the stub check at a file the probe never touched.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_executable_refuses_extensions_spawn_cannot_run() {
+        let _env_lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let name = "qontinui_resolve_probe_batch";
+        std::fs::write(dir.path().join(format!("{name}.cmd")), b"@echo off\n").unwrap();
+        std::fs::write(dir.path().join(format!("{name}.bat")), b"@echo off\n").unwrap();
+
+        let prior = std::env::var_os("PATH");
+        std::env::set_var("PATH", format!("{}", dir.path().display()));
+        let resolved = resolve_executable(name);
+        if let Some(p) = prior {
+            std::env::set_var("PATH", p);
+        }
+
+        assert_eq!(
+            resolved, None,
+            "a .cmd/.bat is not runnable by `Command::spawn`, so it must not be what the stub \
+             check inspects"
+        );
+    }
+
     /// The confirmation ladder: a first timeout is a CANDIDATE, and a
     /// genuinely-slow-but-present tool that answers inside the longer budget is
     /// MEASURED, not unmeasured. Without the retry, every key on a loaded box
@@ -4568,12 +5187,19 @@ dependencies = [
     /// …and a tool that answers at NO budget still ends up unmeasured. The
     /// ladder narrows the unknown arm; it must not close it, because refusing to
     /// install over a version nobody read is the safer failure.
+    ///
+    /// The command is the SLEEPER ITSELF, not `cmd /c ping …`: the wrapped form
+    /// made this test reproduce the very leak it sits beside — `Child::kill` is
+    /// one process, so each run orphaned a `ping.exe` grandchild that kept both
+    /// pipe write ends open and left the reader threads blocked forever.
+    /// `ChildTreeGuard` reaps a tree now, but a test should not depend on the
+    /// mechanism it is not testing.
     #[test]
     fn a_wedged_probe_survives_the_ladder_as_unmeasured() {
         #[cfg(windows)]
-        let (cmd, args) = ("cmd", ["/c", "ping -n 30 127.0.0.1 >nul"]);
+        let (cmd, args) = ("ping", ["-n", "30", "127.0.0.1"]);
         #[cfg(not(windows))]
-        let (cmd, args) = ("sh", ["-c", "sleep 30"]);
+        let (cmd, args) = ("sleep", ["30"]);
 
         assert_eq!(
             version_of_confirmed(
@@ -4587,17 +5213,144 @@ dependencies = [
         );
     }
 
-    /// A key that is unmeasured on EVERY pass of the 15-minute capture loop is
+    /// The stub check runs LAST — after the confirming retry, never instead of
+    /// it. A check that pre-empts the retry spends the one mechanism that
+    /// rescues a slow-but-present tool nowhere, on exactly the boxes where the
+    /// check is most likely to misjudge; that ordering is what let a rustup
+    /// symlink be reported absent while the toolchain was current.
+    ///
+    /// Injected rather than real, because the shape that misjudges (an App
+    /// Execution Alias) cannot be created by a test.
+    #[test]
+    fn the_stub_check_never_pre_empts_the_confirming_retry() {
+        // Answers in ~1s: past the 200ms first budget, inside the retry.
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd", ["/c", "ping -n 2 127.0.0.1 >nul & echo 1.2.3"]);
+        #[cfg(not(windows))]
+        let (cmd, args) = ("sh", ["-c", "sleep 1; echo 1.2.3"]);
+
+        // A stub check that condemns EVERYTHING. If it ran before the retry the
+        // outcome would be `Failed` — i.e. "you do not have this tool".
+        assert_eq!(
+            version_of_confirmed_with(
+                cmd,
+                &args,
+                None,
+                Duration::from_millis(200),
+                TEST_PROBE_BUDGET,
+                &|_| true,
+            ),
+            ProbeOutcome::Measured("1.2.3".to_string()),
+            "the confirming retry must be spent BEFORE any negative verdict"
+        );
+
+        // …and the check is still live: a tool that answers at no budget, whose
+        // binary proves itself a stub, is a definite negative.
+        #[cfg(windows)]
+        let (wedged, wedged_args) = ("cmd", ["/c", "ping -n 30 127.0.0.1 >nul"]);
+        #[cfg(not(windows))]
+        let (wedged, wedged_args) = ("sh", ["-c", "sleep 30"]);
+        assert_eq!(
+            version_of_confirmed_with(
+                wedged,
+                &wedged_args,
+                None,
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                &|_| true,
+            ),
+            ProbeOutcome::Failed,
+            "the stub check must still be able to condemn — it is only later, not gone"
+        );
+    }
+
+    /// A child that EXITS while a grandchild still holds the pipe write ends
+    /// must not hang the capture.
+    ///
+    /// This is the shape a shim leaves behind — `rustc.exe` is a rustup proxy
+    /// that spawns the real toolchain, and a corepack/volta background update
+    /// check outlives its parent by design. The exit path used to `join()` both
+    /// reader threads with NO timeout: the pipes never EOF, `collect_versions`
+    /// blocks forever, and the capture loop — `MissedTickBehavior::Skip` on a
+    /// task that never returns — stops advancing at all. Every budget in this
+    /// module is bypassed by that one unbounded join.
+    #[test]
+    fn a_grandchild_holding_the_pipe_cannot_hang_the_exit_path() {
+        // The parent prints its version and exits IMMEDIATELY; the background
+        // child inherits both pipes and sits on them.
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd", ["/c", "echo 1.2.3 & start /b ping -n 30 127.0.0.1"]);
+        #[cfg(not(windows))]
+        let (cmd, args) = ("sh", ["-c", "echo 1.2.3; sleep 30 &"]);
+
+        let started = std::time::Instant::now();
+        let outcome = version_of_within(cmd, &args, None, TEST_PROBE_BUDGET);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Measured("1.2.3".to_string()),
+            "the tool ANSWERED — a grandchild sitting on the pipe must not lose that"
+        );
+        assert!(
+            elapsed < READER_DRAIN_GRACE + Duration::from_secs(20),
+            "the exit path must be BOUNDED; took {elapsed:?}"
+        );
+        // …and it must have BEEN the blocked case. If the background child did
+        // not actually inherit the pipes, the readers hit EOF immediately, this
+        // returns in milliseconds, and the test passes while testing nothing —
+        // which is worse than not having it. Measured at 2.3s here, i.e. the
+        // full grace, which is only spent when a reader never sees EOF.
+        assert!(
+            elapsed >= READER_DRAIN_GRACE,
+            "the grandchild did not hold the pipes open, so the bounded wait was never \
+             exercised (took {elapsed:?}); this test is not testing what it claims"
+        );
+    }
+
+    /// Only the first line is ever used, so each pipe keeps a bounded prefix —
+    /// but it must keep READING past that prefix. A cap that stopped reading
+    /// would re-create the deadlock the concurrent drain exists to break, for
+    /// any tool that prints more than the cap.
+    #[test]
+    fn output_past_the_keep_cap_is_drained_not_deadlocked() {
+        // ~200 KB, three times the keep cap, with the version line FIRST.
+        #[cfg(windows)]
+        let (cmd, args) = (
+            "cmd",
+            [
+                "/c",
+                "echo 1.2.3 & for /L %i in (1,1,4000) do @echo \
+                 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ],
+        );
+        #[cfg(not(windows))]
+        let (cmd, args) = (
+            "sh",
+            [
+                "-c",
+                "echo 1.2.3; i=0; while [ $i -lt 4000 ]; do echo \
+                 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; i=$((i+1)); done",
+            ],
+        );
+        assert_eq!(
+            version_of_within(cmd, &args, None, TEST_PROBE_BUDGET),
+            ProbeOutcome::Measured("1.2.3".to_string()),
+            "a tool that prints more than the keep cap must still be MEASURED"
+        );
+    }
+
+    /// A key that is unmeasured on EVERY pass of the capture loop is
     /// otherwise reported-and-never-acted-on with nothing to distinguish it from
     /// a one-off. The streak escalates the warn — and deliberately never decays
     /// to `Failed`, which would install over a version nobody read on a timer.
     #[test]
     fn a_persistent_unknown_escalates_its_warning() {
-        let transient = unknown_streak_message("rustc", 1);
+        let transient = unknown_streak_message("rustc", 1, 900);
         assert!(transient.contains("consecutive unmeasured captures: 1"));
         assert!(!transient.contains("WEDGED"));
 
-        let wedged = unknown_streak_message("rustc", UNKNOWN_STREAK_ALARM);
+        let wedged = unknown_streak_message("rustc", UNKNOWN_STREAK_ALARM, 900);
         assert!(
             wedged.contains("CONSECUTIVE CAPTURES"),
             "a perpetually-unknown key must read differently from a one-off: {wedged}"
@@ -4607,6 +5360,66 @@ dependencies = [
         assert!(wedged.contains("rustc --version"));
         // And it never promises to start treating the key as absent.
         assert!(wedged.contains("will NOT start treating it as absent"));
+    }
+
+    /// The elapsed time in that warn must be the runner's REAL one. It was
+    /// `streak * 15` minutes: wrong at the default (four captures span three
+    /// intervals = 45 minutes, not 60) and wildly wrong at the configurable 60s
+    /// floor, where it told an operator "~60 minutes" about ~3 minutes. This is
+    /// a WARN whose entire purpose is "this has been broken long enough to act
+    /// on"; a fabricated duration is the one thing it must not carry.
+    #[test]
+    fn the_wedged_warning_carries_the_real_capture_interval() {
+        let default_interval = unknown_streak_message("rustc", 4, 900);
+        assert!(
+            default_interval.contains("~45 minutes"),
+            "4 captures span 3 intervals of 900s: {default_interval}"
+        );
+        assert!(
+            !default_interval.contains("~60 minutes"),
+            "the old hardcoded `streak * 15` reading must be gone: {default_interval}"
+        );
+
+        let at_the_floor = unknown_streak_message("rustc", 4, 60);
+        assert!(
+            at_the_floor.contains("~3 minutes") && at_the_floor.contains("60s capture interval"),
+            "at the interval floor the same streak is minutes, not an hour: {at_the_floor}"
+        );
+    }
+
+    /// A poisoned counter must not disable the escalation FOREVER. A `Mutex`
+    /// stays poisoned for the process lifetime, so the old `Err` arm returning
+    /// `1` meant a genuinely wedged probe could never reach its alarm wording
+    /// again — the counter is recovered instead.
+    #[test]
+    fn a_poisoned_streak_counter_still_counts() {
+        let key = "qontinui_streak_poison_test_key";
+        clear_unknown_streak(key);
+
+        // Poison the lock from a panicking thread.
+        let _ = std::thread::spawn(|| {
+            let _guard = UNKNOWN_STREAKS.lock().unwrap();
+            panic!("poison the streak counter");
+        })
+        .join();
+        assert!(
+            UNKNOWN_STREAKS.is_poisoned(),
+            "precondition: lock is poisoned"
+        );
+
+        assert_eq!(record_unknown_streak(key), 1);
+        assert_eq!(
+            record_unknown_streak(key),
+            2,
+            "a poisoned counter that degrades to 1 can never escalate again"
+        );
+        clear_unknown_streak(key);
+        assert_eq!(
+            record_unknown_streak(key),
+            1,
+            "clear must work through poison too"
+        );
+        clear_unknown_streak(key);
     }
 
     /// The streak counts CONSECUTIVE captures: any definite outcome — measured

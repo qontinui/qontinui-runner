@@ -99,10 +99,50 @@ pub enum SectionStatus {
     /// Changes performed.
     Applied,
     /// Something on this box prevents the apply. Nothing was changed.
-    Blocked(String),
+    ///
+    /// Carries a [`BlockedCause`] as well as prose: three different situations
+    /// used to flatten into one wire word, leaving a JSON consumer to tell them
+    /// apart by PARSING THE SENTENCE. They are not the same event and they are
+    /// not the same operator action.
+    Blocked { cause: BlockedCause, reason: String },
+}
+
+/// Why a section is [`SectionStatus::Blocked`]. The machine-readable half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedCause {
+    /// A key in this section was never MEASURED, so nothing here can be called
+    /// settled — the apply is refusing on a measurement gap, not on the box.
+    /// Report-only: there is nothing to retry until the probe answers.
+    Unmeasured,
+    /// Every detected manager ran and NOTHING moved the observed version. The
+    /// apply did work; the box did not change. The reasons are per-key, in
+    /// `skipped`.
+    NoMovement,
+    /// Something on this box prevents the apply from running at all (a missing
+    /// precondition, an unreadable or unwritable target).
+    Precondition,
+}
+
+impl BlockedCause {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Unmeasured => "blocked_unmeasured",
+            Self::NoMovement => "blocked_no_movement",
+            Self::Precondition => "blocked_precondition",
+        }
+    }
 }
 
 impl SectionStatus {
+    /// A [`SectionStatus::Blocked`] on a precondition — the default cause for
+    /// every "this box will not let the apply run" case.
+    pub fn blocked_precondition(reason: impl Into<String>) -> Self {
+        Self::Blocked {
+            cause: BlockedCause::Precondition,
+            reason: reason.into(),
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::NotApplyable(p) => format!("not applyable ({})", p.label()),
@@ -111,10 +151,15 @@ impl SectionStatus {
             Self::NothingToDo => "nothing to do".to_string(),
             Self::Planned => "would change".to_string(),
             Self::Applied => "APPLIED".to_string(),
-            Self::Blocked(reason) => format!("blocked: {reason}"),
+            Self::Blocked { reason, .. } => format!("blocked: {reason}"),
         }
     }
 
+    /// The wire word. The three `Blocked` causes get three DIFFERENT words —
+    /// all prefixed `blocked_`, so a consumer that only cares whether the
+    /// section is blocked can still match on the prefix, while one that needs
+    /// to know "un-measurable" from "ran and nothing moved" no longer has to
+    /// regex an English sentence to find out.
     fn wire(&self) -> &'static str {
         match self {
             Self::NotApplyable(_) => "not_applyable",
@@ -123,7 +168,7 @@ impl SectionStatus {
             Self::NothingToDo => "nothing_to_do",
             Self::Planned => "planned",
             Self::Applied => "applied",
-            Self::Blocked(_) => "blocked",
+            Self::Blocked { cause, .. } => cause.wire(),
         }
     }
 }
@@ -595,5 +640,49 @@ mod tests {
         }
         assert!(text.contains("would set"));
         assert!(text.contains("DRY RUN"));
+    }
+
+    /// Three different situations used to flatten into ONE wire word
+    /// (`"blocked"`), leaving a JSON consumer to tell "a key could not be
+    /// measured" from "every manager ran and nothing moved" by parsing the
+    /// prose. They are different events with different operator actions, so
+    /// they get different words — all still prefixed `blocked_`, so a consumer
+    /// that only asks "is this section blocked?" keeps working.
+    #[test]
+    fn each_blocked_cause_gets_its_own_wire_word() {
+        let word = |cause: BlockedCause| {
+            SectionStatus::Blocked {
+                cause,
+                reason: "why".to_string(),
+            }
+            .wire()
+        };
+        assert_eq!(word(BlockedCause::Unmeasured), "blocked_unmeasured");
+        assert_eq!(word(BlockedCause::NoMovement), "blocked_no_movement");
+        assert_eq!(word(BlockedCause::Precondition), "blocked_precondition");
+
+        let words = [
+            word(BlockedCause::Unmeasured),
+            word(BlockedCause::NoMovement),
+            word(BlockedCause::Precondition),
+        ];
+        assert_eq!(
+            words
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3,
+            "a consumer must be able to separate them without reading English"
+        );
+        assert!(
+            words.iter().all(|w| w.starts_with("blocked")),
+            "the prefix is the compatibility surface for 'is it blocked?'"
+        );
+
+        // The human half is unchanged: the label still carries the reason.
+        assert_eq!(
+            SectionStatus::blocked_precondition("no profiles file").label(),
+            "blocked: no profiles file"
+        );
     }
 }

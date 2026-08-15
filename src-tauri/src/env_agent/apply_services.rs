@@ -603,7 +603,8 @@ pub fn apply_section(
     let target = match resolve_target(explicit_profile) {
         Ok(t) => t,
         Err(e) => {
-            let mut out = SectionApply::inert(name, SectionStatus::Blocked(e.message()));
+            let mut out =
+                SectionApply::inert(name, SectionStatus::blocked_precondition(e.message()));
             // A `legacy-env` box is a legitimate configuration, not a failure —
             // say what would have to change for an apply to become possible.
             if matches!(e, TargetError::NoProfilesFile(_)) {
@@ -648,14 +649,14 @@ pub fn apply_section(
 
     let mut root = target.root.clone();
     if let Err(e) = edit_root(&mut root, &target.name, &plan.edits) {
-        out.status = SectionStatus::Blocked(e);
+        out.status = SectionStatus::blocked_precondition(e);
         out.changes.clear();
         return out;
     }
     match write_target(&target, &root) {
         Ok(()) => out.status = SectionStatus::Applied,
         Err(e) => {
-            out.status = SectionStatus::Blocked(e);
+            out.status = SectionStatus::blocked_precondition(e);
             out.changes.clear();
         }
     }

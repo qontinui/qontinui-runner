@@ -231,13 +231,34 @@ impl SectionPlan {
         self.unknown_keys.contains(key)
     }
 
+    /// True when THIS ROW is about a key the box could not measure — the ONE
+    /// definition every renderer and every count uses.
+    ///
+    /// Scoped to [`Change::Missing`] for the same reason [`actionable`](Self::actionable)
+    /// is: an unmeasured key is ABSENT locally, so it can only diff as
+    /// `Missing`, and a `Differs`/`Extra` row on such a key is self-contradictory
+    /// — it reports a local value for a key we are simultaneously claiming we
+    /// never read.
+    ///
+    /// It exists because the two renderers used to DISAGREE about exactly that
+    /// row. The text renderer stamped `[unknown - …]` on any change whose key
+    /// was in the set, while `plan_to_json` hardcoded `"unknown": false` on the
+    /// `Differs`/`Extra` arms as a constant-by-construction — so a hand-built
+    /// `SectionPlan` (which the tests themselves build) made the same row read
+    /// two opposite ways depending on which output you looked at. One function
+    /// now decides, and the JSON constant is a fact about this function rather
+    /// than about a construction nobody could check from the call site.
+    pub fn change_is_unknown(&self, change: &Change) -> bool {
+        matches!(change, Change::Missing { .. }) && self.is_unknown(change.key())
+    }
+
     /// How many reported changes in this section are about an unmeasured key.
     /// Drives the operator-facing summary — an unknown that produced no change
     /// (canonical lacks the key too) is not worth a line.
     pub fn unknown_change_count(&self) -> usize {
         self.changes
             .iter()
-            .filter(|c| self.is_unknown(c.key()))
+            .filter(|c| self.change_is_unknown(c))
             .count()
     }
 
@@ -331,6 +352,16 @@ impl ApplyPlan {
         self.sections
             .iter()
             .map(SectionPlan::unknown_change_count)
+            .sum()
+    }
+
+    /// Unmeasured keys that produced NO drift row anywhere — canonical lacks
+    /// them too, so the only thing standing between them and reading as
+    /// agreement is that they are counted here.
+    pub fn silently_unmeasured_count(&self) -> usize {
+        self.sections
+            .iter()
+            .map(|s| s.silently_unmeasured_keys().len())
             .sum()
     }
 }
@@ -696,7 +727,10 @@ pub fn render_plan(plan: &ApplyPlan) -> String {
             // knowing) but marked, so nobody reads it as something an apply
             // could fix. `unknown` wins when both would apply: it is the
             // stronger statement — we did not read this value at all.
-            let unknown = s.is_unknown(c.key());
+            //
+            // Through `change_is_unknown`, so this renderer and `plan_to_json`
+            // cannot disagree about the same row.
+            let unknown = s.change_is_unknown(c);
             let mark = if unknown {
                 " [unknown - the local probe exceeded its budget; NOT measured, NOT missing]"
             } else if s.is_derived(c.key()) {
@@ -749,13 +783,18 @@ pub fn render_plan(plan: &ApplyPlan) -> String {
              twice).\nThey are reported as UNKNOWN, never as missing, and `env apply` will \
              not act on them — re-run `env capture` on a less busy box to resolve them.\n",
         ));
-        let rows = plan.unknown_count();
-        if rows < unmeasured {
+        // Counted from the keys THEMSELVES, not as `unmeasured - rows`: the
+        // subtraction assumed every unmeasured key produces at most one row and
+        // that every such row is counted as unknown, which is true of a computed
+        // plan and not of a hand-built one. `silently_unmeasured_keys` is the
+        // same predicate the per-section lines above are printed from, so the
+        // count and the lines can never disagree.
+        let silent = plan.silently_unmeasured_count();
+        if silent > 0 {
             out.push_str(&format!(
-                "  {} of them produced no drift row at all, because canonical carries no value \
-                 for them either. That is an absence of evidence, NOT evidence of agreement — \
-                 this machine cannot be called in sync over them.\n",
-                unmeasured - rows,
+                "  {silent} of them produced no drift row at all, because canonical carries no \
+                 value for them either. That is an absence of evidence, NOT evidence of agreement \
+                 — this machine cannot be called in sync over them.\n",
             ));
         }
         out.push('\n');
@@ -799,7 +838,9 @@ pub fn plan_to_json(plan: &ApplyPlan) -> Value {
                 .iter()
                 .map(|c| {
                     let derived = s.is_derived(c.key());
-                    let unknown = s.is_unknown(c.key());
+                    // The SAME predicate the text renderer uses. See
+                    // `SectionPlan::change_is_unknown`.
+                    let unknown = s.change_is_unknown(c);
                     match c {
                         // The wire word: `kind: "unknown"`. An unmeasured key is
                         // absent locally, so it reaches here as `Missing` — but
@@ -817,25 +858,27 @@ pub fn plan_to_json(plan: &ApplyPlan) -> Value {
                             "kind": "missing", "key": key, "canonical": canonical,
                             "derived": derived, "unknown": false,
                         }),
-                        // `unknown: false` is a CONSTANT on these two arms, not a
-                        // dropped variable. Both require a local value, and
-                        // `compute_plan` intersects the unmeasured set against the
-                        // keys with no local value — so `unknown` is false here by
-                        // construction. Emitting the variable instead would leave a
-                        // dead path that, if it ever fired, would contradict `kind`
-                        // on the same object: `"kind": "differs", "unknown": true`
-                        // says both "we read both sides" and "we read neither".
+                        // `unknown` is false on these two arms, and now it is
+                        // false because `change_is_unknown` SAYS so rather than
+                        // because a comment asserts a construction the call site
+                        // cannot check. Both arms require a local value, and a
+                        // `"kind": "differs", "unknown": true` object would say
+                        // both "we read both sides" and "we read neither" — so
+                        // the predicate is scoped to `Missing` and the text
+                        // renderer reads the same one, which is what stops the
+                        // two outputs from contradicting each other on a
+                        // hand-built plan.
                         Change::Differs {
                             key,
                             local,
                             canonical,
                         } => serde_json::json!({
                             "kind": "differs", "key": key, "local": local,
-                            "canonical": canonical, "derived": derived, "unknown": false,
+                            "canonical": canonical, "derived": derived, "unknown": unknown,
                         }),
                         Change::Extra { key, local } => serde_json::json!({
                             "kind": "extra", "key": key, "local": local, "derived": derived,
-                            "unknown": false,
+                            "unknown": unknown,
                         }),
                     }
                 })
@@ -1748,6 +1791,89 @@ mod tests {
             .clone();
         assert_eq!(node["kind"], "differs");
         assert_eq!(node["unknown"], false);
+    }
+
+    /// The two renderers must say the SAME thing about the same row.
+    ///
+    /// They did not: the text renderer marked any change whose key was in
+    /// `unknown_keys`, while `plan_to_json` hardcoded `"unknown": false` on the
+    /// `Differs`/`Extra` arms. On a hand-built `SectionPlan` — the shape the
+    /// test right above this one already constructs — an operator reading the
+    /// preview and a consumer reading `--json` got opposite answers about
+    /// whether the value had been measured.
+    #[test]
+    fn both_renderers_agree_about_which_rows_are_unknown() {
+        let hand_built = SectionPlan {
+            section: "versions".to_string(),
+            policy: Applyable,
+            changes: vec![
+                // Claimed unmeasured AND carrying a local value: contradictory,
+                // and the case the two renderers used to split on.
+                Change::Differs {
+                    key: "node".to_string(),
+                    local: "v20.9.0".to_string(),
+                    canonical: "v22.1.0".to_string(),
+                },
+                Change::Extra {
+                    key: "python".to_string(),
+                    local: "3.13.0".to_string(),
+                },
+                // The honest unknown shape: absent locally.
+                Change::Missing {
+                    key: "rustc".to_string(),
+                    canonical: "1.82.0".to_string(),
+                },
+            ],
+            local_section_absent: false,
+            derived_keys: BTreeSet::new(),
+            unknown_keys: ["node", "python", "rustc"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        };
+        let plan = ApplyPlan {
+            environment_id: "env-1".to_string(),
+            canonical_machine_id: "other".to_string(),
+            canonical_machine_name: None,
+            captured_at: None,
+            is_canonical_self: false,
+            schema_mismatch: None,
+            sections: vec![hand_built],
+        };
+
+        let text = render_plan(&plan);
+        let json = plan_to_json(&plan);
+        let row = |key: &str| {
+            json["sections"][0]["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["key"] == key)
+                .unwrap()
+                .clone()
+        };
+
+        // A row with a local value is never "unknown" — in EITHER renderer.
+        assert_eq!(row("node")["unknown"], false);
+        assert_eq!(row("python")["unknown"], false);
+        for line in text
+            .lines()
+            .filter(|l| l.contains("node:") || l.contains("python:"))
+        {
+            assert!(
+                !line.contains("[unknown"),
+                "text renderer marked a row JSON calls measured: {line}"
+            );
+        }
+
+        // …and the absent one IS, in both.
+        assert_eq!(row("rustc")["unknown"], true);
+        assert_eq!(row("rustc")["kind"], "unknown");
+        assert!(
+            text.lines()
+                .any(|l| l.contains("rustc:") && l.contains("[unknown")),
+            "text renderer dropped the mark JSON kept:\n{text}"
+        );
     }
 
     /// "No changes are auto-applyable — everything above is report-only or needs
