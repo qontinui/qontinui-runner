@@ -706,6 +706,9 @@ mod tests {
         let plan = compute_plan(
             &canonical_cfg,
             local_sections.as_object().unwrap(),
+            // `services` has no budget-bounded probe, so nothing here can be
+            // unmeasured.
+            &Map::new(),
             "env-1",
             "this-box",
         );
@@ -851,7 +854,13 @@ mod tests {
             derived_keys: Map::new(),
         };
         let local = json!({"services": {"database_url": "postgres://old:5432"}});
-        let full = compute_plan(&canonical_cfg, local.as_object().unwrap(), "e", "box");
+        let full = compute_plan(
+            &canonical_cfg,
+            local.as_object().unwrap(),
+            &Map::new(),
+            "e",
+            "box",
+        );
         let section = full.sections.into_iter().next().unwrap();
         let plan = plan_services(
             &section,

@@ -782,6 +782,18 @@ mod tests {
     use serde_json::{json, Map, Value};
 
     fn versions_section(canonical: Value, local: Value, derived: Value) -> SectionPlan {
+        versions_section_with_unknown(canonical, local, derived, json!([]))
+    }
+
+    /// [`versions_section`] plus the LOCAL capture's unmeasured-key list — the
+    /// keys whose `--version` probe blew the capture budget, which are reported
+    /// but must never reach a `VersionAction`.
+    fn versions_section_with_unknown(
+        canonical: Value,
+        local: Value,
+        derived: Value,
+        unknown: Value,
+    ) -> SectionPlan {
         let cfg = CanonicalConfig {
             canonical_machine_id: Some("canon".to_string()),
             canonical_machine_name: Some("spaceship".to_string()),
@@ -798,9 +810,11 @@ mod tests {
             derived_keys: json!({ "versions": derived }).as_object().unwrap().clone(),
         };
         let local_sections = json!({ "versions": local });
+        let local_unknown = json!({ "versions": unknown });
         compute_plan(
             &cfg,
             local_sections.as_object().unwrap(),
+            local_unknown.as_object().unwrap(),
             "env-1",
             "this-box",
         )
@@ -1062,6 +1076,33 @@ mod tests {
             .find(|s| s.key == "some_future_key")
             .expect("unknown key reported");
         assert!(unknown.reason.contains("not an observed toolchain version"));
+    }
+
+    /// The end of the chain the fix cuts: a key the capture could not MEASURE
+    /// (its `--version` probe blew the 3s budget) must never become a real
+    /// install. `actionable()` filters it upstream, so it never reaches
+    /// `Tool::from_key` — and a measured sibling in the same section must still
+    /// install, so the suppression cannot be section-wide.
+    #[test]
+    fn an_unmeasured_key_never_becomes_an_install_action() {
+        let section = versions_section_with_unknown(
+            json!({"rustc": "rustc 1.82.0 (f6e511eec 2024-10-15)", "node": "v24.14.0"}),
+            // Neither captured locally; only `rustc` timed out.
+            json!({}),
+            json!([]),
+            json!(["rustc"]),
+        );
+        assert!(section.is_unknown("rustc"));
+        let plan = plan_versions(&section, &|_| Some(Manager::Volta), &home_scope());
+        let keys: Vec<&str> = plan.actions.iter().map(|a| a.tool.key()).collect();
+        assert_eq!(
+            keys,
+            vec!["node"],
+            "only the genuinely-absent tool may be installed"
+        );
+        // Filtered upstream by `actionable()`, so this module never sees it —
+        // it must not appear as a skip reason invented here either.
+        assert!(!plan.skipped.iter().any(|s| s.key == "rustc"));
     }
 
     /// An unparseable canonical value is refused rather than guessed at.
