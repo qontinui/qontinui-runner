@@ -246,7 +246,23 @@ pub async fn build_envelope() -> ConfigEnvelope {
     );
     // Synchronous collectors — wrap in Some so the isolation driver still drops
     // an (unlikely) empty result.
-    let versions = collectors::collect_versions();
+    //
+    // `collect_versions` is BLOCKING (it shells out to three tools and sleeps in
+    // its own poll loop), and its pinned worst case is 39s — see
+    // `collectors::CAPTURE_PROBE_RETRY_BUDGET`. This runs on the runner's shared
+    // multi-threaded runtime, which also serves the UI Bridge and the coord
+    // door, so calling it inline parked one of those workers for the duration.
+    // `spawn_blocking` puts it on the blocking pool where a long synchronous
+    // call belongs.
+    let versions = tokio::task::spawn_blocking(collectors::collect_versions)
+        .await
+        .unwrap_or_else(|e| {
+            // A panicked/cancelled collector degrades to "we have no local data
+            // for this section", which the pull reports as un-comparable — never
+            // as a section full of missing keys.
+            tracing::warn!("env_agent: versions collector did not complete: {e}");
+            collectors::VersionsCapture::empty()
+        });
     add_section(
         &mut sections,
         apply_versions::VERSIONS_SECTION,
@@ -459,6 +475,22 @@ pub fn build_envelope_blocking() -> Result<ConfigEnvelope, String> {
 // Periodic capture task (clone of fleet::spawn_heartbeat)
 // ============================================================================
 
+/// The capture loop's interval, in seconds: `QONTINUI_ENV_CAPTURE_INTERVAL_SECS`
+/// if it parses, else 900, and never below 60.
+///
+/// **The single reader of that variable**, so nothing downstream can describe
+/// the loop with a hardcoded number. It used to be read inline in
+/// [`spawn_env_capture`] while `collectors` documented — and one WARN
+/// arithmetically claimed — a fixed 15 minutes; at the 60s floor that warn told
+/// an operator "~60 minutes" about three minutes of elapsed time.
+pub fn capture_interval_secs() -> u64 {
+    std::env::var("QONTINUI_ENV_CAPTURE_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(900)
+        .max(60)
+}
+
 /// Spawn the periodic env-capture task on the ambient tokio runtime.
 ///
 /// Interval from `QONTINUI_ENV_CAPTURE_INTERVAL_SECS` (default 900s, floored at
@@ -468,11 +500,7 @@ pub fn build_envelope_blocking() -> Result<ConfigEnvelope, String> {
 /// restart. Runs once shortly after start, then on the interval. Failures
 /// `warn!` and retry on the next tick; the loop never panics.
 pub fn spawn_env_capture() {
-    let secs: u64 = std::env::var("QONTINUI_ENV_CAPTURE_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(900)
-        .max(60);
+    let secs: u64 = capture_interval_secs();
 
     info!(
         "env_agent::capture: starting periodic capture task, interval={}s",

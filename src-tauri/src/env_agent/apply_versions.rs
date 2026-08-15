@@ -84,7 +84,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::apply::{AppliedChange, SectionApply, SectionStatus, SkipRecord};
+use super::apply::{AppliedChange, BlockedCause, SectionApply, SectionStatus, SkipRecord};
 use super::collectors::{self, ProbeScope};
 use super::pull::{Change, SectionPlan};
 
@@ -724,11 +724,26 @@ pub fn apply_section_with(
         // the STATUS has to stop saying the opposite, or the one-line section
         // summary (`versions [nothing to do]`) contradicts them.
         if !section.unknown_keys.is_empty() {
-            out.status = SectionStatus::Blocked(format!(
-                "{} key(s) in this section could not be measured on this box, so nothing here can \
-                 be called settled — see the notes below. Nothing was changed.",
-                section.unknown_keys.len(),
-            ));
+            out.status = SectionStatus::Blocked {
+                cause: BlockedCause::Unmeasured,
+                // Names WHICH keys and points at both places detail can live.
+                // "See the notes below" was a half-truth: a per-key reason lands
+                // in `skipped`, not in `notes`, so an operator following that
+                // sentence could find nothing there and conclude the report was
+                // empty rather than that they were reading the wrong list.
+                reason: format!(
+                    "{} key(s) in this section could not be measured on this box ({}), so nothing \
+                     here can be called settled — see the notes and any skipped entries below. \
+                     Nothing was changed.",
+                    section.unknown_keys.len(),
+                    section
+                        .unknown_keys
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            };
         }
         return out;
     }
@@ -779,12 +794,15 @@ pub fn apply_section_with(
         SectionStatus::Applied
     } else {
         // Every action was attempted and none moved the observed version. That
-        // is not "nothing to do" — say so.
-        SectionStatus::Blocked(
-            "every detected manager ran without moving the observed version — see the reasons \
-             above"
+        // is not "nothing to do" — say so, and say it in a way a JSON consumer
+        // can tell apart from the un-measurable case above without parsing
+        // prose (`blocked_no_movement` vs `blocked_unmeasured`).
+        SectionStatus::Blocked {
+            cause: BlockedCause::NoMovement,
+            reason: "every detected manager ran without moving the observed version — the \
+                     per-key reasons are in the skipped list"
                 .to_string(),
-        )
+        }
     };
     out.skipped.sort_by(|a, b| a.key.cmp(&b.key));
     out
@@ -1168,9 +1186,16 @@ mod tests {
             "an unread key is not 'nothing to do'"
         );
         match &out.status {
-            SectionStatus::Blocked(why) => {
-                assert!(why.contains("could not be measured"), "{why}");
-                assert!(why.contains("Nothing was changed"), "{why}");
+            SectionStatus::Blocked { cause, reason } => {
+                // The CAUSE is the machine-readable half — "we could not measure
+                // a key" must be distinguishable from "every manager ran and
+                // nothing moved" without parsing this sentence.
+                assert_eq!(*cause, BlockedCause::Unmeasured);
+                assert!(reason.contains("could not be measured"), "{reason}");
+                assert!(reason.contains("Nothing was changed"), "{reason}");
+                // It names the key, and points at BOTH lists detail can be in.
+                assert!(reason.contains("rustc"), "{reason}");
+                assert!(reason.contains("skipped"), "{reason}");
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
