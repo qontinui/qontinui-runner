@@ -486,13 +486,120 @@ fn read_device_file(path: &Path) -> std::io::Result<DeviceFile> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-fn atomic_write_device(path: &Path, file: &DeviceFile) -> std::io::Result<()> {
-    let pretty = serde_json::to_vec_pretty(file)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &pretty)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+/// Write the `machine.json` for `device init`, preserving every sibling
+/// top-level field verbatim.
+///
+/// Returns the resulting [`DeviceFile`] plus `was_new` — `true` only on the
+/// one legitimate mint (an absent file).
+///
+/// **Preserving siblings is the point.** This used to round-trip through
+/// [`DeviceFile`], which has no `active_tenant_id` field and no
+/// `#[serde(flatten)]` — so the documented recovery step (`rm machine.json` is
+/// bad advice; `device init` on an existing file is the good one) silently
+/// DELETED the tenant pin that `commands/tenant.rs`, `agent_worktree/census`,
+/// `fs_backstop` and `maintenance_executor` all read. Patching the raw JSON
+/// object keeps `active_tenant_id`, the legacy `machine_id` spelling, and any
+/// field a newer runner adds.
+///
+/// **Never mints when the file exists.** An unreadable/invalid file is an
+/// error, not an excuse to overwrite: overwriting would mint a fresh
+/// `device_id` and therefore a fresh `coord.devices` row for the same machine.
+/// Plan `2026-08-06-device-identity-is-per-profile-not-per-machine` Phase 2.
+fn device_init_write_at(
+    path: &Path,
+    name_arg: Option<&str>,
+    hostname_now: &str,
+) -> Result<(DeviceFile, bool), String> {
+    let (mut obj, existing, was_new) = if path.exists() {
+        let bytes = std::fs::read(path).map_err(|e| {
+            format!(
+                "machine.json at {} is unreadable ({}). \
+                 Refusing to overwrite — inspect or `rm` and re-run.",
+                path.display(),
+                e
+            )
+        })?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+            format!(
+                "machine.json at {} is unreadable ({}). \
+                 Refusing to overwrite — inspect or `rm` and re-run.",
+                path.display(),
+                e
+            )
+        })?;
+        let serde_json::Value::Object(obj) = value else {
+            return Err(format!(
+                "machine.json at {} is not a JSON object. \
+                 Refusing to overwrite — inspect or `rm` and re-run.",
+                path.display()
+            ));
+        };
+        // Validate that a usable identity is actually in there before we
+        // rewrite anything — a `device_id`-less file must not be blessed.
+        let existing: DeviceFile = serde_json::from_value(serde_json::Value::Object(obj.clone()))
+            .map_err(|e| {
+            format!(
+                "machine.json at {} is unreadable ({}). \
+                     Refusing to overwrite — inspect or `rm` and re-run.",
+                path.display(),
+                e
+            )
+        })?;
+        if existing.device_id.trim().is_empty() {
+            return Err(format!(
+                "machine.json at {} has an empty device_id. \
+                 Refusing to overwrite — inspect or `rm` and re-run.",
+                path.display()
+            ));
+        }
+        (obj, existing, false)
+    } else {
+        let minted = DeviceFile {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            hostname: hostname_now.to_string(),
+            name: name_arg.map(|s| s.to_string()),
+        };
+        (serde_json::Map::new(), minted, true)
+    };
+
+    // Re-detect hostname every run — a laptop can be renamed between boots
+    // and the file should reflect the current name. The identity does not
+    // change with it.
+    let name = name_arg
+        .map(|s| s.to_string())
+        .or_else(|| existing.name.clone());
+    let file = DeviceFile {
+        device_id: existing.device_id.clone(),
+        hostname: hostname_now.to_string(),
+        name,
+    };
+
+    obj.insert(
+        "device_id".to_string(),
+        serde_json::Value::String(file.device_id.clone()),
+    );
+    obj.insert(
+        "hostname".to_string(),
+        serde_json::Value::String(file.hostname.clone()),
+    );
+    match &file.name {
+        Some(n) => {
+            obj.insert("name".to_string(), serde_json::Value::String(n.clone()));
+        }
+        None => {
+            obj.remove("name");
+        }
+    }
+
+    let pretty = serde_json::to_vec_pretty(&serde_json::Value::Object(obj))
+        .map_err(|e| format!("serialize machine.json failed: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir {} failed: {e}", parent.display()))?;
+    }
+    qontinui_runner_lib::fs_atomic::atomic_write(path, &pretty)
+        .map_err(|e| format!("write {} failed: {e}", path.display()))?;
+    Ok((file, was_new))
 }
 
 fn detect_hostname() -> String {
@@ -543,48 +650,15 @@ fn cmd_device_init(name_arg: Option<&str>) -> ExitCode {
     // Read existing machine.json if present (re-use UUID for idempotence);
     // otherwise mint a fresh UUID v4. Hostname is always re-detected — a
     // laptop can rename between boots and the file should reflect current.
+    // Sibling top-level fields (notably `active_tenant_id`) are preserved.
     let hostname_now = detect_hostname();
-    let (file, was_new) = if path.exists() {
-        match read_device_file(&path) {
-            Ok(mut existing) => {
-                existing.hostname = hostname_now.clone();
-                if let Some(n) = name_arg {
-                    existing.name = Some(n.to_string());
-                }
-                (existing, false)
-            }
-            Err(e) => {
-                eprintln!(
-                    "machine.json at {} is unreadable ({}). \
-                     Refusing to overwrite — inspect or `rm` and re-run.",
-                    path.display(),
-                    e
-                );
-                return ExitCode::from(2);
-            }
-        }
-    } else {
-        let id = uuid::Uuid::new_v4().to_string();
-        (
-            DeviceFile {
-                device_id: id,
-                hostname: hostname_now.clone(),
-                name: name_arg.map(|s| s.to_string()),
-            },
-            true,
-        )
-    };
-
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("mkdir {} failed: {}", parent.display(), e);
+    let (file, was_new) = match device_init_write_at(&path, name_arg, &hostname_now) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", e);
             return ExitCode::from(2);
         }
-    }
-    if let Err(e) = atomic_write_device(&path, &file) {
-        eprintln!("write {} failed: {}", path.display(), e);
-        return ExitCode::from(2);
-    }
+    };
     // Phase 0 multi-user readiness — ensure the canonical `device_id` key
     // lands even if a legacy `machine_id`-only file slipped past the
     // DeviceFile serialization (e.g. a sibling reader rewrote it). No-op
@@ -1099,22 +1173,23 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn atomic_write_device_via_tmp_then_rename() {
+    fn device_init_write_leaves_no_temp_debris() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("machine.json");
-        let file = DeviceFile {
-            device_id: "00000000-0000-4000-8000-000000000000".to_string(),
-            hostname: "test-host".to_string(),
-            name: Some("test-display-name".to_string()),
-        };
-        atomic_write_device(&path, &file).expect("write");
+        let (file, _) =
+            device_init_write_at(&path, Some("test-display-name"), "test-host").expect("write");
         let loaded = read_device_file(&path).expect("read");
         assert_eq!(loaded.device_id, file.device_id);
-        assert_eq!(loaded.hostname, file.hostname);
-        assert_eq!(loaded.name, file.name);
-        // The .tmp sibling must not linger after a successful rename.
-        let tmp = path.with_extension("json.tmp");
-        assert!(!tmp.exists(), "tmp file should be renamed away");
+        assert_eq!(loaded.hostname, "test-host");
+        assert_eq!(loaded.name.as_deref(), Some("test-display-name"));
+        // No temp sibling of any spelling may linger after a successful write.
+        let debris: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(debris.is_empty(), "temp files left behind: {debris:?}");
     }
 
     /// Back-compat: a pre-Phase-3 machine.json (using the old `machine_id`
@@ -1132,6 +1207,151 @@ mod tests {
         assert_eq!(loaded.device_id, "00000000-0000-4000-8000-000000000000");
         assert_eq!(loaded.hostname, "legacy-host");
         assert!(loaded.name.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // `device init` mint-once / re-use-always — plan
+    // `2026-08-06-device-identity-is-per-profile-not-per-machine` Phase 2(a).
+    //
+    // Coord UPSERTs `ON CONFLICT (device_id)`, so re-presenting the stored id
+    // is the ONLY thing keeping one physical machine to one `coord.devices`
+    // row. Nothing used to fail if a refactor re-introduced a mint here.
+    // Every test uses a tempdir — never the real ~/.qontinui/machine.json.
+    // ------------------------------------------------------------------
+
+    const PINNED_ID: &str = "c79a07d5-0000-4000-8000-000000000001";
+
+    /// `device init` against an EXISTING machine.json re-uses the stored
+    /// `device_id` — it does not mint, on any number of runs.
+    #[test]
+    fn device_init_reuses_the_stored_device_id() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("machine.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "device_id": PINNED_ID,
+                "hostname": "old-host",
+            }))
+            .unwrap(),
+        )
+        .expect("seed");
+
+        for _ in 0..3 {
+            let (file, was_new) =
+                device_init_write_at(&path, None, "new-host").expect("init must succeed");
+            assert!(!was_new, "an existing file must never report a fresh mint");
+            assert_eq!(file.device_id, PINNED_ID, "device_id must be RE-USED");
+            assert_eq!(file.hostname, "new-host", "hostname is re-detected");
+        }
+        assert_eq!(read_device_file(&path).unwrap().device_id, PINNED_ID);
+    }
+
+    /// `device init` PRESERVES `active_tenant_id` and every other sibling
+    /// field. The old `DeviceFile` round-trip dropped them, so the documented
+    /// recovery step silently unpinned the machine's tenant.
+    #[test]
+    fn device_init_preserves_active_tenant_id_and_siblings() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("machine.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "device_id": PINNED_ID,
+                "hostname": "spaceship",
+                "active_tenant_id": "c231d9da-0000-4000-8000-000000000002",
+                "some_future_field": {"nested": true},
+            }))
+            .unwrap(),
+        )
+        .expect("seed");
+
+        device_init_write_at(&path, Some("display"), "spaceship").expect("init");
+
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("json");
+        assert_eq!(
+            v.get("active_tenant_id").and_then(|x| x.as_str()),
+            Some("c231d9da-0000-4000-8000-000000000002"),
+            "device init must NOT delete the tenant pin"
+        );
+        assert_eq!(
+            v.get("some_future_field"),
+            Some(&serde_json::json!({"nested": true})),
+            "unknown top-level fields must survive the round-trip"
+        );
+        assert_eq!(v.get("device_id").and_then(|x| x.as_str()), Some(PINNED_ID));
+        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("display"));
+    }
+
+    /// `device init` against an UNREADABLE/corrupt machine.json refuses to
+    /// overwrite — overwriting would mint a fresh identity and a new
+    /// `coord.devices` row for the same machine.
+    #[test]
+    fn device_init_refuses_to_overwrite_an_unreadable_file() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+
+        for (label, contents) in [
+            ("corrupt json", &b"{ not json at all"[..]),
+            ("not an object", &b"[1,2,3]"[..]),
+            ("missing device_id", &br#"{"hostname":"spaceship"}"#[..]),
+            (
+                "blank device_id",
+                &br#"{"device_id":"  ","hostname":"h"}"#[..],
+            ),
+        ] {
+            let path = dir.path().join(format!("{}.json", label.replace(' ', "_")));
+            std::fs::write(&path, contents).expect("seed");
+            let err = match device_init_write_at(&path, None, "spaceship") {
+                Ok(_) => panic!("{label} must be refused, not written"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("Refusing to overwrite"),
+                "{label}: expected a refusal, got: {err}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                contents,
+                "{label}: the file must be left byte-identical for inspection"
+            );
+        }
+    }
+
+    /// The one legitimate mint: an ABSENT file. The very next run re-uses it.
+    #[test]
+    fn device_init_mints_once_on_an_absent_file_then_reuses() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("machine.json");
+
+        let (first, was_new) = device_init_write_at(&path, None, "spaceship").expect("mint");
+        assert!(was_new, "an absent file is the mint case");
+        assert!(uuid::Uuid::parse_str(&first.device_id).is_ok());
+
+        let (second, was_new_again) =
+            device_init_write_at(&path, None, "spaceship").expect("reuse");
+        assert!(!was_new_again);
+        assert_eq!(
+            second.device_id, first.device_id,
+            "the second run must RE-USE, not re-mint"
+        );
+    }
+
+    /// Defect 4: the machine.json writers must not use the single shared
+    /// `machine.json.tmp` path (raced by every runner instance at startup).
+    /// Squatting that exact path with a directory makes any writer that still
+    /// uses it fail.
+    #[test]
+    fn device_init_does_not_use_the_shared_fixed_temp_path() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("machine.json");
+        let squatted = path.with_extension("json.tmp");
+        std::fs::create_dir(&squatted).expect("squat the legacy tmp path");
+
+        let (file, _) = device_init_write_at(&path, None, "spaceship")
+            .expect("write must succeed despite the squatted tmp path");
+        assert_eq!(read_device_file(&path).unwrap().device_id, file.device_id);
+        assert!(squatted.is_dir(), "the squatted path must be untouched");
     }
 
     #[test]

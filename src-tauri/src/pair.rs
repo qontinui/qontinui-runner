@@ -110,24 +110,12 @@ struct PairStartResponseWire {
 // Identity-file helpers (paired_user.json + machine.json)
 // ============================================================================
 
-/// On-disk shape of `~/.qontinui/machine.json` — only the fields we need
-/// for pairing. The full file may carry more keys; we tolerate extras.
-///
-/// The wire field name is `device_id`; the on-disk field name is the
-/// legacy `machine_id` (preserved for backward compatibility — see the
-/// doc-comment on `DeviceFile` in `bin/qontinui_profile.rs`). The serde
-/// alias accepts both spellings so a pre-rename file still loads.
-#[derive(Debug, Deserialize)]
-struct MachineFile {
-    #[serde(alias = "machine_id")]
-    device_id: String,
-}
-
-/// Path to the per-device identity file. Same recipe as
-/// `bin/qontinui_profile.rs::device_file_path`.
-fn machine_file_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
-}
+// The canonical machine identity (`~/.qontinui/machine.json`) lives in
+// `crate::machine_identity` — one home for the reader, shared with `auth.rs`
+// (which compiles into the bin crate too, where `pair` is not declared).
+// `read_device_id_at` NEVER mints; a missing file is a hard error.
+use crate::machine_identity::machine_file_path;
+pub use crate::machine_identity::read_device_id_at;
 
 /// Read `device_id` from `~/.qontinui/machine.json`. Returns a clear
 /// error if the file is missing — the caller (pair-cli) cannot proceed
@@ -142,18 +130,7 @@ pub fn read_device_id_from_disk() -> Result<String, String> {
 }
 
 fn read_device_id() -> Result<String, String> {
-    let path = machine_file_path().ok_or_else(|| "could not resolve home directory".to_string())?;
-    if !path.exists() {
-        return Err(format!(
-            "device not initialized — run `qontinui_profile device init` first \
-             (no {} on disk)",
-            path.display()
-        ));
-    }
-    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let parsed: MachineFile =
-        serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {}", path.display(), e))?;
-    Ok(parsed.device_id)
+    crate::machine_identity::read_device_id()
 }
 
 /// Backfill the canonical `device_id` key into `~/.qontinui/machine.json`
@@ -220,21 +197,16 @@ pub fn ensure_device_id_persisted_at(path: &std::path::Path) {
             return;
         }
     };
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp, &pretty) {
+    // Unique-temp atomic write: every `machine.json` writer used to share the
+    // single fixed path `machine.json.tmp`, and EVERY runner instance rewrites
+    // this file at startup — so N processes raced one temp file and one could
+    // rename another's half-written temp into place. `fs_atomic::atomic_write`
+    // stamps the temp name with pid + counter + nanos.
+    if let Err(e) = crate::fs_atomic::atomic_write(path, &pretty) {
         tracing::warn!(
-            "ensure_device_id_persisted: write {} failed: {e}",
-            tmp.display()
-        );
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::warn!(
-            "ensure_device_id_persisted: rename {} → {} failed: {e}",
-            tmp.display(),
+            "ensure_device_id_persisted: atomic write {} failed: {e}",
             path.display()
         );
-        let _ = std::fs::remove_file(&tmp);
         return;
     }
     tracing::info!(
@@ -305,21 +277,12 @@ pub fn ensure_device_initialized_at(path: &std::path::Path) {
             return;
         }
     }
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp, &pretty) {
+    // Unique-temp atomic write — see the note in `ensure_device_id_persisted_at`.
+    if let Err(e) = crate::fs_atomic::atomic_write(path, &pretty) {
         tracing::warn!(
-            "ensure_device_initialized: write {} failed: {e}",
-            tmp.display()
-        );
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::warn!(
-            "ensure_device_initialized: rename {} → {} failed: {e}",
-            tmp.display(),
+            "ensure_device_initialized: atomic write {} failed: {e}",
             path.display()
         );
-        let _ = std::fs::remove_file(&tmp);
         return;
     }
     tracing::info!(
@@ -919,6 +882,21 @@ pub fn pair_with_auth_token(
     pair_with_auth_token_with_ids(base, oauth_token, &device_id, &user_id, tenant_id)
 }
 
+/// Build the `POST /api/v1/devices/pair-cli` request body.
+///
+/// Extracted as a pure function so the invariant "`device_id` on the wire is
+/// whatever the caller read off disk — never minted here" is testable without
+/// a network round-trip (plan
+/// `2026-08-06-device-identity-is-per-profile-not-per-machine` Phase 2a).
+fn pair_cli_request_body(device_id: &str, tenant_id: uuid::Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "device_id": device_id,
+        "hostname":  detect_hostname(),
+        "name":      detect_hostname(),
+        "tenant_id": tenant_id.to_string(),
+    })
+}
+
 /// Parameterized variant of [`pair_with_auth_token`] — accepts `device_id`
 /// and `user_id` as explicit arguments instead of reading them from
 /// `~/.qontinui/machine.json` + `{data_local_dir}/.../paired_user.json`.
@@ -942,12 +920,7 @@ pub fn pair_with_auth_token_with_ids(
     tenant_id: uuid::Uuid,
 ) -> Result<PairCompleteResponse, String> {
     let url = format!("{}/api/v1/devices/pair-cli", base);
-    let body = serde_json::json!({
-        "device_id": device_id,
-        "hostname":  detect_hostname(),
-        "name":      detect_hostname(),
-        "tenant_id": tenant_id.to_string(),
-    });
+    let body = pair_cli_request_body(device_id, tenant_id);
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1023,6 +996,15 @@ impl PairCodeRedeemResponse {
     }
 }
 
+/// Build the `POST /api/v1/devices/pair-codes/{code}/redeem` request body.
+/// Pure for the same reason as [`pair_cli_request_body`].
+fn pair_code_request_body(device_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "device_id": device_id,
+        "hostname":  detect_hostname(),
+    })
+}
+
 /// Headless pair flow that consumes a 6-char single-use pair code (no
 /// browser, no OAuth round-trip). The operator mints the code on the
 /// dashboard's ``Auth Tokens`` tab and types it into the runner's
@@ -1055,10 +1037,7 @@ pub fn pair_with_pair_code(
         base.trim_end_matches('/'),
         code.trim().to_uppercase()
     );
-    let body = serde_json::json!({
-        "device_id": device_id,
-        "hostname":  detect_hostname(),
-    });
+    let body = pair_code_request_body(device_id);
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1498,6 +1477,213 @@ pub(crate) fn persist_pairing_with(
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// Regression cover for plan
+/// `2026-08-06-device-identity-is-per-profile-not-per-machine` Phase 2(a):
+/// **a machine mints its `device_id` exactly once and re-presents it forever
+/// after.** Nothing used to fail if a refactor re-introduced a mint on the
+/// pairing path, so a return to one-`coord.devices`-row-per-pairing-attempt
+/// would have been silent.
+#[cfg(test)]
+mod device_identity_invariant_tests {
+    use super::*;
+
+    const STORED_ID: &str = "c79a07d5-0000-4000-8000-000000000001";
+
+    fn seed_machine_json(dir: &std::path::Path, body: serde_json::Value) -> PathBuf {
+        let path = dir.join("machine.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+        path
+    }
+
+    /// The pairing body carries the id READ FROM DISK, verbatim — and reading
+    /// it does not rewrite (let alone re-mint) the file.
+    #[test]
+    fn pair_request_bodies_use_the_device_id_read_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_machine_json(
+            dir.path(),
+            serde_json::json!({ "device_id": STORED_ID, "hostname": "spaceship" }),
+        );
+        let before = std::fs::read(&path).unwrap();
+
+        let id = read_device_id_at(&path).expect("read stored device_id");
+        assert_eq!(id, STORED_ID, "read must return the STORED id, not a mint");
+
+        let tenant = uuid::Uuid::parse_str("c231d9da-0000-4000-8000-000000000002").unwrap();
+        let cli_body = pair_cli_request_body(&id, tenant);
+        assert_eq!(
+            cli_body.get("device_id").and_then(|v| v.as_str()),
+            Some(STORED_ID),
+            "pair-cli body must ship the on-disk device_id"
+        );
+        let code_body = pair_code_request_body(&id);
+        assert_eq!(
+            code_body.get("device_id").and_then(|v| v.as_str()),
+            Some(STORED_ID),
+            "pair-code body must ship the on-disk device_id"
+        );
+
+        // Re-reading is stable, and the read path never wrote.
+        assert_eq!(read_device_id_at(&path).unwrap(), STORED_ID);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "reading device_id must not rewrite machine.json"
+        );
+    }
+
+    /// A missing `machine.json` is a HARD ERROR on the pairing path. If this
+    /// ever falls back to a mint, every unpaired launch invents a new identity.
+    #[test]
+    fn read_device_id_at_hard_errors_when_machine_json_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        let err = read_device_id_at(&path).expect_err("absent file must be an error, not a mint");
+        assert!(
+            err.contains("device not initialized"),
+            "expected the 'device not initialized' guidance, got: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "the failing read must NOT have created an identity file"
+        );
+    }
+
+    /// A corrupt / empty-id file errors rather than silently minting.
+    #[test]
+    fn read_device_id_at_rejects_corrupt_and_empty_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, b"{ not json").unwrap();
+        assert!(read_device_id_at(&corrupt).is_err());
+
+        let empty = seed_machine_json(
+            dir.path(),
+            serde_json::json!({ "device_id": "   ", "hostname": "h" }),
+        );
+        let err = read_device_id_at(&empty).expect_err("blank device_id must error");
+        assert!(err.contains("empty device_id"), "got: {err}");
+    }
+
+    /// `ensure_device_initialized_at` mints ONLY when the file is absent; an
+    /// existing identity survives repeated startup calls byte-for-byte.
+    #[test]
+    fn ensure_device_initialized_at_never_remints_an_existing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_machine_json(
+            dir.path(),
+            serde_json::json!({
+                "device_id": STORED_ID,
+                "hostname": "spaceship",
+                "active_tenant_id": "c231d9da-0000-4000-8000-000000000002",
+            }),
+        );
+        let before = std::fs::read(&path).unwrap();
+        // Every runner instance calls this at startup — call it like a fleet.
+        for _ in 0..5 {
+            ensure_device_initialized_at(&path);
+        }
+        assert_eq!(read_device_id_at(&path).unwrap(), STORED_ID);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "an existing machine.json must be left untouched"
+        );
+    }
+
+    /// The one legitimate mint site: an ABSENT file. Minting is idempotent
+    /// thereafter (second call re-uses the first call's id).
+    #[test]
+    fn ensure_device_initialized_at_mints_once_then_reuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        ensure_device_initialized_at(&path);
+        let first = read_device_id_at(&path).expect("mint on absent file");
+        assert!(uuid::Uuid::parse_str(&first).is_ok(), "must be a UUID");
+        ensure_device_initialized_at(&path);
+        assert_eq!(
+            read_device_id_at(&path).unwrap(),
+            first,
+            "the second call must re-use, not re-mint"
+        );
+    }
+
+    /// A legacy `machine_id`-only file is NORMALIZED, not re-minted — the id
+    /// carries over to the canonical key.
+    #[test]
+    fn ensure_device_id_persisted_at_backfills_without_minting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_machine_json(
+            dir.path(),
+            serde_json::json!({ "machine_id": STORED_ID, "hostname": "spaceship" }),
+        );
+        ensure_device_id_persisted_at(&path);
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("json");
+        assert_eq!(
+            v.get("device_id").and_then(|x| x.as_str()),
+            Some(STORED_ID),
+            "backfill must copy the LEGACY id, never mint a new one"
+        );
+        assert_eq!(
+            v.get("machine_id").and_then(|x| x.as_str()),
+            Some(STORED_ID),
+            "the legacy key stays for readers that still alias off it"
+        );
+    }
+
+    /// Source-level pin: this module may contain exactly ONE UUID-v4 mint —
+    /// the first-launch mint in `ensure_device_initialized_at`. A second one is
+    /// how "one machine, one device row" regresses into one row per pairing
+    /// attempt, and a behavioural test cannot see a mint that only fires on a
+    /// path the test does not exercise.
+    #[test]
+    fn pair_module_has_exactly_one_mint_site() {
+        let src = include_str!("pair.rs");
+        // Split so this needle does not match itself in the source scan.
+        let needle = concat!("Uuid::new_", "v4()");
+        let mints = src.matches(needle).count();
+        assert_eq!(
+            mints, 1,
+            "pair.rs must mint a device_id in exactly one place \
+             (ensure_device_initialized_at, absent-file branch); found {mints}. \
+             If you added a mint, you re-opened the sprawl this test pins shut."
+        );
+    }
+
+    /// Defect 4: all four `machine.json` writers used to share the single fixed
+    /// temp path `machine.json.tmp`, so N runner processes raced one file.
+    /// Occupying that exact path with a DIRECTORY makes any writer that still
+    /// uses it fail; the unique-temp writers sail past.
+    #[test]
+    fn machine_json_writers_do_not_use_the_shared_fixed_temp_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        let squatted = path.with_extension("json.tmp");
+        std::fs::create_dir(&squatted).unwrap();
+
+        // Mint path.
+        ensure_device_initialized_at(&path);
+        let minted = read_device_id_at(&path).expect("mint must succeed despite the squatted tmp");
+
+        // Backfill path (legacy shape, same squatted tmp).
+        let legacy = dir.path().join("legacy.json");
+        std::fs::create_dir(legacy.with_extension("json.tmp")).unwrap();
+        std::fs::write(
+            &legacy,
+            serde_json::to_vec_pretty(&serde_json::json!({ "machine_id": STORED_ID })).unwrap(),
+        )
+        .unwrap();
+        ensure_device_id_persisted_at(&legacy);
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&legacy).unwrap()).unwrap();
+        assert_eq!(v.get("device_id").and_then(|x| x.as_str()), Some(STORED_ID));
+
+        assert!(squatted.is_dir(), "the squatted tmp path must be untouched");
+        assert!(uuid::Uuid::parse_str(&minted).is_ok());
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2357,10 +2543,9 @@ mod tests {
             v.get("hostname").and_then(|x| x.as_str()).is_some(),
             "hostname recorded"
         );
-        // The minted file must parse under the same MachineFile reader that
+        // The minted file must parse under the same canonical reader that
         // errored before the fix (device_id present + deserializable).
-        let parsed: MachineFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(parsed.device_id, id);
+        assert_eq!(read_device_id_at(&path).unwrap(), id);
     }
 
     #[test]

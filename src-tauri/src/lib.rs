@@ -41,6 +41,10 @@ pub mod fs_atomic;
 // modules are Tauri-free.
 pub mod auth;
 pub mod fs_perms;
+/// Canonical reader for `~/.qontinui/machine.json` — the machine's ONE
+/// durable `device_id`. Declared in `main.rs` too, because `auth` compiles
+/// into both crates and must consult it before falling back to its own cache.
+pub mod machine_identity;
 pub mod secure_storage;
 
 // Machine-side dev-environment capture agent (feat/devenv-environments). Runs

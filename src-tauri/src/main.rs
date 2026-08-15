@@ -134,6 +134,7 @@ mod logging;
 // covered by `cargo test --lib`.
 mod looping_agent_coord;
 mod looping_agent_supervisor;
+mod machine_identity;
 mod macros;
 mod mcp;
 mod mcp_api;
