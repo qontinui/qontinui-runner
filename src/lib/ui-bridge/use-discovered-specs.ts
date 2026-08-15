@@ -23,7 +23,16 @@
 import { useEffect, useState } from "react";
 import type { DiscoveredSpec } from "../spec-prompt-builder";
 
-const RUNNER_APP_ID = "qontinui-runner";
+/**
+ * This runner's own app id in the `project.apps` registry.
+ *
+ * Exported so the snapshot enricher in `App.tsx` can stamp it as the
+ * snapshot's top-level `appId`, which the Rust capture path reads to
+ * attribute co-occurrence observations. There must be exactly one literal
+ * for this id in the frontend — a second copy is the producer/consumer key
+ * mismatch class this attribution exists to prevent.
+ */
+export const RUNNER_APP_ID = "qontinui-runner";
 const SPEC_LIST_URL = `http://localhost:9876/apps/${RUNNER_APP_ID}/spec/list`;
 const SPEC_SUBSCRIBE_URL = `http://localhost:9876/apps/${RUNNER_APP_ID}/spec/subscribe`;
 
