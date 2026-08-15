@@ -195,9 +195,28 @@ pub struct SectionPlan {
 }
 
 impl SectionPlan {
-    /// True when this section has nothing to report.
+    /// True when this section has nothing to report — and, load-bearing, when
+    /// everything it would have compared was actually READ.
+    ///
+    /// An unmeasured key makes this false even with zero changes. If canonical's
+    /// stored capture and this box BOTH timed out on `rustc`, both omit the key,
+    /// [`diff_section`] yields nothing, and a definition resting on the change
+    /// list alone would report "in sync" over a key neither side ever read —
+    /// a positive claim computed from an absence, which is the fleet's
+    /// `silent-empty-is-unknown` rule. Silence is the one thing this cannot be
+    /// allowed to read as agreement.
     pub fn is_clean(&self) -> bool {
-        self.changes.is_empty() && !self.local_section_absent
+        self.changes.is_empty() && !self.local_section_absent && self.unknown_keys.is_empty()
+    }
+
+    /// Keys in this section this box could not measure that produced NO diff row
+    /// — canonical does not carry them either, so there is nothing to show in
+    /// the change list and nothing but this to say they exist.
+    pub fn silently_unmeasured_keys(&self) -> Vec<&String> {
+        self.unknown_keys
+            .iter()
+            .filter(|k| !self.changes.iter().any(|c| c.key() == k.as_str()))
+            .collect()
     }
 
     /// True when this key's value is derived from the repo — it converges by
@@ -225,8 +244,20 @@ impl SectionPlan {
     /// Changes this runner would actually act on, given the policy. Only
     /// `Applyable` sections yield actions; `Extra` keys never do; repo-derived
     /// keys never do **regardless of policy** (applying one would fight the repo
-    /// rather than reconcile the box); and neither do keys this box could not
-    /// measure — acting on one would install over a version nobody ever read.
+    /// rather than reconcile the box); and neither does a `Missing` on a key this
+    /// box could not measure — acting on one would install over a version nobody
+    /// ever read.
+    ///
+    /// The unmeasured filter is scoped to [`Change::Missing`] ON PURPOSE, and
+    /// that scope is the whole safety argument. "Unmeasured ⇒ do not act" is
+    /// sound only because an unmeasured key is ABSENT locally and can therefore
+    /// only diff as `Missing`; applied to every kind, the same line would convert
+    /// a real `Change::Differs` — a drift this box measured on both sides — into
+    /// a silently suppressed non-action, which is the original defect's mirror
+    /// image. The invariant is enforced in [`compute_plan`], which intersects the
+    /// unmeasured set against the keys actually absent from the local section;
+    /// this filter is written so that even a caller who defeats that enforcement
+    /// cannot lose a `Differs`.
     pub fn actionable(&self) -> Vec<&Change> {
         if self.policy != Applyable {
             return Vec::new();
@@ -235,7 +266,7 @@ impl SectionPlan {
             .iter()
             .filter(|c| !matches!(c, Change::Extra { .. }))
             .filter(|c| !self.is_derived(c.key()))
-            .filter(|c| !self.is_unknown(c.key()))
+            .filter(|c| !(matches!(c, Change::Missing { .. }) && self.is_unknown(c.key())))
             .collect()
     }
 }
@@ -258,9 +289,35 @@ pub struct ApplyPlan {
 }
 
 impl ApplyPlan {
-    /// True when this box already matches canonical in every section.
+    /// True when this box already matches canonical in every section **and
+    /// every key that verdict rests on was actually read**.
+    ///
+    /// A key this box could not measure makes this false even when it produced
+    /// no diff row: see [`SectionPlan::is_clean`] for why a positive in-sync
+    /// claim must never be computed partly over never-read keys. The
+    /// unmeasured keys are still enumerated — [`unmeasured_key_count`](Self::unmeasured_key_count)
+    /// and the renderers — so the operator gets a reason, not just a `false`.
     pub fn is_in_sync(&self) -> bool {
         self.sections.iter().all(SectionPlan::is_clean)
+    }
+
+    /// Total keys this box could not measure, whether or not they produced a
+    /// diff row. This is the SET size; [`unknown_count`](Self::unknown_count) is
+    /// the row count. They differ exactly when canonical also lacks a key — the
+    /// case that would otherwise read as agreement.
+    pub fn unmeasured_key_count(&self) -> usize {
+        self.sections.iter().map(|s| s.unknown_keys.len()).sum()
+    }
+
+    /// Unmeasured keys sitting in an `Applyable` section — the ones for which
+    /// "no changes are auto-applyable" would be a statement about a measurement
+    /// gap rather than about the box.
+    pub fn unmeasured_in_applyable_count(&self) -> usize {
+        self.sections
+            .iter()
+            .filter(|s| s.policy == Applyable)
+            .map(|s| s.unknown_keys.len())
+            .sum()
     }
 
     /// Total count of changes this runner would act on across all sections.
@@ -296,10 +353,16 @@ fn string_pairs(section: Option<&Value>) -> Vec<(String, String)> {
 
 /// Read a per-section key list (`derived_keys` / `unknown_keys`) into a set.
 ///
-/// An absent entry, an explicit null, a non-array value and non-string members
-/// ALL degrade to the empty set — i.e. to the behavior that existed before the
-/// field did. Both callers suppress an apply action, so a malformed list must
-/// never be able to suppress one by accident.
+/// Degradation is deliberate and always in the SAFE direction — towards the
+/// behavior that existed before the field did — because both callers suppress an
+/// apply action, so a malformed list must never suppress one by accident. It is
+/// not uniform, though:
+///
+/// - An absent entry, an explicit null, or a non-array value degrade WHOLESALE
+///   to the empty set: there is no list to read at all.
+/// - Non-string MEMBERS degrade PER MEMBER, keeping the readable ones —
+///   `["rustc", 7]` yields `{"rustc"}`, not `{}`. Dropping the whole list would
+///   discard a legible suppression because of an unrelated malformed sibling.
 fn string_list(value: Option<&Value>) -> BTreeSet<String> {
     value
         .and_then(Value::as_array)
@@ -361,6 +424,11 @@ fn diff_section(canonical: Option<&Value>, local: Option<&Value>) -> Vec<Change>
 /// precisely because forgetting it is the defect: an unmeasured key looks
 /// exactly like an absent one, and an absent one is an install action. Pass an
 /// empty map only where there genuinely is no capture to speak of.
+///
+/// The set is not trusted verbatim: it is intersected against the keys actually
+/// absent from the matching local section, so a set that did not come from THIS
+/// capture cannot suppress a drift this box measured. See the intersection site
+/// below.
 pub fn compute_plan(
     canonical: &CanonicalConfig,
     local_sections: &Map<String, Value>,
@@ -401,7 +469,26 @@ pub fn compute_plan(
             // Same degradation rule, same reason: a malformed/absent list means
             // "nothing unmeasured here", i.e. exactly the pre-`unknown_keys`
             // behavior — never a wrongly-suppressed action.
-            let unknown_keys: BTreeSet<String> = string_list(local_unknown_keys.get(name));
+            //
+            // Then INTERSECTED against the keys genuinely absent from the local
+            // section. `unknown_keys` suppresses an apply action, and that
+            // suppression is sound only under the invariant "an unmeasured key
+            // is absent locally, so it can only diff as Missing". That invariant
+            // is maintained by `collect_versions` — but this is a `pub fn` taking
+            // an ARBITRARY set, so it cannot be assumed here: a caller passing a
+            // set not co-generated with its section (the
+            // `~/.qontinui/last_env_capture.json` cache, a future server-echoed
+            // set, a merged set) would otherwise turn a real `Change::Differs`
+            // into a suppressed non-action. The intersection makes the invariant
+            // hold BY CONSTRUCTION for every caller, at the one place both the
+            // set and the section are in hand; a key that claims to be unmeasured
+            // while carrying a local value is simply not believed.
+            let local_keys: BTreeSet<String> =
+                string_pairs(loc).into_iter().map(|(k, _)| k).collect();
+            let unknown_keys: BTreeSet<String> = string_list(local_unknown_keys.get(name))
+                .into_iter()
+                .filter(|k| !local_keys.contains(k))
+                .collect();
             SectionPlan {
                 section: name.clone(),
                 policy,
@@ -590,6 +677,15 @@ pub fn render_plan(plan: &ApplyPlan) -> String {
             continue;
         }
         out.push_str(&format!("  {} [{}]\n", s.section, s.policy.label()));
+        // Keys that were never read and produced no row. Without this line the
+        // section header would be the only trace of them, and a section whose
+        // ONLY finding is an unread key would print as an empty block.
+        for key in s.silently_unmeasured_keys() {
+            out.push_str(&format!(
+                "    ? {key}: could not be measured here, and canonical carries no value for it \
+                 either — there is nothing to compare, which is NOT the same as agreeing\n"
+            ));
+        }
         if s.local_section_absent {
             out.push_str(
                 "    ! no local data for this section (collector unavailable) — cannot compare\n",
@@ -643,17 +739,41 @@ pub fn render_plan(plan: &ApplyPlan) -> String {
         out.push('\n');
     }
 
-    let unknown = plan.unknown_count();
-    if unknown > 0 {
+    // Counted over the SET, not the rows: a key neither side measured produces
+    // no row at all, and that is exactly the case an operator must not read as
+    // agreement.
+    let unmeasured = plan.unmeasured_key_count();
+    if unmeasured > 0 {
         out.push_str(&format!(
-            "{unknown} key(s) could NOT be measured on this box (the probe exceeded its \
-             budget).\nThey are reported as UNKNOWN, never as missing, and `env apply` will \
-             not act on them — re-run `env capture` on a less busy box to resolve them.\n\n",
+            "{unmeasured} key(s) could NOT be measured on this box (the probe exceeded its budget \
+             twice).\nThey are reported as UNKNOWN, never as missing, and `env apply` will \
+             not act on them — re-run `env capture` on a less busy box to resolve them.\n",
         ));
+        let rows = plan.unknown_count();
+        if rows < unmeasured {
+            out.push_str(&format!(
+                "  {} of them produced no drift row at all, because canonical carries no value \
+                 for them either. That is an absence of evidence, NOT evidence of agreement — \
+                 this machine cannot be called in sync over them.\n",
+                unmeasured - rows,
+            ));
+        }
+        out.push('\n');
     }
 
     let n = plan.actionable_count();
-    if n == 0 {
+    let blind = plan.unmeasured_in_applyable_count();
+    if n == 0 && blind > 0 {
+        // "Everything above is report-only or needs a human decision" would be
+        // false here: the count is zero partly because a key in an APPLYABLE
+        // section was never read, which is a measurement gap, not a policy one.
+        out.push_str(&format!(
+            "No changes are auto-applyable right now — but {blind} key(s) in applyable \
+             section(s) could not be measured on this box, so this is NOT a statement that \
+             nothing needs doing. Everything else above is report-only or needs a human \
+             decision.\n",
+        ));
+    } else if n == 0 {
         out.push_str(
             "No changes are auto-applyable — everything above is report-only or needs a \
              human decision on this box.\n",
@@ -695,19 +815,27 @@ pub fn plan_to_json(plan: &ApplyPlan) -> Value {
                         }),
                         Change::Missing { key, canonical } => serde_json::json!({
                             "kind": "missing", "key": key, "canonical": canonical,
-                            "derived": derived, "unknown": unknown,
+                            "derived": derived, "unknown": false,
                         }),
+                        // `unknown: false` is a CONSTANT on these two arms, not a
+                        // dropped variable. Both require a local value, and
+                        // `compute_plan` intersects the unmeasured set against the
+                        // keys with no local value — so `unknown` is false here by
+                        // construction. Emitting the variable instead would leave a
+                        // dead path that, if it ever fired, would contradict `kind`
+                        // on the same object: `"kind": "differs", "unknown": true`
+                        // says both "we read both sides" and "we read neither".
                         Change::Differs {
                             key,
                             local,
                             canonical,
                         } => serde_json::json!({
                             "kind": "differs", "key": key, "local": local,
-                            "canonical": canonical, "derived": derived, "unknown": unknown,
+                            "canonical": canonical, "derived": derived, "unknown": false,
                         }),
                         Change::Extra { key, local } => serde_json::json!({
                             "kind": "extra", "key": key, "local": local, "derived": derived,
-                            "unknown": unknown,
+                            "unknown": false,
                         }),
                     }
                 })
@@ -736,11 +864,19 @@ pub fn plan_to_json(plan: &ApplyPlan) -> Value {
         "schema_mismatch": plan.schema_mismatch.map(|(theirs, ours)| serde_json::json!({
             "canonical": theirs, "runner": ours,
         })),
+        // False whenever ANY key went unmeasured, even with zero diff rows: a
+        // positive in-sync claim is never computed over keys nobody read.
+        // `unmeasured_key_count` is the reason it can be false with an empty
+        // change list, so a consumer never has to guess.
         "in_sync": plan.is_in_sync(),
         "actionable_count": plan.actionable_count(),
         // Disjoint from `actionable_count` by construction — `actionable()`
-        // filters unknown keys out.
+        // filters unknown keys out. This counts ROWS an operator can see.
         "unknown_count": plan.unknown_count(),
+        // …and this counts the SET, including keys that produced no row because
+        // canonical lacks them too. `unmeasured_key_count > unknown_count` is
+        // exactly the silent case.
+        "unmeasured_key_count": plan.unmeasured_key_count(),
         "sections": sections,
     })
 }
@@ -1483,11 +1619,19 @@ mod tests {
         assert_eq!(v["actionable_count"], 1);
     }
 
-    /// An unmeasured key that canonical ALSO lacks produces no diff row at all,
-    /// so it must not inflate the unknown counter — the counter describes rows
-    /// an operator can see, not set membership.
+    /// An unmeasured key that canonical ALSO lacks produces no diff ROW, so it
+    /// must not inflate `unknown_count` — that counter describes rows an
+    /// operator can see, not set membership.
+    ///
+    /// But it must NOT therefore be silent, and it must not be called in sync.
+    /// If canonical's stored capture and this box both timed out on `rustc`,
+    /// both omit the key and `diff_section` yields nothing — and the old
+    /// behaviour printed "This machine is IN SYNC with canonical. Nothing to
+    /// do." while the two versions genuinely differed. A positive claim computed
+    /// over a key nobody read is the fleet's `silent-empty-is-unknown` rule; the
+    /// VERDICT changes, the counter does not.
     #[test]
-    fn unknown_key_absent_from_canonical_reports_nothing() {
+    fn unknown_key_absent_from_canonical_is_reported_and_never_called_in_sync() {
         let plan = compute_plan(
             &canonical_with(
                 json!({"versions": {"node": "v22.1.0"}}),
@@ -1501,9 +1645,183 @@ mod tests {
             "other",
         );
         assert!(plan.sections[0].is_unknown("rustc"));
+        // The row counter is unchanged: there is genuinely no row.
         assert_eq!(plan.unknown_count(), 0);
-        assert!(plan.is_in_sync());
-        assert!(!render_plan(&plan).contains("could NOT be measured"));
+        // The SET counter is what carries the fact.
+        assert_eq!(plan.unmeasured_key_count(), 1);
+        assert!(
+            !plan.is_in_sync(),
+            "a verdict resting on a key nobody read is not a verdict"
+        );
+        assert!(!plan.sections[0].is_clean());
+
+        let text = render_plan(&plan);
+        assert!(
+            !text.contains("IN SYNC with canonical"),
+            "must not claim in sync over an unread key: {text}"
+        );
+        assert!(text.contains("could NOT be measured"), "{text}");
+        assert!(
+            text.contains("NOT evidence of agreement"),
+            "the silent case needs saying out loud: {text}"
+        );
+        // The key itself is named, not just counted.
+        assert!(text.contains("rustc"), "{text}");
+
+        let v = plan_to_json(&plan);
+        assert_eq!(v["in_sync"], false);
+        assert_eq!(v["unknown_count"], 0);
+        assert_eq!(v["unmeasured_key_count"], 1);
+    }
+
+    /// The narrow-suppression guard, and the mirror image of the original bug.
+    /// `actionable()` suppresses an unmeasured key only on `Change::Missing` —
+    /// the only kind the "unmeasured ⇒ absent locally" invariant covers. A
+    /// `Differs` means this box DID read a local value, so a set that claims the
+    /// key is unmeasured must not be able to suppress it.
+    #[test]
+    fn a_differs_on_a_key_listed_as_unknown_is_still_actionable() {
+        let canonical = canonical_with(
+            json!({"versions": {"node": "v22.1.0"}}),
+            json!({"versions": "applyable"}),
+        );
+        let local = json!({"versions": {"node": "v20.9.0"}});
+
+        let plan = compute_plan(
+            &canonical,
+            local.as_object().unwrap(),
+            // A set NOT co-generated with this section — the cache/echoed/merged
+            // caller `compute_plan`'s signature allows.
+            &unknown("versions", &["node"]),
+            "env-1",
+            "other",
+        );
+        let s = &plan.sections[0];
+        // The intersection refuses the claim outright: the key carries a local
+        // value, so it cannot have been unmeasured.
+        assert!(
+            !s.is_unknown("node"),
+            "a key with a local value must not be believed unmeasured"
+        );
+        assert!(matches!(
+            s.changes.iter().find(|c| c.key() == "node"),
+            Some(Change::Differs { .. })
+        ));
+        let actionable: Vec<&str> = s.actionable().iter().map(|c| c.key()).collect();
+        assert_eq!(
+            actionable,
+            vec!["node"],
+            "a measured drift must stay actionable"
+        );
+        assert_eq!(plan.actionable_count(), 1);
+        assert_eq!(plan.unmeasured_key_count(), 0);
+
+        // Belt and braces: even with the intersection defeated — a SectionPlan
+        // built by hand, as a future caller could — the filter itself must not
+        // drop a `Differs`.
+        let hand_built = SectionPlan {
+            section: "versions".to_string(),
+            policy: Applyable,
+            changes: vec![Change::Differs {
+                key: "node".to_string(),
+                local: "v20.9.0".to_string(),
+                canonical: "v22.1.0".to_string(),
+            }],
+            local_section_absent: false,
+            derived_keys: BTreeSet::new(),
+            unknown_keys: ["node".to_string()].into_iter().collect(),
+        };
+        assert_eq!(
+            hand_built.actionable().len(),
+            1,
+            "the suppression must be scoped to Missing, not to every change kind"
+        );
+
+        // …and JSON never emits the contradictory pairing.
+        let v = plan_to_json(&plan);
+        let node = v["sections"][0]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["key"] == "node")
+            .unwrap()
+            .clone();
+        assert_eq!(node["kind"], "differs");
+        assert_eq!(node["unknown"], false);
+    }
+
+    /// "No changes are auto-applyable — everything above is report-only or needs
+    /// a human decision" is FALSE when the count is zero because a key in an
+    /// applyable section was never read. That is a measurement gap, not a policy
+    /// one, and reads as "nothing needs doing".
+    #[test]
+    fn zero_actionable_because_unmeasured_does_not_read_as_nothing_to_do() {
+        let plan = compute_plan(
+            &canonical_with(
+                json!({"versions": {"rustc": "rustc 1.82.0"}}),
+                json!({"versions": "applyable"}),
+            ),
+            json!({"versions": {}}).as_object().unwrap(),
+            &unknown("versions", &["rustc"]),
+            "env-1",
+            "other",
+        );
+        assert_eq!(plan.actionable_count(), 0);
+        assert_eq!(plan.unmeasured_in_applyable_count(), 1);
+
+        let text = render_plan(&plan);
+        assert!(
+            text.contains("NOT a statement that nothing needs doing"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("everything above is report-only"),
+            "the report-only wording is false here: {text}"
+        );
+    }
+
+    /// A report-only section's unmeasured key is still unmeasured, but it is not
+    /// a reason to qualify the APPLYABLE verdict — nothing there was going to be
+    /// applied anyway.
+    #[test]
+    fn unmeasured_in_a_report_only_section_keeps_the_plain_wording() {
+        let plan = compute_plan(
+            &canonical_with(
+                json!({"versions": {"rustc": "rustc 1.82.0"}}),
+                json!({"versions": "report_only"}),
+            ),
+            json!({"versions": {}}).as_object().unwrap(),
+            &unknown("versions", &["rustc"]),
+            "env-1",
+            "other",
+        );
+        assert_eq!(plan.unmeasured_in_applyable_count(), 0);
+        let text = render_plan(&plan);
+        assert!(text.contains("everything above is report-only"), "{text}");
+        // …while the key itself is still surfaced.
+        assert!(text.contains("could NOT be measured"), "{text}");
+    }
+
+    /// Non-string members degrade PER MEMBER, not wholesale — the readable
+    /// entries survive an unrelated malformed sibling.
+    #[test]
+    fn string_list_degrades_per_member_not_wholesale() {
+        assert_eq!(
+            string_list(Some(&json!(["rustc", 7]))),
+            ["rustc".to_string()].into_iter().collect::<BTreeSet<_>>(),
+            "a legible member must survive a malformed sibling"
+        );
+        assert_eq!(
+            string_list(Some(&json!(["rustc", null, "node", {"a": 1}]))),
+            ["rustc".to_string(), "node".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        // Wholesale degradation is for the cases where there is no list to read.
+        assert!(string_list(None).is_empty());
+        assert!(string_list(Some(&json!(null))).is_empty());
+        assert!(string_list(Some(&json!("rustc"))).is_empty());
+        assert!(string_list(Some(&json!([7, false]))).is_empty());
     }
 
     /// An empty / absent / malformed local `unknown_keys` must behave EXACTLY

@@ -93,11 +93,22 @@ pub struct ConfigEnvelope {
     /// diff silently drops non-string values, so a `{value, status}` value would
     /// make the key disappear from the diff altogether.
     ///
-    /// Always emitted, including as `{}`. The backend's envelope model ignores
-    /// unknown fields (pydantic's default), so this is inert until the web side
-    /// grows a reader for it — and an explicit `{}` lets that later reader tell
+    /// Always emitted, including as `{}` — deliberately, but note what that does
+    /// and does NOT buy today.
+    ///
+    /// The backend's envelope model ignores unknown fields (pydantic's default),
+    /// and its `to_stored_config()` (`qontinui-web`
+    /// `backend/app/schemas/devenv.py`) persists only `schema_version`,
+    /// `captured_at` and `sections` — so this field is currently DROPPED on
+    /// receipt. It is therefore inert end-to-end: the only consumer that sees it
+    /// is a reader of the local `~/.qontinui/last_env_capture.json` cache.
+    ///
+    /// The `{}` is emitted anyway so that the distinction is available the moment
+    /// persistence lands (a parallel web-side phase): a reader could then tell
     /// "this runner measured everything" from "this runner predates the field",
-    /// which a skipped-when-empty field could not.
+    /// which a skipped-when-empty field could never express. That is the INTENT
+    /// and its dependency — not a capability this runner can claim on its own,
+    /// since nothing downstream of the PUT stores the field yet.
     pub unknown_keys: Map<String, Value>,
 }
 

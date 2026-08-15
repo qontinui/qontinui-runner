@@ -416,6 +416,10 @@ pub type Detector<'a> = &'a dyn Fn(Tool) -> Option<Manager>;
 /// Only [`SectionPlan::actionable`] changes are considered, so a non-applyable
 /// policy, an `Extra` local key and every repo-derived key are excluded before
 /// this sees them. [`Tool::from_key`] then narrows to the three observed keys.
+///
+/// Keys the capture could not MEASURE are excluded upstream too, and are
+/// re-surfaced here as NOTES — see the loop below. They produce no action by
+/// design; they must not produce silence.
 pub fn plan_versions(
     section: &SectionPlan,
     detect: Detector<'_>,
@@ -493,6 +497,23 @@ pub fn plan_versions(
             manager,
             steps: drive_steps(manager, &target_version, scope_is_default),
         });
+    }
+
+    // Keys this box never READ. `actionable()` filtered them out upstream, which
+    // is correct — but "filtered upstream" is exactly how a change becomes
+    // invisible, and an empty action list with nothing beside it renders as
+    // `versions [nothing to do]`. That contradicts this section's own rule
+    // (`SkipRecord`: "Surfaced rather than dropped: a silently-ignored change
+    // reads as 'nothing to do'"). Notes cost no action, so they are the right
+    // channel: the key is reported, and still never installed.
+    for key in &section.unknown_keys {
+        plan.notes.push(format!(
+            "`{key}` could NOT be measured on this box (its `--version` probe exceeded the capture \
+             budget twice), so there is nothing here to compare against canonical. It is NOT being \
+             treated as missing and NOT being installed — installing over a version nobody read is \
+             the failure this refusal exists to prevent. Re-run `env capture` once the box is \
+             quiet, or fix the shim if it never answers."
+        ));
     }
 
     if !plan.actions.is_empty() && !scope_is_default {
@@ -698,6 +719,17 @@ pub fn apply_section_with(
     };
 
     if plan.actions.is_empty() {
+        // `NothingToDo` is a POSITIVE claim about the box, and it is unsound
+        // over a key nobody read. The notes above already carry the detail;
+        // the STATUS has to stop saying the opposite, or the one-line section
+        // summary (`versions [nothing to do]`) contradicts them.
+        if !section.unknown_keys.is_empty() {
+            out.status = SectionStatus::Blocked(format!(
+                "{} key(s) in this section could not be measured on this box, so nothing here can \
+                 be called settled — see the notes below. Nothing was changed.",
+                section.unknown_keys.len(),
+            ));
+        }
         return out;
     }
 
@@ -1100,9 +1132,77 @@ mod tests {
             vec!["node"],
             "only the genuinely-absent tool may be installed"
         );
-        // Filtered upstream by `actionable()`, so this module never sees it —
-        // it must not appear as a skip reason invented here either.
+        // Filtered upstream by `actionable()`, so it never reaches
+        // `Tool::from_key` and must not appear as a skip reason invented here.
         assert!(!plan.skipped.iter().any(|s| s.key == "rustc"));
+        // …but "filtered upstream" is how a change becomes invisible. It IS
+        // surfaced, on the notes channel, which costs no action.
+        let note = plan
+            .notes
+            .iter()
+            .find(|n| n.contains("rustc"))
+            .expect("an unmeasured key must be surfaced, not silently dropped");
+        assert!(note.contains("could NOT be measured"), "{note}");
+        assert!(note.contains("NOT being installed"), "{note}");
+    }
+
+    /// The section-level consequence: with every change unmeasured there are no
+    /// actions and no skips, and the status must NOT be `NothingToDo`. That
+    /// label is a positive claim about the box, and `env apply` printing
+    /// `versions [nothing to do]` about keys it never read is the same silence
+    /// `SkipRecord`'s own doc exists to forbid.
+    #[test]
+    fn an_all_unmeasured_section_is_not_reported_as_nothing_to_do() {
+        let section = versions_section_with_unknown(
+            json!({"rustc": "rustc 1.82.0 (f6e511eec 2024-10-15)"}),
+            json!({}),
+            json!([]),
+            json!(["rustc"]),
+        );
+        let out = apply_section_with(&section, &|_| Some(Manager::Rustup), false);
+        assert!(out.changes.is_empty());
+        assert!(out.skipped.is_empty());
+        assert_ne!(
+            out.status,
+            SectionStatus::NothingToDo,
+            "an unread key is not 'nothing to do'"
+        );
+        match &out.status {
+            SectionStatus::Blocked(why) => {
+                assert!(why.contains("could not be measured"), "{why}");
+                assert!(why.contains("Nothing was changed"), "{why}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        assert!(out.notes.iter().any(|n| n.contains("rustc")));
+
+        // And the rendered report says so rather than going quiet.
+        let text = super::super::apply::render_report(&super::super::apply::ApplyReport {
+            environment_id: "env-1".to_string(),
+            canonical_machine_name: Some("spaceship".to_string()),
+            is_canonical_self: false,
+            confirmed: false,
+            sections: vec![out],
+        });
+        assert!(!text.contains("nothing to do"), "{text}");
+        assert!(text.contains("could NOT be measured"), "{text}");
+    }
+
+    /// …and a section with a real action alongside an unmeasured key still
+    /// plans that action. The surfacing must not become a section-wide brake.
+    #[test]
+    fn an_unmeasured_key_does_not_block_its_measured_sibling() {
+        let section = versions_section_with_unknown(
+            json!({"rustc": "rustc 1.82.0 (f6e511eec 2024-10-15)", "node": "v24.14.0"}),
+            json!({}),
+            json!([]),
+            json!(["rustc"]),
+        );
+        let out = apply_section_with(&section, &|_| Some(Manager::Volta), false);
+        assert_eq!(out.status, SectionStatus::Planned);
+        let keys: Vec<&str> = out.changes.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, vec!["node"]);
+        assert!(out.notes.iter().any(|n| n.contains("rustc")));
     }
 
     /// An unparseable canonical value is refused rather than guessed at.
