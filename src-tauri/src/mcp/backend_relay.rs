@@ -1750,6 +1750,12 @@ fn devenv_auto_enroll_opted_out() -> bool {
 /// carries `enrolled:true` and corrects the server's view.
 const DEVENV_ENROLL_ACK_BUDGET: Duration = Duration::from_secs(20);
 
+/// The budget is only a liveness budget if it expires BEFORE the pinger drops
+/// the socket. Enforced at COMPILE time so raising either constant past the
+/// other cannot ship — a runtime test would only catch it after a build.
+/// (`as_secs` is `const fn`; `PartialOrd for Duration` is not const.)
+const _: () = assert!(DEVENV_ENROLL_ACK_BUDGET.as_secs() < STALE_INBOUND_TIMEOUT.as_secs());
+
 /// Why this runner declines a server-pushed `devenv_enroll`, or `None` when it
 /// accepts. Both inputs are injected, so every refusal case is unit-testable
 /// without a live enroll or a real secondary spawn.
@@ -1878,18 +1884,22 @@ type DevenvEnrollJoin = Result<Result<enroll::EnrollOutcome, String>, tokio::tas
 /// Always returns an ack and never panics the relay — a panic here would take
 /// the whole device socket down with it.
 ///
-/// **Known limitation (pre-existing, recorded not fixed).** This transport and
-/// `env_agent::directive::handle_enroll_directive` (coord's dispatch channel)
-/// both call `enroll::run_enroll` with NO shared in-flight guard, so a
-/// coord-dispatched enroll and a socket-pushed one can overlap and race on
-/// `~/.qontinui/env-agent.json` + the stored machine key. Serialization here is
-/// incidental — `handle_relay_command` is awaited serially in the read loop, so
-/// only ONE socket-pushed enroll runs at a time (which is also why the enroll
-/// itself is NOT detached below, only the capture). Nothing coordinates the two
-/// sources. This change makes the transport fire automatically on every connect,
-/// which raises the odds; a real guard (a process-wide async mutex or a lock file
-/// around `run_enroll`) belongs in the env-agent core where both callers reach
-/// it, not here.
+/// **Concurrency.** Do NOT rely on the read loop to serialize enrolls. It looks
+/// like it does — `handle_relay_command` is awaited serially — but
+/// `DEVENV_ENROLL_ACK_BUDGET` (20s) expires while `run_enroll`'s own POST is
+/// still allowed 30s, and dropping a `spawn_blocking` `JoinHandle` does not
+/// cancel the task. So there is a ≥10s window in which the loop is free to
+/// dispatch a second `devenv_enroll` while the first is still writing. The real
+/// serialization is `enroll::with_enroll_slot`, a process-wide guard inside
+/// `run_enroll` itself: a second concurrent enroll — from this transport, from
+/// coord's `directive::handle_enroll_directive`, from the CLI or the Tauri
+/// command — returns `enroll::ENROLL_ALREADY_IN_FLIGHT` without touching secure
+/// storage or the config, and that reason lands in this handler's `ok:false`
+/// ack via the `Ok(Err(e))` arm below.
+///
+/// The enroll is still not DETACHED here, for a different reason than
+/// serialization: detaching would mean acking before the outcome is known, and
+/// the ack is what the server's dispatch bookkeeping keys on.
 async fn handle_devenv_enroll(data: &Value) -> Option<Value> {
     handle_devenv_enroll_with(data, DEVENV_ENROLL_ACK_BUDGET, |request| {
         let DevenvEnrollRequest {
@@ -1959,7 +1969,17 @@ where
     // Bounded: this future is awaited serially in the relay's read loop, and
     // overrunning `STALE_INBOUND_TIMEOUT` drops the socket *and* the ack. See
     // `DEVENV_ENROLL_ACK_BUDGET` for why the pessimistic ack is the safe side.
-    let outcome = match tokio::time::timeout(budget, spawn_enroll(request)).await {
+    //
+    // `spawn_enroll` is CALLED inside the async block, not passed as an
+    // already-built future: `timeout(budget, spawn_enroll(request))` would
+    // evaluate the closure body before the clock starts. That happens to be
+    // harmless today (the body is a bare `spawn_blocking`), but anything added
+    // ahead of the spawn — a config read, a DNS lookup — would sit OUTSIDE the
+    // liveness budget, and no test would catch it: the injected test closure is
+    // `std::future::pending`, whose eager region is empty.
+    let outcome = match tokio::time::timeout(budget, async move { spawn_enroll(request).await })
+        .await
+    {
         Ok(o) => o,
         Err(_) => {
             let secs = budget.as_secs();
@@ -3963,6 +3983,37 @@ mod tests {
         assert_eq!(ack["environment_id"], "server-env");
     }
 
+    /// The 20s ack budget is shorter than `run_enroll`'s own 30s POST timeout,
+    /// and dropping a `spawn_blocking` handle does not cancel the task — so the
+    /// read loop CAN dispatch a second `devenv_enroll` while the first is still
+    /// writing. `enroll::with_enroll_slot` is what actually serializes them;
+    /// this pins that its refusal reaches the operator as a normal `ok:false`
+    /// ack (with the machine_id echo) rather than being swallowed or retried.
+    #[tokio::test]
+    async fn devenv_enroll_surfaces_the_in_flight_refusal_as_an_ack() {
+        let _env = env_lock();
+        let _restore = EnvVarRestore::capture(DEVENV_ENV_KEYS);
+        clear_devenv_env();
+
+        let frame = json!({
+            "type": "devenv_enroll",
+            "enrollment_code": "ENR-SECOND",
+            "machine_id": "frame-machine",
+        });
+        let ack = handle_devenv_enroll_with(&frame, Duration::from_secs(5), |_req| {
+            std::future::ready(Ok(Err(enroll::ENROLL_ALREADY_IN_FLIGHT.to_string())))
+        })
+        .await
+        .expect("must ack");
+
+        assert_eq!(ack["ok"], false);
+        assert_eq!(
+            ack["reason"], enroll::ENROLL_ALREADY_IN_FLIGHT,
+            "the guard's reason must reach the wire verbatim: {ack}"
+        );
+        assert_eq!(ack["machine_id"], "frame-machine");
+    }
+
     /// A malformed frame is answered, not dropped and not panicked on — the
     /// relay carries every other command on this socket.
     #[tokio::test]
@@ -4146,15 +4197,29 @@ mod tests {
         assert!(payload.get("osVersion").is_some());
     }
 
-    /// The dispatch arm's literal. Routed through `handle_relay_command`'s own
-    /// `match` would need an `ApiState`; the refusal path is reached before any
-    /// state is touched, so this pins the string by asserting that the exact
-    /// spelling — and ONLY it — is answered with a `devenv_enroll_ack`.
-    #[tokio::test]
-    async fn devenv_enroll_command_type_literal_is_pinned() {
-        // The one spelling the server sends.
+    /// Pins the command-type SPELLING qontinui-web sends.
+    ///
+    /// The dispatch arm in `handle_relay_command` is written as the
+    /// `DEVENV_ENROLL_COMMAND` pattern rather than an inline literal, so there
+    /// is no second copy of the string that can drift from this one: asserting
+    /// the const's value is therefore equivalent to asserting the arm's.
+    ///
+    /// **What this does NOT pin**, deliberately stated rather than implied: that
+    /// `handle_relay_command`'s `match` still CONTAINS the arm. Reaching that
+    /// `match` needs an `ApiState`, which owns a `tauri::AppHandle` and so is
+    /// not constructible in a unit test. Deleting the arm would compile, and
+    /// this test would still pass — the frame would fall through to the `_`
+    /// arm's "Unknown relay command type" warn and send no ack. That gap is
+    /// covered by the qontinui-web side's integration test, not here.
+    #[test]
+    fn devenv_enroll_command_type_literal_is_pinned() {
         assert_eq!(DEVENV_ENROLL_COMMAND, "devenv_enroll");
+    }
 
+    /// The ack `type` is the other half of the cross-repo contract: web routes
+    /// on this exact string (`devices_ws.py::_route_device_message`).
+    #[tokio::test]
+    async fn devenv_enroll_answers_with_the_pinned_ack_type() {
         let _env = env_lock();
         let _restore = EnvVarRestore::capture(DEVENV_ENV_KEYS);
         clear_devenv_env();
@@ -4162,7 +4227,7 @@ mod tests {
 
         let ack = handle_devenv_enroll(&json!({"type": DEVENV_ENROLL_COMMAND}))
             .await
-            .expect("the pinned command type must be answered");
+            .expect("every path must ack");
         assert_eq!(ack["type"], "devenv_enroll_ack");
     }
 }
