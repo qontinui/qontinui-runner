@@ -317,8 +317,13 @@ async fn load_and_project_skeleton(
         )));
     }
 
-    // Project S down to S_Ξ.
-    let page_renders = load_page_render_ids(pg_db, &candidate_id, &normalized.union).await?;
+    // Project S down to S_Ξ, scoped to this app. `app_id` is the same value
+    // stamped into the provenance below — two apps whose views slug to the same
+    // page label (the runner's own `specs` tab and qontinui-web's `/specs`
+    // route both slug to `specs`) share this namespace, so an unscoped
+    // intersection would assemble one app's page from another app's renders.
+    let page_renders =
+        load_page_render_ids(pg_db, &candidate_id, &normalized.union, app_id).await?;
     if page_renders.is_empty() {
         // Three different causes land here, and collapsing them is what made a
         // producer/consumer key mismatch require a code read to diagnose. Since
@@ -329,7 +334,14 @@ async fn load_and_project_skeleton(
         // `derived_at` so the answer names the cause rather than guessing at
         // it. It runs only on the failure path, and both `EXISTS` halves
         // short-circuit on `idx_observations_spec`.
-        let seen = page_observation_history(pg_db, &candidate_id, artifact.derived_at).await?;
+        //
+        // It is scoped by the same `app_id` as the query above, deliberately:
+        // a diagnosis drawn from a wider corpus than the query it explains
+        // would name the wrong cause — reporting `ever == true` off another
+        // app's observations and sending the reader to re-derive a page that
+        // this app has simply never been observed on.
+        let seen =
+            page_observation_history(pg_db, &candidate_id, artifact.derived_at, app_id).await?;
         return Err(if !seen.ever {
             // Nothing was ever labelled for this page. Fix: visit it, or make
             // capture label it.
@@ -520,6 +532,26 @@ fn normalize_render_ids(clusters: &[Cluster]) -> NormalizedRenders {
 /// Global artifacts are the ones written with `spec_id IS NULL` — derivation
 /// runs over the whole observation corpus (see [`load_and_project_skeleton`]
 /// for why). `for_page` is used only to name the page in the not-found error.
+///
+/// **Deliberately NOT app-scoped, unlike [`load_page_render_ids`] — and that
+/// asymmetry is a fact about the schema, not an oversight.** This query reads
+/// `state_discovery_artifacts`, which has **no `app_id` column**: the column
+/// `appid_01` added lives on `co_occurrence_observations` alone, and no
+/// migration adds one here. The runner's own CLI states the same thing at
+/// `src-tauri/src/bin/qontinui_specs.rs:232` — the
+/// `state_discovery_artifacts` / `cached_specs` tables "do NOT yet carry"
+/// `app_id`.
+///
+/// So there is nothing to filter on, and adding a filter that reads as scoped
+/// while matching nothing would be worse than none. Giving artifacts an app
+/// dimension is a strictly larger change — a second web migration *plus*
+/// teaching the derivation writer (`state_discovery::derive`'s `INSERT INTO
+/// state_discovery_artifacts`) to derive per-app artifacts, which changes the
+/// derivation model from one global cluster space to one per app. It buys
+/// nothing over a single-app corpus (per-app derivation over runner-only
+/// observations yields exactly one artifact), so it is tracked as a follow-up
+/// rather than done here. The page-level query below is where scoping
+/// currently has to hold.
 async fn load_latest_global_artifact(
     pg_db: &PgDb,
     for_page: &str,
@@ -588,11 +620,25 @@ const MAX_BOUND_RENDERS: usize = 50_000;
 /// unit test that does not reach PG — so the regression guard is an assertion
 /// that this string bounds by `id`, not by time. See
 /// `page_query_is_bounded_by_artifact_ids_not_by_time`.
+///
+/// `app_id = $3` is deliberately **strict** — not `app_id = $3 OR app_id IS
+/// NULL`. NULL-tolerance would permanently re-admit the cross-app mixing this
+/// predicate exists to remove, since every historical row carried `NULL` before
+/// the backfill. Strictness is safe because the backfill migration attributes
+/// the whole pre-existing corpus to `qontinui-runner` and lands first; a row
+/// that still reads `NULL` afterwards genuinely means "app unknown" and must
+/// not be claimed by any app's scoped query.
+///
+/// `invalidated_at IS NULL` must stay: besides its own correctness argument
+/// below, it is the predicate of the partial index
+/// `idx_observations_spec (spec_id, app_id, captured_at) WHERE invalidated_at
+/// IS NULL`, so dropping it would make that index ineligible.
 const PAGE_RENDERS_SQL: &str = r#"SELECT id
    FROM co_occurrence_observations
    WHERE spec_id = $1
      AND invalidated_at IS NULL
-     AND id = ANY($2::uuid[])"#;
+     AND id = ANY($2::uuid[])
+     AND app_id = $3"#;
 
 /// Observation ids labelled for `page_label`, **bounded by the artifact's own
 /// render-set** rather than by a time window.
@@ -633,10 +679,19 @@ const PAGE_RENDERS_SQL: &str = r#"SELECT id
 /// `invalidated_at IS NULL` must stay: an operator-invalidated observation has
 /// to stop counting even though an artifact derived before the invalidation
 /// still names it.
+///
+/// A third filter, `app_id = $3`, scopes the page label to one app. Two apps
+/// whose views slug to the same label share this namespace — the runner's own
+/// `specs` tab and qontinui-web's `/specs` route both slug to `specs` — so
+/// without it a page's `S_Ξ` would be assembled from another app's renders.
+/// `app_id` comes from [`load_and_project_skeleton`], which already holds it
+/// for provenance stamping. The match is strict; see [`PAGE_RENDERS_SQL`] for
+/// why NULL-tolerance is not an option.
 async fn load_page_render_ids(
     pg_db: &PgDb,
     page_label: &str,
     artifact_renders: &[Uuid],
+    app_id: &str,
 ) -> Result<HashSet<Uuid>, AuthoringError> {
     let conn = pg_db
         .pool()
@@ -645,7 +700,7 @@ async fn load_page_render_ids(
         .map_err(|e| AuthoringError::Database(format!("PG pool error: {}", e)))?;
 
     let rows = conn
-        .query(PAGE_RENDERS_SQL, &[&page_label, &artifact_renders])
+        .query(PAGE_RENDERS_SQL, &[&page_label, &artifact_renders, &app_id])
         .await
         .map_err(|e| {
             AuthoringError::Database(format!("PG query co_occurrence_observations: {}", e))
@@ -661,6 +716,36 @@ struct PageObservationHistory {
     /// Has it carried one captured *after* the artifact was derived?
     since_derivation: bool,
 }
+
+/// The failure-path diagnosis query, hoisted to a `const` so a test can pin its
+/// shape — as [`PAGE_RENDERS_SQL`] is, and for the same reason: the statement is
+/// runtime-parsed (this crate uses no sqlx), so a silently de-scoped rewrite
+/// compiles clean and surfaces only as a wrongly-named error on a path nobody
+/// watches.
+///
+/// Both `EXISTS` halves carry `app_id = $3`, matching [`PAGE_RENDERS_SQL`]'s
+/// scoping exactly, and by the same strictness argument. This is not optional:
+/// a diagnostic that asks a broader question than the query it diagnoses answers
+/// the wrong one. An app-scoped miss would report `ever == true` on the strength
+/// of *another* app's observations, so [`load_and_project_skeleton`] would raise
+/// `NoActiveStates` / `ObservedButUnclustered` where the truth is
+/// `NoPageObservations` — reintroducing the very producer/consumer-mismatch
+/// diagnosis failure this function exists to have removed.
+const PAGE_HISTORY_SQL: &str = r#"SELECT EXISTS(
+                   SELECT 1
+                   FROM co_occurrence_observations
+                   WHERE spec_id = $1
+                     AND invalidated_at IS NULL
+                     AND app_id = $3
+               ),
+               EXISTS(
+                   SELECT 1
+                   FROM co_occurrence_observations
+                   WHERE spec_id = $1
+                     AND invalidated_at IS NULL
+                     AND app_id = $3
+                     AND captured_at > $2
+               )"#;
 
 /// Ask PG the two questions that separate the three causes of an empty
 /// intersection, in one round trip.
@@ -687,11 +772,14 @@ struct PageObservationHistory {
 /// just removed. `since_derivation` is bounded by the artifact's own
 /// `derived_at` rather than by a wall-clock window, for the same reason.
 ///
-/// Both halves are `EXISTS`, so both short-circuit on `idx_observations_spec`.
+/// Both halves are `EXISTS`, so both short-circuit on `idx_observations_spec`,
+/// and both are scoped to `app_id` — see [`PAGE_HISTORY_SQL`] for why that
+/// scoping is load-bearing rather than cosmetic.
 async fn page_observation_history(
     pg_db: &PgDb,
     page_label: &str,
     derived_at: chrono::DateTime<chrono::Utc>,
+    app_id: &str,
 ) -> Result<PageObservationHistory, AuthoringError> {
     let conn = pg_db
         .pool()
@@ -700,22 +788,7 @@ async fn page_observation_history(
         .map_err(|e| AuthoringError::Database(format!("PG pool error: {}", e)))?;
 
     let row = conn
-        .query_one(
-            r#"SELECT EXISTS(
-                   SELECT 1
-                   FROM co_occurrence_observations
-                   WHERE spec_id = $1
-                     AND invalidated_at IS NULL
-               ),
-               EXISTS(
-                   SELECT 1
-                   FROM co_occurrence_observations
-                   WHERE spec_id = $1
-                     AND invalidated_at IS NULL
-                     AND captured_at > $2
-               )"#,
-            &[&page_label, &derived_at],
-        )
+        .query_one(PAGE_HISTORY_SQL, &[&page_label, &derived_at, &app_id])
         .await
         .map_err(|e| {
             AuthoringError::Database(format!("PG query co_occurrence_observations: {}", e))
@@ -1693,6 +1766,75 @@ mod tests {
             PAGE_RENDERS_SQL.contains("invalidated_at IS NULL"),
             "an operator-invalidated observation must stop counting even when \
              an older artifact still names it"
+        );
+        // App scoping. Page labels are a shared namespace — the runner's own
+        // `specs` tab and qontinui-web's `/specs` route both slug to `specs` —
+        // so without this predicate one app's S_Ξ is assembled from another
+        // app's renders. Invisible without PG, hence the text assertion.
+        assert!(
+            PAGE_RENDERS_SQL.contains("app_id = $3"),
+            "the page query must be scoped to one app. Got: {PAGE_RENDERS_SQL}"
+        );
+        // And strictly. `OR app_id IS NULL` would permanently re-admit the
+        // cross-app mixing this predicate exists to remove, because every
+        // pre-backfill row carries NULL — a row that still reads NULL after the
+        // backfill means "app unknown" and belongs to no app's scoped query.
+        assert!(
+            !PAGE_RENDERS_SQL.contains("app_id IS NULL"),
+            "app scoping must be strict — NULL-tolerance re-admits cross-app \
+             mixing. Got: {PAGE_RENDERS_SQL}"
+        );
+    }
+
+    #[test]
+    fn failure_path_diagnosis_is_scoped_to_the_same_app_as_the_query() {
+        // The diagnostic must ask exactly the question the query it explains
+        // asks. If `PAGE_RENDERS_SQL` is app-scoped and this is not, an
+        // app-scoped miss reports `ever == true` on the strength of ANOTHER
+        // app's observations, and the caller raises `NoActiveStates` /
+        // `ObservedButUnclustered` where the truth is `NoPageObservations` —
+        // the producer/consumer-mismatch misdiagnosis this function exists to
+        // have removed. Both halves are separate `EXISTS` subqueries, so both
+        // must carry the predicate; scoping only one is a silent half-fix.
+        assert_eq!(
+            PAGE_HISTORY_SQL.matches("app_id = $3").count(),
+            2,
+            "BOTH `EXISTS` halves must be app-scoped, not just one. Got: \
+             {PAGE_HISTORY_SQL}"
+        );
+        assert_eq!(
+            PAGE_HISTORY_SQL.matches("EXISTS(").count(),
+            2,
+            "the diagnosis is two `EXISTS` halves in one round trip; if that \
+             changes, the scoping count above is measuring the wrong thing. \
+             Got: {PAGE_HISTORY_SQL}"
+        );
+        // Strict here too, for the same reason as the query.
+        assert!(
+            !PAGE_HISTORY_SQL.contains("app_id IS NULL"),
+            "the diagnosis must be scoped as strictly as the query. Got: \
+             {PAGE_HISTORY_SQL}"
+        );
+        // The halves that make the diagnosis mean anything: `ever` stays
+        // time-unbounded, `since_derivation` is bounded by the artifact's own
+        // `derived_at` (never a wall-clock window), and invalidated rows never
+        // count on either side.
+        assert_eq!(
+            PAGE_HISTORY_SQL.matches("invalidated_at IS NULL").count(),
+            2,
+            "an invalidated observation must not resurrect either half. Got: \
+             {PAGE_HISTORY_SQL}"
+        );
+        assert_eq!(
+            PAGE_HISTORY_SQL.matches("captured_at").count(),
+            1,
+            "exactly one half is time-bounded — `ever` must stay unbounded or \
+             it stops answering EVER. Got: {PAGE_HISTORY_SQL}"
+        );
+        assert!(
+            PAGE_HISTORY_SQL.contains("captured_at > $2"),
+            "`since_derivation` must be bounded by the artifact's `derived_at` \
+             bind, not by a wall-clock window. Got: {PAGE_HISTORY_SQL}"
         );
     }
 
