@@ -648,6 +648,7 @@ fn authoring_error_reason(
         NoDiscoveryArtifact { .. } => "no-discovery-artifact",
         EmptyArtifact => "empty-artifact",
         NoPageObservations { .. } => "no-page-observations",
+        PageObservationsUnattributed { .. } => "page-observations-unattributed",
         NoActiveStates { .. } => "no-active-states",
         ObservedButUnclustered { .. } => "observed-but-unclustered",
         MalformedAiOutput(_) => "malformed-ai-output",
@@ -670,6 +671,15 @@ fn authoring_error_detail(
             "no observations labelled for page '{}' — the page has never been \
              visited, or capture is not labelling it",
             page_label
+        ),
+        PageObservationsUnattributed { page_label, app_id } => format!(
+            "page '{}' HAS labelled observations, but none of them carries app_id='{}' — \
+             visiting the page will not help. Either the observation app_id backfill has \
+             not been applied on this database (every historical row still reads NULL), or \
+             the capture producer that stamps app_id is not deployed yet. Apply the \
+             backfill / deploy the producer; only if both are already true does this page \
+             genuinely belong to a different app",
+            page_label, app_id
         ),
         NoActiveStates {
             page_label,
@@ -1219,6 +1229,52 @@ mod tests {
         assert!(
             unclustered_detail.contains("re-deriving will not change this"),
             "the unclustered case must say re-deriving won't help: {unclustered_detail}"
+        );
+    }
+
+    /// Only the variant that actually means "this page was never observed" may
+    /// prescribe visiting it.
+    ///
+    /// Regression guard for the second-order cost of app-scoping the failure
+    /// diagnostic: against an un-backfilled or un-attributed corpus every
+    /// app-scoped read is empty, so without the unscoped probe behind
+    /// `PageObservationsUnattributed` this path would tell the operator to go
+    /// click around the UI — for every page at once, and it would never help.
+    #[test]
+    fn only_the_never_observed_diagnosis_prescribes_visiting_the_page() {
+        use crate::workflow_generation::spec_authoring::AuthoringError;
+
+        let never = AuthoringError::NoPageObservations {
+            page_label: "specs".into(),
+        };
+        let unattributed = AuthoringError::PageObservationsUnattributed {
+            page_label: "specs".into(),
+            app_id: "qontinui-runner".into(),
+        };
+
+        assert_ne!(
+            authoring_error_reason(&never),
+            authoring_error_reason(&unattributed),
+            "the two causes must be machine-distinguishable, not just worded differently"
+        );
+
+        let never_detail = authoring_error_detail(&never);
+        assert!(
+            never_detail.contains("never been visited"),
+            "the never-observed case is the one visiting fixes: {never_detail}"
+        );
+
+        let unattributed_detail = authoring_error_detail(&unattributed);
+        assert!(
+            unattributed_detail.contains("visiting the page will not help"),
+            "the unattributed case must explicitly deny the visit remedy, or it reads as a \
+             wordier NoPageObservations: {unattributed_detail}"
+        );
+        assert!(
+            unattributed_detail.contains("backfill")
+                && unattributed_detail.contains("qontinui-runner"),
+            "the unattributed case must name the actual remedies and the app that cannot \
+             see the corpus: {unattributed_detail}"
         );
     }
 
