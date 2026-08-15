@@ -268,6 +268,14 @@ mod workflow_state;
 // plans/2026-08-04-remove-hardcoded-machine-paths-from-product-code.md.
 mod workspace_paths;
 
+// The sibling door to "where is this crate-bundled asset at runtime?" — the
+// Tauri resource resolver, the dev-checkout rung derived from `workspace_paths`,
+// and the shared existence rule. Separate from `workspace_paths` on purpose: an
+// asset shipped inside the installer and a file that exists only in a developer
+// checkout are different things, and resolving one as the other is a wrong
+// answer that looks right on the author's machine. Same plan, slice 5 Phase 6.
+mod bundled_resources;
+
 // Stream E (Flywheel) Step 11 — end-to-end integration test module. The
 // file-level `#![cfg(all(test, feature = "spec-authoring"))]` ensures it
 // only compiles when running tests with the feature enabled.
@@ -915,6 +923,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // sibling publishers above.
                 qontinui_runner_lib::env_agent::publish_pg_pool(
                     publishers_thread_pg.pool().clone(),
+                );
+                // Same lib↔bin bridge, for the workspace root. The `versions`
+                // collector reads the repo checkouts, and `workspace_paths` —
+                // the crate's ONE door to that question — lives in THIS crate,
+                // unreachable from the lib. Publishing the door keeps the
+                // collector off a second resolver (plan
+                // `2026-08-04-remove-hardcoded-machine-paths-from-product-code`,
+                // slice 5 Phase 8).
+                //
+                // The FUNCTION is published, not the value it returns today, and
+                // unconditionally. `workspace_paths` reads the operator-editable
+                // `paths.workspace_root` setting on every call, so a correction
+                // made while the runner is up reaches the next capture instead of
+                // waiting for a restart fleet policy forbids. Publishing a value
+                // guarded by `if let Some(..)` also meant a boot on which nothing
+                // resolved published nothing, permanently — the keys could never
+                // appear afterwards, however the operator fixed the setting.
+                qontinui_runner_lib::env_agent::collectors::publish_workspace_root(
+                    crate::workspace_paths::workspace_root,
                 );
                 qontinui_runner_lib::env_agent::spawn_env_capture();
                 // Phase 3 — dispatched self-enroll: subscribe to coord's
@@ -4003,8 +4030,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // and inject missing dev services. Persist if anything changed so
                 // the cleanup survives future boots (otherwise duplicates can
                 // re-accumulate in settings.json across sessions).
+                //
+                // The root comes from `workspace_paths` — the crate's one door
+                // — not from the deleted `dev_services::find_workspace_root`,
+                // whose rung 2 was the inherited cwd and whose predicate had no
+                // `.git` check (plan
+                // `2026-08-04-remove-hardcoded-machine-paths-from-product-code`,
+                // slice 5 Phase 8). Discovery disposition: an unresolved root
+                // skips dev-service injection for this boot and says so. It
+                // cannot silently inject services rooted at a fabricated path.
                 if dev_services::is_dev_mode() {
-                    if let Some(workspace) = dev_services::find_workspace_root() {
+                    if let Some(workspace) = crate::workspace_paths::workspace_root() {
                         let mutated =
                             dev_services::upgrade_and_dedupe_configs(&mut configs, &workspace);
 
@@ -4036,6 +4072,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 info!("Dev-mode: persisted upgraded/deduped/injected configs to settings");
                             }
                         }
+                    } else {
+                        warn!(
+                            "Dev-mode: no Qontinui workspace root resolves, so the default \
+                             dev services (Docker/backend/frontend/embedding) were NOT \
+                             injected. Set $QONTINUI_ROOT (or `paths.workspace_root`) to \
+                             the directory holding the repo checkouts. \
+                             `workspace_paths` has already logged which probe was rejected."
+                        );
                     }
                 }
 

@@ -1893,16 +1893,36 @@ pub async fn get_execution_spans(
     })))
 }
 
+/// The shared dev-logs directory: `<workspace-root>/.dev-logs`.
+///
+/// It used to be `env!("CARGO_MANIFEST_DIR")/../..` — a **compile-time**
+/// constant, so a shipped binary pointed at the `.dev-logs` of whichever source
+/// tree BUILT it, invisible to any grep for a drive-letter literal. The
+/// resolution now goes to the crate's one door
+/// [`crate::workspace_paths::workspace_root`] (plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
+/// Phase 7 — class 2).
+///
+/// Pure, with the root injected, so the layout rule is unit-testable against a
+/// synthetic root rather than against whatever this machine resolves to.
+fn dev_logs_dir_in(root: &std::path::Path) -> std::path::PathBuf {
+    root.join(".dev-logs")
+}
+
 /// Migrate JSONL logs to the database for a task run.
 ///
 /// TODO: Port the old log_migration logic to write into PostgreSQL. Currently
 /// this endpoint is a stub that returns an error so the client knows the
 /// feature isn't live yet.
+///
+/// The `.dev-logs` resolution below is nevertheless honest rather than
+/// compile-time baked (see [`dev_logs_dir_in`]): the stub is temporary, and a
+/// wrong path that only becomes load-bearing when the stub is implemented is
+/// exactly the kind of latent defect slice 5 Phase 7 removes.
 pub async fn migrate_task_run_logs(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use std::path::PathBuf;
     use tracing::info;
 
     info!("Migrating JSONL logs for task run: {}", id);
@@ -1917,16 +1937,16 @@ pub async fn migrate_task_run_logs(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get the dev-logs directory path
-    let dev_logs_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join(".dev-logs"))
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to resolve .dev-logs path".to_string(),
-            )
-        })?;
+    let workspace_root = crate::workspace_paths::workspace_root().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve .dev-logs path: no Qontinui workspace root resolved. \
+             Set $QONTINUI_ROOT (or the `paths.workspace_root` setting) to the \
+             directory holding the repo checkouts."
+                .to_string(),
+        )
+    })?;
+    let dev_logs_dir = dev_logs_dir_in(&workspace_root);
 
     // Stub until log migration is implemented against PG.
     let _task_run = task_run;
@@ -3150,4 +3170,48 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/current-execution/batch", get(get_current_execution_batch))
         .route("/task-runs/{id}/usage", get(get_task_run_usage))
         .route("/traces/{trace_id}", get(get_trace_correlation))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// The layout rule: `.dev-logs` sits directly under the workspace root, one
+    /// level ABOVE the repo checkouts — not under the runner repo, and not
+    /// wherever the binary happened to be built.
+    ///
+    /// Driven against a synthetic root, so it holds on a fresh checkout and on a
+    /// non-operator machine (the pre-Phase-7 version could not be tested at all:
+    /// its input was a compile-time constant).
+    #[test]
+    fn dev_logs_dir_is_dot_dev_logs_directly_under_the_workspace_root() {
+        let root = if cfg!(windows) {
+            PathBuf::from("Z:/synthetic-workspace-root")
+        } else {
+            PathBuf::from("/synthetic-workspace-root")
+        };
+
+        let got = dev_logs_dir_in(&root);
+
+        assert_eq!(got, root.join(".dev-logs"));
+        assert_eq!(got.parent(), Some(root.as_path()));
+        assert_eq!(got.file_name().and_then(|n| n.to_str()), Some(".dev-logs"));
+        assert!(
+            !got.starts_with(root.join("qontinui-runner")),
+            "the dev-logs dir is shared across repos, never inside one: {}",
+            got.display()
+        );
+    }
+
+    /// Relative roots are joined verbatim — the core adds no normalization of
+    /// its own, because rejecting a non-absolute root is `qontinui_types::paths`'
+    /// job and is tested there.
+    #[test]
+    fn dev_logs_dir_joins_without_normalizing() {
+        assert_eq!(
+            dev_logs_dir_in(Path::new("some/root")),
+            PathBuf::from("some/root").join(".dev-logs")
+        );
+    }
 }

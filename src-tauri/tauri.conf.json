@@ -29,6 +29,7 @@
       "icons/icon.ico"
     ],
     "externalBin": ["binaries/qontinui_profile", "binaries/qontinui-pr"],
+    "resources": ["resources/code-semantics/**/*", "data/**/*"],
     "createUpdaterArtifacts": true
   },
   "plugins": {

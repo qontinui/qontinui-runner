@@ -84,7 +84,7 @@ struct WipAttributionPayload {
     /// `Option<Uuid>`, so emit `Some` only when it parses; omit otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<uuid::Uuid>,
-    /// Top-level repo dir name under `/qontinui-root/` (always `qontinui-*`).
+    /// Top-level repo dir name under the workspace root (always `qontinui-*`).
     repo: String,
     /// Repo-relative path (joins `coord.primary_trees.dirty_files`).
     file: String,
@@ -100,29 +100,96 @@ struct WipAttributionPayload {
     tenant_id: Option<uuid::Uuid>,
 }
 
+/// The directory name to assume when the workspace root does not resolve.
+///
+/// Taken from the shared resolver's own last-resort probe
+/// (`<home>/qontinui-root`) rather than spelled again here, so the fail-soft
+/// default and the resolver can never disagree.
+const DEFAULT_WORKSPACE_DIR_NAME: &str = qontinui_types::paths::HOME_WORKSPACE_DIR;
+
+/// The directory names [`map_path_to_repo_file`] anchors on, in priority order:
+/// the resolved workspace root's own final segment, then
+/// [`DEFAULT_WORKSPACE_DIR_NAME`].
+///
+/// The marker used to be the hardcoded string `qontinui-root`, which assumed the
+/// workspace directory is *named* that. The resolver no longer requires it: any
+/// directory holding `qontinui-runner/.git` is a valid root, and `$QONTINUI_ROOT`
+/// may point anywhere (plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
+/// Phase 8).
+///
+/// **Fail-soft when the root is ABSENT and when it is WRONG.** Falling back only
+/// on `None` was not enough. `qontinui_types::paths` explicitly permits the root
+/// to resolve to a worktree *container*, and `persist_resolved_workspace_root`
+/// then makes that answer sticky in `settings.json` — so the derived marker can
+/// legitimately be something like `hp`, which no transcript path contains. Every
+/// path would then fail to match and the cycle would post zero rows, which reads
+/// exactly like "nobody edited anything". Trying the historical default behind
+/// the derived name costs one extra string search per path and cannot produce a
+/// wrong repo: both markers are matched as whole `/segment/` anchors and the
+/// `qontinui-` prefix check still gates the result.
+fn workspace_dir_markers() -> Vec<String> {
+    let root = crate::workspace_paths::workspace_root();
+    markers_from(workspace_dir_name_of(root.as_deref()))
+}
+
+/// Pure core of [`workspace_dir_markers`]: the derived name first, the default
+/// behind it, never the same name twice.
+fn markers_from(derived: Option<String>) -> Vec<String> {
+    match derived {
+        Some(name) if name != DEFAULT_WORKSPACE_DIR_NAME => {
+            vec![name, DEFAULT_WORKSPACE_DIR_NAME.to_string()]
+        }
+        _ => vec![DEFAULT_WORKSPACE_DIR_NAME.to_string()],
+    }
+}
+
+/// Pure core of [`workspace_dir_name`]: the root's own final path segment.
+/// `None` when there is no root, or when it has no ordinary final component
+/// (a filesystem root such as `C:\`, which is never a workspace root anyway).
+fn workspace_dir_name_of(root: Option<&Path>) -> Option<String> {
+    root.and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+}
+
 /// Map an absolute (or backslash) file path to `(repo, file)` IFF it lives
-/// under a `/qontinui-root/` segment AND its top-level dir starts with
+/// under a `/<workspace_dir>/` segment AND its top-level dir starts with
 /// `qontinui-` (the exact set the tree publisher reports, so `file` lines up
 /// with `coord.primary_trees.dirty_files`).
 ///
-/// - Normalizes `\` → `/`.
-/// - Finds the `/qontinui-root/` segment and takes the remainder.
+/// `workspace_dirs` is tried in order and the first marker that yields a match
+/// wins; see [`workspace_dir_markers`] for why there is more than one. `None`
+/// only when NO marker matches.
+///
+/// `workspace_dirs` is injected rather than read here, so this stays pure — no
+/// IO, no settings read — and unit-testable against a root named anything at
+/// all.
+pub(crate) fn map_path_to_repo_file(
+    file_path: &str,
+    workspace_dirs: &[&str],
+) -> Option<(String, String)> {
+    let normalized = file_path.replace('\\', "/");
+    workspace_dirs
+        .iter()
+        .find_map(|dir| map_normalized_under(&normalized, dir))
+}
+
+/// The single-marker rule, against an already slash-normalized path:
+///
+/// - Finds the `/<workspace_dir>/` segment and takes the remainder.
 /// - `repo` = up to the first `/`; `file` = the rest.
-/// - Returns `None` when there's no `/qontinui-root/` segment, no remainder
+/// - Returns `None` when there's no `/<workspace_dir>/` segment, no remainder
 ///   after the repo, or `repo` doesn't start with `qontinui-` (e.g. a
 ///   `multistate` repo, or a path outside the monorepo).
-///
-/// Pure (no IO) so it's unit-testable without a transcript file or network.
-/// This is the SAME mapping the reverted `claude-config` hook used.
-pub(crate) fn map_path_to_repo_file(file_path: &str) -> Option<(String, String)> {
-    let normalized = file_path.replace('\\', "/");
-    // Anchor on the `/qontinui-root/` segment; take everything after it. The
+fn map_normalized_under(normalized: &str, workspace_dir: &str) -> Option<(String, String)> {
+    // Anchor on the `/<workspace_dir>/` segment; take everything after it. The
     // leading `/` ensures we match a path SEGMENT, not a substring inside a dir
     // name. A nested worktree path (e.g.
-    // `.../qontinui-root/qontinui-runner-wt-foo/src/x.rs`) maps to its own
+    // `.../<workspace_dir>/qontinui-runner-wt-foo/src/x.rs`) maps to its own
     // top-level dir (`qontinui-runner-wt-foo`) — that dir is still `qontinui-*`.
-    let marker = "/qontinui-root/";
-    let idx = normalized.find(marker)?;
+    let marker = format!("/{workspace_dir}/");
+    let idx = normalized.find(&marker)?;
     let rest = &normalized[idx + marker.len()..];
 
     let slash = rest.find('/')?;
@@ -146,10 +213,12 @@ pub(crate) fn map_path_to_repo_file(file_path: &str) -> Option<(String, String)>
 /// Reuses [`transcript::parse_line_for_touched_files`] (which already filters
 /// to Edit/Write/MultiEdit and excludes NotebookEdit, and tolerates malformed
 /// JSON / non-assistant lines by yielding nothing) then applies
-/// [`map_path_to_repo_file`]. Pure (no IO) so it's unit-testable.
+/// [`map_path_to_repo_file`]. Pure (no IO) so it's unit-testable —
+/// `workspace_dirs` is injected for the same reason.
 pub(crate) fn extract_attributions_from_new_bytes(
     session_id: &str,
     new_bytes: &str,
+    workspace_dirs: &[&str],
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in new_bytes.lines() {
@@ -160,7 +229,7 @@ pub(crate) fn extract_attributions_from_new_bytes(
             Err(_) => continue,
         };
         for tf in touched {
-            if let Some(pair) = map_path_to_repo_file(&tf.file_path) {
+            if let Some(pair) = map_path_to_repo_file(&tf.file_path, workspace_dirs) {
                 out.push(pair);
             }
         }
@@ -267,6 +336,13 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
     // sessions publish through their own agent identity, not this walker).
     let tenant_id = crate::fleet::resolve_tenant_id();
 
+    // The workspace directory names every transcript path is anchored on.
+    // Resolved ONCE per cycle, next to the tenant, rather than per file path:
+    // it is a cycle-level property, and `workspace_paths` is deliberately not
+    // memoized (the setting is operator-editable at runtime).
+    let workspace_dirs = workspace_dir_markers();
+    let workspace_dirs: Vec<&str> = workspace_dirs.iter().map(String::as_str).collect();
+
     let mut posted = 0usize;
     for rec in open {
         let session_id = rec.claude_session_id;
@@ -369,7 +445,9 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
         // the file by device, just without a last-writer session).
         let session_uuid = uuid::Uuid::parse_str(&session_id).ok();
 
-        for (repo, file) in extract_attributions_from_new_bytes(&session_id, &new_bytes) {
+        for (repo, file) in
+            extract_attributions_from_new_bytes(&session_id, &new_bytes, &workspace_dirs)
+        {
             let payload = WipAttributionPayload {
                 device_id,
                 session_id: session_uuid,
@@ -529,11 +607,21 @@ mod tests {
     }
 
     // ---- map_path_to_repo_file ------------------------------------------------
+    //
+    // The workspace directory name is INJECTED into every case below. These
+    // assert a string transformation, so they read the same as before the
+    // marker stopped being hardcoded (plan
+    // `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
+    // Phase 8) — but they no longer depend on how the machine running the suite
+    // is configured.
+
+    /// The historical directory name, still the fail-soft default.
+    const WS: &[&str] = &["qontinui-root"];
 
     #[test]
     fn maps_forward_slash_qontinui_path() {
         assert_eq!(
-            map_path_to_repo_file("D:/qontinui-root/qontinui-coord/src/routes.rs"),
+            map_path_to_repo_file("D:/qontinui-root/qontinui-coord/src/routes.rs", WS),
             Some(("qontinui-coord".to_string(), "src/routes.rs".to_string()))
         );
     }
@@ -541,7 +629,7 @@ mod tests {
     #[test]
     fn maps_backslash_variant() {
         assert_eq!(
-            map_path_to_repo_file("D:\\qontinui-root\\qontinui-coord\\src\\routes.rs"),
+            map_path_to_repo_file("D:\\qontinui-root\\qontinui-coord\\src\\routes.rs", WS),
             Some(("qontinui-coord".to_string(), "src/routes.rs".to_string()))
         );
     }
@@ -549,7 +637,7 @@ mod tests {
     #[test]
     fn skips_path_outside_qontinui_root() {
         assert_eq!(
-            map_path_to_repo_file("C:/Users/jspin/Documents/other/file.rs"),
+            map_path_to_repo_file("C:/Users/jspin/Documents/other/file.rs", WS),
             None
         );
     }
@@ -559,7 +647,7 @@ mod tests {
         // A repo under qontinui-root that doesn't start with `qontinui-`
         // (e.g. `multistate`) is NOT reported by the tree publisher → skip.
         assert_eq!(
-            map_path_to_repo_file("D:/qontinui-root/multistate/src/lib.rs"),
+            map_path_to_repo_file("D:/qontinui-root/multistate/src/lib.rs", WS),
             None
         );
     }
@@ -570,7 +658,8 @@ mod tests {
         // still `qontinui-*`), not the inner repo.
         assert_eq!(
             map_path_to_repo_file(
-                "D:/qontinui-root/qontinui-runner-wt-attrcap/src-tauri/src/fleet.rs"
+                "D:/qontinui-root/qontinui-runner-wt-attrcap/src-tauri/src/fleet.rs",
+                WS
             ),
             Some((
                 "qontinui-runner-wt-attrcap".to_string(),
@@ -583,12 +672,126 @@ mod tests {
     fn skips_repo_with_no_file_remainder() {
         // `/qontinui-root/qontinui-coord` with no trailing file → None.
         assert_eq!(
-            map_path_to_repo_file("D:/qontinui-root/qontinui-coord"),
+            map_path_to_repo_file("D:/qontinui-root/qontinui-coord", WS),
             None
         );
         assert_eq!(
-            map_path_to_repo_file("D:/qontinui-root/qontinui-coord/"),
+            map_path_to_repo_file("D:/qontinui-root/qontinui-coord/", WS),
             None
+        );
+    }
+
+    // ---- the marker is derived, not assumed -----------------------------------
+
+    /// The whole point of the change: a workspace root that is NOT named
+    /// `qontinui-root` still attributes. Before this, every edit on such a box
+    /// mapped to `None` and the machine published nothing — a silent, total
+    /// loss of attribution that looked exactly like "this session edited
+    /// nothing".
+    #[test]
+    fn maps_a_workspace_root_named_something_other_than_qontinui_root() {
+        assert_eq!(
+            map_path_to_repo_file(
+                "/srv/checkouts/qontinui-coord/src/routes.rs",
+                &["checkouts"]
+            ),
+            Some(("qontinui-coord".to_string(), "src/routes.rs".to_string()))
+        );
+        assert_eq!(
+            map_path_to_repo_file(
+                "E:\\work\\qontinui-runner\\src-tauri\\src\\fleet.rs",
+                &["work"]
+            ),
+            Some((
+                "qontinui-runner".to_string(),
+                "src-tauri/src/fleet.rs".to_string()
+            ))
+        );
+        // ...and the old hardcoded name is no longer privileged: given ONLY a
+        // root named `work`, a `qontinui-root` segment is just another directory.
+        assert_eq!(
+            map_path_to_repo_file("/srv/checkouts/qontinui-coord/src/routes.rs", &["work"]),
+            None
+        );
+    }
+
+    /// The marker is the root's own final segment.
+    #[test]
+    fn workspace_dir_name_is_the_roots_final_segment() {
+        assert_eq!(
+            workspace_dir_name_of(Some(Path::new("/srv/checkouts"))).as_deref(),
+            Some("checkouts")
+        );
+        assert_eq!(
+            workspace_dir_name_of(Some(Path::new("/srv/checkouts/"))).as_deref(),
+            Some("checkouts"),
+            "a trailing separator must not change the answer"
+        );
+    }
+
+    /// Fail-soft: no resolved root (and no usable final segment) yields no
+    /// derived name, so the caller keeps the historical default rather than
+    /// dropping every attribution row.
+    #[test]
+    fn workspace_dir_name_degrades_rather_than_inventing_one() {
+        assert_eq!(workspace_dir_name_of(None), None);
+        // A filesystem root has no ordinary final component.
+        assert_eq!(workspace_dir_name_of(Some(Path::new("/"))), None);
+        assert_eq!(DEFAULT_WORKSPACE_DIR_NAME, "qontinui-root");
+        // …and the marker list an unresolved root produces is exactly the
+        // historical default, so the pre-Phase-8 behaviour is reproduced.
+        assert_eq!(markers_from(None), vec!["qontinui-root".to_string()]);
+    }
+
+    /// The MIS-resolved case, which falling back only on `None` did not cover.
+    ///
+    /// `qontinui_types::paths` may legitimately resolve the root to a worktree
+    /// container, and `persist_resolved_workspace_root` then makes that answer
+    /// sticky in `settings.json`. The derived marker is then a segment no
+    /// transcript path contains, every path fails to match, and the cycle posts
+    /// zero rows — indistinguishable from "nobody edited anything". Trying the
+    /// default behind the derived name is what keeps that box attributing.
+    #[test]
+    fn a_misresolved_root_falls_back_to_the_default_marker() {
+        let markers = markers_from(Some("hp".to_string()));
+        assert_eq!(
+            markers,
+            vec!["hp".to_string(), "qontinui-root".to_string()],
+            "the derived name is tried first, the default behind it"
+        );
+        let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
+
+        // The derived marker alone matches nothing…
+        let edited = "/srv/qontinui-root/qontinui-coord/src/routes.rs";
+        assert_eq!(map_path_to_repo_file(edited, &["hp"]), None);
+        // …and with the default behind it the row is attributed after all.
+        assert_eq!(
+            map_path_to_repo_file(edited, &markers),
+            Some(("qontinui-coord".to_string(), "src/routes.rs".to_string()))
+        );
+    }
+
+    /// Order is priority order: when BOTH markers match a path, the derived one
+    /// decides, so a correctly-resolved root is never overridden by the default.
+    #[test]
+    fn the_derived_marker_wins_when_both_match() {
+        assert_eq!(
+            map_path_to_repo_file(
+                "/srv/qontinui-root/checkouts/qontinui-coord/src/routes.rs",
+                &["checkouts", "qontinui-root"]
+            ),
+            Some(("qontinui-coord".to_string(), "src/routes.rs".to_string())),
+            "the derived marker `checkouts` must decide; `qontinui-root` would \
+             have yielded the non-`qontinui-` dir `checkouts` and dropped the row"
+        );
+    }
+
+    /// A root that IS named `qontinui-root` must not list the same marker twice.
+    #[test]
+    fn the_default_is_not_duplicated_when_the_root_is_named_that() {
+        assert_eq!(
+            markers_from(Some("qontinui-root".to_string())),
+            vec!["qontinui-root".to_string()]
         );
     }
 
@@ -614,7 +817,7 @@ mod tests {
     #[test]
     fn extract_yields_edit_file_path() {
         let line = assistant_edit_line("D:/qontinui-root/qontinui-coord/src/routes.rs");
-        let got = extract_attributions_from_new_bytes("sess-1", &line);
+        let got = extract_attributions_from_new_bytes("sess-1", &line, WS);
         assert_eq!(
             got,
             vec![("qontinui-coord".to_string(), "src/routes.rs".to_string())]
@@ -637,7 +840,7 @@ mod tests {
             }
         })
         .to_string();
-        assert!(extract_attributions_from_new_bytes("sess-1", &line).is_empty());
+        assert!(extract_attributions_from_new_bytes("sess-1", &line, WS).is_empty());
     }
 
     #[test]
@@ -655,17 +858,17 @@ mod tests {
             }
         })
         .to_string();
-        assert!(extract_attributions_from_new_bytes("sess-1", &user).is_empty());
+        assert!(extract_attributions_from_new_bytes("sess-1", &user, WS).is_empty());
     }
 
     #[test]
     fn extract_skips_malformed_json_without_panicking() {
-        assert!(extract_attributions_from_new_bytes("sess-1", "{not valid json").is_empty());
+        assert!(extract_attributions_from_new_bytes("sess-1", "{not valid json", WS).is_empty());
         // Mixed: one malformed line + one good Edit line → only the good one.
         let good = assistant_edit_line("D:/qontinui-root/qontinui-runner/x.rs");
         let mixed = format!("{{garbage\n{good}\n");
         assert_eq!(
-            extract_attributions_from_new_bytes("sess-1", &mixed),
+            extract_attributions_from_new_bytes("sess-1", &mixed, WS),
             vec![("qontinui-runner".to_string(), "x.rs".to_string())]
         );
     }
@@ -673,7 +876,7 @@ mod tests {
     #[test]
     fn extract_skips_edit_outside_qontinui_root() {
         let line = assistant_edit_line("C:/tmp/scratch.rs");
-        assert!(extract_attributions_from_new_bytes("sess-1", &line).is_empty());
+        assert!(extract_attributions_from_new_bytes("sess-1", &line, WS).is_empty());
     }
 
     #[test]
@@ -693,7 +896,7 @@ mod tests {
             })
             .to_string();
             assert_eq!(
-                extract_attributions_from_new_bytes("sess-1", &line),
+                extract_attributions_from_new_bytes("sess-1", &line, WS),
                 vec![("qontinui-web".to_string(), "app.tsx".to_string())],
                 "tool {tool} should be captured"
             );

@@ -1,16 +1,40 @@
 //! Dev-mode service defaults.
 //!
-//! When the runner starts in development mode, this module detects the
-//! qontinui workspace layout and provides default ProcessConfig entries for
-//! services that the runner should manage (Docker, Backend, Frontend).
+//! When the runner starts in development mode, this module provides default
+//! ProcessConfig entries for the services the runner should manage (Docker,
+//! Backend, Frontend, Embedding), given a workspace root its caller resolved.
 //!
 //! These defaults are only injected when:
 //! - The runner is in dev-mode (debug build or QONTINUI_ENV=development)
 //! - The user has not already configured managed processes for these ports
-//! - The workspace is a qontinui development workspace
+//! - The workspace root resolves
+//!
+//! ## This module no longer answers "where is the workspace root"
+//!
+//! It used to, with a private `find_workspace_root()` + `is_qontinui_workspace()`
+//! pair — the EIGHTH answer to that one question in this crate. It carried no
+//! `D:` literal, which is why it survived slice 1's sweep, but it broke the two
+//! rules the plan exists to establish, both of which are stated authoritatively
+//! by `env_agent::collectors::resolve_probe_scope` and by
+//! `qontinui_types::paths`' own header:
+//!
+//! - its rung 2 was the **inherited cwd**, which makes resolution a function of
+//!   how the runner happened to be launched;
+//! - its predicate was `<dir>/qontinui-web/{backend,frontend}` existing, with no
+//!   `.git` check — the loose-predicate class that produced eight false anchors
+//!   on the author's machine when the shell `resolve_workspace_root` idiom first
+//!   shipped, each anchoring one directory too low.
+//!
+//! Both functions are deleted, not wrapped; callers ask
+//! [`crate::workspace_paths`] instead (plan
+//! `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
+//! Phase 8). `$QONTINUI_PARENT_DIR`, which the old resolver consumed as a final
+//! candidate, is deliberately NOT folded into `workspace_paths`: it names the
+//! dev-services parent, a different concept, and aliasing it would widen the one
+//! door to admit a value that was never validated as a workspace root.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tracing::info;
 
@@ -23,54 +47,6 @@ const DOCKER_SERVICE_ID_SUFFIX: &str = "dev-docker";
 const BACKEND_SERVICE_ID_SUFFIX: &str = "dev-backend";
 const FRONTEND_SERVICE_ID_SUFFIX: &str = "dev-frontend";
 const EMBEDDING_SERVICE_ID_SUFFIX: &str = "dev-embedding";
-
-/// Detect the qontinui workspace root by looking for expected directories.
-///
-/// Searches from the runner executable upward, then from CWD upward,
-/// then checks QONTINUI_PARENT_DIR env var.
-pub fn find_workspace_root() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    // Search from executable location upward
-    if let Ok(exe_path) = std::env::current_exe() {
-        let mut dir = exe_path.parent().map(|p| p.to_path_buf());
-        while let Some(d) = dir {
-            candidates.push(d.clone());
-            dir = d.parent().map(|p| p.to_path_buf());
-        }
-    }
-
-    // Search from CWD upward
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut dir = Some(cwd);
-        while let Some(d) = dir {
-            candidates.push(d.clone());
-            dir = d.parent().map(|p| p.to_path_buf());
-        }
-    }
-
-    // Check QONTINUI_PARENT_DIR env var
-    if let Ok(parent_dir) = std::env::var("QONTINUI_PARENT_DIR") {
-        candidates.push(PathBuf::from(parent_dir));
-    }
-
-    // A valid workspace has qontinui-web with backend and frontend
-    for candidate in candidates {
-        if is_qontinui_workspace(&candidate) {
-            info!("Found qontinui workspace root: {}", candidate.display());
-            return Some(candidate);
-        }
-    }
-
-    None
-}
-
-/// Check if a directory is a qontinui workspace root.
-fn is_qontinui_workspace(dir: &Path) -> bool {
-    dir.join("qontinui-web").join("backend").exists()
-        && dir.join("qontinui-web").join("frontend").exists()
-        && dir.join("qontinui-runner").exists()
-}
 
 /// Generate a deterministic dev service ID based on workspace path and service name.
 ///

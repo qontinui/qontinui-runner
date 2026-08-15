@@ -12,10 +12,39 @@
 //! three actionable keys — **`node`, `python`, `rustc`** — the only ones that
 //! describe the BOX rather than the source tree the capturing binary was built
 //! from. `runner_crate_version`, `node_package_version`, `node_package_name`,
-//! `python_constraint`, `tauri` and the whole `node_dep_*` prefix are repo-
-//! derived: they converge by pulling the repo, and no apply can move them. The
-//! server marks them derived and [`super::pull::SectionPlan::actionable`]
-//! already drops them; [`APPLIABLE_TOOLS`] is the second, independent gate.
+//! `python_constraint`, `tauri` and the whole `node_dep_*` prefix are not:
+//! they describe the source tree, and no apply can move them. The server marks
+//! them derived and [`super::pull::SectionPlan::actionable`] already drops
+//! them; [`APPLIABLE_TOOLS`] is the second, independent gate.
+//!
+//! Every one of those non-appliable keys changed **provenance** in slice 5
+//! Phase 8 of plan `2026-08-04-remove-hardcoded-machine-paths-from-product-code`,
+//! because each was previously reached from `env!("CARGO_MANIFEST_DIR")` — a
+//! compile-time constant naming a path that only existed on the machine the
+//! binary was compiled on. **No classification changed**: they still describe
+//! the build and the source trees, not the box, and no apply can move them.
+//! Exactly one key changed VALUE:
+//!
+//! | key | new provenance | value |
+//! |-----|----------------|-------|
+//! | `runner_crate_version` | `env!("CARGO_PKG_VERSION")` | unchanged |
+//! | `tauri` | the `tauri::VERSION` constant | **CHANGED** |
+//! | `node_package_name`, `node_package_version`, `node_dep_*` | `<workspace-root>/qontinui-runner/package.json` | unchanged |
+//! | `python_constraint` | `<workspace-root>/qontinui-web/backend/pyproject.toml` | unchanged |
+//!
+//! `tauri` is the one value change: it now reports the concrete version of the
+//! crate this binary is LINKED against instead of the declared range (`"2.5"`)
+//! parsed out of the build host's manifest — strictly better, and a one-time
+//! move on that key as runners rebuild.
+//!
+//! The `node_*` keys are called out because they nearly did change value. The
+//! old walk's doc claimed it preferred the `qontinui-web` frontend manifest, but
+//! that branch was unreachable — the walk probed `dir/package.json` first and hit
+//! the runner's own on its second step. Anchoring at the frontend would have
+//! silently retargeted five keys at a sibling repo, leaving `node_package_name`
+//! describing a different package from the `runner_crate_version` beside it.
+//! `super::collectors::workspace_package_json` therefore anchors at
+//! `<workspace-root>/qontinui-runner/package.json`.
 //!
 //! This is not a general installer. It is a three-key problem.
 //!

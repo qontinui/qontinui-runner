@@ -1007,7 +1007,16 @@ pub async fn ui_bridge_execute_action_handler(
                     || lower.contains("control character")
                 {
                     format!(
-                        "{}. Hint: if a field value contains a Windows path, escape each backslash as `\\\\` in the JSON body — or send the body from a file with `curl --data-binary @file.json` to bypass shell re-escaping. Forward slashes also work: `D:/qontinui-root/...`.",
+                        // The example path is a PLACEHOLDER, not a real
+                        // location: an error hint shipped in an open-source
+                        // binary must not name the author's machine layout
+                        // (plan
+                        // `2026-08-04-remove-hardcoded-machine-paths-from-product-code`,
+                        // slice 5 Phase 8). `<PROJECT_ROOT>` matches the
+                        // convention `context/builtins/shell_command_schema.md`
+                        // already uses, and cannot be pasted into a working
+                        // command by mistake.
+                        "{}. Hint: if a field value contains a Windows path, escape each backslash as `\\\\` in the JSON body — or send the body from a file with `curl --data-binary @file.json` to bypass shell re-escaping. Forward slashes also work: `<PROJECT_ROOT>/some/file.txt`.",
                         raw
                     )
                 } else {

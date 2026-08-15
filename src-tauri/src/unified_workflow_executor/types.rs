@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::conditional_routing::{evaluate_routing_rules, ResolvedModelConfig, RoutingContext};
 use crate::unified_workflows::{ModelOverrideConfig, UnifiedWorkflowExt};
@@ -467,6 +467,36 @@ pub struct LoopConfig {
     pub htn_config: crate::planning_bridge::HtnConfig,
 }
 
+/// Locate one of the runner's **bundled HTN planning data** artifacts —
+/// `data/runner_state_machine.json` or the `data/htn_methods/` directory —
+/// given its path relative to the crate root.
+///
+/// Two rungs, each existence-checked, first hit wins:
+///
+/// 1. the **bundled** copy, resolved through Tauri's `BaseDirectory::Resource`;
+/// 2. the dev-checkout copy under the resolved workspace root
+///    (`<root>/qontinui-runner/src-tauri/data/...`), which is what keeps a
+///    `cargo run` / `cargo test` session working with no bundle present.
+///
+/// A total miss is `None`, and the caller leaves the corresponding
+/// `HtnConfig` field unset rather than writing a path that does not exist.
+///
+/// This replaces `env!("CARGO_MANIFEST_DIR").join("data")` (plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
+/// Phase 6). `CARGO_MANIFEST_DIR` is a **compile-time** constant: it named the
+/// source tree the binary was BUILT from, not the box it runs on, so it both
+/// baked the build host's absolute layout into a shipped open-source binary
+/// and — on every other machine — handed the planner a path to nothing while
+/// claiming success. The swap only works because the same phase added
+/// `data/**/*` to `bundle.resources` in `tauri.conf.json`: before that the
+/// installer shipped no `data/` at all, so rung 1 would have named a path
+/// present on **no** host.
+fn bundled_data_path(relative: &Path) -> Option<PathBuf> {
+    let bundled = crate::bundled_resources::resolve(relative);
+    let dev = crate::bundled_resources::dev_checkout(relative);
+    crate::bundled_resources::first_existing([bundled.as_deref(), dev.as_deref()])
+}
+
 impl LoopConfig {
     /// Build a LoopConfig from a UnifiedWorkflow and runtime parameters.
     ///
@@ -551,20 +581,21 @@ impl LoopConfig {
                     state_machine_path: workflow.htn_state_machine_path.clone(),
                     ..crate::planning_bridge::HtnConfig::default()
                 };
-                // Default state_machine_path and methods_directory to bundled data when enabled
+                // Default state_machine_path and methods_directory to the
+                // runner's bundled planning data when HTN is enabled. Each
+                // artifact is resolved independently and existence-checked; a
+                // miss leaves the field `None`, because handing the planner a
+                // path to nothing is worse than telling it we have none.
                 if htn.enabled {
-                    let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
                     if htn.state_machine_path.is_none() {
-                        htn.state_machine_path = Some(
-                            data_dir
-                                .join("runner_state_machine.json")
-                                .display()
-                                .to_string(),
-                        );
+                        htn.state_machine_path =
+                            bundled_data_path(&Path::new("data").join("runner_state_machine.json"))
+                                .map(|p| p.display().to_string());
                     }
                     if htn.methods_directory.is_none() {
                         htn.methods_directory =
-                            Some(data_dir.join("htn_methods").display().to_string());
+                            bundled_data_path(&Path::new("data").join("htn_methods"))
+                                .map(|p| p.display().to_string());
                     }
                 }
                 htn
@@ -1070,6 +1101,9 @@ pub fn is_sequence_child(execution_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The existence rule itself is owned and tested by `crate::bundled_resources`;
+    // what these tests pin is THIS site's rung ORDER (bundle → dev checkout).
+    use crate::bundled_resources::first_existing;
     use crate::step_executor::{StepExecutionConfig, StepExecutionResult, VerificationPhaseResult};
 
     fn mock_step(
@@ -1403,5 +1437,127 @@ mod tests {
             !v.as_object().unwrap().contains_key("node_rollups"),
             "empty LoopResult node_rollups must be skipped on serialize (back-compat)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Bundled HTN planning-data resolution (plan
+    // `2026-08-04-remove-hardcoded-machine-paths-from-product-code`,
+    // slice 5 Phase 6). Every input is injected, so the verdict does not
+    // depend on the machine the suite runs on.
+    // -----------------------------------------------------------------
+
+    /// A throwaway tree to hang candidate paths off. pid/counter-scoped because
+    /// several worktrees on this box run `cargo test` at once, and torn down by
+    /// a `Drop` guard so a failing assertion does not leak it. Mirrors the
+    /// `Fixture` in `crate::workspace_paths`.
+    struct PathFixture {
+        root: PathBuf,
+    }
+
+    impl Drop for PathFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl PathFixture {
+        fn file(&self, name: &str) -> PathBuf {
+            let p = self.root.join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"{}").unwrap();
+            p
+        }
+
+        fn dir(&self, name: &str) -> PathBuf {
+            let p = self.root.join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        }
+
+        /// A path under the fixture that is deliberately never created.
+        fn absent(&self, name: &str) -> PathBuf {
+            self.root.join(name)
+        }
+    }
+
+    fn path_fixture() -> PathFixture {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "qontinui_htn_data_paths_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        PathFixture { root }
+    }
+
+    /// The installed shape: the bundled resource exists, so it wins over the
+    /// dev checkout even when both are present.
+    #[test]
+    fn the_bundled_resource_outranks_the_dev_checkout() {
+        let f = path_fixture();
+        let bundled = f.file("bundle/data/runner_state_machine.json");
+        let dev = f.file("checkout/src-tauri/data/runner_state_machine.json");
+
+        let got = first_existing([Some(&bundled), Some(&dev)]);
+
+        assert_eq!(got.as_deref(), Some(bundled.as_path()));
+    }
+
+    /// The dev shape: `cargo run` / `cargo test` sets no `AppHandle`, so the
+    /// bundled candidate is `None` and resolution must continue past it rather
+    /// than stopping. This is the rung that replaces `CARGO_MANIFEST_DIR`.
+    #[test]
+    fn an_absent_app_handle_falls_through_to_the_dev_checkout() {
+        let f = path_fixture();
+        let dev = f.file("checkout/src-tauri/data/runner_state_machine.json");
+
+        let got = first_existing([None, Some(&dev)]);
+
+        assert_eq!(got.as_deref(), Some(dev.as_path()));
+    }
+
+    /// A bundled candidate that resolves to a path Tauri never unpacked is
+    /// skipped, not returned — the existence check is what makes rung 1 safe to
+    /// try first.
+    #[test]
+    fn a_bundled_candidate_that_does_not_exist_falls_through() {
+        let f = path_fixture();
+        let bundled = f.absent("bundle/data/runner_state_machine.json");
+        let dev = f.file("checkout/src-tauri/data/runner_state_machine.json");
+
+        let got = first_existing([Some(&bundled), Some(&dev)]);
+
+        assert_eq!(got.as_deref(), Some(dev.as_path()));
+    }
+
+    /// `data/htn_methods` is a directory, not a file — the existence check must
+    /// accept it, or the methods rung would never resolve anywhere.
+    #[test]
+    fn a_directory_candidate_resolves_like_a_file_one() {
+        let f = path_fixture();
+        let methods = f.dir("bundle/data/htn_methods");
+
+        let got = first_existing([Some(&methods), None]);
+
+        assert_eq!(got.as_deref(), Some(methods.as_path()));
+    }
+
+    /// The defect this phase fixes: with nothing resolving, the answer is
+    /// `None` so the caller leaves the `HtnConfig` field unset. The old code
+    /// unconditionally wrote a `CARGO_MANIFEST_DIR`-derived path that existed
+    /// on no machine but the build host.
+    #[test]
+    fn nothing_resolving_yields_none_rather_than_a_fabricated_path() {
+        let f = path_fixture();
+        let bundled = f.absent("bundle/data/runner_state_machine.json");
+        let dev = f.absent("checkout/src-tauri/data/runner_state_machine.json");
+
+        assert_eq!(first_existing([Some(&bundled), Some(&dev)]), None);
+
+        let unresolved_root: [Option<&Path>; 2] = [None, None];
+        assert_eq!(first_existing(unresolved_root), None);
     }
 }

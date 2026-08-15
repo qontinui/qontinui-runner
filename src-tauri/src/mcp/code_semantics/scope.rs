@@ -36,12 +36,38 @@ pub fn normalize(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
-/// The default TS scope = the runner's own frontend project. The frontend root
-/// is `CARGO_MANIFEST_DIR/..` (src-tauri's parent); its tsconfig.json is the
-/// scope descriptor.
+/// This repo's checkout directory name under the workspace root.
+const RUNNER_REPO_DIR: &str = "qontinui-runner";
+
+/// The default TS scope = the runner's own frontend project, whose
+/// `tsconfig.json` sits at the runner **repo root**
+/// (`<workspace-root>/qontinui-runner/tsconfig.json`).
+///
+/// It used to be `env!("CARGO_MANIFEST_DIR")/..` — a **compile-time** constant
+/// naming the src-tauri parent on whichever machine built the binary, invisible
+/// to any grep for a drive-letter literal. The plan's author-time table filed
+/// this as a bundled resource; that was corrected at re-vet, because
+/// `tsconfig.json` is **source**, which a packaged install has never contained
+/// and never should. So this is the same sibling-repo resolution its neighbour
+/// [`repo_dir`] already took, and it goes to the crate's one door
+/// [`crate::workspace_paths`] (plan
+/// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
+/// Phase 7 — class 2).
+///
+/// Fail-soft, unchanged: an unresolved workspace root or an absent
+/// `tsconfig.json` both yield `None`, and every caller already treats that as
+/// "no default scope" rather than an error.
 pub fn default_ts_scope() -> Option<Scope> {
-    let frontend_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
-    let tsconfig = frontend_root.join("tsconfig.json");
+    let root = crate::workspace_paths::workspace_root();
+    default_ts_scope_in(root.as_deref())
+}
+
+/// Pure core of [`default_ts_scope`] with the workspace root injected, so the
+/// layout rule is unit-testable against a synthetic tree instead of whatever
+/// this machine happens to resolve to. Same wrapper/core split as
+/// [`repo_dir`] / [`repo_dir_with`].
+fn default_ts_scope_in(root: Option<&Path>) -> Option<Scope> {
+    let tsconfig = root?.join(RUNNER_REPO_DIR).join("tsconfig.json");
     if tsconfig.exists() {
         Some(Scope::ts(&tsconfig))
     } else {
@@ -136,6 +162,29 @@ fn repo_dir_with(
 ///   2. the file's nearest enclosing `tsconfig.json`,
 ///   3. the default TS scope.
 pub fn resolve_scope(scope: Option<&str>, file: Option<&str>) -> Option<Scope> {
+    resolve_scope_with(scope, file, default_ts_scope)
+}
+
+/// Pure core of [`resolve_scope`] with the last rung injected, matching the
+/// wrapper/core split used by [`default_ts_scope`] / [`default_ts_scope_in`] and
+/// [`repo_dir`] / [`repo_dir_with`].
+///
+/// The default is injected because otherwise the fall-through rule cannot be
+/// tested with teeth: on a machine with no resolvable workspace root
+/// `default_ts_scope()` is legitimately `None`, so
+/// `assert_eq!(resolve_scope(Some("/no/such/dir"), None), default_ts_scope())`
+/// passes with `None == None` — it stops distinguishing "fell through to the
+/// default" from "returned None because the explicit scope was bad", and it
+/// reads the operator's real settings to do it.
+///
+/// A closure rather than a value so the rung stays LAZY: rungs 1 and 2 must not
+/// pay a workspace-root resolution (a settings read plus directory probes, and a
+/// WARN on a rejected probe) they never use.
+fn resolve_scope_with(
+    scope: Option<&str>,
+    file: Option<&str>,
+    default: impl FnOnce() -> Option<Scope>,
+) -> Option<Scope> {
     if let Some(s) = scope {
         let p = PathBuf::from(s);
         let tsconfig =
@@ -156,7 +205,7 @@ pub fn resolve_scope(scope: Option<&str>, file: Option<&str>) -> Option<Scope> {
         }
     }
 
-    default_ts_scope()
+    default()
 }
 
 /// Walk up from `file` to find the nearest `tsconfig.json`.
@@ -201,11 +250,52 @@ mod tests {
         assert!(s.unwrap().key.ends_with("tsconfig.json"));
     }
 
+    /// An explicit scope that does not exist must fall THROUGH to the default
+    /// scope rather than erroring.
+    ///
+    /// Driven through [`resolve_scope_with`] against an INJECTED default. The
+    /// obvious spelling — `assert_eq!(resolve_scope(Some("/no/such/dir"), None),
+    /// default_ts_scope())` — is vacuous on any machine with no resolvable
+    /// workspace root, where both sides are `None`: it no longer distinguishes
+    /// "fell through to the default" from "returned None because the explicit
+    /// scope was bad", and it reads the operator's real settings to reach that
+    /// non-verdict. A non-`None` injected default gives the assertion teeth
+    /// everywhere and removes the last ambient read from these tests.
     #[test]
     fn nonexistent_explicit_scope_falls_back_to_default() {
-        let s = resolve_scope(Some("/no/such/dir/anywhere"), None);
-        // Falls through to the default TS scope (frontend tsconfig exists).
-        assert!(s.is_some());
+        let injected = Scope::ts(Path::new("/synthetic/project/tsconfig.json"));
+        let expected = injected.clone();
+        assert_eq!(
+            resolve_scope_with(Some("/no/such/dir/anywhere"), None, move || Some(injected)),
+            Some(expected)
+        );
+    }
+
+    /// …and the same fall-through with no default available is `None`, not an
+    /// error — every caller already treats that as "no scope".
+    #[test]
+    fn nonexistent_explicit_scope_with_no_default_is_none() {
+        assert_eq!(
+            resolve_scope_with(Some("/no/such/dir/anywhere"), None, || None),
+            None
+        );
+    }
+
+    /// The default rung is LAZY: an explicit scope that resolves must not pay a
+    /// workspace-root resolution. Proven by a closure that panics if called.
+    #[test]
+    fn a_resolving_explicit_scope_never_evaluates_the_default() {
+        let f = fixture(true);
+        let project = f.root.join(RUNNER_REPO_DIR);
+        let scope = resolve_scope_with(project.to_str(), None, || {
+            panic!("the default rung must not be evaluated when the explicit scope resolves")
+        })
+        .expect("the explicit project dir carries a tsconfig.json");
+        assert_eq!(
+            scope.key,
+            normalize(&project.join("tsconfig.json")),
+            "the explicit scope, not the default, must win"
+        );
     }
 
     #[test]
@@ -214,10 +304,60 @@ mod tests {
         assert_eq!(normalize(p), "C:/foo/bar/tsconfig.json");
     }
 
+    /// A synthetic workspace root holding `qontinui-runner/tsconfig.json` —
+    /// never this machine's layout, so the verdict holds on a fresh checkout and
+    /// on a non-operator machine. pid + counter scoped because several worktrees
+    /// run `cargo test` on this box at once; `Drop` cleans up even when an
+    /// assertion fails. Same shape as `workspace_paths::tests::Fixture`.
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fixture(with_tsconfig: bool) -> Fixture {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "qontinui_default_ts_scope_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(RUNNER_REPO_DIR)).unwrap();
+        if with_tsconfig {
+            std::fs::write(root.join(RUNNER_REPO_DIR).join("tsconfig.json"), "{}").unwrap();
+        }
+        Fixture { root }
+    }
+
+    /// The layout rule after slice 5 Phase 7: the default scope's tsconfig is
+    /// `<workspace-root>/qontinui-runner/tsconfig.json` — the runner REPO root,
+    /// which is source, not the build machine's `CARGO_MANIFEST_DIR` parent.
     #[test]
-    fn default_ts_scope_exists() {
-        // The runner frontend has a tsconfig.json.
-        assert!(default_ts_scope().is_some());
+    fn default_ts_scope_is_the_runner_repo_tsconfig_under_the_workspace_root() {
+        let f = fixture(true);
+        let scope = default_ts_scope_in(Some(&f.root)).expect("tsconfig exists under the root");
+        assert_eq!(scope.language, "typescript");
+        assert_eq!(
+            scope.key,
+            normalize(&f.root.join(RUNNER_REPO_DIR).join("tsconfig.json"))
+        );
+        assert_eq!(scope.project, scope.key);
+    }
+
+    /// Fail-soft, both ways: a resolved root whose runner checkout carries no
+    /// `tsconfig.json` yields `None`, and so does an unresolved root. Neither is
+    /// an error, and neither invents a path.
+    #[test]
+    fn default_ts_scope_is_none_without_a_tsconfig_or_without_a_root() {
+        let f = fixture(false);
+        assert_eq!(default_ts_scope_in(Some(&f.root)), None);
+        assert_eq!(default_ts_scope_in(None), None);
     }
 
     #[test]
