@@ -66,6 +66,27 @@ pub struct EnvAgentConfig {
     /// order and the rejection reasons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_root: Option<String>,
+    /// Which remote OWNERS the `repos` section may report — e.g.
+    /// `["qontinui"]`.
+    ///
+    /// The `repos` collector auto-discovers checkouts under the workspace root,
+    /// which is zero-configuration but would otherwise sweep a developer's
+    /// unrelated personal repositories into the environment's canonical config.
+    /// That is not merely untidy: the server's drift oracle reports a key
+    /// present on the target but absent from canonical as an `added` delta that
+    /// **breaks `in_sync`**, so an unfiltered box would show permanent,
+    /// unclearable drift while being genuinely in sync.
+    ///
+    /// **Empty (the default) means NO FILTER, not "report nothing".** An empty
+    /// allowlist that suppressed everything would make an unconfigured box
+    /// publish silence — and an absent fact being indistinguishable from "in
+    /// sync" is the exact failure the `repos` section exists to end.
+    ///
+    /// Matching is on the canonical URL's owner segment, case-insensitively:
+    /// forges treat owner names case-insensitively, and two boxes spelling one
+    /// owner differently must not read as different repositories.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repo_owner_allowlist: Vec<String>,
 }
 
 impl EnvAgentConfig {
@@ -123,6 +144,7 @@ mod tests {
             environment_id: "env-123".to_string(),
             enrolled_at: Some("2026-06-22T00:00:00Z".to_string()),
             scope_root: Some("D:/qontinui-root".to_string()),
+            repo_owner_allowlist: Vec::new(),
         };
         let pretty = serde_json::to_vec_pretty(&cfg).unwrap();
         std::fs::write(&path, pretty).unwrap();
@@ -142,6 +164,7 @@ mod tests {
             environment_id: "".to_string(),
             enrolled_at: None,
             scope_root: None,
+            repo_owner_allowlist: Vec::new(),
         };
         assert!(!cfg.is_enrolled());
     }
@@ -167,6 +190,7 @@ mod tests {
             environment_id: "e".to_string(),
             enrolled_at: None,
             scope_root: None,
+            repo_owner_allowlist: Vec::new(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(!json.contains("scope_root"), "got {json}");

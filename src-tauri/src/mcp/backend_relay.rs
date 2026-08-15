@@ -3717,6 +3717,7 @@ mod tests {
             environment_id: "env-123".to_string(),
             enrolled_at: Some("2026-08-15T00:00:00Z".to_string()),
             scope_root: None,
+            repo_owner_allowlist: Vec::new(),
         }
     }
 
@@ -4141,6 +4142,7 @@ mod tests {
                 environment_id: "".to_string(),
                 enrolled_at: None,
                 scope_root: None,
+                repo_owner_allowlist: Vec::new(),
             }),
         ] {
             let block = devenv_runner_info_block(cfg, true, false);

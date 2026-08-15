@@ -27,6 +27,12 @@ use super::enroll::{self, EnrollParams};
 /// channel is `<PREFIX>.<device_id>`.
 const ENROLL_CHANNEL_PREFIX: &str = "events.devenv.enroll_requested";
 
+/// The event-channel prefix coord publishes repos-apply directives on
+/// (plan `2026-08-06-devenv-repos-section`, P4). MUST stay in lockstep with
+/// coord's `devenv_repos_apply_dispatch::REPOS_APPLY_CHANNEL_PREFIX` — a rename
+/// on either side silently drops every directive, with no error on either end.
+const REPOS_APPLY_CHANNEL_PREFIX: &str = "events.devenv.repos_apply_requested";
+
 /// The base (and reset) reconnect back-off.
 const BACKOFF_BASE_MS: u64 = 2_000;
 /// The capped maximum reconnect back-off.
@@ -59,6 +65,94 @@ pub struct EnrollDirective {
 /// Build the device-scoped enroll channel name.
 fn enroll_channel(device_id: uuid::Uuid) -> String {
     format!("{ENROLL_CHANNEL_PREFIX}.{device_id}")
+}
+
+/// Build the device-scoped repos-apply channel name.
+fn repos_apply_channel(device_id: uuid::Uuid) -> String {
+    format!("{REPOS_APPLY_CHANNEL_PREFIX}.{device_id}")
+}
+
+/// Wire shape of the repos-apply directive coord publishes.
+///
+/// It carries a single flag and deliberately no repo list, no clone URLs and no
+/// credentials: the box already holds canonical's `repos` section from its own
+/// pull, and canonical never carries credentials. A directive that shipped a
+/// repo list would let the server choose what lands on someone else's disk,
+/// which is exactly the execution confinement this design refuses to give up.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReposApplyDirective {
+    /// Whether to actually write. **Defaults to `false`** so a malformed or
+    /// partial frame asks for a plan, never for mutation.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// Parse a coord `/ws` envelope and, when it is a repos-apply directive for THIS
+/// device, return it. `None` for every other frame — coord's bridge delivers
+/// foreign frames too, and those are ignored, never an error.
+pub fn parse_repos_apply_envelope(txt: &str, device_id: uuid::Uuid) -> Option<ReposApplyDirective> {
+    let value: serde_json::Value = serde_json::from_str(txt).ok()?;
+    let channel = value.get("channel").and_then(|c| c.as_str())?;
+    if channel != repos_apply_channel(device_id) {
+        return None;
+    }
+    match value.get("payload")? {
+        serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+        other => serde_json::from_value(other.clone()).ok(),
+    }
+}
+
+/// Run THIS box's LOCAL repos apply from a directive, then kick a capture so the
+/// twin's drift re-evaluates against what actually landed.
+///
+/// The server requested; this box decides. Every guard the interactive
+/// `env apply --section repos` path enforces — the workspace-root resolution,
+/// the incomparable-scope refusal, the disk floor, the per-repo auth reporting —
+/// applies unchanged here, because this runs the same code. Best-effort: every
+/// failure is logged, never panics the subscribe loop.
+pub async fn handle_repos_apply_directive(directive: ReposApplyDirective) {
+    let confirm = directive.confirm;
+    let outcome = tokio::task::spawn_blocking(move || {
+        super::apply::apply_blocking(&super::apply::ApplyOptions {
+            confirm,
+            sections: vec![super::apply_repos::REPOS_SECTION.to_string()],
+            ..Default::default()
+        })
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(report)) => {
+            let repos = report
+                .sections
+                .iter()
+                .find(|s| s.section == super::apply_repos::REPOS_SECTION);
+            match repos {
+                Some(s) => info!(
+                    "env_agent::directive: repos apply (confirm={confirm}) → {} ({} change(s), {} skipped)",
+                    s.status.label(),
+                    s.changes.len(),
+                    s.skipped.len()
+                ),
+                None => warn!(
+                    "env_agent::directive: repos apply produced no repos section — \
+                     is this box canonical, or is the section absent from the pull?"
+                ),
+            }
+            if confirm && report.changed_anything() {
+                // Only after a WRITE: a dry run changed nothing, so re-capturing
+                // would burn a push to report the state we already reported.
+                if let Err(e) = super::capture_and_push().await {
+                    warn!(
+                        "env_agent::directive: post-apply capture failed \
+                         (will retry on tick): {e}"
+                    );
+                }
+            }
+        }
+        Ok(Err(e)) => warn!("env_agent::directive: repos apply failed: {e}"),
+        Err(e) => warn!("env_agent::directive: repos apply task panicked: {e}"),
+    }
 }
 
 /// Parse a coord `/ws` envelope (`{channel, payload}`) and, when it is an enroll
@@ -133,9 +227,28 @@ pub async fn handle_enroll_directive(directive: EnrollDirective) {
     }
 }
 
-/// Build the coord `/ws` subscription URL for the enroll directive channel.
-/// Mirrors `agent_runtime::build_coord_ws_url` (scheme swap + idempotent `/ws`
-/// append) but with the enroll pattern. Pure — unit-tested without profile state.
+/// The Redis glob this subscriber PSUBSCRIBEs with: every devenv directive
+/// addressed to THIS device.
+///
+/// coord's `/ws` bridge is one-pattern-per-connection (`coord/src/ws.rs` does a
+/// single `PSUBSCRIBE`), so a second directive kind needs either a second socket
+/// or a wider pattern. The wider pattern is correct here rather than merely
+/// cheaper: both directives are device-scoped, both are consumed by THIS module,
+/// and a second connection would double the reconnect/backoff machinery for no
+/// isolation benefit — the isolation that matters is from the agent-spawn
+/// subscriber, which still has its own connection.
+///
+/// Widening is safe because **every parser matches the channel EXACTLY**
+/// (`parse_enroll_envelope`, `parse_repos_apply_envelope`). A frame this glob
+/// admits but no parser claims is ignored, exactly as a foreign frame already
+/// was — so a wider net can add ignored frames, never misrouted ones.
+fn devenv_directive_pattern(device_id: uuid::Uuid) -> String {
+    format!("events.devenv.*.{device_id}")
+}
+
+/// Build the coord `/ws` subscription URL for this device's devenv directive
+/// channels. Mirrors `agent_runtime::build_coord_ws_url` (scheme swap +
+/// idempotent `/ws` append). Pure — unit-tested without profile state.
 fn build_enroll_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String {
     let base = coord_url.trim().trim_end_matches('/');
     let ws_base = base
@@ -151,7 +264,7 @@ fn build_enroll_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String {
     } else {
         format!("{ws_base}/ws")
     };
-    format!("{ws_base}?pattern={}", enroll_channel(device_id))
+    format!("{ws_base}?pattern={}", devenv_directive_pattern(device_id))
 }
 
 /// Resolve the coord WS URL from the active profile's `coord_url`. `None` when
@@ -248,6 +361,13 @@ async fn connect_and_pump(ws_url: &str, device_id: uuid::Uuid) -> anyhow::Result
                         "env_agent::directive: enroll directive received for device_id={device_id}"
                     );
                     handle_enroll_directive(directive).await;
+                } else if let Some(directive) = parse_repos_apply_envelope(&txt, device_id) {
+                    info!(
+                        "env_agent::directive: repos-apply directive received for \
+                         device_id={device_id} (confirm={})",
+                        directive.confirm
+                    );
+                    handle_repos_apply_directive(directive).await;
                 }
             }
         }
@@ -267,10 +387,29 @@ mod tests {
         let url = build_enroll_ws_url("https://coord.qontinui.io", dev());
         assert_eq!(
             url,
-            "wss://coord.qontinui.io/ws?pattern=events.devenv.enroll_requested.c79a07d5-7e40-49b4-87fa-554c749f9644"
+            "wss://coord.qontinui.io/ws?pattern=events.devenv.*.c79a07d5-7e40-49b4-87fa-554c749f9644"
         );
         assert!(build_enroll_ws_url("http://localhost:8080", dev())
             .starts_with("ws://localhost:8080/ws?pattern="));
+    }
+
+    /// The one PSUBSCRIBE must admit BOTH directive channels for this device —
+    /// coord's bridge is one-pattern-per-connection, so a pattern that only
+    /// covered enroll would make every repos-apply directive vanish silently.
+    #[test]
+    fn the_subscription_pattern_admits_both_directive_channels() {
+        let pat = devenv_directive_pattern(dev());
+        // Redis glob `*` matches any run of characters, so both device-scoped
+        // channels sit under this one pattern.
+        let prefix = "events.devenv.";
+        let suffix = format!(".{}", dev());
+        assert_eq!(pat, format!("{prefix}*{suffix}"));
+        for ch in [enroll_channel(dev()), repos_apply_channel(dev())] {
+            assert!(
+                ch.starts_with(prefix) && ch.ends_with(&suffix),
+                "{ch} must be admitted by {pat}"
+            );
+        }
     }
 
     #[test]
@@ -343,5 +482,66 @@ mod tests {
         })
         .to_string();
         assert!(parse_enroll_envelope(&bad, dev()).is_none());
+    }
+
+    // ---- repos-apply directive (P4) -------------------------------------
+
+    fn repos_frame(device: uuid::Uuid, payload: serde_json::Value) -> String {
+        serde_json::json!({
+            "channel": format!("events.devenv.repos_apply_requested.{}", device),
+            "payload": serde_json::to_string(&payload).unwrap(),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn repos_apply_parses_a_matching_frame() {
+        let d = parse_repos_apply_envelope(
+            &repos_frame(dev(), serde_json::json!({"confirm": true})),
+            dev(),
+        )
+        .expect("must parse");
+        assert!(d.confirm);
+    }
+
+    /// An omitted `confirm` is a DRY RUN. This is the same defaulting coord's
+    /// request body has, and it is defence in depth: a truncated or older frame
+    /// must never be read as permission to write to this box's disk.
+    #[test]
+    fn repos_apply_defaults_to_a_dry_run() {
+        let d = parse_repos_apply_envelope(&repos_frame(dev(), serde_json::json!({})), dev())
+            .expect("must parse");
+        assert!(!d.confirm, "an omitted confirm must never mean 'write'");
+    }
+
+    /// A directive addressed to ANOTHER device must be ignored. The widened
+    /// subscription pattern is device-scoped, but the parser is what actually
+    /// enforces it — and this is the check that stops one box acting on another
+    /// box's instruction.
+    #[test]
+    fn repos_apply_ignores_another_devices_directive() {
+        let other = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000000").unwrap();
+        assert!(parse_repos_apply_envelope(
+            &repos_frame(other, serde_json::json!({"confirm": true})),
+            dev()
+        )
+        .is_none());
+    }
+
+    /// The two parsers must not claim each other's frames. They share one
+    /// connection now, so a parser that matched loosely would route an enroll
+    /// directive into the apply path (or vice versa).
+    #[test]
+    fn the_two_directive_parsers_do_not_claim_each_others_frames() {
+        let repos = repos_frame(dev(), serde_json::json!({"confirm": true}));
+        assert!(parse_enroll_envelope(&repos, dev()).is_none());
+
+        let enroll = serde_json::json!({
+            "channel": format!("events.devenv.enroll_requested.{}", dev()),
+            "payload": serde_json::to_string(&serde_json::json!({"enrollment_code":"X"}))
+                .unwrap(),
+        })
+        .to_string();
+        assert!(parse_repos_apply_envelope(&enroll, dev()).is_none());
     }
 }

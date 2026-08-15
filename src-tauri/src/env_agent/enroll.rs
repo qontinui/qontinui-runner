@@ -273,12 +273,19 @@ fn run_enroll_locked(params: EnrollParams) -> Result<EnrollOutcome, String> {
         .map_err(|e| format!("failed to store machine key: {e}"))?;
 
     // Then write env-agent.json with the RESPONSE environment_id.
+    //
+    // Loaded ONCE and borrowed by both carry-forwards: enroll rewrites the file
+    // wholesale, so every operator-owned field has to be read from the same
+    // snapshot — two independent `load()`s could straddle a concurrent write and
+    // carry forward a mix of two configs.
+    let prior = EnvAgentConfig::load();
     let cfg = EnvAgentConfig {
         backend_url: backend.clone(),
         machine_id: parsed.machine_id.clone(),
         environment_id: environment_id.clone(),
         enrolled_at: Some(chrono::Utc::now().to_rfc3339()),
-        scope_root: carried_forward_scope_root(EnvAgentConfig::load()),
+        scope_root: carried_forward_scope_root(prior.as_ref()),
+        repo_owner_allowlist: carried_forward_repo_owner_allowlist(prior.as_ref()),
     };
     cfg.save()
         .map_err(|e| format!("enrolled + key stored, but writing env-agent.json failed: {e}"))?;
@@ -301,8 +308,24 @@ fn run_enroll_locked(params: EnrollParams) -> Result<EnrollOutcome, String> {
 /// Split out from [`run_enroll`] purely so this is reachable by a test: the
 /// carry-forward sits AFTER the enroll POST, so no test that stops at
 /// validation can observe it.
-fn carried_forward_scope_root(prior: Option<EnvAgentConfig>) -> Option<String> {
-    prior.and_then(|p| p.scope_root)
+fn carried_forward_scope_root(prior: Option<&EnvAgentConfig>) -> Option<String> {
+    prior.and_then(|p| p.scope_root.clone())
+}
+
+/// The `repo_owner_allowlist` an enroll must write: the PRIOR value, carried
+/// forward unchanged, for exactly the reason [`carried_forward_scope_root`]
+/// gives.
+///
+/// The silent-erasure symptom differs in shape and is worth naming: an erased
+/// allowlist does not stop the `repos` section, it WIDENS it — the box starts
+/// reporting every checkout under its workspace root, including the developer's
+/// unrelated personal ones, each of which the server reads as an `added` delta
+/// that breaks `in_sync`. A re-enroll would turn an in-sync box into a
+/// permanently-drifting one with no error anywhere.
+fn carried_forward_repo_owner_allowlist(prior: Option<&EnvAgentConfig>) -> Vec<String> {
+    prior
+        .map(|p| p.repo_owner_allowlist.clone())
+        .unwrap_or_default()
 }
 
 /// Resolve the web backend base URL for the enroll POST. Order:
@@ -407,9 +430,10 @@ mod tests {
             environment_id: "e".to_string(),
             enrolled_at: Some("2026-06-22T00:00:00Z".to_string()),
             scope_root: Some("D:/qontinui-root".to_string()),
+            repo_owner_allowlist: Vec::new(),
         };
         assert_eq!(
-            carried_forward_scope_root(Some(prior)).as_deref(),
+            carried_forward_scope_root(Some(&prior)).as_deref(),
             Some("D:/qontinui-root"),
         );
     }
@@ -420,14 +444,44 @@ mod tests {
     #[test]
     fn enroll_leaves_scope_root_unset_when_there_was_none() {
         assert!(carried_forward_scope_root(None).is_none());
-        assert!(carried_forward_scope_root(Some(EnvAgentConfig {
+        assert!(carried_forward_scope_root(Some(&EnvAgentConfig {
             backend_url: "http://h:8000".to_string(),
             machine_id: "m".to_string(),
             environment_id: "e".to_string(),
             enrolled_at: None,
             scope_root: None,
+            repo_owner_allowlist: Vec::new(),
         }))
         .is_none());
+    }
+
+    /// Re-enroll must preserve the repos owner allowlist for the same reason it
+    /// preserves `scope_root`, but with a worse failure shape: an erased
+    /// allowlist does not silence the `repos` section, it WIDENS it. The box
+    /// starts reporting every checkout under its workspace root, each of the
+    /// unrelated ones landing as an `added` delta that breaks `in_sync` — an
+    /// in-sync box turned permanently-drifting, with no error anywhere.
+    #[test]
+    fn enroll_carries_the_repo_owner_allowlist_forward() {
+        let prior = EnvAgentConfig {
+            backend_url: "http://h:8000".to_string(),
+            machine_id: "m".to_string(),
+            environment_id: "e".to_string(),
+            enrolled_at: None,
+            scope_root: None,
+            repo_owner_allowlist: vec!["qontinui".to_string(), "acme".to_string()],
+        };
+        assert_eq!(
+            carried_forward_repo_owner_allowlist(Some(&prior)),
+            vec!["qontinui".to_string(), "acme".to_string()],
+        );
+    }
+
+    /// A first enroll leaves the allowlist empty — which the collector reads as
+    /// "no filter", not as "report nothing".
+    #[test]
+    fn enroll_leaves_the_allowlist_empty_when_there_was_none() {
+        assert!(carried_forward_repo_owner_allowlist(None).is_empty());
     }
 
     #[test]

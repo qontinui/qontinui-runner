@@ -120,6 +120,123 @@ pub(crate) fn sanitize_database_url(raw: &str) -> Option<String> {
     Some(format!("postgres://{host}:{port}"))
 }
 
+/// A git remote, normalized to one canonical secret-free
+/// `https://<host>/<owner>/<name>` rendering. Returns `None` when the input
+/// does not name a host and a two-or-more segment path.
+///
+/// # Why this is not [`sanitize_url`]
+///
+/// [`sanitize_url`] returns `scheme://host[:port]` and **discards the path** —
+/// which is the whole point for a DSN (the path is the database name, and the
+/// comparable fact is the server) and exactly wrong here: a repository's
+/// identity IS its path. Reusing it would collapse every GitHub remote on a box
+/// to the single value `https://github.com`.
+///
+/// # Why normalization is load-bearing rather than cosmetic
+///
+/// `git@github.com:qontinui/qontinui-runner.git`,
+/// `https://github.com/qontinui/qontinui-runner.git` and
+/// `https://github.com/qontinui/qontinui-runner` are the same repository. Emit
+/// them verbatim and two boxes that merely *cloned differently* read as
+/// permanent drift that no apply can ever clear — the same failure mode
+/// [`sanitize_database_url`] was written to avoid, where two spellings of one
+/// server had to converge on ONE comparable value.
+///
+/// Secret-free by the same contract as its two siblings: userinfo is dropped
+/// structurally, so a token-bearing remote
+/// (`https://x-access-token:<pat>@github.com/owner/name`) cannot reach the
+/// envelope. Only scheme-less SCP-style and `ssh://`/`git://`/`http(s)://`
+/// remotes are recognised; anything else returns `None` for the caller to WARN
+/// about rather than silently drop.
+pub(crate) fn sanitize_git_remote(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // SCP-style (`[user@]host:owner/name`) is not a URL and `url::Url` rejects
+    // it, so rewrite it into one first. Detected by "has a colon that is not
+    // followed by `//`" — `git@github.com:qontinui/x` vs `ssh://git@…`.
+    let as_url = match trimmed.find("://") {
+        Some(_) => trimmed.to_string(),
+        None => {
+            let (host_part, path) = trimmed.split_once(':')?;
+            // Strip `user@`; the userinfo is dropped for the same reason
+            // `sanitize_url` drops it, and `git@` carries no information anyway.
+            let host = host_part.rsplit('@').next()?;
+            if host.is_empty() || path.is_empty() {
+                return None;
+            }
+            format!("ssh://{host}/{}", path.trim_start_matches('/'))
+        }
+    };
+
+    let mut parsed = url::Url::parse(&as_url).ok()?;
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    let host = parsed.host_str()?.to_string();
+
+    // Keep every path segment, so a self-hosted forge that nests groups
+    // (`https://git.example.com/team/sub/name`) is not silently truncated to
+    // its last two. Drop the `.git` suffix — the single most common spelling
+    // difference between two clones of one repository.
+    let segments: Vec<&str> = parsed
+        .path()
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let mut path = segments.join("/");
+    if let Some(stripped) = path.strip_suffix(".git") {
+        path = stripped.to_string();
+    }
+    if path.is_empty() {
+        return None;
+    }
+
+    // Rendered as `https://` regardless of the input scheme: the scheme is a
+    // property of how THIS box chose to clone, not of the repository, so
+    // preserving it would reintroduce the drift this function exists to remove.
+    // The port is preserved when the remote states one, since a forge on a
+    // non-default port is a genuinely different host:port.
+    match parsed.port() {
+        Some(port) => Some(format!("https://{host}:{port}/{path}")),
+        None => Some(format!("https://{host}/{path}")),
+    }
+}
+
+/// The `repo_<owner>_<name>` key for a canonical remote, with every character
+/// outside `[A-Za-z0-9._-]` folded to `_` so the key is a stable, flat envelope
+/// key rather than a URL.
+///
+/// Built from the LAST TWO path segments, which is the owner/name pair on every
+/// forge this project uses; a deeper self-hosted path still yields a stable key
+/// because the full canonical URL remains the key's VALUE.
+fn repo_key(canonical_url: &str) -> Option<String> {
+    let path = canonical_url.split_once("://")?.1.split_once('/')?.1;
+    let mut segments = path.rsplit('/');
+    let name = segments.next()?;
+    let owner = segments.next()?;
+    if name.is_empty() || owner.is_empty() {
+        return None;
+    }
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    Some(format!("repo_{}_{}", safe(owner), safe(name)))
+}
+
 /// Probe whether `127.0.0.1:port` accepts a TCP connection within 200ms.
 /// Returns `"listening"` or `"closed"`. Purely a topology signal — no data is
 /// exchanged.
@@ -650,7 +767,17 @@ const WEB_REPO_DIR: &str = "qontinui-web";
 /// The bin crate's workspace-root door, published as a FUNCTION so it is
 /// re-evaluated on every capture. See the section header for why a published
 /// value would be wrong.
-pub type WorkspaceRootFn = fn() -> Option<std::path::PathBuf>;
+///
+/// It hands over the **whole** [`WorkspaceRoot`], not just the path, because
+/// two sections now read it and they need different parts of the same answer:
+/// [`collect_versions`] wants only the path, while [`collect_repos`] must also
+/// publish WHICH rung resolved it (`repos_scope_kind`) so a peer can tell
+/// whether two boxes' repo readings are comparable at all. Resolving twice
+/// would let those two answers disagree — and the drift oracle would then be
+/// comparing a reading taken under one root against one taken under another,
+/// silently, which is precisely the class of bug `probe_scope_kind` exists to
+/// prevent on the `versions` side.
+pub type WorkspaceRootFn = fn() -> qontinui_types::paths::WorkspaceRoot;
 
 static WORKSPACE_ROOT_DOOR: std::sync::OnceLock<WorkspaceRootFn> = std::sync::OnceLock::new();
 
@@ -673,7 +800,11 @@ pub fn publish_workspace_root(door: WorkspaceRootFn) {
 /// the binary supplied one, else the shared resolver's answer with the settings
 /// rung unavailable. See the section header for why there are two arms rather
 /// than one.
-fn workspace_root() -> Option<std::path::PathBuf> {
+///
+/// Returns the full [`WorkspaceRoot`] so a caller can read the resolution's
+/// KIND as well as its path; [`collect_versions`] discards the kind with
+/// `.into_root()`, [`collect_repos`] publishes it.
+fn workspace_root() -> qontinui_types::paths::WorkspaceRoot {
     if let Some(&door) = WORKSPACE_ROOT_DOOR.get() {
         return door();
     }
@@ -687,7 +818,6 @@ fn workspace_root() -> Option<std::path::PathBuf> {
         exe.as_deref()
             .map(|e| qontinui_types::paths::WorkspaceAnchor::new(e, RUNNER_REPO_DIR)),
     )
-    .into_root()
 }
 
 /// The two versions that are properties of THIS BINARY, baked at compile time.
@@ -772,8 +902,11 @@ pub fn collect_versions() -> Section {
     put_binary_versions(&mut section);
 
     // An unresolved workspace root omits the sibling-tree keys rather than
-    // guessing at a layout — see the workspace-root bridge above.
-    if let Some(root) = workspace_root() {
+    // guessing at a layout — see the workspace-root bridge above. This section
+    // reads only the PATH; the resolution's kind is `repos`' provenance, not
+    // this section's (which carries `probe_scope_kind` for the toolchain scope
+    // instead — a different quantity, see `collect_repos`).
+    if let Some(root) = workspace_root().into_root() {
         put_sibling_tree_versions(&mut section, &root);
     }
 
@@ -806,6 +939,232 @@ pub fn collect_versions() -> Section {
     }
 
     section
+}
+
+// ============================================================================
+// repos — which repositories this box has cloned
+// ============================================================================
+//
+// The section answers "which repositories does this environment require", so a
+// developer is TOLD which ones they are missing (with the clone URL) instead of
+// discovering it by hand. Plan `2026-08-06-devenv-repos-section`, P1.
+//
+// ## The anchor is the workspace root, NOT the probe scope
+//
+// `probe_scope_root` resolves where the toolchain `--version` shells run, and
+// its fallback rung is the HOME directory — deliberately, because "the box's
+// default toolchain" is what a shim-based manager answers outside any project
+// tree. On a box that declares no `scope_root` that is `~`, which holds no
+// checkouts at all: enumerating there would emit an empty section, `add_section`
+// would drop it, and the twin would be told nothing about repositories on the
+// very machine that needed telling. `workspace_root` is the resolution that
+// answers "where do the repo checkouts live", and it is the one used here.
+//
+// ## Depth 1, and not as an approximation
+//
+// Every repo that matters is a depth-1 child of the workspace root, because the
+// repos in this project depend on each other by RELATIVE path
+// (`src-tauri/Cargo.toml`'s `../../qontinui-schemas/rust`,
+// `generate_types.sh`'s `$PROJECT_ROOT/../../qontinui-schemas`). A checkout
+// somewhere else cannot satisfy those, so reporting it as present would be
+// wrong, not generous. Recursing would also descend into `_wt/`,
+// `agent-worktrees/`, `node_modules/` and `target/` for nothing.
+
+/// How many depth-1 entries to examine before giving up.
+///
+/// Not a performance knob — a runaway guard. The operator box carries 624
+/// depth-1 entries under its workspace root, so the real cost is bounded and
+/// small; this exists so a root that accidentally resolves somewhere enormous
+/// (a home directory, a drive root) cannot stall a capture that runs on a
+/// 15-minute loop. Exceeding it WARNs rather than truncating silently.
+const REPO_SCAN_ENTRY_BUDGET: usize = 4096;
+
+/// The provenance key: WHICH KIND of workspace-root resolution these repo
+/// observations were taken under.
+pub(crate) const REPOS_SCOPE_KEY: &str = "repos_scope_kind";
+
+/// The workspace root, for the `repos` APPLY.
+///
+/// The same door the capture reads, exposed deliberately rather than letting
+/// `apply_repos` resolve its own: the apply must clone into the root the capture
+/// enumerated, or it would report against one tree and write into another — and
+/// the drift would never clear no matter how many times it ran.
+pub(crate) fn workspace_root_for_apply() -> qontinui_types::paths::WorkspaceRoot {
+    workspace_root()
+}
+
+/// Read `origin` from a checkout at `dir`, returning its canonical secret-free
+/// URL. `None` when the directory is not a canonical checkout, is a linked
+/// worktree, has no `origin`, or has an unparseable one.
+///
+/// Uses `git2` (already a dependency, and already how this crate opens
+/// repositories in `agent_worktree` and `trigger_system`) rather than shelling
+/// `git`: capture runs on a 15-minute loop over hundreds of directories, and a
+/// process spawn per directory is the one cost that would make this collector
+/// too expensive to run.
+fn origin_of_checkout(dir: &Path) -> Result<Option<String>, String> {
+    let repo = git2::Repository::open(dir).map_err(|e| e.message().to_string())?;
+
+    // A linked worktree is NOT an independent clone: it shares its canonical
+    // checkout's object store and dies with it. Reporting one as "this repo is
+    // present" would tell a developer they have something they do not. On the
+    // operator box these outnumber canonical checkouts 239 to 37, so this is
+    // the common case rather than an edge one.
+    if repo.is_worktree() {
+        return Ok(None);
+    }
+
+    let remote = match repo.find_remote("origin") {
+        Ok(r) => r,
+        // No `origin` is a legitimate state (a local-only scratch repo), not a
+        // failure — distinguish it from an unparseable one so only the latter
+        // WARNs.
+        Err(_) => return Ok(None),
+    };
+    let Some(url) = remote.url() else {
+        return Err("origin has no UTF-8 url".to_string());
+    };
+    match sanitize_git_remote(url) {
+        Some(canonical) => Ok(Some(canonical)),
+        // Deliberately an Err, not a silent None: an unparseable remote is the
+        // exact shape of failure that cost the `services` section its
+        // `database_url` key — see `sanitize_database_url`'s header. The caller
+        // WARNs; it never drops it quietly.
+        None => Err(format!(
+            "origin url is not a recognisable git remote ({} chars)",
+            url.len()
+        )),
+    }
+}
+
+/// Pure core of [`collect_repos`]: enumerate depth-1 checkouts under `root` and
+/// emit one `repo_<owner>_<name>` → canonical-URL key each.
+///
+/// `owner_allowlist` filters by the remote's owner segment. An EMPTY allowlist
+/// means "no filter" — the honest reading of an unconfigured environment, since
+/// an empty allowlist that suppressed everything would make an unconfigured box
+/// publish silence, and silence is what this whole section exists to end.
+///
+/// Injected inputs and no environment reads, so it is testable against a
+/// synthetic tree — the same split `resolve_probe_scope` uses.
+fn collect_repos_under(root: &Path, owner_allowlist: &[String]) -> Section {
+    let mut section = Section::new();
+
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(
+                "env_agent: repos scan cannot read {} ({e}) — section will carry provenance only",
+                root.display()
+            );
+            return section;
+        }
+    };
+
+    let mut examined = 0usize;
+    let mut budget_exceeded = false;
+    for entry in entries.flatten() {
+        examined += 1;
+        if examined > REPO_SCAN_ENTRY_BUDGET {
+            budget_exceeded = true;
+            break;
+        }
+        let path = entry.path();
+        // Cheap prefilter: most depth-1 entries under a workspace root are not
+        // repositories at all (348 of 624 on the operator box), and this avoids
+        // handing every one of them to libgit2.
+        if !path.join(".git").exists() {
+            continue;
+        }
+        match origin_of_checkout(&path) {
+            Ok(Some(canonical)) => {
+                let Some(key) = repo_key(&canonical) else {
+                    warn!(
+                        "env_agent: cannot derive a repo key from {canonical} — skipping this entry"
+                    );
+                    continue;
+                };
+                if !owner_allowlist.is_empty() && !owner_matches(&canonical, owner_allowlist) {
+                    continue;
+                }
+                // Two entries can legitimately resolve to the same repository
+                // (a checkout plus a differently-spelled second clone); they
+                // normalize to the same key AND the same value, so last-write
+                // is not a conflict.
+                put(&mut section, &key, canonical);
+            }
+            Ok(None) => {}
+            Err(reason) => warn!(
+                "env_agent: skipping {} — {reason}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string())
+            ),
+        }
+    }
+
+    if budget_exceeded {
+        warn!(
+            "env_agent: repos scan stopped after {REPO_SCAN_ENTRY_BUDGET} entries under {} — \
+             the section is INCOMPLETE; is the workspace root pointing somewhere unexpected?",
+            root.display()
+        );
+    }
+
+    section
+}
+
+/// Whether a canonical URL's owner segment is in the allowlist (case-insensitive
+/// — forges treat owner names case-insensitively, and two boxes spelling one
+/// owner differently must not read as different repositories).
+fn owner_matches(canonical_url: &str, allowlist: &[String]) -> bool {
+    let Some(path) = canonical_url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map(|(_, p)| p)
+    else {
+        return false;
+    };
+    let mut segments = path.rsplit('/');
+    let _name = segments.next();
+    let Some(owner) = segments.next() else {
+        return false;
+    };
+    allowlist.iter().any(|a| a.eq_ignore_ascii_case(owner))
+}
+
+/// Collect the `repos` section: which repositories are cloned on this box, keyed
+/// by identity and valued by the canonical clone URL, plus the provenance of the
+/// root they were enumerated under.
+///
+/// Returns `None` only when the workspace root does not resolve — there is then
+/// no observation to report, and publishing a bare provenance key saying
+/// "unresolved" would assert a reading that was never taken. Everything else
+/// returns `Some`, INCLUDING a resolved root under which nothing matched: that
+/// is a real, comparable observation ("this box has none of the environment's
+/// repos") and the section must carry it rather than vanish. `add_section`
+/// drops empty sections, so the provenance key is also what keeps a
+/// legitimately-empty result visible instead of silent.
+pub fn collect_repos() -> Option<Section> {
+    let resolved = workspace_root();
+    if let Some(rejected) = resolved.rejected {
+        warn!(
+            "env_agent: repos capture — {} — continuing with the next resolution rung",
+            rejected.describe()
+        );
+    }
+    let kind = resolved.kind;
+    let root = resolved.into_root()?;
+
+    let allowlist = super::config::EnvAgentConfig::load()
+        .map(|c| c.repo_owner_allowlist)
+        .unwrap_or_default();
+
+    let mut section = collect_repos_under(&root, &allowlist);
+    // Written LAST and unconditionally: it is what makes an empty result a
+    // stated observation rather than a dropped section.
+    put(&mut section, REPOS_SCOPE_KEY, kind.wire());
+    Some(section)
 }
 
 /// The `package.json` this capture reports: **this repo's own**, at
@@ -1145,6 +1504,211 @@ mod tests {
     #[test]
     fn sanitize_database_url_still_rejects_garbage() {
         assert!(sanitize_database_url("not a dsn at all ===").is_none());
+    }
+
+    // ---- repos ----------------------------------------------------------
+
+    /// The three spellings of ONE repository must converge on ONE value.
+    /// Without this, two boxes that merely cloned differently read as permanent
+    /// drift that no apply can ever clear.
+    #[test]
+    fn sanitize_git_remote_converges_every_spelling_of_one_repo() {
+        let canonical = "https://github.com/qontinui/qontinui-runner";
+        for spelling in [
+            "git@github.com:qontinui/qontinui-runner.git",
+            "git@github.com:qontinui/qontinui-runner",
+            "https://github.com/qontinui/qontinui-runner.git",
+            "https://github.com/qontinui/qontinui-runner",
+            "ssh://git@github.com/qontinui/qontinui-runner.git",
+            "git://github.com/qontinui/qontinui-runner.git",
+            "  https://github.com/qontinui/qontinui-runner/  ",
+        ] {
+            assert_eq!(
+                sanitize_git_remote(spelling).as_deref(),
+                Some(canonical),
+                "{spelling} must normalize to {canonical}"
+            );
+        }
+    }
+
+    /// A token-bearing remote must never reach the envelope — the same
+    /// structural userinfo strip `sanitize_url` performs.
+    #[test]
+    fn sanitize_git_remote_strips_a_token() {
+        let got =
+            sanitize_git_remote("https://x-access-token:ghp_secret@github.com/qontinui/x.git");
+        assert_eq!(got.as_deref(), Some("https://github.com/qontinui/x"));
+        assert!(!got.unwrap().contains("ghp_secret"));
+    }
+
+    /// A non-GitHub forge is preserved verbatim (host, port, and every path
+    /// segment) — truncating a nested group would collapse two different
+    /// repositories onto one key.
+    #[test]
+    fn sanitize_git_remote_preserves_other_forges_and_nested_groups() {
+        assert_eq!(
+            sanitize_git_remote("git@gitlab.example.com:team/sub/name.git").as_deref(),
+            Some("https://gitlab.example.com/team/sub/name")
+        );
+        assert_eq!(
+            sanitize_git_remote("ssh://git@forge.example.com:2222/owner/name.git").as_deref(),
+            Some("https://forge.example.com:2222/owner/name")
+        );
+    }
+
+    /// Unparseable input returns `None` so the CALLER can WARN. Silently
+    /// dropping it is the failure `sanitize_database_url`'s header documents,
+    /// where a quiet `None` cost the `services` section its most important key.
+    #[test]
+    fn sanitize_git_remote_rejects_what_it_cannot_parse() {
+        for bad in [
+            "",
+            "   ",
+            "not a remote",
+            "https://github.com",
+            "github.com:",
+        ] {
+            assert!(
+                sanitize_git_remote(bad).is_none(),
+                "{bad:?} must not produce a value"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_key_is_owner_and_name_with_unsafe_chars_folded() {
+        assert_eq!(
+            repo_key("https://github.com/qontinui/qontinui-runner").as_deref(),
+            Some("repo_qontinui_qontinui-runner")
+        );
+        // Deeper paths still key on the trailing owner/name pair; the full URL
+        // stays the VALUE, so nothing is lost.
+        assert_eq!(
+            repo_key("https://gitlab.example.com/team/sub/name").as_deref(),
+            Some("repo_sub_name")
+        );
+    }
+
+    #[test]
+    fn owner_allowlist_matches_case_insensitively() {
+        let allow = vec!["QonTinui".to_string()];
+        assert!(owner_matches(
+            "https://github.com/qontinui/qontinui-stack",
+            &allow
+        ));
+        assert!(!owner_matches("https://github.com/someone-else/x", &allow));
+    }
+
+    /// A synthetic workspace root: one canonical checkout, one LINKED WORKTREE
+    /// of it, and one directory that is not a repository at all.
+    fn repos_fixture(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "qontinui_repos_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A real checkout with an `origin`.
+        let repo = root.join("qontinui-runner");
+        let r = git2::Repository::init(&repo).unwrap();
+        r.remote("origin", "git@github.com:qontinui/qontinui-runner.git")
+            .unwrap();
+
+        // A LINKED WORKTREE of it: `.git` is a FILE, not a directory. On the
+        // operator box these outnumber canonical checkouts 239 to 37.
+        let wt = root.join("qontinui-runner-wt-something");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", repo.join(".git").display()),
+        )
+        .unwrap();
+
+        // Not a repository at all — the majority case under a real root.
+        std::fs::create_dir_all(root.join("_cargo-targets")).unwrap();
+
+        root
+    }
+
+    /// The whole point of the section: a canonical checkout is reported, and a
+    /// linked worktree of it is NOT. A worktree shares its checkout's object
+    /// store and dies with it, so counting one as "this repo is present" would
+    /// tell a developer they have something they do not.
+    #[test]
+    fn collect_repos_reports_checkouts_and_excludes_linked_worktrees() {
+        let root = repos_fixture("basic");
+        let section = collect_repos_under(&root, &[]);
+
+        assert_eq!(
+            section
+                .get("repo_qontinui_qontinui-runner")
+                .and_then(Value::as_str),
+            Some("https://github.com/qontinui/qontinui-runner"),
+            "the canonical checkout must be reported, normalized"
+        );
+        assert_eq!(
+            section.len(),
+            1,
+            "the linked worktree and the non-repo must contribute nothing: {section:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An EMPTY allowlist means no filter. An empty allowlist that suppressed
+    /// everything would make an unconfigured box publish silence — and an absent
+    /// fact being indistinguishable from "in sync" is what this section exists
+    /// to end.
+    #[test]
+    fn an_empty_allowlist_filters_nothing() {
+        let root = repos_fixture("empty_allow");
+        assert_eq!(collect_repos_under(&root, &[]).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A non-empty allowlist drops non-matching owners — the filter that keeps
+    /// a developer's personal checkouts from breaking `in_sync` server-side.
+    #[test]
+    fn a_non_matching_allowlist_drops_the_repo() {
+        let root = repos_fixture("allow_filters");
+        assert!(collect_repos_under(&root, &["someone-else".to_string()]).is_empty());
+        assert_eq!(
+            collect_repos_under(&root, &["qontinui".to_string()]).len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A checkout with no `origin` is a legitimate local-only repo, not an
+    /// error: it contributes no key and does not abort the scan.
+    #[test]
+    fn a_checkout_without_an_origin_is_skipped_not_fatal() {
+        let root = repos_fixture("no_origin");
+        let orphan = root.join("local-only");
+        git2::Repository::init(&orphan).unwrap();
+        let section = collect_repos_under(&root, &[]);
+        assert_eq!(
+            section.len(),
+            1,
+            "only the origin-bearing repo: {section:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A root with no repositories under it yields an EMPTY section rather than
+    /// an error — `collect_repos` then adds the provenance key, which is what
+    /// stops `add_section` dropping a legitimately-empty observation.
+    #[test]
+    fn an_empty_root_yields_an_empty_section_not_a_failure() {
+        let root = std::env::temp_dir().join(format!("qontinui_repos_bare_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(collect_repos_under(&root, &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

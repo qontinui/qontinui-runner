@@ -412,7 +412,7 @@ mod tests {
         // The #1025 storm, replayed. Five supervisors tick concurrently against
         // N=1. Check-then-spawn gives five shepherds; claim-first gives one.
         let mut coord = FakeCoordMutex::new();
-        let mut held = vec![None; 5];
+        let mut held = [None; 5];
         let spawns: usize = (0..5)
             .filter(|i| supervisor_tick(&mut coord, &format!("machine-{i}"), 1, &mut held[*i], 0))
             .count();
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn n_slots_admit_exactly_n_shepherds_fleet_wide() {
         let mut coord = FakeCoordMutex::new();
-        let mut held = vec![None; 5];
+        let mut held = [None; 5];
         let spawns: usize = (0..5)
             .filter(|i| supervisor_tick(&mut coord, &format!("machine-{i}"), 2, &mut held[*i], 0))
             .count();

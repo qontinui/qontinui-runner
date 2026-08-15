@@ -941,7 +941,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // resolved published nothing, permanently — the keys could never
                 // appear afterwards, however the operator fixed the setting.
                 qontinui_runner_lib::env_agent::collectors::publish_workspace_root(
-                    crate::workspace_paths::workspace_root,
+                    crate::workspace_paths::runner_workspace_root,
                 );
                 qontinui_runner_lib::env_agent::spawn_env_capture();
                 // Phase 3 — dispatched self-enroll: subscribe to coord's

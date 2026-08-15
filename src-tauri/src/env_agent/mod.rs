@@ -27,7 +27,8 @@
 //!     "db_schema":    { "<key>": "<string>" },
 //!     "versions":     { "<key>": "<string>" },
 //!     "env_contract": { "<VAR_NAME>": "present" },
-//!     "claude_accounts": { "<key>": "<string>" }
+//!     "claude_accounts": { "<key>": "<string>" },
+//!     "repos":        { "repo_<owner>_<name>": "<canonical clone url>" }
 //!   }
 //! }
 //! ```
@@ -44,6 +45,7 @@
 //! is unreachable.
 
 pub mod apply;
+pub mod apply_repos;
 pub mod apply_services;
 pub mod apply_versions;
 pub mod collectors;
@@ -227,6 +229,12 @@ pub async fn build_envelope() -> ConfigEnvelope {
         "claude_accounts",
         collectors::collect_claude_accounts(),
     );
+    // Which repositories this box has cloned. Returns None (section omitted)
+    // only when the workspace root does not resolve — a resolved root under
+    // which nothing matched still returns Some, carrying its provenance key, so
+    // "this box has none of them" stays a stated observation rather than a
+    // dropped section.
+    add_section(&mut sections, "repos", collectors::collect_repos());
 
     ConfigEnvelope {
         schema_version: SCHEMA_VERSION,

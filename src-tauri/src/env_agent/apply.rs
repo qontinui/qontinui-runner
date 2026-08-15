@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 use super::pull::{ApplyPlan, SectionPlan, SectionPolicy};
-use super::{apply_services, apply_versions};
+use super::{apply_repos, apply_services, apply_versions};
 
 /// What the caller asked for.
 #[derive(Debug, Clone, Default)]
@@ -223,6 +223,11 @@ fn dispatch(section: &SectionPlan, opts: &ApplyOptions) -> SectionApply {
         }
         apply_versions::VERSIONS_SECTION => {
             let out = apply_versions::apply_section(section, opts.confirm);
+            audit_if_applied(&out);
+            out
+        }
+        apply_repos::REPOS_SECTION => {
+            let out = apply_repos::apply_section(section, opts.confirm);
             audit_if_applied(&out);
             out
         }
