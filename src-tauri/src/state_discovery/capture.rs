@@ -72,12 +72,89 @@ fn resolve_page_label(snapshot: &serde_json::Value) -> Option<String> {
     Some(pathname_to_spec_id(raw))
 }
 
+/// Resolve the app that produced this snapshot, from the snapshot itself.
+///
+/// Read untyped off the top level, exactly like [`resolve_page_label`] reads
+/// `activeTab` — and for the same reason. The snapshot handler dispatches by
+/// `window_label` and holds no app identity of its own (the call site in
+/// `mcp::ui_bridge::elements` says so outright: "the caller has no scope
+/// knowledge the snapshot doesn't already carry"), so the id must arrive
+/// inside the snapshot rather than as a parameter. The runner frontend stamps
+/// it through its `runner-tabs` snapshot enricher from the single
+/// `RUNNER_APP_ID` constant.
+///
+/// Blank values collapse to `None` so a whitespace-only `appId` records "app
+/// unknown" rather than a key that can never match `project.apps`. The value
+/// is trimmed, so incidental padding still matches the registry instead of
+/// silently attributing the row to nothing.
+///
+/// Returning `None` is meaningful, not a failure: the column is nullable and
+/// `NULL` means exactly "app unknown". Attribution is never fabricated — an
+/// absent id stays absent, and an id the registry does not know is collapsed
+/// to `NULL` by the INSERT itself (see [`OBSERVATION_INSERT_SQL`]).
+fn resolve_app_id(snapshot: &serde_json::Value) -> Option<String> {
+    let raw = snapshot.get("appId")?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// The observation INSERT, hoisted to a `const` so its shape can be pinned by
+/// a test.
+///
+/// This repo uses raw `tokio_postgres`, not sqlx: there is no compile-time
+/// statement checking anywhere in the runner, so a wrong column name or arity
+/// compiles clean and surfaces only as a `warn!` on a fire-and-forget path
+/// nobody watches. The string-assertion test below is the only verification
+/// available without a live PG — the same guard
+/// `page_query_is_bounded_by_artifact_ids_not_by_time` puts on
+/// `PAGE_RENDERS_SQL`.
+///
+/// Casts are deliberate. `$1::text::uuid` because tokio-postgres' `uuid`
+/// feature is not enabled, so the id is serialized as text and PG coerces it
+/// at insertion (a bare `$1::uuid` makes PG infer the parameter as uuid and
+/// `String` serialization then fails). `$4::jsonb`/`$5::jsonb` land the serde
+/// payloads in JSONB columns rather than text. `$6` needs **no** cast:
+/// `project.apps.app_id` is `TEXT PRIMARY KEY` (so the lookup is unique and
+/// index-backed) and `co_occurrence_observations.app_id` is `TEXT`.
+///
+/// `app_id` is validated **inside this statement** rather than with a second
+/// round trip, so capture never pays an extra query per observation: an id the
+/// registry does not know collapses to `NULL`, preserving "absent or unknown
+/// writes NULL and logs, never fabricate".
+///
+/// **Dependency worth naming:** the subquery references `project.apps`, so if
+/// that relation is missing the *whole INSERT fails* and the observation is
+/// silently lost — strictly worse than not attributing it. That is safe only
+/// because the runner is the canonical author of that table and self-heals it
+/// with `CREATE TABLE IF NOT EXISTS project.apps` at pool init
+/// (`crate::database::pg` pool bootstrap) on the very pool that runs this
+/// statement. **If that self-heal is ever removed, this design must change**
+/// to the `table_exists`-guarded form `validate_app_filter` uses in
+/// `bin/qontinui_specs.rs`.
+///
+/// `RETURNING app_id` is what makes the reject case observable, which is why
+/// the call below is `query_opt` and not `execute` — `execute` returns a row
+/// count and would discard it.
+const OBSERVATION_INSERT_SQL: &str = r#"INSERT INTO co_occurrence_observations
+               (id, spec_id, runner_instance, fingerprints, snapshot_metadata, app_id)
+               VALUES ($1::text::uuid, $2, $3, $4::jsonb, $5::jsonb,
+                       (SELECT a.app_id FROM project.apps a WHERE a.app_id = $6))
+               RETURNING app_id"#;
+
 /// Enqueue a single observation derived from a UI Bridge snapshot.
 ///
 /// Extracts a fingerprint per element, resolves the page label (see
-/// [`resolve_page_label`]), records minimal page metadata, and inserts one row
-/// into `co_occurrence_observations`. All errors downgrade to WARN logs — the
+/// [`resolve_page_label`]) and the producing app (see [`resolve_app_id`]),
+/// records minimal page metadata, and inserts one row into
+/// `co_occurrence_observations`. All errors downgrade to WARN logs — the
 /// snapshot path must never fail because of observation capture.
+///
+/// Takes no `app_id` parameter on purpose: the id is read off the snapshot,
+/// which keeps the call site's invariant that the caller carries no scope
+/// knowledge the snapshot doesn't, and avoids threading a value through the
+/// fire-and-forget `tokio::spawn` that invokes this.
 pub async fn enqueue_observation(
     pg_db: Arc<PgDb>,
     snapshot: &serde_json::Value,
@@ -139,6 +216,7 @@ pub async fn enqueue_observation(
     let page_context = page.and_then(|p| p.get("pageContext")).cloned();
 
     let spec_id = resolve_page_label(snapshot);
+    let app_id = resolve_app_id(snapshot);
 
     let snapshot_metadata = serde_json::json!({
         "pathname": pathname,
@@ -167,31 +245,52 @@ pub async fn enqueue_observation(
         }
     };
 
-    // Cast $1 to uuid via ::text::uuid so tokio-postgres serializes the String
-    // as text (its uuid feature is not enabled) and PG coerces to uuid at
-    // insertion. A bare $1::uuid makes PG infer the parameter as uuid and
-    // String serialization fails. Cast $4/$5 to jsonb so the serde_json
-    // payload lands in JSONB columns rather than text.
+    // See `OBSERVATION_INSERT_SQL` for why each cast is there and why the
+    // `project.apps` subquery is safe. `query_opt` rather than `execute`
+    // because `execute` returns a row count, which would discard the
+    // `RETURNING app_id` that makes an unknown id observable.
     let res = conn
-        .execute(
-            r#"INSERT INTO co_occurrence_observations
-               (id, spec_id, runner_instance, fingerprints, snapshot_metadata)
-               VALUES ($1::text::uuid, $2, $3, $4::jsonb, $5::jsonb)"#,
+        .query_opt(
+            OBSERVATION_INSERT_SQL,
             &[
                 &id,
                 &spec_id as &(dyn tokio_postgres::types::ToSql + Sync),
                 &runner_instance,
                 &fingerprints_json,
                 &snapshot_metadata,
+                &app_id,
             ],
         )
         .await;
 
-    if let Err(e) = res {
-        warn!(
-            "state_discovery::capture: failed to insert observation ({} elements): {}",
-            element_count, e
-        );
+    match res {
+        Err(e) => {
+            warn!(
+                "state_discovery::capture: failed to insert observation ({} elements): {}",
+                element_count, e
+            );
+        }
+        Ok(row) => {
+            // The stamped id came back NULL while we supplied one: the app is
+            // not registered in `project.apps`. The row is kept and recorded
+            // un-attributed rather than dropped — it still carries
+            // co-occurrence signal — but this is a producer/consumer key
+            // disagreement, so say so loudly enough to diagnose.
+            // `try_get`, not `get`: `get` panics on a type mismatch, and this
+            // runs inside a fire-and-forget task whose whole contract is that
+            // it cannot disturb the snapshot response.
+            let stored: Option<String> = row
+                .and_then(|r| r.try_get::<_, Option<String>>(0).ok())
+                .flatten();
+            if let (Some(candidate), None) = (app_id.as_deref(), stored.as_deref()) {
+                warn!(
+                    "state_discovery::capture: snapshot claimed appId {:?}, which is not \
+                     registered in project.apps — observation recorded with app_id NULL \
+                     (un-attributed). Register the app or fix the producer's id.",
+                    candidate
+                );
+            }
+        }
     }
 }
 
@@ -290,5 +389,104 @@ mod tests {
         });
         let once = resolve_page_label(&snap).unwrap();
         assert_eq!(pathname_to_spec_id(&once), once);
+    }
+
+    // ---- app attribution -------------------------------------------------
+
+    #[test]
+    fn app_id_is_read_from_the_snapshot_top_level() {
+        // The runner frontend's `runner-tabs` enricher stamps this from
+        // `RUNNER_APP_ID`; the handler never passes it in.
+        let snap = json!({ "appId": "qontinui-runner", "page": { "pathname": "/" } });
+        assert_eq!(resolve_app_id(&snap).as_deref(), Some("qontinui-runner"));
+    }
+
+    #[test]
+    fn absent_app_id_is_none_not_a_fabricated_default() {
+        // A snapshot from a producer that does not stamp an id records
+        // "app unknown". Defaulting to `qontinui-runner` here would be the
+        // confidently-wrong inference this whole change exists to avoid.
+        assert_eq!(resolve_app_id(&json!({})), None);
+        assert_eq!(
+            resolve_app_id(&json!({ "page": { "pathname": "/" } })),
+            None
+        );
+    }
+
+    #[test]
+    fn blank_app_id_is_none() {
+        // Mirrors `resolve_page_label`'s blank handling: an empty or
+        // whitespace-only id is not a key, so it must not be sent to the
+        // registry lookup as if it were one.
+        assert_eq!(resolve_app_id(&json!({ "appId": "" })), None);
+        assert_eq!(resolve_app_id(&json!({ "appId": "   " })), None);
+    }
+
+    #[test]
+    fn non_string_app_id_is_none() {
+        // The field is untyped on the wire; anything that is not a string
+        // cannot be an app id.
+        assert_eq!(resolve_app_id(&json!({ "appId": 42 })), None);
+        assert_eq!(resolve_app_id(&json!({ "appId": null })), None);
+        assert_eq!(
+            resolve_app_id(&json!({ "appId": ["qontinui-runner"] })),
+            None
+        );
+    }
+
+    #[test]
+    fn app_id_is_trimmed_so_padding_still_matches_the_registry() {
+        // `project.apps.app_id` is matched by exact equality, so an untrimmed
+        // value would collapse to NULL for a reason nobody could see.
+        assert_eq!(
+            resolve_app_id(&json!({ "appId": "  qontinui-runner  " })).as_deref(),
+            Some("qontinui-runner")
+        );
+    }
+
+    #[test]
+    fn observation_insert_stamps_app_id_and_validates_it_in_one_statement() {
+        // Shape guard, in the spirit of
+        // `page_query_is_bounded_by_artifact_ids_not_by_time` in
+        // `workflow_generation::spec_authoring`. There is no sqlx in this repo
+        // — every statement is a runtime-parsed string, so a wrong column name
+        // or arity compiles clean and fails only as a `warn!` on a
+        // fire-and-forget path. This test is the only pre-PG verification of
+        // this statement that exists.
+        assert!(
+            OBSERVATION_INSERT_SQL.contains(
+                "(id, spec_id, runner_instance, fingerprints, snapshot_metadata, app_id)"
+            ),
+            "the six-column list must stay in sync with the six binds. Got: {OBSERVATION_INSERT_SQL}"
+        );
+        assert!(
+            OBSERVATION_INSERT_SQL
+                .contains("(SELECT a.app_id FROM project.apps a WHERE a.app_id = $6)"),
+            "app_id must be validated against the registry inside this statement, so an \
+             unknown id collapses to NULL instead of being written as fact. Got: \
+             {OBSERVATION_INSERT_SQL}"
+        );
+        assert!(
+            OBSERVATION_INSERT_SQL.contains("RETURNING app_id"),
+            "without RETURNING, the collapsed-to-NULL case is invisible and the `query_opt` \
+             call below has nothing to read"
+        );
+        // The pre-existing casts are load-bearing; see the const's doc comment.
+        assert!(
+            OBSERVATION_INSERT_SQL.contains("$1::text::uuid"),
+            "tokio-postgres' uuid feature is not enabled — the id must round-trip as text"
+        );
+        assert!(
+            OBSERVATION_INSERT_SQL.contains("$4::jsonb")
+                && OBSERVATION_INSERT_SQL.contains("$5::jsonb"),
+            "the serde payloads must land in JSONB columns, not text"
+        );
+        // $6 must NOT be cast: both sides of the lookup are already TEXT, and a
+        // cast here would only obscure that.
+        assert!(
+            !OBSERVATION_INSERT_SQL.contains("$6::"),
+            "project.apps.app_id and co_occurrence_observations.app_id are both TEXT — $6 \
+             needs no cast"
+        );
     }
 }

@@ -96,7 +96,7 @@ import { PromptExecutionProvider } from "./components/prompt-home/PromptExecutio
 import { PromptAutomationOverlay } from "./components/prompt-home/PromptAutomationOverlay";
 import { BackgroundTaskPill } from "./components/prompt-home/BackgroundTaskPill";
 import { useTaskRuns } from "./hooks/useAiData";
-import { loadDiscoveredSpecs } from "./lib/ui-bridge/use-discovered-specs";
+import { loadDiscoveredSpecs, RUNNER_APP_ID } from "./lib/ui-bridge/use-discovered-specs";
 import { getGlobalSpecStore } from "@qontinui/ui-bridge/specs";
 import { autoPopulateCtr, getGlobalCtr } from "@qontinui/ui-bridge/ctr";
 import { getGlobalRegistry, useUIComponent } from "@qontinui/ui-bridge";
@@ -1144,16 +1144,27 @@ function CtrAutoPopulator() {
 
 /**
  * Registers a pluggable snapshot enricher that contributes the runner's
- * tab metadata (`availableTabs`, `tabActivation`) to every UI Bridge
- * snapshot. These fields describe a runner-shell feature and are not
- * part of the SDK's canonical snapshot schema, so they live here rather
- * than in the registry's built-in tracker enrichers (which Phase 1 of
- * the SDK Tracker Reshape moved into the SDK).
+ * tab metadata (`availableTabs`, `tabActivation`) plus its app identity
+ * (`appId`) to every UI Bridge snapshot. These fields describe a
+ * runner-shell feature and are not part of the SDK's canonical snapshot
+ * schema, so they live here rather than in the registry's built-in tracker
+ * enrichers (which Phase 1 of the SDK Tracker Reshape moved into the SDK).
  *
  * Reads the active tab from `instanceStorage` fresh on each snapshot —
  * do NOT capture `activeTabId` outside the closure. Fallback matches
  * the `tabs_list` IPC handler (`DEFAULT_TAB_ID` — the first tab the runner
  * shell selects on launch).
+ *
+ * `appId` states which app produced the snapshot so the Rust capture path
+ * (`state_discovery::capture::enqueue_observation`) can attribute the
+ * observation instead of inferring it: the snapshot handler dispatches by
+ * `window_label` and holds no app identity of its own, so the id has to
+ * arrive inside the snapshot. It is a synchronous module constant because
+ * `runEnrichers` is strictly synchronous — a Promise-returning enricher
+ * type-errors and would merge nothing at runtime. It is deliberately NOT
+ * added to the SDK's `BridgeSnapshot` type; the enricher return type is
+ * `Record<string, unknown>`, exactly as the shipped `availableTabs` proves,
+ * and typing it there would pull this into a three-repo release lockstep.
  */
 function RunnerTabsEnricher() {
   useEffect(() => {
@@ -1173,7 +1184,7 @@ function RunnerTabsEnricher() {
         path: "/ui-bridge/control/tab/activate",
         bodyExample: { tabId: "<one of availableTabs[].id>" },
       };
-      return { availableTabs, tabActivation };
+      return { availableTabs, tabActivation, appId: RUNNER_APP_ID };
     });
     return dispose;
   }, []);

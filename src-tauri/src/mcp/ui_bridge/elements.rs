@@ -2658,17 +2658,22 @@ pub async fn ui_bridge_get_snapshot_handler(
                 }
             }
 
-            // Mirror the snapshot's top-level `activeTab` / `route` into the
-            // `registration` sub-object so callers reading `registration.activeTab`
-            // see the same value `/control/tabs` reports. Both top-level fields are
+            // Mirror the snapshot's top-level `activeTab` / `route` / `appId` into
+            // the `registration` sub-object so callers reading `registration.activeTab`
+            // see the same value `/control/tabs` reports. `activeTab` / `route` are
             // populated by the SDK from the runner's `getActiveTab` callback (which
             // reads `ACTIVE_TAB_STORAGE_KEY` — the source of truth `tabs_list` also
             // reads), so we just copy them across without a second IPC round-trip.
+            // `appId` is contributed by the frontend's `runner-tabs` snapshot
+            // enricher (`src/App.tsx`) from the single `RUNNER_APP_ID` constant, and
+            // is mirrored here purely so an operator can diagnose observation
+            // attribution off one snapshot read.
             // Purely additive: existing readers of `registration.{totalRegistered,
             // everHadRegistrations, byRoute}` are unaffected.
             {
                 let active_tab_val = data.get("activeTab").cloned();
                 let route_val = data.get("route").cloned();
+                let app_id_val = data.get("appId").cloned();
                 if let Some(obj) = data.as_object_mut() {
                     if let Some(reg_val) = obj.get_mut("registration") {
                         if let Some(reg_obj) = reg_val.as_object_mut() {
@@ -2677,6 +2682,9 @@ pub async fn ui_bridge_get_snapshot_handler(
                             }
                             if let Some(v) = route_val {
                                 reg_obj.insert("route".to_string(), v);
+                            }
+                            if let Some(v) = app_id_val {
+                                reg_obj.insert("appId".to_string(), v);
                             }
                         }
                     }
