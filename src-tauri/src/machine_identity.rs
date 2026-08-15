@@ -7,10 +7,35 @@
 //! pairing and registration idempotent; presenting a fresh one grows a new
 //! `coord.devices` row per attempt for the same box.
 //!
-//! This module exists so that reader has ONE home. It is declared in both
+//! This module is the canonical home for that reader on the paths that can
+//! WRITE or MINT an identity — [`crate::pair`], [`crate::auth`] and the
+//! `qontinui_profile device` subcommand — which is where a duplicated reader
+//! actually costs a second `coord.devices` row. It is declared in both
 //! `lib.rs` and `main.rs` because [`crate::auth`] compiles into both crates
 //! while [`crate::pair`] is lib-only, and `auth.rs` must be able to consult
 //! the canonical identity before falling back to its own encrypted cache.
+//!
+//! It is **not yet the only reader in the runner.** Roughly a dozen hand-rolled
+//! `dirs::home_dir()/.qontinui/machine.json` readers remain (`grep -r
+//! 'join("machine.json")'`): `device_id` readers in `agent_runtime`,
+//! `agent_worktree::{census, isolated_edit}`, `claude_session::federation`,
+//! `terminal::coord_warn`, `fleet`, `main.rs` and `memory::tenant_sync`, plus
+//! `active_tenant_id` readers in `agent_worktree::{fs_backstop,
+//! maintenance_executor}`, `fleet::resource_sample`, `session::dual_write` and
+//! `coord_doctor`. Every one of them is READ-ONLY (the `device_id` ones are all
+//! alias-aware for `machine_id`), and the file's only four WRITERS — `pair`'s
+//! mint and legacy backfill, `commands::tenant`, and `qontinui_profile device
+//! init` — all go through this module's shape. So the invariant does not hang
+//! on folding the readers in; that is a mechanical follow-up buying consistent
+//! error text and one place to change the path.
+//!
+//! Two of them do want the follow-up sooner, and for a real reason:
+//! `main.rs`'s session/helper-task registrar id and
+//! `memory::tenant_sync::init_global` both end in
+//! `.unwrap_or_else(Uuid::new_v4)`, so on a box whose `machine.json` is absent
+//! or corrupt they present coord a fresh per-PROCESS id — the same
+//! second-identity shape [`crate::auth`] was just fixed for. Out of scope for
+//! this plan phase; recorded here so it is not rediscovered from scratch.
 //! Plan `2026-08-06-device-identity-is-per-profile-not-per-machine` Phase 2.
 
 use std::path::{Path, PathBuf};

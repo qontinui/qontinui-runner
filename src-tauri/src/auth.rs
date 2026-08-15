@@ -627,6 +627,38 @@ impl AuthManager {
         Ok(())
     }
 
+    /// Should the encrypted store's cached `device_id` be re-pointed at
+    /// `canonical` (the `machine.json` identity)?
+    ///
+    /// `true` only when the store is READABLE and disagrees. The
+    /// present-but-unreadable case is deliberately excluded even though it
+    /// "disagrees" — [`SecureStorage::get_device_id`] returns `Err` for both
+    /// "nothing cached" and "store undecryptable", while
+    /// [`Self::store_device_id`] REFUSES to write over a present-but-unreadable
+    /// store (`load_tokens_for_write`, Merge mode). So on a renamed or moved
+    /// box — where the hostname+username-derived AES key no longer matches, the
+    /// exact scenario the canonical-identity fix exists for — a naive
+    /// `get_device_id().ok() != Some(canonical)` test is true FOREVER: every
+    /// call logged an `info!`, attempted a doomed write and logged a `warn!`.
+    ///
+    /// That is a hot path (`commands::workflow_events` constructs a fresh
+    /// `AuthManager` and calls `get_device_id` at five sites; the frontend auth
+    /// poll adds `check_auth_status`), and the id returned is correct either
+    /// way — so the whole loop produced nothing but log noise. Repairing the
+    /// store is the operator's explicit re-sign-in path
+    /// (`commands::auth::reset_credential_store`), not a background read's job.
+    fn should_repoint_device_id_cache(&self, canonical: &str) -> bool {
+        if self.secure_storage.is_present_but_unreadable() {
+            debug!(
+                "Device ID cache not re-pointed: the credential store is present but unreadable \
+                 (repair it by signing in again). The canonical machine.json identity is \
+                 returned regardless."
+            );
+            return false;
+        }
+        self.secure_storage.get_device_id().ok().as_deref() != Some(canonical)
+    }
+
     /// Retrieves the machine's device ID.
     ///
     /// Resolution order — **`machine.json` is canonical and wins outright**:
@@ -660,7 +692,21 @@ impl AuthManager {
                 Ok(id) => {
                     // Keep the encrypted store as a CACHE of the canonical id
                     // (best effort — a stale cache must never fail the read).
-                    if self.secure_storage.get_device_id().ok().as_deref() != Some(id.as_str()) {
+                    //
+                    // Skip the re-point entirely when the store is present but
+                    // UNREADABLE. `get_device_id()` returns `Err` for both "no
+                    // id cached" and "store undecryptable", and
+                    // `store_device_id` REFUSES to write over an unreadable
+                    // store (`secure_storage::load_tokens_for_write`, Merge
+                    // mode) — so on a renamed/moved box, where the
+                    // hostname+username-derived AES key no longer matches, the
+                    // divergence test is permanently true and every call logged
+                    // an `info!`, attempted a doomed write and logged a `warn!`.
+                    // This is a HOT path (`commands::workflow_events` builds a
+                    // fresh `AuthManager` per call, plus the frontend auth
+                    // poll), and the id returned is already correct, so the only
+                    // product of retrying is log noise.
+                    if self.should_repoint_device_id_cache(&id) {
                         info!(
                             "Device ID cache re-pointed at canonical machine.json identity: {}",
                             id
@@ -1508,6 +1554,76 @@ mod tests {
         assert!(
             !machine_file.exists(),
             "the auth path must never create machine.json"
+        );
+    }
+
+    /// On a PRESENT-BUT-UNREADABLE credential store the cache re-point is
+    /// skipped, not retried forever.
+    ///
+    /// `SecureStorage::get_device_id()` is `Err` for both "nothing cached" and
+    /// "undecryptable", and `store_device_id` refuses to write over an
+    /// unreadable store — so the naive divergence test stayed true on every
+    /// call. On a renamed/moved box (the scenario this whole change exists
+    /// for) that meant an `info!` + a doomed write + a `warn!` on every one of
+    /// `commands::workflow_events`' five `get_device_id` calls and every
+    /// frontend auth poll, permanently. The id returned was always correct, so
+    /// it was pure noise.
+    #[test]
+    fn device_id_cache_is_not_repointed_over_an_unreadable_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine_file = dir.path().join("machine.json");
+        fs::write(
+            &machine_file,
+            br#"{"device_id":"c79a07d5-0000-4000-8000-00000000000d","hostname":"spaceship"}"#,
+        )
+        .unwrap();
+        let test_name = "device_id_cache_is_not_repointed_over_an_unreadable_store";
+        let mgr = create_test_auth_manager_with_machine_file(test_name, machine_file);
+        // A store that EXISTS but cannot be decrypted/parsed — what a machine
+        // rename or disk move leaves behind (the AES key derives from
+        // hostname+username). Same path the helper handed the manager.
+        let store_path = env::temp_dir()
+            .join("qontinui_test_auth")
+            .join(format!("{test_name}.enc"));
+        fs::write(&store_path, b"not-ciphertext-at-all").unwrap();
+        assert!(
+            mgr.secure_storage.is_present_but_unreadable(),
+            "fixture must actually be a present-but-unreadable store"
+        );
+
+        assert!(
+            !mgr.should_repoint_device_id_cache("c79a07d5-0000-4000-8000-00000000000d"),
+            "an unreadable store must not trigger a re-point that can only fail"
+        );
+        // The read still answers correctly, and does not damage the store.
+        assert_eq!(
+            mgr.get_device_id().unwrap(),
+            "c79a07d5-0000-4000-8000-00000000000d"
+        );
+        assert_eq!(fs::read(&store_path).unwrap(), b"not-ciphertext-at-all");
+    }
+
+    /// The complement: on a READABLE store the re-point still fires when the
+    /// cache diverges (or is empty), and stays quiet once it agrees.
+    #[test]
+    fn device_id_cache_is_repointed_only_while_a_readable_store_diverges() {
+        let mgr = create_test_auth_manager("device_id_cache_repoint_readable_store");
+        const CANONICAL: &str = "c79a07d5-0000-4000-8000-00000000000e";
+
+        // No store file yet → nothing cached → re-point.
+        assert!(mgr.should_repoint_device_id_cache(CANONICAL));
+
+        mgr.store_device_id("deadbeef-0000-4000-8000-00000000ffff")
+            .unwrap();
+        assert!(
+            mgr.should_repoint_device_id_cache(CANONICAL),
+            "a divergent readable cache must be re-pointed"
+        );
+
+        mgr.store_device_id(CANONICAL).unwrap();
+        assert!(
+            !mgr.should_repoint_device_id_cache(CANONICAL),
+            "an agreeing cache must not be rewritten on every read"
         );
     }
 
