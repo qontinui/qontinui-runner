@@ -1175,6 +1175,53 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // unmeasured (probe-budget) keys
+    // ------------------------------------------------------------------
+
+    /// **Pins the DEFECT.** A `versions` probe that exceeds the capture budget
+    /// omits its key entirely (`collectors::collect_versions` has no `else`
+    /// arm), so the pull sees the key as absent LOCALLY and diffs it as
+    /// `Change::Missing`. `Missing` in an applyable, non-derived section is
+    /// ACTIONABLE — `env apply` would drive a real toolchain install for a
+    /// version this box very likely already has, purely because the box was
+    /// busy for three seconds.
+    ///
+    /// Nothing in this suite covered it: the neighbouring cases use `Differs`
+    /// (`actionable_respects_policy_and_skips_extras`,
+    /// `derived_key_is_reported_but_never_actionable`) or a non-applyable
+    /// section (`plan_to_json_emits_wire_policy_and_change_kinds`), which is
+    /// exactly how the defect slipped through.
+    ///
+    /// INVERTED by the fix into
+    /// [`unmeasured_version_key_is_reported_but_never_actionable`].
+    #[test]
+    fn unmeasured_version_key_is_actionable_documents_the_defect() {
+        let plan = compute_plan(
+            &canonical_with(
+                json!({"versions": {"rustc": "rustc 1.82.0 (f6e511eec 2024-10-15)"}}),
+                json!({"versions": "applyable"}),
+            ),
+            // What a timed-out `rustc --version` capture actually looks like:
+            // the key is simply not there.
+            json!({"versions": {"probe_scope_kind": "declared"}})
+                .as_object()
+                .unwrap(),
+            "env-1",
+            "other",
+        );
+        let s = &plan.sections[0];
+        assert_eq!(s.policy, Applyable);
+        assert!(!s.is_derived("rustc"));
+        assert!(matches!(
+            s.changes.iter().find(|c| c.key() == "rustc"),
+            Some(Change::Missing { .. })
+        ));
+        // THE DEFECT: "we could not measure it" is indistinguishable from
+        // "you do not have it", so it becomes an install action.
+        assert_eq!(plan.actionable_count(), 1);
+    }
+
+    // ------------------------------------------------------------------
     // env_contract process-scope caveat
     // ------------------------------------------------------------------
 
