@@ -151,19 +151,55 @@ const DEFAULT_VOLUME_INTERVAL_SECS: u64 = 60;
 /// with sub-minute POSTs.
 const MIN_VOLUME_INTERVAL_SECS: u64 = 60;
 
-/// Resolved volume-sample cadence: env override, floored.
+/// Ceiling for [`VOLUME_INTERVAL_SECS_ENV`] — one hour.
+///
+/// A floor alone only bounds the knob in the direction that costs coord
+/// requests. In the other direction it silently DISABLES the feature:
+/// `QONTINUI_VOLUME_SAMPLE_INTERVAL_SECS=999999999` is a well-formed `u64`,
+/// so it used to be accepted verbatim — monitoring off for 31 years,
+/// announced by a single `info!` at boot, with every disk surface rendering
+/// `pending`/`stale` forever and nothing anywhere saying the publisher was
+/// configured never to run again. An hour is already three orders of
+/// magnitude quieter than the default; past that the honest configuration is
+/// "don't spawn the publisher", not "spawn one that never ticks".
+const MAX_VOLUME_INTERVAL_SECS: u64 = 3600;
+
+/// Compile-time: the default must sit INSIDE the clamp band, or the ordinary
+/// unconfigured boot logs a spurious "CLAMPED" warning at every start.
+const _: () = assert!(
+    MIN_VOLUME_INTERVAL_SECS <= DEFAULT_VOLUME_INTERVAL_SECS
+        && DEFAULT_VOLUME_INTERVAL_SECS <= MAX_VOLUME_INTERVAL_SECS,
+    "DEFAULT_VOLUME_INTERVAL_SECS must lie within [MIN_VOLUME_INTERVAL_SECS, MAX_VOLUME_INTERVAL_SECS]"
+);
+
+/// Resolved volume-sample cadence: env override, clamped to
+/// `[MIN_VOLUME_INTERVAL_SECS, MAX_VOLUME_INTERVAL_SECS]`.
 fn volume_sample_interval_secs() -> u64 {
     resolve_volume_interval(std::env::var(VOLUME_INTERVAL_SECS_ENV).ok().as_deref())
 }
 
 /// PURE resolution of the cadence from a raw env value — unparseable and
-/// absent both fall back to the default, and every value is floored. Split
-/// out because env-driven assertions flake in this crate's test harness
-/// (other threads mutate the process environment).
+/// absent both fall back to the default, and every value is CLAMPED to the
+/// floor/ceiling band. Split out because env-driven assertions flake in this
+/// crate's test harness (other threads mutate the process environment).
+///
+/// Clamping is announced at `warn!`: a knob that was silently rewritten is
+/// how an operator ends up debugging "the disk panel never updates" against
+/// a value they believe is in force.
 fn resolve_volume_interval(raw: Option<&str>) -> u64 {
-    raw.and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_VOLUME_INTERVAL_SECS)
-        .max(MIN_VOLUME_INTERVAL_SECS)
+    let requested = raw
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_VOLUME_INTERVAL_SECS);
+    let clamped = requested.clamp(MIN_VOLUME_INTERVAL_SECS, MAX_VOLUME_INTERVAL_SECS);
+    if clamped != requested {
+        warn!(
+            "worktree_census: {VOLUME_INTERVAL_SECS_ENV}={requested}s is outside the supported \
+             band [{MIN_VOLUME_INTERVAL_SECS}s, {MAX_VOLUME_INTERVAL_SECS}s] — CLAMPED to \
+             {clamped}s. A cadence above the ceiling does not make the publisher quieter, it \
+             turns disk monitoring OFF while every surface keeps rendering `pending`."
+        );
+    }
+    clamped
 }
 
 /// Minimum spacing between low-disk log emissions from the volume publisher.
@@ -641,10 +677,15 @@ impl ChunkPoster {
     /// open the gate would hand the reclaim poller the previous boot's stale
     /// census — precisely the husk-creating race the gate exists to prevent.
     async fn post_volumes(&mut self, volumes: Vec<VolumeReport>) {
+        // DEFENSIVE, not a live path: the only caller
+        // ([`sample_and_publish_volumes`]) already returns on an empty probe,
+        // so this branch is currently unreachable. It is kept because the
+        // property it enforces is a wire invariant, not a caller detail —
+        // nothing measured ⇒ nothing to say, since an empty `volumes` array is
+        // indistinguishable on the wire from "this machine has 0 volumes",
+        // which is the fabricated absence invariant 2 forbids. A future second
+        // caller inherits the rule instead of re-deriving it.
         if volumes.is_empty() {
-            // Nothing measured ⇒ nothing to say. An empty body would be
-            // indistinguishable from "0 volumes", and coord's persist
-            // no-ops on it anyway.
             return;
         }
         let body = WorktreeCensusReq {
@@ -847,11 +888,23 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 // contract documented in the Phase 1 plan.
 // ---------------------------------------------------------------------------
 
-/// Free-space report for one volume (drive letter on Windows).
+/// Free-space report for one volume.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VolumeReport {
-    /// Drive letter with trailing colon, e.g. `"D:"`.
+    /// The volume's identity: the drive letter with a trailing colon (`"D:"`)
+    /// when the mount IS a drive root, else the MOUNT POINT itself
+    /// (`"D:/data"` for a volume mounted into a folder, `"/mnt/data"` on
+    /// POSIX). See [`volume_key`] for why the drive letter alone is not a
+    /// usable key.
     pub volume: String,
+    /// The drive letter the volume is reachable under, when it has one. A
+    /// LABEL, not the key: a folder-mounted volume shares its parent's letter,
+    /// so keying on this collapses distinct volumes into one.
+    ///
+    /// Skipped on the wire when absent so POSIX bodies are byte-identical to
+    /// the pre-existing contract; coord's `VolumeItem` ignores unknown fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drive_letter: Option<String>,
     pub total_bytes: u64,
     pub free_bytes: u64,
 }
@@ -1208,6 +1261,19 @@ fn mounts() -> Vec<(PathBuf, u64, u64)> {
 /// `BTreeMap`), and a mount reporting `total_bytes == 0` is DROPPED: an empty
 /// optical drive or an unmounted card reader is an unreadable volume, and
 /// rendering it as "0 of 0 bytes free" would be a fabricated zero.
+///
+/// "Same key" means the same VOLUME, not the same drive letter — see
+/// [`volume_key`]. Windows reports one physical volume twice with differing
+/// case (`D:\` and `d:\`), which is a genuine duplicate and still collapses;
+/// a volume mounted into a folder (`D:\data`) is a DIFFERENT volume that
+/// merely borrows `D:`'s letter, and must survive.
+///
+/// `wanted` (the census walk's path-scoped filter) matches a mount by its key
+/// OR by its drive-letter label, because the filter set is built from
+/// worktree paths via [`drive_letter_of`] and a worktree under `D:\data\...`
+/// resolves to the letter `D:`. Matching the label keeps the folder-mounted
+/// volume that actually holds those worktrees in the census's attribution set
+/// instead of silently reporting only the letter's root volume.
 fn volumes_from_mounts(
     mounts: &[(PathBuf, u64, u64)],
     wanted: Option<&HashSet<String>>,
@@ -1217,23 +1283,68 @@ fn volumes_from_mounts(
         if *total == 0 {
             continue;
         }
+        let drive_letter = drive_letter_of(mount);
         let key = volume_key(mount);
-        if wanted.is_some_and(|w| !w.contains(&key)) {
-            continue;
+        if let Some(w) = wanted {
+            let matched = w.contains(&key)
+                || drive_letter
+                    .as_ref()
+                    .is_some_and(|letter| w.contains(letter));
+            if !matched {
+                continue;
+            }
         }
-        out.entry(key.clone()).or_insert_with(|| VolumeReport {
-            volume: key,
-            total_bytes: *total,
-            free_bytes: *free,
-        });
+        out.entry(volume_dedup_key(&key, drive_letter.is_some()))
+            .or_insert_with(|| VolumeReport {
+                volume: key,
+                drive_letter,
+                total_bytes: *total,
+                free_bytes: *free,
+            });
     }
     out.into_values().collect()
 }
 
 /// The stable key a mount is reported under: its Windows drive letter
-/// (`"D:"`) when it has one, else the mount point itself (`"/"`, `"/mnt/x"`).
+/// (`"D:"`) when the mount IS that drive's ROOT, else the mount point itself,
+/// separator-normalized (`"D:/data"`, `"/"`, `"/mnt/x"`).
+///
+/// ## Why not the drive letter alone
+///
+/// It used to be, and that DROPPED real volumes. Mounting a volume into an
+/// empty NTFS folder is a normal Windows way to attach a large data disk
+/// (`D:\data`), and `sysinfo` enumerates it as its own mount with its own
+/// capacity. Collapsing it to `"D:"` collided it with `D:\`, and
+/// [`volumes_from_mounts`]'s keep-the-first rule then discarded it — no log,
+/// no marker, a whole disk simply absent from a disk-monitoring feature.
+/// That is exactly the fabricated absence this module's invariant 2 forbids,
+/// so the mount point is the key and the letter rides along as a label.
 fn volume_key(mount: &Path) -> String {
-    drive_letter_of(mount).unwrap_or_else(|| mount.to_string_lossy().to_string())
+    match drive_letter_of(mount) {
+        Some(letter) if is_drive_root(mount) => letter,
+        _ => normalize_path_str(mount),
+    }
+}
+
+/// The map key used to collapse genuine duplicates. Windows paths are
+/// case-insensitive, so `d:\` and `D:\` are one volume; POSIX mount points are
+/// NOT, so `/mnt/Data` and `/mnt/data` stay distinct.
+fn volume_dedup_key(key: &str, windows_path: bool) -> String {
+    if windows_path {
+        key.to_lowercase()
+    } else {
+        key.to_string()
+    }
+}
+
+/// True when a drive-lettered path is the drive's ROOT (`D:\`, `D:/`, `D:`)
+/// rather than a folder on it (`D:\data`).
+fn is_drive_root(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let Some(rest) = s.get(2..) else {
+        return false;
+    };
+    rest.chars().all(|c| c == '\\' || c == '/')
 }
 
 /// Extract the `"D:"`-style drive letter from a path. `None` for paths
@@ -1672,8 +1783,10 @@ fn build_census_chunked(
     let volumes = collect_volumes(&paths);
     // Low-free-space alarm — a LEADING signal so low disk surfaces here rather
     // than as phantom cargo build failures (`os error 112`). Runs on every
-    // completed walk regardless of coord reachability. Read-only.
-    warn_on_low_disk(&volumes);
+    // completed walk regardless of coord reachability. Read-only. The walk is
+    // multi-hour, so it is UNTHROTTLED — only the 60 s publisher needs a rate
+    // limit — and the "did it emit" answer is therefore unused here.
+    let _emitted = warn_on_low_disk(&volumes);
     emitter.finish(volumes.clone());
 
     WorktreeCensusReq {
@@ -1701,10 +1814,18 @@ fn env_bytes(name: &str, default: u64) -> u64 {
 /// Emit a `warn!`/`error!` per volume whose free space is under the floor. A
 /// leading signal for the disk-full condition that otherwise only manifests as
 /// phantom cargo build failures. Read-only; best-effort logging only.
-fn warn_on_low_disk(volumes: &[VolumeReport]) {
+///
+/// Returns whether it ACTUALLY emitted anything. The throttled wrapper needs
+/// that answer: stamping the throttle epoch on a healthy (silent) tick lets a
+/// routine 60 s sample consume the alarm's budget and suppress the FIRST
+/// CRITICAL line of a real emergency — see
+/// [`warn_on_low_disk_throttled`].
+#[must_use]
+fn warn_on_low_disk(volumes: &[VolumeReport]) -> bool {
     let warn_floor = env_bytes(LOW_DISK_WARN_BYTES_ENV, DEFAULT_LOW_DISK_WARN_BYTES);
     let crit_floor = env_bytes(LOW_DISK_CRIT_BYTES_ENV, DEFAULT_LOW_DISK_CRIT_BYTES);
     const GB: f64 = 1_073_741_824.0;
+    let mut emitted = false;
     for v in volumes {
         let free_gb = v.free_bytes as f64 / GB;
         let pct = if v.total_bytes > 0 {
@@ -1721,13 +1842,16 @@ fn warn_on_low_disk(volumes: &[VolumeReport]) {
                 free_gb,
                 pct
             );
+            emitted = true;
         } else if v.free_bytes < warn_floor {
             warn!(
                 "worktree_census: low disk on {} — {:.1} GB free ({:.1}%).",
                 v.volume, free_gb, pct
             );
+            emitted = true;
         }
     }
+    emitted
 }
 
 // ---------------------------------------------------------------------------
@@ -1773,21 +1897,99 @@ fn publish_volume_sample(volumes: Vec<VolumeReport>) -> VolumeSample {
     sample
 }
 
+/// "Nothing has been emitted yet" for the throttle cells below.
+///
+/// NOT `0`: zero is a perfectly well-formed clock reading (the Unix epoch, and
+/// the natural starting point of any injected test clock), so using it as the
+/// sentinel makes the first emission at `now == 0` stamp a value that reads
+/// back as "never" — and the throttle then lets every subsequent call through.
+/// `u64::MAX` is unreachable as a stamp (it is year 584-billion).
+const THROTTLE_NEVER: u64 = u64::MAX;
+
 /// Epoch-seconds of the last low-disk log emission from the publisher.
-static LAST_LOW_DISK_LOG_EPOCH: AtomicU64 = AtomicU64::new(0);
+static LAST_LOW_DISK_LOG_EPOCH: AtomicU64 = AtomicU64::new(THROTTLE_NEVER);
+
+/// Epoch-seconds of the last empty-probe warning from the publisher.
+static LAST_EMPTY_PROBE_LOG_EPOCH: AtomicU64 = AtomicU64::new(THROTTLE_NEVER);
+
+/// Minimum spacing between empty-probe warnings. The condition it reports —
+/// no readable mounts at all — is a STANDING state on a machine that has it
+/// (a container with no mounted host volumes), not an event, so an
+/// unthrottled multi-line `warn!` every 60 s is pure log flood, forever.
+const EMPTY_PROBE_LOG_THROTTLE_SECS: u64 = LOW_DISK_LOG_THROTTLE_SECS;
+
+/// Compile-time: a throttle at or below the publisher's cadence throttles
+/// nothing — every tick would clear the window and the flood returns.
+const _: () = assert!(
+    EMPTY_PROBE_LOG_THROTTLE_SECS > MIN_VOLUME_INTERVAL_SECS
+        && LOW_DISK_LOG_THROTTLE_SECS > MIN_VOLUME_INTERVAL_SECS,
+    "both log throttles must exceed the publisher's minimum cadence"
+);
+
+fn now_epoch_secs() -> u64 {
+    chrono::Utc::now().timestamp().max(0) as u64
+}
+
+/// Rate-limit a log emission to one per `throttle_secs`, stamping the budget
+/// ONLY when `emit` reports that it actually wrote something.
+///
+/// That conditional stamp is the whole point, and its absence was a real
+/// suppression bug: the previous code stamped the epoch BEFORE calling
+/// [`warn_on_low_disk`], which emits nothing when every volume is above the
+/// floor. A healthy boot at t=0 therefore burned the budget, and a disk that
+/// crossed the CRITICAL floor at t=301 s hit `now - last = 1 < 300` and had
+/// its FIRST `error!` DROPPED — the alarm arrived ~5 minutes late, at exactly
+/// the moment it mattered most. A silent (healthy) tick must cost nothing.
+///
+/// Returns whether the emission happened, for the tests to pin.
+fn emit_throttled(
+    cell: &AtomicU64,
+    now: u64,
+    throttle_secs: u64,
+    emit: impl FnOnce() -> bool,
+) -> bool {
+    let last = cell.load(Ordering::Acquire);
+    if last != THROTTLE_NEVER && now.saturating_sub(last) < throttle_secs {
+        return false;
+    }
+    if emit() {
+        cell.store(now, Ordering::Release);
+        true
+    } else {
+        false
+    }
+}
 
 /// [`warn_on_low_disk`], rate-limited to [`LOW_DISK_LOG_THROTTLE_SECS`].
 /// The alarm is a leading signal, not a heartbeat: at the publisher's 60 s
 /// cadence an unthrottled `error!` would bury the very logs used to diagnose
 /// the disk emergency it is announcing.
 fn warn_on_low_disk_throttled(volumes: &[VolumeReport]) {
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
-    let last = LAST_LOW_DISK_LOG_EPOCH.load(Ordering::Acquire);
-    if last != 0 && now.saturating_sub(last) < LOW_DISK_LOG_THROTTLE_SECS {
-        return;
-    }
-    LAST_LOW_DISK_LOG_EPOCH.store(now, Ordering::Release);
-    warn_on_low_disk(volumes);
+    emit_throttled(
+        &LAST_LOW_DISK_LOG_EPOCH,
+        now_epoch_secs(),
+        LOW_DISK_LOG_THROTTLE_SECS,
+        || warn_on_low_disk(volumes),
+    );
+}
+
+/// The empty-probe warning, rate-limited to
+/// [`EMPTY_PROBE_LOG_THROTTLE_SECS`]. Always "emits" when the throttle lets
+/// it through, so unlike the low-disk alarm it does consume the budget every
+/// time it is reached — which is correct: reaching it IS the condition.
+fn warn_on_empty_probe_throttled() {
+    emit_throttled(
+        &LAST_EMPTY_PROBE_LOG_EPOCH,
+        now_epoch_secs(),
+        EMPTY_PROBE_LOG_THROTTLE_SECS,
+        || {
+            warn!(
+                "worktree_census: volume probe returned no mounted volumes — keeping the \
+                 previous sample. This reading is UNKNOWN, not zero free space."
+            );
+            true
+        },
+    );
 }
 
 /// Take ONE volume sample: probe every mount, publish it locally, log the
@@ -1812,10 +2014,9 @@ pub(crate) async fn sample_and_publish_volumes() -> Option<VolumeSample> {
         }
     };
     if volumes.is_empty() {
-        warn!(
-            "worktree_census: volume probe returned no mounted volumes — keeping the previous \
-             sample. This reading is UNKNOWN, not zero free space."
-        );
+        // Throttled: on a machine with no readable mounts this is a standing
+        // condition, and the publisher ticks every 60 s forever.
+        warn_on_empty_probe_throttled();
         return None;
     }
     let sample = publish_volume_sample(volumes);
@@ -1824,27 +2025,130 @@ pub(crate) async fn sample_and_publish_volumes() -> Option<VolumeSample> {
     Some(sample)
 }
 
+/// What a cached [`ChunkPoster`] was built against. A change in ANY component
+/// (an enrolled device, a tenant switch, an active-profile switch that moves
+/// the coord base, or coord being configured/unconfigured) rebuilds the
+/// poster; an unchanged key reuses it, TLS connection pool included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VolumePosterKey {
+    device_id: Uuid,
+    tenant_id: Option<Uuid>,
+    base: Option<String>,
+}
+
+/// A [`ChunkPoster`] plus the key it was built from.
+struct CachedVolumePoster {
+    key: VolumePosterKey,
+    poster: ChunkPoster,
+}
+
+/// Outcome of one resolution pass on the blocking pool.
+enum VolumePosterResolution {
+    /// The cached poster is still valid for the current identity/base.
+    Reuse,
+    /// Identity or base moved (or there was no cache) — here is a fresh one.
+    Rebuilt(Box<CachedVolumePoster>),
+    /// No `device_id`: nothing to POST as. The cache is cleared so a later
+    /// enrollment is picked up.
+    NoIdentity,
+}
+
+/// The process-wide volume poster, built at most once per identity/base.
+static VOLUME_POSTER: OnceLock<tokio::sync::Mutex<Option<CachedVolumePoster>>> = OnceLock::new();
+
+fn volume_poster_cell() -> &'static tokio::sync::Mutex<Option<CachedVolumePoster>> {
+    VOLUME_POSTER.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+/// Resolve identity + destination, reusing `prev` when nothing moved.
+///
+/// SYNCHRONOUS by design and called only from `spawn_blocking`: every step is
+/// blocking work — two `std::fs::read` of `~/.qontinui/machine.json`
+/// ([`load_device_id`], [`resolve_tenant_id`]), the active-profile read behind
+/// [`coord_http_base`], the `owns_shared_root_state()` probe, and a
+/// `reqwest::Client` build that loads the OS trust store.
+fn resolve_volume_poster(prev: Option<VolumePosterKey>) -> VolumePosterResolution {
+    let Some(device_id) = load_device_id() else {
+        return VolumePosterResolution::NoIdentity;
+    };
+    let key = VolumePosterKey {
+        device_id,
+        tenant_id: resolve_tenant_id(),
+        base: coord_http_base(),
+    };
+    if !volume_poster_needs_rebuild(prev.as_ref(), &key) {
+        return VolumePosterResolution::Reuse;
+    }
+    let poster = ChunkPoster::new(device_id, key.tenant_id);
+    VolumePosterResolution::Rebuilt(Box::new(CachedVolumePoster { key, poster }))
+}
+
+/// PURE cache decision: rebuild only when there is no cached poster or the
+/// identity/base it was built against moved. Split out so the reuse property
+/// — the whole point of R3 — is testable without a machine.json, a profile or
+/// a coord.
+fn volume_poster_needs_rebuild(prev: Option<&VolumePosterKey>, next: &VolumePosterKey) -> bool {
+    prev != Some(next)
+}
+
 /// Ship one volumes-only body to coord. Best-effort and fully optional: a
 /// missing identity, an unconfigured coord, a secondary instance or a failed
 /// POST all leave the LOCAL sample untouched — telemetry may be absent, the
 /// measurement never is.
+///
+/// ## Why the poster is CACHED rather than rebuilt per tick
+///
+/// The per-walk poster is rebuilt once per multi-hour walk, where the cost is
+/// noise. This publisher ticks every 60 s on the PUBLISHERS runtime, which is
+/// `worker_threads(1)` and shared with the census, reclaim, the orphan reaper,
+/// the maintenance executor and the fs backstop. Rebuilding here meant two
+/// synchronous `std::fs::read`s, a profile resolution, an instance probe and a
+/// full TLS client build on that single async worker every minute — stalling
+/// every other poller during exactly the disk/IO emergency this feature
+/// exists to report — plus a fresh TCP+TLS handshake to coord every 60 s
+/// forever, because the client (and its connection pool) was dropped each
+/// tick.
+///
+/// So: resolve on the BLOCKING pool (matching the mount probe in
+/// [`sample_and_publish_volumes`]), and keep the poster alive across ticks,
+/// keyed on the resolved identity + coord base so an active-profile switch
+/// still rebuilds it and `resolve_dest` stays the one place the
+/// secondary-instance identity guard is enforced.
 async fn post_volumes_to_coord(volumes: Vec<VolumeReport>) {
-    let Some(device_id) = load_device_id() else {
-        debug!(
-            "worktree_census: no device_id — volume sample stays local this tick (not an error)"
-        );
+    // Held across the resolution await: there is exactly one publisher task,
+    // so this serializes nothing that was ever concurrent, and it keeps the
+    // cache read and its refresh atomic.
+    let mut guard = volume_poster_cell().lock().await;
+    let prev = guard.as_ref().map(|c| c.key.clone());
+    match tokio::task::spawn_blocking(move || resolve_volume_poster(prev)).await {
+        Ok(VolumePosterResolution::Reuse) => {}
+        Ok(VolumePosterResolution::Rebuilt(cached)) => *guard = Some(*cached),
+        Ok(VolumePosterResolution::NoIdentity) => {
+            *guard = None;
+            debug!(
+                "worktree_census: no device_id — volume sample stays local this tick (not an error)"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "worktree_census: volume poster resolution task failed: {e} — the LOCAL sample \
+                 is unaffected, retrying next tick"
+            );
+            return;
+        }
+    }
+    let Some(cached) = guard.as_mut() else {
         return;
     };
-    // Rebuilt each tick, exactly like the per-walk poster: the coord base can
-    // change under an active-profile switch, and `resolve_dest` is the ONE
-    // place the secondary-instance identity guard is enforced.
-    let mut poster = ChunkPoster::new(device_id, resolve_tenant_id());
-    poster.post_volumes(volumes).await;
+    cached.poster.post_volumes(volumes).await;
 }
 
 /// Spawn the dedicated volume publisher on the ambient tokio runtime.
 ///
-/// Cadence from [`VOLUME_INTERVAL_SECS_ENV`] (default 60 s, floored 60 s),
+/// Cadence from [`VOLUME_INTERVAL_SECS_ENV`] (default 60 s, clamped to
+/// 60 s..=3600 s — the ceiling exists so the knob cannot silently turn disk
+/// monitoring off),
 /// `MissedTickBehavior::Skip` like every other poller here. `tokio::interval`
 /// fires its first tick immediately, so a boot has a free-space reading
 /// within milliseconds instead of waiting out the first multi-hour census
@@ -2178,14 +2482,19 @@ mod tests {",
     }
 
     /// Mount list used by the pure volume-mapping tests: two Windows drives,
-    /// a duplicate of one of them, a POSIX mount, and an empty optical drive.
+    /// a case-differing duplicate of one of them, a volume mounted into a
+    /// FOLDER on one of them, a POSIX mount, and an empty optical drive.
     fn sample_mounts() -> Vec<(PathBuf, u64, u64)> {
         vec![
             (PathBuf::from(r"C:\"), 500, 100),
             (PathBuf::from(r"D:\"), 4_000, 93),
-            // Same volume reported twice (Windows does this for a mounted
-            // volume that also has a drive letter) — must not duplicate.
+            // The SAME volume reported twice, differing only in case (Windows
+            // paths are case-insensitive) — a genuine duplicate, must collapse.
             (PathBuf::from(r"d:\"), 4_000, 93),
+            // A DIFFERENT volume that merely borrows D:'s letter — the normal
+            // Windows way to attach a large data disk. Must NOT collapse into
+            // `D:\`; keying on the drive letter used to drop it silently.
+            (PathBuf::from(r"D:\data"), 8_000, 7_000),
             (PathBuf::from("/mnt/data"), 900, 800),
             // No media in the drive: total 0. NOT a volume with no space.
             (PathBuf::from(r"E:\"), 0, 0),
@@ -2207,8 +2516,10 @@ mod tests {",
                 .iter()
                 .map(|v| v.volume.as_str())
                 .collect::<Vec<_>>(),
-            vec!["D:"],
-            "the path-filtered collector must keep its existing behaviour"
+            vec!["D:", "D:/data"],
+            "the path-filtered collector reports the volumes reachable under the \
+             wanted drive letter — the letter's root AND anything folder-mounted \
+             on it, since a worktree under `D:\\data\\...` resolves to `D:`"
         );
 
         let all = volumes_from_mounts(&mounts, None);
@@ -2216,9 +2527,10 @@ mod tests {",
         // deterministic; `/mnt/data` sorts before `C:` on ASCII.
         assert_eq!(
             all.iter().map(|v| v.volume.as_str()).collect::<Vec<_>>(),
-            vec!["/mnt/data", "C:", "D:"],
+            vec!["/mnt/data", "C:", "D:", "D:/data"],
             "every mounted volume must be reported — including ones hosting no \
-             worktree (C:) and POSIX mounts, which have no drive letter"
+             worktree (C:), POSIX mounts, which have no drive letter, and a volume \
+             mounted into a folder on another volume's letter"
         );
         let d = all
             .iter()
@@ -2226,6 +2538,74 @@ mod tests {",
             .expect("D: must be reported");
         assert_eq!(d.free_bytes, 93);
         assert_eq!(d.total_bytes, 4_000);
+    }
+
+    /// A volume mounted into a FOLDER is a real volume and must survive.
+    ///
+    /// Keying on the drive letter collapsed `D:\data` into `D:`, and
+    /// [`volumes_from_mounts`]'s keep-the-first rule then discarded it with no
+    /// log and no marker — a whole 8 TB data disk simply absent from a
+    /// disk-monitoring feature, which is the fabricated absence invariant 2
+    /// forbids. Genuine duplicates (`d:\` vs `D:\`, one volume Windows reports
+    /// twice) must still collapse: the fix distinguishes DIFFERENT MOUNT POINTS
+    /// from the SAME mount point spelled differently.
+    #[test]
+    fn a_folder_mounted_volume_is_reported_and_not_collapsed_into_its_drive_letter() {
+        let all = volumes_from_mounts(&sample_mounts(), None);
+
+        let folder = all
+            .iter()
+            .find(|v| v.volume == "D:/data")
+            .expect("a volume mounted into a folder must be reported, not silently dropped");
+        assert_eq!(
+            (folder.total_bytes, folder.free_bytes),
+            (8_000, 7_000),
+            "the folder-mounted volume must carry ITS OWN capacity, not the \
+             root volume's"
+        );
+        assert_eq!(
+            folder.drive_letter.as_deref(),
+            Some("D:"),
+            "the drive letter survives as a LABEL — it is just no longer the key"
+        );
+
+        let root = all
+            .iter()
+            .find(|v| v.volume == "D:")
+            .expect("the drive root keeps its stable `D:` key (unchanged wire value)");
+        assert_eq!((root.total_bytes, root.free_bytes), (4_000, 93));
+
+        // …and the genuine duplicate is still collapsed.
+        assert_eq!(
+            all.iter().filter(|v| v.volume == "D:").count(),
+            1,
+            "`d:\\` and `D:\\` are ONE volume (Windows paths are case-insensitive) \
+             and must not both be reported: {all:?}"
+        );
+    }
+
+    /// The keying rule itself, at the unit level: a drive ROOT keys to the
+    /// letter (the stable, pre-existing wire value), anything else keys to its
+    /// own mount point.
+    #[test]
+    fn volume_key_is_the_letter_only_for_a_drive_root() {
+        assert_eq!(volume_key(Path::new(r"D:\")), "D:");
+        assert_eq!(volume_key(Path::new("D:/")), "D:");
+        assert_eq!(volume_key(Path::new("d:")), "D:");
+        assert_eq!(volume_key(Path::new(r"D:\data")), "D:/data");
+        assert_eq!(volume_key(Path::new(r"C:\mnt\big")), "C:/mnt/big");
+        assert_eq!(volume_key(Path::new("/mnt/data")), "/mnt/data");
+        assert_eq!(volume_key(Path::new("/")), "/");
+
+        // Windows dedup is case-insensitive; POSIX dedup is NOT.
+        assert_eq!(
+            volume_dedup_key("D:/Data", true),
+            volume_dedup_key("d:/data", true)
+        );
+        assert_ne!(
+            volume_dedup_key("/mnt/Data", false),
+            volume_dedup_key("/mnt/data", false)
+        );
     }
 
     /// A drive with no media reports `total_space() == 0`. Reporting it would
@@ -2273,6 +2653,7 @@ mod tests {",
 
         let published = publish_volume_sample(vec![VolumeReport {
             volume: "D:".to_string(),
+            drive_letter: Some("D:".to_string()),
             total_bytes: 4_000,
             free_bytes: 93,
         }]);
@@ -2293,11 +2674,141 @@ mod tests {",
             resolve_volume_interval(Some("not-a-number")),
             DEFAULT_VOLUME_INTERVAL_SECS
         );
-        // The knob may only make the publisher QUIETER…
+        // The knob may make the publisher QUIETER…
         assert_eq!(resolve_volume_interval(Some("300")), 300);
-        // …never fast enough to hammer coord.
+        assert_eq!(
+            resolve_volume_interval(Some("3600")),
+            MAX_VOLUME_INTERVAL_SECS,
+            "the ceiling itself is a legal value"
+        );
+        // …never fast enough to hammer coord…
         assert_eq!(resolve_volume_interval(Some("1")), MIN_VOLUME_INTERVAL_SECS);
         assert_eq!(resolve_volume_interval(Some("0")), MIN_VOLUME_INTERVAL_SECS);
+        // …and never so quiet that the feature is silently OFF. A well-formed
+        // `u64` of 999999999 used to be accepted verbatim: monitoring disabled
+        // for 31 years, announced by one `info!` at boot, with every disk
+        // surface rendering `pending`/`stale` forever.
+        assert_eq!(
+            resolve_volume_interval(Some("999999999")),
+            MAX_VOLUME_INTERVAL_SECS,
+            "an out-of-band cadence must be CLAMPED, never allowed to disable the feature"
+        );
+        assert_eq!(
+            resolve_volume_interval(Some(&u64::MAX.to_string())),
+            MAX_VOLUME_INTERVAL_SECS
+        );
+        assert_eq!(
+            resolve_volume_interval(Some("3601")),
+            MAX_VOLUME_INTERVAL_SECS
+        );
+        // (The band itself — default inside [min, max] — is pinned at COMPILE
+        // time by the `const _: () = assert!(…)` beside the constants, so a
+        // bad edit fails the build rather than this test.)
+    }
+
+    /// R2: a HEALTHY tick must not consume the low-disk alarm's throttle
+    /// budget.
+    ///
+    /// The bug this pins: the epoch was stamped UNCONDITIONALLY, before
+    /// calling `warn_on_low_disk` — which emits nothing when every volume is
+    /// above the floor. So a healthy boot at t=0 stamped the budget, and a
+    /// disk crossing the CRITICAL floor at t=301 s saw `now - last = 1 < 300`
+    /// and had its FIRST `error!` DROPPED; the alarm surfaced at t≈600 s, five
+    /// minutes into the emergency it exists to announce.
+    ///
+    /// Driven through the pure [`emit_throttled`] seam with a local cell and an
+    /// injected clock, so it is deterministic and never touches the process
+    /// globals or the real time source.
+    #[test]
+    fn a_healthy_tick_does_not_consume_the_low_disk_alarm_budget() {
+        let cell = AtomicU64::new(THROTTLE_NEVER);
+
+        // t=0..300: healthy ticks. `emit` reports "nothing written".
+        for t in [0_u64, 60, 120, 180, 240, 300] {
+            assert!(
+                !emit_throttled(&cell, t, LOW_DISK_LOG_THROTTLE_SECS, || false),
+                "a healthy tick must not report an emission (t={t})"
+            );
+            assert_eq!(
+                cell.load(Ordering::Acquire),
+                THROTTLE_NEVER,
+                "a healthy tick must leave the throttle budget UNSPENT (t={t})"
+            );
+        }
+
+        // t=301: the disk crosses the critical floor. This is the line that
+        // used to be swallowed.
+        assert!(
+            emit_throttled(&cell, 301, LOW_DISK_LOG_THROTTLE_SECS, || true),
+            "the FIRST real alarm must fire immediately, whatever the healthy \
+             ticks before it did"
+        );
+        assert_eq!(cell.load(Ordering::Acquire), 301);
+
+        // …and from there the throttle does its actual job: the alarm is a
+        // leading signal, not a per-minute heartbeat.
+        assert!(
+            !emit_throttled(&cell, 361, LOW_DISK_LOG_THROTTLE_SECS, || true),
+            "a repeat alarm inside the window must be suppressed"
+        );
+        assert!(
+            emit_throttled(&cell, 601, LOW_DISK_LOG_THROTTLE_SECS, || true),
+            "once the window elapses the alarm fires again"
+        );
+        assert_eq!(cell.load(Ordering::Acquire), 601);
+    }
+
+    /// R6: the empty-probe warning is throttled too. On a machine with no
+    /// readable mounts (a container) the condition is STANDING, so an
+    /// unthrottled multi-line `warn!` on a 60 s publisher is log flood forever.
+    #[test]
+    fn the_empty_probe_warning_is_throttled_like_the_low_disk_alarm() {
+        let cell = AtomicU64::new(THROTTLE_NEVER);
+        let mut emissions = 0_u32;
+        // Ten minutes of 60 s ticks on a mountless machine, starting at the
+        // epoch — `THROTTLE_NEVER` is what makes `t=0` a usable stamp rather
+        // than one that reads back as "never emitted".
+        for t in (0_u64..600).step_by(60) {
+            if emit_throttled(&cell, t, EMPTY_PROBE_LOG_THROTTLE_SECS, || true) {
+                emissions += 1;
+            }
+        }
+        assert_eq!(
+            emissions, 2,
+            "ten minutes of empty probes must log twice (t=0, t=300), not ten times"
+        );
+        // (That the throttle exceeds the publisher's cadence at all — without
+        // which it throttles nothing — is pinned at COMPILE time beside the
+        // constants.)
+    }
+
+    /// The empty-probe path must actually route through the throttle — a
+    /// future edit that inlines a bare `warn!` back into
+    /// `sample_and_publish_volumes` would restore the per-minute flood while
+    /// the unit test above still passed.
+    #[test]
+    fn the_empty_probe_branch_calls_the_throttled_warner() {
+        const SRC: &str = include_str!("census.rs");
+        let prod = SRC
+            .split_once(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+        let sampler = prod
+            .split_once("pub(crate) async fn sample_and_publish_volumes(")
+            .map(|(_, after)| after)
+            .expect("sample_and_publish_volumes is the publisher's per-tick body");
+        let body = sampler
+            .split_once("\n}\n")
+            .map(|(b, _)| b)
+            .unwrap_or(sampler);
+        assert!(
+            body.contains("warn_on_empty_probe_throttled()"),
+            "the empty-probe branch must go through the throttled warner"
+        );
     }
 
     /// A volumes-only POST carries no worktree row, so it must NOT release
@@ -2355,6 +2866,150 @@ mod tests {",
             send_squeezed.contains("ifrelease_boot_gate{mark_first_census_posted();}"),
             "the R3 boot gate must be released only for bodies that refresh \
              coord's WORKTREE view"
+        );
+    }
+
+    /// The MIRROR of the test above, and the direction that actually fails
+    /// dangerously.
+    ///
+    /// `a_volumes_only_post_never_releases_the_census_boot_gate` pins that the
+    /// volumes path passes `false`. Nothing pinned that the CENSUS path still
+    /// passes `true`. A future edit flipping it (say, "make both call sites
+    /// consistent") would leave the census-before-reclaim boot gate closed for
+    /// the whole process lifetime, permanently blocking the reclaim engine on
+    /// every boot — failing SAFE (no deletions) and therefore silent: nothing
+    /// alarms, reclaim simply never runs again.
+    ///
+    /// Source-level for the same reason its mirror is: asserting it live needs
+    /// a coord-configured profile and an HTTP server.
+    #[test]
+    fn the_census_chunk_post_still_releases_the_boot_gate() {
+        const SRC: &str = include_str!("census.rs");
+        let prod = SRC
+            .split_once(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+
+        let post_fn = prod
+            .split_once("async fn post(&mut self, chunk: CensusChunk)")
+            .map(|(_, after)| after)
+            .expect("ChunkPoster::post is the census-chunk wire path");
+        let body = post_fn
+            .split_once("\n    }\n")
+            .map(|(b, _)| b)
+            .unwrap_or(post_fn);
+        let squeezed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squeezed.contains("self.send(body,true)"),
+            "the census chunk POST must send with release_boot_gate = true, or the \
+             R3 census-before-reclaim gate never opens and reclaim is disabled for \
+             the whole boot"
+        );
+    }
+
+    /// R3: the volume poster (and its TLS client) is built ONCE and reused
+    /// across ticks, rebuilding only when the identity or coord base moves.
+    ///
+    /// The publisher runs on the `worker_threads(1)` publishers runtime shared
+    /// with the census, reclaim, the orphan reaper, the maintenance executor
+    /// and the fs backstop. Rebuilding per tick meant two `std::fs::read`s, a
+    /// profile resolution, an instance probe and a full `reqwest::Client`
+    /// build on that single async worker every 60 s — plus a fresh TCP+TLS
+    /// handshake to coord every minute, forever, because the client's
+    /// connection pool was dropped with it.
+    #[test]
+    fn the_volume_poster_is_reused_across_ticks_and_rebuilt_only_on_a_real_change() {
+        let device = Uuid::nil();
+        let key = VolumePosterKey {
+            device_id: device,
+            tenant_id: None,
+            base: Some("https://coord.example".to_string()),
+        };
+
+        assert!(
+            volume_poster_needs_rebuild(None, &key),
+            "the first tick has nothing cached and must build"
+        );
+        assert!(
+            !volume_poster_needs_rebuild(Some(&key), &key),
+            "an unchanged identity + base must REUSE the poster — this is the \
+             whole point: no per-tick fs reads, no per-tick TLS handshake"
+        );
+
+        // …but a real change still rebuilds, so `resolve_dest` (the one place
+        // the secondary-instance identity guard lives) is re-consulted.
+        let moved_base = VolumePosterKey {
+            base: Some("https://coord.other".to_string()),
+            ..key.clone()
+        };
+        assert!(
+            volume_poster_needs_rebuild(Some(&key), &moved_base),
+            "an active-profile switch that moves the coord base must rebuild"
+        );
+        let unconfigured = VolumePosterKey {
+            base: None,
+            ..key.clone()
+        };
+        assert!(
+            volume_poster_needs_rebuild(Some(&key), &unconfigured),
+            "coord becoming unconfigured must rebuild"
+        );
+        let moved_tenant = VolumePosterKey {
+            tenant_id: Some(Uuid::from_u128(7)),
+            ..key.clone()
+        };
+        assert!(
+            volume_poster_needs_rebuild(Some(&key), &moved_tenant),
+            "a tenant rebinding must rebuild — the bearer is selected per tenant"
+        );
+        let moved_device = VolumePosterKey {
+            device_id: Uuid::from_u128(9),
+            ..key.clone()
+        };
+        assert!(
+            volume_poster_needs_rebuild(Some(&key), &moved_device),
+            "a re-enrolled device must rebuild — the URL carries the device_id"
+        );
+    }
+
+    /// …and the per-tick path must actually USE that cache, off the async
+    /// worker. A future edit that re-inlines `ChunkPoster::new` into the tick
+    /// restores the stall and the per-minute TLS handshake while the pure test
+    /// above still passes.
+    #[test]
+    fn the_volume_tick_resolves_identity_off_the_async_worker_and_reuses_the_cache() {
+        const SRC: &str = include_str!("census.rs");
+        let prod = SRC
+            .split_once(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+        let tick = prod
+            .split_once("async fn post_volumes_to_coord(")
+            .map(|(_, after)| after)
+            .expect("post_volumes_to_coord is the publisher's per-tick coord path");
+        let body = tick.split_once("\n}\n").map(|(b, _)| b).unwrap_or(tick);
+
+        assert!(
+            body.contains("volume_poster_cell()"),
+            "the tick must go through the cached poster, not build a new one"
+        );
+        assert!(
+            body.contains("spawn_blocking"),
+            "identity/base resolution is blocking fs work and must never run on \
+             the shared single-worker publishers runtime"
+        );
+        assert!(
+            !body.contains("ChunkPoster::new("),
+            "the tick must not construct a ChunkPoster directly — that is what \
+             rebuilt the TLS client every 60 s"
         );
     }
 
@@ -2660,6 +3315,7 @@ mod tests {",
         }
         emitter.finish(vec![VolumeReport {
             volume: "D:".to_string(),
+            drive_letter: Some("D:".to_string()),
             total_bytes: 100,
             free_bytes: 40,
         }]);
@@ -2692,6 +3348,7 @@ mod tests {",
                 tenant_id: None,
                 volumes: vec![VolumeReport {
                     volume: "D:".to_string(),
+                    drive_letter: Some("D:".to_string()),
                     total_bytes: 100,
                     free_bytes: 50,
                 }],
