@@ -786,6 +786,32 @@ pub struct WorktreeCensus {
     /// junctioned or absent.
     pub target_bytes: u64,
 
+    /// Run-provenance (plan `2026-08-16-plan-corpus-authority-and-run-
+    /// provenance`, Phase 1): the **effective** cargo target directory this
+    /// worktree's builds resolve to, as an absolute forward-slashed path.
+    /// See [`resolve_build_target`] for the exact precedence and for the
+    /// cases that deliberately emit `None`.
+    ///
+    /// `None` = NOT OBSERVED, never "no build target". The consumer is a
+    /// deletion engine, so a wrong attribution is strictly worse than a
+    /// null and every unresolvable input takes the `None` arm.
+    ///
+    /// Persisted as `coord.worktree_census.build_target_dir TEXT NULL` (web
+    /// migration `runprov_01_worktree_census_build_target`). Optional on the
+    /// wire — an old runner omits it and coord reads NULL.
+    pub build_target_dir: Option<String>,
+
+    /// Run-provenance: the shared build-pool slot identifier
+    /// [`build_target_dir`](Self::build_target_dir) belongs to — the bare slot
+    /// name (`"slot-2"`, `"lkg"`), NOT the whole `target-pool/slot-2` path.
+    /// `None` whenever the target dir is not inside a `target-pool/` (an
+    /// in-tree `target/`, a `target-agent/`, an ad-hoc out-of-tree cache) —
+    /// a slot is NEVER synthesised for a non-pool directory.
+    ///
+    /// Persisted as `coord.worktree_census.build_slot TEXT NULL`. Optional on
+    /// the wire.
+    pub build_slot: Option<String>,
+
     /// RFC3339 mtime of the worktree dir itself, `None` if unreadable.
     pub last_access_mtime: Option<String>,
     /// Sum of the non-junction real bytes attributable to this worktree
@@ -1043,6 +1069,276 @@ fn target_dir_for(worktree: &Path) -> PathBuf {
         }
     }
     worktree.join("target")
+}
+
+// ---------------------------------------------------------------------------
+// Run provenance — build_target_dir / build_slot (plan
+// `2026-08-16-plan-corpus-authority-and-run-provenance`, Phase 1).
+//
+// `target_dir_for` above answers "which dir do I MEASURE for target_bytes".
+// This section answers the different question "which dir do this worktree's
+// builds actually WRITE TO, and is that dir a shared pool slot" — the pair
+// that lets a cleanup agent attribute build-target bytes to a worktree.
+// ---------------------------------------------------------------------------
+
+/// The effective build target dir + its pool slot for one worktree. Both
+/// halves are independently `Option` because the dir can be known while the
+/// slot is genuinely inapplicable (an in-tree `target/` belongs to no pool).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BuildTarget {
+    pub dir: Option<String>,
+    pub slot: Option<String>,
+}
+
+/// The directory a `cargo` invocation for this worktree runs FROM, which is
+/// the base a **relative** `CARGO_TARGET_DIR` resolves against.
+///
+/// This fleet's builds go through `cargo-guard.sh`, which `cd`s to
+/// `<repo>/src-tauri` before exec'ing cargo and passes slot dirs as
+/// `CARGO_TARGET_DIR=../target-pool/slot-N` — so `src-tauri` is the correct
+/// base here, not the workspace root. `None` when the worktree is not a cargo
+/// project at all (no `Cargo.toml` at either candidate root); that `None` is
+/// what makes a Python/TS repo like `qontinui-web` report no build target
+/// rather than a fabricated `<worktree>/target`.
+fn cargo_invocation_dir_for(worktree: &Path) -> Option<PathBuf> {
+    let src_tauri = worktree.join("src-tauri");
+    if src_tauri.join("Cargo.toml").is_file() {
+        return Some(src_tauri);
+    }
+    if worktree.join("Cargo.toml").is_file() {
+        return Some(worktree.to_path_buf());
+    }
+    None
+}
+
+/// Lexically normalize `.` / `..` components WITHOUT touching the filesystem.
+///
+/// Deliberately not `Path::canonicalize`: the target dir routinely does not
+/// exist yet (a slot that has never been built into), and on Windows
+/// `canonicalize` returns a `\\?\` verbatim prefix that would not match the
+/// path shape every other census field uses. A `..` that would escape the
+/// root is dropped, matching cargo's own path joining.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Only pop a real directory name; never pop the prefix/root.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    // Nothing sensible to pop (already at root, or the path
+                    // is relative and starts with `..`) — keep it verbatim
+                    // so the caller's `is_absolute` check can still reject.
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve `raw` against `base` when relative, then lexically normalize.
+fn absolutize(raw: &str, base: &Path) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        lexical_normalize(p)
+    } else {
+        lexical_normalize(&base.join(p))
+    }
+}
+
+/// The target-dir override configured by a `.cargo/config.toml` inside this
+/// worktree — the "repo's configured pool slot" tier.
+///
+/// Walks from `from` (the cargo invocation dir) up to and INCLUDING
+/// `worktree_root`, nearest-first, and takes the first config file that names
+/// a target dir. Within one file, `[env] CARGO_TARGET_DIR` outranks
+/// `[build] target-dir`, matching cargo's own precedence (the env table feeds
+/// the process environment, which beats the build table).
+///
+/// Path resolution follows cargo: `build.target-dir` is relative to the
+/// directory CONTAINING the `.cargo` dir, while an `[env]` value is relative
+/// to that same directory only when the entry sets `relative = true` —
+/// otherwise it behaves like a shell-set variable and resolves against the
+/// invocation dir (`env_base`).
+///
+/// **The walk STOPS at the worktree root**, so neither `$CARGO_HOME`
+/// (`~/.cargo/config.toml`) nor any config above the repo is consulted, even
+/// though cargo itself would merge them. That is deliberate on both counts:
+///
+/// * those files are machine-global, so honouring one would stamp a single
+///   directory onto every worktree on the box — the wrong-attribution failure
+///   mode this whole field exists to avoid; and
+/// * an unbounded walk makes the resolution depend on where the checkout
+///   happens to sit. A worktree under the user profile would silently pick up
+///   `~/.cargo/config.toml` while one on another volume would not, which is a
+///   difference in LOCATION masquerading as a difference in configuration.
+///
+/// The cost of the bound is that a genuinely machine-global `target-dir`
+/// override reports the in-tree fallback instead. Nothing in this fleet sets
+/// one (the checked-in `src-tauri/.cargo/config.toml` configures sccache and
+/// rustflags only), and the fleet's actual slot routing arrives as an
+/// environment variable from `cargo-guard.sh`, which is tier 1 and unaffected.
+fn cargo_config_target_dir(
+    from: &Path,
+    worktree_root: &Path,
+    env_base: &Path,
+) -> Option<PathBuf> {
+    for dir in from.ancestors() {
+        let at_root = dir == worktree_root;
+        let cargo_dir = dir.join(".cargo");
+        for name in ["config.toml", "config"] {
+            let file = cargo_dir.join(name);
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            // `toml::from_str`, NOT `text.parse::<toml::Value>()`. In toml
+            // 1.x `FromStr for Value` deserializes a TOML *value expression*
+            // (`42`, `{a = 1}`) via `ValueDeserializer`, while `from_str`
+            // goes through `Deserializer::parse` and reads a *document*. The
+            // `parse` form compiles and type-checks identically, then fails
+            // at runtime on the very first `[table]` header — which is every
+            // real `.cargo/config.toml`. It silently degraded this whole tier
+            // to "no override"; the two `cargo_config_*` tests below are what
+            // caught it.
+            let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+                // A malformed config is UNKNOWN, not "no override" — but the
+                // honest degrade here is to keep walking rather than to
+                // invent a value; the caller's final fallback stays the
+                // in-tree target, which is what cargo would also use if it
+                // could not read this file.
+                continue;
+            };
+
+            // Tier A — `[env] CARGO_TARGET_DIR`, string or table form.
+            if let Some(entry) = value.get("env").and_then(|e| e.get("CARGO_TARGET_DIR")) {
+                let (raw, relative) = match entry {
+                    toml::Value::String(s) => (Some(s.as_str()), false),
+                    toml::Value::Table(t) => (
+                        t.get("value").and_then(|v| v.as_str()),
+                        t.get("relative").and_then(|v| v.as_bool()).unwrap_or(false),
+                    ),
+                    _ => (None, false),
+                };
+                if let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) {
+                    let base = if relative { dir } else { env_base };
+                    return Some(absolutize(raw, base));
+                }
+            }
+
+            // Tier B — `[build] target-dir`, always relative to `dir`.
+            if let Some(raw) = value
+                .get("build")
+                .and_then(|b| b.get("target-dir"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(absolutize(raw, dir));
+            }
+
+            // This config file exists but names no target dir — cargo would
+            // keep merging upward, so we do too (within the bound).
+        }
+        if at_root {
+            break;
+        }
+    }
+    None
+}
+
+/// Extract the build-pool slot id from an already-resolved target dir.
+///
+/// Recognises this fleet's pool layout — `<repo>/target-pool/<slot>` where
+/// `<slot>` is `slot-<N>` or the `lkg` (last-known-good) slot. Returns the
+/// bare slot name, lowercased (Windows paths are case-insensitive, so the
+/// same slot must not key two ways in coord).
+///
+/// Anything else is `None`, including a `target-pool` child that is not a
+/// recognised slot name. A slot is NEVER synthesised from a non-pool path:
+/// the consumer is a deletion engine and a fabricated slot id would let it
+/// charge one worktree's bytes to another.
+fn build_slot_for(target_dir: &Path) -> Option<String> {
+    use std::path::Component;
+    let mut comps = target_dir.components();
+    while let Some(c) = comps.next() {
+        let Component::Normal(name) = c else { continue };
+        if !name.to_string_lossy().eq_ignore_ascii_case("target-pool") {
+            continue;
+        }
+        let Some(Component::Normal(slot)) = comps.next() else {
+            return None;
+        };
+        let slot = slot.to_string_lossy().to_ascii_lowercase();
+        let is_numbered = slot
+            .strip_prefix("slot-")
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        if is_numbered || slot == "lkg" {
+            return Some(slot);
+        }
+        return None;
+    }
+    None
+}
+
+/// Resolve `(build_target_dir, build_slot)` for one worktree.
+///
+/// Precedence for the DIR, highest first:
+///
+/// 1. `env_target_dir` — the `CARGO_TARGET_DIR` the census process sees.
+/// 2. The repo's configured target dir from a `.cargo/config.toml` between
+///    the cargo invocation dir and the worktree root inclusive
+///    ([`cargo_config_target_dir`], which explains why the walk stops there)
+///    — the channel through which a repo is pinned to a pool slot.
+/// 3. The in-tree dir [`target_dir_for`] already measures for `target_bytes`,
+///    so the two fields describe the SAME directory in the common case.
+///
+/// Both halves are `None` when the worktree is not a cargo project, and the
+/// dir is `None` when resolution somehow yields a non-absolute path — a
+/// relative path cannot be attributed to disk, and a guess is worse than a
+/// null here.
+///
+/// **Scope caveat, deliberately disclosed:** tier 1 reads the CENSUS
+/// PROCESS's environment, not the environment of the shell that actually ran
+/// the build in that worktree — no such per-worktree record exists on disk
+/// (`cargo-guard.sh` sets `CARGO_TARGET_DIR` per invocation and leaves no
+/// trace). Tiers 2 and 3 are genuinely per-worktree. In the normal fleet
+/// configuration the runner is not launched with `CARGO_TARGET_DIR` set, so
+/// tier 1 is absent and the value is per-worktree throughout; if an operator
+/// DOES export it before launching the runner, every row on that device will
+/// report that one dir, which is honest about what the process can observe
+/// but is machine-scoped rather than worktree-scoped.
+pub(crate) fn resolve_build_target(worktree: &Path, env_target_dir: Option<&str>) -> BuildTarget {
+    let Some(invocation_dir) = cargo_invocation_dir_for(worktree) else {
+        // Not a cargo project — there is no build target to attribute.
+        return BuildTarget::default();
+    };
+
+    let dir = env_target_dir
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|raw| absolutize(raw, &invocation_dir))
+        .or_else(|| cargo_config_target_dir(&invocation_dir, worktree, &invocation_dir))
+        .unwrap_or_else(|| lexical_normalize(&target_dir_for(worktree)));
+
+    if !dir.is_absolute() {
+        return BuildTarget::default();
+    }
+
+    BuildTarget {
+        dir: Some(normalize_path_str(&dir)),
+        slot: build_slot_for(&dir),
+    }
+}
+
+/// [`resolve_build_target`] against the live process environment.
+fn resolve_build_target_live(worktree: &Path) -> BuildTarget {
+    let env = std::env::var("CARGO_TARGET_DIR").ok();
+    resolve_build_target(worktree, env.as_deref())
 }
 
 // ---------------------------------------------------------------------------
@@ -1378,6 +1674,11 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     let (nm_present, nm_is_junction, nm_bytes) = measure_dir(&worktree.join("node_modules"));
     let (target_present, target_is_junction, target_bytes) = measure_dir(&target_dir_for(worktree));
 
+    // Run provenance: WHICH dir this worktree's builds write to, and whether
+    // that dir is a shared pool slot. Filesystem-only + cheap (a couple of
+    // `is_file` probes plus at most one small TOML parse) — no git spawn.
+    let build_target = resolve_build_target_live(worktree);
+
     let last_access_mtime = std::fs::metadata(worktree)
         .ok()
         .and_then(|m| m.modified().ok())
@@ -1421,6 +1722,8 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         target_present,
         target_is_junction,
         target_bytes,
+        build_target_dir: build_target.dir,
+        build_slot: build_target.slot,
         last_access_mtime,
         attributable_bytes,
         landed_in_main,
@@ -1880,6 +2183,276 @@ mod tests {",
         );
     }
 
+    // -----------------------------------------------------------------
+    // Run provenance — build_target_dir / build_slot resolution rules.
+    // Every test drives `resolve_build_target` with an EXPLICIT
+    // `env_target_dir` argument rather than mutating the process
+    // environment: `std::env::set_var` is process-global and cargo runs
+    // unit tests on a shared thread pool, so an env-mutating test races
+    // every other test in the binary.
+    // -----------------------------------------------------------------
+
+    /// A worktree that IS a cargo project, laid out like the runner
+    /// (`src-tauri/Cargo.toml` under the repo root).
+    fn tauri_worktree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src-tauri")).unwrap();
+        std::fs::write(dir.path().join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        dir
+    }
+
+    /// Rule 1 — an ABSOLUTE `CARGO_TARGET_DIR` wins over everything, and a
+    /// pool path yields the bare slot id.
+    #[test]
+    fn build_target_honours_absolute_cargo_target_dir_and_extracts_the_slot() {
+        let wt = tauri_worktree();
+        let pool = wt.path().join("target-pool").join("slot-2");
+        let bt = resolve_build_target(wt.path(), Some(&pool.to_string_lossy()));
+        assert_eq!(bt.dir.as_deref(), Some(normalize_path_str(&pool).as_str()));
+        assert_eq!(bt.slot.as_deref(), Some("slot-2"));
+    }
+
+    /// Rule 1, relative form — `CARGO_TARGET_DIR=../target-pool/slot-0` is
+    /// exactly what `cargo-guard.sh` passes after `cd`ing to `src-tauri`, so
+    /// it must resolve against the invocation dir and normalize the `..`
+    /// away (no `\\?\`, no literal `..` left in the emitted path).
+    #[test]
+    fn build_target_resolves_relative_cargo_target_dir_against_the_invocation_dir() {
+        let wt = tauri_worktree();
+        let bt = resolve_build_target(wt.path(), Some("../target-pool/slot-0"));
+        let expect = normalize_path_str(&wt.path().join("target-pool").join("slot-0"));
+        assert_eq!(bt.dir.as_deref(), Some(expect.as_str()));
+        assert_eq!(bt.slot.as_deref(), Some("slot-0"));
+        assert!(!bt.dir.unwrap().contains(".."));
+    }
+
+    /// The `lkg` (last-known-good) slot is a pool slot too.
+    #[test]
+    fn build_slot_recognises_the_lkg_pool_slot() {
+        let wt = tauri_worktree();
+        let pool = wt.path().join("target-pool").join("lkg");
+        let bt = resolve_build_target(wt.path(), Some(&pool.to_string_lossy()));
+        assert_eq!(bt.slot.as_deref(), Some("lkg"));
+    }
+
+    /// Rule 2 — a NON-POOL target dir is reported, but `build_slot` stays
+    /// `None`. A slot is never synthesised: the consumer is a deletion
+    /// engine, so charging `target-agent/` to some slot would be worse than
+    /// reporting nothing.
+    #[test]
+    fn build_slot_is_none_for_a_non_pool_target_dir() {
+        let wt = tauri_worktree();
+        let agent = wt.path().join("target-agent");
+        let bt = resolve_build_target(wt.path(), Some(&agent.to_string_lossy()));
+        assert_eq!(bt.dir.as_deref(), Some(normalize_path_str(&agent).as_str()));
+        assert_eq!(bt.slot, None, "target-agent/ is not a pool slot");
+
+        // A `target-pool` child that is NOT a recognised slot name is also
+        // None — not a guess at the nearest slot.
+        let odd = wt.path().join("target-pool").join("scratch");
+        let bt = resolve_build_target(wt.path(), Some(&odd.to_string_lossy()));
+        assert!(bt.dir.is_some());
+        assert_eq!(bt.slot, None, "`scratch` is not slot-<N> and not lkg");
+    }
+
+    /// Rule 3 — with no override anywhere, the dir falls back to the SAME
+    /// in-tree dir `target_bytes` measures, so the two fields describe one
+    /// directory. No pool ⇒ no slot.
+    #[test]
+    fn build_target_falls_back_to_the_measured_in_tree_target() {
+        let wt = tauri_worktree();
+        let bt = resolve_build_target(wt.path(), None);
+        let expect = normalize_path_str(&target_dir_for(wt.path()));
+        assert_eq!(bt.dir.as_deref(), Some(expect.as_str()));
+        assert_eq!(bt.slot, None);
+    }
+
+    /// Rule 4 (UNRESOLVABLE) — a worktree with no `Cargo.toml` at either
+    /// candidate root is not a cargo project, so BOTH fields are `None`.
+    /// This is the `qontinui-web` case: emitting `<worktree>/target` there
+    /// would attribute a directory that no build will ever write.
+    #[test]
+    fn build_target_is_none_for_a_non_cargo_worktree() {
+        let wt = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_build_target(wt.path(), None),
+            BuildTarget::default()
+        );
+        // …and an env override does NOT rescue it — the worktree still has
+        // no cargo build to attribute.
+        assert_eq!(
+            resolve_build_target(wt.path(), Some("D:/pool/target-pool/slot-1")),
+            BuildTarget::default()
+        );
+        // A `src-tauri/` dir without a manifest is still not a cargo project.
+        std::fs::create_dir_all(wt.path().join("src-tauri")).unwrap();
+        assert_eq!(
+            resolve_build_target(wt.path(), None),
+            BuildTarget::default()
+        );
+    }
+
+    /// An empty / whitespace-only `CARGO_TARGET_DIR` is treated as UNSET
+    /// (cargo ignores it too) and must not produce the invocation dir itself
+    /// as the target.
+    #[test]
+    fn empty_cargo_target_dir_is_treated_as_unset() {
+        let wt = tauri_worktree();
+        let fallback = resolve_build_target(wt.path(), None);
+        assert_eq!(resolve_build_target(wt.path(), Some("")), fallback);
+        assert_eq!(resolve_build_target(wt.path(), Some("   ")), fallback);
+    }
+
+    /// The configured-pool-slot tier: `.cargo/config.toml` `[build]
+    /// target-dir`, relative to the dir CONTAINING `.cargo`.
+    #[test]
+    fn cargo_config_build_target_dir_is_the_middle_tier() {
+        let wt = tauri_worktree();
+        let cargo_dir = wt.path().join("src-tauri").join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        std::fs::write(
+            cargo_dir.join("config.toml"),
+            "[build]\ntarget-dir = \"../target-pool/slot-1\"\n",
+        )
+        .unwrap();
+
+        let bt = resolve_build_target(wt.path(), None);
+        let expect = normalize_path_str(&wt.path().join("target-pool").join("slot-1"));
+        assert_eq!(bt.dir.as_deref(), Some(expect.as_str()));
+        assert_eq!(bt.slot.as_deref(), Some("slot-1"));
+
+        // …and an env var still outranks it.
+        let bt = resolve_build_target(wt.path(), Some("../target-pool/slot-2"));
+        assert_eq!(bt.slot.as_deref(), Some("slot-2"));
+    }
+
+    /// Within one config file, `[env] CARGO_TARGET_DIR` outranks
+    /// `[build] target-dir`, and `relative = true` rebases it onto the
+    /// config's own directory.
+    #[test]
+    fn cargo_config_env_table_outranks_build_target_dir() {
+        let wt = tauri_worktree();
+        let cargo_dir = wt.path().join("src-tauri").join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        std::fs::write(
+            cargo_dir.join("config.toml"),
+            "[build]\ntarget-dir = \"../target-pool/slot-1\"\n\
+             [env]\nCARGO_TARGET_DIR = { value = \"../../target-pool/lkg\", relative = true }\n",
+        )
+        .unwrap();
+        // `relative = true` ⇒ base is the dir holding `.cargo`
+        // (`<wt>/src-tauri`), so `../../target-pool/lkg` lands beside the
+        // tempdir's parent — assert on the SLOT, which is what a consumer
+        // groups by, plus that the build table lost.
+        let bt = resolve_build_target(wt.path(), None);
+        assert_eq!(bt.slot.as_deref(), Some("lkg"));
+        assert!(!bt.dir.unwrap().ends_with("slot-1"));
+    }
+
+    /// The real runner `.cargo/config.toml` sets `[env] SCCACHE_SERVER_PORT`
+    /// and no target dir at all — a config file that names neither key must
+    /// not short-circuit the walk into a bogus value.
+    #[test]
+    fn cargo_config_without_a_target_dir_falls_through() {
+        let wt = tauri_worktree();
+        let cargo_dir = wt.path().join("src-tauri").join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        std::fs::write(
+            cargo_dir.join("config.toml"),
+            "[env]\nSCCACHE_SERVER_PORT = { value = \"4230\", force = false }\n",
+        )
+        .unwrap();
+        let bt = resolve_build_target(wt.path(), None);
+        assert_eq!(
+            bt.dir.as_deref(),
+            Some(normalize_path_str(&target_dir_for(wt.path())).as_str())
+        );
+        assert_eq!(bt.slot, None);
+    }
+
+    /// The config walk STOPS at the worktree root. A `.cargo/config.toml`
+    /// ABOVE the repo (the shape `$CARGO_HOME/config.toml` takes when a
+    /// checkout happens to live under the user profile) must NOT be picked
+    /// up — otherwise resolution would depend on where the checkout sits
+    /// rather than on how the repo is configured.
+    #[test]
+    fn cargo_config_above_the_worktree_root_is_ignored() {
+        let outer = tempfile::tempdir().unwrap();
+        let wt = outer.path().join("repo");
+        std::fs::create_dir_all(wt.join("src-tauri")).unwrap();
+        std::fs::write(wt.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+
+        // Config one level ABOVE the worktree root — out of bounds.
+        let above = outer.path().join(".cargo");
+        std::fs::create_dir_all(&above).unwrap();
+        std::fs::write(
+            above.join("config.toml"),
+            "[build]\ntarget-dir = \"/somewhere/target-pool/slot-9\"\n",
+        )
+        .unwrap();
+
+        let bt = resolve_build_target(&wt, None);
+        assert_eq!(
+            bt.dir.as_deref(),
+            Some(normalize_path_str(&target_dir_for(&wt)).as_str()),
+            "an out-of-repo config must not win"
+        );
+        assert_eq!(bt.slot, None);
+
+        // The SAME file at the worktree root IS in bounds.
+        let at_root = wt.join(".cargo");
+        std::fs::create_dir_all(&at_root).unwrap();
+        std::fs::write(
+            at_root.join("config.toml"),
+            "[build]\ntarget-dir = \"target-pool/slot-9\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_build_target(&wt, None).slot.as_deref(),
+            Some("slot-9")
+        );
+    }
+
+    /// `build_slot_for` is pure — pin the vocabulary directly, including the
+    /// case-insensitivity Windows paths force on us.
+    #[test]
+    fn build_slot_vocabulary() {
+        let cases: &[(&str, Option<&str>)] = &[
+            (
+                "D:/qontinui-root/qontinui-runner/target-pool/slot-2",
+                Some("slot-2"),
+            ),
+            (
+                "D:/qontinui-root/qontinui-runner/target-pool/slot-10",
+                Some("slot-10"),
+            ),
+            (
+                "D:/qontinui-root/qontinui-runner/target-pool/lkg",
+                Some("lkg"),
+            ),
+            // Windows paths are case-insensitive; one slot must not key twice.
+            (
+                "D:/qontinui-root/qontinui-runner/Target-Pool/SLOT-2",
+                Some("slot-2"),
+            ),
+            // Not a pool at all.
+            ("D:/qontinui-root/qontinui-runner/target", None),
+            ("D:/qontinui-root/qontinui-runner/target-agent", None),
+            // Pool dir with nothing under it, or a non-slot child.
+            ("D:/qontinui-root/qontinui-runner/target-pool", None),
+            ("D:/qontinui-root/qontinui-runner/target-pool/scratch", None),
+            ("D:/qontinui-root/qontinui-runner/target-pool/slot-", None),
+            ("D:/qontinui-root/qontinui-runner/target-pool/slot-x", None),
+        ];
+        for (path, want) in cases {
+            assert_eq!(
+                build_slot_for(Path::new(path)).as_deref(),
+                *want,
+                "build_slot_for({path})"
+            );
+        }
+    }
+
     #[test]
     fn collect_volumes_empty_when_no_drive_letters() {
         // POSIX-style paths have no drive letter → no volume rows (so CI
@@ -2127,6 +2700,8 @@ mod tests {",
             target_present: false,
             target_is_junction: false,
             target_bytes: 0,
+            build_target_dir: None,
+            build_slot: None,
             last_access_mtime: None,
             attributable_bytes: bytes,
             landed_in_main: None,
