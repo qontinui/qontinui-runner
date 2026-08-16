@@ -1032,6 +1032,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // COORD_ORPHAN_TARGET_REAP_ENABLED. Default 900s cadence
                 // (QONTINUI_ORPHAN_TARGET_INTERVAL_SECS). No coord round-trip.
                 agent_worktree::orphan_target_reaper::spawn_orphan_reaper();
+                // Ξ_Disk monitoring (plan 2026-08-07-product-disk-monitoring-
+                // and-cleanup, Phase 1) — the free-space sample, DECOUPLED
+                // from the census walk. Volumes used to ride only the final
+                // chunk of that walk, which takes HOURS on this population
+                // (one measured at 12.25h), so "how much disk is left" was
+                // sampled a couple of times a day. This publisher samples
+                // EVERY mounted volume — not just the ones hosting worktrees
+                // — every 60s (env QONTINUI_VOLUME_SAMPLE_INTERVAL_SECS,
+                // floored 60s), publishes it process-locally for the runner's
+                // own surfaces, and POSTs a volumes-only body to the same
+                // /coord/worktree-census/{device_id} endpoint (zero schema
+                // change). Read-only and unarmable: it deletes nothing and
+                // must answer mid-build, mid-emergency and coord-unreachable
+                // (INV-D1). It belongs on THIS disk-hygiene runtime beside the
+                // reaper, never on the heartbeat thread, which feeds coord's
+                // 120s liveness TTL and must never be starved.
+                agent_worktree::census::spawn_volume_publisher();
                 // Ξ_FS backstop (Phase 5) — a defense-in-depth DETECTOR for
                 // edits that leaked OUTSIDE any session worktree. Periodically
                 // scans the SHARED canonical checkouts; alarms (POST
