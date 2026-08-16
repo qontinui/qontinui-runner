@@ -1677,11 +1677,13 @@ mod tests {
             volumes: vec![
                 census::VolumeReport {
                     volume: "C:".to_string(),
+                    drive_letter: Some("C:".to_string()),
                     total_bytes: 1_000,
                     free_bytes: 400,
                 },
                 census::VolumeReport {
                     volume: "D:".to_string(),
+                    drive_letter: Some("D:".to_string()),
                     total_bytes: 4_000,
                     free_bytes: 93,
                 },
