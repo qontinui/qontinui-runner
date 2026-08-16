@@ -716,6 +716,31 @@ impl TerminalSession {
         cmd.env("QONTINUI_RUNNER_TERMINAL", "1");
         let runner_api_port = crate::mcp::types::get_mcp_api_port();
         cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
+
+        // Forward the continuation-verdict mode to the bundled `Stop` hook so it
+        // can skip its `curl` + `python` round trip while the feature is dark.
+        //
+        // `claude_stop_hook.sh` fires on EVERY assistant turn of EVERY session in
+        // this terminal, and with the flag at its `off` default the endpoint
+        // "answers `allow` with zero coord traffic" — so those spawns bought
+        // nothing. Measured 1.0-3.4s per turn on this fleet (Windows/MSYS process
+        // creation is 0.5-2.3s per spawn).
+        //
+        // Forward the PARSED mode, not the raw env string: `Mode::from_flag` maps
+        // an unknown value to `Off`, so the hook receives the same fail-safe
+        // value the runner itself resolved rather than re-parsing it in bash.
+        //
+        // Freshness, stated rather than hidden: a terminal started before the
+        // operator flips the flag keeps the value it was spawned with. That is
+        // NOT a regression — `Mode::from_env()` reads the RUNNER's own process
+        // env, which itself only changes on a runner restart, so the PTY value is
+        // exactly as fresh as the runner's has ever been.
+        //
+        // Plan: 2026-08-06-stop-hook-per-turn-latency (P3).
+        cmd.env(
+            crate::mcp::continuation_verdict::FLAG_ENV,
+            crate::mcp::continuation_verdict::Mode::from_env().as_str(),
+        );
         // Canonical runner-context briefing (pull-first autonomy protocol +
         // links), rendered from the SINGLE source of truth. The shell
         // integration wrapper reads this env var and passes it to
