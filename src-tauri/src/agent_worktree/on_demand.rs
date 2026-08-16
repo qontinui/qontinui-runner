@@ -290,13 +290,113 @@ pub struct SurveyItem {
     pub coord_reason: Option<String>,
 }
 
-/// Aggregate counts for the panel header.
+/// Aggregate counts for the panel header, plus the machine's free-space
+/// headroom.
+///
+/// ## Why the disk half lives here (INV-D1)
+///
+/// "How much room is left?" and "what can I safely reclaim?" are the same
+/// question to a user staring at a full disk, but they have completely
+/// different availability: the reclaim half depends on a census walk that can
+/// take hours and on coord's decision, while the free-space half depends on
+/// neither. Carrying both here lets the panel answer the disk question on the
+/// cold-start path, mid-walk, and with coord unreachable — the conditions
+/// under which the old PowerShell preview refused to answer at all.
+///
+/// The volume fields come from the decoupled 60 s publisher
+/// ([`census::spawn_volume_publisher`]), NOT from the census snapshot's
+/// `volumes` (which is as old as the walk). When no sample exists yet,
+/// `volumes` is empty AND `volumes_status` is `pending` — the pair is the
+/// honesty contract: empty-with-`pending` is UNKNOWN, never "0 bytes free".
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SurveySummary {
     pub reapable: usize,
     pub blocked: usize,
     /// Bytes that pressing "Clean up safe worktrees" would free.
     pub reclaimable_bytes: u64,
+
+    // --- Volume headroom (disk-monitoring Phase 1, step 3) ---
+    /// Free/total bytes per mounted volume. EMPTY while `volumes_status` is
+    /// `pending` — read the status before reading this.
+    pub volumes: Vec<census::VolumeReport>,
+    /// `pending` (never sampled — UNKNOWN) | `fresh` | `stale`.
+    pub volumes_status: CensusStatus,
+    /// RFC3339 instant of the sample. `None` while `pending`.
+    pub volumes_observed_at: Option<String>,
+    /// Age of the sample in seconds — what the panel renders as "as of Nm
+    /// ago". `None` while `pending`.
+    pub volumes_age_secs: Option<u64>,
+    /// Total free bytes across every sampled volume. `None` — NOT `0` —
+    /// while `pending`.
+    pub free_bytes_total: Option<u64>,
+    /// Total capacity across every sampled volume. `None` while `pending`.
+    pub total_bytes_total: Option<u64>,
+    /// One operator-facing sentence describing the reading's provenance.
+    /// Always present, and explicitly says "not known" rather than implying
+    /// an empty or full disk.
+    pub volumes_note: String,
+}
+
+/// A volume sample older than this is flagged `stale` — 5× the publisher's
+/// 60 s default cadence, so a single missed tick does not cry wolf while a
+/// dead publisher is surfaced within minutes.
+const VOLUME_STALE_AFTER_SECS: u64 = 300;
+
+impl SurveySummary {
+    /// Fill the volume half from the publisher's latest sample.
+    ///
+    /// Called on EVERY survey path — including the cold-start arm where the
+    /// census is still `pending` — because the disk question is answerable
+    /// even when the worktree question is not. That asymmetry is the whole
+    /// point of INV-D1.
+    fn with_volume_sample(
+        mut self,
+        sample: Option<&census::VolumeSample>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let Some(sample) = sample else {
+            self.volumes_status = CensusStatus::Pending;
+            self.volumes_note = "Free space has not been sampled yet this session — this is \
+                                 UNKNOWN, not zero. The volume publisher samples every mounted \
+                                 volume once a minute."
+                .to_string();
+            return self;
+        };
+        let age_secs = (now - sample.taken_at).num_seconds().max(0) as u64;
+        let status = if age_secs <= VOLUME_STALE_AFTER_SECS {
+            CensusStatus::Fresh
+        } else {
+            CensusStatus::Stale
+        };
+        self.free_bytes_total = Some(
+            sample
+                .volumes
+                .iter()
+                .fold(0u64, |acc, v| acc.saturating_add(v.free_bytes)),
+        );
+        self.total_bytes_total = Some(
+            sample
+                .volumes
+                .iter()
+                .fold(0u64, |acc, v| acc.saturating_add(v.total_bytes)),
+        );
+        self.volumes_note = format!(
+            "Free space as of {} ago, across {} volume{}{}.",
+            humanize_secs(age_secs),
+            sample.volumes.len(),
+            if sample.volumes.len() == 1 { "" } else { "s" },
+            if status == CensusStatus::Stale {
+                " (stale — the volume publisher is overdue)"
+            } else {
+                ""
+            },
+        );
+        self.volumes = sample.volumes.clone();
+        self.volumes_status = status;
+        self.volumes_observed_at = Some(sample.taken_at.to_rfc3339());
+        self.volumes_age_secs = Some(age_secs);
+        self
+    }
 }
 
 /// Freshness of the disk census the survey is derived from. This is the
@@ -550,12 +650,19 @@ pub async fn survey(query: SurveyQuery) -> Result<Survey, String> {
     // back to whatever we already had (possibly still `None` on cold start).
     let snapshot = waited.or_else(census::latest_census).or(previous);
 
+    // The free-space half is read from the 60s volume publisher, NOT from the
+    // census snapshot — that is the whole point of decoupling them, and it is
+    // why this line has no `?`, no await on coord and no dependency on the
+    // walk: `None` here is an honest UNKNOWN, rendered as such.
+    let volume_sample = census::latest_volume_sample();
+
     Ok(assemble_survey(
         snapshot.as_ref(),
         pull.as_ref(),
         device_id,
         coord_error,
         census::census_build_active(),
+        volume_sample.as_ref(),
         chrono::Utc::now(),
     ))
 }
@@ -569,6 +676,7 @@ fn assemble_survey(
     coord_device_id: Option<Uuid>,
     coord_error: Option<String>,
     census_refreshing: bool,
+    volume_sample: Option<&census::VolumeSample>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Survey {
     let coord_reachable = pull.is_some();
@@ -586,7 +694,12 @@ fn assemble_survey(
             rejunction_armed,
             canonical_excluded: 0,
             items: Vec::new(),
-            summary: SurveySummary::default(),
+            // INV-D1: the census being pending says NOTHING about free space.
+            // The disk answer is filled in here exactly as it is on the warm
+            // path — a cold start that renders "unknown free space" because
+            // an unrelated walk has not finished is the failure this plan
+            // exists to remove.
+            summary: SurveySummary::default().with_volume_sample(volume_sample, now),
             census_status: CensusStatus::Pending,
             census_taken_at: None,
             census_age_secs: None,
@@ -620,7 +733,9 @@ fn assemble_survey(
             .filter(|i| i.status == "reapable")
             .map(|i| i.attributable_bytes)
             .sum(),
-    };
+        ..Default::default()
+    }
+    .with_volume_sample(volume_sample, now);
 
     Survey {
         device_id: Some(snapshot.req.device_id),
@@ -1540,7 +1655,7 @@ mod tests {
     fn cold_start_without_a_snapshot_is_pending_and_says_so() {
         // The endpoint must ALWAYS answer — and an empty list before the first
         // walk must read as "not known yet", never as "nothing to clean up".
-        let s = assemble_survey(None, None, None, None, true, chrono::Utc::now());
+        let s = assemble_survey(None, None, None, None, true, None, chrono::Utc::now());
         assert_eq!(s.census_status, CensusStatus::Pending);
         assert!(s.items.is_empty());
         assert_eq!(s.summary.reapable, 0);
@@ -1554,6 +1669,128 @@ mod tests {
         );
     }
 
+    fn volume_sample(
+        age: chrono::Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> census::VolumeSample {
+        census::VolumeSample {
+            volumes: vec![
+                census::VolumeReport {
+                    volume: "C:".to_string(),
+                    total_bytes: 1_000,
+                    free_bytes: 400,
+                },
+                census::VolumeReport {
+                    volume: "D:".to_string(),
+                    total_bytes: 4_000,
+                    free_bytes: 93,
+                },
+            ],
+            taken_at: now - age,
+        }
+    }
+
+    /// INV-D1, the central rule: measurement is never gated on the conditions
+    /// that gate deletion. A cold start — no census, nothing known about what
+    /// is reclaimable — must STILL answer "how much disk is left".
+    #[test]
+    fn a_cold_start_census_still_answers_the_free_space_question() {
+        let now = chrono::Utc::now();
+        let sample = volume_sample(chrono::Duration::seconds(30), now);
+
+        let s = assemble_survey(None, None, None, None, true, Some(&sample), now);
+
+        // The reclaim half is honestly unknown…
+        assert_eq!(s.census_status, CensusStatus::Pending);
+        assert!(s.items.is_empty());
+        // …and the disk half answers anyway.
+        assert_eq!(s.summary.volumes_status, CensusStatus::Fresh);
+        assert_eq!(s.summary.volumes.len(), 2);
+        assert_eq!(s.summary.free_bytes_total, Some(493));
+        assert_eq!(s.summary.total_bytes_total, Some(5_000));
+        assert_eq!(s.summary.volumes_age_secs, Some(30));
+        assert!(s.summary.volumes_observed_at.is_some());
+        assert!(
+            s.summary.volumes_note.contains("2 volumes"),
+            "{}",
+            s.summary.volumes_note
+        );
+    }
+
+    /// No sample yet must read as UNKNOWN — never as a machine with zero free
+    /// bytes, and never as one with nothing to report.
+    #[test]
+    fn an_unsampled_volume_reading_is_unknown_never_a_fabricated_zero() {
+        let now = chrono::Utc::now();
+        let s = assemble_survey(None, None, None, None, false, None, now);
+
+        assert_eq!(s.summary.volumes_status, CensusStatus::Pending);
+        assert!(s.summary.volumes.is_empty());
+        assert_eq!(
+            s.summary.free_bytes_total, None,
+            "absent free space must be None, never Some(0)"
+        );
+        assert_eq!(s.summary.total_bytes_total, None);
+        assert_eq!(s.summary.volumes_age_secs, None);
+        assert_eq!(s.summary.volumes_observed_at, None);
+        assert!(
+            s.summary.volumes_note.contains("UNKNOWN"),
+            "the note must say the reading is unknown: {}",
+            s.summary.volumes_note
+        );
+    }
+
+    /// A sample older than the publisher's cadence is still SHOWN — flagged,
+    /// not hidden, and not silently rendered as current.
+    #[test]
+    fn a_stale_volume_sample_is_flagged_and_still_shown() {
+        let now = chrono::Utc::now();
+        let sample = volume_sample(chrono::Duration::seconds(1_800), now);
+        let s = assemble_survey(None, None, None, None, false, Some(&sample), now);
+
+        assert_eq!(s.summary.volumes_status, CensusStatus::Stale);
+        assert_eq!(
+            s.summary.volumes.len(),
+            2,
+            "stale data is flagged, not hidden"
+        );
+        assert_eq!(s.summary.free_bytes_total, Some(493));
+        assert!(
+            s.summary.volumes_note.contains("stale"),
+            "{}",
+            s.summary.volumes_note
+        );
+    }
+
+    /// The two freshness clocks are INDEPENDENT: an hours-old census walk
+    /// alongside a 30s-old volume sample is the normal steady state after
+    /// Phase 1, and conflating them is the defect Phase 1 removes.
+    #[test]
+    fn the_volume_clock_is_independent_of_the_census_clock() {
+        let wt = "D:/qontinui-root/qontinui-runner-wt-clocks";
+        let now = chrono::Utc::now();
+        let old_census = snapshot_of(
+            vec![census_row(wt, false, Some(false))],
+            now,
+            chrono::Duration::seconds(7_200),
+        );
+        let fresh_volumes = volume_sample(chrono::Duration::seconds(15), now);
+
+        let s = assemble_survey(
+            Some(&old_census),
+            None,
+            None,
+            None,
+            false,
+            Some(&fresh_volumes),
+            now,
+        );
+        assert_eq!(s.census_status, CensusStatus::Stale);
+        assert_eq!(s.census_age_secs, Some(7_200));
+        assert_eq!(s.summary.volumes_status, CensusStatus::Fresh);
+        assert_eq!(s.summary.volumes_age_secs, Some(15));
+    }
+
     #[test]
     fn survey_reports_snapshot_age_and_flags_a_stale_one() {
         let wt = "D:/qontinui-root/qontinui-runner-wt-aged";
@@ -1564,7 +1801,7 @@ mod tests {
             now,
             chrono::Duration::seconds(120),
         );
-        let s = assemble_survey(Some(&fresh), None, None, None, false, now);
+        let s = assemble_survey(Some(&fresh), None, None, None, false, None, now);
         assert_eq!(s.census_status, CensusStatus::Fresh);
         assert_eq!(s.census_age_secs, Some(120));
         assert!(s.census_note.contains("2m 0s ago"), "{}", s.census_note);
@@ -1575,7 +1812,7 @@ mod tests {
             now,
             chrono::Duration::seconds(1800),
         );
-        let s = assemble_survey(Some(&old), None, None, None, false, now);
+        let s = assemble_survey(Some(&old), None, None, None, false, None, now);
         assert_eq!(s.census_status, CensusStatus::Stale);
         assert!(s.census_note.contains("stale"), "{}", s.census_note);
         // Stale data is still SHOWN — flagged, not hidden.

@@ -382,8 +382,24 @@ pub(crate) fn pick_volume<'a>(
 /// disk" that disagree is how an operator ends up debugging the dashboard
 /// instead of the machine.
 pub(crate) fn probe_volume_for(root: &Path) -> Option<(PathBuf, u64, u64)> {
+    pick_volume(&enumerate_mounts(), root).cloned()
+}
+
+/// Every mounted volume as `(mount_point, total_bytes, available_bytes)`.
+///
+/// The single `sysinfo::Disks` enumeration site for the whole runner — split
+/// out of [`probe_volume_for`] so the disk-monitoring publisher
+/// ([`crate::agent_worktree::census::collect_all_volumes`]) samples the SAME
+/// reading the CI-node admission floor trips on. That is the "one probe site"
+/// property [`probe_volume_for`]'s doc argues for, extended to the third
+/// consumer: two probes of "free disk" that disagree is how an operator ends
+/// up debugging the dashboard instead of the machine.
+///
+/// An EMPTY result is a failed/blind probe, not "this machine has no disks" —
+/// callers must render it as UNKNOWN and never as zero free space.
+pub(crate) fn enumerate_mounts() -> Vec<(PathBuf, u64, u64)> {
     let disks = sysinfo::Disks::new_with_refreshed_list();
-    let mounts: Vec<(PathBuf, u64, u64)> = disks
+    disks
         .list()
         .iter()
         .map(|d| {
@@ -393,8 +409,7 @@ pub(crate) fn probe_volume_for(root: &Path) -> Option<(PathBuf, u64, u64)> {
                 d.available_space(),
             )
         })
-        .collect();
-    pick_volume(&mounts, root).cloned()
+        .collect()
 }
 
 fn free_disk_gb_for(root: &Path) -> Option<u64> {

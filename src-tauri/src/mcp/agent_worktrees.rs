@@ -104,7 +104,18 @@ pub fn routes() -> Router<Arc<ApiState>> {
 ///       { "id": "…-wt-b", "status": "blocked", "reason": "dirty",
 ///         "reason_detail": "Uncommitted work in this tree (G1) — …" }
 ///     ],
-///     "summary": { "reapable": 1, "blocked": 1, "reclaimable_bytes": 4096 },
+///     "summary": {
+///       "reapable": 1, "blocked": 1, "reclaimable_bytes": 4096,
+///       // Free space — sampled on its OWN 60s tick, NOT by the census walk,
+///       // so these fields answer even while `census_status` is "pending".
+///       "volumes": [ { "volume": "D:", "total_bytes": 4000, "free_bytes": 93 } ],
+///       "volumes_status": "fresh", // "pending" (UNKNOWN) | "fresh" | "stale"
+///       "volumes_observed_at": "2026-08-16T17:49:48Z",
+///       "volumes_age_secs": 12,
+///       "free_bytes_total": 93,    // null — never 0 — while "pending"
+///       "total_bytes_total": 4000,
+///       "volumes_note": "Free space as of 12s ago, across 1 volume."
+///     },
 ///     "census_status": "fresh",   // "pending" | "fresh" | "stale"
 ///     "census_taken_at": "2026-07-19T11:49:48Z",
 ///     "census_age_secs": 214,
@@ -121,6 +132,16 @@ pub fn routes() -> Router<Arc<ApiState>> {
 /// coord pull (15s) plus a ≤10s snapshot wait, always — a cold start with no
 /// snapshot yet returns `census_status: "pending"` with an empty `items` and a
 /// note saying so, never an implied "nothing to clean up".
+///
+/// ### The free-space half is independent (INV-D1)
+///
+/// `summary.volumes*` comes from the 60s volume publisher
+/// (`agent_worktree::census::spawn_volume_publisher`), which shares nothing
+/// with the census walk, coord, or any arming flag. So "how much disk is
+/// left?" is answered on the cold-start path, mid-walk, mid-build and with
+/// coord unreachable — the conditions under which measurement matters most.
+/// `volumes_status: "pending"` with `free_bytes_total: null` is UNKNOWN; it
+/// is never rendered as zero free space.
 ///
 /// ### Query params
 ///

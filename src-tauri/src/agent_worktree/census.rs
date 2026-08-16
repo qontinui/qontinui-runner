@@ -15,6 +15,31 @@
 //! with no recent rows (and thus zero actionable reclaim instructions) for
 //! the entire walk. Volume reports ride ONLY the final chunk of a walk.
 //!
+//! ## Free space is DECOUPLED from the walk (disk-monitoring Phase 1)
+//!
+//! Because volumes rode only the walk's final chunk, "how much disk is left"
+//! was sampled once per multi-HOUR walk (one measured at 12.25 h). That is not
+//! monitoring. [`spawn_volume_publisher`] therefore samples every mounted
+//! volume on its OWN short tick (default 60 s,
+//! `QONTINUI_VOLUME_SAMPLE_INTERVAL_SECS`, floored 60 s), publishes it to a
+//! process-local cell ([`latest_volume_sample`]) and POSTs a **volumes-only**
+//! census body (`worktrees: []`) to the same
+//! `POST /coord/worktree-census/{device_id}` endpoint — zero schema change,
+//! coord already persists `volumes` and `worktrees` independently.
+//!
+//! Two invariants govern that publisher (INV-D1 of
+//! `plans/2026-08-07-product-disk-monitoring-and-cleanup.md`):
+//!
+//! 1. **It answers under every condition** — mid-walk, mid-build,
+//!    coord-unreachable, cold start, secondary instance. The local sample is
+//!    published BEFORE any network attempt, so a telemetry outage costs the
+//!    reading nothing, and a failed POST is DROPPED (never retried, never
+//!    buffered) exactly like a census chunk.
+//! 2. **Absent data is UNKNOWN, never zero.** A probe that returns no volumes
+//!    leaves the previous sample in place and logs; it never publishes an
+//!    empty "0 bytes free" reading, and a volume reporting `total_bytes == 0`
+//!    (no media in the drive) is dropped rather than rendered as full.
+//!
 //! ## Mirrors the machine-wide pollers, not the per-agent ones
 //!
 //! Unlike [`crate::dirty_poller`] (per-agent, JWT-gated, one task per
@@ -111,6 +136,41 @@ fn census_post_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_CENSUS_POST_TIMEOUT_SECS)
         .max(1)
 }
+
+/// Env override (seconds) for the dedicated volume publisher's cadence.
+pub const VOLUME_INTERVAL_SECS_ENV: &str = "QONTINUI_VOLUME_SAMPLE_INTERVAL_SECS";
+
+/// Default volume-sample cadence — 60 s (plan D9 `sample_interval_secs`).
+/// Three orders of magnitude faster than the walk it was extracted from.
+const DEFAULT_VOLUME_INTERVAL_SECS: u64 = 60;
+
+/// Floor for [`VOLUME_INTERVAL_SECS_ENV`], mirroring the orphan reaper's
+/// `QONTINUI_ORPHAN_TARGET_INTERVAL_SECS` floored-60s pattern. It equals the
+/// default deliberately: the knob exists to make the publisher QUIETER on a
+/// machine that wants less telemetry, and can never be used to hammer coord
+/// with sub-minute POSTs.
+const MIN_VOLUME_INTERVAL_SECS: u64 = 60;
+
+/// Resolved volume-sample cadence: env override, floored.
+fn volume_sample_interval_secs() -> u64 {
+    resolve_volume_interval(std::env::var(VOLUME_INTERVAL_SECS_ENV).ok().as_deref())
+}
+
+/// PURE resolution of the cadence from a raw env value — unparseable and
+/// absent both fall back to the default, and every value is floored. Split
+/// out because env-driven assertions flake in this crate's test harness
+/// (other threads mutate the process environment).
+fn resolve_volume_interval(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_VOLUME_INTERVAL_SECS)
+        .max(MIN_VOLUME_INTERVAL_SECS)
+}
+
+/// Minimum spacing between low-disk log emissions from the volume publisher.
+/// The publisher ticks every 60 s; the alarm is a LEADING signal, not a
+/// heartbeat, and an `error!` per minute for hours during a real disk
+/// emergency buries the logs that diagnose it.
+const LOW_DISK_LOG_THROTTLE_SECS: u64 = 300;
 
 // ---------------------------------------------------------------------------
 // Census-before-reclaim boot ordering (the stale-census husk-guard, R3).
@@ -561,14 +621,47 @@ impl ChunkPoster {
             return;
         }
         let volumes = chunk.volumes.unwrap_or_default();
-        let Some((client, url)) = &self.dest else {
-            return;
-        };
         let body = WorktreeCensusReq {
             device_id: self.device_id,
             tenant_id: self.tenant_id,
             volumes,
             worktrees: chunk.rows,
+        };
+        self.send(body, true).await;
+    }
+
+    /// POST a **volumes-only** body (`worktrees: []`) — the decoupled
+    /// free-space sample, on its own 60 s tick rather than once per
+    /// multi-hour walk. Same endpoint, same auth, same drop-on-failure
+    /// posture as a census chunk.
+    ///
+    /// It deliberately does **not** release the R3 census-before-reclaim boot
+    /// gate: this body carries no worktree rows, so coord's worktree view is
+    /// exactly as stale after it as before, and letting a 60 s volume POST
+    /// open the gate would hand the reclaim poller the previous boot's stale
+    /// census — precisely the husk-creating race the gate exists to prevent.
+    async fn post_volumes(&mut self, volumes: Vec<VolumeReport>) {
+        if volumes.is_empty() {
+            // Nothing measured ⇒ nothing to say. An empty body would be
+            // indistinguishable from "0 volumes", and coord's persist
+            // no-ops on it anyway.
+            return;
+        }
+        let body = WorktreeCensusReq {
+            device_id: self.device_id,
+            tenant_id: self.tenant_id,
+            volumes,
+            worktrees: Vec::new(),
+        };
+        self.send(body, false).await;
+    }
+
+    /// The single wire send. `release_boot_gate` is `true` only for bodies
+    /// that actually refresh coord's WORKTREE view (census chunks) — see
+    /// [`ChunkPoster::post_volumes`].
+    async fn send(&mut self, body: WorktreeCensusReq, release_boot_gate: bool) {
+        let Some((client, url)) = &self.dest else {
+            return;
         };
         // Tenant-scoped: the census row this POST carries declares
         // `tenant_id`, so the bearer must come from THAT binding's slot and
@@ -588,8 +681,11 @@ impl ChunkPoster {
                 self.posted += 1;
                 // R3 boot ordering: the first successful chunk POST of this
                 // boot releases the reclaim poller's census-before-reclaim
-                // gate — coord holds rows from that moment on.
-                mark_first_census_posted();
+                // gate — coord holds rows from that moment on. A volumes-only
+                // POST refreshes no worktree row and therefore never opens it.
+                if release_boot_gate {
+                    mark_first_census_posted();
+                }
                 debug!(
                     "worktree_census: chunk posted ({} rows, {} volumes)",
                     body.worktrees.len(),
@@ -1055,9 +1151,13 @@ fn target_dir_for(worktree: &Path) -> PathBuf {
 /// `GetDiskFreeSpaceExW` binding — it gives total + available per mount
 /// portably. We map each worktree's drive letter to the sysinfo disk
 /// whose mount point covers it.
+///
+/// This is the CENSUS-WALK collector and stays path-scoped on purpose: a
+/// census row is attributed to the volume its worktree sits on, and the
+/// low-disk alarm on that path should not fire for an unrelated mount the
+/// runner never writes to. The product question — "how much disk is left,
+/// anywhere?" — is [`collect_all_volumes`], sampled on its own tick.
 fn collect_volumes(worktree_paths: &[PathBuf]) -> Vec<VolumeReport> {
-    use sysinfo::Disks;
-
     // Distinct drive letters (uppercased, with colon) among the paths.
     let mut wanted: HashSet<String> = HashSet::new();
     for p in worktree_paths {
@@ -1068,25 +1168,72 @@ fn collect_volumes(worktree_paths: &[PathBuf]) -> Vec<VolumeReport> {
     if wanted.is_empty() {
         return Vec::new();
     }
+    volumes_from_mounts(&mounts(), Some(&wanted))
+}
 
-    let disks = Disks::new_with_refreshed_list();
+/// Build a [`VolumeReport`] for **every mounted volume**, whether or not a
+/// worktree lives on it.
+///
+/// [`collect_volumes`] answers "how much room is left on the volumes these
+/// worktrees sit on", which is the right question for attributing a census
+/// row and the wrong one for the product requirement — "see available disk
+/// space" is not "…on the volumes we happen to use". A volume with no
+/// worktree on it (a second data drive, a mounted NAS share) was invisible.
+///
+/// Cross-platform: keyed on the drive letter where the mount has one and on
+/// the mount point itself otherwise, so POSIX mounts (`/`, `/home`) are
+/// reported rather than silently dropped.
+///
+/// An EMPTY return is a blind probe, not an empty machine — see the module
+/// doc's invariant 2.
+pub(crate) fn collect_all_volumes() -> Vec<VolumeReport> {
+    volumes_from_mounts(&mounts(), None)
+}
+
+/// Every mounted volume as `(mount_point, total_bytes, available_bytes)`.
+///
+/// Delegates to [`crate::ci_node::admission::enumerate_mounts`] — the runner's
+/// single `sysinfo::Disks` enumeration site — so the free-space number this
+/// module publishes and the one the CI-node admission floor trips on are
+/// literally the same reading.
+fn mounts() -> Vec<(PathBuf, u64, u64)> {
+    crate::ci_node::admission::enumerate_mounts()
+}
+
+/// PURE mapping of `(mount_point, total_bytes, free_bytes)` mounts into
+/// [`VolumeReport`]s, optionally filtered to a set of volume keys. Split out
+/// so both collectors are unit-testable without touching a real disk.
+///
+/// Two entries mapping to the same key keep the FIRST (deterministic via the
+/// `BTreeMap`), and a mount reporting `total_bytes == 0` is DROPPED: an empty
+/// optical drive or an unmounted card reader is an unreadable volume, and
+/// rendering it as "0 of 0 bytes free" would be a fabricated zero.
+fn volumes_from_mounts(
+    mounts: &[(PathBuf, u64, u64)],
+    wanted: Option<&HashSet<String>>,
+) -> Vec<VolumeReport> {
     let mut out: BTreeMap<String, VolumeReport> = BTreeMap::new();
-    for d in disks.list() {
-        let mount = d.mount_point();
-        if let Some(vol) = drive_letter_of(mount) {
-            if wanted.contains(&vol) && !out.contains_key(&vol) {
-                out.insert(
-                    vol.clone(),
-                    VolumeReport {
-                        volume: vol,
-                        total_bytes: d.total_space(),
-                        free_bytes: d.available_space(),
-                    },
-                );
-            }
+    for (mount, total, free) in mounts {
+        if *total == 0 {
+            continue;
         }
+        let key = volume_key(mount);
+        if wanted.is_some_and(|w| !w.contains(&key)) {
+            continue;
+        }
+        out.entry(key.clone()).or_insert_with(|| VolumeReport {
+            volume: key,
+            total_bytes: *total,
+            free_bytes: *free,
+        });
     }
     out.into_values().collect()
+}
+
+/// The stable key a mount is reported under: its Windows drive letter
+/// (`"D:"`) when it has one, else the mount point itself (`"/"`, `"/mnt/x"`).
+fn volume_key(mount: &Path) -> String {
+    drive_letter_of(mount).unwrap_or_else(|| mount.to_string_lossy().to_string())
 }
 
 /// Extract the `"D:"`-style drive letter from a path. `None` for paths
@@ -1583,6 +1730,148 @@ fn warn_on_low_disk(volumes: &[VolumeReport]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The decoupled volume publisher (disk-monitoring Phase 1, step 1 + 2).
+// ---------------------------------------------------------------------------
+
+/// One free-space reading of every mounted volume, with the instant it was
+/// taken. Held process-locally so the runner's own surfaces can answer the
+/// disk question with NO dependency on coord (INV-D1).
+#[derive(Debug, Clone)]
+pub(crate) struct VolumeSample {
+    pub(crate) volumes: Vec<VolumeReport>,
+    pub(crate) taken_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The most recent volume sample, or `None` before the first one lands.
+/// `None` is UNKNOWN — never "no disks" and never "0 bytes free".
+static LATEST_VOLUMES: OnceLock<RwLock<Option<VolumeSample>>> = OnceLock::new();
+
+fn latest_volumes_cell() -> &'static RwLock<Option<VolumeSample>> {
+    LATEST_VOLUMES.get_or_init(|| RwLock::new(None))
+}
+
+/// The latest volume sample. NEVER blocks, never probes, never fabricates —
+/// a caller that gets `None` must render UNKNOWN.
+pub(crate) fn latest_volume_sample() -> Option<VolumeSample> {
+    latest_volumes_cell()
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().cloned())
+}
+
+/// Publish a sample locally. Called BEFORE any network attempt so a coord
+/// outage costs the reading nothing.
+fn publish_volume_sample(volumes: Vec<VolumeReport>) -> VolumeSample {
+    let sample = VolumeSample {
+        volumes,
+        taken_at: chrono::Utc::now(),
+    };
+    if let Ok(mut g) = latest_volumes_cell().write() {
+        *g = Some(sample.clone());
+    }
+    sample
+}
+
+/// Epoch-seconds of the last low-disk log emission from the publisher.
+static LAST_LOW_DISK_LOG_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// [`warn_on_low_disk`], rate-limited to [`LOW_DISK_LOG_THROTTLE_SECS`].
+/// The alarm is a leading signal, not a heartbeat: at the publisher's 60 s
+/// cadence an unthrottled `error!` would bury the very logs used to diagnose
+/// the disk emergency it is announcing.
+fn warn_on_low_disk_throttled(volumes: &[VolumeReport]) {
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let last = LAST_LOW_DISK_LOG_EPOCH.load(Ordering::Acquire);
+    if last != 0 && now.saturating_sub(last) < LOW_DISK_LOG_THROTTLE_SECS {
+        return;
+    }
+    LAST_LOW_DISK_LOG_EPOCH.store(now, Ordering::Release);
+    warn_on_low_disk(volumes);
+}
+
+/// Take ONE volume sample: probe every mount, publish it locally, log the
+/// low-disk alarm (throttled), then POST a volumes-only census body to coord.
+///
+/// Returns the published sample, or `None` when the probe produced nothing —
+/// in which case the previous sample is deliberately LEFT IN PLACE and no
+/// empty reading is published (invariant 2: absent is UNKNOWN, not zero).
+///
+/// Nothing here consults arming, coord reachability, build state or the
+/// census walk: this is the measurement half of INV-D1 and it must answer
+/// mid-build, mid-emergency and offline.
+pub(crate) async fn sample_and_publish_volumes() -> Option<VolumeSample> {
+    // sysinfo's enumeration is a syscall per mount and can block on an
+    // unresponsive network drive, so it never runs on the shared publishers
+    // runtime's single async worker.
+    let volumes = match tokio::task::spawn_blocking(collect_all_volumes).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("worktree_census: volume probe task failed: {e} — keeping the previous sample");
+            return None;
+        }
+    };
+    if volumes.is_empty() {
+        warn!(
+            "worktree_census: volume probe returned no mounted volumes — keeping the previous \
+             sample. This reading is UNKNOWN, not zero free space."
+        );
+        return None;
+    }
+    let sample = publish_volume_sample(volumes);
+    warn_on_low_disk_throttled(&sample.volumes);
+    post_volumes_to_coord(sample.volumes.clone()).await;
+    Some(sample)
+}
+
+/// Ship one volumes-only body to coord. Best-effort and fully optional: a
+/// missing identity, an unconfigured coord, a secondary instance or a failed
+/// POST all leave the LOCAL sample untouched — telemetry may be absent, the
+/// measurement never is.
+async fn post_volumes_to_coord(volumes: Vec<VolumeReport>) {
+    let Some(device_id) = load_device_id() else {
+        debug!(
+            "worktree_census: no device_id — volume sample stays local this tick (not an error)"
+        );
+        return;
+    };
+    // Rebuilt each tick, exactly like the per-walk poster: the coord base can
+    // change under an active-profile switch, and `resolve_dest` is the ONE
+    // place the secondary-instance identity guard is enforced.
+    let mut poster = ChunkPoster::new(device_id, resolve_tenant_id());
+    poster.post_volumes(volumes).await;
+}
+
+/// Spawn the dedicated volume publisher on the ambient tokio runtime.
+///
+/// Cadence from [`VOLUME_INTERVAL_SECS_ENV`] (default 60 s, floored 60 s),
+/// `MissedTickBehavior::Skip` like every other poller here. `tokio::interval`
+/// fires its first tick immediately, so a boot has a free-space reading
+/// within milliseconds instead of waiting out the first multi-hour census
+/// walk.
+///
+/// **Deliberately unguarded by `machine_state_publish_allowed`**, unlike
+/// [`spawn_census`]: the walk's guard is a COST decision (don't burn a
+/// multi-hour walk you cannot publish), while a volume probe costs
+/// microseconds and its LOCAL half must answer on a secondary instance too.
+/// The identity half — never speak for the machine from a secondary — is
+/// enforced where it belongs, at `ChunkPoster::resolve_dest`.
+pub fn spawn_volume_publisher() {
+    let secs = volume_sample_interval_secs();
+    info!("worktree_census: starting volume publisher, interval={secs}s");
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            // Best-effort by construction: `sample_and_publish_volumes`
+            // swallows every failure class into `None` and the loop never
+            // panics — a telemetry gap must never stall the runner.
+            let _ = sample_and_publish_volumes().await;
+        }
+    });
+}
+
 /// Spawn the periodic census task on the ambient tokio runtime.
 ///
 /// Interval read from `QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS` (default
@@ -1886,6 +2175,187 @@ mod tests {",
         // on linux gets a deterministic empty result).
         let paths = vec![PathBuf::from("/tmp/x"), PathBuf::from("/home/y")];
         assert!(collect_volumes(&paths).is_empty());
+    }
+
+    /// Mount list used by the pure volume-mapping tests: two Windows drives,
+    /// a duplicate of one of them, a POSIX mount, and an empty optical drive.
+    fn sample_mounts() -> Vec<(PathBuf, u64, u64)> {
+        vec![
+            (PathBuf::from(r"C:\"), 500, 100),
+            (PathBuf::from(r"D:\"), 4_000, 93),
+            // Same volume reported twice (Windows does this for a mounted
+            // volume that also has a drive letter) — must not duplicate.
+            (PathBuf::from(r"d:\"), 4_000, 93),
+            (PathBuf::from("/mnt/data"), 900, 800),
+            // No media in the drive: total 0. NOT a volume with no space.
+            (PathBuf::from(r"E:\"), 0, 0),
+        ]
+    }
+
+    /// THE Phase-1 step-2 property: a volume with no worktree on it is still
+    /// reported. The path-filtered collector answers the census's attribution
+    /// question and is deliberately kept; the all-volumes collector answers
+    /// the product question ("how much disk is left?").
+    #[test]
+    fn all_volumes_sees_drives_the_worktree_filter_never_would() {
+        let mounts = sample_mounts();
+
+        let wanted: HashSet<String> = ["D:".to_string()].into_iter().collect();
+        let filtered = volumes_from_mounts(&mounts, Some(&wanted));
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|v| v.volume.as_str())
+                .collect::<Vec<_>>(),
+            vec!["D:"],
+            "the path-filtered collector must keep its existing behaviour"
+        );
+
+        let all = volumes_from_mounts(&mounts, None);
+        // Key-sorted and de-duplicated (`BTreeMap`), so the wire order is
+        // deterministic; `/mnt/data` sorts before `C:` on ASCII.
+        assert_eq!(
+            all.iter().map(|v| v.volume.as_str()).collect::<Vec<_>>(),
+            vec!["/mnt/data", "C:", "D:"],
+            "every mounted volume must be reported — including ones hosting no \
+             worktree (C:) and POSIX mounts, which have no drive letter"
+        );
+        let d = all
+            .iter()
+            .find(|v| v.volume == "D:")
+            .expect("D: must be reported");
+        assert_eq!(d.free_bytes, 93);
+        assert_eq!(d.total_bytes, 4_000);
+    }
+
+    /// A drive with no media reports `total_space() == 0`. Reporting it would
+    /// render as "0 bytes free" — a fabricated zero for a volume that could
+    /// not be read at all (INV-D1: absent is UNKNOWN, never zero).
+    #[test]
+    fn an_unreadable_zero_capacity_mount_is_dropped_not_reported_as_full() {
+        let all = volumes_from_mounts(&sample_mounts(), None);
+        assert!(
+            !all.iter().any(|v| v.volume == "E:"),
+            "a zero-capacity mount must never appear as a volume: {all:?}"
+        );
+        assert!(
+            all.iter().all(|v| v.total_bytes > 0),
+            "no reported volume may claim zero capacity: {all:?}"
+        );
+    }
+
+    /// The live probe, on whatever machine the tests run: it may legitimately
+    /// return nothing (a container with no readable mounts), but anything it
+    /// DOES return must be a usable reading.
+    #[test]
+    fn the_live_all_volumes_probe_never_emits_a_fabricated_zero() {
+        for v in collect_all_volumes() {
+            assert!(
+                v.total_bytes > 0,
+                "live probe emitted a zero-capacity volume: {v:?}"
+            );
+            assert!(!v.volume.is_empty(), "live probe emitted an unnamed volume");
+        }
+    }
+
+    /// Before the first sample the reading is ABSENT, and absence is the
+    /// UNKNOWN state — there is no zero-filled placeholder to mistake for a
+    /// measurement. After a publish it is readable without touching disk,
+    /// coord, or the census walk.
+    #[test]
+    fn a_published_volume_sample_is_readable_and_absence_is_unknown() {
+        // Local cell so this never races the process-global one.
+        let cell: RwLock<Option<VolumeSample>> = RwLock::new(None);
+        assert!(
+            cell.read().unwrap().is_none(),
+            "an unsampled cell must hold None (UNKNOWN), never an empty reading"
+        );
+
+        let published = publish_volume_sample(vec![VolumeReport {
+            volume: "D:".to_string(),
+            total_bytes: 4_000,
+            free_bytes: 93,
+        }]);
+        assert_eq!(published.volumes.len(), 1);
+        let read_back = latest_volume_sample().expect("a published sample must be readable");
+        assert_eq!(read_back.volumes, published.volumes);
+        assert_eq!(read_back.taken_at, published.taken_at);
+    }
+
+    #[test]
+    fn the_volume_cadence_is_floored_and_survives_garbage() {
+        assert_eq!(resolve_volume_interval(None), DEFAULT_VOLUME_INTERVAL_SECS);
+        assert_eq!(
+            resolve_volume_interval(Some("")),
+            DEFAULT_VOLUME_INTERVAL_SECS
+        );
+        assert_eq!(
+            resolve_volume_interval(Some("not-a-number")),
+            DEFAULT_VOLUME_INTERVAL_SECS
+        );
+        // The knob may only make the publisher QUIETER…
+        assert_eq!(resolve_volume_interval(Some("300")), 300);
+        // …never fast enough to hammer coord.
+        assert_eq!(resolve_volume_interval(Some("1")), MIN_VOLUME_INTERVAL_SECS);
+        assert_eq!(resolve_volume_interval(Some("0")), MIN_VOLUME_INTERVAL_SECS);
+    }
+
+    /// A volumes-only POST carries no worktree row, so it must NOT release
+    /// the R3 census-before-reclaim boot gate — a 60s telemetry tick opening
+    /// that gate would hand the reclaim poller the PREVIOUS boot's census,
+    /// which is exactly the husk-creating race the gate exists to prevent.
+    ///
+    /// Source-level for the same reason the chokepoint pin above is: the
+    /// alternative needs a live HTTP server plus a coord-configured profile,
+    /// and this asserts the property that would be silently lost by a future
+    /// "simplification" that folds `post_volumes` back into `post`.
+    #[test]
+    fn a_volumes_only_post_never_releases_the_census_boot_gate() {
+        const SRC: &str = include_str!("census.rs");
+        let prod = SRC
+            .split_once(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+
+        let volumes_fn = prod
+            .split_once("async fn post_volumes(")
+            .map(|(_, after)| after)
+            .expect("ChunkPoster::post_volumes is the volumes-only wire path");
+        let body = volumes_fn
+            .split_once("\n    }\n")
+            .map(|(b, _)| b)
+            .unwrap_or(volumes_fn);
+        let squeezed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squeezed.contains("self.send(body,false)"),
+            "post_volumes must send with release_boot_gate = false"
+        );
+        assert!(
+            !squeezed.contains("mark_first_census_posted"),
+            "post_volumes must never mark a census as posted"
+        );
+
+        // …and the single send site must gate the mark on that flag.
+        let send_fn = prod
+            .split_once("async fn send(")
+            .map(|(_, after)| after)
+            .expect("ChunkPoster::send is the single wire send");
+        let send_squeezed: String = send_fn
+            .split_once("\n    }\n")
+            .map(|(b, _)| b)
+            .unwrap_or(send_fn)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            send_squeezed.contains("ifrelease_boot_gate{mark_first_census_posted();}"),
+            "the R3 boot gate must be released only for bodies that refresh \
+             coord's WORKTREE view"
+        );
     }
 
     #[test]
