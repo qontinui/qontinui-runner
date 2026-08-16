@@ -32,9 +32,16 @@
 
 #Requires -RunAsAdministrator
 
+# Roots derive from this script's own location -- it lives at
+# <workspace-root>/qontinui-runner/scripts/, so the runner root is its parent and
+# the workspace root is its grandparent. Previously these defaulted to an
+# absolute `D:\qontinui-root\...`, which made the script unrunnable on any
+# machine checked out elsewhere: the first Join-Path against a non-existent
+# drive threw DriveNotFoundException before a single rule was created. Pass
+# -RunnerRoot / -SupervisorRoot explicitly to override for a non-standard layout.
 param(
-    [string]$RunnerRoot = "D:\qontinui-root\qontinui-runner",
-    [string]$SupervisorRoot = "D:\qontinui-root\qontinui-supervisor",
+    [string]$RunnerRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$SupervisorRoot = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "qontinui-supervisor"),
     [int]$TempPortMin = 9877,
     [int]$TempPortMax = 9899
 )
@@ -80,7 +87,7 @@ $current = [System.Security.Principal.WindowsPrincipal]::new(
     [System.Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $current.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "ERROR: this script must run elevated. Re-launch from an admin PowerShell or:" -ForegroundColor Red
-    Write-Host "  Start-Process pwsh -Verb RunAs -ArgumentList '-File','D:\qontinui-root\qontinui-runner\scripts\setup-firewall.ps1'"
+    Write-Host "  Start-Process pwsh -Verb RunAs -ArgumentList '-File','$PSCommandPath'"
     exit 1
 }
 
