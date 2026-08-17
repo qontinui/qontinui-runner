@@ -134,6 +134,32 @@ pub struct LiveClaudeSession {
     pub resume_command: String,
 }
 
+impl LiveClaudeSession {
+    /// Project this live row into the durable-record identity overlay (D1).
+    ///
+    /// The one place the live→durable field mapping lives, so the confirmation
+    /// hook and the liveness poll cannot drift apart on it.
+    ///
+    /// A NAMELESS row (old CLI builds write no `name`) contributes neither
+    /// `session_name` nor `name_source`: it is still a live session and still
+    /// carries a real account, but claiming a provenance for a name that does
+    /// not exist would be an invented value. The account is always contributed
+    /// — it is derived from the owning config dir, which is always known here.
+    pub fn identity_update(
+        &self,
+    ) -> crate::session::session_lifecycle_store::SessionIdentityUpdate {
+        use crate::session::session_lifecycle_store::{durable_name_source, SessionIdentityUpdate};
+        let named = !self.name.trim().is_empty();
+        SessionIdentityUpdate {
+            account_label: Some(self.account.label.clone()),
+            account_wrapper: Some(self.account.wrapper.clone()),
+            session_name: named.then(|| self.name.clone()),
+            name_source: named.then(|| durable_name_source(self.name_source.as_deref())),
+            ..Default::default()
+        }
+    }
+}
+
 /// Parse one registry file's bytes. Returns `None` only when the JSON is
 /// malformed or carries no usable `sessionId` — nothing to be live *as*.
 ///
@@ -244,6 +270,69 @@ pub fn read_live_sessions(
     out
 }
 
+/// Find the live-registry row for ONE session id, WITHOUT taking a
+/// process-table snapshot.
+///
+/// [`read_live_sessions`] filters by live PID, which costs a full process-table
+/// snapshot (a PowerShell / `/proc` sweep). That price is right for "list
+/// everything open right now" but wrong for the identity stamp on
+/// `POST /control/session-open`, which runs on the provider's STARTUP path and
+/// must not add a system scan to it.
+///
+/// The trade is stated rather than hidden: without the PID filter a stale file
+/// left by a crashed process can be returned. It cannot name a DIFFERENT
+/// session — the correlation key is the session id itself — so the worst case
+/// is a slightly outdated name for the right session, which the 45s liveness
+/// poll then refreshes. That is strictly better than the alternative (no name
+/// at all until the first poll tick).
+///
+/// Returns `None` when no file names the id — the common case at startup, since
+/// Claude Code may not have written its registry file by the time the
+/// SessionStart hook fires. `None` means UNKNOWN: callers must leave the stored
+/// value alone (the sticky rule), never blank it.
+///
+/// When several files name the same id (22 of 80 did on the operator's box),
+/// an OPERATOR-named row wins over a `nameSource: "derived"` one — a `/rename`
+/// is the string the operator actually sees, and letting an auto-name preempt
+/// it is the precedence bug this module's doc comment warns about.
+pub fn find_live_session_by_id(
+    config_dirs: &[std::path::PathBuf],
+    session_id: &str,
+) -> Option<LiveClaudeSession> {
+    let mut best: Option<LiveClaudeSession> = None;
+    for dir in config_dirs {
+        let Ok(entries) = std::fs::read_dir(dir.join("sessions")) else {
+            continue; // no sessions dir on this account — normal
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(session) = parse_registry_file(&bytes, dir) else {
+                continue;
+            };
+            if session.session_id != session_id {
+                continue;
+            }
+            let operator_named = session.name_source.as_deref() != Some("derived");
+            let wins = match &best {
+                None => true,
+                // Only an operator-named row displaces an already-held one, and
+                // only when what it displaces is a derived auto-name.
+                Some(prev) => operator_named && prev.name_source.as_deref() == Some("derived"),
+            };
+            if wins {
+                best = Some(session);
+            }
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +387,95 @@ mod tests {
         let s = parse_registry_file(operator_named, Path::new(".claude-gmail")).unwrap();
         assert_eq!(s.name, "worktree prune");
         assert_eq!(s.name_source, None);
+    }
+
+    /// The D1 projection: a named row contributes account + name + a RESOLVED
+    /// provenance; a nameless one contributes only the account, never an
+    /// invented name or a provenance for a name that does not exist.
+    #[test]
+    fn identity_update_projects_account_and_resolves_name_provenance() {
+        let operator = parse_registry_file(SAMPLE, Path::new("C:/claude/.claude-paktis")).unwrap();
+        let u = operator.identity_update();
+        assert_eq!(u.account_label.as_deref(), Some("paktis"));
+        assert_eq!(u.account_wrapper.as_deref(), Some("clp"));
+        assert_eq!(u.session_name.as_deref(), Some("per-agent coord-mcp proxy"));
+        // Absent `nameSource` resolves to an explicit operator marker, so the
+        // durable record's `None` keeps its one meaning: "never observed".
+        assert_eq!(u.name_source.as_deref(), Some("operator"));
+        // Not this projection's business — the D1 fields it cannot know stay None.
+        assert_eq!(u.tenant_id, None);
+        assert_eq!(u.task_run_id, None);
+        assert_eq!(u.bypass_permissions, None);
+
+        let derived = parse_registry_file(
+            r#"{"pid":1,"sessionId":"s","name":"qontinui-root-ec","nameSource":"derived"}"#,
+            Path::new("C:/claude/.claude-gmail"),
+        )
+        .unwrap();
+        let u = derived.identity_update();
+        assert_eq!(u.name_source.as_deref(), Some("derived"));
+        assert_eq!(u.account_label.as_deref(), Some("gmail"));
+
+        // A nameless row (old CLI build) is still a live session with a real
+        // account, but contributes no name and no provenance.
+        let nameless = parse_registry_file(
+            r#"{"pid":1,"sessionId":"s"}"#,
+            Path::new("C:/x/.claude-gmail"),
+        )
+        .unwrap();
+        let u = nameless.identity_update();
+        assert_eq!(u.account_label.as_deref(), Some("gmail"));
+        assert_eq!(u.session_name, None);
+        assert_eq!(u.name_source, None);
+    }
+
+    /// `find_live_session_by_id` locates ONE session by id without a process
+    /// snapshot, prefers an operator-named row over a derived one when several
+    /// processes report the same id, and answers `None` (UNKNOWN) for an id no
+    /// file names.
+    #[test]
+    fn find_live_session_by_id_prefers_the_operator_named_row() {
+        let root = tmpdir("find-by-id");
+        let acct = root.join(".claude-paktis");
+        let sessions = acct.join("sessions");
+        // Same session id reported by two live processes — the shape 22 of 80
+        // rows had on the operator's box.
+        fs::write(
+            sessions.join("11.json"),
+            r#"{"pid":11,"sessionId":"dup","name":"qontinui-root-ec","nameSource":"derived","cwd":"/x"}"#,
+        )
+        .unwrap();
+        fs::write(
+            sessions.join("12.json"),
+            r#"{"pid":12,"sessionId":"dup","name":"merge train steward","cwd":"/x"}"#,
+        )
+        .unwrap();
+        fs::write(
+            sessions.join("13.json"),
+            r#"{"pid":13,"sessionId":"other","name":"unrelated","cwd":"/x"}"#,
+        )
+        .unwrap();
+
+        let dirs = vec![acct.clone()];
+        let found = find_live_session_by_id(&dirs, "dup").expect("id is present");
+        assert_eq!(
+            found.name, "merge train steward",
+            "an operator name must not be preempted by Claude's auto-name"
+        );
+        assert_eq!(found.account.label, "paktis");
+
+        assert_eq!(
+            find_live_session_by_id(&dirs, "other").unwrap().name,
+            "unrelated"
+        );
+        assert!(
+            find_live_session_by_id(&dirs, "absent").is_none(),
+            "an id no file names is UNKNOWN, not an empty session"
+        );
+        // A config dir with no sessions dir is normal, not an error.
+        assert!(find_live_session_by_id(&[root.join(".claude-nothing")], "dup").is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -1049,6 +1049,15 @@ fn record_from_seed(
         restore_pending_at: None,
         confirmed_at: None,
         handle: None,
+        account_label: None,
+        account_wrapper: None,
+        session_name: None,
+        name_source: None,
+        tenant_id: None,
+        task_run_id: None,
+        bypass_permissions: None,
+        restored_from_boot_at: None,
+        restore_tier: None,
     })
 }
 

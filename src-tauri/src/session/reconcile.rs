@@ -354,6 +354,15 @@ fn bind_record(
         restore_pending_at: None,
         confirmed_at: confirmed.then(|| chrono::Utc::now().timestamp_millis()),
         handle: None,
+        account_label: None,
+        account_wrapper: None,
+        session_name: None,
+        name_source: None,
+        tenant_id: None,
+        task_run_id: None,
+        bypass_permissions: None,
+        restored_from_boot_at: None,
+        restore_tier: None,
     }
 }
 
@@ -1089,6 +1098,15 @@ fn disk_only_record(t: &crate::terminal::transcript::RecentTranscript) -> Termin
         restore_pending_at: None,
         confirmed_at: None,
         handle: None,
+        account_label: None,
+        account_wrapper: None,
+        session_name: None,
+        name_source: None,
+        tenant_id: None,
+        task_run_id: None,
+        bypass_permissions: None,
+        restored_from_boot_at: None,
+        restore_tier: None,
     }
 }
 
@@ -1382,6 +1400,15 @@ mod tests {
             restore_pending_at: None,
             confirmed_at: Some(1),
             handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
         }
     }
 
@@ -1768,6 +1795,15 @@ mod tests {
             restore_pending_at: None,
             confirmed_at: None,
             handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
         };
         store.record_open(phantom);
 
@@ -1921,6 +1957,15 @@ mod tests {
             restore_pending_at: None,
             confirmed_at: None,
             handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
         });
 
         let live = vec![pty("live-term", Some(4242), "C:/repo")];

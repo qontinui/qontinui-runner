@@ -22,11 +22,18 @@ use serde_json::{json, Value};
 
 use crate::database::pg::session_pr_ops::SessionPrRow;
 
-/// Map the projection rows to the command's `available: true` envelope, in the
-/// EXACT wire shape the frontend `useSessionPrs.ts` `SessionPr` interface reads
-/// (`{repo, pr_number, branch, pr_state, merged, merged_at}`). `allMerged` is
-/// true iff every row is merged (vacuously true for an empty set). Pure —
-/// unit-tested below.
+/// Map the projection rows to the command's `available: true` envelope
+/// (`{repo, pr_number, branch, pr_state, merged, merged_at}` per row).
+/// `allMerged` is true iff every row is merged (vacuously true for an empty
+/// set). Pure — unit-tested below.
+///
+/// NOTE: the frontend consumer named here used to be `useSessionPrs.ts`, which
+/// was DELETED when `SessionInfoDropdown` subsumed the PR dropdown. The zone
+/// header now reads [`crate::commands::session_info::session_info_get`], whose
+/// envelope carries the land signal and the three-bucket
+/// opened/landed/unknown split this shape predates. This command survives as
+/// the narrow PR-only read; keep the two in step or delete this one when the
+/// last caller goes.
 fn shape_available(rows: &[SessionPrRow]) -> Value {
     let prs: Vec<Value> = rows
         .iter()
@@ -36,8 +43,18 @@ fn shape_available(rows: &[SessionPrRow]) -> Value {
                 "pr_number": r.pr_number,
                 "branch": r.head_branch,
                 "pr_state": r.pr_state,
+                // `merged` is the LAND verdict, not GitHub's `merged` boolean:
+                // a coord fast-forward land leaves GitHub `merged=false`, and
+                // the majority of this fleet's landings are ff-lands.
                 "merged": r.merged,
                 "merged_at": r.merged_at.map(|t| t.to_rfc3339()),
+                // WHY the row is (or is not) landed — `github-merge` |
+                // `ff-land` | `not-landed` | `land-unknown`. `land_reason` is
+                // set iff the signal is `land-unknown`: a land that could not
+                // be evaluated is never rendered as a confident negative.
+                "land_signal": r.land_signal,
+                "land_reason": r.land_reason,
+                "landed_at": r.landed_at.map(|t| t.to_rfc3339()),
             })
         })
         .collect();
@@ -105,6 +122,34 @@ mod tests {
             } else {
                 None
             },
+            land_signal: Some(if merged { "github-merge" } else { "not-landed" }.to_string()),
+            land_reason: None,
+            landed_at: if merged {
+                Some(Utc.with_ymd_and_hms(2026, 7, 13, 1, 2, 3).unwrap())
+            } else {
+                None
+            },
+            created_at: Some(Utc.with_ymd_and_hms(2026, 7, 12, 0, 0, 0).unwrap()),
+        }
+    }
+
+    /// An ff-landed row: GitHub never merged it, a local content proof did.
+    /// The envelope must carry the land verdict AND its signal, so the
+    /// dropdown can render "landed (ff-land)" rather than "unmerged" (G3).
+    fn ff_landed_row(pr_number: i64) -> SessionPrRow {
+        SessionPrRow {
+            claude_session_id: uuid::Uuid::nil(),
+            repo: "qontinui/qontinui-runner".to_string(),
+            pr_number,
+            head_branch: Some("feat/ff".to_string()),
+            pr_state: Some("merged".to_string()),
+            merged: true,
+            // No GitHub merge stamp exists for an ff-land.
+            merged_at: None,
+            land_signal: Some("ff-land".to_string()),
+            land_reason: None,
+            landed_at: Some(Utc.with_ymd_and_hms(2026, 8, 15, 10, 0, 0).unwrap()),
+            created_at: Some(Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap()),
         }
     }
 
@@ -135,6 +180,23 @@ mod tests {
         assert_eq!(out["available"], json!(true));
         assert_eq!(out["prs"], json!([]));
         // Vacuously all-merged (green) when the session has no PRs.
+        assert_eq!(out["allMerged"], json!(true));
+    }
+
+    #[test]
+    fn ff_landed_row_reports_landed_with_its_signal() {
+        let out = shape_available(&[ff_landed_row(11)]);
+        // The G3 fix, end to end through the read path: a PR GitHub never
+        // merged still reports landed, and says WHY.
+        assert_eq!(out["prs"][0]["merged"], json!(true));
+        assert_eq!(out["prs"][0]["pr_state"], json!("merged"));
+        assert_eq!(out["prs"][0]["land_signal"], json!("ff-land"));
+        assert_eq!(out["prs"][0]["land_reason"], Value::Null);
+        assert_eq!(out["prs"][0]["merged_at"], Value::Null);
+        assert!(out["prs"][0]["landed_at"]
+            .as_str()
+            .unwrap()
+            .starts_with("2026-08-15"));
         assert_eq!(out["allMerged"], json!(true));
     }
 

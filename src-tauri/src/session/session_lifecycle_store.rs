@@ -197,6 +197,137 @@ fn normalize_origin(origin: Option<String>) -> Option<String> {
     })
 }
 
+/// Restore tier: the session was brought back with `claude --resume` and the
+/// provider handshake landed — the transcript continues.
+pub const RESTORE_TIER_RESUMED: &str = "resumed";
+/// Restore tier: only the PTY/terminal came back (no transcript to resume, or
+/// resume was deliberately not attempted). The tile exists; the conversation
+/// does not.
+pub const RESTORE_TIER_TERMINAL_ONLY: &str = "terminal-only";
+/// Restore tier: a resume was attempted for this record and did not land.
+pub const RESTORE_TIER_FAILED: &str = "failed";
+
+/// [`TerminalSessionRecord::name_source`] value meaning "an operator chose this
+/// name" (a `/rename`, or a launch-time name).
+pub const NAME_SOURCE_OPERATOR: &str = "operator";
+/// [`TerminalSessionRecord::name_source`] value meaning "Claude Code invented
+/// this name itself" (its `<dir>-<2hex>` auto-derivation).
+pub const NAME_SOURCE_DERIVED: &str = "derived";
+
+/// Map Claude Code's live-registry `nameSource` into the durable vocabulary.
+///
+/// The registry writes the key ONLY for its own auto-derivation; an operator
+/// `/rename` is spelled by the key's ABSENCE. Storing that absence as `None`
+/// would be a genuine ambiguity here, because `None` on the durable record
+/// already means "never observed" — and under the stickiness rule a `None`
+/// never overwrites, so a session that was auto-named and then `/rename`d
+/// would keep its stale `"derived"` marker forever.
+///
+/// Resolving absence to an explicit [`NAME_SOURCE_OPERATOR`] at the moment of
+/// observation removes both problems: the rename overwrites `"derived"`, and a
+/// stored `None` keeps its one honest meaning, "not observed".
+///
+/// A present-but-unrecognized value is passed through VERBATIM rather than
+/// collapsed — a future CLI variant is not this function's to interpret, and
+/// consumers already apply the registry's own rule (anything but `"derived"` is
+/// operator-chosen).
+pub fn durable_name_source(registry_value: Option<&str>) -> String {
+    match registry_value.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(v) => v.to_string(),
+        None => NAME_SOURCE_OPERATOR.to_string(),
+    }
+}
+
+/// Trim a possibly-empty incoming string to `None`.
+///
+/// The stickiness rule below reads `None` as "the writer reported nothing —
+/// keep what is stored". An empty/whitespace-only string is the same statement
+/// spelled differently, so it must normalize to `None` BEFORE the merge, or a
+/// blank would clobber a known-good value (exactly the trap `config_dir`
+/// already normalizes away at the top of [`SessionLifecycleStore::record_open`]).
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|s| !s.trim().is_empty())
+}
+
+/// Best-effort identity overlay for an existing record — the D1 "who is this
+/// session" fields that live outside the spawn-time record.
+///
+/// Every field is `Option` and every `None` means **"not reported"**, never
+/// "clear it": [`SessionLifecycleStore::update_identity`] merges stickily, so a
+/// live-registry read that misses a session can never blank the account or name
+/// the runner already knows. That is the same rule `config_dir` has always
+/// followed, and it is what makes the stored identity survive the process that
+/// produced it (Claude Code deletes its per-process registry file on exit).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIdentityUpdate {
+    /// Claude account label (`account.label`, e.g. `"gmail"`).
+    pub account_label: Option<String>,
+    /// CLI wrapper for that account (`account.wrapper`, e.g. `"clp"`).
+    pub account_wrapper: Option<String>,
+    /// The name the operator actually sees in the session window / `/resume`.
+    pub session_name: Option<String>,
+    /// Provenance of `session_name` (`"derived"` = Claude Code's own
+    /// `<dir>-<2hex>` auto-name; anything else, including absent, = operator).
+    pub name_source: Option<String>,
+    /// Coord tenant this session was spawned under.
+    pub tenant_id: Option<String>,
+    /// Orchestration task-run id — set only for worker sessions.
+    pub task_run_id: Option<String>,
+    /// Whether this session runs with provider permissions bypassed.
+    pub bypass_permissions: Option<bool>,
+}
+
+impl SessionIdentityUpdate {
+    /// True when the overlay reports nothing at all — the caller can skip the
+    /// store round-trip entirely.
+    fn is_empty(&self) -> bool {
+        self.account_label.is_none()
+            && self.account_wrapper.is_none()
+            && self.session_name.is_none()
+            && self.name_source.is_none()
+            && self.tenant_id.is_none()
+            && self.task_run_id.is_none()
+            && self.bypass_permissions.is_none()
+    }
+
+    /// Normalize every empty/whitespace-only string to `None` so the sticky
+    /// merge treats "reported blank" and "reported nothing" identically.
+    fn normalized(self) -> Self {
+        Self {
+            account_label: non_empty(self.account_label),
+            account_wrapper: non_empty(self.account_wrapper),
+            session_name: non_empty(self.session_name),
+            name_source: non_empty(self.name_source),
+            tenant_id: non_empty(self.tenant_id),
+            task_run_id: non_empty(self.task_run_id),
+            bypass_permissions: self.bypass_permissions,
+        }
+    }
+
+    /// Apply the overlay to `rec` in place, sticky. Returns true iff anything
+    /// actually changed (so callers can skip a durable write on a no-op tick).
+    fn apply(&self, rec: &mut TerminalSessionRecord) -> bool {
+        let mut changed = false;
+        macro_rules! sticky {
+            ($field:ident) => {
+                if self.$field.is_some() && self.$field != rec.$field {
+                    rec.$field = self.$field.clone();
+                    changed = true;
+                }
+            };
+        }
+        sticky!(account_label);
+        sticky!(account_wrapper);
+        sticky!(session_name);
+        sticky!(name_source);
+        sticky!(tenant_id);
+        sticky!(task_run_id);
+        sticky!(bypass_permissions);
+        changed
+    }
+}
+
 /// One persisted terminal-session lifecycle record, keyed by
 /// `claude_session_id`. Timestamps are unix epoch millis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +432,93 @@ pub struct TerminalSessionRecord {
     /// cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
+    /// Claude account label this session runs under (`account.label` from the
+    /// live registry, e.g. `"gmail"`; falls back to the account derived from
+    /// `config_dir` at spawn).
+    ///
+    /// ## Why it is stored at all
+    ///
+    /// The name and account an operator sees live ONLY in Claude Code's own
+    /// per-process registry (`<config_dir>/sessions/<pid>.json`), which Claude
+    /// Code DELETES when the process exits. After a restart the operator
+    /// therefore cannot tell which account a restored session belongs to. The
+    /// D1 fields below (`account_label` … `name_source`) copy that
+    /// process-lifetime data into the durable record so it survives the process
+    /// that produced it.
+    ///
+    /// ## Stickiness (the load-bearing rule)
+    ///
+    /// Written at three points — spawn, `POST /control/session-open`
+    /// confirmation, and every liveness-poll tick that finds the session in the
+    /// live registry. Last write wins, but a read that does NOT see the session
+    /// must never blank a stored value: **absent ⇒ keep**. Enforced in
+    /// [`SessionLifecycleStore::record_open`] and
+    /// [`SessionLifecycleStore::update_identity`], both of which take an
+    /// incoming value only when it is `Some` and non-blank. This is exactly the
+    /// `config_dir` rule.
+    ///
+    /// `#[serde(default)]`: every record written before this field existed
+    /// deserializes as `None` — purely additive, no on-disk migration. There is
+    /// no legacy VALUE vocabulary to normalize at load (unlike `origin`), and
+    /// no writer can persist a blank, because every write path normalizes
+    /// empty→`None` first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    /// CLI wrapper for [`Self::account_label`] (`account.wrapper`, e.g.
+    /// `"clp"`) — the half of the resume command that names the account, so a
+    /// restored session can be reproduced verbatim. Sticky, see
+    /// [`Self::account_label`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_wrapper: Option<String>,
+    /// The session name the operator actually sees (the live registry's `name`
+    /// — verbatim what the session window and `/resume` show). Sticky, see
+    /// [`Self::account_label`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    /// Provenance of [`Self::session_name`], verbatim from the live registry's
+    /// `nameSource`. `Some("derived")` marks Claude Code's own `<dir>-<2hex>`
+    /// auto-name; anything else — INCLUDING absent — means the name is
+    /// operator-chosen (`/rename`). Sticky, see [`Self::account_label`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_source: Option<String>,
+    /// Coord tenant this session was spawned under (`Intent.tenant_id`, stamped
+    /// from `terminal_create`). Already carried on the frontend `TerminalTab`;
+    /// durable here so a restart still knows it. Sticky.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// Orchestration task-run id — present only for WORKER sessions (the
+    /// in-process FSM worker records itself keyed by its task run). Marks the
+    /// record as machine-spawned rather than operator-opened. Sticky.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_run_id: Option<String>,
+    /// Whether the session runs with provider permissions bypassed
+    /// (`--dangerously-skip-permissions` / `--permission-mode
+    /// bypassPermissions`) — the same signal the `terminal-bypass-permissions`
+    /// Tauri event carries to the frontend. Safety-relevant, so it belongs on
+    /// the durable identity record rather than only in process-lifetime UI
+    /// state. Sticky.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass_permissions: Option<bool>,
+    /// Unix millis when a BOOT-RESTORE re-materialized this record, as opposed
+    /// to the session being freshly created. Set by the boot-restore path via
+    /// [`SessionLifecycleStore::mark_restored_from_boot`].
+    ///
+    /// Load-bearing for the restore census: it is the only marker that
+    /// distinguishes "this session came back" from "this session was opened
+    /// again", and the census's `restored` set is exactly the records carrying
+    /// it. Backend-owned and durable (like `restore_pending_at`) so a frontend
+    /// crash mid-restore cannot lose it. Sticky — a later re-record must not
+    /// erase the fact that the record was restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from_boot_at: Option<i64>,
+    /// The honest tier the restore achieved: [`RESTORE_TIER_RESUMED`],
+    /// [`RESTORE_TIER_TERMINAL_ONLY`] or [`RESTORE_TIER_FAILED`]. Mirrors the
+    /// frontend `TerminalTab`'s `resumeFailed` / `restoreTerminalOnly` flags,
+    /// which are process-lifetime only. `None` = this record was never restored
+    /// (or predates the field) — which is a DIFFERENT statement from
+    /// `Some("failed")` and must not be collapsed into it. Sticky.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_tier: Option<String>,
 }
 
 /// One durable, self-contained mutation appended to the write-ahead log.
@@ -669,8 +887,18 @@ impl SessionLifecycleStore {
         // never become a bogus `CLAUDE_CONFIG_DIR=""` on resume, and the sticky
         // guard below must treat "no account reported" uniformly as None (so an
         // empty incoming does not clobber a known-good binding).
+        // Same normalization for the D1 identity fields: the sticky guards
+        // below read `None` as "not reported", so a blank must become `None`
+        // here or it would clobber a known-good account/name.
         let rec = TerminalSessionRecord {
-            config_dir: rec.config_dir.filter(|s| !s.trim().is_empty()),
+            config_dir: non_empty(rec.config_dir),
+            account_label: non_empty(rec.account_label),
+            account_wrapper: non_empty(rec.account_wrapper),
+            session_name: non_empty(rec.session_name),
+            name_source: non_empty(rec.name_source),
+            tenant_id: non_empty(rec.tenant_id),
+            task_run_id: non_empty(rec.task_run_id),
+            restore_tier: non_empty(rec.restore_tier),
             ..rec
         };
         let now = Utc::now().timestamp_millis();
@@ -748,6 +976,44 @@ impl SessionLifecycleStore {
             // incoming value only when present.
             if rec.handle.is_some() {
                 entry.handle = rec.handle;
+            }
+            // The D1 identity fields are STICKY for the same reason
+            // `config_dir` is: they come from sources that are absent far more
+            // often than they are wrong (the live registry only exists while
+            // the process does; the spawn writer knows the account but not the
+            // name; the hook knows neither). Absent ⇒ keep. A caller that
+            // genuinely wants to CHANGE one passes it — last write wins — but
+            // no caller can blank one by omission.
+            if rec.account_label.is_some() {
+                entry.account_label = rec.account_label;
+            }
+            if rec.account_wrapper.is_some() {
+                entry.account_wrapper = rec.account_wrapper;
+            }
+            if rec.session_name.is_some() {
+                entry.session_name = rec.session_name;
+            }
+            if rec.name_source.is_some() {
+                entry.name_source = rec.name_source;
+            }
+            if rec.tenant_id.is_some() {
+                entry.tenant_id = rec.tenant_id;
+            }
+            if rec.task_run_id.is_some() {
+                entry.task_run_id = rec.task_run_id;
+            }
+            if rec.bypass_permissions.is_some() {
+                entry.bypass_permissions = rec.bypass_permissions;
+            }
+            // The restore markers are sticky too: a re-record (the frontend's
+            // post-restore re-assert, a zone move, the provider hook) must not
+            // erase the fact that this record was re-materialized by a boot
+            // restore — that fact is the census's only evidence.
+            if rec.restored_from_boot_at.is_some() {
+                entry.restored_from_boot_at = rec.restored_from_boot_at;
+            }
+            if rec.restore_tier.is_some() {
+                entry.restore_tier = rec.restore_tier;
             }
             entry.state = "open".to_string();
             entry.closed_at = None;
@@ -1073,6 +1339,21 @@ impl SessionLifecycleStore {
     /// verified). While the marker is set the liveness poll skips the record
     /// entirely except for a confident-alive observation — see [`classify`].
     /// No-op (no write) if the session is absent.
+    ///
+    /// ## Also stamps the BOOT-RESTORE marker (restore census, plan D6/P5)
+    ///
+    /// This is the moment the backend learns "a boot-restore is
+    /// re-materializing this record", so it is where `restored_from_boot_at` is
+    /// set — durable and backend-owned exactly like `restore_pending_at`, so a
+    /// frontend crash mid-restore cannot lose the evidence.
+    ///
+    /// The tier stamped here is [`RESTORE_TIER_FAILED`], and that is the HONEST
+    /// statement at this instant: a resume has been attempted for this record
+    /// and has NOT landed. It is upgraded to [`RESTORE_TIER_RESUMED`] by
+    /// [`Self::clear_restore_pending`] the moment the handshake verifies (or
+    /// the poll observes the session confidently alive). Stamping optimistically
+    /// instead would let a restore that silently died report `resumed`, which is
+    /// the one direction the census must never be wrong in.
     pub fn mark_restore_pending(&self, claude_session_id: &str) {
         let now = Utc::now().timestamp_millis();
         let mut m = match self.map.lock() {
@@ -1085,6 +1366,8 @@ impl SessionLifecycleStore {
         let changed = match m.get_mut(claude_session_id) {
             Some(rec) => {
                 rec.restore_pending_at = Some(now);
+                rec.restored_from_boot_at = Some(now);
+                rec.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
                 rec.clone()
             }
             None => return,
@@ -1100,6 +1383,20 @@ impl SessionLifecycleStore {
     /// Clear a session's restore-pending marker (resume handshake verified —
     /// the session is live again). No-op (no write) if the session is absent
     /// or the marker is already clear.
+    ///
+    /// ## Also UPGRADES the restore tier (restore census, plan D6/P5)
+    ///
+    /// Both callers mean the same thing — the verified-handshake path in
+    /// `runVerifiedResume`, and the liveness poll's self-heal when it observes
+    /// the session confidently alive — so this is the one place where "the
+    /// resume actually landed" is known. A record that
+    /// [`Self::mark_restore_pending`] stamped [`RESTORE_TIER_FAILED`] (attempt
+    /// recorded, landing unproven) is therefore promoted to
+    /// [`RESTORE_TIER_RESUMED`] here.
+    ///
+    /// Only a record already carrying `restored_from_boot_at` is touched: a
+    /// session that was never boot-restored must not acquire a restore tier
+    /// just because some other path cleared a marker on it.
     pub fn clear_restore_pending(&self, claude_session_id: &str) {
         let mut m = match self.map.lock() {
             Ok(m) => m,
@@ -1111,6 +1408,11 @@ impl SessionLifecycleStore {
         let changed = match m.get_mut(claude_session_id) {
             Some(rec) if rec.restore_pending_at.is_some() => {
                 rec.restore_pending_at = None;
+                if rec.restored_from_boot_at.is_some()
+                    && rec.restore_tier.as_deref() == Some(RESTORE_TIER_FAILED)
+                {
+                    rec.restore_tier = Some(RESTORE_TIER_RESUMED.to_string());
+                }
                 rec.clone()
             }
             _ => return, // absent or already clear — nothing to flush
@@ -1212,6 +1514,135 @@ impl SessionLifecycleStore {
                 }],
             );
         }
+    }
+
+    /// Merge a best-effort identity overlay onto an existing record — the D1
+    /// refresh path used by the liveness poll, the `POST /control/session-open`
+    /// confirmation and the spawn writers.
+    ///
+    /// STICKY, and that is the point: every `None` in `update` means "this
+    /// source reported nothing", never "clear it". A live-registry read that
+    /// misses the session (Claude Code had not written its per-process file
+    /// yet, or the process already exited) therefore leaves the stored account
+    /// and name intact instead of blanking the only durable copy. Blank strings
+    /// are normalized to `None` first, so "reported empty" degrades to
+    /// "reported nothing" rather than to a destructive write.
+    ///
+    /// Writes ONLY on a real change (an unchanged overlay is the common case on
+    /// a 45s poll tick and must not cost a WAL append), and NEVER creates a
+    /// record — an identity-only row would be a phantom restore candidate.
+    /// Returns true iff the record was found and changed.
+    pub fn update_identity(&self, claude_session_id: &str, update: &SessionIdentityUpdate) -> bool {
+        let update = update.clone().normalized();
+        if update.is_empty() {
+            return false;
+        }
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on update_identity");
+                return false;
+            }
+        };
+        let Some(rec) = m.get_mut(claude_session_id) else {
+            debug!(
+                claude_session_id,
+                "session_lifecycle_store: no record for session — identity overlay dropped"
+            );
+            return false;
+        };
+        if !update.apply(rec) {
+            return false; // nothing new — no durable write
+        }
+        let changed = rec.clone();
+        debug!(
+            claude_session_id,
+            account = changed.account_label.as_deref().unwrap_or("?"),
+            name = changed.session_name.as_deref().unwrap_or("?"),
+            "session_lifecycle_store: session identity refreshed"
+        );
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        true
+    }
+
+    /// [`Self::update_identity`] addressed by TERMINAL id instead of session
+    /// id, for the writers that only ever hold a terminal (the bypass-
+    /// permissions emit sites, the spawn-time tenant stamp). Resolves through
+    /// the same open-record lookup the reconnect path uses; a terminal with no
+    /// open record is a debug-logged no-op.
+    pub fn update_identity_by_terminal(
+        &self,
+        terminal_id: &str,
+        update: &SessionIdentityUpdate,
+    ) -> bool {
+        let Some(rec) = self.find_open_by_terminal(terminal_id) else {
+            debug!(
+                terminal_id,
+                "session_lifecycle_store: no open record for terminal — identity overlay dropped"
+            );
+            return false;
+        };
+        self.update_identity(&rec.claude_session_id, update)
+    }
+
+    /// Stamp the boot-restore markers on a present record: `restored_from_boot_at`
+    /// = now and `restore_tier` = `tier` (one of [`RESTORE_TIER_RESUMED`],
+    /// [`RESTORE_TIER_TERMINAL_ONLY`], [`RESTORE_TIER_FAILED`]).
+    ///
+    /// Backend-owned and durable, exactly like `restore_pending_at`, so a
+    /// frontend crash mid-restore cannot lose the evidence that this record was
+    /// re-materialized rather than freshly created — the restore census has no
+    /// other source for that claim.
+    ///
+    /// NOT monotonic-once: a restore that starts `terminal-only` and then lands
+    /// its resume must be able to say so, and a retry re-stamps its own attempt
+    /// time. Absent record → debug-logged no-op (never creates a row).
+    ///
+    /// ALWAYS re-stamps `restored_from_boot_at`, even when the tier is
+    /// unchanged. The timestamp is the restore census's only way to tell a
+    /// restore that happened THIS boot from a sticky stamp left by a previous
+    /// one (`restored_from_boot_at` survives restarts by design), so skipping
+    /// the write on a repeat tier would make a genuinely-restored session read
+    /// as `missing` on every boot after its first. The cost is one WAL append
+    /// per restore pass per record, which is bounded and rare.
+    pub fn mark_restored_from_boot(&self, claude_session_id: &str, tier: &str) {
+        let now = Utc::now().timestamp_millis();
+        let changed = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on mark_restored_from_boot");
+                    return;
+                }
+            };
+            let Some(rec) = m.get_mut(claude_session_id) else {
+                debug!(
+                    claude_session_id,
+                    tier, "session_lifecycle_store: no record for session — restore marker dropped"
+                );
+                return;
+            };
+            rec.restored_from_boot_at = Some(now);
+            rec.restore_tier = Some(tier.to_string());
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed.clone()),
+                }],
+            );
+            changed
+        };
+        info!(
+            claude_session_id,
+            tier, "session-restore: record marked as restored from boot"
+        );
+        self.snapshot_change(std::iter::once(changed));
     }
 
     /// Re-key a record from `old_id` to `new_id`: remove the entry stored under
@@ -2501,6 +2932,15 @@ mod tests {
             restore_pending_at: None,
             confirmed_at: None,
             handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
         }
     }
 
@@ -3000,6 +3440,285 @@ mod tests {
             Some("C:/other"),
             "a later non-empty Some updates the binding"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // D1 — durable session-info fields (account, name, tenant, restore tier)
+    // ---------------------------------------------------------------------
+
+    /// A LEGACY on-disk record carrying none of the D1 fields must load
+    /// cleanly, with every one of them `None`.
+    ///
+    /// This is the whole claim of the additive `#[serde(default)]` migration:
+    /// the on-disk format did not change, so a registry written by any prior
+    /// build restores exactly as before. A regression here silently wipes every
+    /// restorable on-screen session at boot (`load_map` drops rows it cannot
+    /// deserialize), which is why it gets its own test rather than riding along
+    /// with the behavioural ones.
+    #[test]
+    fn legacy_record_loads_with_every_session_info_field_none() {
+        let json = r#"{"claudeSessionId":"legacy-sess","configDir":"C:/cfg",
+            "workingDir":"C:/repo","pageId":"default","zoneIndex":1,
+            "title":"Old","terminalId":"term-old","openedAt":1,"lastSeenAt":2,
+            "state":"open","closedAt":null,"closeReason":null}"#;
+        let rec: TerminalSessionRecord = serde_json::from_str(json).unwrap();
+
+        assert_eq!(rec.claude_session_id, "legacy-sess");
+        assert!(
+            rec.account_label.is_none(),
+            "no account label on a legacy row"
+        );
+        assert!(rec.account_wrapper.is_none());
+        assert!(rec.session_name.is_none());
+        assert!(rec.name_source.is_none());
+        assert!(rec.tenant_id.is_none());
+        assert!(rec.task_run_id.is_none());
+        assert!(rec.bypass_permissions.is_none());
+        assert!(rec.restored_from_boot_at.is_none());
+        assert!(
+            rec.restore_tier.is_none(),
+            "never-restored and restore-failed must stay distinguishable"
+        );
+
+        // And the same row loads through the real store path, not just serde.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-session-info.json");
+        std::fs::write(&path, format!(r#"{{"legacy-sess": {json} }}"#)).unwrap();
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let loaded = store
+            .get("legacy-sess")
+            .expect("legacy row must survive load");
+        assert!(loaded.account_label.is_none());
+        assert!(loaded.session_name.is_none());
+
+        // Absent fields are also absent on the way back OUT
+        // (`skip_serializing_if`), so a legacy row does not grow nine null keys
+        // just by being loaded and re-persisted.
+        let round = serde_json::to_string(&loaded).unwrap();
+        for key in [
+            "accountLabel",
+            "accountWrapper",
+            "sessionName",
+            "nameSource",
+            "tenantId",
+            "taskRunId",
+            "bypassPermissions",
+            "restoredFromBootAt",
+            "restoreTier",
+        ] {
+            assert!(
+                !round.contains(key),
+                "absent {key} must not be serialized (got: {round})"
+            );
+        }
+    }
+
+    /// THE stickiness rule: a live-registry read that reports nothing must
+    /// never blank a stored account or name — absent ⇒ keep.
+    ///
+    /// Mirrors `record_open_config_dir_is_sticky_and_empty_normalizes_to_none`,
+    /// because it is the same rule: the sources for these fields (the live
+    /// per-process registry, the provider hook, the spawn writer) each know
+    /// only part of the answer and are absent far more often than they are
+    /// wrong. Both write paths are covered — `record_open` and the
+    /// `update_identity` overlay — since a hole in either one loses the data.
+    #[test]
+    fn session_identity_is_sticky_across_record_open_and_update_identity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // Spawn stamps the account; the poll later stamps the name.
+        let mut r = rec("sess-id");
+        r.account_label = Some("gmail".to_string());
+        r.account_wrapper = Some("clg".to_string());
+        store.record_open(r);
+        store.update_identity(
+            "sess-id",
+            &SessionIdentityUpdate {
+                session_name: Some("coord merge train".to_string()),
+                name_source: Some(NAME_SOURCE_OPERATOR.to_string()),
+                ..Default::default()
+            },
+        );
+        let got = store.get("sess-id").unwrap();
+        assert_eq!(got.account_label.as_deref(), Some("gmail"));
+        assert_eq!(got.session_name.as_deref(), Some("coord merge train"));
+
+        // A re-record that omits everything (zone move, boot re-assert, a
+        // provider that reports no account) must preserve all of it.
+        store.record_open(rec("sess-id"));
+        let got = store.get("sess-id").unwrap();
+        assert_eq!(
+            got.account_label.as_deref(),
+            Some("gmail"),
+            "a None re-record must preserve the known account binding"
+        );
+        assert_eq!(got.account_wrapper.as_deref(), Some("clg"));
+        assert_eq!(
+            got.session_name.as_deref(),
+            Some("coord merge train"),
+            "a None re-record must preserve the known session name"
+        );
+        assert_eq!(got.name_source.as_deref(), Some(NAME_SOURCE_OPERATOR));
+
+        // An all-empty overlay is a no-op, not a blanking write — this is the
+        // shape a failed/partial live-registry read produces.
+        assert!(
+            !store.update_identity("sess-id", &SessionIdentityUpdate::default()),
+            "an empty overlay must not write"
+        );
+        // Blank strings degrade to "not reported", never to a destructive write.
+        assert!(!store.update_identity(
+            "sess-id",
+            &SessionIdentityUpdate {
+                account_label: Some("   ".to_string()),
+                session_name: Some(String::new()),
+                ..Default::default()
+            },
+        ));
+        let got = store.get("sess-id").unwrap();
+        assert_eq!(got.account_label.as_deref(), Some("gmail"));
+        assert_eq!(got.session_name.as_deref(), Some("coord merge train"));
+
+        // Sticky is not FROZEN: a real new value still wins (an operator
+        // `/rename` must be able to displace Claude's auto-name).
+        store.update_identity(
+            "sess-id",
+            &SessionIdentityUpdate {
+                session_name: Some("renamed by operator".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            store.get("sess-id").unwrap().session_name.as_deref(),
+            Some("renamed by operator")
+        );
+        // An unchanged overlay costs no durable write.
+        assert!(!store.update_identity(
+            "sess-id",
+            &SessionIdentityUpdate {
+                session_name: Some("renamed by operator".to_string()),
+                ..Default::default()
+            },
+        ));
+
+        // Never creates a record: an identity-only row would be a phantom
+        // restore candidate.
+        assert!(!store.update_identity(
+            "ghost",
+            &SessionIdentityUpdate {
+                session_name: Some("ghost".to_string()),
+                ..Default::default()
+            },
+        ));
+        assert!(store.get("ghost").is_none());
+
+        // The restore markers are sticky the same way — a re-record must not
+        // erase the census's only evidence that this row was re-materialized.
+        store.mark_restored_from_boot("sess-id", RESTORE_TIER_RESUMED);
+        store.record_open(rec("sess-id"));
+        let got = store.get("sess-id").unwrap();
+        assert_eq!(got.restore_tier.as_deref(), Some(RESTORE_TIER_RESUMED));
+        assert!(got.restored_from_boot_at.is_some());
+        // A tier can still be corrected (a resume that later fails).
+        store.mark_restored_from_boot("sess-id", RESTORE_TIER_FAILED);
+        assert_eq!(
+            store.get("sess-id").unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_FAILED)
+        );
+        store.mark_restored_from_boot("ghost", RESTORE_TIER_TERMINAL_ONLY);
+        assert!(
+            store.get("ghost").is_none(),
+            "restore marker never creates a row"
+        );
+    }
+
+    /// Every D1 field survives the JSON+WAL durability path — a mutation lands
+    /// as an appended delta, is replayed on reopen, and still reads back after
+    /// a compaction folds it into the snapshot.
+    ///
+    /// The two halves matter separately: the WAL leg proves an identity write
+    /// is durable WITHOUT a whole-map rewrite (which is what makes it cheap
+    /// enough to run on a 45s poll tick), and the compaction leg proves the
+    /// fields survive the snapshot serialization too.
+    #[test]
+    fn session_info_fields_round_trip_through_the_wal_and_a_compaction() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let wal = wal_path_for(&path);
+
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            let mut r = rec("sess-rt");
+            r.account_label = Some("paktis".to_string());
+            r.account_wrapper = Some("clp".to_string());
+            r.tenant_id = Some("11111111-2222-3333-4444-555555555555".to_string());
+            r.task_run_id = Some("run-77".to_string());
+            r.bypass_permissions = Some(true);
+            store.record_open(r);
+            store.update_identity(
+                "sess-rt",
+                &SessionIdentityUpdate {
+                    session_name: Some("wal round trip".to_string()),
+                    name_source: Some(NAME_SOURCE_DERIVED.to_string()),
+                    ..Default::default()
+                },
+            );
+            store.mark_restored_from_boot("sess-rt", RESTORE_TIER_TERMINAL_ONLY);
+
+            assert!(wal.exists(), "the mutations must have landed in the WAL");
+            let snapshot = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                !snapshot.contains("wal round trip"),
+                "an identity write must not force a whole-map rewrite (snapshot: {snapshot})"
+            );
+        }
+
+        // Reopen replays the WAL.
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        let got = reopened
+            .get("sess-rt")
+            .expect("WAL replay must restore the record");
+        assert_eq!(got.account_label.as_deref(), Some("paktis"));
+        assert_eq!(got.account_wrapper.as_deref(), Some("clp"));
+        assert_eq!(got.session_name.as_deref(), Some("wal round trip"));
+        assert_eq!(got.name_source.as_deref(), Some(NAME_SOURCE_DERIVED));
+        assert_eq!(
+            got.tenant_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(got.task_run_id.as_deref(), Some("run-77"));
+        assert_eq!(got.bypass_permissions, Some(true));
+        assert_eq!(
+            got.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
+        let restored_at = got.restored_from_boot_at.expect("restore marker persisted");
+        assert!(restored_at > 0);
+
+        // And again after compaction folds the deltas into the JSON snapshot.
+        reopened.compact();
+        let snapshot = std::fs::read_to_string(&path).unwrap();
+        assert!(snapshot.contains("wal round trip"));
+        assert!(snapshot.contains("accountWrapper"), "camelCase on disk");
+        let compacted = SessionLifecycleStore::open(&path).unwrap();
+        let got = compacted.get("sess-rt").unwrap();
+        assert_eq!(got.session_name.as_deref(), Some("wal round trip"));
+        assert_eq!(got.restored_from_boot_at, Some(restored_at));
+        assert_eq!(got.bypass_permissions, Some(true));
+    }
+
+    /// `durable_name_source` resolves the registry's ABSENT-means-operator
+    /// convention at observation time, so a stored `None` keeps its one honest
+    /// meaning ("never observed") and a `/rename` can displace `"derived"`.
+    #[test]
+    fn durable_name_source_resolves_absence_to_operator_and_passes_others_through() {
+        assert_eq!(durable_name_source(None), NAME_SOURCE_OPERATOR);
+        assert_eq!(durable_name_source(Some("  ")), NAME_SOURCE_OPERATOR);
+        assert_eq!(durable_name_source(Some("derived")), NAME_SOURCE_DERIVED);
+        // A future CLI variant is not this function's to interpret.
+        assert_eq!(durable_name_source(Some("launch-flag")), "launch-flag");
     }
 
     /// Records predating the origin field must deserialize and read as
@@ -4494,6 +5213,15 @@ mod tests {
             restore_pending_at: None,
             confirmed_at: None,
             handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
         }
     }
 

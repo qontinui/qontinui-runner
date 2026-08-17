@@ -472,6 +472,20 @@ pub async fn dispatch_subtask(
                 restore_pending_at: None,
                 confirmed_at: None,
                 handle: None,
+                account_label: None,
+                account_wrapper: None,
+                session_name: None,
+                name_source: None,
+                tenant_id: None,
+                // D1: marks this record as a WORKER rather than an
+                // operator-opened session. The id is the same value the record
+                // is keyed by (the CLI session id was pre-pinned to it above),
+                // but stating it explicitly is what lets a reader tell the two
+                // kinds apart without re-deriving the coincidence.
+                task_run_id: Some(trid_str.clone()),
+                bypass_permissions: None,
+                restored_from_boot_at: None,
+                restore_tier: None,
             },
         );
         info!(

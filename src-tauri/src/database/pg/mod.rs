@@ -542,6 +542,14 @@ impl PgDb {
         // CREATE TABLE IF NOT EXISTS self-heal is its sole authority. Schema
         // `project` (NOT `runner.` — that namespace is CI-retired via
         // `forbid-runner-schema.yml`).
+        //
+        // LAND-SIGNAL CASCADE columns (`land_signal`, `land_reason`,
+        // `landed_at`) are added by the `ADD COLUMN IF NOT EXISTS` block
+        // below, matching the `project.apps` self-heal idiom above. They exist
+        // because "landed" is NOT GitHub's `merged` boolean on this fleet:
+        // coord fast-forward lands are the majority of landings and leave
+        // `merged=false` / `state=closed`. Same single-consumer posture — no
+        // companion web alembic revision for these columns either.
         conn.batch_execute(
             "CREATE TABLE IF NOT EXISTS project.session_prs ( \
                  claude_session_id UUID        NOT NULL, \
@@ -551,10 +559,16 @@ impl PgDb {
                  pr_state          TEXT, \
                  merged            BOOLEAN     NOT NULL DEFAULT false, \
                  merged_at         TIMESTAMPTZ, \
+                 land_signal       TEXT, \
+                 land_reason       TEXT, \
+                 landed_at         TIMESTAMPTZ, \
                  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(), \
                  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(), \
                  PRIMARY KEY (claude_session_id, repo, pr_number) \
              ); \
+             ALTER TABLE project.session_prs ADD COLUMN IF NOT EXISTS land_signal TEXT; \
+             ALTER TABLE project.session_prs ADD COLUMN IF NOT EXISTS land_reason TEXT; \
+             ALTER TABLE project.session_prs ADD COLUMN IF NOT EXISTS landed_at   TIMESTAMPTZ; \
              CREATE INDEX IF NOT EXISTS ix_session_prs_session \
                  ON project.session_prs (claude_session_id);",
         )

@@ -148,6 +148,18 @@ pub(crate) fn apply_typed_resume_effects(
                 restore_pending_at: None,
                 confirmed_at: None,
                 handle: None,
+                account_label: None,
+                account_wrapper: None,
+                session_name: None,
+                name_source: None,
+                tenant_id: None,
+                task_run_id: None,
+                // D1: the typed `--resume` line the sniff just parsed IS the
+                // evidence for this — the same signal that drives the
+                // `terminal-bypass-permissions` event below, now durable.
+                bypass_permissions: Some(parsed.bypass_permissions),
+                restored_from_boot_at: None,
+                restore_tier: None,
             });
             info!(
                 terminal_id = %terminal_id,

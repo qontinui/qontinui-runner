@@ -167,6 +167,9 @@ pub async fn terminal_create(
     .await;
 
     let repo_detect_handle = app_handle.clone();
+    // D1: the durable tenant stamp runs after the spawn returns, so it needs a
+    // handle of its own (`app_handle` is moved into the blocking spawn below).
+    let tenant_stamp_handle = app_handle.clone();
     let repo_detect_dir = working_dir.clone();
     let cred_helper_dir = working_dir.clone();
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` +
@@ -209,6 +212,28 @@ pub async fn terminal_create(
     if let Some(ctx) = isolated_ctx {
         if let Some(session) = terminal_manager.get(&info.id) {
             session.set_isolated_edit_ctx(ctx);
+        }
+    }
+
+    // D1 tenant stamp. The tenant the operator picked for THIS spawn is known
+    // only here — `Intent.tenant_id` below carries it to coord, and the
+    // frontend `TerminalTab` carries it for the session's lifetime, but nothing
+    // wrote it durably, so a restart lost it. The spawn-time identity seam has
+    // already recorded the session by now (synchronously, inside `create`), so
+    // the record exists and is addressable by terminal id.
+    //
+    // Only stamped when the caller actually chose a tenant: `None` means "let
+    // the registry stamp the device default", and copying a default the runner
+    // did not resolve here would be an invented value.
+    if let Some(tenant) = spawn_tenant_id {
+        if let Some(store) = tenant_stamp_handle.try_state::<Arc<SessionLifecycleStore>>() {
+            store.update_identity_by_terminal(
+                &info.id,
+                &crate::session::session_lifecycle_store::SessionIdentityUpdate {
+                    tenant_id: Some(tenant.to_string()),
+                    ..Default::default()
+                },
+            );
         }
     }
 
@@ -1101,6 +1126,15 @@ pub fn terminal_session_record_open(
         restore_pending_at: None,
         confirmed_at: None,
         handle: None,
+        account_label: None,
+        account_wrapper: None,
+        session_name: None,
+        name_source: None,
+        tenant_id: None,
+        task_run_id: None,
+        bypass_permissions: None,
+        restored_from_boot_at: None,
+        restore_tier: None,
     };
     store.record_open(record);
     Ok(CommandResponse {
@@ -1121,6 +1155,23 @@ pub fn terminal_session_record_open(
 /// Deliberately NOT `terminal_session_record_open`: that refreshes
 /// `last_seen_at` and would make ghost rows immortal. See
 /// [`SessionLifecycleStore::rebind_terminal`].
+///
+/// ## Also stamps the TERMINAL-ONLY restore tier (restore census, plan D6/P5)
+///
+/// This command IS the non-auto-resume half of the boot-restore path (the
+/// `auto-resume` half stamps via `terminal_session_mark_restore_pending`), so
+/// it is the backend point that knows a record came back as terminal + cwd with
+/// no conversation. It stamps
+/// [`RESTORE_TIER_TERMINAL_ONLY`](crate::session::session_lifecycle_store::RESTORE_TIER_TERMINAL_ONLY)
+/// — honestly: the
+/// tile exists, the conversation does not, which is exactly what the frontend's
+/// process-lifetime `restoreTerminalOnly` flag means.
+///
+/// The stamp lives HERE rather than in `SessionLifecycleStore::rebind_terminal`
+/// because only this command's contract is boot-restore-specific; the store
+/// primitive is a generic re-point that a future non-restore caller could
+/// legitimately use, and it must not silently claim such a caller restored
+/// anything.
 #[tauri::command]
 pub fn terminal_session_rebind_terminal(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
@@ -1129,6 +1180,10 @@ pub fn terminal_session_rebind_terminal(
     zone_index: i32,
 ) -> Result<CommandResponse, String> {
     store.rebind_terminal(&claude_session_id, &terminal_id, zone_index);
+    store.mark_restored_from_boot(
+        &claude_session_id,
+        crate::session::session_lifecycle_store::RESTORE_TIER_TERMINAL_ONLY,
+    );
     Ok(CommandResponse {
         success: true,
         message: None,
@@ -1959,6 +2014,15 @@ async fn poll_and_record_session<F>(
                 restore_pending_at: None,
                 confirmed_at: None,
                 handle: None,
+                account_label: None,
+                account_wrapper: None,
+                session_name: None,
+                name_source: None,
+                tenant_id: None,
+                task_run_id: None,
+                bypass_permissions: None,
+                restored_from_boot_at: None,
+                restore_tier: None,
             };
             store.record_open(record);
             info!(
@@ -1996,6 +2060,24 @@ pub(crate) fn record_pinned_session_open(
     zone_index: i32,
     provider: String,
 ) {
+    // D1 account stamp at spawn. The runner genuinely knows the ACCOUNT here —
+    // it just placed `config_dir` into the PTY env — so derive the label +
+    // wrapper from it rather than waiting on the live registry. It does NOT
+    // know the session NAME at spawn (Claude Code invents or reads that after
+    // it starts), so `session_name` stays `None` and the confirmation hook /
+    // liveness poll fills it. Never guess a name: a wrong name is worse than an
+    // absent one, and the sticky merge treats `None` as "keep whatever is
+    // known".
+    //
+    // Guarded on a KNOWN config dir: `account_from_config_dir(None)` answers
+    // `label:"unknown", wrapper:"claude"`, which is a placeholder, not
+    // knowledge. Storing it would turn "we don't know the account" into a
+    // confident-looking string — the silent-empty defect this record exists to
+    // fix. No config dir ⇒ no account stamp; the poll fills it from the live
+    // registry once the session actually runs.
+    let account = config_dir
+        .as_deref()
+        .map(|d| crate::session::past_sessions::account_from_config_dir(Some(d)));
     store.record_open(TerminalSessionRecord {
         claude_session_id: claude_session_id.clone(),
         config_dir,
@@ -2017,6 +2099,16 @@ pub(crate) fn record_pinned_session_open(
         restore_pending_at: None,
         confirmed_at: None,
         handle: None,
+        account_label: account.as_ref().map(|a| a.label.clone()),
+        account_wrapper: account.as_ref().map(|a| a.wrapper.clone()),
+        // Not knowable at spawn — filled by the confirmation hook / poll.
+        session_name: None,
+        name_source: None,
+        tenant_id: None,
+        task_run_id: None,
+        bypass_permissions: None,
+        restored_from_boot_at: None,
+        restore_tier: None,
     });
     info!(
         terminal_id = %terminal_id,
@@ -2121,6 +2213,15 @@ mod tests {
             restore_pending_at: None,
             confirmed_at: Some(3),
             handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
         }
     }
 

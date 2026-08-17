@@ -28,6 +28,14 @@
 //!    Folded into this same tick — NOT a second GitHub poll loop; scoped to
 //!    the session's OWN PRs (never a fleet scan).
 //!
+//! LANDED IS NOT GITHUB'S `merged` BOOLEAN. coord fast-forward lands are the
+//! majority of this fleet's landings and leave `merged=false` / `state=closed`
+//! (`knowledge-base/qontinui-specific/coord-ff-lands.md`), so both write paths
+//! run the [`land_verdict`] cascade instead: GitHub merge → local content
+//! proof (`ff-land`) → otherwise one of TWO distinct terminal states,
+//! `not-landed` (evaluated) and `land-unknown` (could not be evaluated, always
+//! with a reason). The cascade never fetches — see [`probe_land`].
+//!
 //! Best-effort throughout: PG unavailable, no GitHub token, a git/gh failure,
 //! or an API error skips the affected unit and logs — a passive dropdown never
 //! justifies noisy failures.
@@ -40,6 +48,7 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::database::pg::session_pr_ops::SessionPrStatus;
 use crate::database::pg::PgDb;
 use crate::session::session_lifecycle_store::SessionLifecycleStore;
 use crate::trigger_system::github_api::GitHubClient;
@@ -263,8 +272,22 @@ async fn reconcile_session(
             }
 
             let pr_number = pr.number as i64;
-            let state = pr_state_label(pr.merged, &pr.state);
-            let merged_at = pr.merged_at.as_deref().and_then(parse_ts);
+            // CALL SITE 1 of the land cascade (the branch-attribution path).
+            let proof = probe_land(
+                Some(repo_dir),
+                pr.merged,
+                &pr.state,
+                &pr.head_sha,
+                &pr.base_ref,
+            )
+            .await;
+            let verdict = land_verdict(pr.merged, proof);
+            let status = session_pr_status(
+                &verdict,
+                &pr.state,
+                pr.merged_at.as_deref().and_then(parse_ts),
+                pr.closed_at.as_deref().and_then(parse_ts),
+            );
 
             if let Err(e) = pg_db
                 .upsert_session_pr(
@@ -272,9 +295,7 @@ async fn reconcile_session(
                     &repo_full,
                     pr_number,
                     Some(bt.branch.as_str()),
-                    Some(state),
-                    pr.merged,
-                    merged_at,
+                    &status,
                 )
                 .await
             {
@@ -299,19 +320,34 @@ async fn reconcile_session(
         };
         match client.get_pr(owner, repo, row.pr_number as u64).await {
             Ok(pr) => {
-                let state = pr_state_label(pr.merged, &pr.state);
+                // CALL SITE 2 of the land cascade. THIS is the ff-land path in
+                // practice: a landed PR's branch is usually deleted, which is
+                // exactly why the branch path above no longer reaches it.
+                //
+                // The content proof needs a local checkout OF THIS PR'S repo.
+                // A session that moved between repos can hold rows for a repo
+                // this tick did not resolve — that is UNKNOWN (`not_a_repo`),
+                // never a confident negative.
+                let dir_for_row = (row.repo == repo_full).then_some(repo_dir);
+                let proof = probe_land(
+                    dir_for_row,
+                    pr.merged,
+                    &pr.state,
+                    &pr.head_sha,
+                    &pr.base_ref,
+                )
+                .await;
+                let verdict = land_verdict(pr.merged, proof);
                 // `get_pr`'s PrStatus exposes no merged_at; preserve any stamp
-                // the branch path already recorded (frontend renders green off
-                // the `merged` bool, so the timestamp is cosmetic).
+                // the branch path already recorded.
+                let status = session_pr_status(
+                    &verdict,
+                    &pr.state,
+                    row.merged_at,
+                    pr.closed_at.as_deref().and_then(parse_ts),
+                );
                 if let Err(e) = pg_db
-                    .update_session_pr_status(
-                        session_id,
-                        &row.repo,
-                        row.pr_number,
-                        Some(state),
-                        pr.merged,
-                        row.merged_at,
-                    )
+                    .update_session_pr_status(session_id, &row.repo, row.pr_number, &status)
                     .await
                 {
                     warn!("session-PR reconciler: update_session_pr_status failed: {e}");
@@ -329,15 +365,313 @@ async fn reconcile_session(
     Ok(())
 }
 
-/// Map GitHub PR fields to the projection's `pr_state` label.
-fn pr_state_label(merged: bool, state: &str) -> &'static str {
-    if merged {
+/// Map the LAND verdict + GitHub's lifecycle to the projection's `pr_state`
+/// label.
+///
+/// The first argument is the cascade's `landed` verdict, **not** GitHub's
+/// `merged` boolean: a fast-forward land is a land, and reading it off
+/// `merged` is the defect this cascade exists to fix (G3).
+fn pr_state_label(landed: bool, state: &str) -> &'static str {
+    if landed {
         "merged"
     } else if state == "closed" {
         "closed"
     } else {
         "open"
     }
+}
+
+/// Why a land verdict could not be established. Persisted verbatim in
+/// `project.session_prs.land_reason` so the dropdown can say *why* it cannot
+/// answer instead of asserting a negative it never established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandUnknown {
+    /// No local checkout to read: the PR's repo is not the one this tick
+    /// resolved for the session, or `git` could not run there.
+    NotARepo,
+    /// `origin/<base>` does not exist locally.
+    NoBaseRef,
+    /// The PR head commit is not present locally — the usual state after a
+    /// post-land branch delete (and a later `git gc`).
+    HeadObjectMissing,
+    /// Both objects exist and git answered "not an ancestor", but the local
+    /// `origin/<base>` tip is no newer than the PR head — so that ref could
+    /// not contain the head whatever happened upstream, and the negative is an
+    /// artefact of a stale ref rather than evidence. Measured: this repo and
+    /// the running runner were both 19 commits behind `origin/main` at plan
+    /// vet time, so this is the COMMON case on this fleet, not the exotic one.
+    RefStale,
+}
+
+impl LandUnknown {
+    fn as_str(self) -> &'static str {
+        match self {
+            LandUnknown::NotARepo => "not_a_repo",
+            LandUnknown::NoBaseRef => "no_base_ref",
+            LandUnknown::HeadObjectMissing => "head_object_missing",
+            LandUnknown::RefStale => "ref_stale",
+        }
+    }
+}
+
+/// Outcome of signal 2 — the local content proof (`git merge-base
+/// --is-ancestor`). Injected into [`land_verdict`] so the cascade is pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentProof {
+    /// The PR head is an ancestor of `origin/<base>`: the commits ARE on the
+    /// base branch. Land-path independent — this is what catches an ff-land.
+    Ancestor,
+    /// Every input was present and git answered "not an ancestor".
+    NotAncestor,
+    /// The probe could not be evaluated. Carries the recorded reason.
+    Unknown(LandUnknown),
+    /// Deliberately not attempted, and no subprocess was spawned: GitHub
+    /// already reported the PR merged (signal 1 wins), or GitHub still reports
+    /// it OPEN. GitHub closes a PR as soon as its head commits become
+    /// reachable from the base branch — ff-lands included — so `open` is an
+    /// EVALUATED negative, not an unevaluated one.
+    NotAttempted,
+}
+
+/// The land verdict for one PR: what the projection stores and the dropdown
+/// renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LandVerdict {
+    /// True iff some signal PROVED the PR landed.
+    landed: bool,
+    /// `"github-merge"` | `"ff-land"` | `"not-landed"` | `"land-unknown"`
+    /// (`"coord"` is reserved for signal 3, see below).
+    signal: &'static str,
+    /// Set iff `signal == "land-unknown"`.
+    reason: Option<&'static str>,
+}
+
+/// THE CASCADE — first hit wins, each hit recorded. Pure over its inputs, so
+/// it unit-tests without git, PG or the network; `proof` is the injected
+/// result of signal 2 ([`probe_land`]).
+///
+/// 1. GitHub `merged == true` → `github-merge`.
+/// 2. Content proof: the head commit is an ancestor of `origin/<base>` →
+///    `ff-land`. The signal that must ship; 1 and 3 are corroboration.
+/// 3. coord's verdict → `coord`. **NOT WIRED**: the runner has no in-process
+///    coord PR-status client (`coord_pr_status` appears only in `mcp_api.rs`'s
+///    tool-name allowlist, i.e. a proxied MCP tool, not a callable client), and
+///    standing up a new coord client for a corroborating signal would put a
+///    network dependency on a 30s background tick. When such a client exists it
+///    slots in HERE, between 2 and 4, with `signal = "coord"`.
+/// 4. Otherwise TWO distinct terminal states, never merged into one:
+///    `not-landed` (every signal evaluated and said no) and `land-unknown`
+///    (a signal could not be evaluated), the latter always with its reason.
+fn land_verdict(github_merged: bool, proof: ContentProof) -> LandVerdict {
+    if github_merged {
+        return LandVerdict {
+            landed: true,
+            signal: "github-merge",
+            reason: None,
+        };
+    }
+    match proof {
+        ContentProof::Ancestor => LandVerdict {
+            landed: true,
+            signal: "ff-land",
+            reason: None,
+        },
+        ContentProof::Unknown(reason) => LandVerdict {
+            landed: false,
+            signal: "land-unknown",
+            reason: Some(reason.as_str()),
+        },
+        ContentProof::NotAncestor | ContentProof::NotAttempted => LandVerdict {
+            landed: false,
+            signal: "not-landed",
+            reason: None,
+        },
+    }
+}
+
+/// Assemble the projection's status columns from the GitHub payload and the
+/// land verdict.
+///
+/// `landed_at` is the LAND time by whichever signal proved it: GitHub's
+/// `merged_at` for a merge, the PR's `closed_at` for an ff-land (when GitHub
+/// or coord closed it once the commits were on the base branch). Never `now()`
+/// — that is the observation time, not the land time.
+fn session_pr_status(
+    verdict: &LandVerdict,
+    github_state: &str,
+    merged_at: Option<DateTime<Utc>>,
+    closed_at: Option<DateTime<Utc>>,
+) -> SessionPrStatus {
+    SessionPrStatus {
+        pr_state: Some(pr_state_label(verdict.landed, github_state).to_string()),
+        landed: verdict.landed,
+        merged_at,
+        land_signal: Some(verdict.signal.to_string()),
+        land_reason: verdict.reason.map(|r| r.to_string()),
+        landed_at: if verdict.landed {
+            merged_at.or(closed_at)
+        } else {
+            None
+        },
+    }
+}
+
+/// Signal 2: is the PR's head commit already on `origin/<base>`?
+///
+/// GUARDED, because `git merge-base --is-ancestor` exits non-zero for a
+/// MISSING OBJECT and for NOT AN ANCESTOR alike — conflating the two is what
+/// turns a landed PR into a confident "not landed". Both revisions are
+/// verified present first, and every path that cannot answer returns
+/// [`ContentProof::Unknown`] with a reason.
+///
+/// NEVER FETCHES. A background tick that runs `git fetch` across every
+/// session's repo is a cost and concurrency hazard this reconciler
+/// deliberately avoids (its per-tick budget is one `remote get-url` + one
+/// `for-each-ref` per repo). The price is that a stale `origin/<base>` yields
+/// `ref_stale` UNKNOWN rather than a verdict — which is the honest answer.
+///
+/// Cost: zero subprocesses unless GitHub says closed-and-not-merged, then two
+/// `rev-parse` guards + one `merge-base`, plus two `log -1` timestamp reads
+/// only on the negative path.
+async fn probe_land(
+    repo_dir: Option<&str>,
+    github_merged: bool,
+    github_state: &str,
+    head_sha: &str,
+    base_ref: &str,
+) -> ContentProof {
+    if github_merged || github_state != "closed" {
+        return ContentProof::NotAttempted;
+    }
+    let Some(dir) = repo_dir else {
+        return ContentProof::Unknown(LandUnknown::NotARepo);
+    };
+    let (head_sha, base_ref) = (head_sha.trim(), base_ref.trim());
+    if head_sha.is_empty() {
+        return ContentProof::Unknown(LandUnknown::HeadObjectMissing);
+    }
+    if base_ref.is_empty() {
+        return ContentProof::Unknown(LandUnknown::NoBaseRef);
+    }
+
+    let head_rev = format!("{head_sha}^{{commit}}");
+    let base_rev = format!("origin/{base_ref}^{{commit}}");
+
+    match git_rev_present(dir, &head_rev).await {
+        Some(true) => {}
+        Some(false) => return ContentProof::Unknown(LandUnknown::HeadObjectMissing),
+        None => return ContentProof::Unknown(LandUnknown::NotARepo),
+    }
+    match git_rev_present(dir, &base_rev).await {
+        Some(true) => {}
+        Some(false) => return ContentProof::Unknown(LandUnknown::NoBaseRef),
+        None => return ContentProof::Unknown(LandUnknown::NotARepo),
+    }
+
+    match git_is_ancestor(dir, &head_rev, &base_rev).await {
+        Some(true) => ContentProof::Ancestor,
+        Some(false) => classify_negative(
+            git_commit_ts(dir, &head_rev).await,
+            git_commit_ts(dir, &base_rev).await,
+        ),
+        None => ContentProof::Unknown(LandUnknown::NotARepo),
+    }
+}
+
+/// Classify a git "not an ancestor" answer given both commits' committer
+/// timestamps. Pure.
+///
+/// A base tip that is no newer than the PR head cannot contain that head, so
+/// the negative says nothing about whether the PR landed — it says the local
+/// ref is stale. Only a base tip strictly NEWER than the head makes the
+/// negative evidence.
+fn classify_negative(head_ts: Option<i64>, base_ts: Option<i64>) -> ContentProof {
+    match (head_ts, base_ts) {
+        (Some(head), Some(base)) if base > head => ContentProof::NotAncestor,
+        (Some(_), Some(_)) => ContentProof::Unknown(LandUnknown::RefStale),
+        // git could not date an object it had just verified: a broken repo,
+        // not a negative.
+        _ => ContentProof::Unknown(LandUnknown::NotARepo),
+    }
+}
+
+/// `git -C <dir> rev-parse --verify --quiet <rev>` — `Some(true)` present,
+/// `Some(false)` absent (git's quiet exit 1), `None` for any other exit (128 =
+/// not a git repository / fatal) or a spawn failure. "git could not answer" is
+/// never reported as "absent".
+async fn git_rev_present(dir: &str, rev: &str) -> Option<bool> {
+    match Command::new("git")
+        .args(["-C", dir, "rev-parse", "--verify", "--quiet", rev])
+        .output()
+        .await
+    {
+        Ok(out) => match out.status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => {
+                debug!(
+                    "session-PR reconciler: rev-parse {rev} in {dir} errored: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                None
+            }
+        },
+        Err(e) => {
+            debug!("session-PR reconciler: rev-parse {rev} in {dir} spawn failed: {e}");
+            None
+        }
+    }
+}
+
+/// `git -C <dir> merge-base --is-ancestor <ancestor> <descendant>` —
+/// `Some(true)`/`Some(false)` for git's 0/1 answers, `None` for any OTHER exit
+/// (128 = missing object / not a repo) or a spawn failure. A non-answer is
+/// never reported as `false`.
+async fn git_is_ancestor(dir: &str, ancestor: &str, descendant: &str) -> Option<bool> {
+    match Command::new("git")
+        .args([
+            "-C",
+            dir,
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ])
+        .output()
+        .await
+    {
+        Ok(out) => match out.status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => {
+                debug!(
+                    "session-PR reconciler: is-ancestor {ancestor} {descendant} in {dir} errored: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                None
+            }
+        },
+        Err(e) => {
+            debug!("session-PR reconciler: is-ancestor spawn in {dir} failed: {e}");
+            None
+        }
+    }
+}
+
+/// Committer timestamp (epoch seconds) of a commit, or `None` if git fails.
+async fn git_commit_ts(dir: &str, rev: &str) -> Option<i64> {
+    let out = Command::new("git")
+        .args(["-C", dir, "log", "-1", "--format=%ct", rev])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<i64>()
+        .ok()
 }
 
 /// Parse a GitHub RFC3339 timestamp to `DateTime<Utc>`.
@@ -552,12 +886,179 @@ mod tests {
         assert!(parse_owner_repo("").is_none());
     }
 
+    /// The pinning label test, updated (not deleted) for the land cascade: its
+    /// first argument is now the LAND verdict, not GitHub's `merged` boolean —
+    /// so an ff-landed PR (`merged=false`, `state=closed`, landed=true) labels
+    /// `merged` instead of `closed`. That row is the G3 regression guard.
     #[test]
-    fn pr_state_label_prefers_merged_then_closed_then_open() {
+    fn pr_state_label_prefers_landed_then_closed_then_open() {
         assert_eq!(pr_state_label(true, "closed"), "merged");
         assert_eq!(pr_state_label(true, "open"), "merged");
         assert_eq!(pr_state_label(false, "closed"), "closed");
         assert_eq!(pr_state_label(false, "open"), "open");
+    }
+
+    // ---- The land-signal cascade (D3 / G3) --------------------------------
+
+    /// THE HEADLINE CASE. A coord fast-forward land: GitHub reports
+    /// `merged=false, state=closed`, but the head commit IS on `origin/<base>`
+    /// — the majority of this fleet's landings. Must read as landed via
+    /// `ff-land`.
+    #[test]
+    fn ff_landed_pr_is_landed_with_the_ff_land_signal() {
+        let verdict = land_verdict(false, ContentProof::Ancestor);
+        assert!(verdict.landed, "an ff-land is a land");
+        assert_eq!(verdict.signal, "ff-land");
+        assert_eq!(verdict.reason, None);
+        // …and it reaches the projection as a landed row, labelled `merged`.
+        let closed_at = parse_ts("2026-08-15T10:00:00Z");
+        let status = session_pr_status(&verdict, "closed", None, closed_at);
+        assert!(status.landed);
+        assert_eq!(status.pr_state.as_deref(), Some("merged"));
+        assert_eq!(status.land_signal.as_deref(), Some("ff-land"));
+        assert_eq!(status.land_reason, None);
+        // No GitHub merge stamp exists for an ff-land — the close time is the
+        // honest land time.
+        assert_eq!(status.merged_at, None);
+        assert_eq!(status.landed_at, closed_at);
+    }
+
+    /// The ancestor test EVALUATED and said no (both objects present, the base
+    /// tip is strictly newer than the head): a real negative.
+    #[test]
+    fn evaluated_non_ancestor_is_not_landed() {
+        let verdict = land_verdict(false, ContentProof::NotAncestor);
+        assert!(!verdict.landed);
+        assert_eq!(verdict.signal, "not-landed");
+        assert_eq!(verdict.reason, None);
+        let status = session_pr_status(&verdict, "closed", None, parse_ts("2026-08-15T10:00:00Z"));
+        assert_eq!(status.pr_state.as_deref(), Some("closed"));
+        assert_eq!(status.land_signal.as_deref(), Some("not-landed"));
+        // A not-landed row carries no land stamp, even though it has a close
+        // stamp — closed is not landed.
+        assert_eq!(status.landed_at, None);
+    }
+
+    /// The probe COULD NOT BE EVALUATED — a missing base ref, a pruned head
+    /// object, a stale local ref, or no local checkout. Every one of these is
+    /// `land-unknown` WITH a reason and must never collapse into the confident
+    /// `not-landed` above; that collapse is the `silent-empty-is-unknown`
+    /// defect applied to the land verdict.
+    #[test]
+    fn unevaluable_probe_is_land_unknown_with_a_reason_never_not_landed() {
+        for (unknown, want_reason) in [
+            (LandUnknown::NoBaseRef, "no_base_ref"),
+            (LandUnknown::HeadObjectMissing, "head_object_missing"),
+            (LandUnknown::RefStale, "ref_stale"),
+            (LandUnknown::NotARepo, "not_a_repo"),
+        ] {
+            let verdict = land_verdict(false, ContentProof::Unknown(unknown));
+            assert!(!verdict.landed, "unknown is not a land: {want_reason}");
+            assert_eq!(verdict.signal, "land-unknown", "reason={want_reason}");
+            assert_ne!(
+                verdict.signal, "not-landed",
+                "an unevaluable probe must not become a confident negative"
+            );
+            assert_eq!(verdict.reason, Some(want_reason));
+
+            let status = session_pr_status(&verdict, "closed", None, None);
+            assert_eq!(status.land_signal.as_deref(), Some("land-unknown"));
+            assert_eq!(status.land_reason.as_deref(), Some(want_reason));
+            assert!(!status.landed);
+            assert_eq!(status.landed_at, None);
+        }
+    }
+
+    /// Signal 1 still wins, and wins outright — GitHub's merge needs no local
+    /// proof, so even an unevaluable probe cannot demote it.
+    #[test]
+    fn github_merge_wins_the_cascade_regardless_of_the_probe() {
+        for proof in [
+            ContentProof::NotAttempted,
+            ContentProof::Ancestor,
+            ContentProof::NotAncestor,
+            ContentProof::Unknown(LandUnknown::HeadObjectMissing),
+        ] {
+            let verdict = land_verdict(true, proof);
+            assert!(verdict.landed);
+            assert_eq!(verdict.signal, "github-merge");
+            assert_eq!(verdict.reason, None);
+        }
+        let merged_at = parse_ts("2026-08-14T09:00:00Z");
+        let status = session_pr_status(
+            &land_verdict(true, ContentProof::NotAttempted),
+            "closed",
+            merged_at,
+            parse_ts("2026-08-14T09:00:05Z"),
+        );
+        assert_eq!(status.pr_state.as_deref(), Some("merged"));
+        // GitHub's merge stamp is preferred over the close stamp.
+        assert_eq!(status.landed_at, merged_at);
+    }
+
+    /// A "not an ancestor" answer is only evidence when the local
+    /// `origin/<base>` tip is strictly NEWER than the PR head. Equal or older
+    /// means the ref cannot contain the head — a stale-ref artefact, not a
+    /// verdict. (Measured at plan-vet time: this repo and the running runner
+    /// were both 19 commits behind `origin/main`.)
+    #[test]
+    fn stale_base_ref_turns_a_negative_into_unknown() {
+        // Base tip newer than the head ⇒ the negative is real.
+        assert_eq!(
+            classify_negative(Some(1_000), Some(2_000)),
+            ContentProof::NotAncestor
+        );
+        // Base tip OLDER than the head ⇒ it could not possibly contain it.
+        assert_eq!(
+            classify_negative(Some(2_000), Some(1_000)),
+            ContentProof::Unknown(LandUnknown::RefStale)
+        );
+        // Same second, distinct commits ⇒ inconclusive, so unknown.
+        assert_eq!(
+            classify_negative(Some(1_000), Some(1_000)),
+            ContentProof::Unknown(LandUnknown::RefStale)
+        );
+        // git could not date an object it had just verified ⇒ broken repo.
+        assert_eq!(
+            classify_negative(None, Some(1_000)),
+            ContentProof::Unknown(LandUnknown::NotARepo)
+        );
+        assert_eq!(
+            classify_negative(Some(1_000), None),
+            ContentProof::Unknown(LandUnknown::NotARepo)
+        );
+    }
+
+    /// The probe spends NO subprocess when the answer is already known, and
+    /// degrades to a reasoned unknown when there is nothing local to read.
+    #[tokio::test]
+    async fn probe_skips_work_it_does_not_need_and_never_guesses() {
+        // GitHub already said merged — signal 1 wins, nothing to prove.
+        assert_eq!(
+            probe_land(Some("D:/nonexistent"), true, "closed", "abc", "main").await,
+            ContentProof::NotAttempted
+        );
+        // Still open on GitHub: GitHub closes a PR once its commits reach the
+        // base branch, so `open` is an evaluated negative.
+        assert_eq!(
+            probe_land(Some("D:/nonexistent"), false, "open", "abc", "main").await,
+            ContentProof::NotAttempted
+        );
+        // No local checkout for this PR's repo ⇒ unknown, not "not landed".
+        assert_eq!(
+            probe_land(None, false, "closed", "abc", "main").await,
+            ContentProof::Unknown(LandUnknown::NotARepo)
+        );
+        // A PR payload with no head sha / no base ref is unevaluable, and each
+        // gap names itself.
+        assert_eq!(
+            probe_land(Some("D:/nonexistent"), false, "closed", "  ", "main").await,
+            ContentProof::Unknown(LandUnknown::HeadObjectMissing)
+        );
+        assert_eq!(
+            probe_land(Some("D:/nonexistent"), false, "closed", "abc", "").await,
+            ContentProof::Unknown(LandUnknown::NoBaseRef)
+        );
     }
 
     #[test]
