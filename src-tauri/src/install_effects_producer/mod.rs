@@ -141,6 +141,20 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/control/sessions/restore-health",
             get(get_sessions_restore_health),
         )
+        // Session-info raw read path (session-info-dropdown plan D5): the HTTP
+        // twin of `session_info_get`, listing EVERY open session's projection.
+        // Proves the data is right independently of rendering, and gives the
+        // restore census a cheap oracle. A test that passes here and fails
+        // against the rendered UI Bridge read (or vice versa) is a real defect.
+        .route("/control/sessions/info", get(get_sessions_info))
+        // Restore CENSUS (plan D6, closing G6): the pre-restart expected set
+        // (latched at boot, before any restore mutated a record) vs what
+        // actually came back. The one route that answers "did restore work?"
+        // rather than "could it have?".
+        .route(
+            "/control/sessions/restore-census",
+            get(get_sessions_restore_census),
+        )
         // Phase 4: private-registry credential CRUD. Mounted alongside the
         // Phase-1 run route so a single `install_effects_producer::routes()`
         // merge in `mcp_api.rs` covers the whole producer surface.
@@ -342,6 +356,121 @@ async fn get_sessions_restore_health(
     )))
 }
 
+/// `GET /control/sessions/info`. Every OPEN session's full identity projection
+/// (D1) — the RAW half of D5's two required read paths.
+///
+/// ⚠️ DELIBERATELY NOT modelled on [`get_sessions_restore_health`] above, which
+/// degrades to `{sessions: [], unrestorable: 0}` with NO reason when the
+/// lifecycle store is missing from Tauri state. That empty is indistinguishable
+/// from "this runner has zero sessions" — the exact silent-empty defect (G5)
+/// these routes exist to fix, so reproducing it here would ship the bug into
+/// its own cure. Every degraded branch below carries an explicit
+/// `status: "unavailable"` + `reason`:
+///
+/// | Branch | `reason` |
+/// |---|---|
+/// | lifecycle store absent from Tauri state | `lifecycle_store_unavailable` |
+///
+/// A degraded PR ledger does NOT degrade the listing — identity is answerable
+/// without it — it degrades each session's `prs.status` with its own reason.
+///
+/// Read-only: it stats the disk and touches no registry state, so probing it is
+/// always safe.
+async fn get_sessions_info(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<crate::commands::session_info::SessionsInfoResponse>> {
+    use crate::commands::session_info::{build_session_info, SessionsInfoResponse, STATUS_OK};
+    use crate::session::reconcile::DiskTranscriptIndex;
+    use crate::session::session_lifecycle_store::SessionLifecycleStore;
+    use tauri::Manager;
+
+    let store = state
+        .app_handle
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone());
+    let Some(store) = store else {
+        warn!(
+            "control/sessions/info: lifecycle store not in Tauri state — \
+             reporting unavailable WITH a reason (never a bare empty list)"
+        );
+        return Json(ApiResponse::success(SessionsInfoResponse::unavailable(
+            "lifecycle_store_unavailable",
+        )));
+    };
+    // Discovered ONCE for the whole listing, not per session.
+    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
+    let probe = DiskTranscriptIndex::discover();
+    let mut records = store.open_records();
+    records.sort_by(|a, b| {
+        a.terminal_id
+            .cmp(&b.terminal_id)
+            .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
+    });
+    let mut sessions = Vec::with_capacity(records.len());
+    for rec in &records {
+        sessions.push(build_session_info(rec, &config_dirs, &probe).await);
+    }
+    Json(ApiResponse::success(SessionsInfoResponse {
+        status: STATUS_OK.to_string(),
+        reason: None,
+        sessions,
+    }))
+}
+
+/// `GET /control/sessions/restore-census`. The pre-restart census (latched at
+/// boot from the durable store, BEFORE any restore mutated a record — see
+/// [`crate::session::restore_census`]) diffed against what actually came back.
+///
+/// Same anti-silent-empty discipline as [`get_sessions_info`]: every degraded
+/// branch states a `reason` and a `verdict: "unknown"`, never an empty census
+/// that reads like "nothing needed restoring":
+///
+/// | Branch | `reason` | `verdict` |
+/// |---|---|---|
+/// | lifecycle store absent from Tauri state | `lifecycle_store_unavailable` | `unknown` |
+/// | the boot latch never ran | `census_not_latched` | `unknown` |
+/// | this process never classified its boot | `boot_not_classified` | `unknown` |
+/// | the previous shutdown was not clean | `no_clean_shutdown_marker` | `unknown` |
+///
+/// Boot classification is read via `boot_classification()` — NEVER
+/// `classify_boot()`, which rewrites the marker on first call and would make a
+/// diagnostic read mutate the very state it reports on.
+async fn get_sessions_restore_census(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<crate::session::restore_census::RestoreCensusResponse>> {
+    use crate::session::restore_census::{
+        build_census, RestoreCensusResponse, RESTORE_VERDICT_UNKNOWN, STATUS_UNAVAILABLE,
+    };
+    use crate::session::session_lifecycle_store::SessionLifecycleStore;
+    use tauri::Manager;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let boot = crate::session::shutdown_marker::boot_classification();
+    let store = state
+        .app_handle
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone());
+    let Some(store) = store else {
+        warn!(
+            "control/sessions/restore-census: lifecycle store not in Tauri state — \
+             reporting unknown WITH a reason (never a bare empty census)"
+        );
+        return Json(ApiResponse::success(RestoreCensusResponse {
+            status: STATUS_UNAVAILABLE.to_string(),
+            reason: Some("lifecycle_store_unavailable".to_string()),
+            generated_at: now,
+            shutdown_at: boot.and_then(|b| b.prior_marker_at),
+            clean_shutdown: boot.map(|b| !b.crash_recovery),
+            expected: Vec::new(),
+            restored: Vec::new(),
+            missing: Vec::new(),
+            unexpected: Vec::new(),
+            verdict: RESTORE_VERDICT_UNKNOWN.to_string(),
+        }));
+    };
+    Json(ApiResponse::success(build_census(&store, boot, now)))
+}
+
 /// Body of `POST /control/shim-beacon` — a fire-and-forget diagnostic the
 /// identity shim POSTs on every invocation so shim execution is observable in
 /// the runner logs (does the shim run for organic sessions? does it deliver
@@ -475,6 +604,30 @@ fn record_session_open_into(
     // a provider therefore never gets a hook and stays provisional, so Phase 4's
     // restore classifier won't try to `--resume` a phantom shell "session".
     store.confirm_session(&req.session_id);
+
+    // D1 name stamp at confirmation. The account is already durable (the
+    // `record_pinned_session_open` above derives it from `config_dir`), but the
+    // NAME the operator sees lives only in Claude Code's per-process registry,
+    // which it deletes on exit. Copy it onto the record now so it survives the
+    // process.
+    //
+    // Scoped to the hook's OWN config dir when it reported one — the session's
+    // registry file can only live under its own account — so the common case
+    // reads one directory instead of every configured account's.
+    //
+    // A miss is NORMAL and must stay silent: the hook can fire before Claude
+    // Code has written its registry file. `update_identity` is sticky, so
+    // nothing is blanked and the liveness poll stamps the name on its next
+    // tick. Never invent a name here.
+    let dirs: Vec<std::path::PathBuf> = match req.config_dir.as_deref() {
+        Some(d) if !d.trim().is_empty() => vec![std::path::PathBuf::from(d)],
+        _ => crate::terminal::transcript::find_claude_config_dirs(),
+    };
+    if let Some(live) =
+        crate::session::claude_session_registry::find_live_session_by_id(&dirs, &req.session_id)
+    {
+        store.update_identity(&req.session_id, &live.identity_update());
+    }
 }
 
 /// `POST /install-effects/run`.
@@ -1426,6 +1579,15 @@ mod tests {
             restore_pending_at: None,
             confirmed_at: confirmed.then_some(3),
             handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
         }
     }
 
@@ -1619,6 +1781,15 @@ mod tests {
             restore_pending_at: None,
             confirmed_at: None,
             handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
         });
 
         // The confirming hook fires with bash-flavored context.

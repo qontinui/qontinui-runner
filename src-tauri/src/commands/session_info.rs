@@ -1,0 +1,777 @@
+//! ONE durable session-identity read path — the projection behind the Terminal
+//! zone-header session-info dropdown (plan
+//! `2026-08-16-runner-session-info-dropdown-and-restore-verification`, D1/P3).
+//!
+//! ## Why one command instead of three
+//!
+//! The dropdown needs the durable lifecycle record, the process-lifetime live
+//! registry overlay (account + the name the operator actually sees) and the
+//! runner-local PR ledger. Assembling those from three separate frontend calls
+//! produces a partially-loaded panel whose blank rows are indistinguishable
+//! from genuinely-absent data — exactly the ambiguity G5 describes. So
+//! [`session_info_get`] returns the WHOLE projection in one shot, and the
+//! frontend renders it or renders its `reason`.
+//!
+//! ## Every unknown is spelled
+//!
+//! `prs.status: "unavailable"` WITH a `reason` is a different state from
+//! `openCount: 0`, and a PR whose land verdict could not be evaluated
+//! (`land-unknown`) is reported in its own `unknown` bucket with the recorded
+//! reason — never folded into a confident "not landed". That is served policy
+//! `verification-and-evidence` `silent-empty-is-unknown` applied to this
+//! surface; it is the whole point of the surface.
+//!
+//! ## Pure core, thin shell
+//!
+//! Everything that decides a value lives in a pure function over plain data
+//! ([`project_session_info`], [`project_prs`], [`prs_unavailable`]), so the
+//! projection unit-tests without a Tauri handle, a live disk or PG — the idiom
+//! [`crate::install_effects_producer::project_restore_health`] established. The
+//! Tauri command and the HTTP twin (`GET /control/sessions/info`) are both thin
+//! shells over the same functions, so the rendered and raw read paths cannot
+//! drift (D5).
+
+use std::sync::Arc;
+
+use serde::Serialize;
+
+use crate::database::pg::session_pr_ops::SessionPrRow;
+use crate::session::claude_session_registry::LiveClaudeSession;
+use crate::session::session_lifecycle_store::{
+    SessionLifecycleStore, TerminalSessionRecord, NAME_SOURCE_DERIVED, NAME_SOURCE_OPERATOR,
+};
+
+/// `name.source` when nothing ever reported a name provenance for this session
+/// — a record written before the D1 fields existed, or one whose process died
+/// before the live registry was read. Deliberately NOT collapsed into
+/// `"operator"`: "nobody told us" and "an operator chose it" are different
+/// claims (R2 — never back-fill by guessing).
+pub const NAME_SOURCE_UNKNOWN: &str = "unknown";
+
+/// `prs.status` / envelope status: the ledger answered.
+pub const STATUS_OK: &str = "ok";
+/// `prs.status` / envelope status: the ledger could NOT answer, and `reason`
+/// says why. Renders differently from an empty-but-known ledger.
+pub const STATUS_UNAVAILABLE: &str = "unavailable";
+
+/// The land signal the reconciler writes when it could not evaluate a land
+/// verdict at all (see `session_pr_reconciler::land_verdict`). Such a row is
+/// surfaced in [`SessionPrs::unknown`], never counted as not-landed.
+const LAND_SIGNAL_UNKNOWN: &str = "land-unknown";
+
+/// The four identifiers a session carries (D2). All four are shown rather than
+/// guessing which two the operator meant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIdentity {
+    /// The `--resume` key and the registry's map key.
+    pub claude_session_id: String,
+    /// The runner PTY/terminal uuid currently hosting the session.
+    pub terminal_id: String,
+    /// Coord-minted fleet session handle (`fsh_…`). Already durable on the
+    /// record as `handle` — read, never re-minted here.
+    pub fleet_session_handle: Option<String>,
+    pub tenant_id: Option<String>,
+    /// Set only for worker (machine-spawned) sessions.
+    pub task_run_id: Option<String>,
+}
+
+/// The name the operator sees, plus where it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionName {
+    /// `None` ⇒ no name was ever observed (NOT "the session is unnamed").
+    pub value: Option<String>,
+    /// `"operator"` | `"derived"` | `"unknown"`.
+    pub source: String,
+}
+
+/// Which Claude account the session runs under — the G1 answer that used to die
+/// with the process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAccount {
+    pub label: Option<String>,
+    /// CLI wrapper (`clp`, `clg`, …) — the half of the resume command that
+    /// names the account.
+    pub wrapper: Option<String>,
+    pub config_dir: Option<String>,
+}
+
+/// Where the session's tile lives in the grid, and where the shell runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPlacement {
+    pub page_id: String,
+    pub zone_index: i32,
+    pub working_dir: Option<String>,
+}
+
+/// Lifecycle + restore state. `confirmed` / `transcriptExists` / `restorable`
+/// are the SAME join `GET /control/sessions/restore-health` performs, so the
+/// two surfaces can never disagree about whether a session is resumable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLifecycleInfo {
+    /// `"open"` | `"closed"`.
+    pub state: String,
+    pub provider: String,
+    /// `"authoritative"` | `"observed"` | `"reconciled"`; `None` on a legacy
+    /// row that asserted none.
+    pub origin: Option<String>,
+    pub opened_at: i64,
+    pub last_seen_at: i64,
+    pub closed_at: Option<i64>,
+    pub close_reason: Option<String>,
+    /// A provider hook (or a confirmed bind) proved a real session exists.
+    pub confirmed: bool,
+    /// A `*.jsonl` transcript for this id exists on disk.
+    pub transcript_exists: bool,
+    /// `confirmed && transcriptExists` — this id can actually be `--resume`d.
+    pub restorable: bool,
+    /// Set iff a BOOT-RESTORE re-materialized this record (never for a freshly
+    /// created session) — the restore census's only honest "it came back"
+    /// signal.
+    pub restored_from_boot_at: Option<i64>,
+    /// `"resumed"` | `"terminal-only"` | `"failed"`; `None` = never restored,
+    /// which is NOT the same claim as `"failed"`.
+    pub restore_tier: Option<String>,
+    /// `None` ⇒ never reported (unknown), not `false`.
+    pub bypass_permissions: Option<bool>,
+}
+
+/// One PR this session authored (attributed by the `Session-Id:` git trailer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPrOpened {
+    pub repo: String,
+    pub pr_number: i64,
+    pub branch: Option<String>,
+    /// When the runner-local projection FIRST attributed this PR to the session
+    /// (`project.session_prs.created_at`), RFC3339. The runner does not mirror
+    /// GitHub's own `created_at`, so this is named for what it actually is.
+    pub opened_at: Option<String>,
+    /// `"open"` | `"closed"` | `"merged"` — the label the dropdown renders.
+    pub pr_state: Option<String>,
+}
+
+/// One PR this session authored that some signal PROVED landed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPrLanded {
+    pub repo: String,
+    pub pr_number: i64,
+    /// RFC3339 land instant, by whichever signal proved it.
+    pub landed_at: Option<String>,
+    /// `"github-merge"` | `"ff-land"` | `"coord"` — WHY this counts as landed.
+    pub land_signal: Option<String>,
+}
+
+/// One PR whose land verdict could NOT be evaluated. Surfaced in its own bucket
+/// because folding it into "not landed" asserts a negative the runner never
+/// established — the R1 failure mode that would make the dropdown worse than no
+/// dropdown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPrUnknown {
+    pub repo: String,
+    pub pr_number: i64,
+    /// `"ref_stale"` | `"head_object_missing"` | `"no_base_ref"` |
+    /// `"not_a_repo"` — or `"unspecified"` when a row somehow carries the
+    /// unknown signal without its reason (still never a confident negative).
+    pub reason: String,
+}
+
+/// The session's PR ledger, split opened / landed / unevaluable.
+///
+/// `opened` and `landed` are deliberately **NOT disjoint**: a PR opened and
+/// landed by the same session appears in both, which is why the counts are
+/// labelled `3 opened · 2 landed` rather than presented as a partition (D3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPrs {
+    /// [`STATUS_OK`] | [`STATUS_UNAVAILABLE`].
+    pub status: String,
+    /// REQUIRED whenever `status != "ok"`.
+    pub reason: Option<String>,
+    pub opened: Vec<SessionPrOpened>,
+    pub landed: Vec<SessionPrLanded>,
+    /// Rows whose land verdict could not be evaluated (`land-unknown`).
+    pub unknown: Vec<SessionPrUnknown>,
+    pub open_count: usize,
+    pub landed_count: usize,
+    pub unknown_count: usize,
+}
+
+/// The projected body — every field group of D1. Flattened into
+/// [`SessionInfoEnvelope`] so the wire shape is exactly D1's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfoBody {
+    pub identity: SessionIdentity,
+    pub name: SessionName,
+    pub account: SessionAccount,
+    pub placement: SessionPlacement,
+    pub lifecycle: SessionLifecycleInfo,
+    pub prs: SessionPrs,
+}
+
+/// The one-shot session-info envelope.
+///
+/// `available: false` ALWAYS carries a `reason` — there is no branch that
+/// returns a bare empty projection, because "no such session" and "the store
+/// isn't reachable" must not render identically (acceptance criterion 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfoEnvelope {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(flatten)]
+    pub body: Option<SessionInfoBody>,
+}
+
+impl SessionInfoEnvelope {
+    /// The degraded envelope: no projection, but always a stated reason.
+    pub fn unavailable(reason: &str) -> Self {
+        Self {
+            available: false,
+            reason: Some(reason.to_string()),
+            body: None,
+        }
+    }
+}
+
+/// Response body of `GET /control/sessions/info` — every OPEN session's
+/// projection.
+///
+/// Carries its own `status`/`reason` so a runner that cannot reach its
+/// lifecycle store says so, instead of returning `sessions: []` (which reads
+/// identically to "this runner has zero sessions" — the silent empty this whole
+/// plan exists to remove).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionsInfoResponse {
+    /// [`STATUS_OK`] | [`STATUS_UNAVAILABLE`].
+    pub status: String,
+    /// REQUIRED whenever `status != "ok"`.
+    pub reason: Option<String>,
+    pub sessions: Vec<SessionInfoEnvelope>,
+}
+
+impl SessionsInfoResponse {
+    /// Degraded listing — empty WITH a reason, never a bare empty.
+    pub fn unavailable(reason: &str) -> Self {
+        Self {
+            status: STATUS_UNAVAILABLE.to_string(),
+            reason: Some(reason.to_string()),
+            sessions: Vec::new(),
+        }
+    }
+}
+
+/// Normalize a stored/live `name_source` into the wire vocabulary.
+///
+/// The live registry spells "an operator renamed this" as the ABSENCE of the
+/// key, which [`crate::session::session_lifecycle_store::durable_name_source`]
+/// already resolves on the write side. Here we only interpret what is stored:
+/// `"derived"` is Claude Code's own auto-name, any other present value is
+/// operator-chosen, and ABSENT is honestly [`NAME_SOURCE_UNKNOWN`] — on the
+/// durable record `None` means "never observed", and reporting that as
+/// `"operator"` would invent a provenance (R2).
+fn wire_name_source(stored: Option<&str>) -> &'static str {
+    match stored.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(NAME_SOURCE_DERIVED) => NAME_SOURCE_DERIVED,
+        Some(_) => NAME_SOURCE_OPERATOR,
+        None => NAME_SOURCE_UNKNOWN,
+    }
+}
+
+/// Trim `Some("")` to `None` — a blank stored string is "not reported", never a
+/// value (the same normalization the store applies on write).
+fn non_empty(v: Option<&String>) -> Option<String> {
+    v.map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// Project the runner-local PR ledger rows into the dropdown's opened/landed
+/// split. Pure.
+///
+/// - `opened` — EVERY attributed row: the git trailer proves this session
+///   authored the branch, regardless of wall-clock (assumption 9.2).
+/// - `landed` — rows whose stored `merged` column (the LAND verdict, widened
+///   when the land-signal cascade shipped) is true, each carrying the signal
+///   that proved it.
+/// - `unknown` — rows the cascade could not evaluate, with their reason.
+pub fn project_prs(rows: &[SessionPrRow]) -> SessionPrs {
+    let opened: Vec<SessionPrOpened> = rows
+        .iter()
+        .map(|r| SessionPrOpened {
+            repo: r.repo.clone(),
+            pr_number: r.pr_number,
+            branch: r.head_branch.clone(),
+            opened_at: r.created_at.map(|t| t.to_rfc3339()),
+            pr_state: r.pr_state.clone(),
+        })
+        .collect();
+    let landed: Vec<SessionPrLanded> = rows
+        .iter()
+        .filter(|r| r.merged)
+        .map(|r| SessionPrLanded {
+            repo: r.repo.clone(),
+            pr_number: r.pr_number,
+            landed_at: r.landed_at.or(r.merged_at).map(|t| t.to_rfc3339()),
+            land_signal: r.land_signal.clone(),
+        })
+        .collect();
+    let unknown: Vec<SessionPrUnknown> = rows
+        .iter()
+        .filter(|r| r.land_signal.as_deref() == Some(LAND_SIGNAL_UNKNOWN))
+        .map(|r| SessionPrUnknown {
+            repo: r.repo.clone(),
+            pr_number: r.pr_number,
+            reason: r
+                .land_reason
+                .clone()
+                .unwrap_or_else(|| "unspecified".to_string()),
+        })
+        .collect();
+    SessionPrs {
+        status: STATUS_OK.to_string(),
+        reason: None,
+        open_count: opened.len(),
+        landed_count: landed.len(),
+        unknown_count: unknown.len(),
+        opened,
+        landed,
+        unknown,
+    }
+}
+
+/// The degraded PR ledger: empty lists, `status: "unavailable"`, and a stated
+/// reason. Pure.
+///
+/// This is NOT the same value as `project_prs(&[])`: that one asserts "this
+/// session opened no PRs", this one asserts nothing at all. Rendering them
+/// identically is the G5 defect.
+pub fn prs_unavailable(reason: &str) -> SessionPrs {
+    SessionPrs {
+        status: STATUS_UNAVAILABLE.to_string(),
+        reason: Some(reason.to_string()),
+        opened: Vec::new(),
+        landed: Vec::new(),
+        unknown: Vec::new(),
+        open_count: 0,
+        landed_count: 0,
+        unknown_count: 0,
+    }
+}
+
+/// Project one durable record (⨝ live-registry overlay ⨝ PR ledger) into the
+/// dropdown envelope. Pure — no disk, no PG, no Tauri handle.
+///
+/// The live overlay WINS on name and account when present (it is the fresher
+/// copy of the same values the stickiness rule persisted), and is simply absent
+/// once the process exits — at which point the durable copy is the only one
+/// left, which is exactly why D1 stores it.
+pub fn project_session_info(
+    rec: &TerminalSessionRecord,
+    live: Option<&LiveClaudeSession>,
+    transcript_exists: bool,
+    prs: SessionPrs,
+) -> SessionInfoEnvelope {
+    let confirmed = rec.confirmed_at.is_some();
+    let live_name = live
+        .map(|l| l.name.trim())
+        .filter(|n| !n.is_empty())
+        .map(String::from);
+    let (name_value, name_source) = match live_name {
+        // A live row's name is ground truth, and its own `nameSource` (absent ⇒
+        // operator-renamed) is the provenance that goes with it.
+        Some(n) => (
+            Some(n),
+            crate::session::session_lifecycle_store::durable_name_source(
+                live.and_then(|l| l.name_source.as_deref()),
+            ),
+        ),
+        None => (
+            non_empty(rec.session_name.as_ref()),
+            wire_name_source(rec.name_source.as_deref()).to_string(),
+        ),
+    };
+    // No name ⇒ no provenance to claim.
+    let name_source = if name_value.is_none() {
+        NAME_SOURCE_UNKNOWN.to_string()
+    } else {
+        name_source
+    };
+
+    SessionInfoEnvelope {
+        available: true,
+        reason: None,
+        body: Some(SessionInfoBody {
+            identity: SessionIdentity {
+                claude_session_id: rec.claude_session_id.clone(),
+                terminal_id: rec.terminal_id.clone(),
+                fleet_session_handle: non_empty(rec.handle.as_ref()),
+                tenant_id: non_empty(rec.tenant_id.as_ref()),
+                task_run_id: non_empty(rec.task_run_id.as_ref()),
+            },
+            name: SessionName {
+                value: name_value,
+                source: name_source,
+            },
+            account: SessionAccount {
+                label: live
+                    .map(|l| l.account.label.clone())
+                    .or_else(|| non_empty(rec.account_label.as_ref())),
+                wrapper: live
+                    .map(|l| l.account.wrapper.clone())
+                    .or_else(|| non_empty(rec.account_wrapper.as_ref())),
+                config_dir: non_empty(rec.config_dir.as_ref()),
+            },
+            placement: SessionPlacement {
+                page_id: rec.page_id.clone(),
+                zone_index: rec.zone_index,
+                working_dir: non_empty(rec.working_dir.as_ref()),
+            },
+            lifecycle: SessionLifecycleInfo {
+                state: rec.state.clone(),
+                provider: rec.provider.clone(),
+                origin: rec.origin.clone(),
+                opened_at: rec.opened_at,
+                last_seen_at: rec.last_seen_at,
+                closed_at: rec.closed_at,
+                close_reason: rec.close_reason.clone(),
+                confirmed,
+                transcript_exists,
+                restorable: crate::session::snapshot_history::is_restorable_identity(
+                    confirmed,
+                    transcript_exists,
+                ),
+                restored_from_boot_at: rec.restored_from_boot_at,
+                restore_tier: rec.restore_tier.clone(),
+                bypass_permissions: rec.bypass_permissions,
+            },
+            prs,
+        }),
+    }
+}
+
+/// Read the runner-local PR ledger for one session, fail-soft.
+///
+/// Reaches PG the way `session_prs_get` does — [`crate::database::pg::pg_available`]
+/// then `PgDb::try_global()`, a process GLOBAL rather than Tauri state — which
+/// is why the HTTP twin needs no `ApiState` plumbing for the join.
+///
+/// Every degraded condition returns [`prs_unavailable`] with a reason:
+/// `invalid_session_id` (the id is not a uuid, so it can never key the
+/// projection), `db_unavailable`, `db_error`.
+pub async fn load_prs(claude_session_id: &str) -> SessionPrs {
+    let Ok(session_uuid) = uuid::Uuid::parse_str(claude_session_id.trim()) else {
+        return prs_unavailable("invalid_session_id");
+    };
+    if !crate::database::pg::pg_available() {
+        return prs_unavailable("db_unavailable");
+    }
+    let Some(pg_db) = crate::database::pg::PgDb::try_global() else {
+        return prs_unavailable("db_unavailable");
+    };
+    match pg_db.list_session_prs(session_uuid).await {
+        Ok(rows) => project_prs(&rows),
+        Err(e) => {
+            tracing::debug!("session_info: list_session_prs failed (fail-soft): {e}");
+            prs_unavailable("db_error")
+        }
+    }
+}
+
+/// Build the full projection for `rec`, doing the impure reads (live registry,
+/// transcript probe, PR ledger) around the pure core.
+///
+/// `config_dirs` and `probe` are hoisted by the caller so a LIST of sessions
+/// discovers the Claude config dirs and the transcript index ONCE, not per row.
+pub async fn build_session_info(
+    rec: &TerminalSessionRecord,
+    config_dirs: &[std::path::PathBuf],
+    probe: &dyn crate::session::snapshot_history::TranscriptProbe,
+) -> SessionInfoEnvelope {
+    let live = crate::session::claude_session_registry::find_live_session_by_id(
+        config_dirs,
+        &rec.claude_session_id,
+    );
+    let transcript_exists =
+        probe.transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
+    let prs = load_prs(&rec.claude_session_id).await;
+    project_session_info(rec, live.as_ref(), transcript_exists, prs)
+}
+
+/// `session_info_get` — the ONE read the session-info dropdown makes.
+///
+/// Returns the whole D1 projection for `claude_session_id`: durable record ⨝
+/// live-registry overlay ⨝ PR ledger. Never `Err` for a data condition (the
+/// dropdown must render an honest "unknown" rather than an error toast per
+/// zone per poll); the degraded envelope always carries its `reason`:
+///
+/// | Branch | `reason` |
+/// |---|---|
+/// | blank id from the caller | `missing_session_id` |
+/// | no registry record under that id | `session_not_found` |
+///
+/// PG degradation does NOT degrade the whole envelope — identity is still
+/// answerable without the ledger — it degrades `prs.status` alone, with its own
+/// reason.
+#[tauri::command]
+pub async fn session_info_get(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    claude_session_id: String,
+) -> Result<SessionInfoEnvelope, String> {
+    let id = claude_session_id.trim().to_string();
+    if id.is_empty() {
+        return Ok(SessionInfoEnvelope::unavailable("missing_session_id"));
+    }
+    let Some(rec) = store.get(&id) else {
+        return Ok(SessionInfoEnvelope::unavailable("session_not_found"));
+    };
+    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
+    let probe = crate::session::reconcile::DiskTranscriptIndex::discover();
+    Ok(build_session_info(&rec, &config_dirs, &probe).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn record(id: &str) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            claude_session_id: id.to_string(),
+            config_dir: Some("C:/Users/x/.claude-paktis".to_string()),
+            working_dir: Some("C:/qontinui-root/qontinui-runner".to_string()),
+            page_id: "default".to_string(),
+            zone_index: 3,
+            title: Some("runner".to_string()),
+            terminal_id: "term-1".to_string(),
+            opened_at: 1_000,
+            last_seen_at: 2_000,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: "claude".to_string(),
+            origin: Some("authoritative".to_string()),
+            restore_pending_at: None,
+            confirmed_at: Some(1_500),
+            handle: Some("fsh_abc".to_string()),
+            account_label: Some("paktis".to_string()),
+            account_wrapper: Some("clp".to_string()),
+            session_name: Some("stored-name".to_string()),
+            name_source: Some(NAME_SOURCE_DERIVED.to_string()),
+            tenant_id: Some("tenant-1".to_string()),
+            task_run_id: None,
+            bypass_permissions: Some(false),
+            restored_from_boot_at: None,
+            restore_tier: None,
+        }
+    }
+
+    fn pr_row(pr_number: i64, merged: bool, land_signal: &str) -> SessionPrRow {
+        SessionPrRow {
+            claude_session_id: uuid::Uuid::nil(),
+            repo: "qontinui/qontinui-runner".to_string(),
+            pr_number,
+            head_branch: Some("feat/x".to_string()),
+            pr_state: Some(if merged { "merged" } else { "open" }.to_string()),
+            merged,
+            merged_at: None,
+            land_signal: Some(land_signal.to_string()),
+            land_reason: None,
+            landed_at: merged.then(|| Utc.with_ymd_and_hms(2026, 8, 15, 10, 0, 0).unwrap()),
+            created_at: Some(Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap()),
+        }
+    }
+
+    #[test]
+    fn session_info_projects_all_four_identifiers_and_the_durable_identity() {
+        let rec = record("11111111-1111-4111-8111-111111111111");
+        let env = project_session_info(&rec, None, true, project_prs(&[]));
+        let body = env
+            .body
+            .as_ref()
+            .expect("available envelope carries a body");
+        assert!(env.available);
+        assert_eq!(
+            body.identity.claude_session_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(body.identity.terminal_id, "term-1");
+        // The fleet handle is READ from the pre-existing `handle` field.
+        assert_eq!(
+            body.identity.fleet_session_handle.as_deref(),
+            Some("fsh_abc")
+        );
+        assert_eq!(body.identity.tenant_id.as_deref(), Some("tenant-1"));
+        assert_eq!(body.identity.task_run_id, None);
+        // Durable account survives the process that produced it (G1).
+        assert_eq!(body.account.label.as_deref(), Some("paktis"));
+        assert_eq!(body.account.wrapper.as_deref(), Some("clp"));
+        assert_eq!(body.placement.zone_index, 3);
+        assert_eq!(body.placement.page_id, "default");
+        // confirmed && transcriptExists — the restore-health join.
+        assert!(body.lifecycle.confirmed);
+        assert!(body.lifecycle.restorable);
+    }
+
+    #[test]
+    fn transcriptless_confirmed_session_is_not_restorable() {
+        let rec = record("22222222-2222-4222-8222-222222222222");
+        let env = project_session_info(&rec, None, false, project_prs(&[]));
+        let body = env.body.unwrap();
+        assert!(body.lifecycle.confirmed);
+        assert!(!body.lifecycle.transcript_exists);
+        assert!(
+            !body.lifecycle.restorable,
+            "a confirmed record with no transcript is a phantom — never restorable"
+        );
+    }
+
+    #[test]
+    fn name_source_absent_is_unknown_not_operator() {
+        let mut rec = record("33333333-3333-4333-8333-333333333333");
+        rec.name_source = None;
+        let env = project_session_info(&rec, None, true, project_prs(&[]));
+        let body = env.body.unwrap();
+        assert_eq!(body.name.value.as_deref(), Some("stored-name"));
+        // R2: never back-fill a provenance nobody reported.
+        assert_eq!(body.name.source, NAME_SOURCE_UNKNOWN);
+    }
+
+    #[test]
+    fn nameless_record_reports_unknown_rather_than_a_blank_operator_name() {
+        let mut rec = record("44444444-4444-4444-8444-444444444444");
+        rec.session_name = None;
+        rec.name_source = Some(NAME_SOURCE_OPERATOR.to_string());
+        let env = project_session_info(&rec, None, true, project_prs(&[]));
+        let body = env.body.unwrap();
+        assert_eq!(body.name.value, None);
+        assert_eq!(body.name.source, NAME_SOURCE_UNKNOWN);
+    }
+
+    #[test]
+    fn derived_name_source_is_carried_through_verbatim() {
+        let rec = record("55555555-5555-4555-8555-555555555555");
+        let env = project_session_info(&rec, None, true, project_prs(&[]));
+        assert_eq!(env.body.unwrap().name.source, NAME_SOURCE_DERIVED);
+    }
+
+    /// THE G5 FIX, pinned: an unavailable ledger and a genuinely empty one are
+    /// different values on the wire.
+    #[test]
+    fn pr_ledger_unavailable_is_distinct_from_a_genuine_zero() {
+        let rec = record("66666666-6666-4666-8666-666666666666");
+        let degraded = project_session_info(&rec, None, true, prs_unavailable("db_unavailable"))
+            .body
+            .unwrap()
+            .prs;
+        let empty = project_session_info(&rec, None, true, project_prs(&[]))
+            .body
+            .unwrap()
+            .prs;
+
+        assert_eq!(degraded.status, STATUS_UNAVAILABLE);
+        assert_eq!(degraded.reason.as_deref(), Some("db_unavailable"));
+        assert_eq!(empty.status, STATUS_OK);
+        assert_eq!(empty.reason, None);
+        // Both have zero rows — the STATUS is the only thing that separates
+        // "we could not ask" from "the answer is none".
+        assert_eq!(degraded.open_count, 0);
+        assert_eq!(empty.open_count, 0);
+        assert_ne!(degraded, empty);
+    }
+
+    #[test]
+    fn opened_and_landed_overlap_rather_than_partition() {
+        // 3 attributed rows, 2 of them landed — the `3 opened · 2 landed`
+        // labelling D3 requires. A landed PR is STILL an opened PR.
+        let rows = [
+            pr_row(1, true, "github-merge"),
+            pr_row(2, true, "ff-land"),
+            pr_row(3, false, "not-landed"),
+        ];
+        let prs = project_prs(&rows);
+        assert_eq!(prs.open_count, 3);
+        assert_eq!(prs.landed_count, 2);
+        assert_eq!(prs.opened.len(), 3);
+        assert_eq!(prs.landed.len(), 2);
+        // The ff-land is reported landed WITH its signal (G3, end to end).
+        assert_eq!(prs.landed[1].land_signal.as_deref(), Some("ff-land"));
+        assert!(prs.landed[1].landed_at.is_some());
+        assert_eq!(prs.unknown_count, 0);
+    }
+
+    #[test]
+    fn land_unknown_rows_are_surfaced_with_their_reason_not_counted_as_not_landed() {
+        let mut unknown_row = pr_row(9, false, LAND_SIGNAL_UNKNOWN);
+        unknown_row.land_reason = Some("ref_stale".to_string());
+        let prs = project_prs(&[unknown_row]);
+        // Not landed…
+        assert_eq!(prs.landed_count, 0);
+        // …but NOT a confident negative either: it has its own bucket + reason.
+        assert_eq!(prs.unknown_count, 1);
+        assert_eq!(prs.unknown[0].reason, "ref_stale");
+        assert_eq!(prs.unknown[0].pr_number, 9);
+        // Still an OPENED PR of this session.
+        assert_eq!(prs.open_count, 1);
+    }
+
+    #[test]
+    fn land_unknown_without_a_recorded_reason_still_never_reads_as_a_negative() {
+        let prs = project_prs(&[pr_row(10, false, LAND_SIGNAL_UNKNOWN)]);
+        assert_eq!(prs.unknown_count, 1);
+        assert_eq!(prs.unknown[0].reason, "unspecified");
+    }
+
+    #[test]
+    fn unavailable_envelope_always_carries_a_reason() {
+        let env = SessionInfoEnvelope::unavailable("session_not_found");
+        assert!(!env.available);
+        assert_eq!(env.reason.as_deref(), Some("session_not_found"));
+        assert!(env.body.is_none());
+        let listing = SessionsInfoResponse::unavailable("lifecycle_store_unavailable");
+        assert_eq!(listing.status, STATUS_UNAVAILABLE);
+        assert_eq!(
+            listing.reason.as_deref(),
+            Some("lifecycle_store_unavailable")
+        );
+        assert!(listing.sessions.is_empty());
+    }
+
+    #[test]
+    fn envelope_serializes_in_the_d1_camel_case_shape() {
+        let rec = record("77777777-7777-4777-8777-777777777777");
+        let env =
+            project_session_info(&rec, None, true, project_prs(&[pr_row(1, true, "ff-land")]));
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["available"], serde_json::json!(true));
+        // Flattened groups sit at the top level, exactly as D1 spells them.
+        assert_eq!(v["identity"]["terminalId"], serde_json::json!("term-1"));
+        assert_eq!(
+            v["identity"]["fleetSessionHandle"],
+            serde_json::json!("fsh_abc")
+        );
+        assert_eq!(v["placement"]["zoneIndex"], serde_json::json!(3));
+        assert_eq!(v["lifecycle"]["transcriptExists"], serde_json::json!(true));
+        assert_eq!(v["lifecycle"]["restoreTier"], serde_json::Value::Null);
+        assert_eq!(v["prs"]["status"], serde_json::json!("ok"));
+        assert_eq!(v["prs"]["landedCount"], serde_json::json!(1));
+        assert_eq!(
+            v["prs"]["landed"][0]["landSignal"],
+            serde_json::json!("ff-land")
+        );
+        // A degraded ledger spells its reason on the wire.
+        let degraded = project_session_info(&rec, None, true, prs_unavailable("db_error"));
+        let dv = serde_json::to_value(&degraded).unwrap();
+        assert_eq!(dv["prs"]["status"], serde_json::json!("unavailable"));
+        assert_eq!(dv["prs"]["reason"], serde_json::json!("db_error"));
+    }
+}

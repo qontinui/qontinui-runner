@@ -56,8 +56,15 @@ pub struct HeadPr {
     /// `merged_at` being present is the equivalent signal).
     pub merged: bool,
     pub merged_at: Option<String>,
+    /// RFC3339 close time, present for every non-open PR. The best available
+    /// land timestamp for a fast-forward land, which sets no `merged_at`.
+    pub closed_at: Option<String>,
     pub head_ref: String,
     pub head_sha: String,
+    /// The PR's BASE branch name (e.g. `"main"`), unprefixed. The session-PR
+    /// reconciler's content-proof land signal tests the head commit against
+    /// `origin/<base_ref>`.
+    pub base_ref: String,
 }
 
 /// A minimal GitHub API client.
@@ -75,6 +82,11 @@ pub struct PrStatus {
     pub merged: bool,
     pub mergeable: Option<bool>,
     pub head_sha: String,
+    /// The PR's BASE branch name (e.g. `"main"`), unprefixed — see
+    /// [`HeadPr::base_ref`].
+    pub base_ref: String,
+    /// RFC3339 close time — see [`HeadPr::closed_at`].
+    pub closed_at: Option<String>,
     pub title: String,
     pub html_url: String,
 }
@@ -302,6 +314,8 @@ impl GitHubClient {
             merged: body["merged"].as_bool().unwrap_or(false),
             mergeable: body["mergeable"].as_bool(),
             head_sha: body["head"]["sha"].as_str().unwrap_or("").to_string(),
+            base_ref: body["base"]["ref"].as_str().unwrap_or("").to_string(),
+            closed_at: body["closed_at"].as_str().map(|s| s.to_string()),
             title: body["title"].as_str().unwrap_or("").to_string(),
             html_url: body["html_url"].as_str().unwrap_or("").to_string(),
         })
@@ -346,8 +360,10 @@ impl GitHubClient {
                     state: pr["state"].as_str().unwrap_or("unknown").to_string(),
                     merged: pr["merged_at"].is_string(),
                     merged_at: pr["merged_at"].as_str().map(|s| s.to_string()),
+                    closed_at: pr["closed_at"].as_str().map(|s| s.to_string()),
                     head_ref: pr["head"]["ref"].as_str().unwrap_or("").to_string(),
                     head_sha: pr["head"]["sha"].as_str().unwrap_or("").to_string(),
+                    base_ref: pr["base"]["ref"].as_str().unwrap_or("").to_string(),
                 })
             })
             .collect())

@@ -321,6 +321,15 @@ mod tests {
             restore_pending_at: None,
             confirmed_at: Some(3),
             handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
         }
     }
 

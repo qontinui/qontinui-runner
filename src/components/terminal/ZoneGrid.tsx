@@ -1,12 +1,4 @@
-import {
-  memo,
-  useCallback,
-  useMemo,
-  useReducer,
-  useRef,
-  useEffect,
-  type RefObject,
-} from "react";
+import { memo, useCallback, useMemo, useReducer, useRef, useEffect, type RefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
@@ -31,7 +23,6 @@ import {
   ZoneContextMenu,
   ZoneQuickActions,
   ZoneLabel,
-  SessionPrDropdown,
   HiddenTerminal,
   formatUptime,
   countMatches,
@@ -42,6 +33,7 @@ import {
   useTransitionEffects,
   useUIStateCx,
 } from "./contexts";
+import { SessionInfoDropdown } from "./SessionInfoDropdown";
 import { classifyTabs, type TabClassification } from "./classifyTabs";
 import { useZoneVirtualization } from "./useZoneVirtualization";
 import {
@@ -453,8 +445,7 @@ function ZoneGridInner({
     [],
   );
   const setZoneFilter = useCallback(
-    (zoneIndex: number, value: string) =>
-      dispatch({ type: "SET_ZONE_FILTER", zoneIndex, value }),
+    (zoneIndex: number, value: string) => dispatch({ type: "SET_ZONE_FILTER", zoneIndex, value }),
     [],
   );
   const clearZoneFilter = useCallback(
@@ -519,7 +510,7 @@ function ZoneGridInner({
           <div className="absolute top-0 left-0 right-0 flex items-center gap-2 px-3 py-1 bg-[#13141f]/90 backdrop-blur-sm z-20 cursor-pointer">
             <span className="text-[10px] text-[#7aa2f7] font-medium">Maximized</span>
             <span className="text-[10px] text-[#a9b1d6]">{tab.title}</span>
-            <SessionPrDropdown claudeSessionId={tab.claudeSessionId} />
+            <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={singleViewZone} />
             <span className="text-[9px] text-[#565f89] ml-auto">
               Esc or double-click to restore
             </span>
@@ -979,8 +970,7 @@ function ZoneCellInner({
             onUserInputLine: onUserInputLine
               ? (input: string) => onUserInputLine(tabId, input)
               : undefined,
-            onShellIntegration: (event: ShellIntegrationEvent) =>
-              onShellIntegration(tabId, event),
+            onShellIntegration: (event: ShellIntegrationEvent) => onShellIntegration(tabId, event),
             onTitleChange: (title: string) => onTitleChange(tabId, title),
           }
         : null,
@@ -1025,9 +1015,7 @@ function ZoneCellInner({
   const isStale = tab && staleTabs?.has(tab.id);
   const searchMatch =
     tab && outputSearchQuery
-      ? lastLines.some((l) =>
-          l.toLowerCase().includes(outputSearchQuery.toLowerCase()),
-        )
+      ? lastLines.some((l) => l.toLowerCase().includes(outputSearchQuery.toLowerCase()))
       : false;
   const isSwapSource = swapSource === zoneIdx;
   const isSelected = selectedZones?.has(zoneIdx);

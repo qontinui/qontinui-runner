@@ -69,6 +69,7 @@ pub mod past_sessions;
 pub mod provider_adapter;
 pub mod reconcile;
 pub mod redact;
+pub mod restore_census; // Pre/post-restart session census — the G6 outcome check behind GET /control/sessions/restore-census
 pub mod restore_record_emitter;
 pub mod session_lifecycle_store;
 pub mod shutdown_marker;

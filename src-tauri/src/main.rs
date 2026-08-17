@@ -2140,6 +2140,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Terminal zone-header PR dropdown — per-session PR merged/unmerged
             // status proxied from coord's GET /pr-merge/session/:id/prs.
             commands::session_prs::session_prs_get,
+            // Terminal zone-header SESSION-INFO dropdown (plan
+            // 2026-08-16-runner-session-info-dropdown-and-restore-verification
+            // D1) — the ONE read that returns identity ⨝ live-registry overlay
+            // ⨝ PR ledger in a single shot, so the panel can never render a
+            // partially-loaded (and therefore ambiguous) state.
+            commands::session_info::session_info_get,
             // Plan 2026-05-22-coord-native-session-coordination §D12 / Phase 4 —
             // active tenant resolver for the frontend TenantContext.
             commands::tenant::get_active_tenant,
@@ -2926,9 +2932,37 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // would reveal it is long gone. Read-only + snapshot-path only:
                 // the registry never consults the probe, so this can describe
                 // restore behavior but not change it.
-                lifecycle_store.attach_transcript_probe(std::sync::Arc::new(
-                    session::reconcile::DiskTranscriptIndex::discover(),
-                ));
+                let transcript_index =
+                    std::sync::Arc::new(session::reconcile::DiskTranscriptIndex::discover());
+                lifecycle_store.attach_transcript_probe(transcript_index.clone());
+
+                // RESTORE CENSUS (plan
+                // `2026-08-16-runner-session-info-dropdown-and-restore-verification`
+                // D6/P5) — LATCH the pre-restart `expected` set RIGHT HERE, and
+                // exactly once.
+                //
+                // Placement is the whole correctness argument (R3): this line
+                // runs after the store is opened and after `classify_boot`
+                // stashed the boot classification (both above), but BEFORE the
+                // boot reconcile pass, the liveness poll and the frontend's
+                // restore drain — none of which can run until setup returns.
+                // So the latched set is the SHUTDOWN-time set, read before any
+                // restore mutates a record, never a set re-derived from what
+                // came back (which would make `verdict: "match"` vacuous and
+                // "wrong in the operator's favour").
+                //
+                // `boot_classification()` — NOT `classify_boot()`, which
+                // rewrites the marker on first call; it already ran above, so
+                // the stash is populated. The census owns no path of its own:
+                // it reads this instance-scoped store and this instance's
+                // marker, so a temp runner cannot inherit the primary's census
+                // (the 2026-08-10 regression).
+                session::restore_census::latch_expected(
+                    &lifecycle_store,
+                    transcript_index.as_ref(),
+                    chrono::Utc::now().timestamp_millis(),
+                    session::shutdown_marker::boot_classification(),
+                );
 
                 // Restore-registry cloud mirror (plan 2026-07-09-runner-
                 // session-history-cloud-sync §3.4, Phase 4; gate split off
@@ -3126,6 +3160,52 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // helper failed → classify Skips every matched record.
                         let tick_snapshot_ok = !snap.parent_map.is_empty();
 
+                        // D1 identity refresh. Claude Code's per-process
+                        // registry is the ONLY source for the account + name an
+                        // operator actually sees, and it is deleted when the
+                        // process exits — so this tick is the runner's standing
+                        // chance to copy that data onto the durable record while
+                        // the session is still alive. Reuses the snapshot this
+                        // tick already took (the PID filter is what makes the
+                        // read honest: a crashed process cannot delete its own
+                        // file).
+                        //
+                        // Sticky by construction: a session ABSENT from this map
+                        // gets no `update_identity` call at all, so a failed or
+                        // partial registry read can never blank a stored account
+                        // or name. An indeterminate snapshot (the fail-closed
+                        // `live_pids_from_snapshot` error) degrades to "no
+                        // identity data this tick", never to a blanking write.
+                        let live_identity: StdHashMap<String, session::session_lifecycle_store::SessionIdentityUpdate> =
+                            if open.is_empty() {
+                                StdHashMap::new()
+                            } else {
+                                match session::claude_session_registry::live_pids_from_snapshot(&snap) {
+                                    Ok(live_pids) => session::claude_session_registry::read_live_sessions(
+                                        &terminal::transcript::find_claude_config_dirs(),
+                                        &live_pids,
+                                    )
+                                    .into_iter()
+                                    // `read_live_sessions` returns one row per
+                                    // PROCESS and several processes may report
+                                    // one session id; it is sorted stably, so
+                                    // keeping the FIRST row per id is a stable
+                                    // choice rather than a coin flip.
+                                    .fold(StdHashMap::new(), |mut acc, s| {
+                                        acc.entry(s.session_id.clone())
+                                            .or_insert_with(|| s.identity_update());
+                                        acc
+                                    }),
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            error = %e,
+                                            "session lifecycle poll: live-session registry indeterminate — identity refresh skipped this tick"
+                                        );
+                                        StdHashMap::new()
+                                    }
+                                }
+                            };
+
                         // Index the live terminals ONCE per tick (plan
                         // 2026-07-28-runner-many-sessions-performance §7a/B8).
                         // The match below used to be up to two full linear
@@ -3150,6 +3230,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         for rec in &open {
+                            // D1 stickiness in action: only a session the live
+                            // registry ACTUALLY reported this tick is refreshed.
+                            // Absent ⇒ untouched, which is what lets the stored
+                            // account/name outlive the process that produced
+                            // them. `update_identity` itself writes only on a
+                            // real change, so a steady-state tick costs nothing
+                            // durable.
+                            if let Some(update) = live_identity.get(&rec.claude_session_id) {
+                                poll_lifecycle_store
+                                    .update_identity(&rec.claude_session_id, update);
+                            }
+
                             // Match the live terminal: by id first, then the
                             // (page_id, title, working_dir) triple as fallback.
                             let info = live_by_id

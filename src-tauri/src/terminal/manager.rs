@@ -121,6 +121,36 @@ impl TerminalManager {
             error!("Failed to emit terminal-created: {}", e);
         }
 
+        // D1: the same bypass fact, made DURABLE on the session's lifecycle
+        // record. The event below is process-lifetime UI state; the record has
+        // to answer "did this session run with permissions bypassed?" after a
+        // restart, and that is a safety-relevant question.
+        //
+        // Stamped for BOTH answers, not only `true`: the runner built this
+        // spawn's argv, so `false` here is knowledge ("this spawn carried no
+        // bypass flag"), not absence. Reserving `None` for genuine absence is
+        // what keeps "unknown" and "not bypassed" distinguishable on the
+        // record. A later typed `claude --dangerously-skip-permissions` in the
+        // same PTY re-stamps `true` from the resume sniff (last write wins).
+        //
+        // The record already exists: `TerminalSession::spawn` records the
+        // pre-pinned session synchronously through the identity seam before it
+        // returns.
+        {
+            use tauri::Manager;
+            if let Some(store) = emitter
+                .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+            {
+                store.update_identity_by_terminal(
+                    &info.id,
+                    &crate::session::session_lifecycle_store::SessionIdentityUpdate {
+                        bypass_permissions: Some(bypass_permissions),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
         // Bypass-aware needs-input hint — emitted only when the spawn command
         // implies bypassed permissions. Emitted AFTER `terminal-created`; the
         // frontend listener buffers a bypass mark whose tab record hasn't
