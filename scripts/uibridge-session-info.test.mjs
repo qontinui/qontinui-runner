@@ -276,8 +276,17 @@ async function http(path, { method = "GET", body, timeoutMs = REQUEST_TIMEOUT_MS
       url,
     };
   } catch (err) {
-    const kind = err?.name === "TimeoutError" ? `timeout after ${timeoutMs}ms` : String(err?.message ?? err);
-    return { ok: false, status: 0, json: null, text: "", error: kind, ms: Date.now() - started, url };
+    const kind =
+      err?.name === "TimeoutError" ? `timeout after ${timeoutMs}ms` : String(err?.message ?? err);
+    return {
+      ok: false,
+      status: 0,
+      json: null,
+      text: "",
+      error: kind,
+      ms: Date.now() - started,
+      url,
+    };
   }
 }
 
@@ -467,7 +476,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function measureEmptiness() {
   const terms = await fetchTerminals();
   const health = await fetchRestoreHealth();
-  if (!terms.ok) return { empty: false, evaluable: false, detail: `GET /terminals: ${terms.error}` };
+  if (!terms.ok)
+    return { empty: false, evaluable: false, detail: `GET /terminals: ${terms.error}` };
   if (!health.ok) {
     return {
       empty: false,
@@ -487,47 +497,117 @@ async function measureEmptiness() {
 }
 
 /**
- * The §0.1 self-hosting gate: is THIS process's own Claude session hosted in a
- * terminal of the runner it is about to restart?
+ * The §0.1 self-hosting gate: would restarting this runner kill THIS process?
  *
- * The only reliable check is looking for our own `CLAUDE_CODE_SESSION_ID` in
- * `GET /control/sessions/restore-health`. Checking for `QONTINUI_*` env vars is
- * NOT a substitute: a `claude` started inside a runner PTY without the runner's
- * env injection registers as `origin: "observed"` and carries none of them, yet
- * is every bit as runner-hosted — killing the runner still kills it mid-test.
+ * The authoritative test is PROCESS ANCESTRY, not the runner's registry.
+ * Restarting a runner kills its process tree, so the only thing that decides
+ * the question is whether a runner process is an ancestor of this one.
  *
- * Fails CLOSED: no `CLAUDE_CODE_SESSION_ID` in the environment means we cannot
- * prove we are outside, which is not the same as being outside.
+ * ⚠️ Do NOT gate on "is my `CLAUDE_CODE_SESSION_ID` in `/control/sessions/
+ * restore-health`". That was this gate's original implementation and it is
+ * WRONG in the common direction — it aborts runs that are perfectly safe.
+ * The runner tracks Claude sessions it merely NOTICED: `origin: "observed"` is
+ * documented in `session_lifecycle_store.rs` as "a claude-process-start-anchored,
+ * uniquely-correlated TRANSCRIPT bind — the transcript proves the session
+ * exists". A `claude` launched from an ordinary PowerShell window is discovered
+ * exactly that way and appears in the registry bound to a terminal id, while
+ * being no part of the runner's process tree. Measured 2026-08-17: a session
+ * present in `restore-health` as `origin: "observed"` SURVIVED the runner being
+ * killed, and its ancestry was
+ * `powershell.exe <- claude.exe <- powershell.exe <- WindowsTerminal.exe`.
+ *
+ * Registry presence is therefore reported as CONTEXT, never as the verdict.
+ *
+ * Fails CLOSED: if ancestry cannot be walked, we cannot prove we are outside,
+ * which is not the same as being outside.
  */
 async function measureSelfHosting(health) {
   const own = (process.env.CLAUDE_CODE_SESSION_ID || "").trim();
-  if (!own) {
+
+  // Context only — see the warning above. Never decides `safe`.
+  let registryNote = "not checked";
+  if (own) {
+    const h = health ?? (await fetchRestoreHealth());
+    if (h.ok) {
+      const hit = h.sessions.find((s) => String(s.claudeSessionId).trim() === own);
+      registryNote = hit
+        ? `own session ${own} IS in the registry (terminal ${hit.terminalId}, origin ` +
+          `${hit.origin ?? "?"}) — context only, not proof of hosting`
+        : `own session ${own} is not among the runner's ${h.sessions.length} record(s)`;
+    } else {
+      registryNote = `restore-health unavailable: ${h.error}`;
+    }
+  }
+
+  const ancestry = await walkProcessAncestry();
+  if (!ancestry.ok) {
     return {
       safe: false,
       evaluable: false,
       detail:
-        "CLAUDE_CODE_SESSION_ID is unset — cannot prove this process is outside the runner. " +
-        "Failing closed: absence of the id is not evidence of being outside it.",
+        `cannot walk process ancestry (${ancestry.error}) — cannot prove this process is ` +
+        `outside the runner's process tree. Failing closed. [${registryNote}]`,
     };
   }
-  const h = health ?? (await fetchRestoreHealth());
-  if (!h.ok) return { safe: false, evaluable: false, detail: `restore-health: ${h.error}` };
-  const hit = h.sessions.find((s) => String(s.claudeSessionId).trim() === own);
-  if (hit) {
+  const runnerAncestor = ancestry.chain.find((p) => /qontinui-runner/i.test(p.name));
+  if (runnerAncestor) {
     return {
       safe: false,
       evaluable: true,
       detail:
-        `SELF-HOSTED: own CLAUDE_CODE_SESSION_ID ${own} is bound to runner terminal ` +
-        `${hit.terminalId} (origin: ${hit.origin ?? "?"}). Restarting this runner would kill ` +
-        `the test process mid-run (plan §0.1).`,
+        `SELF-HOSTED: ${runnerAncestor.name} (pid ${runnerAncestor.pid}) is an ancestor of this ` +
+        `process. Restarting this runner would kill the test mid-run. [${registryNote}]`,
     };
   }
   return {
     safe: true,
     evaluable: true,
-    detail: `own session ${own} is not among the runner's ${h.sessions.length} record(s)`,
+    detail:
+      `no runner process in this process's ancestry ` +
+      `(${ancestry.chain.map((p) => p.name).join(" <- ")}) [${registryNote}]`,
   };
+}
+
+/**
+ * Walk this process's parent chain. Windows-only via WMI; on other platforms it
+ * reads `/proc/<pid>/stat`. Bounded to 16 hops so a cycle cannot hang the gate.
+ */
+async function walkProcessAncestry() {
+  const chain = [];
+  try {
+    if (process.platform === "win32") {
+      const { execFile } = await import("node:child_process");
+      const { promisify } = await import("node:util");
+      const run = promisify(execFile);
+      const ps =
+        "$p=$PID;$out=@();for($i=0;$i -lt 16;$i++){" +
+        '$o=Get-CimInstance Win32_Process -Filter "ProcessId = $p" -ErrorAction SilentlyContinue;' +
+        'if(-not $o){break};$out+="$($o.Name)|$($o.ProcessId)";' +
+        "if(-not $o.ParentProcessId -or $o.ParentProcessId -eq 0){break};$p=$o.ParentProcessId};" +
+        '$out -join "`n"';
+      const { stdout } = await run("powershell.exe", ["-NoProfile", "-Command", ps], {
+        timeout: 30_000,
+      });
+      for (const line of String(stdout).split(/\r?\n/)) {
+        const [name, pid] = line.trim().split("|");
+        if (name) chain.push({ name, pid: Number(pid) });
+      }
+    } else {
+      const { readFile } = await import("node:fs/promises");
+      let pid = process.pid;
+      for (let i = 0; i < 16 && pid > 0; i++) {
+        const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+        const name = stat.slice(stat.indexOf("(") + 1, stat.lastIndexOf(")"));
+        const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        chain.push({ name, pid });
+        pid = Number(rest[1]);
+      }
+    }
+  } catch (e) {
+    return { ok: false, error: e?.message ?? String(e), chain };
+  }
+  if (chain.length === 0) return { ok: false, error: "empty ancestry", chain };
+  return { ok: true, chain };
 }
 
 /**
@@ -593,7 +673,11 @@ async function createFixtures(ctx) {
       "three fixture sessions across >=2 Claude accounts, in distinct zones",
       "--fixture needs --accounts with at least two names; the roster is machine-global and this script will not guess account names",
     );
-    skip("T0.3", "a trivial prompt in each fixture session (transcript + confirmed_at)", "no fixtures");
+    skip(
+      "T0.3",
+      "a trivial prompt in each fixture session (transcript + confirmed_at)",
+      "no fixtures",
+    );
     skip("T0.4", "one operator-renamed session and one Claude-derived one", "no fixtures");
     return;
   }
@@ -630,7 +714,11 @@ async function createFixtures(ctx) {
       [`created ${created.length}/3`, ...problems].join("\n"),
     );
   } else if (zones.size !== 3) {
-    fail("T0.2", "three fixture sessions across >=2 Claude accounts, in distinct zones", `zone indices were ${[...zones].join(", ")} — not three distinct zones`);
+    fail(
+      "T0.2",
+      "three fixture sessions across >=2 Claude accounts, in distinct zones",
+      `zone indices were ${[...zones].join(", ")} — not three distinct zones`,
+    );
   } else if (accountLabels.size < 2) {
     fail(
       "T0.2",
@@ -659,12 +747,20 @@ async function createFixtures(ctx) {
       detail: r.ok ? "" : `submit-prompt to ${tid}: ${r.error}`,
     });
   }
-  assertAll("T0.3", "a trivial prompt in each fixture session (transcript + confirmed_at)", promptFindings);
+  assertAll(
+    "T0.3",
+    "a trivial prompt in each fixture session (transcript + confirmed_at)",
+    promptFindings,
+  );
 
   // Step 4 — one operator `/rename`, one left Claude-derived, so BOTH branches
   // of the name-provenance split are covered rather than only the default one.
   if (created.length === 0) {
-    skip("T0.4", "one operator-renamed session and one Claude-derived one", "no fixtures were created");
+    skip(
+      "T0.4",
+      "one operator-renamed session and one Claude-derived one",
+      "no fixtures were created",
+    );
     return;
   }
   const renameTarget = created[0];
@@ -673,7 +769,11 @@ async function createFixtures(ctx) {
     { method: "POST", body: { message: "/rename uibridge-fixture-operator-named" } },
   );
   if (!r.ok) {
-    fail("T0.4", "one operator-renamed session and one Claude-derived one", `/rename submit failed: ${r.error}`);
+    fail(
+      "T0.4",
+      "one operator-renamed session and one Claude-derived one",
+      `/rename submit failed: ${r.error}`,
+    );
     return;
   }
   await sleep(PANEL_SETTLE_MS * 4);
@@ -863,7 +963,10 @@ function compareRow(element, field, expected, label) {
   const isUnknown = unk.present && String(unk.value) === "true";
 
   if (fieldAttr.present && String(fieldAttr.value) !== field) {
-    return { ok: false, detail: `${label}: data-session-info-field='${fieldAttr.value}', expected '${field}'` };
+    return {
+      ok: false,
+      detail: `${label}: data-session-info-field='${fieldAttr.value}', expected '${field}'`,
+    };
   }
   if (expected === null) {
     if (!val.present && isUnknown) return { ok: true, detail: "" };
@@ -888,7 +991,10 @@ function compareRow(element, field, expected, label) {
     return { ok: false, detail: `${label}: rendered '${val.value}' != backend '${expected}'` };
   }
   if (isUnknown) {
-    return { ok: false, detail: `${label}: carries a value AND data-session-info-unknown="true" — contradictory` };
+    return {
+      ok: false,
+      detail: `${label}: carries a value AND data-session-info-unknown="true" — contradictory`,
+    };
   }
   return { ok: true, detail: "" };
 }
@@ -942,13 +1048,19 @@ async function runDropdownPass(ctx, phase, ids) {
     const triggerId = infoElementId("trigger", zone.zoneIndex);
     const click = await clickElement(triggerId);
     if (!click.ok) {
-      t3.push({ ok: false, detail: `zone ${zone.zoneIndex}: click ${triggerId} failed — ${click.error}` });
+      t3.push({
+        ok: false,
+        detail: `zone ${zone.zoneIndex}: click ${triggerId} failed — ${click.error}`,
+      });
       continue;
     }
     await sleep(PANEL_SETTLE_MS);
     const reg = await fetchElements();
     if (!reg.ok) {
-      t3.push({ ok: false, detail: `zone ${zone.zoneIndex}: elements re-read failed — ${reg.error}` });
+      t3.push({
+        ok: false,
+        detail: `zone ${zone.zoneIndex}: elements re-read failed — ${reg.error}`,
+      });
       continue;
     }
     const present = new Set(reg.elements.map((e) => String(e?.id ?? "")));
@@ -985,7 +1097,14 @@ async function runDropdownPass(ctx, phase, ids) {
         t4.push({ ok: false, detail: `zone ${zone.zoneIndex}: GET element ${id} — ${el.error}` });
         continue;
       }
-      t4.push(compareRow(el.element, field, backendValueForField(session, field), `zone ${zone.zoneIndex} ${field}`));
+      t4.push(
+        compareRow(
+          el.element,
+          field,
+          backendValueForField(session, field),
+          `zone ${zone.zoneIndex} ${field}`,
+        ),
+      );
     }
   }
   assertAll(ids.t4, `rendered raw value == backend raw value, field by field${label}`, t4);
@@ -1012,10 +1131,16 @@ async function runDropdownPass(ctx, phase, ids) {
     }
     const sources = projections.map((p) => p.name?.source ?? "unknown");
     if (!sources.includes("operator")) {
-      t5.push({ ok: false, detail: `no opened session reports name.source='operator' (saw: ${sources.join(", ")})` });
+      t5.push({
+        ok: false,
+        detail: `no opened session reports name.source='operator' (saw: ${sources.join(", ")})`,
+      });
     }
     if (!sources.includes("derived")) {
-      t5.push({ ok: false, detail: `no opened session reports name.source='derived' (saw: ${sources.join(", ")})` });
+      t5.push({
+        ok: false,
+        detail: `no opened session reports name.source='derived' (saw: ${sources.join(", ")})`,
+      });
     }
     if (t5.length === 0) t5.push({ ok: true, detail: "" });
     assertAll(ids.t5, `account and name are correct and distinct across sessions${label}`, t5);
@@ -1031,9 +1156,17 @@ async function runDropdownAssertions(ctx) {
 
   // --- T1 --------------------------------------------------------------
   if (!z.ok) {
-    fail("T1", "each zone header is discoverable and bound to the expected session", `GET /ui-bridge/control/elements: ${z.error}`);
+    fail(
+      "T1",
+      "each zone header is discoverable and bound to the expected session",
+      `GET /ui-bridge/control/elements: ${z.error}`,
+    );
   } else if (z.zones.length === 0) {
-    skip("T1", "each zone header is discoverable and bound to the expected session", "the UI Bridge registry contains no terminal-zone-header-<n> element");
+    skip(
+      "T1",
+      "each zone header is discoverable and bound to the expected session",
+      "the UI Bridge registry contains no terminal-zone-header-<n> element",
+    );
   } else if (!info.ok || info.status !== "ok") {
     fail(
       "T1",
@@ -1076,7 +1209,10 @@ async function runDropdownAssertions(ctx) {
         });
         continue;
       }
-      if (ctx.fixtures && !ctx.fixtures.some((f) => f.session.identity.claudeSessionId === zone.claudeSessionId)) {
+      if (
+        ctx.fixtures &&
+        !ctx.fixtures.some((f) => f.session.identity.claudeSessionId === zone.claudeSessionId)
+      ) {
         findings.push({
           ok: false,
           detail: `${zone.headerId} is bound to ${zone.claudeSessionId}, which is not one of the fixtures this run created`,
@@ -1091,9 +1227,17 @@ async function runDropdownAssertions(ctx) {
   // --- T2 --------------------------------------------------------------
   const bound = (z.zones || []).filter((x) => x.claudeSessionId);
   if (!z.ok) {
-    skip("T2", "the info trigger exists for every session-bound zone and does NOT self-hide", `elements read failed: ${z.error}`);
+    skip(
+      "T2",
+      "the info trigger exists for every session-bound zone and does NOT self-hide",
+      `elements read failed: ${z.error}`,
+    );
   } else if (bound.length === 0) {
-    skip("T2", "the info trigger exists for every session-bound zone and does NOT self-hide", "no zone header carries a data-claude-session-id");
+    skip(
+      "T2",
+      "the info trigger exists for every session-bound zone and does NOT self-hide",
+      "no zone header carries a data-claude-session-id",
+    );
   } else {
     const present = new Set((z.registry || []).map((e) => String(e?.id ?? "")));
     const findings = bound.map((zone) => {
@@ -1105,7 +1249,11 @@ async function runDropdownAssertions(ctx) {
             detail: `${id} is absent from the UI Bridge registry although zone ${zone.zoneIndex} is bound to session ${zone.claudeSessionId} — the trigger must render even when the backing read (or the PR ledger) is unavailable (G5)`,
           };
     });
-    assertAll("T2", "the info trigger exists for every session-bound zone and does NOT self-hide", findings);
+    assertAll(
+      "T2",
+      "the info trigger exists for every session-bound zone and does NOT self-hide",
+      findings,
+    );
   }
 
   // --- T0.5 (PR arm honesty) + T3/T4/T5 -----------------------------------
@@ -1116,7 +1264,11 @@ async function runDropdownAssertions(ctx) {
     ? info.sessions.filter((s) => s.available && s.prs?.status && s.prs.status !== "ok")
     : [];
   if (!info.ok) {
-    skip("T0.5", "either a populated PR ledger OR the prs.status/reason path is exercised", `/control/sessions/info: ${info.error}`);
+    skip(
+      "T0.5",
+      "either a populated PR ledger OR the prs.status/reason path is exercised",
+      `/control/sessions/info: ${info.error}`,
+    );
   } else if (withPrs.length > 0) {
     pass(
       "T0.5",
@@ -1194,7 +1346,10 @@ function killRunnerProcessOnly() {
     .map((s) => s.trim())
     .filter((s) => /^\d+$/.test(s));
   if (pids.length === 0) {
-    return { ok: false, detail: `no process named '${RUNNER_PROCESS_NAME}' is running — nothing to crash` };
+    return {
+      ok: false,
+      detail: `no process named '${RUNNER_PROCESS_NAME}' is running — nothing to crash`,
+    };
   }
   const killed = [];
   for (const pid of pids) {
@@ -1211,10 +1366,14 @@ function killRunnerProcessOnly() {
     }
     // Single pid, no -T / tree semantics anywhere.
     const k = powershell(["-Command", `Stop-Process -Id ${pid} -Force -Confirm:$false`]);
-    if (!k.ok) return { ok: false, detail: `Stop-Process -Id ${pid} failed: ${k.stderr || k.error}` };
+    if (!k.ok)
+      return { ok: false, detail: `Stop-Process -Id ${pid} failed: ${k.stderr || k.error}` };
     killed.push(pid);
   }
-  return { ok: true, detail: `stopped runner pid(s) ${killed.join(", ")} (no tree flag, no node/powershell touched)` };
+  return {
+    ok: true,
+    detail: `stopped runner pid(s) ${killed.join(", ")} (no tree flag, no node/powershell touched)`,
+  };
 }
 
 // ===========================================================================
@@ -1235,7 +1394,11 @@ async function runRestoreAssertions(ctx) {
   // --- T6: the pre-restart census -----------------------------------------
   const c = await fetchCensus();
   if (!c.ok) {
-    fail("T6", "the pre-restart census is complete, and is saved as the oracle", `GET /control/sessions/restore-census: ${c.error}`);
+    fail(
+      "T6",
+      "the pre-restart census is complete, and is saved as the oracle",
+      `GET /control/sessions/restore-census: ${c.error}`,
+    );
   } else {
     const census = c.census ?? {};
     const expected = Array.isArray(census.expected) ? census.expected : [];
@@ -1248,11 +1411,15 @@ async function runRestoreAssertions(ctx) {
       const expectedIds = new Set(expected.map((e) => e.claudeSessionId));
       const missing = [...fixtureIds].filter((id) => !expectedIds.has(id));
       const extra = [...expectedIds].filter((id) => !fixtureIds.has(id));
-      if (missing.length) problems.push(`expected[] omits fixture session(s): ${missing.join(", ")}`);
-      if (extra.length) problems.push(`expected[] carries non-fixture session(s): ${extra.join(", ")}`);
+      if (missing.length)
+        problems.push(`expected[] omits fixture session(s): ${missing.join(", ")}`);
+      if (extra.length)
+        problems.push(`expected[] carries non-fixture session(s): ${extra.join(", ")}`);
       const unrestorable = expected.filter((e) => e.restorable !== true);
       if (unrestorable.length) {
-        problems.push(`expected[] rows not restorable: ${unrestorable.map((e) => e.claudeSessionId).join(", ")}`);
+        problems.push(
+          `expected[] rows not restorable: ${unrestorable.map((e) => e.claudeSessionId).join(", ")}`,
+        );
       }
     } else if (expected.length === 0) {
       problems.push(
@@ -1271,10 +1438,18 @@ async function runRestoreAssertions(ctx) {
           `expected=${expected.length}, cleanShutdown=${census.cleanShutdown}, verdict=${census.verdict}; oracle -> ${opts.oracle}`,
         );
       } catch (e) {
-        fail("T6", "the pre-restart census is complete, and is saved as the oracle", `could not write the oracle to ${opts.oracle}: ${e?.message ?? e}`);
+        fail(
+          "T6",
+          "the pre-restart census is complete, and is saved as the oracle",
+          `could not write the oracle to ${opts.oracle}: ${e?.message ?? e}`,
+        );
       }
     } else {
-      fail("T6", "the pre-restart census is complete, and is saved as the oracle", problems.join("\n"));
+      fail(
+        "T6",
+        "the pre-restart census is complete, and is saved as the oracle",
+        problems.join("\n"),
+      );
     }
   }
 
@@ -1285,36 +1460,80 @@ async function runRestoreAssertions(ctx) {
       "runner the implementer itself emptied, and §0.1 measured both premises FALSE; the default-off flag is " +
       "that condition made mechanical.";
     skip("T7", "the runner restarts cleanly (clean shutdown marker, then healthy)", why);
-    skip("T8", "the correct sessions were restored — verdict match, oracle set equality, placement held", why + " T7 never ran, so there is no post-restart state.");
+    skip(
+      "T8",
+      "the correct sessions were restored — verdict match, oracle set equality, placement held",
+      why + " T7 never ran, so there is no post-restart state.",
+    );
     skipT9Pass(why + " T7 never ran.");
-    skip("T9.tier", "restore-tier is populated and honest ('resumed' implies transcriptExists)", why + " T7 never ran.");
+    skip(
+      "T9.tier",
+      "restore-tier is populated and honest ('resumed' implies transcriptExists)",
+      why + " T7 never ran.",
+    );
     return;
   }
 
   const gate = await gatesAllowMutation("T7 pre-restart");
   if (!gate.ok) {
-    fail("T7", "the runner restarts cleanly (clean shutdown marker, then healthy)", `ABORTED — ${gate.detail}`);
-    skip("T8", "the correct sessions were restored — verdict match, oracle set equality, placement held", "T7 aborted at its gate re-check");
+    fail(
+      "T7",
+      "the runner restarts cleanly (clean shutdown marker, then healthy)",
+      `ABORTED — ${gate.detail}`,
+    );
+    skip(
+      "T8",
+      "the correct sessions were restored — verdict match, oracle set equality, placement held",
+      "T7 aborted at its gate re-check",
+    );
     skipT9Pass("T7 aborted at its gate re-check");
-    skip("T9.tier", "restore-tier is populated and honest ('resumed' implies transcriptExists)", "T7 aborted at its gate re-check");
+    skip(
+      "T9.tier",
+      "restore-tier is populated and honest ('resumed' implies transcriptExists)",
+      "T7 aborted at its gate re-check",
+    );
     return;
   }
 
   const stop = powershell(["-File", opts.devStart, "-StopRunner"]);
   if (!stop.ok) {
-    fail("T7", "the runner restarts cleanly (clean shutdown marker, then healthy)", `dev-start.ps1 -StopRunner failed (${stop.code}): ${stop.stderr || stop.error}`);
-    skip("T8", "the correct sessions were restored — verdict match, oracle set equality, placement held", "the restart did not complete");
+    fail(
+      "T7",
+      "the runner restarts cleanly (clean shutdown marker, then healthy)",
+      `dev-start.ps1 -StopRunner failed (${stop.code}): ${stop.stderr || stop.error}`,
+    );
+    skip(
+      "T8",
+      "the correct sessions were restored — verdict match, oracle set equality, placement held",
+      "the restart did not complete",
+    );
     skipT9Pass("the restart did not complete");
-    skip("T9.tier", "restore-tier is populated and honest ('resumed' implies transcriptExists)", "the restart did not complete");
+    skip(
+      "T9.tier",
+      "restore-tier is populated and honest ('resumed' implies transcriptExists)",
+      "the restart did not complete",
+    );
     return;
   }
   const start = powershell(["-File", opts.devStart, "-Runner"]);
   const healthy = await waitForHealthy();
   if (!healthy.ok) {
-    fail("T7", "the runner restarts cleanly (clean shutdown marker, then healthy)", `${healthy.detail}\n-Runner exit ${start.code}: ${start.stderr || "(no stderr)"}`);
-    skip("T8", "the correct sessions were restored — verdict match, oracle set equality, placement held", "the runner never came back healthy");
+    fail(
+      "T7",
+      "the runner restarts cleanly (clean shutdown marker, then healthy)",
+      `${healthy.detail}\n-Runner exit ${start.code}: ${start.stderr || "(no stderr)"}`,
+    );
+    skip(
+      "T8",
+      "the correct sessions were restored — verdict match, oracle set equality, placement held",
+      "the runner never came back healthy",
+    );
     skipT9Pass("the runner never came back healthy");
-    skip("T9.tier", "restore-tier is populated and honest ('resumed' implies transcriptExists)", "the runner never came back healthy");
+    skip(
+      "T9.tier",
+      "restore-tier is populated and honest ('resumed' implies transcriptExists)",
+      "the runner never came back healthy",
+    );
     return;
   }
   // "A clean shutdown marker was written" is asserted through the census's own
@@ -1322,7 +1541,11 @@ async function runRestoreAssertions(ctx) {
   const post = await fetchCensus();
   const clean = post.ok && post.census?.cleanShutdown === true && post.census?.shutdownAt != null;
   if (clean) {
-    pass("T7", "the runner restarts cleanly (clean shutdown marker, then healthy)", `${healthy.detail}; cleanShutdown=true, shutdownAt=${post.census.shutdownAt}`);
+    pass(
+      "T7",
+      "the runner restarts cleanly (clean shutdown marker, then healthy)",
+      `${healthy.detail}; cleanShutdown=true, shutdownAt=${post.census.shutdownAt}`,
+    );
   } else {
     fail(
       "T7",
@@ -1335,27 +1558,44 @@ async function runRestoreAssertions(ctx) {
 
   // --- T8: the core claim --------------------------------------------------
   if (!ctx.oracle) {
-    skip("T8", "the correct sessions were restored — verdict match, oracle set equality, placement held", "T6 never saved an oracle");
+    skip(
+      "T8",
+      "the correct sessions were restored — verdict match, oracle set equality, placement held",
+      "T6 never saved an oracle",
+    );
   } else if (!post.ok) {
-    fail("T8", "the correct sessions were restored — verdict match, oracle set equality, placement held", `GET /control/sessions/restore-census: ${post.error}`);
+    fail(
+      "T8",
+      "the correct sessions were restored — verdict match, oracle set equality, placement held",
+      `GET /control/sessions/restore-census: ${post.error}`,
+    );
   } else {
     const census = post.census ?? {};
     const problems = [];
     if (census.verdict !== "match") {
-      problems.push(`verdict='${census.verdict}' (reason='${census.reason ?? "<none>"}'), expected 'match'`);
+      problems.push(
+        `verdict='${census.verdict}' (reason='${census.reason ?? "<none>"}'), expected 'match'`,
+      );
     }
     const missing = Array.isArray(census.missing) ? census.missing : [];
     const unexpected = Array.isArray(census.unexpected) ? census.unexpected : [];
-    if (missing.length) problems.push(`missing[]: ${missing.map((m) => `${m.claudeSessionId}(${m.reason})`).join(", ")}`);
+    if (missing.length)
+      problems.push(
+        `missing[]: ${missing.map((m) => `${m.claudeSessionId}(${m.reason})`).join(", ")}`,
+      );
     if (unexpected.length) {
-      problems.push(`unexpected[]: ${unexpected.map((u) => `${u.claudeSessionId}(${u.reason})`).join(", ")}`);
+      problems.push(
+        `unexpected[]: ${unexpected.map((u) => `${u.claudeSessionId}(${u.reason})`).join(", ")}`,
+      );
     }
     const oracleIds = new Set((ctx.oracle.expected || []).map((e) => e.claudeSessionId));
     const restoredIds = new Set((census.restored || []).map((r) => r.claudeSessionId));
     const notBack = [...oracleIds].filter((id) => !restoredIds.has(id));
     const surprise = [...restoredIds].filter((id) => !oracleIds.has(id));
-    if (notBack.length) problems.push(`in the oracle's expected set but not restored: ${notBack.join(", ")}`);
-    if (surprise.length) problems.push(`restored but absent from the oracle's expected set: ${surprise.join(", ")}`);
+    if (notBack.length)
+      problems.push(`in the oracle's expected set but not restored: ${notBack.join(", ")}`);
+    if (surprise.length)
+      problems.push(`restored but absent from the oracle's expected set: ${surprise.join(", ")}`);
     // Placement: zoneIndex AND pageId must survive the restart.
     const byId = new Map((ctx.oracle.expected || []).map((e) => [e.claudeSessionId, e]));
     const info = await fetchSessionsInfo();
@@ -1365,7 +1605,9 @@ async function runRestoreAssertions(ctx) {
       if (Number(r.zoneIndex) !== Number(was.zoneIndex)) {
         problems.push(`${r.claudeSessionId}: zoneIndex ${was.zoneIndex} -> ${r.zoneIndex}`);
       }
-      const now = info.ok ? info.sessions.find((s) => s.identity?.claudeSessionId === r.claudeSessionId) : null;
+      const now = info.ok
+        ? info.sessions.find((s) => s.identity?.claudeSessionId === r.claudeSessionId)
+        : null;
       if (now && now.placement?.pageId !== was.pageId) {
         problems.push(`${r.claudeSessionId}: pageId '${was.pageId}' -> '${now.placement?.pageId}'`);
       }
@@ -1377,7 +1619,11 @@ async function runRestoreAssertions(ctx) {
         `verdict=match; ${restoredIds.size} session(s) restored, set-equal to the oracle's expected set; placement unchanged`,
       );
     } else {
-      fail("T8", "the correct sessions were restored — verdict match, oracle set equality, placement held", problems.join("\n"));
+      fail(
+        "T8",
+        "the correct sessions were restored — verdict match, oracle set equality, placement held",
+        problems.join("\n"),
+      );
     }
   }
 
@@ -1393,24 +1639,41 @@ async function runRestoreAssertions(ctx) {
       info2.ok ? `restore-health: ${rh.error ?? "unreadable"}` : `sessions/info: ${info2.error}`,
     );
   } else {
-    const restored = info2.sessions.filter((s) => s.available && s.lifecycle?.restoredFromBootAt != null);
+    const restored = info2.sessions.filter(
+      (s) => s.available && s.lifecycle?.restoredFromBootAt != null,
+    );
     if (restored.length === 0) {
-      skip("T9.tier", "restore-tier is populated and honest ('resumed' implies transcriptExists)", "no session carries a restoredFromBootAt stamp after the restart");
+      skip(
+        "T9.tier",
+        "restore-tier is populated and honest ('resumed' implies transcriptExists)",
+        "no session carries a restoredFromBootAt stamp after the restart",
+      );
     } else {
       const findings = restored.map((s) => {
         const id = s.identity.claudeSessionId;
         const tier = s.lifecycle.restoreTier;
         const h = rh.sessions.find((x) => x.claudeSessionId === id);
-        if (!tier) return { ok: false, detail: `${id}: restoredFromBootAt is set but restoreTier is null — the tier must be populated` };
+        if (!tier)
+          return {
+            ok: false,
+            detail: `${id}: restoredFromBootAt is set but restoreTier is null — the tier must be populated`,
+          };
         if (tier === "resumed" && h && h.transcriptExists !== true) {
-          return { ok: false, detail: `${id}: claims restoreTier='resumed' but restore-health reports transcriptExists=false` };
+          return {
+            ok: false,
+            detail: `${id}: claims restoreTier='resumed' but restore-health reports transcriptExists=false`,
+          };
         }
         if (tier === "terminal-only" && s.lifecycle.restoreTier === "resumed") {
           return { ok: false, detail: `${id}: a terminal-only restore must not claim 'resumed'` };
         }
         return { ok: true, detail: "" };
       });
-      assertAll("T9.tier", "restore-tier is populated and honest ('resumed' implies transcriptExists)", findings);
+      assertAll(
+        "T9.tier",
+        "restore-tier is populated and honest ('resumed' implies transcriptExists)",
+        findings,
+      );
     }
   }
 }
@@ -1450,17 +1713,30 @@ function allPrRows(info) {
  * because fetching is a network op against the operator's own checkout.
  */
 function checkHeadObjectPresent(repoDir, base, allowFetch) {
-  if (!repoDir) return { evaluable: false, detail: "--repo-dir not given, so the head-object precondition could not be checked" };
+  if (!repoDir)
+    return {
+      evaluable: false,
+      detail: "--repo-dir not given, so the head-object precondition could not be checked",
+    };
   if (allowFetch) {
-    const f = powershell(["-Command", `git -C '${repoDir}' fetch --quiet origin ${base}`], { timeoutMs: 180_000 });
-    if (!f.ok) return { evaluable: false, detail: `git fetch origin ${base} failed: ${f.stderr || f.error}` };
+    const f = powershell(["-Command", `git -C '${repoDir}' fetch --quiet origin ${base}`], {
+      timeoutMs: 180_000,
+    });
+    if (!f.ok)
+      return {
+        evaluable: false,
+        detail: `git fetch origin ${base} failed: ${f.stderr || f.error}`,
+      };
   }
   const baseRef = powershell([
     "-Command",
     `git -C '${repoDir}' rev-parse --verify --quiet 'origin/${base}^{commit}'`,
   ]);
   if (!baseRef.stdout) {
-    return { evaluable: false, detail: `origin/${base} does not resolve in ${repoDir} (no_base_ref)` };
+    return {
+      evaluable: false,
+      detail: `origin/${base} does not resolve in ${repoDir} (no_base_ref)`,
+    };
   }
   return {
     evaluable: true,
@@ -1483,7 +1759,11 @@ async function runHonestyAssertions(ctx) {
   } else {
     const gate = await gatesAllowMutation("T10 pre-crash");
     if (!gate.ok) {
-      fail("T10", "a hard-crash boot reports verdict 'unknown', not 'match'", `ABORTED — ${gate.detail}`);
+      fail(
+        "T10",
+        "a hard-crash boot reports verdict 'unknown', not 'match'",
+        `ABORTED — ${gate.detail}`,
+      );
     } else {
       const k = killRunnerProcessOnly();
       if (!k.ok) {
@@ -1492,13 +1772,25 @@ async function runHonestyAssertions(ctx) {
         const start = powershell(["-File", opts.devStart, "-Runner"]);
         const healthy = await waitForHealthy();
         if (!healthy.ok) {
-          fail("T10", "a hard-crash boot reports verdict 'unknown', not 'match'", `${k.detail}\n${healthy.detail}\n-Runner exit ${start.code}: ${start.stderr || "(no stderr)"}`);
+          fail(
+            "T10",
+            "a hard-crash boot reports verdict 'unknown', not 'match'",
+            `${k.detail}\n${healthy.detail}\n-Runner exit ${start.code}: ${start.stderr || "(no stderr)"}`,
+          );
         } else {
           const c = await fetchCensus();
           if (!c.ok) {
-            fail("T10", "a hard-crash boot reports verdict 'unknown', not 'match'", `census unreadable after the crash boot: ${c.error}`);
+            fail(
+              "T10",
+              "a hard-crash boot reports verdict 'unknown', not 'match'",
+              `census unreadable after the crash boot: ${c.error}`,
+            );
           } else if (c.census?.verdict === "unknown" && c.census?.reason) {
-            pass("T10", "a hard-crash boot reports verdict 'unknown', not 'match'", `${k.detail}; verdict='unknown' reason='${c.census.reason}' cleanShutdown=${c.census.cleanShutdown}`);
+            pass(
+              "T10",
+              "a hard-crash boot reports verdict 'unknown', not 'match'",
+              `${k.detail}; verdict='unknown' reason='${c.census.reason}' cleanShutdown=${c.census.cleanShutdown}`,
+            );
           } else {
             fail(
               "T10",
@@ -1517,13 +1809,21 @@ async function runHonestyAssertions(ctx) {
   if (!info.ok) {
     const why = `GET /control/sessions/info: ${info.error}`;
     skip("T11", "an ff-landed PR is reported LANDED with landSignal 'ff-land'", why);
-    skip("T11b", "an unevaluable land signal reports 'land-unknown' WITH a reason, never a confident not-landed", why);
+    skip(
+      "T11b",
+      "an unevaluable land signal reports 'land-unknown' WITH a reason, never a confident not-landed",
+      why,
+    );
     return;
   }
   if (info.status !== "ok") {
     const why = `/control/sessions/info reported status='${info.status}' reason='${info.reason}'`;
     skip("T11", "an ff-landed PR is reported LANDED with landSignal 'ff-land'", why);
-    skip("T11b", "an unevaluable land signal reports 'land-unknown' WITH a reason, never a confident not-landed", why);
+    skip(
+      "T11b",
+      "an unevaluable land signal reports 'land-unknown' WITH a reason, never a confident not-landed",
+      why,
+    );
     return;
   }
 
@@ -1598,7 +1898,10 @@ async function runHonestyAssertions(ctx) {
         return { ok: false, detail: `${key}: in the unknown bucket but carries NO reason` };
       }
       if (landedKeys.has(key)) {
-        return { ok: false, detail: `${key}: appears in BOTH prs.landed and prs.unknown — the verdict cannot be both proved and unevaluable` };
+        return {
+          ok: false,
+          detail: `${key}: appears in BOTH prs.landed and prs.unknown — the verdict cannot be both proved and unevaluable`,
+        };
       }
       return { ok: true, detail: "" };
     });
@@ -1696,7 +1999,9 @@ async function main() {
       `${opts.allowRestart ? "RESTARTS ALLOWED" : "restarts OFF"}, ` +
       `${opts.readOnly ? "read-only (no clicks)" : "clicks allowed"}`,
   );
-  console.log(`  timeouts      request ${REQUEST_TIMEOUT_MS}ms, health poll ${HEALTH_POLL_BUDGET_MS}ms`);
+  console.log(
+    `  timeouts      request ${REQUEST_TIMEOUT_MS}ms, health poll ${HEALTH_POLL_BUDGET_MS}ms`,
+  );
 
   const health = await http("/health", { timeoutMs: HEALTH_PROBE_TIMEOUT_MS });
   if (!health.ok) {
@@ -1706,7 +2011,9 @@ async function main() {
   }
   const buildId = health.json?.buildId ?? health.json?.data?.buildId ?? "unknown";
   const behind = health.json?.data?.buildDrift?.commitsBehind;
-  console.log(`  runner build  ${buildId}${behind === undefined ? "" : ` (${behind} commits behind origin/main)`}`);
+  console.log(
+    `  runner build  ${buildId}${behind === undefined ? "" : ` (${behind} commits behind origin/main)`}`,
+  );
   console.log(`  /health       ${health.status} in ${health.ms}ms`);
 
   const ctx = { opts, gates: { empty: false, notSelfHosted: false }, oracle: null };
