@@ -1332,11 +1332,7 @@ fn absolutize(raw: &str, base: &Path) -> PathBuf {
 /// one (the checked-in `src-tauri/.cargo/config.toml` configures sccache and
 /// rustflags only), and the fleet's actual slot routing arrives as an
 /// environment variable from `cargo-guard.sh`, which is tier 1 and unaffected.
-fn cargo_config_target_dir(
-    from: &Path,
-    worktree_root: &Path,
-    env_base: &Path,
-) -> Option<PathBuf> {
+fn cargo_config_target_dir(from: &Path, worktree_root: &Path, env_base: &Path) -> Option<PathBuf> {
     for dir in from.ancestors() {
         let at_root = dir == worktree_root;
         let cargo_dir = dir.join(".cargo");
