@@ -108,6 +108,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
 /// * `?refresh=1` — kick a fresh walk in the BACKGROUND; the response still
 ///   comes from the cached snapshot with `census_refreshing: true`.
 /// * `?waitSecs=N` — bounded override of the snapshot wait (capped at 10).
+///   Parsed LENIENTLY: a malformed value falls back to the default rather than
+///   rejecting the request. Typed as a number, axum's `Query` extractor answers
+///   a bodiless 400 before this handler runs, which would contradict the "no
+///   error arm" claim below — a typo in a query knob is not a reason to withhold
+///   the disk report.
 async fn disk_reclaimable_handler(
     State(_state): State<Arc<ApiState>>,
     Query(query): Query<DiskSurveyQuery>,

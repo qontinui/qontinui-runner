@@ -43,13 +43,21 @@
 //! |---|---|---|---|
 //! | no walk has completed yet | `pending` | `[]` | `null` |
 //! | the survey could not run (no workspace root) | `unavailable` | `[]` | `null`, with the REASON in `census_note` |
-//! | a walk completed and found nothing | `fresh` | `[]` | `0` |
+//! | a walk completed, saw the whole tree, and found nothing | `fresh` | `[]` | `0` |
+//! | a walk completed but could NOT see the whole tree, and found nothing | `fresh` | `[]` | `null`, with the gaps in `census_note` + `scan` |
 //! | a walk completed | `fresh` / `stale` | items | measured |
 //!
 //! A read that FAILED and a population that is genuinely EMPTY never render the
 //! same, byte totals are `null` rather than `0` whenever they are unknown, and a
 //! truncated walk or an unreadable subtree is reported
 //! ([`ScanStats`]) instead of silently under-counting.
+//!
+//! Row four is the one that was wrong until the Phase 2 review: the empty branch
+//! consulted neither `read_errors` nor `truncated`, and `sum_bytes` over an
+//! empty iterator returns `Some(0)`. A failed `read_dir(root)` — detached drive,
+//! permissions change, a bad `paths.workspace_root` — therefore produced a
+//! `fresh` census whose every total was a hard zero, under a note asserting the
+//! zero had been *measured*. See [`ScanStats::incomplete`].
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,7 +70,7 @@ use tracing::{info, warn};
 use super::census;
 use super::on_demand::{humanize_secs, volume_headroom, CensusStatus};
 use super::orphan_target_reaper::{
-    self as reaper, Candidate, ClassifyOptions, SkipReason, TargetClass,
+    self as reaper, Candidate, ClassifyOptions, DirtyProbe, SkipReason, TargetClass,
 };
 
 /// Env override for the survey interval (seconds). Default 3600 s, floored
@@ -211,11 +219,42 @@ pub struct ScanStats {
     pub dirs_visited: usize,
     /// The visit ceiling was hit — `items` is a PREFIX of the population.
     pub truncated: bool,
-    /// Directories whose read failed. A failed read is never folded into
-    /// "nothing there".
+    /// Directories whose read failed (a `read_dir` open, or the `.git` probe
+    /// that decides ownership). A failed read is never folded into "nothing
+    /// there".
     pub read_errors: Vec<ScanError>,
+    /// Directory ENTRIES that errored after their directory opened. Counted
+    /// separately from `read_errors`, which records only open failures — a dir
+    /// that opens and then errors mid-iteration under-reports otherwise.
+    pub entry_errors: usize,
+    /// Directories not descended into because the walk's depth bound was
+    /// reached. Surfaced because a target root below the bound is simply ABSENT
+    /// from `items` — the bound is a designed limit, but an invisible one is
+    /// indistinguishable from "there was nothing there".
+    ///
+    /// Deliberately NOT folded into `bytes_incomplete`: the bound is reached on
+    /// any deep tree, so folding it in would leave that flag permanently true
+    /// and destroy its ability to signal a real failure.
+    pub depth_limited_dirs: usize,
+    /// Reparse points (junctions/symlinks) the walk refused to follow. A
+    /// junctioned target root appears neither as an item nor as an error, by
+    /// design — following it would double-count the tree behind it — so it is
+    /// counted here rather than vanishing.
+    pub reparse_dirs_skipped: usize,
     pub roots_with_unknown_bytes: usize,
     pub roots_with_partial_bytes: usize,
+}
+
+impl ScanStats {
+    /// True when the walk did not see the whole tree it was asked about. Used
+    /// to decide whether an EMPTY item list is a measured zero or an unknown
+    /// population — the two must never render the same.
+    ///
+    /// The depth bound is excluded on purpose (see `depth_limited_dirs`); these
+    /// are the failures, not the designed limits.
+    fn incomplete(&self) -> bool {
+        self.truncated || !self.read_errors.is_empty() || self.entry_errors > 0
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -258,8 +297,16 @@ pub struct DiskSurveyQuery {
     #[serde(default)]
     pub refresh: Option<String>,
     /// Bounded override of the snapshot wait, capped at [`MAX_WAIT_SECS`].
+    ///
+    /// **Deliberately a `String`, not a `u64`.** Typed as `Option<u64>`, axum's
+    /// `Query` extractor REJECTS a malformed `?waitSecs=` (`abc`, `-1`, `1.5`)
+    /// with a bodiless 400 before the handler ever runs — which contradicts this
+    /// surface's whole claim that it always renders an answer, and hands the
+    /// caller a response with no `census_note` to read. A typo in a query knob
+    /// is not a reason to withhold the disk report. Parsed and clamped in
+    /// [`DiskSurveyQuery::wait`] instead.
     #[serde(default)]
-    pub wait_secs: Option<u64>,
+    pub wait_secs: Option<String>,
 }
 
 impl DiskSurveyQuery {
@@ -270,12 +317,17 @@ impl DiskSurveyQuery {
         )
     }
 
+    /// The bounded wait: parsed leniently, clamped to [`MAX_WAIT_SECS`], and
+    /// falling back to [`DEFAULT_WAIT_SECS`] on anything unparseable.
     pub fn wait(&self) -> Duration {
-        Duration::from_secs(
-            self.wait_secs
-                .unwrap_or(DEFAULT_WAIT_SECS)
-                .min(MAX_WAIT_SECS),
-        )
+        let secs = self
+            .wait_secs
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_WAIT_SECS);
+        Duration::from_secs(secs.min(MAX_WAIT_SECS))
     }
 }
 
@@ -366,7 +418,16 @@ fn render_item(
         bytes_partial: measured.is_some_and(|m| m.unreadable_dirs > 0),
         last_used_at,
         repo_root: c.repo_root.as_deref().map(path_string),
-        verb: c.class.has_verb().then_some(VERB_ORPHAN_REAPER),
+        // Derived from the VERDICT, not from the class alone. Class-derived, a
+        // `<wt>/target` blocked with `reason: "owned-by-worktree-reclaim"` still
+        // advertised `verb: "orphan-target-reaper"` — this engine claiming
+        // another engine's territory in the very field that names the owner.
+        // A refusal on THIS engine's own guards (dirty, kept, grace, building)
+        // keeps the verb: the verb says who would act, and that is still us.
+        verb: match verdict {
+            Err(reason) if reason.owned_elsewhere() => None,
+            _ => c.class.has_verb().then_some(VERB_ORPHAN_REAPER),
+        },
     }
 }
 
@@ -403,6 +464,9 @@ pub(super) fn build_snapshot(root: &Path, opts: &ClassifyOptions) -> DiskSurveyS
                 error: e.clone(),
             })
             .collect(),
+        entry_errors: enumeration.entry_errors,
+        depth_limited_dirs: enumeration.depth_limited_dirs,
+        reparse_dirs_skipped: enumeration.reparse_dirs_skipped,
         roots_with_unknown_bytes: items.iter().filter(|i| i.bytes.is_none()).count(),
         roots_with_partial_bytes: items.iter().filter(|i| i.bytes_partial).count(),
     };
@@ -554,6 +618,22 @@ pub(super) fn assemble(
         SurveyStatus::Stale
     };
 
+    // An empty item list from an INCOMPLETE walk is an UNKNOWN population, not
+    // a measured zero.
+    //
+    // The defect this closes: `sum_bytes` over an empty iterator returns
+    // `Some(0)`, so a walk whose `read_dir(root)` FAILED — a detached drive, a
+    // permissions change, a bad `paths.workspace_root` — produced
+    // `census_status: "fresh"`, every total a hard `0`, every `by_class` row
+    // `roots: 0`, and a note flatly asserting the zero had been MEASURED. The
+    // worst possible answer ("nothing to reclaim") rendered from a failed read.
+    let population_unknown = snapshot.items.is_empty() && snapshot.scan.incomplete();
+    // Nullify every total when the population itself is unknown. Applied to the
+    // OUTPUT of `sum_bytes` rather than inside it, because `sum_bytes`'s own
+    // contract — "no items at all ⇒ a known zero" — is correct and is what the
+    // genuinely-empty case relies on.
+    let known = |total: Option<u64>| if population_unknown { None } else { total };
+
     let by_class: Vec<ClassSummary> = TargetClass::all()
         .into_iter()
         .map(|class| {
@@ -563,9 +643,9 @@ pub(super) fn assemble(
             ClassSummary {
                 class: token,
                 roots: in_class().count(),
-                bytes: sum_bytes(in_class()),
+                bytes: known(sum_bytes(in_class())),
                 reclaimable_roots: reclaimable().count(),
-                reclaimable_bytes: sum_bytes(reclaimable()),
+                reclaimable_bytes: known(sum_bytes(reclaimable())),
                 roots_with_unknown_bytes: in_class().filter(|i| i.bytes.is_none()).count(),
                 verb: class.has_verb().then_some(VERB_ORPHAN_REAPER),
                 note: class_note(class),
@@ -590,13 +670,14 @@ pub(super) fn assemble(
             .iter()
             .filter(|i| i.status == "blocked")
             .count(),
-        total_bytes: sum_bytes(snapshot.items.iter()),
-        reclaimable_bytes: sum_bytes(snapshot.items.iter().filter(|i| i.status == "reclaimable")),
+        total_bytes: known(sum_bytes(snapshot.items.iter())),
+        reclaimable_bytes: known(sum_bytes(
+            snapshot.items.iter().filter(|i| i.status == "reclaimable"),
+        )),
         report_only_bytes,
-        bytes_incomplete: snapshot.scan.truncated
+        bytes_incomplete: snapshot.scan.incomplete()
             || snapshot.scan.roots_with_unknown_bytes > 0
-            || snapshot.scan.roots_with_partial_bytes > 0
-            || !snapshot.scan.read_errors.is_empty(),
+            || snapshot.scan.roots_with_partial_bytes > 0,
         by_class,
         volumes: Vec::new(),
         volumes_status: CensusStatus::default(),
@@ -608,16 +689,65 @@ pub(super) fn assemble(
     };
     volumes_block(&mut summary);
 
-    let note = if snapshot.items.is_empty() {
+    // What the walk failed to see, in the operator's words. Empty when it saw
+    // everything it set out to.
+    let gaps = {
+        let mut parts: Vec<String> = Vec::new();
+        if snapshot.scan.truncated {
+            parts.push("it hit its visit ceiling".to_string());
+        }
+        if !snapshot.scan.read_errors.is_empty() {
+            parts.push(format!(
+                "{} director{} could not be read (see `scan.read_errors`)",
+                snapshot.scan.read_errors.len(),
+                if snapshot.scan.read_errors.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            ));
+        }
+        if snapshot.scan.entry_errors > 0 {
+            parts.push(format!(
+                "{} director{} entr{} errored mid-listing",
+                snapshot.scan.entry_errors,
+                if snapshot.scan.entry_errors == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                if snapshot.scan.entry_errors == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            ));
+        }
+        parts.join("; ")
+    };
+
+    let note = if population_unknown {
+        // The R1 branch. An empty list here is the SHAPE of a failed read, and
+        // saying "measured zero" over it is the single most misleading sentence
+        // this surface could print.
         format!(
-            "The walk under {} completed {} ago and found NO cargo target roots. This is a \
-             measured zero, not a missing reading.",
+            "The walk under {} completed {} ago and found no cargo target roots, but it did NOT \
+             see the whole tree: {}. The population is therefore UNKNOWN, not zero — the byte \
+             totals are null rather than 0, and nothing here says there is nothing to reclaim.",
+            snapshot.root,
+            humanize_secs(age_secs),
+            gaps,
+        )
+    } else if snapshot.items.is_empty() {
+        format!(
+            "The walk under {} completed {} ago, read every directory it set out to, and found \
+             NO cargo target roots. This is a measured zero, not a missing reading.",
             snapshot.root,
             humanize_secs(age_secs),
         )
     } else {
         format!(
-            "Disk state as of {} ago, from a {} ms walk of {} under {}.{}{} Removal always \
+            "Disk state as of {} ago, from a {} ms walk of {} under {}.{}{}{} Removal always \
              re-checks live disk before touching anything.",
             humanize_secs(age_secs),
             snapshot.build_ms,
@@ -627,12 +757,26 @@ pub(super) fn assemble(
             } else {
                 format!(" {} directories", snapshot.scan.dirs_visited)
             },
-            if snapshot.scan.truncated {
-                " The walk hit its visit ceiling, so this list is INCOMPLETE."
+            if gaps.is_empty() {
+                String::new()
             } else {
-                ""
+                format!(" This list is INCOMPLETE: {gaps}.")
             },
-            if summary.bytes_incomplete && !snapshot.scan.truncated {
+            if snapshot.scan.depth_limited_dirs > 0 {
+                format!(
+                    " {} director{} were not descended into at the walk's depth bound, so a \
+                     target root below it is absent rather than measured.",
+                    snapshot.scan.depth_limited_dirs,
+                    if snapshot.scan.depth_limited_dirs == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                )
+            } else {
+                String::new()
+            },
+            if summary.bytes_incomplete && gaps.is_empty() {
                 " Some sizes could not be read, so the byte totals are lower bounds."
             } else {
                 ""
@@ -789,7 +933,30 @@ pub async fn survey(query: DiskSurveyQuery) -> DiskSurvey {
 /// [`SURVEY_INTERVAL_SECS_ENV`] (default 3600 s, floored 300 s). The first tick
 /// fires immediately, so the preview stops being `pending` as soon as the first
 /// walk finishes rather than one interval later.
+///
+/// ## Instance-gated, exactly like [`super::census::spawn_census`]
+///
+/// The walk is MACHINE-wide: it sizes every cargo target root on the box, so
+/// every runner process on it produces the same answer from the same disk.
+/// Unguarded, the primary, every secondary and every supervisor-spawned temp
+/// runner each started a full-machine sizing walk at boot and hourly — several
+/// multi-minute I/O storms over identical data, on a box whose disk pressure is
+/// the reason this feature exists.
+///
+/// This is the **cost** half of the census's guard and nothing more: this module
+/// publishes nothing to coord and holds no machine identity, so there is no
+/// identity half to enforce at a chokepoint. The on-demand path is deliberately
+/// left open — `GET /disk/reclaimable` on a secondary still self-heals via
+/// [`spawn_rebuild`], the same asymmetry `census::spawn_census_rebuild` has.
 pub fn spawn_disk_surveyor() {
+    if !crate::instance::owns_shared_root_state() {
+        info!(
+            "disk_survey: not the shared-root-owning instance — skipping the PERIODIC reclaim \
+             survey (the walk is machine-wide and the owning instance covers this disk). \
+             `GET /disk/reclaimable` still answers here and can still refresh on demand."
+        );
+        return;
+    }
     let interval = survey_interval();
     info!(
         "disk_survey: starting periodic reclaim survey, interval={}s",
@@ -833,21 +1000,41 @@ mod tests {
         fs::write(dir.join(".git"), b"gitdir: /repo/.git/worktrees/wt\n").unwrap();
     }
 
+    /// Push every mtime under `dir` back by `age`, so the root reads as IDLE to
+    /// the classifier's deepest-artifact probe.
+    ///
+    /// Load-bearing for the INV-D1 test below: the fixtures write their
+    /// artifacts *now*, so without aging EVERY root is inside any realistic
+    /// grace window and the "this one has a build in flight" arm passes on the
+    /// grace window alone — i.e. with its live-build stand-in deleted. Directory
+    /// mtimes matter as much as file ones, because `newest_artifact_age` reads
+    /// the mtime of each ENTRY of its probe dirs, and those entries include
+    /// subdirectories; `filetime` handles dirs on Windows too, which
+    /// `File::set_times` does not without backup semantics.
+    fn age_target_root(dir: &Path, age: Duration) {
+        let when = filetime::FileTime::from_system_time(std::time::SystemTime::now() - age);
+        fn walk(p: &Path, when: filetime::FileTime) {
+            if let Ok(entries) = fs::read_dir(p) {
+                for entry in entries.flatten() {
+                    let child = entry.path();
+                    if child.is_dir() {
+                        walk(&child, when);
+                    }
+                    filetime::set_file_mtime(&child, when).unwrap();
+                }
+            }
+            filetime::set_file_mtime(p, when).unwrap();
+        }
+        walk(dir, when);
+    }
+
     /// Options with the git probe stubbed to "clean", zero grace, no pins.
     fn clean_opts() -> ClassifyOptions {
-        ClassifyOptions {
-            grace: Duration::ZERO,
-            keep_names: Vec::new(),
-            worktree_is_dirty: |_| false,
-        }
+        ClassifyOptions::with_probe(Duration::ZERO, |_| DirtyProbe::Clean)
     }
 
     fn dirty_opts() -> ClassifyOptions {
-        ClassifyOptions {
-            grace: Duration::ZERO,
-            keep_names: Vec::new(),
-            worktree_is_dirty: |_| true,
-        }
+        ClassifyOptions::with_probe(Duration::ZERO, |_| DirtyProbe::Dirty)
     }
 
     fn find<'a>(s: &'a DiskSurveySnapshot, needle: &str) -> &'a DiskReclaimItem {
@@ -890,6 +1077,12 @@ mod tests {
     /// see, so the live-build discriminator on this platform is the artifact
     /// mtime inside the grace window. A just-written artifact under a real
     /// grace is exactly what a build in flight looks like here.
+    ///
+    /// This is only a discriminator because the caller AGES both roots first.
+    /// It previously was not: `mk_target_root` had just written
+    /// `debug/deps/libfoo.rlib` at the same instant, so both roots were inside
+    /// the grace window regardless and every POSIX assertion passed with this
+    /// function's body deleted.
     #[cfg(not(windows))]
     fn hold_a_build(target_root: &Path) -> (impl std::any::Any, &'static str) {
         fs::write(target_root.join("debug/deps/live.rlib"), b"in-flight").unwrap();
@@ -909,6 +1102,14 @@ mod tests {
         let idle = root.join("target-wt-idle");
         mk_target_root(&building);
         mk_target_root(&idle);
+        // Age BOTH roots past any grace FIRST. Without this the fixtures' own
+        // just-written artifacts put every root inside the window, and the
+        // POSIX arm below proves only that the grace window exists — it passes
+        // with `hold_a_build`'s body deleted. Aged, the ONLY thing that can put
+        // `building` back inside the window is the live-build stand-in itself.
+        for root_dir in [&building, &idle] {
+            age_target_root(root_dir, Duration::from_secs(7 * 86_400));
+        }
 
         // The live-build stand-in must be held for the WHOLE walk.
         let (_held, expected_reason) = hold_a_build(&building);
@@ -916,11 +1117,7 @@ mod tests {
         // A grace long enough that a freshly-written artifact is inside it —
         // the POSIX live-build discriminator. On Windows the held lock fires
         // first regardless.
-        let opts = ClassifyOptions {
-            grace: Duration::from_secs(86_400),
-            keep_names: Vec::new(),
-            worktree_is_dirty: |_| false,
-        };
+        let opts = ClassifyOptions::with_probe(Duration::from_secs(86_400), |_| DirtyProbe::Clean);
         let snapshot = build_snapshot(root, &opts);
 
         // 1. It ANSWERED, with the full population — not an empty list, not an
@@ -943,19 +1140,45 @@ mod tests {
             live.bytes.unwrap_or(0) > 0,
             "a blocked root is sized like any other"
         );
-        // 4. And the OTHER root is unaffected: one build in flight must not
-        //    suppress the rest of the report.
+        // 4. And the OTHER root — same walk, same 24h grace, aged past it — is
+        //    RECLAIMABLE. This is the discrimination: one build in flight blocks
+        //    exactly one item and leaves the rest of the report intact. It is
+        //    also what makes the arm above non-vacuous on EVERY platform: with
+        //    `hold_a_build` neutered, `building` is aged like its sibling and
+        //    assertion 2 fails.
         let other = find(&snapshot, "target-wt-idle");
         assert_eq!(
-            other.status, "blocked",
-            "inside the 24h grace this one is grace-pending, not reclaimable"
+            other.status, "reclaimable",
+            "an idle, aged root stays reclaimable while its neighbour builds"
+        );
+        assert_eq!(other.reason, None);
+        // Pin the aging itself, on both platforms. If `age_target_root` silently
+        // stopped working, the idle root would be freshly-written like the
+        // fixture made it, the two roots would agree again for a reason that has
+        // nothing to do with the build, and this test would quietly go back to
+        // proving only that a grace window exists.
+        let last_used = |i: &DiskReclaimItem| {
+            chrono::DateTime::parse_from_rfc3339(
+                i.last_used_at
+                    .as_deref()
+                    .expect("a sized root has an mtime"),
+            )
+            .expect("last_used_at is RFC3339")
+            .with_timezone(&chrono::Utc)
+        };
+        let now = chrono::Utc::now();
+        assert!(
+            (now - last_used(other)).num_hours() >= 24,
+            "the idle root must really be idle, not merely outside the window by luck"
+        );
+        assert!(
+            (now - last_used(live)).num_hours() < 1,
+            "and the build-in-flight root must really be fresh"
         );
 
-        // Now the same walk at zero grace: the idle root becomes reclaimable
-        // while the build-in-flight root STAYS blocked on Windows (held lock)
-        // and becomes reclaimable on POSIX (where mtime is the only signal).
-        // Asserting the idle root flips proves the grace arm is live and this
-        // test is not vacuous.
+        // Now the same walk at zero grace: the build-in-flight root STAYS
+        // blocked on Windows (the held lock is checked before any mtime) and
+        // becomes reclaimable on POSIX, where mtime is the only signal.
         let zero = build_snapshot(root, &clean_opts());
         assert_eq!(find(&zero, "target-wt-idle").status, "reclaimable");
         #[cfg(windows)]
@@ -978,11 +1201,7 @@ mod tests {
             mk_target_root(&root.join(name));
         }
         // A 24h grace blocks all three as freshly-built.
-        let opts = ClassifyOptions {
-            grace: Duration::from_secs(86_400),
-            keep_names: Vec::new(),
-            worktree_is_dirty: |_| false,
-        };
+        let opts = ClassifyOptions::with_probe(Duration::from_secs(86_400), |_| DirtyProbe::Clean);
         let snapshot = build_snapshot(root, &opts);
         let survey = assemble(Some(&snapshot), None, None, false, chrono::Utc::now());
 
@@ -1088,6 +1307,12 @@ mod tests {
     /// The other half of the boundary: paths another engine owns are reported
     /// (with bytes) but never given this reaper's verb, so the two engines can
     /// never race on one path.
+    ///
+    /// The build-pool fixture deliberately sits OUTSIDE the worktree. The pool
+    /// lives inside a canonical checkout on the real machine, which made the old
+    /// fixture — `target-pool` nested in a linked worktree — assert protection
+    /// this reaper was granting for the wrong reason, and one that a failed
+    /// `.git` read could take away. Its location must not be what protects it.
     #[test]
     fn paths_owned_by_other_engines_are_reported_but_never_candidates() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1097,10 +1322,12 @@ mod tests {
         // worktree-reclaim owns `<wt>/target` and `<wt>/src-tauri/target`.
         mk_target_root(&wt.join("target"));
         mk_target_root(&wt.join("src-tauri/target"));
-        // the build system owns `target-agent` and `target-pool/<slot>`.
-        mk_target_root(&wt.join("target-agent"));
-        mk_target_root(&wt.join("target-pool/slot-0"));
-        mk_target_root(&wt.join("target-pool/lkg"));
+        // the build system owns `target-agent` and `target-pool/<slot>` —
+        // wherever they sit. `target-pool` here is a bare sibling of the
+        // worktree, with no enclosing checkout to strip a prefix against.
+        mk_target_root(&root.join("target-agent"));
+        mk_target_root(&root.join("target-pool/slot-0"));
+        mk_target_root(&root.join("target-pool/lkg"));
 
         let snapshot = build_snapshot(root, &clean_opts());
         assert_eq!(snapshot.items.len(), 5, "all five are ENUMERATED");
@@ -1116,7 +1343,41 @@ mod tests {
             assert_eq!(item.reason, Some(reason), "{needle}");
             // Still measured — the point of the preview is that you SEE it.
             assert!(item.bytes.unwrap_or(0) > 0, "{needle} must still be sized");
+            // And it must NOT carry this reaper's verb. `verb` names who would
+            // act; advertising `orphan-target-reaper` next to
+            // `reason: "owned-by-worktree-reclaim"` is this engine claiming
+            // another engine's territory in the field that names the owner.
+            assert_eq!(
+                item.verb, None,
+                "{needle} is owned elsewhere — it must advertise no verb of ours"
+            );
         }
+        // Non-vacuous: a root this engine DOES own still carries the verb.
+        mk_target_root(&wt.join("target-renamed"));
+        let with_ours = build_snapshot(root, &clean_opts());
+        let ours = find(&with_ours, "target-renamed");
+        assert_eq!(ours.status, "reclaimable");
+        assert_eq!(ours.verb, Some(VERB_ORPHAN_REAPER));
+    }
+
+    /// A refusal on THIS engine's own guards keeps the verb — the field says who
+    /// WOULD act, and a dirty worktree or an unelapsed grace is a "not yet",
+    /// not a change of owner.
+    #[test]
+    fn a_root_blocked_by_our_own_guards_keeps_its_verb() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wt = root.join("repo-wt-dirty-verb");
+        mk_linked_worktree(&wt);
+        mk_target_root(&wt.join("target-slug"));
+        let dirty = build_snapshot(root, &dirty_opts());
+        let item = find(&dirty, "target-slug");
+        assert_eq!(item.reason, Some("worktree-dirty"));
+        assert_eq!(
+            item.verb,
+            Some(VERB_ORPHAN_REAPER),
+            "we are still the engine that would reap it once the tree is clean"
+        );
     }
 
     #[test]
@@ -1189,6 +1450,81 @@ mod tests {
         // Both have an empty item list — which is exactly why the list alone
         // must never be the thing a caller reads.
         assert!(unavailable.items.is_empty() && empty.items.is_empty());
+    }
+
+    /// **R1 — the empty result of a FAILED walk is not "a measured zero".**
+    ///
+    /// `read_dir(root)` fails (detached drive, a permissions change, a bad
+    /// `paths.workspace_root`): the walk records one read error and returns zero
+    /// candidates. The empty branch consulted neither `read_errors` nor
+    /// `truncated`, and `sum_bytes` over an empty iterator returns `Some(0)` —
+    /// so `census_status` came back `fresh`, every byte total a hard `0`, every
+    /// `by_class` row `roots: 0`, under a note asserting the zero was MEASURED.
+    /// The web then printed "Nothing to reclaim … a measured answer, not a
+    /// missing one." A failed read rendered as the worst possible answer.
+    #[test]
+    fn a_failed_root_read_is_unknown_not_a_measured_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Never created — `read_dir` on it fails exactly like a detached drive.
+        let missing = tmp.path().join("detached-volume");
+        let snapshot = build_snapshot(&missing, &clean_opts());
+        assert!(snapshot.items.is_empty(), "the walk found nothing…");
+        assert_eq!(snapshot.scan.read_errors.len(), 1, "…because it FAILED");
+
+        let s = assemble(Some(&snapshot), None, None, false, chrono::Utc::now());
+
+        // Every total is UNKNOWN, not zero.
+        assert_eq!(s.summary.total_bytes, None);
+        assert_eq!(s.summary.reclaimable_bytes, None);
+        assert_eq!(s.summary.report_only_bytes, None);
+        for c in &s.summary.by_class {
+            assert_eq!(c.bytes, None, "{} must not report a zero", c.class);
+            assert_eq!(c.reclaimable_bytes, None, "{}", c.class);
+        }
+        // `bytes_incomplete` was already the one surviving signal — keep it, and
+        // make the prose agree with it instead of contradicting it.
+        assert!(s.summary.bytes_incomplete);
+        assert!(
+            !s.census_note.contains("measured zero"),
+            "note asserted a measured zero over a failed read: {}",
+            s.census_note
+        );
+        assert!(s.census_note.contains("UNKNOWN"), "{}", s.census_note);
+        assert!(
+            s.census_note.contains("could not be read"),
+            "the note must name the gap: {}",
+            s.census_note
+        );
+
+        // Non-vacuous: a walk that SUCCEEDED over an empty tree still reports a
+        // measured zero, and the two notes differ.
+        let empty_tree = tempfile::tempdir().unwrap();
+        let ok = build_snapshot(empty_tree.path(), &clean_opts());
+        let ok = assemble(Some(&ok), None, None, false, chrono::Utc::now());
+        assert_eq!(ok.summary.total_bytes, Some(0));
+        assert!(ok.census_note.contains("measured zero"));
+        assert_ne!(ok.census_note, s.census_note);
+    }
+
+    /// The same distinction one layer down: a walk that found roots but could
+    /// not read part of the tree keeps its measured (lower-bound) totals — only
+    /// an EMPTY result from an incomplete walk becomes unknown.
+    #[test]
+    fn a_partial_walk_that_found_roots_keeps_its_lower_bound_totals() {
+        let tmp = tempfile::tempdir().unwrap();
+        mk_target_root(&tmp.path().join("target-found"));
+        let mut snapshot = build_snapshot(tmp.path(), &clean_opts());
+        snapshot.scan.read_errors.push(ScanError {
+            path: "/somewhere/unreadable".to_string(),
+            error: "permission denied".to_string(),
+        });
+        let s = assemble(Some(&snapshot), None, None, false, chrono::Utc::now());
+        assert!(
+            s.summary.total_bytes.unwrap_or(0) > 0,
+            "what WAS measured is still reported"
+        );
+        assert!(s.summary.bytes_incomplete, "…as a lower bound");
+        assert!(s.census_note.contains("INCOMPLETE"), "{}", s.census_note);
     }
 
     /// A pending survey must not suppress the free-space answer. That
@@ -1298,13 +1634,79 @@ mod tests {
     fn query_wait_is_capped_and_refresh_parses() {
         let q = DiskSurveyQuery {
             refresh: Some("1".into()),
-            wait_secs: Some(9_999),
+            wait_secs: Some("9999".into()),
         };
         assert!(q.refresh_requested());
         assert_eq!(q.wait(), Duration::from_secs(MAX_WAIT_SECS));
         let d = DiskSurveyQuery::default();
         assert!(!d.refresh_requested());
         assert_eq!(d.wait(), Duration::from_secs(DEFAULT_WAIT_SECS));
+        assert_eq!(
+            DiskSurveyQuery {
+                refresh: None,
+                wait_secs: Some("3".into())
+            }
+            .wait(),
+            Duration::from_secs(3)
+        );
+    }
+
+    /// A malformed `?waitSecs=` must be ACCEPTED and clamped, never rejected.
+    /// Typed `Option<u64>`, axum's `Query` extractor 400s with an empty body
+    /// before the handler runs — so a typo in a query knob withheld the disk
+    /// report entirely, and the response carried no `census_note` explaining
+    /// itself. That directly contradicts this route's "there is no error arm".
+    #[test]
+    fn a_malformed_wait_secs_is_accepted_and_clamped() {
+        for junk in ["abc", "-1", "1.5", "", "   ", "99999999999999999999999"] {
+            let q = DiskSurveyQuery {
+                refresh: None,
+                wait_secs: Some(junk.to_string()),
+            };
+            assert_eq!(
+                q.wait(),
+                Duration::from_secs(DEFAULT_WAIT_SECS),
+                "?waitSecs={junk} must fall back to the default, not reject the request"
+            );
+        }
+        // And the real extractor accepts it — the half that used to 400 lives
+        // in axum's `Query`, not in `wait()`, so assert against `Query` itself.
+        let uri: axum::http::Uri = "/disk/reclaimable?waitSecs=abc&refresh=1".parse().unwrap();
+        let axum::extract::Query(parsed) =
+            axum::extract::Query::<DiskSurveyQuery>::try_from_uri(&uri).expect(
+                "a malformed waitSecs must still EXTRACT — this rejection is the bodiless 400 \
+                 the String type exists to prevent",
+            );
+        assert!(parsed.refresh_requested());
+        assert_eq!(parsed.wait(), Duration::from_secs(DEFAULT_WAIT_SECS));
+    }
+
+    /// **R6** — the periodic walk is machine-wide, so it must not run once per
+    /// runner process on the box. Source-level for the same reason
+    /// `census::the_census_post_chokepoint_carries_the_guard` is: the predicate
+    /// reads process-global env that parallel test threads mutate.
+    #[test]
+    fn the_periodic_surveyor_is_instance_gated() {
+        const SRC: &str = include_str!("disk_survey.rs");
+        let prod = SRC
+            .split_once(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+        let spawn = prod
+            .split_once("pub fn spawn_disk_surveyor() {")
+            .map(|(_, after)| after)
+            .expect("spawn_disk_surveyor must exist; move this pin if it is renamed");
+        let body = spawn.split_once("\n}\n").map(|(b, _)| b).unwrap_or(spawn);
+        assert!(
+            body.contains("owns_shared_root_state()"),
+            "the hourly full-machine sizing walk is spawned with no instance guard, so every \
+             secondary and every supervisor-spawned temp runner starts its own copy of it — \
+             several multi-minute I/O storms over identical data, on a disk-pressured box."
+        );
     }
 
     #[test]
