@@ -1052,6 +1052,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // reaper, never on the heartbeat thread, which feeds coord's
                 // 120s liveness TTL and must never be starved.
                 agent_worktree::census::spawn_volume_publisher();
+                // Ξ_Disk monitoring Phase 2 — the RECLAIM PREVIEW's snapshot
+                // builder, serving `GET /disk/reclaimable`. Walks every cargo
+                // target root on the machine (all four classes: in-repo
+                // canonical, linked sibling worktrees, containers, bare
+                // out-of-tree), classifies each with the SAME classifier the
+                // reaper's destructive cycle uses, and sizes it — so the
+                // preview cannot drift from what the verb would do. Sizing
+                // terabytes is a multi-minute walk, so it publishes a snapshot
+                // the route serves rather than rebuilding per request; the
+                // first tick fires immediately. Read-only: it deletes NOTHING
+                // and consults no arming flag, no coord, and no global
+                // build-in-flight condition — a build in flight blocks one
+                // item, never the report (INV-D1). Default 3600s cadence
+                // (QONTINUI_DISK_SURVEY_INTERVAL_SECS, floored 300s).
+                agent_worktree::disk_survey::spawn_disk_surveyor();
                 // Ξ_FS backstop (Phase 5) — a defense-in-depth DETECTOR for
                 // edits that leaked OUTSIDE any session worktree. Periodically
                 // scans the SHARED canonical checkouts; alarms (POST

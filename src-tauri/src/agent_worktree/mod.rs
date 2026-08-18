@@ -60,6 +60,7 @@ use crate::worktree::run_git_command;
 pub mod canonical_paths;
 pub mod census;
 pub mod dirty;
+pub mod disk_survey;
 pub mod edit_effect_loop;
 pub mod fs_backstop;
 pub mod fs_observer;

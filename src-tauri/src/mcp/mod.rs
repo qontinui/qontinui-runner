@@ -58,6 +58,9 @@ pub mod decision_trail_api;
 pub mod development_intelligence;
 pub mod device_jwt_refresher;
 pub mod discovery;
+// `GET /disk/reclaimable` — the runner-local disk-reclaim preview (INV-D1:
+// answers with a build in flight, never gated on the deletion gates).
+pub mod disk_reclaim;
 pub mod dom_capture;
 pub mod entity_profiles_api;
 pub mod envelope;

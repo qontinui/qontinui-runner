@@ -6314,6 +6314,12 @@ pub fn create_router(
         // a differently-meaning `POST /worktrees/remove`). Kept in its own
         // namespace so the two destructive routes can never be confused.
         .merge(crate::mcp::agent_worktrees::routes())
+        // `GET /disk/reclaimable` — the read-only cargo-target reclaim preview.
+        // A DIFFERENT resource again: build directories anywhere on the
+        // machine, including inside canonical checkouts that are not worktrees
+        // and never reclaimable. Read-only, and deliberately not gated on any
+        // of the conditions that gate deletion (INV-D1).
+        .merge(crate::mcp::disk_reclaim::routes())
         .merge(crate::mcp::agent_tokens::routes())
         .merge(crate::install_effects_producer::routes())
         .merge(crate::mcp::token_analytics::routes())
