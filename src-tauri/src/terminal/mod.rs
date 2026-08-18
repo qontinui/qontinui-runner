@@ -345,6 +345,14 @@ summary via POST http://127.0.0.1:{api_port}/sessions/spawn.",
         briefing.push_str(&plan_capture_clause(api_port, &coord_url));
     }
 
+    // Provisioning-gated clause. `coord_mcp_deliverable()` is a pure in-process
+    // read (no I/O — this function runs on the spawn path) and fails to FALSE
+    // when no Tauri runtime is reachable, so a session that cannot be given the
+    // memory tools is never told to use them and keeps the local-file fallback.
+    if crate::coord_mcp::coord_mcp_deliverable() {
+        briefing.push_str(&memory_clause());
+    }
+
     briefing
 }
 
@@ -376,6 +384,49 @@ document: coord_get_prompt_document(kind=\"agent_playbook\", \
 name=\"plan-capture\"), or GET \
 {coord_url}/coord/agent-prompt-documents/agent_playbook/plan-capture."
     )
+}
+
+/// The coord-memory clause — PROTOCOL + LINKS ONLY.
+///
+/// Plan: `2026-08-05-runner-memory-injection-and-tenant-fail-closed` Phase 4.
+///
+/// ## Why this exists
+///
+/// Coord-backed session memory is provisioned into every runner-spawned session
+/// (the per-session `.mcp.json` / `QONTINUI_MCP_CONFIG` seam, with
+/// `coord_memory_record` + `coord_memory_search` allowlisted) but nothing ever
+/// told a session to USE it. Claude Code's built-in file-memory directive won
+/// uncontested, so sessions wrote local topic files that — since the memory
+/// cutover retired the runner's up-federation — now reach coord by nothing.
+///
+/// ## Why an appended system prompt is enough
+///
+/// Measured, not assumed (plan Phase 1, 2026-08-18): a two-arm A/B differing
+/// ONLY in the presence of this text. With it, the session recorded to coord
+/// (`memory_id 889da044-…`) and wrote **zero** local `.md` files; without it,
+/// the same prompt in the same shape wrote a topic file plus the `MEMORY.md`
+/// index line and never reached coord. The wording below is the arm that won,
+/// verbatim — reword it and the evidence no longer applies to what ships.
+///
+/// ## Contracts inherited from [`runner_context`]
+///
+/// - **Protocol + links only.** No policy prose; bodies live in coord.
+/// - **No tenant/agent identity.** Tenant rides the CREDENTIAL (the proxy injects
+///   the session's device JWT and coord binds `tenant_id` from the token claim,
+///   never from a request argument), so naming a tenant here would be both
+///   inert and an invitation for the model to try to set one. That omission is
+///   deliberate — do not "helpfully" add it.
+/// - **Leading blank line** so it appends as a new paragraph and can never
+///   disturb [`RUNNER_CONTEXT_SOURCE_MARKER`] on line 1.
+fn memory_clause() -> String {
+    "
+
+Session memory is coord-backed in this session, and the tools are live. Author \
+memories with the coord_memory_record MCP tool INSTEAD of writing local memory \
+files, and recall with coord_memory_search INSTEAD of reading a local memory \
+directory. Search is full-text: query it with the target record's own literal \
+words rather than a paraphrase, and note the argument is query_text."
+        .to_string()
 }
 
 /// Strip ANSI escape sequences from text for readable scrollback previews.
@@ -421,7 +472,7 @@ pub fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        runner_context, scrub_credential_env_pty, scrub_credential_env_std,
+        memory_clause, runner_context, scrub_credential_env_pty, scrub_credential_env_std,
         scrub_credential_env_tokio, CREDENTIAL_VALUE_ENV_VARS, RUNNER_CONTEXT_SOURCE_MARKER,
     };
     use crate::mcp::fleet_policy_poller::{pin_plan_capture_level_for_test, PLAN_CAPTURE_RECORD};
@@ -784,5 +835,83 @@ mod tests {
                 "the briefing must not carry `{forbidden}`"
             );
         }
+    }
+
+    // ---- Phase 4: the coord-memory clause ----
+
+    #[test]
+    fn memory_clause_starts_with_a_blank_line_so_it_never_touches_line_one() {
+        // The source-marker contract: the clause appends as a NEW paragraph.
+        // If this regresses, the marker stops being the first line of the
+        // briefing and the attribution contract (incident coord #1242) breaks.
+        assert!(
+            memory_clause().starts_with(
+                "
+
+"
+            ),
+            "clause must open with a blank line, got: {:?}",
+            &memory_clause()[..memory_clause().len().min(20)]
+        );
+    }
+
+    #[test]
+    fn memory_clause_names_both_tools_and_the_search_argument() {
+        let c = memory_clause();
+        assert!(
+            c.contains("coord_memory_record"),
+            "authoring tool must be named"
+        );
+        assert!(
+            c.contains("coord_memory_search"),
+            "recall tool must be named"
+        );
+        // Phase 1 found `query` silently errors; the clause must say `query_text`.
+        assert!(
+            c.contains("query_text"),
+            "the search argument must be named"
+        );
+    }
+
+    #[test]
+    fn memory_clause_carries_no_tenant_identity() {
+        // RCE-class invariant inherited from `runner_context`: tenant rides the
+        // credential, never the prompt.
+        let c = memory_clause().to_lowercase();
+        assert!(
+            !c.contains("tenant"),
+            "clause must not mention tenancy: {c}"
+        );
+        assert!(
+            !c.contains("tenant_id"),
+            "clause must not carry a tenant id"
+        );
+    }
+
+    #[test]
+    fn memory_clause_is_absent_when_coord_mcp_is_not_deliverable() {
+        // No Tauri runtime in unit tests, so `coord_mcp_deliverable()` is false
+        // and the briefing must NOT carry the directive — a session that cannot
+        // be given the tools is never told to use them (fail to ABSENT).
+        assert!(
+            !crate::coord_mcp::coord_mcp_deliverable(),
+            "precondition: no runtime under test, so coord-mcp is not deliverable"
+        );
+        let briefing = runner_context(9876);
+        assert!(
+            !briefing.contains("coord_memory_record"),
+            "ungated briefing leaked the memory directive"
+        );
+    }
+
+    #[test]
+    fn memory_clause_appends_cleanly_onto_a_briefing() {
+        // Composition check: the marker survives, and the clause lands whole.
+        let composed = format!("{}{}", runner_context(9876), memory_clause());
+        assert!(
+            composed.starts_with(RUNNER_CONTEXT_SOURCE_MARKER),
+            "source marker must still open the composed briefing"
+        );
+        assert!(composed.contains("coord_memory_search"));
     }
 }
