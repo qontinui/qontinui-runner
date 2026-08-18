@@ -657,33 +657,6 @@ fn copy_exe_stub(shim_dir: &Path, name: &str) {
             return;
         }
     };
-    // Smart App Control blocks the stub from EXECUTING, and a stub that cannot
-    // execute is worse than no stub at all: `.exe` beats `.cmd` on PATHEXT, so a
-    // blocked `claude.exe` SHADOWS the working `claude.cmd` and the tool fails
-    // outright instead of degrading to the scripts this materializer already
-    // wrote. The existing fail-open only covers a failed COPY, not a refused
-    // EXEC, so the copy succeeds and the fallback never fires.
-    //
-    // Measured 2026-08-18: SAC enforced, CodeIntegrity 3077 refused
-    // `%TEMP%\qontinui-identity-<id>\claude.exe` (policy
-    // {0283ac0f-fff1-49ae-ada1-8a933130cad6}, the SAC base policy) because the
-    // stub is unsigned local code. With the `.exe` removed, `claude` resolved to
-    // `claude.cmd` and `claude --version` answered normally — the scripts are a
-    // complete substitute here. Same block also hit the 2026-07-16
-    // `spawn_failed: CreateProcessW ... qontinui-identity-<uuid>\claude` gate.
-    //
-    // SAC has NO exclusion mechanism (no path/publisher allow-list), so this
-    // cannot be waived by configuration; skipping the stub is the fix.
-    if smart_app_control_enforced() {
-        tracing::debug!(
-            tool = name,
-            "install-intercept: Smart App Control is enforced — skipping the unsigned              qontinui-shim.exe stub, which SAC would block and which would then shadow              the working .cmd on PATHEXT. Scripts-only shadow (fully functional)."
-        );
-        // Remove a stub left by an earlier build/boot, or it keeps shadowing.
-        let stale = shim_dir.join(format!("{name}.exe"));
-        let _ = std::fs::remove_file(&stale);
-        return;
-    }
     let dest = shim_dir.join(format!("{name}.exe"));
     if let Err(e) = std::fs::copy(&stub, &dest) {
         tracing::debug!(
@@ -692,42 +665,6 @@ fn copy_exe_stub(shim_dir: &Path, name: &str) {
             "install-intercept: failed to copy qontinui-shim.exe stub — scripts-only fallback"
         );
     }
-}
-
-/// Is Windows Smart App Control ENFORCED on this machine?
-///
-/// `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy!VerifiedAndReputablePolicyState`:
-/// `0` = off, `1` = enforced, `2` = evaluation. Only `1` blocks.
-///
-/// **Fails OPEN**: an unreadable key, a missing value, or any error answers
-/// `false`, so every non-SAC machine keeps today's behaviour exactly. The cost
-/// of a false negative is the status quo; the cost of a false positive would be
-/// silently dropping a stub a machine could have run.
-#[cfg(target_os = "windows")]
-fn smart_app_control_enforced() -> bool {
-    use std::process::Command;
-    let out = Command::new("reg")
-        .args([
-            "query",
-            r"HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy",
-            "/v",
-            "VerifiedAndReputablePolicyState",
-        ])
-        .output();
-    let Ok(out) = out else { return false };
-    if !out.status.success() {
-        return false;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    // `... REG_DWORD    0x1`
-    text.split_whitespace()
-        .last()
-        .and_then(|v| {
-            v.strip_prefix("0x")
-                .and_then(|h| u32::from_str_radix(h, 16).ok())
-        })
-        .map(|v| v == 1)
-        .unwrap_or(false)
 }
 
 /// Locate the `qontinui-shim` stub binary next to the runner exe. Returns the
