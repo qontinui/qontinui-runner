@@ -892,10 +892,928 @@ fn put_sibling_tree_versions(section: &mut Section, workspace_root: &Path) {
     }
 }
 
+// ============================================================================
+// python dependency capture — TWO halves, and they are not interchangeable
+// ============================================================================
+//
+// Plan `2026-08-08-ci-tool-registry-and-canonical-configuration-parity`, P3.
+//
+// ## The gap
+//
+// The captured `versions` vocabulary carried a `node_dep_` prefix (per-dep keys
+// built as `format!("node_dep_{dep}")`, see [`put_sibling_tree_versions`]) and
+// **no python equivalent** — `git grep python_dep_ origin/main` was empty in
+// both qontinui-runner and qontinui-web. `python_constraint` was never a
+// substitute: it is the single INTERPRETER constraint (`^3.12`) out of
+// `tool.poetry.dependencies.python`, so the largest python surface in the fleet
+// contributed nothing a drift oracle could compare.
+//
+// ## Why one half would have re-created the bug it fixes
+//
+// The obvious fix — mirror `node_dep_` for python — closes the *vocabulary*
+// gap and NOT the drift gap, because of two facts that only bite together:
+//
+// 1. `node_dep_*` stores the **declared range** out of `package.json`, not an
+//    installed version (`collectors.rs`, [`put_sibling_tree_versions`]). So does
+//    `python_constraint`. Both are COMMITTED artifacts — as is a lockfile.
+//    Two boxes on the same commit hold identical values no matter what is
+//    actually installed in their environments.
+// 2. Keys the server classifies as repo-**derived** are excluded from the
+//    `in_sync` oracle (qontinui-web `devenv_drift.py`): a difference on a
+//    derived key yields severity `info` and leaves `in_sync == True`.
+//
+// Compose them and a python capture built only from pyproject/poetry.lock,
+// classified derived, reports `in_sync: True` for a box whose site-packages
+// differ completely — the exact "reports success while measuring nothing" class
+// this phase exists to remove, rebuilt by the fix for it.
+//
+// So this module ships BOTH halves, with deliberately DIFFERENT prefixes
+// because the prefix is what selects the server-side classification:
+//
+// | half | prefix | reads | classification | answers |
+// |------|--------|-------|----------------|---------|
+// | A | `python_dep_` | the backend `pyproject.toml` | repo-derived (`info`) | "what does the project DECLARE" |
+// | B | `python_installed_` | a live `pip list` | NOT derived (real drift) | "what is actually INSTALLED here" |
+//
+// Half A is vocabulary parity with `node_dep_*`: same source kind (a declared
+// range), same severity, converging by updating the checkout. qontinui-web has
+// already registered `python_dep_` in
+// `devenv_section_policy._DERIVED_KEY_PREFIXES` (branch
+// `p3/python-dep-drift-policy`), and that registration is why Half A must NOT
+// carry installed-version semantics: the server would classify a real
+// installed-package difference `info` and hide it.
+//
+// Half B is what closes the gap. It must NEVER be registered as derived, and
+// its prefix is deliberately distinct so it cannot be swallowed by a
+// `startswith("python_dep_")` rule.
+//
+// ## Cardinality — one key per DECLARED dep, a fixed FIVE for the environment
+//
+// Half A is bounded by the manifest: 37 direct runtime deps declared beside
+// `python` in the backend pyproject as measured 2026-08-18. That is the same
+// order as `node_dep_*` and the same thing a human edits, so per-key is worth
+// its cost — the value of these keys is that a reader sees WHICH declaration
+// moved.
+//
+// Half B is bounded by construction at FIVE keys regardless of environment
+// size, because the environment is where the counts explode: the backend's own
+// lock already resolves to 133 packages and a real site-packages is larger
+// still, so one key per installed package would be hundreds of keys per machine
+// per capture — the cost the plan warns about, on the half that runs on every
+// box rather than only on boxes with a checkout. A sha256 over the sorted
+// `name==version` set buys full-fidelity detection (any package, any version,
+// added or removed, moves it) for O(1) keys. What a digest cannot do is say
+// WHICH package moved; that is an accepted trade, and it is why Half A exists
+// beside it — between them a reader gets "the declaration moved" per-key and
+// "something in the environment moved" at a glance.
+//
+// ## Provenance, and why each half carries its own
+//
+// [`ProbeScopeKind`] is the precedent: a key that exists so a consumer can tell
+// whether canonical's numbers are even COMPARABLE with its own before acting on
+// a difference. Both halves follow it.
+//
+// Half B needs its own scope key rather than leaning on `probe_scope_kind`,
+// even though it runs in the same resolved scope. `probe_scope_kind` is
+// server-classified **derived**, so a scope difference between two boxes is
+// `info` and does not break `in_sync` — exactly the swallowing this half exists
+// to avoid. A digest difference caused by measuring two different scopes would
+// then be reported as installed drift with nothing to say it was not
+// comparable. [`PYTHON_INSTALLED_SCOPE_KEY`] is the non-derived twin.
+//
+// Half B carries a SECOND comparability key, [`PYTHON_INSTALLED_ENV_KIND_KEY`],
+// because the scope kind does not identify the interpreter. The interpreter
+// comes off the inherited PATH, so a runner launched from an activated venv and
+// the same runner launched from a plain shell inventory different environments
+// on one box — the launch-dependence `resolve_probe_scope` exists to keep out
+// of the toolchain keys, landing here on the one family that drives `in_sync`.
+// The env kind is the gate that makes those two readings refusable instead of
+// silently comparable, and it is sourced from the interpreter itself so it
+// cannot disagree with the digest it certifies. Full reasoning, and what the
+// gate does NOT fix, in the Half B section header.
+//
+// ## Silence is never success
+//
+// Both provenance keys are written UNCONDITIONALLY, including on every rung
+// where nothing was found, so "measured, found nothing" is a different wire
+// state from "could not measure":
+//
+// - measured-empty → `python_installed_probe = "pip_list"`, `..._count = "0"`,
+//   a digest present (the digest of the empty set).
+// - unmeasurable → `python_installed_probe` names WHY (`python_absent`,
+//   `pip_unavailable`, `probe_timeout`, `unparseable_output`) and the count and
+//   digest keys are ABSENT, so an unmeasured box can never be read as `0`
+//   packages.
+//
+// **Known residuals, stated rather than hidden.** A capture reports; it cannot
+// force a verdict. Two of them are open:
+//
+// 1. Two boxes BOTH unmeasurable for the same reason hold equal values and
+//    would compare clean. Closing that needs the consuming oracle to treat a
+//    `python_installed_probe` other than `measured` as not-clean — a
+//    qontinui-web change, not a runner one.
+// 2. `python_installed_env_kind` makes an interpreter mismatch VISIBLE and
+//    refusable, but two boxes that both resolve *a* venv both report `venv`,
+//    and their digests will still be compared even though the venvs differ.
+//    Closing that needs a declared interpreter, resolved the way `scope_root`
+//    is; deliberately out of scope here.
+
+/// Provenance key for Half A: which source the `python_dep_*` declarations came
+/// from, including every way there could be none.
+///
+/// ## Why the `__` infix, and why the prefix is still `python_dep_`
+///
+/// The prefix must stay `python_dep_` because qontinui-web classifies by
+/// `str.startswith`: one prefix registration then covers this meta key too, and
+/// a provenance marker can never be split off into "actionable drift" offering
+/// to apply a source name.
+///
+/// Collision with a real package is structurally impossible rather than
+/// unlikely: package-derived keys are built from a PEP 503 normalized name
+/// ([`normalize_python_dep_name`]), which collapses every run of `-`, `_` and
+/// `.` into a SINGLE separator, so no package name can produce a `__` infix.
+const PYTHON_DEP_SOURCE_KEY: &str = "python_dep__source";
+
+/// Half B provenance: HOW the installed inventory was obtained, and — when it
+/// was not — why. See "Silence is never success" above.
+const PYTHON_INSTALLED_PROBE_KEY: &str = "python_installed_probe";
+
+/// Half B scope: WHICH kind of scope the inventory probe ran in. The
+/// non-derived twin of `probe_scope_kind`; see the section header for why
+/// leaning on that one would let an incomparability difference be swallowed.
+const PYTHON_INSTALLED_SCOPE_KEY: &str = "python_installed_scope_kind";
+
+/// Half B COMPARABILITY GATE: which kind of python environment the inventory
+/// came from (`venv` | `system` | `unknown`).
+///
+/// This is not decoration beside the digest — it states whether two digests may
+/// be compared AT ALL, the same job `probe_scope_kind` does for the toolchain
+/// versions. A consumer that compares digests across differing values here is
+/// reading incomparable numbers. Sourced from the interpreter itself
+/// (`sys.prefix != sys.base_prefix`), never from `VIRTUAL_ENV`; see the Half B
+/// section header for why a shell-set variable could disagree with the very
+/// interpreter it would be certifying.
+///
+/// No path is emitted, only the kind — machine-local strings are dropped
+/// structurally throughout this module.
+const PYTHON_INSTALLED_ENV_KIND_KEY: &str = "python_installed_env_kind";
+
+/// Half B: how many packages the digest was taken over. Present ONLY when an
+/// inventory was actually read, so `0` means "measured, environment is empty"
+/// and absence means "not measured".
+const PYTHON_INSTALLED_COUNT_KEY: &str = "python_installed_count";
+
+/// Half B: sha256 over the sorted `name==version` set actually installed.
+const PYTHON_INSTALLED_DIGEST_KEY: &str = "python_installed_digest";
+
+/// Budget for the installed-inventory probe.
+///
+/// Five times [`CAPTURE_PROBE_BUDGET`] on purpose. The three `--version` shells
+/// that budget was sized for print a string and exit; the inventory script
+/// starts an interpreter and walks every distribution's metadata in
+/// site-packages, which is I/O-bound and scales with the environment. Sizing it
+/// at 3s would not make the capture faster — it would make this key read
+/// `probe_timeout` on exactly the large environments it most needs to measure,
+/// which is a false negative dressed as a budget.
+///
+/// A budget is NOT the mitigation for a stalled child: [`run_bounded_capture`]
+/// drains stdout concurrently and never pipes stderr, so a child cannot block
+/// on a full buffer. Raising this number would have hidden that bug rather than
+/// fixed it.
+const PYTHON_INVENTORY_BUDGET: Duration = Duration::from_secs(15);
+
+/// PEP 503 name normalization, rendered for use as a section key.
+///
+/// PEP 503 lowercases and collapses every run of `-`, `_` and `.` to a single
+/// separator; we emit `_` as that separator so the key reads like the rest of
+/// the section. `Pillow`, `python-multipart` and `opencv_python.headless`
+/// therefore become `pillow`, `python_multipart`, `opencv_python_headless` —
+/// stable across two boxes that spell the same dependency differently, which
+/// would otherwise read as permanent drift.
+///
+/// Collapsing runs is also what makes the `__` meta-key infix unforgeable (see
+/// [`PYTHON_DEP_SOURCE_KEY`]). Any character outside `[a-z0-9]` that is not a
+/// separator is dropped rather than passed through, so a key is always a safe
+/// identifier.
+fn normalize_python_dep_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_separator = false;
+    for ch in raw.chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            // Only remember the separator; emitting it is deferred so a
+            // trailing run never lands in the key.
+            pending_separator = !out.is_empty();
+            continue;
+        }
+        if !ch.is_ascii_alphanumeric() {
+            continue;
+        }
+        if pending_separator {
+            out.push('_');
+            pending_separator = false;
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Half A — python_dep_*: what the project DECLARES (repo-derived)
+// ---------------------------------------------------------------------------
+
+/// Which source the `python_dep_*` declarations were read from — including
+/// every way there could be none.
+///
+/// Every non-[`Self::Pyproject`] variant means NO declaration keys were emitted,
+/// and each names a DIFFERENT reason. That distinction is the point: without it
+/// "this box declares nothing different" and "this box was never read" are the
+/// same wire state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonDepSource {
+    /// Read and parsed, declarations taken from `[tool.poetry.dependencies]`.
+    Pyproject,
+    /// Read and parsed, declarations taken from PEP 621 `[project]
+    /// dependencies`.
+    ///
+    /// A DISTINCT value from [`Self::Pyproject`] because the two dialects spell
+    /// the same declaration differently (`^0.136` vs `>=0.136`). Collapsing
+    /// them would show a fleet mid-migration as every key drifted, with the
+    /// provenance key insisting both sides read the same thing.
+    PyprojectPep621,
+    /// The pyproject exists but could not be read or parsed as TOML. A distinct
+    /// state from absent: the checkout is there, the file is not usable.
+    PyprojectUnreadable,
+    /// No `qontinui-web/backend/pyproject.toml` under the workspace root — e.g.
+    /// a production box without the source checkout.
+    PyprojectAbsent,
+    /// The workspace root itself did not resolve, so no sibling path could even
+    /// be formed. Distinct from [`Self::PyprojectAbsent`]: there the layout was
+    /// known and the file was missing; here the layout is unknown.
+    WorkspaceUnresolved,
+}
+
+impl PythonDepSource {
+    /// The stable wire string carried in `versions.python_dep__source`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Pyproject => "pyproject",
+            Self::PyprojectPep621 => "pyproject_pep621",
+            Self::PyprojectUnreadable => "pyproject_unreadable",
+            Self::PyprojectAbsent => "pyproject_absent",
+            Self::WorkspaceUnresolved => "workspace_unresolved",
+        }
+    }
+}
+
+/// Which spelling of the manifest a declaration set came from.
+///
+/// Kept apart because the two spell the SAME declaration differently — poetry's
+/// `^0.136` against PEP 621's `>=0.136` — so a fleet mid-migration would show
+/// every key drifted with nothing to say why. This is the same comparability
+/// question `probe_scope_kind` answers for toolchain versions, one layer down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclarationDialect {
+    /// `[tool.poetry.dependencies]` — caret/tilde constraints.
+    Poetry,
+    /// PEP 621 `[project] dependencies` — PEP 508 requirement strings.
+    Pep621,
+}
+
+/// The DIRECT dependency declarations of a parsed backend pyproject, as
+/// `(normalized name, declared constraint)` sorted by name, plus WHICH dialect
+/// they were read from.
+///
+/// Mirrors `node_dep_*` exactly: the value is the DECLARED RANGE as written in
+/// the manifest (`^0.136`, `>=0.0.9`), not a resolved or installed version.
+/// Half B is where installed reality lives; conflating the two under this
+/// prefix is the failure the section header describes.
+///
+/// Poetry spells a dependency two ways and both are read: a bare string
+/// (`fastapi = "^0.136"`) and a table carrying extras
+/// (`uvicorn = {extras = ["standard"], version = "^0.38"}`), whose `version`
+/// field is the constraint. A table WITHOUT a `version` (a `path`/`git` dep) has
+/// no comparable constraint to publish, so it contributes no key rather than a
+/// fabricated one.
+///
+/// ## Dialect selection FALLS THROUGH on an empty result
+///
+/// The poetry table is preferred, but only when it actually yields
+/// declarations. Poetry 2.x supports a documented hybrid layout that keeps
+/// `[tool.poetry.dependencies]` for source and constraint OVERRIDES while the
+/// real list lives in `[project].dependencies`. Returning unconditionally on a
+/// parsed-but-empty poetry table would publish that subset — or nothing at all
+/// — while `python_dep__source` still said the manifest was read successfully:
+/// "read fine, declares nothing", which is this module's own
+/// silence-reads-as-success failure one layer down.
+///
+/// `python` is excluded: it is the interpreter constraint, already published as
+/// `python_constraint`.
+///
+/// Deliberately NOT the dev group — same call `node_dep_*` makes by listing
+/// three runtime packages rather than every `devDependency`.
+fn python_declared_deps(pyproject: &toml::Value) -> (DeclarationDialect, Vec<(String, String)>) {
+    let poetry = pyproject
+        .get("tool")
+        .and_then(|v| v.get("poetry"))
+        .and_then(|v| v.get("dependencies"))
+        .and_then(|v| v.as_table())
+        .map(poetry_declared_deps)
+        .unwrap_or_default();
+    if !poetry.is_empty() {
+        return (DeclarationDialect::Poetry, drop_name_collisions(poetry));
+    }
+
+    let pep621 = pyproject
+        .get("project")
+        .and_then(|v| v.get("dependencies"))
+        .and_then(|v| v.as_array())
+        .map(|items| pep621_declared_deps(items.as_slice()))
+        .unwrap_or_default();
+    if !pep621.is_empty() {
+        return (DeclarationDialect::Pep621, drop_name_collisions(pep621));
+    }
+
+    // Neither dialect declared anything. Report the poetry dialect (the one
+    // this backend uses) with an empty set rather than inventing a third
+    // "declares nothing" dialect — `python_dep__source` already distinguishes
+    // "the file was read" from "there was no file".
+    (DeclarationDialect::Poetry, Vec::new())
+}
+
+/// Drop every declaration whose NORMALIZED name is claimed more than once.
+///
+/// PEP 503 normalization and marker-stripping both collapse distinct
+/// requirements onto one key: `redis>=5; python_version<'3.12'` and
+/// `redis>=6; python_version>='3.12'` become two `redis` entries with different
+/// constraints, and `put` is a map insert, so last-write-wins would publish one
+/// conditional declaration as if it were the unconditional truth. There is no
+/// single honest value for such a key, so it gets none — the same call the
+/// poetry branch makes for a path dep: no key rather than a fabricated one.
+///
+/// Input is assumed sorted by name (both producers sort), so collisions are
+/// adjacent.
+fn drop_name_collisions(mut deps: Vec<(String, String)>) -> Vec<(String, String)> {
+    deps.sort();
+    deps.dedup();
+    let mut out: Vec<(String, String)> = Vec::with_capacity(deps.len());
+    let mut i = 0;
+    while i < deps.len() {
+        let run_end = deps[i..]
+            .iter()
+            .position(|(n, _)| *n != deps[i].0)
+            .map_or(deps.len(), |off| i + off);
+        if run_end - i == 1 {
+            out.push(deps[i].clone());
+        }
+        i = run_end;
+    }
+    out
+}
+
+/// `[tool.poetry.dependencies]` → `(normalized name, declared constraint)`.
+fn poetry_declared_deps(table: &toml::map::Map<String, toml::Value>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (raw_name, spec) in table {
+        if raw_name == "python" {
+            continue;
+        }
+        let constraint = match spec {
+            toml::Value::String(s) => Some(s.as_str()),
+            toml::Value::Table(t) => t.get("version").and_then(|v| v.as_str()),
+            _ => None,
+        };
+        let (Some(constraint), name) = (constraint, normalize_python_dep_name(raw_name)) else {
+            continue;
+        };
+        if name.is_empty() || constraint.is_empty() {
+            continue;
+        }
+        out.push((name, constraint.to_string()));
+    }
+    out.sort();
+    out
+}
+
+/// PEP 621 `[project] dependencies` → `(normalized name, declared constraint)`.
+///
+/// `dependencies = ["fastapi>=0.136", "redis[hiredis] ~= 5.0"]`. The NAME is
+/// everything before the first extras bracket, version specifier, environment
+/// marker or whitespace; the rest, minus the extras, is the constraint. A bare
+/// requirement has no specifier, and `*` — poetry's own spelling for "any
+/// version" — is the honest rendering where an empty string would read as a
+/// missing value.
+///
+/// ## Direct-reference (`@`) requirements are DROPPED
+///
+/// PEP 508 allows `name @ <url>` — `qontinui-schemas @ file:///D:/...`,
+/// `pkg @ git+ssh://git@host/repo`. Three reasons none of them may be
+/// published, any one of which is sufficient:
+///
+/// 1. It is not a version constraint, so it is the same case the poetry branch
+///    already refuses: a `path`/`git` dep contributes no key rather than a
+///    fabricated one. Publishing it here would make the two dialects disagree
+///    about the same dependency.
+/// 2. A `file://` URL is a machine-local ABSOLUTE PATH. This module drops those
+///    structurally everywhere else; letting one onto the wire through a
+///    requirement string is the same leak by a different door, and it would read
+///    as permanent drift between any two boxes besides.
+/// 3. A `git+ssh://user@host/...` URL can carry USERINFO, and it would reach the
+///    section without passing [`sanitize_url`] — the function this file calls
+///    the single choke point that guarantees a credential cannot leak. A second
+///    path onto the wire that bypasses the choke point defeats the choke point.
+fn pep621_declared_deps(items: &[toml::Value]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for req in items.iter().filter_map(|v| v.as_str()) {
+        // Environment markers describe WHEN the dep applies, not which version,
+        // so they are dropped before splitting.
+        let req = req.split(';').next().unwrap_or("").trim();
+        // Direct references are dropped whole — see the doc above. Checked
+        // BEFORE splitting, because `@` can appear inside the URL too.
+        if req.contains('@') {
+            continue;
+        }
+        let split_at = req.find(|c: char| {
+            c.is_whitespace() || matches!(c, '[' | '(' | '<' | '>' | '=' | '!' | '~')
+        });
+        let (raw_name, rest) = match split_at {
+            Some(i) => (&req[..i], req[i..].trim()),
+            None => (req, ""),
+        };
+        let name = normalize_python_dep_name(raw_name);
+        if name.is_empty() || name == "python" {
+            continue;
+        }
+        // Drop an extras group (`[hiredis]`) — it is not a version.
+        let constraint = match rest.strip_prefix('[') {
+            Some(after) => after.split(']').nth(1).unwrap_or("").trim(),
+            None => rest,
+        };
+        let constraint = if constraint.is_empty() {
+            "*"
+        } else {
+            constraint
+        };
+        out.push((name, constraint.to_string()));
+    }
+    out.sort();
+    out
+}
+
+/// Resolve Half A from a workspace root. Pure over the filesystem layout (no
+/// environment reads), so every rung — including each "read nothing, and here
+/// is why" — is testable against a synthetic tree.
+fn resolve_python_declared(
+    workspace_root: Option<&Path>,
+) -> (PythonDepSource, Vec<(String, String)>) {
+    let Some(root) = workspace_root else {
+        return (PythonDepSource::WorkspaceUnresolved, Vec::new());
+    };
+    let Some(path) = web_backend_pyproject(root) else {
+        return (PythonDepSource::PyprojectAbsent, Vec::new());
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return (PythonDepSource::PyprojectUnreadable, Vec::new());
+    };
+    let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
+        return (PythonDepSource::PyprojectUnreadable, Vec::new());
+    };
+    let (dialect, declared) = python_declared_deps(&parsed);
+    let source = match dialect {
+        DeclarationDialect::Poetry => PythonDepSource::Pyproject,
+        DeclarationDialect::Pep621 => PythonDepSource::PyprojectPep621,
+    };
+    (source, declared)
+}
+
+/// Write Half A into the section.
+fn put_python_declared_deps(section: &mut Section, workspace_root: Option<&Path>) {
+    let (source, declared) = resolve_python_declared(workspace_root);
+    for (name, constraint) in declared {
+        put(section, &format!("python_dep_{name}"), constraint);
+    }
+    // Written LAST, and unconditionally. Last so the no-forge invariant holds
+    // STRUCTURALLY — this write cannot be overwritten by a package-derived key
+    // even if normalization were ever weakened — rather than resting on the
+    // proof that no package name can produce the `__` infix. Unconditionally
+    // because it is what makes an empty result a stated observation rather than
+    // an absent one, the same role `repos_scope_kind` plays in
+    // [`collect_repos`].
+    put(section, PYTHON_DEP_SOURCE_KEY, source.wire());
+}
+
+// ---------------------------------------------------------------------------
+// Half B — python_installed_*: what is actually INSTALLED (NOT derived)
+// ---------------------------------------------------------------------------
+//
+// ## Which environment this measures, and the guarantee it can give
+//
+// The interpreter is resolved from the INHERITED PATH. That is a real
+// limitation and it is the same defect class [`resolve_probe_scope`] documents
+// for the cwd: what gets measured becomes a function of how the runner process
+// was launched. A runner started from an activated venv resolves that venv's
+// `python`; the same runner restarted from a plain shell resolves the global
+// one. The three `--version` shells have always had this sensitivity, but it
+// stayed latent because a venv and a global interpreter usually report the same
+// `3.12.x`. A sha256 over a whole package set does not stay latent — it differs
+// every time — and it lands on the one key family deliberately excluded from
+// the derived classification, i.e. the family that drives `in_sync`.
+//
+// The runner cannot make PATH deterministic without pinning an interpreter
+// path, which is exactly the machine-local configuration this module refuses to
+// put on the wire. So the guarantee is the [`ProbeScopeKind`] one instead:
+// **publish the comparability marker beside the measurement, sourced from the
+// same observation, and require consumers to gate on it.**
+//
+// [`PYTHON_INSTALLED_ENV_KIND_KEY`] is that gate. It is NOT decoration beside
+// the digest — it is the statement of whether two digests may be compared at
+// all. A consumer that compares digests across differing `env_kind` values is
+// reading incomparable numbers, exactly as `apply_versions`'s `scope_mismatch`
+// refuses a `versions` apply across differing `probe_scope_kind`.
+//
+// Crucially the marker comes from the INTERPRETER ITSELF (`sys.prefix !=
+// sys.base_prefix`), not from the `VIRTUAL_ENV` environment variable. That
+// variable is set by shell ACTIVATION, so it is both false-negative (a runner
+// launched with an absolute venv interpreter and no activation) and
+// false-positive (an activated shell whose PATH resolution then lands
+// elsewhere). Reading it would have described the launching shell while the
+// digest described some other interpreter — a marker that can disagree with the
+// thing it certifies is worse than none. One probe, one interpreter, both
+// facts.
+//
+// ### Residual, stated because it is not closed
+//
+// The gate makes the incomparability VISIBLE and refusable; it does not make
+// the measurement launch-independent. Two boxes that both resolve a venv report
+// `env_kind = venv` and their digests will still be compared, even though they
+// are different venvs. Closing that needs a declared interpreter (an operator
+// setting, resolved like `scope_root`) — deliberately out of scope here, and
+// noted so the next change does not mistake the gate for a full fix.
+
+/// The outcome of a bounded subprocess whose FULL stdout we need.
+///
+/// [`version_of_within`] cannot serve here: it returns only the first line and
+/// collapses spawn failure, timeout and non-zero exit into one `None`. Half B
+/// needs all of stdout (a JSON document) AND needs those failures kept apart,
+/// because each is a different provenance answer and "could not measure" must
+/// never render as "measured, found nothing".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// The process exited 0. Carries all of stdout.
+    Ok(String),
+    /// The process could not be started — the command is not on PATH.
+    SpawnFailed,
+    /// The process ran and exited non-zero.
+    NonZeroExit,
+    /// The process outlived its budget and was killed.
+    TimedOut,
+}
+
+/// Run a bounded subprocess and capture its FULL stdout, keeping the failure
+/// modes apart.
+///
+/// ## Why this does NOT reuse [`version_of_within`]'s poll-then-read shape
+///
+/// That shape is safe for a `--version` probe and unsafe here. It leaves both
+/// pipes attached and reads them only AFTER `try_wait` reports exit, so the
+/// child must exit before a single byte is drained. A pipe holds 64 KiB
+/// (`PIPE_BUFFER_CAPACITY` in std's `child_pipe.rs`; the same order on Linux):
+/// once the child fills it, the child blocks in `write`, never exits,
+/// `try_wait` never returns `Some`, and the budget expires. The probe then
+/// reports [`ProbeOutcome::TimedOut`] — a stall misreported as a slow
+/// environment, and worst on the LARGE environments Half B most needs to
+/// measure. `version_of_within` escapes this only because a version string is
+/// bytes, not kilobytes.
+///
+/// Two fixes, both load-bearing:
+///
+/// 1. **stderr is `Stdio::null()`.** Nothing in this function consumes stderr,
+///    and an undrained pipe is a deadlock waiting for a noisy child. A python
+///    with leftover partial installs emits one `Ignoring invalid distribution`
+///    warning per bad dist and can fill 64 KiB on its own.
+/// 2. **stdout is drained by a reader thread** that runs concurrently with the
+///    wait loop, so the child can never block on a full buffer. On timeout the
+///    child is killed, which closes the write end and lets the reader finish,
+///    so the thread is always joinable and never leaks.
+fn run_bounded_capture(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    budget: Duration,
+) -> ProbeOutcome {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let started = Instant::now();
+    let mut command = crate::process_helpers::no_window(cmd);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // Never piped: see the doc above. An unconsumed pipe is a deadlock.
+        .stderr(Stdio::null());
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let Ok(mut child) = command.spawn() else {
+        return ProbeOutcome::SpawnFailed;
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        // Cannot happen with `Stdio::piped()`, but reporting a failed
+        // measurement is the only honest answer if it ever does.
+        let _ = child.kill();
+        let _ = child.wait();
+        return ProbeOutcome::NonZeroExit;
+    };
+
+    // Drains CONCURRENTLY with the wait loop below — this is what keeps the
+    // child from blocking on a full pipe.
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+
+    let deadline = started + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = reader.join().unwrap_or_default();
+                return if status.success() {
+                    ProbeOutcome::Ok(out)
+                } else {
+                    ProbeOutcome::NonZeroExit
+                };
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // The kill closed the write end, so this join returns
+                    // rather than hanging.
+                    let _ = reader.join();
+                    return ProbeOutcome::TimedOut;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // A `try_wait` error means we lost track of the child; treat it as
+            // a failed measurement rather than an empty one.
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return ProbeOutcome::NonZeroExit;
+            }
+        }
+    }
+}
+
+/// The inventory probe: a stdlib-only python script printing ONE compact JSON
+/// document carrying both facts Half B needs.
+///
+/// ## Why not `pip list --format=json`
+///
+/// Three reasons, in order of weight:
+///
+/// 1. **It cannot certify its own environment.** The venv marker has to come
+///    from the same interpreter that produced the inventory, or the two can
+///    disagree — see the section header. `sys.prefix`/`sys.base_prefix` are
+///    available only from inside the interpreter.
+/// 2. **pip need not be installed.** `importlib.metadata` is stdlib since 3.8,
+///    and the backend requires >=3.12, so this reads the same install database
+///    pip would with strictly fewer preconditions.
+/// 3. **pip is chatty on stderr**, which this probe discards; a quiet probe is
+///    easier to reason about than one whose diagnostics vanish.
+///
+/// Names are emitted raw and normalized on the Rust side, so ONE normalizer
+/// ([`normalize_python_dep_name`]) governs both halves and they cannot drift.
+const PYTHON_INVENTORY_SCRIPT: &str = "import json,sys\n\
+     from importlib.metadata import distributions\n\
+     p={}\n\
+     for d in distributions():\n\
+     \x20   try:\n\
+     \x20       n=d.metadata['Name']; v=d.version\n\
+     \x20   except Exception:\n\
+     \x20       continue\n\
+     \x20   if n and v: p[n]=v\n\
+     json.dump({'venv':sys.prefix!=sys.base_prefix,'packages':p},sys.stdout)\n";
+
+/// HOW the installed inventory was obtained — and, when it was not, why.
+///
+/// Only [`Self::Measured`] carries a measurement. Every other variant means the
+/// count and digest keys are ABSENT, so an unmeasured box can never be read as
+/// an empty one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonInventoryProbe {
+    /// The interpreter ran the inventory script and its output parsed.
+    Measured,
+    /// The resolved probe scope is not a usable directory, so no probe could be
+    /// started there. Distinct from [`Self::PythonAbsent`]: nothing was learned
+    /// about python at all, and labelling it "python absent" would assert
+    /// something this rung never tested. (`resolve_probe_scope` normally
+    /// guarantees an existing directory, so this is a defence-in-depth rung.)
+    ScopeUnusable,
+    /// No `python` on PATH in the resolved scope — nothing to inventory.
+    PythonAbsent,
+    /// `python` ran and exited non-zero: no `importlib.metadata`, a broken
+    /// install, or a sandbox refusing the read.
+    ProbeFailed,
+    /// The probe outlived [`PYTHON_INVENTORY_BUDGET`] and was killed. NOT an
+    /// empty environment. Since [`run_bounded_capture`] drains stdout
+    /// concurrently and discards stderr, this can no longer mean "the child
+    /// filled a pipe and stalled" — it means genuinely slow, so a box reporting
+    /// it is worth looking at rather than explaining away.
+    ProbeTimeout,
+    /// The interpreter exited 0 but its output was not the document we can
+    /// read. A changed contract, not an empty environment.
+    UnparseableOutput,
+}
+
+impl PythonInventoryProbe {
+    /// The stable wire string carried in `versions.python_installed_probe`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::ScopeUnusable => "scope_unusable",
+            Self::PythonAbsent => "python_absent",
+            Self::ProbeFailed => "probe_failed",
+            Self::ProbeTimeout => "probe_timeout",
+            Self::UnparseableOutput => "unparseable_output",
+        }
+    }
+}
+
+/// WHICH kind of python environment the inventory was taken from — the
+/// comparability gate. See the section header: two digests may only be compared
+/// when these agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonEnvKind {
+    /// `sys.prefix != sys.base_prefix` — a virtual environment.
+    Venv,
+    /// The interpreter's own installation.
+    System,
+    /// Nothing was measured, so the environment was never identified. NOT a
+    /// synonym for `system`: claiming a kind we did not observe is the failure
+    /// this whole module is built against.
+    Unknown,
+}
+
+impl PythonEnvKind {
+    /// The stable wire string carried in `versions.python_installed_env_kind`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Venv => "venv",
+            Self::System => "system",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A resolved installed-package inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PythonInventory {
+    probe: PythonInventoryProbe,
+    /// The comparability gate. [`PythonEnvKind::Unknown`] whenever nothing was
+    /// measured.
+    env_kind: PythonEnvKind,
+    /// `(digest, package_count)`. `Some` iff an inventory was actually read —
+    /// so `Some(_, 0)` is "measured, environment is empty" and `None` is "not
+    /// measured".
+    measured: Option<(String, usize)>,
+}
+
+impl PythonInventory {
+    /// An inventory that measured nothing, for the stated `probe` reason.
+    fn nothing(probe: PythonInventoryProbe) -> Self {
+        Self {
+            probe,
+            env_kind: PythonEnvKind::Unknown,
+            measured: None,
+        }
+    }
+}
+
+/// Parse the inventory script's JSON into `(env kind, normalized sorted set)`.
+///
+/// Returns `None` when the document is not the object we emit — a changed
+/// contract, which must not render as an empty environment. `venv` is required
+/// rather than defaulted: defaulting it would invent a comparability verdict.
+///
+/// Names go through [`normalize_python_dep_name`] so two boxes spelling the
+/// same distribution differently (`Pillow` vs `pillow`) do not read as drift; a
+/// duplicate normalized name keeps the last seen, which is what the install
+/// database itself would resolve to.
+fn parse_inventory_json(text: &str) -> Option<(PythonEnvKind, Vec<(String, String)>)> {
+    let parsed: Value = serde_json::from_str(text).ok()?;
+    let env_kind = match parsed.get("venv")?.as_bool()? {
+        true => PythonEnvKind::Venv,
+        false => PythonEnvKind::System,
+    };
+    let packages = parsed.get("packages")?.as_object()?;
+    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (name, version) in packages {
+        let Some(version) = version.as_str() else {
+            continue;
+        };
+        let normalized = normalize_python_dep_name(name);
+        if normalized.is_empty() || version.is_empty() {
+            continue;
+        }
+        seen.insert(normalized, version.to_string());
+    }
+    Some((env_kind, seen.into_iter().collect()))
+}
+
+/// sha256 over a package set, rendered as lowercase hex.
+///
+/// Fields are LENGTH-PREFIXED rather than joined with separators. A `name==ver`
+/// rendering is ambiguous the moment a version contains the framing bytes: two
+/// different sets could hash the same, which on a key whose entire job is "are
+/// these identical" is the one bug that cannot be noticed by reading the
+/// output. Length prefixes make the encoding injective for any byte content.
+///
+/// Input order is the `BTreeMap`'s in [`parse_inventory_json`], so the digest is
+/// a pure function of the SET and cannot move because the interpreter enumerated
+/// site-packages in a different order. Full 64-hex, not truncated.
+fn python_package_set_digest(packages: &[(String, String)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (name, version) in packages {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((version.len() as u64).to_le_bytes());
+        hasher.update(version.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Turn a probe outcome into an inventory. Pure, so every rung — including all
+/// the unmeasurable ones — is testable without spawning anything.
+fn inventory_from_outcome(outcome: ProbeOutcome) -> PythonInventory {
+    match outcome {
+        ProbeOutcome::SpawnFailed => PythonInventory::nothing(PythonInventoryProbe::PythonAbsent),
+        ProbeOutcome::NonZeroExit => PythonInventory::nothing(PythonInventoryProbe::ProbeFailed),
+        ProbeOutcome::TimedOut => PythonInventory::nothing(PythonInventoryProbe::ProbeTimeout),
+        ProbeOutcome::Ok(stdout) => match parse_inventory_json(&stdout) {
+            Some((env_kind, packages)) => PythonInventory {
+                probe: PythonInventoryProbe::Measured,
+                env_kind,
+                measured: Some((python_package_set_digest(&packages), packages.len())),
+            },
+            None => PythonInventory::nothing(PythonInventoryProbe::UnparseableOutput),
+        },
+    }
+}
+
+/// Write Half B into the section.
+///
+/// The probe runs in the SAME resolved scope as the `python` version key, so
+/// the interpreter inventoried here is the one that key reports. No interpreter
+/// path is emitted: it is machine-local and incomparable, the same reason
+/// [`ProbeScopeKind`] publishes a kind rather than a path.
+fn put_python_installed(section: &mut Section, scope: &ProbeScope) {
+    // Guarded rather than left to the spawn: a bad cwd and a missing
+    // interpreter both surface as a spawn error, and reporting "python absent"
+    // for an unusable directory would assert something never tested.
+    let inventory = match scope.root.as_deref() {
+        Some(root) if !root.is_dir() => {
+            PythonInventory::nothing(PythonInventoryProbe::ScopeUnusable)
+        }
+        root => inventory_from_outcome(run_bounded_capture(
+            "python",
+            &["-c", PYTHON_INVENTORY_SCRIPT],
+            root,
+            PYTHON_INVENTORY_BUDGET,
+        )),
+    };
+
+    // Written UNCONDITIONALLY: these three are what make an unmeasurable box a
+    // stated observation instead of a silent one.
+    put(section, PYTHON_INSTALLED_PROBE_KEY, inventory.probe.wire());
+    put(section, PYTHON_INSTALLED_SCOPE_KEY, scope.kind.wire());
+    put(
+        section,
+        PYTHON_INSTALLED_ENV_KIND_KEY,
+        inventory.env_kind.wire(),
+    );
+
+    if let Some((digest, count)) = inventory.measured {
+        put(section, PYTHON_INSTALLED_DIGEST_KEY, digest);
+        put(section, PYTHON_INSTALLED_COUNT_KEY, count.to_string());
+    }
+}
+
 /// Collect the `versions` section: this binary's own crate + tauri versions,
 /// node deps from this repo's own `package.json` under the workspace root,
-/// python from the web-backend pyproject.toml, plus bounded `--version` shells
-/// where the tools resolve. Missing inputs → key absent, never an error.
+/// python from the web-backend pyproject.toml, the `python_dep_*` DECLARED
+/// constraints from that same manifest (no lockfile is read, and these are
+/// constraints — not pins, and not installed versions; the whole reason Half B
+/// exists is that a declaration cannot tell you what is installed), the
+/// `python_installed_*` inventory of the live interpreter, plus bounded
+/// `--version` shells where the tools resolve. Missing inputs → key absent,
+/// never an error — with the stated exception of the two provenance keys
+/// `python_dep__source` and `python_installed_probe`, written on every rung
+/// precisely so "measured nothing" cannot look like "found no difference".
 pub fn collect_versions() -> Section {
     let mut section = Section::new();
 
@@ -906,9 +1824,17 @@ pub fn collect_versions() -> Section {
     // reads only the PATH; the resolution's kind is `repos`' provenance, not
     // this section's (which carries `probe_scope_kind` for the toolchain scope
     // instead — a different quantity, see `collect_repos`).
-    if let Some(root) = workspace_root().into_root() {
-        put_sibling_tree_versions(&mut section, &root);
+    let root = workspace_root().into_root();
+    if let Some(root) = &root {
+        put_sibling_tree_versions(&mut section, root);
     }
+
+    // Half A. NOT inside the `if let` above, deliberately: the `python_dep_*`
+    // family carries its own provenance key and that key must be written on
+    // EVERY rung — including "the workspace root did not resolve", which is
+    // exactly the case where staying silent would let an unread box look like
+    // one that agrees with canonical. See the section header above.
+    put_python_declared_deps(&mut section, root.as_deref());
 
     // ---- bounded `--version` shells (optional, 3s budget each) ----
     //
@@ -926,6 +1852,15 @@ pub fn collect_versions() -> Section {
     // somewhere else. The PATH is deliberately NOT emitted: it differs between
     // any two boxes while meaning the same thing, and it is operator-local.
     put(&mut section, "probe_scope_kind", scope.kind.wire());
+
+    // Half B — the installed-package inventory. Runs in the SAME resolved scope
+    // as the three shells below, so the interpreter it inventories is the one
+    // the `python` key reports. It publishes its OWN scope key rather than
+    // relying on `probe_scope_kind` above, because that one is server-classified
+    // derived and an incomparability difference must not be swallowed at `info`
+    // — see the section header.
+    put_python_installed(&mut section, &scope);
+
     let scope = scope.root;
     let scope_ref = scope.as_deref();
     if let Some(v) = version_of("rustc", &["--version"], scope_ref) {
@@ -1811,6 +2746,734 @@ mod tests {
             .unwrap();
             self
         }
+
+        /// Overwrite the web backend's `pyproject.toml`. Requires
+        /// [`Self::with_web_tree`] to have created the directory.
+        fn with_backend_pyproject(self, contents: &str) -> Self {
+            let backend = self.root.join(WEB_REPO_DIR).join("backend");
+            std::fs::write(backend.join("pyproject.toml"), contents).unwrap();
+            self
+        }
+    }
+
+    // ---- python dependency capture: Half A (declared) + Half B (installed) ----
+
+    /// A pyproject in the shape the web backend actually uses: PEP 621 metadata
+    /// with `dynamic = ["dependencies"]`, and poetry's own dependency table
+    /// carrying the interpreter constraint plus the direct deps — including
+    /// both spellings poetry allows (a bare string and an extras table) and a
+    /// path dep, which has no version constraint to publish.
+    const SYNTHETIC_BACKEND_PYPROJECT: &str = r#"
+[project]
+name = "backend"
+version = "0.1.0"
+dynamic = ["dependencies"]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.15"
+fastapi = "^0.136"
+python-multipart = ">=0.0.9"
+Pillow = "^12"
+uvicorn = {extras = ["standard"], version = "^0.38"}
+qontinui-schemas = {path = "../../qontinui-schemas", develop = true}
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+"#;
+
+    fn python_dep_keys(section: &Section) -> Vec<String> {
+        section
+            .keys()
+            .filter(|k| k.starts_with("python_dep_") && !k.starts_with("python_dep__"))
+            .cloned()
+            .collect()
+    }
+
+    /// **Half A is vocabulary parity with `node_dep_*`, which stores the
+    /// DECLARED RANGE.** The value must be the constraint as written in the
+    /// manifest, never a resolved or installed version: qontinui-web registers
+    /// `python_dep_` as a repo-derived prefix, and a derived key is excluded
+    /// from the `in_sync` oracle — so shipping installed-version semantics under
+    /// this prefix would publish the one thing that matters at a severity that
+    /// hides it.
+    #[test]
+    fn python_dep_keys_carry_the_declared_constraint_like_node_dep() {
+        let f = workspace_fixture()
+            .with_web_tree()
+            .with_backend_pyproject(SYNTHETIC_BACKEND_PYPROJECT);
+        let mut section = Section::new();
+        put_python_declared_deps(&mut section, Some(&f.root));
+
+        assert_eq!(
+            section.get(PYTHON_DEP_SOURCE_KEY).and_then(|v| v.as_str()),
+            Some("pyproject"),
+        );
+
+        // Declared ranges, verbatim.
+        assert_eq!(
+            section.get("python_dep_fastapi").and_then(|v| v.as_str()),
+            Some("^0.136"),
+        );
+        // Name normalization: PEP 503 lowercases and collapses separators, so
+        // `python-multipart` and `Pillow` land on stable keys.
+        assert_eq!(
+            section
+                .get("python_dep_python_multipart")
+                .and_then(|v| v.as_str()),
+            Some(">=0.0.9"),
+        );
+        assert_eq!(
+            section.get("python_dep_pillow").and_then(|v| v.as_str()),
+            Some("^12"),
+        );
+        // Poetry's table spelling: the constraint is the `version` field, and
+        // the extras list is not a version.
+        assert_eq!(
+            section.get("python_dep_uvicorn").and_then(|v| v.as_str()),
+            Some("^0.38"),
+        );
+
+        // A path dep has no comparable constraint — no key rather than a
+        // fabricated one.
+        assert!(
+            !section.contains_key("python_dep_qontinui_schemas"),
+            "a path dep has no version constraint to publish"
+        );
+        // The interpreter constraint is `python_constraint`'s job, not a dep.
+        assert!(!section.contains_key("python_dep_python"));
+        // Dev group is out of scope, mirroring `node_dep_*`.
+        assert!(!section.contains_key("python_dep_pytest"));
+
+        assert_eq!(python_dep_keys(&section).len(), 4);
+    }
+
+    /// Half A provenance names the source ACTUALLY read on every rung, and each
+    /// "read nothing" rung is a DIFFERENT value — so an unread box is
+    /// distinguishable from one whose manifest declares nothing.
+    #[test]
+    fn python_dep_source_reports_the_source_actually_read() {
+        assert_eq!(
+            resolve_python_declared(None).0,
+            PythonDepSource::WorkspaceUnresolved
+        );
+
+        let bare = workspace_fixture();
+        assert_eq!(
+            resolve_python_declared(Some(&bare.root)).0,
+            PythonDepSource::PyprojectAbsent
+        );
+
+        let broken = workspace_fixture()
+            .with_web_tree()
+            .with_backend_pyproject("not { toml [[");
+        assert_eq!(
+            resolve_python_declared(Some(&broken.root)).0,
+            PythonDepSource::PyprojectUnreadable
+        );
+
+        let good = workspace_fixture()
+            .with_web_tree()
+            .with_backend_pyproject(SYNTHETIC_BACKEND_PYPROJECT);
+        assert_eq!(
+            resolve_python_declared(Some(&good.root)).0,
+            PythonDepSource::Pyproject
+        );
+
+        // A manifest that resolved but declares nothing beside `python`: the
+        // source says `pyproject` and there are simply no dep keys — a
+        // different observation from every rung above.
+        let empty = workspace_fixture()
+            .with_web_tree()
+            .with_backend_pyproject("[tool.poetry.dependencies]\npython = \"^3.12\"\n");
+        let (source, declared) = resolve_python_declared(Some(&empty.root));
+        assert_eq!(source, PythonDepSource::Pyproject);
+        assert!(declared.is_empty());
+
+        let wires = [
+            PythonDepSource::Pyproject,
+            PythonDepSource::PyprojectUnreadable,
+            PythonDepSource::PyprojectAbsent,
+            PythonDepSource::WorkspaceUnresolved,
+        ]
+        .map(|s| s.wire());
+        let unique: std::collections::BTreeSet<&str> = wires.iter().copied().collect();
+        assert_eq!(unique.len(), wires.len(), "wire strings must be distinct");
+    }
+
+    /// The scope hazard `workspace_package_json` documents, applied to python:
+    /// `python_dep_<name>` carries no repo qualifier, so it must describe
+    /// exactly ONE tree — the same tree `python_constraint` reads. A pyproject
+    /// anywhere else is never a substitute, and the resolver never climbs out
+    /// of the workspace root.
+    #[test]
+    fn python_dep_scope_is_the_web_backend_and_never_walks() {
+        let f = workspace_fixture().with_runner_tree();
+        std::fs::write(f.root.join("pyproject.toml"), SYNTHETIC_BACKEND_PYPROJECT).unwrap();
+        std::fs::write(
+            f.root.join(RUNNER_REPO_DIR).join("pyproject.toml"),
+            SYNTHETIC_BACKEND_PYPROJECT,
+        )
+        .unwrap();
+
+        assert_eq!(
+            web_backend_pyproject(&f.root),
+            None,
+            "only the web backend's own pyproject counts"
+        );
+        assert_eq!(
+            resolve_python_declared(Some(&f.root)).0,
+            PythonDepSource::PyprojectAbsent,
+            "a decoy pyproject elsewhere must not be adopted"
+        );
+    }
+
+    /// A backend that migrates off poetry's dependency table to PEP 621 must
+    /// degrade to a DIFFERENT key set, never to a silently empty capture that
+    /// reports clean. The value stays a declared constraint on that path too,
+    /// and the dialect is reported so the two spellings are never conflated.
+    #[test]
+    fn declared_deps_fall_back_to_pep_621_when_poetry_table_is_absent() {
+        let pep621: toml::Value = toml::from_str(
+            r#"
+[project]
+name = "backend"
+dependencies = [
+  "fastapi>=0.136",
+  "redis[hiredis] ~= 5.0",
+  "pillow ; python_version >= '3.12'",
+  "sqlalchemy",
+]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            python_declared_deps(&pep621),
+            (
+                DeclarationDialect::Pep621,
+                vec![
+                    ("fastapi".to_string(), ">=0.136".to_string()),
+                    // An environment marker says WHEN the dep applies, not
+                    // which version, so it is dropped rather than published.
+                    ("pillow".to_string(), "*".to_string()),
+                    // The extras group is stripped; the specifier survives.
+                    ("redis".to_string(), "~= 5.0".to_string()),
+                    // No specifier at all — `*` is poetry's own spelling for
+                    // "any", honest where an empty string would look like a
+                    // missing value.
+                    ("sqlalchemy".to_string(), "*".to_string()),
+                ]
+            )
+        );
+
+        // The poetry table WINS when it actually declares something.
+        let both: toml::Value = toml::from_str(
+            "[project]\ndependencies = [\"wrong-one\"]\n\
+             [tool.poetry.dependencies]\npython = \"^3.12\"\nfastapi = \"^0.136\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            python_declared_deps(&both),
+            (
+                DeclarationDialect::Poetry,
+                vec![("fastapi".to_string(), "^0.136".to_string())]
+            )
+        );
+
+        // …but an override-only poetry table must FALL THROUGH to PEP 621, not
+        // report "read fine, declares nothing". Poetry 2.x's hybrid layout
+        // keeps the poetry table for source/constraint overrides while the real
+        // list lives in `[project]`; returning the empty subset there would be
+        // silence reading as success one layer down.
+        let hybrid: toml::Value = toml::from_str(
+            "[project]\ndependencies = [\"fastapi>=0.136\", \"redis>=5\"]\n\
+             [tool.poetry.dependencies]\npython = \"^3.12\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            python_declared_deps(&hybrid),
+            (
+                DeclarationDialect::Pep621,
+                vec![
+                    ("fastapi".to_string(), ">=0.136".to_string()),
+                    ("redis".to_string(), ">=5".to_string()),
+                ]
+            ),
+            "an override-only poetry table must not hide the real declaration list"
+        );
+
+        // PEP 508 direct references are DROPPED whole. They are not version
+        // constraints (the poetry branch already refuses the equivalent), a
+        // `file://` URL is a machine-local absolute path, and a `git+ssh://`
+        // URL would put userinfo on the wire without ever passing
+        // `sanitize_url` — the file's single credential choke point.
+        let direct_refs: toml::Value = toml::from_str(
+            "[project]\ndependencies = [\
+             \"qontinui-schemas @ file:///D:/qontinui-root/qontinui-schemas\", \
+             \"secretpkg @ git+ssh://git:hunter2@example.com/o/r.git\", \
+             \"fastapi>=0.136\"]\n",
+        )
+        .unwrap();
+        let (dialect, deps) = python_declared_deps(&direct_refs);
+        assert_eq!(dialect, DeclarationDialect::Pep621);
+        assert_eq!(
+            deps,
+            vec![("fastapi".to_string(), ">=0.136".to_string())],
+            "direct-reference requirements must contribute no key at all"
+        );
+        let rendered = format!("{deps:?}");
+        assert!(
+            !rendered.contains("qontinui-root"),
+            "machine-local path leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("hunter2"),
+            "credential leaked: {rendered}"
+        );
+
+        // Two requirements collapsing onto ONE normalized key (markers are
+        // stripped) publish NOTHING for that key: there is no honest single
+        // value, and `put` is a map insert, so last-write-wins would present a
+        // conditional declaration as the unconditional truth.
+        let collide: toml::Value = toml::from_str(
+            "[project]\ndependencies = [\
+             \"redis>=5 ; python_version<'3.12'\", \
+             \"redis>=6 ; python_version>='3.12'\", \
+             \"fastapi>=0.136\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            python_declared_deps(&collide).1,
+            vec![("fastapi".to_string(), ">=0.136".to_string())],
+            "a normalized-name collision must drop the key, not pick a winner"
+        );
+    }
+
+    /// **Half B is the half that closes the gap, and it must not be swallowed.**
+    /// qontinui-web classifies derived keys by `str.startswith("python_dep_")`;
+    /// any installed-inventory key under that prefix would be scored `info` and
+    /// excluded from `in_sync`, which is the exact failure this half exists to
+    /// prevent.
+    ///
+    /// Asserted BEHAVIOURALLY, on the keys actually emitted into a section
+    /// rather than on the constants. Checking the constants would pass for
+    /// someone who wrote `put(section, "python_dep_installed_count", …)` with a
+    /// literal — breaking the highest-stakes invariant in this change while the
+    /// test named after it stayed green.
+    #[test]
+    fn installed_keys_use_a_prefix_the_derived_rule_cannot_swallow() {
+        let f = workspace_fixture()
+            .with_web_tree()
+            .with_backend_pyproject(SYNTHETIC_BACKEND_PYPROJECT);
+        let mut section = Section::new();
+        put_python_declared_deps(&mut section, Some(&f.root));
+        put_python_installed(&mut section, &unusable_scope(ProbeScopeKind::Default));
+
+        // Everything Half B emitted must be OUTSIDE the derived prefix.
+        let installed: Vec<&String> = section
+            .keys()
+            .filter(|k| k.starts_with("python_installed_"))
+            .collect();
+        assert!(
+            !installed.is_empty(),
+            "Half B must emit keys even when it cannot measure"
+        );
+        for key in &installed {
+            assert!(
+                !key.starts_with("python_dep_"),
+                "{key} would be classified repo-derived and hidden from in_sync"
+            );
+        }
+
+        // And the converse: EVERY key under the derived prefix is either Half
+        // A's provenance marker or one of the declarations Half A resolved.
+        // Nothing else may hide there — an installed-inventory key smuggled
+        // under this prefix is the failure this test exists to catch.
+        let declared = resolve_python_declared(Some(&f.root)).1;
+        for key in section.keys().filter(|k| k.starts_with("python_dep_")) {
+            if key == PYTHON_DEP_SOURCE_KEY {
+                continue;
+            }
+            let name = key.strip_prefix("python_dep_").unwrap();
+            assert!(
+                declared.iter().any(|(n, _)| n == name),
+                "{key} is under the derived prefix but is not a resolved declaration"
+            );
+        }
+
+        // Half A's meta key is the opposite case: it MUST share the derived
+        // prefix so ONE server registration covers it, and no package name can
+        // forge it.
+        assert!(PYTHON_DEP_SOURCE_KEY.starts_with("python_dep__"));
+        assert!(section.contains_key(PYTHON_DEP_SOURCE_KEY));
+        for raw in [
+            "source",
+            "lock-digest",
+            "lock__digest",
+            "lock..digest",
+            "LOCK_-_DIGEST",
+            "_source",
+            "source_",
+        ] {
+            let key = format!("python_dep_{}", normalize_python_dep_name(raw));
+            assert!(
+                !key.starts_with("python_dep__"),
+                "package name {raw:?} forged a meta key: {key}"
+            );
+        }
+        assert_eq!(normalize_python_dep_name("Pillow"), "pillow");
+        assert_eq!(
+            normalize_python_dep_name("opencv-python.headless"),
+            "opencv_python_headless"
+        );
+        assert_eq!(normalize_python_dep_name("--"), "");
+    }
+
+    /// A scope whose root cannot be used, so Half B exercises an unmeasurable
+    /// rung deterministically instead of whatever python this box happens to
+    /// have.
+    fn unusable_scope(kind: ProbeScopeKind) -> ProbeScope {
+        ProbeScope {
+            root: Some(
+                std::env::temp_dir()
+                    .join("qontinui_no_such_scope_root")
+                    .join(std::process::id().to_string()),
+            ),
+            rejected: None,
+            kind,
+        }
+    }
+
+    /// Half B reads a real installed inventory: the script's document produces a
+    /// digest over the whole set at a FIXED key cost, and the digest moves for
+    /// any package difference — which is what makes a box whose environment
+    /// differs report drifted rather than clean.
+    #[test]
+    fn installed_inventory_digests_the_whole_environment_at_fixed_cost() {
+        let doc = r#"{"venv": false, "packages":
+            {"requests": "2.32.3", "Pillow": "12.1.0", "fastapi": "0.136.2"}}"#;
+        let inventory = inventory_from_outcome(ProbeOutcome::Ok(doc.to_string()));
+        assert_eq!(inventory.probe, PythonInventoryProbe::Measured);
+        assert_eq!(inventory.env_kind, PythonEnvKind::System);
+        let (digest, count) = inventory.measured.clone().expect("a parsed doc measures");
+        assert_eq!(count, 3);
+        assert_eq!(digest.len(), 64, "full sha256 hex, got {digest}");
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Order- and case-independent: the digest is a function of the SET.
+        let reordered = r#"{"venv": false, "packages":
+            {"fastapi": "0.136.2", "pillow": "12.1.0", "requests": "2.32.3"}}"#;
+        assert_eq!(
+            inventory_from_outcome(ProbeOutcome::Ok(reordered.to_string())).measured,
+            inventory.measured,
+            "case + order differences are not environment differences"
+        );
+
+        // ONE package at a different version moves it — the exit condition.
+        let bumped = doc.replace("2.32.3", "2.32.4");
+        assert_ne!(
+            inventory_from_outcome(ProbeOutcome::Ok(bumped)).measured,
+            inventory.measured,
+            "a differing installed package must not read as clean"
+        );
+        // …and so does one extra package.
+        let extra = r#"{"venv": false, "packages":
+            {"requests": "2.32.3", "Pillow": "12.1.0", "fastapi": "0.136.2",
+             "numpy": "2.3.0"}}"#;
+        assert_ne!(
+            inventory_from_outcome(ProbeOutcome::Ok(extra.to_string())).measured,
+            inventory.measured,
+        );
+
+        // The digest framing is INJECTIVE. With `name==version` joining, a
+        // version carrying the framing bytes could make two different sets hash
+        // identically; length-prefixing makes that impossible.
+        let a = [("a".to_string(), "1\nb==2".to_string())];
+        let b = [
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ];
+        assert_ne!(
+            python_package_set_digest(&a),
+            python_package_set_digest(&b),
+            "digest framing must be unambiguous"
+        );
+    }
+
+    /// The comparability GATE. The interpreter comes off the inherited PATH, so
+    /// a venv and a system interpreter on ONE box produce different digests;
+    /// `python_installed_env_kind` is what makes that refusable instead of
+    /// silently comparable. It must come from the interpreter itself, so it can
+    /// never disagree with the digest it certifies, and it must be `unknown` —
+    /// never `system` — when nothing was measured.
+    #[test]
+    fn env_kind_gates_digest_comparability_and_is_never_assumed() {
+        let venv = inventory_from_outcome(ProbeOutcome::Ok(
+            r#"{"venv": true, "packages": {"fastapi": "0.136.2"}}"#.to_string(),
+        ));
+        let system = inventory_from_outcome(ProbeOutcome::Ok(
+            r#"{"venv": false, "packages": {"fastapi": "0.136.2"}}"#.to_string(),
+        ));
+        assert_eq!(venv.env_kind, PythonEnvKind::Venv);
+        assert_eq!(system.env_kind, PythonEnvKind::System);
+        // Same packages: the digest CANNOT distinguish them, which is exactly
+        // why the gate has to be a separate published key.
+        assert_eq!(venv.measured, system.measured);
+        assert_ne!(venv.env_kind.wire(), system.env_kind.wire());
+
+        // A document without the marker is UNPARSEABLE, not "assume system".
+        // Defaulting it would invent a comparability verdict.
+        assert_eq!(
+            inventory_from_outcome(ProbeOutcome::Ok(
+                r#"{"packages": {"fastapi": "0.136.2"}}"#.to_string()
+            ))
+            .probe,
+            PythonInventoryProbe::UnparseableOutput,
+        );
+
+        // Nothing measured => `unknown`, on every unmeasurable rung.
+        for outcome in [
+            ProbeOutcome::SpawnFailed,
+            ProbeOutcome::NonZeroExit,
+            ProbeOutcome::TimedOut,
+            ProbeOutcome::Ok("not json".to_string()),
+        ] {
+            assert_eq!(
+                inventory_from_outcome(outcome.clone()).env_kind,
+                PythonEnvKind::Unknown,
+                "for {outcome:?}: an unmeasured environment has no kind"
+            );
+        }
+        let wires = [
+            PythonEnvKind::Venv,
+            PythonEnvKind::System,
+            PythonEnvKind::Unknown,
+        ]
+        .map(|k| k.wire());
+        let unique: std::collections::BTreeSet<&str> = wires.iter().copied().collect();
+        assert_eq!(unique.len(), wires.len());
+    }
+
+    /// **The negative case — the one that matters more.** "Measured, and the
+    /// environment is empty" must be distinguishable on the wire from "could
+    /// not measure", or a box that was never measured reads exactly like a box
+    /// that agrees with canonical.
+    #[test]
+    fn unmeasurable_environment_is_distinguishable_from_a_measured_empty_one() {
+        // Measured, empty: the probe names the method, the count STATES zero,
+        // and a digest (of the empty set) exists.
+        let measured = inventory_from_outcome(ProbeOutcome::Ok(
+            r#"{"venv":false,"packages":{}}"#.to_string(),
+        ));
+        assert_eq!(measured.probe, PythonInventoryProbe::Measured);
+        let (empty_digest, count) = measured.measured.clone().expect("an empty set is measured");
+        assert_eq!(count, 0, "a parsed-but-empty environment must STATE zero");
+        assert_eq!(empty_digest, python_package_set_digest(&[]));
+
+        // Every unmeasurable rung: a DIFFERENT reason, and NO count and NO
+        // digest — so it can never be misread as zero packages.
+        for (outcome, expected) in [
+            (
+                ProbeOutcome::SpawnFailed,
+                PythonInventoryProbe::PythonAbsent,
+            ),
+            (ProbeOutcome::NonZeroExit, PythonInventoryProbe::ProbeFailed),
+            (ProbeOutcome::TimedOut, PythonInventoryProbe::ProbeTimeout),
+            // Exited 0, but the output is not the contract we can read. A
+            // changed interpreter script, NOT an empty environment.
+            (
+                ProbeOutcome::Ok("Package  Version\n-------  -------".to_string()),
+                PythonInventoryProbe::UnparseableOutput,
+            ),
+            (
+                ProbeOutcome::Ok("[\"not\", \"an object\"]".to_string()),
+                PythonInventoryProbe::UnparseableOutput,
+            ),
+        ] {
+            let inventory = inventory_from_outcome(outcome.clone());
+            assert_eq!(inventory.probe, expected, "for {outcome:?}");
+            assert!(
+                inventory.measured.is_none(),
+                "{expected:?} must publish neither a count nor a digest"
+            );
+            assert_ne!(
+                inventory.probe.wire(),
+                measured.probe.wire(),
+                "an unmeasurable box must not share the measured box's provenance"
+            );
+        }
+
+        let wires = [
+            PythonInventoryProbe::Measured,
+            PythonInventoryProbe::ScopeUnusable,
+            PythonInventoryProbe::PythonAbsent,
+            PythonInventoryProbe::ProbeFailed,
+            PythonInventoryProbe::ProbeTimeout,
+            PythonInventoryProbe::UnparseableOutput,
+        ]
+        .map(|p| p.wire());
+        let unique: std::collections::BTreeSet<&str> = wires.iter().copied().collect();
+        assert_eq!(unique.len(), wires.len(), "wire strings must be distinct");
+    }
+
+    /// **A child that outruns the pipe buffer must not stall the probe.**
+    ///
+    /// `run_bounded_capture` used to leave both pipes attached and read stdout
+    /// only after `try_wait` reported exit. A pipe holds 64 KiB, so a child
+    /// writing past that blocked in `write`, never exited, and the probe
+    /// reported `probe_timeout` — degrading on exactly the large environments
+    /// Half B most needs to measure. Nothing caught it because no test ever
+    /// produced more than a version string.
+    ///
+    /// This drives a REAL child well past the buffer, so a regression to
+    /// poll-then-read fails here rather than in production.
+    #[test]
+    fn bounded_capture_survives_a_child_that_outruns_the_pipe_buffer() {
+        let dir = std::env::temp_dir().join(format!(
+            "qontinui_probe_flood_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = dir.join("payload.txt");
+        // 256 KiB — four times the 64 KiB pipe capacity, so the old shape
+        // deadlocks rather than merely coming close.
+        let line = "x".repeat(255);
+        let body: String = std::iter::repeat(line.as_str())
+            .take(1024)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&payload, &body).unwrap();
+        let payload_str = payload.to_string_lossy().to_string();
+
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd", vec!["/c", "type", payload_str.as_str()]);
+        #[cfg(not(windows))]
+        let (cmd, args) = ("cat", vec![payload_str.as_str()]);
+
+        // A budget short enough that a genuine deadlock cannot masquerade as a
+        // slow box: copying 256 KiB is milliseconds' work.
+        let outcome = run_bounded_capture(cmd, &args, None, Duration::from_secs(20));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match outcome {
+            ProbeOutcome::Ok(out) => assert!(
+                out.len() >= 200_000,
+                "stdout was truncated: got {} bytes, expected the whole payload",
+                out.len()
+            ),
+            other => panic!(
+                "a child writing 256 KiB must complete, not {other:?} — \
+                 stdout is not being drained concurrently"
+            ),
+        }
+    }
+
+    /// Half B publishes its own scope kind rather than leaning on
+    /// `probe_scope_kind`, which the server classifies derived — a difference
+    /// there is scored `info` and would let two boxes that measured
+    /// incomparable scopes still read as agreeing. The three unconditional keys
+    /// are written on every rung, including the unmeasurable ones.
+    #[test]
+    fn installed_capture_always_states_provenance_scope_and_env_kind() {
+        for kind in [
+            ProbeScopeKind::Declared,
+            ProbeScopeKind::Default,
+            ProbeScopeKind::Inherited,
+        ] {
+            let scope = unusable_scope(kind);
+            let mut section = Section::new();
+            put_python_installed(&mut section, &scope);
+
+            assert_eq!(
+                section
+                    .get(PYTHON_INSTALLED_SCOPE_KEY)
+                    .and_then(|v| v.as_str()),
+                Some(kind.wire()),
+                "the scope kind must be stated, not inherited from probe_scope_kind"
+            );
+            // An unusable scope is reported AS SUCH — not as "python absent",
+            // which would assert something this rung never tested.
+            assert_eq!(
+                section
+                    .get(PYTHON_INSTALLED_PROBE_KEY)
+                    .and_then(|v| v.as_str()),
+                Some("scope_unusable"),
+            );
+            assert_eq!(
+                section
+                    .get(PYTHON_INSTALLED_ENV_KIND_KEY)
+                    .and_then(|v| v.as_str()),
+                Some("unknown"),
+                "an unmeasured environment must not be labelled `system`"
+            );
+            // Nothing measured, so neither measurement key may appear.
+            assert!(!section.contains_key(PYTHON_INSTALLED_COUNT_KEY));
+            assert!(!section.contains_key(PYTHON_INSTALLED_DIGEST_KEY));
+            // Nothing here may leak a machine-local path.
+            let json = serde_json::to_string(&section).unwrap();
+            assert!(
+                !json.contains("qontinui_no_such_scope_root"),
+                "a probe path must never reach the wire: {json}"
+            );
+        }
+    }
+
+    /// Both provenance keys are present on a REAL capture no matter how this
+    /// box resolves — the whole point of hoisting Half A out of the `if let`
+    /// and writing Half B's three keys unconditionally.
+    #[test]
+    fn collect_versions_always_publishes_both_provenance_keys() {
+        let section = collect_versions();
+
+        let source = section
+            .get(PYTHON_DEP_SOURCE_KEY)
+            .and_then(|v| v.as_str())
+            .expect("python_dep__source must be present on every capture");
+        assert!(
+            [
+                "pyproject",
+                "pyproject_pep621",
+                "pyproject_unreadable",
+                "pyproject_absent",
+                "workspace_unresolved",
+            ]
+            .contains(&source),
+            "unknown Half A provenance {source}"
+        );
+
+        let probe = section
+            .get(PYTHON_INSTALLED_PROBE_KEY)
+            .and_then(|v| v.as_str())
+            .expect("python_installed_probe must be present on every capture");
+        assert!(
+            [
+                "measured",
+                "scope_unusable",
+                "python_absent",
+                "probe_failed",
+                "probe_timeout",
+                "unparseable_output",
+            ]
+            .contains(&probe),
+            "unknown Half B provenance {probe}"
+        );
+
+        // Measurement keys track the probe verdict exactly: present iff
+        // measured. This is the invariant that keeps "not measured" from ever
+        // rendering as an agreeing box.
+        let measured = probe == "measured";
+        assert_eq!(section.contains_key(PYTHON_INSTALLED_COUNT_KEY), measured);
+        assert_eq!(section.contains_key(PYTHON_INSTALLED_DIGEST_KEY), measured);
+        assert!(section.contains_key(PYTHON_INSTALLED_SCOPE_KEY));
+
+        // The comparability gate is always stated, and is only a real kind when
+        // something was actually measured.
+        let env_kind = section
+            .get(PYTHON_INSTALLED_ENV_KIND_KEY)
+            .and_then(|v| v.as_str())
+            .expect("the comparability gate must be present on every capture");
+        assert!(["venv", "system", "unknown"].contains(&env_kind));
+        assert_eq!(env_kind != "unknown", measured);
     }
 
     /// `runner_crate_version` and `tauri` are properties of the BINARY, baked at
