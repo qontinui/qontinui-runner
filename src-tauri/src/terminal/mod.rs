@@ -834,6 +834,25 @@ mod tests {
     }
 
     #[test]
+    fn memory_clause_has_no_collapsed_whitespace_runs() {
+        // Regression guard for a real defect caught in review: a multi-line Rust
+        // string literal whose `\` line-continuations go missing silently keeps
+        // compiling, but ships the source indentation INSIDE the string — the
+        // model then receives "resolve its          tenant". Substring assertions
+        // do not catch it, because the words are all still there.
+        let c = memory_clause();
+        let body = c.trim_start_matches('\n');
+        assert!(
+            !body.contains("  "),
+            "clause carries a collapsed whitespace run (lost line continuation): {body:?}"
+        );
+        assert!(
+            !body.contains('\n'),
+            "clause body must be one paragraph — a raw newline means a continuation was dropped"
+        );
+    }
+
+    #[test]
     fn memory_clause_carries_no_tenant_identity() {
         // RCE-class invariant inherited from `runner_context`: tenant rides the
         // credential, never the prompt.

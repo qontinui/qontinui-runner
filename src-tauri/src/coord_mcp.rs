@@ -1635,7 +1635,11 @@ pub(crate) fn proxy_session_pin_for_nonce(nonce: &str) -> crate::session::tenant
 pub(crate) fn tenant_unresolvable_error() -> (u16, String) {
     (
         503,
-        "COORD_MCP_PROXY_TENANT_UNRESOLVABLE: this machine cannot resolve its          tenant — ~/.qontinui/machine.json is missing or malformed AND the          device JWT carries no tenant_id claim. Coord memory and other          tenant-scoped writes are refused rather than attributed to the          default tenant. Fix by repairing machine.json or re-pairing the device."
+        "COORD_MCP_PROXY_TENANT_UNRESOLVABLE: this machine cannot resolve its tenant \
+         — ~/.qontinui/machine.json is missing or malformed AND the device JWT \
+         carries no tenant_id claim. Coord memory and other tenant-scoped writes \
+         are refused rather than attributed to the default tenant. Fix by \
+         repairing machine.json or re-pairing the device."
             .to_string(),
     )
 }
@@ -1685,13 +1689,16 @@ pub(crate) fn session_tenant_or_refuse(nonce: Option<&str>) -> Result<Option<Uui
             match device_jwt_claim_tenant() {
                 Some(t) => {
                     warn!(
-                        "coord_mcp: machine pin unresolvable; falling back to the device JWT's                          tenant claim ({t}) — repair ~/.qontinui/machine.json"
+                        "coord_mcp: machine pin unresolvable; falling back to the \
+                         device JWT's tenant claim ({t}) — repair ~/.qontinui/machine.json"
                     );
                     Ok(Some(t))
                 }
                 None => {
                     warn!(
-                        "coord_mcp: REFUSING proxy request — tenant unresolvable by any route                          (no usable machine.json pin and no tenant_id claim on the device JWT)"
+                        "coord_mcp: REFUSING proxy request — tenant unresolvable by \
+                         any route (no usable machine.json pin and no tenant_id claim \
+                         on the device JWT)"
                     );
                     Err(tenant_unresolvable_error())
                 }
