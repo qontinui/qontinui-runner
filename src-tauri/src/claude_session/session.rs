@@ -323,18 +323,14 @@ impl ClaudeSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Set CLAUDE_CONFIG_DIR to the resolved account (for multi-account support)
         // Silently refresh OAuth credentials if expired before spawning the subprocess.
         crate::ai_provider::oauth_refresh::try_ensure_valid_credentials(
             effective_config_dir.as_deref(),
         );
-        if let Some(ref config_dir) = effective_config_dir {
-            info!(
-                "Setting CLAUDE_CONFIG_DIR={} for session {}",
-                config_dir, session_id
-            );
-            cmd.env("CLAUDE_CONFIG_DIR", config_dir.as_str());
-        }
+        // The LAST env mutations before the spawn — account pin, then the
+        // credential scrub. Extracted so the production call site is
+        // unit-testable; see the function's doc comment.
+        Self::finalize_child_env(&mut cmd, effective_config_dir.as_deref(), session_id);
 
         // ── Observable-bridge federation: spawn-time pull + watcher ───
         //
@@ -1952,6 +1948,42 @@ impl ClaudeSession {
         }
     }
 
+    /// The final env mutations applied to the bidirectional stream-json child
+    /// before it is spawned: the resolved-account pin, then the credential
+    /// scrub.
+    ///
+    /// **Highest-consequence seam in the crate.** This session runs with
+    /// `--permission-mode bypassPermissions` and writes an on-disk transcript,
+    /// so a credential that reaches its env can land in a persisted artifact as
+    /// well as in a model context — the habitual
+    /// `JWT|KEY|TOKEN|SECRET` redaction filter does not match `PASSWORD`. Name
+    /// list and rationale: `crate::terminal::CREDENTIAL_VALUE_ENV_VARS`.
+    ///
+    /// The scrub is LAST: `CLAUDE_CONFIG_DIR` is the only env set after the
+    /// argv/marker block in [`Self::spawn`], and the federation block that runs
+    /// between this call and `cmd.spawn()` does I/O only. So the strip is
+    /// last-write-wins by construction.
+    ///
+    /// Extracted from [`Self::spawn`] because that function spawns a real
+    /// `claude` and cannot run in a unit test — with the scrub inlined there,
+    /// deleting it reddened nothing.
+    fn finalize_child_env(
+        cmd: &mut std::process::Command,
+        effective_config_dir: Option<&str>,
+        session_id: &str,
+    ) {
+        // Set CLAUDE_CONFIG_DIR to the resolved account (for multi-account support).
+        if let Some(config_dir) = effective_config_dir {
+            info!(
+                "Setting CLAUDE_CONFIG_DIR={} for session {}",
+                config_dir, session_id
+            );
+            cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+        }
+
+        crate::terminal::scrub_credential_env_std(cmd);
+    }
+
     /// Internal: wait for child process to exit.
     fn wait_for_child(mut child: Child, session_id: &str) {
         loop {
@@ -2007,6 +2039,50 @@ impl std::fmt::Debug for ClaudeSession {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    // =======================================================================
+    // Bidirectional stream-json spawn seam — production call-site coverage for
+    // the credential scrub (plan
+    // 2026-08-07-runner-context-visibility-and-session-env-secret-hygiene).
+    //
+    // `ClaudeSession::finalize_child_env` IS the env tail of
+    // `ClaudeSession::spawn` — deleting the `scrub_credential_env_std` call
+    // from it reddens this test. Highest consequence of the eight seams: this
+    // one runs bypassPermissions and persists a transcript.
+    // =======================================================================
+
+    #[test]
+    fn stream_json_session_finalize_child_env_scrubs_credential_values() {
+        let mut cmd = std::process::Command::new("dummy");
+        // As the inherited process env would have supplied them.
+        for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
+            cmd.env(name, "hunter2");
+        }
+
+        super::ClaudeSession::finalize_child_env(
+            &mut cmd,
+            Some("/tmp/claude-config"),
+            "session-under-test",
+        );
+
+        crate::terminal::assert_credentials_scrubbed_std(&cmd, "ClaudeSession::finalize_child_env");
+
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.iter().any(
+                |(k, v)| k == "CLAUDE_CONFIG_DIR" && v.as_deref() == Some("/tmp/claude-config")
+            ),
+            "the resolved account pin must still be applied"
+        );
+    }
 
     /// The `isolated_edit_ctx` slot on `ClaudeSession` is the worktree-isolation
     /// Phase 3 (restart-resilience) fix for the `mem::forget` claim leak: a

@@ -848,35 +848,14 @@ impl TerminalSession {
         // injects nothing.
         Self::apply_install_intercept_env(&mut cmd, &id);
 
-        // Set CLAUDE_CONFIG_DIR so Claude Code uses the resolved account
-        // (multi-account support with auto-rotation on rate-limit) — UNLESS
-        // the caller already pinned an account via `extra_env`. A caller pin
-        // (backend continuation spawns, account-migration respawns) is a
-        // deliberate per-session choice and must not be clobbered by the
-        // process-global resolved dir, which may point at a different (or
-        // freshly-exhausted) account.
-        if !caller_pinned_config_dir {
-            if let Some(config_dir) = effective_claude_config_dir.as_deref() {
-                cmd.env("CLAUDE_CONFIG_DIR", config_dir);
-            }
-        }
-
-        // Same class as the `CLAUDECODE` / `CLAUDE_CHILD_SESSION_ENV` strips
-        // above, but for credential VALUES: the runner inherits plaintext
-        // passwords (Windows USER-scope vars; the supervisor's forwarded
-        // auto-login password) and would otherwise hand them to every `claude`
-        // typed into a pane, where an `env` dump prints them into the
-        // transcript — the habitual `JWT|KEY|TOKEN|SECRET` redaction filter
-        // does not match `PASSWORD`. Name list and rationale:
-        // `crate::terminal::CREDENTIAL_VALUE_ENV_VARS`.
-        //
-        // Deliberately the LAST env mutation before the spawn, AFTER the
-        // caller-supplied `extra_env` loop. That makes the strip last-write-wins
-        // by construction: no present or future caller can reintroduce one of
-        // these names through `extra_env`. Placing it beside the marker strips
-        // above would have left exactly that hole (no caller exploits it today,
-        // but nothing enforced it either).
-        crate::terminal::scrub_credential_env_pty(&mut cmd);
+        // The LAST env mutations before the spawn — account pin, then the
+        // credential scrub. Extracted so the ordering is unit-testable; see the
+        // function's doc comment for why it must stay last.
+        Self::finalize_child_env(
+            &mut cmd,
+            effective_claude_config_dir.as_deref(),
+            caller_pinned_config_dir,
+        );
 
         // Spawn the child process
         let child = pair
@@ -1395,6 +1374,47 @@ impl TerminalSession {
             app_handle: Some(session_app_handle),
             input_line_buf: Arc::new(Mutex::new(String::new())),
         })
+    }
+
+    /// The final env mutations applied to a PTY child before it is spawned:
+    /// the resolved-account pin, then the credential-value scrub.
+    ///
+    /// **Why the scrub is last.** Same class as the `CLAUDECODE` /
+    /// `CLAUDE_CHILD_SESSION_ENV` strips earlier in [`Self::spawn`], but for
+    /// credential VALUES: the runner inherits plaintext passwords (Windows
+    /// USER-scope vars; the supervisor's forwarded auto-login password) and
+    /// would otherwise hand them to every `claude` typed into a pane, where an
+    /// `env` dump prints them into the transcript — the habitual
+    /// `JWT|KEY|TOKEN|SECRET` redaction filter does not match `PASSWORD`. Name
+    /// list and rationale: `crate::terminal::CREDENTIAL_VALUE_ENV_VARS`.
+    ///
+    /// It runs AFTER the caller-supplied `extra_env` loop, which makes the
+    /// strip last-write-wins by construction: no present or future caller can
+    /// reintroduce one of these names through `extra_env`. Placing it beside the
+    /// marker strips would have left exactly that hole (no caller exploits it
+    /// today, but nothing enforced it either).
+    ///
+    /// **Why it is a function.** Extracting it is what makes the production
+    /// call site testable at all — `spawn` opens a real PTY and cannot run in a
+    /// unit test, so with the scrub inlined there, deleting it reddened nothing.
+    ///
+    /// `caller_pinned_config_dir` says the caller already set `CLAUDE_CONFIG_DIR`
+    /// through `extra_env` (backend continuation spawns, account-migration
+    /// respawns). That pin is a deliberate per-session account choice and must
+    /// not be clobbered by the process-global resolved dir, which may point at a
+    /// different (or freshly-exhausted) account.
+    fn finalize_child_env(
+        cmd: &mut CommandBuilder,
+        effective_claude_config_dir: Option<&str>,
+        caller_pinned_config_dir: bool,
+    ) {
+        if !caller_pinned_config_dir {
+            if let Some(config_dir) = effective_claude_config_dir {
+                cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+            }
+        }
+
+        crate::terminal::scrub_credential_env_pty(cmd);
     }
 
     /// Build the PTY child [`CommandBuilder`] from an optional program+args
@@ -2664,6 +2684,66 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =======================================================================
+    // PTY spawn seam — production call-site coverage for the credential scrub
+    // (plan 2026-08-07-runner-context-visibility-and-session-env-secret-hygiene)
+    //
+    // These test `TerminalSession::finalize_child_env`, which IS the production
+    // env tail of `TerminalSession::spawn` — not a re-implementation of it. If
+    // the `scrub_credential_env_pty` call is deleted from that function, these
+    // fail.
+    // =======================================================================
+
+    /// The seam must remove a credential value that is already present in the
+    /// child's env map — the production case, where `CommandBuilder::new` seeds
+    /// the map from the process env (and, on Windows, from a fresh HKLM/HKCU
+    /// `Environment` read).
+    #[test]
+    fn pty_finalize_child_env_scrubs_credential_values() {
+        let mut cmd = CommandBuilder::new("dummy");
+        for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
+            cmd.env(name, "hunter2");
+        }
+
+        TerminalSession::finalize_child_env(&mut cmd, Some("/tmp/claude-config"), false);
+
+        crate::terminal::assert_credentials_scrubbed_pty(
+            &cmd,
+            "TerminalSession::finalize_child_env",
+        );
+        assert_eq!(
+            cmd.get_env("CLAUDE_CONFIG_DIR").and_then(|v| v.to_str()),
+            Some("/tmp/claude-config"),
+            "the resolved account pin must still be applied"
+        );
+    }
+
+    /// The ordering contract: the scrub runs AFTER the caller's `extra_env`
+    /// loop, so a caller that re-supplies a credential name cannot defeat it.
+    /// Simulated here by seeding the value the way `extra_env` would, then
+    /// running the same tail `spawn` runs.
+    #[test]
+    fn pty_finalize_child_env_scrub_beats_a_caller_supplied_credential() {
+        let mut cmd = CommandBuilder::new("dummy");
+        // As if `extra_env` had carried both a legitimate pin and a credential.
+        cmd.env("CLAUDE_CONFIG_DIR", "/caller/pinned");
+        for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
+            cmd.env(name, "hunter2");
+        }
+
+        TerminalSession::finalize_child_env(&mut cmd, Some("/resolved/dir"), true);
+
+        crate::terminal::assert_credentials_scrubbed_pty(
+            &cmd,
+            "TerminalSession::finalize_child_env (caller-pinned)",
+        );
+        assert_eq!(
+            cmd.get_env("CLAUDE_CONFIG_DIR").and_then(|v| v.to_str()),
+            Some("/caller/pinned"),
+            "a caller pin must not be clobbered by the resolved dir"
+        );
+    }
 
     /// In-memory `Write` whose bytes can be inspected after the writes.
     /// Backed by an `Arc<Mutex<Vec<u8>>>` so the test can read it after

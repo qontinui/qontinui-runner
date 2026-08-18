@@ -38,25 +38,47 @@ pub use manager::TerminalManager;
 /// supervisor (`qontinui-supervisor/src/process/env_forwarders.rs:209-210`).
 /// There is no other route in, so every fix belongs at a runner spawn seam.
 ///
-/// **Which seams are covered — and which are NOT.** This currently scrubs the
-/// two seams named by plan
-/// `2026-08-07-runner-context-visibility-and-session-env-secret-hygiene`
-/// Phase 1: [`session::TerminalSession::spawn`] (PTY panes) and
-/// `agent_runtime::spawn_claude_child` (headless `claude -p` workers).
-/// **That is not yet every Claude-CLI spawn seam in this crate.** The crate's
+/// **Which seams are covered.** Every seam in this crate that starts a Claude
+/// or Gemini CLI *session* — i.e. one that carries a prompt and can therefore
+/// put an `env` dump into a model context or an on-disk transcript. The crate's
 /// own marker for such a seam is the paired
 /// `env_remove("CLAUDECODE")` + `env_remove(CLAUDE_CHILD_SESSION_ENV)` strip
 /// documented at `session/transport/claude_cli.rs:23-50`; `grep -rn env_remove
-/// src-tauri/src` enumerates them. Still UNSCRUBBED at the time of writing:
-/// `claude_session/session.rs` (bidirectional stream-json, bypassPermissions,
-/// writes an on-disk transcript), `claude_session/runner.rs`,
-/// `ai_provider/process.rs::spawn_and_wait_with_doctor` (the shared choke point
-/// for the `claude --print` / `gemini -p` one-shots),
-/// `orchestration_loop/fix_agent.rs` and `commands/command_interpreter.rs`.
-/// The first four take a `std::process::Command` and would need a third wrapper
-/// beside the two below; the last two are `tokio::process::Command` and can call
-/// [`scrub_credential_env_tokio`] verbatim. Extending the coverage is tracked as
-/// follow-up work — do NOT read this const as "the leak is closed everywhere".
+/// src-tauri/src` enumerates them. The eight covered seams, each scrubbing as
+/// its LAST env mutation before spawn:
+///
+/// | seam | `Command` type | wrapper |
+/// |---|---|---|
+/// | `session::TerminalSession::finalize_child_env` (PTY panes) | `portable_pty::CommandBuilder` | [`scrub_credential_env_pty`] |
+/// | `agent_runtime::finalize_headless_child_env` (headless `claude -p`) | `tokio::process::Command` | [`scrub_credential_env_tokio`] |
+/// | `claude_session::session::finalize_child_env` (bidirectional stream-json, bypassPermissions, on-disk transcript) | `std::process::Command` | [`scrub_credential_env_std`] |
+/// | `claude_session::runner::build_inline_child_command` | `std::process::Command` | [`scrub_credential_env_std`] |
+/// | `ai_provider::process::prepare_ai_child_env` (choke point for the `claude --print` **and** `gemini -p` one-shots) | `std::process::Command` | [`scrub_credential_env_std`] |
+/// | `ai_provider::claude_cli::build_scorer_command` (auto-response option scorer) | `std::process::Command` | [`scrub_credential_env_std`] |
+/// | `orchestration_loop::fix_agent::build_fix_agent_command` | `tokio::process::Command` | [`scrub_credential_env_tokio`] |
+/// | `commands::command_interpreter::build_interpret_command` | `tokio::process::Command` | [`scrub_credential_env_tokio`] |
+///
+/// Every one of those is an extracted, unit-tested env-construction function
+/// (plan `2026-08-07-runner-context-visibility-and-session-env-secret-hygiene`
+/// Phase 1 + follow-up), so deleting a `scrub_*` call reddens a test rather
+/// than silently reopening the leak.
+///
+/// **Which spawn sites deliberately do NOT scrub, and why.** Three `claude`
+/// spawn sites carry the `CLAUDECODE` marker or a claude/gemini program name
+/// but are not session seams, so a scrub there would buy nothing:
+///
+/// - `instance_manager.rs` launches a SECONDARY qontinui-runner, not a CLI
+///   session. That runner is a legitimate holder of these values (see
+///   "Consumers that still work" below) and every session IT spawns comes back
+///   through the seams above. Scrubbing here would break `setup_wizard` /
+///   `headless_browser` on secondaries for no gain.
+/// - `commands/ai_settings.rs` (`claude --version` / `gemini --version`
+///   connection tests) and `fleet.rs::detect_claude_code_now`
+///   (`claude --version` availability probe) pass no prompt, load no model and
+///   write no transcript. There is no context for an `env` dump to land in.
+///
+/// If you add a spawn site that passes a prompt to a CLI, it belongs in the
+/// table above, not in this list.
 ///
 /// **Why plaintext in a session env is not benign.** The habitual redaction
 /// idiom `env | sed 's/\(JWT\|KEY\|TOKEN\|SECRET\)=.*/\1=<redacted>/'` does NOT
@@ -102,11 +124,77 @@ pub(crate) fn scrub_credential_env_pty(cmd: &mut portable_pty::CommandBuilder) {
 
 /// Strip [`CREDENTIAL_VALUE_ENV_VARS`] from a tokio child's environment.
 ///
-/// Twin of [`scrub_credential_env_pty`] over the other `Command` type the two
-/// spawn seams use. Both read the SAME name list so the seams cannot drift.
+/// Twin of [`scrub_credential_env_pty`] over one of the other two `Command`
+/// types the spawn seams use. All three wrappers read the SAME name list so the
+/// seams cannot drift.
 pub(crate) fn scrub_credential_env_tokio(cmd: &mut tokio::process::Command) {
     for name in CREDENTIAL_VALUE_ENV_VARS {
         cmd.env_remove(name);
+    }
+}
+
+/// Strip [`CREDENTIAL_VALUE_ENV_VARS`] from a `std::process::Command` child's
+/// environment.
+///
+/// Third and last of the wrappers, for the blocking seams
+/// (`claude_session::{session, runner}`, `ai_provider::{process, claude_cli}`).
+/// Takes `&mut` rather than a builder-style `Command` so it also fits the
+/// `&mut std::process::Command` call site in
+/// `ai_provider::process::spawn_and_wait_with_doctor`, which never owns the
+/// command it prepares.
+///
+/// `std::process::Command::env_remove` records the name as *cleared* in the
+/// child's env override map, which suppresses the value the child would
+/// otherwise inherit from this process — it is not merely "decline to set".
+/// `tokio::process::Command` is a wrapper over this same type and inherits the
+/// behaviour, which is why the two functions are one-liners over one const.
+pub(crate) fn scrub_credential_env_std(cmd: &mut std::process::Command) {
+    for name in CREDENTIAL_VALUE_ENV_VARS {
+        cmd.env_remove(name);
+    }
+}
+
+/// Test-only assertion: every [`CREDENTIAL_VALUE_ENV_VARS`] name is marked for
+/// removal on a `std::process::Command` built by a production seam.
+///
+/// Shared by the per-seam call-site tests so each seam asserts the SAME
+/// property against the SAME name list — a name added to the const is
+/// immediately required at every seam rather than at whichever ones someone
+/// remembered to update.
+#[cfg(test)]
+pub(crate) fn assert_credentials_scrubbed_std(cmd: &std::process::Command, seam: &str) {
+    let envs: Vec<(String, bool)> = cmd
+        .get_envs()
+        .map(|(k, v)| (k.to_string_lossy().to_string(), v.is_none()))
+        .collect();
+    for name in CREDENTIAL_VALUE_ENV_VARS {
+        assert!(
+            envs.iter().any(|(k, cleared)| k == *name && *cleared),
+            "{seam}: {name} is not marked for removal — the credential scrub \
+             is missing from this spawn seam's env construction"
+        );
+    }
+}
+
+/// Test-only twin of [`assert_credentials_scrubbed_std`] for the tokio seams.
+#[cfg(test)]
+pub(crate) fn assert_credentials_scrubbed_tokio(cmd: &tokio::process::Command, seam: &str) {
+    assert_credentials_scrubbed_std(cmd.as_std(), seam);
+}
+
+/// Test-only twin of [`assert_credentials_scrubbed_std`] for the PTY seam.
+///
+/// `CommandBuilder` keeps base env and overrides in ONE map, so a scrubbed name
+/// is simply ABSENT rather than present-and-cleared. Seed the values before
+/// calling the seam under test, or this assertion passes vacuously.
+#[cfg(test)]
+pub(crate) fn assert_credentials_scrubbed_pty(cmd: &portable_pty::CommandBuilder, seam: &str) {
+    for name in CREDENTIAL_VALUE_ENV_VARS {
+        assert!(
+            cmd.get_env(name).is_none(),
+            "{seam}: {name} survived — the credential scrub is missing from \
+             this spawn seam's env construction"
+        );
     }
 }
 
@@ -323,8 +411,8 @@ pub fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        runner_context, scrub_credential_env_pty, scrub_credential_env_tokio,
-        CREDENTIAL_VALUE_ENV_VARS, RUNNER_CONTEXT_SOURCE_MARKER,
+        runner_context, scrub_credential_env_pty, scrub_credential_env_std,
+        scrub_credential_env_tokio, CREDENTIAL_VALUE_ENV_VARS, RUNNER_CONTEXT_SOURCE_MARKER,
     };
     use crate::mcp::fleet_policy_poller::{pin_plan_capture_level_for_test, PLAN_CAPTURE_RECORD};
 
@@ -447,6 +535,50 @@ mod tests {
             assert!(
                 envs.iter().any(|(k, v)| k == *name && v.is_none()),
                 "{name} is not marked for removal on the tokio seam"
+            );
+        }
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "QONTINUI_TEST_AUTO_LOGIN_EMAIL"
+                    && v.as_deref() == Some("operator@example.com")),
+            "the identifier must survive — skills read it"
+        );
+    }
+
+    /// Behavioural twin on the blocking `std::process::Command` seam. A prior
+    /// `env(name, …)` must be REPLACED by the cleared marker, not left standing:
+    /// that is what proves the wrapper suppresses an inherited value rather than
+    /// merely declining to add one.
+    #[test]
+    fn scrub_records_removals_on_a_std_command() {
+        let mut cmd = std::process::Command::new("dummy");
+        for name in CREDENTIAL_VALUE_ENV_VARS {
+            cmd.env(name, "hunter2");
+        }
+        cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", "operator@example.com");
+
+        scrub_credential_env_std(&mut cmd);
+
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        for name in CREDENTIAL_VALUE_ENV_VARS {
+            assert!(
+                envs.iter().any(|(k, v)| k == *name && v.is_none()),
+                "{name} is not marked for removal on the std seam"
+            );
+            assert!(
+                !envs
+                    .iter()
+                    .any(|(k, v)| k == *name && v.as_deref() == Some("hunter2")),
+                "{name} still carries its value on the std seam"
             );
         }
         assert!(

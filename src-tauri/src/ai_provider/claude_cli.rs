@@ -303,6 +303,51 @@ fn scorer_claude_program(settings: &ClaudeCliSettings) -> String {
 ///
 /// Bounded by `timeout`: the child is killed and `None` returned if it does not
 /// exit in time, so a wedged CLI never strands the scheduler task.
+/// Build the one-shot scorer's `claude --print` command, fully env-prepared.
+///
+/// On Windows route through cmd.exe `/c` (so a `.cmd`/`.ps1` shim on PATH
+/// resolves), elsewhere invoke the program directly. The prompt is piped over
+/// STDIN by the caller (not passed as a `-p` argv) — the scoring prompt is long
+/// + multi-line + JSON-heavy, and cmd.exe corrupts special chars
+/// (`"`, `%`, `^`, `&`, `|`, `<`, `>`) in arguments (the exact reason
+/// `run_claude_cli` always pipes on Windows). `claude --print` reads the prompt
+/// from stdin when no positional prompt is given.
+///
+/// **This seam does NOT route through
+/// [`super::process::spawn_and_wait_with_doctor`]** — it spawns and polls its
+/// own child so it can enforce a timeout — so it needs its own copy of the env
+/// preamble, credential scrub included. The scrub is last: the returned command
+/// is spawned directly by [`score_options_via_cli`] with no further env
+/// mutation. See `crate::terminal::CREDENTIAL_VALUE_ENV_VARS`.
+///
+/// Returned by value (rather than the env work being inlined at the call site)
+/// so the constructed environment is unit-testable without spawning `claude`.
+fn build_scorer_command(program: &str, config_dir: Option<&str>) -> std::process::Command {
+    let mut cmd = if std::env::consts::OS == "windows" {
+        let mut c = crate::process_helpers::cmd_no_window();
+        c.args(["/c", program, "--print"]);
+        c
+    } else {
+        let mut c = crate::process_helpers::no_window(program);
+        c.arg("--print");
+        c
+    };
+    if let Some(dir) = config_dir {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    cmd.env_remove("CLAUDECODE");
+    // Same rule, sibling marker — see `session::transport::claude_cli` docs.
+    cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+    cmd.env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    crate::terminal::scrub_credential_env_std(&mut cmd);
+
+    cmd
+}
+
 pub(crate) fn score_options_via_cli(
     prompt: &str,
     settings: &ClaudeCliSettings,
@@ -314,32 +359,7 @@ pub(crate) fn score_options_via_cli(
     // Refresh OAuth before spawning, same as run_claude_cli.
     super::oauth_refresh::try_ensure_valid_credentials(config_dir.as_deref());
 
-    // Build the command. On Windows route through cmd.exe /c (so a `.cmd`/`.ps1`
-    // shim on PATH resolves), elsewhere invoke the program directly. The prompt
-    // is piped over STDIN (not passed as a `-p` argv) — the scoring prompt is
-    // long + multi-line + JSON-heavy, and cmd.exe corrupts special chars
-    // (", %, ^, &, |, <, >) in arguments (the exact reason `run_claude_cli`
-    // always pipes on Windows). `claude --print` reads the prompt from stdin
-    // when no positional prompt is given.
-    let mut cmd = if std::env::consts::OS == "windows" {
-        let mut c = crate::process_helpers::cmd_no_window();
-        c.args(["/c", &program, "--print"]);
-        c
-    } else {
-        let mut c = crate::process_helpers::no_window(&program);
-        c.arg("--print");
-        c
-    };
-    if let Some(dir) = config_dir.as_deref() {
-        cmd.env("CLAUDE_CONFIG_DIR", dir);
-    }
-    cmd.env_remove("CLAUDECODE");
-    // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-    cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
-    cmd.env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string());
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut cmd = build_scorer_command(&program, config_dir.as_deref());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -479,5 +499,51 @@ fn process_cli_output(output: std::process::Output) -> AiResponse {
 
         error!("{}", diagnostic);
         AiResponse::error_with_output(stdout, diagnostic)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_scorer_command;
+
+    // =======================================================================
+    // Auto-response option scorer — production call-site coverage for the
+    // credential scrub (plan
+    // 2026-08-07-runner-context-visibility-and-session-env-secret-hygiene).
+    //
+    // This seam was missed by #1056's review: it spawns `claude --print`
+    // directly instead of going through `process::spawn_and_wait_with_doctor`,
+    // so the choke-point fix does NOT cover it. `build_scorer_command` IS the
+    // command `score_options_via_cli` spawns — deleting the
+    // `scrub_credential_env_std` call from it reddens this test.
+    // =======================================================================
+
+    #[test]
+    fn scorer_command_scrubs_credential_values() {
+        let cmd = build_scorer_command("claude", Some("/tmp/claude-config"));
+
+        crate::terminal::assert_credentials_scrubbed_std(&cmd, "build_scorer_command");
+
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.iter().any(
+                |(k, v)| k == "CLAUDE_CONFIG_DIR" && v.as_deref() == Some("/tmp/claude-config")
+            ),
+            "the resolved account pin must survive"
+        );
+        for marker in ["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION"] {
+            assert!(
+                envs.iter().any(|(k, v)| k == marker && v.is_none()),
+                "{marker} must still be stripped"
+            );
+        }
     }
 }

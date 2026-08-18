@@ -30,6 +30,43 @@ pub fn should_rebuild(fixes: &[serde_json::Value]) -> bool {
     false
 }
 
+/// Build the fix agent's `claude --print` command, fully env-prepared.
+///
+/// The credential scrub is the LAST env mutation: nothing between here and
+/// [`run_fix_agent`]'s `cmd.spawn()` touches the env (only the Windows
+/// creation-flag, which is not env). See
+/// `crate::terminal::CREDENTIAL_VALUE_ENV_VARS` — this agent runs
+/// `bypassPermissions`, and its stdout/stderr are streamed into the runner's
+/// logs, so an `env` dump here is doubly persisted.
+///
+/// Returned by value so the constructed environment is unit-testable without
+/// spawning `claude`.
+fn build_fix_agent_command(prompt_file: &str, model: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.args([
+        "--print",
+        prompt_file,
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "text",
+        "--model",
+        model,
+    ])
+    .env_remove("CLAUDECODE")
+    // Same rule, sibling marker — see `session::transport::claude_cli` docs.
+    .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+    crate::terminal::scrub_credential_env_tokio(&mut cmd);
+
+    cmd
+}
+
 /// Build a prompt for Claude CLI to implement fixes.
 pub fn build_fix_prompt(fixes: &[serde_json::Value], additional_context: Option<&str>) -> String {
     let mut prompt = String::from("# Implement Reflection Fixes\n\n");
@@ -107,25 +144,7 @@ pub async fn run_fix_agent(
         model, timeout_secs
     );
 
-    let mut cmd = tokio::process::Command::new("claude");
-    cmd.args([
-        "--print",
-        &prompt_file.display().to_string(),
-        "--permission-mode",
-        "bypassPermissions",
-        "--output-format",
-        "text",
-        "--model",
-        model,
-    ])
-    .env_remove("CLAUDECODE")
-    // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-    .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
-
-    #[cfg(windows)]
-    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let mut cmd = build_fix_agent_command(&prompt_file.display().to_string(), model);
 
     let mut child = cmd
         .spawn()

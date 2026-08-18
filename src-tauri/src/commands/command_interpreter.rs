@@ -110,6 +110,49 @@ Choose the single action that best matches the user's intent and return ONLY a J
 Do not invent action ids that are not in the catalog. Do not include prose, code fences, or markdown. \
 Return only the JSON object.";
 
+/// Build the Tier-3 router's `claude -p` command, fully env-prepared.
+///
+/// Before plan `2026-08-07-runner-context-visibility-and-session-env-secret-hygiene`
+/// this seam did NO env surgery at all — it inherited the runner's whole
+/// environment, plaintext passwords included. It now carries the same preamble
+/// as the other Claude spawn seams: the two inherited-session markers, then the
+/// credential-value scrub as the LAST env mutation before `.output()`. See
+/// `crate::terminal::CREDENTIAL_VALUE_ENV_VARS`.
+///
+/// (The markers were previously absent here too. `claude -p` one-shots do not
+/// refuse to start on a nested-session marker the way an interactive session
+/// does, so their absence was not visibly broken — but the crate's spawn-site
+/// strip rule, documented at `session/transport/claude_cli.rs:23-50`, applies
+/// to every Claude CLI spawn site, so they belong here.)
+///
+/// Returned by value so the constructed environment is unit-testable without
+/// spawning `claude`.
+fn build_interpret_command(prompt: &str) -> Command {
+    let mut cmd = crate::process_helpers::tokio_no_window("claude");
+    cmd.arg("-p")
+        .arg("--output-format")
+        .arg("json")
+        .arg("--json-schema")
+        .arg(OUTPUT_SCHEMA)
+        .arg("--system-prompt")
+        .arg(SYSTEM_PROMPT)
+        // Block every edit/exec tool — this is a router, not an agent.
+        // The model still has read tools available (Read, Grep, etc.)
+        // but those have no useful effect on a one-shot routing call.
+        .arg("--disallowed-tools")
+        .arg("Edit,Write,Bash,WebFetch,WebSearch,NotebookEdit,Task,Agent")
+        .arg("--model")
+        .arg("haiku")
+        .arg(prompt)
+        .env_remove("CLAUDECODE")
+        // Same rule, sibling marker — see `session::transport::claude_cli` docs.
+        .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+
+    crate::terminal::scrub_credential_env_tokio(&mut cmd);
+
+    cmd
+}
+
 /// Phase 8 Tier-3 entry point — invoked from the TS frontend's
 /// `interpretCommand` after Tier-1/2 miss.
 ///
@@ -133,22 +176,7 @@ pub async fn command_interpret(
         tools_json, text
     );
 
-    let output = crate::process_helpers::tokio_no_window("claude")
-        .arg("-p")
-        .arg("--output-format")
-        .arg("json")
-        .arg("--json-schema")
-        .arg(OUTPUT_SCHEMA)
-        .arg("--system-prompt")
-        .arg(SYSTEM_PROMPT)
-        // Block every edit/exec tool — this is a router, not an agent.
-        // The model still has read tools available (Read, Grep, etc.)
-        // but those have no useful effect on a one-shot routing call.
-        .arg("--disallowed-tools")
-        .arg("Edit,Write,Bash,WebFetch,WebSearch,NotebookEdit,Task,Agent")
-        .arg("--model")
-        .arg("haiku")
-        .arg(&prompt)
+    let output = build_interpret_command(&prompt)
         .output()
         .await
         .map_err(|e| format!("claude spawn failed: {e}"))?;
@@ -188,4 +216,42 @@ pub async fn command_interpret(
         .map_err(|e| format!("structured_output parse: {e} — raw: {structured}"))?;
 
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod spawn_env_tests {
+    use super::build_interpret_command;
+
+    // =======================================================================
+    // Tier-3 router spawn seam — production call-site coverage for the
+    // credential scrub (plan
+    // 2026-08-07-runner-context-visibility-and-session-env-secret-hygiene).
+    //
+    // `build_interpret_command` IS the command `command_interpret` runs —
+    // deleting the `scrub_credential_env_tokio` call from it reddens this test.
+    // =======================================================================
+
+    #[test]
+    fn interpret_command_scrubs_credential_values() {
+        let cmd = build_interpret_command("open the settings page");
+
+        crate::terminal::assert_credentials_scrubbed_tokio(&cmd, "build_interpret_command");
+
+        let envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        for marker in ["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION"] {
+            assert!(
+                envs.iter().any(|(k, v)| k == marker && v.is_none()),
+                "{marker} must still be stripped"
+            );
+        }
+    }
 }

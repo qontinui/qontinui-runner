@@ -4327,6 +4327,56 @@ fn pick_autonomous_git_identity(
     (name, email)
 }
 
+/// The final env mutations applied to a headless `claude -p` child before it
+/// is spawned: the runner-context marker + API port, then the credential scrub.
+///
+/// **Runner-context marker + API port — PTY parity for the HEADLESS seam.**
+/// `QONTINUI_RUNNER_CONTEXT` is the fleet's canonical "am I inside the runner?"
+/// predicate, but before plan
+/// `2026-08-07-runner-context-visibility-and-session-env-secret-hygiene` only
+/// the PTY path set it (`terminal/session.rs`). A headless `claude -p` worker
+/// therefore read the predicate as EMPTY while running inside the runner — a
+/// false negative that made every consumer of it wrong on this path.
+///
+/// Why an env var rather than a probe: identity must be answerable without a
+/// `/health` round trip (the port may be busy, wedged, or slow — a doomed IPv6
+/// connect alone has been measured at ~2s on this fleet), and the marker
+/// survives a runner restart because the child keeps the env it was spawned
+/// with.
+///
+/// Rendered from `crate::terminal::runner_context` — the SINGLE source of
+/// truth, the same call the three PTY callers make (`agent_runtime.rs`
+/// continuation + fleet spawns, `looping_agent_supervisor.rs`) — so the
+/// headless and PTY seams cannot drift. See the contract docs on that function
+/// (`terminal/mod.rs`) for the briefing's attributable-source marker and its
+/// fleet-gated clause.
+///
+/// Note this seam only EXPORTS the briefing; a direct-exec `claude` sources no
+/// shell integration, so whether it also reaches the model depends on the
+/// caller's `--append-system-prompt` argv (see
+/// `build_continuation_claude_command`). The env var is what makes the
+/// predicate answerable either way.
+///
+/// **The credential scrub is last.** Same control as the PTY seam in
+/// `terminal/session.rs`, single-sourced name list — see
+/// `crate::terminal::CREDENTIAL_VALUE_ENV_VARS` for why the runner is the
+/// chokepoint and why `JWT|KEY|TOKEN|SECRET` redaction misses these. Nothing in
+/// [`spawn_claude_child`] sets env after this call, so the strip is
+/// last-write-wins by construction.
+///
+/// Extracted from [`spawn_claude_child`] because that function spawns a real
+/// process and cannot run in a unit test — with the scrub inlined there,
+/// deleting it reddened nothing.
+fn finalize_headless_child_env(cmd: &mut tokio::process::Command, runner_api_port: u16) {
+    cmd.env(
+        "QONTINUI_RUNNER_CONTEXT",
+        crate::terminal::runner_context(runner_api_port),
+    );
+    cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
+
+    crate::terminal::scrub_credential_env_tokio(cmd);
+}
+
 /// Spawn `claude` CLI as a tokio child. `initial_prompt` is piped to
 /// stdin. stdout/stderr are inherited as pipes so the caller can stream
 /// them.
@@ -4385,44 +4435,10 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
     ) {
         cmd.env(k, v);
     }
-    // Runner-context marker + API port — PTY parity for the HEADLESS seam.
-    //
-    // `QONTINUI_RUNNER_CONTEXT` is the fleet's canonical "am I inside the
-    // runner?" predicate, but until now only the PTY path set it
-    // (`terminal/session.rs`). A headless `claude -p` worker therefore read the
-    // predicate as EMPTY while running inside the runner — a false negative
-    // that made every consumer of it wrong on this path.
-    //
-    // Why an env var rather than a probe: identity must be answerable without a
-    // `/health` round trip (the port may be busy, wedged, or slow — a doomed
-    // IPv6 connect alone has been measured at ~2s on this fleet), and the
-    // marker survives a runner restart because the child keeps the env it was
-    // spawned with.
-    //
-    // Rendered from `crate::terminal::runner_context` — the SINGLE source of
-    // truth, the same call the three PTY callers make (`agent_runtime.rs`
-    // continuation + fleet spawns, `looping_agent_supervisor.rs`) — so the
-    // headless and PTY seams cannot drift. See the contract docs on that
-    // function (`terminal/mod.rs`) for the briefing's attributable-source
-    // marker and its fleet-gated clause.
-    //
-    // Note this seam only EXPORTS the briefing; a direct-exec `claude` sources
-    // no shell integration, so whether it also reaches the model depends on the
-    // caller's `--append-system-prompt` argv (see
-    // `build_continuation_claude_command`). The env var is what makes the
-    // predicate answerable either way.
-    let runner_api_port = crate::mcp::types::get_mcp_api_port();
-    cmd.env(
-        "QONTINUI_RUNNER_CONTEXT",
-        crate::terminal::runner_context(runner_api_port),
-    );
-    cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
-    // Strip credential-VALUE env vars before the child inherits them. Same
-    // control as the PTY seam in `terminal/session.rs`, single-sourced name
-    // list — see `crate::terminal::CREDENTIAL_VALUE_ENV_VARS` for why the
-    // runner is the chokepoint and why `JWT|KEY|TOKEN|SECRET` redaction misses
-    // these.
-    crate::terminal::scrub_credential_env_tokio(&mut cmd);
+    // Runner-context marker + API port, then the credential scrub — the LAST
+    // env mutations before the spawn. Extracted so the production call site is
+    // unit-testable; see the function's doc comment.
+    finalize_headless_child_env(&mut cmd, crate::mcp::types::get_mcp_api_port());
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.
@@ -4727,6 +4743,53 @@ mod tests {
     use super::*;
 
     use crate::test_env::env_lock;
+
+    // =======================================================================
+    // Headless spawn seam — production call-site coverage for the credential
+    // scrub (plan
+    // 2026-08-07-runner-context-visibility-and-session-env-secret-hygiene).
+    //
+    // This tests `finalize_headless_child_env`, which IS the production env
+    // tail of `spawn_claude_child`. Deleting the `scrub_credential_env_tokio`
+    // call from it reddens this test.
+    // =======================================================================
+
+    #[test]
+    fn headless_finalize_child_env_scrubs_credential_values() {
+        let mut cmd = tokio::process::Command::new("dummy");
+        // As the inherited process env would have supplied them.
+        for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
+            cmd.env(name, "hunter2");
+        }
+
+        finalize_headless_child_env(&mut cmd, 9876);
+
+        crate::terminal::assert_credentials_scrubbed_tokio(&cmd, "finalize_headless_child_env");
+
+        // The runner-context half of the same tail must survive — this seam is
+        // load-bearing for the "am I inside the runner?" predicate, and a scrub
+        // that also ate the marker would be a regression in the other direction.
+        let envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "QONTINUI_RUNNER_API_PORT" && v.as_deref() == Some("9876")),
+            "the runner API port must still be exported"
+        );
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "QONTINUI_RUNNER_CONTEXT" && v.is_some()),
+            "the runner-context briefing must still be exported"
+        );
+    }
 
     /// Sentinel returned by the test mint closure so a mint outcome is
     /// unambiguous and deterministic (no uuid in tests).

@@ -298,6 +298,38 @@ fn run_async_inline<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
+/// Build the inline runner's `claude` child command, fully env-prepared.
+///
+/// The env preamble is the crate-standard one for a Claude-CLI spawn seam: the
+/// two inherited-session markers, a fresh trace id, then the credential-value
+/// scrub. The scrub is LAST because nothing between here and
+/// [`run_claude_session_inline`]'s `cmd.spawn()` touches the env — the
+/// federation block in between does I/O only — so the strip is
+/// last-write-wins by construction. See
+/// `crate::terminal::CREDENTIAL_VALUE_ENV_VARS` for why the runner is the
+/// chokepoint and why `JWT|KEY|TOKEN|SECRET` redaction misses these names.
+///
+/// Returned by value so the constructed environment is unit-testable without
+/// spawning `claude`.
+fn build_inline_child_command(cli_args: &[String], working_dir: &str) -> std::process::Command {
+    let mut cmd = crate::process_helpers::cmd_no_window();
+    cmd.args(cli_args)
+        .current_dir(working_dir)
+        // Remove CLAUDECODE env var to prevent "nested session" detection.
+        // The runner spawns Claude CLI as an automation tool, not as a nested session.
+        .env_remove("CLAUDECODE")
+        // Same rule, sibling marker — see `session::transport::claude_cli` docs.
+        .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
+        .env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    crate::terminal::scrub_credential_env_std(&mut cmd);
+
+    cmd
+}
+
 /// Returns the session output when complete.
 ///
 /// This is the new "in-runner" execution model that replaces independent process spawning.
@@ -473,18 +505,7 @@ fn run_claude_session_inline(
         "claude",
     ));
 
-    let mut cmd = crate::process_helpers::cmd_no_window();
-    cmd.args(&cli_args)
-        .current_dir(working_dir)
-        // Remove CLAUDECODE env var to prevent "nested session" detection.
-        // The runner spawns Claude CLI as an automation tool, not as a nested session.
-        .env_remove("CLAUDECODE")
-        // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-        .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
-        .env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    let mut cmd = build_inline_child_command(&cli_args, working_dir);
 
     // ── Observable-bridge federation: spawn-time pull + watcher ───────
     //
@@ -2717,5 +2738,44 @@ mod telemetry_tests {
             acc,
             vec!["Bash".to_string(), "Edit".to_string(), "Read".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod spawn_env_tests {
+    use super::build_inline_child_command;
+
+    // =======================================================================
+    // Inline runner spawn seam — production call-site coverage for the
+    // credential scrub (plan
+    // 2026-08-07-runner-context-visibility-and-session-env-secret-hygiene).
+    //
+    // `build_inline_child_command` IS the command `run_claude_session_inline`
+    // spawns — deleting the `scrub_credential_env_std` call from it reddens
+    // this test.
+    // =======================================================================
+
+    #[test]
+    fn inline_child_command_scrubs_credential_values() {
+        let args = vec!["/c".to_string(), "claude".to_string()];
+        let cmd = build_inline_child_command(&args, ".");
+
+        crate::terminal::assert_credentials_scrubbed_std(&cmd, "build_inline_child_command");
+
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        for marker in ["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION"] {
+            assert!(
+                envs.iter().any(|(k, v)| k == marker && v.is_none()),
+                "{marker} must still be stripped"
+            );
+        }
     }
 }
