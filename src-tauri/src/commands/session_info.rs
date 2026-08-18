@@ -59,6 +59,47 @@ pub const STATUS_UNAVAILABLE: &str = "unavailable";
 /// surfaced in [`SessionPrs::unknown`], never counted as not-landed.
 const LAND_SIGNAL_UNKNOWN: &str = "land-unknown";
 
+/// `identityEvidence`: a provider hook fired for this id — a REAL provider
+/// started in this terminal.
+pub const IDENTITY_CONFIRMED: &str = "confirmed";
+/// `identityEvidence`: no hook, but a transcript for this id exists on disk —
+/// the session demonstrably produced output.
+pub const IDENTITY_TRANSCRIPT: &str = "transcript";
+/// `identityEvidence`: NEITHER. The record is the spawn-time identity seam and
+/// nothing has corroborated it, so the id and account are a PREDICTION about a
+/// provider that may never start here.
+pub const IDENTITY_PROVISIONAL: &str = "provisional";
+
+/// Classify how much evidence backs this record's identity. Pure.
+///
+/// `apply_identity_seam` (`terminal/session.rs:803`) writes an
+/// `origin: "authoritative"` record with a pinned session id and a
+/// roster-selected account for **EVERY** terminal — including a plain shell
+/// that never runs a provider, because at spawn time the runner cannot know
+/// whether the operator will type `claude`, run `ls`, or sit at a prompt
+/// (`session_lifecycle_store.rs:401-413`). So `origin` is NOT evidence: it
+/// records who wrote the row, not whether a session exists.
+///
+/// Measured 2026-08-18: a bare `POST /terminals` alone yielded
+/// `acct: tiohorst, origin: authoritative, confirmed: false,
+/// transcriptExists: false` — a PowerShell shell advertising an account and a
+/// Claude id. On a machine with a populated account roster that is EVERY
+/// terminal, which is what this classification exists to keep the UI honest
+/// about.
+///
+/// This is deliberately the SAME predicate the restore classifier already
+/// gates auto-resume on (`confirmed_at` OR a real transcript) — one definition,
+/// two consumers, so the panel can never disagree with what restore will do.
+pub fn classify_identity_evidence(confirmed: bool, transcript_exists: bool) -> &'static str {
+    if confirmed {
+        IDENTITY_CONFIRMED
+    } else if transcript_exists {
+        IDENTITY_TRANSCRIPT
+    } else {
+        IDENTITY_PROVISIONAL
+    }
+}
+
 /// The four identifiers a session carries (D2). All four are shown rather than
 /// guessing which two the operator meant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -129,6 +170,11 @@ pub struct SessionLifecycleInfo {
     pub transcript_exists: bool,
     /// `confirmed && transcriptExists` — this id can actually be `--resume`d.
     pub restorable: bool,
+    /// How much evidence backs this identity: `confirmed` | `transcript` |
+    /// `provisional`. See [`classify_identity_evidence`]. A `provisional` row
+    /// means the id and account are the spawn-time seam's PREDICTION, not an
+    /// observation — the UI must not present them as fact.
+    pub identity_evidence: String,
     /// Set iff a BOOT-RESTORE re-materialized this record (never for a freshly
     /// created session) — the restore census's only honest "it came back"
     /// signal.
@@ -446,6 +492,8 @@ pub fn project_session_info(
                 close_reason: rec.close_reason.clone(),
                 confirmed,
                 transcript_exists,
+                identity_evidence: classify_identity_evidence(confirmed, transcript_exists)
+                    .to_string(),
                 restorable: crate::session::snapshot_history::is_restorable_identity(
                     confirmed,
                     transcript_exists,
@@ -541,6 +589,55 @@ pub async fn session_info_get(
 
 #[cfg(test)]
 mod tests {
+    /// The defect this classification exists for: a bare shell must NOT be
+    /// presented as a real session. Measured live 2026-08-18 — `POST /terminals`
+    /// alone produced `confirmed:false, transcriptExists:false` with a
+    /// roster-selected account, so this is the common case, not an edge case.
+    #[test]
+    fn a_spawn_time_seam_record_with_no_corroboration_is_provisional() {
+        assert_eq!(
+            classify_identity_evidence(false, false),
+            IDENTITY_PROVISIONAL
+        );
+    }
+
+    /// A provider hook fired: this is the observable proof a REAL provider
+    /// started, and it is what the restore classifier trusts.
+    #[test]
+    fn a_hook_confirmed_record_is_confirmed() {
+        assert_eq!(classify_identity_evidence(true, false), IDENTITY_CONFIRMED);
+        // Confirmation wins even with a transcript — it is the stronger signal.
+        assert_eq!(classify_identity_evidence(true, true), IDENTITY_CONFIRMED);
+    }
+
+    /// No hook, but a transcript exists: the session demonstrably produced
+    /// output. Weaker than a hook, but still evidence — and NOT provisional.
+    #[test]
+    fn a_transcript_without_a_hook_is_evidence_not_provisional() {
+        assert_eq!(classify_identity_evidence(false, true), IDENTITY_TRANSCRIPT);
+        assert_ne!(
+            classify_identity_evidence(false, true),
+            IDENTITY_PROVISIONAL
+        );
+    }
+
+    /// The predicate must agree with the restore classifier, which gates
+    /// auto-resume on `confirmed_at` OR a transcript. If these ever diverge the
+    /// panel would claim an identity restore refuses to act on.
+    #[test]
+    fn evidence_agrees_with_the_restore_auto_resume_predicate() {
+        for (confirmed, transcript) in [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let restore_would_resume = confirmed || transcript;
+            let ev = classify_identity_evidence(confirmed, transcript);
+            assert_eq!(
+                restore_would_resume,
+                ev != IDENTITY_PROVISIONAL,
+                "confirmed={confirmed} transcript={transcript} -> {ev}"
+            );
+        }
+    }
+
     use super::*;
     use chrono::{TimeZone, Utc};
 

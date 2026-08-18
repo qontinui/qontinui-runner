@@ -25,6 +25,8 @@ import { describe, it, expect } from "vitest";
 import {
   deriveTrigger,
   formatEpochMs,
+  isProvisionalIdentity,
+  PROVISIONAL_SUFFIX,
   normalizeSessionInfo,
   prGithubUrl,
   prKey,
@@ -624,5 +626,66 @@ describe("normalizeSessionInfo", () => {
       prs: b.prs,
     });
     expect(state.body?.name).toEqual({ value: null, source: UNKNOWN_TEXT });
+  });
+});
+
+/** A body whose identity carries the given evidence, built on the shared
+ * `body()` fixture so it stays in step with the real shape. */
+function evidenceBody(ev: "confirmed" | "transcript" | "provisional"): SessionInfoBody {
+  const b = body();
+  return { ...b, lifecycle: { ...b.lifecycle, identityEvidence: ev } };
+}
+const provisionalBody = () => evidenceBody("provisional");
+
+describe("provisional identity (the phantom-shell defect)", () => {
+  // The runner pins a session id and picks an account for EVERY terminal at
+  // spawn, including a plain shell nobody ever runs a provider in. Measured
+  // 2026-08-18: a bare POST /terminals produced acct=tiohorst,
+  // origin=authoritative, confirmed=false, transcriptExists=false.
+  it("treats an uncorroborated spawn-time record as provisional", () => {
+    expect(isProvisionalIdentity({ identityEvidence: "provisional" })).toBe(true);
+  });
+
+  it("does NOT treat corroborated identities as provisional", () => {
+    expect(isProvisionalIdentity({ identityEvidence: "confirmed" })).toBe(false);
+    expect(isProvisionalIdentity({ identityEvidence: "transcript" })).toBe(false);
+  });
+
+  it("treats an ABSENT field as not-provisional, so an older runner is not relabelled", () => {
+    // Unknown provenance is not the same as known-provisional. A runner that
+    // predates the field must not have every session marked as a prediction.
+    expect(isProvisionalIdentity({})).toBe(false);
+  });
+
+  it("marks the trigger distinctly from unavailable and from a genuine zero", () => {
+    const provisional = deriveTrigger({
+      status: "ok",
+      reason: null,
+      body: provisionalBody(),
+    });
+    expect(provisional.dataSummary).toBe("identity-provisional");
+    // Not conflated with "we could not read" ...
+    expect(provisional.dataSummary).not.toContain("unavailable");
+    // ... and not conflated with a session that simply has no PRs.
+    expect(provisional.countText).not.toBe("0");
+  });
+
+  it("qualifies the account and Claude id rows, and only those", () => {
+    const rows = sessionInfoRows(
+      provisionalBody(),
+    );
+    const byField = Object.fromEntries(rows.map((r) => [r.field, r]));
+    expect(byField["account"].display).toContain(PROVISIONAL_SUFFIX.trim());
+    expect(byField["claude-session-id"].display).toContain(PROVISIONAL_SUFFIX.trim());
+    // The working dir is a real observation regardless — do not tar it.
+    expect(byField["working-dir"].display).not.toContain(PROVISIONAL_SUFFIX.trim());
+  });
+
+  it("leaves rows unqualified when the identity is confirmed", () => {
+    const rows = sessionInfoRows(
+      evidenceBody("confirmed"),
+    );
+    const acct = rows.find((r) => r.field === "account");
+    expect(acct?.display).not.toContain(PROVISIONAL_SUFFIX.trim());
   });
 });

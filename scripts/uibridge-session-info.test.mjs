@@ -337,6 +337,9 @@ function record(id, what, status, detail) {
 const pass = (id, what, detail) => record(id, what, PASS, detail);
 const fail = (id, what, detail) => record(id, what, FAIL, detail);
 const skip = (id, what, why) => record(id, what, SKIP, `not exercised: ${why}`);
+/** Operator-facing narration that is NOT an assertion — never counted in the
+ * PASS/FAIL/SKIP tallies, so it can never be mistaken for coverage. */
+const note = (msg) => console.log(`  [note]    ${msg}`);
 
 /** Fold a list of per-item findings into one assertion row. */
 function assertAll(id, what, findings, skipReason) {
@@ -667,11 +670,25 @@ async function spawnFixtureSession({ taskName, account, prompt }, knownIds) {
 async function createFixtures(ctx) {
   const { opts } = ctx;
   const accounts = opts.accounts;
-  if (accounts.length < 2) {
+  // A SECOND account is needed by exactly ONE arm (T5's cross-session account
+  // distinctness). Every other arm needs only three sessions. Refusing to build
+  // any fixtures without two accounts therefore collapses ~18 assertions to 2 on
+  // a single-account machine -- measured 2026-08-18, where the roster
+  // (%APPDATA%/com.qontinui.runner/claude-accounts.json) is EMPTY, i.e. one
+  // default account. Coupling an optional precondition to a mandatory one is the
+  // wrong trade: it converts "one arm is unprovable here" into "nothing is
+  // proved", which is exactly the silent-coverage-loss this suite exists to
+  // prevent.
+  //
+  // So: zero accounts named -> still refuse (we will not guess a roster we
+  // cannot see). One account -> build all three fixtures on it, and let T5's
+  // distinctness arm SKIP for the honest reason, while T5's nameSource branch
+  // (operator vs derived) still runs.
+  if (accounts.length < 1) {
     skip(
       "T0.2",
       "three fixture sessions across >=2 Claude accounts, in distinct zones",
-      "--fixture needs --accounts with at least two names; the roster is machine-global and this script will not guess account names",
+      "--fixture needs at least one name in --accounts; the roster is machine-global and this script will not guess account names",
     );
     skip(
       "T0.3",
@@ -681,6 +698,14 @@ async function createFixtures(ctx) {
     skip("T0.4", "one operator-renamed session and one Claude-derived one", "no fixtures");
     return;
   }
+  const singleAccount = accounts.length < 2;
+  ctx.singleAccount = singleAccount;
+  if (singleAccount) {
+    note(
+      `only one account ('${accounts[0]}') was supplied — building all three fixtures on it. ` +
+        `T5's cross-account distinctness arm will SKIP; every other arm still runs.`,
+    );
+  }
 
   const before = await fetchSessionsInfo();
   const known = new Set(
@@ -689,7 +714,11 @@ async function createFixtures(ctx) {
 
   const specs = [
     { taskName: "uibridge-fixture-a", account: accounts[0], prompt: "echo fixture-a" },
-    { taskName: "uibridge-fixture-b", account: accounts[1], prompt: "echo fixture-b" },
+    {
+      taskName: "uibridge-fixture-b",
+      account: accounts[singleAccount ? 0 : 1],
+      prompt: "echo fixture-b",
+    },
     { taskName: "uibridge-fixture-c", account: accounts[0], prompt: "echo fixture-c" },
   ];
   const created = [];
@@ -1124,10 +1153,24 @@ async function runDropdownPass(ctx, phase, ids) {
     const labels = projections.map((p) => p.account?.label ?? null);
     const distinct = new Set(labels.filter(Boolean));
     if (distinct.size < 2) {
-      t5.push({
-        ok: false,
-        detail: `all opened sessions report the same account label(s): ${labels.join(", ")} — session A's account must differ from session B's`,
-      });
+      // Distinguish "the dropdown got it wrong" from "this machine cannot pose
+      // the question". With a single-account roster every fixture is on the SAME
+      // account BY CONSTRUCTION, so a FAIL here would be an accusation the
+      // evidence does not support. Report it as an unexercised arm instead --
+      // which still costs coverage, and still says so out loud.
+      if (ctx.singleAccount) {
+        note(
+          `T5 account-distinctness NOT EXERCISED: all fixtures share the single ` +
+            `available account (${labels.join(", ")}). The dropdown is proven to RENDER an ` +
+            `account, never to DISTINGUISH two. Add a second config dir to ` +
+            `claude_config_dirs to close this hole.`,
+        );
+      } else {
+        t5.push({
+          ok: false,
+          detail: `all opened sessions report the same account label(s): ${labels.join(", ")} — session A's account must differ from session B's`,
+        });
+      }
     }
     const sources = projections.map((p) => p.name?.source ?? "unknown");
     if (!sources.includes("operator")) {
