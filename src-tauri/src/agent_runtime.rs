@@ -4385,6 +4385,44 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
     ) {
         cmd.env(k, v);
     }
+    // Runner-context marker + API port — PTY parity for the HEADLESS seam.
+    //
+    // `QONTINUI_RUNNER_CONTEXT` is the fleet's canonical "am I inside the
+    // runner?" predicate, but until now only the PTY path set it
+    // (`terminal/session.rs`). A headless `claude -p` worker therefore read the
+    // predicate as EMPTY while running inside the runner — a false negative
+    // that made every consumer of it wrong on this path.
+    //
+    // Why an env var rather than a probe: identity must be answerable without a
+    // `/health` round trip (the port may be busy, wedged, or slow — a doomed
+    // IPv6 connect alone has been measured at ~2s on this fleet), and the
+    // marker survives a runner restart because the child keeps the env it was
+    // spawned with.
+    //
+    // Rendered from `crate::terminal::runner_context` — the SINGLE source of
+    // truth, the same call the three PTY callers make (`agent_runtime.rs`
+    // continuation + fleet spawns, `looping_agent_supervisor.rs`) — so the
+    // headless and PTY seams cannot drift. See the contract docs on that
+    // function (`terminal/mod.rs`) for the briefing's attributable-source
+    // marker and its fleet-gated clause.
+    //
+    // Note this seam only EXPORTS the briefing; a direct-exec `claude` sources
+    // no shell integration, so whether it also reaches the model depends on the
+    // caller's `--append-system-prompt` argv (see
+    // `build_continuation_claude_command`). The env var is what makes the
+    // predicate answerable either way.
+    let runner_api_port = crate::mcp::types::get_mcp_api_port();
+    cmd.env(
+        "QONTINUI_RUNNER_CONTEXT",
+        crate::terminal::runner_context(runner_api_port),
+    );
+    cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
+    // Strip credential-VALUE env vars before the child inherits them. Same
+    // control as the PTY seam in `terminal/session.rs`, single-sourced name
+    // list — see `crate::terminal::CREDENTIAL_VALUE_ENV_VARS` for why the
+    // runner is the chokepoint and why `JWT|KEY|TOKEN|SECRET` redaction misses
+    // these.
+    crate::terminal::scrub_credential_env_tokio(&mut cmd);
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.

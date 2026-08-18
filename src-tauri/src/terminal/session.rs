@@ -861,6 +861,23 @@ impl TerminalSession {
             }
         }
 
+        // Same class as the `CLAUDECODE` / `CLAUDE_CHILD_SESSION_ENV` strips
+        // above, but for credential VALUES: the runner inherits plaintext
+        // passwords (Windows USER-scope vars; the supervisor's forwarded
+        // auto-login password) and would otherwise hand them to every `claude`
+        // typed into a pane, where an `env` dump prints them into the
+        // transcript — the habitual `JWT|KEY|TOKEN|SECRET` redaction filter
+        // does not match `PASSWORD`. Name list and rationale:
+        // `crate::terminal::CREDENTIAL_VALUE_ENV_VARS`.
+        //
+        // Deliberately the LAST env mutation before the spawn, AFTER the
+        // caller-supplied `extra_env` loop. That makes the strip last-write-wins
+        // by construction: no present or future caller can reintroduce one of
+        // these names through `extra_env`. Placing it beside the marker strips
+        // above would have left exactly that hole (no caller exploits it today,
+        // but nothing enforced it either).
+        crate::terminal::scrub_credential_env_pty(&mut cmd);
+
         // Spawn the child process
         let child = pair
             .slave

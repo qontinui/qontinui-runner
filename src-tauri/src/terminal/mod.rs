@@ -27,6 +27,89 @@ pub mod vt_sanitize;
 
 pub use manager::TerminalManager;
 
+/// Environment variables that carry a credential VALUE and must never be
+/// inherited by a runner-spawned session.
+///
+/// **Why the runner is the chokepoint.** All three reach an agent session ONLY
+/// by being inherited through the runner process:
+/// `QONTINUI_OPERATOR2_PASSWORD` and `QONTINUI_TEST_LOGIN_PASSWORD` are Windows
+/// USER-scope variables the runner picks up at launch;
+/// `QONTINUI_TEST_AUTO_LOGIN_PASSWORD` is stamped onto the runner process by the
+/// supervisor (`qontinui-supervisor/src/process/env_forwarders.rs:209-210`).
+/// There is no other route in, so every fix belongs at a runner spawn seam.
+///
+/// **Which seams are covered — and which are NOT.** This currently scrubs the
+/// two seams named by plan
+/// `2026-08-07-runner-context-visibility-and-session-env-secret-hygiene`
+/// Phase 1: [`session::TerminalSession::spawn`] (PTY panes) and
+/// `agent_runtime::spawn_claude_child` (headless `claude -p` workers).
+/// **That is not yet every Claude-CLI spawn seam in this crate.** The crate's
+/// own marker for such a seam is the paired
+/// `env_remove("CLAUDECODE")` + `env_remove(CLAUDE_CHILD_SESSION_ENV)` strip
+/// documented at `session/transport/claude_cli.rs:23-50`; `grep -rn env_remove
+/// src-tauri/src` enumerates them. Still UNSCRUBBED at the time of writing:
+/// `claude_session/session.rs` (bidirectional stream-json, bypassPermissions,
+/// writes an on-disk transcript), `claude_session/runner.rs`,
+/// `ai_provider/process.rs::spawn_and_wait_with_doctor` (the shared choke point
+/// for the `claude --print` / `gemini -p` one-shots),
+/// `orchestration_loop/fix_agent.rs` and `commands/command_interpreter.rs`.
+/// The first four take a `std::process::Command` and would need a third wrapper
+/// beside the two below; the last two are `tokio::process::Command` and can call
+/// [`scrub_credential_env_tokio`] verbatim. Extending the coverage is tracked as
+/// follow-up work — do NOT read this const as "the leak is closed everywhere".
+///
+/// **Why plaintext in a session env is not benign.** The habitual redaction
+/// idiom `env | sed 's/\(JWT\|KEY\|TOKEN\|SECRET\)=.*/\1=<redacted>/'` does NOT
+/// match `PASSWORD`, so an `env` dump prints these verbatim into a transcript
+/// that then travels to a model provider and into coord's session mirror. A
+/// filter nobody remembers to widen is not a control; removing the value is.
+///
+/// **Identifiers are deliberately NOT listed.** The matching `*_EMAIL` /
+/// `*_USERNAME` variables name an account, they do not authenticate one, and
+/// skills legitimately read them (e.g. `commands/setup_wizard.rs:52` reads
+/// `QONTINUI_TEST_AUTO_LOGIN_EMAIL`). Adding them here would break working
+/// consumers for no security gain.
+///
+/// **Consumers that still work.** `commands/setup_wizard.rs` reads the RUNNER's
+/// own process env, which is untouched — only the CHILD's env is scrubbed. And
+/// `mcp/headless_browser.rs` re-supplies `QONTINUI_TEST_AUTO_LOGIN_EMAIL` /
+/// `_PASSWORD` to its own launcher child from `AppCredentials`, which are
+/// fetched from AWS SSM (`spec_api::auth_injection`), not from any env.
+///
+/// Do not put a password-bearing variable into a session env; put its name here.
+pub(crate) const CREDENTIAL_VALUE_ENV_VARS: &[&str] = &[
+    "QONTINUI_OPERATOR2_PASSWORD",
+    "QONTINUI_TEST_LOGIN_PASSWORD",
+    "QONTINUI_TEST_AUTO_LOGIN_PASSWORD",
+];
+
+/// Strip [`CREDENTIAL_VALUE_ENV_VARS`] from a PTY child's environment.
+///
+/// `CommandBuilder` seeds its env map at construction (`get_base_env`) from
+/// `std::env::vars_os()` **plus, on Windows, a fresh read of the HKLM and HKCU
+/// `Environment` registry keys, which are inserted OVER the process-env
+/// entries**. So `env_remove` here genuinely drops the inherited value rather
+/// than merely declining to add one — and it also drops a USER-scope value the
+/// runner process itself never held, which is exactly the shape of
+/// `QONTINUI_OPERATOR2_PASSWORD` and `QONTINUI_TEST_LOGIN_PASSWORD`. That
+/// registry re-read is unique to this seam; the tokio seam inherits the process
+/// env only.
+pub(crate) fn scrub_credential_env_pty(cmd: &mut portable_pty::CommandBuilder) {
+    for name in CREDENTIAL_VALUE_ENV_VARS {
+        cmd.env_remove(name);
+    }
+}
+
+/// Strip [`CREDENTIAL_VALUE_ENV_VARS`] from a tokio child's environment.
+///
+/// Twin of [`scrub_credential_env_pty`] over the other `Command` type the two
+/// spawn seams use. Both read the SAME name list so the seams cannot drift.
+pub(crate) fn scrub_credential_env_tokio(cmd: &mut tokio::process::Command) {
+    for name in CREDENTIAL_VALUE_ENV_VARS {
+        cmd.env_remove(name);
+    }
+}
+
 /// The attributable source marker prefixed to [`runner_context`]'s briefing.
 ///
 /// Shape: `[source: <package>/runner_context@<version>+<git-sha>]`. The git SHA
@@ -239,8 +322,140 @@ pub fn strip_ansi(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{runner_context, RUNNER_CONTEXT_SOURCE_MARKER};
+    use super::{
+        runner_context, scrub_credential_env_pty, scrub_credential_env_tokio,
+        CREDENTIAL_VALUE_ENV_VARS, RUNNER_CONTEXT_SOURCE_MARKER,
+    };
     use crate::mcp::fleet_policy_poller::{pin_plan_capture_level_for_test, PLAN_CAPTURE_RECORD};
+
+    // =======================================================================
+    // Session credential-env scrub (plan
+    // 2026-08-07-runner-context-visibility-and-session-env-secret-hygiene)
+    // =======================================================================
+
+    /// The list is the contract. Assert membership by name so removing an entry
+    /// is a deliberate, reviewed act rather than a silent regression that only
+    /// shows up as a password in someone's transcript.
+    #[test]
+    fn credential_env_list_covers_the_three_known_plaintext_passwords() {
+        for expected in [
+            "QONTINUI_OPERATOR2_PASSWORD",
+            "QONTINUI_TEST_LOGIN_PASSWORD",
+            "QONTINUI_TEST_AUTO_LOGIN_PASSWORD",
+        ] {
+            assert!(
+                CREDENTIAL_VALUE_ENV_VARS.contains(&expected),
+                "{expected} must be scrubbed from every session env"
+            );
+        }
+    }
+
+    /// Identifiers must NOT be scrubbed: `*_EMAIL` / `*_USERNAME` name an
+    /// account rather than authenticating one, and in-crate + skill consumers
+    /// read them (`commands/setup_wizard.rs:52`). Guards against someone
+    /// "hardening" the list into a breakage.
+    #[test]
+    fn credential_env_list_excludes_identifier_variables() {
+        for name in CREDENTIAL_VALUE_ENV_VARS {
+            assert!(
+                !name.ends_with("_EMAIL") && !name.ends_with("_USERNAME"),
+                "{name} is an identifier, not a credential value — do not scrub it"
+            );
+        }
+    }
+
+    /// Every listed name must actually look like a credential VALUE. Cheap
+    /// tripwire against the list drifting into a general-purpose env denylist.
+    #[test]
+    fn credential_env_list_entries_are_credential_values() {
+        for name in CREDENTIAL_VALUE_ENV_VARS {
+            assert!(
+                name.contains("PASSWORD")
+                    || name.contains("SECRET")
+                    || name.contains("TOKEN")
+                    || name.contains("_KEY"),
+                "{name} does not read as a credential value"
+            );
+        }
+    }
+
+    /// Behavioural: on the PTY seam the scrub must remove an INHERITED value,
+    /// not merely decline to set one. `CommandBuilder` seeds its env map from
+    /// the process env at construction, so seeding then scrubbing exercises
+    /// exactly the production case.
+    #[test]
+    fn scrub_removes_inherited_values_from_a_pty_command() {
+        // Premise guard. Seeding below uses `cmd.env(...)` rather than mutating
+        // the process env (racy, and `unsafe` on newer editions), which is only
+        // equivalent to the production case because `CommandBuilder` keeps base
+        // env and overrides in ONE map. If a future portable-pty stopped seeding
+        // in `new()`, the child would inherit the parent env directly at spawn,
+        // `env_remove` would become a no-op, and the rest of this test would
+        // still pass — a silent security regression. Assert the premise.
+        assert!(
+            portable_pty::CommandBuilder::new("dummy")
+                .get_env("PATH")
+                .is_some()
+                || portable_pty::CommandBuilder::new("dummy")
+                    .get_env("Path")
+                    .is_some(),
+            "portable-pty no longer seeds the base env in new() — \
+             env_remove is now a no-op at the PTY seam"
+        );
+
+        let mut cmd = portable_pty::CommandBuilder::new("dummy");
+        for name in CREDENTIAL_VALUE_ENV_VARS {
+            cmd.env(name, "hunter2");
+        }
+        cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", "operator@example.com");
+
+        scrub_credential_env_pty(&mut cmd);
+
+        for name in CREDENTIAL_VALUE_ENV_VARS {
+            assert!(cmd.get_env(name).is_none(), "{name} survived the PTY scrub");
+        }
+        assert_eq!(
+            cmd.get_env("QONTINUI_TEST_AUTO_LOGIN_EMAIL")
+                .and_then(|v| v.to_str()),
+            Some("operator@example.com"),
+            "the identifier must survive — skills read it"
+        );
+    }
+
+    /// Behavioural twin on the tokio seam. `tokio::process::Command` records a
+    /// removal as `(key, None)` in its env overrides, which is what suppresses
+    /// the inherited value at spawn.
+    #[test]
+    fn scrub_records_removals_on_a_tokio_command() {
+        let mut cmd = tokio::process::Command::new("dummy");
+        cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", "operator@example.com");
+
+        scrub_credential_env_tokio(&mut cmd);
+
+        let envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        for name in CREDENTIAL_VALUE_ENV_VARS {
+            assert!(
+                envs.iter().any(|(k, v)| k == *name && v.is_none()),
+                "{name} is not marked for removal on the tokio seam"
+            );
+        }
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "QONTINUI_TEST_AUTO_LOGIN_EMAIL"
+                    && v.as_deref() == Some("operator@example.com")),
+            "the identifier must survive — skills read it"
+        );
+    }
 
     /// A distinctive fragment of the capture clause. Deliberately an ENDPOINT,
     /// not a prose phrase: prose gets reworded, the route is the contract.
