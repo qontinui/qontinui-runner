@@ -2816,19 +2816,34 @@ async fn coord_mcp_proxy_handler(
             // `device_bearer_for(Some(t))` serves the legacy slot only when `t`
             // IS the default binding; for a NON-default tenant it returns the
             // tenant's own slot, or `None` on a miss — it NEVER presents another
-            // tenant's credential. A `None` session tenant (single-tenant / no
-            // active pin) resolves the legacy default slot, unchanged pre-B3.
-            let session_tenant = nonce
-                .as_deref()
-                .and_then(crate::coord_mcp::proxy_session_tenant_for_nonce);
-            // Read the live device JWT (filesystem I/O → off the async executor),
-            // the same fresh token `backend_relay` reads for this tenant.
-            let mut tok = tokio::task::spawn_blocking(move || {
-                crate::auth::device_bearer_for(session_tenant.as_ref())
-            })
-            .await
-            .ok()
-            .flatten();
+            // tenant's credential. An UNPINNED session (single-tenant / no
+            // active pin) resolves the legacy default slot, unchanged pre-B3;
+            // the pre-B3 carve-out that let an UNRESOLVABLE machine do the same
+            // is closed — see `coord_mcp::session_tenant_or_refuse`.
+            // Phase 3 (memory-injection plan): pin resolution + the
+            // fail-closed refusal live in ONE helper shared by all four
+            // bearer-selection sites, so the policy cannot drift between them.
+            let (session_tenant, initial_tok) =
+                match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
+                    Ok(pair) => pair,
+                    Err((status, msg)) => {
+                        warn!("coord-mcp proxy: {msg}");
+                        return (
+                            axum::http::StatusCode::from_u16(status)
+                                .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+                            Json(serde_json::json!({
+                                "success": false,
+                                "error": msg,
+                                "code": "COORD_MCP_PROXY_TENANT_UNRESOLVABLE",
+                                "retryable": false,
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+            // The live device JWT was read alongside the pin decision above
+            // (same blocking pool, same freshness as `backend_relay`'s read).
+            let mut tok = initial_tok;
             // Phase 3 (terminal-autonomy-survives-logout): a momentarily-missing
             // device JWT is almost always the refresher's re-mint window or a
             // transient-backoff gap (Phases 1-2) — NOT a dead session. Kick the
@@ -3354,17 +3369,29 @@ async fn coord_claims_read_proxy_handler(
     // the SESSION's tenant (B3): select via `device_bearer_for` off the nonce's
     // frozen tenant, never the legacy default slot. A non-default slot miss
     // resolves `None` here → the gate 401s (the safe degrade), never another
-    // tenant's credential. AuthManager does filesystem I/O, so keep it off the
-    // async executor.
-    let session_tenant = nonce
-        .as_deref()
-        .and_then(crate::coord_mcp::proxy_session_tenant_for_nonce);
-    let bearer = tokio::task::spawn_blocking(move || {
-        crate::auth::device_bearer_for(session_tenant.as_ref())
-    })
-    .await
-    .ok()
-    .flatten();
+    // tenant's credential. A machine that cannot resolve its tenant by ANY
+    // route is refused outright rather than defaulting (Phase 3). AuthManager
+    // does filesystem I/O, so the decision runs on the blocking pool.
+    // Phase 3 (memory-injection plan): pin resolution + the fail-closed
+    // refusal live in ONE helper shared by all four bearer-selection sites.
+    let (_session_tenant, bearer) =
+        match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
+            Ok(pair) => pair,
+            Err((status, msg)) => {
+                warn!("coord-mcp claims proxy: {msg}");
+                return (
+                    axum::http::StatusCode::from_u16(status)
+                        .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": msg,
+                        "code": "COORD_MCP_PROXY_TENANT_UNRESOLVABLE",
+                        "retryable": false,
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     if let Err((status, msg)) = crate::coord_mcp::proxy_request_gate(
         nonce.as_deref(),
@@ -3747,17 +3774,29 @@ async fn coord_write_proxy_handler(
     // the SESSION's tenant (B3): select via `device_bearer_for` off the nonce's
     // frozen tenant, never the legacy default slot. A non-default slot miss
     // resolves `None` here → the gate 401s (the safe degrade), never another
-    // tenant's credential. AuthManager does filesystem I/O, so keep it off the
-    // async executor.
-    let session_tenant = nonce
-        .as_deref()
-        .and_then(crate::coord_mcp::proxy_session_tenant_for_nonce);
-    let bearer = tokio::task::spawn_blocking(move || {
-        crate::auth::device_bearer_for(session_tenant.as_ref())
-    })
-    .await
-    .ok()
-    .flatten();
+    // tenant's credential. A machine that cannot resolve its tenant by ANY
+    // route is refused outright rather than defaulting (Phase 3). AuthManager
+    // does filesystem I/O, so the decision runs on the blocking pool.
+    // Phase 3 (memory-injection plan): pin resolution + the fail-closed
+    // refusal live in ONE helper shared by all four bearer-selection sites.
+    let (_session_tenant, bearer) =
+        match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
+            Ok(pair) => pair,
+            Err((status, msg)) => {
+                warn!("coord-mcp write proxy: {msg}");
+                return (
+                    axum::http::StatusCode::from_u16(status)
+                        .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": msg,
+                        "code": "COORD_MCP_PROXY_TENANT_UNRESOLVABLE",
+                        "retryable": false,
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     if let Err((status, msg)) = crate::coord_mcp::proxy_request_gate(
         nonce.as_deref(),
@@ -4343,18 +4382,30 @@ async fn vcs_create_pull_request_handler(
             // B3: select the bearer for the SESSION's tenant (frozen on the
             // nonce), NOT the legacy default slot — a non-default miss returns
             // `None` (the degrade path below), never another tenant's token.
-            let session_tenant = nonce
-                .as_deref()
-                .and_then(crate::coord_mcp::proxy_session_tenant_for_nonce);
-            // Live read — the same fresh device JWT the `/coord-mcp` proxy
-            // injects. AuthManager does filesystem I/O, so keep it off the
-            // async executor.
-            let mut tok = tokio::task::spawn_blocking(move || {
-                crate::auth::device_bearer_for(session_tenant.as_ref())
-            })
-            .await
-            .ok()
-            .flatten();
+            // An unresolvable-by-any-route machine is refused (Phase 3).
+            // Phase 3 (memory-injection plan): pin resolution + the
+            // fail-closed refusal live in ONE helper shared by all four
+            // bearer-selection sites, so the policy cannot drift between them.
+            let (session_tenant, initial_tok) =
+                match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
+                    Ok(pair) => pair,
+                    Err((status, msg)) => {
+                        warn!("vcs pr proxy: {msg}");
+                        return (
+                            axum::http::StatusCode::from_u16(status)
+                                .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+                            Json(serde_json::json!({
+                                "success": false,
+                                "error": msg,
+                                "code": "COORD_MCP_PROXY_TENANT_UNRESOLVABLE",
+                                "retryable": false,
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+            // The live device JWT was read alongside the pin decision above.
+            let mut tok = initial_tok;
             // A momentarily-missing device JWT is usually the refresher's
             // re-mint window, not a dead pairing — kick the refresher and wait
             // the bounded DEVICE_JWT_REMINT_WAIT (~5s) before degrading, the

@@ -157,12 +157,16 @@ impl Default for DualWriteGate {
 /// `pub(crate)` so the session-sync POST path can use the same resolved
 /// tenant to attribute sessions (otherwise they register under the nil
 /// tenant and are invisible to the operator's tenant-scoped dashboard).
+///
+/// **Thin adapter over [`crate::session::tenant_pin::resolve_tenant_pin`].**
+/// The typed resolver is the implementation; this keeps the `Option<Uuid>`
+/// shape every existing call site was written against, so introducing the type
+/// is observably inert. Callers that must distinguish "no tenant stated" from
+/// "cannot state a tenant" — the proxy's credential selection — call the typed
+/// resolver directly instead; collapsing to `None` here is lossy BY DESIGN and
+/// is exactly why the fail-closed decision cannot be made from this function.
 pub(crate) fn resolve_active_tenant_id() -> Option<Uuid> {
-    let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let raw = value.get("active_tenant_id").and_then(|v| v.as_str())?;
-    Uuid::parse_str(raw).ok()
+    crate::session::tenant_pin::resolve_tenant_pin().pinned()
 }
 
 /// Read a `u64` env var with a sane default. (Duplicated from

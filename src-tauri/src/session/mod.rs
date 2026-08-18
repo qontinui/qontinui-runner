@@ -73,6 +73,7 @@ pub mod restore_record_emitter;
 pub mod session_lifecycle_store;
 pub mod shutdown_marker;
 pub mod snapshot_history;
+pub mod tenant_pin;
 pub mod tracking_health;
 pub mod transcript_emitter;
 pub mod transport;

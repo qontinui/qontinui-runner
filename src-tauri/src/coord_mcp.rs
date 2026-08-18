@@ -57,7 +57,9 @@
 //!   session presents ITS tenant's device JWT — or, on a slot miss,
 //!   degrades to the refresh/401 path and sends nothing (never another
 //!   tenant's token). Restored / adopted nonces carry no tenant (`None`)
-//!   and fall back to the legacy default slot, the pre-B3 behavior.
+//!   and fall back to the legacy default slot, the pre-B3 behavior — EXCEPT
+//!   where the machine cannot state its tenant by any route, which is refused
+//!   outright (see `session_tenant_or_refuse`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -169,11 +171,23 @@ struct NonceBinding {
     /// DEVICE proxy path selects its injected bearer with
     /// `auth::device_bearer_for(session_tenant.as_ref())` so the proxy acts
     /// as the SESSION's tenant, not whatever binding happens to own the
-    /// legacy `access_token` slot (B3). `None` on a single-tenant install
-    /// with no active pin (→ `device_bearer_for(None)` = the legacy default
-    /// slot, byte-identical to pre-B3 behavior). Unused for Agent nonces —
-    /// their bearer is the agent JWT, whose tenant claim is frozen at mint.
-    session_tenant: Option<Uuid>,
+    /// legacy `access_token` slot (B3). Unused for Agent nonces — their bearer
+    /// is the agent JWT, whose tenant claim is frozen at mint.
+    ///
+    /// **Typed since the memory-injection plan's Phase 3.** This was an
+    /// `Option<Uuid>`, whose `None` conflated three very different things: a
+    /// legitimate single-tenant install, a nonce RESTORED from the store, a
+    /// nonce ADOPTED off disk — and, once the machine's own pin could fail,
+    /// a machine that cannot state its tenant at all. Only the last of those
+    /// may fail closed, so the distinction has to survive in the binding
+    /// rather than being reconstructed later (it cannot be).
+    ///
+    /// The restore and adopt paths below therefore say
+    /// [`TenantPin::Unpinned`] EXPLICITLY, not `Unresolvable`: they carry no
+    /// tenant because the STORE does not persist one, which says nothing about
+    /// whether this machine knows its tenant. Classifying them `Unresolvable`
+    /// would refuse every restored session after every runner restart.
+    session_pin: crate::session::tenant_pin::TenantPin,
     /// The runner TERMINAL this nonce was provisioned for, frozen at mint time
     /// (same pattern and lifetime as `session_tenant`).
     ///
@@ -1099,7 +1113,13 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
                 // behavior. A restored device session pre-dates this restart;
                 // its original tenant is unrecoverable, and defaulting is the
                 // safe (never cross-tenant) choice.
-                session_tenant: None,
+                //
+                // UNPINNED, never `Unresolvable`: "the store did not persist a
+                // tenant" is a property of the STORE, not of this machine's
+                // ability to state its tenant. Marking it `Unresolvable` would
+                // make the Phase 3 fail-closed refuse every restored session
+                // after every runner restart — an outage, not a hardening.
+                session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
                 // Likewise the persisted store carries no terminal id, so a
                 // restored nonce cannot claim one — caller self-identification
                 // falls back to the workdir leg for it. Faking a terminal here
@@ -1280,7 +1300,11 @@ fn mint_and_register_nonce(
     // for the coord record. Resolved OUTSIDE the map lock (it is a file read)
     // so the registry mutex is never held across I/O. `None` on a
     // single-tenant install (→ legacy default slot at inject time).
-    let session_tenant = crate::session::dual_write::resolve_active_tenant_id();
+    // Typed at the mint (plan Phase 3): the ONE place that reads this machine's
+    // own pin, so the Pinned / Unpinned / Unresolvable distinction is captured
+    // while it still exists. Every other construction site of `NonceBinding`
+    // has no machine pin to read and says `Unpinned` explicitly.
+    let session_pin = crate::session::tenant_pin::resolve_tenant_pin();
     // Forensics cause resolved BEFORE `principal` is moved into the map.
     let mint_cause = match (&principal, ephemeral) {
         (ProxyPrincipal::Device, false) => "persistent device mint (runner-spawn/re-provision)",
@@ -1346,8 +1370,8 @@ fn mint_and_register_nonce(
                 workdir: workdir.to_string(),
                 principal,
                 lifetime,
-                session_tenant,
-                // Frozen at mint time, exactly like `session_tenant`. This is
+                session_pin,
+                // Frozen at mint time, exactly like `session_pin`. This is
                 // the deterministic leg of caller self-identification — see
                 // [`NonceBinding::terminal_id`] / [`terminal_id_for_nonce`].
                 terminal_id: terminal_id.map(str::to_string),
@@ -1583,7 +1607,137 @@ pub(crate) fn proxy_principal_for_nonce(nonce: &str) -> Option<ProxyPrincipal> {
 /// `device_bearer_for`, which returns `None` (→ the proxy's refresh/401 path)
 /// on a non-default slot miss rather than falling back to the legacy slot.
 pub(crate) fn proxy_session_tenant_for_nonce(nonce: &str) -> Option<Uuid> {
-    live_binding(nonce).and_then(|b| b.session_tenant)
+    live_binding(nonce).and_then(|b| b.session_pin.pinned())
+}
+
+/// The typed pin a DEVICE proxy nonce was provisioned under.
+///
+/// A nonce with no live binding (graced, or already reaped) reads
+/// [`TenantPin::Unpinned`], never `Unresolvable`: a graced session is a
+/// legitimate one whose binding simply aged out, and the nonce/scope gate in
+/// [`proxy_request_gate`] is what decides whether it may proceed at all. Only a
+/// binding minted on a machine that could not state its tenant reads
+/// `Unresolvable`.
+pub(crate) fn proxy_session_pin_for_nonce(nonce: &str) -> crate::session::tenant_pin::TenantPin {
+    live_binding(nonce)
+        .map(|b| b.session_pin)
+        .unwrap_or(crate::session::tenant_pin::TenantPin::Unpinned)
+}
+
+/// Typed refusal for a session whose tenant cannot be resolved by ANY route.
+///
+/// Shaped like [`device_jwt_refreshing_error`] — a structured, diagnosable
+/// status rather than a bare 401 — but deliberately **not** retryable: the
+/// refreshing error means "come back in a moment", while this means "this
+/// machine cannot say who it is, and waiting will not change that". A bare 401
+/// here would read as a dead transport and send the operator down the
+/// `/coord-revive` path for a configuration problem.
+pub(crate) fn tenant_unresolvable_error() -> (u16, String) {
+    (
+        503,
+        "COORD_MCP_PROXY_TENANT_UNRESOLVABLE: this machine cannot resolve its          tenant — ~/.qontinui/machine.json is missing or malformed AND the          device JWT carries no tenant_id claim. Coord memory and other          tenant-scoped writes are refused rather than attributed to the          default tenant. Fix by repairing machine.json or re-pairing the device."
+            .to_string(),
+    )
+}
+
+/// Resolve the tenant to select a DEVICE bearer for — or refuse.
+///
+/// Plan: `2026-08-05-runner-memory-injection-and-tenant-fail-closed` Phase 3.
+/// **This is the single implementation of the fail-closed decision.** All four
+/// `mcp_api` bearer-selection sites (the coord-mcp proxy handler, the claims
+/// proxy, the write proxy, and the per-principal pick) call it instead of
+/// re-deriving the rule, because four hand-copied copies of a policy is how
+/// three of them silently drift.
+///
+/// ## The rule
+///
+/// | Pin | Behavior |
+/// |---|---|
+/// | `Pinned(t)` | select `t`'s slot — unchanged pre-existing behavior |
+/// | `Unpinned` | legacy default slot (`device_bearer_for(None)`) — the legitimate single-tenant shape, unchanged |
+/// | `Unresolvable` | **only** refuses if the device JWT ALSO carries no `tenant_id` claim |
+///
+/// ## Why `Unresolvable` alone is not enough to refuse
+///
+/// The pin is a FILE-level classification, and a machine with no
+/// `machine.json` at all still has an authoritative tenant: coord stamps
+/// `tenant_id` into every device JWT it issues. Refusing on the file alone
+/// would break correctly-paired machines that simply never seeded the file —
+/// a shape known to exist in this fleet. So the refusal keys on "no tenant is
+/// knowable by ANY route", which needs both signals to miss. Deciding
+/// priority: **robustness** — the failure mode of refusing too eagerly is an
+/// outage on healthy machines, which is strictly worse than the silent
+/// default-tenant write on a machine that is genuinely broken.
+///
+/// Returns the tenant to pass to [`crate::auth::device_bearer_for`] (`None`
+/// meaning "the legacy default slot"), or a typed refusal to return verbatim.
+pub(crate) fn session_tenant_or_refuse(nonce: Option<&str>) -> Result<Option<Uuid>, (u16, String)> {
+    use crate::session::tenant_pin::TenantPin;
+    let pin = nonce
+        .map(proxy_session_pin_for_nonce)
+        .unwrap_or(TenantPin::Unpinned);
+    match pin {
+        TenantPin::Pinned(t) => Ok(Some(t)),
+        TenantPin::Unpinned => Ok(None),
+        TenantPin::Unresolvable => {
+            // Second and last route to a tenant: the device JWT's own claim,
+            // which coord issued and which is authoritative.
+            match device_jwt_claim_tenant() {
+                Some(t) => {
+                    warn!(
+                        "coord_mcp: machine pin unresolvable; falling back to the device JWT's                          tenant claim ({t}) — repair ~/.qontinui/machine.json"
+                    );
+                    Ok(Some(t))
+                }
+                None => {
+                    warn!(
+                        "coord_mcp: REFUSING proxy request — tenant unresolvable by any route                          (no usable machine.json pin and no tenant_id claim on the device JWT)"
+                    );
+                    Err(tenant_unresolvable_error())
+                }
+            }
+        }
+    }
+}
+
+/// Async wrapper: resolve the session tenant AND read its bearer, or refuse.
+///
+/// The four `mcp_api` sites all need both halves — the tenant to hand to
+/// `await_device_jwt_remint_for` on the degrade path, and the bearer itself —
+/// so returning both keeps the call sites to one `await` and one `match`.
+///
+/// `AuthManager` does filesystem I/O and the `Unresolvable` arm reads a JWT, so
+/// the whole decision runs on the blocking pool, exactly where the per-site
+/// `device_bearer_for` call used to run.
+///
+/// A join failure (panic or cancellation) degrades to `Ok((None, None))` —
+/// byte-for-byte the old `.ok().flatten()` behavior — rather than manufacturing
+/// a refusal out of an executor hiccup.
+pub(crate) async fn session_bearer_and_tenant_or_refuse(
+    nonce: Option<String>,
+) -> Result<(Option<Uuid>, Option<String>), (u16, String)> {
+    match tokio::task::spawn_blocking(move || {
+        session_tenant_or_refuse(nonce.as_deref())
+            .map(|t| (t, crate::auth::device_bearer_for(t.as_ref())))
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => Ok((None, None)),
+    }
+}
+
+/// The `tenant_id` claim on whatever device JWT this runner currently holds.
+///
+/// Reads the legacy default slot — the only slot reachable without already
+/// knowing a tenant, which is precisely the situation this is resolving. Uses
+/// the existing unverified-payload decoder ([`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]);
+/// signature verification is coord's job, and the value is used only to pick a
+/// local credential slot, never as an authorization decision.
+fn device_jwt_claim_tenant() -> Option<Uuid> {
+    let jwt = crate::auth::device_bearer_for(None)?;
+    let raw = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&jwt)?;
+    Uuid::parse_str(&raw).ok()
 }
 
 // ============================================================================
@@ -2013,6 +2167,36 @@ pub(crate) fn resolve_bound_api_port() -> Option<u16> {
         }
     }
     None
+}
+
+/// Can this runner deliver coord-mcp to a session it is about to spawn?
+///
+/// Plan: `2026-08-05-runner-memory-injection-and-tenant-fail-closed` Phase 4.
+///
+/// This is the **spawn-path-safe** provisioning signal: a pure in-process read
+/// (Tauri app handle → managed `AppState`), no filesystem I/O, no lock held
+/// across I/O, so it is legal to call from
+/// [`crate::terminal::runner_context`] — which renders on every spawn and whose
+/// contract forbids I/O.
+///
+/// It answers exactly the question [`provision_coord_mcp_config_file`] and
+/// [`write_coord_mcp_proxy_config`] answer before writing anything: is the
+/// bound API port resolvable? [`resolve_bound_api_port`] returns `None`
+/// fail-closed when no Tauri runtime / managed state is reachable, and callers
+/// "MUST treat `None` as refuse to write a proxy config" — so `false` here means
+/// no session spawned now can be given a working coord-mcp.
+///
+/// ## Why not the `.coord-mcp-status` breadcrumb
+///
+/// [`COORD_MCP_STATUS_FILE`] cannot serve as a spawn-time gate. It is written by
+/// [`probe_and_breadcrumb_proxy`] on a DETACHED thread specifically so it never
+/// blocks provisioning, and a HEALTHY session writes nothing — so at the moment
+/// a briefing is rendered, "absent" means *healthy OR not-yet-probed*, which is
+/// indistinguishable and reads healthy essentially always. A gate on it would be
+/// vacuous rather than conservative, and reading it would be disk I/O on the
+/// spawn path besides.
+pub(crate) fn coord_mcp_deliverable() -> bool {
+    resolve_bound_api_port().is_some()
 }
 
 /// Write the DEVICE-path `.mcp.json`: an `http`-transport server pointing at
@@ -2960,7 +3144,10 @@ fn adopt_on_disk_nonce(workdir: &str, nonce: &str) {
                 // is unrecoverable across the restart — fall back to the legacy
                 // default slot (`device_bearer_for(None)`), the pre-B3 behavior
                 // for these device nonces (never cross-tenant).
-                session_tenant: None,
+                //
+                // UNPINNED for the same reason as the restore path above: the
+                // absence is the FILE's, not the machine's.
+                session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
                 // Same reason for the terminal: a `.mcp.json` carries only URL
                 // + nonce, so the terminal the file was originally provisioned
                 // for is unrecoverable — and that terminal's PTY died with the
@@ -3399,7 +3586,7 @@ mod tests {
                     lifetime: NonceLifetime::Ephemeral {
                         expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
                     },
-                    session_tenant: None,
+                    session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
                     terminal_id: None,
                 },
             );
@@ -3412,7 +3599,7 @@ mod tests {
                         expires_at: std::time::Instant::now()
                             + std::time::Duration::from_secs(3600),
                     },
-                    session_tenant: None,
+                    session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
                     terminal_id: None,
                 },
             );
@@ -3454,7 +3641,7 @@ mod tests {
                 lifetime: NonceLifetime::Ephemeral {
                     expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
                 },
-                session_tenant: None,
+                session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
                 terminal_id: None,
             },
         );
