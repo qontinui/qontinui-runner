@@ -720,11 +720,19 @@ impl TerminalSession {
         // Forward the continuation-verdict mode to the bundled `Stop` hook so it
         // can skip its `curl` + `python` round trip while the feature is dark.
         //
-        // `claude_stop_hook.sh` fires on EVERY assistant turn of EVERY session in
-        // this terminal, and with the flag at its `off` default the endpoint
-        // "answers `allow` with zero coord traffic" — so those spawns bought
-        // nothing. Measured 1.0-3.4s per turn on this fleet (Windows/MSYS process
-        // creation is 0.5-2.3s per spawn).
+        // `claude_stop_hook.sh` USED to fire on every assistant turn of every
+        // session in this terminal, and with the flag at its `off` default the
+        // endpoint "answers `allow` with zero coord traffic" — so those spawns
+        // bought nothing. Measured 1.0-3.4s per turn on this fleet
+        // (Windows/MSYS process creation is 0.5-2.3s per spawn).
+        //
+        // The hook is now gated at REGISTRATION time (`session::claude_hook`):
+        // in the default dark posture the delivered `--settings` file carries no
+        // `hooks.Stop` key at all, so the per-turn `bash` spawn does not happen
+        // in the first place. This forward is therefore belt-and-braces — it
+        // still covers a HAND-STARTED `claude` that picks up a settings file
+        // written by a previously-ARMED runner, where the script's own dark-mode
+        // short-circuit is the only thing standing between the turn and a `curl`.
         //
         // Forward the PARSED mode, not the raw env string: `Mode::from_flag` maps
         // an unknown value to `Off`, so the hook receives the same fail-safe
