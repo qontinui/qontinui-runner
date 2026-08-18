@@ -59,6 +59,11 @@ export interface SessionPlacement {
 }
 
 export interface SessionLifecycleInfo {
+  /** How much evidence backs this identity: `confirmed` (a provider hook
+   * fired) | `transcript` (a transcript exists on disk) | `provisional`
+   * (NEITHER — the spawn-time seam's prediction). Server-derived; see the Rust
+   * `classify_identity_evidence`. */
+  identityEvidence?: IdentityEvidence;
   state: string;
   provider: string;
   origin: string | null;
@@ -304,6 +309,21 @@ export function deriveTrigger(state: SessionInfoState): TriggerState {
   const summary = summarizePrs(prs);
   const who = state.body.name.value ?? UNKNOWN_TEXT;
 
+  // A provisional identity is reported BEFORE the PR roll-up, because it
+  // qualifies the whole panel: if no provider ever started here, the id and
+  // account below are a prediction and the PR ledger is about a session that
+  // may not exist. Distinguishable from `unavailable` (we could not read) and
+  // from a genuine zero — the same three-way honesty the land signal uses.
+  if (isProvisionalIdentity(state.body.lifecycle)) {
+    return {
+      tone: "partial",
+      color: TONE_COLORS.partial,
+      countText: "~",
+      summary: `Session info: provisional — ${PROVISIONAL_NOTE}`,
+      dataSummary: "identity-provisional",
+    };
+  }
+
   if (prs.status !== "ok") {
     return {
       tone: "unknown",
@@ -435,8 +455,36 @@ export function formatEpochMs(ms: number | null): string | null {
  * a field with no value renders `unknown`, it does not vanish (R2). Pure —
  * unit-tested, so the UI Bridge id/field contract is checkable without a DOM.
  */
+/** Evidence backing a session's identity. `provisional` is the load-bearing
+ * one: the runner pins a session id and picks an account for EVERY terminal at
+ * spawn, including a plain shell that never runs a provider, so an unqualified
+ * id/account would be a confident claim about something that may never exist. */
+export type IdentityEvidence = "confirmed" | "transcript" | "provisional";
+
+/** Is this identity merely predicted? Treats an ABSENT field as NOT provisional
+ * — an older runner that does not send `identityEvidence` must not have every
+ * session relabelled; unknown provenance is not the same as known-provisional. */
+export function isProvisionalIdentity(lifecycle: {
+  identityEvidence?: IdentityEvidence;
+}): boolean {
+  return lifecycle.identityEvidence === "provisional";
+}
+
+/** Suffix appended to identity-derived rows when the identity is provisional.
+ * Short enough to sit inline; the panel also carries the full explanation. */
+export const PROVISIONAL_SUFFIX = " — provisional";
+
+/** The one-line explanation shown in the panel when identity is provisional. */
+export const PROVISIONAL_NOTE =
+  "No provider has started in this terminal — the id and account are the " +
+  "runner's spawn-time prediction, not an observation.";
+
 export function sessionInfoRows(body: SessionInfoBody): InfoRowSpec[] {
   const { identity, name, account, placement, lifecycle, prs } = body;
+  // The id and account come from the spawn-time seam, which fires for every
+  // terminal. Without corroboration they are a PREDICTION, and the panel must
+  // not print a prediction the way it prints an observation.
+  const provisional = isProvisionalIdentity(lifecycle);
   const prsOk = prs.status === "ok";
   const prsReason = `unavailable — ${prs.reason ?? UNKNOWN_TEXT}`;
 
@@ -459,15 +507,23 @@ export function sessionInfoRows(body: SessionInfoBody): InfoRowSpec[] {
       "account",
       "Account",
       account.label,
-      account.label
+      (account.label
         ? account.wrapper
           ? `${account.label} (${account.wrapper})`
           : account.label
-        : UNKNOWN_TEXT,
+        : UNKNOWN_TEXT) + (provisional && account.label ? PROVISIONAL_SUFFIX : ""),
     ),
     row("name", "Name", name.value),
     row("terminal-id", "Terminal id", identity.terminalId, undefined, true),
-    row("claude-session-id", "Claude id", identity.claudeSessionId, undefined, true),
+    row(
+      "claude-session-id",
+      "Claude id",
+      identity.claudeSessionId,
+      identity.claudeSessionId
+        ? identity.claudeSessionId + (provisional ? PROVISIONAL_SUFFIX : "")
+        : UNKNOWN_TEXT,
+      true,
+    ),
     row("fleet-handle", "Fleet handle", identity.fleetSessionHandle, undefined, true),
     row("tenant", "Tenant", identity.tenantId, undefined, true),
     row("task-run", "Task run", identity.taskRunId, undefined, true),

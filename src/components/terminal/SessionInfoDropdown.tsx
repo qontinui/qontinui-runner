@@ -6,6 +6,8 @@ import {
   useSessionInfo,
   deriveTrigger,
   sessionInfoElementId,
+  isProvisionalIdentity,
+  PROVISIONAL_NOTE,
   sessionInfoRows,
   summarizePrs,
   prPanelRows,
@@ -127,12 +129,25 @@ function SessionInfoPanelBody({
   }
 
   const body = state.body;
+  const provisional = isProvisionalIdentity(body.lifecycle);
   const rows = sessionInfoRows(body);
   const prs = summarizePrs(body.prs);
   const prRows = prPanelRows(body.prs);
 
   return (
     <>
+      {/* A provisional identity is qualified ONCE, at the top, rather than only
+          per-row: it governs how the whole panel should be read. Amber, not red
+          — nothing is broken, the runner simply has not observed a provider
+          here yet. */}
+      {provisional && (
+        <div
+          className="px-2 py-1 border-b border-[#2a2d3d] text-[9px] text-[#e0af68] leading-snug"
+          data-session-info-provisional="true"
+        >
+          {PROVISIONAL_NOTE}
+        </div>
+      )}
       <div className="flex items-center gap-1.5 px-2 py-1 border-b border-[#2a2d3d]">
         <span className="text-[9px] text-[#a9b1d6] truncate">
           {body.name.value ?? UNKNOWN_TEXT}
