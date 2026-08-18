@@ -22,23 +22,88 @@
 //! ~1.35 TB was recovered by hand. This module reaps that population
 //! automatically, complementing (never replacing) the worktree reaper.
 //!
-//! ## Scope — out-of-tree roots ONLY
+//! ## Scope — FOUR classes, disjoint by construction ([`TargetClass`])
 //!
-//! To stay cleanly disjoint from the worktree reaper AND the build system, this
-//! reaper NEVER descends into a repo checkout or a worktree, so it can never
-//! touch a canonical `<repo>/target`, `<repo>/src-tauri/target`, `target-agent`,
-//! or `target-pool` (those live INSIDE repo dirs and belong to the build
-//! system / worktree reaper). It only considers:
-//!   * a direct child of `qontinui_root()` that is ITSELF a cargo target root, and
-//!   * children (one level, `_wt` two) of the known container dirs
-//!     (`_cargo-targets`, `cargo-targets`, `_targets`, `.wt-targets`, `_wt`).
+//! **This module used to be out-of-tree-only.** It declared repo checkouts and
+//! linked worktrees out of scope specifically so it *"stays out-of-tree-only so
+//! it can never race those guards"* (the worktree reclaim engine's Pinned /
+//! dirty / G6 guards). That scope statement is **superseded** by the
+//! disk-monitoring plan
+//! (`plans/2026-08-07-product-disk-monitoring-and-cleanup.md`, Phase 2 step 3),
+//! whose Phase 0 census measured the population the old scope could not see:
+//!
+//! | Class | Roots | Bytes | measured 2026-08-16 |
+//! |---|---:|---:|---|
+//! | in-repo-canonical (`.git` **dir**) | 41 | 1,669.8 GB | 47 % — the LARGEST class |
+//! | sibling-worktree, linked (`.git` **file**) | 110 | 910.5 GB | 26 % |
+//! | container (`_wt`, `_targets`, …) | 85 | 859.4 GB | 24 % |
+//! | sibling-nongit | 8 | 131.2 GB | 4 % |
+//!
+//! Two of those four classes were entirely invisible to the old enumerator, and
+//! together they hold **73 % of the bytes**. The enumerator now walks all four
+//! and tags every root with its [`TargetClass`]; the boundary is enforced in the
+//! **classifier**, not by refusing to look.
+//!
+//! ### The boundary — who owns which path (the race that used to be avoided by blindness)
+//!
+//! Descending into repos and worktrees puts this reaper in territory the
+//! worktree reclaim engine and the build system also touch. The two engines are
+//! kept disjoint **by path, not by ignorance**:
+//!
+//! | Path (relative to the enclosing checkout/worktree) | Owner | Verdict here |
+//! |---|---|---|
+//! | basename `target` (`<wt>/target`, `<wt>/src-tauri/target`) | worktree reclaim ([`super::reclaim`]) | [`SkipReason::OwnedByWorktreeReclaim`] — never a candidate |
+//! | anything under `target-pool/`, or basename `target-agent` | the build system / `cargo-guard` | [`SkipReason::OwnedByBuildPool`] — never a candidate |
+//! | any root inside a **canonical checkout** (`.git` is a dir) | nobody yet — v1 defers the verb | [`SkipReason::ReportOnly`] — measured and reported, never removed |
+//! | a **renamed** in-worktree build dir in a linked worktree (`target-<slug>`, `target-sessrestore`, …) | THIS reaper | subject to G-dirty + the five gates |
+//!
+//! and, layered on top for anything inside a linked worktree:
+//!
+//!   * **G-dirty** — a worktree with uncommitted work has an
+//!     [`SkipReason::WorktreeDirty`] verdict for every build dir inside it. This
+//!     takes worktree-reclaim's inviolable G1 authority where it applies, using
+//!     the SAME predicate ([`super::dirty::porcelain_is_dirty`]) so the two
+//!     engines can never disagree about whether a tree is dirty.
+//!
+//! So the old "can never race those guards" property is **preserved and now
+//! stated positively**: this reaper's verb reaches only paths no other engine
+//! claims, and the paths another engine claims are still *measured and reported*
+//! — which is the whole point of the survey ([`super::disk_survey`]).
 //!
 //! A "cargo target root" is identified positively by a cargo marker — a
 //! `CACHEDIR.TAG` (newer cargo) OR a `.rustc_info.json` (present in EVERY cargo
 //! target root, including the majority on this machine that have no tag). Either
 //! is authoritative; a dir with neither is never treated as a target.
 //!
-//! ## Safety gates (each candidate must clear ALL — see [`classify`])
+//! ## Report mode (INV-D1) — measurement is NEVER gated on the deletion gates
+//!
+//! [`classify_candidate`] is **pure over its injected [`ClassifyOptions`]**: no
+//! env read, no arming check, no deletion, and — the property this exists for —
+//! **no preflight abort**. The motivating defect is `cargo-sweep-all.ps1
+//! -WhatIf`, which aborts (`exit 2`) in preflight when any cargo/rustc process
+//! is running, making the read-only report unobtainable during exactly the disk
+//! emergency it is needed for. A preview that refuses to render is
+//! indistinguishable from "nothing to reclaim".
+//!
+//! Here, a root with a build in flight is reported as
+//! `blocked: `[`SkipReason::Building`] — a per-candidate verdict, never a
+//! global refusal. [`super::disk_survey`] calls THIS classifier, so the preview
+//! cannot drift from what the verb would actually do.
+//!
+//! ## Safety gates (each candidate must clear ALL — see [`classify_candidate`])
+//!
+//! The first three are the **boundary gates** added when the enumerator grew
+//! past out-of-tree-only; they run BEFORE the original five, so a path another
+//! engine owns is refused before any disk probing happens.
+//!   * **G-report-only** — a root inside a canonical checkout (`.git` is a
+//!     directory) has no v1 verb. Reported with its bytes; never removed, not
+//!     even when armed.
+//!   * **G-owner** — a root another engine owns by path (basename `target`,
+//!     `target-agent`, or anything under `target-pool/`) is never a candidate
+//!     here, so the two engines cannot race on one path.
+//!   * **G-dirty** — a root inside a linked worktree with uncommitted work is
+//!     never a candidate: worktree-reclaim's inviolable G1 applies wherever a
+//!     worktree exists, and it is evaluated with the same predicate.
 //!   * **G-kept (pin)** — never a dir carrying a `.reap-keep` sentinel or named
 //!     in `COORD_ORPHAN_TARGET_KEEP`. The ledger-less equivalent of the worktree
 //!     reaper's `retention='pinned'`; a pin wins even when armed. A pinned
@@ -69,11 +134,11 @@
 //!     (default 86400 = 24 h, matching the worktree remove-grace).
 //!
 //! ## Deliberately out of scope (named follow-ups, not silent gaps)
-//!   * **Renamed IN-worktree targets** (`<repo>-wt-<slug>/target-<slug>`) — these
-//!     live inside enumerated worktrees; extending the worktree census/reaper to
-//!     recognize non-`target` build-dir names is the correct home for them (keeps
-//!     the Pinned/dirty/G6 worktree guards authoritative). This reaper stays
-//!     out-of-tree-only so it can never race those guards.
+//!   * **Pruning WITHIN a live in-repo target dir.** The in-repo-canonical class
+//!     is the largest by bytes (1.67 TB, 47 %) and is enumerated and reported
+//!     here, but it has **no verb in v1**: removing a canonical `<repo>/target`
+//!     whole is not what is wanted; pruning stale artifacts *inside* one needs
+//!     its own guard design. Tracked as the plan's first follow-up.
 //!   * **Orphan `node_modules`** — a distinct population (no `CACHEDIR.TAG`); not
 //!     reaped here.
 //!
@@ -114,10 +179,54 @@ pub const KEEP_SENTINEL: &str = ".reap-keep";
 const DEFAULT_GRACE_SECS: u64 = 86_400;
 const DEFAULT_INTERVAL_SECS: u64 = 900;
 
-/// Container dirs whose immediate children may themselves be target roots.
-/// `_wt` gets one extra level (`_wt/<slug>/target*`).
-const CONTAINER_DIRS: &[&str] = &["_cargo-targets", "cargo-targets", "_targets", ".wt-targets"];
-const NESTED_CONTAINER_DIRS: &[&str] = &["_wt"];
+/// Container dirs whose descendants may themselves be target roots
+/// (`_wt/<slug>/target*`, `_targets/<slug>`, …).
+const CONTAINER_DIRS: &[&str] = &[
+    "_cargo-targets",
+    "cargo-targets",
+    "_targets",
+    ".wt-targets",
+    "_wt",
+];
+
+/// How deep below the workspace root the enumerator walks. Covers every layout
+/// this fleet produces — `_wt/<slug>/src-tauri/target-x` is the deepest at 4 —
+/// while keeping a mistaken root (a home dir, `C:\`) from becoming an unbounded
+/// walk. Pruning at every discovered target root keeps the real cost far below
+/// the bound.
+const MAX_WALK_DEPTH: u32 = 4;
+
+/// Hard ceiling on directories visited in one enumeration. Hitting it sets
+/// [`Enumeration::truncated`], which the survey renders as an explicit
+/// "this list is incomplete" — an under-count is never reported silently.
+const MAX_DIRS_VISITED: usize = 200_000;
+
+/// Directories the walk never descends into. `.git` holds no build artifacts;
+/// the rest are large populations with no cargo target roots inside them, so
+/// descending only costs time.
+const NEVER_DESCEND: &[&str] = &[
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".next",
+    ".pnpm-store",
+    ".turbo",
+];
+
+/// Build directories inside a checkout/worktree that belong to the **worktree
+/// reclaim engine** ([`super::reclaim`] removes `<worktree>/target` and
+/// `<worktree>/node_modules`). Matched on the BASENAME, so `<wt>/target` and
+/// `<wt>/src-tauri/target` are both covered.
+const WORKTREE_RECLAIM_BASENAME: &str = "target";
+
+/// Build directories inside a checkout/worktree that belong to the **build
+/// system** (`cargo-guard`'s shared agent dir and the supervisor's build pool).
+/// `target-agent` is matched on the basename; `target-pool` on any path
+/// component, so `target-pool/slot-0` and `target-pool/lkg` are both covered.
+const BUILD_POOL_BASENAME: &str = "target-agent";
+const BUILD_POOL_COMPONENT: &str = "target-pool";
 
 /// True iff `COORD_ORPHAN_TARGET_REAP_ENABLED` is truthy. Default OFF (dry-run).
 pub fn reap_armed() -> bool {
@@ -157,78 +266,225 @@ fn is_target_root(dir: &Path) -> bool {
     has_cargo_marker(dir)
 }
 
-/// One reap candidate: an out-of-tree cargo target root.
+/// Where a cargo target root lives, which decides **who owns it**.
+///
+/// The distinction between the first two is made on the `.git` entry's TYPE and
+/// nothing else: a canonical checkout carries `.git` as a **directory**, a
+/// linked git worktree carries it as a **file**. A `is_dir()` test alone
+/// mis-assigns every linked worktree (110 of them on this machine, 910 GB), so
+/// both forms are always tested — see [`git_marker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TargetClass {
+    /// Inside a canonical repo checkout (`.git` is a directory). **Report-only
+    /// in v1** — the largest class by bytes and the one whose verb is deferred.
+    InRepoCanonical,
+    /// Inside a linked git worktree (`.git` is a FILE pointing at the main
+    /// repo's `worktrees/<name>` dir).
+    SiblingWorktree,
+    /// Under one of the known container dirs (`_wt`, `_targets`,
+    /// `_cargo-targets`, `cargo-targets`, `.wt-targets`).
+    Container,
+    /// A bare out-of-tree root with no enclosing git repo at all
+    /// (`target-wt-<slug>`, `cargo-target-coord`, …).
+    SiblingNonGit,
+}
+
+impl TargetClass {
+    /// Wire token — stable, kebab-case, matching the plan's census table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TargetClass::InRepoCanonical => "in-repo-canonical",
+            TargetClass::SiblingWorktree => "sibling-worktree",
+            TargetClass::Container => "container",
+            TargetClass::SiblingNonGit => "sibling-nongit",
+        }
+    }
+
+    /// Every class, in the plan's byte-descending order — so a summary can list
+    /// a class with **zero** roots explicitly instead of omitting it (an absent
+    /// class and an empty class must not render the same).
+    pub fn all() -> [TargetClass; 4] {
+        [
+            TargetClass::InRepoCanonical,
+            TargetClass::SiblingWorktree,
+            TargetClass::Container,
+            TargetClass::SiblingNonGit,
+        ]
+    }
+
+    /// Whether this reaper's verb reaches this class at all in v1.
+    /// `in-repo-canonical` is **report-only**: measured, surfaced, never removed.
+    pub fn has_verb(self) -> bool {
+        !matches!(self, TargetClass::InRepoCanonical)
+    }
+}
+
+/// One enumerated cargo target root.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub path: PathBuf,
+    pub class: TargetClass,
+    /// Root of the enclosing checkout / linked worktree, when there is one.
+    /// `None` for [`TargetClass::Container`] and [`TargetClass::SiblingNonGit`].
+    pub repo_root: Option<PathBuf>,
 }
 
-/// Enumerate out-of-tree cargo target roots under `root`. Never descends into a
-/// repo checkout or worktree — only direct children that are themselves target
-/// roots, plus the shallow contents of the known container dirs.
+/// Result of one enumeration pass. Carries the walk's own limits so an
+/// incomplete answer can SAY it is incomplete.
+#[derive(Debug, Clone, Default)]
+pub struct Enumeration {
+    pub candidates: Vec<Candidate>,
+    /// Directories visited (bounded by [`MAX_DIRS_VISITED`]).
+    pub dirs_visited: usize,
+    /// The visit ceiling was hit — the candidate list is a PREFIX of the real
+    /// population, not the whole of it.
+    pub truncated: bool,
+    /// Directories whose `read_dir` failed, with the reason. A failed read is
+    /// reported, never folded into "nothing there".
+    pub read_errors: Vec<(PathBuf, String)>,
+}
+
+/// What kind of `.git` entry a directory carries — the ONLY discriminator
+/// between a canonical checkout and a linked worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitMarker {
+    /// `.git` is a directory ⇒ canonical checkout.
+    Dir,
+    /// `.git` is a FILE (`gitdir: …`) ⇒ linked worktree.
+    File,
+}
+
+fn git_marker(dir: &Path) -> Option<GitMarker> {
+    match std::fs::symlink_metadata(dir.join(".git")) {
+        Ok(m) if m.is_dir() => Some(GitMarker::Dir),
+        Ok(m) if m.is_file() => Some(GitMarker::File),
+        _ => None,
+    }
+}
+
+/// The descent context — what the walker is currently inside.
+#[derive(Debug, Clone)]
+enum WalkCtx {
+    /// The workspace root, or a plain directory under it that is neither a
+    /// container nor a git repo.
+    Loose,
+    /// Under a known container dir.
+    Container,
+    /// Inside a checkout (`InRepoCanonical`) or a linked worktree
+    /// (`SiblingWorktree`), rooted at the given path.
+    Repo { root: PathBuf, class: TargetClass },
+}
+
+impl WalkCtx {
+    fn class(&self) -> TargetClass {
+        match self {
+            WalkCtx::Loose => TargetClass::SiblingNonGit,
+            WalkCtx::Container => TargetClass::Container,
+            WalkCtx::Repo { class, .. } => *class,
+        }
+    }
+
+    fn repo_root(&self) -> Option<PathBuf> {
+        match self {
+            WalkCtx::Repo { root, .. } => Some(root.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Enumerate EVERY cargo target root under `root`, tagged with its
+/// [`TargetClass`].
+///
+/// Walks all four classes — the two out-of-tree ones this module always saw,
+/// plus the in-repo and in-worktree populations that hold 73 % of the bytes.
+/// The safety boundary is enforced downstream in [`classify_candidate`], not by
+/// refusing to look: a root another engine owns is *measured and reported*, and
+/// separately refused a verb.
+///
+/// Invariants held by the walk itself:
+///   * **never descends INTO a target root** — a discovered root is pruned, so
+///     `target/debug/deps` can never be enumerated as a nested candidate;
+///   * **never follows a reparse point** (junction or symlink), for either
+///     descent or classification (`symlink_metadata` throughout);
+///   * bounded by [`MAX_WALK_DEPTH`] and [`MAX_DIRS_VISITED`], and says so via
+///     [`Enumeration::truncated`] when the bound bites.
+pub fn enumerate_all(root: &Path) -> Enumeration {
+    let mut e = Enumeration::default();
+    walk(root, 0, &WalkCtx::Loose, &mut e);
+    e
+}
+
+/// Back-compat facade: just the candidate list.
 pub fn enumerate_candidates(root: &Path) -> Vec<Candidate> {
-    let mut out = Vec::new();
-    let entries = match std::fs::read_dir(root) {
-        Ok(e) => e,
-        Err(_) => return out,
+    enumerate_all(root).candidates
+}
+
+fn walk(dir: &Path, depth: u32, ctx: &WalkCtx, e: &mut Enumeration) {
+    if depth > MAX_WALK_DEPTH || e.truncated {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            // A read that FAILED is not a directory that is EMPTY. Record it so
+            // the survey can say the list is missing a branch.
+            e.read_errors.push((dir.to_path_buf(), err.to_string()));
+            return;
+        }
     };
     for entry in entries.flatten() {
+        if e.dirs_visited >= MAX_DIRS_VISITED {
+            e.truncated = true;
+            return;
+        }
         let path = entry.path();
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(_) => continue,
         };
-        if !meta.file_type().is_dir() || meta.file_type().is_symlink() || is_junction(&path) {
+        let ft = meta.file_type();
+        if !ft.is_dir() || ft.is_symlink() || is_junction(&path) {
             continue;
         }
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
             None => continue,
         };
-        // Case 1: the direct child is itself a bare target root.
-        if is_target_root(&path) {
-            out.push(Candidate { path });
+        if NEVER_DESCEND.contains(&name) {
             continue;
         }
-        // Case 2: a known container dir — its immediate children may be roots.
-        if CONTAINER_DIRS.contains(&name) {
-            collect_roots_shallow(&path, 1, &mut out);
-            continue;
-        }
-        // Case 3: `_wt` — target roots live one level deeper (`_wt/<slug>/target*`).
-        if NESTED_CONTAINER_DIRS.contains(&name) {
-            collect_roots_shallow(&path, 2, &mut out);
-            continue;
-        }
-        // Otherwise: a repo checkout / worktree / data dir — never descend.
-    }
-    out
-}
+        e.dirs_visited += 1;
 
-/// Collect target roots up to `depth` levels below `dir` (depth 1 = direct
-/// children). Skips reparse points; stops at the first target root on a path.
-fn collect_roots_shallow(dir: &Path, depth: u32, out: &mut Vec<Candidate>) {
-    if depth == 0 {
-        return;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if !meta.file_type().is_dir() || meta.file_type().is_symlink() || is_junction(&path) {
+        // A target root terminates the branch — we never walk inside one.
+        if is_target_root(&path) {
+            e.candidates.push(Candidate {
+                path,
+                class: ctx.class(),
+                repo_root: ctx.repo_root(),
+            });
             continue;
         }
-        if is_target_root(&path) {
-            out.push(Candidate { path });
+
+        // Otherwise decide what the child IS, then descend with that context.
+        let child_ctx = if CONTAINER_DIRS.contains(&name) {
+            WalkCtx::Container
         } else {
-            collect_roots_shallow(&path, depth - 1, out);
-        }
+            match git_marker(&path) {
+                Some(GitMarker::Dir) => WalkCtx::Repo {
+                    root: path.clone(),
+                    class: TargetClass::InRepoCanonical,
+                },
+                Some(GitMarker::File) => WalkCtx::Repo {
+                    root: path.clone(),
+                    class: TargetClass::SiblingWorktree,
+                },
+                // Not a repo boundary — stay in the caller's context, so a
+                // target root under `qontinui-worktrees/<slug>/…` inherits the
+                // right class instead of being mis-tagged at every level.
+                None => ctx.clone(),
+            }
+        };
+        walk(&path, depth + 1, &child_ctx, e);
     }
 }
 
@@ -275,7 +531,7 @@ fn cargo_lock_held(target_root: &Path) -> bool {
 /// no orphan root here is a cross-compile dir; if that changes, add the
 /// `<triple>/debug` probes (and the matching lock dirs in `cargo_lock_held`).
 /// The 24 h grace still backstops this: a cross-compile root idle >24 h is safe.
-fn newest_artifact_age(target_root: &Path) -> Option<Duration> {
+pub(super) fn newest_artifact_age(target_root: &Path) -> Option<Duration> {
     let probes = [
         "debug/deps",
         "debug/.fingerprint",
@@ -311,16 +567,36 @@ fn newest_artifact_age(target_root: &Path) -> Option<Duration> {
 /// Recursive byte size of `dir`, summing real file sizes and SKIPPING any
 /// reparse point (never traversed). For pre-removal telemetry only.
 fn dir_size_skipping_junctions(dir: &Path) -> u64 {
-    let mut total: u64 = 0;
-    let read = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
+    measure_dir_size(dir).map(|m| m.bytes).unwrap_or(0)
+}
+
+/// A size measurement plus how trustworthy it is.
+///
+/// The plain `-> u64` form above cannot distinguish "0 bytes" from "could not
+/// read", and a fabricated zero on a disk-reclaim preview is exactly the
+/// dishonesty this feature exists to remove. Callers that RENDER a size use
+/// this; the reaper's own logging keeps the scalar form.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SizeMeasurement {
+    pub bytes: u64,
+    /// Sub-directories whose `read_dir` failed. `> 0` ⇒ `bytes` is a LOWER
+    /// BOUND, and the caller must say so rather than present it as exact.
+    pub unreadable_dirs: usize,
+}
+
+/// Measure `dir` recursively, junction-safe. `None` iff `dir` itself could not
+/// be read at all — an UNKNOWN size, never a zero.
+pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut m = SizeMeasurement::default();
     for entry in read.flatten() {
         let path = entry.path();
         let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+            Ok(meta) => meta,
+            Err(_) => {
+                m.unreadable_dirs += 1;
+                continue;
+            }
         };
         let ft = meta.file_type();
         if ft.is_symlink() {
@@ -330,17 +606,37 @@ fn dir_size_skipping_junctions(dir: &Path) -> u64 {
             if is_junction(&path) {
                 continue;
             }
-            total = total.saturating_add(dir_size_skipping_junctions(&path));
+            match measure_dir_size(&path) {
+                Some(child) => {
+                    m.bytes = m.bytes.saturating_add(child.bytes);
+                    m.unreadable_dirs += child.unreadable_dirs;
+                }
+                None => m.unreadable_dirs += 1,
+            }
         } else if ft.is_file() {
-            total = total.saturating_add(meta.len());
+            m.bytes = m.bytes.saturating_add(meta.len());
         }
     }
-    total
+    Some(m)
 }
 
-/// The reason a candidate was NOT reaped this tick (for shadow-mode logging).
+/// The reason a candidate was NOT reaped this tick (for shadow-mode logging and
+/// for the report-mode survey's `blocked` items). Every refusal carries exactly
+/// one — a candidate is never dropped silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
+    /// **G-report-only** — inside a canonical checkout. v1 measures this class
+    /// (the largest by bytes) and deliberately gives it no verb.
+    ReportOnly,
+    /// **G-owner** — the worktree reclaim engine owns this path
+    /// (`<worktree>/target`, `<worktree>/src-tauri/target`).
+    OwnedByWorktreeReclaim,
+    /// **G-owner** — the build system owns this path (`target-agent`, or
+    /// anything under `target-pool/`).
+    OwnedByBuildPool,
+    /// **G-dirty** — the enclosing worktree has uncommitted work, so
+    /// worktree-reclaim's inviolable G1 applies to everything inside it.
+    WorktreeDirty,
     /// The root (or a nested dir being deleted) is a reparse point — never
     /// followed; only the link is ever unlinked, never recursed into.
     Reparse,
@@ -353,32 +649,217 @@ pub enum SkipReason {
     Kept,
 }
 
+impl SkipReason {
+    /// Stable kebab-case wire token.
+    pub fn token(self) -> &'static str {
+        match self {
+            SkipReason::ReportOnly => "report-only",
+            SkipReason::OwnedByWorktreeReclaim => "owned-by-worktree-reclaim",
+            SkipReason::OwnedByBuildPool => "owned-by-build-pool",
+            SkipReason::WorktreeDirty => "worktree-dirty",
+            SkipReason::Reparse => "reparse",
+            SkipReason::Building => "building",
+            SkipReason::GracePending => "grace-pending",
+            SkipReason::Kept => "kept",
+        }
+    }
+
+    /// One operator-facing sentence. Rendered next to the token so a refusal is
+    /// legible without reading this source.
+    pub fn detail(self) -> &'static str {
+        match self {
+            SkipReason::ReportOnly => {
+                "Inside a canonical repo checkout. Measured and reported, but v1 has no cleanup \
+                 verb for this class — removing a live `<repo>/target` whole is not wanted, and \
+                 pruning inside one needs its own guard design."
+            }
+            SkipReason::OwnedByWorktreeReclaim => {
+                "The worktree reclaim engine owns this path — it removes `<worktree>/target` and \
+                 `<worktree>/node_modules` under its own Pinned/dirty/G6 guards. Reported here so \
+                 the bytes are visible; never removed here, so the two engines cannot race."
+            }
+            SkipReason::OwnedByBuildPool => {
+                "The build system owns this path (`target-agent` / `target-pool/<slot>`) — it is \
+                 the shared agent build dir or a supervisor pool slot, not garbage."
+            }
+            SkipReason::WorktreeDirty => {
+                "The enclosing worktree has uncommitted work. Worktree-reclaim's G1 is inviolable \
+                 and applies to every build dir inside a dirty tree."
+            }
+            SkipReason::Reparse => {
+                "A junction/symlink. Only the link would ever be unlinked, never the tree behind \
+                 it, so it is not treated as reclaimable space."
+            }
+            SkipReason::Building => {
+                "A build is in flight here (a held `.cargo-lock`, or an unreadable/unrecognised \
+                 layout treated conservatively as live)."
+            }
+            SkipReason::GracePending => {
+                "Idle, but the no-activity grace window has not elapsed yet."
+            }
+            SkipReason::Kept => {
+                "Operator-pinned — a `.reap-keep` sentinel at its top level, or its name in \
+                 `COORD_ORPHAN_TARGET_KEEP`. A pin is honoured even when armed."
+            }
+        }
+    }
+}
+
+/// Everything [`classify_candidate`] needs, injected rather than read from the
+/// ambient process. Constructing this is the ONLY place env is consulted, which
+/// is what makes the classifier itself pure — and therefore callable in report
+/// mode from an HTTP handler with no arming check and no preflight abort
+/// (INV-D1).
+#[derive(Clone)]
+pub struct ClassifyOptions {
+    /// Idle window a root must clear.
+    pub grace: Duration,
+    /// Basenames pinned by the operator (the `COORD_ORPHAN_TARGET_KEEP` list).
+    pub keep_names: Vec<String>,
+    /// Dirtiness probe for the enclosing worktree. Injectable so the boundary
+    /// gate is unit-testable without a git repo; the production value is
+    /// [`worktree_is_dirty`], the SAME predicate worktree-reclaim uses.
+    pub worktree_is_dirty: fn(&Path) -> bool,
+}
+
+impl ClassifyOptions {
+    /// Ambient configuration: env grace + env keep-list + the real git probe.
+    pub fn from_env() -> Self {
+        Self::new(grace())
+    }
+
+    /// Explicit grace, env keep-list, real git probe.
+    pub fn new(grace: Duration) -> Self {
+        Self {
+            grace,
+            keep_names: keep_names_from_env(),
+            worktree_is_dirty,
+        }
+    }
+}
+
+/// Parse `COORD_ORPHAN_TARGET_KEEP` into basenames. Absent ⇒ empty list.
+fn keep_names_from_env() -> Vec<String> {
+    std::env::var(KEEP_ENV)
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True iff `path` is a git worktree with reclaim-scoped uncommitted work.
+/// Delegates to [`super::dirty::porcelain_is_dirty`] — the same predicate the
+/// census and [`super::reclaim`] use, so the engines can never disagree.
+///
+/// **Fail-safe direction:** a git invocation that fails to RUN reads as dirty
+/// (do not touch a tree we cannot reason about). Note this is the opposite of
+/// [`super::reclaim::worktree_is_dirty`]'s `unwrap_or(false)`: there, a failed
+/// probe leaves coord's own dirty verdict in charge; here there is no second
+/// opinion, so the refusal has to be the default.
+pub fn worktree_is_dirty(path: &Path) -> bool {
+    let Some(path_str) = path.to_str() else {
+        return true;
+    };
+    match crate::process_helpers::no_window("git")
+        .args(["-C", path_str, "status", "--porcelain"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            super::dirty::porcelain_is_dirty(&String::from_utf8_lossy(&o.stdout))
+        }
+        _ => true,
+    }
+}
+
 /// True iff this target root is operator-pinned: a `.reap-keep` sentinel at its
-/// top level, or its basename in the `COORD_ORPHAN_TARGET_KEEP` comma-list.
-/// Honored even when armed — a pin is never overridden by arming.
-fn is_kept(path: &Path) -> bool {
+/// top level, or its basename in `keep_names`. Honored even when armed — a pin
+/// is never overridden by arming.
+fn is_kept(path: &Path, keep_names: &[String]) -> bool {
     if std::fs::symlink_metadata(path.join(KEEP_SENTINEL)).is_ok() {
         return true;
     }
-    if let Ok(list) = std::env::var(KEEP_ENV) {
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            return list
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .any(|kept| kept == name);
-        }
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => keep_names.iter().any(|kept| kept == name),
+        None => false,
     }
-    false
 }
 
-/// Classify a candidate: `Ok(())` = reapable, `Err(reason)` = skip. Pure over
-/// the injected `grace` so it is unit-testable without env/disk timing. The
-/// checks are ordered cheapest-and-safest first so a pinned/junction/live dir
-/// short-circuits before any deletion is ever contemplated.
-pub fn classify(path: &Path, grace: Duration) -> Result<(), SkipReason> {
+/// The **boundary gates** (G-report-only / G-owner / G-dirty). Pure over the
+/// candidate's class and its path relative to the enclosing checkout, plus the
+/// injected dirtiness probe.
+///
+/// Split out from the five disk gates because these are the ones that make
+/// walking into repos and worktrees safe at all: they answer "does another
+/// engine own this path?" without touching disk beyond the enclosing tree's
+/// `git status`.
+fn boundary_verdict(c: &Candidate, opts: &ClassifyOptions) -> Result<(), SkipReason> {
+    let basename = c
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+
+    if let Some(repo_root) = c.repo_root.as_deref() {
+        // Inside a checkout or a linked worktree: another engine may own the
+        // path outright. Checked BEFORE the class verdict so a `<repo>/target`
+        // is attributed to its real owner rather than to "v1 has no verb".
+        if basename == WORKTREE_RECLAIM_BASENAME {
+            return Err(SkipReason::OwnedByWorktreeReclaim);
+        }
+        if basename == BUILD_POOL_BASENAME
+            || c.path
+                .strip_prefix(repo_root)
+                .ok()
+                .into_iter()
+                .flat_map(|rel| rel.components())
+                .any(|comp| comp.as_os_str() == BUILD_POOL_COMPONENT)
+        {
+            return Err(SkipReason::OwnedByBuildPool);
+        }
+    }
+
+    // v1 gives the in-repo-canonical class no verb at all.
+    if !c.class.has_verb() {
+        return Err(SkipReason::ReportOnly);
+    }
+
+    // Worktree-reclaim's inviolable G1, applied wherever a worktree exists.
+    if c.class == TargetClass::SiblingWorktree {
+        if let Some(repo_root) = c.repo_root.as_deref() {
+            if (opts.worktree_is_dirty)(repo_root) {
+                return Err(SkipReason::WorktreeDirty);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Classify an enumerated candidate: `Ok(())` = reapable, `Err(reason)` = skip.
+///
+/// **Pure over `opts`** — no env read, no arming check, no deletion, and no
+/// preflight abort. That is INV-D1 in code: [`super::disk_survey`] calls this
+/// exact function in report mode, so the preview cannot drift from what the
+/// verb would do, and a build in flight yields a per-candidate
+/// [`SkipReason::Building`] rather than a refusal to answer.
+///
+/// Gate order is the safety contract: boundary gates (cheapest, no disk probing
+/// beyond `git status`) first, then pin, then reparse, then the positive
+/// artifact check, then the live-build and grace probes.
+pub fn classify_candidate(c: &Candidate, opts: &ClassifyOptions) -> Result<(), SkipReason> {
+    boundary_verdict(c, opts)?;
+    classify_path(&c.path, opts)
+}
+
+/// The five original per-directory gates, for a path whose ownership boundary
+/// has already been cleared (or that has none, being a bare out-of-tree root).
+pub fn classify_path(path: &Path, opts: &ClassifyOptions) -> Result<(), SkipReason> {
     // Pin wins over everything, including arming.
-    if is_kept(path) {
+    if is_kept(path, &opts.keep_names) {
         return Err(SkipReason::Kept);
     }
     // Never touch a reparse point — unlink the link only, never recurse in.
@@ -400,9 +881,15 @@ pub fn classify(path: &Path, grace: Duration) -> Result<(), SkipReason> {
     match newest_artifact_age(path) {
         // Unreadable age → fail-safe: treat as building (do not reap).
         None => Err(SkipReason::Building),
-        Some(age) if age < grace => Err(SkipReason::GracePending),
+        Some(age) if age < opts.grace => Err(SkipReason::GracePending),
         Some(_) => Ok(()),
     }
+}
+
+/// Convenience facade over [`classify_path`] for a bare out-of-tree root, with
+/// the keep-list read from the ambient env.
+pub fn classify(path: &Path, grace: Duration) -> Result<(), SkipReason> {
+    classify_path(path, &ClassifyOptions::new(grace))
 }
 
 /// Positive rebuildable-artifact check (defense in depth on top of the
@@ -458,22 +945,36 @@ pub fn tick_once() -> ReapSummary {
     run_cycle(&root, reap_armed(), grace())
 }
 
+/// Bucket a skip reason into [`ReapSummary`]'s counters.
+fn count_skip(summary: &mut ReapSummary, reason: SkipReason) {
+    match reason {
+        SkipReason::Kept => summary.skipped_kept += 1,
+        SkipReason::Reparse => summary.skipped_reparse += 1,
+        SkipReason::Building => summary.skipped_live += 1,
+        SkipReason::GracePending => summary.skipped_grace += 1,
+        SkipReason::ReportOnly => summary.skipped_report_only += 1,
+        SkipReason::OwnedByWorktreeReclaim | SkipReason::OwnedByBuildPool => {
+            summary.skipped_other_owner += 1
+        }
+        SkipReason::WorktreeDirty => summary.skipped_worktree_dirty += 1,
+    }
+}
+
 /// One reaper cycle over `root` with explicit `armed`/`grace` (the testable
 /// seam). Enumerates out-of-tree target roots, classifies each, and — only when
 /// `armed` — removes the reapable ones junction-safely. When `!armed` it merely
 /// logs "would reap" and removes NOTHING. Returns a summary.
 pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
-    let candidates = enumerate_candidates(root);
+    let opts = ClassifyOptions::new(grace);
+    let enumeration = enumerate_all(root);
     let mut summary = ReapSummary {
-        scanned: candidates.len(),
+        scanned: enumeration.candidates.len(),
+        truncated: enumeration.truncated,
         ..Default::default()
     };
-    for c in candidates {
-        match classify(&c.path, grace) {
-            Err(SkipReason::Kept) => summary.skipped_kept += 1,
-            Err(SkipReason::Reparse) => summary.skipped_reparse += 1,
-            Err(SkipReason::Building) => summary.skipped_live += 1,
-            Err(SkipReason::GracePending) => summary.skipped_grace += 1,
+    for c in enumeration.candidates {
+        match classify_candidate(&c, &opts) {
+            Err(reason) => count_skip(&mut summary, reason),
             Ok(()) => {
                 let bytes = dir_size_skipping_junctions(&c.path);
                 summary.candidates += 1;
@@ -508,10 +1009,12 @@ pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
         }
     }
     info!(
-        "orphan_target_reaper: cycle armed={armed} scanned={} candidates={} \
+        "orphan_target_reaper: cycle armed={armed} scanned={} truncated={} candidates={} \
          candidate_gb={:.2} reaped={} reaped_gb={:.2} \
-         skipped(live={},grace={},reparse={},kept={}) errors={}",
+         skipped(live={},grace={},reparse={},kept={},report_only={},other_owner={},wt_dirty={}) \
+         errors={}",
         summary.scanned,
+        summary.truncated,
         summary.candidates,
         summary.candidate_bytes as f64 / 1_073_741_824.0,
         summary.reaped,
@@ -520,6 +1023,9 @@ pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
         summary.skipped_grace,
         summary.skipped_reparse,
         summary.skipped_kept,
+        summary.skipped_report_only,
+        summary.skipped_other_owner,
+        summary.skipped_worktree_dirty,
         summary.errors,
     );
     summary
@@ -529,6 +1035,8 @@ pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
 #[derive(Debug, Default, Clone)]
 pub struct ReapSummary {
     pub scanned: usize,
+    /// The enumeration hit its visit ceiling — `scanned` is a lower bound.
+    pub truncated: bool,
     pub candidates: usize,
     pub candidate_bytes: u64,
     pub reaped: usize,
@@ -537,6 +1045,12 @@ pub struct ReapSummary {
     pub skipped_grace: usize,
     pub skipped_reparse: usize,
     pub skipped_kept: usize,
+    /// In-repo-canonical roots: enumerated and measured, no v1 verb.
+    pub skipped_report_only: usize,
+    /// Owned by the worktree reclaim engine or the build pool.
+    pub skipped_other_owner: usize,
+    /// Inside a worktree with uncommitted work (G-dirty).
+    pub skipped_worktree_dirty: usize,
     pub errors: usize,
 }
 
@@ -578,9 +1092,10 @@ mod tests {
         fs::write(dir.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172").unwrap();
     }
 
-    /// A cargo target root that has NO `CACHEDIR.TAG` — only `.rustc_info.json`
-    /// + a `debug/` layout. This is the MAJORITY population on the real machine
-    /// (`_cargo-targets/<slug>`, `_targets/<slug>`, `.wt-targets/<slug>`, …).
+    /// A cargo target root that has NO `CACHEDIR.TAG` — only a
+    /// `.rustc_info.json` plus a `debug/` layout. This is the MAJORITY
+    /// population on the real machine (`_cargo-targets/<slug>`,
+    /// `_targets/<slug>`, `.wt-targets/<slug>`, …).
     fn mk_target_root_no_tag(dir: &Path) {
         fs::create_dir_all(dir.join("debug/deps")).unwrap();
         fs::write(dir.join(".rustc_info.json"), b"{}").unwrap();
@@ -615,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn enumerate_finds_bare_and_container_roots_but_not_repo_checkouts() {
+    fn enumerate_finds_every_class_and_tags_it() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // Bare out-of-tree target root (direct child).
@@ -624,33 +1139,179 @@ mod tests {
         mk_target_root(&root.join("_cargo-targets/blastfix"));
         // Nested container (_wt/<slug>/target).
         mk_target_root(&root.join("_wt/coord-x/target"));
-        // A repo checkout with a canonical target INSIDE — must NOT be found
-        // (we never descend into a non-container, non-root child).
+        // A canonical repo checkout (`.git` is a DIRECTORY) with targets
+        // inside. These used to be invisible; they are now enumerated and
+        // tagged `in-repo-canonical` — the class the classifier then refuses.
         let repo = root.join("qontinui-runner");
-        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(repo.join(".git/refs")).unwrap();
         mk_target_root(&repo.join("target"));
         mk_target_root(&repo.join("src-tauri/target"));
 
         let cands = enumerate_candidates(root);
-        let names: Vec<String> = cands
-            .iter()
-            .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert!(names.contains(&"target-wt-saf3".to_string()));
-        assert!(names.contains(&"blastfix".to_string()));
-        // The only `target` in the set is the _wt one, never the two inside the
-        // repo checkout — we must never descend into a repo checkout / worktree.
-        let wt_target = cands
+        let by_name = |name: &str| {
+            cands
+                .iter()
+                .find(|c| c.path.file_name().unwrap().to_string_lossy() == name)
+                .unwrap_or_else(|| panic!("no candidate named {name}"))
+        };
+        assert_eq!(by_name("target-wt-saf3").class, TargetClass::SiblingNonGit);
+        assert_eq!(by_name("blastfix").class, TargetClass::Container);
+        // `_wt/coord-x/target` — a container child, not a git worktree.
+        let wt_target: Vec<_> = cands
             .iter()
             .filter(|c| c.path.components().any(|comp| comp.as_os_str() == "_wt"))
-            .count();
-        assert_eq!(wt_target, 1, "_wt/coord-x/target must be found");
-        let repo_leak = cands.iter().any(|c| {
-            c.path
-                .components()
-                .any(|comp| comp.as_os_str() == "qontinui-runner")
-        });
-        assert!(!repo_leak, "must never descend into a repo checkout");
+            .collect();
+        assert_eq!(wt_target.len(), 1, "_wt/coord-x/target must be found");
+        assert_eq!(wt_target[0].class, TargetClass::Container);
+        // Both in-repo targets are now FOUND, tagged, and attributed to their
+        // checkout — the visibility Phase 0 measured at 1.67 TB.
+        let in_repo: Vec<_> = cands
+            .iter()
+            .filter(|c| c.class == TargetClass::InRepoCanonical)
+            .collect();
+        assert_eq!(
+            in_repo.len(),
+            2,
+            "<repo>/target and <repo>/src-tauri/target"
+        );
+        for c in in_repo {
+            assert_eq!(c.repo_root.as_deref(), Some(repo.as_path()));
+        }
+    }
+
+    #[test]
+    fn a_linked_worktree_is_detected_by_its_dot_git_file() {
+        // The `.git`-as-FILE form is the ONLY discriminator between a linked
+        // worktree and a canonical checkout. A `is_dir()` test alone
+        // mis-assigns all 110 linked worktrees Phase 0 measured (910 GB).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let linked = root.join("qontinui-runner-wt-a");
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(linked.join(".git"), b"gitdir: /repo/.git/worktrees/a\n").unwrap();
+        mk_target_root(&linked.join("target-a"));
+
+        let cands = enumerate_candidates(root);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].class, TargetClass::SiblingWorktree);
+        assert_eq!(cands[0].repo_root.as_deref(), Some(linked.as_path()));
+    }
+
+    #[test]
+    fn in_repo_canonical_is_report_only_even_at_zero_grace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let repo = root.join("some-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        mk_target_root(&repo.join("target-renamed"));
+        let opts = ClassifyOptions {
+            grace: Duration::ZERO,
+            keep_names: Vec::new(),
+            worktree_is_dirty: |_| false,
+        };
+        let cands = enumerate_candidates(root);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(
+            classify_candidate(&cands[0], &opts),
+            Err(SkipReason::ReportOnly),
+            "v1 gives the largest class no verb — not even when armed"
+        );
+    }
+
+    #[test]
+    fn boundary_gates_refuse_paths_other_engines_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wt = root.join("repo-wt-x");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join(".git"), b"gitdir: /repo/.git/worktrees/x\n").unwrap();
+        mk_target_root(&wt.join("target"));
+        mk_target_root(&wt.join("target-agent"));
+        mk_target_root(&wt.join("target-pool/slot-0"));
+        mk_target_root(&wt.join("target-renamed"));
+
+        let opts = ClassifyOptions {
+            grace: Duration::ZERO,
+            keep_names: Vec::new(),
+            worktree_is_dirty: |_| false,
+        };
+        let verdict = |name: &str| {
+            let c = enumerate_candidates(root)
+                .into_iter()
+                .find(|c| c.path.ends_with(name))
+                .unwrap_or_else(|| panic!("no candidate {name}"));
+            classify_candidate(&c, &opts)
+        };
+        assert_eq!(
+            verdict("target"),
+            Err(SkipReason::OwnedByWorktreeReclaim),
+            "<worktree>/target belongs to the worktree reclaim engine"
+        );
+        assert_eq!(verdict("target-agent"), Err(SkipReason::OwnedByBuildPool));
+        assert_eq!(verdict("slot-0"), Err(SkipReason::OwnedByBuildPool));
+        // The renamed in-worktree build dir IS this reaper's territory — the
+        // population the module doc used to declare out of scope.
+        assert_eq!(verdict("target-renamed"), Ok(()));
+    }
+
+    #[test]
+    fn a_dirty_worktree_blocks_its_renamed_build_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wt = root.join("repo-wt-dirty");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join(".git"), b"gitdir: /repo/.git/worktrees/d\n").unwrap();
+        mk_target_root(&wt.join("target-renamed"));
+        let c = enumerate_candidates(root).into_iter().next().unwrap();
+
+        let clean = ClassifyOptions {
+            grace: Duration::ZERO,
+            keep_names: Vec::new(),
+            worktree_is_dirty: |_| false,
+        };
+        let dirty = ClassifyOptions {
+            worktree_is_dirty: |_| true,
+            ..clean.clone()
+        };
+        assert_eq!(classify_candidate(&c, &clean), Ok(()));
+        assert_eq!(
+            classify_candidate(&c, &dirty),
+            Err(SkipReason::WorktreeDirty),
+            "worktree-reclaim's G1 is inviolable wherever a worktree exists"
+        );
+    }
+
+    #[test]
+    fn skip_reasons_have_distinct_tokens_and_details() {
+        let all = [
+            SkipReason::ReportOnly,
+            SkipReason::OwnedByWorktreeReclaim,
+            SkipReason::OwnedByBuildPool,
+            SkipReason::WorktreeDirty,
+            SkipReason::Reparse,
+            SkipReason::Building,
+            SkipReason::GracePending,
+            SkipReason::Kept,
+        ];
+        let tokens: std::collections::BTreeSet<&str> = all.iter().map(|r| r.token()).collect();
+        assert_eq!(tokens.len(), all.len(), "every reason needs its own token");
+        for r in all {
+            assert!(!r.detail().is_empty(), "{:?} needs an operator sentence", r);
+        }
+    }
+
+    #[test]
+    fn walk_never_descends_into_a_target_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let outer = root.join("target-outer");
+        mk_target_root(&outer);
+        // A marker dir INSIDE a discovered root must never become a second
+        // candidate — the walk prunes at the root.
+        mk_target_root(&outer.join("debug/inner"));
+        let cands = enumerate_candidates(root);
+        assert_eq!(cands.len(), 1);
+        assert!(cands[0].path.ends_with("target-outer"));
     }
 
     #[test]

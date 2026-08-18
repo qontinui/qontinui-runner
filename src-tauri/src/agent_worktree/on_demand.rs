@@ -354,33 +354,73 @@ impl SurveySummary {
         sample: Option<&census::VolumeSample>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Self {
-        let Some(sample) = sample else {
-            self.volumes_status = CensusStatus::Pending;
-            self.volumes_note = "Free space has not been sampled yet this session — this is \
-                                 UNKNOWN, not zero. The volume publisher samples every mounted \
-                                 volume once a minute."
-                .to_string();
-            return self;
+        let h = volume_headroom(sample, now);
+        self.volumes = h.volumes;
+        self.volumes_status = h.status;
+        self.volumes_observed_at = h.observed_at;
+        self.volumes_age_secs = h.age_secs;
+        self.free_bytes_total = h.free_bytes_total;
+        self.total_bytes_total = h.total_bytes_total;
+        self.volumes_note = h.note;
+        self
+    }
+}
+
+/// The volume half of a disk-facing surface, computed once and shared by every
+/// consumer (this module's worktree survey and
+/// [`super::disk_survey`]'s reclaim preview) so the two can never disagree
+/// about how much room is left or how old the reading is.
+///
+/// `sample: None` is UNKNOWN: `status` is `pending`, every byte total is
+/// `None` — **never `0`** — and `note` says so in words.
+#[derive(Debug, Clone)]
+pub(super) struct VolumeHeadroom {
+    pub(super) volumes: Vec<census::VolumeReport>,
+    pub(super) status: CensusStatus,
+    pub(super) observed_at: Option<String>,
+    pub(super) age_secs: Option<u64>,
+    pub(super) free_bytes_total: Option<u64>,
+    pub(super) total_bytes_total: Option<u64>,
+    pub(super) note: String,
+}
+
+pub(super) fn volume_headroom(
+    sample: Option<&census::VolumeSample>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> VolumeHeadroom {
+    let Some(sample) = sample else {
+        return VolumeHeadroom {
+            volumes: Vec::new(),
+            status: CensusStatus::Pending,
+            observed_at: None,
+            age_secs: None,
+            free_bytes_total: None,
+            total_bytes_total: None,
+            note: "Free space has not been sampled yet this session — this is UNKNOWN, not zero. \
+                   The volume publisher samples every mounted volume once a minute."
+                .to_string(),
         };
-        let age_secs = (now - sample.taken_at).num_seconds().max(0) as u64;
-        let status = if age_secs <= VOLUME_STALE_AFTER_SECS {
-            CensusStatus::Fresh
-        } else {
-            CensusStatus::Stale
-        };
-        self.free_bytes_total = Some(
+    };
+    let age_secs = (now - sample.taken_at).num_seconds().max(0) as u64;
+    let status = if age_secs <= VOLUME_STALE_AFTER_SECS {
+        CensusStatus::Fresh
+    } else {
+        CensusStatus::Stale
+    };
+    VolumeHeadroom {
+        free_bytes_total: Some(
             sample
                 .volumes
                 .iter()
                 .fold(0u64, |acc, v| acc.saturating_add(v.free_bytes)),
-        );
-        self.total_bytes_total = Some(
+        ),
+        total_bytes_total: Some(
             sample
                 .volumes
                 .iter()
                 .fold(0u64, |acc, v| acc.saturating_add(v.total_bytes)),
-        );
-        self.volumes_note = format!(
+        ),
+        note: format!(
             "Free space as of {} ago, across {} volume{}{}.",
             humanize_secs(age_secs),
             sample.volumes.len(),
@@ -390,12 +430,11 @@ impl SurveySummary {
             } else {
                 ""
             },
-        );
-        self.volumes = sample.volumes.clone();
-        self.volumes_status = status;
-        self.volumes_observed_at = Some(sample.taken_at.to_rfc3339());
-        self.volumes_age_secs = Some(age_secs);
-        self
+        ),
+        volumes: sample.volumes.clone(),
+        status,
+        observed_at: Some(sample.taken_at.to_rfc3339()),
+        age_secs: Some(age_secs),
     }
 }
 
@@ -771,7 +810,7 @@ fn assemble_survey(
 }
 
 /// `95` → `"1m 35s"`. Small, allocation-cheap, and only used for the note.
-fn humanize_secs(secs: u64) -> String {
+pub(super) fn humanize_secs(secs: u64) -> String {
     if secs < 60 {
         return format!("{secs}s");
     }
