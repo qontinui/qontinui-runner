@@ -1,3 +1,13 @@
+// Large `serde_json::json!` macros in the database export need this. Moved
+// from `main.rs` with the tree — `database` compiles here now.
+#![recursion_limit = "256"]
+// Many modules are in active development with planned integrations.
+#![allow(dead_code)]
+// API response types are intentionally detailed.
+#![allow(clippy::type_complexity)]
+// Refactoring to structs is tracked separately.
+#![allow(clippy::too_many_arguments)]
+
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::fs;
 use std::sync::OnceLock;
@@ -220,3 +230,224 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+// ==========================================================================
+// Relocated from `main.rs` (Phase 2) — the bin-only module tree. Files did
+// not move; only these declarations did. `main.rs` keeps a
+// `pub use qontinui_runner_lib::<m>;` shim for each, deleted in Phase 3.
+// ==========================================================================
+pub mod action_service;
+pub mod agent_authorization;
+pub mod agent_claims;
+pub mod agent_commands;
+pub mod agent_daemons;
+pub mod agent_http;
+pub mod agent_pusher;
+pub mod agent_runtime;
+pub mod agent_token;
+pub mod agent_worktree;
+pub mod agentic_verification;
+pub mod ai_pricing;
+pub mod ai_provider;
+pub mod ai_router;
+pub mod ai_workflows;
+pub mod api_config;
+pub mod api_request;
+pub mod asset_headers;
+pub mod auto_commit;
+pub mod backup;
+pub mod blind_spots;
+pub mod build_drift;
+pub mod bundled_resources;
+pub mod check_executor;
+pub mod check_generation;
+pub mod ci_node;
+pub mod claude_accounts;
+pub mod claude_protocol;
+pub mod claude_session;
+pub mod click_overlay;
+pub mod commands;
+pub mod comparison;
+pub mod config;
+pub mod config_facade;
+pub mod config_storage;
+pub mod constraint_engine;
+pub mod container;
+pub mod context;
+pub mod coord_doctor_cmd;
+pub mod coord_http;
+pub mod coord_mcp;
+pub mod coord_questions;
+pub mod coordinator;
+pub mod cost_management;
+pub mod crash_dumps;
+pub mod crash_observability;
+pub mod credential_helper;
+pub mod database;
+pub mod debug_lifecycle;
+pub mod demo_workflows;
+pub mod dev_services;
+pub mod dirty_poller;
+pub mod discoveries;
+pub mod display;
+pub mod doctor;
+pub mod dom_capture;
+pub mod drain;
+pub mod embedded_pg;
+pub mod error;
+pub mod error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
+pub mod event_system;
+pub mod execution_context;
+pub mod execution_core;
+pub mod executor;
+pub mod exploration;
+pub mod findings;
+pub mod fixer;
+pub mod fleet;
+pub mod fleet_commands;
+pub mod flow_control;
+#[cfg(test)]
+pub mod flywheel_e2e_tests;
+pub mod follow_up;
+pub mod git_status_subset;
+pub mod git_supervision;
+pub mod graphql;
+pub mod health_monitor;
+pub mod heartbeat;
+pub mod helper_tasks;
+pub mod install_effects_producer;
+pub mod instance;
+pub mod instance_health;
+pub mod instance_manager;
+pub mod iteration_bundle;
+#[cfg(windows)]
+pub mod job_object;
+pub mod knowledge_acquisition;
+pub mod known_issues;
+pub mod launch_env;
+pub mod log_consolidation;
+pub mod logging;
+pub mod looping_agent_coord;
+pub mod looping_agent_supervisor;
+pub mod macros;
+pub mod mcp;
+pub mod mcp_api;
+pub mod mcp_client;
+pub mod mcp_embedded;
+pub mod memory;
+pub mod meta_optimizer;
+pub mod middleware;
+pub mod observer_registry;
+pub mod online_learning;
+pub mod orchestration_loop;
+pub mod orchestration_loop_configs;
+pub mod orchestrator;
+pub mod otel;
+pub mod outbound_trace; // Plan 2026-07-08-ui-bridge-reach-and-verify-gated-flows P5 — redacted outbound-call trace
+pub mod paths;
+pub mod planning_bridge;
+pub mod playwright;
+pub mod pm_detect;
+pub mod process_capture;
+pub mod productivity;
+pub mod projects;
+pub mod prompt_library;
+pub mod prompt_snippets;
+pub mod prompts;
+pub mod rag;
+pub mod recording;
+pub mod reflection;
+pub mod regression_api;
+pub mod repo_detection;
+pub mod resource_guard;
+pub mod restate;
+pub mod rework;
+pub mod routing;
+pub mod runtime_env;
+pub mod safe_lock;
+pub mod saved_api_requests;
+pub mod scenarios;
+pub mod scheduler;
+pub mod scheduler_service;
+pub mod schema_registry;
+pub mod screen;
+pub mod sdk_features;
+pub mod security;
+pub mod semantic_conventions;
+pub mod server_mode;
+pub mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
+pub mod session_attribution;
+pub mod session_bus; // Session Bus Phase 3b — gated directed-message delivery executor
+pub mod session_pr_reconciler; // Runner-local per-session PR attribution → project.session_prs (Terminal dropdown)
+pub mod settings;
+pub mod skills;
+pub mod slash_commands;
+pub mod spawn_placement;
+pub mod spec_api;
+pub mod spec_experimentation;
+pub mod spec_utils;
+pub mod startup_panic;
+pub mod state_discovery;
+pub mod state_explorer;
+pub mod state_machine_configs;
+pub mod stats;
+pub mod step_event_builder;
+pub mod step_executor;
+pub mod step_injection;
+pub mod step_metadata;
+pub mod step_output;
+pub mod step_registry;
+pub mod step_types;
+pub mod steps;
+pub mod storage;
+pub mod str_utils;
+pub mod subagent;
+pub mod summary_generator;
+pub mod tauri_app_handle;
+pub mod tauri_command_audit;
+pub mod terminal;
+pub mod test_executor;
+pub mod test_orchestrator;
+pub mod ticket_system;
+#[cfg(test)]
+pub mod tier_matrix_tests;
+pub mod tiered_info;
+pub mod timeout_config;
+pub mod trace_api;
+pub mod tracing_layers;
+pub mod trigger_system;
+pub mod tunnel;
+pub mod ui_bridge_evaluate;
+pub mod ui_bridge_invoke;
+pub mod ui_bridge_invoke_probe;
+pub mod ui_bridge_plugin;
+pub mod ui_error;
+pub mod unified_ai_session;
+pub mod unified_workflow_executor;
+pub mod unified_workflows;
+pub mod util;
+pub mod validation;
+pub mod verification;
+pub mod vga;
+pub mod video_recorder;
+pub mod vision;
+pub mod wake_handler; // Phase F.1 — qontinui:// custom-URL deep-link wake handler
+pub mod webview_recovery; // Dead-webview detection (WebView2 ProcessFailed) + in-process recovery
+pub mod win32_compat;
+pub mod window_assignments;
+pub mod window_manager;
+pub mod window_placement;
+pub mod workflow;
+pub mod workflow_event_bus;
+pub mod workflow_generation;
+pub mod workflow_queue;
+pub mod workflow_state;
+pub mod workspace_paths;
+pub mod worktree;
+pub mod wrappers;
+pub mod zombie_sweep;
+
+// Mirrors main.rs's `use commands::AppState;` re-export. 26 call sites
+// spell it `crate::AppState` and 103 spell it `crate::commands::AppState`;
+// both must resolve against this crate root now that the tree lives here.
+pub use commands::AppState;
