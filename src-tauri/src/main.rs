@@ -1066,6 +1066,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // build-in-flight condition — a build in flight blocks one
                 // item, never the report (INV-D1). Default 3600s cadence
                 // (QONTINUI_DISK_SURVEY_INTERVAL_SECS, floored 300s).
+                // Instance-gated like spawn_census: the walk is MACHINE-wide, so
+                // the periodic tick runs only on the shared-root-owning
+                // instance — otherwise every secondary and every
+                // supervisor-spawned temp runner would start its own hourly
+                // full-machine sizing walk over identical data, on the very
+                // disk-pressured box this feature exists for. On-demand
+                // (`?refresh=1`) still works everywhere.
                 agent_worktree::disk_survey::spawn_disk_surveyor();
                 // Ξ_FS backstop (Phase 5) — a defense-in-depth DETECTOR for
                 // edits that leaked OUTSIDE any session worktree. Periodically
