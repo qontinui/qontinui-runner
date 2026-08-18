@@ -196,6 +196,14 @@ pub struct SurveySummary {
     /// Any byte total above is a lower bound (a truncated walk, an unreadable
     /// subtree, or a root that could not be sized).
     pub bytes_incomplete: bool,
+    /// **The COUNTS above are unknown, not zero.** `roots`, `reclaimable`,
+    /// `blocked` and every `by_class[].roots` / `reclaimable_roots` are plain
+    /// `usize`, so a walk that read nothing renders them as a hard `0` — the
+    /// same shape a genuinely-empty tree produces. The byte totals go `null` in
+    /// that case; the counts cannot, so this flag carries the same statement for
+    /// them. A consumer that keys a "measured zero" rendering off `roots == 0`
+    /// (the web's `measuredZeroBuckets.forBucket()` does) MUST read this first.
+    pub roots_unknown: bool,
     pub by_class: Vec<ClassSummary>,
 
     // --- Volume headroom (Phase 1's 60 s publisher — INV-D1) ---
@@ -250,10 +258,25 @@ impl ScanStats {
     /// to decide whether an EMPTY item list is a measured zero or an unknown
     /// population — the two must never render the same.
     ///
-    /// The depth bound is excluded on purpose (see `depth_limited_dirs`); these
-    /// are the failures, not the designed limits.
+    /// The depth bound is excluded on purpose (see `depth_limited_dirs`); the
+    /// bound bites on any deep tree, so folding it in would leave this
+    /// permanently true and destroy its ability to signal a real gap. The
+    /// EMPTY-list branch of [`assemble`] handles the bound separately, in prose:
+    /// it refuses to say "measured zero" while `depth_limited_dirs > 0`.
+    ///
+    /// `reparse_dirs_skipped` **is** folded in, and is the door the first fix
+    /// missed. A junctioned subtree is not a designed limit in the same sense as
+    /// the depth bound: it is a branch the walk CHOSE not to enter, and its
+    /// contents are unmeasured. A `paths.workspace_root` whose children are all
+    /// junctions (`_wt` shared checkouts, `.wt-targets` links) otherwise
+    /// produced `items: []` with no read errors — every total a hard `0` under a
+    /// note asserting a measured zero, which is the original defect reached
+    /// through a second door.
     fn incomplete(&self) -> bool {
-        self.truncated || !self.read_errors.is_empty() || self.entry_errors > 0
+        self.truncated
+            || !self.read_errors.is_empty()
+            || self.entry_errors > 0
+            || self.reparse_dirs_skipped > 0
     }
 }
 
@@ -557,6 +580,8 @@ pub(super) fn assemble(
             reclaimable_bytes: None,
             report_only_bytes: None,
             bytes_incomplete: false,
+            // No walk produced these zeros, so they are not measured ones.
+            roots_unknown: true,
             by_class,
             volumes: Vec::new(),
             volumes_status: CensusStatus::default(),
@@ -678,6 +703,9 @@ pub(super) fn assemble(
         bytes_incomplete: snapshot.scan.incomplete()
             || snapshot.scan.roots_with_unknown_bytes > 0
             || snapshot.scan.roots_with_partial_bytes > 0,
+        // The counts are `usize`, so `known()` cannot null them the way it nulls
+        // the byte totals. Same statement, carried by a flag.
+        roots_unknown: population_unknown,
         by_class,
         volumes: Vec::new(),
         volumes_status: CensusStatus::default(),
@@ -723,7 +751,42 @@ pub(super) fn assemble(
                 }
             ));
         }
+        if snapshot.scan.reparse_dirs_skipped > 0 {
+            parts.push(format!(
+                "{} junction{} not followed, so whatever {} point at is unmeasured",
+                snapshot.scan.reparse_dirs_skipped,
+                if snapshot.scan.reparse_dirs_skipped == 1 {
+                    " was"
+                } else {
+                    "s were"
+                },
+                if snapshot.scan.reparse_dirs_skipped == 1 {
+                    "it points"
+                } else {
+                    "they point"
+                }
+            ));
+        }
         parts.join("; ")
+    };
+
+    // The walk's depth bound, in the operator's words. Emitted in BOTH the
+    // empty and the non-empty branch: an empty item list under a bitten bound is
+    // exactly where "measured zero" is most tempting and most wrong, and with
+    // `MAX_WALK_DEPTH = 4` the bound is bitten on essentially every real root.
+    let depth_bound_sentence = if snapshot.scan.depth_limited_dirs > 0 {
+        format!(
+            " {} director{} were not descended into at the walk's depth bound, so a target root \
+             below it is absent rather than measured.",
+            snapshot.scan.depth_limited_dirs,
+            if snapshot.scan.depth_limited_dirs == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        )
+    } else {
+        String::new()
     };
 
     let note = if population_unknown {
@@ -733,10 +796,25 @@ pub(super) fn assemble(
         format!(
             "The walk under {} completed {} ago and found no cargo target roots, but it did NOT \
              see the whole tree: {}. The population is therefore UNKNOWN, not zero — the byte \
-             totals are null rather than 0, and nothing here says there is nothing to reclaim.",
+             totals are null rather than 0, and nothing here says there is nothing to \
+             reclaim.{}",
             snapshot.root,
             humanize_secs(age_secs),
             gaps,
+            depth_bound_sentence,
+        )
+    } else if snapshot.items.is_empty() && !depth_bound_sentence.is_empty() {
+        // Empty list, no failed read — but the depth bound bit. The walk read
+        // everything it OPENED; it did not open everything there is. Saying
+        // "measured zero" here over-claims, so the sentence stops short of it
+        // and names the bound instead.
+        format!(
+            "The walk under {} completed {} ago, read every directory it opened, and found NO \
+             cargo target roots at or above its depth bound.{} So this is not a certified \
+             \"nothing to reclaim\": it is a zero over the part of the tree the walk reaches.",
+            snapshot.root,
+            humanize_secs(age_secs),
+            depth_bound_sentence,
         )
     } else if snapshot.items.is_empty() {
         format!(
@@ -762,20 +840,7 @@ pub(super) fn assemble(
             } else {
                 format!(" This list is INCOMPLETE: {gaps}.")
             },
-            if snapshot.scan.depth_limited_dirs > 0 {
-                format!(
-                    " {} director{} were not descended into at the walk's depth bound, so a \
-                     target root below it is absent rather than measured.",
-                    snapshot.scan.depth_limited_dirs,
-                    if snapshot.scan.depth_limited_dirs == 1 {
-                        "y"
-                    } else {
-                        "ies"
-                    }
-                )
-            } else {
-                String::new()
-            },
+            depth_bound_sentence,
             if summary.bytes_incomplete && gaps.is_empty() {
                 " Some sizes could not be read, so the byte totals are lower bounds."
             } else {
@@ -1504,6 +1569,146 @@ mod tests {
         assert_eq!(ok.summary.total_bytes, Some(0));
         assert!(ok.census_note.contains("measured zero"));
         assert_ne!(ok.census_note, s.census_note);
+    }
+
+    /// **R-1, door two — an all-junction root is an UNKNOWN population.**
+    ///
+    /// `incomplete()` counted `truncated`, `read_errors` and `entry_errors` and
+    /// stopped there. A `paths.workspace_root` whose children are all junctions
+    /// — entirely plausible here (`_wt` shared checkouts, `.wt-targets` links) —
+    /// produces `items: []`, `reparse_dirs_skipped > 0`, and NO read errors. So
+    /// `population_unknown` was `false`, every total came back `Some(0)`,
+    /// `bytes_incomplete` was `false`, and the note said the walk "read every
+    /// directory it set out to … This is a measured zero, not a missing
+    /// reading." The original defect, intact, through a second door.
+    ///
+    /// A junctioned subtree is not a designed limit the way the depth bound is:
+    /// it is a branch the walk CHOSE not to enter, and its contents are
+    /// unmeasured.
+    #[test]
+    fn a_root_of_only_junctions_is_unknown_not_a_measured_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Junctions/symlinks need privileges this test cannot assume, so the
+        // walk's own OUTPUT is reproduced instead: nothing found, nothing
+        // errored, and every branch skipped as a reparse point. That is exactly
+        // the shape `enumerate_all` returns for an all-junction root — see
+        // `orphan_target_reaper::the_walk_counts_its_depth_bound_and_its_skipped_reparse_points`,
+        // which pins the counter against real symlinks.
+        let mut snapshot = build_snapshot(tmp.path(), &clean_opts());
+        assert!(snapshot.items.is_empty());
+        assert!(
+            snapshot.scan.read_errors.is_empty(),
+            "nothing FAILED to read"
+        );
+        assert_eq!(snapshot.scan.entry_errors, 0);
+        assert!(!snapshot.scan.truncated);
+        snapshot.scan.reparse_dirs_skipped = 3;
+
+        let s = assemble(Some(&snapshot), None, None, false, chrono::Utc::now());
+        assert_eq!(s.summary.total_bytes, None, "the population is UNKNOWN");
+        assert_eq!(s.summary.reclaimable_bytes, None);
+        assert_eq!(s.summary.report_only_bytes, None);
+        for c in &s.summary.by_class {
+            assert_eq!(c.bytes, None, "{} must not report a zero", c.class);
+        }
+        assert!(s.summary.bytes_incomplete);
+        assert!(
+            !s.census_note.contains("measured zero"),
+            "note asserted a measured zero over an unentered subtree: {}",
+            s.census_note
+        );
+        assert!(s.census_note.contains("UNKNOWN"), "{}", s.census_note);
+        assert!(
+            s.census_note.contains("junction"),
+            "the note must NAME the gap it is claiming: {}",
+            s.census_note
+        );
+
+        // Non-vacuous: the identical snapshot with no skipped junctions is a
+        // real measured zero.
+        let clean = build_snapshot(tmp.path(), &clean_opts());
+        let clean = assemble(Some(&clean), None, None, false, chrono::Utc::now());
+        assert_eq!(clean.summary.total_bytes, Some(0));
+        assert!(clean.census_note.contains("measured zero"));
+    }
+
+    /// **R-1, door three — the empty branch never mentioned the depth bound.**
+    ///
+    /// The `depth_limited_dirs > 0` sentence was emitted only in the
+    /// items-NON-empty branch. With `MAX_WALK_DEPTH = 4` the bound is bitten on
+    /// essentially any real root, so an empty item list would have asserted a
+    /// measured zero — with no mention of the bound at all — in almost every
+    /// case where the population below the bound is precisely what is unknown.
+    ///
+    /// The bound stays OUT of `incomplete()` (it bites on any deep tree, so
+    /// folding it in would leave `bytes_incomplete` permanently true and destroy
+    /// its signal). It is handled in prose instead: the counts stay measured,
+    /// the "measured zero" CLAIM does not.
+    #[test]
+    fn an_empty_result_under_the_depth_bound_never_claims_a_measured_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut snapshot = build_snapshot(tmp.path(), &clean_opts());
+        assert!(snapshot.items.is_empty());
+        snapshot.scan.depth_limited_dirs = 7;
+
+        let s = assemble(Some(&snapshot), None, None, false, chrono::Utc::now());
+        assert!(
+            !s.census_note.contains("measured zero"),
+            "the bound was bitten; nothing certified this zero: {}",
+            s.census_note
+        );
+        assert!(
+            s.census_note.contains("depth bound"),
+            "the note must name the bound: {}",
+            s.census_note
+        );
+        assert!(
+            s.census_note.contains('7'),
+            "…and how many directories it stopped at: {}",
+            s.census_note
+        );
+        // The bound is a designed limit, not a failed read: what WAS walked is
+        // still a real zero, so the totals stay measured rather than going null.
+        assert_eq!(s.summary.total_bytes, Some(0));
+        assert!(!s.summary.roots_unknown);
+    }
+
+    /// **R-4 — the `roots` counts are `usize`, so `known()` cannot null them.**
+    ///
+    /// Under a failed walk every byte total goes `null`, but `summary.roots`,
+    /// `reclaimable`, `blocked` and every `by_class[].roots` stay a hard `0` —
+    /// the exact shape a genuinely-empty tree produces. Harmless while the only
+    /// consumer gates on `items.length !== 0`, but the web's
+    /// `measuredZeroBuckets.forBucket()` keys on `roots === 0`, so a future
+    /// reader of the rollup alone would get a certified zero out of a walk that
+    /// read nothing. The flag carries for the counts what `null` carries for the
+    /// bytes.
+    #[test]
+    fn roots_counts_are_flagged_unknown_when_the_walk_read_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("detached-volume");
+        let failed = build_snapshot(&missing, &clean_opts());
+        let failed = assemble(Some(&failed), None, None, false, chrono::Utc::now());
+        assert_eq!(failed.summary.roots, 0, "the count itself cannot say more…");
+        assert!(failed.summary.roots_unknown, "…so the flag has to");
+
+        // Non-vacuous on both sides: a successful empty walk reports a real zero,
+        // and a cold start (no walk at all) is unknown too.
+        let ok = build_snapshot(tmp.path(), &clean_opts());
+        let ok = assemble(Some(&ok), None, None, false, chrono::Utc::now());
+        assert_eq!(ok.summary.roots, 0);
+        assert!(!ok.summary.roots_unknown, "a measured zero is not unknown");
+
+        let cold = assemble(None, None, None, false, chrono::Utc::now());
+        assert!(cold.summary.roots_unknown);
+        let unavailable = assemble(
+            None,
+            Some("no root".to_string()),
+            None,
+            false,
+            chrono::Utc::now(),
+        );
+        assert!(unavailable.summary.roots_unknown);
     }
 
     /// The same distinction one layer down: a walk that found roots but could
