@@ -96,6 +96,7 @@ mod execution_context;
 mod execution_core;
 mod executor;
 mod exploration;
+mod external_volume;
 mod findings;
 mod fixer;
 // Row 2 Phase 1 (fleet topology + per-device budget). Detects local

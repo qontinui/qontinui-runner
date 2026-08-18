@@ -416,6 +416,73 @@ fn free_disk_gb_for(root: &Path) -> Option<u64> {
     probe_volume_for(root).map(|(_, _, avail)| avail / (1024 * 1024 * 1024))
 }
 
+/// Verdict of the pre-build disk gate. `Reject` carries the operator-readable
+/// reason verbatim, so [`start_build`] does not re-word it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DiskGate {
+    Ok,
+    Reject(String),
+}
+
+/// Pure disk-admission policy: free space, the floor, and — new in plan
+/// `2026-08-07-external-storage-tiering-for-fleet-disk-pressure` Phase 5 —
+/// whether the build path sits on a **declared external volume**.
+///
+/// # The polarity is per-path, and that is the whole change
+///
+/// `free_gb == None` means the volume could not be resolved. For an internal
+/// path that stays **fail-OPEN**, exactly as before: a telemetry gap must not
+/// brick the lane, and the floor is a guard rather than a security boundary.
+/// For a path on a removable volume it becomes **fail-CLOSED**, because the
+/// cost asymmetry inverts. Proceeding on an unresolvable internal probe risks
+/// a failed build; proceeding on an unresolvable *external* probe risks a
+/// partially written artifact tree on a volume that just went away — or 300
+/// GiB written into the un-mounted stub, filling the very disk the relocation
+/// exists to relieve. A refusal is strictly recoverable; that is not.
+///
+/// `external` is `None` when no external volume is declared **or** this path
+/// is not under it — which, on a machine with no dock, is every path. That is
+/// how this ships with no behaviour change: with nothing declared, every arm
+/// below is byte-identical to the pre-Phase-5 code.
+///
+/// Pure so the polarity can be pinned in unit tests with **no dock attached
+/// and no filesystem touched** — the same reason [`pick_volume`] and the
+/// supervisor's `disk_guard_allows` are pure.
+pub(crate) fn disk_gate(
+    free_gb: Option<u64>,
+    floor_gb: u64,
+    external: Option<&crate::external_volume::ExternalVolumeState>,
+    root: &Path,
+) -> DiskGate {
+    // A declared-but-not-provably-present external volume is refused BEFORE
+    // free space is even considered: "how much room is on it" is not a
+    // meaningful question about a volume that is absent, or about one that
+    // turned out to be a different volume than the one declared.
+    if let Some(state) = external {
+        if let Some(reason) = state.refusal_reason(root) {
+            return DiskGate::Reject(reason);
+        }
+    }
+
+    match free_gb {
+        Some(free) if free < floor_gb => DiskGate::Reject(format!(
+            "free disk {free} GiB on the {} volume is below the ci_node.min_free_disk_gb \
+             floor ({floor_gb} GiB)",
+            root.display()
+        )),
+        Some(_) => DiskGate::Ok,
+        None if external.is_some() => DiskGate::Reject(format!(
+            "could not resolve free disk for {} — it is on the declared EXTERNAL volume, \
+             so this refuses rather than proceeding (fail-closed guard): an unresolvable \
+             probe is precisely the condition under which a build on a removable volume \
+             must not start",
+            root.display()
+        )),
+        // Internal path, unresolvable probe: unchanged fail-open.
+        None => DiskGate::Ok,
+    }
+}
+
 /// Minimum free **commit** (GiB) to START a build (plan §4.6: "minimum free
 /// RAM" alongside the disk floor).
 ///
@@ -620,27 +687,35 @@ fn start_build(payload: CiDispatchPayload, settings: CiNodeSettings) {
         return;
     };
 
-    match free_disk_gb_for(&root) {
-        Some(free) if free < settings.min_free_disk_gb => {
-            reject(
-                &payload,
-                format!(
-                    "free disk {free} GiB on the {} volume is below the ci_node.min_free_disk_gb \
-                     floor ({} GiB)",
-                    root.display(),
-                    settings.min_free_disk_gb
-                ),
-            );
+    // Is this build path on a declared external volume? `None` on a machine
+    // with no declaration — which keeps every arm below byte-identical to the
+    // pre-Phase-5 behaviour. Probed ONCE and threaded through, so the gate
+    // decision and the log line below cannot disagree about the volume's state.
+    let external = crate::external_volume::external_state_for(&root);
+    let free_gb = free_disk_gb_for(&root);
+
+    match disk_gate(free_gb, settings.min_free_disk_gb, external.as_ref(), &root) {
+        DiskGate::Reject(reason) => {
+            reject(&payload, reason);
             return;
         }
-        Some(free) => info!(
-            "ci_node: disk gate ok ({free} GiB free ≥ {} GiB floor)",
-            settings.min_free_disk_gb
-        ),
-        None => warn!(
-            "ci_node: could not resolve free disk for {} — proceeding (fail-open guard)",
-            root.display()
-        ),
+        DiskGate::Ok => match free_gb {
+            Some(free) => info!(
+                "ci_node: disk gate ok ({free} GiB free ≥ {} GiB floor{})",
+                settings.min_free_disk_gb,
+                if external.is_some() {
+                    ", on the declared external volume"
+                } else {
+                    ""
+                }
+            ),
+            // Only reachable for an INTERNAL path — `disk_gate` rejects an
+            // unresolvable probe on an external one.
+            None => warn!(
+                "ci_node: could not resolve free disk for {} — proceeding (fail-open guard)",
+                root.display()
+            ),
+        },
     }
 
     // Memory floor (plan §4.6): a build admitted onto a starved box would OOM
@@ -1225,5 +1300,150 @@ mod tests {
             None,
             "no matching mount → None (caller fails open)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // External-volume tiering — plan
+    // `2026-08-07-external-storage-tiering-for-fleet-disk-pressure`,
+    // Phases 3 and 5. Every case below runs with NO dock attached and no
+    // filesystem access, which is the point: the plan's HW-ABSENT branch
+    // has to be fully verifiable on a machine that has no external drive.
+    // -----------------------------------------------------------------
+
+    use crate::external_volume::ExternalVolumeState;
+
+    /// The binding rule from the plan's "The binding mechanism" §2: mount the
+    /// external volume at a path INSIDE the workspace root, so the existing
+    /// longest-mount-prefix match selects it for external paths and the
+    /// internal volume for everything else — **with no change to
+    /// `pick_volume`**. This test is what makes that claim checkable instead
+    /// of asserted.
+    #[test]
+    fn external_mount_inside_the_root_wins_the_longest_prefix() {
+        let mounts = vec![
+            (PathBuf::from("/data"), 4000 * GIB, 100 * GIB), // internal, nearly full
+            (PathBuf::from("/data/qontinui-ext"), 4000 * GIB, 3900 * GIB), // external
+        ];
+        // A path on the external mount resolves to the EXTERNAL volume's free
+        // space, not the internal one it is nested inside.
+        assert_eq!(
+            pick_volume(&mounts, Path::new("/data/qontinui-ext/targets/coord")).map(|v| v.2),
+            Some(3900 * GIB),
+            "the longer mount prefix must win — otherwise every external path \
+             would report the internal volume's free space"
+        );
+        // And everything else still resolves to the internal volume.
+        assert_eq!(
+            pick_volume(
+                &mounts,
+                Path::new("/data/qontinui-root/qontinui-coord/target")
+            )
+            .map(|v| v.2),
+            Some(100 * GIB)
+        );
+    }
+
+    const FLOOR: u64 = 20;
+    const ROOT: &str = "/data/qontinui-ext/targets";
+
+    #[test]
+    fn internal_path_with_unresolvable_probe_still_proceeds() {
+        // The no-regression half of the plan's admission row. `external:
+        // None` is what every path looks like on a box with no declaration,
+        // so this is also the "byte-identical to today" guarantee.
+        assert_eq!(
+            disk_gate(None, FLOOR, None, Path::new("/data/qontinui-root")),
+            DiskGate::Ok,
+            "an internal path with an unresolvable probe must keep failing OPEN"
+        );
+    }
+
+    #[test]
+    fn external_path_with_unresolvable_probe_is_rejected() {
+        // The inversion this plan exists for.
+        let got = disk_gate(
+            None,
+            FLOOR,
+            Some(&ExternalVolumeState::Present),
+            Path::new(ROOT),
+        );
+        match got {
+            DiskGate::Reject(r) => {
+                assert!(r.contains("EXTERNAL"), "reason should name why: {r}");
+                assert!(r.contains("fail-closed"), "reason was: {r}");
+            }
+            DiskGate::Ok => panic!("an unresolvable probe on an external path must REJECT"),
+        }
+    }
+
+    #[test]
+    fn absent_external_volume_is_rejected_before_free_space_is_considered() {
+        // Note the free-space argument says there is plenty of room. It is
+        // irrelevant: room on WHAT? The volume is not mounted, so the stub we
+        // would be measuring is on the internal disk.
+        let got = disk_gate(
+            Some(3900),
+            FLOOR,
+            Some(&ExternalVolumeState::Absent),
+            Path::new(ROOT),
+        );
+        match got {
+            DiskGate::Reject(r) => assert!(r.contains("NOT mounted"), "reason was: {r}"),
+            DiskGate::Ok => panic!("an absent external volume must REJECT even with free space"),
+        }
+    }
+
+    #[test]
+    fn mismatched_external_volume_is_rejected_and_says_so_distinctly() {
+        // The dangerous case: a volume IS mounted, it is just the wrong one.
+        // It must not be reported as a disconnect — an operator who reads
+        // "not mounted" will go and plug the drive in, which is not the fix.
+        let got = disk_gate(
+            Some(3900),
+            FLOOR,
+            Some(&ExternalVolumeState::Mismatched {
+                expected: "{d913fcde}".into(),
+                found: "{ffffffff}".into(),
+            }),
+            Path::new(ROOT),
+        );
+        match got {
+            DiskGate::Reject(r) => {
+                assert!(r.contains("WRONG volume"), "reason was: {r}");
+                assert!(
+                    !r.contains("NOT mounted"),
+                    "must not read as a disconnect: {r}"
+                );
+            }
+            DiskGate::Ok => panic!("a mismatched volume must REJECT"),
+        }
+    }
+
+    #[test]
+    fn present_external_volume_above_the_floor_proceeds() {
+        assert_eq!(
+            disk_gate(
+                Some(3900),
+                FLOOR,
+                Some(&ExternalVolumeState::Present),
+                Path::new(ROOT)
+            ),
+            DiskGate::Ok
+        );
+    }
+
+    #[test]
+    fn the_ordinary_floor_still_rejects_on_both_kinds_of_volume() {
+        // Phase 5 must not accidentally become the ONLY reason a build is
+        // refused: the pre-existing free-space floor keeps working, external
+        // or not.
+        for external in [None, Some(&ExternalVolumeState::Present)] {
+            match disk_gate(Some(1), FLOOR, external, Path::new(ROOT)) {
+                DiskGate::Reject(r) => {
+                    assert!(r.contains("min_free_disk_gb"), "reason was: {r}")
+                }
+                DiskGate::Ok => panic!("1 GiB free is below the {FLOOR} GiB floor"),
+            }
+        }
     }
 }
