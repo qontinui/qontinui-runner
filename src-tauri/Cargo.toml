@@ -14,7 +14,13 @@ default-run = "qontinui-runner"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "qontinui_runner_lib"
-crate-type = ["cdylib", "rlib"]
+# `rlib` only. The `cdylib` was dropped 2026-08-18: it existed for the Tauri
+# mobile entry point and had zero consumers — `src-tauri/gen/` was never
+# initialized, nothing references the `.dll`, and `externalBin` names only bin
+# targets — yet `cargo build`/`cargo test` emitted it on every desktop build.
+# Re-add the word if a mobile target is ever initialized. Rationale:
+# plans/2026-08-06-runner-move-bin-module-tree-into-lib-crate.md, Phase 0 step 1.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.5", features = [] }
