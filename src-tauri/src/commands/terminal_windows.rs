@@ -77,6 +77,12 @@ struct SessionAssignmentChanged {
 /// identical webview (same bundle, boot hint, port injection, headers). The
 /// caller is responsible for positioning (placement vs saved geometry),
 /// `show()`/`set_focus()`, and any events.
+///
+/// ⚠ **Blocking. Never call this directly from a tokio worker** — the
+/// post-build [`crate::webview_recovery::verify_window_has_a_webview`] probe is
+/// an unbounded event-loop round-trip off the main thread. `restore_pop_out_windows`
+/// runs on the main thread (inline dispatch); [`open_terminal_window`] hands it
+/// to `spawn_blocking`.
 fn build_pop_out_webview(
     app: &tauri::AppHandle,
     label: &str,
@@ -104,14 +110,37 @@ fn build_pop_out_webview(
         .decorations(true)
         .on_web_resource_request(crate::asset_headers::stamp_no_store_on_index);
 
+    // Same WebView2 environment as this runner's main window — its isolated
+    // user-data folder and its anti-throttling browser args. Without this
+    // Tauri forces `%LOCALAPPDATA%\com.qontinui.runner` (the PRIMARY's profile
+    // root) on the pop-out, and on a secondary runner WebView2 then fails with
+    // `HRESULT(0x8007139F)`, leaving a window with no webview at all. See
+    // `webview_recovery::apply_main_window_env_options`.
+    builder = crate::webview_recovery::apply_main_window_env_options(builder);
+
     // Mirror the main window: inject the API port so the pop-out's frontend
     // addresses the runner's HTTP API (location.port is empty on tauri.localhost).
     let api_port = crate::mcp::types::get_mcp_api_port();
     builder = builder.initialization_script(format!("window.__QONTINUI_PORT__ = {};", api_port));
 
-    builder
+    let window = builder
         .build()
-        .map_err(|e| format!("Failed to build pop-out window {}: {}", label, e))
+        .map_err(|e| format!("Failed to build pop-out window {}: {}", label, e))?;
+
+    // `build()` returning `Ok` is NOT evidence of a webview — see
+    // `webview_recovery::verify_window_has_a_webview`. Both callers treat a
+    // negative here as a build failure: the interactive path persists no
+    // record, the boot path skips and continues.
+    crate::webview_recovery::verify_window_has_a_webview(&window, label)?;
+
+    // A webview that is created and later DIES is a different failure from one
+    // that was never created, and the probe above — a point-in-time check —
+    // structurally cannot see it. Subscribe for the rest of this window's life.
+    // Non-main role on purpose: a pop-out's death must never drive the MAIN
+    // window's recovery ladder.
+    crate::webview_recovery::attach_non_main_process_failed_handler(&window);
+
+    Ok(window)
 }
 
 /// Open a new pop-out terminal window. Allocates the next `term-N` label,
@@ -119,6 +148,29 @@ fn build_pop_out_webview(
 /// `?view=terminal&window=term-N` boot hint), positions it via the reused
 /// placement pipeline when a `placement` is supplied, and emits `window-opened`.
 /// Returns the new window record.
+///
+/// **Nothing is persisted until the window's webview is proven.** Before Phase 3
+/// of `2026-08-10-popout-webview2-creation-failure` this called
+/// `WindowAssignments::create_window` *before* the build, so a failure left a
+/// persisted `term-N` record behind — and a PAGE-BOUND record survives
+/// `prune_empty_pop_outs` by design, so it was rebuilt (and failed again) at
+/// every subsequent boot, forever. The label is now *reserved* across the build
+/// (which keeps allocation atomic against a concurrent open) and the record is
+/// committed only after [`build_pop_out_webview`] — build **and** its post-build
+/// webview probe — succeeds.
+///
+/// # Why the build runs on a blocking thread
+///
+/// This is an `async fn` command, so its body runs on a tokio **worker**, and
+/// [`build_pop_out_webview`]'s post-build probe is a `Message::Window` getter
+/// with an unbounded `rx.recv()` (see
+/// [`crate::webview_recovery::verify_window_has_a_webview`]). On a cold WebView2
+/// profile the event loop is busy inside
+/// `CreateCoreWebView2EnvironmentWithOptions` for **seconds**, and a wedged
+/// event loop never answers at all — either would occupy a worker for the whole
+/// wait. `spawn_blocking` puts that on a thread whose job is to block. A
+/// timeout was deliberately not used instead: a slow-but-healthy cold-profile
+/// build would trip it and a healthy pop-out would be reported as a failure.
 #[tauri::command]
 pub async fn open_terminal_window(
     app: tauri::AppHandle,
@@ -126,10 +178,51 @@ pub async fn open_terminal_window(
     placement: Option<SpawnPlacement>,
     bound_page: Option<String>,
 ) -> Result<WindowRecord, String> {
-    let record = assignments.create_window(None, None, bound_page.clone(), now_ms());
-    let label = record.label.clone();
+    let label = assignments.reserve_popout_label();
 
-    let window = build_pop_out_webview(&app, &label, bound_page.as_deref())?;
+    let built = {
+        let app = app.clone();
+        let label_for_build = label.clone();
+        let bound_page = bound_page.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            build_pop_out_webview(&app, &label_for_build, bound_page.as_deref())
+        })
+        .await
+        .map_err(|e| format!("pop-out build task for {} panicked: {}", label, e))?
+    };
+
+    let window = match built {
+        Ok(w) => w,
+        Err(e) => {
+            // No record was written, so there is nothing to prune and nothing
+            // survives to be retried at the next boot — which is the whole
+            // point. The label stays RESERVED (burned) rather than being handed
+            // back: `build()` returning `Ok` already put a webview-less window
+            // into Tauri's own registry, which nothing ever removes, so
+            // rebuilding this label would fail with
+            // `Error::WebviewLabelAlreadyExists` forever. See
+            // `WindowAssignments::reserved_labels`.
+            //
+            // Loud, and loud in the two places that can act on it: this
+            // `error!` for the operator reading the log, and the `Err` return
+            // for the frontend that asked for the window. Deliberately NOT
+            // `ui_error` — see the "no backend writer" section of
+            // `crate::ui_error`: that field is a process-lifetime latch meaning
+            // "the MAIN window's React tree crashed", and writing a pop-out
+            // failure into it would take this otherwise-healthy runner out of
+            // the fleet's dispatch pool permanently.
+            tracing::error!(
+                window = %label,
+                error = %e,
+                "open_terminal_window: pop-out has no webview — no window record created"
+            );
+            return Err(e);
+        }
+    };
+
+    // The webview is real: commit the reserved label as a persisted record.
+    let record =
+        assignments.create_reserved_window(label.clone(), None, None, bound_page.clone(), now_ms());
 
     // Apply placement (physical global coords) when provided; otherwise let the
     // OS place it (cascaded near the focused window).
@@ -210,7 +303,19 @@ pub fn restore_pop_out_windows(
         let window = match build_pop_out_webview(app, &label, record.bound_page.as_deref()) {
             Ok(w) => w,
             Err(e) => {
-                tracing::warn!(window = %label, error = %e, "restore_pop_out_windows: build failed — skipping");
+                // Boot must NOT abort on one bad window — skip and continue, as
+                // this arm always did. What changed in Phase 3 is that there is
+                // finally an `Err` to catch: the post-build webview probe in
+                // `build_pop_out_webview` turns the silent
+                // `failed to create webview` class into one. `error!` rather
+                // than the old `warn!`, because this is now a diagnosed failure
+                // rather than a generic builder complaint — and it is the only
+                // sink this path has: a restore failure is deliberately not
+                // written to `ui_error` (see the "no backend writer" section of
+                // `crate::ui_error`), which would latch the whole runner
+                // `errored` for the rest of the process's life over one
+                // pop-out.
+                tracing::error!(window = %label, error = %e, "restore_pop_out_windows: pop-out has no webview — skipping");
                 continue;
             }
         };
@@ -530,13 +635,124 @@ pub fn handle_window_close(app: &tauri::AppHandle, label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::webview_recovery::{webview_env_options, MainWindowSpec, MAIN_WINDOW_BROWSER_ARGS};
+    use crate::window_placement::WindowPlacement;
+    use std::path::PathBuf;
     use tempfile::tempdir;
+
+    /// A `MainWindowSpec` differing only in the field under test.
+    ///
+    /// `MAIN_WINDOW_SPEC` is a write-once `OnceLock` with no setter, so the
+    /// tests build the spec directly (all fields are `pub`) and assert on the
+    /// pure selection helper — mirroring `instance.rs`'s
+    /// `primary_keeps_the_unscoped_path`: assert on the pure core, never
+    /// through the process env, because sibling harness threads mutate it.
+    fn spec_with(data_dir: Option<PathBuf>) -> MainWindowSpec {
+        MainWindowSpec {
+            data_dir,
+            initial_size: (1600.0, 1000.0),
+            decorations: true,
+            placement: WindowPlacement::Maximized,
+            is_secondary: false,
+        }
+    }
+
+    /// The whole selection, in one table.
+    ///
+    /// `webview_env_options` is a small function and these are its only
+    /// interesting inputs, so three near-identical `assert_eq!(opts.data_dir,
+    /// Some(dir))` tests were three spellings of "the field is copied". What
+    /// is worth pinning is that the copy happens for **every** shape of
+    /// `data_dir` — including the primary's, which is the one that CHANGES
+    /// behaviour — and that the browser args ride along in all of them (D2:
+    /// same folder with differing `additionalBrowserArguments` is the one
+    /// configuration WebView2 is documented inconsistently on across runtime
+    /// versions).
+    ///
+    /// Rows, and what each is about:
+    ///
+    /// * **Secondary** — the defect this plan is about. A `term-N` pop-out set
+    ///   no `data_directory`, so Tauri forced it onto
+    ///   `%LOCALAPPDATA%\com.qontinui.runner` — the **primary's** profile root —
+    ///   and WebView2 failed with `HRESULT(0x8007139F)`.
+    /// * **Primary** — stated honestly: this makes the primary's pop-out
+    ///   consistent with the primary's own main window, it does NOT leave it
+    ///   where it is today (today it lands on `…\com.qontinui.runner`, profile
+    ///   `…\EBWebView`). A deliberate behaviour change, covered in the plan's
+    ///   Risks, effective only on the primary's next operator-driven restart.
+    /// * **No data dir** — off-Windows `instance::webview2_data_dir` returns
+    ///   `None`, so nothing may be applied and the propagation is a no-op there.
+    #[test]
+    fn every_non_main_webview_inherits_its_own_main_windows_environment() {
+        let cases: [(&str, Option<PathBuf>); 3] = [
+            (
+                "secondary — its own isolated folder, never the primary's root",
+                Some(PathBuf::from(
+                    r"C:\Users\x\AppData\Local\com.qontinui.runner\EBWebView-test-19fed73e1a7-6",
+                )),
+            ),
+            (
+                "primary — its own main window's folder",
+                Some(PathBuf::from(
+                    r"C:\Users\x\AppData\Local\com.qontinui.runner\EBWebView",
+                )),
+            ),
+            ("off-Windows / default profile — nothing to apply", None),
+        ];
+
+        for (why, data_dir) in cases {
+            let opts = webview_env_options(Some(&spec_with(data_dir.clone())));
+            assert_eq!(
+                opts.data_dir, data_dir,
+                "{why}: a non-main webview must land on exactly the folder its own main \
+                 window uses, not on Tauri's forced %LOCALAPPDATA%\\<identifier> default"
+            );
+            assert_eq!(
+                opts.browser_args,
+                Some(MAIN_WINDOW_BROWSER_ARGS),
+                "{why}: the shared constant must be reused verbatim — a hand-rolled second \
+                 string silently drops wry's msWebOOUI/msPdfOOUI/msSmartScreenProtection \
+                 defaults, which setting additional_browser_args REPLACES"
+            );
+        }
+    }
+
+    /// Server mode / no main window ever built: `MAIN_WINDOW_SPEC` is an unset
+    /// `OnceLock`, so `main_window_spec()` is `None`. Apply nothing, and above
+    /// all do not panic — the pop-out path is unreachable in server mode, but
+    /// the fix must survive being reached.
+    #[test]
+    fn no_main_window_yields_no_environment_options() {
+        let opts = webview_env_options(None);
+
+        assert_eq!(opts.data_dir, None);
+        assert_eq!(
+            opts.browser_args, None,
+            "with no recorded main window there is no option source to mirror"
+        );
+    }
 
     fn store() -> (tempfile::TempDir, WindowAssignments) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("window-assignments.json");
         let wa = WindowAssignments::open(&path).unwrap();
         (dir, wa)
+    }
+
+    /// Reserve + commit in one step, for the close/prune tests that only need a
+    /// pop-out record to exist. `WindowAssignments::create_window` used to spell
+    /// this in production; Phase 3 left it with no production callers (a record
+    /// must not be persisted until its window's webview is proven), so it was
+    /// deleted rather than kept as a public API nothing ships.
+    fn create_window(
+        wa: &WindowAssignments,
+        title: Option<String>,
+        geometry: Option<WindowGeometry>,
+        bound_page: Option<String>,
+        now_ms: i64,
+    ) -> WindowRecord {
+        let label = wa.reserve_popout_label();
+        wa.create_reserved_window(label, title, geometry, bound_page, now_ms)
     }
 
     #[test]
@@ -547,7 +763,7 @@ mod tests {
         // operator's window (and grid layout) on a clean `exit`.
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let bound = wa.create_window(None, None, Some("page-A".to_string()), 10);
+        let bound = create_window(&wa, None, None, Some("page-A".to_string()), 10);
         wa.assign_session("sess-A", &bound.label);
         // The exit waiter reassigns the dead session to main immediately before
         // consulting the guard, leaving the owner map empty.
@@ -566,7 +782,7 @@ mod tests {
         // that is the behaviour the helper exists for.
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, None, 10);
+        let w = create_window(&wa, None, None, None, 10);
         wa.assign_session("sess-A", &w.label);
         wa.assign_session("sess-A", MAIN_WINDOW_LABEL); // the exit reassign
 
@@ -576,11 +792,193 @@ mod tests {
         );
     }
 
+    // ── Phase 3: a failed pop-out build must leave nothing behind ─────────
+
+    /// Why the orphan mattered, and why "it gets pruned anyway" is false.
+    /// A PAGE-BOUND record is deliberately preserved by the boot orphan sweep
+    /// (`clear_session_owners` + `prune_empty_pop_outs`), so under the pre-fix
+    /// ordering a webview-less page-bound pop-out was rebuilt — and failed
+    /// again — at **every** subsequent boot, forever.
+    #[test]
+    fn the_pre_fix_ordering_left_a_page_bound_orphan_that_boot_retried_forever() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+
+        // The ordering Phase 3 removed, composed explicitly because the
+        // one-step `create_window` that used to spell it no longer exists in
+        // production (F7): the record exists BEFORE the build.
+        let orphan_label = wa.reserve_popout_label();
+        let orphan =
+            wa.create_reserved_window(orphan_label, None, None, Some("page-A".to_string()), 10);
+        // …the build then fails and nothing removes the record.
+
+        // Replay the boot orphan sweep exactly as `restore_pop_out_windows` does.
+        wa.clear_session_owners();
+        let pruned = wa.prune_empty_pop_outs();
+
+        assert!(
+            !pruned.contains(&orphan.label),
+            "page-bound records survive the sweep by design — that is the carve-out"
+        );
+        assert!(
+            wa.pop_out_records().iter().any(|r| r.label == orphan.label),
+            "so the pre-fix ordering handed boot-restore a webview-less window to retry forever"
+        );
+
+        // And the post-fix ordering never produces this state at all — see
+        // `a_label_burned_by_a_failed_build_is_not_reused_by_the_retry`, which
+        // asserts the same emptiness against a sequence that actually contains
+        // a failed attempt.
+    }
+
+    /// The reservation keeps label allocation atomic even though the record is
+    /// now committed after the build. Two opens in flight at once must not
+    /// derive the same `term-N` — which a plain read-only "peek" would.
+    #[test]
+    fn two_in_flight_opens_never_reserve_the_same_label() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+
+        let a = wa.reserve_popout_label();
+        let b = wa.reserve_popout_label();
+
+        assert_eq!((a.as_str(), b.as_str()), ("term-1", "term-2"));
+    }
+
+    /// A committed reservation stops occupying the counter, so a normal
+    /// open/open/open sequence still yields `term-1`, `term-2`, `term-3` —
+    /// the reservation set is not a leak.
+    #[test]
+    fn committing_a_reservation_advances_the_counter_by_exactly_one() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+
+        let first = wa.reserve_popout_label();
+        let record = wa.create_reserved_window(first.clone(), None, None, None, 10);
+        assert_eq!(record.label, first);
+        assert_eq!(record.label, "term-1");
+
+        let second = wa.reserve_popout_label();
+        assert_eq!(second, "term-2");
+        wa.create_reserved_window(second, None, None, None, 20);
+
+        assert_eq!(wa.reserve_popout_label(), "term-3");
+    }
+
+    /// A label burned by a failed build is **never** handed back. `build()`
+    /// returning `Ok` already put a webview-less window into Tauri's own
+    /// registry (`tauri` 2.11.1 `src/manager/webview.rs`, `attach_webview`),
+    /// which nothing removes because no wry-side window exists to raise a
+    /// `Destroyed` event — so rebuilding that label would fail with
+    /// `Error::WebviewLabelAlreadyExists` (`src/manager/webview.rs:437`) for
+    /// the rest of the process's life. The retry must get a fresh label.
+    #[test]
+    fn a_label_burned_by_a_failed_build_is_not_reused_by_the_retry() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+
+        let failed = wa.reserve_popout_label(); // build fails; never committed
+        let retry = wa.reserve_popout_label();
+
+        assert_ne!(
+            failed, retry,
+            "reusing the burned label would hit WebviewLabelAlreadyExists forever"
+        );
+        assert_eq!(retry, "term-2");
+        assert!(
+            wa.pop_out_records().is_empty(),
+            "and still nothing is persisted for either attempt"
+        );
+    }
+
+    /// The error must name the cause, not the symptom. The getter failing
+    /// reads like a stalled window; what actually happened is that no webview
+    /// was ever created, and wry's own `failed to create webview` log line is
+    /// the proof.
+    #[test]
+    fn the_no_webview_error_names_the_real_cause() {
+        let msg = crate::webview_recovery::no_webview_error("term-3", "failed to receive message");
+
+        assert!(msg.contains("term-3"), "names the window: {msg}");
+        assert!(msg.contains("no webview"), "names the cause: {msg}");
+        assert!(
+            msg.contains("failed to create webview"),
+            "points at the log line that IS the failure: {msg}"
+        );
+    }
+
+    /// **A pop-out failure must NOT make the runner report `errored`.**
+    ///
+    /// The inverse of what the first cut of this code asserted, and the
+    /// correction is the point. That version routed a webview-less pop-out into
+    /// `ui_error`, which is a **process-lifetime latch** (its only clearer is
+    /// the React boundary's own `componentDidUpdate` transition, unreachable for
+    /// an error the boundary never raised) that every consumer reads as "the
+    /// MAIN window's React tree crashed": `/health` `derived_status: errored`,
+    /// `frontendReady: false`, qontinui-web's dispatcher 503ing
+    /// `runner_unhealthy`, the runner gone from every picker. One failed pop-out
+    /// would have taken an otherwise-healthy runner out of the fleet's dispatch
+    /// pool for good — breaking the very UI-Bridge readiness this plan exists to
+    /// restore. Full reasoning: the "no backend writer" section of
+    /// `crate::ui_error`.
+    ///
+    /// The flag is **derived from the state**, never passed as a literal — the
+    /// test it replaces hard-coded both `has_ui_error` arguments, so it held
+    /// whether or not the code under test did anything at all.
+    #[tokio::test]
+    async fn a_failed_pop_out_leaves_the_runner_reporting_healthy() {
+        let state = crate::ui_error::UiErrorState::new();
+
+        let status = |has_ui_error: bool| {
+            crate::ui_error::compute_derived_status(
+                has_ui_error,
+                false,
+                None,
+                Some(true),
+                Some(true),
+            )
+        };
+
+        assert_eq!(status(state.get().await.is_some()), "healthy", "control");
+
+        // NOT an end-to-end pop-out exercise — no window is built here and no
+        // line of `build_pop_out_webview` runs; that needs a Tauri app harness
+        // this module deliberately does not have. What is covered is the two
+        // halves that decide the fleet-visible outcome: the message a hollow
+        // build produces (`no_webview_error` — the exact string
+        // `build_pop_out_webview` returns and logs) is loud enough to diagnose
+        // from, and `UiErrorState` is untouched, so `derived_status` stays
+        // `healthy`. That the builder actually returns THIS message on a hollow
+        // build is held by `webview_recovery::verify_window_has_a_webview` and
+        // by the source-level probe guard, not by this test.
+        let err = crate::webview_recovery::no_webview_error("term-1", "failed to receive message");
+        assert!(err.contains("failed to create webview"), "loud: {err}");
+
+        assert!(
+            state.get().await.is_none(),
+            "no backend path may write ui_error — `ui_error_has_exactly_one_writer` \
+             guards this at the source level"
+        );
+        assert_eq!(
+            status(state.get().await.is_some()),
+            "healthy",
+            "one dead pop-out must not remove an otherwise-healthy runner from the fleet"
+        );
+
+        // And the latch really is one-way, which is why it must stay the React
+        // boundary's: once set, only `clear_ui_error` (a #[tauri::command] the
+        // boundary invokes) empties it.
+        state
+            .report("the React tree crashed".into(), None, None, None)
+            .await;
+        assert_eq!(status(state.get().await.is_some()), "errored");
+    }
+
     #[test]
     fn popout_with_a_surviving_sibling_session_stays_open() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, None, 10);
+        let w = create_window(&wa, None, None, None, 10);
         wa.assign_session("sess-A", &w.label);
         wa.assign_session("sess-B", &w.label);
         wa.assign_session("sess-A", MAIN_WINDOW_LABEL); // sess-A exited

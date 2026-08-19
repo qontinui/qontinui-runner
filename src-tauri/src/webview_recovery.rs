@@ -98,7 +98,7 @@ const LABEL_RELEASE_POLL_MS: u64 = 50;
 /// NOTE: setting `additional_browser_args` REPLACES wry's default
 /// `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`, so those
 /// are re-listed here. Windows-only (no-op elsewhere).
-const MAIN_WINDOW_BROWSER_ARGS: &str =
+pub(crate) const MAIN_WINDOW_BROWSER_ARGS: &str =
     "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
      CalculateNativeWinOcclusion,IntensiveWakeUpThrottling \
      --disable-background-timer-throttling \
@@ -155,10 +155,50 @@ static MAIN_WINDOW_SPEC: OnceLock<MainWindowSpec> = OnceLock::new();
 /// calls it at startup; [`trigger_ui_recovery`] calls it again when it has to
 /// recreate a dead one. Anything added to the builder chain must be added
 /// here, so both paths get it.
+///
+/// # The non-main-builder contract
+///
+/// "Both paths" means the two **main-window** paths only — it never covered
+/// the runner's other three `WebviewWindowBuilder` sites
+/// (`commands::terminal_windows::build_pop_out_webview`,
+/// `click_overlay::initialize_overlay`,
+/// `commands::project_preview::open_project_preview`), and that omission is
+/// what caused plan `2026-08-10-popout-webview2-creation-failure`: pop-outs on
+/// a secondary runner got no webview at all.
+///
+/// So, concretely, when you add a builder option here, decide which of the two
+/// it is:
+///
+/// * **A WebView2 *environment* option** (`data_directory`,
+///   `additional_browser_args` — anything that configures the WebView2
+///   environment rather than the window) → put it in [`WebviewEnvOptions`] /
+///   [`webview_env_options`], **not** in this chain. All four sites read that
+///   one source, so every window gets it automatically.
+/// * **A main-window-only option** (title, placement, min size, …) → it
+///   belongs in this chain, and the other three sites deliberately do not get
+///   it.
+///
+/// Adding an environment option directly to this chain re-opens that bug.
+///
+/// # Failure, and why it is fatal here
+///
+/// Returns `Err` when the builder fails **or** when
+/// [`verify_window_has_a_webview`] cannot prove the window got a webview.
+/// Both callers already treat that as fatal for their own scope, and both are
+/// right to: `main.rs`'s setup closure aborts startup (a runner whose main
+/// window has no webview can never serve any UI, and the pre-existing arm
+/// already aborted on a builder error — this is the same failure class
+/// arriving through a different door), and [`recreate_main_window`] turns it
+/// into `RecoveryOutcome::Failed` so the ladder escalates instead of reporting
+/// a successful rebuild of a hollow window.
+///
+/// ⚠ **Do not run this on a tokio worker** — see
+/// [`verify_window_has_a_webview`]'s threading note. The two callers are the
+/// setup closure (main thread, inline dispatch) and a `spawn_blocking` task.
 pub fn build_main_window(
     app: &tauri::AppHandle,
     spec: &MainWindowSpec,
-) -> tauri::Result<tauri::WebviewWindow> {
+) -> Result<tauri::WebviewWindow, String> {
     let label = qontinui_runner_lib::get_main_window_label();
     let url = tauri::WebviewUrl::App("index.html".into());
 
@@ -174,12 +214,13 @@ pub fn build_main_window(
         // can't serve a stale shell whose <script src> tags point at hashed
         // asset filenames the new bundle no longer contains. Hashed `/assets/*`
         // responses pass through with their default headers.
-        .on_web_resource_request(crate::asset_headers::stamp_no_store_on_index)
-        .additional_browser_args(MAIN_WINDOW_BROWSER_ARGS);
+        .on_web_resource_request(crate::asset_headers::stamp_no_store_on_index);
 
-    if let Some(ref dir) = spec.data_dir {
-        builder = builder.data_directory(dir.clone());
-    }
+    // The WebView2 environment options, from the same selector the three
+    // non-main builders read — so "identical environment" is structural rather
+    // than a comment two modules apart. Note this reads the spec being built
+    // FROM, not `main_window_spec()`: at startup nothing is recorded yet.
+    builder = apply_env_options(builder, webview_env_options(Some(spec)));
 
     // Inject the intended API port as a global so the frontend's synchronous
     // port-resolution fast-path (`window.__QONTINUI_PORT__`) resolves to the
@@ -192,7 +233,16 @@ pub fn build_main_window(
 
     builder = spec.placement.configure_builder(builder);
 
-    let win = builder.build()?;
+    let win = builder
+        .build()
+        .map_err(|e| format!("WebviewWindowBuilder::build() for '{label}': {e}"))?;
+
+    // `build()` returning `Ok` is NOT evidence of a webview. On the main window
+    // that distinction is the difference between a runner with a UI and one
+    // that only *looks* like it has one — and, on the recreate rung, between a
+    // recovery ladder that escalates and one that stops on a hollow window.
+    verify_window_has_a_webview(&win, label)?;
+
     spec.placement.finalize(&win);
     let _ = win.show();
     let _ = win.set_focus();
@@ -214,6 +264,212 @@ pub fn build_main_window(
 /// The spec the main window was built from, if one was ever built.
 pub fn main_window_spec() -> Option<&'static MainWindowSpec> {
     MAIN_WINDOW_SPEC.get()
+}
+
+// ────────── WebView2 environment options for non-main webviews ───────────
+
+/// The WebView2 environment options a webview is built with.
+///
+/// Extracted as a plain value so the *selection* can be asserted in a unit
+/// test with no Tauri app and no window — the builder itself cannot be
+/// inspected. See [`webview_env_options`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WebviewEnvOptions {
+    /// WebView2 user-data folder. `None` means "apply nothing", which on
+    /// Windows lets Tauri force `%LOCALAPPDATA%\<identifier>` instead.
+    pub data_dir: Option<std::path::PathBuf>,
+    /// `additional_browser_args`, or `None` to leave wry's defaults alone.
+    pub browser_args: Option<&'static str>,
+}
+
+/// Which WebView2 environment options a webview must be built with, given the
+/// spec the main window was (or will be) built from.
+///
+/// **This is the single option source for all four `WebviewWindowBuilder`
+/// sites in the runner** — the main window here, plus the `term-N` pop-outs,
+/// the click overlay and the project preview, which reach it through
+/// [`apply_main_window_env_options`].
+///
+/// # Why both options, not just the folder
+///
+/// Plan `2026-08-10-popout-webview2-creation-failure` D2. Propagating the
+/// folder alone would leave the two environments sharing **one** user-data
+/// folder while still passing **different** `additionalBrowserArguments` —
+/// the one configuration WebView2 is documented inconsistently on across
+/// runtime versions. It would also leave every non-main webview without the
+/// anti-throttling flags, and a pop-out terminal is the surface most likely to
+/// sit backgrounded on another virtual desktop, which is exactly what
+/// [`MAIN_WINDOW_BROWSER_ARGS`] exists to survive.
+///
+/// # `None`
+///
+/// `MAIN_WINDOW_SPEC` is a `OnceLock` written only by [`build_main_window`],
+/// so `None` means "no main window was ever constructed" (server mode) — never
+/// "not yet". There is nothing to mirror: apply nothing, and do not panic. The
+/// non-main builder paths are unreachable under server mode, but the fix must
+/// survive being reached.
+pub(crate) fn webview_env_options(spec: Option<&MainWindowSpec>) -> WebviewEnvOptions {
+    match spec {
+        Some(spec) => WebviewEnvOptions {
+            // `None` off-Windows and for the default profile
+            // (`instance::webview2_data_dir` returns `None` on non-Windows),
+            // which makes the whole propagation a no-op there.
+            data_dir: spec.data_dir.clone(),
+            browser_args: Some(MAIN_WINDOW_BROWSER_ARGS),
+        },
+        None => WebviewEnvOptions::default(),
+    }
+}
+
+/// Apply an already-selected [`WebviewEnvOptions`] to a builder.
+fn apply_env_options<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
+    mut builder: tauri::WebviewWindowBuilder<'a, R, M>,
+    opts: WebviewEnvOptions,
+) -> tauri::WebviewWindowBuilder<'a, R, M> {
+    if let Some(args) = opts.browser_args {
+        builder = builder.additional_browser_args(args);
+    }
+    if let Some(dir) = opts.data_dir {
+        builder = builder.data_directory(dir);
+    }
+    builder
+}
+
+/// Give a **non-main** webview the same WebView2 environment as the live main
+/// window. Every `WebviewWindowBuilder` outside [`build_main_window`] must
+/// call this.
+///
+/// Without it, Tauri forces `%LOCALAPPDATA%\<identifier>` on any webview built
+/// with no `data_directory` (`tauri` 2.11.1 `src/manager/webview.rs`, "in
+/// `windows`, we need to force a data_directory but we do respect
+/// user-specification"). On a secondary runner that is the **primary's**
+/// profile root rather than the secondary's isolated folder, and WebView2
+/// refuses it with `HRESULT(0x8007139F)` — a pop-out window with no webview at
+/// all. Plan `2026-08-10-popout-webview2-creation-failure`.
+pub(crate) fn apply_main_window_env_options<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
+    builder: tauri::WebviewWindowBuilder<'a, R, M>,
+) -> tauri::WebviewWindowBuilder<'a, R, M> {
+    apply_env_options(builder, webview_env_options(main_window_spec()))
+}
+
+// ────────────── post-build proof that a webview actually exists ──────────────
+
+/// Prove that `window` actually got a webview, by asking the windowing backend
+/// something only a live window can answer.
+///
+/// **Every `WebviewWindowBuilder` site in this crate calls this** — the main
+/// window in [`build_main_window`], plus the `term-N` pop-outs, the click
+/// overlay and the project preview. `webview_builders_all_apply_the_shared_env_options`
+/// pins that as a source-level invariant rather than a convention.
+///
+/// # Why a window getter — and why NOT the two obvious checks
+///
+/// `WebviewWindowBuilder::build()` reports success for a window that has no
+/// webview at all. `WryWindowDispatcher::create_window` (tauri-runtime-wry
+/// 2.11.2 `src/lib.rs:~300-345`) *sends* `Message::CreateWindow` to the event
+/// loop and returns `Ok(DetachedWindow)` immediately — construction has not
+/// been attempted when `build()` returns. The event loop's handler for that
+/// message (`src/lib.rs:4084-4091`) is `Ok(w) => windows.insert(…)` /
+/// `Err(e) => log::error!("{e}")`: on failure it logs and **never inserts the
+/// window into wry's `windows` map**. That `log::error!` *is* the
+/// `ERROR tauri_runtime_wry: failed to create webview: …` line in the runner
+/// logs. Tauri, meanwhile, inserted the window into its OWN registry
+/// unconditionally (`tauri` 2.11.1 `src/manager/webview.rs:610-632`,
+/// `attach_webview`).
+///
+/// So two checks that look obvious both fail **silently open**. Do not
+/// reinstate them:
+///
+/// * *"the label is present in `app.webview_windows()`"* — **always true**.
+///   That map is Tauri's own; a hollow window is in it exactly like a healthy
+///   one.
+/// * *"it answers a trivial `eval`"* — **fire-and-forget**. On the default
+///   (non-`tracing`-feature) arm `WebviewMessage::EvaluateScript` carries no
+///   reply channel (tauri-runtime-wry 2.11.2 `src/lib.rs:3777-3782`), so
+///   `Webview::eval` returns `Ok(())` whether or not anything ran.
+///
+/// A **window getter** is the direct falsifier of the mechanism above. The
+/// getter macro (`src/lib.rs:196-211`) sends `Message::Window(window_id, …)`
+/// with a reply `tx` and maps a closed channel to
+/// `Error::FailedToReceiveMessage`; the handler (`src/lib.rs:3372-3381`)
+/// early-returns when the id is **absent from wry's `windows` map** — precisely
+/// the state a failed `Message::CreateWindow` leaves behind — dropping `tx`
+/// unsent. So it returns `Err` on exactly this failure and `Ok` on a healthy
+/// window. `is_visible()` is used here; `inner_size()` / `scale_factor()` /
+/// any other `Message::Window` getter would do. Only the `Ok`/`Err` is
+/// meaningful — never the `bool` (the click overlay is built `visible(false)`
+/// on purpose, and a pop-out is `show()`n by its caller afterwards).
+///
+/// # Properties, stated so nobody "hardens" them away
+///
+/// * **Ordered, not racy.** `build()` and this probe go through the same
+///   serialized event-loop queue (`send_user_message`, `src/lib.rs:235-243`,
+///   which runs inline when called on the main thread), so
+///   `Message::CreateWindow` is always handled before this `Message::Window`.
+///   **No sleep, no retry loop, no polling** — adding one would be
+///   cargo-culting.
+/// * **Nested message pumping does not reopen that race, though it looks like
+///   it should.** wry builds the WebView2 environment under
+///   `webview2_com::wait_with_pump` (webview2-com 0.38.2 `lib.rs:60-81`) — a
+///   nested `GetMessageA`/`DispatchMessageA` pump that runs *inside* the
+///   `Message::CreateWindow` handler and *before* `windows.insert`. A probe
+///   message pumped there would be dispatched while the window is still
+///   absent from the map, i.e. every healthy build would report `Err`. It does
+///   not happen: tao 0.35.0 `EventLoopRunner::send_event`
+///   (`platform_impl/windows/event_loop/runner.rs:208-226`) checks
+///   `should_buffer()` (`:143-148`, true for as long as `event_handler` is
+///   taken — which it is, throughout the outer handler) and pushes the event
+///   onto `event_buffer` instead of dispatching it. The buffer is flushed by
+///   `dispatch_buffered_events()` (`:259-271`) only after the outer handler
+///   returns, i.e. after the insert. **Do not "fix" this with a delay.**
+/// * **Platform-neutral.** No `#[cfg(windows)]`, no WebView2 types, no HRESULT
+///   matching. Off-Windows it is a cheap always-`Ok` assertion.
+/// * **It covers the never-created case**, which
+///   [`attach_non_main_process_failed_handler`] structurally cannot see — that
+///   handler is a subscription on a webview that exists.
+///
+/// # Threading — this call blocks, and deliberately has no timeout
+///
+/// Off the main thread the getter takes the proxy branch and `rx.recv()`s with
+/// **no timeout** (tauri-runtime-wry 2.11.2 `src/lib.rs:196-211`), so it blocks
+/// its thread until the event loop answers. Callers must therefore run it on
+/// the **main thread** (where `send_user_message` dispatches inline) or on a
+/// **blocking** thread (`tauri::async_runtime::spawn_blocking`) — never
+/// directly on a tokio worker, where a cold-profile WebView2 environment
+/// creation (seconds) or a wedged event loop (unbounded) would starve the async
+/// runtime.
+///
+/// A short timeout was considered and **rejected**: a cold-profile build on a
+/// loaded box is slow but healthy, so a bound tight enough to be useful would
+/// turn healthy pop-outs into reported failures — the same false-positive class
+/// this probe exists to avoid producing. A wedged event loop costs one blocking
+/// thread instead, which is recoverable and cannot lie.
+///
+/// Plan `2026-08-10-popout-webview2-creation-failure` Phase 3 / D4.
+pub(crate) fn verify_window_has_a_webview(
+    window: &tauri::WebviewWindow,
+    label: &str,
+) -> Result<(), String> {
+    window
+        .is_visible()
+        .map(|_| ())
+        .map_err(|e| no_webview_error(label, &e.to_string()))
+}
+
+/// The message a failed [`verify_window_has_a_webview`] produces.
+///
+/// Split out so it can be asserted without a Tauri app, and so every call site
+/// words the failure identically. It must name the **real** cause rather than
+/// the getter that surfaced it: a getter that cannot answer looks like a
+/// stalled window, but what actually happened is that no webview was ever
+/// created, and the log line proving it is wry's own
+/// `failed to create webview`.
+pub(crate) fn no_webview_error(label: &str, backend_error: &str) -> String {
+    format!(
+        "Window {} was built but has no webview — the windowing backend does not know this \
+         window ({}). No webview was created; check the log for `failed to create webview`.",
+        label, backend_error
+    )
 }
 
 // ───────────────────────── failure classification ────────────────────────
@@ -902,9 +1158,20 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
         tokio::time::sleep(std::time::Duration::from_millis(LABEL_RELEASE_POLL_MS)).await;
     }
 
-    // `WebviewWindowBuilder::build()` dispatches to the event loop and blocks
-    // the calling thread until it answers, so it must not run on an async
-    // worker.
+    // Why `spawn_blocking` — corrected 2026-08-19. The reason this comment used
+    // to give ("`build()` dispatches to the event loop and blocks the calling
+    // thread until it answers") is **false**: off the main thread
+    // `WryWindowDispatcher::create_window` only *sends* `Message::CreateWindow`
+    // and returns `Ok` immediately (tauri-runtime-wry 2.11.2
+    // `src/lib.rs:~300-345`) — that fire-and-forget is the whole reason
+    // `build_main_window` has to probe afterwards at all.
+    //
+    // The real reason is that probe: `verify_window_has_a_webview` is a
+    // `Message::Window` getter whose `rx.recv()` has **no timeout**
+    // (`src/lib.rs:196-211`), so on a non-main thread it blocks until the event
+    // loop answers — seconds while WebView2 builds a cold profile under
+    // `webview2_com::wait_with_pump`, unbounded if the loop is wedged. That
+    // must cost a blocking thread, never a tokio worker.
     //
     // UNVERIFIED (needs the coordinator's live kill test on a temp runner):
     // whether a WebView2 user-data directory (`spec.data_dir`, set for
@@ -914,12 +1181,41 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     // exhausting rather than spinning. Everything else about this path is
     // established from the Tauri/wry sources; this one is not statically
     // decidable.
+    //
+    // ⚠ **This probe runs inside the `RECOVERY_IN_PROGRESS` critical section**,
+    // and that interaction is a real cost of the no-timeout decision rather
+    // than an oversight. The flag is set by the single-flight swap in
+    // `handle_process_failed` and cleared only by `InProgressGuard::drop`. If
+    // the tao event loop is itself wedged, the probe folded into
+    // `build_main_window` never returns, this `.await` never resumes, the
+    // guard never drops, and every later recovery attempt returns
+    // `Skipped { why: "already_in_progress" }` — recovery latches OFF instead
+    // of failing loudly. Three things bound it, and none of them is "unlikely":
+    //
+    // * It needs an **independently** wedged loop. The failure this ladder
+    //   exists for — a WebView2 browser-process death — leaves tao running, so
+    //   the getter answers and the guard drops normally.
+    // * The obvious hardening is rejected. A timeout on *this* `await` would
+    //   let a second recovery run `destroy()` + `build()` against the same
+    //   label while the first blocking thread is still inside
+    //   `build_main_window` — exactly the concurrent-recreate race the
+    //   single-flight exists to prevent, and a `WindowLabelAlreadyExists`
+    //   machine. A timeout on the **probe** is rejected separately and for a
+    //   different reason: see `verify_window_has_a_webview`, where a
+    //   cold-profile build is slow but healthy.
+    // * A wedged tao loop is not a state this ladder could recover from even
+    //   with a free latch — the recreate it would unblock dispatches through
+    //   that same loop.
     let app_for_build = app.clone();
     let built = tokio::task::spawn_blocking(move || build_main_window(&app_for_build, &spec))
         .await
         .map_err(|e| format!("recreate task panicked: {e}"))?;
 
-    let win = built.map_err(|e| format!("WebviewWindowBuilder::build(): {e}"))?;
+    // `build_main_window` already folds its post-build webview probe into this
+    // `Err`, so reaching the `Ok` arm means the rebuilt window HAS a webview —
+    // the terminal rung of the ladder can no longer report success over a
+    // hollow main window.
+    let win = built?;
 
     // Re-arm detection on the fresh webview — otherwise the first recovery
     // would be the last one this process could ever notice.
@@ -955,6 +1251,77 @@ fn capture_placement(win: &tauri::WebviewWindow, fallback: &WindowPlacement) -> 
 /// because the Phase 1b heartbeat-staleness backstop covers the gap.
 #[cfg(windows)]
 pub fn attach_process_failed_handler(window: &tauri::WebviewWindow) {
+    attach_process_failed(window, ProcessFailedRole::MainWindow);
+}
+
+/// [`attach_process_failed_handler`] for a **non-main** webview.
+///
+/// Wired at all three non-main builder sites:
+/// `commands::terminal_windows::build_pop_out_webview` (`term-N`),
+/// `click_overlay::initialize_overlay`, and
+/// `commands::project_preview::open_project_preview`. Until plan
+/// `2026-08-10-popout-webview2-creation-failure` Phase 3 the subscription had
+/// exactly two call sites, both on a main window, so a pop-out whose webview
+/// *died* was as silent as one that never got built. This closes that gap one
+/// rung up from the build-time [`verify_window_has_a_webview`] probe those same
+/// three sites now run.
+#[cfg(windows)]
+pub fn attach_non_main_process_failed_handler(window: &tauri::WebviewWindow) {
+    attach_process_failed(window, ProcessFailedRole::NonMain);
+}
+
+/// Which window the subscription is on, and therefore what a `ProcessFailed`
+/// event on it means.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessFailedRole {
+    /// The runner's `"main"` window. Its death takes the whole UI with it, so
+    /// the event drives [`trigger_ui_recovery`].
+    MainWindow,
+    /// Any other webview — a `term-N` pop-out, the click overlay, the project
+    /// preview.
+    ///
+    /// **Never** drives [`trigger_ui_recovery`]: that ladder rebuilds the MAIN
+    /// window ([`recreate_main_window`]), so routing a pop-out's crash into it
+    /// would tear down and recreate a window that never failed.
+    ///
+    /// **And never writes `ui_error`** — see
+    /// [`is_terminal_for_a_non_main_webview`] and the "no backend writer"
+    /// section of [`crate::ui_error`]. The response is a log line whose LEVEL
+    /// carries the classification: `error!` for a webview that is genuinely
+    /// dead, the pre-existing `warn!` for the transient classes WebView2
+    /// recovers from by itself.
+    NonMain,
+}
+
+/// Is this failure kind the **death** of a non-main webview, or a transient
+/// state it recovers from?
+///
+/// Deliberately *not* [`is_no_op_reason`]. That predicate answers a different
+/// question — "does the MAIN window's recovery ladder need to act?" — and
+/// derives from [`plan_action`], which maps only
+/// `FrameRenderExited | Ancillary(_)` to [`RecoveryAction::None`] because
+/// everything else is worth a *reload* on the main window. A non-main webview
+/// has no reload driver, so borrowing that predicate silently promoted
+/// [`ProcessFailureKind::RenderUnresponsive`] — WebView2's "the renderer has
+/// not answered a ping", routinely followed by the renderer answering — into a
+/// reported incident. That over-trigger is half of why the first cut of this
+/// code latched an otherwise-healthy runner into `derived_status: "errored"`.
+///
+/// So: a webview whose **browser** or **renderer process exited** is dead and
+/// stays dead until something rebuilds it — that is worth an `error!`. An
+/// unresponsive renderer, an out-of-process iframe's renderer, and the
+/// GPU/utility/sandbox helpers are all self-healing, and stay at `warn!`.
+#[cfg(windows)]
+fn is_terminal_for_a_non_main_webview(kind: ProcessFailureKind) -> bool {
+    matches!(
+        kind,
+        ProcessFailureKind::BrowserExited | ProcessFailureKind::RenderExited
+    )
+}
+
+#[cfg(windows)]
+fn attach_process_failed(window: &tauri::WebviewWindow, role: ProcessFailedRole) {
     use tauri::Manager;
 
     // Never attach on a runner that was launched headless. `main.rs` does not
@@ -965,6 +1332,7 @@ pub fn attach_process_failed_handler(window: &tauri::WebviewWindow) {
     }
 
     let app = window.app_handle().clone();
+    let label = window.label().to_string();
 
     let dispatch = window.with_webview(move |wv| {
         // webview2-com re-exports the WebView2 COM types as `Microsoft`; they
@@ -978,6 +1346,10 @@ pub fn attach_process_failed_handler(window: &tauri::WebviewWindow) {
             ICoreWebView2, ICoreWebView2ProcessFailedEventArgs, COREWEBVIEW2_PROCESS_FAILED_KIND,
         };
         use webview2_com::ProcessFailedEventHandler;
+
+        // The event handler below is `move` and takes `label`; keep a copy for
+        // this closure's own attach/failure log line.
+        let label_for_log = label.clone();
 
         // Built outside the `unsafe` block below so the one `unsafe` inside the
         // callback (`ProcessFailedKind()`) is not a nested — and therefore
@@ -1003,22 +1375,46 @@ pub fn attach_process_failed_handler(window: &tauri::WebviewWindow) {
                 // Log EVERY event, even the ones we take no action on, so the
                 // failure is in the log trail whether or not recovery works.
                 warn!(
+                    window = %label,
                     kind = kind.as_str(),
                     raw_kind = raw,
                     "WebView2 ProcessFailed"
                 );
 
-                // We are on the WebView2 UI thread — never block it.
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let outcome =
-                        trigger_ui_recovery(&app, RecoveryReason::ProcessFailed(kind)).await;
-                    info!(
-                        kind = kind.as_str(),
-                        outcome = outcome.as_str(),
-                        "WebView2 ProcessFailed recovery finished"
-                    );
-                });
+                match role {
+                    ProcessFailedRole::MainWindow => {
+                        // We are on the WebView2 UI thread — never block it.
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let outcome =
+                                trigger_ui_recovery(&app, RecoveryReason::ProcessFailed(kind))
+                                    .await;
+                            info!(
+                                kind = kind.as_str(),
+                                outcome = outcome.as_str(),
+                                "WebView2 ProcessFailed recovery finished"
+                            );
+                        });
+                    }
+                    ProcessFailedRole::NonMain => {
+                        // No recovery ladder for a non-main webview, and no
+                        // `ui_error` write — see `ProcessFailedRole::NonMain`.
+                        // The response is the log level: the transient classes
+                        // stay at the `warn!` above; a webview that is
+                        // genuinely dead gets an `error!` naming the window,
+                        // so it is greppable and unmistakable.
+                        if is_terminal_for_a_non_main_webview(kind) {
+                            error!(
+                                window = %label,
+                                kind = kind.as_str(),
+                                raw_kind = raw,
+                                "WebView2 process died on a non-main window — that window's UI \
+                                 is dead until it is rebuilt. The runner itself is unaffected \
+                                 and stays healthy."
+                            );
+                        }
+                    }
+                }
                 Ok(())
             },
         ));
@@ -1041,8 +1437,13 @@ pub fn attach_process_failed_handler(window: &tauri::WebviewWindow) {
         })();
 
         match result {
-            Ok(()) => info!("WebView2 ProcessFailed handler attached to the main window"),
+            Ok(()) => info!(
+                window = %label_for_log,
+                role = ?role,
+                "WebView2 ProcessFailed handler attached"
+            ),
             Err(e) => warn!(
+                window = %label_for_log,
                 error = %e,
                 "Failed to attach the WebView2 ProcessFailed handler — \
                  falling back to the heartbeat-staleness backstop"
@@ -1073,6 +1474,16 @@ pub fn attach_process_failed_handler(_window: &tauri::WebviewWindow) {
     debug!(
         "ProcessFailed subscription is Windows-only; this platform relies on the \
          heartbeat-staleness backstop for dead-webview detection"
+    );
+}
+
+/// Non-Windows stub for the non-main subscription — same deliberate no-op as
+/// [`attach_process_failed_handler`] above, for the same reason.
+#[cfg(not(windows))]
+pub fn attach_non_main_process_failed_handler(_window: &tauri::WebviewWindow) {
+    debug!(
+        "ProcessFailed subscription is Windows-only; a non-main webview's death is \
+         invisible on this platform"
     );
 }
 
@@ -1456,5 +1867,180 @@ mod tests {
         // whose main.rs somehow skipped `set_server_mode` still needs recovery.
         // The `no_main_window` gate is what protects the headless case.
         assert!(!is_server_mode());
+    }
+
+    // ── the non-main `ProcessFailed` classification ───────────────────────
+
+    /// The over-trigger the 2026-08-19 review caught. `is_no_op_reason` is
+    /// derived from `plan_action`, which keeps `RenderUnresponsive` actionable
+    /// because the MAIN window can usefully be reloaded — so reusing it on a
+    /// non-main webview promoted "the renderer has not answered a ping yet"
+    /// into a reported incident. The two predicates must disagree here, and
+    /// that disagreement is the point.
+    #[cfg(windows)]
+    #[test]
+    fn an_unresponsive_renderer_is_not_a_dead_non_main_webview() {
+        let kind = ProcessFailureKind::RenderUnresponsive;
+        assert!(
+            !is_terminal_for_a_non_main_webview(kind),
+            "WebView2 routinely recovers an unresponsive renderer"
+        );
+        assert!(
+            !is_no_op_reason(RecoveryReason::ProcessFailed(kind)),
+            "control: the MAIN window's ladder DOES act on this kind — which is \
+             exactly why the non-main path must not borrow that predicate"
+        );
+    }
+
+    /// Genuine death, on both classes WebView2 does not restart by itself.
+    #[cfg(windows)]
+    #[test]
+    fn a_dead_browser_or_renderer_process_is_a_dead_non_main_webview() {
+        assert!(is_terminal_for_a_non_main_webview(
+            ProcessFailureKind::BrowserExited
+        ));
+        assert!(is_terminal_for_a_non_main_webview(
+            ProcessFailureKind::RenderExited
+        ));
+    }
+
+    /// The self-healing classes: an out-of-process iframe's renderer and the
+    /// GPU/utility/sandbox helpers. WebView2 restarts these itself and the
+    /// top-level document keeps running.
+    #[cfg(windows)]
+    #[test]
+    fn self_healing_subprocess_exits_are_not_a_dead_non_main_webview() {
+        assert!(!is_terminal_for_a_non_main_webview(
+            ProcessFailureKind::FrameRenderExited
+        ));
+        for raw in 4..=9 {
+            assert!(
+                !is_terminal_for_a_non_main_webview(ProcessFailureKind::from_raw(raw)),
+                "ancillary subprocess {raw} is noise, not a dead webview"
+            );
+        }
+    }
+
+    // ── the invariant this whole plan is about, as a source-level guard ────
+
+    /// Every `.rs` file under `src-tauri/src`, found from `CARGO_MANIFEST_DIR`
+    /// rather than the CWD — a test executable run from the wrong directory
+    /// would otherwise find nothing and pass **vacuously**.
+    fn rust_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let name = path.display().to_string();
+                    out.push((name, std::fs::read_to_string(&path).expect("read source")));
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&src, &mut out);
+        assert!(
+            out.len() > 20,
+            "source walk found only {} files — the walk is broken, not the crate",
+            out.len()
+        );
+        out
+    }
+
+    /// **The invariant the whole plan is about.**
+    ///
+    /// Plan `2026-08-10-popout-webview2-creation-failure`: a fourth
+    /// `WebviewWindowBuilder` site existed that nobody knew about, it applied
+    /// none of the main window's WebView2 environment options, and on a
+    /// secondary runner its window came up with no webview at all — silently,
+    /// because `build()` still returned `Ok`.
+    ///
+    /// Asserting "the four known sites are correct" would not have caught that
+    /// bug and will not catch the next one. So this asserts the **general**
+    /// rule instead: every `WebviewWindowBuilder::new` in the crate is followed
+    /// — **within the next `WINDOW` lines**, not merely somewhere in the same
+    /// file — by both halves of the contract: the shared environment options
+    /// going in, and the post-build webview probe coming out. A fifth site, or
+    /// an edit that drops either call from one of the four, fails here. All
+    /// four of those mutations were replayed against this scan to confirm it
+    /// detects them; a file-wide count, which is what this test did first, did
+    /// not.
+    ///
+    /// `build_main_window` spells the options call as the private
+    /// `apply_env_options(builder, webview_env_options(…))` because it is the
+    /// source of the values rather than a consumer of them; the three non-main
+    /// sites go through `apply_main_window_env_options`. Both spellings count.
+    #[test]
+    fn webview_builders_all_apply_the_shared_env_options_and_probe_the_result() {
+        // Spelled with `concat!` so this line is not itself a match when the
+        // scan reaches this file.
+        const BUILDER: &str = concat!("WebviewWindowBuilder", "::new");
+        const PROBE: &str = "verify_window_has_a_webview(";
+        // `apply_main_window_env_options(` for the three non-main sites,
+        // `webview_env_options(` for `build_main_window` itself.
+        const ENV_OPTS: [&str; 2] = ["apply_main_window_env_options(", "webview_env_options("];
+        // How far after a `WebviewWindowBuilder::new` the two required calls
+        // must appear. Generous — the longest real chain today spans ~30 lines
+        // — but bounded on purpose: a whole-file count is what the FIRST cut of
+        // this test did, and it was VACUOUS. `terminal_windows.rs` names
+        // `webview_env_options` twice more in its own test module, so removing
+        // the production call still left the file-wide count above the
+        // threshold and the mutation went undetected (checked by replaying the
+        // scan over a mutated copy of the tree, 2026-08-19). Locality is what
+        // makes the assertion mean anything.
+        const WINDOW: usize = 80;
+
+        let mut sites = 0usize;
+        for (name, body) in rust_sources() {
+            let lines: Vec<&str> = body.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.trim_start().starts_with("//") || !line.contains(BUILDER) {
+                    continue;
+                }
+                sites += 1;
+
+                // The lines that could carry the calls: comments are prose, and
+                // a `fn` signature is the DEFINITION of one of these helpers,
+                // not a call to it — counting either is how a guard goes
+                // vacuous.
+                let end = (i + WINDOW).min(lines.len());
+                let scope: String = lines[i..end]
+                    .iter()
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        !t.starts_with("//") && !t.starts_with("fn ") && !l.contains(" fn ")
+                    })
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                assert!(
+                    ENV_OPTS.iter().any(|n| scope.contains(n)),
+                    "{name}:{} builds a webview window without applying the shared WebView2 \
+                     environment options within {WINDOW} lines. Every builder must call \
+                     `webview_recovery::apply_main_window_env_options` — without it Tauri \
+                     forces `%LOCALAPPDATA%\\<identifier>` (the PRIMARY runner's profile root) \
+                     on the window, and on a secondary runner it comes up with no webview at \
+                     all (`HRESULT(0x8007139F)`).",
+                    i + 1
+                );
+                assert!(
+                    scope.contains(PROBE),
+                    "{name}:{} builds a webview window without probing it within {WINDOW} \
+                     lines. Every builder must call \
+                     `webview_recovery::verify_window_has_a_webview` after `build()` — \
+                     `build()` returns `Ok` for a window that has no webview at all.",
+                    i + 1
+                );
+            }
+        }
+
+        assert!(
+            sites >= 4,
+            "expected at least the four known WebviewWindowBuilder sites, found {sites} — \
+             the scan is broken, not the crate"
+        );
     }
 }

@@ -64,8 +64,10 @@ pub fn validate_preview_url(url: &str) -> Result<url::Url, String> {
 
 /// Open (or focus + re-navigate) the preview window for a project.
 ///
-/// Returns `true` when a new window was created, `false` when an existing one
-/// was reused — the caller uses that only for telemetry/prose; both are success.
+/// Returns `true` when a new window was created, `false` when an existing —
+/// and **probed** — one was reused; the caller uses that only for
+/// telemetry/prose, and both are success. A reused window that turns out to
+/// have no webview is an `Err`, not an `Ok(false)`: see the reuse branch.
 #[tauri::command]
 pub async fn open_project_preview(
     app: AppHandle,
@@ -80,7 +82,36 @@ pub async fn open_project_preview(
     // Already open — navigate it to the (possibly corrected) URL and raise it.
     // `set_focus` on a minimised window also restores it, which is what an
     // operator pressing Open a second time means by it.
+    //
+    // ⚠ "Already open" is only Tauri's word for it, and it is not enough to
+    // act on. Tauri inserts a window into its own registry the moment
+    // `build()` returns `Ok` (`tauri` 2.11.1 `src/manager/webview.rs`,
+    // `attach_webview`) and only removes it on a `Destroyed` event, which can
+    // never fire for a window wry never created — so `get_webview_window`
+    // finds a HOLLOW registration exactly like a healthy one. Both calls below
+    // would then lie: `navigate` and `set_focus` are fire-and-forget
+    // `send_user_message` messages whose handler early-returns for a window id
+    // absent from wry's map, so both return `Ok` and this command would report
+    // `Ok(false)` ("reused an existing one") for doing precisely nothing —
+    // every time, for the rest of the process's life. Probe first.
     if let Some(existing) = app.get_webview_window(&label) {
+        // On a blocking thread for the same reason the build path below is:
+        // the probe is an unbounded event-loop round-trip.
+        let probe_window = existing.clone();
+        let probe_label = label.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::webview_recovery::verify_window_has_a_webview(&probe_window, &probe_label)
+        })
+        .await
+        .map_err(|e| format!("preview probe task for {label} panicked: {e}"))?
+        .map_err(|e| {
+            format!(
+                "{e} This project's preview cannot be reopened until the runner restarts: \
+                 Tauri holds the label `{label}` for the life of the process, so building a \
+                 replacement fails with `WebviewLabelAlreadyExists`."
+            )
+        })?;
+
         existing
             .navigate(parsed.clone())
             .map_err(|e| format!("Failed to navigate the preview window: {e}"))?;
@@ -91,13 +122,71 @@ pub async fn open_project_preview(
         return Ok(false);
     }
 
-    WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(parsed))
+    // Built on a BLOCKING thread, not this tokio worker: the post-build webview
+    // probe below is an unbounded event-loop round-trip
+    // (`webview_recovery::verify_window_has_a_webview`), which on a cold
+    // WebView2 profile takes seconds and on a wedged event loop never returns.
+    // No timeout, deliberately — a slow-but-healthy build must not be reported
+    // as a failure.
+    let app_for_build = app.clone();
+    let label_for_build = label.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let builder = WebviewWindowBuilder::new(
+            &app_for_build,
+            &label_for_build,
+            WebviewUrl::External(parsed),
+        )
         .title(window_title)
         .inner_size(1280.0, 900.0)
-        .resizable(true)
-        .build()
-        .map(|_| true)
-        .map_err(|e| format!("Failed to open the preview window: {e}"))
+        .resizable(true);
+
+        // Same WebView2 environment as this runner's main window (isolated
+        // user-data folder + browser args). Without it Tauri forces the PRIMARY's
+        // `%LOCALAPPDATA%\com.qontinui.runner` profile root on this preview, which
+        // on a secondary runner fails with `HRESULT(0x8007139F)`.
+        let builder = crate::webview_recovery::apply_main_window_env_options(builder);
+
+        let window = builder
+            .build()
+            .map_err(|e| format!("Failed to open the preview window: {e}"))?;
+
+        // `build()` returning `Ok` proves nothing about the webview. What a
+        // probe failure means HERE, decided rather than copied: the preview is
+        // a single operator-requested window with nothing else depending on it,
+        // so the honest response is to fail the invoke that asked for it — the
+        // operator pressed Open and gets told it did not open, instead of
+        // staring at an empty frame.
+        //
+        // It is **not** retryable. An earlier version of this comment claimed
+        // "a later Open builds a new window under the same label, so nothing is
+        // latched"; that is false, and it was the premise the reuse branch's
+        // silent `Ok(false)` rested on. Tauri registered this window on
+        // `build()`'s `Ok` and can only drop it on a `Destroyed` event wry will
+        // never emit for a window it never created, so
+        // `project-preview-<id>` is burned for the life of the process:
+        // rebuilding it returns `Error::WebviewLabelAlreadyExists`
+        // (`tauri` 2.11.1 `src/manager/webview.rs:436-438`). A later Open takes
+        // the reuse branch instead and is failed there by the same probe. This
+        // is the same semantics `WindowAssignments::reserved_labels` documents
+        // for `term-N`.
+        //
+        // A per-attempt label suffix WOULD make it retryable and was
+        // considered. Declined: `preview_window_label` is a pure function of
+        // the project id, and it is how the reuse branch above and
+        // `close_project_preview` find the window at all. Making the label
+        // unpredictable buys a retry at the cost of the one-window-per-project
+        // key both of those depend on — a worse defect than a truthful error
+        // that names the restart as the cure. Nothing goes into `ui_error` —
+        // see the "no backend writer" section of `crate::ui_error`.
+        crate::webview_recovery::verify_window_has_a_webview(&window, &label_for_build)?;
+
+        // A preview webview that later DIES is a different failure from one
+        // that was never created; the point-in-time probe cannot see it.
+        crate::webview_recovery::attach_non_main_process_failed_handler(&window);
+        Ok(true)
+    })
+    .await
+    .map_err(|e| format!("preview build task for {label} panicked: {e}"))?
 }
 
 /// Close a project's preview window. `Ok(false)` when there was none open —
