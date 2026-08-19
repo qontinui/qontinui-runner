@@ -88,7 +88,11 @@ fn http_client() -> Result<&'static reqwest::Client, String> {
 }
 
 fn coord_base() -> Result<String, String> {
-    crate::mcp::agent_worktrees::coord_http_base().map(|b| b.trim_end_matches('/').to_string())
+    // String family: always yields a base (never errors).
+    Ok(qontinui_runner_lib::profiles::coord_base_with_source()
+        .0
+        .trim_end_matches('/')
+        .to_string())
 }
 
 // ===========================================================================

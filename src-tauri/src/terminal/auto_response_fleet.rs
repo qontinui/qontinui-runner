@@ -160,18 +160,14 @@ fn cache_path_in(base: PathBuf) -> Option<PathBuf> {
 
 /// Rules endpoint on coord (`{coord_base}/coord/policies/runner-rules`).
 ///
-/// Resolves the coord base via the shared resolver (`COORD_HTTP_URL` env →
-/// active profile `coord_url`, ws→http) — the SAME path every other coord
-/// reader uses. Returns `None` when nothing is configured, so the fetch tick
-/// cleanly skips (no localhost fallback, no web URL).
+/// Resolves via [`qontinui_runner_lib::profiles::connected_coord_base`] — the
+/// SINGLE connected-vs-isolated definition. `None` only when the runner is
+/// isolated, so the fetch tick cleanly skips (no localhost fallback, no web
+/// URL); a hosted-tier runner with no explicit `coord_url` still fetches its
+/// fleet rules from production, which is the shipped end-user config.
 fn rules_endpoint_url() -> Option<String> {
-    match qontinui_runner_lib::profiles::resolve_coord_base() {
-        qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(format!(
-            "{}/coord/policies/runner-rules",
-            base.trim_end_matches('/')
-        )),
-        _ => None,
-    }
+    qontinui_runner_lib::profiles::connected_coord_base()
+        .map(|base| format!("{base}/coord/policies/runner-rules"))
 }
 
 /// Read the on-disk cache from `path`, if present and parseable.

@@ -99,14 +99,6 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Resolve the coord HTTP base URL. Priority: `COORD_HTTP_URL` env →
-/// active profile (`profiles::load_strict().coord_url`, ws→http) →
-/// tier-aware default (prod coord on a hosted `qontinui_account`-tier
-/// runner, dev-localhost guess — logged once per process — otherwise).
-fn resolve_coord_url() -> String {
-    qontinui_runner_lib::profiles::coord_base_with_source().0
-}
-
 // ---------------------------------------------------------------------------
 // CoordSync facade
 // ---------------------------------------------------------------------------
@@ -165,7 +157,7 @@ impl CoordSync {
     /// Construct a CoordSync with all settings resolved from env. Used at
     /// app startup; tests prefer [`CoordSync::new_for_test`].
     pub fn new(outbox: Arc<OutboxWriter>) -> Self {
-        let coord_url = resolve_coord_url();
+        let coord_url = qontinui_runner_lib::profiles::coord_base_with_source().0;
         let heartbeat = Duration::from_secs(env_u64(
             "QONTINUI_SESSION_HEARTBEAT_SECS",
             DEFAULT_HEARTBEAT_SECS,

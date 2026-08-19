@@ -457,18 +457,7 @@ async fn get_heatmap(
 async fn get_heatmap_live(
     State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let base = match crate::mcp::agent_worktrees::coord_http_base() {
-        Ok(b) => b,
-        Err(e) => {
-            return Ok(Json(serde_json::json!({
-                "agents": [],
-                "heatmap": [],
-                "count": 0,
-                "degraded": true,
-                "error": format!("coord URL not configured: {e}"),
-            })));
-        }
-    };
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let url = format!(
         "{}/coord/worktree-dirty?heatmap=true",
         base.trim_end_matches('/')

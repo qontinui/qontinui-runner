@@ -1464,9 +1464,14 @@ mod usage_twin_report {
         if std::env::var_os("QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED").is_some() {
             return;
         }
-        let base = match qontinui_runner_lib::profiles::resolve_coord_base() {
-            qontinui_runner_lib::profiles::CoordBase::Configured(base) => base,
-            _ => return,
+        // Connected-set: on a hosted (`qontinui_account`-tier) runner the
+        // production coordinator IS this account's backend, so the usage
+        // rollup must reach it even when profiles.json carries no explicit
+        // `coord_url`. An isolated runner reports nothing (and the
+        // `QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED` kill switch above still
+        // opts a connected one out).
+        let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+            return;
         };
         let url = format!("{}/coord/claude-accounts/usage", base.trim_end_matches('/'));
         let body = WireBody {

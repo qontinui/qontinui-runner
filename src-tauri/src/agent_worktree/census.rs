@@ -88,6 +88,10 @@ use serde::Serialize;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// The runner's connected-vs-isolated decision, imported (not re-wrapped)
+/// from its single definition in `profiles`.
+use qontinui_runner_lib::profiles::connected_coord_base;
+
 use super::canonical_paths::default_canonical_path;
 
 /// Default census cadence — 300s (5 min). The census is a heavy-ish
@@ -616,10 +620,11 @@ impl ChunkPoster {
             );
             return None;
         }
-        match coord_http_base() {
+        match connected_coord_base() {
             None => {
                 debug!(
-                    "worktree_census: no coord_url configured — census chunks will not be POSTed"
+                    "worktree_census: runner is ISOLATED (no coord configured, not a \
+                     hosted tier) — census chunks will not be POSTed"
                 );
                 None
             }
@@ -1059,30 +1064,6 @@ fn load_device_id() -> Option<Uuid> {
 /// duplicating the machine.json parse.
 pub(crate) fn load_device_id_pub() -> Option<Uuid> {
     load_device_id()
-}
-
-/// Resolve the coord HTTP base. `COORD_HTTP_URL` env → active profile
-/// `coord_url` (ws→http, `/ws` suffix stripped). Returns `None` (the
-/// tick cleanly skips) when nothing is configured, matching
-/// `fleet::coord_http_base`.
-fn coord_http_base() -> Option<String> {
-    // Delegates to the shared resolver, preserving `None` (the tick cleanly
-    // skips) when nothing is configured. The shared resolver already trims the
-    // trailing slash on both the env and ws→http paths; the extra trim here is
-    // a belt-and-suspenders no-op kept for byte-identical behavior.
-    match qontinui_runner_lib::profiles::resolve_coord_base() {
-        qontinui_runner_lib::profiles::CoordBase::Configured(base) => {
-            Some(base.trim_end_matches('/').to_string())
-        }
-        _ => None,
-    }
-}
-
-/// Crate-visible alias of [`coord_http_base`] so the Phase 4 reclaim
-/// poller reuses the identical coord-base resolution (env → profile,
-/// ws→http, `/ws`-suffix strip).
-pub(crate) fn coord_http_base_pub() -> Option<String> {
-    coord_http_base()
 }
 
 /// Read `active_tenant_id` from `~/.qontinui/machine.json` — Phase 8b
@@ -2364,7 +2345,7 @@ fn volume_poster_cell() -> &'static tokio::sync::Mutex<Option<CachedVolumePoster
 /// SYNCHRONOUS by design and called only from `spawn_blocking`: every step is
 /// blocking work — two `std::fs::read` of `~/.qontinui/machine.json`
 /// ([`load_device_id`], [`resolve_tenant_id`]), the active-profile read behind
-/// [`coord_http_base`], the `owns_shared_root_state()` probe, and a
+/// [`connected_coord_base`], the `owns_shared_root_state()` probe, and a
 /// `reqwest::Client` build that loads the OS trust store.
 fn resolve_volume_poster(prev: Option<VolumePosterKey>) -> VolumePosterResolution {
     let Some(device_id) = load_device_id() else {
@@ -2373,7 +2354,7 @@ fn resolve_volume_poster(prev: Option<VolumePosterKey>) -> VolumePosterResolutio
     let key = VolumePosterKey {
         device_id,
         tenant_id: resolve_tenant_id(),
-        base: coord_http_base(),
+        base: connected_coord_base(),
     };
     if !volume_poster_needs_rebuild(prev.as_ref(), &key) {
         return VolumePosterResolution::Reuse;

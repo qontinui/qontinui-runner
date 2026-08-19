@@ -364,7 +364,7 @@ async fn tick_once() -> Result<usize, String> {
         Some(d) => d,
         None => return Ok(0), // unpaired — nothing to do
     };
-    let base = match crate::agent_worktree::census::coord_http_base_pub() {
+    let base = match qontinui_runner_lib::profiles::connected_coord_base() {
         Some(b) => b,
         None => return Ok(0),
     };

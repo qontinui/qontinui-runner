@@ -39,6 +39,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+/// The runner's connected-vs-isolated decision, imported (not re-wrapped) from
+/// its single definition. The heartbeat runs iff the runner is connected.
+use qontinui_runner_lib::profiles::connected_coord_base;
+
 use crate::database::pg::PgDb;
 
 /// Per-machine resource samples (plan §A1/§A2). Driven from
@@ -465,26 +469,6 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
     s
 }
 
-/// Resolve the coord HTTP base. Source-of-truth chain: env `COORD_HTTP_URL`
-/// → `~/.qontinui/profiles.json` active profile's `coord_url` (ws→http) →
-/// tier-aware default.
-///
-/// Honors `COORD_HTTP_URL` to match `mcp::agent_worktrees::coord_http_base`,
-/// `commands::claims`, and `commands::productivity`, so per-machine
-/// staging-pointing of the heartbeat no longer requires a profiles.json edit.
-/// Option-family mapping of the shared policy: `Configured | TierDefault ⇒
-/// Some` (a tier-defaulted base on a hosted runner is a real, dialable coord
-/// — the heartbeat MUST run against it), while a dev-localhost GUESS keeps
-/// the deliberate `None` so the heartbeat cleanly skips instead of spamming
-/// connection errors at a phantom localhost coord every tick.
-pub(crate) fn coord_http_base() -> Option<String> {
-    use qontinui_runner_lib::profiles::CoordBase;
-    match qontinui_runner_lib::profiles::coord_base_policy().0 {
-        CoordBase::Configured(base) | CoordBase::TierDefault(base) => Some(base),
-        CoordBase::DevLocalhost(_) | CoordBase::Unset => None,
-    }
-}
-
 /// POST the budget payload with exponential backoff (2s, 4s, 8s, 16s, 32s, 60s).
 /// Returns Ok on first success; returns Err with the last error if every
 /// attempt fails. The caller decides whether to surface or swallow.
@@ -784,7 +768,7 @@ pub async fn publish_budget(
     // the operator's lifeline when coord is unreachable.
     write_last_budget_cache(&body, &device_id_str);
 
-    let coord_base = match coord_http_base() {
+    let coord_base = match connected_coord_base() {
         Some(b) => b,
         None => {
             warn!(
@@ -1331,7 +1315,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         }
     };
 
-    let base = match coord_http_base() {
+    let base = match connected_coord_base() {
         Some(b) => b,
         None => {
             info!(
@@ -1658,7 +1642,7 @@ pub fn spawn_heartbeat() {
 //
 // Mirrors the `heartbeat_to_coord` + `spawn_heartbeat` pair above:
 // - Reuses `load_device_file` for identity.
-// - Reuses `coord_http_base` for the coord HTTP endpoint resolver.
+// - Reuses `profiles::connected_coord_base` for the coord HTTP endpoint.
 // - Best-effort: errors `warn!` and the next tick retries; the loop never
 //   panics.
 // - Same `MissedTickBehavior::Skip` posture so a system suspend doesn't
@@ -2962,8 +2946,7 @@ async fn record_git_op_fleet_feed(
         debug!("fleet::pull_executor: no tenant_id — skipping git_ops fleet-feed record");
         return;
     };
-    let Some(base) = qontinui_runner_lib::observable_bridge::git_ops_client::coord_http_base()
-    else {
+    let Some(base) = connected_coord_base() else {
         return;
     };
     let client = match qontinui_runner_lib::observable_bridge::git_ops_client::build_client() {
@@ -3040,7 +3023,7 @@ pub async fn publish_tree_state() -> Result<(), String> {
     // coord resolves device-side, exactly the pre-8b behavior.
     let publisher_tenant = resolve_tenant_id();
 
-    let base = match coord_http_base() {
+    let base = match connected_coord_base() {
         Some(b) => b,
         None => {
             info!(
@@ -3321,7 +3304,8 @@ async fn run_auto_fresh_cycle() -> Result<(), String> {
     let device_id = uuid::Uuid::parse_str(&device.device_id)
         .map_err(|e| format!("invalid device_id UUID: {e}"))?;
 
-    let coord_base = coord_http_base().ok_or_else(|| "no coord endpoint available".to_string())?;
+    let coord_base =
+        connected_coord_base().ok_or_else(|| "no coord endpoint available".to_string())?;
 
     // Poll coord for test-targets designated for this device + auto_fresh enabled
     let url = format!(

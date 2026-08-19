@@ -350,6 +350,20 @@ pub const QONTINUI_ACCOUNT_TIER: &str = "qontinui_account";
 /// "Pure-ish": reads the process env and `~/.qontinui/profiles.json`, but does
 /// no logging and no fallback — callers decide the fallback posture (usually
 /// via [`coord_base_policy`] / [`coord_base_with_source`]).
+///
+/// # This fn CANNOT answer "is this runner connected?"
+///
+/// It returns only [`CoordBase::Configured`] or [`CoordBase::Unset`] — it never
+/// applies the tier arm, so it reports `Unset` for the SHIPPED end-user hosted
+/// configuration (a `qontinui_account`-tier runner whose profiles.json carries
+/// no `coord_url`). Ten Option-family call sites once matched
+/// `Configured ⇒ Some, _ => None` on this and thereby classified the entire
+/// hosted fleet as isolated, silently dropping its fleet state.
+///
+/// Use [`connected_coord_base`] for the connected-vs-isolated decision, or
+/// [`coord_base_with_source`] when you need a base string unconditionally.
+/// Reach for this one only to inspect what was *explicitly configured*, with
+/// no policy applied.
 pub fn resolve_coord_base() -> CoordBase {
     resolve_coord_base_with_source().0
 }
@@ -616,6 +630,60 @@ pub fn coord_base_with_source() -> (String, CoordBaseSource) {
         CoordBase::Unset => DEV_LOCALHOST_COORD_BASE.to_string(),
     };
     (base, source)
+}
+
+/// **THE** definition of "this runner is CONNECTED to a coordinator."
+///
+/// The runner has exactly two modes, and mode is a property of the RUNNER, not
+/// of the call site:
+///
+/// - **connected** — the user has a qontinui account (or has explicitly named a
+///   coord), so fleet state uploads to a real coordinator;
+/// - **isolated** — a standalone app with no coordinator, where every coord
+///   surface must no-op cleanly rather than dial a phantom endpoint.
+///
+/// Mode is derived from CONFIGURATION ONLY — never from reachability. A network
+/// blip, a coord outage, or a 503 must never flip a connected runner to
+/// isolated: this fn reads env / profiles.json / settings.json and nothing else.
+///
+/// Option-family mapping of [`coord_base_policy`], exactly as [`CoordBase`]
+/// documents it:
+///
+/// | Variant | Result | Why |
+/// |---|---|---|
+/// | [`CoordBase::Configured`] | `Some(base)` | explicitly named coord |
+/// | [`CoordBase::TierDefault`] | `Some(base)` | see below |
+/// | [`CoordBase::DevLocalhost`] | `None` | a GUESS, not a coord |
+/// | [`CoordBase::Unset`] | `None` | structurally unreachable here |
+///
+/// **Why `TierDefault` counts as connected.** It is the SHIPPED end-user
+/// configuration: a `qontinui_account`-tier runner that has never had a
+/// `coord_url` written into `~/.qontinui/profiles.json` — and the same arm
+/// covers an unreadable `settings.json`, whose tier is UNKNOWN rather than
+/// local. [`PROD_COORD_BASE`] is a real, dialable coordinator that this runner
+/// is a member of; the hosted fleet must still heartbeat, register worktrees,
+/// push work units and forward reviews against it. Treating that as isolated
+/// classifies the ENTIRE hosted fleet as standalone and silently drops its
+/// fleet state — which is precisely the defect that made
+/// `HttpWorkUnitSink::from_profile` return `None` on every shipped hosted
+/// runner.
+///
+/// `DevLocalhost` stays `None` on the opposite argument: `http://localhost:9870`
+/// is a guess made when nothing at all is configured on a non-hosted runner.
+/// Dialing it would spam connection errors at a coordinator that is usually not
+/// running, and would report "connected" for a runner that is plainly isolated.
+///
+/// Callers that need the always-returns-a-`String` shape (proxies, doctor,
+/// diagnostics) want [`coord_base_with_source`] instead — that family cannot
+/// express "isolated" at all, so it is never the right door for a feature that
+/// must no-op when the runner is standalone.
+pub fn connected_coord_base() -> Option<String> {
+    match coord_base_policy().0 {
+        CoordBase::Configured(base) | CoordBase::TierDefault(base) => {
+            Some(base.trim_end_matches('/').to_string())
+        }
+        CoordBase::DevLocalhost(_) | CoordBase::Unset => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,6 +1147,143 @@ mod tests {
         assert_eq!(TierRead::Absent.known(), None);
         assert_eq!(TierRead::Unknown("boom".into()).known(), None);
         assert_ne!(TierRead::Absent, TierRead::Unknown("boom".into()));
+    }
+
+    // ------------------------------------------------------------------
+    // connected_coord_base — the single definition of "connected". These go
+    // end-to-end (env → profiles.json → settings.json tier → policy → Option)
+    // rather than through `apply_tier_policy`, because the DEFECT this phase
+    // fixes lived in the composition, not in the policy matrix: the policy
+    // already said `TierDefault ⇒ Some`, and the Option-family call sites
+    // simply never asked it.
+    //
+    // Hermetic on any machine, including a dev box with a real
+    // `~/.qontinui/profiles.json`:
+    //   * `COORD_HTTP_URL` removed  ⇒ the env arm misses;
+    //   * `QONTINUI_ENV` pointed at a profile name that cannot exist ⇒
+    //     `load_strict()` errors ⇒ the profile arm misses ⇒ `Unset`;
+    //   * `QONTINUI_CONFIG_DIR` pointed at a temp dir ⇒ `read_runner_tier()`
+    //     reads OUR settings.json, never the operator's.
+    // Serialized on the shared `env_lock` (process-global env), and restored
+    // through `EnvVarRestore` on the panic path too.
+    // ------------------------------------------------------------------
+
+    /// A profile name no real `profiles.json` can carry, so the profile arm of
+    /// `resolve_coord_base()` misses deterministically on every machine.
+    const NO_SUCH_PROFILE: &str = "__qontinui_test_no_such_profile__";
+
+    /// Env vars every `connected_coord_base` test mutates.
+    const COORD_ENV_KEYS: &[&str] = &["COORD_HTTP_URL", "QONTINUI_ENV", "QONTINUI_CONFIG_DIR"];
+
+    /// Point the resolver at a hermetic config dir with nothing configured:
+    /// no `COORD_HTTP_URL`, an unresolvable active profile, and `settings.json`
+    /// written from `settings_json` (`None` ⇒ no file at all, i.e.
+    /// [`TierRead::Absent`]).
+    fn isolate_coord_env(dir: &std::path::Path, settings_json: Option<&str>) {
+        std::env::remove_var("COORD_HTTP_URL");
+        std::env::set_var("QONTINUI_ENV", NO_SUCH_PROFILE);
+        std::env::set_var("QONTINUI_CONFIG_DIR", dir);
+        if let Some(body) = settings_json {
+            std::fs::write(dir.join("settings.json"), body).unwrap();
+        }
+        // Precondition: nothing is configured, so the tier arm is what decides.
+        assert_eq!(
+            resolve_coord_base(),
+            CoordBase::Unset,
+            "test setup failed to reach the Unset arm"
+        );
+    }
+
+    /// The shipped end-user hosted configuration: tier `qontinui_account`, no
+    /// `coord_url` in profiles.json, no `COORD_HTTP_URL`. This runner IS
+    /// connected — reading it as isolated silently drops the entire hosted
+    /// fleet's work units, worktrees, reviews, plans and tasks.
+    #[test]
+    fn connected_coord_base_hosted_tier_with_nothing_configured_is_connected() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        let dir = tempfile::tempdir().unwrap();
+        isolate_coord_env(
+            dir.path(),
+            Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)),
+        );
+        assert_eq!(
+            read_runner_tier(),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.into())
+        );
+        assert_eq!(
+            connected_coord_base(),
+            Some(PROD_COORD_BASE.to_string()),
+            "a hosted runner with no explicit coord_url must read as CONNECTED"
+        );
+    }
+
+    /// An UNREADABLE settings.json means the tier is UNKNOWN, not local — the
+    /// policy already prefers production there, and "connected" must follow it.
+    #[test]
+    fn connected_coord_base_unreadable_settings_is_connected() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        let dir = tempfile::tempdir().unwrap();
+        isolate_coord_env(dir.path(), Some("{not json"));
+        assert!(matches!(read_runner_tier(), TierRead::Unknown(_)));
+        assert_eq!(
+            connected_coord_base(),
+            Some(PROD_COORD_BASE.to_string()),
+            "an unknown tier must not silently isolate a possibly-hosted runner"
+        );
+    }
+
+    /// A non-hosted runner with nothing configured is ISOLATED — and must NOT
+    /// leak the dev-localhost guess into the Option family.
+    #[test]
+    fn connected_coord_base_non_hosted_tier_is_isolated() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        for tier in ["local", "local_provider", "something_new"] {
+            let dir = tempfile::tempdir().unwrap();
+            isolate_coord_env(dir.path(), Some(&format!(r#"{{"tier":"{tier}"}}"#)));
+            let got = connected_coord_base();
+            assert_eq!(got, None, "tier {tier} must read as isolated");
+            assert_ne!(
+                got.as_deref(),
+                Some(DEV_LOCALHOST_COORD_BASE),
+                "the dev-localhost GUESS must never surface as a connected base"
+            );
+            // The String family, by contrast, still hands back the guess —
+            // which is exactly why it cannot express "isolated".
+            assert_eq!(coord_base_with_source().0, DEV_LOCALHOST_COORD_BASE);
+        }
+    }
+
+    /// No settings.json at all (`TierRead::Absent`) is a genuinely tier-less
+    /// install: isolated.
+    #[test]
+    fn connected_coord_base_absent_settings_is_isolated() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        let dir = tempfile::tempdir().unwrap();
+        isolate_coord_env(dir.path(), None);
+        assert_eq!(read_runner_tier(), TierRead::Absent);
+        assert_eq!(connected_coord_base(), None);
+    }
+
+    /// An explicit `COORD_HTTP_URL` wins over every tier — including the ones
+    /// that would otherwise isolate the runner.
+    #[test]
+    fn connected_coord_base_env_wins_over_every_tier() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        for tier in ["local", "local_provider", QONTINUI_ACCOUNT_TIER] {
+            let dir = tempfile::tempdir().unwrap();
+            isolate_coord_env(dir.path(), Some(&format!(r#"{{"tier":"{tier}"}}"#)));
+            std::env::set_var("COORD_HTTP_URL", "https://explicit.example/");
+            assert_eq!(
+                connected_coord_base(),
+                Some("https://explicit.example".to_string()),
+                "explicit COORD_HTTP_URL must win on tier {tier} (and be slash-trimmed)"
+            );
+        }
     }
 
     #[test]

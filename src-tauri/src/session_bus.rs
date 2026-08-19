@@ -59,16 +59,6 @@ fn enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve the coord HTTP base, or `None` when nothing is configured (skip the
-/// tick cleanly rather than spam connection errors) — same posture as
-/// `fleet::coord_http_base`.
-fn coord_base() -> Option<String> {
-    match qontinui_runner_lib::profiles::resolve_coord_base() {
-        qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(base),
-        _ => None,
-    }
-}
-
 /// Spawn the periodic delivery executor on the ambient tokio runtime. A no-op
 /// (logs + returns) when disabled.
 pub fn spawn_session_bus_executor() {
@@ -96,7 +86,7 @@ pub fn spawn_session_bus_executor() {
 
 /// One delivery pass: pull pending → inject into live targets → mark delivered.
 async fn deliver_once() -> anyhow::Result<()> {
-    let Some(base) = coord_base() else {
+    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
         debug!("session_bus: no coord base configured — skipping tick");
         return Ok(());
     };

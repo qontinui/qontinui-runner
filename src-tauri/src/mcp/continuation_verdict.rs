@@ -404,8 +404,7 @@ pub(super) fn coord_client_parts() -> Result<(String, String), String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| "no device JWT (unpaired)".to_string())?;
-    let base = crate::mcp::agent_worktrees::coord_http_base()
-        .map_err(|e| format!("coord base unresolved: {e}"))?;
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     Ok((base.trim_end_matches('/').to_string(), jwt))
 }
 

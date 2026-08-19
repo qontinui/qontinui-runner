@@ -1964,21 +1964,13 @@ pub async fn add_task_dependency(
 // need to know the coord URL or handle CORS.
 // ---------------------------------------------------------------------------
 
-/// Resolve coord's HTTP base. Same source-of-truth chain as
-/// `mcp::agent_worktrees::coord_http_base`: env `COORD_HTTP_URL` →
-/// profile `coord_url` (ws→http via `coord_ws_to_http`) → tier-aware
-/// default (prod coord on a hosted runner, dev-localhost guess otherwise).
-fn coord_http_base_for_fleet() -> String {
-    qontinui_runner_lib::profiles::coord_base_with_source().0
-}
-
 /// `get_coord_http_base` — expose the runner's resolved coord HTTP base
 /// to the frontend so in-app surfaces (e.g. Spawn-from-Plan) reach the
 /// SAME coord the backend session-sync uses, instead of a hardcoded
 /// dev-localhost base. Mirrors the `get_fleet_health` proxy pattern.
 #[tauri::command]
 pub fn get_coord_http_base() -> String {
-    coord_http_base_for_fleet()
+    qontinui_runner_lib::profiles::coord_base_with_source().0
 }
 
 /// Body for coord's `POST /agents/spawn`.
@@ -2113,7 +2105,7 @@ pub async fn spawn_from_plan(
 ) -> Result<serde_json::Value, String> {
     // Resolve the coord base the SAME way `get_coord_http_base` does
     // (env `COORD_HTTP_URL` → active profile `coord_url` → dev-localhost).
-    let base = coord_http_base_for_fleet();
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/agents/spawn");
 
@@ -2202,7 +2194,7 @@ pub async fn spawn_from_plan(
 /// alerts stay best-effort `[]` for NON-auth failures.
 #[tauri::command]
 pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
-    let base = coord_http_base_for_fleet();
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

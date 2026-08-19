@@ -183,7 +183,7 @@ pub(crate) async fn run_dispatch(
     let base = {
         let pinned = payload.coord_http_url.trim().trim_end_matches('/');
         if pinned.is_empty() {
-            match super::coord_http_base() {
+            match qontinui_runner_lib::profiles::connected_coord_base() {
                 Some(b) => b,
                 None => {
                     warn!(

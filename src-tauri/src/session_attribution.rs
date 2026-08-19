@@ -12,7 +12,8 @@
 //!
 //! This loop is a sibling of [`crate::fleet::spawn_tree_publisher`]:
 //! - Reuses [`crate::fleet::load_device_file`] for identity (`device_id`).
-//! - Reuses [`crate::fleet::coord_http_base`] for the coord HTTP endpoint.
+//! - Reuses [`qontinui_runner_lib::profiles::connected_coord_base`] for the
+//!   coord HTTP endpoint (the single connected-vs-isolated definition).
 //! - Reuses [`crate::terminal::transcript::session_transcript_path`] for the
 //!   `$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/<session-id>.jsonl` path so we
 //!   never hand-roll Claude's project-path encoding.
@@ -296,12 +297,12 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
             return Ok(());
         }
     };
-    let base = match crate::fleet::coord_http_base() {
+    let base = match qontinui_runner_lib::profiles::connected_coord_base() {
         Some(b) => b,
         None => {
             info!(
-                "session_attribution: ~/.qontinui/profiles.json missing or active \
-                 profile has no coord_url — no coord to attribute to. Skipping."
+                "session_attribution: runner is ISOLATED (nothing configured and not a \
+                 hosted tier) — no coord to attribute to. Skipping."
             );
             return Ok(());
         }

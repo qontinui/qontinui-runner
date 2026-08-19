@@ -69,15 +69,8 @@ fn parse_repo_slug(url: &str) -> Option<String> {
     None
 }
 
-fn coord_http_base() -> String {
-    // Delegates to the shared tier-aware policy fn: env → profile →
-    // prod default on a hosted (qontinui_account-tier) runner → dev-localhost
-    // guess (logged once per process) otherwise.
-    qontinui_runner_lib::profiles::coord_base_with_source().0
-}
-
 async fn fetch_registered_repos() -> Result<CanonicalRepos, String> {
-    let base = coord_http_base();
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/canonical-repos");
 
@@ -234,7 +227,7 @@ pub async fn check_and_emit_unregistered(
 
 #[tauri::command]
 pub async fn register_repo_with_coord(repo: String) -> Result<serde_json::Value, String> {
-    let base = coord_http_base();
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/canonical-repos");
 
