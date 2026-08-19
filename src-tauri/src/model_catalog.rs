@@ -610,6 +610,34 @@ mod tests {
         }
     }
 
+    /// The bare-family suffix table must resolve too. It is a SECOND table
+    /// feeding `lookup`, so the guardrail over `ALIASES` alone left a typo in
+    /// it undetectable — found reviewing this change, not after it broke.
+    #[test]
+    fn guardrail_every_bare_family_target_resolves() {
+        for (family, target) in BARE_FAMILY_ALIASES {
+            assert!(
+                CATALOG.iter().any(|f| f.id == *target),
+                "bare family `{family}` targets `{target}`, which is not in the catalog"
+            );
+        }
+    }
+
+    /// The two alias tables overlap on the bare family names. Where they
+    /// overlap they must agree, or `opus` and `vendor-opus` would price
+    /// differently — a discrepancy nothing else would surface.
+    #[test]
+    fn guardrail_alias_tables_agree_where_they_overlap() {
+        for (family, bare_target) in BARE_FAMILY_ALIASES {
+            if let Some((_, alias_target)) = ALIASES.iter().find(|(a, _)| a == family) {
+                assert_eq!(
+                    alias_target, bare_target,
+                    "`{family}` resolves to `{alias_target}` as an exact alias but                      `{bare_target}` as a suffix"
+                );
+            }
+        }
+    }
+
     /// Catalog ids must be unique — a duplicate makes `lookup` order-dependent.
     #[test]
     fn guardrail_catalog_ids_are_unique() {
