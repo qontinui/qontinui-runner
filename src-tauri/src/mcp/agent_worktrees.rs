@@ -198,16 +198,3 @@ async fn reclaim_handler(
         )),
     }
 }
-
-// ============================================================================
-// Coord URL resolution
-// ============================================================================
-
-pub(crate) fn coord_http_base() -> Result<String, String> {
-    // Source-of-truth chain: env `COORD_HTTP_URL` → profile `coord_url`
-    // (ws→http) → tier-aware default (prod coord on a hosted runner,
-    // dev-localhost guess otherwise). Delegates to the shared policy fn. This
-    // resolver never errored before (it always fell back to a default-Ok), so
-    // the `Result` contract is preserved by always returning Ok.
-    Ok(qontinui_runner_lib::profiles::coord_base_with_source().0)
-}

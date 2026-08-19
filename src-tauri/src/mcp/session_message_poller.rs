@@ -778,14 +778,10 @@ async fn deliver_once(
         }
     };
 
-    let base = match crate::mcp::agent_worktrees::coord_http_base() {
-        Ok(b) => b,
-        Err(e) => {
-            debug!("session_message_poller: coord base unresolved ({e}) — skipping tick");
-            return Ok(());
-        }
-    };
-    let base = base.trim_end_matches('/').to_string();
+    let base = qontinui_runner_lib::profiles::coord_base_with_source()
+        .0
+        .trim_end_matches('/')
+        .to_string();
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))

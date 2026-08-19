@@ -326,14 +326,19 @@ impl HttpWorkUnitSink {
         }
     }
 
-    /// Resolve from the active coord profile (env `COORD_HTTP_URL` or the
-    /// profile's `coord_url`). `None` when coord is unconfigured — the trigger
-    /// then no-ops, never localhost-guessing.
+    /// Resolve from the runner's CONNECTED coord base
+    /// ([`crate::profiles::connected_coord_base`] — env `COORD_HTTP_URL`, the
+    /// active profile's `coord_url`, or the production default on a
+    /// hosted-tier runner).
+    ///
+    /// `None` only when the runner is ISOLATED — i.e. genuinely standalone, so
+    /// the trigger no-ops rather than dialing a dev-localhost guess. It is NOT
+    /// "None when `coord_url` is absent": a `qontinui_account`-tier runner that
+    /// never had a `coord_url` written into profiles.json is the SHIPPED
+    /// end-user configuration, and reading it as unconfigured would silently
+    /// drop the entire hosted fleet's work-unit state.
     pub fn from_profile() -> Option<Self> {
-        match crate::profiles::resolve_coord_base() {
-            crate::profiles::CoordBase::Configured(base) => Some(Self::new(base)),
-            _ => None,
-        }
+        crate::profiles::connected_coord_base().map(Self::new)
     }
 }
 

@@ -16,7 +16,7 @@
 //!
 //! This is a deliberate sibling of [`super::reclaim`]: identical machine-
 //! wide, anonymous, device-keyed identity (`census::load_device_id_pub` /
-//! `census::coord_http_base_pub`), the same `tokio::time::interval` +
+//! `profiles::connected_coord_base`), the same `tokio::time::interval` +
 //! `MissedTickBehavior::Skip` cadence (env
 //! `QONTINUI_MAINTENANCE_INTERVAL_SECS`, default 300s, floored 30s), and
 //! the same warn-and-retry, never-panic loop. The reclaim module owns
@@ -378,7 +378,7 @@ async fn report_reset_git_op(
         debug!("maintenance: no tenant_id — skipping git_op record for {repo_path}");
         return;
     };
-    let Some(base) = git_ops_client::coord_http_base() else {
+    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
         debug!("maintenance: no coord_url — skipping git_op record for {repo_path}");
         return;
     };
@@ -502,7 +502,7 @@ pub async fn tick_once() -> Result<(), String> {
             return Ok(());
         }
     };
-    let base = match super::census::coord_http_base_pub() {
+    let base = match qontinui_runner_lib::profiles::connected_coord_base() {
         Some(b) => b,
         None => {
             debug!("maintenance: no coord_url configured — skipping");

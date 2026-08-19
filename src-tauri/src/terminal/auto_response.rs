@@ -784,15 +784,15 @@ mod resolve {
         pub reason: Option<String>,
     }
 
-    /// Coord resolve endpoint URL, or `None` when no coord base is configured.
+    /// Coord resolve endpoint URL, or `None` when the runner is ISOLATED.
+    ///
+    /// Connected-set ([`qontinui_runner_lib::profiles::connected_coord_base`]):
+    /// fleet auto-response policies are a hosted-fleet feature, so a
+    /// `qontinui_account`-tier runner with no explicit `coord_url` must still
+    /// resolve against production — that is the shipped end-user config.
     fn resolve_endpoint_url() -> Option<String> {
-        match qontinui_runner_lib::profiles::resolve_coord_base() {
-            qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(format!(
-                "{}/coord/policies/resolve",
-                base.trim_end_matches('/')
-            )),
-            _ => None,
-        }
+        qontinui_runner_lib::profiles::connected_coord_base()
+            .map(|base| format!("{base}/coord/policies/resolve"))
     }
 
     /// Map a parsed resolve response to the response text to inject.
@@ -892,16 +892,13 @@ mod report {
         metadata: serde_json::Value,
     }
 
-    /// Coord audit-report endpoint URL, or `None` when no coord base is
-    /// configured (then the report is silently skipped).
+    /// Coord audit-report endpoint URL, or `None` when the runner is ISOLATED
+    /// (then the report is silently skipped). Connected-set — the audit trail
+    /// belongs with the coordinator that resolved the injection, so it follows
+    /// `resolve_endpoint_url`'s posture exactly.
     fn report_endpoint_url() -> Option<String> {
-        match qontinui_runner_lib::profiles::resolve_coord_base() {
-            qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(format!(
-                "{}/coord/prompt-injections/report",
-                base.trim_end_matches('/')
-            )),
-            _ => None,
-        }
+        qontinui_runner_lib::profiles::connected_coord_base()
+            .map(|base| format!("{base}/coord/prompt-injections/report"))
     }
 
     /// Fire-and-forget report of a `submit_prompt` regex injection. `raw_trigger`

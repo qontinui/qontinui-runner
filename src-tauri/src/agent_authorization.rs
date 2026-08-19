@@ -1236,10 +1236,7 @@ fn classify_failure(status: reqwest::StatusCode, body: &str, safe_url: &str) -> 
 }
 
 async fn fetch_effective() -> Fetched {
-    let base = match crate::mcp::agent_worktrees::coord_http_base() {
-        Ok(b) => b,
-        Err(e) => return Fetched::Err(format!("no coord base url: {e}")),
-    };
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     if !crate::coord_http::have_device_token() {
         return Fetched::Unpaired;
     }

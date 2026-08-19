@@ -1013,7 +1013,7 @@ fn flush_batch(
     let Some(client) = client else {
         return; // client build failed earlier — keep buffering (capped).
     };
-    let Some(base) = coord_http_base() else {
+    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
         return; // coord not configured — keep buffering (capped).
     };
 
@@ -1069,20 +1069,6 @@ fn requeue_front(queue: &mut std::collections::VecDeque<LogEntry>, batch: Vec<Lo
     }
     while queue.len() > AGENT_LOG_QUEUE_CAP {
         queue.pop_back();
-    }
-}
-
-/// Resolve the coord HTTP base (env `COORD_HTTP_URL` → active profile
-/// `coord_url`). `None` when nothing is configured — the emitter then keeps
-/// buffering (capped) rather than dropping, matching the other resolvers'
-/// no-localhost-fallback posture. `pub(crate)` so the session-handle
-/// registrar ([`super::session_handle`]) shares the same resolution.
-pub(crate) fn coord_http_base() -> Option<String> {
-    match qontinui_runner_lib::profiles::resolve_coord_base() {
-        qontinui_runner_lib::profiles::CoordBase::Configured(base) => {
-            Some(base.trim_end_matches('/').to_string())
-        }
-        _ => None,
     }
 }
 

@@ -370,8 +370,7 @@ pub async fn acquire(
         return Err(AllocateError::Other("repos must not be empty".into()));
     }
 
-    let coord_http_base = crate::mcp::agent_worktrees::coord_http_base()
-        .map_err(|e| AllocateError::Other(format!("coord URL not configured: {e}")))?;
+    let coord_http_base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let device_id = read_device_id()
         .map_err(|e| AllocateError::Other(format!("device_id not available: {e}")))?;
 

@@ -11,9 +11,9 @@
 //! the runner-side spawn flow spawns a tokio task at acquire time and
 //! the webview never sees them.
 //!
-//! All three commands use the same coord-HTTP-base resolution chain
-//! as `mcp::agent_worktrees::coord_http_base`: env `COORD_HTTP_URL` →
-//! profile `coord_url` (ws→http) → tier-aware default. JWT is
+//! All three commands resolve the coord HTTP base through the shared
+//! String-family door `profiles::coord_base_with_source`: env `COORD_HTTP_URL`
+//! → profile `coord_url` (ws→http) → tier-aware default. JWT is
 //! NOT applied here — `/claims/acquire` is gated behind no auth on
 //! coord today (Phase 2 spec §1.1); `/coord/claims/steal` accepts
 //! either an admin-secret header or a Bearer JWT, with the JWT path
@@ -94,18 +94,6 @@ pub struct StealArgs {
 
 pub type StealResultDto = serde_json::Value;
 
-/// Coord-HTTP-base resolver — mirrors the proven chain from
-/// `mcp::agent_worktrees::coord_http_base`. Held here as a private
-/// helper so this module is callable without taking the `ApiState`
-/// dependency that lives behind axum (Tauri commands don't have
-/// access to it without significantly more plumbing).
-fn coord_http_base() -> String {
-    // Delegates to the shared tier-aware policy fn: env → profile →
-    // prod default on a hosted (qontinui_account-tier) runner → dev-localhost
-    // guess (logged once per process) otherwise.
-    qontinui_runner_lib::profiles::coord_base_with_source().0
-}
-
 /// The module's coord client, built once.
 ///
 /// All three claim commands share the same 10s deadline, so it stays baked into
@@ -134,7 +122,7 @@ fn http_client() -> Result<&'static reqwest::Client, String> {
 /// `Err(String)` for the React layer's `.catch`.
 #[tauri::command]
 pub async fn claims_acquire(args: AcquireArgs) -> Result<AcquireResultDto, String> {
-    let base = coord_http_base();
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/claims/acquire");
 
@@ -180,7 +168,7 @@ pub async fn claims_acquire(args: AcquireArgs) -> Result<AcquireResultDto, Strin
 /// `Err`.
 #[tauri::command]
 pub async fn claims_release(args: ReleaseArgs) -> Result<ReleaseResultDto, String> {
-    let base = coord_http_base();
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/claims/release");
 
@@ -239,7 +227,7 @@ pub async fn claims_release(args: ReleaseArgs) -> Result<ReleaseResultDto, Strin
 /// remain functional.
 #[tauri::command]
 pub async fn claims_steal(args: StealArgs) -> Result<StealResultDto, String> {
-    let base = coord_http_base();
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/claims/steal");
 

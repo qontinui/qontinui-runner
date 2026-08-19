@@ -58,6 +58,11 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+/// The runner's connected-vs-isolated decision, imported (not re-wrapped) from
+/// its single definition in `profiles`. Every coord surface in this module
+/// no-ops when it is `None` (the runner is standalone).
+use qontinui_runner_lib::profiles::connected_coord_base;
+
 // =============================================================================
 // Wire shapes (mirror of qontinui-coord/src/agents_spawn.rs)
 // =============================================================================
@@ -453,22 +458,6 @@ fn agent_log_path(agent_id: uuid::Uuid) -> Option<PathBuf> {
     agent_logs_root().map(|d| d.join(format!("{agent_id}.log")))
 }
 
-/// Resolve the coord HTTP base. Honors the `COORD_HTTP_URL` env var FIRST
-/// (mirrors `mcp::agent_worktrees::coord_http_base`'s env check — every other
-/// resolver honors it, this one used to ignore it), then falls back to the
-/// active profile's `coord_url` (mirrors the resolver in `fleet.rs`). Returns
-/// `None` when neither is set — runtime no-ops in that case (no localhost
-/// fallback, unchanged).
-fn coord_http_base() -> Option<String> {
-    // Delegates to the shared resolver, preserving the no-localhost-fallback
-    // posture: only an explicitly-configured base (env or profile) yields
-    // `Some`; nothing configured ⇒ `None` (runtime no-ops, unchanged).
-    match qontinui_runner_lib::profiles::resolve_coord_base() {
-        qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(base),
-        _ => None,
-    }
-}
-
 /// Resolve the coord WS URL from the active profile's `coord_url`,
 /// normalizing the scheme to `ws://` / `wss://` and ensuring the `/ws`
 /// path is present (exactly once) with an `events.agent.*` pattern filter.
@@ -635,7 +624,7 @@ pub fn spawn_runtime() {
         }
     };
 
-    if coord_http_base().is_none() {
+    if connected_coord_base().is_none() {
         info!(
             "agent_runtime: profile has no coord_url — agent spawn runtime \
              disabled. Skipping."
@@ -2060,7 +2049,7 @@ enum DispatchOutcome {
 /// parse error all `warn!` once and return — the live WS subscription proceeds
 /// regardless (a missed poll is retried on the next connect).
 async fn poll_pending_continuations(device_id: uuid::Uuid) {
-    let Some(base) = coord_http_base() else {
+    let Some(base) = connected_coord_base() else {
         return;
     };
     let url = format!("{base}/coord/agents/pending-continuations?device_id={device_id}");
@@ -2211,7 +2200,7 @@ impl ContinuationPollReportBody {
 /// delivery**: a 404 (coord's route not deployed yet — parallel phase) is
 /// `debug!`; any other non-2xx or transport error is one `warn!`.
 async fn post_continuation_poll_report(device_id: uuid::Uuid, counts: PollRunCounts) {
-    let Some(base) = coord_http_base() else {
+    let Some(base) = connected_coord_base() else {
         return;
     };
     let url = format!("{base}/coord/agents/continuation-poll-report");
@@ -2289,7 +2278,7 @@ struct PendingUnitDispatchesResponse {
 /// `warn!`/`debug!` once and return — the live WS subscription proceeds regardless
 /// (a missed poll is retried on the next connect; at-least-once is preserved).
 async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
-    let Some(base) = coord_http_base() else {
+    let Some(base) = connected_coord_base() else {
         return;
     };
     let url = format!("{base}/coord/agents/pending-unit-dispatches?device_id={device_id}");
@@ -2369,7 +2358,7 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 /// claim surface to consult, so the in-process dedupe is the only guard, as
 /// before.
 async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> SpawnDecision {
-    let Some(base) = coord_http_base() else {
+    let Some(base) = connected_coord_base() else {
         return SpawnDecision::Spawn;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
@@ -2408,7 +2397,7 @@ async fn post_continuation_outcome(
     spawned: bool,
     detail: Option<String>,
 ) {
-    let Some(base) = coord_http_base() else {
+    let Some(base) = connected_coord_base() else {
         return;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
@@ -2496,7 +2485,7 @@ struct ContinuationDeferredBody {
 /// **Best-effort**: the route may 404 until coord's parallel phase deploys —
 /// ANY non-2xx or transport error is `debug!` and we move on.
 async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, reason: String) {
-    let Some(base) = coord_http_base() else {
+    let Some(base) = connected_coord_base() else {
         return;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-deferred");
@@ -2557,7 +2546,7 @@ struct UnitDispatchConsumedBody {
 /// No `coord_http_base` (legacy / coord not configured) → no-op: there is no
 /// consume surface to ack against (the unit pull also can't have happened).
 async fn post_unit_dispatch_consumed(dispatch_id: uuid::Uuid, device_id: uuid::Uuid) {
-    let Some(base) = coord_http_base() else {
+    let Some(base) = connected_coord_base() else {
         return;
     };
     let url = format!("{base}/coord/agents/unit-dispatches/{dispatch_id}/consumed");
@@ -3895,7 +3884,7 @@ async fn run_agent_subprocess(
         // configured coord base (dev/no-coord), and each daemon self-skips when it has
         // no work (no push targets / no worktrees).
         if !payload.jwt.is_empty() {
-            if let Some(base) = coord_http_base() {
+            if let Some(base) = connected_coord_base() {
                 let allocate = payload_to_allocate_result(&payload);
                 crate::agent_daemons::spawn_for_agent_with_token(
                     &allocate,
@@ -4569,7 +4558,7 @@ async fn flush_log_queue(agent_id: uuid::Uuid, queue: &Arc<Mutex<VecDeque<LogLin
 }
 
 async fn post_log_line(agent_id: uuid::Uuid, line: &LogLine) -> bool {
-    let Some(base) = coord_http_base() else {
+    let Some(base) = connected_coord_base() else {
         return false;
     };
     let url = format!("{base}/agents/{agent_id}/log");
@@ -4607,7 +4596,7 @@ async fn run_heartbeat_loop(payload: LaunchPayload) {
         // refresh failure (maybe_refresh logs + returns Ok) never breaks the
         // heartbeat loop.
         if let Some(slot) = crate::coord_mcp::lookup_agent_token(payload.agent_id) {
-            if let Some(base) = coord_http_base() {
+            if let Some(base) = connected_coord_base() {
                 let _ =
                     crate::agent_token::maybe_refresh(&slot, &base, payload.agent_id, "agent_mcp")
                         .await;
@@ -4617,7 +4606,7 @@ async fn run_heartbeat_loop(payload: LaunchPayload) {
 }
 
 async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
-    let base = coord_http_base().ok_or_else(|| anyhow::anyhow!("no coord_url"))?;
+    let base = connected_coord_base().ok_or_else(|| anyhow::anyhow!("no coord_url"))?;
     let body = ClaimHeartbeat {
         kind: "phase".to_string(),
         resource_key: payload.claim_token.clone(),
@@ -4646,7 +4635,7 @@ async fn report_spawn_complete(
     note: Option<&str>,
     push_ref: Option<&str>,
 ) {
-    let Some(base) = coord_http_base() else {
+    let Some(base) = connected_coord_base() else {
         return;
     };
     let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
@@ -4693,7 +4682,7 @@ async fn report_spawn_failed(
     restarts_attempted: u32,
     push_ref: Option<&str>,
 ) {
-    let Some(base) = coord_http_base() else {
+    let Some(base) = connected_coord_base() else {
         return;
     };
     let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
@@ -5889,7 +5878,7 @@ mod tests {
     /// (a portable shell that prints + exits 0). Proves the arm spawns a child
     /// and returns `Ok(())` end-to-end. The coord lifecycle POSTs
     /// (`spawn-complete`/`spawn-failed`) no-op gracefully here because no
-    /// `coord_url` profile is configured in the test env (`coord_http_base()`
+    /// `coord_url` profile is configured in the test env (`connected_coord_base()`
     /// returns `None`), so this asserts the SPAWN path, not the HTTP posts.
     ///
     /// Gated behind `QONTINUI_AGENT_RUNTIME_E2E=1` (the shell-as-claude

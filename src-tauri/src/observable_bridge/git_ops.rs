@@ -123,10 +123,10 @@ impl GitOpBridge {
                 return;
             }
         };
-        let base = match git_ops_client::coord_http_base() {
+        let base = match crate::profiles::connected_coord_base() {
             Some(b) => b,
             None => {
-                debug!("observable_bridge::git_op::emit: no coord_url; dropping op");
+                debug!("observable_bridge::git_op::emit: runner is isolated; dropping op");
                 return;
             }
         };

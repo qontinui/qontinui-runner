@@ -1457,7 +1457,7 @@ pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> 
             return Ok(None);
         }
     };
-    let base = match super::census::coord_http_base_pub() {
+    let base = match qontinui_runner_lib::profiles::connected_coord_base() {
         Some(b) => b,
         None => {
             debug!("worktree_reclaim: no coord_url configured — skipping");

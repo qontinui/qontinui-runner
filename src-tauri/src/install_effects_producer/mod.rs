@@ -619,7 +619,9 @@ async fn observe_verify_with_base<L: RegistryTokenLookup + ?Sized>(
 /// chain). Split out so tests inject a mock-server base directly via
 /// [`run_with_base`].
 fn coord_base() -> Result<String, String> {
-    crate::mcp::agent_worktrees::coord_http_base()
+    // String family: always yields a base (never errors); the `Result` is kept
+    // only because [`run_with_base`]'s test seam threads one.
+    Ok(qontinui_runner_lib::profiles::coord_base_with_source().0)
 }
 
 // ===========================================================================

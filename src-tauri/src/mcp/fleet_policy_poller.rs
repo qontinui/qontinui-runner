@@ -743,15 +743,12 @@ enum CapabilityCheck {
 /// - `fleet_policy` ABSENT but `capabilities` present ⇒ Capable (coord ships
 ///   other caps but not this flag yet — don't disable).
 /// - NO `capabilities` field at all (coord predates it) ⇒ Capable.
-/// - ANY error (coord base unresolved / request / non-2xx / decode) ⇒ Capable.
-///   We never disable the poller because we couldn't reach `/health`.
+/// - ANY error (request / non-2xx / decode) ⇒ Capable. We never disable the
+///   poller because we couldn't reach `/health`. (The coord base itself can no
+///   longer fail to resolve: `profiles::coord_base_with_source` always yields
+///   one.)
 async fn check_fleet_policy_capability() -> CapabilityCheck {
-    let base = match crate::mcp::agent_worktrees::coord_http_base() {
-        Ok(b) => b,
-        // No coord base ⇒ assume capable; the poll loop's own per-tick base
-        // resolution + JWT gating handles an actually-unconfigured runner.
-        Err(_) => return CapabilityCheck::Capable,
-    };
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let url = format!("{}/health", base.trim_end_matches('/'));
 
     let client = match reqwest::Client::builder()
@@ -995,7 +992,7 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
 }
 
 /// One GET against coord for `domain`. Resolves the coord base the SAME way the
-/// install-effects producer does (`agent_worktrees::coord_http_base()`) and
+/// install-effects producer does (`profiles::coord_base_with_source()`) and
 /// presents the device JWT from `AuthManager::get_access_token()` as the
 /// `Authorization: Bearer` — the exact accessor `backend_relay` uses
 /// (`backend_relay.rs:452`) to authenticate the device WS.
@@ -1016,10 +1013,7 @@ async fn fetch_fleet_policy(domain: &str) -> Result<FleetPolicyResponse, FetchEr
 
     // coord base — identical source-of-truth chain to the producer's
     // `coord_base()` (env COORD_HTTP_URL → profile coord_url → default).
-    let base = match crate::mcp::agent_worktrees::coord_http_base() {
-        Ok(b) => b,
-        Err(e) => return Err(FetchError::Failed(format!("coord base unresolved: {e}"))),
-    };
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let url = format!(
         "{}/coord/fleet-policy?domain={domain}",
         base.trim_end_matches('/')

@@ -97,7 +97,7 @@ pub enum CoordQuestionError {
 /// `question_id` on success.
 ///
 /// `coord_base` is the HTTP base (no trailing slash, no `/ws` suffix) —
-/// resolve it via `fleet::coord_http_base()` at the call site; this
+/// resolve it via `profiles::connected_coord_base()` at the call site; this
 /// function stays profile-agnostic so it's trivially testable.
 ///
 /// On transient network failure the call retries once after 2s. After

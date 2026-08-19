@@ -133,16 +133,6 @@ pub(crate) fn repo_slug_is_safe(repo: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
 }
 
-/// Resolve the coord HTTP base (env `COORD_HTTP_URL` first, then the active
-/// profile) — the same shared resolver `agent_runtime` and `fleet` use; no
-/// localhost fallback.
-pub(crate) fn coord_http_base() -> Option<String> {
-    match qontinui_runner_lib::profiles::resolve_coord_base() {
-        qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(base),
-        _ => None,
-    }
-}
-
 /// Spawn the CI-node runtime. Mirrors `agent_runtime::spawn_runtime`:
 /// no device identity or coord base ⇒ inert.
 ///
@@ -158,8 +148,8 @@ pub fn spawn_ci_node_runtime() {
         );
         return;
     };
-    if coord_http_base().is_none() {
-        info!("ci_node: profile has no coord_url — CI-node runtime disabled. Skipping.");
+    if qontinui_runner_lib::profiles::connected_coord_base().is_none() {
+        info!("ci_node: runner is ISOLATED (no coord configured, not a hosted tier) — CI-node runtime disabled. Skipping.");
         return;
     }
     info!("ci_node: starting for device_id={device_id}");

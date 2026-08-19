@@ -42,18 +42,6 @@ pub fn build_client() -> Result<reqwest::Client> {
         .context("observable_bridge::git_ops_client: reqwest client build")
 }
 
-/// Resolve the coord HTTP base. Delegates to the shared resolver in
-/// `crate::profiles` so the `wss://…/ws` → `https://…` normalization
-/// (and the `COORD_HTTP_URL` env override) lives in one place.
-///
-/// Preserves `None` when nothing is configured (Option-family contract).
-pub fn coord_http_base() -> Option<String> {
-    match crate::profiles::resolve_coord_base() {
-        crate::profiles::CoordBase::Configured(base) => Some(base),
-        _ => None,
-    }
-}
-
 /// `POST /coord/git-ops/record` — append one git op to the tenant feed.
 ///
 /// Best-effort: returns `Result` so the caller can log and continue. The

@@ -72,13 +72,6 @@ pub(crate) fn config_file_path(session_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("qontinui-git-cred-{session_id}.json"))
 }
 
-fn coord_http_base() -> String {
-    // Delegates to the shared tier-aware policy fn: env → profile →
-    // prod default on a hosted (qontinui_account-tier) runner → dev-localhost
-    // guess (logged once per process) otherwise.
-    qontinui_runner_lib::profiles::coord_base_with_source().0
-}
-
 async fn fetch_push_token(coord_base: &str, session_id: &str) -> Result<String, String> {
     let url = format!(
         "{}/coord/sessions/{}/push-token",
@@ -434,7 +427,7 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
         }
     };
 
-    let coord_base = coord_http_base();
+    let coord_base = qontinui_runner_lib::profiles::coord_base_with_source().0;
 
     let (push_token_result, repos_result) = tokio::join!(
         fetch_push_token(&coord_base, session_id),

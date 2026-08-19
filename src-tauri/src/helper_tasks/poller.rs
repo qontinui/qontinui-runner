@@ -74,8 +74,7 @@ async fn tick() -> Result<(), String> {
         }
     };
 
-    let base = crate::mcp::agent_worktrees::coord_http_base()
-        .map_err(|e| format!("coord base unresolved: {e}"))?;
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
 
     let client = reqwest::Client::builder()
