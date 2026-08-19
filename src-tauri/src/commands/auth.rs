@@ -292,6 +292,19 @@ pub async fn check_auth_status() -> Result<AuthStatus, String> {
 /// the `user` field — never the verdict.
 const ENRICHMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Sub-budget for the FIRST of enrichment's two network legs — the bearer
+/// resolution, which performs a Cognito `refresh_token` grant when the stored
+/// token is stale.
+///
+/// Without a sub-budget the two legs share one clock, so a slow grant starves
+/// the `users/me` GET behind it and enrichment times out as a whole — the
+/// profile is lost on precisely the calls where a refresh happened to fall
+/// due. Capping the first leg separately bounds that: on overrun we fall back
+/// to the STORED access token (the same REPLACE-not-REVOKE posture
+/// `refresh_cognito_bearer` takes on a failed grant) and still spend the
+/// remaining budget on the profile fetch.
+const BEARER_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
 async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     info!("Checking authentication status");
 
@@ -371,11 +384,34 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     // from "not signed in" and renders the sign-in screen at a runner that
     // is fully authenticated (observed on pop-out terminal windows, whose
     // fresh webview probes auth while the app is still booting).
-    // Cap the whole enrichment so the verdict is never held hostage to it.
+    // Cap the whole enrichment so the verdict is never held hostage to it, and
+    // cap the bearer leg WITHIN that so it cannot starve the profile fetch —
+    // see [`BEARER_BUDGET`].
     let user = match tokio::time::timeout(ENRICHMENT_BUDGET, async {
-        match web_backend_user_bearer(&auth_manager).await {
-            Ok(access_token) => fetch_user_info(&access_token).await,
-            Err(_) => None,
+        let bearer =
+            match tokio::time::timeout(BEARER_BUDGET, web_backend_user_bearer(&auth_manager)).await
+            {
+                Ok(Ok(access_token)) => Some(access_token),
+                // Not signed in to Cognito at all — nothing to enrich with.
+                Ok(Err(_)) => None,
+                Err(_) => {
+                    // The grant outran its sub-budget. Use the stored token: it is
+                    // what `refresh_cognito_bearer` itself would have returned had
+                    // the grant failed outright, and a token that is merely near
+                    // expiry still authenticates a `users/me` GET.
+                    warn!(
+                        "check_auth_status: bearer resolution exceeded {BEARER_BUDGET:?} — \
+                         falling back to the stored access token for profile enrichment"
+                    );
+                    auth_manager
+                        .get_oauth_access_token()
+                        .ok()
+                        .filter(|t| !t.trim().is_empty())
+                }
+            };
+        match bearer {
+            Some(access_token) => fetch_user_info(&access_token).await,
+            None => None,
         }
     })
     .await
