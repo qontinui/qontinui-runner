@@ -841,7 +841,13 @@ mod tests {
     #[test]
     fn tool_dirs_prepend_without_replacing_the_host_path() {
         let dir = PathBuf::from("/tools/cargo-nextest/0.9.98");
-        let env = DispatchEnv::build(1, 2, Path::new("/ci-target"), &[dir.clone()], &[]);
+        let env = DispatchEnv::build(
+            1,
+            2,
+            Path::new("/ci-target"),
+            std::slice::from_ref(&dir),
+            &[],
+        );
         let path = exports(&env, "PATH").expect("PATH must be exported when a tool is provisioned");
         let mut entries = std::env::split_paths(&path);
         assert_eq!(entries.next().as_deref(), Some(dir.as_path()));
@@ -997,9 +1003,25 @@ mod tests {
             Some("qontinui-no-such-container-runtime"),
             &["qontinui-ci-0198f2b4-2222-7aaa-bbbb-cccccccccccc-redis"],
         );
+        // Held across the move, because `cleanup` consumes the workspace and
+        // the point of this test is what cleanup DID, not what it left behind.
+        let removals = workspace.services.removal_log();
         workspace
             .cleanup(reporting::ResultReported::for_test())
             .await;
+
+        // The services half: cleanup must have issued the forced removal. Its
+        // name says "tears down services", so it has to assert that — the
+        // earlier version asserted only on the directory.
+        assert_eq!(
+            removals.lock().unwrap().clone(),
+            vec![vec![
+                "rm".to_string(),
+                "-f".to_string(),
+                "qontinui-ci-0198f2b4-2222-7aaa-bbbb-cccccccccccc-redis".to_string()
+            ]],
+            "cleanup must tear down the dispatch's service containers"
+        );
 
         assert!(
             !dispatch_root.exists(),

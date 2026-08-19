@@ -1264,13 +1264,68 @@ fn write_python_shim(bin_dir: &Path, stem: &str, module: &str) -> Result<PathBuf
 /// the Windows `.cmd`-shim respawn (`docker` on Windows is an exe, but podman
 /// and Docker Desktop's compatibility shims are not always). Sharing this is
 /// strictly better than a second copy of the spawn/timeout/shim logic.
+/// An argv rendered for an ERROR MESSAGE with credential-bearing tokens
+/// stripped.
+///
+/// Error strings from this helper travel a long way: `services` logs them to
+/// the runner's on-disk dev log, pushes them into the dispatch's live progress
+/// stream, and they end up in the `log_tail` coord PERSISTS with the dispatch
+/// result. So a value that reaches an argv here is effectively published.
+///
+/// The container flag `-e KEY=VALUE` is the shape that carries one. Callers in
+/// this crate now pass `-e KEY` (bare, value supplied via
+/// [`run_capture_env`]), so this is belt-and-braces for that path — but it is
+/// NOT redundant: this helper keeps gaining callers, and the next one to write
+/// `-e PASSWORD=…` should leak nothing. The KEY is kept because it is the
+/// diagnostic half; only the value is dropped.
+fn redacted_argv(args: &[&str]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut prev_was_env_flag = false;
+    for arg in args {
+        if prev_was_env_flag {
+            match arg.split_once('=') {
+                Some((key, _)) => out.push(format!("{key}=<redacted>")),
+                // The bare form carries no value to redact.
+                None => out.push((*arg).to_string()),
+            }
+        } else {
+            out.push((*arg).to_string());
+        }
+        prev_was_env_flag = matches!(*arg, "-e" | "--env");
+    }
+    out
+}
+
 pub(super) async fn run_capture(
     program: &str,
     args: &[&str],
     timeout: Duration,
     path_dir: Option<&Path>,
 ) -> Result<String, String> {
-    fn build(program: &str, args: &[&str], path_dir: Option<&Path>) -> tokio::process::Command {
+    run_capture_env(program, args, timeout, path_dir, &[]).await
+}
+
+/// [`run_capture`] plus environment variables handed to the child.
+///
+/// This exists so a caller can pass a SECRET to a child process without ever
+/// putting it on an argv. `services` needs exactly that: `docker run -e NAME`
+/// (no `=value`) means "inherit NAME from my environment", so the container
+/// gets its password while the password never appears in a command line —
+/// neither in this function's error strings, nor in the host process table
+/// that every other session on the machine can read.
+pub(super) async fn run_capture_env(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    path_dir: Option<&Path>,
+    envs: &[(String, String)],
+) -> Result<String, String> {
+    fn build(
+        program: &str,
+        args: &[&str],
+        path_dir: Option<&Path>,
+        envs: &[(String, String)],
+    ) -> tokio::process::Command {
         let mut cmd = crate::process_helpers::tokio_no_window(program);
         cmd.args(args)
             .stdin(std::process::Stdio::null())
@@ -1284,9 +1339,12 @@ pub(super) async fn run_capture(
                 cmd.env("PATH", joined);
             }
         }
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
         cmd
     }
-    let mut cmd = build(program, args, path_dir);
+    let mut cmd = build(program, args, path_dir, envs);
     let spawned = tokio::time::timeout(timeout, cmd.output()).await;
     let out = match spawned {
         Ok(Ok(o)) => o,
@@ -1297,13 +1355,14 @@ pub(super) async fn run_capture(
             let mut argv = vec!["/C".to_string(), program.to_string()];
             argv.extend(args.iter().map(|a| (*a).to_string()));
             let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-            let mut shim = build("cmd.exe", &argv_ref, path_dir);
+            let mut shim = build("cmd.exe", &argv_ref, path_dir, envs);
             match tokio::time::timeout(timeout, shim.output()).await {
                 Ok(Ok(o)) => o,
                 Ok(Err(e2)) => return Err(format!("spawn {program} (direct: {e}; cmd /C: {e2})")),
                 Err(_) => {
                     return Err(format!(
-                        "{program} did not answer {args:?} within {}s",
+                        "{program} did not answer {:?} within {}s",
+                        redacted_argv(args),
                         timeout.as_secs()
                     ))
                 }
@@ -1312,7 +1371,8 @@ pub(super) async fn run_capture(
         Ok(Err(e)) => return Err(format!("spawn {program}: {e}")),
         Err(_) => {
             return Err(format!(
-                "{program} did not answer {args:?} within {}s",
+                "{program} did not answer {:?} within {}s",
+                redacted_argv(args),
                 timeout.as_secs()
             ))
         }
@@ -1324,7 +1384,8 @@ pub(super) async fn run_capture(
     );
     if !out.status.success() {
         return Err(format!(
-            "{program} {args:?} exited {} ({})",
+            "{program} {:?} exited {} ({})",
+            redacted_argv(args),
             out.status,
             text.trim()
         ));
@@ -1392,6 +1453,75 @@ pub(crate) fn version_is_reported(output: &str, version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An argv formatted into an error string must not carry a credential.
+    ///
+    /// These error strings are logged to disk, streamed to coord live, and
+    /// PERSISTED by coord in the dispatch result's `log_tail`, so a secret that
+    /// reaches one is published. Callers in this crate pass the bare `-e NAME`
+    /// form, and this is the second line of defence for the next caller that
+    /// does not.
+    #[test]
+    fn argv_rendered_for_an_error_drops_env_values() {
+        let args = [
+            "run",
+            "-d",
+            "--name",
+            "qontinui-ci-d1-postgres",
+            "-e",
+            "POSTGRES_PASSWORD=correcthorsebatterystaple",
+            "--env",
+            "PGPASSWORD=hunter2",
+            "-e",
+            "POSTGRES_DB", // bare: nothing to redact
+            "postgres:16",
+        ];
+        let rendered = format!("{:?}", redacted_argv(&args));
+        assert!(
+            !rendered.contains("correcthorsebatterystaple"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        // The NAME survives — it is the diagnostic half.
+        assert!(
+            rendered.contains("POSTGRES_PASSWORD=<redacted>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("PGPASSWORD=<redacted>"), "{rendered}");
+        assert!(rendered.contains("POSTGRES_DB"), "{rendered}");
+        // Everything that is not an env value is untouched, so the error stays
+        // diagnosable.
+        assert!(rendered.contains("qontinui-ci-d1-postgres"), "{rendered}");
+        assert!(rendered.contains("postgres:16"), "{rendered}");
+    }
+
+    /// The out-of-band path actually delivers: a value passed as env reaches
+    /// the child, and never appears in the command line.
+    #[tokio::test]
+    async fn run_capture_env_delivers_a_value_without_putting_it_on_the_argv() {
+        #[cfg(target_os = "windows")]
+        let (program, args) = ("cmd.exe", vec!["/C", "echo %QONTINUI_TEST_SECRET%"]);
+        #[cfg(not(target_os = "windows"))]
+        let (program, args) = ("sh", vec!["-c", "printf %s \"$QONTINUI_TEST_SECRET\""]);
+
+        let out = run_capture_env(
+            program,
+            &args,
+            Duration::from_secs(30),
+            None,
+            &[(
+                "QONTINUI_TEST_SECRET".to_string(),
+                "correcthorsebatterystaple".to_string(),
+            )],
+        )
+        .await
+        .expect("the child must run");
+        assert!(out.contains("correcthorsebatterystaple"), "got {out:?}");
+        assert!(
+            !format!("{args:?}").contains("correcthorsebatterystaple"),
+            "the value must never be in the argv"
+        );
+    }
 
     #[test]
     fn registry_is_closed() {
