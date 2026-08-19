@@ -759,10 +759,23 @@ async fn continuation_verdict(
 /// absent or unrecognised value normalizes to `startup` in
 /// [`crate::mcp::policy_context::normalize_source`], because an unrecognised
 /// start is still a start.
+///
+/// `claude_session_id` is the Claude session UUID from the SAME hook payload,
+/// and it is a SECOND, independent identity from `{id}` in the path. `{id}` is
+/// the runner TERMINAL id — which is what [`resolve_session_key`] returns and
+/// what addresses the route — while this is the session coord attributes the
+/// policy read to. One runner terminal can host several Claude sessions in
+/// sequence, so attributing a read to the terminal id would file every one of
+/// them under the same session. Optional and never fabricated: absent or
+/// unparseable ⇒ the coord fetch goes out WITHOUT the attribution header and
+/// coord records `claude_session_id = NULL`, which the compliance signal reads
+/// as `unavailable`, never as non-compliance.
 #[derive(Debug, Deserialize)]
 struct PolicyContextQuery {
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    claude_session_id: Option<String>,
 }
 
 /// `GET /sessions/{id}/policy-context` — the SessionStart policy-injection
@@ -793,7 +806,13 @@ async fn policy_context(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let key = resolve_session_key(&state, &id, &serde_json::Value::Null);
-    match crate::mcp::policy_context::policy_context(&key, q.source.as_deref()).await {
+    // Parse STRICTLY, and never fall back to `key` on failure. `key` is the
+    // terminal id; seating it in coord's durable `claude_session_id` column
+    // would be a fabricated provenance value that the compliance signal then
+    // reads as fact. An unparseable id is simply no id.
+    let attribution =
+        crate::mcp::policy_context::parse_attribution_session(q.claude_session_id.as_deref());
+    match crate::mcp::policy_context::policy_context(&key, q.source.as_deref(), attribution).await {
         Some(envelope) => Json(envelope).into_response(),
         None => StatusCode::OK.into_response(),
     }

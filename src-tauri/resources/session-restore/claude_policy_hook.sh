@@ -89,7 +89,10 @@ command -v curl >/dev/null 2>&1 || exit 0
 # Extract a field from the stdin JSON. Python is PREFERRED (robust JSON) but
 # OPTIONAL here: unlike the Stop hook, this script can still do useful work
 # without it whenever `QONTINUI_TERMINAL_ID` is set, so a missing interpreter
-# degrades the `source` label instead of killing the injection.
+# degrades the `source` label and the read's ATTRIBUTION instead of killing the
+# injection. The session still receives its policy; coord just records the read
+# with a NULL session id, which reads downstream as `unavailable` — an admitted
+# blind spot, never a non-compliance verdict.
 extract() {
   command -v python >/dev/null 2>&1 || { printf ''; return 0; }
   printf '%s' "$payload" | python -c "import sys,json
@@ -100,12 +103,33 @@ except Exception:
 " 2>/dev/null
 }
 
-# Session key: prefer the runner terminal id (the route resolves it against
-# local state), else the Claude session id from the hook payload — the same
+# The CLAUDE session id, straight off the hook payload. This is the id coord
+# attributes a policy read to (`X-Coord-Caller-Session`), and it is NOT the
+# runner terminal id below — one runner terminal can host several Claude
+# sessions, so the terminal id would attribute every one of them to the same
+# session. Sent as its own query param precisely so the route never has to
+# guess which of the two it is holding.
+#
+# Constrained to canonical UUID shape here as a cheap first filter (the route
+# parses it strictly and drops anything that fails). Never fabricated: if the
+# payload carries no session id, the param is simply omitted and coord records
+# the read with a NULL session — an honest "unattributable", which downstream
+# reads as `unavailable`, never as non-compliance.
+raw_sid="$(extract session_id)"
+csid="$raw_sid"
+case "$csid" in
+  [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
+  *) csid="" ;;
+esac
+
+# Session key for ADDRESSING the route: prefer the runner terminal id (the
+# route resolves it against local state), else the Claude session id — the same
 # precedence `claude_stop_hook.sh` uses, so both hooks key on one identity.
+# Deliberately separate from `csid` above: this one names the route's path
+# segment, that one names WHO the read is attributed to.
 sid="$term"
 if [ -z "$sid" ]; then
-  sid="$(extract session_id)"
+  sid="$raw_sid"
 fi
 [ -z "$sid" ] && exit 0
 
@@ -121,8 +145,17 @@ case "$src" in
   *) src="" ;;
 esac
 
+# Both params are shape-constrained above, so neither needs encoding: `src` is
+# one of four literals and `csid` is hex-and-hyphens.
 url="http://127.0.0.1:${port}/sessions/${sid}/policy-context"
-[ -n "$src" ] && url="${url}?source=${src}"
+sep="?"
+if [ -n "$src" ]; then
+  url="${url}${sep}source=${src}"
+  sep="&"
+fi
+if [ -n "$csid" ]; then
+  url="${url}${sep}claude_session_id=${csid}"
+fi
 
 # The route fetches from coord, so allow more headroom than the loopback trip
 # itself needs — but stay bounded: a hung coord must not stall a session
