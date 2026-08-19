@@ -61,11 +61,11 @@ fn default_simple_model() -> String {
 }
 
 fn default_medium_model() -> String {
-    "claude-sonnet-4-20250514".to_string()
+    "claude-sonnet-5".to_string()
 }
 
 fn default_complex_model() -> String {
-    "claude-opus-4-20250514".to_string()
+    "claude-opus-5".to_string()
 }
 
 fn default_file_thresholds() -> (usize, usize) {
@@ -122,21 +122,37 @@ impl RoutingConfig {
     /// Replace deprecated model IDs with current defaults.
     /// Called when loading routing config from DB to prevent stale persisted
     /// model IDs from silently breaking AI-routed tasks.
+    ///
+    /// # Why this matches the FAMILY, not the generation
+    ///
+    /// This check used to enumerate generations
+    /// (`claude-haiku-4` / `claude-sonnet-4` / `claude-opus-4`), which made it
+    /// rot on every model release: once Claude 5 shipped, an operator who
+    /// correctly configured `claude-opus-5` had it **silently replaced** with
+    /// `claude-opus-4-20250514` — a `warn!` line and nothing else, since
+    /// `AiResponse` carries no record of a substitution. A route succeeded and
+    /// the wrong model answered.
+    ///
+    /// Worse, the substitution is logged at `info!` — not even `warn!` — and
+    /// `AiResponse` carries no record of it, so the only way to discover the
+    /// downgrade was log archaeology.
+    ///
+    /// The fix keys on the part of the id that does NOT rot. Anthropic's
+    /// current scheme is `claude-<family>-<generation>[-<date>]`, so matching
+    /// `claude-<family>-` accepts every present and future generation of a
+    /// known family, while still rejecting the retired
+    /// `claude-<generation>-<family>` ids (`claude-3-opus-20240229`) that this
+    /// function exists to replace. The generation number is never parsed, so
+    /// there is nothing to bump.
+    ///
+    /// That validity question now lives in the capability catalog
+    /// (`crate::model_catalog::is_recognized_id`), not in a private list here —
+    /// that is the whole point of holding capability facts as data. This
+    /// function keeps only the *policy*: what to DO about an unrecognized id.
     pub fn sanitize_model_ids(&mut self) {
-        // Known-good model ID prefixes (current generation)
-        const VALID_PREFIXES: &[&str] = &[
-            "claude-haiku-4",
-            "claude-sonnet-4",
-            "claude-opus-4",
-            // Allow explicit versioned IDs from any current model
-            "claude-3-5-sonnet-", // Still valid if user explicitly set it
-        ];
-
         fn is_valid(model: &str) -> bool {
-            VALID_PREFIXES
-                .iter()
-                .any(|prefix| model.starts_with(prefix))
-                || model.is_empty() // Empty = use default
+            // Empty = "use the provider default"; preserve it.
+            model.is_empty() || crate::model_catalog::is_recognized_id(model)
         }
 
         if !is_valid(&self.simple_model) {
@@ -576,6 +592,104 @@ mod tests {
         let config = RoutingConfig::default();
         assert!(config.enabled);
         assert_eq!(config.file_count_thresholds, (3, 10));
+    }
+
+    /// A CURRENT-generation model id must survive `sanitize_model_ids`.
+    ///
+    /// This is the regression test for the silent-downgrade bug: the old
+    /// generation-enumerating allowlist rewrote `claude-opus-5` to
+    /// `claude-opus-4-20250514` with only a `warn!` to show for it. The check
+    /// is generation-agnostic now, so this test also guards the NEXT bump —
+    /// `claude-opus-6` is asserted here deliberately, as a model that does not
+    /// exist yet. If someone reintroduces a generation-pinned allowlist, this
+    /// fails immediately rather than after the next release.
+    #[test]
+    fn current_generation_model_ids_survive_sanitize() {
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-20250514",
+            // Future generations: the whole point of matching the family.
+            "claude-opus-6",
+            "claude-sonnet-7-20300101",
+        ] {
+            let mut config = RoutingConfig {
+                simple_model: model.to_string(),
+                medium_model: model.to_string(),
+                complex_model: model.to_string(),
+                ..Default::default()
+            };
+            config.sanitize_model_ids();
+            assert_eq!(
+                config.simple_model, model,
+                "sanitize_model_ids silently rewrote a valid model id `{model}` — \
+                 this is the silent-downgrade bug regressing"
+            );
+            assert_eq!(config.medium_model, model);
+            assert_eq!(config.complex_model, model);
+        }
+    }
+
+    /// Retired `claude-<generation>-<family>` ids are still replaced — the
+    /// behaviour this function exists for must survive the fix above.
+    #[test]
+    fn retired_model_ids_are_still_replaced() {
+        for retired in [
+            "claude-3-opus-20240229",
+            "claude-2.1",
+            "gpt-4-turbo",
+            "garbage",
+        ] {
+            let mut config = RoutingConfig {
+                complex_model: retired.to_string(),
+                ..Default::default()
+            };
+            config.sanitize_model_ids();
+            assert_eq!(
+                config.complex_model,
+                default_complex_model(),
+                "retired id `{retired}` should have been replaced with the default"
+            );
+        }
+    }
+
+    /// The defaults must themselves be ids the sanitizer accepts. A default
+    /// that fails its own validity check is the rot this bug was made of.
+    #[test]
+    fn defaults_are_self_consistent() {
+        let mut config = RoutingConfig::default();
+        let (s, m, c) = (
+            config.simple_model.clone(),
+            config.medium_model.clone(),
+            config.complex_model.clone(),
+        );
+        config.sanitize_model_ids();
+        assert_eq!(
+            config.simple_model, s,
+            "default simple_model is not self-valid"
+        );
+        assert_eq!(
+            config.medium_model, m,
+            "default medium_model is not self-valid"
+        );
+        assert_eq!(
+            config.complex_model, c,
+            "default complex_model is not self-valid"
+        );
+    }
+
+    /// An empty string means "use the provider default" and must be preserved,
+    /// not replaced — the sanitizer's `is_valid` returns true for it.
+    #[test]
+    fn empty_model_id_is_preserved() {
+        let mut config = RoutingConfig {
+            complex_model: String::new(),
+            ..Default::default()
+        };
+        config.sanitize_model_ids();
+        assert_eq!(config.complex_model, "");
     }
 
     #[test]

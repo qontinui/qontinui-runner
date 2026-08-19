@@ -144,20 +144,21 @@ pub struct CacheAwareRequestBuilder {
 /// | Haiku 3.x (e.g. `claude-haiku-3-5-*`) | 2048 | **8192** |
 /// | Sonnet / Opus / others | 1024 | **4096** |
 ///
-/// Match is case-insensitive substring-style. The `haiku-4` check runs
-/// first so a `claude-haiku-4-9-*` future bump inherits the 16384-char
-/// floor rather than falling through to the haiku-3 case. Unknown future
-/// haiku families (e.g. `haiku-5`) fall to the 4096-char default — flag
-/// for review when that ships rather than guessing the floor.
+/// The per-model floor is a **capability fact**, so it lives in
+/// [`crate::model_catalog`] with the rest of them rather than in a private
+/// substring ladder here. This function is now just the lookup plus the
+/// documented default.
+///
+/// The old ladder matched `haiku-4` / `haiku-3` as substrings and fell through
+/// to 4096 for everything else — including, by its own admission, unknown
+/// future haiku families, which would have silently taken a floor four times
+/// too small. The catalog states the floor per model and reports the absence
+/// honestly; see [`crate::model_catalog::DEFAULT_CACHE_MIN_BLOCK_CHARS`] for
+/// why an unknown floor is nonetheless allowed to resolve to a number (it
+/// costs cache efficiency, never correctness — unlike an unknown *modality*
+/// fact, which would drop user content).
 pub(crate) fn min_cacheable_chars(model: &str) -> usize {
-    let m = model.to_ascii_lowercase();
-    if m.contains("haiku-4") {
-        16384
-    } else if m.contains("haiku-3") {
-        8192
-    } else {
-        4096
-    }
+    crate::model_catalog::cache_min_block_chars_or_default(model)
 }
 
 impl CacheAwareRequestBuilder {
