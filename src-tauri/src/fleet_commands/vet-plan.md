@@ -678,10 +678,22 @@ shape from `coord_work_unit_upsert` (MCP) and `POST /coord/work-units/upsert`
 (HTTP) alike. Read it as:
 
 - **`previous_status: null`, `transitioned: true`** — step 1 *created* the row.
-  There is no prior status and nothing to protect: proceed to Step B.
-- **`previous_status: "<status>"`, `transitioned: false`** — the unit already
-  existed at `<status>`. That is the value the rest of this step means by "the
-  current status".
+  There is no prior status to protect: proceed to Step B. **The row is not
+  status-less, though — a status-omitting INSERT seeds the empty string**
+  (`VALUES (…, COALESCE($3::text, ''), …)`), so the value Step C's CAS guard
+  needs here is `from_status: ""`, not `null` and not `"draft"`.
+- **`previous_status: ""`, `transitioned: false`** — same empty seed, seen on a
+  re-run: the row exists and was created by an earlier status-omitting upsert.
+  Treat it exactly like the case above — nothing to protect, `from_status: ""`.
+- **`previous_status: "<non-empty status>"`, `transitioned: false`** — the unit
+  already existed at `<status>`. That is the value the rest of this step means by
+  "the current status".
+
+> **Do not truthiness-test `previous_status`.** `""` and `null` are different
+> rows — one exists with an empty status, one did not exist a moment ago — and
+> both are falsy. Branch on the explicit cases above; a `if (!previous_status)`
+> collapses them and loses the CAS value for the commonest path of all, the one
+> where this very session just created the unit.
 
 Only if you did not keep the upsert response, re-read it with
 `GET $COORD_HTTP_URL/coord/agent-work-units/<plan stem>` and take
@@ -708,13 +720,27 @@ derivation this whole ordering exists to protect.
 > fail from one wrong URL, and the failure reads as a credential problem rather
 > than a wrong door.
 >
-> If the status is genuinely unavailable (no upsert response kept, no device JWT,
-> MCP masked), that is **UNKNOWN, not `draft`**. Do not invent a `from_status`: a
-> guessed one CAS-fails against every real row, and omitting it turns Step C into
-> the unconditional write this ordering exists to prevent. Report the registry
-> transition as **not made**, say why, and register the gate on the status you last
-> knew — an unmade transition is recoverable on the next run; a destroyed
-> attestation is not.
+> If the status is genuinely unavailable — you discarded the upsert response AND
+> the re-read fails — that is **UNKNOWN, not `draft`**. Do not invent a
+> `from_status`: a guessed one CAS-fails against every real row, and omitting it
+> turns Step C into the unconditional write this ordering exists to prevent.
+> Report the registry transition as **not made** and say why.
+>
+> **And do NOT register the `unit_ready` gate on a guessed `ready_status`.**
+> `ready_verdict` is a bare `status != ready_status` string compare with no
+> non-empty guard, so a guess fails in one of two ways and the quieter one is
+> worse: guess `"vetted"` or `"draft"` and the gate pins **open** until the ~7-day
+> sweep (bad, but visible as a stalled gate); guess `""` — the value a
+> freshly-created row actually holds — and it compares EQUAL, so the gate **clears
+> immediately** and publishes "ready, dispatchable work" for a unit that never
+> reached any vetted-class status. A false green is strictly worse than the rot
+> this section exists to prevent. Report the gate as **not registered**, with the
+> reason, and let the next run key it on an observed status.
+>
+> (If the failure is total — no device JWT and no MCP — then step 1 never ran
+> either, so there is no `work_unit_id` and no gate to register in the first
+> place. The reachable version of this branch is the narrower one: the upsert
+> succeeded, its response was discarded, and the re-read then failed.)
 
 **Step B — attempt the real thing.**
 
@@ -730,7 +756,8 @@ agent-reachable route produces `ready` any other way (the operator-transition ro
 can set it directly, but that is not yours). It lands when the attester is
 genuinely not the owner — a different device, or a peer holding a real agent JWT —
 and it is also the path the graduated-self-attestation relaxation
-(`policies/lifecycle_autonomy.rs`) would open if the fleet ever arms it.
+(`crates/coord/src/policies/lifecycle_autonomy.rs`) would open if the fleet ever
+arms it.
 
 **Step C — on a 403, fall back and move on.**
 
@@ -740,8 +767,17 @@ POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition
 ```
 
 Send `from_status` as a CAS guard so a peer attestation that landed between your
-read and this write cannot be clobbered; on a conflict, re-read and re-apply Step
-A's skip rule rather than forcing.
+read and this write cannot be clobbered. Use the value Step A established —
+including the literal `""` when this session just created the row.
+
+The CAS is checked BEFORE the attestation authz, so a stale guard answers **`409`**
+`{"error":"from_status does not match current status","current_status":"<actual>","asserted_from_status":"<yours>"}`
+— not one of the three `403`s below. Distinguish them: a `409` means a peer moved
+the unit under you, and **the response body already carries `current_status`**, so
+re-apply Step A's skip rule against that value directly rather than re-reading (the
+re-read would route back through a door that may be exactly what failed). Never
+retry by dropping `from_status`; that converts the guard into the blind write it
+exists to prevent.
 
 Three 403 codes are expected here and NONE is a failure of the vet:
 
@@ -755,10 +791,17 @@ Three 403 codes are expected here and NONE is a failure of the vet:
   Free transition claims ownership and un-strands it.
 - **`attester_unresolved`** — YOUR token derives no actor key, i.e. it carries a
   `tenant_id` but no `device_id`. This is the one you will hit on the acting-user
-  service token (transport tier 3 above), and it is the one case graduation can
-  never relax. Fall back the same way, but say in your report that the attestation
-  was not merely refused — it was **unattemptable from this door**, and would need
-  a device- or agent-identified caller even to be evaluated.
+  service token (transport tier 3 above). Fall back the same way, but say in your
+  report that the attestation was not merely refused — it was **unattemptable from
+  this door**, and would need a device- or agent-identified caller even to be
+  evaluated.
+
+Graduation relaxes exactly ONE of the three: `self_attestation_forbidden`. Both
+`owner_unresolved` and `attester_unresolved` are returned verbatim and are **not**
+relaxable — graduation is earned by a concrete actor's track record, so with no
+resolvable actor key there is nothing that could have been earned
+(`crates/coord/src/policies/lifecycle_autonomy.rs`, the
+`OwnerUnresolved | AttesterUnresolved` arm).
 
 None of the three is a transport problem, a credential problem, or a coord bug — do
 not run `/coord-revive`, do not retry on another door, and do not report the vet as
