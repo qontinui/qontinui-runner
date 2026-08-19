@@ -6,6 +6,10 @@
           {
             "type": "command",
             "command": "bash '@@HOOK_SCRIPT@@'"
+          },
+          {
+            "type": "command",
+            "command": "bash '@@POLICY_HOOK_SCRIPT@@'"
           }
         ]
       }

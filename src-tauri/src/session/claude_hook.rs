@@ -59,10 +59,27 @@ const STOP_HOOK_SCRIPT: &str = include_str!("../../resources/session-restore/cla
 /// session is behaviorally inert until the flag is armed.
 const PRECOMPACT_HOOK_SCRIPT: &str =
     include_str!("../../resources/session-restore/claude_precompact_hook.sh");
+/// Policy-injection hook script template (bundled) — the SECOND `SessionStart`
+/// command (plan `2026-08-08-runner-enforced-policy-pull.md` Phase 1). It rides
+/// the same `SessionStart` block as [`HOOK_SCRIPT`] rather than extending it,
+/// because that script is the confirmation/liveness carrier and must keep its
+/// silent-stdout contract; this one exists precisely to PRINT — its stdout is
+/// the `hookSpecificOutput.additionalContext` envelope Claude splices into the
+/// session's context, so `policy/session-protocol` Step 0 is satisfied by
+/// construction instead of by the agent volunteering. Same dumb-curl posture as
+/// the Stop/PreCompact scripts: it reads its seam from env
+/// (`QONTINUI_TERMINAL_ID`, `QONTINUI_RUNNER_API_PORT`) and prints the runner's
+/// response verbatim; every decision lives in the runner's
+/// `GET /sessions/{id}/policy-context` endpoint — flag-gated
+/// `QONTINUI_POLICY_INJECTION` default `off`, which answers an EMPTY body, so
+/// shipping the hook to every session is behaviorally inert until armed.
+const POLICY_HOOK_SCRIPT: &str =
+    include_str!("../../resources/session-restore/claude_policy_hook.sh");
 /// Settings template (bundled). `@@HOOK_SCRIPT@@` → the absolute path of the
 /// materialized SessionStart hook script; `@@STOP_HOOK_SCRIPT@@` → the
 /// materialized Stop hook script; `@@PRECOMPACT_HOOK_SCRIPT@@` → the
-/// materialized PreCompact hook script.
+/// materialized PreCompact hook script; `@@POLICY_HOOK_SCRIPT@@` → the
+/// materialized SessionStart policy-injection script.
 const HOOK_SETTINGS: &str =
     include_str!("../../resources/session-restore/claude_hook_settings.json");
 
@@ -72,6 +89,8 @@ const HOOK_SCRIPT_NAME: &str = "claude_session_hook.sh";
 const STOP_HOOK_SCRIPT_NAME: &str = "claude_stop_hook.sh";
 /// File name of the materialized PreCompact-hook script.
 const PRECOMPACT_HOOK_SCRIPT_NAME: &str = "claude_precompact_hook.sh";
+/// File name of the materialized SessionStart policy-injection script.
+const POLICY_HOOK_SCRIPT_NAME: &str = "claude_policy_hook.sh";
 /// File name of the materialized `--settings` file.
 const HOOK_SETTINGS_NAME: &str = "claude_hook_settings.json";
 
@@ -102,12 +121,12 @@ pub fn session_restore_dir() -> PathBuf {
 /// pinned via `--session-id`; only the confirmation hook is absent). The hook
 /// script is marked executable on Unix.
 ///
-/// CACHED PER `base_dir` (Phase 6, B2). The four files are byte-identical for a
+/// CACHED PER `base_dir` (Phase 6, B2). The files are byte-identical for a
 /// given `base_dir` — the scripts are `include_str!`'d constants and the
 /// settings file only substitutes paths derived from `base_dir` — yet every
-/// terminal spawn rewrote all four plus three `chmod`s. After the first
-/// materialize in this process a spawn costs four `stat`s (proving the files are
-/// still there) and nothing else. An externally deleted or modified file falls
+/// terminal spawn rewrote all of them plus a `chmod` each. After the first
+/// materialize in this process a spawn costs one `stat` per file (proving they
+/// are still there) and nothing else. An externally deleted or modified file falls
 /// straight through to a full rewrite, so the cache can never serve a path that
 /// is not on disk.
 pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
@@ -149,6 +168,17 @@ pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
     }
     set_executable(&precompact_script_path);
 
+    // SessionStart policy injection (runner-enforced-policy-pull Phase 1) —
+    // same carrier, same fail-open posture. Registered as a SECOND command in
+    // the EXISTING `SessionStart` block, so the confirmation hook above keeps
+    // its silent-stdout contract while this one carries the injected text.
+    let policy_script_path = base_dir.join(POLICY_HOOK_SCRIPT_NAME);
+    if let Err(e) = std::fs::write(&policy_script_path, POLICY_HOOK_SCRIPT.as_bytes()) {
+        tracing::warn!(error = %e, path = %policy_script_path.display(), "session-restore: claude policy-hook script write failed");
+        return None;
+    }
+    set_executable(&policy_script_path);
+
     // Substitute the scripts' absolute paths into the settings `command`s.
     // JSON needs backslashes escaped (a Windows path) so the settings file
     // stays valid JSON Claude can parse.
@@ -157,10 +187,12 @@ pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
     let precompact_script_for_json = precompact_script_path
         .to_string_lossy()
         .replace('\\', "\\\\");
+    let policy_script_for_json = policy_script_path.to_string_lossy().replace('\\', "\\\\");
     let settings = HOOK_SETTINGS
         .replace("@@HOOK_SCRIPT@@", &script_for_json)
         .replace("@@STOP_HOOK_SCRIPT@@", &stop_script_for_json)
-        .replace("@@PRECOMPACT_HOOK_SCRIPT@@", &precompact_script_for_json);
+        .replace("@@PRECOMPACT_HOOK_SCRIPT@@", &precompact_script_for_json)
+        .replace("@@POLICY_HOOK_SCRIPT@@", &policy_script_for_json);
     let settings_path = base_dir.join(HOOK_SETTINGS_NAME);
     if let Err(e) = std::fs::write(&settings_path, settings.as_bytes()) {
         tracing::warn!(error = %e, path = %settings_path.display(), "session-restore: claude hook settings write failed");
@@ -180,17 +212,18 @@ static MATERIALIZED: once_cell::sync::Lazy<
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Every file [`materialize`] is responsible for, in `base_dir`.
-fn hook_files(base_dir: &Path) -> [PathBuf; 4] {
+fn hook_files(base_dir: &Path) -> [PathBuf; 5] {
     [
         base_dir.join(HOOK_SCRIPT_NAME),
         base_dir.join(STOP_HOOK_SCRIPT_NAME),
         base_dir.join(PRECOMPACT_HOOK_SCRIPT_NAME),
+        base_dir.join(POLICY_HOOK_SCRIPT_NAME),
         base_dir.join(HOOK_SETTINGS_NAME),
     ]
 }
 
 /// The settings path for `base_dir` if this process already materialized it AND
-/// all four files are still present. `None` (⇒ full rewrite) otherwise, so an
+/// all the files are still present. `None` (⇒ full rewrite) otherwise, so an
 /// operator who deletes the dir gets it back on the next spawn.
 fn cached_materialization(base_dir: &Path) -> Option<PathBuf> {
     let settings_path = MATERIALIZED.lock().ok()?.get(base_dir)?.clone();
@@ -322,6 +355,64 @@ mod tests {
         assert!(precompact_text.contains("/context-low"));
         assert!(precompact_text.contains("QONTINUI_RUNNER_API_PORT"));
         assert!(precompact_text.contains("QONTINUI_TERMINAL_ID"));
+
+        // The SAME settings file registers the SessionStart POLICY-INJECTION
+        // hook (runner-enforced-policy-pull Phase 1) as a SECOND command inside
+        // the EXISTING `SessionStart` block — not a second `SessionStart` key,
+        // which would be a distinct registration Claude has no obligation to
+        // merge, and not an edit to the confirmation script, which must keep
+        // its silent-stdout contract.
+        let policy_script_path = tmp.path().join(POLICY_HOOK_SCRIPT_NAME);
+        assert!(
+            policy_script_path.exists(),
+            "policy-hook script materialized"
+        );
+        assert!(
+            !settings_text.contains("@@POLICY_HOOK_SCRIPT@@"),
+            "policy placeholder substituted"
+        );
+        let session_start = v["hooks"]["SessionStart"]
+            .as_array()
+            .expect("SessionStart is an array");
+        assert_eq!(
+            session_start.len(),
+            1,
+            "exactly ONE SessionStart registration — the policy hook is a \
+             sibling command inside it, never a second matcher block"
+        );
+        let session_start_cmds = session_start[0]["hooks"]
+            .as_array()
+            .expect("SessionStart block has a hooks array");
+        assert_eq!(
+            session_start_cmds.len(),
+            2,
+            "confirmation hook + policy hook share the one SessionStart block"
+        );
+        let policy_cmd = session_start_cmds[1]["command"].as_str().unwrap();
+        assert!(
+            policy_cmd.contains(POLICY_HOOK_SCRIPT_NAME),
+            "second SessionStart command runs our policy-hook script"
+        );
+
+        // The policy script GETs the policy-context route, reads the seam env,
+        // and — the load-bearing difference from every other bundled hook —
+        // PRINTS the runner's response, because its stdout IS the injection.
+        let policy_text = std::fs::read_to_string(&policy_script_path).unwrap();
+        assert!(policy_text.contains("/policy-context"));
+        assert!(policy_text.contains("QONTINUI_RUNNER_API_PORT"));
+        assert!(policy_text.contains("QONTINUI_TERMINAL_ID"));
+        assert!(
+            policy_text.contains("printf '%s' \"$resp\""),
+            "the response is printed VERBATIM — the script builds no JSON"
+        );
+
+        // The confirmation hook stays silent. If this script ever grows a
+        // stdout write, Claude would try to read it as a hook envelope and the
+        // two SessionStart commands would fight over the same channel.
+        assert!(
+            !script_text.contains("printf '%s' \"$resp\""),
+            "claude_session_hook.sh must keep its silent-stdout contract"
+        );
 
         // The DELIVERY never writes to / reads from the user's config: both
         // materialized files live under the runner's own app-data dir (the
