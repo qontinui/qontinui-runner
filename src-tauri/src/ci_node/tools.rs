@@ -642,17 +642,6 @@ pub(crate) async fn provision(
         // binaries land.
         let resolved = resolve(spec, &tool.version, host_triple())?;
         let dir = tool_dir(root, spec.name, &tool.version);
-        // `dir` is built from a MANIFEST-supplied version, and since the cache
-        // is now removed rather than left in place, that value gates a
-        // RECURSIVE DELETE. `manifest::validate_tool_version` is what keeps it
-        // to `[A-Za-z0-9._+-]` with no `..`; this assertion is here so the two
-        // files cannot drift apart silently.
-        debug_assert!(
-            dir.starts_with(tools_cache_root(root)),
-            "tool dir {} escaped the cache root {}",
-            dir.display(),
-            tools_cache_root(root).display()
-        );
         let bin_dir = resolved.bin_dir_at(&dir);
 
         // A cache directory is either adopted whole or REMOVED whole. The
@@ -698,7 +687,7 @@ pub(crate) async fn provision(
                     "[ci-node] tool {} {} — cached copy failed verification ({e}); reinstalling",
                     spec.name, tool.version
                 ));
-                remove_cache_dir(&dir)?;
+                remove_cache_dir(&dir, &tools_cache_root(root))?;
             }
             None => {
                 // Present but with no runnable primary: a half-deleted or
@@ -713,7 +702,7 @@ pub(crate) async fn provision(
                         "[ci-node] tool {} {} — cache dir has no runnable {}; removing",
                         spec.name, tool.version, resolved.primary
                     ));
-                    remove_cache_dir(&dir)?;
+                    remove_cache_dir(&dir, &tools_cache_root(root))?;
                 }
             }
         }
@@ -759,7 +748,34 @@ pub(crate) async fn provision(
 /// than the wedge this function exists to prevent, and one that did not exist
 /// before the wedge fix. A concurrent `remove_dir_all` can also surface
 /// `NotFound` for an inner entry mid-walk, which is the same benign story.
-fn remove_cache_dir(dir: &Path) -> Result<(), String> {
+fn remove_cache_dir(dir: &Path, cache_root: &Path) -> Result<(), String> {
+    // A REAL guard, not a `debug_assert!`.
+    //
+    // `dir` is built from a MANIFEST-supplied version, and this commit series
+    // is what turned that value from "protects a URL and a cache key" into
+    // "protects a RECURSIVE DELETE". `manifest::validate_tool_version` is what
+    // actually keeps it to `[A-Za-z0-9._+-]` with no `..`; this is the
+    // belt-and-braces check that keeps the two files from drifting apart.
+    //
+    // Two things it does NOT do, both learned the hard way. It is not a
+    // `debug_assert!`, because `[profile.release]` does not enable debug
+    // assertions and a check that compiles out of the shipped runner guards
+    // nothing. And it does not rely on `starts_with` alone, because that is a
+    // LEXICAL component-prefix test: `.ci-tools/node/../../evil` starts_with
+    // `.ci-tools` and would sail through — vacuous against exactly the
+    // traversal it claims to catch. The `ParentDir` scan is what makes the
+    // pair sound.
+    let escapes = !dir.starts_with(cache_root)
+        || dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if escapes {
+        return Err(format!(
+            "refusing to remove {}: it is not a plain path under the tool cache {}",
+            dir.display(),
+            cache_root.display()
+        ));
+    }
     match std::fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
         // Already gone — a concurrent dispatch won the race. That is the
@@ -1092,7 +1108,8 @@ fn copy_bounded(
             // Refuse BEFORE writing the overflowing chunk, so a bomb cannot
             // put even one byte past the ceiling on a user's disk.
             return Err(format!(
-                "archive expands past the {MAX_EXTRACTED_BYTES}-byte ceiling — refusing                  (decompression bomb)"
+                "archive expands past the {MAX_EXTRACTED_BYTES}-byte ceiling \
+                 — refusing (decompression bomb)"
             ));
         }
         out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
@@ -1512,6 +1529,20 @@ fn materialize_links(dest: &Path, links: &[LinkEntry], url: &str) -> Result<(), 
     Ok(())
 }
 
+/// The launcher's body.
+///
+/// Split out as a pure function on purpose: the write path around it is
+/// `#[cfg(unix)]`, so on the Windows dev box every test of it takes the
+/// refusal arm and the body's shape would go unexercised on the platform most
+/// of this fleet's development happens on. This is testable everywhere.
+///
+/// The target is interpolated raw, which is only sound because
+/// [`symlink_target_is_contained`] has already restricted it to
+/// `[A-Za-z0-9._/-]` — no character in that set means anything to `sh`.
+fn launcher_body(target: &str) -> String {
+    format!("#!/bin/sh\nexec \"$(dirname \"$0\")/{target}\" \"$@\"\n")
+}
+
 /// Write the launcher itself. Unix-only by construction: the curated Windows
 /// asset is a zip and zip link entries are refused outright, so a link entry
 /// reaching a non-Unix host is an unreviewed archive shape and refuses rather
@@ -1523,8 +1554,8 @@ fn write_link_launcher(dest: &Path, rel: &Path, target: &str) -> Result<(), Stri
     }
     #[cfg(unix)]
     {
-        let body = format!("#!/bin/sh\nexec \"$(dirname \"$0\")/{target}\" \"$@\"\n");
-        std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+        std::fs::write(&path, launcher_body(target))
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod {}: {e}", path.display()))?;
@@ -1866,13 +1897,29 @@ pub(super) async fn run_capture_env(
         // overrides a config `index-url`, but `extra-index-url`, `find-links`,
         // `trusted-host` and `pre` are ADDITIVE and survive, so a box with an
         // internal mirror configured still had a dependency-confusion surface.
-        // Pointing the variable at the null device is the documented way to
-        // make pip load no config file at all, which is what "where a
-        // distribution comes from is a property of this registry" requires.
+        // Setting the variable to the null device is the documented way to make
+        // pip load no config file at all.
+        //
+        // THE SPELLING IS LOAD-BEARING AND MUST BE LOWERCASE. pip's skip is an
+        // exact string comparison, not a path resolution
+        // (`_internal/configuration.py::_load_config_files`):
+        //
+        //     if config_files[kinds.ENV][0:1] == [os.devnull]:
+        //         return   # this return is what skips GLOBAL and SITE too
+        //
+        // and `os.devnull` on Windows is `'nul'`, lowercase (`ntpath.py`).
+        // `"NUL" != "nul"`, so an uppercase value never fires that return:
+        // measured with this repo's own Python, `PIP_CONFIG_FILE=NUL` gives
+        // `devnull match: False` and still loads the GLOBAL and SITE configs —
+        // i.e. exactly the additive `extra-index-url`/`find-links`/
+        // `trusted-host` this is here to neutralise. Only the USER config gets
+        // suppressed, incidentally, because `iter_config_files` drops USER
+        // whenever the variable is set at all. With `nul` the match is True and
+        // nothing is loaded. POSIX `/dev/null` matches exactly and is fine.
         cmd.env(
             "PIP_CONFIG_FILE",
             if cfg!(target_os = "windows") {
-                "NUL"
+                "nul"
             } else {
                 "/dev/null"
             },
@@ -3096,30 +3143,55 @@ mod tests {
         }
     }
 
-    /// A hostile target must not reach the launcher body even end-to-end.
+    /// A hostile target must not reach the launcher body end-to-end — and
+    /// this test has to FAIL if the charset check is removed.
+    ///
+    /// Two details make it discriminating rather than decorative.
+    ///
+    /// First, the archive ships a DECOY whose file name is literally the
+    /// payload. `safe_tree_path` permits shell metacharacters in entry NAMES —
+    /// only the launcher body cares — so without the charset check the link
+    /// resolves to a real regular file and a launcher IS written, and the
+    /// `expect_err` below blows up. An earlier version omitted the decoy and
+    /// passed either way, because `materialize_links` then refused with "did
+    /// not provide as a regular file", a message that shares the `refusing`
+    /// substring with the refusal actually under test.
+    ///
+    /// Second, the payload's metacharacters are `;` and a space rather than a
+    /// quote. Both are equally special to `sh`, but a quote is an ILLEGAL
+    /// FILENAME CHARACTER ON WINDOWS, so a quote-bearing decoy cannot be
+    /// created there at all (`os error 123`) and the test would fail for a
+    /// filesystem reason on the dev box instead of proving anything. `;` and
+    /// space are legal in Windows filenames, so this discriminates on both
+    /// platforms. The quote-bearing payloads are covered by
+    /// `link_targets_with_shell_metacharacters_are_refused`, which is pure and
+    /// needs no filesystem.
     #[test]
     fn injection_target_is_refused_by_the_extractor() {
         let root = "pkg-1.0.0";
+        const PAYLOAD: &str = "../lib/real.js; touch pwned";
         let archive = targz(&[
             file("pkg-1.0.0/lib/real.js", b"x"),
-            (
-                "pkg-1.0.0/bin/tool",
-                tar::EntryType::Symlink,
-                "../lib/real.js\"; touch pwned; \"",
-                b"",
-            ),
+            // The decoy: a real file at exactly the path the payload names, so
+            // the chain check cannot be what refuses this.
+            file("pkg-1.0.0/lib/real.js; touch pwned", b"decoy"),
+            ("pkg-1.0.0/bin/tool", tar::EntryType::Symlink, PAYLOAD, b""),
         ]);
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = extract_tree(
-            &archive,
-            ArchiveKind::TarGz,
-            root,
-            &dir.path().join("dest"),
-            "test://inject",
-        )
-        .unwrap_err();
-        assert!(err.contains("refusing"), "got: {err}");
-        assert!(!dir.path().join("pwned").exists());
+        let dest = dir.path().join("dest");
+        let err = extract_tree(&archive, ArchiveKind::TarGz, root, &dest, "test://inject")
+            .expect_err("a metacharacter-bearing target must be refused");
+        assert!(
+            err.contains("escapes the extraction root"),
+            "must be refused by containment+charset, not by the chain check: {err}"
+        );
+        // The decoy proves the chain check would have been satisfied…
+        assert!(
+            dest.join("lib").join("real.js; touch pwned").is_file(),
+            "the decoy must exist, or this test proves nothing"
+        );
+        // …and no launcher exists, so nothing can carry the payload to a shell.
+        assert!(!dest.join("bin").join("tool").exists());
     }
 
     /// Every other chain test asserts a REFUSAL, so this one asserts the
@@ -3206,12 +3278,37 @@ mod tests {
     #[test]
     fn removing_an_already_removed_cache_dir_is_not_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("cache");
+        let root = dir.path();
+        let target = root.join("cache");
         std::fs::create_dir_all(target.join("nested")).expect("mkdir");
-        remove_cache_dir(&target).expect("first removal");
+        remove_cache_dir(&target, root).expect("first removal");
         assert!(!target.exists());
         // The loser of the race calls this on a path that no longer exists.
-        remove_cache_dir(&target).expect("NotFound must not fail the dispatch");
+        remove_cache_dir(&target, root).expect("NotFound must not fail the dispatch");
+    }
+
+    /// The delete guard must catch a path that only LOOKS contained.
+    /// `starts_with` alone is a lexical component-prefix test, so it accepts
+    /// `<root>/node/../../evil` — the ParentDir scan is the half that works.
+    #[test]
+    fn the_delete_guard_refuses_a_path_that_escapes_the_cache_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("cache");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        let sneaky = root.join("node").join("..").join("..").join("evil");
+        // It passes the lexical prefix test…
+        assert!(sneaky.starts_with(&root), "precondition for the test");
+        // …and is still refused.
+        let err = remove_cache_dir(&sneaky, &root).unwrap_err();
+        assert!(err.contains("not a plain path"), "got: {err}");
+
+        // A path outside the root entirely is refused too.
+        let outside = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        let err = remove_cache_dir(&outside, &root).unwrap_err();
+        assert!(err.contains("not a plain path"), "got: {err}");
+        assert!(outside.exists(), "nothing outside the root may be deleted");
     }
 
     /// The two messages a user actually hits — unpinned version, tampered
@@ -3226,5 +3323,51 @@ mod tests {
         );
         assert!(msg.contains("reviewed SHA-256"), "{msg}");
         assert!(msg.contains("add its digests"), "{msg}");
+
+        // The decompression-bomb refusal is the other one a user can hit, and
+        // it was mangled in the very commit that fixed the first two — the
+        // earlier version of this test only exercised `resolve`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut out = std::fs::File::create(dir.path().join("o")).expect("create");
+        let mut budget = 1u64;
+        let msg = copy_bounded(&mut &b"toolong"[..], &mut out, &mut budget)
+            .expect_err("over budget must refuse");
+        assert!(
+            !msg.contains("   "),
+            "message carries baked-in indentation: {msg:?}"
+        );
+        assert!(msg.contains("decompression bomb"), "{msg}");
+    }
+
+    /// The launcher body, exercised on EVERY platform — the write path around
+    /// it is Unix-only, so without this its shape is untested on the dev box.
+    #[test]
+    fn launcher_body_has_a_constant_shape() {
+        const PREFIX: &str = "#!/bin/sh\nexec \"$(dirname \"$0\")/";
+        for target in [
+            "../lib/node_modules/npm/bin/npm-cli.js",
+            "../lib/node_modules/corepack/dist/corepack.js",
+            "real",
+        ] {
+            let body = launcher_body(target);
+            // Exactly two lines, and the target sits inside the quoted word,
+            // so it can never become a second command.
+            assert_eq!(body.lines().count(), 2, "{body}");
+            assert!(body.starts_with(PREFIX), "{body}");
+            assert!(body.ends_with("\" \"$@\"\n"), "{body}");
+            let interpolated = body
+                .trim_start_matches(PREFIX)
+                .split('"')
+                .next()
+                .expect("quoted word");
+            assert_eq!(interpolated, target);
+            // Nothing a shell treats as special can have survived into it.
+            assert!(
+                interpolated
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')),
+                "{interpolated}"
+            );
+        }
     }
 }
