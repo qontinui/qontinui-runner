@@ -3699,8 +3699,30 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             webview_recovery::attach_process_failed_handler(&win);
                         }
                         Err(e) => {
+                            // Fatal on purpose, and now covers one more case
+                            // than it used to: `build_main_window` folds its
+                            // post-build webview probe into this `Err`, so a
+                            // main window that came up with NO webview aborts
+                            // startup instead of running blind behind a window
+                            // that can never render anything.
+                            //
+                            // What that costs, recorded because it is a real
+                            // trade and not a free win: this `return` leaves
+                            // the setup closure BEFORE the MCP API server is
+                            // spawned (below, ~"Start MCP API server in
+                            // background"), so the process exits with nothing
+                            // listening on the API port. Previously a hollow
+                            // main window still served `/health` and the UI
+                            // Bridge, so the supervisor-visible signature was
+                            // "up but errored"; it is now "gone" — a spawn
+                            // failure with no port to probe. That is the
+                            // honest signature for a runner that can never
+                            // render its UI (an errored-but-listening runner
+                            // still gets discovered and handed work), but it
+                            // does mean the diagnostic surface for this class
+                            // is the LOG line above, never an HTTP probe.
                             error!("Failed to create main window: {}", e);
-                            return Err(Box::new(e));
+                            return Err(e.into());
                         }
                     }
 

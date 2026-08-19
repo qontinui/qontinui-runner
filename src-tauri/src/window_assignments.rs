@@ -32,8 +32,9 @@
 //!   for any unknown session id, so unassigned tabs render in the main window —
 //!   backward-compatible with the single-window world.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -119,6 +120,36 @@ pub struct WindowClose {
 pub struct WindowAssignments {
     path: PathBuf,
     inner: Mutex<WindowAssignmentsState>,
+    /// Pop-out labels handed out by [`WindowAssignments::reserve_popout_label`]
+    /// that have **no persisted record** — a window whose webview is mid-build,
+    /// or one whose build failed.
+    ///
+    /// In-memory only and deliberately never persisted: a label burned by a
+    /// failed build must be reusable after a restart.
+    ///
+    /// Why it exists: `term-N` is derived as `max(N) + 1` over the *records*
+    /// (see [`next_popout_label`]), so today it is allocated by the very act of
+    /// inserting the record. Plan `2026-08-10-popout-webview2-creation-failure`
+    /// Phase 3 moves record insertion to **after** a successful build, which
+    /// would otherwise let two concurrent `open_terminal_window` calls derive
+    /// the same label while neither has committed a record. The reservation set
+    /// closes that window: allocation stays atomic, while nothing is persisted
+    /// until the webview is proven.
+    ///
+    /// A reservation is **never handed back** on failure, and that is
+    /// deliberate. Tauri inserts a window into its own registry the moment
+    /// `build()` returns `Ok` (`tauri` 2.11.1 `src/manager/webview.rs`,
+    /// `attach_webview`) and never removes a *webview-less* one — no wry-side
+    /// window exists, so no `Destroyed` event can ever fire for it. Rebuilding
+    /// the same label would therefore fail with
+    /// `Error::WebviewLabelAlreadyExists` (`src/manager/webview.rs:437`) for the
+    /// rest of the process's life. Burning the label costs a monotonically
+    /// higher `N` on the next attempt — exactly what the pre-Phase-3 code did,
+    /// minus the persisted record that survived reboots.
+    reserved_labels: Mutex<HashSet<WindowLabel>>,
+    /// Sequence for the poisoned-`inner`-lock fallback label only. See
+    /// [`WindowAssignments::fallback_label`].
+    fallback_seq: AtomicU64,
 }
 
 impl WindowAssignments {
@@ -133,6 +164,8 @@ impl WindowAssignments {
         Ok(Self {
             path,
             inner: Mutex::new(state),
+            reserved_labels: Mutex::new(HashSet::new()),
+            fallback_seq: AtomicU64::new(0),
         })
     }
 
@@ -167,46 +200,100 @@ impl WindowAssignments {
         true
     }
 
-    /// Allocate the next monotonic `term-N` label and insert a pop-out window
-    /// record. Persists and returns the new record (the command layer creates
-    /// the actual `WebviewWindow` and emits `window-opened`).
-    pub fn create_window(
+    /// Reserve the next monotonic `term-N` label **without persisting
+    /// anything**.
+    ///
+    /// The returned label collides with neither an existing record nor any
+    /// other outstanding reservation. It stays reserved until
+    /// [`Self::create_reserved_window`] commits it as a record — and if the
+    /// window is never built, it stays reserved (burned) for the rest of the
+    /// process's life, which is required, not sloppy: see
+    /// [`WindowAssignments::reserved_labels`].
+    ///
+    /// Plan `2026-08-10-popout-webview2-creation-failure` Phase 3: a pop-out
+    /// record must not be persisted until its webview is *proven*, so the label
+    /// has to be allocatable independently of the record. A plain read-only
+    /// "peek" would not do — two concurrent opens would peek the same `N`.
+    pub fn reserve_popout_label(&self) -> WindowLabel {
+        // Lock order in this module: `reserved_labels` BEFORE `inner`. Every
+        // method that takes both must use this order.
+        let mut reserved = match self.reserved_labels.lock() {
+            Ok(r) => r,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let label = match self.inner.lock() {
+            Ok(s) => next_popout_label(&s.windows, &reserved),
+            Err(e) => {
+                // Poisoned lock: still hand back a usable, unique label so the
+                // caller can proceed, just not a monotonic `term-N` one.
+                warn!(error = %e, "window_assignments: lock poisoned on reserve_popout_label");
+                self.fallback_label()
+            }
+        };
+        reserved.insert(label.clone());
+        label
+    }
+
+    /// The label handed out when the `inner` lock is poisoned and the normal
+    /// `max(N) + 1` derivation is unavailable.
+    ///
+    /// A process-lifetime [`AtomicU64`], not a wall clock. The wall-clock
+    /// spelling this replaced (`term-<unix_millis>`) collides outright for two
+    /// reservations inside the same millisecond, and the collision is
+    /// **silent**: `HashSet::insert` returns `false` and both callers walk away
+    /// believing they hold the label, after which the second `build()` fails
+    /// with `WebviewLabelAlreadyExists` for no visible reason. A counter cannot
+    /// do that.
+    ///
+    /// The `fallback-` infix keeps these out of the monotonic namespace on
+    /// purpose: [`next_popout_label`] parses the suffix as `u32`, so a
+    /// `fallback-` label is skipped rather than becoming a `max(N)` that all
+    /// later labels have to climb past.
+    fn fallback_label(&self) -> WindowLabel {
+        let n = self.fallback_seq.fetch_add(1, AtomicOrdering::Relaxed);
+        format!("{POPOUT_LABEL_PREFIX}fallback-{n}")
+    }
+
+    /// Commit a label reserved by [`Self::reserve_popout_label`] as a real
+    /// pop-out record. Persists and returns the record (the command layer emits
+    /// `window-opened`).
+    pub fn create_reserved_window(
         &self,
+        label: WindowLabel,
         title: Option<String>,
         geometry: Option<WindowGeometry>,
         bound_page: Option<String>,
         now_ms: i64,
     ) -> WindowRecord {
-        let (record, snapshot) = {
+        let record = WindowRecord {
+            label: label.clone(),
+            kind: WindowKind::PopOut,
+            title,
+            geometry,
+            bound_page,
+            created_at: now_ms,
+        };
+        let snapshot = {
+            // Same lock order as `reserve_popout_label`.
+            let mut reserved = match self.reserved_labels.lock() {
+                Ok(r) => r,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             let mut s = match self.inner.lock() {
                 Ok(s) => s,
                 Err(e) => {
-                    // Poisoned lock: still return a usable label derived from
-                    // the count so the caller can proceed; persistence is
-                    // skipped this round.
-                    warn!(error = %e, "window_assignments: lock poisoned on create_window");
-                    let label = format!("{POPOUT_LABEL_PREFIX}{}", now_ms);
-                    return WindowRecord {
-                        label,
-                        kind: WindowKind::PopOut,
-                        title,
-                        geometry,
-                        bound_page,
-                        created_at: now_ms,
-                    };
+                    // The reservation is deliberately NOT released here. The
+                    // window this label names WAS built — releasing it would
+                    // hand the same label to the next open, whose `build()`
+                    // then fails with `WebviewLabelAlreadyExists`. Persistence
+                    // is what is lost on this path, not the allocation.
+                    warn!(error = %e, "window_assignments: lock poisoned on create_reserved_window");
+                    return record;
                 }
             };
-            let label = next_popout_label(&s.windows);
-            let record = WindowRecord {
-                label: label.clone(),
-                kind: WindowKind::PopOut,
-                title,
-                geometry,
-                bound_page,
-                created_at: now_ms,
-            };
-            s.windows.insert(label, record.clone());
-            (record, s.clone())
+            s.windows.insert(label.clone(), record.clone());
+            reserved.remove(&label);
+            s.clone()
         };
         self.persist(&snapshot);
         record
@@ -522,9 +609,18 @@ impl WindowAssignments {
 /// Next monotonic `term-N` label: one greater than the highest existing
 /// `term-N` (so labels are stable and reused on restore — a closed `term-2`
 /// frees its number only if it's the highest). Starts at `term-1`.
-fn next_popout_label(windows: &HashMap<WindowLabel, WindowRecord>) -> WindowLabel {
+///
+/// The highest `N` in use counts **both** committed records and outstanding
+/// reservations. Reservations must be included or two concurrent opens would
+/// derive the same label while neither has persisted a record yet — see
+/// [`WindowAssignments::reserved_labels`].
+fn next_popout_label(
+    windows: &HashMap<WindowLabel, WindowRecord>,
+    reserved: &HashSet<WindowLabel>,
+) -> WindowLabel {
     let max_n = windows
         .keys()
+        .chain(reserved.iter())
         .filter_map(|k| k.strip_prefix(POPOUT_LABEL_PREFIX))
         .filter_map(|n| n.parse::<u32>().ok())
         .max()
@@ -572,6 +668,25 @@ mod tests {
         (dir, wa)
     }
 
+    /// Reserve + commit in one step, for the tests that only need a pop-out
+    /// record to exist and do not care about the two-phase split.
+    ///
+    /// This used to be a production method (`WindowAssignments::create_window`).
+    /// Phase 3 of `2026-08-10-popout-webview2-creation-failure` left it with no
+    /// production callers — a record must not be persisted until its window's
+    /// webview is proven — so it moved here rather than surviving as a public
+    /// API nothing ships (delete-over-deprecate).
+    fn create_window(
+        wa: &WindowAssignments,
+        title: Option<String>,
+        geometry: Option<WindowGeometry>,
+        bound_page: Option<String>,
+        now_ms: i64,
+    ) -> WindowRecord {
+        let label = wa.reserve_popout_label();
+        wa.create_reserved_window(label, title, geometry, bound_page, now_ms)
+    }
+
     #[test]
     fn owner_of_defaults_to_main() {
         let (_d, wa) = store();
@@ -582,11 +697,42 @@ mod tests {
     fn create_window_allocates_monotonic_term_labels() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let a = wa.create_window(None, None, None, 10);
-        let b = wa.create_window(None, None, None, 20);
+        let a = create_window(&wa, None, None, None, 10);
+        let b = create_window(&wa, None, None, None, 20);
         assert_eq!(a.label, "term-1");
         assert_eq!(b.label, "term-2");
         assert_eq!(a.kind, WindowKind::PopOut);
+    }
+
+    /// The poisoned-lock fallback must be unique and must not poison the
+    /// monotonic namespace.
+    ///
+    /// The `term-<unix_millis>` spelling this replaced failed both: two
+    /// reservations in the same millisecond produced the *same* label, and
+    /// `HashSet::insert` swallowed the collision silently — two callers would
+    /// each believe they held it, and the second `build()` would fail with
+    /// `WebviewLabelAlreadyExists` for no visible reason.
+    #[test]
+    fn the_poisoned_lock_fallback_label_is_unique_and_out_of_band() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+
+        // Back to back — the wall-clock spelling collided exactly here.
+        let a = wa.fallback_label();
+        let b = wa.fallback_label();
+        assert_ne!(a, b, "two fallback labels in the same instant must differ");
+
+        // And a fallback label must not become the `max(N)` every later
+        // `term-N` has to climb past.
+        let mut reserved = HashSet::new();
+        reserved.insert(a);
+        reserved.insert(b);
+        assert_eq!(
+            next_popout_label(&HashMap::new(), &reserved),
+            "term-1",
+            "a fallback label is outside the numeric namespace, so it does not \
+             advance the monotonic counter"
+        );
     }
 
     #[test]
@@ -609,7 +755,7 @@ mod tests {
     fn close_window_reassigns_all_its_sessions_to_main() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, None, 10);
+        let w = create_window(&wa, None, None, None, 10);
         wa.assign_session("sess-A", &w.label);
         wa.assign_session("sess-B", &w.label);
         wa.assign_session("sess-C", "term-2"); // a different window
@@ -644,21 +790,21 @@ mod tests {
         {
             let wa = WindowAssignments::open(&path).unwrap();
             wa.ensure_main(1);
-            let w = wa.create_window(Some("Pop 1".into()), None, None, 10);
+            let w = create_window(&wa, Some("Pop 1".into()), None, None, 10);
             wa.assign_session("sess-A", &w.label);
         }
         let wa = WindowAssignments::open(&path).unwrap();
         assert_eq!(wa.owner_of("sess-A"), "term-1");
         assert!(wa.snapshot().windows.contains_key("term-1"));
         // Next allocation continues monotonically after restore.
-        assert_eq!(wa.create_window(None, None, None, 20).label, "term-2");
+        assert_eq!(create_window(&wa, None, None, None, 20).label, "term-2");
     }
 
     #[test]
     fn update_geometry_persists_only_on_change() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, None, 10);
+        let w = create_window(&wa, None, None, None, 10);
         let g = WindowGeometry {
             x: 100,
             y: 200,
@@ -685,8 +831,8 @@ mod tests {
     fn pop_out_records_excludes_main() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        wa.create_window(None, None, None, 10);
-        wa.create_window(None, None, None, 20);
+        create_window(&wa, None, None, None, 10);
+        create_window(&wa, None, None, None, 20);
         let pops = wa.pop_out_records();
         assert_eq!(pops.len(), 2);
         assert!(pops.iter().all(|r| r.kind == WindowKind::PopOut));
@@ -697,7 +843,7 @@ mod tests {
     fn reconcile_orphans_reassigns_dangling_owners_to_main() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, None, 10); // term-1 exists
+        let w = create_window(&wa, None, None, None, 10); // term-1 exists
         wa.assign_session("sess-live", &w.label); // valid owner
         wa.assign_session("sess-orphan", "term-7"); // term-7 never existed
         let reassigned = wa.reconcile_orphans();
@@ -712,7 +858,7 @@ mod tests {
     fn has_assigned_sessions_reflects_owner_map() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, None, 10); // term-1, no sessions yet
+        let w = create_window(&wa, None, None, None, 10); // term-1, no sessions yet
         assert!(
             !wa.has_assigned_sessions(&w.label),
             "a freshly-created pop-out owns no sessions"
@@ -735,8 +881,8 @@ mod tests {
     fn is_page_bound_is_true_only_for_windows_with_a_bound_page() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let bound = wa.create_window(None, None, Some("page-A".to_string()), 10);
-        let per_id = wa.create_window(None, None, None, 20);
+        let bound = create_window(&wa, None, None, Some("page-A".to_string()), 10);
+        let per_id = create_window(&wa, None, None, None, 20);
 
         assert!(
             wa.is_page_bound(&bound.label),
@@ -760,9 +906,9 @@ mod tests {
     fn prune_empty_pop_outs_removes_only_session_less_popouts() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let empty1 = wa.create_window(None, None, None, 10); // term-1, empty
-        let live = wa.create_window(None, None, None, 20); // term-2, will hold a session
-        let empty2 = wa.create_window(None, None, None, 30); // term-3, empty
+        let empty1 = create_window(&wa, None, None, None, 10); // term-1, empty
+        let live = create_window(&wa, None, None, None, 20); // term-2, will hold a session
+        let empty2 = create_window(&wa, None, None, None, 30); // term-3, empty
         wa.assign_session("sess-live", &live.label);
 
         let mut pruned = wa.prune_empty_pop_outs();
@@ -784,8 +930,8 @@ mod tests {
     fn clear_session_owners_then_prune_removes_all_popouts_on_boot() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let a = wa.create_window(None, None, None, 10);
-        let b = wa.create_window(None, None, None, 20);
+        let a = create_window(&wa, None, None, None, 10);
+        let b = create_window(&wa, None, None, None, 20);
         // Simulate the persisted (now-stale) owner map from a prior session.
         wa.assign_session("dead-tid-1", &a.label);
         wa.assign_session("dead-tid-2", &b.label);
@@ -812,8 +958,8 @@ mod tests {
     fn prune_empty_pop_outs_noop_when_all_have_sessions() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let a = wa.create_window(None, None, None, 10);
-        let b = wa.create_window(None, None, None, 20);
+        let a = create_window(&wa, None, None, None, 10);
+        let b = create_window(&wa, None, None, None, 20);
         wa.assign_session("s1", &a.label);
         wa.assign_session("s2", &b.label);
         assert!(wa.prune_empty_pop_outs().is_empty());
@@ -826,9 +972,9 @@ mod tests {
         wa.ensure_main(1);
         // A page-bound pop-out owns NO session_owner entry (it claims terminals
         // by page_id) yet must survive the prune.
-        let bound = wa.create_window(None, None, Some("page-A".into()), 10);
+        let bound = create_window(&wa, None, None, Some("page-A".into()), 10);
         // A per-id pop-out with no sessions is genuinely empty → pruned.
-        let empty = wa.create_window(None, None, None, 20);
+        let empty = create_window(&wa, None, None, None, 20);
 
         let pruned = wa.prune_empty_pop_outs();
         assert_eq!(pruned, vec![empty.label.clone()]);
@@ -844,9 +990,9 @@ mod tests {
         {
             let wa = WindowAssignments::open(&path).unwrap();
             wa.ensure_main(1);
-            wa.create_window(None, None, Some("page-A".into()), 10); // page-bound
-            wa.create_window(None, None, None, 20); // per-id, will be empty on boot
-                                                    // Simulate the prior session's (now-stale) owner map.
+            create_window(&wa, None, None, Some("page-A".into()), 10); // page-bound
+            create_window(&wa, None, None, None, 20); // per-id, will be empty on boot
+                                                      // Simulate the prior session's (now-stale) owner map.
             wa.assign_session("dead-tid", "term-2");
         }
         // Reopen (process restart) and run the boot sweep order from

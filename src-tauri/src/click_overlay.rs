@@ -26,7 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Whether the overlay window has been initialized.
 static OVERLAY_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -216,8 +216,57 @@ pub fn initialize_overlay(app_handle: &tauri::AppHandle) -> Result<(), String> {
     {
         builder = builder.transparent(true);
     }
+
+    // Same WebView2 environment as this runner's main window (isolated
+    // user-data folder + browser args). Without it Tauri forces the PRIMARY's
+    // `%LOCALAPPDATA%\com.qontinui.runner` profile root on this overlay, which
+    // on a secondary runner fails with `HRESULT(0x8007139F)`.
+    builder = crate::webview_recovery::apply_main_window_env_options(builder);
+
     match builder.build() {
-        Ok(_window) => {
+        Ok(window) => {
+            // `build()` returning `Ok` proves nothing about the webview — see
+            // `webview_recovery::verify_window_has_a_webview`.
+            //
+            // What a probe failure means HERE, decided deliberately rather
+            // than copied from the pop-out path: the overlay is a passive
+            // click-visualisation surface, so the failure must not take
+            // anything else down — the error goes back to the caller and
+            // nothing else is touched.
+            //
+            // It is **not** retryable, and an earlier version of this comment
+            // claimed it was. Tauri registered the window on `build()`'s `Ok`
+            // (`tauri` 2.11.1 `src/manager/webview.rs`, `attach_webview`) and
+            // only drops a registration on a `Destroyed` event wry can never
+            // emit for a window it never created, so the `click-overlay` label
+            // is burned for the life of the process: a second
+            // `initialize_overlay` re-enters `WebviewWindowBuilder::new` and
+            // fails with `Error::WebviewLabelAlreadyExists`
+            // (`src/manager/webview.rs:436-438`).
+            //
+            // `OVERLAY_INITIALIZED` therefore stays `false` for **honesty, not
+            // recovery**, and that is still the right value: the early-return
+            // at the top would otherwise make every later `initialize_overlay`
+            // return `Ok` over an overlay that can never draw. Leaving it
+            // `false` turns those calls into a loud `WebviewLabelAlreadyExists`
+            // instead. What it does NOT do — the benefit the old comment
+            // claimed — is stop the highlight path drawing into nothing:
+            // `show_click_highlight` never reads this flag. It looks the window
+            // up with `get_webview_window`, finds the hollow registration, and
+            // `eval`s fire-and-forget into a webview that does not exist. Only
+            // destroying the hollow registration could fix that, and there is
+            // nothing to destroy. Nothing is written to `ui_error` — see the
+            // "no backend writer" section of `crate::ui_error`.
+            if let Err(e) =
+                crate::webview_recovery::verify_window_has_a_webview(&window, "click-overlay")
+            {
+                error!("{e}");
+                return Err(e);
+            }
+            // A webview that is created and later DIES is a different failure
+            // from one that was never created, and the point-in-time probe
+            // above structurally cannot see it.
+            crate::webview_recovery::attach_non_main_process_failed_handler(&window);
             OVERLAY_INITIALIZED.store(true, Ordering::Relaxed);
             info!("Click overlay window initialized");
             // Note: Click-through behavior is achieved via Tauri's transparent(true)

@@ -21,6 +21,59 @@
 //! writes coalesce repeat occurrences of the same `message`/`digest` into
 //! a single record with an incrementing `count` and a sliding
 //! `reported_at` timestamp while preserving `first_seen`.
+//!
+//! # There is deliberately NO backend writer into this state
+//!
+//! **Decision recorded 2026-08-19**, plan
+//! `2026-08-10-popout-webview2-creation-failure` Phase 3, after review of a
+//! first cut that added one (`report_from_backend`, since deleted). The
+//! function is gone; this is why, so nobody re-adds it as an obvious
+//! convenience. `ui_error_has_exactly_one_writer` pins it as a test.
+//!
+//! `ui_error` is not a general "something went wrong in the UI" channel. It
+//! means one specific thing — *the React error boundary at the top of the main
+//! window's component tree caught an unhandled error* — and three properties
+//! follow from that meaning, all of which a backend writer breaks:
+//!
+//! 1. **It is a latch with exactly one clear path, and that path is the
+//!    frontend's.** The only clearer is [`clear_ui_error`], invoked from
+//!    `src/ErrorBoundary.tsx`'s `componentDidUpdate` behind
+//!    `prevState.hasError && !this.state.hasError`. A fresh mount starts
+//!    `hasError === false`, so that transition can *never* fire for an error
+//!    the boundary did not itself raise. Anything the backend writes here is
+//!    therefore latched for the **lifetime of the process**.
+//! 2. **Every consumer reads it as "the main window's tree is dead."**
+//!    `mcp_api.rs`'s `/health` maps any `ui_error` to
+//!    `derived_status: "errored"` (via [`compute_derived_status`]) and
+//!    `mcp::ui_bridge::request` maps it to `FrontendState::TreeCrashed`, i.e.
+//!    `frontendReady: false`. Downstream of that, qontinui-web's dispatcher
+//!    refuses to auto-select the runner (503 `runner_unhealthy`), the runner
+//!    disappears from every picker, and the supervisor attributes later dev
+//!    actions as `D3Category::Contradiction`.
+//! 3. **So a non-main webview failure written here is both a permanent latch
+//!    and a lie** — it takes an otherwise-healthy runner out of the fleet's
+//!    dispatch pool, forever, because one pop-out window failed. On the pop-out
+//!    defect this plan is about, that would have broken the very UI-Bridge
+//!    readiness the plan exists to restore.
+//!
+//! What the backend uses instead, per failure class:
+//!
+//! * **A window that was built without a webview** — the builder returns `Err`
+//!   (`webview_recovery::verify_window_has_a_webview`), which is loud where it
+//!   belongs: the interactive pop-out path logs `tracing::error!` and fails the
+//!   `open_terminal_window` invoke back to the caller that asked for the
+//!   window; boot-restore logs and skips; the *main* window's builder makes it
+//!   fatal to startup and to the recovery ladder's terminal rung. D4's
+//!   "loud, never silently successful" is satisfied by the `Err` + the log, not
+//!   by a health latch.
+//! * **A non-main webview that later dies** — an `error!` log line naming the
+//!   window (`webview_recovery::attach_non_main_process_failed_handler`).
+//! * **The MAIN window's UI dying** — already covered, and by a signal with the
+//!   properties a health signal needs: [`ui_dead_now`] over
+//!   `ui_bridge_last_pong`. It is **self-clearing** (the next pong retracts it)
+//!   and it is **attributed to the right window** (only the main window's
+//!   frontend pongs). That is the shape a backend-observed health signal has to
+//!   have; `ui_error` is not it.
 
 use std::sync::Arc;
 
@@ -669,5 +722,214 @@ mod tests {
             obj["first_seen"].is_string(),
             "DateTime serializes as ISO8601 string"
         );
+    }
+
+    /// **`ui_error` has exactly one writer, and it is the frontend.**
+    ///
+    /// A tripwire for the decision recorded in this module's "There is
+    /// deliberately NO backend writer" section. The convenience of routing a
+    /// Rust-side UI failure into this state is obvious and the cost is not —
+    /// it is a permanent, mis-attributed latch that takes a healthy runner out
+    /// of the fleet's dispatch pool — so the ban is asserted rather than
+    /// commented.
+    ///
+    /// Scope, stated honestly. [`ui_error_writer_hits`] matches on the
+    /// **verb prefix** (`report…` / `clear…`) after any of the three ways this
+    /// state is reachable — `x.ui_error.…`, `x.ui_error().…` (the accessor at
+    /// `commands::compartments`) and `crate::ui_error::…` — so every *named*
+    /// wrapper is caught, not just the bare call. That matters: the writer
+    /// this guard was written to keep out was called `report_from_backend`,
+    /// and the first cut of this test banned the literal `"ui_error.report("`,
+    /// whose mandatory `(` let `report_from_backend` through under two of its
+    /// three spellings. Symmetry matters for the same reason — a backend
+    /// *clear* silently un-latches a genuine ErrorBoundary crash, which is
+    /// worse than a spurious report, so `clear` is banned exactly as hard.
+    ///
+    /// What it still does NOT catch, so nobody mistakes it for a proof: a
+    /// writer that first binds the `Arc` to a differently-named local
+    /// (`let s = st.ui_error(); s.report(…)`), or one that reaches
+    /// `UiErrorState` through a re-export under another module path. It is a
+    /// tripwire; the module doc is the real authority.
+    #[test]
+    fn ui_error_has_exactly_one_writer() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push((
+                        path.display().to_string(),
+                        std::fs::read_to_string(&path).expect("read source"),
+                    ));
+                }
+            }
+        }
+
+        // From CARGO_MANIFEST_DIR, never the CWD: a test binary run from the
+        // wrong directory would otherwise scan nothing and pass vacuously.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(
+            files.len() > 20,
+            "source walk found only {} files — the walk is broken, not the crate",
+            files.len()
+        );
+
+        let mut scanned = 0usize;
+        // Collected, not asserted per-line: a run that fails must name EVERY
+        // writer it found, so one mutation replay answers "which spellings are
+        // caught?" in a single run instead of one recompile per spelling.
+        let mut writers: Vec<String> = Vec::new();
+        for (name, body) in &files {
+            if name.ends_with("ui_error.rs") {
+                continue;
+            }
+            scanned += 1;
+            for (i, line) in body.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                for hit in ui_error_writer_hits(code) {
+                    writers.push(format!("{name}:{}: {hit}", i + 1));
+                }
+            }
+        }
+        assert!(
+            writers.is_empty(),
+            "backend writers of ui_error found:\n  {}\n\n`ui_error` means \"the React error \
+             boundary caught an unhandled error in the MAIN window's tree\": it is a \
+             process-lifetime latch whose only clear path is the frontend's own \
+             `clear_ui_error`, and every consumer turns it into `derived_status: errored` + \
+             `frontendReady: false`, which removes the runner from qontinui-web's dispatch \
+             pool. A backend *clear* is worse still — it silently un-latches a real crash. A \
+             backend-observed failure needs a self-clearing, correctly-attributed signal \
+             instead — see this module's \"There is deliberately NO backend writer\" section.",
+            writers.join("\n  ")
+        );
+        assert!(
+            scanned > 20,
+            "scanned only {scanned} files besides ui_error.rs"
+        );
+    }
+
+    /// Every `ui_error` **writer** spelling on one line of source.
+    ///
+    /// Matches `…ui_error.<fn>`, `…ui_error().<fn>` and `…ui_error::<fn>`
+    /// (including a `use …::{a, b}` group) and reports a hit when `<fn>`
+    /// starts with `report` or `clear` — the two mutating verbs on
+    /// [`UiErrorState`]. **Prefix, never a trailing `(`**: see
+    /// `ui_error_has_exactly_one_writer`'s doc for why.
+    ///
+    /// The anchor must be a whole identifier, so `has_ui_error`,
+    /// `ui_error_snapshot` and `gather_ui_error_signals` are not matches. The
+    /// only exemption is `ui_error::report_ui_error` / `ui_error::clear_ui_error`
+    /// — the FRONTEND's own `#[tauri::command]`s, named once in `main.rs`'s
+    /// `invoke_handler` list. Those are the sanctioned writer, not a bypass.
+    fn ui_error_writer_hits(code: &str) -> Vec<String> {
+        const ANCHOR: &str = "ui_error";
+        const WRITE_VERBS: [&str; 2] = ["report", "clear"];
+        const FRONTEND_COMMANDS: [&str; 2] = ["report_ui_error", "clear_ui_error"];
+
+        fn is_ident(c: char) -> bool {
+            c.is_ascii_alphanumeric() || c == '_'
+        }
+
+        let mut hits = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = code[from..].find(ANCHOR) {
+            let start = from + rel;
+            let after = start + ANCHOR.len();
+            from = after;
+
+            if code[..start].chars().next_back().is_some_and(is_ident) {
+                continue;
+            }
+            let rest = &code[after..];
+            if rest.starts_with(is_ident) {
+                continue;
+            }
+
+            let (rest, accessor) = match rest.strip_prefix("()") {
+                Some(r) => (r, "()"),
+                None => (rest, ""),
+            };
+            let (rest, sep) = if let Some(r) = rest.strip_prefix("::") {
+                (r, "::")
+            } else if let Some(r) = rest.strip_prefix('.') {
+                (r, ".")
+            } else {
+                continue;
+            };
+
+            // `use crate::ui_error::{report_from_backend, UiError};`
+            let names: Vec<&str> = match rest.strip_prefix('{') {
+                Some(group) => group.split([',', '}']).map(str::trim).collect(),
+                None => vec![rest],
+            };
+            for name in names {
+                let ident: String = name.chars().take_while(|c| is_ident(*c)).collect();
+                if ident.is_empty() || !WRITE_VERBS.iter().any(|v| ident.starts_with(v)) {
+                    continue;
+                }
+                if sep == "::" && FRONTEND_COMMANDS.contains(&ident.as_str()) {
+                    continue;
+                }
+                hits.push(format!("{ANCHOR}{accessor}{sep}{ident}"));
+            }
+        }
+        hits
+    }
+
+    /// The matcher's own truth table — the replay that
+    /// `ui_error_has_exactly_one_writer` is only as good as.
+    ///
+    /// The first four rows are the exact spellings a pre-PR review replayed
+    /// against the `"ui_error.report("` version of the guard, where rows 2-4
+    /// were **missed**; rows 2 and 3 name `report_from_backend`, the very
+    /// function the guard exists to keep out. Row 5 is the backend *clear*,
+    /// which is worse than a backend report and which the old guard also
+    /// missed. Do not delete a row to make a change pass.
+    #[test]
+    fn the_writer_guard_catches_every_known_bypass() {
+        for banned in [
+            "        app_state.ui_error.report(m).await;",
+            "        app_state.ui_error.report_from_backend(m).await;",
+            "        crate::ui_error::report_from_backend(&app, m).await;",
+            "        app_state.ui_error().clear().await;",
+            "        app_state.ui_error.clear_from_backend().await;",
+            "        state.app_state.ui_error().report_from_backend(m).await;",
+            "    use crate::ui_error::{report_from_backend, UiError};",
+        ] {
+            assert!(
+                !ui_error_writer_hits(banned.trim_start()).is_empty(),
+                "writer slipped past the guard: {banned}"
+            );
+        }
+
+        // Reads, unrelated identifiers and the frontend's own commands are NOT
+        // writers. A guard that fires on these gets deleted by the next person
+        // who trips it, which is how a real guard dies.
+        for allowed in [
+            "let ui_error_snapshot = app_state.ui_error.get().await;",
+            "let has_ui_error = state.app_state.ui_error.get().await.is_some();",
+            "let ui_error = gather_ui_error_signals(&state, last_pong, age).await;",
+            "ui_error::clear_ui_error,",
+            "ui_error::report_ui_error,",
+            "ui_error::get_ui_error,",
+            "use crate::ui_error::UiError;",
+            "use crate::ui_error::{compute_derived_status, ui_stale};",
+            "let expression = \"invoke(\\\"report_ui_error\\\", {stack: \\\"at A\\\"})\";",
+            "pub ui_error: Arc<crate::ui_error::UiErrorState>,",
+            "\"ui_error\": ui_error_json,",
+        ] {
+            assert!(
+                ui_error_writer_hits(allowed).is_empty(),
+                "false positive — this is not a writer: {allowed} => {:?}",
+                ui_error_writer_hits(allowed)
+            );
+        }
     }
 }
