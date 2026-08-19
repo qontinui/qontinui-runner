@@ -3128,6 +3128,17 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                  JWT (sub_type={other:?}) — skipping coord-mcp provisioning for \
                  {workdir} (would 401 against coord's EdDSA verifier)"
             );
+            // Breadcrumb: this is the 2026-08-05 Service-token case. The session
+            // otherwise learns it has no coord identity only when a claim-gated
+            // tool refuses, mid-task. Name the OBSERVED sub_type so the session
+            // can self-diagnose (`service` ⇒ it inherited a foreign bearer).
+            write_degraded_breadcrumb(
+                workdir,
+                &format!(
+                    "bearer sub_type={} is not device/agent — coord-mcp NOT provisioned",
+                    other.unwrap_or("<absent>")
+                ),
+            );
             return;
         }
     }
@@ -3137,6 +3148,22 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
             "coord_mcp: {workdir}/.mcp.json already holds a non-coord-mcp \
              config — leaving it untouched (no coord-mcp provisioning)"
         );
+        // Breadcrumb: the shared-root / foreign-config inheritance case — the one
+        // that supplied the wrong (Service) bearer on 2026-08-05.
+        //
+        // ONLY when the workdir ends up with no coord-mcp server at all.
+        // `coord_mcp_safe_to_write` also returns false for two cases that leave
+        // the session BETTER off than a device provision would: an existing
+        // agent-JWT coord-mcp config (the no-downgrade guard) and a secondary
+        // runner declining the primary's shared-root config. Breadcrumbing those
+        // would drop a permanent, never-cleared "UNREACHABLE" line into a session
+        // whose coord-mcp works — a false alarm is worse than no breadcrumb.
+        if !workdir_declares_coord_mcp(workdir) {
+            write_degraded_breadcrumb(
+                workdir,
+                "workdir .mcp.json declares no coord-mcp and is not ours to rewrite — not provisioned",
+            );
+        }
         return;
     }
 
@@ -5410,6 +5437,114 @@ mod tests {
         );
         let port = read_proxy_port(&wd);
         assert_eq!(port, Some(34567), "config must carry the passed bound port");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A bearer whose `sub_type` is neither `device` nor `agent` — the 2026-08-05
+    /// tenant `SubType::Service` case — must leave a session-readable breadcrumb
+    /// NAMING the observed `sub_type`, not just a `tracing::info!` the session
+    /// cannot see. Without it the session discovers it has no coord identity only
+    /// when a claim-gated tool refuses, mid-task.
+    #[test]
+    fn non_device_agent_bearer_writes_a_degraded_breadcrumb_naming_the_sub_type() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let svc = {
+            let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"service"}"#);
+            format!("h.{payload}.s")
+        };
+        let d = std::env::temp_dir().join(format!("coord-mcp-svc-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        let wd = d.to_string_lossy().to_string();
+
+        provision_coord_mcp_with_jwt(&wd, &svc, Some(19876));
+
+        assert!(
+            !d.join(".mcp.json").exists(),
+            "a Service bearer must still NOT be written (would 401 coord's verifier)"
+        );
+        let crumb = std::fs::read_to_string(d.join(COORD_MCP_STATUS_FILE))
+            .expect("the sub_type skip must leave a session-readable breadcrumb");
+        assert!(
+            crumb.contains("coord-mcp UNREACHABLE") && crumb.contains("/gate"),
+            "breadcrumb must be the actionable degraded line: {crumb}"
+        );
+        assert!(
+            crumb.contains("sub_type=service"),
+            "breadcrumb must NAME the observed sub_type so the session self-diagnoses: {crumb}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The shared-root / foreign-config inheritance case: the workdir already
+    /// holds someone else's `.mcp.json` (which is how the wrong bearer arrived on
+    /// 2026-08-05). We correctly leave it alone — and must now say so where the
+    /// session can read it.
+    #[test]
+    fn foreign_mcp_json_workdir_writes_a_degraded_breadcrumb() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let dev = {
+            let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#);
+            format!("h.{payload}.s")
+        };
+        let d = std::env::temp_dir().join(format!("coord-mcp-foreign-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        let wd = d.to_string_lossy().to_string();
+        // A user's own config with NO coord-mcp entry → not ours to rewrite.
+        let foreign = r#"{"mcpServers":{"some-other":{"type":"http","url":"https://x/mcp"}}}"#;
+        std::fs::write(d.join(".mcp.json"), foreign).unwrap();
+
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+
+        assert_eq!(
+            std::fs::read_to_string(d.join(".mcp.json")).unwrap(),
+            foreign,
+            "the user's own config must be preserved verbatim"
+        );
+        let crumb = std::fs::read_to_string(d.join(COORD_MCP_STATUS_FILE))
+            .expect("the non-clobber skip must leave a session-readable breadcrumb");
+        assert!(
+            crumb.contains("coord-mcp UNREACHABLE") && crumb.contains("/gate"),
+            "breadcrumb must be the actionable degraded line: {crumb}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ...but NOT a false alarm. The no-downgrade guard also refuses a device
+    /// write into a workdir that already holds a working AGENT coord-mcp config.
+    /// That session's coord-mcp is fine — and nothing would ever clear a
+    /// breadcrumb dropped here (no probe runs on this path), so it would be a
+    /// permanent lie. Assert the breadcrumb is withheld.
+    #[test]
+    fn existing_agent_coord_mcp_config_gets_no_false_degraded_breadcrumb() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let mk = |sub_type: &str| {
+            let payload =
+                URL_SAFE_NO_PAD.encode(format!(r#"{{"sub_type":"{sub_type}"}}"#).as_bytes());
+            format!("h.{payload}.s")
+        };
+        let d = std::env::temp_dir().join(format!("coord-mcp-nodown-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        let wd = d.to_string_lossy().to_string();
+        let agent_cfg = format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"https://c/mcp","headers":{{"Authorization":"Bearer {}"}}}}}}}}"#,
+            mk("agent")
+        );
+        std::fs::write(d.join(".mcp.json"), &agent_cfg).unwrap();
+
+        provision_coord_mcp_with_jwt(&wd, &mk("device"), Some(19876));
+
+        assert_eq!(
+            std::fs::read_to_string(d.join(".mcp.json")).unwrap(),
+            agent_cfg,
+            "a device bearer must not downgrade an existing agent-JWT config"
+        );
+        assert!(
+            !d.join(COORD_MCP_STATUS_FILE).exists(),
+            "a workdir that already declares coord-mcp must NOT get an UNREACHABLE breadcrumb"
+        );
 
         let _ = std::fs::remove_dir_all(&d);
     }

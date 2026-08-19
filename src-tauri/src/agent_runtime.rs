@@ -3670,6 +3670,48 @@ async fn acquire_continuation_workdir(
     Ok((workdir, None, uuid::Uuid::now_v7()))
 }
 
+/// Resolve this runner's ACTUALLY-BOUND API port from managed Tauri state, via
+/// the process-global `AppHandle` (background tasks get no `AppHandle`
+/// parameter). Same read the terminal continuation path performs inline —
+/// `AppState.api_port`, never the `QONTINUI_PORT`/`MCP_API_PORT` env default,
+/// which is wrong on every secondary/temp runner.
+///
+/// `None` means the port is genuinely unresolvable (no Tauri runtime, or
+/// `AppState` not managed yet). Callers MUST keep failing closed on `None`; do
+/// not substitute a default.
+pub(crate) fn resolve_bound_api_port() -> Option<u16> {
+    use tauri::Manager;
+    crate::tauri_app_handle::current().and_then(|app| {
+        app.try_state::<Arc<crate::commands::AppState>>()
+            .map(|s| crate::mcp::types::runner_api_port(s.inner()))
+    })
+}
+
+/// The `bound_port` argument the headless gate continuation hands to coord-mcp
+/// provisioning.
+///
+/// Exists as its own function (with an INJECTED resolver) because the defect it
+/// closes was a hardcoded `None` at the call site: the headless path passed
+/// `None` unconditionally, so the device arm of `provision_coord_mcp_with_jwt`
+/// hit its unresolvable-port refusal every time and that path never provisioned
+/// anything. A literal at a call site is untestable; a resolver seam is not.
+fn headless_continuation_bound_port(resolve: impl FnOnce() -> Option<u16>) -> Option<u16> {
+    let port = resolve();
+    match port {
+        Some(p) => info!(
+            "agent_runtime: headless gate-continuation: resolved bound API port {p} \
+             for coord-mcp provisioning"
+        ),
+        None => warn!(
+            "agent_runtime: headless gate-continuation: bound API port is \
+             unresolvable (no managed AppState) — coord-mcp provisioning will \
+             fail closed; the session gets a degraded breadcrumb, not a config \
+             pointing at a dead port"
+        ),
+    }
+    port
+}
+
 /// Run a gate continuation as a headless `claude` child (the existing
 /// subprocess flow), posting `spawn-complete` on first successful spawn and
 /// `spawn-failed` on a non-zero / failed exit. Mirrors the agent-spawn path's
@@ -3686,10 +3728,17 @@ async fn run_continuation_headless(
     let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
     // Provision coord-mcp for the headless session so it receives coord's
     // session-start `instructions` preamble and can call coord_declare_intent —
-    // parity with the terminal continuation path (which provisions the bound_port
-    // proxy shape). Headless has no bound port → `None` selects the device-JWT
-    // static-bearer shape.
-    crate::coord_mcp::provision_coord_mcp_for_session(workdir, None);
+    // parity with the terminal continuation path.
+    //
+    // The bearer is the runner's DEVICE JWT, so provisioning takes the device
+    // arm and writes the loopback PROXY shape, which needs the ACTUALLY-BOUND
+    // API port. Resolve it from managed Tauri state exactly as the terminal
+    // continuation does; when no `AppState` is reachable this stays `None` and
+    // provisioning fails closed (refuses the write + drops a degraded
+    // breadcrumb) rather than emitting a config pointing at the bootstrap
+    // default `:9876`, which is dead on any secondary/temp runner.
+    let bound_port = headless_continuation_bound_port(resolve_bound_api_port);
+    crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
     match spawn_claude_child(workdir, initial_prompt).await {
         Ok(mut child) => {
             let pid = child.id().map(|p| p as i64);
@@ -5960,6 +6009,50 @@ mod tests {
         assert!(
             res.is_err(),
             "terminal arm must Err (not panic / not silently drop) with no AppHandle"
+        );
+    }
+
+    /// The headless gate-continuation must hand coord-mcp provisioning a REAL
+    /// resolved bound port — not the hardcoded `None` it passed before, which
+    /// made the device arm refuse the write every single time (that path had
+    /// therefore never provisioned anything).
+    ///
+    /// Pairs with `coord_mcp::device_path_with_bound_port_writes_proxy_and_no_
+    /// synchronous_breadcrumb`, which proves the other half: a `Some(port)`
+    /// reaching `provision_coord_mcp_with_jwt` writes the proxy `.mcp.json` on
+    /// exactly that port.
+    #[test]
+    fn headless_continuation_passes_the_resolved_port_through() {
+        assert_eq!(
+            headless_continuation_bound_port(|| Some(19_876)),
+            Some(19_876),
+            "a resolvable bound port must reach provisioning verbatim (the write happens)"
+        );
+    }
+
+    /// ...and where the port is GENUINELY unresolvable the headless path must
+    /// still fail closed: `None` in, `None` out. Substituting a default (`:9876`)
+    /// would write a dead-but-valid-looking proxy config on any secondary/temp
+    /// runner — the F1 root cause. Downstream, `provision_coord_mcp_with_jwt`
+    /// turns this `None` into a refusal + a degraded breadcrumb.
+    #[test]
+    fn headless_continuation_stays_fail_closed_on_an_unresolvable_port() {
+        assert_eq!(
+            headless_continuation_bound_port(|| None),
+            None,
+            "an unresolvable port must NOT be defaulted — provisioning must refuse"
+        );
+    }
+
+    /// The production resolver itself: with no Tauri runtime (this unit-test
+    /// context has no process-global `AppHandle`) it must return `None` rather
+    /// than fabricating the env/bootstrap default port.
+    #[test]
+    fn resolve_bound_api_port_is_none_without_a_tauri_runtime() {
+        let port = resolve_bound_api_port();
+        assert_eq!(
+            port, None,
+            "no AppHandle ⇒ no managed AppState ⇒ the port is UNKNOWN, never a default"
         );
     }
 
