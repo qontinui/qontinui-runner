@@ -637,18 +637,30 @@ fn deliver_compliance_nudge(
     }
     // Compare-and-set: two Stops racing for one session must not both deliver.
     // Losing the claim means another turn already sent it — allow this stop.
-    if !crate::mcp::session_compliance::mark_nudged(&nudge.session_id, nudge.max_attempts) {
+    //
+    // The claim is per `(session, class)`. Before that, the marker was keyed on
+    // the session alone, which made the classes mutually exclusive: the first
+    // one to fire permanently suppressed the other, so a session that got a
+    // report nudge could never be told it skipped the policy pull.
+    if !crate::mcp::session_compliance::mark_nudged(
+        &nudge.session_id,
+        nudge.class,
+        nudge.max_attempts,
+    ) {
         return None;
     }
     cap_registry().record(&cap_key, now);
-    // Names the attempt, because the string is operator-visible in both the
-    // verdict log and `VerdictResponse.reason` — "nudging once" on attempt 3
-    // of 3 is exactly the kind of confidently-wrong line this whole feature
-    // exists to stop producing.
-    let attempt = crate::mcp::session_compliance::nudge_attempts_reported(&nudge.session_id);
+    // Names the class AND the attempt, because the string is operator-visible in
+    // both the verdict log and `VerdictResponse.reason` — "nudging once" on
+    // attempt 3 of 3 is exactly the kind of confidently-wrong line this whole
+    // feature exists to stop producing, and an unnamed class makes two
+    // independent budgets read as one.
+    let attempt =
+        crate::mcp::session_compliance::nudge_attempts_reported(&nudge.session_id, nudge.class);
     let reason = format!(
         "session-compliance: verdict `unverified` with a non-empty coord footprint \
-         — nudge {attempt} of {}",
+         — {} nudge {attempt} of {}",
+        nudge.class.as_str(),
         nudge.max_attempts
     );
     // The same one-line-per-Stop verdict log the continuation arm writes, so
@@ -1076,11 +1088,16 @@ mod tests {
     // independent of `FLAG_ENV`, and the per-session claim is only counted on
     // real delivery.
 
-    use crate::mcp::session_compliance::ComplianceNudge;
+    use crate::mcp::session_compliance::{ComplianceNudge, NudgeClass};
 
     fn nudge_for(session: &str) -> ComplianceNudge {
+        nudge_of(session, NudgeClass::Report)
+    }
+
+    fn nudge_of(session: &str, class: NudgeClass) -> ComplianceNudge {
         ComplianceNudge {
             session_id: session.to_string(),
+            class,
             prompt: "produce the block".to_string(),
             // 1 keeps these cases on the historical once-per-session cap, so
             // they still assert what they were written to assert.
@@ -1132,7 +1149,11 @@ mod tests {
         assert_eq!(v.mode, "off");
         assert_eq!(v.prompt.as_deref(), Some("produce the block"));
         // Delivery consumed the session's only claim at max_attempts=1.
-        assert!(!crate::mcp::session_compliance::mark_nudged(key, 1));
+        assert!(!crate::mcp::session_compliance::mark_nudged(
+            key,
+            NudgeClass::Report,
+            1
+        ));
     }
 
     #[test]
@@ -1149,7 +1170,7 @@ mod tests {
         // The per-session claim must NOT have been burned by a nudge the
         // cap swallowed — a later turn is still allowed to deliver it.
         assert!(
-            crate::mcp::session_compliance::mark_nudged(key, 1),
+            crate::mcp::session_compliance::mark_nudged(key, NudgeClass::Report, 1),
             "cap suppression must leave the session's nudge claim unconsumed"
         );
     }
@@ -1157,7 +1178,50 @@ mod tests {
     #[test]
     fn a_session_already_nudged_is_not_nudged_again() {
         let key = "cv-already-nudged";
-        assert!(crate::mcp::session_compliance::mark_nudged(key, 1));
+        assert!(crate::mcp::session_compliance::mark_nudged(
+            key,
+            NudgeClass::Report,
+            1
+        ));
         assert!(deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On).is_none());
+    }
+
+    /// THE regression this phase exists to prevent, asserted at the DELIVERY
+    /// seam: exhausting one class's budget must not suppress the other's.
+    ///
+    /// Under the old session-only marker key the second delivery here returned
+    /// `None` — a session that had been nudged about its report could never be
+    /// told it had skipped the policy pull, and the operator surface read clean
+    /// while a whole verification arm was dead.
+    #[test]
+    fn one_exhausted_nudge_class_does_not_suppress_the_other() {
+        let key = "cv-class-independence";
+
+        let first =
+            deliver_compliance_nudge(key, Some(nudge_of(key, NudgeClass::Report)), Mode::On)
+                .expect("the report nudge delivers");
+        assert!(
+            first.reason.contains("report nudge 1 of 1"),
+            "{}",
+            first.reason
+        );
+
+        // That class is now spent...
+        assert!(
+            deliver_compliance_nudge(key, Some(nudge_of(key, NudgeClass::Report)), Mode::On)
+                .is_none(),
+            "the report class is capped at 1"
+        );
+
+        // ...and the OTHER class is untouched.
+        let second =
+            deliver_compliance_nudge(key, Some(nudge_of(key, NudgeClass::PolicyPull)), Mode::On)
+                .expect("the policy-pull nudge must still deliver");
+        assert_eq!(second.decision, "block");
+        assert!(
+            second.reason.contains("policy_pull nudge 1 of 1"),
+            "the reason must name the class, so two budgets never read as one: {}",
+            second.reason
+        );
     }
 }

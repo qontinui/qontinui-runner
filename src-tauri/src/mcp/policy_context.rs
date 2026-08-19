@@ -68,6 +68,35 @@
 //! never blocks a session start. Mirrors [`crate::session::claude_hook`]'s
 //! posture, where a materialize failure just omits `--settings`.
 //!
+//! ## Attribution — the read is recorded against the SESSION, not the terminal
+//!
+//! Every coord fetch carries `?via=session_start_injection` and, when the hook
+//! supplied a parseable one, `X-Coord-Caller-Session: <claude session id>`.
+//! Coord records the read in `coord.session_policy_reads` and the compliance
+//! reconciler reads those rows to answer "did this session pull policy?".
+//!
+//! Two ids are in play and they are NOT interchangeable. The route's path
+//! segment is the runner TERMINAL id (what `resolve_session_key` returns); the
+//! header carries the CLAUDE session id, which the hook script lifts from the
+//! `SessionStart` stdin payload and passes as its own query param. One terminal
+//! hosts several Claude sessions in sequence, so attributing a read to the
+//! terminal id would file every one of them under the same session. The runner's
+//! device JWT is what makes coord's fail-closed `session_on_device` binding
+//! accept the header at all — that is why an injection is attributable.
+//!
+//! No id, or an unparseable one, means NO header: coord records
+//! `claude_session_id = NULL`, which the compliance signal reads as
+//! `unavailable`. Never fabricated, never substituted with the terminal id — a
+//! fabricated provenance value is worse than an admitted gap, because the
+//! reconciler reads that column as fact.
+//!
+//! ## Caching does not suppress recording
+//!
+//! See [`fetch_payload`]. The 45 s cache exists to avoid re-fetching ~8 KB of
+//! body, not to make a session's pull invisible — so when there is a session to
+//! attribute to, both coord reads go out on every call, CONDITIONALLY, and coord
+//! answers 304 while still recording the read.
+//!
 //! ## Transport — the agent door, never the operator door
 //!
 //! All fetches go to `/coord/agent-prompt-documents{,/{kind}/{name}}`, coord's
@@ -115,6 +144,19 @@ const CACHE_TTL: Duration = Duration::from_secs(45);
 /// unrecognised one. `startup` is the conservative read: it is the case that
 /// definitely needs the policy.
 const DEFAULT_SOURCE: &str = "startup";
+
+/// The `?via=` marker coord's agent door maps to
+/// `session_policy_reads.source = 'session_start_injection'`.
+///
+/// Physically the same HTTP door any agent reads through; semantically a
+/// distinct event — the RUNNER reading on a session's behalf and injecting the
+/// result into that session's context. It must count as the session having
+/// pulled policy, because under this phase that is precisely what happened.
+///
+/// Coord honours only this exact literal and degrades anything else to
+/// `http_door`, so the two spellings are one contract (coord:
+/// `PolicyReadSource::from_http_via`).
+const VIA_MARKER: &str = "session_start_injection";
 
 // ===========================================================================
 // Mode (pure) — mirrors `continuation_verdict::Mode` exactly
@@ -171,10 +213,10 @@ impl Mode {
 /// to the caller's tenant from the bearer — never pass a tenant here.
 ///
 /// Same shape as `prompt_library::list_url`, which is the settled builder for
-/// this door; only the `kind` differs.
+/// this door; only the `kind` and the [`VIA_MARKER`] differ.
 fn list_url(base: &str) -> String {
     format!(
-        "{}/coord/agent-prompt-documents?kind={KIND}",
+        "{}/coord/agent-prompt-documents?kind={KIND}&via={VIA_MARKER}",
         base.trim_end_matches('/')
     )
 }
@@ -187,10 +229,58 @@ fn list_url(base: &str) -> String {
 /// slash a path-traversing one). Slug-shaped names encode to themselves.
 fn document_url(base: &str, name: &str) -> String {
     format!(
-        "{}/coord/agent-prompt-documents/{KIND}/{}",
+        "{}/coord/agent-prompt-documents/{KIND}/{}?via={VIA_MARKER}",
         base.trim_end_matches('/'),
         urlencoding::encode(name)
     )
+}
+
+/// Attach the session-attribution header, or send bare.
+///
+/// Coord validates this header FAIL-CLOSED (`agent_sessions::session_on_device`)
+/// against the device the runner's JWT identifies, which is the whole reason an
+/// injection is attributable at all: the runner is a trusted device asserting
+/// "this read was for session S", and coord checks that S really is bound here.
+///
+/// `None` sends nothing. Coord then records `claude_session_id = NULL`, which
+/// the compliance signal reads as `unavailable` — an admitted blind spot, never
+/// a non-compliance verdict. **Never fabricate an id and never substitute the
+/// runner terminal id**: the terminal id is a different id space, and seating it
+/// in coord's durable provenance column would manufacture attribution that the
+/// reconciler then reads as fact.
+fn attach_attribution(
+    req: reqwest::RequestBuilder,
+    session: Option<uuid::Uuid>,
+) -> reqwest::RequestBuilder {
+    match session {
+        Some(s) => req.header(crate::coord_mcp::CALLER_SESSION_HEADER, s.to_string()),
+        None => req,
+    }
+}
+
+/// Parse the hook-supplied Claude session id for attribution.
+///
+/// Strict UUID parse, no repair and no fallback. The route hands whatever the
+/// hook extracted from the `SessionStart` stdin payload; anything that is not a
+/// UUID is simply no attribution. This is the ONLY place a session id enters the
+/// fetch path, which is what makes "never fabricate one" checkable.
+pub fn parse_attribution_session(raw: Option<&str>) -> Option<uuid::Uuid> {
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    match uuid::Uuid::parse_str(raw) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            // `debug`, not `warn`: a session id the runner cannot parse is a
+            // degraded ATTRIBUTION, not a degraded injection — the session still
+            // gets its policy, and the honest downstream reading is
+            // `unavailable`.
+            debug!(
+                value = %raw,
+                error = %e,
+                "policy-context: claude_session_id is not a UUID — fetching without attribution"
+            );
+            None
+        }
+    }
 }
 
 // ===========================================================================
@@ -446,10 +536,28 @@ fn parse_document_version(body: &Value) -> Option<i64> {
 
 struct CacheEntry {
     at: Instant,
-    /// The list response's `ETag`, replayed as `If-None-Match` so a warm cache
-    /// costs coord a 304 instead of a full list + hydration.
-    etag: Option<String>,
+    /// The LIST response's `ETag`, replayed as `If-None-Match` so a warm cache
+    /// costs coord a 304 instead of a full list.
+    list_etag: Option<String>,
+    /// The `session-protocol` DOCUMENT response's `ETag`, replayed the same way.
+    ///
+    /// This one is what makes the recording round-trip affordable: the body is
+    /// ~8 KB and the validator is ~20 bytes, so a warm cache re-reads the
+    /// protocol for the price of a 304 — see the module docs on caching vs
+    /// recording.
+    doc_etag: Option<String>,
     payload: PolicyPayload,
+}
+
+/// What the cache holds for one coord base.
+#[derive(Default)]
+struct CacheSnapshot {
+    /// The payload, when it is still within [`CACHE_TTL`].
+    fresh: Option<PolicyPayload>,
+    /// The payload at any age — what gets served when coord is unreachable.
+    any: Option<PolicyPayload>,
+    list_etag: Option<String>,
+    doc_etag: Option<String>,
 }
 
 /// Keyed on the resolved coord base URL.
@@ -465,42 +573,37 @@ fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// `(fresh payload, replayable etag, any cached payload)` for `base`.
-fn cache_snapshot(base: &str) -> (Option<PolicyPayload>, Option<String>, Option<PolicyPayload>) {
+fn cache_snapshot(base: &str) -> CacheSnapshot {
     let Ok(g) = cache().lock() else {
-        return (None, None, None);
+        return CacheSnapshot::default();
     };
     let Some(entry) = g.get(base) else {
-        return (None, None, None);
+        return CacheSnapshot::default();
     };
-    let fresh = if entry.at.elapsed() < CACHE_TTL {
-        Some(entry.payload.clone())
-    } else {
-        None
-    };
-    (fresh, entry.etag.clone(), Some(entry.payload.clone()))
+    CacheSnapshot {
+        fresh: (entry.at.elapsed() < CACHE_TTL).then(|| entry.payload.clone()),
+        any: Some(entry.payload.clone()),
+        list_etag: entry.list_etag.clone(),
+        doc_etag: entry.doc_etag.clone(),
+    }
 }
 
-fn cache_store(base: &str, etag: Option<String>, payload: PolicyPayload) {
+fn cache_store(
+    base: &str,
+    list_etag: Option<String>,
+    doc_etag: Option<String>,
+    payload: PolicyPayload,
+) {
     if let Ok(mut g) = cache().lock() {
         g.insert(
             base.to_string(),
             CacheEntry {
                 at: Instant::now(),
-                etag,
+                list_etag,
+                doc_etag,
                 payload,
             },
         );
-    }
-}
-
-/// On a 304, refresh the TTL stamp so the next 45s serve straight from cache
-/// without another conditional round-trip.
-fn cache_touch(base: &str) {
-    if let Ok(mut g) = cache().lock() {
-        if let Some(entry) = g.get_mut(base) {
-            entry.at = Instant::now();
-        }
     }
 }
 
@@ -508,79 +611,135 @@ fn cache_touch(base: &str) {
 // Coord fetch (every failure ⇒ Err ⇒ the fail-open notice)
 // ===========================================================================
 
-/// Fetch the injection payload for `base`, serving the 45s cache when warm.
+/// What one conditional fetch of the LIST came back as.
+enum ListOutcome {
+    /// 304 — the cached index still stands, and coord recorded the read.
+    NotModified,
+    Fresh {
+        index: Vec<PolicyDocSummary>,
+        etag: Option<String>,
+    },
+    /// Transport error, non-2xx, or an undecodable body. Carries the HUMAN
+    /// reason that would be rendered into the fail-open notice.
+    Failed(String),
+}
+
+/// What one conditional fetch of `policy/session-protocol` came back as.
+enum ProtocolOutcome {
+    /// 304 — the cached body still stands, and coord recorded the read. This is
+    /// the arm the whole conditional-fetch design exists to produce.
+    NotModified,
+    Fresh {
+        body: String,
+        version: Option<i64>,
+        etag: Option<String>,
+    },
+    Failed(String),
+}
+
+/// Fetch the injection payload for `base`.
+///
+/// ## Caching and RECORDING are separate concerns (the crux)
+///
+/// The 45 s cache exists to avoid re-FETCHING ~8 KB of document bodies. It must
+/// NOT suppress coord's record of the read, because that record is the only
+/// evidence a session ever pulled policy — and a cache that silenced it would
+/// make the compliance signal blind on precisely the warm-cache session starts
+/// that are the common case, reporting "never pulled" about sessions the runner
+/// had just handed the policy to.
+///
+/// So when there is a session to attribute the read to, BOTH coord reads go out
+/// on EVERY call, conditionally (`If-None-Match` against the stored validators).
+/// Coord answers 304 with an empty payload — and records a 304 as a real read on
+/// both doors, deliberately: a conditional re-poll IS a read, the caller now
+/// holds current content verified against coord's own ETag, and counting it
+/// otherwise would make a well-behaved caching client look less compliant than a
+/// naive one. Net cost per session start: two near-empty round-trips, which is
+/// exactly the granularity wanted.
+///
+/// The TTL still short-circuits when there is NO attribution — a NULL-attributed
+/// row is unusable by the signal, so the round-trip would buy nothing and the
+/// cache's original purpose stands unchanged.
 ///
 /// `Err(reason)` is a HUMAN reason that gets rendered verbatim into the
 /// fail-open notice, so it must name what went wrong, not just that something
 /// did.
-async fn fetch_payload(base: &str) -> Result<PolicyPayload, String> {
-    let (fresh, etag, any_cached) = cache_snapshot(base);
-    if let Some(payload) = fresh {
-        debug!("policy-context: served from cache");
-        return Ok(payload);
+async fn fetch_payload(
+    base: &str,
+    attribution: Option<uuid::Uuid>,
+) -> Result<PolicyPayload, String> {
+    let snap = cache_snapshot(base);
+    if attribution.is_none() {
+        if let Some(payload) = snap.fresh.clone() {
+            debug!(
+                "policy-context: served from cache — no attributable session, so the \
+                 recording round-trip would buy nothing"
+            );
+            return Ok(payload);
+        }
     }
 
     let client = crate::mcp::continuation_verdict::http_client()?;
 
-    // Conditional list fetch. `coord_get` attaches the device bearer itself
-    // (re-read per call — the JWT has a short TTL) and drives the data-plane
+    // Both reads go out. `coord_get` attaches the device bearer itself (re-read
+    // per call — the JWT has a short TTL) and drives the data-plane
     // auth-coverage metric, which is why the caller's `coord_client_parts`
     // token is used only to detect "unpaired" and is not threaded down here:
     // one credential source, read as late as possible.
-    let mut req = crate::coord_http::coord_get(&client, list_url(base));
-    if let Some(etag) = etag {
-        req = req.header(reqwest::header::IF_NONE_MATCH, etag);
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("coord unreachable: {e}"))?;
+    let list = fetch_list(&client, base, snap.list_etag.as_deref(), attribution).await;
+    let protocol = fetch_protocol(&client, base, snap.doc_etag.as_deref(), attribution).await;
 
-    let status = resp.status();
-    if status == reqwest::StatusCode::NOT_MODIFIED {
-        cache_touch(base);
-        return any_cached.ok_or_else(|| {
-            // A 304 with nothing cached means the entry was evicted between the
-            // snapshot and the response. Report it rather than serving empty.
-            "coord answered 304 but the cached policy payload was gone".to_string()
-        });
-    }
-    if !status.is_success() {
-        // Serve a stale payload rather than nothing: yesterday's policy beats
-        // the "pull failed" notice, and the header states the fetch time so the
-        // staleness is visible.
-        if let Some(stale) = any_cached {
+    // ---- Compose. Each half falls back to its cached counterpart independently,
+    // ---- so one failing door never discards the other's fresh answer.
+    let (index, list_etag) = match list {
+        ListOutcome::Fresh { index, etag } => (index, etag),
+        ListOutcome::NotModified => (
+            snap.any
+                .as_ref()
+                .map(|p| p.index.clone())
+                .unwrap_or_default(),
+            snap.list_etag.clone(),
+        ),
+        ListOutcome::Failed(ref reason) => {
+            // No cached payload and no list ⇒ nothing to serve but the notice.
+            // With a cached one, serve it: yesterday's policy beats the "pull
+            // failed" notice, and the injection header states the fetch time so
+            // the staleness is visible.
+            let Some(stale) = snap.any.as_ref() else {
+                return Err(reason.clone());
+            };
             warn!(
-                status = status.as_u16(),
-                "policy-context: list non-2xx — serving stale cached payload"
+                reason = %reason,
+                "policy-context: list fetch failed — serving the cached index"
             );
-            return Ok(stale);
+            (stale.index.clone(), snap.list_etag.clone())
         }
-        return Err(format!(
-            "coord answered HTTP {} to the policy-document list",
-            status.as_u16()
-        ));
-    }
+    };
 
-    let new_etag = resp
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let list_body: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("coord policy-document list was undecodable: {e}"))?;
-    let index = parse_index(&list_body);
-
-    // Hydrate the ONE body we inject. A failure here is a partial, not a
-    // failure: the index is still worth delivering, and the renderer says
-    // plainly that the protocol body is missing.
-    let (protocol_body, protocol_version) = match fetch_protocol(&client, base).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            warn!(reason = %e, "policy-context: session-protocol body fetch failed — injecting index only");
-            (None, None)
+    let (protocol_body, protocol_version, doc_etag) = match protocol {
+        ProtocolOutcome::Fresh {
+            body,
+            version,
+            etag,
+        } => (Some(body), version, etag),
+        ProtocolOutcome::NotModified => (
+            snap.any.as_ref().and_then(|p| p.protocol_body.clone()),
+            snap.any.as_ref().and_then(|p| p.protocol_version),
+            snap.doc_etag.clone(),
+        ),
+        ProtocolOutcome::Failed(ref reason) => {
+            // A body failure is a PARTIAL, not a failure: the index is still
+            // worth delivering, and the renderer says plainly that the protocol
+            // body is missing.
+            warn!(
+                reason = %reason,
+                "policy-context: session-protocol fetch failed — falling back to the cached body"
+            );
+            (
+                snap.any.as_ref().and_then(|p| p.protocol_body.clone()),
+                snap.any.as_ref().and_then(|p| p.protocol_version),
+                snap.doc_etag.clone(),
+            )
         }
     };
 
@@ -589,35 +748,112 @@ async fn fetch_payload(base: &str) -> Result<PolicyPayload, String> {
         protocol_version,
         index,
     };
-    // Do NOT cache a partial: a transient blip on the body fetch must not pin
-    // an index-only payload for a full TTL when the real body is one retry
-    // away. Same reasoning `continuation_verdict` applies to its fallback.
+    // Do NOT cache a partial: a transient blip on the body fetch must not pin an
+    // index-only payload for a full TTL when the real body is one retry away.
+    // Same reasoning `continuation_verdict` applies to its fallback.
     if payload.protocol_body.is_some() {
-        cache_store(base, new_etag, payload.clone());
+        cache_store(base, list_etag, doc_etag, payload.clone());
+    }
+    if payload.protocol_body.is_none() && payload.index.is_empty() {
+        return Err(
+            "coord returned neither the policy index nor the session-protocol body".to_string(),
+        );
     }
     Ok(payload)
 }
 
-/// Fetch `policy/session-protocol`'s body + version.
+/// Conditionally fetch the `kind=policy` index.
+async fn fetch_list(
+    client: &reqwest::Client,
+    base: &str,
+    etag: Option<&str>,
+    attribution: Option<uuid::Uuid>,
+) -> ListOutcome {
+    let mut req = attach_attribution(
+        crate::coord_http::coord_get(client, list_url(base)),
+        attribution,
+    );
+    if let Some(etag) = etag {
+        req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return ListOutcome::Failed(format!("coord unreachable: {e}")),
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        return ListOutcome::NotModified;
+    }
+    if !status.is_success() {
+        return ListOutcome::Failed(format!(
+            "coord answered HTTP {} to the policy-document list",
+            status.as_u16()
+        ));
+    }
+    let etag = response_etag(&resp);
+    match resp.json::<Value>().await {
+        Ok(body) => ListOutcome::Fresh {
+            index: parse_index(&body),
+            etag,
+        },
+        Err(e) => ListOutcome::Failed(format!("coord policy-document list was undecodable: {e}")),
+    }
+}
+
+/// Conditionally fetch `policy/session-protocol`'s body + version.
+///
+/// The `If-None-Match` here is what turns the per-session-start recording read
+/// into a near-empty one: coord's agent single-document door answers 304 with no
+/// body and still records the read at the version it would have served.
 async fn fetch_protocol(
     client: &reqwest::Client,
     base: &str,
-) -> Result<(Option<String>, Option<i64>), String> {
-    let url = document_url(base, PROTOCOL_DOC_NAME);
-    let resp = crate::coord_http::coord_get(client, url)
-        .send()
-        .await
-        .map_err(|e| format!("request: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("coord answered HTTP {}", status.as_u16()));
+    etag: Option<&str>,
+    attribution: Option<uuid::Uuid>,
+) -> ProtocolOutcome {
+    let mut req = attach_attribution(
+        crate::coord_http::coord_get(client, document_url(base, PROTOCOL_DOC_NAME)),
+        attribution,
+    );
+    if let Some(etag) = etag {
+        req = req.header(reqwest::header::IF_NONE_MATCH, etag);
     }
-    let body: Value = resp.json().await.map_err(|e| format!("undecodable: {e}"))?;
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return ProtocolOutcome::Failed(format!("request: {e}")),
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        return ProtocolOutcome::NotModified;
+    }
+    if !status.is_success() {
+        return ProtocolOutcome::Failed(format!("coord answered HTTP {}", status.as_u16()));
+    }
+    let etag = response_etag(&resp);
+    let body: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return ProtocolOutcome::Failed(format!("undecodable: {e}")),
+    };
     // Reuse the settled row-envelope reader — it unwraps `document`, trims, and
     // treats an empty body as absent.
-    let text = crate::mcp::continuation_verdict::rules_from_doc_body(&body)
-        .ok_or_else(|| "coord returned an empty session-protocol body".to_string())?;
-    Ok((Some(text), parse_document_version(&body)))
+    match crate::mcp::continuation_verdict::rules_from_doc_body(&body) {
+        Some(text) => ProtocolOutcome::Fresh {
+            body: text,
+            version: parse_document_version(&body),
+            etag,
+        },
+        None => {
+            ProtocolOutcome::Failed("coord returned an empty session-protocol body".to_string())
+        }
+    }
+}
+
+/// The response's `ETag`, when it carries a header-safe one.
+fn response_etag(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 /// UTC timestamp for the attribution header, second resolution.
@@ -636,7 +872,11 @@ fn now_stamp() -> String {
 /// Every failure resolves to `Some(envelope(fail-open notice))`, because a
 /// session that silently receives nothing is in exactly the pre-plan state this
 /// module exists to end.
-pub async fn policy_context(session_key: &str, source: Option<&str>) -> Option<Value> {
+pub async fn policy_context(
+    session_key: &str,
+    source: Option<&str>,
+    attribution: Option<uuid::Uuid>,
+) -> Option<Value> {
     let mode = Mode::from_env();
     let source = normalize_source(source);
 
@@ -649,12 +889,21 @@ pub async fn policy_context(session_key: &str, source: Option<&str>) -> Option<V
         return None;
     }
 
+    if attribution.is_none() {
+        debug!(
+            session = %session_key,
+            source,
+            "policy-context: no parseable Claude session id — fetching without the \
+             attribution header; coord will record this read with a NULL session"
+        );
+    }
+
     let fetched_at = now_stamp();
     // `coord_client_parts` is the shared accessor `continuation_verdict` and
     // `session_compliance` both use — same credential, same coord base. Its
     // error is the honest "unpaired" reason, which the notice renders verbatim.
     let text = match crate::mcp::continuation_verdict::coord_client_parts() {
-        Ok((base, _jwt)) => match fetch_payload(&base).await {
+        Ok((base, _jwt)) => match fetch_payload(&base, attribution).await {
             Ok(payload) => render_injection(&payload, source, &fetched_at),
             Err(reason) => {
                 warn!(session = %session_key, source, reason = %reason, "policy-context: pull failed — injecting the fail-open notice");
@@ -760,7 +1009,7 @@ mod tests {
         let url = list_url("https://coord.example.com");
         assert_eq!(
             url,
-            "https://coord.example.com/coord/agent-prompt-documents?kind=policy"
+            "https://coord.example.com/coord/agent-prompt-documents?kind=policy&via=session_start_injection"
         );
         assert!(url.contains("/coord/agent-prompt-documents"));
         assert!(
@@ -774,7 +1023,7 @@ mod tests {
         let url = document_url("https://coord.example.com/", PROTOCOL_DOC_NAME);
         assert_eq!(
             url,
-            "https://coord.example.com/coord/agent-prompt-documents/policy/session-protocol"
+            "https://coord.example.com/coord/agent-prompt-documents/policy/session-protocol?via=session_start_injection"
         );
         assert!(url.contains("/coord/agent-prompt-documents/"));
         assert!(
@@ -800,6 +1049,131 @@ mod tests {
         ] {
             assert!(!url.contains("tenant"), "no tenant in the URL: {url}");
         }
+    }
+
+    /// Both doors carry the `?via=` marker coord maps to
+    /// `source = 'session_start_injection'`. Without it the read is recorded as
+    /// a plain `http_door` pull and the injection stops being distinguishable
+    /// from a session reading for itself — which is the one thing the source
+    /// column exists to tell apart.
+    #[test]
+    fn both_urls_carry_the_session_start_injection_marker() {
+        for url in [
+            list_url("https://coord.example.com"),
+            document_url("https://coord.example.com", PROTOCOL_DOC_NAME),
+        ] {
+            assert!(
+                url.contains("via=session_start_injection"),
+                "the read must be attributable to the injection: {url}"
+            );
+        }
+        // The literal is a contract with coord's `PolicyReadSource::from_http_via`,
+        // which honours ONLY this exact spelling and degrades anything else to
+        // `http_door`. Pin it here so a rename cannot silently demote the source.
+        assert_eq!(VIA_MARKER, "session_start_injection");
+    }
+
+    // ── Attribution ─────────────────────────────────────────────────────
+
+    /// The Claude session id is parsed STRICTLY. Anything that is not a UUID —
+    /// including a runner terminal id, which is the id that would otherwise be
+    /// in reach — yields no attribution at all rather than a fabricated one.
+    #[test]
+    fn attribution_parses_only_a_real_uuid_and_never_invents_one() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            parse_attribution_session(Some(&id.to_string())),
+            Some(id),
+            "a canonical UUID is the attribution"
+        );
+        assert_eq!(
+            parse_attribution_session(Some(&format!("  {id}  "))),
+            Some(id),
+            "surrounding whitespace from a shell-built query string is tolerated"
+        );
+
+        for hostile in [
+            "",
+            "   ",
+            "not-a-uuid",
+            // A runner TERMINAL id — the exact wrong id space. Coord's
+            // `session_on_device` would reject it, but the runner must not send
+            // it in the first place.
+            "term-4",
+            "terminal-0f2a",
+            // Half a UUID, and a UUID with junk appended.
+            "23d4d5c0-ddef-4fc2-a541",
+            "23d4d5c0-ddef-4fc2-a541-5324a1eea8f6-extra",
+        ] {
+            assert_eq!(
+                parse_attribution_session(Some(hostile)),
+                None,
+                "`{hostile}` must not become an attribution"
+            );
+        }
+        assert_eq!(parse_attribution_session(None), None);
+    }
+
+    /// `attach_attribution` is the only place the header is set, so its two
+    /// arms ARE the "never fabricate an id" rule.
+    #[test]
+    fn the_caller_session_header_is_set_only_when_there_is_a_session() {
+        let client = reqwest::Client::new();
+        let id = uuid::Uuid::new_v4();
+
+        let with = attach_attribution(client.get("http://127.0.0.1/x"), Some(id))
+            .build()
+            .expect("request builds");
+        assert_eq!(
+            with.headers()
+                .get(crate::coord_mcp::CALLER_SESSION_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(id.to_string().as_str())
+        );
+
+        let without = attach_attribution(client.get("http://127.0.0.1/x"), None)
+            .build()
+            .expect("request builds");
+        assert!(
+            without
+                .headers()
+                .get(crate::coord_mcp::CALLER_SESSION_HEADER)
+                .is_none(),
+            "no session ⇒ no header at all; coord then records a NULL session, \
+             which reads as `unavailable` rather than as non-compliance"
+        );
+    }
+
+    // ── Cache vs recording ──────────────────────────────────────────────
+
+    /// The cache stores BOTH validators. The document one is the load-bearing
+    /// addition: it is what lets a warm cache re-read `session-protocol` — and
+    /// so make the session's pull observable — for the price of a 304 instead
+    /// of ~8 KB of body.
+    #[test]
+    fn the_cache_round_trips_both_validators() {
+        let base = format!("https://cache-test-{}.example.com", uuid::Uuid::new_v4());
+        assert!(cache_snapshot(&base).any.is_none(), "starts empty");
+
+        cache_store(
+            &base,
+            Some("\"14:aaaa\"".to_string()),
+            Some("\"1:bbbb\"".to_string()),
+            sample_payload(),
+        );
+
+        let snap = cache_snapshot(&base);
+        assert_eq!(snap.list_etag.as_deref(), Some("\"14:aaaa\""));
+        assert_eq!(
+            snap.doc_etag.as_deref(),
+            Some("\"1:bbbb\""),
+            "without a document validator the recording read would have to pull the body"
+        );
+        assert_eq!(snap.any.as_ref(), Some(&sample_payload()));
+        assert!(
+            snap.fresh.is_some(),
+            "a just-stored entry is inside the TTL"
+        );
     }
 
     // ── Rendering ───────────────────────────────────────────────────────

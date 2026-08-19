@@ -102,8 +102,8 @@
 //! Delivered by returning `{"decision":"block","prompt":…}` from the existing
 //! continuation-verdict path — no new spawn, and the two loop guards already
 //! there (`stop_hook_active` short-circuit, rolling hourly cap) are inherited,
-//! not rebuilt. It fires **at most `max_attempts` times per session** (the
-//! served config's value, defaulting to 1 and clamped to
+//! not rebuilt. It fires **at most `max_attempts` times per session PER
+//! [`NudgeClass`]** (the served config's value, defaulting to 1 and clamped to
 //! [`MAX_NUDGE_ATTEMPTS_CEILING`]), and only when ALL of:
 //!
 //! 1. enforcement is `enabled` AND `applicable`, and
@@ -115,6 +115,18 @@
 //! nudge on every turn end would nag every session at its first pause — a
 //! false positive by construction. A session that has done no reportable work
 //! has nothing to report and gets nothing.
+//!
+//! ## Two nudge classes, two budgets
+//!
+//! An `unverified` verdict can mean two independent things, and they need
+//! opposite corrections: the REPORT arm (the block is missing or did not
+//! reconcile) and the POLICY-PULL arm (coord observed no read of
+//! `policy/session-protocol` at its current version — the session is being held
+//! to policy it never pulled). [`NudgeClass`] names them, and the per-session
+//! marker is keyed on `(session_id, class)` so one can never suppress the
+//! other. Only coord's `absent` result is nudgeable: `unavailable` and `error`
+//! mean coord could not check, and nudging on either would assert something
+//! coord does not know.
 //!
 //! **`reopen` mode is NOT implemented.** Re-opening a closed session is a
 //! spawn that outlives the request, and
@@ -686,11 +698,60 @@ async fn post_compliance(
 // The nudge (§A4)
 // ===========================================================================
 
+/// Which ARM of the compliance verdict a nudge is correcting.
+///
+/// ## Why this exists at all
+///
+/// The per-session marker used to be keyed on the session id ALONE. With one
+/// nudge class that was indistinguishable from correct; with two it is a
+/// silent-suppression bug — whichever class fired first would permanently
+/// suppress the other, so a session that got a report nudge could never be told
+/// it skipped the policy pull. A verification arm swallowed by an unrelated arm
+/// is WORSE than no arm, because the dashboard reads clean while the check is
+/// dead. Keying the marker on `(session_id, class)` is what keeps the arms
+/// independent.
+///
+/// The variants are `&'static str`-backed rather than free strings so the key
+/// space is closed: a typo cannot mint a third class that silently gets its own
+/// budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NudgeClass {
+    /// The POLICY_COMPLIANCE block is missing, malformed, or its claims did not
+    /// reconcile against coord's own record.
+    Report,
+    /// Coord observed no read of `policy/session-protocol` at its current
+    /// version for this session — the session is being held to policy it never
+    /// pulled. Strictly a PRECONDITION of the report arm, which is why it is
+    /// offered first when both are due.
+    PolicyPull,
+}
+
+impl NudgeClass {
+    /// Priority order, and the enumeration every "is any class still eligible?"
+    /// check walks. [`PolicyPull`](Self::PolicyPull) leads deliberately:
+    /// telling a session to fix its report while it has never read the document
+    /// that defines the report is backwards.
+    pub const ALL: [NudgeClass; 2] = [NudgeClass::PolicyPull, NudgeClass::Report];
+
+    /// The stable label. Appears in the marker key and in operator-visible log
+    /// lines, so it is part of the observable contract.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NudgeClass::Report => "report",
+            NudgeClass::PolicyPull => "policy_pull",
+        }
+    }
+}
+
 /// A corrective prompt the continuation-verdict handler may deliver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComplianceNudge {
-    /// Claude session id — the key [`mark_nudged`] counts against on delivery.
+    /// Claude session id — half of the key [`mark_nudged`] counts against.
     pub session_id: String,
+    /// The other half. Carried on the candidate rather than re-derived at
+    /// delivery for the same reason [`Self::max_attempts`] is: the delivery site
+    /// must claim against exactly the budget the eligibility check consulted.
+    pub class: NudgeClass,
     pub prompt: String,
     /// The cap this candidate was authorised against, carried so the delivery
     /// site's compare-and-set checks the SAME number the eligibility check
@@ -732,9 +793,15 @@ struct NudgeState {
 /// session spanning a restart CAN exceed `max_attempts` overall, and the
 /// honest consequence is that the count reported to coord is this run's, not
 /// the session's lifetime total.
-static NUDGED: OnceLock<Mutex<HashMap<String, NudgeState>>> = OnceLock::new();
+///
+/// **Keyed on `(session_id, class)`, not on `session_id` alone.** The single-key
+/// form made the nudge classes MUTUALLY EXCLUSIVE per session: whichever fired
+/// first permanently suppressed the other, so a session that got a report nudge
+/// could never be told it skipped the policy pull, and the dashboard would read
+/// clean while a whole verification arm was dead. See [`NudgeClass`].
+static NUDGED: OnceLock<Mutex<HashMap<(String, NudgeClass), NudgeState>>> = OnceLock::new();
 
-fn nudged() -> &'static Mutex<HashMap<String, NudgeState>> {
+fn nudged() -> &'static Mutex<HashMap<(String, NudgeClass), NudgeState>> {
     NUDGED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -745,18 +812,31 @@ fn nudged() -> &'static Mutex<HashMap<String, NudgeState>> {
 /// still sound. Propagating instead would disable nudging for the whole
 /// process lifetime after a single unrelated panic — silently, since every
 /// caller's poison arm looks exactly like "this session was never nudged".
-fn nudged_guard() -> std::sync::MutexGuard<'static, HashMap<String, NudgeState>> {
+fn nudged_guard() -> std::sync::MutexGuard<'static, HashMap<(String, NudgeClass), NudgeState>> {
     nudged().lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// How many nudges this run has delivered to the session.
-fn nudge_attempts_for(session_id: &str) -> u32 {
-    nudged_guard().get(session_id).map_or(0, |s| s.attempts)
+/// How many nudges of THIS CLASS this run has delivered to the session.
+fn nudge_attempts_for(session_id: &str, class: NudgeClass) -> u32 {
+    nudged_guard()
+        .get(&(session_id.to_string(), class))
+        .map_or(0, |s| s.attempts)
+}
+
+/// Is any class still under the cap? The pre-coord eligibility screen, which
+/// runs before there is a verdict to derive a class from.
+///
+/// Advisory, like the single-class check it replaces: [`mark_nudged`] re-checks
+/// the specific class under the lock at delivery.
+fn any_class_under_cap(session_id: &str, max_attempts: u32) -> bool {
+    NudgeClass::ALL
+        .iter()
+        .any(|c| nudge_attempts_for(session_id, *c) < max_attempts)
 }
 
 /// The same count, for the delivery site's operator-visible reason string.
-pub fn nudge_attempts_reported(session_id: &str) -> u32 {
-    nudge_attempts_for(session_id)
+pub fn nudge_attempts_reported(session_id: &str, class: NudgeClass) -> u32 {
+    nudge_attempts_for(session_id, class)
 }
 
 /// The state to report to coord, or `None` when THIS RUN has no record of the
@@ -772,25 +852,49 @@ pub fn nudge_attempts_reported(session_id: &str) -> u32 {
 /// So callers must OMIT the fields on `None` rather than send a zero. Omission
 /// is right in both directions: coord keeps `0` if it never had anything, and
 /// keeps `3` if it did.
+///
+/// Coord stores ONE count per session, so the classes are SUMMED here — the
+/// stored number means "how many corrective nudges did this session receive",
+/// which is a fact about the session, not about any one arm. The per-class
+/// budgets stay runner-side, where the cap is actually enforced.
 fn nudge_state_for(session_id: &str) -> Option<(u32, Option<String>)> {
-    nudged_guard()
-        .get(session_id)
-        .map(|s| (s.attempts, s.last_at.clone()))
+    let g = nudged_guard();
+    let mut attempts = 0u32;
+    let mut last_at: Option<String> = None;
+    let mut seen = false;
+    for class in NudgeClass::ALL {
+        let Some(state) = g.get(&(session_id.to_string(), class)) else {
+            continue;
+        };
+        seen = true;
+        attempts = attempts.saturating_add(state.attempts);
+        // RFC3339 with a fixed-width millisecond field and a `Z` suffix sorts
+        // lexicographically in timestamp order, which `mark_nudged` guarantees
+        // — so `max` is the most recent delivery across the classes.
+        if state.last_at > last_at {
+            last_at = state.last_at.clone();
+        }
+    }
+    seen.then_some((attempts, last_at))
 }
 
-/// Claim one nudge against `max_attempts`. Returns `true` when THIS caller won
-/// the claim, `false` when the session is already at the cap (or the guard is
-/// poisoned). Called by the continuation-verdict handler at the moment it emits
-/// the block, not when the candidate is computed — a candidate the cap
-/// swallowed must stay eligible.
+/// Claim one nudge of `class` against `max_attempts`. Returns `true` when THIS
+/// caller won the claim, `false` when the session is already at the cap FOR THAT
+/// CLASS (or the guard is poisoned). Called by the continuation-verdict handler
+/// at the moment it emits the block, not when the candidate is computed — a
+/// candidate the cap swallowed must stay eligible.
 ///
 /// Compare-and-set rather than a separate check-then-set: two Stops racing for
 /// the same session must not both deliver. `max_attempts: 0` therefore means
 /// never nudge, which the old set-based cap could not express.
+///
+/// The claim is per `(session, class)`: one class exhausting its budget must
+/// never consume another's, which is the whole point of keying the marker on the
+/// pair.
 #[must_use]
-pub fn mark_nudged(session_id: &str, max_attempts: u32) -> bool {
+pub fn mark_nudged(session_id: &str, class: NudgeClass, max_attempts: u32) -> bool {
     let mut g = nudged_guard();
-    let entry = g.entry(session_id.to_string()).or_default();
+    let entry = g.entry((session_id.to_string(), class)).or_default();
     if entry.attempts >= max_attempts {
         return false;
     }
@@ -881,8 +985,127 @@ fn explicitly_failed(e: &Value) -> bool {
     false
 }
 
-/// Build the corrective prompt, carrying coord's observations so the
-/// correction is productive rather than a second guess.
+/// Coord's session-level policy-pull signal, read out of the reconciliation
+/// payload (`session_signals[]`, `Signal::json` shape).
+///
+/// Returns the signal's `detail` ONLY when the result is exactly `absent` — the
+/// one arm that means "coord looked and this session had not pulled policy".
+///
+/// `unavailable` and `error` must NEVER reach here as a nudge. They mean coord
+/// could not check — an unattributable transport, or the read table not
+/// provisioned yet — and nudging a session over coord's own blind spot would
+/// assert something coord does not know. The strict `== "absent"` match is what
+/// enforces that: a future result word fails closed to "do not nudge".
+pub fn policy_pull_absent(reconciliation: &Value) -> Option<&Value> {
+    reconciliation
+        .get("session_signals")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|s| {
+            s.get("signal").and_then(Value::as_str) == Some("policy_pull")
+                && s.get("result").and_then(Value::as_str) == Some("absent")
+        })
+        .map(|s| s.get("detail").unwrap_or(&Value::Null))
+}
+
+/// Did the REPORT arm itself fail — as distinct from the session merely never
+/// having pulled policy?
+///
+/// The two are independent failures with independent corrections, and coord's
+/// single `unverified` verdict covers both. Without this split, a session whose
+/// block reconciled perfectly but which never read the policy would be told to
+/// "re-emit the block" — a false statement about its own work, and the
+/// `ux-priorities#honesty` failure this feature was commissioned to catch.
+fn report_arm_failed(v: &ComplianceVerdict) -> bool {
+    let reason = v.reason.trim();
+    // `absent` (or an empty reason) is the missing-block case.
+    if reason == "absent" || reason.is_empty() {
+        return true;
+    }
+    // A block that coord could not reconcile names refs, or says so in `reason`.
+    if !unreconciled_refs(&v.reconciliation).is_empty() {
+        return true;
+    }
+    if v.reconciliation
+        .get("unreconciled_refs")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+    {
+        return true;
+    }
+    if v.reconciliation.get("schema_ok").and_then(Value::as_bool) == Some(false) {
+        return true;
+    }
+    // Coord appends the policy-pull clause to `reason` with a `; ` separator
+    // when BOTH failed, and emits it alone when only the pull did. A reason that
+    // is ONLY the policy-pull clause is not a report failure.
+    !reason.starts_with("policy pull not observed")
+}
+
+/// Which class of nudge this verdict warrants, in priority order.
+///
+/// Both can be due at once; the caller takes the first whose per-class budget is
+/// not exhausted, so the other stays eligible for a later turn instead of being
+/// swallowed.
+fn due_nudge_classes(v: &ComplianceVerdict) -> Vec<NudgeClass> {
+    let mut due = Vec::with_capacity(2);
+    if policy_pull_absent(&v.reconciliation).is_some() {
+        due.push(NudgeClass::PolicyPull);
+    }
+    if report_arm_failed(v) {
+        due.push(NudgeClass::Report);
+    }
+    due
+}
+
+/// The corrective prompt for a session coord observed no policy pull from.
+///
+/// Deliberately NOT phrased as "you did not emit the block": the session may
+/// have emitted a perfect one. The failure is upstream of the report — it is
+/// being held to documents it never read — so the correction is Step 0, named
+/// with the doors that actually work.
+fn policy_pull_nudge_text(detail: &Value) -> String {
+    let mut out = String::from(
+        "Coord has no record of this session reading `policy/session-protocol` at its \
+         current version.\n",
+    );
+    if let Some(why) = detail.get("why").and_then(Value::as_str) {
+        out.push_str(why);
+        out.push_str(".\n");
+    }
+    // The stale case is materially different from "never read", and saying so
+    // is what makes the correction land: a session that read v5 believes it is
+    // current and will not re-read unless told the number moved.
+    let stale = detail
+        .get("stale_version_reads")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty());
+    if let (Some(stale), Some(current)) = (stale, detail.get("current_version")) {
+        let versions: Vec<String> = stale
+            .iter()
+            .filter_map(|r| r.get("version").and_then(Value::as_i64))
+            .map(|v| format!("v{v}"))
+            .collect();
+        if !versions.is_empty() {
+            out.push_str(&format!(
+                "You read {} while v{} is current.\n",
+                versions.join(", "),
+                current
+            ));
+        }
+    }
+    out.push_str(
+        "`policy/session-protocol` Step 0: never work from memory of these documents; they \
+         version frequently. Pull them now — `coord_list_prompt_documents` + \
+         `coord_get_prompt_document`, or the equal-authority device door \
+         `GET /coord/agent-prompt-documents{,/{kind}/{name}}` if the MCP tools are masked — \
+         and apply them to the work you have already done this session before closing.",
+    );
+    out
+}
+
+/// Build the corrective prompt for the REPORT arm, carrying coord's
+/// observations so the correction is productive rather than a second guess.
 pub fn nudge_text(v: &ComplianceVerdict) -> String {
     fn render(list: &[String]) -> String {
         if list.is_empty() {
@@ -1003,12 +1226,15 @@ async fn observe_turn_end_inner(hook_input: &Value) -> Option<ComplianceNudge> {
     //    verdict — so emit it DETACHED and return immediately, and the hook
     //    never waits on coord. That is the whole fleet under the report-only
     //    default, and every repeat turn of an already-nudged session.
-    // The cap is the operator's configured number, not a hard-coded 1. This
-    // read is advisory — `mark_nudged` re-checks it under the lock at delivery,
-    // which is the point two racing Stops are actually serialised.
+    // The cap is the operator's configured number, not a hard-coded 1, and it
+    // applies PER CLASS — a session that has exhausted its report nudges may
+    // still be owed a policy-pull one, which is exactly the suppression the
+    // class key exists to prevent. This read is advisory; `mark_nudged`
+    // re-checks the chosen class under the lock at delivery, which is the point
+    // two racing Stops are actually serialised.
     let nudge_possible = applicability.nudge_allowed(&config.mode)
         && !crate::mcp::continuation_verdict::stop_hook_active_from(hook_input)
-        && nudge_attempts_for(session_id) < config.max_attempts;
+        && any_class_under_cap(session_id, config.max_attempts);
     if !nudge_possible {
         let sid = session_id.to_string();
         tauri::async_runtime::spawn(async move {
@@ -1030,9 +1256,28 @@ async fn observe_turn_end_inner(hook_input: &Value) -> Option<ComplianceNudge> {
         );
         return None;
     }
+
+    // Pick the first DUE class whose per-class budget is not exhausted. Taking
+    // the first *due* class unconditionally would let an exhausted policy-pull
+    // budget mask a fresh report failure, which is the same suppression in a
+    // different costume.
+    let class = due_nudge_classes(&verdict)
+        .into_iter()
+        .find(|c| nudge_attempts_for(session_id, *c) < config.max_attempts)?;
+    let prompt = match class {
+        // `policy_pull_absent` re-reads the payload rather than being threaded
+        // down from `due_nudge_classes`, so the text is built from the same
+        // detail the classification was made on and cannot describe a different
+        // signal than the one that fired.
+        NudgeClass::PolicyPull => {
+            policy_pull_nudge_text(policy_pull_absent(&verdict.reconciliation)?)
+        }
+        NudgeClass::Report => nudge_text(&verdict),
+    };
     Some(ComplianceNudge {
         session_id: session_id.to_string(),
-        prompt: nudge_text(&verdict),
+        class,
+        prompt,
         max_attempts: config.max_attempts,
     })
 }
@@ -1724,14 +1969,15 @@ mod tests {
     fn mark_nudged_is_a_counted_compare_and_set() {
         let a = "session-compliance-test-marker-a";
         let b = "session-compliance-test-marker-b";
-        assert_eq!(nudge_attempts_for(a), 0);
-        assert!(mark_nudged(a, 1), "first claim wins");
+        let c = NudgeClass::Report;
+        assert_eq!(nudge_attempts_for(a, c), 0);
+        assert!(mark_nudged(a, c, 1), "first claim wins");
         assert!(
-            !mark_nudged(a, 1),
+            !mark_nudged(a, c, 1),
             "second claim must lose at max_attempts=1"
         );
-        assert_eq!(nudge_attempts_for(a), 1);
-        assert_eq!(nudge_attempts_for(b), 0, "the cap is per session");
+        assert_eq!(nudge_attempts_for(a, c), 1);
+        assert_eq!(nudge_attempts_for(b, c), 0, "the cap is per session");
     }
 
     /// The headline behaviour of the change: the cap is the OPERATOR's number.
@@ -1740,12 +1986,13 @@ mod tests {
     #[test]
     fn a_higher_cap_allows_exactly_that_many() {
         let s = "session-compliance-test-cap-three";
+        let c = NudgeClass::Report;
         for i in 1..=3 {
-            assert!(mark_nudged(s, 3), "attempt {i} of 3 must be granted");
-            assert_eq!(nudge_attempts_for(s), i);
+            assert!(mark_nudged(s, c, 3), "attempt {i} of 3 must be granted");
+            assert_eq!(nudge_attempts_for(s, c), i);
         }
-        assert!(!mark_nudged(s, 3), "the fourth is refused");
-        assert_eq!(nudge_attempts_for(s), 3, "and does not increment");
+        assert!(!mark_nudged(s, c, 3), "the fourth is refused");
+        assert_eq!(nudge_attempts_for(s, c), 3, "and does not increment");
     }
 
     /// `max_attempts: 0` means never nudge — a setting the old cap could not
@@ -1753,8 +2000,14 @@ mod tests {
     #[test]
     fn a_zero_cap_never_nudges() {
         let s = "session-compliance-test-cap-zero";
-        assert!(!mark_nudged(s, 0));
-        assert_eq!(nudge_attempts_for(s), 0);
+        for c in NudgeClass::ALL {
+            assert!(!mark_nudged(s, c, 0));
+            assert_eq!(nudge_attempts_for(s, c), 0);
+        }
+        assert!(
+            !any_class_under_cap(s, 0),
+            "a zero cap leaves no class eligible, so the pre-coord screen              short-circuits before the verdict is even fetched"
+        );
     }
 
     /// The entire backward-compatibility argument for this change: an
@@ -1800,7 +2053,7 @@ mod tests {
     #[test]
     fn the_nudge_timestamp_is_fixed_width_utc() {
         let s = "session-compliance-test-stamp";
-        assert!(mark_nudged(s, 1));
+        assert!(mark_nudged(s, NudgeClass::Report, 1));
         let (attempts, last_at) = nudge_state_for(s).expect("a nudged session has state");
         assert_eq!(attempts, 1);
         let at = last_at.expect("a delivered nudge stamps its time");
@@ -1842,6 +2095,245 @@ mod tests {
         assert!(stampless.get("last_nudged_at").is_none());
     }
 
+    // ── per-CLASS keying (plan `2026-08-08-runner-enforced-policy-pull`
+    //    Phase 3) ─────────────────────────────────────────────────────────
+
+    /// THE regression this whole sub-change exists to prevent.
+    ///
+    /// `NUDGED` used to be keyed on `session_id` ALONE. With a second nudge
+    /// class that makes the two MUTUALLY EXCLUSIVE per session — whichever
+    /// fires first permanently suppresses the other, so a session that got a
+    /// report-enforcement nudge could never be told it skipped the policy pull.
+    /// A verification arm silently swallowed by an unrelated arm is worse than
+    /// no arm, because the dashboard reads clean.
+    #[test]
+    fn one_classs_marker_does_not_suppress_the_other() {
+        let s = "session-compliance-test-class-independence";
+
+        assert!(mark_nudged(s, NudgeClass::Report, 1), "report claim wins");
+        assert!(
+            !mark_nudged(s, NudgeClass::Report, 1),
+            "the report class is now at its cap"
+        );
+
+        // ...and the policy-pull class is untouched. Under the old key this
+        // assertion failed: the session was simply "already nudged".
+        assert_eq!(nudge_attempts_for(s, NudgeClass::PolicyPull), 0);
+        assert!(
+            mark_nudged(s, NudgeClass::PolicyPull, 1),
+            "an exhausted report budget must not consume the policy-pull one"
+        );
+        assert_eq!(nudge_attempts_for(s, NudgeClass::PolicyPull), 1);
+        assert_eq!(
+            nudge_attempts_for(s, NudgeClass::Report),
+            1,
+            "and the policy-pull delivery did not touch the report counter"
+        );
+    }
+
+    /// The pre-coord screen must stay open while ANY class has budget left,
+    /// or an exhausted class would suppress the other one turn earlier — the
+    /// same bug moved upstream of the marker.
+    #[test]
+    fn the_pre_coord_screen_stays_open_while_any_class_has_budget() {
+        let s = "session-compliance-test-any-class";
+        assert!(any_class_under_cap(s, 1));
+        assert!(mark_nudged(s, NudgeClass::PolicyPull, 1));
+        assert!(
+            any_class_under_cap(s, 1),
+            "one class spent, the other still due"
+        );
+        assert!(mark_nudged(s, NudgeClass::Report, 1));
+        assert!(!any_class_under_cap(s, 1), "both classes spent");
+    }
+
+    /// The configured cap applies PER CLASS, and `max_attempts: 0` still means
+    /// never — for every class.
+    #[test]
+    fn the_configured_cap_applies_to_each_class_independently() {
+        let s = "session-compliance-test-per-class-cap";
+        for c in NudgeClass::ALL {
+            for i in 1..=2 {
+                assert!(mark_nudged(s, c, 2), "{} attempt {i} of 2", c.as_str());
+            }
+            assert!(!mark_nudged(s, c, 2), "{} is capped at 2", c.as_str());
+            assert_eq!(nudge_attempts_for(s, c), 2);
+        }
+    }
+
+    /// Coord stores ONE count per session, so the classes are SUMMED on the
+    /// wire — and the `None`-vs-`0` distinction survives that summing. `None`
+    /// still means "this run has no record of the session", which must OMIT the
+    /// fields rather than send a fabricated `0` into a last-write-wins store.
+    #[test]
+    fn the_reported_count_sums_the_classes_without_collapsing_none_to_zero() {
+        let s = "session-compliance-test-sum";
+        assert!(
+            nudge_state_for(s).is_none(),
+            "no record for either class is None, not Some((0, None))"
+        );
+
+        assert!(mark_nudged(s, NudgeClass::Report, 1));
+        assert_eq!(nudge_state_for(s).expect("recorded").0, 1);
+
+        assert!(mark_nudged(s, NudgeClass::PolicyPull, 1));
+        let (attempts, last_at) = nudge_state_for(s).expect("recorded");
+        assert_eq!(attempts, 2, "coord's per-session count spans the classes");
+        assert!(
+            last_at.is_some(),
+            "the most recent delivery across the classes stamps the report"
+        );
+
+        // And the omission rule still holds end to end.
+        let body = compliance_body(
+            None,
+            Some(ABSENT_NO_BLOCK),
+            nudge_state_for("never-seen-sum"),
+        );
+        assert!(body.get("nudge_attempts").is_none());
+    }
+
+    /// The class labels are part of the observable contract (marker key,
+    /// operator-visible reason strings), and the policy-pull one must match
+    /// coord's signal name so the two sides read as one thing.
+    #[test]
+    fn the_class_labels_are_stable_and_distinct() {
+        assert_eq!(NudgeClass::Report.as_str(), "report");
+        assert_eq!(NudgeClass::PolicyPull.as_str(), "policy_pull");
+        assert_eq!(NudgeClass::ALL.len(), 2);
+        assert_ne!(NudgeClass::ALL[0], NudgeClass::ALL[1]);
+        assert_eq!(
+            NudgeClass::ALL[0],
+            NudgeClass::PolicyPull,
+            "the precondition arm is offered first: telling a session to fix its report \
+             while it has never read the document defining the report is backwards"
+        );
+    }
+
+    // ── the policy-pull arm ──────────────────────────────────────────────
+
+    fn verdict_with(reconciliation: Value, reason: &str) -> ComplianceVerdict {
+        ComplianceVerdict::from_body(&json!({
+            "verdict": "unverified",
+            "reason": reason,
+            "reconciliation": reconciliation,
+            "footprint": {"prs": ["qontinui/qontinui-coord#1"], "commits": [], "claims": []},
+        }))
+    }
+
+    fn policy_pull_signal(result: &str, detail: Value) -> Value {
+        json!({"session_signals": [{
+            "signal": "policy_pull",
+            "result": result,
+            "detail": detail,
+        }]})
+    }
+
+    /// `unavailable` and `error` mean coord could not CHECK. Nudging on either
+    /// would assert something coord does not know — and it is exactly the
+    /// population (unattributable transports, a coord ahead of its migration)
+    /// that the `Unavailable` arm exists to protect.
+    #[test]
+    fn only_an_absent_policy_pull_signal_is_nudgeable() {
+        let detail = json!({"why": "no read"});
+        assert!(policy_pull_absent(&policy_pull_signal("absent", detail.clone())).is_some());
+        for benign in ["found", "unavailable", "error", "", "ABSENT", "future_word"] {
+            assert!(
+                policy_pull_absent(&policy_pull_signal(benign, detail.clone())).is_none(),
+                "`{benign}` must not produce a nudge"
+            );
+        }
+        // A payload from a coord that does not emit the signal at all.
+        assert!(policy_pull_absent(&json!({"items": []})).is_none());
+        assert!(policy_pull_absent(&Value::Null).is_none());
+        // A different session-level signal must not be mistaken for this one.
+        assert!(policy_pull_absent(&json!({"session_signals": [
+            {"signal": "something_else", "result": "absent", "detail": {}}
+        ]}))
+        .is_none());
+    }
+
+    /// The two arms are independent: a session whose block reconciled perfectly
+    /// but which never pulled policy gets the POLICY-PULL nudge, not "re-emit
+    /// the block" — which would be a false statement about its own work.
+    #[test]
+    fn a_clean_report_with_no_policy_pull_nudges_only_the_policy_arm() {
+        let v = verdict_with(
+            {
+                let mut r = policy_pull_signal("absent", json!({"why": "no read"}));
+                r["schema_ok"] = json!(true);
+                r["unreconciled_refs"] = json!([]);
+                r
+            },
+            "policy pull not observed: no read",
+        );
+        assert_eq!(due_nudge_classes(&v), vec![NudgeClass::PolicyPull]);
+        assert!(
+            !report_arm_failed(&v),
+            "a reason that is ONLY the policy-pull clause is not a report failure"
+        );
+    }
+
+    /// Both failing yields both classes, policy-pull first — so a single turn
+    /// delivers one and the other stays eligible instead of being swallowed.
+    #[test]
+    fn both_arms_failing_yields_both_classes_in_priority_order() {
+        let mut r = policy_pull_signal("absent", json!({"why": "no read"}));
+        r["schema_ok"] = json!(true);
+        r["unreconciled_refs"] = json!(["#1"]);
+        let v = verdict_with(
+            r,
+            "1 of 1 item(s) could not be reconciled: #1; policy pull not observed: no read",
+        );
+        assert_eq!(
+            due_nudge_classes(&v),
+            vec![NudgeClass::PolicyPull, NudgeClass::Report]
+        );
+    }
+
+    /// A missing block with the policy pull FOUND is the pre-existing report
+    /// arm, untouched.
+    #[test]
+    fn a_missing_block_with_a_found_pull_is_the_report_arm_alone() {
+        let v = verdict_with(policy_pull_signal("found", json!({})), "absent");
+        assert_eq!(due_nudge_classes(&v), vec![NudgeClass::Report]);
+    }
+
+    /// The policy-pull prompt must correct STEP 0, name the doors that work,
+    /// and — when the read was merely stale — say so, because a session that
+    /// read v5 believes it is current and will not re-read unless told the
+    /// number moved.
+    #[test]
+    fn the_policy_pull_prompt_states_the_stale_case_distinctly() {
+        let never = policy_pull_nudge_text(&json!({
+            "current_version": 6,
+            "why": "this session has attributed policy reads but never read \
+                    policy/session-protocol",
+            "stale_version_reads": [],
+        }));
+        assert!(never.contains("policy/session-protocol"));
+        assert!(never.contains("Step 0"));
+        assert!(
+            never.contains("/coord/agent-prompt-documents"),
+            "the masked-tools escape hatch must be named: {never}"
+        );
+        assert!(!never.contains("while v6 is current"));
+        assert!(
+            !never.contains("did not emit"),
+            "this arm must never assert the block was missing: {never}"
+        );
+
+        let stale = policy_pull_nudge_text(&json!({
+            "current_version": 6,
+            "why": "this session read policy/session-protocol at a SUPERSEDED version",
+            "stale_version_reads": [{"version": 5, "source": "mcp"}],
+        }));
+        assert!(
+            stale.contains("You read v5 while v6 is current"),
+            "the stale case must name both numbers: {stale}"
+        );
+    }
+
     /// Two Stops racing the same session must not both deliver — the stated
     /// reason `mark_nudged` is a compare-and-set rather than check-then-set.
     #[test]
@@ -1849,12 +2341,12 @@ mod tests {
         let s = "session-compliance-test-race";
         let winners: usize = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
-                .map(|_| scope.spawn(move || usize::from(mark_nudged(s, 1))))
+                .map(|_| scope.spawn(move || usize::from(mark_nudged(s, NudgeClass::Report, 1))))
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
         });
         assert_eq!(winners, 1, "exactly one of eight racing claims may win");
-        assert_eq!(nudge_attempts_for(s), 1);
+        assert_eq!(nudge_attempts_for(s, NudgeClass::Report), 1);
     }
 
     // ── coverage bound ───────────────────────────────────────────────────
