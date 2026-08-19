@@ -112,22 +112,31 @@ pub fn assign_process_to_job(process_handle: HANDLE) {
     }
 }
 
-/// A dedicated, OWNED Job Object with a job-wide committed-memory limit —
-/// the CI-build OOM backstop (runner-as-CI-node plan §4.6: "job-object
-/// memory limit as a backstop", load-bearing not polish). Distinct from the
-/// global singleton: a memory limit on the global job would throttle every
-/// runner child (agents, terminals), so CI builds get their own job. The
-/// handle is RAII — dropping it (dispatch end) closes the job, and
-/// kill-on-close reaps any stray build processes with it. A process may
-/// belong to both this job and the global one (nested jobs, Win8+).
-pub struct ScopedMemoryLimitedJob(HANDLE);
+/// A dedicated, OWNED Job Object whose close reaps every process assigned
+/// to it. The handle is RAII — dropping it closes the job, and
+/// kill-on-close terminates the assigned process AND everything it
+/// spawned. A process may belong to both this job and the global one
+/// (nested jobs, Win8+).
+///
+/// Two callers, both needing tree-scoped cleanup the global singleton
+/// cannot give (it only fires when the whole runner exits):
+///
+/// - CI builds pass a memory limit — the CI-build OOM backstop
+///   (runner-as-CI-node plan §4.6: "job-object memory limit as a
+///   backstop", load-bearing not polish). A memory limit on the global
+///   job would throttle every runner child (agents, terminals), so CI
+///   builds get their own job.
+/// - The agent pusher passes `None` — it needs only the kill-on-close
+///   tree reap, to stop a timed-out `git push` leaking its transport
+///   helper (see `agent_pusher::push_one`).
+pub struct ScopedKillOnCloseJob(HANDLE);
 
 // SAFETY: same contract as JobObjectHandle — the handle is only used via
 // thread-safe Job Object APIs and never mutated after creation.
-unsafe impl Send for ScopedMemoryLimitedJob {}
-unsafe impl Sync for ScopedMemoryLimitedJob {}
+unsafe impl Send for ScopedKillOnCloseJob {}
+unsafe impl Sync for ScopedKillOnCloseJob {}
 
-impl Drop for ScopedMemoryLimitedJob {
+impl Drop for ScopedKillOnCloseJob {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
             unsafe {
@@ -137,26 +146,31 @@ impl Drop for ScopedMemoryLimitedJob {
     }
 }
 
-impl ScopedMemoryLimitedJob {
-    /// Create a job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and a
-    /// `JOB_OBJECT_LIMIT_JOB_MEMORY` commit ceiling of `memory_limit_bytes`
-    /// across all assigned processes. `None` on any API failure — callers
+impl ScopedKillOnCloseJob {
+    /// Create a job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, optionally
+    /// adding a `JOB_OBJECT_LIMIT_JOB_MEMORY` commit ceiling of
+    /// `memory_limit_bytes` across all assigned processes. Pass `None` for
+    /// the kill-on-close reap alone. `None` on any API failure — callers
     /// degrade to the global job only (a missing backstop must not block
-    /// the build).
-    pub fn create(memory_limit_bytes: usize) -> Option<Self> {
+    /// the caller).
+    pub fn create(memory_limit_bytes: Option<usize>) -> Option<Self> {
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if handle.is_null() || handle == INVALID_HANDLE_VALUE {
                 warn!(
-                    "ScopedMemoryLimitedJob: CreateJobObjectW failed (error {})",
+                    "ScopedKillOnCloseJob: CreateJobObjectW failed (error {})",
                     std::io::Error::last_os_error()
                 );
                 return None;
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags =
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_JOB_MEMORY;
-            info.JobMemoryLimit = memory_limit_bytes;
+            info.BasicLimitInformation.LimitFlags = match memory_limit_bytes {
+                Some(limit) => {
+                    info.JobMemoryLimit = limit;
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_JOB_MEMORY
+                }
+                None => JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            };
             let result = SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
@@ -165,7 +179,7 @@ impl ScopedMemoryLimitedJob {
             );
             if result == 0 {
                 warn!(
-                    "ScopedMemoryLimitedJob: SetInformationJobObject failed (error {})",
+                    "ScopedKillOnCloseJob: SetInformationJobObject failed (error {})",
                     std::io::Error::last_os_error()
                 );
                 CloseHandle(handle);
@@ -186,9 +200,63 @@ impl ScopedMemoryLimitedJob {
             let result = AssignProcessToJobObject(self.0, process_handle);
             if result == 0 {
                 warn!(
-                    "ScopedMemoryLimitedJob: assign failed (error {})",
+                    "ScopedKillOnCloseJob: assign failed (error {})",
                     std::io::Error::last_os_error()
                 );
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// `None` must still yield a usable job — the agent pusher's case,
+    /// where only the kill-on-close reap is wanted and a memory ceiling
+    /// would be wrong (a push is not a build).
+    #[test]
+    fn create_without_a_memory_limit_yields_a_job() {
+        let job = ScopedKillOnCloseJob::create(None);
+        assert!(
+            job.is_some(),
+            "kill-on-close job creation should succeed on Windows"
+        );
+    }
+
+    /// Closing the job must terminate what was assigned to it. This is the
+    /// property `agent_pusher::push_one` leans on: `kill_on_drop` reaps
+    /// only the direct child, so a timed-out `git push` used to leave its
+    /// `git-remote-https` transport helper running. Descendants inherit
+    /// job membership, so reaping the assigned process reaps the tree.
+    #[test]
+    fn dropping_the_job_kills_the_assigned_process() {
+        let job = ScopedKillOnCloseJob::create(None).expect("create job");
+
+        // A child that would otherwise outlive this test by ~60s.
+        let mut child = Command::new("cmd.exe")
+            .args(["/c", "ping", "-n", "60", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+
+        job.assign(child.as_raw_handle() as _);
+        drop(job);
+
+        // Kill-on-close is asynchronous; poll rather than assume.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(_) => break,
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    panic!("child survived the job close — kill-on-close did not fire");
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
             }
         }
     }

@@ -568,25 +568,62 @@ async fn push_one(
     //   the output-future is dropped and `kill_on_drop(true)` reaps the
     //   git child instead of leaking it.
     //
+    // `kill_on_drop` reaps the DIRECT child only, which is not enough:
+    // `git push` spawns `git-remote-https` to carry the transfer, and that
+    // grandchild survives its parent's death still holding the TLS
+    // connection and its committed memory. Under a push storm those
+    // orphans accumulate for the runner's whole lifetime — the global
+    // job object only reaps them when the runner itself exits. On
+    // 2026-08-19 that leak walked this machine into the Windows commit
+    // limit (STATUS_COMMITMENT_LIMIT, 0xC000012D) and the kernel killed
+    // the WebView2 browser process, blanking the runner UI.
+    //
+    // So the child also goes into a scoped kill-on-close job: dropping it
+    // (timeout, error, or normal return) terminates the whole tree.
+    // Nested jobs make this compose with the global one (Win8+).
+    //
     // The argument vector (including those bounds and the prompt-proofing
     // overrides) is built by the pure [`push_args`]; `GIT_TERMINAL_PROMPT`
     // must be applied here on the command itself.
     let started = std::time::Instant::now();
-    let out = match tokio::time::timeout(
-        push_timeout,
-        crate::process_helpers::tokio_no_window("git")
-            .args(push_args(
-                &target.worktree_path,
-                token,
-                &origin_url,
-                &refspec,
-            ))
-            .env(GIT_TERMINAL_PROMPT_ENV.0, GIT_TERMINAL_PROMPT_ENV.1)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    {
+    let child = crate::process_helpers::tokio_no_window("git")
+        .args(push_args(
+            &target.worktree_path,
+            token,
+            &origin_url,
+            &refspec,
+        ))
+        .env(GIT_TERMINAL_PROMPT_ENV.0, GIT_TERMINAL_PROMPT_ENV.1)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning git push for {}", target.branch))?;
+
+    // Held until this function returns; drop closes the job and reaps the
+    // tree. Assignment is best-effort — on failure we still have
+    // `kill_on_drop` plus the global job, i.e. exactly today's behaviour.
+    //
+    // Residual race: git could spawn its transport helper between `spawn`
+    // and `assign`. In practice git parses config and resolves the remote
+    // first, so the window is microseconds; closing it fully needs
+    // CREATE_SUSPENDED, which `tokio::process` does not expose.
+    #[cfg(windows)]
+    let _tree_job = {
+        let job = crate::job_object::ScopedKillOnCloseJob::create(None);
+        match (job.as_ref(), child.raw_handle()) {
+            (Some(j), Some(handle)) => j.assign(handle as _),
+            (None, _) => debug!(
+                "agent_pusher: scoped push job unavailable — \
+                 falling back to kill_on_drop + the global job"
+            ),
+            (_, None) => debug!("agent_pusher: git child handle unavailable — no scoped job"),
+        }
+        job
+    };
+
+    let out = match tokio::time::timeout(push_timeout, child.wait_with_output()).await {
         Ok(res) => res.with_context(|| format!("invoking git push for {}", target.branch))?,
         Err(_) => {
             let elapsed = started.elapsed();

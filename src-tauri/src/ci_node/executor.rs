@@ -72,7 +72,7 @@ const CI_JOB_MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024 * 1024;
 /// non-Windows so call sites stay platform-uniform.
 struct CiJob {
     #[cfg(windows)]
-    inner: Option<crate::job_object::ScopedMemoryLimitedJob>,
+    inner: Option<crate::job_object::ScopedKillOnCloseJob>,
 }
 
 impl CiJob {
@@ -80,7 +80,7 @@ impl CiJob {
         #[cfg(windows)]
         {
             let inner =
-                crate::job_object::ScopedMemoryLimitedJob::create(CI_JOB_MEMORY_LIMIT_BYTES);
+                crate::job_object::ScopedKillOnCloseJob::create(Some(CI_JOB_MEMORY_LIMIT_BYTES));
             if inner.is_none() {
                 warn!(
                     "ci_node: per-dispatch memory-limit job unavailable — \
