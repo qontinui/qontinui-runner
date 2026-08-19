@@ -1775,38 +1775,159 @@ fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
+/// Resolve the repo's trunk remote-tracking ref for `worktree` — e.g.
+/// `origin/main`, `origin/master`.
+///
+/// The census used to hardcode `origin/main`. For a repo whose trunk is
+/// `master` that gate could never pass, so [`compute_landed_in_main`]
+/// returned `None` for every worktree of that repo *for the worktree's whole
+/// life* — not transiently — and coord's G2 read every one of them as
+/// not-landed. Measured 2026-08-19 on this fleet: five governed
+/// (`qontinui-*`) repos have a non-`main` trunk, so the blast radius was
+/// never hypothetical.
+///
+/// Resolution order:
+///
+/// 1. `refs/remotes/origin/HEAD` — the symbolic ref `git clone` writes,
+///    pointing at the remote's default branch. It lives in the `.git`
+///    COMMON dir, so every linked worktree of a repo sees it; `git worktree
+///    add` cannot leave it unset (verified across five real worktrees,
+///    2026-08-19).
+/// 2. `origin/main` — the historical behaviour, kept as the fallback for a
+///    clone whose `origin/HEAD` was never written.
+/// 3. `None` — genuinely unresolvable.
+///
+/// **Every rung is verified with `rev-parse` before it is returned.** That
+/// matters most for rung 1: `origin/HEAD` is written at clone time and is
+/// NOT auto-refreshed when the remote's default branch changes (`git remote
+/// set-head origin -a` is the refresh). A stale-but-present `origin/HEAD`
+/// would otherwise resolve to a *wrong* trunk, which is worse than an honest
+/// `None` — a wrong trunk can answer `Some(true)` and let a worktree be
+/// reclaimed. Present-and-unresolvable therefore falls through to rung 2
+/// rather than being trusted.
+///
+/// There is deliberately NO "configured trunk" rung: nothing in this repo
+/// writes such a key, and an unread config would be a rung that silently
+/// always misses while reading like coverage.
+fn resolve_trunk_ref(worktree: &Path) -> Option<String> {
+    // (1) origin/HEAD — the remote's declared default branch.
+    if let Some(head) = git_capture(
+        worktree,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    ) {
+        let head = head.trim();
+        // Verify it actually resolves: a stale origin/HEAD naming a deleted
+        // branch must NOT be trusted as the trunk.
+        if !head.is_empty()
+            && git_capture(worktree, &["rev-parse", "--verify", "--quiet", head]).is_some()
+        {
+            return Some(head.to_string());
+        }
+    }
+
+    // (2) The historical default, still verified before use.
+    if git_capture(
+        worktree,
+        &["rev-parse", "--verify", "--quiet", "origin/main"],
+    )
+    .is_some()
+    {
+        return Some("origin/main".to_string());
+    }
+
+    // (3) Honest unknown.
+    None
+}
+
+/// Refresh a repo's trunk remote-tracking ref, once per census tick.
+///
+/// Every ancestry / patch-id test in [`compute_landed_in_main`] runs against
+/// whatever the local `origin/<trunk>` last happened to be. Nothing in this
+/// module ever fetched, so a worktree that had not fetched since its PR
+/// landed reported `landed_in_main = false` — confidently and wrongly.
+/// Measured 2026-08-19: five of eleven canonical checkouts on this machine
+/// held a stale trunk ref, including one fetched forty minutes earlier.
+///
+/// **Per REPO, never per worktree.** `refs/remotes/origin/*` lives in the
+/// `.git` common dir, so every linked worktree of a repo shares one trunk
+/// ref: fetching once refreshes all of them, and fetching per worktree would
+/// multiply network calls for no additional information.
+///
+/// Best-effort throughout — a failure leaves the previous ref in place and
+/// [`compute_landed_in_main`] simply answers from a staler trunk, exactly as
+/// it did before this existed. The census walk is measured in hours and the
+/// tick is [`DEFAULT_CENSUS_INTERVAL_SECS`] (300s), so one fetch per repo is
+/// noise against the walk it precedes.
+fn fetch_trunk(canonical: &Path) {
+    let Some(dir) = canonical.to_str() else {
+        return;
+    };
+    let Some(trunk) = resolve_trunk_ref(canonical) else {
+        // No resolvable trunk — nothing to refresh, and inventing a
+        // refspec here would be the guess `resolve_trunk_ref` refuses.
+        return;
+    };
+    let Some(branch) = trunk.strip_prefix("origin/") else {
+        return;
+    };
+
+    // A hung fetch would stall the whole walk, and `std::process::Command`
+    // has no timeout. Git's own low-speed abort is the dependency-free
+    // bound: give up on a transfer that moves under 1 KiB/s for 20s.
+    let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+    match crate::process_helpers::no_window("git")
+        .args([
+            "-C",
+            dir,
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "origin",
+            &refspec,
+        ])
+        .env("GIT_HTTP_LOW_SPEED_LIMIT", "1024")
+        .env("GIT_HTTP_LOW_SPEED_TIME", "20")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .status()
+    {
+        Ok(st) if st.success() => {
+            debug!("worktree_census: refreshed {trunk} for {dir}");
+        }
+        Ok(st) => {
+            debug!("worktree_census: fetch {trunk} for {dir} exited {st} (staleness retained)");
+        }
+        Err(e) => {
+            debug!("worktree_census: fetch {trunk} for {dir} failed to spawn: {e}");
+        }
+    }
+}
+
 /// Compute G2 `landed_in_main` for a worktree using local git only.
 ///
-/// 1. `git merge-base --is-ancestor HEAD origin/main` exit 0 → `Some(true)`
-///    (HEAD is on origin/main via a true merge / fast-forward).
-/// 2. Else `git cherry origin/main HEAD`: if it emits ≥1 line and EVERY
+/// The trunk is resolved per repo ([`resolve_trunk_ref`]), NOT assumed to be
+/// `origin/main`, and it is refreshed once per census tick per repo
+/// ([`fetch_trunk`]).
+///
+/// 1. `git merge-base --is-ancestor HEAD <trunk>` exit 0 → `Some(true)`
+///    (HEAD is on the trunk via a true merge / fast-forward).
+/// 2. Else `git cherry <trunk> HEAD`: if it emits ≥1 line and EVERY
 ///    line starts with `-`, every HEAD-unique commit has a patch-id
-///    equivalent already on origin/main (rebase / cherry-pick) → `Some(true)`.
+///    equivalent already on the trunk (rebase / cherry-pick) → `Some(true)`.
 /// 3. Else `Some(false)` — there is genuinely-unlanded work.
-/// 4. Any git failure / missing `origin/main` / detached oddity → `None`
+/// 4. Any git failure / unresolvable trunk / detached oddity → `None`
 ///    (honest unknown; coord's gate treats `None` as not-landed).
 ///
 /// Squash merges are deliberately NOT covered (the patch-id changes) —
 /// coord handles those via the PR `close_cause='merged'` signal.
 fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
-    // Require a resolvable origin/main ref; without it we can't answer.
-    git_capture(
-        worktree,
-        &["rev-parse", "--verify", "--quiet", "origin/main"],
-    )?;
+    // Require a resolvable trunk; without it we can't answer.
+    let trunk = resolve_trunk_ref(worktree)?;
 
     let wt = worktree.to_str()?;
 
-    // (1) Ancestry test — exit 0 means HEAD is an ancestor of origin/main.
+    // (1) Ancestry test — exit 0 means HEAD is an ancestor of the trunk.
     if let Ok(status) = crate::process_helpers::no_window("git")
-        .args([
-            "-C",
-            wt,
-            "merge-base",
-            "--is-ancestor",
-            "HEAD",
-            "origin/main",
-        ])
+        .args(["-C", wt, "merge-base", "--is-ancestor", "HEAD", &trunk])
         .status()
     {
         if status.success() {
@@ -1820,7 +1941,7 @@ fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
     // (2) Patch-id test via `git cherry`. Lines starting `-` are commits
     // whose patch-id already exists on the upstream; `+` lines are
     // genuinely-unlanded. ALL lines must be `-` (and there must be ≥1).
-    let cherry = git_capture(worktree, &["cherry", "origin/main", "HEAD"])?;
+    let cherry = git_capture(worktree, &["cherry", &trunk, "HEAD"])?;
     let mut saw_line = false;
     for line in cherry.lines() {
         let line = line.trim();
@@ -1838,7 +1959,7 @@ fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
         return Some(true);
     }
 
-    // (3) No cherry lines + not an ancestor: HEAD == origin/main tip would
+    // (3) No cherry lines + not an ancestor: HEAD == the trunk tip would
     // have been caught by the ancestry test, so this is the no-info case —
     // treat as not landed (there is nothing showing it landed).
     Some(false)
@@ -1863,25 +1984,36 @@ pub(crate) fn compute_canonical_is_dirty(canonical: &Path) -> Option<bool> {
 /// Ξ_Worktree P7.3 — advisory base-divergence summary for the canonical
 /// checkout. Never errors the census; falls back gracefully:
 ///
-/// * On `main` → `Some("on:main")`.
-/// * Otherwise, with `origin/main` resolvable →
+/// * On the repo's own trunk branch → `Some("on:<trunk>")`.
+/// * Otherwise, with the trunk ref resolvable →
 ///   `Some("on:<branch>;<behind>\t<ahead>")` from
-///   `git rev-list --count --left-right origin/main...HEAD`.
-/// * Otherwise (missing `origin/main`, detached HEAD, git failure) → just
+///   `git rev-list --count --left-right <trunk>...HEAD`.
+/// * Otherwise (unresolvable trunk, detached HEAD, git failure) → just
 ///   the branch name `Some("on:<branch>")`, or `None` if even the branch is
 ///   unresolvable.
+///
+/// Shares [`resolve_trunk_ref`] with [`compute_landed_in_main`]. It used to
+/// hardcode `main` twice — an `if branch == "main"` early return and an
+/// `origin/main...HEAD` range — so on a `master`-trunk repo it silently
+/// degraded to the bare branch name with no ahead/behind, feeding the
+/// operator a wrong-but-plausible advisory.
 fn compute_canonical_base_divergence(canonical: &Path) -> Option<String> {
     let branch = compute_canonical_branch(canonical)?;
-    if branch == "main" {
-        return Some("on:main".to_string());
+    let trunk = resolve_trunk_ref(canonical);
+    // On the trunk branch itself there is no divergence to report.
+    if let Some(t) = trunk.as_deref() {
+        if t.strip_prefix("origin/") == Some(branch.as_str()) {
+            return Some(format!("on:{branch}"));
+        }
     }
-    // Best-effort ahead/behind vs origin/main. `--left-right` on the
-    // symmetric-difference `A...B` prints `<behind>\t<ahead>`. A missing
-    // origin/main makes this fail → fall back to just the branch name.
-    match git_capture(
-        canonical,
-        &["rev-list", "--count", "--left-right", "origin/main...HEAD"],
-    ) {
+    // Best-effort ahead/behind vs the trunk. `--left-right` on the
+    // symmetric-difference `A...B` prints `<behind>\t<ahead>`. An
+    // unresolvable trunk makes this fail → fall back to just the branch name.
+    let Some(trunk) = trunk else {
+        return Some(format!("on:{branch}"));
+    };
+    let range = format!("{trunk}...HEAD");
+    match git_capture(canonical, &["rev-list", "--count", "--left-right", &range]) {
         Some(lr) if !lr.is_empty() => Some(format!("on:{branch};{lr}")),
         _ => Some(format!("on:{branch}")),
     }
@@ -1921,8 +2053,8 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
 
     let attributable_bytes = nm_bytes.saturating_add(target_bytes);
 
-    // G2: ancestry/patch-id "landed in origin/main" — local git only,
-    // None when undeterminable (no origin/main, git failure).
+    // G2: ancestry/patch-id "landed in the repo's trunk" — local git only,
+    // None when undeterminable (unresolvable trunk, git failure).
     let landed_in_main = compute_landed_in_main(worktree);
 
     // G6 shadow-mode: held-cargo-lock-only build probe for the FLEET census
@@ -2006,6 +2138,14 @@ fn enumerate_worktrees_with(root: &Path, on_row: &mut dyn FnMut(WorktreeCensus))
         // differs from its slug still anchors correctly. (For the flat
         // layout the two agree.)
         let _ = default_canonical_path(repo);
+
+        // Refresh this repo's trunk ONCE, before any of its worktrees are
+        // captured. `refs/remotes/origin/*` lives in the shared `.git`
+        // common dir, so this single fetch is what makes `landed_in_main`
+        // fresh for EVERY worktree of the repo below. Best-effort: on
+        // failure the walk proceeds against the staler trunk, exactly as it
+        // did before this call existed.
+        fetch_trunk(canonical);
 
         let mut candidates: Vec<PathBuf> = Vec::new();
         candidates.extend(git_registered_worktrees(canonical));
@@ -3642,6 +3782,213 @@ mod tests {",
         git(&["add", "b.txt"]);
         git(&["commit", "-q", "-m", "c2"]);
         assert_eq!(compute_landed_in_main(path), Some(false));
+    }
+
+    // -----------------------------------------------------------------
+    // Trunk-agnostic `landed_in_main` (plan
+    // 2026-08-08-runner-census-landed-in-main-trunk-agnostic-and-fresh).
+    //
+    // Every test below FAILS on the pre-fix code, which hardcoded
+    // `origin/main` in the rev-parse gate, the ancestry test and the
+    // `git cherry` range.
+    // -----------------------------------------------------------------
+
+    /// Build a temp git repo with one commit. Returns a `git` runner bound
+    /// to it. Shared by the trunk tests below.
+    fn trunk_fixture(path: &Path) -> impl Fn(&[&str]) + '_ {
+        let wt = path.to_str().unwrap();
+        let git = move |args: &[&str]| {
+            let out = Command::new("git")
+                .args([&["-C", wt], args].concat())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), b"x").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "c1"]);
+        git
+    }
+
+    /// Phase 3 step 7 — a `master`-trunk repo resolves and answers
+    /// `Some(true)` for a landed commit.
+    ///
+    /// This is the whole point of the plan: pre-fix, `rev-parse --verify
+    /// origin/main` failed here, `?` short-circuited, and the function
+    /// returned `None` forever for every worktree of such a repo. Five
+    /// governed `qontinui-*` repos on this fleet have a non-`main` trunk
+    /// (measured 2026-08-19), so this is a live class, not a hypothetical.
+    #[test]
+    fn landed_in_main_resolves_a_master_trunk_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = trunk_fixture(path);
+
+        // A `master`-trunk remote: origin/master exists, origin/main does NOT.
+        let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        git(&["update-ref", "refs/remotes/origin/master", &head]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/master",
+        ]);
+
+        // Guard the premise: the OLD hardcoded ref genuinely does not exist,
+        // so a pass here cannot be an accident of a stray origin/main.
+        assert!(
+            git_capture(path, &["rev-parse", "--verify", "--quiet", "origin/main"]).is_none(),
+            "fixture must NOT have an origin/main, or the test proves nothing"
+        );
+
+        assert_eq!(resolve_trunk_ref(path).as_deref(), Some("origin/master"));
+        assert_eq!(compute_landed_in_main(path), Some(true));
+
+        // And an unlanded commit on top is still correctly Some(false).
+        std::fs::write(path.join("b.txt"), b"y").unwrap();
+        git(&["add", "b.txt"]);
+        git(&["commit", "-q", "-m", "c2"]);
+        assert_eq!(compute_landed_in_main(path), Some(false));
+    }
+
+    /// Phase 3 step 8 — no resolvable trunk still yields the honest `None`,
+    /// never a silent `false`. coord's G2 reads `None` as not-landed, so a
+    /// `false` here would be indistinguishable from a measured verdict.
+    #[test]
+    fn landed_in_main_is_none_when_no_trunk_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let _git = trunk_fixture(path);
+
+        // Neither origin/HEAD nor origin/main exists.
+        assert!(resolve_trunk_ref(path).is_none());
+        assert_eq!(compute_landed_in_main(path), None);
+    }
+
+    /// A STALE `origin/HEAD` — present, but naming a branch that no longer
+    /// resolves — must NOT be trusted as the trunk. `origin/HEAD` is written
+    /// at clone time and never auto-refreshed, and a wrong trunk is worse
+    /// than an honest unknown: it can answer `Some(true)` and let a worktree
+    /// be reclaimed. Rung 1 must fall through to rung 2 here.
+    #[test]
+    fn stale_origin_head_falls_through_to_origin_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = trunk_fixture(path);
+        let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+
+        // origin/HEAD points at a branch that does not exist; origin/main does.
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/deleted-default",
+        ]);
+        git(&["update-ref", "refs/remotes/origin/main", &head]);
+
+        assert_eq!(resolve_trunk_ref(path).as_deref(), Some("origin/main"));
+        assert_eq!(compute_landed_in_main(path), Some(true));
+    }
+
+    /// Phase 3 step 10 — a rebase-land (SHA rewritten, patch identical) is
+    /// still recognised via the `git cherry` patch-id path, on a non-`main`
+    /// trunk. This is the case coord measured at 21% wrong (52 of 249
+    /// ff-landed worktrees, prod 2026-08-07); the plan does not claim to fix
+    /// that rate, but the patch-id path must keep working once the trunk is
+    /// resolved rather than assumed.
+    #[test]
+    fn rebase_land_is_recognised_by_patch_id_on_a_master_trunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = trunk_fixture(path);
+        let base = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+
+        // A feature commit on a branch off `base`.
+        git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(path.join("feat.txt"), b"feature\n").unwrap();
+        git(&["add", "feat.txt"]);
+        git(&["commit", "-q", "-m", "feat"]);
+        let feature_sha = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+
+        // Simulate the ff-land: the SAME patch replayed onto the trunk with
+        // a different committer date, so the commit SHA differs while the
+        // patch-id is identical — exactly what a coord rebase-land produces.
+        git(&["checkout", "-q", "--detach", &base]);
+        git(&["cherry-pick", "--no-commit", &feature_sha]);
+        git(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "feat (rebased onto trunk)",
+        ]);
+        let landed_sha = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(
+            landed_sha, feature_sha,
+            "the fixture must rewrite the SHA, or it is not testing a rebase-land"
+        );
+
+        // Publish it as the repo's `master` trunk.
+        git(&["update-ref", "refs/remotes/origin/master", &landed_sha]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/master",
+        ]);
+
+        // Back on the feature branch: HEAD is NOT an ancestor of the trunk
+        // (the SHA was rewritten), so only the patch-id path can answer.
+        git(&["checkout", "-q", "feature"]);
+        assert!(
+            git_capture(
+                path,
+                &["merge-base", "--is-ancestor", "HEAD", "origin/master"]
+            )
+            .is_none(),
+            "fixture must not be ancestor-reachable, or the patch-id path is untested"
+        );
+        assert_eq!(compute_landed_in_main(path), Some(true));
+    }
+
+    /// The base-divergence advisory is trunk-agnostic too — it used to
+    /// hardcode `main` twice (`if branch == "main"` and
+    /// `origin/main...HEAD`), so on a `master`-trunk repo it silently
+    /// degraded to the bare branch name with no ahead/behind.
+    #[test]
+    fn base_divergence_uses_the_repo_trunk_not_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = trunk_fixture(path);
+
+        git(&["branch", "-M", "master"]);
+        let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        git(&["update-ref", "refs/remotes/origin/master", &head]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/master",
+        ]);
+
+        // On the trunk branch itself → no divergence reported.
+        assert_eq!(
+            compute_canonical_base_divergence(path).as_deref(),
+            Some("on:master")
+        );
+
+        // One commit ahead on a topic branch → real ahead/behind counts,
+        // which the pre-fix code could not produce here.
+        git(&["checkout", "-q", "-b", "topic"]);
+        std::fs::write(path.join("c.txt"), b"z").unwrap();
+        git(&["add", "c.txt"]);
+        git(&["commit", "-q", "-m", "c2"]);
+        assert_eq!(
+            compute_canonical_base_divergence(path).as_deref(),
+            Some("on:topic;0\t1")
+        );
     }
 
     /// Ξ_Worktree P7.3 — canonical-checkout facts on a real temp git repo.
