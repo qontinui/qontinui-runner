@@ -400,6 +400,17 @@ async fn flusher_loop(
 #[must_use = "a dispatch's worktree may only be cleaned up once its result has been reported"]
 pub(crate) struct ResultReported(());
 
+impl ResultReported {
+    /// TEST-ONLY receipt, so `DispatchWorkspace::cleanup` can be exercised
+    /// without a coord to POST to. `#[cfg(test)]` keeps the production
+    /// ordering guarantee intact: no shipped code path can reach this, so
+    /// cleanup still cannot run before a real `post_result`.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        ResultReported(())
+    }
+}
+
 /// POST the final result, retrying on the [`RESULT_RETRY_SECS`] schedule.
 /// `reason` adds a `reason` key next to `steps` (used for admission
 /// rejections).
