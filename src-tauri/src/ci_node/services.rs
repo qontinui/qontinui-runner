@@ -103,7 +103,13 @@
 //! * A dispatch removes only containers whose names it minted from its OWN
 //!   dispatch id. Nothing else on the machine is ever touched — the developer's
 //!   own Postgres, and a peer dispatch's containers, are outside the blast
-//!   radius by construction.
+//!   radius by construction. The one place that is scoped to the dispatch ID
+//!   rather than to what this dispatch CREATED is the pre-emptive `rm -f`
+//!   before a start, which clears a leftover of a crashed earlier attempt at
+//!   the same id. That is deliberate and is the same widening
+//!   `prepare_worktree` already makes for the dispatch directory; a dispatch id
+//!   is minted once by coord, so the only thing it can hit is this dispatch's
+//!   own debris.
 //!
 //! # Blast radius on disk and on the network
 //!
@@ -122,6 +128,23 @@
 //! before reaching the IPv4-published port (the same measured trap that makes
 //! every probe script in this workspace spell the runner's own port
 //! `http://127.0.0.1:9876`).
+//!
+//! # The generated password is never written down
+//!
+//! It is passed to the container through the runtime child's ENVIRONMENT, with
+//! the argv carrying only the bare flag `-e POSTGRES_PASSWORD` (docker and
+//! podman both read that as "inherit this name from my environment"). That is
+//! not tidiness. An argv is published twice over on this lane: it sits in the
+//! host process table for the duration of the call, readable by every other
+//! session on a machine that runs many; and it is formatted into the error
+//! strings this module logs to the runner's dev log, streams live to coord, and
+//! ships in the `log_tail` coord PERSISTS with the dispatch result. The
+//! triggers are ordinary failures this module explicitly handles — a port race,
+//! an image tag that does not resolve, a pull that exceeds its budget. A
+//! per-dispatch password in a persisted remote record is exactly the hazard the
+//! generation was supposed to avoid. `tools::run_capture` additionally redacts
+//! the value after any `-e`/`--env` flag before formatting an argv into an
+//! error, so a future caller that writes the `KEY=VALUE` form leaks nothing.
 //!
 //! # Env: executor-owned, so the allowlist did not move
 //!
@@ -171,6 +194,20 @@ pub(crate) const DISPATCH_LABEL: &str = "qontinui.ci.dispatch";
 /// Host address services are published on, and the address the exported env
 /// spells. IPv4 loopback explicitly — never `localhost`.
 const LOOPBACK: &str = "127.0.0.1";
+/// Wall-clock budget for the synchronous last-resort reaper in
+/// [`ServiceStack::drop`]. Shorter than the async path's budget because it
+/// blocks a thread that cannot yield to anything else.
+const DROP_REAP_BUDGET: Duration = Duration::from_secs(20);
+/// Poll interval while the blocking reaper waits.
+const DROP_REAP_POLL: Duration = Duration::from_millis(50);
+/// How long the PUBLISHED host port has to start accepting connections once
+/// the server itself reports ready.
+const HOST_PORT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-attempt connect budget for the host-side reachability probe.
+const HOST_PORT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Gap between host-side connect attempts.
+const HOST_PORT_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Attempts at picking a free host port before giving up. A port is chosen by
 /// binding `:0` and releasing it, so a racing process can take it in the gap;
 /// a retry costs one failed `run`.
@@ -209,6 +246,12 @@ pub(crate) struct ServiceSpec {
     pub image_repo: &'static str,
     /// Port the server listens on INSIDE the container.
     pub container_port: u16,
+    /// `--memory` ceiling for the container (docker/podman size syntax).
+    /// Sized per kind rather than globally: a Postgres running a test suite
+    /// legitimately needs more than a cache does.
+    pub memory_limit: &'static str,
+    /// `--cpus` ceiling.
+    pub cpu_limit: &'static str,
 }
 
 /// The closed registry.
@@ -219,6 +262,8 @@ static KNOWN_SERVICES: &[ServiceSpec] = &[
         kind: ServiceKind::Postgres,
         image_repo: "postgres",
         container_port: 5432,
+        memory_limit: "2g",
+        cpu_limit: "2",
     },
     // What qontinui-web's `test` job actually uses: a drop-in Postgres that
     // ships the `vector` extension. Stock postgres:16 does not, and every
@@ -228,12 +273,16 @@ static KNOWN_SERVICES: &[ServiceSpec] = &[
         kind: ServiceKind::Postgres,
         image_repo: "pgvector/pgvector",
         container_port: 5432,
+        memory_limit: "2g",
+        cpu_limit: "2",
     },
     ServiceSpec {
         name: "redis",
         kind: ServiceKind::Redis,
         image_repo: "redis",
         container_port: 6379,
+        memory_limit: "512m",
+        cpu_limit: "1",
     },
 ];
 
@@ -287,7 +336,20 @@ pub(crate) fn container_name(dispatch_id: &str, entry: &str) -> String {
     format!("qontinui-ci-{dispatch_id}-{entry}")
 }
 
-/// Env the runner sets INSIDE the container.
+/// Names of the env vars the runner sets INSIDE the container. Only the NAMES
+/// go on the command line (`-e NAME`, the inherit-from-my-environment form);
+/// the values travel out of band via [`container_env`]. See [`run_argv`].
+fn container_env_names(kind: ServiceKind) -> &'static [&'static str] {
+    match kind {
+        ServiceKind::Postgres => &["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"],
+        // The Actions lane runs redis with no auth and so does this: the port
+        // is loopback-only and the container is gone at dispatch end.
+        ServiceKind::Redis => &[],
+    }
+}
+
+/// The VALUES for [`container_env_names`], handed to the container-runtime
+/// child through its process environment — never through its argv.
 fn container_env(kind: ServiceKind, creds: &ServiceCreds) -> Vec<(String, String)> {
     match kind {
         ServiceKind::Postgres => vec![
@@ -295,8 +357,6 @@ fn container_env(kind: ServiceKind, creds: &ServiceCreds) -> Vec<(String, String
             ("POSTGRES_PASSWORD".to_string(), creds.password.clone()),
             ("POSTGRES_DB".to_string(), creds.database.clone()),
         ],
-        // The Actions lane runs redis with no auth and so does this: the port
-        // is loopback-only and the container is gone at dispatch end.
         ServiceKind::Redis => Vec::new(),
     }
 }
@@ -369,15 +429,31 @@ pub(crate) fn exported_env_keys(kind: ServiceKind) -> Vec<&'static str> {
 }
 
 /// The `run` argv for one service. Pure, so the properties that matter —
-/// loopback-only publish, no bind mounts, the dispatch label — are asserted
+/// loopback-only publish, no bind mounts, the dispatch label, a resource
+/// ceiling, and **no credential anywhere on the command line** — are asserted
 /// without a container runtime.
+///
+/// # Why the env flags are BARE
+///
+/// `-e NAME` (no `=value`) means "inherit NAME from the invoking process's
+/// environment", and both docker and podman implement it. That is not a style
+/// choice here. An argv reaches two places a secret must never go:
+///
+/// 1. the host PROCESS TABLE, readable by every other session on the machine
+///    for as long as the call runs, and
+/// 2. this module's own ERROR STRINGS — which are logged to the runner's dev
+///    log, streamed live to coord, and persisted by coord in the dispatch
+///    result's `log_tail`. The triggers are ordinary: a port race, a tag that
+///    does not resolve, a pull that exceeds its budget.
+///
+/// So the value goes through [`super::tools::run_capture_env`] instead, and
+/// only the NAME is ever written down.
 pub(crate) fn run_argv(
     spec: &ServiceSpec,
     image: &str,
     name: &str,
     dispatch_id: &str,
     host_port: u16,
-    creds: &ServiceCreds,
 ) -> Vec<String> {
     let mut argv = vec![
         "run".to_string(),
@@ -389,10 +465,24 @@ pub(crate) fn run_argv(
         // Loopback ONLY. `-p 5432:5432` would publish on every interface.
         "-p".to_string(),
         format!("{LOOPBACK}:{host_port}:{}", spec.container_port),
+        // A ceiling, for the same reason every other stage of this lane has
+        // one (`cargo_build_jobs`, `test_threads`, the dispatch Job Object's
+        // committed-memory backstop): the machine is a contributor's, not a
+        // disposable Actions VM, and this was the only provisioning stage
+        // without a bound. The container is OUTSIDE the dispatch Job Object —
+        // it belongs to the daemon — so the Job Object's limit does not cover
+        // it and this flag is the only ceiling there is. Where a host cannot
+        // enforce the limit (cgroup v1 without swap accounting) the runtime
+        // prints a warning and continues; it is not a start failure.
+        "--memory".to_string(),
+        spec.memory_limit.to_string(),
+        "--cpus".to_string(),
+        spec.cpu_limit.to_string(),
     ];
-    for (k, v) in container_env(spec.kind, creds) {
+    for name in container_env_names(spec.kind) {
         argv.push("-e".to_string());
-        argv.push(format!("{k}={v}"));
+        // BARE. The value is passed out of band; see this function's docs.
+        argv.push((*name).to_string());
     }
     // No `-v`, no `--mount`: a dispatch service writes nowhere on the host.
     argv.push(image.to_string());
@@ -427,7 +517,23 @@ pub(crate) struct ServiceStack {
     runtime: Option<String>,
     /// Container names, registered BEFORE creation.
     containers: Vec<String>,
+    /// Every removal command this stack actually ISSUED, recorded inside the
+    /// removal loop.
+    ///
+    /// This exists because the alternative was a set of teardown tests that a
+    /// regression could not fail: asserting "the vec is empty afterwards"
+    /// passes just as well when the removal loop is deleted and only the
+    /// `mem::take` remains. Recording the command binds the test to the
+    /// behaviour instead of to the bookkeeping — and it is the ONLY
+    /// CI-runnable detector, since the tests that drive a real daemon are
+    /// `#[ignore]`d and CI has no Docker.
+    removals: RemovalLog,
 }
+
+/// Shared handle so a caller that has already moved the stack (the executor's
+/// `DispatchWorkspace::cleanup` consumes `self`) can still assert what was
+/// removed.
+pub(crate) type RemovalLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
 
 impl ServiceStack {
     pub(crate) fn new(dispatch_id: &str) -> Self {
@@ -435,6 +541,19 @@ impl ServiceStack {
             dispatch_id: dispatch_id.to_string(),
             runtime: None,
             containers: Vec::new(),
+            removals: RemovalLog::default(),
+        }
+    }
+
+    /// Handle onto [`Self::removals`], for a caller that needs to assert what
+    /// teardown did after the stack itself is gone.
+    pub(crate) fn removal_log(&self) -> RemovalLog {
+        std::sync::Arc::clone(&self.removals)
+    }
+
+    fn record_removal(&self, argv: &[String]) {
+        if let Ok(mut log) = self.removals.lock() {
+            log.push(argv.to_vec());
         }
     }
 
@@ -502,7 +621,7 @@ impl ServiceStack {
                 "[ci-node] service {} ({}) started as {name} on {LOOPBACK}:{port} — waiting for readiness",
                 spec.name, image
             ));
-            self.wait_ready(&runtime, spec, &name, &creds, ready_timeout, cancel)
+            self.wait_ready(&runtime, spec, &name, &creds, port, ready_timeout, cancel)
                 .await?;
             log(format!(
                 "[ci-node] service {} ready on {LOOPBACK}:{port}",
@@ -513,8 +632,14 @@ impl ServiceStack {
         Ok(exports)
     }
 
-    /// Create the container, retrying on a fresh port when the chosen one was
-    /// taken between the probe and the run.
+    /// Create the container, retrying on a fresh port when — and ONLY when —
+    /// the chosen one was taken between the probe and the run.
+    ///
+    /// The retry is scoped to that one diagnosis on purpose. Retrying every
+    /// failure would multiply the slowest failure by [`PORT_ATTEMPTS`]: a pull
+    /// that hangs to its 900s budget would take 45 minutes to produce its loud
+    /// error, which is indistinguishable from a wedged dispatch. Everything
+    /// that is not a port collision fails on the first attempt.
     async fn start(
         &self,
         runtime: &str,
@@ -524,45 +649,65 @@ impl ServiceStack {
         creds: &ServiceCreds,
         log: &mut (dyn FnMut(String) + Send),
     ) -> Result<u16, String> {
+        // The container env VALUES ride the child process's environment, never
+        // its argv — see `run_argv`. This is the credential path.
+        let child_env = container_env(spec.kind, creds);
         let mut last_err = String::new();
         for attempt in 1..=PORT_ATTEMPTS {
             let port = free_loopback_port()?;
-            let argv = run_argv(spec, image, name, &self.dispatch_id, port, creds);
+            let argv = run_argv(spec, image, name, &self.dispatch_id, port);
             if attempt == 1 {
                 log(format!(
                     "[ci-node] service {} — starting {image} (a first use pulls the image, which can take minutes)",
                     spec.name
                 ));
             }
-            match run_owned(runtime, &argv, CONTAINER_START_TIMEOUT).await {
+            match run_owned_env(runtime, &argv, CONTAINER_START_TIMEOUT, &child_env).await {
                 Ok(_) => return Ok(port),
                 Err(e) => {
                     warn!(
                         "ci_node: starting service {} attempt {attempt}/{PORT_ATTEMPTS} failed: {e}",
                         spec.name
                     );
+                    let retryable = is_port_conflict(&e);
                     last_err = e;
                     // Whatever the runtime left behind under this name must go
                     // before the next attempt can reuse it.
                     let _ = run_capture(runtime, &["rm", "-f", name], CONTAINER_CMD_TIMEOUT, None)
                         .await;
+                    if !retryable {
+                        break;
+                    }
+                    log(format!(
+                        "[ci-node] service {} — host port {port} was taken between reservation                          and start; retrying on a fresh port",
+                        spec.name
+                    ));
                 }
             }
         }
         Err(format!(
-            "service '{}' could not be started from {image} after {PORT_ATTEMPTS} attempt(s): {last_err}",
+            "service '{}' could not be started from {image}: {last_err}",
             spec.name
         ))
     }
 
     /// Block until the service answers, or fail loudly with the last probe
     /// output and the container's own logs.
+    ///
+    /// Three checks, cheapest-to-fail first:
+    ///
+    /// 1. the server answers its own protocol INSIDE the container;
+    /// 2. (Postgres) the generated credential authenticates over TCP;
+    /// 3. the PUBLISHED port is reachable from this process — the only one of
+    ///    the three that exercises the path a step actually uses.
+    #[allow(clippy::too_many_arguments)]
     async fn wait_ready(
         &self,
         runtime: &str,
         spec: &ServiceSpec,
         name: &str,
         creds: &ServiceCreds,
+        host_port: u16,
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
@@ -579,6 +724,13 @@ impl ServiceStack {
                             "container {name} is no longer running — the image exited during \
                              startup"
                         ))
+                    }
+                    Err(e) if is_missing_container(&e) => {
+                        // Removed out of band: waiting cannot bring it back, so
+                        // fail now instead of burning the whole budget.
+                        return ReadyState::Fatal(format!(
+                            "container {name} no longer exists: {e}"
+                        ));
                     }
                     Err(e) => return ReadyState::NotYet(format!("inspect failed: {e}")),
                 }
@@ -605,29 +757,89 @@ impl ServiceStack {
             }
         }
 
-        // One real query before the gate opens. `pg_isready` proves a listener;
-        // this proves the database answers, which is what a step needs.
+        // A real query before the gate opens. `pg_isready` proves a listener;
+        // this proves the database answers a statement, which is what a step
+        // needs.
+        //
+        // It is addressed to the container's OWN network address rather than to
+        // 127.0.0.1, and that detail is the whole point. The official image's
+        // initdb writes `host all all 127.0.0.1/32 trust` into `pg_hba.conf`
+        // BEFORE the entrypoint appends its `scram-sha-256` line, so a query
+        // over in-container loopback authenticates as TRUST: it would pass with
+        // no password at all and prove nothing about the credential this
+        // dispatch generated. The container's routable address matches the
+        // appended rule instead, so a successful query means the password the
+        // steps were handed actually authenticates.
         if spec.kind == ServiceKind::Postgres {
-            let confirm = vec![
-                "psql".to_string(),
-                "-U".to_string(),
-                creds.user.clone(),
-                "-d".to_string(),
-                creds.database.clone(),
-                "-h".to_string(),
-                LOOPBACK.to_string(),
-                "-tAc".to_string(),
-                "SELECT 1".to_string(),
-            ];
-            run_owned(runtime, &exec_argv(name, &confirm), CONTAINER_CMD_TIMEOUT)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "service '{}' reported ready but did not answer a SELECT 1: {e}",
-                        spec.name
+            match container_ip(runtime, name).await {
+                Ok(ip) => {
+                    let mut argv = vec![
+                        "exec".to_string(),
+                        "-e".to_string(),
+                        "PGPASSWORD".to_string(), // BARE — value passed below.
+                        name.to_string(),
+                        "psql".to_string(),
+                        "-U".to_string(),
+                        creds.user.clone(),
+                        "-d".to_string(),
+                        creds.database.clone(),
+                        "-h".to_string(),
+                        ip,
+                        "-tAc".to_string(),
+                        "SELECT 1".to_string(),
+                    ];
+                    argv.shrink_to_fit();
+                    run_owned_env(
+                        runtime,
+                        &argv,
+                        CONTAINER_CMD_TIMEOUT,
+                        &[("PGPASSWORD".to_string(), creds.password.clone())],
                     )
-                })?;
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "service '{}' reported ready but did not answer an authenticated \
+                             SELECT 1 over TCP: {e}",
+                            spec.name
+                        )
+                    })?;
+                }
+                Err(e) => {
+                    // A DISCLOSED degrade, not a silent skip: a rootless setup
+                    // may expose no routable container address. Fall back to the
+                    // loopback query — which still proves the database answers —
+                    // and say plainly what was not proven.
+                    warn!(
+                        "ci_node: no container network address for {name} ({e}) — the Postgres \
+                         credential cannot be verified end-to-end on this runtime; falling back \
+                         to an in-container loopback query, which its pg_hba trust rule will \
+                         satisfy without a password"
+                    );
+                    let confirm = vec![
+                        "psql".to_string(),
+                        "-U".to_string(),
+                        creds.user.clone(),
+                        "-d".to_string(),
+                        creds.database.clone(),
+                        "-h".to_string(),
+                        LOOPBACK.to_string(),
+                        "-tAc".to_string(),
+                        "SELECT 1".to_string(),
+                    ];
+                    run_owned(runtime, &exec_argv(name, &confirm), CONTAINER_CMD_TIMEOUT)
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "service '{}' reported ready but did not answer a SELECT 1: {e}",
+                                spec.name
+                            )
+                        })?;
+                }
+            }
         }
+
+        // Last, the only check that exercises the path a STEP uses.
+        wait_host_port_reachable(spec.name, host_port, HOST_PORT_TIMEOUT, cancel).await?;
         Ok(())
     }
 
@@ -652,7 +864,9 @@ impl ServiceStack {
             return;
         };
         for name in containers {
-            match run_owned(&runtime, &removal_argv(&name), CONTAINER_CMD_TIMEOUT).await {
+            let argv = removal_argv(&name);
+            self.record_removal(&argv);
+            match run_owned(&runtime, &argv, CONTAINER_CMD_TIMEOUT).await {
                 Ok(_) => info!("ci_node: removed service container {name}"),
                 Err(e) => warn!("ci_node: removing service container {name} failed: {e}"),
             }
@@ -665,6 +879,7 @@ impl ServiceStack {
             dispatch_id: dispatch_id.to_string(),
             runtime: runtime.map(str::to_string),
             containers: containers.iter().map(|c| (*c).to_string()).collect(),
+            removals: RemovalLog::default(),
         }
     }
 
@@ -678,8 +893,8 @@ impl Drop for ServiceStack {
     /// Last-resort reaper for the one path the async teardown cannot cover: a
     /// panic unwinding out of the dispatch task. A normal teardown empties the
     /// list, so this is a no-op on every ordinary run. It blocks on purpose —
-    /// a leaked container outlives the runner, a few blocked milliseconds do
-    /// not. It cannot help if the PROCESS is killed; see the module docs.
+    /// a leaked container outlives the runner, a BOUNDED wait does not. It
+    /// cannot help if the PROCESS is killed; see the module docs.
     fn drop(&mut self) {
         let containers = std::mem::take(&mut self.containers);
         if containers.is_empty() {
@@ -689,18 +904,71 @@ impl Drop for ServiceStack {
             return;
         };
         warn!(
-            "ci_node: dispatch {} dropped with {} service container(s) still up — \
-             reaping synchronously",
+            "ci_node: dispatch {} dropped with {} service container(s) still up — reaping              synchronously",
             self.dispatch_id,
             containers.len()
         );
         for name in containers {
-            let _ = crate::process_helpers::no_window(&runtime)
-                .args(removal_argv(&name))
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            let argv = removal_argv(&name);
+            self.record_removal(&argv);
+            if let Err(e) = reap_blocking(&runtime, &argv, DROP_REAP_BUDGET) {
+                warn!("ci_node: last-resort reap of {name} failed: {e}");
+            }
+        }
+    }
+}
+
+/// Synchronous, WALL-CLOCK-BOUNDED container removal for [`ServiceStack::drop`],
+/// which runs where no async runtime can be awaited.
+///
+/// Two properties the naive `Command::status()` does not have, both taken from
+/// this fleet's own failure modes:
+///
+/// * **A budget.** `status()` waits forever, and a container daemon that is up,
+///   listening and DEAF is a documented state here. Blocking a worker thread
+///   permanently to reap one container trades a leak for something worse. The
+///   child is killed and abandoned when the budget expires, and the failure is
+///   logged rather than swallowed.
+/// * **The Windows shim fallback.** `std::process::Command` cannot launch a
+///   `.cmd`/`.bat`, which is precisely why the async path shares
+///   `tools::run_capture`. Without the same fallback here, the reaper would be
+///   a silent no-op on exactly the machines whose runtime is a shim — the leak
+///   it exists to prevent, wearing a success.
+fn reap_blocking(runtime: &str, argv: &[String], budget: Duration) -> Result<(), String> {
+    fn spawn(program: &str, argv: &[String]) -> std::io::Result<std::process::Child> {
+        crate::process_helpers::no_window(program)
+            .args(argv)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    }
+    let mut child = match spawn(runtime, argv) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && cfg!(target_os = "windows") => {
+            let mut shim_argv = vec!["/C".to_string(), runtime.to_string()];
+            shim_argv.extend(argv.iter().cloned());
+            spawn("cmd.exe", &shim_argv)
+                .map_err(|e2| format!("spawn {runtime} (direct: {e}; cmd /C: {e2})"))?
+        }
+        Err(e) => return Err(format!("spawn {runtime}: {e}")),
+    };
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("{runtime} {argv:?} exited {status}")),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err(format!(
+                        "{runtime} did not answer {argv:?} within {}s — abandoning the reap                          rather than blocking this thread forever. The container may survive;                          it carries the {DISPATCH_LABEL} label",
+                        budget.as_secs()
+                    ));
+                }
+                std::thread::sleep(DROP_REAP_POLL);
+            }
+            Err(e) => return Err(format!("wait on {runtime}: {e}")),
         }
     }
 }
@@ -824,8 +1092,83 @@ fn exec_argv(name: &str, argv: &[String]) -> Vec<String> {
 /// is built as `Vec<String>` (so it is a pure, testable value) and borrowed
 /// only here.
 async fn run_owned(runtime: &str, argv: &[String], timeout: Duration) -> Result<String, String> {
+    run_owned_env(runtime, argv, timeout, &[]).await
+}
+
+/// [`run_owned`] with environment variables for the child. This is how a
+/// credential reaches a container: the argv carries `-e NAME`, the value
+/// arrives here, and nothing quotable ever holds the secret.
+async fn run_owned_env(
+    runtime: &str,
+    argv: &[String],
+    timeout: Duration,
+    envs: &[(String, String)],
+) -> Result<String, String> {
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-    run_capture(runtime, &args, timeout, None).await
+    super::tools::run_capture_env(runtime, &args, timeout, None, envs).await
+}
+
+/// Does this `run` failure mean the host port was taken between reservation
+/// and start? Pure, so the retry policy is testable without a daemon.
+///
+/// Matched on the messages docker and podman actually emit. Anything else is
+/// NOT retried: see [`ServiceStack::start`] for why a blanket retry is worse
+/// than no retry.
+fn is_port_conflict(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("port is already allocated")
+        || lower.contains("address already in use")
+        || lower.contains("bind for ")
+        || lower.contains("rootlessport")
+}
+
+/// Does this error mean the container is GONE rather than merely unhealthy?
+/// A removed-out-of-band container can never become ready, so waiting out the
+/// full readiness budget for it is pure delay.
+fn is_missing_container(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("no such container")
+        || lower.contains("no such object")
+        || lower.contains("not found")
+}
+
+/// Can a STEP actually reach this service?
+///
+/// The in-container probes prove the server is up; they say nothing about the
+/// published port, and a step connects from the HOST through the runtime's
+/// port-forwarding path (on Windows, Docker Desktop's proxy — a recurring flake
+/// on this platform). If publish binds but does not forward, every in-container
+/// probe passes, the gate opens green, and each step fails with a connection
+/// error that reads like a bug in the code under test. That is the lying-gate
+/// outcome this module exists to prevent, arriving through a different door, so
+/// readiness is not declared until a connection from THIS process succeeds.
+async fn wait_host_port_reachable(
+    label: &str,
+    port: u16,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    wait_until_ready(label, timeout, HOST_PORT_INTERVAL, cancel, move || async move {
+        match tokio::time::timeout(
+            HOST_PORT_CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect((LOOPBACK, port)),
+        )
+        .await
+        {
+            Ok(Ok(_stream)) => ReadyState::Ready,
+            Ok(Err(e)) => ReadyState::NotYet(format!("connect {LOOPBACK}:{port}: {e}")),
+            Err(_) => ReadyState::NotYet(format!(
+                "connect {LOOPBACK}:{port} did not answer within {}s",
+                HOST_PORT_CONNECT_TIMEOUT.as_secs()
+            )),
+        }
+    })
+    .await
+    .map_err(|e| {
+        format!(
+            "{e}. The container reported ready but its PUBLISHED port is not reachable from the              host, so every step would fail with a connection error attributed to the code under              test. This is the runtime's port-forwarding path, not the server"
+        )
+    })
 }
 
 async fn container_is_running(runtime: &str, name: &str) -> Result<bool, String> {
@@ -837,6 +1180,28 @@ async fn container_is_running(runtime: &str, name: &str) -> Result<bool, String>
     )
     .await?;
     Ok(out.trim().eq_ignore_ascii_case("true"))
+}
+
+/// The container's own routable address. Used to reach Postgres by a route that
+/// is NOT in-container loopback, so the image's `pg_hba` trust rule for
+/// 127.0.0.1 cannot mask a credential failure.
+async fn container_ip(runtime: &str, name: &str) -> Result<String, String> {
+    let out = run_capture(
+        runtime,
+        &[
+            "inspect",
+            "-f",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+            name,
+        ],
+        CONTAINER_CMD_TIMEOUT,
+        None,
+    )
+    .await?;
+    out.split_whitespace()
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{name} reports no container network address"))
 }
 
 async fn container_logs(runtime: &str, name: &str) -> String {
@@ -933,7 +1298,7 @@ mod tests {
     }
 
     /// The blast radius, asserted on the argv: loopback-only publish, the
-    /// dispatch label, and NO bind mount or volume of any kind.
+    /// dispatch label, a resource ceiling, and NO bind mount or volume.
     #[test]
     fn run_argv_publishes_on_loopback_only_and_mounts_nothing() {
         let spec = lookup("postgres-pgvector").unwrap();
@@ -943,7 +1308,6 @@ mod tests {
             "qontinui-ci-d-123-postgres-pgvector",
             "d-123",
             51999,
-            &creds(),
         );
         let publish = argv
             .iter()
@@ -959,13 +1323,96 @@ mod tests {
                 "run argv must not contain {banned}: {argv:?}"
             );
         }
-        // The image is the last token, and the credentials ride container env.
+        // Services are the only provisioning stage that leaves something
+        // RUNNING, so they carry a ceiling like every other stage of this lane.
+        assert!(argv.contains(&"--memory".to_string()));
+        assert!(argv.contains(&"--cpus".to_string()));
+        // The image is the last token.
         assert_eq!(argv.last().unwrap(), "pgvector/pgvector:pg16");
-        assert!(argv.contains(&"POSTGRES_PASSWORD=s3cret".to_string()));
-        // Redis gets no credentials at all.
-        let redis = lookup("redis").unwrap();
-        let rargv = run_argv(redis, "redis:7-alpine", "c", "d-123", 6399, &creds());
-        assert!(!rargv.iter().any(|a| a.contains("PASSWORD")));
+    }
+
+    /// THE CREDENTIAL NEVER TOUCHES AN ARGV.
+    ///
+    /// An argv reaches the host process table and — via this module's error
+    /// strings — the runner's dev log, the live progress stream, and the
+    /// `log_tail` coord PERSISTS with the dispatch result. So the env flags are
+    /// emitted in the bare `-e NAME` (inherit-from-my-environment) form and the
+    /// values travel through the child's environment instead.
+    #[test]
+    fn credentials_never_appear_on_the_command_line() {
+        let creds = ServiceCreds {
+            user: "qontinui_ci".to_string(),
+            password: "correcthorsebatterystaple".to_string(),
+            database: "qontinui_ci".to_string(),
+        };
+        for entry in ["postgres", "postgres-pgvector", "redis"] {
+            let spec = lookup(entry).unwrap();
+            let argv = run_argv(spec, "img:1", "c", "d-123", 51999);
+            assert!(
+                !argv.iter().any(|a| a.contains(&creds.password)),
+                "{entry}: the password reached the argv: {argv:?}"
+            );
+            // No `KEY=VALUE` env token at all — the bare form is the contract.
+            for (i, tok) in argv.iter().enumerate() {
+                if tok == "-e" {
+                    let value = &argv[i + 1];
+                    assert!(
+                        !value.contains('='),
+                        "{entry}: env flag must be bare, got {value:?}"
+                    );
+                }
+            }
+            // …and the values are still delivered, out of band.
+            let env = container_env(spec.kind, &creds);
+            let names: Vec<&str> = container_env_names(spec.kind).to_vec();
+            assert_eq!(env.len(), names.len());
+            for (k, _) in &env {
+                assert!(names.contains(&k.as_str()), "{k} has no bare flag");
+            }
+            if spec.kind == ServiceKind::Postgres {
+                assert!(env
+                    .iter()
+                    .any(|(k, v)| k == "POSTGRES_PASSWORD" && v == &creds.password));
+            }
+        }
+    }
+
+    /// Only a port collision is retried. A blanket retry would multiply the
+    /// SLOWEST failure by `PORT_ATTEMPTS` — a hung pull would take 45 minutes
+    /// to produce its loud error.
+    #[test]
+    fn only_a_port_collision_is_retried() {
+        for retryable in [
+            "docker: Error response from daemon: driver failed programming external connectivity: \
+             Bind for 127.0.0.1:51999 failed: port is already allocated",
+            "address already in use",
+            "rootlessport cannot expose privileged port",
+        ] {
+            assert!(is_port_conflict(retryable), "should retry: {retryable}");
+        }
+        for fatal in [
+            "Unable to find image 'postgres:16-nope' locally / not found",
+            "docker did not answer within 900s",
+            "permission denied while trying to connect to the Docker daemon socket",
+        ] {
+            assert!(!is_port_conflict(fatal), "must NOT retry: {fatal}");
+        }
+    }
+
+    /// A container removed out of band can never become ready, so it hits the
+    /// fast Fatal path rather than the full readiness budget.
+    #[test]
+    fn a_vanished_container_is_diagnosed_not_waited_out() {
+        for gone in [
+            "Error: No such container: qontinui-ci-d-1-redis",
+            "Error: no such object: qontinui-ci-d-1-redis",
+            "Error response from daemon: not found",
+        ] {
+            assert!(is_missing_container(gone), "should be fatal: {gone}");
+        }
+        assert!(!is_missing_container(
+            "container is restarting, wait until it is running"
+        ));
     }
 
     /// Steps see IPv4 loopback and the EPHEMERAL port — never `localhost`
@@ -1167,11 +1614,20 @@ mod tests {
         assert!(err.contains("cancelled"), "got: {err}");
     }
 
-    /// Teardown removes exactly the containers this dispatch registered, is
-    /// best-effort (the runtime here does not exist, and that is not an error
-    /// the caller sees), and EMPTIES the stack so `Drop` does not try again.
+    /// Teardown ISSUES a forced removal for exactly the containers this
+    /// dispatch registered — asserted on the commands, not on the bookkeeping.
+    ///
+    /// Asserting "the vec is empty afterwards" would pass just as well if the
+    /// removal loop were deleted and only the `mem::take` remained, which makes
+    /// it no regression detector at all. The recorded commands bind the test to
+    /// the behaviour, and they are the only detector CI can run: the tests that
+    /// drive a real daemon are `#[ignore]`d and CI has no Docker.
+    ///
+    /// The runtime named here does not exist, which also pins best-effort: a
+    /// removal that cannot run is not an error the caller sees, and it must
+    /// still empty the stack so `Drop` does not try again.
     #[tokio::test]
-    async fn teardown_is_best_effort_and_empties_the_stack() {
+    async fn teardown_issues_a_forced_removal_for_every_container() {
         let mut stack = ServiceStack::for_test(
             "d-teardown",
             Some("qontinui-no-such-container-runtime"),
@@ -1180,15 +1636,39 @@ mod tests {
                 "qontinui-ci-d-teardown-postgres",
             ],
         );
+        let log = stack.removal_log();
         assert_eq!(stack.container_names().len(), 2);
+
         stack.teardown().await;
+
+        let issued = log.lock().unwrap().clone();
+        assert_eq!(
+            issued,
+            vec![
+                vec![
+                    "rm".to_string(),
+                    "-f".to_string(),
+                    "qontinui-ci-d-teardown-redis".to_string()
+                ],
+                vec![
+                    "rm".to_string(),
+                    "-f".to_string(),
+                    "qontinui-ci-d-teardown-postgres".to_string()
+                ],
+            ],
+            "teardown must issue a forced removal per registered container"
+        );
         assert!(
             stack.container_names().is_empty(),
             "teardown must empty the stack even when the removal command fails"
         );
-        // Idempotent: a second teardown (and the Drop that follows) is a no-op.
+
+        // Idempotent: a second teardown issues nothing new, and neither does
+        // the Drop that follows.
         stack.teardown().await;
-        assert!(stack.container_names().is_empty());
+        assert_eq!(log.lock().unwrap().len(), 2);
+        drop(stack);
+        assert_eq!(log.lock().unwrap().len(), 2);
     }
 
     /// The removal is a FORCED remove by exact name — never a filter, never a
@@ -1206,8 +1686,8 @@ mod tests {
     }
 
     /// A stack that still holds containers is not silently forgotten when it is
-    /// dropped without a teardown — the reaper fires. (The runtime does not
-    /// exist, so this exercises the path without touching a container.)
+    /// dropped without a teardown — the reaper ISSUES the removal. Asserted on
+    /// the command, because "does not panic" is satisfied by an empty `drop`.
     #[test]
     fn dropping_a_live_stack_reaps_rather_than_leaking() {
         let stack = ServiceStack::for_test(
@@ -1215,7 +1695,85 @@ mod tests {
             Some("qontinui-no-such-container-runtime"),
             &["qontinui-ci-d-drop-redis"],
         );
-        drop(stack); // must not panic, and must not hang
+        let log = stack.removal_log();
+        let started = Instant::now();
+        drop(stack);
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![vec![
+                "rm".to_string(),
+                "-f".to_string(),
+                "qontinui-ci-d-drop-redis".to_string()
+            ]],
+            "the last-resort reaper must actually issue the removal"
+        );
+        // And it is BOUNDED: a wedged daemon must not own this thread forever.
+        assert!(started.elapsed() < DROP_REAP_BUDGET);
+    }
+
+    /// The blocking reaper honours its wall-clock budget rather than waiting
+    /// forever on a daemon that is up, listening and deaf.
+    #[test]
+    fn the_blocking_reaper_is_bounded() {
+        // A program that exists on every supported host and never exits on its
+        // own: the platform sleep, asked for far longer than the budget.
+        #[cfg(target_os = "windows")]
+        let (program, argv) = (
+            "powershell",
+            vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Seconds 120".to_string(),
+            ],
+        );
+        #[cfg(not(target_os = "windows"))]
+        let (program, argv) = ("sleep", vec!["120".to_string()]);
+
+        let started = Instant::now();
+        let err = reap_blocking(program, &argv, Duration::from_millis(400))
+            .expect_err("a command that outlives the budget must be abandoned");
+        assert!(err.contains("did not answer"), "got: {err}");
+        assert!(err.contains(DISPATCH_LABEL), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "reaper blocked for {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The host-side gate: readiness is not declared until a connection from
+    /// THIS process succeeds, because that is the path a step uses.
+    #[tokio::test]
+    async fn host_port_gate_passes_on_a_listener_and_fails_loudly_without_one() {
+        let listener = std::net::TcpListener::bind((LOOPBACK, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        wait_host_port_reachable(
+            "redis",
+            port,
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("a bound port must satisfy the host gate");
+
+        // Nothing listening: the gate must FAIL, naming the forwarding path —
+        // never open green on a port a step cannot reach.
+        drop(listener);
+        let dead = free_loopback_port().unwrap();
+        let err = wait_host_port_reachable(
+            "postgres",
+            dead,
+            Duration::from_millis(200),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("an unreachable published port must fail the dispatch");
+        assert!(err.contains("did not become ready"), "got: {err}");
+        assert!(
+            err.contains("PUBLISHED port is not reachable"),
+            "got: {err}"
+        );
+        assert!(err.contains(&dead.to_string()), "got: {err}");
     }
 
     // ── Real container runtime ────────────────────────────────────────────
@@ -1256,12 +1814,32 @@ mod tests {
             .find(|(k, _)| k == "DATABASE_URL")
             .map(|(_, v)| v.clone())
             .expect("DATABASE_URL");
-        println!("exports: {exports:?}");
+        // KEYS only. Printing the value would put a live credential in a test
+        // log for no diagnostic gain — the same discipline this module applies
+        // to its own error strings.
+        let keys: Vec<&str> = exports.iter().map(|(k, _)| k.as_str()).collect();
+        println!("exported keys: {keys:?}");
         assert!(url.starts_with("postgresql://qontinui_ci:"));
         assert_eq!(stack.container_names().len(), 2);
 
+        // The password the steps were handed is NOT on any command line: it
+        // reached the container through the child's environment.
+        let password = url
+            .trim_start_matches("postgresql://qontinui_ci:")
+            .split('@')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(password.len(), 32);
+
+        let log = stack.removal_log();
         stack.teardown().await;
         assert!(stack.container_names().is_empty());
+        assert_eq!(
+            log.lock().unwrap().len(),
+            2,
+            "teardown must issue one removal per container"
+        );
 
         // Nothing labelled with this dispatch survives.
         let leftovers = run_capture(
