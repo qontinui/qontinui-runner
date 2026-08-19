@@ -106,6 +106,7 @@ pub mod plan_library;
 pub mod plans;
 pub mod playwright;
 pub mod playwright_collection;
+pub mod policy_context;
 pub mod prm_export;
 pub mod probe_executor;
 pub mod processes;

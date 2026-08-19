@@ -288,6 +288,16 @@ pub fn runner_context(api_port: u16) -> String {
     // profile → localhost fallback) so the prompt never disagrees with the
     // runner's own coord client.
     let coord_url = crate::coord_mcp::coord_base_url();
+    // The HTTP fallbacks below name `/coord/agent-prompt-documents`, coord's
+    // device/agent (`require_jwt`) door — NOT the sibling
+    // `/coord/prompt-documents`, which is the OPERATOR door and 403s a device
+    // JWT (documented at length on `mcp::continuation_verdict`'s rules URL and
+    // in `prompt_library`'s module docs). The briefing named the operator door
+    // until 2026-08-19, which meant the one WRITTEN escape hatch for a session
+    // whose coord MCP tools are masked was dead on arrival — it 403s exactly
+    // when it is needed. `policy/session-protocol` Step 0 names the agent door
+    // for this reason; the briefing now agrees with it.
+    // (plan `2026-08-08-runner-enforced-policy-pull.md` Phase 1.8)
     let mut briefing = format!(
         "{RUNNER_CONTEXT_SOURCE_MARKER}
 You are running inside the Qontinui Runner — an autonomous multi-agent \
@@ -300,8 +310,8 @@ Policies and playbooks are pull-first documents, not baked into this prompt. \
 Discover them via the coord MCP tools: coord_list_prompt_documents (names + \
 descriptions, cheap) and coord_get_prompt_document (full body on demand). \
 HTTP fallback if those tools are unavailable: \
-GET {coord_url}/coord/prompt-documents (list, optional ?kind= filter) and \
-GET {coord_url}/coord/prompt-documents/{{kind}}/{{name}}.
+GET {coord_url}/coord/agent-prompt-documents (list, optional ?kind= filter) and \
+GET {coord_url}/coord/agent-prompt-documents/{{kind}}/{{name}}.
 
 When you would ask the user a question: fetch the relevant policy and DECIDE, \
 recording it via coord_request_policy / coord_record_decision. Only a \
@@ -364,7 +374,7 @@ report that fed a prompt, the prompt that authored a plan) — record the edge \
 every time, not only the artifact. Protocol detail lives in the coord prompt \
 document: coord_get_prompt_document(kind=\"agent_playbook\", \
 name=\"plan-capture\"), or GET \
-{coord_url}/coord/prompt-documents/agent_playbook/plan-capture."
+{coord_url}/coord/agent-prompt-documents/agent_playbook/plan-capture."
     )
 }
 
@@ -612,6 +622,34 @@ mod tests {
         );
     }
 
+    /// The briefing's advertised HTTP fallback must name coord's DEVICE/AGENT
+    /// door. `/coord/prompt-documents/*` is the operator door: it resolves
+    /// tenancy from a verified Cognito operator context and 403s the device JWT
+    /// a runner session carries. Naming it made the one written escape hatch
+    /// for a masked-tools session dead on arrival — it fails exactly when it is
+    /// needed, and fails with an auth error that looks like a permissions
+    /// problem rather than a wrong-URL one.
+    /// (plan `2026-08-08-runner-enforced-policy-pull.md` Phase 1.8)
+    #[test]
+    fn briefing_http_fallback_names_the_agent_door_not_the_operator_door() {
+        let _pin = pin_plan_capture_level_for_test("off");
+        let briefing = runner_context(9876);
+        assert!(
+            briefing.contains("/coord/agent-prompt-documents (list, optional ?kind= filter)"),
+            "the list fallback must be the agent door: {briefing}"
+        );
+        assert!(
+            briefing.contains("/coord/agent-prompt-documents/{kind}/{name}"),
+            "the single-document fallback must be the agent door: {briefing}"
+        );
+        // The negative is the load-bearing half: `agent-prompt-documents`
+        // CONTAINS `prompt-documents`, so match on the full path segment.
+        assert!(
+            !briefing.contains("/coord/prompt-documents"),
+            "the operator door 403s a device JWT and must never be advertised: {briefing}"
+        );
+    }
+
     /// The marker must actually discriminate builds — a bare package/version
     /// stamp moves only once per release, so every locally-built runner on the
     /// fleet would attribute to the same string. Guards the `+<git-sha>`
@@ -690,7 +728,9 @@ mod tests {
         assert!(briefing.contains("provenance edge"));
         // LINKS, not policy prose: the long form is a coord prompt document.
         assert!(briefing.contains("coord_get_prompt_document"));
-        assert!(briefing.contains("/coord/prompt-documents/agent_playbook/plan-capture"));
+        // The AGENT door — the operator door 403s a device JWT, so a link to it
+        // is a link a session cannot follow.
+        assert!(briefing.contains("/coord/agent-prompt-documents/agent_playbook/plan-capture"));
 
         // The marker contract survives an appended clause.
         assert_eq!(

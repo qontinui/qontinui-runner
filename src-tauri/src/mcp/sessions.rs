@@ -750,6 +750,56 @@ async fn continuation_verdict(
 }
 
 // =============================================================================
+// /sessions/<id>/policy-context
+// =============================================================================
+
+/// Query for [`policy_context`]. `source` is the Claude `SessionStart` payload's
+/// `source` (`startup` | `resume` | `compact`), forwarded by the hook script so
+/// the injection can be labelled with WHY the session started. Optional: an
+/// absent or unrecognised value normalizes to `startup` in
+/// [`crate::mcp::policy_context::normalize_source`], because an unrecognised
+/// start is still a start.
+#[derive(Debug, Deserialize)]
+struct PolicyContextQuery {
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// `GET /sessions/{id}/policy-context` — the SessionStart policy-injection
+/// endpoint (plan `2026-08-08-runner-enforced-policy-pull.md` Phase 1).
+///
+/// Sibling of [`continuation_verdict`] in every respect that matters: `{id}` is
+/// the runner terminal id the hook script sends (`QONTINUI_TERMINAL_ID`,
+/// falling back to the Claude session id), resolved through the same
+/// [`resolve_session_key`]; all policy lives in
+/// [`crate::mcp::policy_context`]; and it is flag-gated
+/// (`QONTINUI_POLICY_INJECTION`, default `off`).
+///
+/// **Always 200, never 5xx.** Two distinct 200s:
+///
+/// - a JSON `hookSpecificOutput` envelope ⇒ the hook prints it and Claude
+///   splices `additionalContext` into the session's context;
+/// - an EMPTY body ⇒ inject nothing. That is the answer in `off` and `observe`
+///   mode, and it is what the hook script's `[ -z "$resp" ]` guard already
+///   treats as "decline", so the dark path and the unreachable path coincide.
+///
+/// A coord failure does NOT produce an empty body — it produces an envelope
+/// carrying the fail-open notice, because a session that silently receives
+/// nothing is in exactly the pre-plan state the phase exists to end.
+async fn policy_context(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(q): Query<PolicyContextQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let key = resolve_session_key(&state, &id, &serde_json::Value::Null);
+    match crate::mcp::policy_context::policy_context(&key, q.source.as_deref()).await {
+        Some(envelope) => Json(envelope).into_response(),
+        None => StatusCode::OK.into_response(),
+    }
+}
+
+// =============================================================================
 // /sessions/<id>/context-low
 // =============================================================================
 
@@ -934,4 +984,5 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(continuation_verdict),
         )
         .route("/sessions/{id}/context-low", post(context_low))
+        .route("/sessions/{id}/policy-context", get(policy_context))
 }
