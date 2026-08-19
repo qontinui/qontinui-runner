@@ -288,6 +288,7 @@ mod flywheel_e2e_tests;
 // See plans/2026-05-20-runner-tier-decoupling.md.
 #[cfg(test)]
 mod tier_matrix_tests;
+mod turn_ending_shadow;
 mod worktree;
 mod wrappers;
 mod zombie_sweep;

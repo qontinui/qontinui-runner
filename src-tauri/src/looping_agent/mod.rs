@@ -34,6 +34,11 @@
 //!   spawn-failure backoff.
 //! - [`playbook`] — the bundled built-in playbook(s) + the spawn/relaunch/
 //!   nudge prompt builders.
+//! - [`turn_ending`] — the pure premature-bailout detector: classify a turn's
+//!   FINAL TEXT as complete / waiting-on-signal / user-deflection / bailout /
+//!   unknown. `&str` in, verdict out. Its input comes from the Claude Code
+//!   transcript JSONL (bin-side glue), NOT the rendered grid — the grid's
+//!   normalizer collapses newlines, so paragraph structure does not survive it.
 //!
 //! The impure glue (spawning visible tabs, submitting prompts, reading live
 //! grids) lives in the runner bin at `src/looping_agent_supervisor.rs` and is
@@ -46,3 +51,4 @@ pub mod lease;
 pub mod playbook;
 pub mod policy;
 pub mod registry;
+pub mod turn_ending;

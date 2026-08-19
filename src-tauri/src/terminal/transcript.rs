@@ -289,7 +289,13 @@ fn extract_resume_name(content: &str) -> Option<String> {
 /// Read the last `max` bytes of `path` as a string, dropping the leading
 /// partial line (the seek may land mid-line). Returns the whole file when it is
 /// smaller than `max`. `None` on any I/O error (fail-soft).
-fn read_tail_bytes(path: &Path, max: u64) -> Option<String> {
+///
+/// `pub(crate)` so the turn-ending shadow reader
+/// ([`crate::turn_ending_shadow`]) can reuse the SAME bounded-tail semantics
+/// instead of writing a second one with subtly different partial-line handling.
+/// It reads with a much larger cap — see that module for why 4 KB is wrong for
+/// classifying a turn's final paragraph.
+pub(crate) fn read_tail_bytes(path: &Path, max: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -782,7 +788,7 @@ fn parse_user_record(record: &serde_json::Value) -> Option<TranscriptMessage> {
 }
 
 /// Parse an `assistant` type record from the JSONL transcript.
-fn parse_assistant_record(record: &serde_json::Value) -> Option<TranscriptMessage> {
+pub(crate) fn parse_assistant_record(record: &serde_json::Value) -> Option<TranscriptMessage> {
     let uuid = record.get("uuid")?.as_str()?.to_string();
     let timestamp = record
         .get("timestamp")

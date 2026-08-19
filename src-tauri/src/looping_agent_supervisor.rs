@@ -448,6 +448,43 @@ async fn supervise_one(
         }
     }
 
+    // SHADOW MODE (plan 2026-08-11-agent-bailout-detector-for-finish-to-zero,
+    // Phase 2): a confirmed-idle tick is the moment a turn just ENDED, so it is
+    // the moment to classify how it ended. Classify and record only — the
+    // verdict feeds NOTHING below, and `TickInput` deliberately does not carry
+    // it. The false-positive rate on real fleet traffic is unknown; Phase 3
+    // reviews the recorded corpus by hand before Phase 4 enables any action.
+    //
+    // Note this reads the TRANSCRIPT, not the grid `idle` was computed from —
+    // the grid's normalizer collapses newlines, so the "last non-empty
+    // paragraph" rule cannot be evaluated against it. See `turn_ending_shadow`.
+    if idle {
+        if let Some(csid) = rec.runtime.claude_session_id.as_deref() {
+            let agent_id = rec.def.id.clone();
+            let journal_path = rec.def.journal_path.clone();
+            let csid = csid.to_string();
+            // Off the tick's critical path: the read touches disk and sweeps
+            // every Claude config dir on the box, and shadow mode must never
+            // slow or perturb the loop it observes.
+            // Returns None when this tick saw the SAME ending already
+            // journalled — the common case at a 5s tick.
+            tokio::task::spawn_blocking(move || {
+                if let Some(ending) = crate::turn_ending_shadow::observe_turn_ending(
+                    &agent_id,
+                    &journal_path,
+                    &csid,
+                    now_ms,
+                ) {
+                    debug!(
+                        agent = %agent_id,
+                        ending = %ending.kind_label(),
+                        "looping_agent_supervisor: turn ending recorded (SHADOW MODE)"
+                    );
+                }
+            });
+        }
+    }
+
     let input = TickInput {
         // Phase 8: BOTH posture inputs now come from the resolved effective
         // state, not from the local registry row. `resolve` has already folded
