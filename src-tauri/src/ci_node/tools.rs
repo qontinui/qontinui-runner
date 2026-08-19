@@ -1278,20 +1278,39 @@ fn write_python_shim(bin_dir: &Path, stem: &str, module: &str) -> Result<PathBuf
 /// NOT redundant: this helper keeps gaining callers, and the next one to write
 /// `-e PASSWORD=…` should leak nothing. The KEY is kept because it is the
 /// diagnostic half; only the value is dropped.
-fn redacted_argv(args: &[&str]) -> Vec<String> {
+///
+/// **All three spellings docker and podman accept are handled**, because a
+/// redactor that fails open is worse than none — it is trusted. The separated
+/// `-e NAME=VALUE`, the attached long `--env=NAME=VALUE`, and the attached
+/// short `-eNAME=VALUE` all redact; the first version of this function handled
+/// only the separated form and passed the other two through verbatim, which is
+/// exactly the shape a future caller is most likely to write.
+pub(super) fn redacted_argv(args: &[&str]) -> Vec<String> {
+    /// `NAME=VALUE` -> `NAME=<redacted>`; a token with no `=` carries no value
+    /// and is returned as-is.
+    fn drop_value(token: &str) -> String {
+        match token.split_once('=') {
+            Some((key, _)) => format!("{key}=<redacted>"),
+            None => token.to_string(),
+        }
+    }
     let mut out = Vec::with_capacity(args.len());
     let mut prev_was_env_flag = false;
     for arg in args {
+        let token = *arg;
         if prev_was_env_flag {
-            match arg.split_once('=') {
-                Some((key, _)) => out.push(format!("{key}=<redacted>")),
-                // The bare form carries no value to redact.
-                None => out.push((*arg).to_string()),
-            }
+            // Separated form: `-e` `NAME=VALUE`.
+            out.push(drop_value(token));
+        } else if let Some(rest) = token.strip_prefix("--env=") {
+            // Attached long form: `--env=NAME=VALUE`.
+            out.push(format!("--env={}", drop_value(rest)));
+        } else if token.len() > 2 && token.starts_with("-e") && !token.starts_with("--") {
+            // Attached short form: `-eNAME=VALUE`.
+            out.push(format!("-e{}", drop_value(&token[2..])));
         } else {
-            out.push((*arg).to_string());
+            out.push(token.to_string());
         }
-        prev_was_env_flag = matches!(*arg, "-e" | "--env");
+        prev_was_env_flag = matches!(token, "-e" | "--env");
     }
     out
 }
@@ -1463,36 +1482,62 @@ mod tests {
     /// does not.
     #[test]
     fn argv_rendered_for_an_error_drops_env_values() {
+        const SECRET: &str = "correcthorsebatterystaple";
         let args = [
             "run",
             "-d",
             "--name",
             "qontinui-ci-d1-postgres",
+            // Separated form.
             "-e",
             "POSTGRES_PASSWORD=correcthorsebatterystaple",
             "--env",
-            "PGPASSWORD=hunter2",
+            "PGPASSWORD=correcthorsebatterystaple",
+            // Attached forms. Both are accepted by docker and podman, and both
+            // were passed through VERBATIM by the first version of this
+            // function — a redactor that fails open is worse than none,
+            // because it is trusted.
+            "--env=POSTGRES_INITDB_ARGS=correcthorsebatterystaple",
+            "-ePGPASSFILE=correcthorsebatterystaple",
+            // Bare: nothing to redact.
             "-e",
-            "POSTGRES_DB", // bare: nothing to redact
+            "POSTGRES_DB",
             "postgres:16",
         ];
         let rendered = format!("{:?}", redacted_argv(&args));
         assert!(
-            !rendered.contains("correcthorsebatterystaple"),
-            "{rendered}"
+            !rendered.contains(SECRET),
+            "a value survived redaction: {rendered}"
         );
-        assert!(!rendered.contains("hunter2"), "{rendered}");
-        // The NAME survives — it is the diagnostic half.
-        assert!(
-            rendered.contains("POSTGRES_PASSWORD=<redacted>"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("PGPASSWORD=<redacted>"), "{rendered}");
-        assert!(rendered.contains("POSTGRES_DB"), "{rendered}");
+        // Every NAME survives — it is the diagnostic half.
+        for kept in [
+            "POSTGRES_PASSWORD=<redacted>",
+            "PGPASSWORD=<redacted>",
+            "--env=POSTGRES_INITDB_ARGS=<redacted>",
+            "-ePGPASSFILE=<redacted>",
+            "POSTGRES_DB",
+        ] {
+            assert!(rendered.contains(kept), "{kept} missing from {rendered}");
+        }
         // Everything that is not an env value is untouched, so the error stays
         // diagnosable.
         assert!(rendered.contains("qontinui-ci-d1-postgres"), "{rendered}");
         assert!(rendered.contains("postgres:16"), "{rendered}");
+    }
+
+    /// Degenerate argv shapes must not panic, swallow a token, or leak.
+    #[test]
+    fn redaction_handles_degenerate_argv_shapes() {
+        assert_eq!(redacted_argv(&[]), Vec::<String>::new());
+        // `-e` as the LAST token: nothing follows it to redact.
+        assert_eq!(redacted_argv(&["run", "-e"]), vec!["run", "-e"]);
+        // A flag whose "value" is another flag, then the real pair.
+        assert_eq!(
+            redacted_argv(&["-e", "-e", "K=V"]),
+            vec!["-e", "-e", "K=<redacted>"]
+        );
+        // A lone `-e`-prefixed token that is NOT an env flag stays intact.
+        assert_eq!(redacted_argv(&["--exec", "x"]), vec!["--exec", "x"]);
     }
 
     /// The out-of-band path actually delivers: a value passed as env reaches
@@ -1516,11 +1561,11 @@ mod tests {
         )
         .await
         .expect("the child must run");
+        // The value reached the child. That it is not on the argv is asserted
+        // where it is actually decided — `services::run_argv`, whose output is
+        // the thing that could carry it — rather than against a literal here
+        // that never contained it.
         assert!(out.contains("correcthorsebatterystaple"), "got {out:?}");
-        assert!(
-            !format!("{args:?}").contains("correcthorsebatterystaple"),
-            "the value must never be in the argv"
-        );
     }
 
     #[test]

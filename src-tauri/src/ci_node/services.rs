@@ -129,7 +129,7 @@
 //! every probe script in this workspace spell the runner's own port
 //! `http://127.0.0.1:9876`).
 //!
-//! # The generated password is never written down
+//! # The generated password is never on an argv, nor in this module's errors
 //!
 //! It is passed to the container through the runtime child's ENVIRONMENT, with
 //! the argv carrying only the bare flag `-e POSTGRES_PASSWORD` (docker and
@@ -145,6 +145,29 @@
 //! generation was supposed to avoid. `tools::run_capture` additionally redacts
 //! the value after any `-e`/`--env` flag before formatting an argv into an
 //! error, so a future caller that writes the `KEY=VALUE` form leaks nothing.
+//!
+//! What that does and does not cover, stated exactly rather than left to the
+//! heading:
+//!
+//! * The value is never in the RUNNER's own environment — it is set on the
+//!   runtime CLI child's `Command` for the duration of one call. On Unix
+//!   `/proc/<pid>/environ` is owner-only, whereas `/proc/<pid>/cmdline` is
+//!   world-readable, which is the asymmetry this buys; and the error strings
+//!   were persisted by coord forever, which is the one it buys most.
+//! * `docker inspect` still shows the container's `Config.Env` whatever form
+//!   was used. That is unavoidable and is gated behind daemon access, which on
+//!   this platform is already root-equivalent.
+//! * The REMAINING channel is step output. [`exports_for`] hands every step
+//!   `DATABASE_URL` (which embeds the password) and `PGPASSWORD`, and step
+//!   stdout goes to the same progress sink and the same persisted `log_tail`,
+//!   so a step that runs `env` or `set -x` republishes it. That is inherent to
+//!   giving a step a database — the Actions lane does the same — and is a
+//!   property of the service contract, not a defect this module can close.
+//!
+//! The alternatives were weighed and are worse here: `--env-file` moves the
+//! secret into a file whose PATH is then on the argv and which outlives the
+//! call; `POSTGRES_PASSWORD_FILE` needs a bind mount, breaking the "no `-v`, no
+//! `--mount`" invariant above; `--mount type=secret` is swarm-only for `run`.
 //!
 //! # Env: executor-owned, so the allowlist did not move
 //!
@@ -298,11 +321,26 @@ pub(crate) fn known_service_names() -> Vec<&'static str> {
 /// manifest is a committed file and a committed password is a password on
 /// GitHub. The user and database names are fixed so the exported env is
 /// predictable; only the password is random.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ServiceCreds {
     pub user: String,
     pub password: String,
     pub database: String,
+}
+
+/// Hand-written so the password has no `{:?}` path at all.
+///
+/// The derive was the sink a future `warn!("{creds:?}")` would have used —
+/// closing the CLASS is cheaper than auditing each new format string for the
+/// instance.
+impl std::fmt::Debug for ServiceCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceCreds")
+            .field("user", &self.user)
+            .field("database", &self.database)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ServiceCreds {
@@ -679,8 +717,12 @@ impl ServiceStack {
                         break;
                     }
                     log(format!(
-                        "[ci-node] service {} — host port {port} was taken between reservation                          and start; retrying on a fresh port",
-                        spec.name
+                        concat!(
+                            "[ci-node] service {name} — host port {port} was taken ",
+                            "between reservation and start; retrying on a fresh port"
+                        ),
+                        name = spec.name,
+                        port = port
                     ));
                 }
             }
@@ -785,10 +827,11 @@ impl ServiceStack {
                         creds.database.clone(),
                         "-h".to_string(),
                         ip,
+                        "-p".to_string(),
+                        spec.container_port.to_string(),
                         "-tAc".to_string(),
                         "SELECT 1".to_string(),
                     ];
-                    argv.shrink_to_fit();
                     run_owned_env(
                         runtime,
                         &argv,
@@ -839,7 +882,8 @@ impl ServiceStack {
         }
 
         // Last, the only check that exercises the path a STEP uses.
-        wait_host_port_reachable(spec.name, host_port, HOST_PORT_TIMEOUT, cancel).await?;
+        wait_host_port_reachable(spec.name, spec.kind, host_port, HOST_PORT_TIMEOUT, cancel)
+            .await?;
         Ok(())
     }
 
@@ -904,7 +948,10 @@ impl Drop for ServiceStack {
             return;
         };
         warn!(
-            "ci_node: dispatch {} dropped with {} service container(s) still up — reaping              synchronously",
+            concat!(
+                "ci_node: dispatch {} dropped with {} service container(s) still up ",
+                "— reaping synchronously"
+            ),
             self.dispatch_id,
             containers.len()
         );
@@ -935,6 +982,13 @@ impl Drop for ServiceStack {
 ///   a silent no-op on exactly the machines whose runtime is a shim — the leak
 ///   it exists to prevent, wearing a success.
 fn reap_blocking(runtime: &str, argv: &[String], budget: Duration) -> Result<(), String> {
+    /// Borrow an owned argv for the shared redactor. Nothing in this function's
+    /// own argv is secret, but every OTHER argv-into-error site in this module
+    /// goes through the redactor, and a lone exception is how the discipline
+    /// erodes.
+    fn borrowed(argv: &[String]) -> Vec<&str> {
+        argv.iter().map(String::as_str).collect()
+    }
     fn spawn(program: &str, argv: &[String]) -> std::io::Result<std::process::Child> {
         crate::process_helpers::no_window(program)
             .args(argv)
@@ -957,13 +1011,30 @@ fn reap_blocking(runtime: &str, argv: &[String], budget: Duration) -> Result<(),
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => return Err(format!("{runtime} {argv:?} exited {status}")),
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "{runtime} {:?} exited {status}",
+                    super::tools::redacted_argv(&borrowed(argv))
+                ))
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
+                    // Reap it. Without this the killed child stays a zombie on
+                    // Unix for the runner's lifetime — a leak of a different
+                    // kind than the one this function exists to prevent, but
+                    // still a leak.
+                    let _ = child.wait();
                     return Err(format!(
-                        "{runtime} did not answer {argv:?} within {}s — abandoning the reap                          rather than blocking this thread forever. The container may survive;                          it carries the {DISPATCH_LABEL} label",
-                        budget.as_secs()
+                        concat!(
+                            "{runtime} did not answer {argv_shown:?} within {secs}s — ",
+                            "abandoning the reap rather than blocking this thread forever. ",
+                            "The container may survive; it carries the {label} label"
+                        ),
+                        runtime = runtime,
+                        argv_shown = super::tools::redacted_argv(&borrowed(argv)),
+                        secs = budget.as_secs(),
+                        label = DISPATCH_LABEL,
                     ));
                 }
                 std::thread::sleep(DROP_REAP_POLL);
@@ -1127,48 +1198,116 @@ fn is_port_conflict(err: &str) -> bool {
 /// full readiness budget for it is pure delay.
 fn is_missing_container(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
-    lower.contains("no such container")
-        || lower.contains("no such object")
-        || lower.contains("not found")
+    // Anchored to the two messages docker and podman actually emit for a
+    // container that is GONE. A bare "not found" also matches an image pull
+    // failure and a transient daemon hiccup, which would turn a retryable
+    // NotYet into a dispatch-failing Fatal.
+    lower.contains("no such container") || lower.contains("no such object")
 }
 
 /// Can a STEP actually reach this service?
 ///
 /// The in-container probes prove the server is up; they say nothing about the
 /// published port, and a step connects from the HOST through the runtime's
-/// port-forwarding path (on Windows, Docker Desktop's proxy — a recurring flake
-/// on this platform). If publish binds but does not forward, every in-container
-/// probe passes, the gate opens green, and each step fails with a connection
-/// error that reads like a bug in the code under test. That is the lying-gate
-/// outcome this module exists to prevent, arriving through a different door, so
-/// readiness is not declared until a connection from THIS process succeeds.
+/// port-forwarding path (on Windows, Docker Desktop's userland proxy — a
+/// recurring flake on this platform).
+///
+/// **A connect alone would not prove that.** `docker-proxy` binds the host port
+/// and accepts the connection BEFORE it dials the container, so a broken
+/// forward still returns a connected socket and only resets afterwards. A gate
+/// that stopped at `connect` would report success while measuring strictly less
+/// than it claims — the exact failure this module exists to prevent, arriving
+/// through a different door. So it exchanges BYTES: a request the service's own
+/// protocol defines, and an answer only the real server produces.
+///
+/// What it therefore proves: traffic reaches a server of the expected kind and
+/// comes back. What it does NOT prove: that the server on the other end is THIS
+/// container — nothing observable from the host could, though a competing
+/// listener on the port would have failed `run -p` first.
+async fn host_handshake(kind: ServiceKind, port: u16) -> ReadyState {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = match tokio::time::timeout(
+        HOST_PORT_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect((LOOPBACK, port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return ReadyState::NotYet(format!("connect {LOOPBACK}:{port}: {e}")),
+        Err(_) => {
+            return ReadyState::NotYet(format!(
+                "connect {LOOPBACK}:{port} did not answer within {}s",
+                HOST_PORT_CONNECT_TIMEOUT.as_secs()
+            ))
+        }
+    };
+
+    // The cheapest legal exchange each protocol defines, chosen so it needs no
+    // credential and leaves no state behind.
+    let (request, answer_is_good): (&[u8], fn(&[u8]) -> bool) = match kind {
+        ServiceKind::Redis => (b"PING\r\n", |b| b.starts_with(b"+PONG")),
+        // Postgres SSLRequest: int32 length 8, int32 code 80877103. The server
+        // answers exactly one byte — `S` or `N` — before any authentication
+        // happens, so this reaches the real server without a password.
+        ServiceKind::Postgres => (&[0, 0, 0, 8, 4, 210, 22, 47], |b| {
+            matches!(b.first(), Some(b'S' | b'N'))
+        }),
+    };
+
+    if let Err(e) = tokio::time::timeout(HOST_PORT_CONNECT_TIMEOUT, stream.write_all(request)).await
+    {
+        return ReadyState::NotYet(format!("write to {LOOPBACK}:{port} timed out: {e}"));
+    }
+    let mut buf = [0u8; 32];
+    match tokio::time::timeout(HOST_PORT_CONNECT_TIMEOUT, stream.read(&mut buf)).await {
+        Ok(Ok(0)) => ReadyState::NotYet(format!(
+            "{LOOPBACK}:{port} accepted the connection then closed it without answering \
+             (the runtime bound the port but traffic is not reaching the container)"
+        )),
+        Ok(Ok(n)) if answer_is_good(&buf[..n]) => ReadyState::Ready,
+        Ok(Ok(n)) => ReadyState::NotYet(format!(
+            "{LOOPBACK}:{port} answered {:?}, which is not this service's protocol",
+            String::from_utf8_lossy(&buf[..n])
+        )),
+        Ok(Err(e)) => ReadyState::NotYet(format!("read from {LOOPBACK}:{port}: {e}")),
+        Err(_) => ReadyState::NotYet(format!(
+            "{LOOPBACK}:{port} accepted the connection but did not answer within {}s",
+            HOST_PORT_CONNECT_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 async fn wait_host_port_reachable(
     label: &str,
+    kind: ServiceKind,
     port: u16,
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
-    wait_until_ready(label, timeout, HOST_PORT_INTERVAL, cancel, move || async move {
-        match tokio::time::timeout(
-            HOST_PORT_CONNECT_TIMEOUT,
-            tokio::net::TcpStream::connect((LOOPBACK, port)),
-        )
-        .await
-        {
-            Ok(Ok(_stream)) => ReadyState::Ready,
-            Ok(Err(e)) => ReadyState::NotYet(format!("connect {LOOPBACK}:{port}: {e}")),
-            Err(_) => ReadyState::NotYet(format!(
-                "connect {LOOPBACK}:{port} did not answer within {}s",
-                HOST_PORT_CONNECT_TIMEOUT.as_secs()
-            )),
-        }
-    })
-    .await
-    .map_err(|e| {
-        format!(
-            "{e}. The container reported ready but its PUBLISHED port is not reachable from the              host, so every step would fail with a connection error attributed to the code under              test. This is the runtime's port-forwarding path, not the server"
-        )
-    })
+    let result = wait_until_ready(
+        label,
+        timeout,
+        HOST_PORT_INTERVAL,
+        cancel,
+        move || async move { host_handshake(kind, port).await },
+    )
+    .await;
+    match result {
+        Ok(()) => Ok(()),
+        // A cancelled dispatch is NOT a forwarding failure. Decorating it with
+        // one would be wrong-cause attribution — the very thing this gate was
+        // added to prevent — so the cancellation arm passes through untouched.
+        Err(e) if cancel.is_cancelled() => Err(e),
+        Err(e) => Err(format!(
+            concat!(
+                "{e}. The published port did not complete a protocol exchange, so a step ",
+                "would fail with a connection error attributed to the code under test. ",
+                "This is the runtime's port-forwarding path, not the server"
+            ),
+            e = e
+        )),
+    }
 }
 
 async fn container_is_running(runtime: &str, name: &str) -> Result<bool, String> {
@@ -1355,7 +1494,12 @@ mod tests {
             // No `KEY=VALUE` env token at all — the bare form is the contract.
             for (i, tok) in argv.iter().enumerate() {
                 if tok == "-e" {
-                    let value = &argv[i + 1];
+                    // `.get` rather than indexing: a regression that emitted a
+                    // TRAILING `-e` should fail this assertion, not panic
+                    // before it runs.
+                    let value = argv
+                        .get(i + 1)
+                        .unwrap_or_else(|| panic!("{entry}: trailing -e with no name: {argv:?}"));
                     assert!(
                         !value.contains('='),
                         "{entry}: env flag must be bare, got {value:?}"
@@ -1406,13 +1550,21 @@ mod tests {
         for gone in [
             "Error: No such container: qontinui-ci-d-1-redis",
             "Error: no such object: qontinui-ci-d-1-redis",
-            "Error response from daemon: not found",
         ] {
             assert!(is_missing_container(gone), "should be fatal: {gone}");
         }
-        assert!(!is_missing_container(
-            "container is restarting, wait until it is running"
-        ));
+        // NOT fatal: a transient daemon answer, and an image-layer "not found"
+        // — a bare "not found" match would turn either into a dispatch failure.
+        for transient in [
+            "container is restarting, wait until it is running",
+            "error during connect: this error may indicate that the docker daemon is not running",
+            "failed to resolve reference: manifest not found",
+        ] {
+            assert!(
+                !is_missing_container(transient),
+                "must stay retryable: {transient}"
+            );
+        }
     }
 
     /// Steps see IPv4 loopback and the EPHEMERAL port — never `localhost`
@@ -1741,27 +1893,75 @@ mod tests {
         );
     }
 
-    /// The host-side gate: readiness is not declared until a connection from
-    /// THIS process succeeds, because that is the path a step uses.
+    /// The host-side gate, on the failure it actually names.
+    ///
+    /// A LISTENER THAT ACCEPTS AND CLOSES is precisely the losing shape:
+    /// Docker Desktop's userland proxy binds the host port and accepts before
+    /// it dials the container, so a broken forward still yields a connected
+    /// socket. A gate that stopped at `connect` would go green here — which is
+    /// why it exchanges bytes instead.
     #[tokio::test]
-    async fn host_port_gate_passes_on_a_listener_and_fails_loudly_without_one() {
-        let listener = std::net::TcpListener::bind((LOOPBACK, 0)).unwrap();
+    async fn host_gate_rejects_a_port_that_accepts_but_carries_no_traffic() {
+        let listener = tokio::net::TcpListener::bind((LOOPBACK, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let accepting = tokio::spawn(async move {
+            // Accept and drop, forever: bound, reachable, and useless.
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let err = wait_host_port_reachable(
+            "redis",
+            ServiceKind::Redis,
+            port,
+            Duration::from_millis(400),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a port that accepts but never answers must NOT open the gate");
+        assert!(err.contains("did not become ready"), "got: {err}");
+        assert!(err.contains("port-forwarding path"), "got: {err}");
+        accepting.abort();
+    }
+
+    /// …and it passes when the service speaks its own protocol, which is the
+    /// only evidence that traffic reaches a real server and comes back.
+    #[tokio::test]
+    async fn host_gate_passes_when_the_service_answers_its_protocol() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((LOOPBACK, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fake_redis = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 16];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    if buf[..n].starts_with(b"PING") {
+                        let _ = stream.write_all(b"+PONG\r\n").await;
+                    }
+                }
+            }
+        });
+
         wait_host_port_reachable(
             "redis",
+            ServiceKind::Redis,
             port,
             Duration::from_secs(5),
             &CancellationToken::new(),
         )
         .await
-        .expect("a bound port must satisfy the host gate");
+        .expect("a service that answers PING must open the gate");
+        fake_redis.abort();
+    }
 
-        // Nothing listening: the gate must FAIL, naming the forwarding path —
-        // never open green on a port a step cannot reach.
-        drop(listener);
+    /// Nothing listening at all: still a loud failure naming the port.
+    #[tokio::test]
+    async fn host_gate_fails_loudly_when_nothing_is_listening() {
         let dead = free_loopback_port().unwrap();
         let err = wait_host_port_reachable(
             "postgres",
+            ServiceKind::Postgres,
             dead,
             Duration::from_millis(200),
             &CancellationToken::new(),
@@ -1769,11 +1969,125 @@ mod tests {
         .await
         .expect_err("an unreachable published port must fail the dispatch");
         assert!(err.contains("did not become ready"), "got: {err}");
-        assert!(
-            err.contains("PUBLISHED port is not reachable"),
-            "got: {err}"
-        );
         assert!(err.contains(&dead.to_string()), "got: {err}");
+    }
+
+    /// A CANCELLED dispatch is not a port-forwarding failure. Decorating it
+    /// with one would be wrong-cause attribution — the class this gate was
+    /// added to prevent — so the cancellation arm passes through undecorated.
+    #[tokio::test]
+    async fn a_cancelled_dispatch_is_not_reported_as_a_forwarding_failure() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = wait_host_port_reachable(
+            "postgres",
+            ServiceKind::Postgres,
+            free_loopback_port().unwrap(),
+            Duration::from_secs(5),
+            &cancel,
+        )
+        .await
+        .expect_err("a cancelled dispatch must stop waiting");
+        assert!(err.contains("cancelled"), "got: {err}");
+        assert!(
+            !err.contains("port-forwarding path"),
+            "a cancellation must not be blamed on the forwarding path: {err}"
+        );
+    }
+
+    /// Does this source line contain a string literal with a run of spaces
+    /// after text? That is the fingerprint of a `\`-continued literal that lost
+    /// its continuation: the source indentation gets baked INTO the message.
+    fn has_mangled_literal(line: &str) -> bool {
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut run = 0usize;
+        let mut prev_was_text = false;
+        for ch in line.chars() {
+            if escaped {
+                escaped = false;
+                prev_was_text = true;
+                continue;
+            }
+            match ch {
+                '\\' if in_string => escaped = true,
+                '"' => {
+                    in_string = !in_string;
+                    run = 0;
+                    prev_was_text = false;
+                }
+                // A space INSIDE a literal, AFTER text: this is the run that
+                // matters.
+                ' ' if in_string && prev_was_text => {
+                    run += 1;
+                    if run >= 3 {
+                        return true;
+                    }
+                }
+                // A space inside a literal with no text before it: legitimate
+                // leading indentation — a message may start indented. This arm
+                // looks redundant and is not: without it a leading space falls
+                // through to the catch-all below and is recorded as TEXT, so
+                // the very next space starts counting a run. That conflation
+                // was a real bug in the first version of this detector, and
+                // collapsing the two space arms reintroduces it.
+                ' ' if in_string => {}
+                _ if in_string => {
+                    run = 0;
+                    prev_was_text = true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Operator-facing strings must not carry runs of baked-in whitespace.
+    ///
+    /// A real defect class in this module's history, not a style rule: a
+    /// `\`-continued literal whose continuation is collapsed silently bakes the
+    /// source indentation into the message, and these messages reach the dev
+    /// log, the live progress stream and the `log_tail` coord persists.
+    /// `cargo fmt --check` cannot catch it — it does not touch string contents
+    /// — which is exactly why three manual passes missed it.
+    ///
+    /// The detector is checked against a synthetic sample first, so this cannot
+    /// become another test that passes because it measures nothing.
+    #[test]
+    fn operator_messages_carry_no_mangled_whitespace() {
+        // Samples are BUILT rather than written as literals: a literal run of
+        // spaces in this file would be flagged by the scan below, which is the
+        // detector working correctly on its own test.
+        let gap = " ".repeat(6);
+
+        // It catches the real shape…
+        assert!(has_mangled_literal(&format!(
+            "warn!(\"ci_node: dispatch dropped with containers still up{gap}reaping now\");"
+        )));
+        assert!(has_mangled_literal(&format!("let m = \"a b{gap}c\";")));
+
+        // …and does not fire on ordinary code, indentation, or comments.
+        assert!(!has_mangled_literal(
+            "        let x = \"ci_node: service {} ready on {}:{}\";"
+        ));
+        assert!(!has_mangled_literal(&format!(
+            "        // a comment with{gap}spaces"
+        )));
+        assert!(!has_mangled_literal(&format!(
+            "        let y = 1;{gap}// trailing comment"
+        )));
+        assert!(!has_mangled_literal(
+            "    let f = \"{{range .Networks}}{{.IPAddress}} {{end}}\";"
+        ));
+
+        for (lineno, line) in include_str!("services.rs").lines().enumerate() {
+            assert!(
+                !has_mangled_literal(line),
+                "services.rs:{}: a string literal carries a run of spaces — a lost line \
+                 continuation bakes source indentation into an operator message: {line}",
+                lineno + 1
+            );
+        }
     }
 
     // ── Real container runtime ────────────────────────────────────────────
