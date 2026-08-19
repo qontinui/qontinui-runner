@@ -143,6 +143,7 @@ mod mcp_embedded;
 mod memory;
 mod meta_optimizer;
 mod middleware;
+mod model_catalog;
 mod observer_registry;
 mod online_learning;
 mod orchestration_loop;

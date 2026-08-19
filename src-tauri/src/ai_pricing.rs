@@ -29,143 +29,53 @@ impl ModelPricing {
 }
 
 // ============================================================================
-// Model Pricing Data (as of 2024/2025)
-// ============================================================================
-
-// Claude 3.5 models
-const CLAUDE_3_5_SONNET_PRICING: ModelPricing = ModelPricing::new(3.0, 15.0);
-const CLAUDE_3_5_HAIKU_PRICING: ModelPricing = ModelPricing::new(0.25, 1.25);
-
-// Claude 3 models
-const CLAUDE_3_OPUS_PRICING: ModelPricing = ModelPricing::new(15.0, 75.0);
-const CLAUDE_3_SONNET_PRICING: ModelPricing = ModelPricing::new(3.0, 15.0);
-const CLAUDE_3_HAIKU_PRICING: ModelPricing = ModelPricing::new(0.25, 1.25);
-
-// Claude Opus 4 models (latest as of 2025)
-const CLAUDE_OPUS_4_PRICING: ModelPricing = ModelPricing::new(15.0, 75.0);
-const CLAUDE_OPUS_4_5_PRICING: ModelPricing = ModelPricing::new(15.0, 75.0);
-
-// Claude Sonnet 4 models (latest as of 2025)
-const CLAUDE_SONNET_4_PRICING: ModelPricing = ModelPricing::new(3.0, 15.0);
-
-// Claude Haiku 4.5 (latest as of 2025)
-const CLAUDE_HAIKU_4_5_PRICING: ModelPricing = ModelPricing::new(0.80, 4.0);
-
-// Gemini models (Google AI)
-const GEMINI_1_5_PRO_PRICING: ModelPricing = ModelPricing::new(1.25, 5.0);
-const GEMINI_1_5_FLASH_PRICING: ModelPricing = ModelPricing::new(0.075, 0.30);
-const GEMINI_2_0_FLASH_PRICING: ModelPricing = ModelPricing::new(0.10, 0.40);
-
-// ============================================================================
 // Pricing Lookup
 // ============================================================================
 
+/// Fallback used when a model's price is not in the catalog.
+///
+/// **This is a GUESS, and it is load-bearing.** `calculate_cost_usd` and its
+/// cache-aware siblings return a bare `f64` with no channel to say "unknown",
+/// so an unpriced model is either silently costed at this rate or silently
+/// costed at zero — and zero is worse, because it reads as "this call was
+/// free" rather than "we do not know". Until routing carries provenance
+/// (plan §3.3, `AiResponse.route`), the substitution is at least LOGGED by
+/// `pricing_or_fallback` rather than being invisible.
+const UNKNOWN_MODEL_FALLBACK_PRICING: ModelPricing = ModelPricing::new(3.0, 15.0);
+
 /// Get pricing for a model by its ID.
 ///
-/// Model IDs are matched case-insensitively and support various formats:
-/// - Full model IDs: "claude-3-5-sonnet-20240620", "claude-3-opus-20240229"
-/// - Short names: "claude-3-5-sonnet", "claude-3-opus", "opus", "sonnet"
-/// - Gemini models: "gemini-1.5-pro", "gemini-1.5-flash"
+/// Delegates to [`crate::model_catalog`] — the single place capability facts
+/// live. This function used to carry its own ~90-line substring ladder over
+/// model names, which had rotted: it returned `None` for every Claude 5 id, so
+/// those calls fell through to the fallback above and were costed at Sonnet
+/// rates.
 ///
-/// Returns `None` if the model is not recognized.
+/// Returns `None` when the catalog does not state a price. `None` means
+/// **unknown**, not free — never record it as zero.
 pub fn get_pricing(model_id: &str) -> Option<ModelPricing> {
-    let model_lower = model_id.to_lowercase();
+    crate::model_catalog::cost_for(model_id)
+        .map(|c| ModelPricing::new(c.input_per_million, c.output_per_million))
+}
 
-    // Claude Opus 4.5 (newest)
-    if model_lower.contains("opus-4-5") || model_lower.contains("opus-4.5") {
-        return Some(CLAUDE_OPUS_4_5_PRICING);
+/// Resolve pricing, falling back to [`UNKNOWN_MODEL_FALLBACK_PRICING`] and
+/// SAYING SO when the catalog has no price.
+///
+/// Every unpriced-model path goes through here so the guess is recorded
+/// exactly once per call rather than being spread across four functions that
+/// each silently substituted the same constant.
+fn pricing_or_fallback(model_id: &str) -> ModelPricing {
+    match get_pricing(model_id) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                model = model_id,
+                "no catalog price for this model - costing it at the fallback rate; \
+                 the recorded cost is an ESTIMATE, not a measurement"
+            );
+            UNKNOWN_MODEL_FALLBACK_PRICING
+        }
     }
-
-    // Claude Opus 4
-    if model_lower.contains("opus-4") && !model_lower.contains("opus-4-5") {
-        return Some(CLAUDE_OPUS_4_PRICING);
-    }
-
-    // Claude Sonnet 4
-    if model_lower.contains("sonnet-4")
-        && !model_lower.contains("3-5")
-        && !model_lower.contains("3.5")
-    {
-        return Some(CLAUDE_SONNET_4_PRICING);
-    }
-
-    // Claude 3.5 Sonnet (various date-stamped versions)
-    if model_lower.contains("3-5-sonnet")
-        || model_lower.contains("3.5-sonnet")
-        || model_lower.contains("claude-3-5-sonnet")
-        || model_lower.contains("claude-3.5-sonnet")
-    {
-        return Some(CLAUDE_3_5_SONNET_PRICING);
-    }
-
-    // Claude Haiku 4.5
-    if model_lower.contains("haiku-4-5") || model_lower.contains("haiku-4.5") {
-        return Some(CLAUDE_HAIKU_4_5_PRICING);
-    }
-
-    // Claude 3.5 Haiku
-    if model_lower.contains("3-5-haiku")
-        || model_lower.contains("3.5-haiku")
-        || model_lower.contains("claude-3-5-haiku")
-        || model_lower.contains("claude-3.5-haiku")
-    {
-        return Some(CLAUDE_3_5_HAIKU_PRICING);
-    }
-
-    // Claude 3 Opus
-    if model_lower.contains("3-opus") || model_lower.contains("claude-3-opus") {
-        return Some(CLAUDE_3_OPUS_PRICING);
-    }
-
-    // Claude 3 Sonnet
-    if model_lower.contains("3-sonnet") || model_lower.contains("claude-3-sonnet") {
-        return Some(CLAUDE_3_SONNET_PRICING);
-    }
-
-    // Claude 3 Haiku
-    if model_lower.contains("3-haiku") || model_lower.contains("claude-3-haiku") {
-        return Some(CLAUDE_3_HAIKU_PRICING);
-    }
-
-    // Generic model names (short forms)
-    if model_lower == "opus" || model_lower.ends_with("-opus") {
-        return Some(CLAUDE_3_OPUS_PRICING);
-    }
-    if model_lower == "sonnet" || model_lower.ends_with("-sonnet") {
-        return Some(CLAUDE_3_5_SONNET_PRICING);
-    }
-    if model_lower == "haiku" || model_lower.ends_with("-haiku") {
-        return Some(CLAUDE_3_5_HAIKU_PRICING);
-    }
-
-    // Claude CLI (use default sonnet pricing as it's the most common)
-    if model_lower == "claude-cli" || model_lower == "claude" {
-        return Some(CLAUDE_3_5_SONNET_PRICING);
-    }
-
-    // Gemini 2.0 Flash
-    if model_lower.contains("gemini-2.0-flash") || model_lower.contains("gemini-2-0-flash") {
-        return Some(GEMINI_2_0_FLASH_PRICING);
-    }
-
-    // Gemini 1.5 Pro
-    if model_lower.contains("gemini-1.5-pro")
-        || model_lower.contains("gemini-1-5-pro")
-        || model_lower.contains("gemini-pro")
-    {
-        return Some(GEMINI_1_5_PRO_PRICING);
-    }
-
-    // Gemini 1.5 Flash
-    if model_lower.contains("gemini-1.5-flash")
-        || model_lower.contains("gemini-1-5-flash")
-        || model_lower.contains("gemini-flash")
-    {
-        return Some(GEMINI_1_5_FLASH_PRICING);
-    }
-
-    // Unknown model
-    None
 }
 
 /// Calculate cost in cents (USD) based on token usage and model.
@@ -241,17 +151,10 @@ pub fn calculate_cost_breakdown(
 pub fn calculate_cost_usd(input_tokens: u64, output_tokens: u64, model_id: &str) -> f64 {
     // Compute directly in f64 USD to preserve sub-cent precision
     // (calculate_cost_cents rounds to whole cents, losing accuracy for small token counts)
-    let pricing = match get_pricing(model_id) {
-        Some(p) => p,
-        None => {
-            if input_tokens > 0 || output_tokens > 0 {
-                // Use Sonnet pricing as a reasonable default for unknown models
-                CLAUDE_3_5_SONNET_PRICING
-            } else {
-                return 0.0;
-            }
-        }
-    };
+    if input_tokens == 0 && output_tokens == 0 {
+        return 0.0;
+    }
+    let pricing = pricing_or_fallback(model_id);
     let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input_per_million;
     let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output_per_million;
     input_cost + output_cost
@@ -271,20 +174,12 @@ pub fn calculate_cost_usd_with_cache(
     cache_read_tokens: u64,
     model_id: &str,
 ) -> f64 {
-    let pricing = match get_pricing(model_id) {
-        Some(p) => p,
-        None => {
-            let has_tokens = input_tokens > 0
-                || output_tokens > 0
-                || cache_creation_tokens > 0
-                || cache_read_tokens > 0;
-            if has_tokens {
-                CLAUDE_3_5_SONNET_PRICING
-            } else {
-                return 0.0;
-            }
-        }
-    };
+    let has_tokens =
+        input_tokens > 0 || output_tokens > 0 || cache_creation_tokens > 0 || cache_read_tokens > 0;
+    if !has_tokens {
+        return 0.0;
+    }
+    let pricing = pricing_or_fallback(model_id);
 
     let base_input_per_token = pricing.input_per_million / 1_000_000.0;
     let output_per_token = pricing.output_per_million / 1_000_000.0;
@@ -302,10 +197,7 @@ pub fn calculate_cache_savings_usd(cache_read_tokens: u64, model_id: &str) -> f6
     if cache_read_tokens == 0 {
         return 0.0;
     }
-    let pricing = match get_pricing(model_id) {
-        Some(p) => p,
-        None => CLAUDE_3_5_SONNET_PRICING,
-    };
+    let pricing = pricing_or_fallback(model_id);
     let base_input_per_token = pricing.input_per_million / 1_000_000.0;
     cache_read_tokens as f64 * base_input_per_token * 0.9
 }
