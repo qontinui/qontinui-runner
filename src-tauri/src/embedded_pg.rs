@@ -61,6 +61,24 @@
 //! `starting` / stale pid file, or a port that refuses connections, all fall
 //! through to the normal provisioning path. A stale pid file can never wedge a
 //! cold boot.
+//!
+//! ## Known limitation — the ownership model closes only ONE direction
+//!
+//! `Attached` → `Owned` is closed: an attached process can no longer stop a
+//! cluster it joined, on any path (see [`release_without_stopping`] for the
+//! error paths, which leak rather than drop).
+//!
+//! `Owned` → `Attached` is **not** closed. The owner stopping its cluster
+//! — the ordinary [`stop_on_exit`] at app quit, or a failure after `start()`
+//! succeeded — pulls the server out from under any peer that has attached. An
+//! attached peer holds a `deadpool` with no reconnect logic, so it 503s for the
+//! rest of its life. Failure paths at least leave the server up (they release
+//! instead of stopping), but a clean owner exit legitimately stops it: there is
+//! no reference count over the cluster, and inventing one would need exactly
+//! the extra bookkeeping this design avoids. In practice the owner is the
+//! long-lived primary runner and the attached peers are short-lived temp
+//! runners, so the surviving direction is the one that matters; a peer that
+//! outlives the primary must be restarted.
 
 use postgresql_embedded::{PostgreSQL, Settings};
 use std::net::SocketAddr;
@@ -244,6 +262,32 @@ async fn attach_to_running(
     port: u16,
 ) -> Result<ManagedPg, String> {
     settings.port = port;
+
+    // Re-read `pg-pass` HERE rather than trusting the value `bootstrap`
+    // resolved before probing. On a genuinely cold boot with two runners, the
+    // password resolved up there is `Settings::default()`'s fresh random one
+    // (the file did not exist yet) and the peer writes the real password at
+    // initdb inside our probe/retry window — attaching with the stale random
+    // password would fail `password authentication failed` and degrade us. A
+    // `ready` pid file proves initdb completed, so the file exists and is
+    // authoritative by now.
+    let stored = std::fs::read_to_string(&settings.password_file).map_err(|e| {
+        format!(
+            "embedded Postgres is running on port {port} but its password file {} could not be \
+             read: {e}",
+            settings.password_file.display()
+        )
+    })?;
+    let stored = stored.trim();
+    if stored.is_empty() {
+        return Err(format!(
+            "embedded Postgres is running on port {port} but its password file {} is empty — \
+             the superuser password is unrecoverable",
+            settings.password_file.display()
+        ));
+    }
+    settings.password = stored.to_string();
+
     let url = settings.url(db_name);
     let maintenance_url = settings.url("postgres");
 
@@ -315,12 +359,28 @@ async fn ensure_database(maintenance_url: &str, db_name: &str) -> Result<(), Str
             .map(|row| row.get(0))
             .map_err(|e| format!("attached embedded PG database probe failed: {e}"))?;
         if !exists {
-            client
+            // Check-then-act: the attach window opens as soon as the owner's
+            // postmaster reports `ready`, which is BEFORE the owner runs its
+            // own `create_database` — so the two genuinely overlap and the
+            // loser gets 42P04. That outcome is a success for our purposes
+            // (the database exists), and treating it as an error would degrade
+            // one of the two runners for no reason.
+            if let Err(e) = client
                 .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
                 .await
-                .map_err(|e| {
-                    format!("attached embedded PG create database {db_name} failed: {e}")
-                })?;
+            {
+                let duplicate =
+                    e.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_DATABASE);
+                if !duplicate {
+                    return Err(format!(
+                        "attached embedded PG create database {db_name} failed: {e}"
+                    ));
+                }
+                tracing::info!(
+                    db = db_name,
+                    "embedded PG database was created concurrently by another runner"
+                );
+            }
         }
         Ok(())
     }
@@ -334,10 +394,22 @@ async fn ensure_database(maintenance_url: &str, db_name: &str) -> Result<(), Str
 /// Release a `PostgreSQL` handle **without** letting its `Drop` run.
 ///
 /// `postgresql_embedded`'s `Drop` calls `pg_ctl stop -m fast` whenever
-/// `postmaster.pid` exists, which — next to a cluster owned by *another* runner
-/// process — would shut that runner's database down. On the error paths where a
-/// foreign postmaster is live, leaking the handle (a few hundred bytes, once,
-/// at a failed boot) is strictly better than that.
+/// `postmaster.pid` merely *exists* — it never checks who started that
+/// postmaster. So dropping a handle beside a cluster owned by another runner
+/// process shuts that runner's database down.
+///
+/// Note how much weaker `Drop`'s predicate is than
+/// [`probe_running_cluster`]'s: the probe additionally demands a parseable
+/// `ready` status and a TCP connect inside a timeout. Every state in the gap —
+/// a peer in crash/WAL recovery (`starting`), a live peer whose probe timed out
+/// under load, a pid file caught mid in-place-rewrite — is a live foreign
+/// postmaster that the probe reports as absent. Guarding the leak on the probe
+/// is therefore *not* sound, and any probe-then-drop is TOCTOU-racy besides.
+/// Callers on the pre-`start()`-success paths leak **unconditionally**: this
+/// process demonstrably does not own a running postmaster there, so there is
+/// nothing legitimate for `Drop` to stop.
+///
+/// The cost is one leaked handle (a few hundred bytes, once, at a failed boot).
 fn release_without_stopping(handle: PostgreSQL) {
     std::mem::forget(handle);
 }
@@ -496,42 +568,90 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
     let port = settings.port;
     let settings_for_attach = settings.clone();
 
+    // From here to a successful `start()`, this process owns no running
+    // postmaster — so `handle` must never be *dropped*, only released. See
+    // [`release_without_stopping`]: `Drop` stops whatever `postmaster.pid`
+    // names, which on these paths can only be a peer's cluster (a `starting`
+    // peer in crash recovery, a live peer whose probe timed out, a pid file
+    // caught mid-rewrite). The leak is unconditional and therefore also
+    // TOCTOU-free — no probe result can go stale between the check and the drop.
+    //
+    // Accepted consequence: if `pg_ctl start -w` reports a timeout while the
+    // postmaster actually did come up, we leak a handle to a cluster we DO own
+    // and never stop it at exit, orphaning a `postgres` process. That is
+    // strictly better than killing a peer's database, and it self-heals — the
+    // next boot attaches to that same cluster instead of fighting it.
     let mut handle = PostgreSQL::new(settings);
     if let Err(e) = handle.setup().await {
-        let msg = format!("embedded Postgres setup (initdb) failed: {e}");
-        // If a foreign postmaster came up meanwhile, dropping `handle` here
-        // would stop it. Leak instead.
-        if probe_running_cluster(&data_dir).await.is_some() {
-            release_without_stopping(handle);
-        }
-        return Err(msg);
+        release_without_stopping(handle);
+        return Err(format!("embedded Postgres setup (initdb) failed: {e}"));
     }
     if let Err(e) = handle.start().await {
         // We may simply have lost the boot race: a peer that was `starting`
         // when we probed can be `ready` by now. One final attach attempt —
-        // still bounded, still no loop.
-        if let Some(port) = probe_running_cluster(&data_dir).await {
-            release_without_stopping(handle);
+        // still bounded, still no loop. Probe first, release unconditionally,
+        // and only then branch.
+        let winner = probe_running_cluster(&data_dir).await;
+        release_without_stopping(handle);
+        if let Some(port) = winner {
             tracing::info!(
                 port,
                 "lost the embedded Postgres start race ({e}) — attaching to the winner instead"
             );
             return attach_to_running(settings_for_attach, db_name, port).await;
         }
-        // No live cluster: `handle`'s Drop is a no-op (or a harmless stop
-        // against a dead pid file), so let it drop normally.
         return Err(format!("embedded Postgres start failed: {e}"));
     }
 
-    let exists = handle
-        .database_exists(db_name)
-        .await
-        .map_err(|e| format!("embedded Postgres database_exists({db_name}) failed: {e}"))?;
-    if !exists {
-        handle
-            .create_database(db_name)
-            .await
-            .map_err(|e| format!("embedded Postgres create_database({db_name}) failed: {e}"))?;
+    // Past this point the server IS running and a peer may already have
+    // attached to it (the attach window opens the moment the postmaster reports
+    // `ready`, which is before we get here). An attached peer builds a
+    // `deadpool` against this server and has no reconnect logic, so stopping it
+    // out from under them 503s that runner for the rest of its life. Every
+    // failure below therefore releases the handle instead of dropping it: this
+    // process is degrading anyway, and an orphaned `postgres` is a far cheaper
+    // outcome than a peer's database vanishing. `main.rs` degrades on the Err
+    // exactly as before.
+    macro_rules! fail_without_stopping {
+        ($handle:expr, $msg:expr) => {{
+            release_without_stopping($handle);
+            return Err($msg);
+        }};
+    }
+
+    // Each await is bound to a local before the `match`: a scrutinee's
+    // temporaries (here, a future borrowing `handle`) live to the end of the
+    // match statement, which would forbid moving `handle` inside an arm.
+    let exists = handle.database_exists(db_name).await;
+    match exists {
+        Ok(true) => {}
+        Ok(false) => {
+            let created = handle.create_database(db_name).await;
+            if let Err(e) = created {
+                // Concurrency: a peer that attached the instant we reported
+                // `ready` can create the database between our probe and our
+                // create (SQLSTATE 42P04). The crate wraps its sqlx error in an
+                // opaque `CreateDatabaseError(String)`, so the SQLSTATE is not
+                // inspectable through this API — re-probe instead, which is
+                // both version-proof and stricter (it asserts the end state we
+                // actually need).
+                let reprobe = handle.database_exists(db_name).await;
+                match reprobe {
+                    Ok(true) => tracing::info!(
+                        db = db_name,
+                        "embedded PG database was created concurrently by another runner"
+                    ),
+                    _ => fail_without_stopping!(
+                        handle,
+                        format!("embedded Postgres create_database({db_name}) failed: {e}")
+                    ),
+                }
+            }
+        }
+        Err(e) => fail_without_stopping!(
+            handle,
+            format!("embedded Postgres database_exists({db_name}) failed: {e}")
+        ),
     }
 
     // The schema gate is deliberately decoupled from database creation: gating
@@ -541,8 +661,20 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
     // and apply whenever it is missing. `batch_execute` runs the whole dump in
     // one implicit transaction, so a crashed/failed apply rolls back and this
     // probe stays false on the next boot — self-healing.
-    if !schema_applied(&url).await? {
-        apply_canonical_schema(&url).await?;
+    match schema_applied(&url).await {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Err(e) = apply_canonical_schema(&url).await {
+                // Same concurrent-apply tolerance as the attach path: the dump
+                // runs in one implicit transaction, so the loser aborts
+                // wholesale and the winner's schema is complete.
+                if !schema_applied(&url).await.unwrap_or(false) {
+                    fail_without_stopping!(handle, e);
+                }
+                tracing::info!("embedded PG schema was applied concurrently by another runner");
+            }
+        }
+        Err(e) => fail_without_stopping!(handle, e),
     }
 
     tracing::info!(
@@ -835,8 +967,12 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).expect("temp data dir");
-        // A port that was free a moment ago and has nothing listening on it.
-        let dead_port = free_loopback_port().expect("a free loopback port");
+        // A privileged, reserved port: nothing on this box can bind it without
+        // elevation, so the connect is deterministically refused. (Taking a
+        // port from `free_loopback_port()` would be racy — ~9 concurrent
+        // sessions run here and any of them can bind it between the probe and
+        // ours.)
+        let dead_port: u16 = 1;
         std::fs::write(
             dir.join(POSTMASTER_PID),
             pid_file("31488", &dead_port.to_string(), "ready"),
@@ -1079,6 +1215,78 @@ mod tests {
         let _ = conn.await;
 
         stop(owner.handle).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The failed-boot path must not take a live peer's cluster down with it.
+    ///
+    /// This is the case the attach probe CANNOT see: the peer's pid file says
+    /// `starting` (crash/WAL recovery — the common state for a runner that was
+    /// killed rather than stopped), so `probe_running_cluster` reports nothing,
+    /// while `PostgreSQL::drop`'s predicate (does `postmaster.pid` exist) is
+    /// satisfied and would fire `pg_ctl stop -m fast` at the *live* server.
+    ///
+    /// The test drives it against a genuinely running postmaster rather than a
+    /// bare TCP listener on a fake PID: `pg_ctl stop` acts on the PID in the
+    /// pid file, so a stand-in listener would survive the bug and the assertion
+    /// would prove nothing.
+    #[tokio::test]
+    async fn failed_boot_beside_a_starting_peer_does_not_stop_it() {
+        let _guard = PG_TEST_LOCK.lock().await;
+        let root =
+            std::env::temp_dir().join(format!("qr-embedded-pg-test-nostop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root); // clean any prior run
+
+        // A real, running, owned cluster stands in for the peer.
+        let peer = bootstrap(root.clone(), "qontinui_test4")
+            .await
+            .expect("peer boot should succeed");
+
+        // Rewrite its status line to `starting`, leaving the PID and port
+        // intact — exactly what a postmaster in recovery publishes. PostgreSQL
+        // only rewrites this line at state transitions, so the running server
+        // is unaffected.
+        let pid_path = root.join("pg-data").join(POSTMASTER_PID);
+        let original = std::fs::read_to_string(&pid_path).expect("read the peer's pid file");
+        let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
+        assert!(
+            lines.len() > PID_LINE_STATUS,
+            "a running postmaster must publish all 8 lines"
+        );
+        lines[PID_LINE_STATUS] = "starting".to_string();
+        std::fs::write(&pid_path, format!("{}\n", lines.join("\n"))).expect("rewrite pid file");
+        assert_eq!(
+            probe_running_cluster(&root.join("pg-data")).await,
+            None,
+            "a `starting` peer must be invisible to the attach probe — that is the point"
+        );
+
+        // Our boot cannot attach (status is not `ready`) and cannot start (the
+        // data dir is locked), so it fails. With the handle merely dropped, its
+        // `Drop` would stop the peer here.
+        let err = bootstrap(root.clone(), "qontinui_test4")
+            .await
+            .err()
+            .expect("boot beside a locked data dir must fail");
+        assert!(
+            err.contains("start failed") || err.contains("setup"),
+            "unexpected failure mode: {err}"
+        );
+
+        // The peer must still be serving.
+        let (client, conn) = connect_test_client(&peer.url).await;
+        let one: i32 = client
+            .query_one("SELECT 1", &[])
+            .await
+            .expect("the peer's cluster must survive a failed boot next to it")
+            .get(0);
+        assert_eq!(one, 1);
+        drop(client);
+        let _ = conn.await;
+
+        // Restore the status line so the ordinary stop path sees a normal file.
+        let _ = std::fs::write(&pid_path, original);
+        stop(peer.handle).await;
         let _ = std::fs::remove_dir_all(&root);
     }
 }
