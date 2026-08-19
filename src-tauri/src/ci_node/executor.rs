@@ -869,8 +869,7 @@ mod tests {
         envs.extend(env.exports.iter().cloned());
         let last = envs
             .iter()
-            .filter(|(k, _)| k == "CARGO_BUILD_JOBS")
-            .next_back()
+            .rfind(|(k, _)| k == "CARGO_BUILD_JOBS")
             .expect("present");
         assert_eq!(last.1, "1");
     }
