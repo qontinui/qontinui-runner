@@ -23,7 +23,32 @@ const SERVICE_NAME: &str = "com.qontinui.runner";
 /// Coord mints 4-hour device-JWTs (14_400s). TTL/3 = 4_800s = 80 min.
 /// The refresher loop calls `device_jwt_needs_refresh` to decide whether
 /// to call `pair_with_auth_token` and replace the stored JWT.
+///
+/// This constant is sized for the DEVICE JWT and nothing else. The Cognito
+/// access token has its own, much shorter TTL and its own threshold —
+/// [`COGNITO_REFRESH_BEFORE_EXPIRY_SECS`]. Reusing this one for Cognito is
+/// the bug fixed below: 4_800s exceeds the Cognito token's entire 3_600s
+/// lifetime, so the staleness predicate was true the instant a refresh
+/// completed and every auth check paid a fresh `refresh_token` grant.
 pub const REFRESH_BEFORE_EXPIRY_SECS: i64 = 4 * 60 * 60 / 3;
+
+/// Refresh the Cognito access token once we're within TTL/3 of expiry.
+///
+/// Cognito mints 1-hour access tokens (`expires_in: 3600` — see
+/// `cognito::TokenResponse` and its parse tests). TTL/3 = 1_200s = 20 min,
+/// the same one-third convention as [`REFRESH_BEFORE_EXPIRY_SECS`].
+///
+/// The invariant that matters is `COGNITO_REFRESH_BEFORE_EXPIRY_SECS <
+/// COGNITO_ACCESS_TOKEN_TTL_SECS`: a threshold at or above the token's own
+/// lifetime makes [`AuthManager::cognito_token_needs_refresh`] permanently
+/// true, which turns every `check_auth_status` into a synchronous network
+/// round-trip. `cognito_threshold_is_below_token_ttl` pins it.
+pub const COGNITO_REFRESH_BEFORE_EXPIRY_SECS: i64 = 60 * 60 / 3;
+
+/// The `expires_in` Cognito returns on both the code-for-token exchange and
+/// the refresh grant. Declared here so the threshold above can be pinned
+/// against it by a test rather than by a comment.
+pub const COGNITO_ACCESS_TOKEN_TTL_SECS: i64 = 3_600;
 
 /// Minimal projection of a device-JWT payload — only the `exp` claim is
 /// consulted by the refresher. Signature is NOT verified here; the
@@ -906,12 +931,20 @@ impl AuthManager {
     }
 
     /// `true` iff the Cognito access token is missing OR within
-    /// [`REFRESH_BEFORE_EXPIRY_SECS`] of expiry. Used by the device-JWT
+    /// [`COGNITO_REFRESH_BEFORE_EXPIRY_SECS`] of expiry. Used by the device-JWT
     /// refresher to refresh the Cognito token *first* when it's stale (so the
     /// subsequent device re-bind presents a fresh user bearer).
+    ///
+    /// Deliberately NOT [`REFRESH_BEFORE_EXPIRY_SECS`]: that threshold is
+    /// TTL/3 of coord's 4-hour DEVICE JWT (4_800s), which is longer than the
+    /// Cognito access token lives (3_600s). Borrowing it made this predicate
+    /// return `true` even 80ms after a successful refresh, so every
+    /// `check_auth_status` forced a blocking Cognito `refresh_token` grant —
+    /// which then consumed the caller's whole enrichment budget and left the
+    /// UI on its "Checking authentication…" shell.
     pub fn cognito_token_needs_refresh(&self) -> bool {
         match self.secure_storage.get_oauth_expires_at() {
-            Some(exp) => chrono::Utc::now().timestamp() + REFRESH_BEFORE_EXPIRY_SECS >= exp,
+            Some(exp) => chrono::Utc::now().timestamp() + COGNITO_REFRESH_BEFORE_EXPIRY_SECS >= exp,
             // No stored expiry → either never signed in via Cognito, or a
             // partial write. Treat as "needs refresh" only if we actually
             // hold a refresh token; otherwise there's nothing to refresh.
@@ -2176,5 +2209,78 @@ mod device_jwt_tests {
     fn refresh_threshold_is_ttl_over_three() {
         // Pin the constant — coord mints 4h JWTs, refresh threshold = TTL/3.
         assert_eq!(REFRESH_BEFORE_EXPIRY_SECS, 4_800);
+    }
+
+    #[test]
+    fn cognito_threshold_is_ttl_over_three() {
+        // Same one-third convention, but against Cognito's 1h access token.
+        assert_eq!(COGNITO_REFRESH_BEFORE_EXPIRY_SECS, 1_200);
+        assert_eq!(COGNITO_ACCESS_TOKEN_TTL_SECS, 3_600);
+    }
+
+    /// The invariant the whole fix rests on. A threshold at or above the
+    /// token's own lifetime makes `cognito_token_needs_refresh` permanently
+    /// true. The device-JWT constant (4_800s) violates it, which is exactly
+    /// why Cognito may not borrow it.
+    #[test]
+    fn cognito_threshold_is_below_token_ttl() {
+        assert!(
+            COGNITO_REFRESH_BEFORE_EXPIRY_SECS < COGNITO_ACCESS_TOKEN_TTL_SECS,
+            "a refresh threshold >= the token TTL makes every freshly-minted \
+             token instantly stale (threshold={COGNITO_REFRESH_BEFORE_EXPIRY_SECS}, \
+             ttl={COGNITO_ACCESS_TOKEN_TTL_SECS})"
+        );
+        assert!(
+            REFRESH_BEFORE_EXPIRY_SECS >= COGNITO_ACCESS_TOKEN_TTL_SECS,
+            "regression guard: the device-JWT threshold exceeds the Cognito \
+             TTL, so reusing it for Cognito reintroduces the always-stale loop"
+        );
+    }
+
+    /// The reported symptom, at the unit level: store tokens exactly as
+    /// `refresh_cognito_bearer` does after a successful grant
+    /// (`expires_at = now + expires_in`) and assert the very next staleness
+    /// check says NO. Before the fix this returned `true` immediately, so
+    /// every `check_auth_status` forced another blocking Cognito round-trip.
+    #[test]
+    fn freshly_refreshed_cognito_token_is_not_immediately_stale() {
+        let mgr = create_test_auth_manager("freshly_refreshed_cognito_token_is_not_stale");
+        let now = chrono::Utc::now().timestamp();
+        mgr.store_oauth_tokens(
+            "access",
+            "id",
+            "refresh",
+            now + COGNITO_ACCESS_TOKEN_TTL_SECS,
+        )
+        .unwrap();
+        assert!(
+            !mgr.cognito_token_needs_refresh(),
+            "a token stored one second ago with a full 1h TTL must not report stale"
+        );
+    }
+
+    #[test]
+    fn cognito_token_within_threshold_is_stale() {
+        let mgr = create_test_auth_manager("cognito_token_within_threshold_is_stale");
+        let now = chrono::Utc::now().timestamp();
+        // 10 minutes left — inside the 20-minute threshold.
+        mgr.store_oauth_tokens("access", "id", "refresh", now + 10 * 60)
+            .unwrap();
+        assert!(
+            mgr.cognito_token_needs_refresh(),
+            "a token inside COGNITO_REFRESH_BEFORE_EXPIRY_SECS must report stale"
+        );
+    }
+
+    #[test]
+    fn expired_cognito_token_is_stale() {
+        let mgr = create_test_auth_manager("expired_cognito_token_is_stale");
+        let now = chrono::Utc::now().timestamp();
+        mgr.store_oauth_tokens("access", "id", "refresh", now - 60)
+            .unwrap();
+        assert!(
+            mgr.cognito_token_needs_refresh(),
+            "an already-expired token must report stale"
+        );
     }
 }
