@@ -36,36 +36,6 @@ export async function checkPathClaims(paths: string[]): Promise<Record<string, U
 }
 
 // ----------------------------------------------------------------------------
-// Decompose Plan — Phase 3 (in-product /decompose-plan replacement)
-// ----------------------------------------------------------------------------
-
-/**
- * Result returned by the `decompose_plan` Tauri command. `idempotentSkip`
- * is true when the plan was already decomposed at this hash; `stamped` is
- * true when a fresh `<!-- decomposed: -->` marker was appended to the
- * markdown.
- */
-export interface DecomposeResult {
-  planId: string;
-  taskCount: number;
-  versionHash: string;
-  idempotentSkip: boolean;
-  stamped: boolean;
-}
-
-/**
- * Decompose a plan markdown file into the in-product task graph. Reads
- * the file, asks the active LLM provider to identify phases/tasks/
- * claims/dependencies, then POSTs the structured payload to the runner's
- * `/plans/decompose` endpoint. Throws on any failure — callers should
- * catch and inspect the message for the "Configure an LLM provider…"
- * affordance string.
- */
-export async function decomposePlan(planPath: string): Promise<DecomposeResult> {
-  return invoke<DecomposeResult>("decompose_plan", { planPath });
-}
-
-// ----------------------------------------------------------------------------
 // Auto-Review — Phase 4 (in-product /auto-review replacement)
 // ----------------------------------------------------------------------------
 

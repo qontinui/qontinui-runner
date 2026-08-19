@@ -105,7 +105,6 @@ export function OneshotPanel() {
       {!loading && !error && empty && (
         <div className="text-center text-muted-foreground py-8 text-sm">
           No one-shot activity yet — fires when productivity-stack tasks (
-          <code className="font-mono">/decompose-plan</code>,{" "}
           <code className="font-mono">/auto-review</code>, etc.) are run via the in-product Rust
           path.
         </div>

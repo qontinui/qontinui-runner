@@ -6118,7 +6118,6 @@ pub fn create_router(
         .merge(crate::mcp::ws_relay::routes())
         .merge(crate::wrappers::routes::router())
         .merge(crate::mcp::physical_device_api::routes())
-        .merge(crate::mcp::plans::routes())
         // Plan & prompt library agent write door (plan
         // 2026-08-10-plan-and-prompt-library-in-web Phase 3). The two write
         // routes are gated by QONTINUI_PLAN_LIBRARY_WRITE (off by default);
