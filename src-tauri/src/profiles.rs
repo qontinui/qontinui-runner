@@ -646,27 +646,52 @@ pub fn coord_base_with_source() -> (String, CoordBaseSource) {
 /// blip, a coord outage, or a 503 must never flip a connected runner to
 /// isolated: this fn reads env / profiles.json / settings.json and nothing else.
 ///
-/// Option-family mapping of [`coord_base_policy`], exactly as [`CoordBase`]
-/// documents it:
+/// Option-family mapping of [`coord_base_policy`]. Note it keys on the
+/// `(base, source)` PAIR, not on the variant alone — [`CoordBase::TierDefault`]
+/// is produced by two different inputs and only one of them means "connected":
 ///
-/// | Variant | Result | Why |
-/// |---|---|---|
-/// | [`CoordBase::Configured`] | `Some(base)` | explicitly named coord |
-/// | [`CoordBase::TierDefault`] | `Some(base)` | see below |
-/// | [`CoordBase::DevLocalhost`] | `None` | a GUESS, not a coord |
-/// | [`CoordBase::Unset`] | `None` | structurally unreachable here |
+/// | Variant | Source | Result | Why |
+/// |---|---|---|---|
+/// | [`CoordBase::Configured`] | `Env` / `Profile` | `Some(base)` | explicitly named coord |
+/// | [`CoordBase::TierDefault`] | [`CoordBaseSource::TierDefault`] | `Some(base)` | tier READ, and it says `qontinui_account` |
+/// | [`CoordBase::TierDefault`] | [`CoordBaseSource::UnknownTierProdDefault`] | **`None`** | tier NOT read — see below |
+/// | [`CoordBase::DevLocalhost`] | `DevLocalhostFallback` | `None` | a GUESS, not a coord |
+/// | [`CoordBase::Unset`] | — | `None` | structurally unreachable here |
 ///
-/// **Why `TierDefault` counts as connected.** It is the SHIPPED end-user
-/// configuration: a `qontinui_account`-tier runner that has never had a
-/// `coord_url` written into `~/.qontinui/profiles.json` — and the same arm
-/// covers an unreadable `settings.json`, whose tier is UNKNOWN rather than
-/// local. [`PROD_COORD_BASE`] is a real, dialable coordinator that this runner
-/// is a member of; the hosted fleet must still heartbeat, register worktrees,
-/// push work units and forward reviews against it. Treating that as isolated
+/// **Why the genuine `TierDefault` counts as connected.** It is the SHIPPED
+/// end-user configuration: a `qontinui_account`-tier runner that has never had
+/// a `coord_url` written into `~/.qontinui/profiles.json`.
+/// [`PROD_COORD_BASE`] is a real, dialable coordinator that this runner is a
+/// member of; the hosted fleet must still heartbeat, register worktrees, push
+/// work units and forward reviews against it. Treating that as isolated
 /// classifies the ENTIRE hosted fleet as standalone and silently drops its
 /// fleet state — which is precisely the defect that made
 /// `HttpWorkUnitSink::from_profile` return `None` on every shipped hosted
 /// runner.
+///
+/// **Why [`CoordBaseSource::UnknownTierProdDefault`] does NOT.** That arm fires
+/// when `settings.json` could not be read or parsed, so the tier is UNKNOWN —
+/// and unknown must never authorize egress to production. The failure is
+/// routine, not exotic: [`read_runner_tier`] returns [`TierRead::Unknown`] on
+/// any read/parse error, including losing a race with another runner
+/// instance's `fs_atomic` rename of that same file, and [`coord_base_policy`]
+/// re-reads it on every call with no caching. A `tier: "local"` dev box that
+/// loses that race ONCE would otherwise start dialing
+/// `https://coord.qontinui.io` from every Option-family surface — fetching
+/// fleet auto-response rules from production, persisting them to
+/// `~/.qontinui/fleet-auto-response-rules.json` (from which boot re-seeds them,
+/// so a single transient failure arms them permanently), injecting them into
+/// live operator terminals, and then shipping the matched screen text and the
+/// injected prompt back to prod on every hit. These call sites are
+/// fire-and-forget and swallow their outcomes at `debug!`/`warn!`, so the
+/// "guessing production fails LOUDLY" rationale in [`apply_tier_policy`] —
+/// sound for the String family, which surfaces the failure to an operator —
+/// does not transfer to this one. Absence of evidence about the tier is not
+/// evidence of membership.
+///
+/// The String family's posture is deliberately left unchanged:
+/// [`coord_base_with_source`] still yields the production base on an unknown
+/// tier, because a doctor/proxy caller wants the loud failure.
 ///
 /// `DevLocalhost` stays `None` on the opposite argument: `http://localhost:9870`
 /// is a guess made when nothing at all is configured on a non-hosted runner.
@@ -678,11 +703,21 @@ pub fn coord_base_with_source() -> (String, CoordBaseSource) {
 /// express "isolated" at all, so it is never the right door for a feature that
 /// must no-op when the runner is standalone.
 pub fn connected_coord_base() -> Option<String> {
-    match coord_base_policy().0 {
-        CoordBase::Configured(base) | CoordBase::TierDefault(base) => {
+    match coord_base_policy() {
+        // Explicitly configured — env `COORD_HTTP_URL` or the profile's
+        // `coord_url`. The tier is irrelevant; the operator named the coord.
+        (CoordBase::Configured(base), _) => Some(base.trim_end_matches('/').to_string()),
+        // The tier was actually READ and it says `qontinui_account`.
+        (CoordBase::TierDefault(base), CoordBaseSource::TierDefault) => {
             Some(base.trim_end_matches('/').to_string())
         }
-        CoordBase::DevLocalhost(_) | CoordBase::Unset => None,
+        // Everything else is ISOLATED. Notably `(TierDefault,
+        // UnknownTierProdDefault)`: the production base was a GUESS made
+        // because settings.json was unreadable, and an unknown tier must not
+        // authorize egress to prod. Also `DevLocalhost` (a guess, not a coord)
+        // and `Unset` (structurally unreachable — `coord_base_policy` never
+        // yields it).
+        _ => None,
     }
 }
 
@@ -1218,10 +1253,23 @@ mod tests {
         );
     }
 
-    /// An UNREADABLE settings.json means the tier is UNKNOWN, not local — the
-    /// policy already prefers production there, and "connected" must follow it.
+    /// An UNREADABLE settings.json means the tier is UNKNOWN — and unknown must
+    /// NOT authorize egress to production.
+    ///
+    /// The String family deliberately keeps its fail-loud posture here (it
+    /// still yields [`PROD_COORD_BASE`], with source
+    /// [`CoordBaseSource::UnknownTierProdDefault`], so a doctor/proxy caller
+    /// gets an auth/DNS error it can surface). The Option family must not: its
+    /// call sites are fire-and-forget pollers that swallow outcomes at
+    /// `debug!`/`warn!`, so a hosted-looking guess produces silent egress
+    /// instead of a loud failure. `read_runner_tier` returns `Unknown` on ANY
+    /// read/parse error — including losing a race with another runner
+    /// instance's atomic rewrite of settings.json — and `coord_base_policy`
+    /// re-reads the file on every call, so a `tier: "local"` box only has to
+    /// lose that race once. Absence of evidence about the tier is not evidence
+    /// of fleet membership.
     #[test]
-    fn connected_coord_base_unreadable_settings_is_connected() {
+    fn connected_coord_base_unreadable_settings_is_isolated() {
         let _g = env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
         let dir = tempfile::tempdir().unwrap();
@@ -1229,9 +1277,19 @@ mod tests {
         assert!(matches!(read_runner_tier(), TierRead::Unknown(_)));
         assert_eq!(
             connected_coord_base(),
-            Some(PROD_COORD_BASE.to_string()),
-            "an unknown tier must not silently isolate a possibly-hosted runner"
+            None,
+            "an UNKNOWN tier must not read as connected — that would let one \
+             transient settings.json read failure point a local dev box at \
+             production coord"
         );
+        // The policy layer itself is untouched: it still resolves the prod base
+        // with the `unknown_tier_prod_default` source. Only the Option family's
+        // interpretation of that pair changed.
+        let (base, source) = coord_base_policy();
+        assert_eq!(base, CoordBase::TierDefault(PROD_COORD_BASE.to_string()));
+        assert_eq!(source, CoordBaseSource::UnknownTierProdDefault);
+        // …and the String family keeps its fail-loud posture unchanged.
+        assert_eq!(coord_base_with_source().0, PROD_COORD_BASE);
     }
 
     /// A non-hosted runner with nothing configured is ISOLATED — and must NOT
@@ -1243,16 +1301,19 @@ mod tests {
         for tier in ["local", "local_provider", "something_new"] {
             let dir = tempfile::tempdir().unwrap();
             isolate_coord_env(dir.path(), Some(&format!(r#"{{"tier":"{tier}"}}"#)));
-            let got = connected_coord_base();
-            assert_eq!(got, None, "tier {tier} must read as isolated");
-            assert_ne!(
-                got.as_deref(),
-                Some(DEV_LOCALHOST_COORD_BASE),
-                "the dev-localhost GUESS must never surface as a connected base"
+            assert_eq!(
+                connected_coord_base(),
+                None,
+                "tier {tier} must read as isolated"
             );
-            // The String family, by contrast, still hands back the guess —
-            // which is exactly why it cannot express "isolated".
-            assert_eq!(coord_base_with_source().0, DEV_LOCALHOST_COORD_BASE);
+            // The non-vacuous half of the property: the String family DOES
+            // still hand back the dev-localhost guess on this exact input, so
+            // the `None` above is the Option family deliberately dropping a
+            // base that was available — not an input that produced nothing.
+            // That is precisely what the guess must never leak as "connected".
+            let (base, source) = coord_base_with_source();
+            assert_eq!(base, DEV_LOCALHOST_COORD_BASE, "tier {tier}");
+            assert_eq!(source, CoordBaseSource::DevLocalhostFallback, "tier {tier}");
         }
     }
 
