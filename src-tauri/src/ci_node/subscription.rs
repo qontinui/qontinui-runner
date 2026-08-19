@@ -79,13 +79,23 @@ pub(crate) fn build_ci_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String 
     format!("{ws_base}?pattern=events.ci.*.{device_id}")
 }
 
-/// Resolve the raw profile `coord_url` (which may already end in `/ws`) —
-/// mirrors `agent_runtime::coord_ws_url`'s source of truth.
+/// Resolve the CI-dispatch WS URL through [`profiles::connected_coord_base`] —
+/// the SAME door `ci_node::spawn_ci_node_runtime`'s gate uses, and the same
+/// source of truth as `agent_runtime::coord_ws_url`.
+///
+/// It previously read the raw profile `coord_url`
+/// (`load_strict().ok()?.coord_url?`), honoring neither `COORD_HTTP_URL` nor
+/// the hosted-tier default, so on a `qontinui_account`-tier runner with no
+/// `coord_url` the gate passed and this returned `None` — the runtime logged
+/// that it started while CI dispatch was dead. The gate and the resolver must
+/// read the same fact.
+///
+/// The base arrives with any `/ws` suffix already stripped
+/// (`profiles::coord_ws_to_http`); [`build_ci_ws_url`] flips the scheme and
+/// re-appends it idempotently.
 fn ci_ws_url(device_id: uuid::Uuid) -> Option<String> {
-    let coord_url = qontinui_runner_lib::profiles::load_strict()
-        .ok()?
-        .coord_url?;
-    Some(build_ci_ws_url(&coord_url, device_id))
+    let coord_base = qontinui_runner_lib::profiles::connected_coord_base()?;
+    Some(build_ci_ws_url(&coord_base, device_id))
 }
 
 /// The CI channels this device consumes.
@@ -142,7 +152,10 @@ pub(crate) async fn subscribe_loop(device_id: uuid::Uuid) {
     let mut backoff_ms: u64 = CI_BACKOFF_BASE_MS;
     loop {
         let Some(ws_url) = ci_ws_url(device_id) else {
-            warn!("ci_node: no coord_url in profile; retrying in {CI_NO_COORD_URL_RETRY_SECS}s");
+            warn!(
+                "ci_node: runner is ISOLATED (no coord configured, not a hosted tier); \
+                 retrying in {CI_NO_COORD_URL_RETRY_SECS}s"
+            );
             tokio::time::sleep(Duration::from_secs(CI_NO_COORD_URL_RETRY_SECS)).await;
             continue;
         };
@@ -274,6 +287,51 @@ mod tests {
             build_ci_ws_url("https://coord.qontinui.io", device),
             format!("wss://coord.qontinui.io/ws?pattern=events.ci.*.{device}")
         );
+    }
+
+    /// REGRESSION (P2a review #2): `spawn_ci_node_runtime` gates on
+    /// `connected_coord_base().is_none()`, so `ci_ws_url` must resolve from the
+    /// same door. Reading the raw profile `coord_url` left a hosted
+    /// (`qontinui_account`-tier) runner with no `coord_url` logging that CI
+    /// dispatch had started while the subscription never opened.
+    #[test]
+    fn ci_ws_url_agrees_with_the_spawn_gate_on_every_tier() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            "COORD_HTTP_URL",
+            "QONTINUI_ENV",
+            "QONTINUI_CONFIG_DIR",
+        ]);
+        let device = uuid::Uuid::nil();
+        // (settings.json body, expected ws url)
+        let cases: [(&str, Option<String>); 3] = [
+            (
+                r#"{"tier":"qontinui_account"}"#,
+                Some(format!(
+                    "wss://coord.qontinui.io/ws?pattern=events.ci.*.{device}"
+                )),
+            ),
+            // Non-hosted: isolated — no dev-localhost guess leaks through.
+            (r#"{"tier":"local"}"#, None),
+            // Unreadable settings.json ⇒ tier UNKNOWN ⇒ must NOT dial prod.
+            ("{not json", None),
+        ];
+        for (settings, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            std::env::remove_var("COORD_HTTP_URL");
+            std::env::set_var("QONTINUI_ENV", "__qontinui_test_no_such_profile__");
+            std::env::set_var("QONTINUI_CONFIG_DIR", dir.path());
+            std::fs::write(dir.path().join("settings.json"), settings).unwrap();
+
+            let gate = qontinui_runner_lib::profiles::connected_coord_base();
+            let ws = ci_ws_url(device);
+            assert_eq!(
+                gate.is_some(),
+                ws.is_some(),
+                "gate and WS resolver disagreed for settings {settings:?}"
+            );
+            assert_eq!(ws, expected, "settings {settings:?}");
+        }
     }
 
     #[test]

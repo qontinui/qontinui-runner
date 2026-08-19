@@ -458,24 +458,33 @@ fn agent_log_path(agent_id: uuid::Uuid) -> Option<PathBuf> {
     agent_logs_root().map(|d| d.join(format!("{agent_id}.log")))
 }
 
-/// Resolve the coord WS URL from the active profile's `coord_url`,
-/// normalizing the scheme to `ws://` / `wss://` and ensuring the `/ws`
-/// path is present (exactly once) with an `events.agent.*` pattern filter.
+/// Resolve the coord WS URL, normalizing the scheme to `ws://` / `wss://` and
+/// ensuring the `/ws` path is present (exactly once) with an `events.agent.*`
+/// pattern filter.
 ///
-/// Mirrors `session::handoff::coord_ws_url`, but unlike that path — which
-/// receives the coord HTTP base with `/ws` already stripped — this reads the
-/// RAW profile `coord_url`, whose shipped `dev`/`production` values ALREADY
-/// end in `/ws` (e.g. `wss://coord.qontinui.io/ws`, see
-/// `bin/qontinui_profile.rs`). The construction is therefore made idempotent
-/// via [`build_coord_ws_url`]: appending `/ws` to an already-`/ws` base would
-/// produce `…/ws/ws` → 401 at the ALB → the subscribe loop never connects in
-/// prod. The coord `/ws` endpoint is a Redis pub/sub bridge at the `/ws` path
-/// (not the root); connecting to the root also returns 401.
+/// Resolved through [`connected_coord_base`] — the SAME door
+/// [`spawn_runtime`]'s gate uses. It previously read the raw profile
+/// `coord_url` directly (`load_strict().ok()?.coord_url?`), which honored
+/// neither `COORD_HTTP_URL` nor the hosted-tier default. That disagreed with
+/// the gate: on a `qontinui_account`-tier runner whose profiles.json has no
+/// `coord_url` — the shipped end-user configuration — the gate passed, then
+/// this returned `None`, the subscriber loop exited `Ok(())`, and
+/// `spawn_supervised_forever` read that as a restart. The result was a
+/// permanent 5s→300s respawn loop with agent-spawn delivery dead (there is no
+/// poll backstop for `events.agent.spawn_requested`) while the logs claimed
+/// the runtime was up. The gate and the resolver must read the same fact.
+///
+/// [`connected_coord_base`] hands back the coord HTTP base with any `/ws`
+/// suffix already stripped by `profiles::coord_ws_to_http` (so the shipped
+/// `wss://coord.qontinui.io/ws` arrives here as `https://coord.qontinui.io`);
+/// [`build_coord_ws_url`] then flips the scheme and appends `/ws`. That append
+/// stays idempotent because the builder also accepts a base that already ends
+/// in `/ws`: producing `…/ws/ws` would 401 at the ALB and the subscribe loop
+/// would never connect in prod. The coord `/ws` endpoint is a Redis pub/sub
+/// bridge at the `/ws` path (not the root); connecting to the root also 401s.
 fn coord_ws_url(device_id: uuid::Uuid) -> Option<String> {
-    let coord_url = qontinui_runner_lib::profiles::load_strict()
-        .ok()?
-        .coord_url?;
-    Some(build_coord_ws_url(&coord_url, device_id))
+    let coord_base = connected_coord_base()?;
+    Some(build_coord_ws_url(&coord_base, device_id))
 }
 
 /// Pure builder for the coord agent-spawn WS subscription URL. Extracted from
@@ -626,8 +635,8 @@ pub fn spawn_runtime() {
 
     if connected_coord_base().is_none() {
         info!(
-            "agent_runtime: profile has no coord_url — agent spawn runtime \
-             disabled. Skipping."
+            "agent_runtime: runner is ISOLATED (no coord configured, not a hosted \
+             tier) — agent spawn runtime disabled. Skipping."
         );
         return;
     }
@@ -741,7 +750,10 @@ async fn subscribe_to_spawn_requests(device_id: uuid::Uuid) -> anyhow::Result<()
     let ws_url = match coord_ws_url(device_id) {
         Some(u) => u,
         None => {
-            warn!("agent_runtime: no coord_url; subscriber loop exiting");
+            warn!(
+                "agent_runtime: runner is ISOLATED (no coord configured, not a hosted \
+                 tier) — subscriber loop exiting"
+            );
             return Ok(());
         }
     };
@@ -5374,6 +5386,84 @@ mod tests {
             build_coord_ws_url("https://coord.qontinui.io/", device),
             format!("wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}")
         );
+    }
+
+    /// REGRESSION (P2a review #2): the spawn gate and the WS resolver must
+    /// read the SAME fact.
+    ///
+    /// `spawn_runtime` gates on `connected_coord_base().is_none()`. When
+    /// `coord_ws_url` read the raw profile `coord_url` instead, a hosted
+    /// (`qontinui_account`-tier) runner with no `coord_url` — the shipped
+    /// end-user configuration — passed the gate, then got `None` here. The
+    /// subscriber loop exited `Ok(())`, `spawn_supervised_forever` read that
+    /// as a restart, and agent-spawn delivery stayed dead in a permanent
+    /// 5s→300s respawn loop while the logs said the runtime was up.
+    ///
+    /// Hermetic: `COORD_HTTP_URL` removed, `QONTINUI_ENV` pointed at a profile
+    /// name that cannot exist (so the profile arm misses on any machine), and
+    /// `QONTINUI_CONFIG_DIR` pointed at a temp `settings.json` we own.
+    #[test]
+    fn coord_ws_url_resolves_on_hosted_tier_with_no_profile_coord_url() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            "COORD_HTTP_URL",
+            "QONTINUI_ENV",
+            "QONTINUI_CONFIG_DIR",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var("COORD_HTTP_URL");
+        std::env::set_var("QONTINUI_ENV", "__qontinui_test_no_such_profile__");
+        std::env::set_var("QONTINUI_CONFIG_DIR", dir.path());
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"tier":"qontinui_account"}"#,
+        )
+        .unwrap();
+
+        let device = uuid::Uuid::nil();
+        // The gate says connected…
+        assert_eq!(
+            qontinui_runner_lib::profiles::connected_coord_base().as_deref(),
+            Some(qontinui_runner_lib::profiles::PROD_COORD_BASE),
+        );
+        // …so the resolver behind it must agree, and produce exactly one `/ws`.
+        assert_eq!(
+            coord_ws_url(device),
+            Some(format!(
+                "wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}"
+            )),
+            "gate and WS resolver disagreed — the respawn-loop regression"
+        );
+    }
+
+    /// The inverse: a NON-hosted runner with nothing configured is isolated, so
+    /// the gate refuses AND the resolver yields `None`. Also covers the
+    /// unreadable-settings.json case, which must NOT dial production.
+    #[test]
+    fn coord_ws_url_is_none_when_isolated_or_tier_unknown() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            "COORD_HTTP_URL",
+            "QONTINUI_ENV",
+            "QONTINUI_CONFIG_DIR",
+        ]);
+        for settings in [r#"{"tier":"local"}"#, "{not json"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::env::remove_var("COORD_HTTP_URL");
+            std::env::set_var("QONTINUI_ENV", "__qontinui_test_no_such_profile__");
+            std::env::set_var("QONTINUI_CONFIG_DIR", dir.path());
+            std::fs::write(dir.path().join("settings.json"), settings).unwrap();
+            assert_eq!(
+                qontinui_runner_lib::profiles::connected_coord_base(),
+                None,
+                "settings {settings:?}"
+            );
+            assert_eq!(
+                coord_ws_url(uuid::Uuid::nil()),
+                None,
+                "settings {settings:?} must not open a prod WS subscription"
+            );
+        }
     }
 
     #[test]
