@@ -403,16 +403,6 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: false,
         observe_projection: None,
     },
-    // Productivity Stack — Phase 3 (in-product /decompose-plan replacement).
-    ProxyableCommand {
-        name: "decompose_plan",
-        description: "Decompose a plan markdown into a structured task graph + populate the upcoming-file claim registry. Reads the plan, computes a SHA-256 hash for idempotency, asks the active LLM provider to identify phases/tasks/claims/dependencies, then POSTs the structured payload to /plans/decompose. Returns `{ planId, taskCount, versionHash, idempotentSkip, stamped }`. When no LLM provider is configured, returns the error string \"Configure an LLM provider in Settings → AI to use Decompose Plan.\" so the calling modal can show the affordance.",
-        args_schema: r#"{"type":"object","required":["planPath"],"properties":{"planPath":{"type":"string"}}}"#,
-        response_schema: r#"{"type":"object","required":["planId","taskCount","versionHash","idempotentSkip","stamped"],"properties":{"planId":{"type":"string"},"taskCount":{"type":"integer"},"versionHash":{"type":"string"},"idempotentSkip":{"type":"boolean"},"stamped":{"type":"boolean"}}}"#,
-        // Required `planPath` arg; empty-args probe would always fail.
-        probe_with_empty_args: false,
-        observe_projection: None,
-    },
     // Productivity Stack — Phase 5 (in-product /summarize-session and /rewind-session replacements).
     ProxyableCommand {
         name: "summarize_session",

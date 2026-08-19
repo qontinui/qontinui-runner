@@ -103,7 +103,6 @@ pub mod pg_guard;
 pub mod physical_device;
 pub mod physical_device_api;
 pub mod plan_library;
-pub mod plans;
 pub mod playwright;
 pub mod playwright_collection;
 pub mod prm_export;

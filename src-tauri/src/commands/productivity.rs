@@ -1532,57 +1532,6 @@ pub async fn list_workers(
 }
 
 // ============================================================================
-// Decompose Plan — Phase 3 (in-product replacement for /decompose-plan)
-// ============================================================================
-//
-// Promotes the personal `qontinui-claude-config/.claude/commands/decompose-
-// plan.md` slash command to a Tauri command so any qontinui user can run
-// it from the UI without depending on the Claude CLI. Underlying
-// implementation lives at `crate::productivity::decompose`.
-
-/// Hint surfaced in the UI when the active LLM provider is unconfigured.
-/// Same string for `Disabled` and `NoCredentials` — both flow through the
-/// same Settings -> AI affordance.
-const DECOMPOSE_PROVIDER_HINT: &str =
-    "Configure an LLM provider in Settings → AI to use Decompose Plan.";
-
-/// Decompose a plan markdown into a structured task graph + populate the
-/// upcoming-file claim registry. Wraps the in-process `OneshotLlm` call
-/// followed by a loopback POST to `/plans/decompose`.
-///
-/// Returns a structured payload with `planId` + `taskCount` so the UI can
-/// render a success toast. On `OneshotError::Disabled` /
-/// `OneshotError::NoCredentials`, returns the error string
-/// [`DECOMPOSE_PROVIDER_HINT`] so the modal can show the affordance + a
-/// link to Settings.
-#[tauri::command]
-pub async fn decompose_plan(
-    app_handle: tauri::AppHandle,
-    plan_path: String,
-) -> Result<crate::productivity::decompose::DecomposeResult, String> {
-    let app_state = require_app_state(&app_handle)?;
-    let pg = app_state.pg_db.clone();
-    let runner_port = crate::mcp::types::runner_api_port(&app_state);
-
-    let llm = crate::ai_provider::oneshot::oneshot_for_settings();
-
-    crate::productivity::decompose::decompose_plan_in_product(
-        &pg,
-        llm.as_ref(),
-        &plan_path,
-        runner_port,
-    )
-    .await
-    .map_err(|e| match e {
-        crate::productivity::decompose::DecomposeError::LlmDisabled
-        | crate::productivity::decompose::DecomposeError::LlmNoCredentials => {
-            DECOMPOSE_PROVIDER_HINT.to_string()
-        }
-        other => other.to_string(),
-    })
-}
-
-// ============================================================================
 // Backfill stuck tasks — coord-task-status-hygiene plan, Phase 3
 // ============================================================================
 //

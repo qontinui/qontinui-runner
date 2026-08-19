@@ -35,12 +35,12 @@ use axum::{extract::Request, http::StatusCode, middleware::Next, response::Respo
 use crate::mcp::types::ApiResponse;
 
 /// Route families that are ENTIRELY DB-backed — every route at or under the
-/// prefix requires PG. Matched segment-wise (so `/plans` matches `/plans` and
-/// `/plans/decompose` but not `/plansomething`). `*` matches one segment.
+/// prefix requires PG. Matched segment-wise (so `/workers` matches `/workers`
+/// and `/workers/x/status` but not `/workersomething`). `*` matches one
+/// segment.
 /// Verified against the live route registrations + handler bodies.
 const DB_BACKED_PREFIXES: &[&str] = &[
     // Coordinator / planning / tasks
-    "/plans",
     "/coordinator",
     "/workers",
     "/tasks", // completion_reports: /tasks/{id}/report, /add-dependency
@@ -281,8 +281,6 @@ mod tests {
     #[test]
     fn whole_db_families_match_at_and_under_prefix() {
         for p in [
-            "/plans",
-            "/plans/decompose",
             "/coordinator/state",
             "/workers",
             "/task-runs",
@@ -373,7 +371,6 @@ mod tests {
             "/apps/myapp/spec/health",
             "/apps/myapp/spec/subscribe",
             // Segment-boundary lookalikes must NOT match.
-            "/plansomething",
             "/task-runs-archive",
             "/reviewsx",
         ] {

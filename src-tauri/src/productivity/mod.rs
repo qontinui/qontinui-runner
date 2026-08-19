@@ -6,7 +6,6 @@
 //!
 //! See `plans/productivity-stack-product-readiness.md` for the multi-phase
 //! design.
-//! - Phase 3 ships [`decompose`].
 //! - Phase 4 ships [`review`].
 //! - Phase 5 ships [`rewind`] + [`summarize`].
 //!
@@ -16,7 +15,6 @@
 //! `done`. Dry-run by default.
 
 pub mod backfill_tasks;
-pub mod decompose;
 pub mod review;
 pub mod rewind;
 pub mod summarize;

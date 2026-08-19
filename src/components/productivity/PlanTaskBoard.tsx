@@ -36,14 +36,12 @@ import {
   Archive,
   BookOpen,
   Undo2,
-  ClipboardList,
   ShieldCheck,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { autoReviewTask, getTaskDetail, getPlanTasks, type DecomposeResult } from "./api";
+import { autoReviewTask, getTaskDetail, getPlanTasks } from "./api";
 import { listPlansFiltered } from "./reflectionApi";
 import { ReflectionPanel } from "./ReflectionPanel";
-import { DecomposePlanModal } from "./DecomposePlanModal";
 import {
   rewindSession,
   summarizeSession,
@@ -183,7 +181,6 @@ interface PlansListProps {
   error: string | null;
   showArchived: boolean;
   onShowArchivedChange: (next: boolean) => void;
-  onDecompose: () => void;
 }
 
 function PlansList({
@@ -195,7 +192,6 @@ function PlansList({
   error,
   showArchived,
   onShowArchivedChange,
-  onDecompose,
 }: PlansListProps) {
   return (
     <div
@@ -224,15 +220,6 @@ function PlansList({
             archived
           </label>
           <button
-            onClick={onDecompose}
-            className="inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border border-border text-foreground hover:bg-primary/10 hover:text-primary hover:border-primary/40 transition-colors"
-            data-ui-bridge-id="productivity.decompose-plan-button"
-            title="Decompose a plan markdown into the task graph"
-          >
-            <ClipboardList className="w-3 h-3" />
-            Decompose
-          </button>
-          <button
             onClick={onRefresh}
             disabled={loading}
             className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors"
@@ -253,8 +240,7 @@ function PlansList({
           </div>
         ) : plans.length === 0 ? (
           <div className="p-3 text-xs text-muted-foreground italic">
-            No plans yet. Run <code className="font-mono text-[11px]">/decompose-plan</code> to
-            populate this list.
+            No plans yet.
           </div>
         ) : (
           <ul className="divide-y divide-border/60">
@@ -950,15 +936,6 @@ export function PlanTaskBoard() {
 
   const [reflectionOpen, setReflectionOpen] = useState<boolean>(false);
 
-  // Decompose-plan modal state. `decomposeInitialPath` is seeded from the
-  // currently-selected plan (so re-decomposing an existing plan is a
-  // one-click operation). When no plan is selected, the modal opens
-  // empty and the user types/pastes a path manually. A future revision
-  // could scan `D:/qontinui-root/plans/` for the most-recently-modified
-  // *.md, but that requires a Tauri command we don't have today.
-  const [decomposeOpen, setDecomposeOpen] = useState<boolean>(false);
-  const [decomposeInitialPath, setDecomposeInitialPath] = useState<string | null>(null);
-
   const fetchPlans = useCallback(async () => {
     setPlansLoading(true);
     setPlansError(null);
@@ -1179,23 +1156,6 @@ export function PlanTaskBoard() {
     [plans, selectedPlanId],
   );
 
-  const handleOpenDecompose = useCallback(() => {
-    // Seed with the currently-selected plan's path so re-decomposing is
-    // one-click. The modal happily accepts an empty path otherwise.
-    setDecomposeInitialPath(selectedPlan?.markdownPath ?? null);
-    setDecomposeOpen(true);
-  }, [selectedPlan]);
-
-  const handleDecomposeSuccess = useCallback(
-    (result: DecomposeResult) => {
-      // Refresh the plan list so the freshly-decomposed plan shows up,
-      // then surface it as the active selection.
-      void fetchPlans();
-      setSelectedPlanId(result.planId);
-    },
-    [fetchPlans],
-  );
-
   return (
     <div className="h-full flex" data-page-id="productivity-plans">
       {/* Left: Plans (25%) */}
@@ -1209,7 +1169,6 @@ export function PlanTaskBoard() {
           error={plansError}
           showArchived={showArchived}
           onShowArchivedChange={setShowArchived}
-          onDecompose={handleOpenDecompose}
         />
       </div>
 
@@ -1265,14 +1224,6 @@ export function PlanTaskBoard() {
           }}
         />
       </div>
-
-      {/* Decompose-plan modal — Phase 3 of productivity-stack-product-readiness. */}
-      <DecomposePlanModal
-        open={decomposeOpen}
-        onClose={() => setDecomposeOpen(false)}
-        initialPlanPath={decomposeInitialPath}
-        onSuccess={handleDecomposeSuccess}
-      />
     </div>
   );
 }

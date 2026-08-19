@@ -42,18 +42,20 @@ pub struct TaskRow {
 }
 
 /// Input shape for `insert_task`. The DB allocates the `id`. `depends_on`
-/// must be the UUIDs of already-inserted prereq tasks (resolved by the
-/// caller — see `mcp::plans::POST /plans/decompose`).
+/// must be the UUIDs of already-inserted prereq tasks, resolved by the
+/// caller.
 ///
-/// `identity_hash` is the stable per-task identity used for
-/// re-decompose 3-way merge — `sha256(plan_id || '|' || phase_name ||
-/// '|' || sequence_in_phase || '|' || description)`, in hex. The runner
-/// computes it inside `mcp/plans.rs::decompose_plan` after the plan
-/// UPSERT (because we need the post-UPSERT plan_id). Callers that
-/// don't have a sensible hash to supply (synthetic-test inserts, ad-hoc
-/// fixtures) may pass an empty string — the DB column is nullable, but
-/// the field is intentionally `&str` rather than `Option<&str>` so the
-/// merge path in `decompose_plan` can't accidentally elide it.
+/// `identity_hash` is the stable per-task identity the DB column carries —
+/// `sha256(plan_id || '|' || phase_name || '|' || sequence_in_phase ||
+/// '|' || description)`, in hex. It was computed by the plan-decompose
+/// endpoint, deleted on 2026-08-19 by plan
+/// `2026-08-16-delete-runner-plans-decompose-dead-coord-plans-writer`
+/// because it wrote `coord.plans`, a table alembic dropped on 2026-07-11
+/// in `coord_p4_03_drop_plans`. No caller produces a hash today; callers
+/// without a sensible hash to supply (synthetic-test inserts, ad-hoc
+/// fixtures) pass an empty string — the DB column is nullable, but the
+/// field stays `&str` rather than `Option<&str>` so a future writer
+/// cannot elide it by accident.
 #[derive(Debug, Clone)]
 pub struct InsertTaskInput<'a> {
     pub plan_id: &'a str,

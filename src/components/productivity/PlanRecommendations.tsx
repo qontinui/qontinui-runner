@@ -90,9 +90,7 @@ export function PlanRecommendations() {
         </div>
       ) : rows.length === 0 ? (
         <div className="rounded-md border border-border/40 bg-muted/10 p-3 text-xs text-muted-foreground">
-          No plan candidates with ready/unassigned tasks. Run
-          <code className="font-mono mx-1">/decompose-plan</code>
-          on a vetted plan to populate this card.
+          No plan candidates with ready/unassigned tasks.
         </div>
       ) : (
         <ul className="flex flex-col gap-2">
