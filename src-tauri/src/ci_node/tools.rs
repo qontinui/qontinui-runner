@@ -1258,7 +1258,13 @@ fn write_python_shim(bin_dir: &Path, stem: &str, module: &str) -> Result<PathBuf
 /// the steps will get. That is not cosmetic: node's Unix `bin/npm` is a
 /// symlink to a `#!/usr/bin/env node` script, so verifying npm without our own
 /// node in front of PATH would either fail or, worse, verify the HOST's node.
-async fn run_capture(
+///
+/// `pub(super)` because [`super::services`] runs container commands with the
+/// same requirements — no console window, a hard timeout, combined output, and
+/// the Windows `.cmd`-shim respawn (`docker` on Windows is an exe, but podman
+/// and Docker Desktop's compatibility shims are not always). Sharing this is
+/// strictly better than a second copy of the spawn/timeout/shim logic.
+pub(super) async fn run_capture(
     program: &str,
     args: &[&str],
     timeout: Duration,

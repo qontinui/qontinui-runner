@@ -47,6 +47,7 @@ pub(crate) mod host_sizing;
 pub(crate) mod junit;
 pub(crate) mod manifest;
 pub(crate) mod reporting;
+pub(crate) mod services;
 pub(crate) mod settings_directive;
 pub(crate) mod sibling;
 pub(crate) mod subscription;

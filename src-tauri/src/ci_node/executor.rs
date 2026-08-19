@@ -18,11 +18,14 @@
 //!   contending with the developer's own `target/`.
 //!
 //! Provisioning happens between the manifest read and the first step, in this
-//! order: tools ([`super::tools`]) then siblings ([`super::sibling`]). Both
-//! are declared IN the manifest, so neither can run before it is read and
-//! validated; both abort the dispatch on failure, because a step that
-//! silently ran without its declared tool or sibling produces a verdict that
-//! looks like a code failure and is not.
+//! order: tools ([`super::tools`]), siblings ([`super::sibling`]), then
+//! services ([`super::services`]). All three are declared IN the manifest, so
+//! none can run before it is read and validated; all three abort the dispatch
+//! on failure, because a step that silently ran without its declared tool,
+//! sibling or database produces a verdict that looks like a code failure and is
+//! not. Services come last because they are the only stage that leaves
+//! something RUNNING: there is no reason to start a database before finding out
+//! a declared tool does not exist for this platform.
 //!
 //! ## Capture-before-cleanup (type-enforced, not conventional)
 //!
@@ -103,18 +106,26 @@ impl CiJob {
     }
 }
 
-/// The on-disk footprint of one dispatch, and the ONLY thing that may remove
-/// it.
+/// Everything one dispatch brought into existence — the directory tree AND the
+/// service containers — and the ONLY thing that may remove them.
 ///
 /// [`cleanup`](DispatchWorkspace::cleanup) consumes a
 /// [`reporting::ResultReported`] receipt, which only
 /// [`reporting::post_result`] can mint. That makes "reported, then cleaned up"
 /// the only expressible order — see the module docs for why the reverse order
 /// is a silent, green-looking data-loss bug.
+///
+/// The service stack lives here, rather than beside the provisioning call,
+/// precisely so that it rides that single exit path: every early return in
+/// [`run_dispatch`] already goes through `cleanup`, so adding a second thing to
+/// remove could not miss one. A leaked container is worse than a failed build.
 struct DispatchWorkspace {
     root: PathBuf,
     repo: String,
     dispatch_id: String,
+    /// Containers started for this dispatch. Empty (and inert) unless the
+    /// manifest declared `[[services]]`.
+    services: super::services::ServiceStack,
 }
 
 impl DispatchWorkspace {
@@ -123,13 +134,20 @@ impl DispatchWorkspace {
             root: root.to_path_buf(),
             repo: repo.to_string(),
             dispatch_id: dispatch_id.to_string(),
+            services: super::services::ServiceStack::new(dispatch_id),
         }
     }
 
-    /// Remove the dispatch's worktree and dispatch root. Consumes both `self`
-    /// and the reporting receipt, so it can run at most once per dispatch and
-    /// never before the result (with its JUnit artifact) has been POSTed.
-    async fn cleanup(self, _reported: reporting::ResultReported) {
+    /// Destroy the dispatch's service containers, then its worktree and
+    /// dispatch root. Consumes both `self` and the reporting receipt, so it can
+    /// run at most once per dispatch and never before the result (with its
+    /// JUnit artifact) has been POSTed.
+    ///
+    /// Containers first: they hold no state the report needs, and taking them
+    /// down before a slow filesystem delete shortens the window in which a
+    /// crash could leak one.
+    async fn cleanup(mut self, _reported: reporting::ResultReported) {
+        self.services.teardown().await;
         super::checkout::cleanup_dispatch(&self.root, &self.repo, &self.dispatch_id).await;
     }
 }
@@ -192,7 +210,7 @@ pub(crate) async fn run_dispatch(
     // Everything on disk this dispatch owns. Only `workspace.cleanup(receipt)`
     // may remove it, and a receipt only exists after `post_result` — so no
     // path out of this function can delete the JUnit before it is sent.
-    let workspace = DispatchWorkspace::new(&root, &payload.repo, &payload.dispatch_id);
+    let mut workspace = DispatchWorkspace::new(&root, &payload.repo, &payload.dispatch_id);
 
     // ── Checkout ──
     sink.push(&format!(
@@ -276,33 +294,44 @@ pub(crate) async fn run_dispatch(
     let build_jobs = manifest.limits.effective_cargo_build_jobs(host);
     let test_threads = manifest.limits.effective_test_threads(host);
     sink.push(&format!(
-        "[ci-node] manifest ok: {} step(s), {} sibling(s), {} tool(s); \
+        "[ci-node] manifest ok: {} step(s), {} sibling(s), {} tool(s), {} service(s); \
          cargo_build_jobs={build_jobs} test_threads={test_threads} \
          (host sizing: {} / {})",
         manifest.steps.len(),
         manifest.siblings.len(),
         manifest.tools.len(),
+        manifest.services.len(),
         host.cargo_build_jobs,
         host.test_threads
     ));
 
-    // ── Provisioning (tools, then siblings) ──
-    let provisioning = provision(&payload, &root, &worktree, &manifest, &sink).await;
-    let tool_dirs = match provisioning {
-        Ok(dirs) => {
+    // ── Provisioning (tools, siblings, then services) ──
+    let provision_started = Instant::now();
+    let provisioning = provision(
+        &payload,
+        &root,
+        &worktree,
+        &manifest,
+        &sink,
+        &cancel,
+        &mut workspace.services,
+    )
+    .await;
+    let (tool_dirs, service_env) = match provisioning {
+        Ok(provisioned) => {
             steps_summary.push(StepSummary {
                 name: "[setup] provision".to_string(),
                 conclusion: "success".to_string(),
-                duration_secs: 0,
+                duration_secs: provision_started.elapsed().as_secs(),
             });
-            dirs
+            provisioned
         }
         Err(e) => {
             sink.push(&format!("[ci-node] provisioning failed: {e}"));
             steps_summary.push(StepSummary {
                 name: "[setup] provision".to_string(),
                 conclusion: "failure".to_string(),
-                duration_secs: 0,
+                duration_secs: provision_started.elapsed().as_secs(),
             });
             let tail = sink.finish().await;
             // No artifact: provisioning aborts BEFORE the first step, so any
@@ -328,7 +357,13 @@ pub(crate) async fn run_dispatch(
         .join(".ci-target")
         .join(crate::agent_runtime::local_repo_name(&payload.repo));
 
-    let dispatch_env = DispatchEnv::build(build_jobs, test_threads, &ci_target_dir, &tool_dirs);
+    let dispatch_env = DispatchEnv::build(
+        build_jobs,
+        test_threads,
+        &ci_target_dir,
+        &tool_dirs,
+        &service_env,
+    );
 
     // Per-dispatch memory-backstop job (held across all steps; dropping it
     // at dispatch end kill-on-closes any stray build processes).
@@ -407,19 +442,27 @@ pub(crate) async fn run_dispatch(
 }
 
 /// Provision what the manifest declares. Returns the tool directories to
-/// prepend to the step PATH.
+/// prepend to the step PATH, and the service connection env to export to every
+/// step.
 ///
-/// Tools first, siblings second: a sibling fetch is the slower and more
-/// failure-prone half (network, declaration validation), and there is no
-/// reason to pay for it before finding out a declared tool does not exist for
-/// this platform.
+/// Tools first, siblings second, services last. A sibling fetch is slower and
+/// more failure-prone than a tool install (network, declaration validation),
+/// and there is no reason to pay for it before finding out a declared tool does
+/// not exist for this platform — and less reason still to have a database
+/// RUNNING while finding that out. Services are also the only stage whose
+/// failure can leave something behind, which is why the stack is owned by the
+/// caller's `DispatchWorkspace` and passed in: a partially-provisioned stack
+/// still names every container it started, and the caller's cleanup removes
+/// them.
 async fn provision(
     payload: &CiDispatchPayload,
     root: &Path,
     worktree: &Path,
     manifest: &CiManifest,
     sink: &ProgressSink,
-) -> Result<Vec<PathBuf>, String> {
+    cancel: &CancellationToken,
+    services: &mut super::services::ServiceStack,
+) -> Result<(Vec<PathBuf>, Vec<(String, String)>), String> {
     let mut log = |line: String| sink.push(&line);
 
     let tool_dirs = super::tools::provision(root, &manifest.tools, &mut log).await?;
@@ -439,7 +482,11 @@ async fn provision(
     )
     .await?;
 
-    Ok(tool_dirs)
+    let service_env = services
+        .provision(&manifest.services, &mut log, cancel)
+        .await?;
+
+    Ok((tool_dirs, service_env))
 }
 
 /// Read + validate the manifest from the checked-out tree. The path is
@@ -587,6 +634,7 @@ impl DispatchEnv {
         test_threads: u32,
         ci_target_dir: &Path,
         tool_dirs: &[PathBuf],
+        service_env: &[(String, String)],
     ) -> Self {
         let mut exports = vec![
             // The build-phase cap.
@@ -618,6 +666,12 @@ impl DispatchEnv {
             // node still resolve.
             exports.push(("PATH".to_string(), path));
         }
+        // Service connections. Executor-owned for a reason the manifest cannot
+        // work around: the host port is assigned at dispatch time and the
+        // password is generated per dispatch, so a committed file could only
+        // ever hold a wrong value. The manifest rejects these keys outright
+        // with a pointer to the `[[services]]` entry that provides them.
+        exports.extend(service_env.iter().cloned());
         Self { exports }
     }
 }
@@ -772,7 +826,7 @@ mod tests {
     /// agent in the test phase too.
     #[test]
     fn executor_exports_both_phases_of_cap() {
-        let env = DispatchEnv::build(3, 7, Path::new("/ci-target"), &[]);
+        let env = DispatchEnv::build(3, 7, Path::new("/ci-target"), &[], &[]);
         assert_eq!(exports(&env, "CARGO_BUILD_JOBS").as_deref(), Some("3"));
         assert_eq!(exports(&env, "RUST_TEST_THREADS").as_deref(), Some("7"));
         assert_eq!(exports(&env, "NEXTEST_TEST_THREADS").as_deref(), Some("7"));
@@ -787,7 +841,7 @@ mod tests {
     #[test]
     fn tool_dirs_prepend_without_replacing_the_host_path() {
         let dir = PathBuf::from("/tools/cargo-nextest/0.9.98");
-        let env = DispatchEnv::build(1, 2, Path::new("/ci-target"), &[dir.clone()]);
+        let env = DispatchEnv::build(1, 2, Path::new("/ci-target"), &[dir.clone()], &[]);
         let path = exports(&env, "PATH").expect("PATH must be exported when a tool is provisioned");
         let mut entries = std::env::split_paths(&path);
         assert_eq!(entries.next().as_deref(), Some(dir.as_path()));
@@ -803,7 +857,7 @@ mod tests {
     /// outright — this asserts the second half of that belt-and-braces.)
     #[test]
     fn executor_exports_are_applied_last() {
-        let env = DispatchEnv::build(1, 2, Path::new("/ci-target"), &[]);
+        let env = DispatchEnv::build(1, 2, Path::new("/ci-target"), &[], &[]);
         let step_env = vec![("CARGO_BUILD_JOBS".to_string(), "64".to_string())];
         let mut envs = step_env.clone();
         envs.extend(env.exports.iter().cloned());
@@ -865,6 +919,104 @@ mod tests {
                 .artifact()
                 .is_none(),
             "post-cleanup capture must find nothing — proving order matters"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Service connection env reaches the steps, and it is applied AFTER the
+    /// step's own env, so the executor's value is the one the child sees.
+    #[test]
+    fn service_env_is_exported_to_every_step() {
+        let service_env = super::super::services::exports_for(
+            super::super::services::ServiceKind::Redis,
+            6399,
+            &super::super::services::ServiceCreds {
+                user: "u".to_string(),
+                password: "p".to_string(),
+                database: "d".to_string(),
+            },
+        );
+        let env = DispatchEnv::build(1, 2, Path::new("/ci-target"), &[], &service_env);
+        assert_eq!(
+            exports(&env, "REDIS_URL").as_deref(),
+            Some("redis://127.0.0.1:6399")
+        );
+        assert_eq!(exports(&env, "REDIS_PORT").as_deref(), Some("6399"));
+        // Nothing declared ⇒ nothing exported: a manifest without services
+        // must not gain a connection variable pointing nowhere.
+        let bare = DispatchEnv::build(1, 2, Path::new("/ci-target"), &[], &[]);
+        assert!(exports(&bare, "REDIS_URL").is_none());
+        assert!(exports(&bare, "DATABASE_URL").is_none());
+    }
+
+    /// TEARDOWN RIDES THE FAILURE PATH. `cleanup` is the single exit of
+    /// `run_dispatch` — every early return (checkout failure, manifest
+    /// rejection, provisioning failure) reaches it — so this asserts the two
+    /// halves it must do: remove the service containers, and remove EXACTLY
+    /// the one dispatch directory.
+    ///
+    /// The runtime named here does not exist, which is the point: teardown is
+    /// best-effort, so a removal that cannot run must still empty the stack and
+    /// must never abort the directory cleanup that follows it.
+    #[tokio::test]
+    async fn cleanup_tears_down_services_and_removes_exactly_one_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "ci-cleanup-test-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let dispatch_id = "0198f2b4-2222-7aaa-bbbb-cccccccccccc";
+        let repo = "qontinui/qontinui-coord";
+
+        // Inside the cleanup unit: the worktree and a provisioned sibling.
+        let dispatch_root = super::super::checkout::ci_dispatch_root(&base, dispatch_id);
+        let worktree = super::super::checkout::ci_worktree_path(&base, dispatch_id, repo);
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(worktree.join("src").join("lib.rs"), "fn main() {}").unwrap();
+        let sibling = dispatch_root.join("qontinui-schemas");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("Cargo.toml"), "[package]").unwrap();
+
+        // OUTSIDE it: a peer dispatch, the warm CI target cache, and the
+        // primary checkout. None of these may be touched.
+        let peer =
+            super::super::checkout::ci_dispatch_root(&base, "0198f2b4-3333-7aaa-bbbb-cccccccccccc");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::write(peer.join("keep.txt"), "peer").unwrap();
+        let warm_target = base.join(".ci-target").join("qontinui-coord");
+        std::fs::create_dir_all(&warm_target).unwrap();
+        std::fs::write(warm_target.join("keep.txt"), "warm").unwrap();
+        let primary = base.join("qontinui-coord");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::write(primary.join("keep.txt"), "primary").unwrap();
+
+        let mut workspace = DispatchWorkspace::new(&base, repo, dispatch_id);
+        workspace.services = super::super::services::ServiceStack::for_test(
+            dispatch_id,
+            Some("qontinui-no-such-container-runtime"),
+            &["qontinui-ci-0198f2b4-2222-7aaa-bbbb-cccccccccccc-redis"],
+        );
+        workspace
+            .cleanup(reporting::ResultReported::for_test())
+            .await;
+
+        assert!(
+            !dispatch_root.exists(),
+            "the dispatch root must be removed: {}",
+            dispatch_root.display()
+        );
+        assert!(
+            peer.join("keep.txt").exists(),
+            "a peer dispatch was removed"
+        );
+        assert!(
+            warm_target.join("keep.txt").exists(),
+            "the warm CI target cache was removed"
+        );
+        assert!(
+            primary.join("keep.txt").exists(),
+            "the primary checkout was removed"
         );
 
         let _ = std::fs::remove_dir_all(&base);
