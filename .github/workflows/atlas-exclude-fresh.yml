@@ -274,7 +274,17 @@ jobs:
           DATABASE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
         run: poetry run alembic upgrade head
 
+      # Bounded against a job-time apt hang — see the rationale on the
+      # `Install dependencies (Ubuntu)` step in .github/workflows/ci.yml.
+      # Sizing: 19 successful runs, p50 6s, p90 9s, max 10s. 5 min is
+      # deliberately NOT the 5-10x of a 10-second observation that would give
+      # ~60-100s: at that scale the bound sits inside ordinary apt-mirror
+      # jitter and becomes a new flake source (this plan's own Risk 3). 5 min
+      # is a floor — 30x the worst observed — and still turns a multi-hour hang
+      # into a fast failure. It matches the bound the same plan puts on
+      # qontinui-web's postgresql-client sites.
       - name: Install Postgres client (native psql for the regen script)
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-client-16
