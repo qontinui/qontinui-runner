@@ -939,9 +939,51 @@ pub async fn ui_bridge_list_runner_windows_handler(
 // Pong / IPC response
 // ============================================================================
 
+/// Provenance of a `POST /ui-bridge/pong`.
+///
+/// The frontend sends pongs down two paths that mean **completely different
+/// things**, and until this query parameter existed they landed in the same
+/// atomic and were indistinguishable after the fact:
+///
+/// * `?source=event` — the `ui-bridge-ping` Tauri event was DELIVERED to the
+///   renderer. The pong itself may still travel back over HTTP (the JS→Rust
+///   `emit` fallback for the WebView2 IPC failure mode), but delivery of the
+///   ping is proof the native message loop pumped, so this stamps the
+///   event-provenance clock.
+/// * `?source=safety-net` — the frontend's unconditional 3s interval, which is
+///   NOT triggered by anything the loop delivered. It proves the renderer is
+///   alive and nothing at all about the UI thread; WebView2 services `fetch`
+///   in the browser/network process.
+///
+/// **Unlabeled is treated as the safety net**, on purpose: an unlabeled pong
+/// (an older frontend bundle, an external caller, a curl) genuinely carries no
+/// provenance, and reading "unknown" as "the loop is pumping" would silently
+/// restore the blindness this split removes. The cost of that choice is
+/// bounded — the unlabeled pong still advances `ui_bridge_last_pong`, so
+/// readiness, `responsive` and `ui_stale` behave exactly as before.
+#[derive(Debug, Default, Deserialize)]
+pub struct PongQuery {
+    /// `"event"` | `"safety-net"`. Absent ⇒ safety net (see above).
+    pub source: Option<String>,
+}
+
+impl PongQuery {
+    /// Whether this pong proves the native event loop delivered something.
+    fn is_event_provenance(&self) -> bool {
+        self.source.as_deref() == Some("event")
+    }
+}
+
 /// Handle UI Bridge pong from frontend.
+///
+/// Stores two stamps, not one: `ui_bridge_last_pong` (any provenance — "a
+/// renderer is alive") and, for `?source=event` only,
+/// `ui_error::record_event_pong` ("the native event loop delivered our ping").
+/// Keeping them apart is what lets `derived_status` express a hung UI thread
+/// behind a live renderer — see `crate::ui_error::LAST_EVENT_PONG_MS`.
 pub async fn ui_bridge_pong_handler(
     State(state): State<Arc<ApiState>>,
+    Query(query): Query<PongQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -951,11 +993,18 @@ pub async fn ui_bridge_pong_handler(
         .app_state
         .ui_bridge_last_pong
         .store(now, std::sync::atomic::Ordering::Relaxed);
+    let event_provenance = query.is_event_provenance();
+    if event_provenance {
+        crate::ui_error::record_event_pong();
+    }
     // Unblock any requests waiting for frontend readiness
     state.ui_bridge_ready.notify_waiters();
-    Ok(Json(ApiResponse::success(
-        serde_json::json!({ "pong": true }),
-    )))
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "pong": true,
+        // Echoed so a caller (and a manual `curl`) can see which liveness fact
+        // it just asserted, rather than guessing at the default.
+        "eventProvenance": event_provenance,
+    }))))
 }
 
 // NOTE: `POST /ui-bridge/heartbeat` used to live here as an IPC forward to a
@@ -981,6 +1030,10 @@ pub async fn ui_bridge_ipc_response_handler(
         .app_state
         .ui_bridge_last_pong
         .store(now, std::sync::atomic::Ordering::Relaxed);
+    // EVENT PROVENANCE: this is a response to a `ui-bridge-request` that the
+    // native event loop DELIVERED to the renderer. Only the return leg fell
+    // back to HTTP, so the delivery half still proves the loop pumped.
+    crate::ui_error::record_event_pong();
     Json(ApiResponse::success(
         serde_json::json!({ "received": true }),
     ))
@@ -1482,4 +1535,52 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/batch"),
         ("POST", "/ui-bridge/control/batch"),
     ]
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod pong_provenance_tests {
+    use super::PongQuery;
+
+    /// Parse through axum's OWN `Query` extractor, so the test exercises the
+    /// real wire form and the real deserializer rather than a hand-built
+    /// struct that could drift from what the route actually receives.
+    fn parse(query: &str) -> PongQuery {
+        let uri: axum::http::Uri = format!("http://127.0.0.1/ui-bridge/pong?{query}")
+            .parse()
+            .expect("uri parses");
+        axum::extract::Query::<PongQuery>::try_from_uri(&uri)
+            .expect("query parses")
+            .0
+    }
+
+    #[test]
+    fn source_event_is_the_only_event_provenance_value() {
+        assert!(parse("source=event").is_event_provenance());
+    }
+
+    /// The unlabeled and safety-net forms are the SAME weak claim: the
+    /// renderer is alive. Reading either as proof the native loop is pumping
+    /// is precisely the blindness the split removes — WebView2 answers these
+    /// `fetch`es from its browser process while the UI thread is frozen.
+    #[test]
+    fn unlabeled_and_safety_net_carry_no_event_provenance() {
+        for q in ["", "source=safety-net", "source=", "source=unknown"] {
+            assert!(
+                !parse(q).is_event_provenance(),
+                "{q:?} must not assert the native loop is pumping"
+            );
+        }
+    }
+
+    /// An unlabeled pong must still PARSE — an older frontend bundle, an
+    /// external tool or a bare `curl` keeps working and keeps the
+    /// any-provenance stamp fresh; only the event clock is withheld.
+    #[test]
+    fn missing_source_is_accepted_not_rejected() {
+        assert_eq!(parse("").source, None);
+    }
 }

@@ -427,10 +427,25 @@ pub(super) async fn gather_ui_error_signals(
         last_pong_age_ms,
         crate::ui_error::UI_DEAD_AFTER_MS,
     );
+    // Native message-loop liveness as a DISTINCT input. The pong stamp above
+    // cannot express it: the frontend's unconditional 3s HTTP pong is
+    // serviced by WebView2's browser process, off the host's UI thread, so it
+    // stays fresh right through a hang. Computed from the same observation of
+    // the pong atomic the caller already made, so the diagnostics verdict and
+    // the status verdict cannot drift.
+    let native_ui = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
+        probe_wedged: crate::ui_error::native_ui_probe_verdict(),
+        window_getter_unresponsive: false,
+        last_pong,
+        pong_age_ms: last_pong_age_ms,
+        last_event_pong: crate::ui_error::last_event_pong(),
+        event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
+    });
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
         has_ui_error: ui_error.is_some(),
         has_recent_crash: recent_crash.is_some(),
         ui_dead: Some(ui_dead),
+        native_ui_wedged: Some(native_ui.wedged),
         embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
         ..Default::default()
     });
@@ -1089,6 +1104,12 @@ pub(crate) fn wrap_ipc_result(
             let detail = classify_transport_error(&e);
             let status = match detail.code {
                 UiBridgeErrorCode::FrontendNotReady => StatusCode::SERVICE_UNAVAILABLE,
+                // A wedged native event loop is a 503, not a 500: nothing is
+                // broken, the request cannot be delivered RIGHT NOW, and the
+                // code carries `RecoveryHint::WaitForRecovery`. Mapping it to
+                // 500 would tell an agent to give up on a condition that
+                // clears.
+                UiBridgeErrorCode::EventLoopUnresponsive => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             Err((status, Json(api_error_detailed(e, detail))))

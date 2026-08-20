@@ -292,6 +292,244 @@ pub fn ui_dead_now(last_pong: &std::sync::atomic::AtomicU64) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Pong provenance + native UI-thread liveness
+// ---------------------------------------------------------------------------
+
+/// How long since the last **event-provenance** pong (see
+/// [`record_event_pong`]) before the native event loop is judged to have
+/// stopped delivering events to a renderer that is still demonstrably alive.
+///
+/// Deliberately the same number as [`UI_DEAD_AFTER_MS`], and deliberately a
+/// separate constant: it measures a *different fact* (the loop stopped
+/// delivering) off a *different stamp*, and the two calibrations must be free
+/// to move apart without one silently dragging the other. The 3s
+/// `ui-bridge-ping` cadence makes this 30 consecutive undelivered pings.
+pub const UI_EVENT_DEAD_AFTER_MS: u64 = UI_DEAD_AFTER_MS;
+
+/// Wall-clock ms of the last pong whose arrival PROVES the native event loop
+/// pumped — 0 until the first one.
+///
+/// # Why this atom exists (the 2026-08-19 finding)
+///
+/// `AppState::ui_bridge_last_pong` serves **two independent liveness facts
+/// through one slot**, and that is the defect. The frontend answers
+/// `ui-bridge-ping` over a Tauri event, but it ALSO runs an unconditional 3s
+/// HTTP pong as a safety net against a WebView2 JS→Rust IPC failure
+/// (`src/hooks/useUIBridgeEventHandler.ts`). WebView2 services `fetch` in the
+/// browser/network process, **not** on the host's UI thread — so during a
+/// native message-loop hang with a live renderer the HTTP pong keeps landing,
+/// `ui_bridge_last_pong` stays fresh, [`ui_stale`] never fires and
+/// `derived_status` stays `healthy` forever. There was no detection floor at
+/// all for that failure, not a 90s one.
+///
+/// This stamp advances **only** on evidence that the loop delivered something
+/// to the renderer:
+///
+/// * the `ui-bridge-pong` Tauri event listener (round trip both ways);
+/// * `POST /ui-bridge/pong?source=event` — the ping WAS delivered, only the
+///   JS→Rust return leg fell back to HTTP (the very failure the safety net
+///   exists for, so its provenance must survive the fallback);
+/// * `ui-bridge-response` / `POST /ui-bridge/ipc-response` — a
+///   `ui-bridge-request` emitted through the loop reached the renderer and
+///   was answered.
+///
+/// The unconditional safety-net pong (`?source=safety-net`, and any unlabeled
+/// `POST /ui-bridge/pong` from an older frontend or an external caller) does
+/// **not** advance it: arriving over HTTP proves the renderer is alive and
+/// nothing at all about the native loop.
+///
+/// # Reading the two stamps together
+///
+/// * native loop wedged, renderer alive → **event pong stale, any-pong
+///   fresh** → this bug (2026-08-19). Only the split can express it.
+/// * renderer / browser process dead (the 2026-08-01 mode) → **both stale** →
+///   [`ui_stale`] fires exactly as it already did; provenance changes nothing.
+/// * loop healthy → both fresh.
+///
+/// A process-global rather than an `AppState` field on purpose: the one
+/// detector proved to keep running through a wedge is
+/// [`crate::health_monitor`]'s dedicated OS thread, which holds no
+/// `AppState` and no runtime. A liveness fact only an `AppState` holder can
+/// read is unreadable exactly when it matters.
+static LAST_EVENT_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stamp an **event-provenance** pong. See [`LAST_EVENT_PONG_MS`] for which
+/// call sites qualify — and, more importantly, which do not.
+pub fn record_event_pong() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    LAST_EVENT_PONG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The last event-provenance pong stamp (ms since epoch), or 0 if none has
+/// ever arrived. 0 is UNKNOWN — never "the loop is dead"; see [`ui_stale`]'s
+/// `last_pong == 0` guard, which this reuses verbatim.
+pub fn last_event_pong() -> u64 {
+    LAST_EVENT_PONG_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Age in ms of the last event-provenance pong, read off the wall clock.
+///
+/// `0` when none has ever landed — the caller pairs it with
+/// [`last_event_pong`] so [`ui_stale`]'s never-seen guard can distinguish
+/// UNKNOWN from fresh. `saturating_sub` for the same NTP reason as
+/// [`ui_dead_now`].
+pub fn last_event_pong_age_ms() -> u64 {
+    let stamp = last_event_pong();
+    if stamp == 0 {
+        return 0;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    now_ms.saturating_sub(stamp)
+}
+
+/// Everything the native-UI-thread verdict is computed from. A struct, like
+/// `crate::mcp::ui_bridge::request::FrontendStateInputs`, so four sinks
+/// cannot transpose same-typed positional arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeUiInputs {
+    /// The Win32 `SendMessageTimeoutW` rung, read from
+    /// [`crate::health_monitor::ui_thread_wedged`] — a plain cached atomic,
+    /// safe from an async handler. `None` = the probe cannot run here
+    /// (non-Windows, or no main-window HWND cached yet) and is UNKNOWN, never
+    /// "fine". Use [`native_ui_probe_verdict`] to read it.
+    pub probe_wedged: Option<bool>,
+    /// This caller's OWN bounded window-getter round-trip timed out just now
+    /// (`window_probe::WINDOW_GETTER_TIMEOUT`). Only `/health` sets it: having
+    /// just watched its own liveness getter time out, reporting `healthy`
+    /// would be a fresh lie of exactly the kind this change removes.
+    pub window_getter_unresponsive: bool,
+    /// `AppState::ui_bridge_last_pong` — a pong of ANY provenance. Proves the
+    /// renderer is alive; proves nothing about the native loop.
+    pub last_pong: u64,
+    /// Age of `last_pong`. Meaningless when `last_pong == 0`.
+    pub pong_age_ms: u64,
+    /// [`last_event_pong`] — the provenance-bearing stamp.
+    pub last_event_pong: u64,
+    /// Age of `last_event_pong`. Meaningless when it is 0.
+    pub event_pong_age_ms: u64,
+}
+
+/// One verdict on the native message loop, with every component preserved so
+/// the surfaces can report *why* rather than just *that*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeUiLiveness {
+    /// [`NativeUiInputs::probe_wedged`], passed through for reporting.
+    pub probe_wedged: Option<bool>,
+    /// [`NativeUiInputs::window_getter_unresponsive`], passed through.
+    pub window_getter_unresponsive: bool,
+    /// The renderer is demonstrably alive AND no event-provenance pong has
+    /// landed inside [`UI_EVENT_DEAD_AFTER_MS`]. This is the pong-provenance
+    /// reading of the 2026-08-19 failure, and it is cross-platform — the
+    /// Win32 probe is not.
+    pub events_undelivered: bool,
+    /// Age of the last event-provenance pong; `None` = none ever seen
+    /// (boot, server mode, or a frontend that has never been pinged).
+    pub event_pong_age_ms: Option<u64>,
+    /// The verdict fed to [`compute_derived_status`] as its `native_ui_wedged`
+    /// input.
+    pub wedged: bool,
+    /// Stable machine-readable reason. `"pumping"` and `"unknown"` are the two
+    /// non-wedged values; do not reword these, fleet consumers match on them.
+    pub reason: &'static str,
+}
+
+/// Classify the native message loop. Pure — no clock, no atomics, no runtime.
+///
+/// Ordering of the wedged reasons is by directness of evidence: the Win32
+/// round-trip asks the loop itself, the caller's own timed-out getter is a
+/// single sample of the same thing, and event-pong staleness is the
+/// downstream, cross-platform inference.
+pub fn classify_native_ui(i: NativeUiInputs) -> NativeUiLiveness {
+    // The renderer answered recently over SOME path, so it is alive. Only
+    // then is a missing event-pong evidence about the LOOP rather than about
+    // the frontend being gone (which `ui_dead` already covers, and which must
+    // keep reporting as the 2026-08-01 mode, not as this one).
+    let renderer_alive = i.last_pong > 0 && !ui_stale(i.last_pong, i.pong_age_ms, UI_DEAD_AFTER_MS);
+    // `ui_stale`'s `> 0` guard is doing real work here: a frontend that has
+    // never produced an event-provenance pong is UNKNOWN (booting, server
+    // mode, no ping loop), never wedged.
+    let events_stale = ui_stale(
+        i.last_event_pong,
+        i.event_pong_age_ms,
+        UI_EVENT_DEAD_AFTER_MS,
+    );
+    let events_undelivered = renderer_alive && events_stale;
+
+    let reason = if i.probe_wedged == Some(true) {
+        "native_probe_wedged"
+    } else if i.window_getter_unresponsive {
+        "window_getter_unresponsive"
+    } else if events_undelivered {
+        "events_undelivered"
+    } else if i.probe_wedged == Some(false) {
+        "pumping"
+    } else {
+        "unknown"
+    };
+
+    NativeUiLiveness {
+        probe_wedged: i.probe_wedged,
+        window_getter_unresponsive: i.window_getter_unresponsive,
+        events_undelivered,
+        event_pong_age_ms: (i.last_event_pong > 0).then_some(i.event_pong_age_ms),
+        wedged: i.probe_wedged == Some(true) || i.window_getter_unresponsive || events_undelivered,
+        reason,
+    }
+}
+
+/// Read the Win32 rung without blocking: the cached
+/// [`crate::health_monitor::ui_thread_wedged`] atomic, gated on the probe
+/// being able to run at all.
+///
+/// **Never** call `health_monitor::ui_thread_pumping()` from an async sink —
+/// it is a blocking `SendMessageTimeoutW` with a 3s ceiling, so an `async fn`
+/// calling it parks a tokio worker for 3s during exactly the hang it is
+/// reporting. That is the bug this phase removes from `/health`, not one to
+/// re-introduce. The 3-consecutive-sample escalation behind the atom also
+/// keeps a single long repaint from flapping the fleet's status.
+pub fn native_ui_probe_verdict() -> Option<bool> {
+    // No cached HWND means nothing to ask (non-Windows stub, server mode, or
+    // pre-window startup). UNKNOWN, not healthy.
+    crate::ui_thread_probe::main_hwnd()?;
+    // A stopped monitor never clears the atom either, so `false` from it would
+    // be a claim nobody made. UNKNOWN is the honest reading — same rule as the
+    // missing handle above.
+    if !crate::health_monitor::is_running() {
+        return None;
+    }
+    Some(crate::health_monitor::ui_thread_wedged())
+}
+
+/// [`classify_native_ui`] against the live atomics and the wall clock, for the
+/// sinks that do not already hold a `last_pong` / `pong_age_ms` pair.
+///
+/// `saturating_sub` for the same reason [`ui_dead_now`] uses it: a backwards
+/// clock step can leave a stamp ahead of `now`, and age 0 (maximally fresh) is
+/// the honest reading where a plain subtraction would panic.
+pub fn native_ui_liveness_now(last_pong: &std::sync::atomic::AtomicU64) -> NativeUiLiveness {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let last_pong = last_pong.load(std::sync::atomic::Ordering::Relaxed);
+    let last_event_pong = last_event_pong();
+    classify_native_ui(NativeUiInputs {
+        probe_wedged: native_ui_probe_verdict(),
+        window_getter_unresponsive: false,
+        last_pong,
+        pong_age_ms: now_ms.saturating_sub(last_pong),
+        last_event_pong,
+        event_pong_age_ms: now_ms.saturating_sub(last_event_pong),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Derived-status helper
 // ---------------------------------------------------------------------------
 
@@ -322,6 +560,21 @@ pub fn ui_dead_now(last_pong: &std::sync::atomic::AtomicU64) -> bool {
 ///   kills the UI host while the Rust backend keeps serving, so `ui_error`
 ///   (set by the React error boundary) is structurally unavailable and
 ///   `/health` reported `healthy` with a dead window for 19 hours.
+/// * `native_ui_wedged` — the native message loop has stopped pumping, from
+///   [`native_ui_liveness_now`] / [`classify_native_ui`]. `None` = this sink
+///   cannot tell; `Some(true)` = errored.
+///
+///   **A DISTINCT input from `ui_dead`, and it must stay distinct.** `ui_dead`
+///   reads `ui_bridge_last_pong`, which the frontend keeps fresh over an
+///   unconditional 3s HTTP `fetch` that WebView2 services in its browser
+///   process — off the host's UI thread entirely. So during the 2026-08-19
+///   failure (native loop hung, renderer alive, `Responding: False`, `/health`
+///   still `200`) `ui_dead` is `false` for as long as the hang lasts, and was
+///   the ONLY UI-liveness input this function had. Folding the native signal
+///   into `ui_dead` would have made a wedged loop indistinguishable from a
+///   dead webview and left it hostage to the same pong; as its own input,
+///   `derived_status` can go `errored` on the native evidence **without
+///   depending on the pong at all**.
 /// * `embedding_reachable` — `None` until the first probe has run (treated as
 ///   unknown, not degraded — avoids false positives during boot). `Some(true)`
 ///   = healthy. `Some(false)` = degraded.
@@ -355,11 +608,13 @@ pub fn ui_dead_now(last_pong: &std::sync::atomic::AtomicU64) -> bool {
 /// probed `pg_reachable`; the others pass `None`. All four DO pass a real
 /// `ui_dead` — the heartbeat sinks especially, since nothing polls `/health`
 /// on an end user's machine and the heartbeats are the only path by which a
-/// dead UI is ever visible off-box.
+/// dead UI is ever visible off-box. All four also pass a real
+/// `native_ui_wedged`, for the same reason and with more force: that failure
+/// has no pong-based floor under it at all.
 /// The sub-signals [`compute_derived_status`] weighs.
 ///
 /// A struct rather than a positional argument list because the inputs are
-/// now four consecutive, mutually interchangeable `Option<bool>`s:
+/// now five consecutive, mutually interchangeable `Option<bool>`s:
 /// transposing two of them compiles silently and yields a wrong health
 /// verdict, on the one function every fleet probe trusts. Named fields make
 /// that a compile error instead.
@@ -376,6 +631,11 @@ pub struct HealthInputs {
     pub has_recent_crash: bool,
     /// UI liveness from `last_pong`. See [`ui_stale`].
     pub ui_dead: Option<bool>,
+    /// The native message loop stopped pumping. A DISTINCT input from
+    /// `ui_dead`: the frontend's unconditional 3s HTTP pong is serviced by
+    /// WebView2's browser process, so `ui_dead` stays `Some(false)` for the
+    /// whole hang. `None` where the sink cannot probe it.
+    pub native_ui_wedged: Option<bool>,
     /// Embedding-service reachability; `None` until the first probe.
     pub embedding_reachable: Option<bool>,
     /// Bounded PG liveness; `None` when not probed.
@@ -385,7 +645,11 @@ pub struct HealthInputs {
 }
 
 pub fn compute_derived_status(i: &HealthInputs) -> &'static str {
-    if i.has_ui_error || i.has_recent_crash || matches!(i.ui_dead, Some(true)) {
+    if i.has_ui_error
+        || i.has_recent_crash
+        || matches!(i.ui_dead, Some(true))
+        || matches!(i.native_ui_wedged, Some(true))
+    {
         "errored"
     } else if matches!(i.embedding_reachable, Some(false))
         || matches!(i.pg_reachable, Some(false))
@@ -787,6 +1051,11 @@ mod tests {
                 // startup-only dump scanner cannot see a mid-run WebView2
                 // Crashpad dump. Left at their `false` defaults.
                 ui_dead: Some(ui_dead), // the only signal that stayed correct
+                // The native probe is UNKNOWN in this replay, and that is the
+                // point: the 2026-08-01 mode is caught by the pong rung alone,
+                // exactly as it already was. Provenance changes nothing here —
+                // a dead browser process pongs on NEITHER path. Left at its
+                // `None` default.
                 embedding_reachable: Some(true),
                 pg_reachable: Some(true),
                 relay_connected: Some(true),
@@ -1159,5 +1428,287 @@ mod tests {
                 ui_error_writer_hits(allowed)
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pong provenance + the native UI-thread input (plan
+    // 2026-08-19-runner-blocked-ui-thread-cannot-be-closed, Phase 5)
+    // -----------------------------------------------------------------------
+
+    /// Build inputs for the healthy case; each test perturbs one field.
+    fn native_inputs() -> NativeUiInputs {
+        NativeUiInputs {
+            probe_wedged: Some(false),
+            window_getter_unresponsive: false,
+            last_pong: SOME_PONG,
+            pong_age_ms: 1_000,
+            last_event_pong: SOME_PONG,
+            event_pong_age_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn native_ui_healthy_when_loop_pumps_and_both_pongs_are_fresh() {
+        let v = classify_native_ui(native_inputs());
+        assert!(!v.wedged);
+        assert!(!v.events_undelivered);
+        assert_eq!(v.reason, "pumping");
+        assert_eq!(v.event_pong_age_ms, Some(1_000));
+    }
+
+    /// **The 2026-08-19 bug, in one assertion.**
+    ///
+    /// Native loop wedged, renderer alive: the frontend's unconditional 3s
+    /// HTTP pong is serviced by WebView2's browser process, so
+    /// `ui_bridge_last_pong` stays fresh and `ui_stale` reads `false` forever.
+    /// Only the event-provenance stamp goes stale, and only because the loop
+    /// stopped delivering `ui-bridge-ping`. Before the split, the two facts
+    /// shared one slot and this state was inexpressible.
+    #[test]
+    fn native_ui_event_pong_stale_while_http_pong_fresh_is_this_bug() {
+        let v = classify_native_ui(NativeUiInputs {
+            // The Win32 rung is deliberately UNKNOWN here so the assertion
+            // rests on provenance ALONE — this is the cross-platform arm.
+            probe_wedged: None,
+            last_event_pong: SOME_PONG,
+            event_pong_age_ms: UI_EVENT_DEAD_AFTER_MS + 1,
+            ..native_inputs()
+        });
+        assert!(v.events_undelivered, "renderer alive + events undelivered");
+        assert!(v.wedged);
+        assert_eq!(v.reason, "events_undelivered");
+
+        // And the shipped pong predicate still reads the runner as fine —
+        // which is precisely why a distinct input was needed.
+        assert!(!ui_stale(SOME_PONG, 1_000, UI_DEAD_AFTER_MS));
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                native_ui_wedged: Some(v.wedged),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                ..Default::default()
+            }),
+            "errored",
+            "a wedged native loop must not report healthy just because the renderer pongs"
+        );
+    }
+
+    /// The mirror-image mode must NOT be reclassified. When the browser
+    /// process dies (2026-08-01) neither path pongs, so `ui_dead` fires as it
+    /// always did and the native verdict stays out of it — the two incidents
+    /// keep distinct reasons.
+    #[test]
+    fn native_ui_both_pongs_stale_is_the_dead_webview_mode_not_a_native_hang() {
+        let stale = UI_DEAD_AFTER_MS + 1;
+        let v = classify_native_ui(NativeUiInputs {
+            probe_wedged: None,
+            pong_age_ms: stale,
+            event_pong_age_ms: stale,
+            ..native_inputs()
+        });
+        assert!(
+            !v.events_undelivered,
+            "the renderer is gone, so a missing event pong says nothing about the loop"
+        );
+        assert!(!v.wedged);
+        assert_eq!(v.reason, "unknown");
+        assert!(ui_stale(SOME_PONG, stale, UI_DEAD_AFTER_MS));
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(true),
+                native_ui_wedged: Some(v.wedged),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                ..Default::default()
+            }),
+            "errored",
+            "the 2026-08-01 arm still fires, through `ui_dead`"
+        );
+    }
+
+    /// Never-ponged is UNKNOWN on the event stamp too. Server mode
+    /// (`QONTINUI_SERVER_MODE` mounts no webview) would otherwise report a
+    /// permanent native hang — the same regression `ui_stale`'s `> 0` guard
+    /// exists to prevent, which is why this reuses it rather than re-deriving.
+    #[test]
+    fn native_ui_never_event_ponged_is_unknown_not_wedged() {
+        for age in [0, 1, UI_EVENT_DEAD_AFTER_MS + 1, u64::MAX] {
+            let v = classify_native_ui(NativeUiInputs {
+                probe_wedged: None,
+                last_event_pong: 0,
+                event_pong_age_ms: age,
+                ..native_inputs()
+            });
+            assert!(!v.wedged, "never-event-ponged must not read as wedged (age {age})");
+            assert_eq!(v.event_pong_age_ms, None, "no stamp ⇒ no age (age {age})");
+            assert_eq!(v.reason, "unknown");
+        }
+    }
+
+    #[test]
+    fn native_ui_probe_outranks_the_inferred_reasons() {
+        let v = classify_native_ui(NativeUiInputs {
+            probe_wedged: Some(true),
+            window_getter_unresponsive: true,
+            event_pong_age_ms: UI_EVENT_DEAD_AFTER_MS + 1,
+            ..native_inputs()
+        });
+        assert!(v.wedged);
+        assert_eq!(
+            v.reason, "native_probe_wedged",
+            "the Win32 round-trip asks the loop itself; it wins the reason"
+        );
+    }
+
+    /// `/health`'s own bounded getter timing out is direct evidence about the
+    /// loop. Reporting `healthy` right after watching it time out would be a
+    /// new lie in place of the one this phase removes.
+    #[test]
+    fn native_ui_own_window_getter_timeout_is_a_wedged_verdict() {
+        let v = classify_native_ui(NativeUiInputs {
+            probe_wedged: None,
+            window_getter_unresponsive: true,
+            ..native_inputs()
+        });
+        assert!(v.wedged);
+        assert_eq!(v.reason, "window_getter_unresponsive");
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                native_ui_wedged: Some(v.wedged),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                ..Default::default()
+            }),
+            "errored"
+        );
+    }
+
+    /// The native input must be able to carry the verdict on its own — no
+    /// pong help, no crash dump, no error boundary. That is the whole point of
+    /// making it a distinct parameter.
+    #[test]
+    fn derived_status_errored_on_the_native_signal_alone() {
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                native_ui_wedged: Some(true),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                ..Default::default()
+            }),
+            "errored"
+        );
+        // …and it outranks a merely-degraded subsystem, like every other
+        // `errored` input.
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                native_ui_wedged: Some(true),
+                embedding_reachable: Some(false),
+                pg_reachable: Some(false),
+                ..Default::default()
+            }),
+            "errored"
+        );
+    }
+
+    #[test]
+    fn derived_status_unknown_native_signal_is_unchanged_from_before() {
+        // `None` = this sink cannot tell (non-Windows, no HWND yet). Identical
+        // verdicts to `Some(false)`, so no sink is downgraded by adding the
+        // input before it can answer.
+        for native in [None, Some(false)] {
+            assert_eq!(
+                compute_derived_status(&HealthInputs {
+                    ui_dead: Some(false),
+                    native_ui_wedged: native,
+                    embedding_reachable: Some(true),
+                    pg_reachable: Some(true),
+                    ..Default::default()
+                }),
+                "healthy"
+            );
+            assert_eq!(
+                compute_derived_status(&HealthInputs {
+                    ui_dead: Some(false),
+                    native_ui_wedged: native,
+                    embedding_reachable: Some(false),
+                    ..Default::default()
+                }),
+                "degraded"
+            );
+            assert_eq!(
+                compute_derived_status(&HealthInputs {
+                    has_ui_error: true,
+                    ui_dead: Some(false),
+                    native_ui_wedged: native,
+                    embedding_reachable: Some(true),
+                    pg_reachable: Some(true),
+                    ..Default::default()
+                }),
+                "errored"
+            );
+        }
+    }
+
+    /// The 2026-08-19 incident payload, replayed. On `origin/main` this reads
+    /// `healthy` — `Responding: False` on the process while `/health` answered
+    /// `200` and the pong loop never missed a beat.
+    #[test]
+    fn derived_status_regression_2026_08_19_wedged_ui_thread_read_healthy() {
+        let pong_age_ms = 2_000; // HTTP pong, serviced off the UI thread
+        let ui_dead = ui_stale(SOME_PONG, pong_age_ms, UI_DEAD_AFTER_MS);
+        assert!(!ui_dead, "the shipped pong rung is blind to this failure");
+        let native = classify_native_ui(NativeUiInputs {
+            probe_wedged: Some(true), // SendMessageTimeoutW(WM_NULL) timed out
+            window_getter_unresponsive: true, // /health's own getter timed out
+            pong_age_ms,
+            event_pong_age_ms: 25 * 60 * 1_000, // no ping delivered in 25 min
+            ..native_inputs()
+        });
+        assert!(native.wedged);
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                // ui_error: null — the React tree is fine
+                // recent_crash: null — nothing died
+                ui_dead: Some(ui_dead),
+                // false: the pong keeps arriving over HTTP
+                native_ui_wedged: Some(native.wedged),
+                // the only signal that can see this
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                ..Default::default()
+            }),
+            "errored",
+            "a runner whose window cannot be closed must not report healthy"
+        );
+    }
+
+    #[test]
+    fn event_pong_stamp_advances_only_when_recorded() {
+        // Process-global, so this test asserts the transition it causes rather
+        // than any starting value — a sibling test may have stamped it first.
+        record_event_pong();
+        let stamped = last_event_pong();
+        assert!(stamped > 0, "recording must leave a non-zero stamp");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            now_ms.saturating_sub(stamped) < 60_000,
+            "the stamp must be a wall-clock ms epoch, not a monotonic tick"
+        );
+    }
+
+    #[test]
+    fn event_dead_rung_tracks_the_pong_dead_rung() {
+        // They are equal today and free to diverge; what may never happen is
+        // the event rung firing BEFORE the diagnostics rung, which would make
+        // a booting frontend look like a wedged loop.
+        assert!(UI_STALE_AFTER_MS <= UI_EVENT_DEAD_AFTER_MS);
+        assert_eq!(UI_EVENT_DEAD_AFTER_MS, UI_DEAD_AFTER_MS);
     }
 }

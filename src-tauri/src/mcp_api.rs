@@ -472,6 +472,40 @@ async fn diagnostic_screenshot(
     }
 }
 
+/// Bounded `is_visible()` for `/health`.
+///
+/// `WebviewWindow::is_visible()` looks like a field read and is not: it posts
+/// to the tao event loop and blocks the caller on `rx.recv()` with **no
+/// timeout** (`tauri::window::Window::is_visible` →
+/// `tauri-runtime-wry`'s `window_getter!` → `getter!`). Called bare from this
+/// `async fn` — which is how `/health` called it until Phase 5 of plan
+/// `2026-08-19-runner-blocked-ui-thread-cannot-be-closed` — it parks a tokio
+/// WORKER thread for the entire duration of a UI-thread hang, on all three
+/// aliases (`/health`, `/ui-bridge/health`, `/ui-bridge/status`). A liveness
+/// endpoint must not be able to hang on the condition it exists to report,
+/// and `num_cpus` concurrent polls of it would have silenced the whole HTTP
+/// surface.
+///
+/// Same shape as `window_probe::inner_size`, and it reuses that module's
+/// `WINDOW_GETTER_TIMEOUT` and error type so the two surfaces cannot drift
+/// about what "wedged" means. `Ok(None)` = the loop answered but the getter
+/// itself failed — the benign case the bare `.ok()` already produced;
+/// `Err(EventLoopUnresponsive)` = the loop did not answer, which `/health`
+/// surfaces to the caller (`screenshots.rs`'s `:399` arm, not the `:221` one
+/// that warns and carries on with `None`).
+async fn bounded_window_visible(
+    window: &tauri::WebviewWindow,
+) -> Result<Option<bool>, crate::mcp::ui_bridge::window_probe::WindowProbeError> {
+    use crate::mcp::ui_bridge::window_probe::{WindowProbeError, WINDOW_GETTER_TIMEOUT};
+    let window = window.clone();
+    let handle = tokio::task::spawn_blocking(move || window.is_visible().ok());
+    match tokio::time::timeout(WINDOW_GETTER_TIMEOUT, handle).await {
+        Ok(Ok(visible)) => Ok(visible),
+        Ok(Err(join_err)) => Err(WindowProbeError::TaskFailed(join_err.to_string())),
+        Err(_elapsed) => Err(WindowProbeError::EventLoopUnresponsive),
+    }
+}
+
 /// Health check endpoint (also served at `/ui-bridge/health` and
 /// `/ui-bridge/status` — all three share this handler).
 /// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
@@ -616,7 +650,53 @@ async fn health(
     // downgrades the runner to `degraded`. `None` (no PG configured) does NOT
     // downgrade. Depends on B-1's pool timeout — plus a 2s ceiling here — so
     // the probe itself can never hang the handler.
+    // Time the PG probe SEPARATELY, and publish it as its own field.
+    //
+    // This is not curiosity, it is a latency confound that already caused a
+    // near-misreading. On 2026-08-19 `/health` answered `200` in 2.039 s while
+    // the process reported `Responding: False`, and that number was very
+    // nearly read as UI-thread latency. It was not: `pg_liveness_probe` is
+    // awaited here, BEFORE anything touches the event loop, and it is capped
+    // at exactly 2 s (and deliberately uncached). So 2.039 s was ~2.000 s of
+    // PG-timeout tax plus ~39 ms for everything else, and said almost nothing
+    // about the UI thread. With `pgProbeMs` on the wire the split is
+    // arithmetic, not inference.
+    let pg_probe_started = std::time::Instant::now();
     let pg_reachable = pg_liveness_probe().await;
+    let pg_probe_ms = pg_probe_started.elapsed().as_millis() as u64;
+
+    let main_window = {
+        use tauri::Manager;
+        state
+            .app_handle
+            .get_webview_window(qontinui_runner_lib::get_main_window_label())
+    };
+    // BOUNDED (see `bounded_window_visible`): `is_visible()` used to be called
+    // bare, inline in the `FrontendStateInputs` literal below — an unbounded
+    // event-loop round-trip inside an `async fn`, on the one endpoint the
+    // supervisor and the fleet poll. A liveness endpoint that hangs on the
+    // condition it reports is worse than one that reports nothing.
+    let (window_visible, window_visible_probe) = match main_window.as_ref() {
+        Some(window) => match bounded_window_visible(window).await {
+            Ok(Some(visible)) => (visible, "ok"),
+            // The loop ANSWERED; the getter itself failed. Benign, and exactly
+            // what the previous bare `.ok().unwrap_or(false)` produced.
+            Ok(None) => (false, "getter_failed"),
+            Err(crate::mcp::ui_bridge::window_probe::WindowProbeError::EventLoopUnresponsive) => {
+                warn!(
+                    "/health: the window visibility getter did not answer within the window-probe \
+                     timeout — the native UI thread is not pumping"
+                );
+                (false, "event_loop_unresponsive")
+            }
+            Err(e) => {
+                warn!("/health: window visibility probe task failed: {e}");
+                (false, "probe_task_failed")
+            }
+        },
+        None => (false, "no_window"),
+    };
+
     // A dead WebView2 host leaves the Rust backend serving happily, so neither
     // `ui_error` (React error boundary) nor `recent_crash` (startup-only dump
     // scan) can see it. `last_pong` can — it advances off the unconditional 3s
@@ -633,10 +713,28 @@ async fn health(
     // whose entire purpose is diagnosis.
     let relay_status = crate::mcp::backend_relay::web_integration_status(&state).await;
     let relay_connected = crate::mcp::backend_relay::relay_health_from(&relay_status);
+    // …but `last_pong` CANNOT see a wedged native UI thread, and that is the
+    // whole reason this second input exists. The frontend's safety-net pong is
+    // a plain `fetch`, which WebView2 services in its browser/network process
+    // rather than on the host's UI thread, so it keeps landing while the
+    // window is frozen. `ui_dead` therefore reads `false` for the entire hang.
+    // The native input carries three independent pieces of evidence — the
+    // health monitor's Win32 `WM_NULL` round-trip, this handler's own getter
+    // timeout, and event-pong provenance — none of which route through the
+    // pong stamp.
+    let native_ui = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
+        probe_wedged: crate::ui_error::native_ui_probe_verdict(),
+        window_getter_unresponsive: window_visible_probe == "event_loop_unresponsive",
+        last_pong,
+        pong_age_ms,
+        last_event_pong: crate::ui_error::last_event_pong(),
+        event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
+    });
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
         has_ui_error: ui_error_snapshot.is_some(),
         has_recent_crash: recent_crash_snapshot.is_some(),
         ui_dead: Some(ui_dead),
+        native_ui_wedged: Some(native_ui.wedged),
         embedding_reachable: embedding_reachable_cached(),
         pg_reachable,
         relay_connected,
@@ -671,19 +769,11 @@ async fn health(
     // wired. That is the whole distinction the latch claimed to draw, and the
     // pong establishes it on a self-driving 3s loop instead of waiting on
     // external traffic.
-    let main_window = {
-        use tauri::Manager;
-        state
-            .app_handle
-            .get_webview_window(qontinui_runner_lib::get_main_window_label())
-    };
     let frontend_state = crate::mcp::ui_bridge::request::classify_frontend_state(
         crate::mcp::ui_bridge::request::FrontendStateInputs {
             window_exists: main_window.is_some(),
-            window_visible: main_window
-                .as_ref()
-                .and_then(|w| w.is_visible().ok())
-                .unwrap_or(false),
+            // Bounded above, not fetched inline: see `bounded_window_visible`.
+            window_visible,
             last_pong,
             last_pong_age_ms: pong_age_ms,
             console_error_count: console_errors,
@@ -789,6 +879,34 @@ async fn health(
             // from "it attached to the machine-shared one" — the port is
             // ephemeral either way. Null off the embedded arms.
             "embeddedDataRoot": crate::embedded_pg::embedded_data_root(),
+            // How much of THIS response's latency was the PG probe. A timed-out
+            // probe costs exactly its 2s ceiling, which is most of a "slow"
+            // /health and has nothing to do with the UI thread — the 2026-08-19
+            // confound, now reported instead of inferred.
+            "probeMs": pg_probe_ms,
+        },
+        // Native message-loop liveness (plan
+        // 2026-08-19-runner-blocked-ui-thread-cannot-be-closed, Phase 5).
+        // `wedged: true` means the window is frozen and the X button does
+        // nothing, while every other field on this response looks healthy —
+        // that is the failure, not a contradiction. `reason` names which
+        // evidence decided; `probeWedged: null` is UNKNOWN (non-Windows, or no
+        // window handle cached yet), never "fine".
+        "uiThread": {
+            "wedged": native_ui.wedged,
+            "reason": native_ui.reason,
+            "probeWedged": native_ui.probe_wedged,
+            "eventsUndelivered": native_ui.events_undelivered,
+            "eventPongAgeMs": native_ui.event_pong_age_ms,
+            // The provenance split itself: `lastEventPong` only advances when
+            // the loop DELIVERED an event, `lastHeartbeat` advances on any
+            // pong including the renderer's out-of-process HTTP safety net.
+            // Fresh `lastHeartbeat` + stale `lastEventPong` is this bug.
+            "lastEventPong": crate::ui_error::last_event_pong(),
+            // Result of this handler's OWN bounded event-loop round-trip:
+            // "ok" | "getter_failed" | "event_loop_unresponsive" |
+            // "probe_task_failed" | "no_window".
+            "windowVisibleProbe": window_visible_probe,
         },
         // PR-credential surface (plan qontinui-pr-credential-provisioning,
         // Phase 0): cached `gh auth status` verdict. `state: "pending"` +
@@ -5033,6 +5151,13 @@ pub fn create_router(
             let pending = pending_for_listener.clone();
             let pending_count = pending_count_for_listener.clone();
 
+            // EVENT PROVENANCE: a response can only exist because the
+            // `ui-bridge-request` we emitted was delivered to the renderer by
+            // the native event loop, and came back as a Tauri event. That is
+            // proof the loop pumped — unlike the frontend's HTTP safety-net
+            // pong, which WebView2 services off the UI thread entirely.
+            crate::ui_error::record_event_pong();
+
             // Parse the response payload.
             // Tauri 2.x may double-serialize: emit(name, obj) serializes obj to JSON,
             // but event.payload() can return a JSON string that itself contains a
@@ -5378,6 +5503,13 @@ pub fn create_router(
                 .unwrap()
                 .as_millis() as u64;
             last_pong.store(now, std::sync::atomic::Ordering::Relaxed);
+            // EVENT PROVENANCE: this pong answered a `ui-bridge-ping` the
+            // event loop delivered, and travelled back as a Tauri event, so it
+            // proves the native loop is pumping. `ui_bridge_last_pong` above
+            // cannot carry that fact — the frontend also pongs unconditionally
+            // over HTTP, which WebView2 serves from its browser process while
+            // the UI thread is frozen.
+            crate::ui_error::record_event_pong();
             // Unblock any requests waiting for frontend readiness
             ready.notify_waiters();
         });

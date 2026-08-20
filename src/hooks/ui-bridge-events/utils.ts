@@ -25,12 +25,32 @@ export async function httpSendResponse(response: unknown): Promise<boolean> {
 }
 
 /**
- * Send a pong to the Rust backend via HTTP fallback.
+ * Where a pong came from — the Rust side keeps two clocks, not one.
+ *
+ * - `"event"`: sent because the native event loop DELIVERED a
+ *   `ui-bridge-ping` to this renderer. Even when the JS to Rust `emit` leg
+ *   fails and we fall back to this HTTP call, the ping's delivery is proof
+ *   the loop is pumping, so the provenance survives the fallback.
+ * - `"safety-net"`: the hook's unconditional 3s interval, plus the one-shot
+ *   readiness ping. Nothing delivered it, so it proves only that this
+ *   renderer is alive. WebView2 services `fetch` in the browser/network
+ *   process, so these keep landing while the host UI thread is frozen —
+ *   which is exactly why Rust must be able to tell them apart (plan
+ *   2026-08-19-runner-blocked-ui-thread-cannot-be-closed).
  */
-export async function httpSendPong(): Promise<boolean> {
+export type PongSource = "event" | "safety-net";
+
+/**
+ * Send a pong to the Rust backend via HTTP.
+ *
+ * Defaults to `"safety-net"`: an unlabeled pong genuinely carries no
+ * provenance, and the Rust side treats unknown provenance as the weaker
+ * claim rather than assuming the loop is healthy.
+ */
+export async function httpSendPong(source: PongSource = "safety-net"): Promise<boolean> {
   try {
     const port = getApiPort();
-    const resp = await fetch(`http://localhost:${port}/ui-bridge/pong`, {
+    const resp = await fetch(`http://localhost:${port}/ui-bridge/pong?source=${source}`, {
       method: "POST",
     });
     return resp.ok;
@@ -787,10 +807,7 @@ export function closestElementIds(target: string, candidates: readonly string[])
  * gates (Rust pre-IPC + this frontend pre-check) can't disagree and silently
  * reject a hover-gated toolbar button registered with an explicit `actions=` prop.
  */
-export function isElementActionAllowed(
-  allowedActions: readonly string[],
-  action: string,
-): boolean {
+export function isElementActionAllowed(allowedActions: readonly string[], action: string): boolean {
   if (allowedActions.length === 0) return true;
   if (allowedActions.includes(action)) return true;
   if (action === "hoverClick" && allowedActions.includes("click")) return true;

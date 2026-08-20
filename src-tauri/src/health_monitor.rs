@@ -1622,6 +1622,7 @@ mod tests {
         let mut w = WatchdogState::default();
         let t0 = 1_000_000_000_000i64;
         assert_eq!(w.step(sample(t0, 0, false)), None);
+    }
 
     // ---- Phase 4: the native message-loop rung ----
     //
