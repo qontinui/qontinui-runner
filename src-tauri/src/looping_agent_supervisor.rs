@@ -1103,9 +1103,13 @@ async fn spawn_looping_agent_terminal(
 
 /// Wire status for one looping agent: the durable record plus live
 /// observations.
+///
+/// `pub`: it is the return type of `#[tauri::command]` fns registered in
+/// `main.rs`, which is a separate crate now, so the command wrappers expose it
+/// across the boundary.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct LoopingAgentStatus {
+pub struct LoopingAgentStatus {
     #[serde(flatten)]
     pub record: LoopingAgentRecord,
     /// A live tab is currently hosting (or being boot-restored for) this
