@@ -49,6 +49,11 @@ struct HeartbeatPayload {
     /// of `ui_error`: non-unwinding panics abort the process before the
     /// React boundary can report them.
     recent_crash: Option<HeartbeatRecentCrash>,
+    /// Phase 5 of the blocked-UI-thread plan — native message-loop liveness.
+    /// See [`HeartbeatUiThread`]; `wedged: true` is the 2026-08-19 failure
+    /// (window frozen, X button dead) that every other field reports as
+    /// healthy.
+    ui_thread: HeartbeatUiThread,
 }
 
 /// Snake-case projection of [`crate::crash_dumps::RecentCrash`] for the
@@ -76,6 +81,48 @@ impl From<crate::crash_dumps::RecentCrash> for HeartbeatRecentCrash {
             panic_location: c.panic_location,
             panic_message: c.panic_message,
             thread: c.thread,
+        }
+    }
+}
+
+/// Native message-loop liveness on the heartbeat wire (plan
+/// `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 5).
+///
+/// Emitted so a wedged UI thread is legible OFF-BOX — the operator's window
+/// is frozen, so no in-window surface can reach them. It is deliberately a
+/// *report*, never a dependency: detection happens in-process
+/// (`health_monitor`'s dedicated OS thread and the pong-provenance split), and
+/// a runner whose heartbeat cannot reach the backend is still detected,
+/// escalated and breadcrumbed locally.
+///
+/// Additive field — backends that don't know it ignore it, the same contract
+/// `lan_reachable` above documents. Every key is always present (null rather
+/// than absent) so consumers can assume the shape.
+#[derive(Debug, Clone, Serialize)]
+struct HeartbeatUiThread {
+    /// The verdict that fed `derived_status`.
+    wedged: bool,
+    /// `"pumping" | "unknown" | "native_probe_wedged" |
+    /// "window_getter_unresponsive" | "events_undelivered"`.
+    reason: &'static str,
+    /// The Win32 `SendMessageTimeoutW` rung. `null` = could not ask
+    /// (non-Windows, or no main-window handle cached yet) — UNKNOWN, not fine.
+    probe_wedged: Option<bool>,
+    /// The renderer is alive but the loop has stopped delivering events to it.
+    /// Cross-platform, unlike `probe_wedged`.
+    events_undelivered: bool,
+    /// Age of the last event-provenance pong; `null` if none has ever landed.
+    event_pong_age_ms: Option<u64>,
+}
+
+impl From<crate::ui_error::NativeUiLiveness> for HeartbeatUiThread {
+    fn from(v: crate::ui_error::NativeUiLiveness) -> Self {
+        Self {
+            wedged: v.wedged,
+            reason: v.reason,
+            probe_wedged: v.probe_wedged,
+            events_undelivered: v.events_undelivered,
+            event_pong_age_ms: v.event_pong_age_ms,
         }
     }
 }
@@ -193,6 +240,14 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // visible off-box. That is why `ui_bridge_last_pong` lives on
             // `AppState`: this loop only ever holds an `Arc<AppState>`.
             let ui_dead = crate::ui_error::ui_dead_now(&app_state.ui_bridge_last_pong);
+            // The native message loop, as a DISTINCT input. `ui_dead` cannot
+            // see a wedged UI thread: the frontend's unconditional 3s HTTP
+            // pong is serviced by WebView2's browser process, so the pong
+            // stamp stays fresh for the whole hang. Off Windows the Win32 half
+            // reads UNKNOWN and the webview's JS shares the blocked main
+            // thread anyway, so the 90s pong rung really does cover it there;
+            // on Windows this is the only detector the failure has.
+            let native_ui = crate::ui_error::native_ui_liveness_now(&app_state.ui_bridge_last_pong);
             // Relay health travels on the heartbeat for the same reason
             // `ui_dead` does: nothing polls `/health` on an end user's
             // machine, so this is the only path by which a relay that is
@@ -203,6 +258,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     has_ui_error: ui_error_snapshot.is_some(),
                     has_recent_crash: recent_crash_snapshot.is_some(),
                     ui_dead: Some(ui_dead),
+                    native_ui_wedged: Some(native_ui.wedged),
                     embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
                     relay_connected,
                     ..Default::default()
@@ -276,6 +332,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     derived_status: derived_status.clone(),
                     ui_error: ui_error_snapshot.clone(),
                     recent_crash: recent_crash_snapshot.clone(),
+                    ui_thread: HeartbeatUiThread::from(native_ui),
                 };
 
                 match client.post(&heartbeat_url).json(&payload).send().await {
@@ -325,6 +382,10 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     "derived_status": derived_status,
                     "ui_error": ui_error_snapshot,
                     "recent_crash": recent_crash_snapshot,
+                    // Same native-hang report as the backend heartbeat, so the
+                    // primary's /instances aggregation (and the supervisor
+                    // reading it) can see a wedged secondary.
+                    "ui_thread": HeartbeatUiThread::from(native_ui),
                 });
 
                 match client.post(&url).json(&body).send().await {
@@ -449,6 +510,16 @@ mod tests {
             derived_status: "healthy".to_string(),
             ui_error: None,
             recent_crash: None,
+            ui_thread: HeartbeatUiThread::from(crate::ui_error::classify_native_ui(
+                crate::ui_error::NativeUiInputs {
+                    probe_wedged: Some(false),
+                    window_getter_unresponsive: false,
+                    last_pong: 1,
+                    pong_age_ms: 0,
+                    last_event_pong: 1,
+                    event_pong_age_ms: 0,
+                },
+            )),
         };
 
         let json = serde_json::to_value(&payload).expect("payload serializes");
@@ -535,5 +606,78 @@ mod tests {
             provisioning_gated_status("degraded", ProvisioningReadiness::IncompleteEnforced, "x"),
             "degraded"
         );
+    }
+    // ---- Native UI-thread liveness on the wire (2026-08-19 plan, Phase 5) ----
+
+    /// The heartbeat is one of only two paths by which a wedged UI thread is
+    /// visible off-box — and the operator's window is frozen, so the in-window
+    /// surface cannot reach them. Lock the wire shape.
+    #[test]
+    fn payload_carries_the_native_ui_thread_block() {
+        let native = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
+            probe_wedged: Some(true),
+            window_getter_unresponsive: false,
+            last_pong: 1_700_000_000_000,
+            pong_age_ms: 2_000,
+            last_event_pong: 1_700_000_000_000,
+            event_pong_age_ms: 400_000,
+        });
+        let payload = HeartbeatPayload {
+            hostname: "test-host".to_string(),
+            ip: "127.0.0.1".to_string(),
+            port: 9876,
+            lan_reachable: false,
+            instance_name: None,
+            os: "windows".to_string(),
+            os_version: None,
+            running_task_count: 0,
+            running_task_ids: vec![],
+            derived_status: "errored".to_string(),
+            ui_error: None,
+            recent_crash: None,
+            ui_thread: HeartbeatUiThread::from(native),
+        };
+        let json = serde_json::to_value(&payload).expect("payload serializes");
+        let ui_thread = json["ui_thread"]
+            .as_object()
+            .expect("ui_thread is an object");
+        assert_eq!(ui_thread["wedged"], serde_json::Value::Bool(true));
+        assert_eq!(ui_thread["reason"], "native_probe_wedged");
+        assert_eq!(ui_thread["probe_wedged"], serde_json::Value::Bool(true));
+        assert_eq!(
+            ui_thread["events_undelivered"],
+            serde_json::Value::Bool(true),
+            "a 400s-old event pong behind a 2s-old HTTP pong is the provenance signature"
+        );
+        assert_eq!(ui_thread["event_pong_age_ms"], 400_000);
+        // Every key present even when unknown, so consumers can assume shape.
+        for key in [
+            "wedged",
+            "reason",
+            "probe_wedged",
+            "events_undelivered",
+            "event_pong_age_ms",
+        ] {
+            assert!(ui_thread.contains_key(key), "missing key {key}");
+        }
+    }
+
+    /// UNKNOWN must serialize as an explicit null, not vanish: absence would
+    /// read as "no problem" on a platform where the probe cannot run at all.
+    #[test]
+    fn payload_ui_thread_unknown_probe_serializes_as_null() {
+        let native = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
+            probe_wedged: None,
+            window_getter_unresponsive: false,
+            last_pong: 0,
+            pong_age_ms: 0,
+            last_event_pong: 0,
+            event_pong_age_ms: 0,
+        });
+        let json = serde_json::to_value(HeartbeatUiThread::from(native)).expect("serializes");
+        assert_eq!(json["probe_wedged"], serde_json::Value::Null);
+        assert_eq!(json["event_pong_age_ms"], serde_json::Value::Null);
+        assert_eq!(json["wedged"], serde_json::Value::Bool(false));
+        assert_eq!(json["reason"], "unknown");
     }
 }

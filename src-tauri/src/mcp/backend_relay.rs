@@ -1442,11 +1442,19 @@ async fn run_heartbeat_sender<S>(
         // would cost two file reads and a credential read every 30s to
         // rediscover a known value.
         let relay_connected = Some(true);
+        // The native message loop, as a DISTINCT input — `ui_dead` is blind to
+        // it. The frontend's unconditional 3s HTTP pong is serviced by
+        // WebView2's browser process, so a hung UI thread leaves the pong
+        // stamp fresh; without this input a runner whose window will not even
+        // close relays `healthy` to the web backend indefinitely.
+        let native_ui =
+            crate::ui_error::native_ui_liveness_now(&api_state.app_state.ui_bridge_last_pong);
         let derived_status =
             crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
                 has_ui_error: ui_error_snapshot.is_some(),
                 has_recent_crash: recent_crash_snapshot.is_some(),
                 ui_dead: Some(ui_dead),
+                native_ui_wedged: Some(native_ui.wedged),
                 embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
                 relay_connected,
                 ..Default::default()
@@ -1467,6 +1475,17 @@ async fn run_heartbeat_sender<S>(
             "derived_status": derived_status,
             "ui_error": ui_error_snapshot,
             "recent_crash": recent_crash_snapshot,
+            // Native message-loop liveness, so the backend can tell a wedged
+            // UI thread from a healthy runner that merely stopped repainting.
+            // snake_case for the same reason as the three above — this payload
+            // is read by name on the Python side.
+            "ui_thread": {
+                "wedged": native_ui.wedged,
+                "reason": native_ui.reason,
+                "probe_wedged": native_ui.probe_wedged,
+                "events_undelivered": native_ui.events_undelivered,
+                "event_pong_age_ms": native_ui.event_pong_age_ms,
+            },
         });
         let text = match serde_json::to_string(&payload) {
             Ok(t) => t,

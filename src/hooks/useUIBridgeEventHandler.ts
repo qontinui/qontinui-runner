@@ -268,27 +268,41 @@ export function useUIBridgeEventHandler(): void {
           });
         });
 
-        // Listen for ping and respond with pong (Tauri event + HTTP fallback)
+        // Listen for ping and respond with pong (Tauri event + HTTP fallback).
+        // Reaching this callback AT ALL means the native event loop delivered
+        // the ping, so both legs below carry "event" provenance — including
+        // the HTTP fallback, where only the JS→Rust return trip failed.
         const unlistenPing = await listen("ui-bridge-ping", async () => {
           try {
             await emit("ui-bridge-pong", { timestamp: Date.now() });
           } catch {
             // Tauri event failed — use HTTP fallback
-            await httpSendPong();
+            await httpSendPong("event");
           }
         });
 
         // Also set up a periodic HTTP pong as a safety net in case
-        // Tauri events from JS→Rust stop working (WebView2 IPC issue)
+        // Tauri events from JS→Rust stop working (WebView2 IPC issue).
+        //
+        // KEEP THIS. It covers a real failure mode, and deleting it would
+        // reopen that one. But it is tagged "safety-net" because it proves
+        // only that this renderer is alive: WebView2 runs fetch() in the
+        // browser/network process, so it keeps succeeding while the host's
+        // native UI thread is hung and the window will not even close. Rust
+        // keeps a separate event-provenance clock so the two cases are
+        // distinguishable — see the 2026-08-19 plan.
         const pongInterval = setInterval(() => {
-          httpSendPong().catch(() => {});
+          httpSendPong("safety-net").catch(() => {});
         }, 3000);
 
         log.debug("Listener set up successfully");
 
         // Signal readiness immediately rather than waiting for next ping cycle.
         // This unblocks any Rust-side requests waiting on the readiness gate.
-        httpSendPong().catch(() => {});
+        // "safety-net": nothing was delivered to trigger it, so it asserts
+        // only that this renderer mounted — the readiness gate reads the
+        // any-provenance stamp, so its behavior is unchanged.
+        httpSendPong("safety-net").catch(() => {});
 
         // Store ping unlisten for cleanup
         const originalUnlisten = unlisten;
