@@ -999,22 +999,47 @@ pub(crate) fn spawn_log_proxy_nonce_rejected(nonce: Option<&str>, cause: impl In
     tokio::task::spawn_blocking(move || log_proxy_nonce_rejected(nonce.as_deref(), &cause));
 }
 
-/// Project the live nonce map down to the DEVICE-only `nonce → workdir` shape
-/// the encrypted store persists (OQ3): agent bindings are dropped so they never
-/// reach disk. The store contract is unchanged (`HashMap<String, String>`), so
-/// the persistence/restore seams and their tests stay green.
+/// Project the live nonce map down to the DEVICE-only shape the encrypted store
+/// persists (OQ3): agent bindings are dropped so they never reach disk.
 ///
-/// [`NonceLifetime::Ephemeral`] bindings are dropped too (plan 2026-07-17 §1/E).
-/// A mint-route nonce is issued to a session the runner did not spawn, so it
-/// must not outlive this process: the store has no expiry column, so a persisted
-/// ephemeral nonce would silently restore as an UNBOUNDED one — laundering the
-/// weaker class into the stronger one across a restart. Non-persistence is also
-/// half of what makes the TTL meaningful (a leaked nonce cannot be replayed
-/// against the next runner).
-fn device_nonce_snapshot(map: &HashMap<String, NonceBinding>) -> HashMap<String, String> {
+/// **This function IS the persisted shape.** The whole chain is typed on its
+/// return value — `device_nonce_snapshot` → [`enqueue_nonce_persist`] /
+/// [`persist_proxy_nonces`] →
+/// [`crate::secure_storage::SecureStorage::store_coord_mcp_nonces`] →
+/// `StoredTokens::coord_mcp_nonces` →
+/// [`crate::secure_storage::SecureStorage::load_coord_mcp_nonces`] →
+/// [`restore_proxy_nonces_from`]. Widening the store and the restore leg alone
+/// would ship inert: `terminal_id` would never be WRITTEN, so every restore
+/// would still land `None` and the slot-collapse would survive untouched.
+///
+/// Widened to carry `terminal_id` by plan 2026-08-20 Phase 4 — see
+/// [`crate::secure_storage::StoredNonceBinding`] for why, and for what is
+/// deliberately still not carried.
+///
+/// **Both existing drops are preserved verbatim** and are not up for
+/// relitigation here:
+/// - `principal == Device` (OQ3) — agent nonces must never reach disk.
+/// - [`NonceLifetime::Ephemeral`] (plan 2026-07-17 §1/E) — a mint-route nonce is
+///   issued to a session the runner did not spawn, so it must not outlive this
+///   process: the store has no expiry column, so a persisted ephemeral nonce
+///   would silently restore as an UNBOUNDED one, laundering the weaker class
+///   into the stronger one across a restart. Non-persistence is also half of
+///   what makes the TTL meaningful (a leaked nonce cannot be replayed against
+///   the next runner).
+fn device_nonce_snapshot(
+    map: &HashMap<String, NonceBinding>,
+) -> HashMap<String, crate::secure_storage::StoredNonceBinding> {
     map.iter()
         .filter(|(_, b)| b.principal == ProxyPrincipal::Device && !b.lifetime.is_ephemeral())
-        .map(|(n, b)| (n.clone(), b.workdir.clone()))
+        .map(|(n, b)| {
+            (
+                n.clone(),
+                crate::secure_storage::StoredNonceBinding {
+                    workdir: b.workdir.clone(),
+                    terminal_id: b.terminal_id.clone(),
+                },
+            )
+        })
         .collect()
 }
 
@@ -1063,11 +1088,11 @@ const NONCE_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_mi
 #[derive(Default)]
 struct NoncePersistQueue {
     /// The newest snapshot awaiting a write, if any.
-    pending: Option<HashMap<String, String>>,
+    pending: Option<HashMap<String, crate::secure_storage::StoredNonceBinding>>,
     /// Whether the flush thread is alive (it drains until `pending` is empty).
     flushing: bool,
     /// The last snapshot actually written, so an unchanged map costs nothing.
-    last_written: Option<HashMap<String, String>>,
+    last_written: Option<HashMap<String, crate::secure_storage::StoredNonceBinding>>,
     /// Consecutive failed write attempts for the CURRENT pending snapshot.
     /// Bounds the failure re-queue (see [`flush_nonce_persist_once`]) so a
     /// permanently broken store retries a few times instead of spinning the
@@ -1092,7 +1117,7 @@ static NONCE_PERSIST: once_cell::sync::Lazy<std::sync::Mutex<NoncePersistQueue>>
 /// re-mints (see [`crate::secure_storage::SecureStorage::load_coord_mcp_nonces`]).
 /// The in-memory registry stays authoritative for this process either way, so
 /// nothing a live session depends on rides the debounce.
-fn enqueue_nonce_persist(snapshot: HashMap<String, String>) {
+fn enqueue_nonce_persist(snapshot: HashMap<String, crate::secure_storage::StoredNonceBinding>) {
     let start_thread = {
         let mut q = match NONCE_PERSIST.lock() {
             Ok(q) => q,
@@ -1165,7 +1190,7 @@ fn flush_nonce_persist_once() {
     // Re-queue `snapshot` for another attempt, but never over a NEWER one a
     // concurrent `enqueue_nonce_persist` has already parked, and only while the
     // retry budget lasts.
-    fn requeue(snapshot: HashMap<String, String>) {
+    fn requeue(snapshot: HashMap<String, crate::secure_storage::StoredNonceBinding>) {
         let Ok(mut q) = NONCE_PERSIST.lock() else {
             return;
         };
@@ -1310,14 +1335,14 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
     let mut inserted = 0usize;
     let restored = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        for (nonce, workdir) in persisted {
+        for (nonce, binding) in persisted {
             let vacant = !map.contains_key(&nonce);
             // Only DEVICE bindings are ever persisted (OQ3), so a restored entry
             // is unconditionally a Device principal. An agent nonce can never be
             // restored — its slot is process-global and gone after a restart, so
             // it would hard-fail closed anyway.
             map.entry(nonce).or_insert(NonceBinding {
-                workdir,
+                workdir: binding.workdir,
                 principal: ProxyPrincipal::Device,
                 // Only Persistent bindings are ever written to the store
                 // (`device_nonce_snapshot`), so a restored entry is
@@ -1337,12 +1362,22 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
                 // make the Phase 3 fail-closed refuse every restored session
                 // after every runner restart — an outage, not a hardening.
                 session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
-                // Likewise the persisted store carries no terminal id, so a
-                // restored nonce cannot claim one — caller self-identification
-                // falls back to the workdir leg for it. Faking a terminal here
-                // would be worse than a miss: it would name a PTY that died
-                // with the previous runner process.
-                terminal_id: None,
+                // The terminal IS carried, since plan 2026-08-20 Phase 4
+                // widened the store to hold it. It is not an identity claim —
+                // the PTY it names died with the previous runner process, so
+                // caller self-identification still misses on a restored nonce
+                // (`terminal_record_missing`, which is the honest verdict).
+                // What it restores is the EVICTION KEY. The predicate in
+                // `mint_and_register_nonce` is one slot per
+                // `(workdir, terminal_id, Persistent)`; reconstructing every
+                // restored binding as `None` collapsed all of a shared
+                // workdir's restored nonces into ONE slot, so the first
+                // persistent mint into that workdir evicted the lot — the
+                // measured 33-deep cascade in five seconds against
+                // `D:\qontinui-root` on 2026-08-19. `None` is still what a
+                // pre-Phase-4 store and a genuinely terminal-less binding
+                // restore as.
+                terminal_id: binding.terminal_id,
             });
             if vacant {
                 inserted += 1;
@@ -4219,8 +4254,14 @@ mod tests {
     /// Build one persisted-store value in whatever shape the store currently
     /// takes, so the store-shape tests state their intent (workdir + terminal)
     /// once rather than tracking the schema at every call site.
-    fn stored_binding(workdir: &str, _terminal_id: Option<&str>) -> String {
-        workdir.to_string()
+    fn stored_binding(
+        workdir: &str,
+        terminal_id: Option<&str>,
+    ) -> crate::secure_storage::StoredNonceBinding {
+        crate::secure_storage::StoredNonceBinding {
+            workdir: workdir.to_string(),
+            terminal_id: terminal_id.map(str::to_string),
+        }
     }
 
     /// The DEVICE-path proxy shape: loopback URL built from the passed bound
@@ -4886,7 +4927,7 @@ mod tests {
         // It is actually on disk (independent of the in-memory map).
         let persisted = store.load_coord_mcp_nonces();
         assert_eq!(
-            persisted.get(&nonce).map(String::as_str),
+            persisted.get(&nonce).map(|b| b.workdir.as_str()),
             Some(workdir.as_str()),
             "the minted nonce must be mirrored to the encrypted store"
         );
@@ -4945,7 +4986,7 @@ mod tests {
             "an agent nonce must NEVER be persisted to the encrypted store"
         );
         assert_eq!(
-            persisted.get(&dev_nonce).map(String::as_str),
+            persisted.get(&dev_nonce).map(|b| b.workdir.as_str()),
             Some(dev_wd.as_str()),
             "a device nonce in the same map must still be persisted"
         );
@@ -4957,6 +4998,232 @@ mod tests {
             map.remove(&dev_nonce);
         }
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Phase 4 of plan 2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning
+    /// — the restart slot-collapse, closed.
+    ///
+    /// THE gate test: it goes through the REAL producer
+    /// (`device_nonce_snapshot`) → persist → restore round trip rather than a
+    /// hand-built store, because the failure mode this phase is most exposed to
+    /// is shipping INERT — widening only the store and the restore leg while
+    /// the producer keeps dropping `terminal_id` on the floor would leave every
+    /// restore landing `None`, the slot-collapse untouched, and a hand-built
+    /// store test passing anyway.
+    ///
+    /// Two bindings, one workdir, two terminals. Before the fix both restored
+    /// as `(workdir, None)` — the SAME eviction slot — so one persistent mint
+    /// killed both. That is the 33-deep cascade in five seconds measured
+    /// against `D:\qontinui-root` on 2026-08-19.
+    #[test]
+    fn restored_nonces_keep_their_terminal_so_a_remint_evicts_only_one_slot() {
+        let _serial = restore_forensics_lock();
+        let (store_dir, store) = temp_store("terminal-slot");
+
+        // One shared workdir, two distinct terminals — the ordinary state for
+        // two panes opened in the same repo root.
+        let wd = store_dir.join("shared-wd").to_string_lossy().to_string();
+        let term_a = format!("term-a-{}", uuid::Uuid::now_v7());
+        let term_b = format!("term-b-{}", uuid::Uuid::now_v7());
+        let (a, _) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            Some(&term_a),
+        );
+        let (b, snapshot) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            Some(&term_b),
+        );
+        // THROUGH THE REAL PRODUCER — `persist_proxy_nonces_with_store` calls
+        // `device_nonce_snapshot`, so an inert phase fails right here.
+        persist_proxy_nonces_with_store(&store, &snapshot);
+
+        // The terminal actually reached disk. (Assert before the restore, so a
+        // producer that dropped it cannot be masked by a live in-memory hit.)
+        let persisted = store.load_coord_mcp_nonces();
+        assert_eq!(
+            persisted.get(&a).and_then(|x| x.terminal_id.as_deref()),
+            Some(term_a.as_str()),
+            "the PRODUCER must write the terminal id — widening only the store \
+             and the restore leg ships this phase inert"
+        );
+        assert_eq!(
+            persisted.get(&b).and_then(|x| x.terminal_id.as_deref()),
+            Some(term_b.as_str())
+        );
+
+        // Simulate the restart: both nonces leave the live map, then the boot
+        // restore merges them back.
+        {
+            let mut map = proxy_nonces().lock().unwrap();
+            map.remove(&a);
+            map.remove(&b);
+        }
+        restore_proxy_nonces_from(&store);
+        assert_eq!(
+            terminal_id_for_nonce(&a).as_deref(),
+            Some(term_a.as_str()),
+            "a restored binding must carry the terminal it was minted for"
+        );
+        assert_eq!(terminal_id_for_nonce(&b).as_deref(), Some(term_b.as_str()));
+
+        // Arm 1 — THE MEASURED CASCADE. A TERMINAL-LESS persistent mint into
+        // the same workdir (the in-cwd `.mcp.json` writer and the boot
+        // self-heal both mint with `None`) must now evict NEITHER restored
+        // binding. Pre-Phase-4 every restored binding carried `terminal_id:
+        // None`, so `None == None` matched all of them and one mint took the
+        // lot — 33 of them in five seconds against `D:\qontinui-root` on
+        // 2026-08-19.
+        let (terminalless, _) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            None,
+        );
+        assert!(
+            live_binding(&a).is_some() && live_binding(&b).is_some(),
+            "a terminal-less re-mint must not collapse the restored per-terminal \
+             slots — this assertion IS the 33-deep eviction cascade"
+        );
+
+        // Arm 2 — a same-terminal re-provision still evicts its own
+        // predecessor, and ONLY that one. The narrowing must not degrade into
+        // "nothing is ever evicted".
+        let (fresh_a, _) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            Some(&term_a),
+        );
+        assert!(
+            live_binding(&a).is_none(),
+            "terminal A's own predecessor is still evicted by its re-provision"
+        );
+        assert!(
+            live_binding(&b).is_some(),
+            "terminal B's restored nonce must SURVIVE A's re-mint"
+        );
+        assert!(
+            live_binding(&terminalless).is_some(),
+            "and so must the terminal-less binding — a different slot again"
+        );
+
+        {
+            let mut map = proxy_nonces().lock().unwrap();
+            map.remove(&a);
+            map.remove(&b);
+            map.remove(&fresh_a);
+            map.remove(&terminalless);
+        }
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Phase 4 — a PRE-widening store (bare workdir strings) still restores,
+    /// with `terminal_id: None` exactly as it behaved before. **No `.enc`
+    /// migration is required**, and the legacy arm is what guarantees it: a
+    /// deserialization regression here would drop every persisted device nonce
+    /// on the next boot, i.e. reproduce the incident this plan closes.
+    #[test]
+    fn legacy_bare_string_nonce_store_restores_without_migration() {
+        let _serial = restore_forensics_lock();
+        let (store_dir, store) = temp_store("legacy-nonce");
+
+        let wd = store_dir.join("legacy-wd").to_string_lossy().to_string();
+        let nonce = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        // The legacy on-disk shape is written by `secure_storage`'s own
+        // round-trip test (it owns `StoredTokens`); here we pin the CONSUMER
+        // half — a store holding a terminal-less binding restores as one.
+        store
+            .store_coord_mcp_nonces(&HashMap::from([(
+                nonce.clone(),
+                stored_binding(&wd, None),
+            )]))
+            .expect("write the legacy-equivalent store");
+
+        restore_proxy_nonces_from(&store);
+        assert!(
+            proxy_nonce_is_valid(&nonce),
+            "a terminal-less persisted nonce must still restore"
+        );
+        assert_eq!(
+            workdir_for_nonce(&nonce).as_deref(),
+            Some(wd.as_str()),
+            "and keep its workdir"
+        );
+        assert_eq!(
+            terminal_id_for_nonce(&nonce),
+            None,
+            "a legacy entry claims no terminal — faking one would name a PTY \
+             that never existed"
+        );
+
+        {
+            let mut map = proxy_nonces().lock().unwrap();
+            map.remove(&nonce);
+        }
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Phase 4 — the OQ3 filter survives the widening: no agent binding reaches
+    /// the snapshot, whatever the value shape. Asserted against
+    /// `device_nonce_snapshot` DIRECTLY (the producer), not merely against what
+    /// lands on disk, so a future persist path that bypasses the store cannot
+    /// quietly leak one.
+    #[test]
+    fn device_nonce_snapshot_drops_agent_and_ephemeral_nonces() {
+        let wd = format!("D:/snapshot-filter-wt-{}", uuid::Uuid::now_v7());
+        let term = format!("term-{}", uuid::Uuid::now_v7());
+        let (device, _) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            Some(&term),
+        );
+        let (agent, _) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Agent {
+                agent_id: uuid::Uuid::new_v4(),
+            },
+            NonceLifetime::Persistent,
+            None,
+        );
+        let (ephemeral, map) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::ephemeral(),
+            None,
+        );
+
+        let snapshot = device_nonce_snapshot(&map);
+        assert_eq!(
+            snapshot.get(&device).and_then(|b| b.terminal_id.as_deref()),
+            Some(term.as_str()),
+            "a persistent device binding is persisted WITH its terminal"
+        );
+        assert!(
+            !snapshot.contains_key(&agent),
+            "OQ3: an agent nonce must never reach the persisted shape"
+        );
+        assert!(
+            !snapshot.contains_key(&ephemeral),
+            "plan 2026-07-17 §1/E: an ephemeral nonce must never reach the \
+             persisted shape — the store has no expiry column, so it would \
+             restore UNBOUNDED"
+        );
+
+        {
+            let mut m = proxy_nonces().lock().unwrap();
+            m.remove(&device);
+            m.remove(&agent);
+            m.remove(&ephemeral);
+        }
     }
 
     /// Phase 3b — `persist_proxy_nonces` honors the `nonce_persistence_enabled`

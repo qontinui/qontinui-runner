@@ -97,6 +97,66 @@ const STORAGE_FILE: &str = "auth_tokens.enc";
 ///
 /// All new fields carry `#[serde(default)]` so a pre-Phase-5 `auth_tokens.enc`
 /// (only the first three keys) still deserializes.
+/// One persisted coord-mcp proxy nonce binding.
+///
+/// Widened from a bare workdir `String` by plan
+/// 2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning Phase 4. The
+/// in-memory eviction predicate is one slot per `(workdir, terminal_id,
+/// Persistent)`, but the store carried only the workdir — so every restored
+/// binding was reconstructed with `terminal_id: None`, every restored device
+/// nonce for a shared workdir landed in the SAME slot, and the first
+/// persistent mint into that workdir evicted all of them at once. That is the
+/// measured 33-deep eviction cascade in five seconds against `D:\qontinui-root`
+/// on 2026-08-19.
+///
+/// Deliberately NOT carried here: the principal class (only DEVICE bindings are
+/// ever persisted — OQ3 — so a stored class would be a redundant field that
+/// could disagree with the filter), the lifetime (only Persistent bindings are
+/// persisted, and a stored expiry is exactly what would let an ephemeral nonce
+/// restore as an unbounded one), and `session_tenant` (widening the store makes
+/// it possible, but tenant restoration has its own cross-tenant blast radius
+/// and is a separate decision).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StoredNonceBinding {
+    /// The session workdir the nonce was provisioned into.
+    pub workdir: String,
+    /// The runner terminal the nonce was provisioned for, when there was one.
+    /// `None` for the genuinely terminal-less bindings (the in-cwd `.mcp.json`
+    /// writer, the boot self-heal, an adopted on-disk nonce) — and for every
+    /// binding restored from a pre-Phase-4 store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+}
+
+/// The on-disk value shape for `coord_mcp_nonces`, with the legacy arm kept
+/// readable so **no `.enc` migration is required**.
+///
+/// `untagged` tries the variants in order: a JSON string can only match
+/// `Legacy`, a JSON object can only match `Modern`. Writing always goes through
+/// `Modern`, so a store converges on the new shape the first time it is
+/// rewritten — which is every mint — without any one-shot migration step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredNonceEntry {
+    /// Pre-Phase-4: a bare workdir string, no terminal.
+    Legacy(String),
+    Modern(StoredNonceBinding),
+}
+
+impl From<StoredNonceEntry> for StoredNonceBinding {
+    fn from(e: StoredNonceEntry) -> Self {
+        match e {
+            // A legacy entry restores with `terminal_id: None` — EXACTLY the
+            // pre-Phase-4 behaviour, not a downgrade of one that had a terminal.
+            StoredNonceEntry::Legacy(workdir) => StoredNonceBinding {
+                workdir,
+                terminal_id: None,
+            },
+            StoredNonceEntry::Modern(b) => b,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct StoredTokens {
     access_token: Option<String>,
@@ -110,15 +170,19 @@ struct StoredTokens {
     oauth_refresh_token: Option<String>,
     #[serde(default)]
     oauth_expires_at: Option<i64>,
-    /// Persisted coord-mcp loopback proxy nonces: nonce → workdir it was
-    /// provisioned into (plan 2026-06-13 Phase 3b). The nonce is a
+    /// Persisted coord-mcp loopback proxy nonces: nonce → the binding it was
+    /// provisioned with (plan 2026-06-13 Phase 3b). The nonce is a
     /// **loopback-only** proxy key (127.0.0.1) — NOT a bearer — so persisting it
     /// at rest leaks nothing exploitable off-box, and it is the only way an
     /// already-running agent's already-read `.mcp.json` keeps validating across a
     /// runner rebuild/restart (the MCP client never re-reads the file). Carries
     /// `#[serde(default)]` so a pre-Phase-3b `.enc` deserializes.
+    ///
+    /// The value was a bare workdir `String` until plan 2026-08-20 Phase 4
+    /// widened it to [`StoredNonceBinding`]; [`StoredNonceEntry`] keeps the
+    /// bare-string shape readable so no `.enc` migration is required.
     #[serde(default)]
-    coord_mcp_nonces: std::collections::HashMap<String, String>,
+    coord_mcp_nonces: std::collections::HashMap<String, StoredNonceEntry>,
     /// Per-machine API key for the dev-environment capture agent
     /// (`mk_<token>`), minted ONCE by the qontinui-web enroll endpoint
     /// (`POST /api/v1/devenv/agent/enroll`). Sent as the `X-Machine-Key`
@@ -876,29 +940,45 @@ impl SecureStorage {
         Ok(())
     }
 
-    /// Persist the full coord-mcp loopback proxy nonce map (nonce → workdir),
-    /// replacing any prior persisted set (plan 2026-06-13 Phase 3b). Called by
-    /// the in-memory `PROXY_NONCES` registry on every mint/eviction so the
-    /// durable copy tracks the live set. Best-effort: a write failure is
-    /// surfaced to the caller, which logs and continues (the in-memory map
-    /// remains authoritative for this process lifetime).
+    /// Persist the full coord-mcp loopback proxy nonce map (nonce →
+    /// [`StoredNonceBinding`]), replacing any prior persisted set (plan
+    /// 2026-06-13 Phase 3b). Called by the in-memory `PROXY_NONCES` registry on
+    /// every mint/eviction so the durable copy tracks the live set.
+    /// Best-effort: a write failure is surfaced to the caller, which logs and
+    /// continues (the in-memory map remains authoritative for this process
+    /// lifetime).
+    ///
+    /// Always writes the MODERN shape, so a legacy store converges on the first
+    /// rewrite instead of needing a migration pass.
     pub fn store_coord_mcp_nonces(
         &self,
-        nonces: &std::collections::HashMap<String, String>,
+        nonces: &std::collections::HashMap<String, StoredNonceBinding>,
     ) -> Result<()> {
         let mut tokens = self.load_tokens_for_write()?;
-        tokens.coord_mcp_nonces = nonces.clone();
+        tokens.coord_mcp_nonces = nonces
+            .iter()
+            .map(|(n, b)| (n.clone(), StoredNonceEntry::Modern(b.clone())))
+            .collect();
         self.save_tokens(&tokens)?;
         Ok(())
     }
 
-    /// Load the persisted coord-mcp loopback proxy nonce map (nonce → workdir).
+    /// Load the persisted coord-mcp loopback proxy nonce map, normalizing both
+    /// on-disk shapes to [`StoredNonceBinding`] (a pre-Phase-4 bare-string entry
+    /// reads back with `terminal_id: None`, exactly as it behaved before).
     /// Returns an empty map when the store is absent / unreadable / pre-Phase-3b
     /// — a missing nonce simply 401s and the next provisioning re-mints, so an
     /// empty restore is the safe default (today's in-memory-only behavior).
-    pub fn load_coord_mcp_nonces(&self) -> std::collections::HashMap<String, String> {
+    pub fn load_coord_mcp_nonces(
+        &self,
+    ) -> std::collections::HashMap<String, StoredNonceBinding> {
         self.load_tokens()
-            .map(|t| t.coord_mcp_nonces)
+            .map(|t| {
+                t.coord_mcp_nonces
+                    .into_iter()
+                    .map(|(n, e)| (n, e.into()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1838,6 +1918,87 @@ mod tests {
         assert_eq!(parsed.access_token.as_deref(), Some("a"));
         assert_eq!(parsed.agent_machine_key.as_deref(), Some("mk_x"));
         assert!(parsed.device_machine_key.is_none());
+    }
+
+    /// Plan 2026-08-20 Phase 4 — a store written by the PRE-widening code
+    /// (`coord_mcp_nonces` values are bare workdir strings) must still
+    /// deserialize, with `terminal_id: None`. **No `.enc` migration is
+    /// required**: a deserialization regression here would drop every persisted
+    /// device nonce on the next boot — i.e. reproduce the 2026-08-19 incident
+    /// this plan closes.
+    ///
+    /// Asserted at the SERDE level against a raw legacy document, not through a
+    /// re-encrypted round trip, because the raw JSON is the actual on-disk
+    /// contract and the only thing a hand-built modern store could not pin.
+    #[test]
+    fn test_legacy_bare_string_coord_mcp_nonces_deserialize() {
+        let raw = r#"{"access_token":"a","refresh_token":"r","device_id":"d",
+                      "coord_mcp_nonces":{"abc123":"D:\\qontinui-root"}}"#;
+        let parsed: StoredTokens = serde_json::from_str(raw).expect("legacy nonce shape decodes");
+        let entry = parsed
+            .coord_mcp_nonces
+            .get("abc123")
+            .expect("the legacy entry survives");
+        assert_eq!(entry, &StoredNonceEntry::Legacy("D:\\qontinui-root".into()));
+        let b: StoredNonceBinding = entry.clone().into();
+        assert_eq!(b.workdir, "D:\\qontinui-root");
+        assert_eq!(
+            b.terminal_id, None,
+            "a legacy entry restores terminal-less — exactly the pre-Phase-4 \
+             behaviour, not a downgrade"
+        );
+    }
+
+    /// The MODERN shape round-trips through the same untagged enum, and both
+    /// shapes coexist in one document (a store part-way through its first
+    /// rewrite).
+    #[test]
+    fn test_modern_and_legacy_coord_mcp_nonces_coexist_and_round_trip() {
+        let raw = r#"{"coord_mcp_nonces":{
+                        "old":"D:\\wd-a",
+                        "new":{"workdir":"D:\\wd-b","terminal_id":"term-7"}}}"#;
+        let parsed: StoredTokens = serde_json::from_str(raw).expect("mixed shapes decode");
+        let old: StoredNonceBinding = parsed.coord_mcp_nonces["old"].clone().into();
+        let new: StoredNonceBinding = parsed.coord_mcp_nonces["new"].clone().into();
+        assert_eq!(old.terminal_id, None);
+        assert_eq!(new.terminal_id.as_deref(), Some("term-7"));
+        assert_eq!(new.workdir, "D:\\wd-b");
+
+        // A write always emits the modern shape, so a store converges without a
+        // migration pass. `terminal_id: None` is skipped, so a terminal-less
+        // modern entry stays a compact object rather than carrying a null.
+        let modern = serde_json::to_value(StoredNonceEntry::Modern(StoredNonceBinding {
+            workdir: "D:\\wd-c".into(),
+            terminal_id: None,
+        }))
+        .unwrap();
+        assert_eq!(modern, serde_json::json!({"workdir": "D:\\wd-c"}));
+    }
+
+    /// The widened value survives a REAL encrypted store round trip through the
+    /// public API, not merely a serde round trip.
+    #[test]
+    fn test_coord_mcp_nonce_terminal_id_survives_store_round_trip() {
+        let storage = create_test_storage("coord_mcp_nonce_terminal_round_trip");
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "n1".to_string(),
+            StoredNonceBinding {
+                workdir: "D:\\wd".into(),
+                terminal_id: Some("term-1".into()),
+            },
+        );
+        map.insert(
+            "n2".to_string(),
+            StoredNonceBinding {
+                workdir: "D:\\wd".into(),
+                terminal_id: None,
+            },
+        );
+        storage.store_coord_mcp_nonces(&map).unwrap();
+
+        let loaded = storage.load_coord_mcp_nonces();
+        assert_eq!(loaded, map, "the persisted shape round-trips exactly");
     }
 
     #[test]

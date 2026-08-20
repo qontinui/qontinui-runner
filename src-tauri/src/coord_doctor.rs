@@ -1038,7 +1038,10 @@ fn nonce_is_registered(nonce: &str) -> bool {
     if nonce.is_empty() {
         return false;
     }
-    let map: HashMap<String, String> = match crate::secure_storage::SecureStorage::new() {
+    // Membership only — the value shape (widened to carry `terminal_id` by plan
+    // 2026-08-20 Phase 4) is deliberately not spelled out here, so this stays
+    // correct across further widenings.
+    let map = match crate::secure_storage::SecureStorage::new() {
         Ok(s) => s.load_coord_mcp_nonces(),
         Err(_) => return false,
     };
