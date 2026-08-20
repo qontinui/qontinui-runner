@@ -585,15 +585,21 @@ impl LoopController {
         // When starting from the beginning (not resuming), clear any stale data
         // from previous interrupted runs to prevent data pollution.
         // This includes: checkpoints, transition history, verification results, workflow state
-        if matches!(resume_point, ResumePoint::FromStart) {
-            info!(
-                "Fresh run - clearing old data for execution {}",
-                config.execution_id
-            );
-
-            // Clear step checkpoints
-            if let Err(e) = resume_manager.clear_all_checkpoints(&config.execution_id) {
-                warn!("Failed to clear old checkpoints: {} - continuing anyway", e);
+        //
+        // GUARDED: `FromStart` is no longer proof that nothing ran. Phase 1
+        // made a MISSING workflow-execution-state row resolve to `FromStart`,
+        // which is exactly what a crash mid-setup leaves behind (checkpoints
+        // written, state row never persisted); and a composed-run child always
+        // resolves to `FromStart` while its checkpoints live under the shared
+        // parent id. `clear_checkpoints_for_fresh_run` refuses both.
+        {
+            let verdict =
+                resume_manager.clear_checkpoints_for_fresh_run(&config.execution_id, &resume_point);
+            if verdict.cleared() {
+                info!(
+                    "Fresh run - cleared old step checkpoints for execution {}",
+                    config.execution_id
+                );
             }
 
             // Clearing of transition history, verification phase results,

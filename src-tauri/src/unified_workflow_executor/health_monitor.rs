@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use futures_util::FutureExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::mcp::types::MCP_API_PORT;
 use crate::str_utils::truncate_str;
@@ -672,104 +672,54 @@ pub async fn build_resume_agentic_context(
         }
     }
 
-    // Strategy 2: Build context from step checkpoints (which remap to parent ID).
+    // Strategy 2: Build the context from this iteration's verification
+    // checkpoints.
+    //
+    // RECONCILED WITH THE PHASE-2 REPLAY READER. Two readers now consume the
+    // same journal, and they must never disagree about a single row:
+    //
+    // * Phase 2 (`phases::journalled_step`) reuses a step's journalled result
+    //   INSTEAD of executing it. It consumes exactly `is_replayable()` rows.
+    // * This function narrates to the model the work that is still outstanding.
+    //   It consumes exactly `is_outstanding()` rows.
+    //
+    // Those two predicates are disjoint by construction
+    // (`checkpoint_reader_partition_is_total_and_disjoint` in
+    // `workflow_state::checkpoint`), so a step can never be both skipped as
+    // already-done AND described to the model as still to do. Belt and braces,
+    // the verification phase is excluded from the replay set outright
+    // (`phases::phase_is_replayable`), so nothing this function reads has been
+    // replayed at all.
+    //
+    // Consequently this reader NO LONGER touches `result_json`. That field is
+    // the replay reader's payload; a failed checkpoint never carries one
+    // anyway, because the upsert writes `result_json = NULL` on the failure
+    // path (`database/pg/workflow_state.rs`).
+    //
+    // NOTE: `get_completed_steps` does NOT remap a composed-run child to its
+    // parent id — only the WRITE path does. A child therefore reads back
+    // nothing here and falls through to Strategy 3, which is the correct
+    // outcome: children of one composed run share a single checkpoint
+    // keyspace, so a hit would be a sibling's result, not this workflow's.
     let checkpoint_mgr = crate::workflow_state::CheckpointManager::new("unified");
-    if let Ok(checkpoints) =
-        checkpoint_mgr.get_completed_steps(execution_id, "verification", Some(iteration))
-    {
-        if !checkpoints.is_empty() {
-            let failed: Vec<_> = checkpoints
-                .iter()
-                .filter(|cp| {
-                    matches!(
-                        cp.status,
-                        crate::workflow_state::StepCheckpointStatus::Failed
-                    )
-                })
-                .collect();
-
-            let total = checkpoints.len();
-            let passed = checkpoints
-                .iter()
-                .filter(|cp| {
-                    matches!(
-                        cp.status,
-                        crate::workflow_state::StepCheckpointStatus::Success
-                    )
-                })
-                .count();
-
-            if !failed.is_empty() {
-                let mut context = String::new();
-                context.push_str("## Verification Results (Resumed)\n\n");
-                context.push_str(&format!(
-                    "**Status:** {} of {} verification steps passed\n\n",
-                    passed, total
-                ));
-                context.push_str("### Failed Steps\n\n");
-
-                for cp in &failed {
-                    let name = cp.step_name.as_deref().unwrap_or("unknown");
-                    let step_type = &cp.step_type;
-                    context.push_str(&format!("#### {} ({})\n", name, step_type));
-
-                    if let Some(ref error) = cp.error {
-                        context.push_str(&format!("**Error:** {}\n", error));
-                    }
-
-                    // If result_json is available (e.g., for successful steps that later
-                    // became relevant), include it
-                    if let Some(ref result_str) = cp.result_json {
-                        if let Ok(result_data) =
-                            serde_json::from_str::<serde_json::Value>(result_str)
-                        {
-                            // Extract stdout/output if present
-                            if let Some(output) = result_data
-                                .get("stdout")
-                                .or_else(|| result_data.get("output"))
-                                .and_then(|v| v.as_str())
-                            {
-                                if !output.is_empty() {
-                                    let truncated = if output.len() > 2000 {
-                                        let t = truncate_str(output, 2000);
-                                        format!(
-                                            "{}...\n[truncated, {} more chars]",
-                                            t,
-                                            output.len() - t.len()
-                                        )
-                                    } else {
-                                        output.to_string()
-                                    };
-                                    context.push_str(&format!(
-                                        "**Output:**\n```\n{}\n```\n",
-                                        truncated
-                                    ));
-                                }
-                            }
-                        }
-                    }
-
-                    context.push('\n');
-                }
-
+    match checkpoint_mgr.get_completed_steps(execution_id, "verification", Some(iteration)) {
+        Ok(checkpoints) => {
+            if let Some(context) = narrate_verification_checkpoints(&checkpoints) {
                 info!(
-                    "RESUME: Built agentic context from step checkpoints ({} chars, {} failed steps)",
-                    context.len(),
-                    failed.len()
+                    "RESUME: Built agentic context from step checkpoints ({} chars)",
+                    context.len()
                 );
                 return context;
-            } else {
-                // All verification steps passed — no failures to fix
-                info!(
-                    "RESUME: All {} verification steps passed, no failures to fix",
-                    total
-                );
-                return format!(
-                    "All {} verification steps passed. No failures to investigate. \
-                     Proceed with any analysis or improvements based on the workflow context provided.",
-                    total
-                );
             }
+        }
+        Err(e) => {
+            // Not knowing is not the same as "no verification ran".
+            warn!(
+                execution_id = %execution_id,
+                iteration = %iteration,
+                error = %e,
+                "RESUME: checkpoint read failed, falling back to the generic context"
+            );
         }
     }
 
@@ -778,4 +728,237 @@ pub async fn build_resume_agentic_context(
     "Resuming agentic phase. No verification data is available. \
      Proceed with analysis based on the workflow context and instructions provided."
         .to_string()
+}
+
+/// Narrate a verification iteration's checkpoints as agentic context.
+///
+/// Pure, so the partition against the Phase-2 replay reader is testable without
+/// a database. Returns `None` when the slice carries no TERMINAL row at all —
+/// there is nothing to say, and the caller should fall through to its generic
+/// context.
+///
+/// `Pending`/`Running` rows are excluded from the counts as well as from the
+/// narration. They are the debris of the crash itself (a step was marked
+/// started and never finished), so counting them would report verification
+/// steps that never produced a result — and Phase 2 will re-execute exactly
+/// those, because `is_replayable()` rejects them too.
+pub(crate) fn narrate_verification_checkpoints(
+    checkpoints: &[crate::workflow_state::StepCheckpoint],
+) -> Option<String> {
+    let terminal: Vec<&crate::workflow_state::StepCheckpoint> = checkpoints
+        .iter()
+        .filter(|cp| cp.status.is_terminal())
+        .collect();
+
+    if terminal.is_empty() {
+        return None;
+    }
+
+    let total = terminal.len();
+    let passed = terminal
+        .iter()
+        .filter(|cp| cp.status.is_replayable())
+        .count();
+    let failed: Vec<&&crate::workflow_state::StepCheckpoint> = terminal
+        .iter()
+        .filter(|cp| cp.status.is_outstanding())
+        .collect();
+
+    if failed.is_empty() {
+        info!(
+            "RESUME: All {} verification steps passed, no failures to fix",
+            total
+        );
+        return Some(format!(
+            "All {} verification steps passed. No failures to investigate. \
+             Proceed with any analysis or improvements based on the workflow context provided.",
+            total
+        ));
+    }
+
+    let mut context = String::new();
+    context.push_str("## Verification Results (Resumed)\n\n");
+    context.push_str(&format!(
+        "**Status:** {} of {} verification steps passed\n\n",
+        passed, total
+    ));
+    context.push_str("### Failed Steps\n\n");
+
+    for cp in &failed {
+        let name = cp.step_name.as_deref().unwrap_or("unknown");
+        context.push_str(&format!("#### {} ({})\n", name, cp.step_type));
+
+        if let Some(ref error) = cp.error {
+            let shown = if error.len() > 2000 {
+                let t = truncate_str(error, 2000);
+                format!(
+                    "{}...\n[truncated, {} more chars]",
+                    t,
+                    error.len() - t.len()
+                )
+            } else {
+                error.clone()
+            };
+            context.push_str(&format!("**Error:** {}\n", shown));
+        }
+
+        context.push('\n');
+    }
+
+    info!(
+        "RESUME: Narrated {} failed verification step(s) of {} terminal checkpoint(s)",
+        failed.len(),
+        total
+    );
+    Some(context)
+}
+
+#[cfg(test)]
+mod resume_context_tests {
+    use super::*;
+    use crate::workflow_state::{StepCheckpoint, StepCheckpointStatus};
+
+    fn cp(
+        step_index: usize,
+        name: &str,
+        status: StepCheckpointStatus,
+        error: Option<&str>,
+        result_json: Option<&str>,
+    ) -> StepCheckpoint {
+        let mut c = StepCheckpoint::new(
+            "exec-1",
+            "unified",
+            "verification",
+            Some(3),
+            step_index,
+            "playwright",
+        )
+        .with_step_name(name);
+        c.status = status;
+        c.error = error.map(str::to_string);
+        c.result_json = result_json.map(str::to_string);
+        c
+    }
+
+    /// THE reconciliation test: the rows Phase 2 replays and the rows this
+    /// narration describes are disjoint, and together they cover every
+    /// terminal row. A step can never be skipped as done AND narrated as
+    /// outstanding.
+    #[test]
+    fn replayed_and_narrated_checkpoints_are_disjoint() {
+        let rows = vec![
+            cp(
+                0,
+                "login works",
+                StepCheckpointStatus::Success,
+                None,
+                Some("{\"ok\":true}"),
+            ),
+            cp(
+                1,
+                "dashboard renders",
+                StepCheckpointStatus::Failed,
+                Some("expected Submit"),
+                None,
+            ),
+            cp(2, "logout works", StepCheckpointStatus::Skipped, None, None),
+            cp(
+                3,
+                "half-run step",
+                StepCheckpointStatus::Running,
+                None,
+                None,
+            ),
+        ];
+
+        let replayed: Vec<usize> = rows
+            .iter()
+            .filter(|c| c.status.is_replayable())
+            .map(|c| c.step_index)
+            .collect();
+        let narrated: Vec<usize> = rows
+            .iter()
+            .filter(|c| c.status.is_outstanding())
+            .map(|c| c.step_index)
+            .collect();
+
+        assert_eq!(replayed, vec![0, 2]);
+        assert_eq!(narrated, vec![1]);
+        assert!(
+            replayed.iter().all(|i| !narrated.contains(i)),
+            "a replayed step must never also be narrated as work to do"
+        );
+
+        let context = narrate_verification_checkpoints(&rows).expect("has a failure to narrate");
+        assert!(context.contains("dashboard renders"), "{}", context);
+        assert!(
+            !context.contains("login works"),
+            "a replayed step must not be narrated: {}",
+            context
+        );
+        assert!(
+            !context.contains("half-run step"),
+            "crash debris must not be narrated: {}",
+            context
+        );
+    }
+
+    /// The counts describe TERMINAL rows only: a `Running` row left behind by
+    /// the crash is not a verification step that produced a result.
+    #[test]
+    fn counts_exclude_crash_debris() {
+        let rows = vec![
+            cp(0, "a", StepCheckpointStatus::Success, None, None),
+            cp(1, "b", StepCheckpointStatus::Failed, Some("boom"), None),
+            cp(2, "c", StepCheckpointStatus::Running, None, None),
+            cp(3, "d", StepCheckpointStatus::Pending, None, None),
+        ];
+        let context = narrate_verification_checkpoints(&rows).expect("has a failure");
+        assert!(
+            context.contains("1 of 2 verification steps passed"),
+            "counts must cover terminal rows only: {}",
+            context
+        );
+    }
+
+    /// A fully-passing iteration says so rather than inventing failures.
+    #[test]
+    fn all_passed_reports_no_failures() {
+        let rows = vec![
+            cp(0, "a", StepCheckpointStatus::Success, None, None),
+            cp(1, "b", StepCheckpointStatus::Skipped, None, None),
+        ];
+        let context = narrate_verification_checkpoints(&rows).expect("has terminal rows");
+        assert!(
+            context.starts_with("All 2 verification steps passed"),
+            "{}",
+            context
+        );
+    }
+
+    /// Nothing terminal — including an empty slice, and a slice of pure crash
+    /// debris — means the caller must fall through, not narrate an empty list.
+    #[test]
+    fn nothing_terminal_falls_through() {
+        assert!(narrate_verification_checkpoints(&[]).is_none());
+        let debris = vec![
+            cp(0, "a", StepCheckpointStatus::Running, None, None),
+            cp(1, "b", StepCheckpointStatus::Pending, None, None),
+        ];
+        assert!(narrate_verification_checkpoints(&debris).is_none());
+    }
+
+    /// A long error is truncated rather than blowing out the prompt.
+    #[test]
+    fn long_errors_are_truncated() {
+        let long = "x".repeat(5000);
+        let rows = vec![cp(0, "a", StepCheckpointStatus::Failed, Some(&long), None)];
+        let context = narrate_verification_checkpoints(&rows).expect("has a failure");
+        assert!(
+            context.contains("[truncated,"),
+            "{}",
+            &context[..200.min(context.len())]
+        );
+        assert!(context.len() < 3000);
+    }
 }

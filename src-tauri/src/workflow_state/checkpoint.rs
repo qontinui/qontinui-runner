@@ -39,6 +39,41 @@ impl std::fmt::Display for StepCheckpointStatus {
     }
 }
 
+impl StepCheckpointStatus {
+    /// Does this status mean the step's journaled outcome may be REUSED on
+    /// resume instead of executing the step again?
+    ///
+    /// This is the single definition of "Phase 2 replays it". The narration
+    /// reader (`unified_workflow_executor::health_monitor::
+    /// build_resume_agentic_context`) uses [`Self::is_outstanding`], which is
+    /// the disjoint complement over the terminal statuses — so a step can never
+    /// be both replayed as done AND narrated to the model as still to do.
+    /// `checkpoint_reader_partition_is_total_and_disjoint` pins that property.
+    pub fn is_replayable(&self) -> bool {
+        matches!(
+            self,
+            StepCheckpointStatus::Success | StepCheckpointStatus::Skipped
+        )
+    }
+
+    /// Did this step reach a terminal state that still represents WORK TO DO?
+    ///
+    /// Only `Failed`. `Pending`/`Running` are not terminal: they are the debris
+    /// of the crash itself (the step was started and never finished), so they
+    /// are neither replayed nor reported as a verification outcome.
+    pub fn is_outstanding(&self) -> bool {
+        matches!(self, StepCheckpointStatus::Failed)
+    }
+
+    /// Did the step finish, one way or another?
+    ///
+    /// `Pending`/`Running` rows survive a crash and would otherwise be counted
+    /// as verification results that never actually produced one.
+    pub fn is_terminal(&self) -> bool {
+        self.is_replayable() || self.is_outstanding()
+    }
+}
+
 impl std::str::FromStr for StepCheckpointStatus {
     type Err = String;
 
@@ -258,31 +293,6 @@ impl CheckpointManager {
             .get_workflow_step_checkpoints_sync(execution_id, phase, iteration)
     }
 
-    /// Get the last completed step index for a phase/iteration.
-    ///
-    /// Returns None if no steps have been completed.
-    pub fn get_last_completed_step_index(
-        &self,
-        execution_id: &str,
-        phase: &str,
-        iteration: Option<u32>,
-    ) -> Result<Option<usize>, String> {
-        let checkpoints = self.get_completed_steps(execution_id, phase, iteration)?;
-
-        let last_completed = checkpoints
-            .iter()
-            .filter(|cp| {
-                matches!(
-                    cp.status,
-                    StepCheckpointStatus::Success | StepCheckpointStatus::Skipped
-                )
-            })
-            .map(|cp| cp.step_index)
-            .max();
-
-        Ok(last_completed)
-    }
-
     /// Clear all checkpoints for a specific iteration.
     ///
     /// This is used when retrying a failed iteration.
@@ -316,24 +326,69 @@ impl CheckpointManager {
             .delete_workflow_step_checkpoints_sync(execution_id, None, None)
     }
 
-    /// Check if a step has already been completed successfully.
-    pub fn is_step_completed(
+    /// The journaled checkpoint for one step slice, if that step is already
+    /// done and its outcome may be reused instead of re-executing it.
+    ///
+    /// This replaces the former `is_step_completed` passthrough (and the
+    /// unused `get_last_completed_step_index`): a `bool` cannot carry the
+    /// `result_json` that the resume path must REUSE, and the last-completed
+    /// index silently assumed the completed set was contiguous, which a
+    /// partially-failed phase violates.
+    ///
+    /// Two things it does that the old predicate did not:
+    ///
+    /// 1. **Stage-aware.** `(phase, iteration, step_index)` is NOT unique — the
+    ///    checkpoint table is keyed on `stage_index` too, and every stage of a
+    ///    multi-stage workflow writes its setup steps as
+    ///    `iteration = Some(0), step_index = 0..`. A stage-blind lookup would
+    ///    replay stage 0's result as stage 1's.
+    /// 2. **Refuses composed-run children.** `save_step` remaps a child's
+    ///    `execution_id` to `get_parent_task_id(..)`, so every child of one
+    ///    composed run writes into a SINGLE shared keyspace and siblings
+    ///    overwrite each other. The read path does NOT remap, so a child reads
+    ///    back nothing today regardless; refusing explicitly makes that
+    ///    outcome independent of the asymmetry, because a read made symmetric
+    ///    with the write would hand a child its SIBLING's result — which is
+    ///    not evidence about this workflow at all.
+    pub fn completed_step(
         &self,
         execution_id: &str,
         phase: &str,
         iteration: Option<u32>,
+        stage_index: Option<u32>,
         step_index: usize,
-    ) -> Result<bool, String> {
-        let checkpoints = self.get_completed_steps(execution_id, phase, iteration)?;
+    ) -> Result<Option<StepCheckpoint>, String> {
+        if get_parent_task_id(execution_id) != execution_id {
+            debug!(
+                execution_id = %execution_id,
+                phase = %phase,
+                step_index = %step_index,
+                "Composed-run child: checkpoints are keyed under the shared parent id, not replaying"
+            );
+            return Ok(None);
+        }
 
-        Ok(checkpoints.iter().any(|cp| {
-            cp.step_index == step_index
-                && matches!(
-                    cp.status,
-                    StepCheckpointStatus::Success | StepCheckpointStatus::Skipped
-                )
-        }))
+        let checkpoints = self.get_completed_steps(execution_id, phase, iteration)?;
+        Ok(select_replayable(&checkpoints, stage_index, step_index).cloned())
     }
+}
+
+/// Pure half of [`CheckpointManager::completed_step`]: pick the replayable
+/// checkpoint for one `(stage_index, step_index)` slice.
+///
+/// A missing stage index and stage 0 are the same thing: the write path
+/// `COALESCE`s a missing stage to 0 (`database/pg/workflow_state.rs`), so a row
+/// read back always carries `Some(0)` where the caller passed `None`.
+pub fn select_replayable(
+    checkpoints: &[StepCheckpoint],
+    stage_index: Option<u32>,
+    step_index: usize,
+) -> Option<&StepCheckpoint> {
+    checkpoints.iter().find(|cp| {
+        cp.step_index == step_index
+            && cp.stage_index.unwrap_or(0) == stage_index.unwrap_or(0)
+            && cp.status.is_replayable()
+    })
 }
 
 #[cfg(test)]
@@ -381,6 +436,104 @@ mod tests {
         assert_eq!(checkpoint.status, StepCheckpointStatus::Failed);
         assert!(checkpoint.error.is_some());
         assert_eq!(checkpoint.duration_ms, Some(2500));
+    }
+
+    fn cp(
+        step_index: usize,
+        stage_index: Option<u32>,
+        status: StepCheckpointStatus,
+    ) -> StepCheckpoint {
+        let mut c =
+            StepCheckpoint::new("exec-1", "unified", "setup", Some(0), step_index, "command")
+                .with_stage_index(stage_index);
+        c.status = status;
+        c.result_json = Some(format!("{{\"step\":{}}}", step_index));
+        c
+    }
+
+    /// The two journal readers partition the status set: every status is
+    /// replayed by Phase 2 XOR narrated as outstanding XOR not terminal at all.
+    #[test]
+    fn checkpoint_reader_partition_is_total_and_disjoint() {
+        let all = [
+            StepCheckpointStatus::Pending,
+            StepCheckpointStatus::Running,
+            StepCheckpointStatus::Success,
+            StepCheckpointStatus::Failed,
+            StepCheckpointStatus::Skipped,
+        ];
+        for st in all {
+            assert!(
+                !(st.is_replayable() && st.is_outstanding()),
+                "{:?} is both replayed and narrated as work to do",
+                st
+            );
+            assert_eq!(
+                st.is_terminal(),
+                st.is_replayable() || st.is_outstanding(),
+                "{:?} terminality disagrees with the partition",
+                st
+            );
+        }
+        assert!(StepCheckpointStatus::Success.is_replayable());
+        assert!(StepCheckpointStatus::Skipped.is_replayable());
+        assert!(StepCheckpointStatus::Failed.is_outstanding());
+        // Crash debris is neither replayed nor counted as a result.
+        assert!(!StepCheckpointStatus::Running.is_terminal());
+        assert!(!StepCheckpointStatus::Pending.is_terminal());
+    }
+
+    #[test]
+    fn select_replayable_only_returns_completed_steps() {
+        let rows = vec![
+            cp(0, Some(0), StepCheckpointStatus::Success),
+            cp(1, Some(0), StepCheckpointStatus::Failed),
+            cp(2, Some(0), StepCheckpointStatus::Running),
+            cp(3, Some(0), StepCheckpointStatus::Skipped),
+        ];
+        assert_eq!(select_replayable(&rows, None, 0).unwrap().step_index, 0);
+        assert!(
+            select_replayable(&rows, None, 1).is_none(),
+            "failed step must re-execute"
+        );
+        assert!(
+            select_replayable(&rows, None, 2).is_none(),
+            "crash debris must re-execute"
+        );
+        assert_eq!(select_replayable(&rows, None, 3).unwrap().step_index, 3);
+        assert!(select_replayable(&rows, None, 9).is_none());
+    }
+
+    /// `(phase, iteration, step_index)` repeats across the stages of a
+    /// multi-stage workflow; only `stage_index` separates them.
+    #[test]
+    fn select_replayable_does_not_cross_stages() {
+        let rows = vec![
+            cp(0, Some(0), StepCheckpointStatus::Success),
+            cp(0, Some(1), StepCheckpointStatus::Failed),
+        ];
+        assert_eq!(
+            select_replayable(&rows, Some(0), 0).unwrap().status,
+            StepCheckpointStatus::Success
+        );
+        assert!(
+            select_replayable(&rows, Some(1), 0).is_none(),
+            "stage 1 must not replay stage 0's result"
+        );
+        assert!(
+            select_replayable(&rows, Some(2), 0).is_none(),
+            "an unwritten stage has nothing to replay"
+        );
+    }
+
+    /// A missing stage index and stage 0 are the same slice (the write path
+    /// COALESCEs a missing stage to 0).
+    #[test]
+    fn select_replayable_treats_missing_stage_as_stage_zero() {
+        let rows = vec![cp(0, None, StepCheckpointStatus::Success)];
+        assert!(select_replayable(&rows, Some(0), 0).is_some());
+        assert!(select_replayable(&rows, None, 0).is_some());
+        assert!(select_replayable(&rows, Some(1), 0).is_none());
     }
 
     #[test]

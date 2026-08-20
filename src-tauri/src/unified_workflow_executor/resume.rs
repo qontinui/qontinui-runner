@@ -235,6 +235,84 @@ impl ResumePoint {
     }
 }
 
+/// What [`ResumeManager::clear_checkpoints_for_fresh_run`] decided to do with
+/// the step journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearVerdict {
+    /// Genuinely a fresh run with nothing journaled — safe to clear.
+    Clear,
+    /// Not a fresh start, so there is nothing to clear.
+    KeptNotAFreshStart,
+    /// A composed-run child (`composed-run-<ts>-workflow-<n>`).
+    ///
+    /// The checkpoint paths are ASYMMETRIC about that id shape: `save_step`
+    /// remaps a child to `get_parent_task_id(..)`, while the read and delete
+    /// paths pass the id through verbatim (`database/pg/workflow_state.rs`).
+    /// So TODAY a child's wipe matches zero rows and destroys nothing - this
+    /// arm is an invariant, not a live fix, and it also stops the run logging
+    /// a wipe it did not perform. It earns its place because the obvious
+    /// repair of that asymmetry (remap on delete too, so a child can clean up
+    /// what it wrote) would turn every child's "fresh start" into a wipe of
+    /// the PARENT's journal and every sibling's. Deciding on the ID SHAPE,
+    /// before the journal is ever read, means that repair cannot become a
+    /// data-loss bug.
+    KeptComposedRunChild,
+    /// `FromStart` was reached with work already journaled. After Phase 1,
+    /// `FromStart` no longer means "nothing ran": it is what a MISSING state
+    /// row resolves to, which is exactly what a crash mid-setup leaves behind
+    /// (checkpoints written, state row never persisted). Wiping there is the
+    /// re-execute-and-re-bill defect this plan exists to close.
+    KeptJournalNotEmpty,
+}
+
+impl ClearVerdict {
+    /// Human-readable reason, for the log line at the call site.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            ClearVerdict::Clear => "fresh run with an empty journal",
+            ClearVerdict::KeptNotAFreshStart => "resuming, not a fresh start",
+            ClearVerdict::KeptComposedRunChild => {
+                "composed-run child: the journal belongs to the parent and its siblings"
+            }
+            ClearVerdict::KeptJournalNotEmpty => {
+                "FromStart with journalled work: a crash before the state row was written"
+            }
+        }
+    }
+
+    /// Did this verdict delete anything?
+    pub fn cleared(&self) -> bool {
+        matches!(self, ClearVerdict::Clear)
+    }
+}
+
+/// Pure guard for the fresh-run checkpoint wipe.
+///
+/// `checkpoints` is invoked lazily and only when the cheap structural checks
+/// have not already answered, so a resume never pays for a read it will ignore.
+pub fn fresh_run_clear_verdict(
+    execution_id: &str,
+    resume_point: &ResumePoint,
+    checkpoints: &dyn Fn() -> Vec<StepCheckpoint>,
+) -> ClearVerdict {
+    if !resume_point.is_fresh_start() {
+        return ClearVerdict::KeptNotAFreshStart;
+    }
+
+    // A composed-run child ALWAYS resolves to `FromStart` (it never reads the
+    // shared state row, and `completed_step` refuses its checkpoints), so this
+    // arm is on the hot path, not a corner case.
+    if is_sequence_child(execution_id) {
+        return ClearVerdict::KeptComposedRunChild;
+    }
+
+    if checkpoints().is_empty() {
+        ClearVerdict::Clear
+    } else {
+        ClearVerdict::KeptJournalNotEmpty
+    }
+}
+
 /// Manages resume logic for unified workflows.
 ///
 /// The ResumeManager uses checkpoint data to determine where to resume
@@ -308,8 +386,21 @@ impl ResumeManager {
         legacy: &dyn Fn() -> Result<ResumePoint, String>,
     ) -> Result<ResumePoint, String> {
         // See `determine_resume_point`: a child's state row belongs to its
-        // siblings just as much as to it, so checkpoints — which are keyed on
-        // the child's own execution_id — are the only admissible evidence.
+        // siblings just as much as to it, so it is never admissible evidence
+        // for THIS child and we fall back to checkpoints.
+        //
+        // Note what that buys today, precisely: `CheckpointManager::save_step`
+        // remaps a child's checkpoints onto the PARENT id (the `task_runs` FK
+        // requires it) and `StepCheckpoint` carries no column saying which
+        // child wrote a row. So a read by the child's id returns EMPTY and a
+        // child resolves to `FromStart` — safe (it can never resume as a
+        // sibling), and identical to the pre-existing behaviour, but NOT
+        // precise: composed-run children still re-execute and re-bill.
+        //
+        // This branch is therefore the correct shape waiting on the write
+        // path, not a live fix. The moment checkpoints gain a child-keyed
+        // identity, it starts returning precise child resume points with no
+        // change here.
         if is_sequence_child(execution_id) {
             debug!(
                 execution_id = %execution_id,
@@ -674,25 +765,49 @@ impl ResumeManager {
         }
     }
 
-    /// Check if a specific step has been completed.
-    pub fn is_step_completed(
-        &self,
-        execution_id: &str,
-        phase: &str,
-        iteration: Option<u32>,
-        step_index: usize,
-    ) -> Result<bool, String> {
-        self.checkpoint_mgr
-            .is_step_completed(execution_id, phase, iteration, step_index)
-    }
-
     /// Clear all checkpoints for an execution (for fresh restart).
+    ///
+    /// UNGUARDED — this is the raw delete. Callers on the resume path must go
+    /// through [`Self::clear_checkpoints_for_fresh_run`], which refuses the
+    /// two cases where a wipe destroys a journal that is still load-bearing.
     pub fn clear_all_checkpoints(&self, execution_id: &str) -> Result<(), String> {
         info!(
             execution_id = %execution_id,
             "Clearing all checkpoints for fresh restart"
         );
         self.checkpoint_mgr.clear_all_checkpoints(execution_id)
+    }
+
+    /// Clear the step journal, but only when this really is a fresh run.
+    ///
+    /// Returns the verdict that was applied, so the caller can log it.
+    /// See [`fresh_run_clear_verdict`] for the rules and why each exists.
+    pub fn clear_checkpoints_for_fresh_run(
+        &self,
+        execution_id: &str,
+        resume_point: &ResumePoint,
+    ) -> ClearVerdict {
+        let verdict = fresh_run_clear_verdict(execution_id, resume_point, &|| {
+            self.load_checkpoints(execution_id)
+        });
+
+        if matches!(verdict, ClearVerdict::Clear) {
+            if let Err(e) = self.clear_all_checkpoints(execution_id) {
+                warn!(
+                    execution_id = %execution_id,
+                    error = %e,
+                    "Failed to clear old checkpoints - continuing anyway"
+                );
+            }
+        } else {
+            info!(
+                execution_id = %execution_id,
+                verdict = %verdict.reason(),
+                "Keeping the existing step journal"
+            );
+        }
+
+        verdict
     }
 
     /// Clear checkpoints for a specific iteration (for retry).
@@ -716,6 +831,7 @@ impl ResumeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unified_workflow_executor::get_parent_task_id;
 
     #[test]
     fn test_resume_point_description() {
@@ -1318,5 +1434,123 @@ mod tests {
         ];
         let newest = newest_completed(&cps).expect("a completed checkpoint exists");
         assert_eq!(newest.phase, "agentic");
+    }
+
+    // =====================================================================
+    // Fresh-run journal wipe guard
+    //
+    // `loop_controller` wipes the step journal whenever the resume point is
+    // `FromStart`. After Phase 1, `FromStart` is ALSO what a missing state row
+    // resolves to — so the wipe now has two ways to destroy a journal that is
+    // still needed. These pin both.
+    // =====================================================================
+
+    fn setup_checkpoint(execution_id: &str) -> Vec<StepCheckpoint> {
+        vec![checkpoint(
+            execution_id,
+            "setup",
+            Some(0),
+            0,
+            Some(0),
+            StepCheckpointStatus::Success,
+            "2026-08-20T00:00:01+00:00",
+        )]
+    }
+
+    fn checkpoints_must_not_be_read() -> Vec<StepCheckpoint> {
+        panic!("the journal must not be read once a structural check has answered");
+    }
+
+    #[test]
+    fn test_fresh_run_with_empty_journal_clears() {
+        assert_eq!(
+            fresh_run_clear_verdict(EXEC, &ResumePoint::FromStart, &no_checkpoints),
+            ClearVerdict::Clear
+        );
+    }
+
+    #[test]
+    fn test_resuming_never_clears_and_never_reads_the_journal() {
+        for point in [
+            ResumePoint::SetupPhase {
+                from_step: 2,
+                stage_index: None,
+            },
+            ResumePoint::VerificationPhase {
+                iteration: 3,
+                from_step: 1,
+                stage_index: Some(1),
+            },
+            ResumePoint::AgenticPhase {
+                iteration: 3,
+                stage_index: None,
+            },
+            ResumePoint::CompletionPhase { from_step: 0 },
+            ResumePoint::StageStart { from_stage: 2 },
+        ] {
+            assert_eq!(
+                fresh_run_clear_verdict(EXEC, &point, &checkpoints_must_not_be_read),
+                ClearVerdict::KeptNotAFreshStart,
+                "{:?}",
+                point
+            );
+        }
+    }
+
+    /// The mid-setup crash: checkpoints written, state row never persisted, so
+    /// Phase 1 resolves `FromStart`. Wiping here is exactly the
+    /// re-execute-and-re-bill defect.
+    #[test]
+    fn test_from_start_with_journalled_work_is_not_wiped() {
+        let cps = setup_checkpoint(EXEC);
+        assert_eq!(
+            fresh_run_clear_verdict(EXEC, &ResumePoint::FromStart, &|| cps.clone()),
+            ClearVerdict::KeptJournalNotEmpty
+        );
+    }
+
+    /// A composed-run child always resolves to `FromStart`: it never reads the
+    /// shared state row, and its own id has no checkpoint rows to read either.
+    /// Writes remap to `get_parent_task_id(..)` but reads and deletes do NOT,
+    /// so an unguarded wipe is a no-op today. What this pins is that the
+    /// verdict is reached from the ID SHAPE ALONE, before the journal is
+    /// consulted — so making the delete path symmetric with the write path
+    /// (the natural repair) cannot turn a child's fresh start into a wipe of
+    /// the parent's journal and every sibling's.
+    #[test]
+    fn test_composed_run_child_from_start_never_wipes_the_parent_journal() {
+        let parent = get_parent_task_id(CHILD);
+        assert_ne!(parent, CHILD, "CHILD must actually be a composed-run child");
+
+        // Sibling `workflow-1` already journalled work under the parent id.
+        let parent_journal = setup_checkpoint(&parent);
+        assert!(!parent_journal.is_empty());
+
+        // The child's own id has no rows at all, so an unguarded "is the
+        // journal empty?" test would answer YES and clear.
+        assert_eq!(
+            fresh_run_clear_verdict(
+                CHILD,
+                &ResumePoint::FromStart,
+                &checkpoints_must_not_be_read
+            ),
+            ClearVerdict::KeptComposedRunChild
+        );
+    }
+
+    #[test]
+    fn test_clear_verdict_reports_whether_it_deleted() {
+        assert!(ClearVerdict::Clear.cleared());
+        assert!(!ClearVerdict::KeptNotAFreshStart.cleared());
+        assert!(!ClearVerdict::KeptComposedRunChild.cleared());
+        assert!(!ClearVerdict::KeptJournalNotEmpty.cleared());
+        for v in [
+            ClearVerdict::Clear,
+            ClearVerdict::KeptNotAFreshStart,
+            ClearVerdict::KeptComposedRunChild,
+            ClearVerdict::KeptJournalNotEmpty,
+        ] {
+            assert!(!v.reason().is_empty());
+        }
     }
 }
