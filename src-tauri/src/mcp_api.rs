@@ -6913,6 +6913,16 @@ pub fn create_router(
     #[cfg(any(debug_assertions, feature = "test-fixtures"))]
     let base_router = base_router.merge(crate::mcp::test_fixtures::routes());
 
+    // Debug-only UI-thread wedge affordance
+    // (`POST/GET /__debug/wedge-ui-thread`). The runtime gates for the close
+    // path, the native-hang detection rung and the honest `/health` all need a
+    // genuinely blocked tao thread, and every non-deliberate way to produce
+    // one is a bug. The cfg gate matches the `mcp::debug_wedge` module
+    // declaration in `mcp/mod.rs`, so a release build contains neither the
+    // route nor the handler. Same shape as the relay's forced-panic switch.
+    #[cfg(debug_assertions)]
+    let base_router = base_router.merge(crate::mcp::debug_wedge::routes());
+
     // Canonical JSON 404 for unmatched routes. axum's default fallback returns
     // an empty body with no Content-Type, which both breaks the canonical
     // envelope contract and trips the debug envelope_audit layer (it sees a

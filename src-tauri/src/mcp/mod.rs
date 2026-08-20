@@ -54,6 +54,10 @@ pub mod contexts;
 pub mod continuation_verdict;
 pub mod coordinator;
 pub mod debug_builder_prompt;
+/// Debug-only UI-thread wedge affordance. Absent from release builds — see the
+/// module docs for why the gate is load-bearing.
+#[cfg(debug_assertions)]
+pub mod debug_wedge;
 pub mod decision_trail_api;
 pub mod development_intelligence;
 pub mod device_jwt_refresher;
