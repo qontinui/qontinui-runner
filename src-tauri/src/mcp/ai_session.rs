@@ -2840,3 +2840,507 @@ mod tests {
         );
     }
 }
+
+// ============================================================================
+// Emergency quit — a close path that survives a hung native event loop
+// ============================================================================
+
+/// The runner's one in-process door out that does not route through the tao
+/// event loop.
+///
+/// Plan `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 3 step 2.
+///
+/// # The problem this solves
+///
+/// Before this, a wedged runner had exactly two doors and both were wrong.
+/// `POST /ui-bridge/control/page/close-request` enqueued `WindowMessage::Close`
+/// onto the blocked loop and answered `200 {"success": true}`; `POST
+/// /restart-runner` (`super::restart_runner`) did a bare
+/// `std::process::exit(0)` with **no teardown at all**, losing in-flight AI
+/// turns, leaking terminal and agent process trees, and skipping every
+/// next-boot marker. An end user of a shipped desktop app has neither a
+/// PowerShell prompt nor a reason to know a PID exists.
+///
+/// # `app_handle.exit(0)` is NOT the terminator here
+///
+/// `AppHandle::exit` (`tauri-2.11.1/src/app.rs:573-580`) calls
+/// `runtime_handle.request_exit`, whose wry implementation
+/// (`tauri-runtime-wry-2.11.2/src/lib.rs:2751-2757`) is *structurally
+/// identical to `close`*: a bare `proxy.send_event(Message::RequestExit(code))`
+/// that deliberately bypasses `send_user_message`, carrying upstream's own NOTE
+/// saying so. Its internal `std::process::exit` escape hatch fires only when
+/// `send_event` returns `Err` — i.e. when the loop is already **dead**, never
+/// when it is merely **wedged**, which is precisely the case this module
+/// exists for. So `std::process::exit(0)` after the teardown is the *expected*
+/// terminator, not a fallback for an edge case. `exit(0)` is still attempted
+/// first, with a short deadline, so a healthy loop gets the clean path.
+///
+/// # Consent — design decision 3
+///
+/// Force-exit is permitted **only** downstream of an explicit user/operator
+/// close action. [`request_force_close`] is called from exactly one place:
+/// `POST /ui-bridge/control/page/force-close`. No detector calls it, and the
+/// native-hang rung in `health_monitor` deliberately detects and surfaces
+/// without ever exiting — a user who clicked X consented to losing the window,
+/// nobody consented to losing 102 live agent sessions because a background
+/// probe timed out.
+///
+/// # Relationship to `main.rs`'s Phase 2 shutdown worker
+///
+/// [`run_teardown`] is the sequence, in `main.rs`'s order, on `main.rs`'s
+/// budget (`crate::shutdown_budget`), using only steps that are safe off the
+/// UI thread. It is written here rather than in `main.rs` because it must be
+/// callable from an HTTP handler when the event loop will never deliver
+/// `CloseRequested` at all. `main.rs`'s `WindowEvent::CloseRequested` worker
+/// body is the same sequence and **should call this function** — see the
+/// integration note on [`run_teardown`].
+pub mod emergency_quit {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use tracing::{error, info, warn};
+
+    use crate::commands::AppState;
+    use crate::shutdown_budget;
+
+    /// One force-close per process. A second `POST` while teardown is running
+    /// must not start a competing sequence — two threads racing through
+    /// `TerminalManager::close_all` and the `taskkill` loop would double the
+    /// work and halve the budget for no benefit.
+    static FORCE_CLOSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    /// The absolute ceiling on how long a force-close can take before the
+    /// process terminates regardless. Deliberately the SAME constant the
+    /// X-button path arms (`main.rs`), so there is one number rather than a
+    /// second clock with its own assumptions.
+    pub fn force_close_budget() -> Duration {
+        shutdown_budget::FORCE_EXIT_BUDGET
+    }
+
+    /// Accept an explicit force-close and run it in the background.
+    ///
+    /// Returns `true` if this call started the teardown, `false` if one was
+    /// already running (the caller is told so; it is not an error).
+    ///
+    /// Returns immediately — the HTTP response must reach the operator before
+    /// the process dies, which is why nothing here blocks and why the
+    /// terminator lives on a spawned thread rather than in the handler.
+    pub fn request_force_close(
+        app_handle: tauri::AppHandle,
+        app_state: Arc<AppState>,
+        reason: String,
+    ) -> bool {
+        if FORCE_CLOSE_REQUESTED.swap(true, Ordering::SeqCst) {
+            warn!("Force-close already in progress — ignoring duplicate request: {reason}");
+            return false;
+        }
+
+        warn!(
+            "FORCE-CLOSE accepted ({reason}) — running the off-loop teardown, hard budget {}s",
+            force_close_budget().as_secs()
+        );
+
+        // ── Arm the absolute watchdog FIRST ──
+        //
+        // Same reasoning as `main.rs` Phase 2 step 2: a deadline armed after
+        // the slow part bounds nothing. This thread does no work, holds no
+        // lock, and cannot be blocked by anything the teardown does, so it is
+        // the one guarantee that an operator who asked to close gets a closed
+        // process — even if the teardown thread itself wedges on a poisoned
+        // mutex or a `.output()` that never returns.
+        let hard_deadline = force_close_budget();
+        std::thread::spawn(move || {
+            std::thread::sleep(hard_deadline);
+            warn!(
+                "Force-close watchdog: teardown did not finish within {}s — exiting process",
+                hard_deadline.as_secs()
+            );
+            // `process::exit` runs no destructors and no `RunEvent::Exit`, so
+            // the AI-output writer's queued tail is drained here or lost.
+            crate::commands::logging::flush_ai_output_log();
+            std::process::exit(0);
+        });
+
+        // ── The teardown itself, on a plain OS thread ──
+        //
+        // `std::thread::spawn`, not `spawn_blocking`: this must not depend on
+        // the tokio runtime's health, and it matches the primitive the
+        // X-button path deliberately chose (see `main.rs` — moving to a tokio
+        // thread would start firing `Handle::try_current()`-guarded coord
+        // claim releases that are skipped today, i.e. a silent behaviour
+        // change smuggled in behind a threading fix).
+        std::thread::spawn(move || {
+            let budget = shutdown_budget::Budget::start(shutdown_budget::WORKER_BUDGET);
+            run_teardown(&app_handle, &app_state, &budget);
+
+            info!(
+                "Force-close teardown finished in {}ms — requesting Tauri app exit",
+                budget.elapsed().as_millis()
+            );
+            // Attempt the clean path. This is an ENQUEUE onto the same loop
+            // that may well be the reason we are here, so it is tried, not
+            // relied on.
+            app_handle.exit(0);
+
+            std::thread::sleep(shutdown_budget::FORCE_EXIT_MARGIN);
+            warn!(
+                "Tauri did not terminate within {}s of the force-close teardown finishing \
+                 (expected when the event loop is wedged) — exiting process",
+                shutdown_budget::FORCE_EXIT_MARGIN.as_secs()
+            );
+            crate::commands::logging::flush_ai_output_log();
+            std::process::exit(0);
+        });
+
+        true
+    }
+
+    /// The bounded, UI-thread-independent teardown sequence.
+    ///
+    /// **Order is `main.rs`'s order and must stay that way.** Letting the exit
+    /// race ahead of WIP-ref capture silently loses stashed work, which is the
+    /// one outcome worse than a window that will not close.
+    ///
+    /// Every step draws its slice from the single [`shutdown_budget::Budget`]
+    /// passed in, so no step can borrow from a later one and the sum can never
+    /// exceed what the watchdog was armed with.
+    ///
+    /// # What is deliberately NOT here
+    ///
+    /// The three steps `main.rs` keeps on the UI thread —
+    /// `commands::terminal_windows::mark_app_quitting`, `capture_open_geometry`
+    /// and `window.hide()`. `capture_open_geometry`'s per-window queries are
+    /// safe *only* on the main thread, where `send_user_message` short-circuits
+    /// to a direct inline Win32 call; from any other thread the same getters
+    /// become `rx.recv()` with no timeout and would park this teardown forever
+    /// (trap 3 of the plan). During a wedge there is no thread that can run
+    /// them, so pop-out geometry for that one session is lost — a strictly
+    /// better outcome than a runner that cannot be closed, and strictly better
+    /// than `taskkill`, which loses it too *and* skips everything below.
+    ///
+    /// # Integration note — this should be `main.rs`'s worker body too
+    ///
+    /// `main.rs`'s `WindowEvent::CloseRequested` worker performs this same
+    /// sequence inline. It cannot call this function until its body is
+    /// extracted, which is a `main.rs` edit outside this change's scope; once
+    /// it is, the worker collapses to
+    /// `run_teardown(&worker_app_handle, &worker_app_state, &budget)` and there
+    /// is exactly one copy of the shutdown ordering in the tree.
+    pub fn run_teardown(
+        app_handle: &tauri::AppHandle,
+        app_state: &Arc<AppState>,
+        budget: &shutdown_budget::Budget,
+    ) {
+        use tauri::Manager;
+
+        // Clear the active-instance session file. This is a plain
+        // `remove_file` with no event-loop dependency, and it is the reason a
+        // `taskkill`ed runner comes back with "instances I didn't ask for":
+        // `instance_manager::save_active_instances` persists the running set on
+        // every launch/stop, and boot reads it back through
+        // `load_and_clear_active_instances` and relaunches every id. Skipping
+        // this step is what makes an unclean exit look like a restore request.
+        crate::instance_manager::clear_active_instances();
+
+        // Deregister from the `runner_instances` registry. Its own thread with
+        // its own mini-runtime, exactly as on the X-button path: it is a
+        // network round-trip and must never become part of the sequential
+        // teardown's critical path.
+        spawn_instance_deregistration(app_state);
+
+        // Bridges, ADB forwards/reverses, and the Python extraction executor,
+        // under the budget's join slice. Anything still running past the
+        // deadline is reaped by the process exit.
+        let cleanup_state = app_state.clone();
+        let cleanup = std::thread::spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => {
+                    rt.block_on(async {
+                        let manager_guard = cleanup_state.bridge_manager.lock().await;
+                        if let Some(ref manager) = *manager_guard {
+                            info!("Force-close: stopping all bridges");
+                            manager.remove_all().await;
+                        }
+                    });
+                    rt.block_on(async {
+                        if let Some(usb) = cleanup_state.usb_transport.get() {
+                            info!("Force-close: releasing ADB forwards and reverses");
+                            usb.release_all().await;
+                        }
+                    });
+                }
+                Err(e) => error!("Force-close: failed to create cleanup runtime: {e}"),
+            }
+            if let Ok(mut guard) = cleanup_state.extraction_executor.lock() {
+                if let Some(mut ee) = guard.take() {
+                    info!("Force-close: stopping extraction executor");
+                    let _ = ee.stop();
+                }
+            }
+        });
+        let join_deadline = budget.sub_deadline(shutdown_budget::SHUTDOWN_JOIN_BUDGET);
+        while !cleanup.is_finished() && Instant::now() < join_deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !cleanup.is_finished() {
+            warn!(
+                "Force-close: bridge/ADB/extractor cleanup exceeded its {}s slice — continuing",
+                shutdown_budget::SHUTDOWN_JOIN_BUDGET.as_secs()
+            );
+        }
+
+        // Graceful drain: flush in-flight AI turns to the output log, stash
+        // dirty worktrees to `refs/wip/*`, heartbeat coord claims. Idempotent —
+        // returns instantly with `already_drained` if the supervisor already
+        // hit `POST /drain`.
+        let drain_timeout = std::cmp::min(
+            crate::drain::configured_timeout(),
+            budget.slice(shutdown_budget::EXIT_DRAIN_BUDGET),
+        );
+        let summary = crate::drain::drain(app_handle, drain_timeout);
+        info!(
+            "Force-close drain: drained={} wip_refs={} claims={} timed_out={} elapsed_ms={} \
+             already_drained={}",
+            summary.drained_sessions,
+            summary.wip_refs_written,
+            summary.claims_persisted,
+            summary.timed_out,
+            summary.elapsed_ms,
+            summary.already_drained
+        );
+
+        // A force-close is a PLANNED exit, not a crash: stamp the marker so the
+        // next boot classifies the restart as quiet, and retract the port
+        // advertisement so the runner stops advertising a port it is releasing.
+        // Both idempotent with `drain()`'s own stamping.
+        let marker_path = crate::session::shutdown_marker::marker_path();
+        crate::session::shutdown_marker::mark_clean_shutdown(&marker_path);
+        qontinui_runner_lib::runner_breadcrumb::remove_published();
+
+        // Cancel in-flight CI-node builds so their executors can attempt a
+        // best-effort `cancelled` POST.
+        crate::ci_node::shutdown_all();
+
+        // Close interactive Claude sessions (µs each; does not kill children —
+        // the PID loop below does that).
+        if let Some(sm) = app_handle.try_state::<Arc<crate::claude_session::SessionManager>>() {
+            sm.close_all_sessions();
+        }
+
+        // Embedded terminal sessions, under a global cap. Per terminal this is
+        // `taskkill /F /T` plus two 2s joins plus a recursive `remove_dir_all`.
+        if let Some(tm) = app_handle.try_state::<Arc<crate::terminal::TerminalManager>>() {
+            tm.close_all(budget.sub_deadline(shutdown_budget::TERMINAL_CLOSE_BUDGET));
+        }
+
+        kill_orphaned_ai_processes(app_state, budget);
+
+        // The four cleanups that need the app's own runtime. Fire-and-forget
+        // with a bounded grace: each is a courtesy stop, and none of them owns
+        // state that survives the process.
+        spawn_async_service_stops(app_state);
+        std::thread::sleep(budget.slice(shutdown_budget::ASYNC_CLEANUP_GRACE));
+    }
+
+    /// Remove (secondary) or mark stopped (primary) this runner's row in the
+    /// `runner_instances` registry, on its own thread.
+    fn spawn_instance_deregistration(app_state: &Arc<AppState>) {
+        let pg = app_state.pg_db.clone();
+        let own_port = app_state.api_port.load(Ordering::Relaxed);
+        let is_secondary = crate::instance::is_secondary();
+        let primary_port = crate::instance::primary_port();
+        let id = format!(
+            "{}-{}",
+            if is_secondary { "ext" } else { "primary" },
+            own_port
+        );
+
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async {
+                if is_secondary {
+                    let _ = pg.remove_runner_instance(&id).await;
+                    let _ = pg.cleanup_dead_runner_instances(0).await;
+                    info!("Force-close: deregistered secondary instance (port={own_port})");
+                    if let Some(pp) = primary_port {
+                        if let Ok(client) = reqwest::Client::builder()
+                            .timeout(Duration::from_secs(2))
+                            .build()
+                        {
+                            // coord-auth-exempt(not-coord): 127.0.0.1 loopback
+                            // to the PRIMARY runner instance's own API, telling
+                            // it this secondary is stopping. Same box, no coord.
+                            let url = format!("http://127.0.0.1:{pp}/instances/{id}/stop");
+                            let _ = client.post(&url).send().await;
+                        }
+                    }
+                } else {
+                    // Primary: mark stopped rather than delete — secondaries
+                    // query the row to detect that the primary is gone.
+                    let _ = pg
+                        .update_runner_instance_heartbeat(&id, Some(0), "stopped")
+                        .await;
+                    info!("Force-close: marked primary instance as stopped in DB");
+                }
+            });
+        });
+    }
+
+    /// Kill the agent process trees tracked by the AI PID tracker.
+    ///
+    /// These have no other reaper: a `claude` CLI tree orphaned here OUTLIVES
+    /// the runner, which is the concrete harm `POST /restart-runner`'s bare
+    /// `process::exit` does today.
+    fn kill_orphaned_ai_processes(app_state: &Arc<AppState>, budget: &shutdown_budget::Budget) {
+        let pids_to_kill: Vec<u32> = {
+            // Poison-recovering: a panicked writer elsewhere must not silently
+            // turn "kill the orphans" into a no-op.
+            let mut pids = app_state
+                .ai_pid_tracker
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let copy = pids.clone();
+            pids.clear();
+            copy
+        };
+        if pids_to_kill.is_empty() {
+            return;
+        }
+        info!(
+            "Force-close: killing {} orphaned AI process(es): {:?}",
+            pids_to_kill.len(),
+            pids_to_kill
+        );
+        let kill_deadline = budget.sub_deadline(shutdown_budget::AI_KILL_BUDGET);
+        for pid in &pids_to_kill {
+            if Instant::now() >= kill_deadline {
+                warn!(
+                    "Force-close: AI-process kill loop hit its {}s cap — leaving the remaining \
+                     PIDs to process exit",
+                    shutdown_budget::AI_KILL_BUDGET.as_secs()
+                );
+                break;
+            }
+            // `/T` is CORRECT here and must stay: it kills a CHILD AGENT'S OWN
+            // process tree (the `claude` CLI and whatever it spawned), which is
+            // the semantics of quitting the app. Categorically different from
+            // `/T` on the RUNNER's own PID, which would take every live Claude
+            // Code session on the box down with it and is forbidden.
+            let mut cmd = crate::process_helpers::no_window("taskkill");
+            cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+            let per_kill = std::cmp::max(
+                std::cmp::min(
+                    shutdown_budget::TASKKILL_TIMEOUT,
+                    kill_deadline.saturating_duration_since(Instant::now()),
+                ),
+                // Floored: skipping a kill leaks a process tree that outlives
+                // the runner.
+                shutdown_budget::TASKKILL_FLOOR,
+            );
+            match crate::drain::output_with_timeout(cmd, per_kill) {
+                Ok(Some(output)) => {
+                    if output.status.success() {
+                        info!("Force-close: killed AI process tree for PID {pid}");
+                    } else {
+                        info!("Force-close: AI process PID {pid} already exited");
+                    }
+                }
+                Ok(None) => warn!(
+                    "Force-close: taskkill for PID {pid} exceeded its {per_kill:?} timeout — \
+                     abandoned"
+                ),
+                Err(e) => error!("Force-close: failed to taskkill PID {pid}: {e}"),
+            }
+        }
+    }
+
+    /// Managed processes, error monitor, Doctor, trigger service.
+    fn spawn_async_service_stops(app_state: &Arc<AppState>) {
+        let pcm = app_state.clone();
+        tauri::async_runtime::spawn(async move {
+            let manager_lock = pcm.process_capture_manager.lock().await;
+            if let Some(ref manager) = *manager_lock {
+                info!("Force-close: stopping all managed processes");
+                manager.stop_all().await;
+            }
+        });
+
+        let em = app_state.clone();
+        tauri::async_runtime::spawn(async move {
+            let handle_lock = em.error_monitor_handle.lock().await;
+            if let Some(ref handle) = *handle_lock {
+                info!("Force-close: stopping error monitor service");
+                if let Err(e) = handle.stop().await {
+                    error!("Force-close: failed to stop error monitor service: {e}");
+                }
+            }
+        });
+
+        let doc = app_state.clone();
+        tauri::async_runtime::spawn(async move {
+            let handle_lock = doc.doctor_handle.lock().await;
+            if let Some(ref handle) = *handle_lock {
+                info!("Force-close: stopping Doctor service");
+                if let Err(e) = handle.shutdown().await {
+                    error!("Force-close: failed to stop Doctor service: {e}");
+                }
+            }
+        });
+
+        tauri::async_runtime::spawn(async move {
+            crate::trigger_system::stop_trigger_service().await;
+        });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The force-close latch is single-shot. A second `POST` while a
+        /// teardown is running must be told "already in progress" rather than
+        /// starting a competing sequence — two threads racing through
+        /// `TerminalManager::close_all` and the `taskkill` loop would halve the
+        /// budget for the same work.
+        ///
+        /// Exercised through the latch directly rather than through
+        /// [`request_force_close`], which by design ends in
+        /// `std::process::exit`.
+        #[test]
+        fn force_close_latch_is_single_shot() {
+            let previous = FORCE_CLOSE_REQUESTED.swap(false, Ordering::SeqCst);
+            assert!(
+                !FORCE_CLOSE_REQUESTED.swap(true, Ordering::SeqCst),
+                "the first request must win the latch"
+            );
+            assert!(
+                FORCE_CLOSE_REQUESTED.swap(true, Ordering::SeqCst),
+                "a second request must observe the latch already taken"
+            );
+            FORCE_CLOSE_REQUESTED.store(previous, Ordering::SeqCst);
+        }
+
+        /// The force-close ceiling is the SAME number the X-button path arms.
+        /// Two doors out of one process with two different ideas of how long
+        /// teardown may take is exactly the four-uncoordinated-clocks defect
+        /// Phase 2 removed; this test fails the moment someone reintroduces it.
+        #[test]
+        fn force_close_uses_the_one_shutdown_budget() {
+            assert_eq!(force_close_budget(), shutdown_budget::FORCE_EXIT_BUDGET);
+            assert_eq!(
+                force_close_budget(),
+                shutdown_budget::WORKER_BUDGET + shutdown_budget::FORCE_EXIT_MARGIN,
+                "the hard deadline must be the worker budget plus exactly one margin — the \
+                 same arithmetic the close handler's watchdog uses"
+            );
+        }
+    }
+}

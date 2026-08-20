@@ -200,6 +200,21 @@ pub enum UiBridgeErrorCode {
     ConcurrencyLimitReached,
     FrontendUnresponsive,
     FrontendNotReady,
+    /// The **native** event loop has stopped pumping messages, so anything
+    /// that must be *dispatched* to it — `window.close()`, `AppHandle::exit`,
+    /// every window getter, `eval` from off-thread — silently queues instead
+    /// of running.
+    ///
+    /// Deliberately distinct from [`Self::FrontendNotReady`] and
+    /// [`Self::FrontendUnresponsive`], and the distinction is the whole point
+    /// of the variant: in this failure the frontend is typically **fine**
+    /// (WebView2 services `fetch` out-of-process, so the UI Bridge pong keeps
+    /// arriving) and it is the Win32 host loop that is wedged. A caller that
+    /// cannot tell the two apart retries a readiness wait that will never
+    /// succeed. Produced by the close door in `page.rs` off
+    /// `health_monitor::ui_thread_pumping`; see plan
+    /// `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 3.
+    EventLoopUnresponsive,
     WindowNotFound,
     // Element targeting errors
     ElementNotFound,
@@ -564,6 +579,12 @@ pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
         UiBridgeErrorCode::ConcurrencyLimitReached => RecoveryHint::RetryAfterMs(500),
         UiBridgeErrorCode::FrontendUnresponsive => RecoveryHint::WaitForRecovery,
         UiBridgeErrorCode::FrontendNotReady => RecoveryHint::RetryAfterMs(2000),
+        // NOT `RetryAfterMs`: a wedged native loop does not clear on a fixed
+        // backoff, and every retry re-enqueues onto the same blocked queue.
+        // The loop *can* recover (a long synchronous handler eventually
+        // returns), so it is not `Unrecoverable` either — the caller should
+        // wait for the wedge to clear, or take the explicit force-close door.
+        UiBridgeErrorCode::EventLoopUnresponsive => RecoveryHint::WaitForRecovery,
         UiBridgeErrorCode::WindowNotFound => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::ElementNotFound => RecoveryHint::Resnapshot,
         UiBridgeErrorCode::ElementNotVisible => RecoveryHint::ScrollIntoView,

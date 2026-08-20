@@ -507,32 +507,268 @@ pub async fn ui_bridge_page_hard_refresh_handler(
     }
 }
 
+// ============================================================================
+// Native event-loop liveness gate for the close doors
+// ============================================================================
+//
+// Plan `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 3.
+//
+// `window.close()` is NOT a call — it is an enqueue.
+// `tauri-runtime-wry-2.11.2/src/lib.rs:2270-2277` deliberately bypasses
+// `send_user_message` and does a bare
+// `proxy.send_event(Message::Window(id, WindowMessage::Close))`, carrying
+// upstream's own NOTE saying so. Onto a wedged loop that queues exactly like
+// `WM_CLOSE`: nothing happens, and this route used to answer
+// `200 {"success": true, "message": "Close requested; …handler should now
+// fire"}` — a claim it had no way to check and, during the 2026-08-19
+// incident, an actively false one.
+//
+// So the door asks first, using the ONE probe that does not share fate with
+// the thing it measures: `health_monitor::ui_thread_pumping()`
+// (`SendMessageTimeoutW(WM_NULL, SMTO_ABORTIFHUNG)`), plus the latched
+// `ui_thread_wedged()` verdict the monitor already maintains.
+
+/// What the liveness gate concluded about the native event loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventLoopVerdict {
+    /// A `WM_NULL` round-trip completed inside the probe's timeout.
+    Pumping,
+    /// Confirmed not pumping. `reason` discriminates how we know.
+    Wedged(&'static str),
+    /// Could not ask. **Treated as a refusal on Windows** — see
+    /// [`event_loop_verdict`].
+    Unknown(&'static str),
+}
+
+impl EventLoopVerdict {
+    /// The refusal body, or `None` when the door may proceed.
+    ///
+    /// # UNKNOWN is a refusal on Windows, and a pass everywhere else
+    ///
+    /// This asymmetry is deliberate and is the crux of the step.
+    ///
+    /// On **Windows**, UNKNOWN means the probe exists, the window exists, and
+    /// the probe still could not establish that the loop is pumping (no
+    /// resolvable `HWND`, or a handle the OS rejects). Answering `200` there
+    /// is precisely the defect this step removes: the route would once again
+    /// be claiming a success it cannot verify. `503` with
+    /// `context.confirmed: false` says the honest thing instead — *refused,
+    /// not observed* — and keeps the two cases distinguishable on the wire, so
+    /// a caller is never told a maybe is a yes.
+    ///
+    /// On **non-Windows**, UNKNOWN means something different: there is no
+    /// probe at all. `SendMessageTimeoutW` asks a Win32 question and
+    /// `ui_thread_pumping()` is a `None`-returning stub off Windows, so a
+    /// blanket refusal would break this route on every macOS and Linux build
+    /// for a condition it cannot even be in the same way — those platforms run
+    /// the webview on the same main thread, so a blocked loop stops the HTTP
+    /// pong too and the shipped 90 s `ui_stale` arm does cover it. Absence of
+    /// a detector is not evidence of a hang, so the pre-existing behaviour is
+    /// preserved there verbatim.
+    fn refusal(self) -> Option<(bool, &'static str)> {
+        match self {
+            EventLoopVerdict::Pumping => None,
+            EventLoopVerdict::Wedged(reason) => Some((true, reason)),
+            EventLoopVerdict::Unknown(reason) => {
+                #[cfg(windows)]
+                {
+                    Some((false, reason))
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = reason;
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Ask whether the native event loop is pumping, without blocking a tokio
+/// worker for the probe's timeout.
+///
+/// Order matters. The latched `ui_thread_wedged()` flag is a free atomic read
+/// maintained by the health monitor's own OS thread across
+/// `WEDGE_FAILURE_THRESHOLD` consecutive samples, so it is both cheaper and
+/// *better evidence* than a single fresh sample — it has already survived the
+/// noise floor. Only when it is clear do we pay for a live probe, and that
+/// probe (`SendMessageTimeoutW`, up to 3 s) goes to `spawn_blocking`: it is a
+/// synchronous Win32 round-trip and must not park an async worker.
+async fn event_loop_verdict() -> EventLoopVerdict {
+    if crate::health_monitor::ui_thread_wedged() {
+        return EventLoopVerdict::Wedged("wedge_detector_latched");
+    }
+
+    match tokio::task::spawn_blocking(crate::health_monitor::ui_thread_pumping).await {
+        Ok(Some(sample)) if sample.pumping => EventLoopVerdict::Pumping,
+        Ok(Some(_)) => EventLoopVerdict::Wedged("probe_no_round_trip"),
+        Ok(None) => EventLoopVerdict::Unknown("probe_unavailable"),
+        Err(e) => {
+            warn!("Event-loop liveness probe task failed: {e}");
+            EventLoopVerdict::Unknown("probe_task_failed")
+        }
+    }
+}
+
 /// Simulate a user clicking the window's X button.
+///
+/// Returns `503 EVENT_LOOP_UNRESPONSIVE` instead of a fabricated `200` when
+/// the native event loop is not pumping — see [`EventLoopVerdict`] for the
+/// mechanism and for why UNKNOWN also refuses on Windows. The refusal body
+/// names `POST /ui-bridge/control/page/force-close`, which is the door that
+/// still works in that state.
 pub async fn ui_bridge_page_close_request_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     use tauri::Manager;
     info!("UI Bridge API: Close request (simulating X-button click)");
 
-    if let Some(window) = state
+    let Some(window) = state
         .app_handle
         .get_webview_window(qontinui_runner_lib::get_main_window_label())
-    {
-        window.close().map_err(|e| {
-            let msg = format!("Failed to close main window: {}", e);
-            error!("{}", msg);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg)))
-        })?;
-        Ok(Json(ApiResponse::success(serde_json::json!({
-            "success": true,
-            "message": "Close requested; Tauri WindowEvent::CloseRequested handler should now fire"
-        }))))
-    } else {
-        Err((
+    else {
+        // Checked BEFORE the liveness gate on purpose: with no main window
+        // there is nothing to close and nothing to probe, and this route has
+        // always answered 500 for it. A headless/server-mode runner must keep
+        // getting that answer rather than a misleading "the loop is wedged".
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error("Main webview window not found".to_string())),
-        ))
+        ));
+    };
+
+    if let Some((confirmed, reason)) = event_loop_verdict().await.refusal() {
+        warn!(
+            reason,
+            confirmed, "Refusing close-request: the native event loop is not pumping"
+        );
+        let detail = UiBridgeError::event_loop_unresponsive(reason, confirmed);
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(api_error_detailed(detail.message.clone(), detail)),
+        ));
     }
+
+    window.close().map_err(|e| {
+        let msg = format!("Failed to close main window: {}", e);
+        error!("{}", msg);
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg)))
+    })?;
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "success": true,
+        "message": "Close requested; Tauri WindowEvent::CloseRequested handler should now fire"
+    }))))
+}
+
+/// Request body for `POST /ui-bridge/control/page/force-close`.
+///
+/// Parsed leniently (see [`ui_bridge_page_force_close_handler`]) rather than
+/// through the `UiBridgeJson` envelope extractor the rest of this family uses:
+/// a door whose entire purpose is to work when the runner is wedged must not
+/// be defeated by a missing `Content-Type` header on an operator's bare
+/// `curl -XPOST`. There is exactly one optional field, so the shape-error
+/// hints the envelope would add have nothing to say.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceCloseRequest {
+    /// Free-text audit line recording *who asked and why*. Optional — the
+    /// route name is itself explicit — but it is logged and echoed back, and
+    /// callers should set it.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Parse a force-close body without ever failing the request.
+///
+/// An empty body, a body with no `Content-Type`, or malformed JSON all degrade
+/// to the default (no stated reason) instead of a 4xx. Rejecting the one door
+/// that works during a wedge because the operator forgot a header would
+/// reintroduce, in a new place, exactly the "no way out of the process" defect
+/// this route exists to close.
+fn parse_force_close_body(body: &str) -> ForceCloseRequest {
+    if body.trim().is_empty() {
+        return ForceCloseRequest::default();
+    }
+    match serde_json::from_str::<ForceCloseRequest>(body) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            warn!("Force-close body was not valid JSON ({e}) — proceeding with no stated reason");
+            ForceCloseRequest::default()
+        }
+    }
+}
+
+/// Shut the runner down along a path that does not need the event loop.
+///
+/// # This is the only door out of a wedged process that is not a `taskkill`
+///
+/// Everything else routes through the blocked loop.
+/// [`ui_bridge_page_close_request_handler`] enqueues `WindowMessage::Close`;
+/// `AppHandle::exit(0)` (`tauri-2.11.1/src/app.rs:573-580` → `request_exit`,
+/// `tauri-runtime-wry-2.11.2/src/lib.rs:2751-2757`) is *structurally
+/// identical* — a bare `proxy.send_event(Message::RequestExit(code))` that
+/// also bypasses `send_user_message`. Its internal `std::process::exit` escape
+/// hatch fires only when `send_event` returns `Err`, i.e. when the loop is
+/// already **dead**, never when it is merely **wedged**. So on this door
+/// `std::process::exit(0)` after the teardown is the *expected* terminator,
+/// not an edge case — `main.rs`'s own force-exit watchdog documents having
+/// learned the same thing.
+///
+/// # Bound to an explicit close action — design decision 3
+///
+/// Force-exit is permitted **only** downstream of an explicit user/operator
+/// close request. Nothing in this tree force-exits on bare hang detection: the
+/// health monitor detects and surfaces, and stops there. A user who asked to
+/// close has consented to losing the window; nobody consents to losing every
+/// in-flight agent session because a background probe timed out (102 live
+/// `claude.exe` children in the incident that prompted this). This handler is
+/// reachable only by an explicit `POST` to a route whose name says what it
+/// does, and is called by no detector.
+///
+/// Unlike `POST /restart-runner` — the only pre-existing HTTP-reachable
+/// `process::exit`, which skips teardown entirely — this runs the bounded
+/// teardown sequence first, so WIP is stashed, terminals and orphaned agent
+/// process trees are killed, the clean-shutdown marker is stamped and
+/// `active_instances.json` is cleared.
+pub async fn ui_bridge_page_force_close_handler(
+    State(state): State<Arc<ApiState>>,
+    body: String,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let request = parse_force_close_body(&body);
+    let reason = request
+        .reason
+        .unwrap_or_else(|| "operator force-close via /ui-bridge/control/page/force-close".into());
+
+    // Report the loop's state alongside the acknowledgement. The door does not
+    // *depend* on the verdict — an operator who asked to close is entitled to
+    // close a healthy runner too — but it is the one moment we can cheaply
+    // record whether this was a wedge or a routine quit.
+    let verdict = event_loop_verdict().await;
+
+    let accepted = crate::mcp::ai_session::emergency_quit::request_force_close(
+        state.app_handle.clone(),
+        state.app_state.clone(),
+        reason.clone(),
+    );
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "success": true,
+        "accepted": accepted,
+        "reason": reason,
+        "eventLoop": match verdict {
+            EventLoopVerdict::Pumping => "pumping",
+            EventLoopVerdict::Wedged(_) => "wedged",
+            EventLoopVerdict::Unknown(_) => "unknown",
+        },
+        "budgetSecs":
+            crate::mcp::ai_session::emergency_quit::force_close_budget().as_secs(),
+        "message": if accepted {
+            "Force-close accepted; teardown is running off the event loop and the process \
+             will exit within its budget"
+        } else {
+            "Force-close already in progress; the existing teardown owns the exit"
+        },
+    }))))
 }
 
 /// Same-origin absolute URL → the app-relative path the frontend can act on.
@@ -1866,6 +2102,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(ui_bridge_page_close_request_handler),
         )
         .route(
+            "/ui-bridge/control/page/force-close",
+            post(ui_bridge_page_force_close_handler),
+        )
+        .route(
             "/ui-bridge/control/page/navigate",
             post(ui_bridge_page_navigate_handler),
         )
@@ -2476,6 +2716,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/page/refresh"),
         ("POST", "/ui-bridge/control/page/hard-refresh"),
         ("POST", "/ui-bridge/control/page/close-request"),
+        ("POST", "/ui-bridge/control/page/force-close"),
         ("POST", "/ui-bridge/control/page/navigate"),
         ("POST", "/ui-bridge/control/page/navigate-to"),
         ("GET", "/ui-bridge/control/page/routes"),
@@ -2884,5 +3125,82 @@ mod page_evaluate_tagging_tests {
             Some(&serde_json::json!(7))
         );
         assert_eq!(store.pending_len().await, 0);
+    }
+}
+
+#[cfg(test)]
+mod close_door_tests {
+    //! The close doors' liveness policy and the force-close body parser.
+    //!
+    //! Plan `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 3.
+    //! These cover the *decisions*, not the Win32 probe itself — a real
+    //! `SendMessageTimeoutW` round-trip needs a window and a message loop, so
+    //! it belongs to the temp-runner gate, not a unit test.
+
+    use super::{parse_force_close_body, EventLoopVerdict};
+
+    /// A pumping loop must not be refused. This is the arm that keeps the
+    /// pre-existing behaviour intact for every healthy runner — the change is
+    /// meant to remove a false success, not add a false failure.
+    #[test]
+    fn a_pumping_loop_is_never_refused() {
+        assert_eq!(EventLoopVerdict::Pumping.refusal(), None);
+    }
+
+    /// A confirmed wedge refuses, and says it is confirmed. Both discriminators
+    /// the health monitor can produce are covered: the latched multi-sample
+    /// verdict and a single failed round-trip.
+    #[test]
+    fn a_confirmed_wedge_refuses_as_confirmed() {
+        assert_eq!(
+            EventLoopVerdict::Wedged("wedge_detector_latched").refusal(),
+            Some((true, "wedge_detector_latched"))
+        );
+        assert_eq!(
+            EventLoopVerdict::Wedged("probe_no_round_trip").refusal(),
+            Some((true, "probe_no_round_trip"))
+        );
+    }
+
+    /// **UNKNOWN refuses on Windows.** This is the decision the whole step
+    /// turns on: the route previously answered `200 {"success": true}` for a
+    /// close it had no way to verify, and during the 2026-08-19 incident that
+    /// answer was false. An unverifiable close is reported as a refusal with
+    /// `confirmed: false` — never as a success.
+    #[cfg(windows)]
+    #[test]
+    fn unknown_refuses_on_windows_but_does_not_claim_an_observation() {
+        assert_eq!(
+            EventLoopVerdict::Unknown("probe_unavailable").refusal(),
+            Some((false, "probe_unavailable")),
+            "UNKNOWN must refuse, and must flag itself unconfirmed"
+        );
+    }
+
+    /// **UNKNOWN passes off Windows**, and the asymmetry is not an oversight.
+    /// `SendMessageTimeoutW` asks a Win32 question; `ui_thread_pumping()` is a
+    /// `None`-returning stub elsewhere. Refusing on that `None` would break
+    /// this route on every macOS/Linux build for a condition those platforms
+    /// detect by another route entirely (the webview shares the main thread
+    /// there, so a blocked loop stops the HTTP pong and the shipped 90s
+    /// `ui_stale` arm fires). Absence of a detector is not evidence of a hang.
+    #[cfg(not(windows))]
+    #[test]
+    fn unknown_passes_off_windows_where_no_probe_exists() {
+        assert_eq!(EventLoopVerdict::Unknown("probe_unavailable").refusal(), None);
+    }
+
+    /// The force-close body parser never fails the request. An operator whose
+    /// runner is wedged must not be turned away over a missing header.
+    #[test]
+    fn force_close_body_parsing_never_rejects() {
+        assert_eq!(parse_force_close_body("").reason, None);
+        assert_eq!(parse_force_close_body("   ").reason, None);
+        assert_eq!(parse_force_close_body("not json at all").reason, None);
+        assert_eq!(parse_force_close_body("{}").reason, None);
+        assert_eq!(
+            parse_force_close_body(r#"{"reason":"X button did nothing"}"#).reason,
+            Some("X button did nothing".to_string())
+        );
     }
 }
