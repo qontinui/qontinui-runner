@@ -49,7 +49,7 @@ const WEDGE_REESCALATION_EVERY: u32 = 60;
 /// what "slow" means. It must stay strictly below the sample interval, or the
 /// probe would stretch the cadence of the loop it rides on; a unit test pins
 /// that ordering.
-const UI_THREAD_PROBE_TIMEOUT_MS: u32 = 3_000;
+pub const UI_THREAD_PROBE_TIMEOUT_MS: u32 = 3_000;
 
 /// Flag to control the health monitor
 static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -310,6 +310,10 @@ pub struct UiThreadSample {
 }
 
 /// Warn once, not every 5s, when the probe cannot ask the question.
+///
+/// `cfg(windows)` because its only reader is [`ui_thread_pumping`]'s Windows
+/// arm; without the gate it is `dead_code` on every other platform.
+#[cfg(windows)]
 static UI_THREAD_PROBE_DEFECT_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Blocking native message-loop probe.
@@ -464,6 +468,12 @@ struct WedgeDetector {
     kind: WedgeKind,
     consecutive_failures: u32,
     escalated: bool,
+    /// When the CURRENT failure streak started, for the reported duration.
+    ///
+    /// Set by [`Self::observe`], never by the pure [`Self::step`] — so every
+    /// threshold test stays clock-free while the number a human reads is
+    /// measured rather than inferred. See [`reported_unresponsive_secs`].
+    first_failure_at: Option<std::time::Instant>,
 }
 
 /// What the caller should do about this observation.
@@ -477,6 +487,16 @@ enum WedgeAction {
     ReEscalate { consecutive_failures: u32 },
     /// Recovered after having escalated.
     Recovered { was_failing_for: u32 },
+    /// The probe went UNKNOWN while this rung was latched, so the latch is
+    /// released for want of evidence — **not** because recovery was observed.
+    ///
+    /// Without this the latch is a one-way door: `observe()` is only reached
+    /// with a real sample, so a rung that escalates and then loses its probe
+    /// (a destroyed window, a handle the OS rejects) can never see the
+    /// `Recovered` arm again. `derived_status` would stay pinned `errored` and
+    /// `close-request` would answer 503 for the rest of the process's life,
+    /// including long after the loop came back.
+    LatchReleasedUnknown { was_failing_for: u32 },
 }
 
 impl WedgeDetector {
@@ -545,22 +565,58 @@ impl WedgeDetector {
         }
     }
 
-    /// Fold in an observation, **publish the watchdog-visible state**, and
-    /// only then perform the escalation side effects.
+    /// Fold in an UNKNOWN observation — "the probe could not ask".
     ///
-    /// The ordering is the Item 4 fix and it is load-bearing. Iteration 14
-    /// stored `BACKEND_WEDGED` inside the escalation arm and left
-    /// `MONITOR_CONSECUTIVE_FAILURES` / `MONITOR_HEARTBEAT_MS` to the caller,
-    /// *after* this function returned — i.e. after `error!` had already handed
-    /// the record to the tracing subscriber. One blocked writer and the thread
-    /// stops here having published nothing, which is why an 11-minute outage
-    /// showed `consecutive /livez failures 0` and never named `backend-wedged`.
-    ///
-    /// Atomics are stores to plain memory: they cannot block, so they go
-    /// first. Then the on-disk breadcrumb. Tracing last, because it is the
-    /// only step that shares fate with the subsystem being reported.
+    /// UNKNOWN is NOT a failure (it must never accumulate toward an
+    /// escalation) and it is NOT a success (nothing was observed, so it must
+    /// not be reported as recovery). What it must do is release a latch it can
+    /// no longer justify: see [`WedgeAction::LatchReleasedUnknown`].
+    fn step_unknown(&mut self) -> WedgeAction {
+        let was = self.consecutive_failures;
+        self.consecutive_failures = 0;
+        if !self.escalated {
+            return WedgeAction::None;
+        }
+        self.escalated = false;
+        WedgeAction::LatchReleasedUnknown {
+            was_failing_for: was,
+        }
+    }
+
+    /// Fold in an observation and perform the escalation side effects.
     fn observe(&mut self, alive: bool) {
+        // Stamp the START of the streak, before `step` mutates the counter.
+        // The reported duration is then measured wall-clock, not
+        // `failures × interval` — see [`reported_unresponsive_secs`].
+        if !alive && self.consecutive_failures == 0 {
+            self.first_failure_at = Some(std::time::Instant::now());
+        }
+        let streak_started = self.first_failure_at;
         let action = self.step(alive);
+        if alive {
+            self.first_failure_at = None;
+        }
+        self.dispatch(action, streak_started);
+    }
+
+    /// Fold in an UNKNOWN observation and perform its side effects.
+    fn observe_unknown(&mut self) {
+        let streak_started = self.first_failure_at;
+        let action = self.step_unknown();
+        self.first_failure_at = None;
+        self.dispatch(action, streak_started);
+    }
+
+    /// The side effects for one [`WedgeAction`].
+    ///
+    /// **Publishes the watchdog-visible state first**, for every action and
+    /// both entry points. Atomics are stores to plain memory: they cannot
+    /// block, so they go first. Then the on-disk breadcrumb. Tracing last,
+    /// because it is the only step that shares fate with the subsystem being
+    /// reported — an 11-minute outage showed `consecutive /livez failures 0`
+    /// and never named `backend-wedged` precisely because the publish sat
+    /// behind an `error!` whose subscriber was parked.
+    fn dispatch(&mut self, action: WedgeAction, streak_started: Option<std::time::Instant>) {
         self.publish();
         match action {
             WedgeAction::None => {}
@@ -570,7 +626,7 @@ impl WedgeDetector {
             | WedgeAction::ReEscalate {
                 consecutive_failures,
             } => {
-                let secs = consecutive_failures as u64 * SELF_PROBE_INTERVAL_SECS;
+                let secs = reported_unresponsive_secs(streak_started, consecutive_failures);
                 // Breadcrumb FIRST, log second. `error!` goes through the
                 // tracing subscriber — a writer, a bounded channel, a file
                 // mutex — none of which is guaranteed to be schedulable in the
@@ -618,7 +674,7 @@ impl WedgeDetector {
                 }
             }
             WedgeAction::Recovered { was_failing_for } => {
-                let secs = was_failing_for as u64 * SELF_PROBE_INTERVAL_SECS;
+                let secs = reported_unresponsive_secs(streak_started, was_failing_for);
                 match self.kind {
                     WedgeKind::Backend => {
                         BACKEND_WEDGED.store(false, Ordering::SeqCst);
@@ -639,7 +695,52 @@ impl WedgeDetector {
                     }
                 }
             }
+            WedgeAction::LatchReleasedUnknown { was_failing_for } => {
+                let secs = reported_unresponsive_secs(streak_started, was_failing_for);
+                match self.kind {
+                    WedgeKind::Backend => BACKEND_WEDGED.store(false, Ordering::SeqCst),
+                    WedgeKind::UiThread => {
+                        UI_THREAD_WEDGED.store(false, Ordering::SeqCst);
+                        crate::webview_recovery::clear_native_ui_thread_hang();
+                    }
+                }
+                // Deliberately NOT phrased as a recovery, and deliberately no
+                // breadcrumb: nothing was observed. The latch is released
+                // because the evidence for it expired, which is a different
+                // fact from "the loop is pumping again".
+                warn!(
+                    was_failing_for_secs = secs,
+                    kind = ?self.kind,
+                    "Wedge latch released after {secs}s of failures: the probe can no longer \
+                     be asked (UNKNOWN). NOT an observed recovery — the surfaces that read \
+                     the latch now report UNKNOWN instead of a wedge nobody is still watching."
+                );
+            }
         }
+    }
+}
+
+/// How long to report a rung as having been unresponsive.
+///
+/// Prefers the MEASURED wall-clock span since the first failure of the streak.
+/// The old arithmetic — `consecutive_failures × SELF_PROBE_INTERVAL_SECS` —
+/// silently under-reports, because the real inter-sample gap is the sleep PLUS
+/// whatever the probes cost: on the UI-thread rung a hung loop can add up to
+/// `UI_THREAD_PROBE_TIMEOUT_MS` per sample, so the runtime gate measured
+/// ~17.2s for a wedge this formula called 15s (worst case 24s). That figure is
+/// written into `wedge-incidents.log` and into a user-visible notification, so
+/// it is read by a human trying to reconstruct an outage.
+///
+/// The estimate stays as the fallback for the one case with no stamp (a
+/// detector driven directly, e.g. by a test), where it is explicitly a LOWER
+/// BOUND.
+fn reported_unresponsive_secs(
+    streak_started: Option<std::time::Instant>,
+    consecutive_failures: u32,
+) -> u64 {
+    match streak_started {
+        Some(t) => t.elapsed().as_secs(),
+        None => consecutive_failures as u64 * SELF_PROBE_INTERVAL_SECS,
     }
 }
 
@@ -1170,19 +1271,28 @@ pub fn start_health_monitor() {
             // blocked subscriber can no longer erase the evidence.
             wedge.observe(prober.probe());
 
-            // UNKNOWN (no cached HWND yet, non-Windows, a rejected handle)
-            // is skipped rather than folded in as a failure: it must not
-            // accumulate toward an escalation.
-            if let Some(sample) = ui_thread_pumping() {
-                if !sample.pumping {
-                    debug!(
-                        os_reports_hung = ?sample.os_reports_hung,
-                        last_error = sample.last_error,
-                        "UI-thread probe: no WM_NULL round-trip within \
-                         {UI_THREAD_PROBE_TIMEOUT_MS}ms"
-                    );
+            // UNKNOWN (no cached HWND yet, non-Windows, a rejected
+            // handle) never accumulates toward an escalation — but it is
+            // not simply skipped either. `observe_unknown` releases an
+            // already-latched wedge, because a latch is only honest while
+            // something is still observing it: the raw skip this replaces
+            // made the latch a ONE-WAY door, pinning `derived_status` at
+            // `errored` and `close-request` at 503 for the rest of the
+            // process's life if the probe went permanently UNKNOWN after
+            // escalating.
+            match ui_thread_pumping() {
+                Some(sample) => {
+                    if !sample.pumping {
+                        debug!(
+                            os_reports_hung = ?sample.os_reports_hung,
+                            last_error = sample.last_error,
+                            "UI-thread probe: no WM_NULL round-trip within \
+                             {UI_THREAD_PROBE_TIMEOUT_MS}ms"
+                        );
+                    }
+                    ui_wedge.observe(sample.pumping);
                 }
-                ui_wedge.observe(sample.pumping);
+                None => ui_wedge.observe_unknown(),
             }
         }
         info!("Health monitor livez probe stopped");
@@ -1214,11 +1324,23 @@ pub fn start_health_monitor() {
     });
 }
 
-/// Stop the health monitoring background task
+/// Stop the health monitoring background task.
+///
+/// **Clears the wedge latches too, and that is not tidiness.** The atoms are
+/// read by surfaces that outlive the monitor: `ui_error::native_ui_probe_verdict`
+/// (→ every `derived_status` sink) and `mcp/ui_bridge/page.rs`'s
+/// `event_loop_verdict` (→ the `close-request` 503). Leaving `UI_THREAD_WEDGED`
+/// set with no thread left to ever clear it means those surfaces keep asserting
+/// a wedge that nobody is observing any more — permanently, since only the
+/// monitor's `Recovered` arm clears it. A stopped monitor knows nothing; the
+/// honest state is UNKNOWN, which is what a cleared atom plus the
+/// `is_running()` guard produces.
 pub fn stop_health_monitor() {
     info!("Stopping health monitor");
     MONITOR_RUNNING.store(false, Ordering::SeqCst);
     WATCHDOG_STOP.store(true, Ordering::SeqCst);
+    BACKEND_WEDGED.store(false, Ordering::SeqCst);
+    UI_THREAD_WEDGED.store(false, Ordering::SeqCst);
 }
 
 /// Check if the health monitor is running
@@ -1715,15 +1837,136 @@ mod tests {
     }
 
     #[test]
-    fn ui_thread_probe_timeout_stays_under_the_sample_interval() {
-        // The probe rides the 5s loop. A timeout at or above the interval
-        // would stretch the cadence of the loop it is measured against — and
-        // silently degrade the backend rung's clock along with it.
+    fn the_probes_cannot_dominate_the_sample_cadence() {
+        // The predecessor of this test asserted only `3000 < 5000` while its
+        // comment claimed the probe "does not stretch the cadence of the loop
+        // it rides on". Those are different statements, and the second is the
+        // one that matters: the loop's real inter-sample gap is the sleep PLUS
+        // both probes, so a timeout under the interval bounds nothing on its
+        // own. Assert the property the comment claims.
         assert!(
             (UI_THREAD_PROBE_TIMEOUT_MS as u64) < SELF_PROBE_INTERVAL_SECS * 1_000,
             "ui-thread probe timeout {UI_THREAD_PROBE_TIMEOUT_MS}ms is not under the \
              {SELF_PROBE_INTERVAL_SECS}s sample interval"
         );
+
+        // Worst case per iteration: sleep + a /livez probe that burns its full
+        // timeout + a UI probe that burns its full timeout.
+        let worst_case_gap_ms = SELF_PROBE_INTERVAL_SECS * 1_000
+            + SELF_PROBE_TIMEOUT_SECS * 1_000
+            + UI_THREAD_PROBE_TIMEOUT_MS as u64;
+        assert!(
+            worst_case_gap_ms <= 3 * SELF_PROBE_INTERVAL_SECS * 1_000,
+            "the worst-case inter-sample gap is {worst_case_gap_ms}ms — over 3x the nominal \
+             {SELF_PROBE_INTERVAL_SECS}s cadence, so the clock behind every reported \
+             duration has drifted from the constant that names it"
+        );
+    }
+
+    #[test]
+    fn a_reported_duration_prefers_the_measured_elapsed_over_the_estimate() {
+        // FINDING 8. `consecutive_failures x SELF_PROBE_INTERVAL_SECS` is a
+        // LOWER BOUND, not the duration: the gap between samples is the sleep
+        // plus up to `UI_THREAD_PROBE_TIMEOUT_MS`, which is how the runtime
+        // gate measured ~17.2s for a wedge the formula called 15s. The number
+        // reaches `wedge-incidents.log` and a user-visible notification, so it
+        // must be the measured span whenever one exists.
+        let estimate = WEDGE_FAILURE_THRESHOLD as u64 * SELF_PROBE_INTERVAL_SECS;
+        assert_eq!(
+            reported_unresponsive_secs(None, WEDGE_FAILURE_THRESHOLD),
+            estimate,
+            "with no stamp the estimate is all there is"
+        );
+
+        // A streak that demonstrably started longer ago than the estimate must
+        // report the longer, true figure.
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(estimate + 7))
+            .expect("Instant arithmetic");
+        let measured = reported_unresponsive_secs(Some(long_ago), WEDGE_FAILURE_THRESHOLD);
+        assert!(
+            measured >= estimate + 7,
+            "reported {measured}s must be the measured span, not the {estimate}s estimate"
+        );
+    }
+
+    #[test]
+    fn an_unknown_probe_releases_a_latched_wedge_but_is_not_a_recovery() {
+        // FINDING 6(a). `observe()` runs only for a REAL sample, so before
+        // `step_unknown` a rung that escalated and then lost its probe could
+        // never reach the `Recovered` arm again: `derived_status` stayed
+        // pinned `errored` and `close-request` answered 503 for the rest of
+        // the process's life, even after the loop came back.
+        let mut d = WedgeDetector::new(WedgeKind::UiThread);
+        for _ in 0..WEDGE_FAILURE_THRESHOLD {
+            d.step(false);
+        }
+        assert!(d.escalated, "precondition: the rung is latched");
+
+        let action = d.step_unknown();
+        assert_eq!(
+            action,
+            WedgeAction::LatchReleasedUnknown {
+                was_failing_for: WEDGE_FAILURE_THRESHOLD
+            },
+            "an UNKNOWN sample must release the latch for want of evidence"
+        );
+        assert!(!d.escalated, "the latch must be gone");
+        assert_eq!(d.consecutive_failures, 0);
+
+        // …and it is DISTINCT from a recovery, which is a positive
+        // observation. Collapsing the two would report an outage as having
+        // ended when nothing was seen at all.
+        assert_ne!(
+            action,
+            WedgeAction::Recovered {
+                was_failing_for: WEDGE_FAILURE_THRESHOLD
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_never_escalates_and_never_manufactures_a_release() {
+        // The other half of the contract: UNKNOWN must not accumulate toward
+        // an escalation (that is how a non-Windows build, UNKNOWN forever,
+        // would otherwise declare a permanent hang), and on a rung that never
+        // latched it must be silent.
+        let mut d = WedgeDetector::new(WedgeKind::UiThread);
+        for _ in 0..(WEDGE_FAILURE_THRESHOLD * 10) {
+            assert_eq!(d.step_unknown(), WedgeAction::None);
+        }
+        assert!(!d.escalated);
+
+        // Sub-threshold failures followed by UNKNOWN: the streak is dropped,
+        // silently, because nothing was ever escalated.
+        for _ in 0..(WEDGE_FAILURE_THRESHOLD - 1) {
+            d.step(false);
+        }
+        assert_eq!(d.step_unknown(), WedgeAction::None);
+        assert_eq!(d.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn stopping_the_monitor_clears_the_wedge_latches() {
+        // FINDING 6(b). `stop_health_monitor` cleared `MONITOR_RUNNING` and
+        // left the atoms set, so `event_loop_verdict()` answered
+        // `Wedged("wedge_detector_latched")` off a DEAD monitor — refusing
+        // every close forever — while `/health`, which additionally checks
+        // `is_running()`, correctly reported UNKNOWN. Two readers, two
+        // answers, one atom.
+        let was_running = is_running();
+        BACKEND_WEDGED.store(true, Ordering::SeqCst);
+        UI_THREAD_WEDGED.store(true, Ordering::SeqCst);
+        assert!(backend_wedged() && ui_thread_wedged(), "precondition");
+
+        stop_health_monitor();
+
+        assert!(
+            !ui_thread_wedged(),
+            "a stopped monitor must not keep asserting a UI-thread wedge nobody is watching"
+        );
+        assert!(!backend_wedged(), "same for the backend rung");
+        MONITOR_RUNNING.store(was_running, Ordering::SeqCst);
     }
 
     #[test]

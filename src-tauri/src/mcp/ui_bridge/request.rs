@@ -445,7 +445,7 @@ pub(super) async fn gather_ui_error_signals(
         has_ui_error: ui_error.is_some(),
         has_recent_crash: recent_crash.is_some(),
         ui_dead: Some(ui_dead),
-        native_ui_wedged: Some(native_ui.wedged),
+        native_ui_wedged: native_ui.wedged,
         embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
         ..Default::default()
     });

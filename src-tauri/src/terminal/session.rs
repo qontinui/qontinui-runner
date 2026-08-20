@@ -3280,17 +3280,39 @@ impl TerminalSession {
             }
         }
 
-        // Drop the writer to signal EOF on stdin
-        if let Ok(mut writer) = self.writer.lock() {
-            drop(writer.flush());
+        // Drop the writer to signal EOF on stdin.
+        //
+        // BOUNDED + poison-recovering (Phase 2 step 5). `self.writer.lock()`
+        // was unbounded and sits INSIDE the deadline: a writer lock held by a
+        // thread blocked on a full PTY parks this worker past its slice, and
+        // `TerminalManager::close_all` only checks the clock BETWEEN sessions,
+        // so it cannot see that happen. The bare `if let Ok(..)` was also a
+        // silent skip on poison. Both are now explicit outcomes.
+        let lock_budget = lock_acquire_budget(deadline);
+        match crate::safe_lock::lock_with_deadline(&self.writer, "terminal writer", lock_budget) {
+            Some(mut writer) => drop(writer.flush()),
+            None => warn!(
+                terminal_id = %self.id,
+                "Could not acquire the writer lock within the shutdown budget — skipping \
+                 the stdin EOF flush (the PTY child is already killed)"
+            ),
         }
 
         // Drop the master PTY handle — this closes the OS pipe and unblocks the
-        // reader thread which may be stuck in a blocking read() call.
-        if let Ok(mut master) = self.master.lock() {
-            // Replace with a placeholder so the Drop actually runs now.
-            // MasterPty is trait-object-boxed, so we swap it out.
-            let _dropped = std::mem::replace(&mut *master, create_noop_master());
+        // reader thread which may be stuck in a blocking read() call. Bounded
+        // for the same reason as the writer above.
+        match crate::safe_lock::lock_with_deadline(&self.master, "terminal master pty", lock_budget)
+        {
+            Some(mut master) => {
+                // Replace with a placeholder so the Drop actually runs now.
+                // MasterPty is trait-object-boxed, so we swap it out.
+                let _dropped = std::mem::replace(&mut *master, create_noop_master());
+            }
+            None => warn!(
+                terminal_id = %self.id,
+                "Could not acquire the master-PTY lock within the shutdown budget — the \
+                 handle will be released by process exit"
+            ),
         }
 
         // Join threads with a timeout so we never hang the UI. Under a
@@ -3388,6 +3410,38 @@ const TASKKILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// a process tree that outlives the runner.
 const KILL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Cap on each bounded lock acquisition inside
+/// [`TerminalSession::close_with_deadline`] **when a shutdown deadline is in
+/// force**.
+///
+/// Both locks are uncontended in the overwhelmingly common case, so this is a
+/// ceiling on the pathological case (a holder blocked on a full PTY), not a
+/// cost paid normally. Well under `JOIN_TIMEOUT`: failing to flush stdin or to
+/// swap the master handle costs nothing after the process exits, whereas
+/// waiting on it costs the whole shutdown budget.
+const LOCK_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The same cap for the **interactive** single-pane close (`deadline: None`).
+///
+/// Deliberately far more generous. There is no competing work and no budget to
+/// protect there, so the shutdown ceiling would be a behaviour cliff: a
+/// contended writer lock would silently skip the stdin EOF flush on a path
+/// that previously always did it. This is still a ceiling rather than the
+/// unbounded `lock()` it replaces — a user closing one pane must not be able
+/// to hang the caller — just one sized for "wait for a slow holder", not for
+/// "the process is about to exit anyway".
+const INTERACTIVE_LOCK_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long [`TerminalSession::close_with_deadline`] may spend acquiring one of
+/// its two internal locks. See the two constants above for why the interactive
+/// path gets a different number.
+fn lock_acquire_budget(deadline: Option<std::time::Instant>) -> std::time::Duration {
+    match deadline {
+        Some(_) => clamp_to_deadline(LOCK_ACQUIRE_TIMEOUT, deadline),
+        None => INTERACTIVE_LOCK_ACQUIRE_TIMEOUT,
+    }
+}
+
 /// `min(default, time left before `deadline`)`, or just `default` when there is
 /// no deadline. Saturates at zero, never wraps.
 fn clamp_to_deadline(
@@ -3410,6 +3464,21 @@ fn join_with_timeout(
     terminal_id: &str,
     timeout: std::time::Duration,
 ) {
+    // A zero budget means "the shutdown deadline is spent" — there is no time
+    // to wait, so spawning a helper thread whose only job is to be waited on
+    // for zero seconds is pure cost: two throwaway threads per terminal, at
+    // `O(terminals)`, on the squeezed path. Detach immediately instead. The
+    // PTY child is already dead by this point (the floored `taskkill` above
+    // always runs); what is skipped is only the join.
+    if timeout.is_zero() {
+        debug!(
+            terminal_id = %terminal_id,
+            thread = %name,
+            "Shutdown budget spent — detaching thread without joining"
+        );
+        return;
+    }
+
     let (tx, rx) = std::sync::mpsc::channel();
     let thread_name = name.to_string();
     let tid = terminal_id.to_string();
@@ -4977,6 +5046,36 @@ mod tests {
     /// the production [`tee_into_scrollback`] path into each session's own
     /// Arcs, then asserts isolation through the real
     /// [`TerminalSession::get_scrollback_buffer`].
+    /// Phase 2 step 5: the two internal locks in `close_with_deadline` are
+    /// BOUNDED, and the interactive path is not squeezed by the shutdown
+    /// ceiling.
+    ///
+    /// The shutdown path must never spend more than its slice waiting on a
+    /// lock (a writer held by a thread blocked on a full PTY parks the worker
+    /// past its budget, and `TerminalManager::close_all` only checks the clock
+    /// BETWEEN sessions, so it cannot see that happen). The interactive
+    /// single-pane close has no budget to protect and must not inherit that
+    /// cliff — skipping the stdin EOF flush there would be a regression.
+    #[test]
+    fn lock_acquire_budgets_differ_between_shutdown_and_interactive_close() {
+        // Interactive: generous, but still a ceiling rather than `lock()`.
+        assert_eq!(lock_acquire_budget(None), INTERACTIVE_LOCK_ACQUIRE_TIMEOUT);
+        assert!(INTERACTIVE_LOCK_ACQUIRE_TIMEOUT > LOCK_ACQUIRE_TIMEOUT);
+
+        // Shutdown, plenty of budget left: capped at the shutdown ceiling.
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(lock_acquire_budget(Some(far)), LOCK_ACQUIRE_TIMEOUT);
+
+        // Shutdown, budget spent: zero. `lock_with_deadline` still makes one
+        // `try_lock` attempt, so an uncontended lock is never skipped.
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert!(lock_acquire_budget(Some(past)).is_zero());
+
+        // The shutdown ceiling must stay well under the per-thread join, or
+        // two lock waits could consume a whole terminal's slice on their own.
+        assert!(LOCK_ACQUIRE_TIMEOUT * 2 < JOIN_TIMEOUT);
+    }
+
     #[test]
     fn scrollback_buffers_are_per_session_distinct() {
         const MARKER_A: &str = "QONTINUI_DISTINCT_MARKER_AAAAA";

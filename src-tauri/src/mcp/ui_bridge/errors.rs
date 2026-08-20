@@ -582,6 +582,11 @@ impl UiBridgeError {
                 "reason": reason,
                 "confirmed": confirmed,
                 "escapeHatch": "POST /ui-bridge/control/page/force-close",
+                // The escape hatch is CSRF-gated: it requires this header
+                // (any value), which forces a CORS preflight a drive-by
+                // cross-origin POST cannot satisfy. Named here so a caller
+                // reading the refusal has everything it needs to act on it.
+                "escapeHatchHeader": "X-Qontinui-Force-Close: 1",
             })),
         }
     }

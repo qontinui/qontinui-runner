@@ -1349,6 +1349,30 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     // Re-arm detection on the fresh webview — otherwise the first recovery
     // would be the last one this process could ever notice.
     attach_process_failed_handler(&win);
+
+    // ── Re-cache the main-window HWND ──
+    //
+    // `invalidate_main_hwnd()` above emptied the memo and NOTHING refilled it,
+    // so every probe for the rest of the process's life paid the `EnumWindows`
+    // sweep — the fallback, on the hot 5 s detector path, forever after any
+    // recovery. Refill it here, at the one site that knows a fresh window
+    // exists.
+    //
+    // Deliberately via `main_hwnd()`'s own sweep rather than `win.hwnd()`:
+    // this is NOT the UI thread (we are back on an async task after
+    // `spawn_blocking`), so `Window::hwnd()` here would be the unbounded
+    // event-loop getter — `getter!` → `rx.recv()` with no timeout — which is
+    // exactly what this whole module is not allowed to do off the main thread.
+    // The sweep reads only the window table (no `SendMessage`), memoizes what
+    // it finds, and simply reports `None` if the new window is not visible
+    // yet, in which case the next detector tick re-resolves.
+    match crate::ui_thread_probe::main_hwnd() {
+        Some(hwnd) => info!("UI recovery: re-cached main-window HWND {hwnd:#x} after recreate"),
+        None => warn!(
+            "UI recovery: could not re-resolve a main-window HWND after recreate — the \
+             native-liveness probe will retry on its next tick"
+        ),
+    }
     Ok(())
 }
 
@@ -1859,6 +1883,34 @@ mod tests {
             ExitVeto::VetoWindowAlive
         );
         assert!(decide_exit_veto(false, false, true).is_veto());
+    }
+
+    /// FINDING 2, stated as the arithmetic that caused it.
+    ///
+    /// `emergency_quit::request_force_close` neither closes nor hides the main
+    /// window, so at `RunEvent::ExitRequested` the window is alive. Without
+    /// quit-intent that is `VetoWindowAlive` and `api.prevent_exit()` — so
+    /// `app_handle.exit(0)` was refused on EVERY force-close, healthy runners
+    /// included, `embedded_pg::stop_on_exit()` never ran, and the hard exit one
+    /// `FORCE_EXIT_MARGIN` later orphaned a `postgres` holding the data dir and
+    /// port. The fix is upstream of this function — force-close now calls
+    /// `mark_app_quitting()` — and this pins why that call is load-bearing
+    /// rather than tidy.
+    #[test]
+    fn force_close_without_the_quitting_flag_would_be_vetoed() {
+        // The shape of a force-close BEFORE the fix: no quit intent, no swap,
+        // main window still on screen.
+        assert_eq!(
+            decide_exit_veto(false, false, true),
+            ExitVeto::VetoWindowAlive,
+            "this is the veto that orphaned PostgreSQL on every force-close"
+        );
+        // …and with the flag the force-close path now sets first.
+        assert_eq!(
+            decide_exit_veto(true, false, true),
+            ExitVeto::AllowQuitRequested
+        );
+        assert!(!decide_exit_veto(true, false, true).is_veto());
     }
 
     #[test]

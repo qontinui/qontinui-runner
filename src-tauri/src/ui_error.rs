@@ -432,8 +432,21 @@ pub struct NativeUiLiveness {
     /// (boot, server mode, or a frontend that has never been pinged).
     pub event_pong_age_ms: Option<u64>,
     /// The verdict fed to [`compute_derived_status`] as its `native_ui_wedged`
-    /// input.
-    pub wedged: bool,
+    /// input — and a genuine THREE-state answer, not a boolean.
+    ///
+    /// `None` = UNKNOWN: nobody established anything. That is the state of a
+    /// non-Windows build (no `SendMessageTimeoutW` to ask with), of a Windows
+    /// runner before its main-window handle is cached, and of a runner whose
+    /// health monitor is not running — none of which is evidence that the loop
+    /// is fine. Collapsing it into `false` published `uiThread.wedged: false`
+    /// on `/health`, the heartbeat and the relay: a positive "not wedged"
+    /// assertion about a fact nobody checked.
+    ///
+    /// `Some(false)` is the stronger claim and is reserved for it: a round
+    /// trip actually came back. `compute_derived_status` treats the two alike
+    /// (both are non-`errored`), so this is about what the runner SAYS, not
+    /// about what it does — which is exactly the point.
+    pub wedged: Option<bool>,
     /// Stable machine-readable reason. `"pumping"` and `"unknown"` are the two
     /// non-wedged values; do not reword these, fleet consumers match on them.
     pub reason: &'static str,
@@ -473,12 +486,23 @@ pub fn classify_native_ui(i: NativeUiInputs) -> NativeUiLiveness {
         "unknown"
     };
 
+    let wedged = i.probe_wedged == Some(true) || i.window_getter_unresponsive || events_undelivered;
+
     NativeUiLiveness {
         probe_wedged: i.probe_wedged,
         window_getter_unresponsive: i.window_getter_unresponsive,
         events_undelivered,
         event_pong_age_ms: (i.last_event_pong > 0).then_some(i.event_pong_age_ms),
-        wedged: i.probe_wedged == Some(true) || i.window_getter_unresponsive || events_undelivered,
+        // UNKNOWN travels as UNKNOWN. `reason == "unknown"` is precisely the
+        // case where no rung answered: the Win32 probe could not be asked, the
+        // caller's own getter did not time out, and event-pong staleness is
+        // not evidence (either the renderer is gone or it has never ponged).
+        // Publishing `false` there would be a claim nobody made.
+        wedged: if reason == "unknown" {
+            None
+        } else {
+            Some(wedged)
+        },
         reason,
     }
 }
@@ -1450,7 +1474,11 @@ mod tests {
     #[test]
     fn native_ui_healthy_when_loop_pumps_and_both_pongs_are_fresh() {
         let v = classify_native_ui(native_inputs());
-        assert!(!v.wedged);
+        assert_eq!(
+            v.wedged,
+            Some(false),
+            "a round trip came back — this is the STRONG not-wedged claim, not UNKNOWN"
+        );
         assert!(!v.events_undelivered);
         assert_eq!(v.reason, "pumping");
         assert_eq!(v.event_pong_age_ms, Some(1_000));
@@ -1475,7 +1503,7 @@ mod tests {
             ..native_inputs()
         });
         assert!(v.events_undelivered, "renderer alive + events undelivered");
-        assert!(v.wedged);
+        assert_eq!(v.wedged, Some(true));
         assert_eq!(v.reason, "events_undelivered");
 
         // And the shipped pong predicate still reads the runner as fine —
@@ -1484,7 +1512,7 @@ mod tests {
         assert_eq!(
             compute_derived_status(&HealthInputs {
                 ui_dead: Some(false),
-                native_ui_wedged: Some(v.wedged),
+                native_ui_wedged: v.wedged,
                 embedding_reachable: Some(true),
                 pg_reachable: Some(true),
                 ..Default::default()
@@ -1511,13 +1539,16 @@ mod tests {
             !v.events_undelivered,
             "the renderer is gone, so a missing event pong says nothing about the loop"
         );
-        assert!(!v.wedged);
+        assert_eq!(
+            v.wedged, None,
+            "nothing was established about the loop — UNKNOWN, not a not-wedged claim"
+        );
         assert_eq!(v.reason, "unknown");
         assert!(ui_stale(SOME_PONG, stale, UI_DEAD_AFTER_MS));
         assert_eq!(
             compute_derived_status(&HealthInputs {
                 ui_dead: Some(true),
-                native_ui_wedged: Some(v.wedged),
+                native_ui_wedged: v.wedged,
                 embedding_reachable: Some(true),
                 pg_reachable: Some(true),
                 ..Default::default()
@@ -1540,7 +1571,10 @@ mod tests {
                 event_pong_age_ms: age,
                 ..native_inputs()
             });
-            assert!(!v.wedged, "never-event-ponged must not read as wedged (age {age})");
+            assert_eq!(
+                v.wedged, None,
+                "never-event-ponged is UNKNOWN, never a not-wedged claim (age {age})"
+            );
             assert_eq!(v.event_pong_age_ms, None, "no stamp ⇒ no age (age {age})");
             assert_eq!(v.reason, "unknown");
         }
@@ -1554,7 +1588,7 @@ mod tests {
             event_pong_age_ms: UI_EVENT_DEAD_AFTER_MS + 1,
             ..native_inputs()
         });
-        assert!(v.wedged);
+        assert_eq!(v.wedged, Some(true));
         assert_eq!(
             v.reason, "native_probe_wedged",
             "the Win32 round-trip asks the loop itself; it wins the reason"
@@ -1571,12 +1605,12 @@ mod tests {
             window_getter_unresponsive: true,
             ..native_inputs()
         });
-        assert!(v.wedged);
+        assert_eq!(v.wedged, Some(true));
         assert_eq!(v.reason, "window_getter_unresponsive");
         assert_eq!(
             compute_derived_status(&HealthInputs {
                 ui_dead: Some(false),
-                native_ui_wedged: Some(v.wedged),
+                native_ui_wedged: v.wedged,
                 embedding_reachable: Some(true),
                 pg_reachable: Some(true),
                 ..Default::default()
@@ -1668,14 +1702,14 @@ mod tests {
             event_pong_age_ms: 25 * 60 * 1_000, // no ping delivered in 25 min
             ..native_inputs()
         });
-        assert!(native.wedged);
+        assert_eq!(native.wedged, Some(true));
         assert_eq!(
             compute_derived_status(&HealthInputs {
                 // ui_error: null — the React tree is fine
                 // recent_crash: null — nothing died
                 ui_dead: Some(ui_dead),
                 // false: the pong keeps arriving over HTTP
-                native_ui_wedged: Some(native.wedged),
+                native_ui_wedged: native.wedged,
                 // the only signal that can see this
                 embedding_reachable: Some(true),
                 pg_reachable: Some(true),
@@ -1684,6 +1718,65 @@ mod tests {
             "errored",
             "a runner whose window cannot be closed must not report healthy"
         );
+    }
+
+    /// FINDING 7 — UNKNOWN must not be published as `wedged: false`.
+    ///
+    /// `NativeUiLiveness.wedged` used to be a plain `bool`, so every UNKNOWN
+    /// state — non-Windows (no `SendMessageTimeoutW` to ask with), a Windows
+    /// runner before its main-window HWND is cached, a runner whose health
+    /// monitor is not running — was published on `/health`, on the heartbeat
+    /// and on the relay as `uiThread.wedged: false`: a positive "not wedged"
+    /// assertion about a fact nobody established.
+    ///
+    /// It is behaviourally a no-op (`compute_derived_status` treats `None` and
+    /// `Some(false)` alike, pinned just below), which is exactly why it needs
+    /// a test of its own — nothing else in the suite can fail if it regresses.
+    #[test]
+    fn unknown_native_liveness_is_published_as_unknown_not_as_not_wedged() {
+        // Every input UNKNOWN or silent: no probe verdict, no getter timeout,
+        // no event-pong evidence either way.
+        let v = classify_native_ui(NativeUiInputs {
+            probe_wedged: None,
+            window_getter_unresponsive: false,
+            last_pong: 0,
+            pong_age_ms: 0,
+            last_event_pong: 0,
+            event_pong_age_ms: 0,
+        });
+        assert_eq!(v.reason, "unknown", "precondition: nothing was established");
+        assert_eq!(
+            v.wedged, None,
+            "UNKNOWN must travel as UNKNOWN — `Some(false)` is a claim that a round trip \
+             came back, which is not what happened"
+        );
+
+        // The wire shape follows the type: `null`, not `false`.
+        let json = serde_json::json!({ "wedged": v.wedged });
+        assert!(
+            json["wedged"].is_null(),
+            "the published field must be null for UNKNOWN, got {}",
+            json["wedged"]
+        );
+
+        // `reason == "unknown"` is the exact discriminator, in both directions.
+        assert_eq!(classify_native_ui(native_inputs()).wedged, Some(false));
+        assert_eq!(classify_native_ui(native_inputs()).reason, "pumping");
+
+        // …and the behaviour is unchanged: this is a honesty fix, not a
+        // status change. UNKNOWN and not-wedged still both mean "not errored".
+        for w in [None, Some(false)] {
+            assert_eq!(
+                compute_derived_status(&HealthInputs {
+                    ui_dead: Some(false),
+                    native_ui_wedged: w,
+                    embedding_reachable: Some(true),
+                    pg_reachable: Some(true),
+                    ..Default::default()
+                }),
+                "healthy"
+            );
+        }
     }
 
     #[test]

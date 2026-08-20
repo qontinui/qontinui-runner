@@ -587,28 +587,65 @@ impl EventLoopVerdict {
 /// Ask whether the native event loop is pumping, without blocking a tokio
 /// worker for the probe's timeout.
 ///
-/// Order matters. The latched `ui_thread_wedged()` flag is a free atomic read
-/// maintained by the health monitor's own OS thread across
-/// `WEDGE_FAILURE_THRESHOLD` consecutive samples, so it is both cheaper and
-/// *better evidence* than a single fresh sample — it has already survived the
-/// noise floor. Only when it is clear do we pay for a live probe, and that
-/// probe (`SendMessageTimeoutW`, up to 3 s) goes to `spawn_blocking`: it is a
-/// synchronous Win32 round-trip and must not park an async worker.
+/// Order matters. The latched wedge verdict — read through
+/// `ui_error::native_ui_probe_verdict()`, the same guarded reader every
+/// `derived_status` sink uses — is a free atomic read maintained by the health
+/// monitor's own OS thread across `WEDGE_FAILURE_THRESHOLD` consecutive
+/// samples, so it is both cheaper and *better evidence* than a single fresh
+/// sample: it has already survived the noise floor. Only when it is clear do
+/// we pay for a live probe, and that probe (`SendMessageTimeoutW`, up to 3 s)
+/// goes to `spawn_blocking` under a ceiling: it is a synchronous Win32 round
+/// trip and must neither park an async worker nor await one without a bound.
 async fn event_loop_verdict() -> EventLoopVerdict {
-    if crate::health_monitor::ui_thread_wedged() {
+    // The SAME guarded read the `derived_status` sinks use
+    // (`ui_error::native_ui_probe_verdict`), not the raw atomic. Reading
+    // `health_monitor::ui_thread_wedged()` directly made this route disagree
+    // with `/health` in a way that is worse than either answer alone:
+    // `stop_health_monitor()` clears `MONITOR_RUNNING` without clearing the
+    // wedge atomics, so this door answered `Wedged("wedge_detector_latched")`
+    // off a DEAD monitor — refusing every close forever — while `/health`
+    // correctly reported UNKNOWN. One reader, one guard.
+    if crate::ui_error::native_ui_probe_verdict() == Some(true) {
         return EventLoopVerdict::Wedged("wedge_detector_latched");
     }
 
-    match tokio::task::spawn_blocking(crate::health_monitor::ui_thread_pumping).await {
-        Ok(Some(sample)) if sample.pumping => EventLoopVerdict::Pumping,
-        Ok(Some(_)) => EventLoopVerdict::Wedged("probe_no_round_trip"),
-        Ok(None) => EventLoopVerdict::Unknown("probe_unavailable"),
-        Err(e) => {
+    // BOUNDED. `ui_thread_pumping` is a blocking `SendMessageTimeoutW` capped
+    // at `UI_THREAD_PROBE_TIMEOUT_MS` (3 s), but "capped" is a property of the
+    // Win32 call, not of this `await`: a `spawn_blocking` join has no deadline
+    // of its own, so a future regression in the probe (or a saturated blocking
+    // pool that never starts the task) would park `close-request` with no
+    // ceiling at all — on the one route an operator reaches for when the
+    // window will not close. The ceiling sits just above the probe's own so a
+    // healthy-but-slow sample still lands.
+    let probe = tokio::task::spawn_blocking(crate::health_monitor::ui_thread_pumping);
+    match tokio::time::timeout(EVENT_LOOP_PROBE_CEILING, probe).await {
+        Ok(Ok(Some(sample))) if sample.pumping => EventLoopVerdict::Pumping,
+        Ok(Ok(Some(_))) => EventLoopVerdict::Wedged("probe_no_round_trip"),
+        Ok(Ok(None)) => EventLoopVerdict::Unknown("probe_unavailable"),
+        Ok(Err(e)) => {
             warn!("Event-loop liveness probe task failed: {e}");
             EventLoopVerdict::Unknown("probe_task_failed")
         }
+        Err(_elapsed) => {
+            // The probe is itself bounded, so overrunning this ceiling means
+            // the blocking pool never ran it (or the bound regressed). Either
+            // way we did not observe the loop — UNKNOWN, which on Windows is
+            // already a refusal.
+            warn!(
+                "Event-loop liveness probe did not return within {:?} — reporting UNKNOWN",
+                EVENT_LOOP_PROBE_CEILING
+            );
+            EventLoopVerdict::Unknown("probe_timed_out")
+        }
     }
 }
+
+/// Ceiling on the whole `spawn_blocking` round-trip in [`event_loop_verdict`].
+///
+/// One second of headroom over `health_monitor::UI_THREAD_PROBE_TIMEOUT_MS`
+/// (3 s), which is the probe's own internal bound; the margin covers pool
+/// scheduling, not a slower probe. A test pins the ordering.
+const EVENT_LOOP_PROBE_CEILING: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Simulate a user clicking the window's X button.
 ///
@@ -678,13 +715,51 @@ pub struct ForceCloseRequest {
     pub reason: Option<String>,
 }
 
+/// Mandatory header on `POST /ui-bridge/control/page/force-close`.
+///
+/// # Why a header, on this route specifically
+///
+/// The MCP API's CORS layer is `allow_origin(Any)` by deliberate design
+/// (`mcp_api.rs`: MCP clients, WSL, and the `tauri://localhost` webview all
+/// have to reach it, and the security boundary is the loopback bind). A
+/// **simple** cross-origin `POST` — no custom header, no JSON `Content-Type`,
+/// no body — is exempt from the CORS preflight entirely, so any page in the
+/// operator's browser could previously force-close the runner and, with it,
+/// `taskkill /F /T` every tracked agent tree. `close-request` and
+/// `/restart-runner` share that shape, so the class is not new; what is new is
+/// that force-close is the most *reliable* of the three and the only one that
+/// still works when the others refuse.
+///
+/// Requiring ANY custom header takes the request out of the simple-request set
+/// and forces an `OPTIONS` preflight, which a drive-by page cannot satisfy
+/// without the runner opting in. It costs a legitimate caller one flag:
+///
+/// ```text
+/// curl -X POST -H "X-Qontinui-Force-Close: 1" http://127.0.0.1:9876/ui-bridge/control/page/force-close
+/// ```
+///
+/// The body stays optional and lenient (see [`parse_force_close_body`]) — the
+/// header is the whole gate, so a wedged-runner rescue still needs nothing but
+/// `curl`.
+pub const FORCE_CLOSE_HEADER: &str = "x-qontinui-force-close";
+
+/// True when the mandatory [`FORCE_CLOSE_HEADER`] is present.
+///
+/// Presence is the entire test: the value is unconstrained on purpose, because
+/// it is the *preflight* that does the work, not the contents. Pure, so the
+/// contract can be asserted without an HTTP stack.
+fn force_close_header_present(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(FORCE_CLOSE_HEADER)
+}
+
 /// Parse a force-close body without ever failing the request.
 ///
 /// An empty body, a body with no `Content-Type`, or malformed JSON all degrade
 /// to the default (no stated reason) instead of a 4xx. Rejecting the one door
 /// that works during a wedge because the operator forgot a header would
 /// reintroduce, in a new place, exactly the "no way out of the process" defect
-/// this route exists to close.
+/// this route exists to close. (The one header that IS required is
+/// [`FORCE_CLOSE_HEADER`], and it is checked before the body is looked at.)
 fn parse_force_close_body(body: &str) -> ForceCloseRequest {
     if body.trim().is_empty() {
         return ForceCloseRequest::default();
@@ -730,10 +805,34 @@ fn parse_force_close_body(body: &str) -> ForceCloseRequest {
 /// teardown sequence first, so WIP is stashed, terminals and orphaned agent
 /// process trees are killed, the clean-shutdown marker is stamped and
 /// `active_instances.json` is cleared.
+///
+/// # Required header
+///
+/// Every call must carry [`FORCE_CLOSE_HEADER`] (`X-Qontinui-Force-Close`,
+/// any value). Without it the route answers `400` and does nothing — see that
+/// constant for why a header rather than an origin allowlist.
 pub async fn ui_bridge_page_force_close_handler(
     State(state): State<Arc<ApiState>>,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // CSRF gate — see `FORCE_CLOSE_HEADER`. Checked FIRST, before any state is
+    // touched, so a rejected request cannot have started a teardown.
+    if !force_close_header_present(&headers) {
+        warn!(
+            "Rejecting force-close: the mandatory {FORCE_CLOSE_HEADER} header is absent (a \
+             simple cross-origin POST cannot send it)"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "force-close requires the '{FORCE_CLOSE_HEADER}' header (any value); it forces \
+                 a CORS preflight that a drive-by cross-origin POST cannot satisfy. \
+                  e.g. curl -X POST -H '{FORCE_CLOSE_HEADER}: 1' <url>"
+            ))),
+        ));
+    }
+
     let request = parse_force_close_body(&body);
     let reason = request
         .reason
@@ -3137,7 +3236,10 @@ mod close_door_tests {
     //! `SendMessageTimeoutW` round-trip needs a window and a message loop, so
     //! it belongs to the temp-runner gate, not a unit test.
 
-    use super::{parse_force_close_body, EventLoopVerdict};
+    use super::{
+        force_close_header_present, parse_force_close_body, EventLoopVerdict,
+        EVENT_LOOP_PROBE_CEILING, FORCE_CLOSE_HEADER,
+    };
 
     /// A pumping loop must not be refused. This is the arm that keeps the
     /// pre-existing behaviour intact for every healthy runner — the change is
@@ -3190,8 +3292,153 @@ mod close_door_tests {
         assert_eq!(EventLoopVerdict::Unknown("probe_unavailable").refusal(), None);
     }
 
+    /// The `spawn_blocking` join in [`event_loop_verdict`] must have a ceiling
+    /// ABOVE the probe's own internal bound, or a healthy-but-slow sample is
+    /// reported as UNKNOWN (a refusal, on Windows) and the door stops working
+    /// for the case it was written for.
+    #[test]
+    fn the_event_loop_probe_ceiling_sits_above_the_probe_s_own_bound() {
+        let probe_bound = std::time::Duration::from_millis(
+            crate::health_monitor::UI_THREAD_PROBE_TIMEOUT_MS as u64,
+        );
+        assert!(
+            EVENT_LOOP_PROBE_CEILING > probe_bound,
+            "the async ceiling {EVENT_LOOP_PROBE_CEILING:?} must exceed the probe's own \
+             {probe_bound:?} bound, or every slow-but-successful probe reads as UNKNOWN"
+        );
+        // …and it must still be a CEILING. An unbounded join is what this
+        // replaces: `close-request` is the route an operator reaches for when
+        // the window will not close, and it must answer.
+        assert!(
+            EVENT_LOOP_PROBE_CEILING <= std::time::Duration::from_secs(10),
+            "close-request must answer promptly; {EVENT_LOOP_PROBE_CEILING:?} is not prompt"
+        );
+    }
+
+    /// FINDING 1(b) — the probe join is BOUNDED.
+    ///
+    /// `spawn_blocking(...).await` has no deadline of its own. The Win32 call
+    /// inside is capped, but that is a property of the probe, not of the
+    /// await: a saturated blocking pool (which finding 3 shows a wedge can
+    /// produce) means the task never starts and `close-request` parks with no
+    /// ceiling at all — on the one route that exists for a runner whose window
+    /// will not close.
+    ///
+    /// A SOURCE assertion because the failure needs a saturated tokio blocking
+    /// pool to reproduce.
+    #[test]
+    fn the_close_request_probe_join_is_wrapped_in_a_timeout() {
+        let src = include_str!("page.rs");
+        let start = src
+            .find("async fn event_loop_verdict()")
+            .expect("event_loop_verdict must exist");
+        let end = src[start..].find("\n}\n").expect("its body ends") + start;
+        let body: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("spawn_blocking"),
+            "negative control: the probe still goes to a blocking task"
+        );
+        assert!(
+            body.contains("tokio::time::timeout"),
+            "the spawn_blocking join must be bounded — an unbounded await here parks \
+             close-request for the whole wedge"
+        );
+        assert!(
+            body.contains("EVENT_LOOP_PROBE_CEILING"),
+            "…and bounded by the named ceiling, not an inline literal"
+        );
+    }
+
+    /// FINDING 6 — both readers of the wedge latch use the SAME guard.
+    ///
+    /// This route read `health_monitor::ui_thread_wedged()` raw while every
+    /// `derived_status` sink read it through
+    /// `ui_error::native_ui_probe_verdict()`, which additionally requires a
+    /// cached HWND and a RUNNING monitor. The two disagreed exactly when it
+    /// mattered: `stop_health_monitor()` cleared `MONITOR_RUNNING` without
+    /// clearing the atom, so this door answered `Wedged` off a dead monitor —
+    /// refusing every close forever — while `/health` correctly said UNKNOWN.
+    #[test]
+    fn the_close_door_reads_the_latch_through_the_same_guard_as_health() {
+        let src = include_str!("page.rs");
+        let start = src
+            .find("async fn event_loop_verdict()")
+            .expect("event_loop_verdict must exist");
+        let end = src[start..].find("\n}\n").expect("its body ends") + start;
+        let body: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("native_ui_probe_verdict()"),
+            "the latch must be read through the shared guarded reader"
+        );
+        assert!(
+            !body.contains("health_monitor::ui_thread_wedged()"),
+            "the raw atomic read is back — this door will disagree with /health about a \
+             stopped monitor and refuse every close forever"
+        );
+    }
+
+    /// FINDING 11 — force-close is CSRF-gated by a mandatory custom header.
+    ///
+    /// The MCP API is `CorsLayer::new().allow_origin(Any)` by design, and the
+    /// body parser never rejects, so a **simple** cross-origin `POST` (no
+    /// custom header, no JSON `Content-Type`, no body) is exempt from the CORS
+    /// preflight entirely — any page in the operator's browser could
+    /// force-close the runner and `taskkill /F /T` every tracked agent tree.
+    /// Requiring any custom header takes the request out of the simple set and
+    /// forces a preflight a drive-by page cannot satisfy.
+    #[test]
+    fn force_close_requires_a_header_a_simple_cross_origin_post_cannot_send() {
+        use axum::http::HeaderMap;
+
+        // The drive-by shape: nothing but the method and the URL.
+        assert!(
+            !force_close_header_present(&HeaderMap::new()),
+            "a bare cross-origin POST must not satisfy the gate"
+        );
+
+        // Headers a SIMPLE request is allowed to carry are not enough either —
+        // none of them triggers a preflight.
+        let mut simple = HeaderMap::new();
+        simple.insert("content-type", "text/plain".parse().unwrap());
+        simple.insert("accept", "*/*".parse().unwrap());
+        simple.insert("origin", "https://evil.example".parse().unwrap());
+        assert!(
+            !force_close_header_present(&simple),
+            "simple-request headers must not satisfy the gate"
+        );
+
+        // The operator's `curl -H 'X-Qontinui-Force-Close: 1'` does. Value is
+        // irrelevant — the preflight is the gate, not the contents.
+        for value in ["1", "0", "", "yes please"] {
+            let mut ok = HeaderMap::new();
+            ok.insert(FORCE_CLOSE_HEADER, value.parse().unwrap());
+            assert!(
+                force_close_header_present(&ok),
+                "any value of {FORCE_CLOSE_HEADER} must pass (value {value:?})"
+            );
+        }
+
+        // Header names are case-insensitive on the wire; the gate must be too.
+        let mut mixed = HeaderMap::new();
+        mixed.insert("x-qontinui-force-close", "1".parse().unwrap());
+        assert!(force_close_header_present(&mixed));
+
+        // The constant is the lowercase wire form (axum's `HeaderMap` keys are
+        // lowercase), so a rename cannot silently disarm the gate.
+        assert_eq!(FORCE_CLOSE_HEADER, FORCE_CLOSE_HEADER.to_ascii_lowercase());
+    }
+
     /// The force-close body parser never fails the request. An operator whose
-    /// runner is wedged must not be turned away over a missing header.
+    /// runner is wedged must not be turned away over a missing BODY — the one
+    /// thing it is turned away over is the header above.
     #[test]
     fn force_close_body_parsing_never_rejects() {
         assert_eq!(parse_force_close_body("").reason, None);

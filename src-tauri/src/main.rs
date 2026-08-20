@@ -5297,9 +5297,30 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // window-closed / session-assignment-changed events, and return.
                 // Only the "main" window falls through to the shutdown path.
                 let win_label = window.label().to_string();
-                if win_label != window_assignments::MAIN_WINDOW_LABEL
-                    && commands::terminal_windows::handle_window_close(window.app_handle(), &win_label)
-                {
+                if win_label != window_assignments::MAIN_WINDOW_LABEL {
+                    // FINDING 10 — this `return` is UNCONDITIONAL, and the
+                    // `&& handle_window_close(...)` it replaces was not.
+                    //
+                    // `handle_window_close` returns `false` whenever the
+                    // `WindowAssignments` state is unavailable. Execution then
+                    // fell through into the MAIN-window shutdown path below:
+                    // `api.prevent_close()` + `window.hide()` on the POP-OUT
+                    // (so the pop-out stays alive-but-hidden while the window
+                    // the user did not close stays on screen), plus a full app
+                    // teardown and a force-exit watchdog — for one terminal
+                    // pane being dismissed. The reassignment failure is worth a
+                    // log line; it is not worth quitting the application.
+                    if !commands::terminal_windows::handle_window_close(
+                        window.app_handle(),
+                        &win_label,
+                    ) {
+                        warn!(
+                            label = %win_label,
+                            "Pop-out close: session reassignment did not run (window \
+                             assignments state unavailable). Letting the window close anyway \
+                             — falling through here would tear the whole app down."
+                        );
+                    }
                     return;
                 }
 
@@ -5383,8 +5404,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     // `process::exit` never runs `RunEvent::Exit`, so drain the
                     // AI-output writer here too — this path is exactly the one
-                    // whose tail explains the stall.
+                    // whose tail explains the stall — and stop the embedded
+                    // PostgreSQL, which `RunEvent::ExitRequested` would have
+                    // stopped on the clean path. An orphaned `postgres` holds
+                    // the data dir and the port and blocks the next start.
                     commands::logging::flush_ai_output_log();
+                    crate::embedded_pg::stop_on_exit();
                     std::process::exit(0);
                 });
 
@@ -5411,6 +5436,29 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let worker_app_handle = window.app_handle().clone();
                 let worker_app_state = app_state.inner().clone();
                 std::thread::spawn(move || {
+                    // ── ONE teardown per process, across BOTH doors ──
+                    //
+                    // FINDING 9. `emergency_quit`'s latch used to guard
+                    // force-close against force-close only, so an in-flight
+                    // X-button close plus a `POST /ui-bridge/control/page/
+                    // force-close` ran `run_teardown` TWICE, concurrently: two
+                    // `TerminalManager::close_all`s, two
+                    // `kill_orphaned_ai_processes`, and two `drain::drain`s
+                    // that can both pass the `DRAINED` check before either sets
+                    // it. Both doors now claim the same latch.
+                    //
+                    // Losing the claim is not an error and not a reason to
+                    // exit here: the other door owns the sequence AND the
+                    // exit, and this handler's own force-exit watchdog (armed
+                    // above, on the same budget) is still a valid backstop.
+                    if !crate::mcp::ai_session::emergency_quit::try_claim_teardown() {
+                        warn!(
+                            "Window close: a teardown is already running (force-close door) \
+                             — not starting a second one; that door owns the exit"
+                        );
+                        return;
+                    }
+
                     let budget = shutdown_budget::Budget::start(
                         shutdown_budget::WORKER_BUDGET,
                     );
@@ -5482,6 +5530,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         shutdown_budget::FORCE_EXIT_MARGIN.as_secs()
                     );
                     commands::logging::flush_ai_output_log();
+                    // Same reason as the watchdog above: a hard exit skips
+                    // `RunEvent::ExitRequested`, so PostgreSQL is stopped here
+                    // or orphaned.
+                    crate::embedded_pg::stop_on_exit();
                     std::process::exit(0);
                 });
             }

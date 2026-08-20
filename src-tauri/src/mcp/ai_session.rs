@@ -2908,11 +2908,45 @@ pub mod emergency_quit {
     use crate::commands::AppState;
     use crate::shutdown_budget;
 
-    /// One force-close per process. A second `POST` while teardown is running
-    /// must not start a competing sequence — two threads racing through
-    /// `TerminalManager::close_all` and the `taskkill` loop would double the
-    /// work and halve the budget for no benefit.
-    static FORCE_CLOSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+    /// One teardown per process, across BOTH doors.
+    ///
+    /// A second `POST` while teardown is running must not start a competing
+    /// sequence — two threads racing through `TerminalManager::close_all` and
+    /// the `taskkill` loop would double the work and halve the budget for no
+    /// benefit. Until the pre-PR review this guarded force-close against
+    /// force-close ONLY, which left the cross-door race wide open: an
+    /// in-flight X-button close plus a `POST force-close` ran
+    /// [`run_teardown`] twice, CONCURRENTLY — two `close_all`s, two
+    /// `kill_orphaned_ai_processes`, and two `drain::drain`s that can both
+    /// pass the `DRAINED` check before either sets it. `main.rs`'s
+    /// `CloseRequested` worker now takes the same latch via
+    /// [`try_claim_teardown`].
+    static TEARDOWN_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+    /// Claim the one-teardown-per-process slot.
+    ///
+    /// `true` = the caller owns the teardown and must run it. `false` = another
+    /// door already owns it; the caller must NOT start a second sequence (its
+    /// own force-exit watchdog remains a valid backstop either way).
+    pub fn try_claim_teardown() -> bool {
+        !TEARDOWN_CLAIMED.swap(true, Ordering::SeqCst)
+    }
+
+    /// Stop the bundled embedded PostgreSQL immediately before a hard exit.
+    ///
+    /// `std::process::exit` runs no destructors and no `RunEvent::Exit`, and —
+    /// the defect this closes — a force-close never reaches
+    /// `RunEvent::ExitRequested` either on a healthy runner, because
+    /// `app_handle.exit(0)` is vetoed while the main window is still alive.
+    /// `main.rs`'s `stop_on_exit()` therefore never ran and every force-close
+    /// orphaned a `postgres` holding the data dir and the port, which then
+    /// blocks the NEXT runner start. Called on every hard-exit path here as
+    /// belt and braces: it must not depend on the veto decision. `stop_on_exit`
+    /// is itself idempotent (it `take()`s the handle out of a `OnceLock` slot)
+    /// and a no-op against an external DB.
+    fn stop_embedded_pg_before_hard_exit() {
+        crate::embedded_pg::stop_on_exit();
+    }
 
     /// The absolute ceiling on how long a force-close can take before the
     /// process terminates regardless. Deliberately the SAME constant the
@@ -2935,10 +2969,32 @@ pub mod emergency_quit {
         app_state: Arc<AppState>,
         reason: String,
     ) -> bool {
-        if FORCE_CLOSE_REQUESTED.swap(true, Ordering::SeqCst) {
-            warn!("Force-close already in progress — ignoring duplicate request: {reason}");
+        if !try_claim_teardown() {
+            warn!("A teardown is already in progress — ignoring duplicate request: {reason}");
             return false;
         }
+
+        // ── Flag the shutdown BEFORE anything else ──
+        //
+        // Without this, force-close was refused its own exit on EVERY runner,
+        // healthy ones included. `app_handle.exit(0)` below raises
+        // `RunEvent::ExitRequested`; `webview_recovery::should_veto_exit` reads
+        // `is_app_quitting()` FIRST and, finding it false with the main window
+        // still alive (force-close deliberately neither closes nor hides it),
+        // returns `VetoWindowAlive` and calls `api.prevent_exit()`. The clean
+        // path was therefore unreachable by construction:
+        // `embedded_pg::stop_on_exit()` never ran, and the hard exit 3s later
+        // orphaned a `postgres` holding the data dir and port — the exact leak
+        // `stop_on_exit` exists to prevent, which then blocks the next runner
+        // start. It also charged a pointless `FORCE_EXIT_MARGIN` and logged
+        // "expected when the event loop is wedged" on a perfectly healthy
+        // runner.
+        //
+        // `mark_app_quitting` is a plain atomic store with no event-loop
+        // dependency, so it is safe on this HTTP thread — unlike the other two
+        // UI-thread-only close steps (`capture_open_geometry`, `window.hide()`)
+        // which `run_teardown` deliberately omits.
+        crate::commands::terminal_windows::mark_app_quitting();
 
         warn!(
             "FORCE-CLOSE accepted ({reason}) — running the off-loop teardown, hard budget {}s",
@@ -2961,8 +3017,10 @@ pub mod emergency_quit {
                 hard_deadline.as_secs()
             );
             // `process::exit` runs no destructors and no `RunEvent::Exit`, so
-            // the AI-output writer's queued tail is drained here or lost.
+            // the AI-output writer's queued tail is drained here or lost, and
+            // the embedded PostgreSQL is stopped here or orphaned.
             crate::commands::logging::flush_ai_output_log();
+            stop_embedded_pg_before_hard_exit();
             std::process::exit(0);
         });
 
@@ -2994,6 +3052,7 @@ pub mod emergency_quit {
                 shutdown_budget::FORCE_EXIT_MARGIN.as_secs()
             );
             crate::commands::logging::flush_ai_output_log();
+            stop_embedded_pg_before_hard_exit();
             std::process::exit(0);
         });
 
@@ -3012,9 +3071,14 @@ pub mod emergency_quit {
     ///
     /// # What is deliberately NOT here
     ///
-    /// The three steps `main.rs` keeps on the UI thread —
-    /// `commands::terminal_windows::mark_app_quitting`, `capture_open_geometry`
-    /// and `window.hide()`. `capture_open_geometry`'s per-window queries are
+    /// The two steps `main.rs` keeps on the UI thread —
+    /// `capture_open_geometry` and `window.hide()`. (`mark_app_quitting` is the
+    /// third step of that group in `main.rs`, but it is a plain atomic store
+    /// with no event-loop dependency, so each door sets it for itself: the
+    /// close handler above the worker, [`request_force_close`] at its own top.
+    /// It is NOT in here because the two doors set it at different moments —
+    /// force-close must set it before its `app_handle.exit(0)` can be
+    /// vetoed.) `capture_open_geometry`'s per-window queries are
     /// safe *only* on the main thread, where `send_user_message` short-circuits
     /// to a direct inline Win32 call; from any other thread the same getters
     /// become `rx.recv()` with no timeout and would park this teardown forever
@@ -3336,27 +3400,99 @@ pub mod emergency_quit {
     mod tests {
         use super::*;
 
-        /// The force-close latch is single-shot. A second `POST` while a
-        /// teardown is running must be told "already in progress" rather than
-        /// starting a competing sequence — two threads racing through
+        /// The teardown latch is single-shot and, since the pre-PR review,
+        /// shared by BOTH doors.
+        ///
+        /// A second claim while a teardown is running must be refused rather
+        /// than starting a competing sequence — two threads racing through
         /// `TerminalManager::close_all` and the `taskkill` loop would halve the
         /// budget for the same work.
         ///
-        /// Exercised through the latch directly rather than through
+        /// FINDING 9: the latch used to guard force-close against force-close
+        /// only, so an in-flight X-button close plus a `POST force-close` ran
+        /// `run_teardown` twice, concurrently. `try_claim_teardown` is the one
+        /// door both paths now go through, which is what this asserts —
+        /// exercised through the latch rather than through
         /// [`request_force_close`], which by design ends in
         /// `std::process::exit`.
         #[test]
-        fn force_close_latch_is_single_shot() {
-            let previous = FORCE_CLOSE_REQUESTED.swap(false, Ordering::SeqCst);
+        fn the_teardown_latch_is_single_shot_across_both_doors() {
+            let previous = TEARDOWN_CLAIMED.swap(false, Ordering::SeqCst);
+
+            // Door 1 (say, the X-button worker in `main.rs`) claims it.
+            assert!(try_claim_teardown(), "the first claimant must win the latch");
+            // Door 2 (a concurrent `POST force-close`) must be refused.
             assert!(
-                !FORCE_CLOSE_REQUESTED.swap(true, Ordering::SeqCst),
-                "the first request must win the latch"
+                !try_claim_teardown(),
+                "a second claimant must observe the latch already taken — otherwise both \
+                 doors run run_teardown concurrently"
             );
+            // …and it stays taken; nothing releases it inside a process that
+            // is on its way out.
+            assert!(!try_claim_teardown());
+
+            TEARDOWN_CLAIMED.store(previous, Ordering::SeqCst);
+        }
+
+        /// FINDING 2 — force-close must mark the app quitting, and must stop
+        /// the embedded PostgreSQL on every hard-exit path.
+        ///
+        /// Without `mark_app_quitting()`, `app_handle.exit(0)` raises
+        /// `RunEvent::ExitRequested`, `should_veto_exit` reads quit-intent
+        /// false with the main window still alive (force-close deliberately
+        /// neither closes nor hides it), and `api.prevent_exit()` refuses the
+        /// exit — on EVERY force-close, healthy runners included. The clean
+        /// path's `embedded_pg::stop_on_exit()` then never runs and the hard
+        /// exit 3s later orphans a `postgres` holding the data dir and port,
+        /// which blocks the next runner start.
+        ///
+        /// A SOURCE assertion because the function it guards ends in
+        /// `std::process::exit` and cannot be called from a test. The veto
+        /// arithmetic itself is asserted in `webview_recovery`'s tests
+        /// (`force_close_without_the_quitting_flag_would_be_vetoed`); this
+        /// pins the half that lives here — that the flag is set at all, that
+        /// it is set BEFORE the exit is requested (the ordering contract
+        /// `is_app_quitting`'s docs state), and that no hard exit skips PG.
+        #[test]
+        fn force_close_marks_quitting_and_stops_pg_before_every_hard_exit() {
+            let src = include_str!("ai_session.rs");
+            let start = src
+                .find("pub fn request_force_close(")
+                .expect("request_force_close must exist");
+            let end = src[start..]
+                .find("pub fn run_teardown(")
+                .expect("run_teardown follows it")
+                + start;
+            let body: String = src[start..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let flag_at = body
+                .find("mark_app_quitting()")
+                .expect("force-close must mark the app quitting, or its own exit is vetoed");
+            let exit_at = body
+                .find("app_handle.exit(0)")
+                .expect("force-close still asks Tauri to exit cleanly first");
             assert!(
-                FORCE_CLOSE_REQUESTED.swap(true, Ordering::SeqCst),
-                "a second request must observe the latch already taken"
+                flag_at < exit_at,
+                "mark_app_quitting() must run BEFORE app_handle.exit(0) — the ordering \
+                 contract in is_app_quitting()'s docs; after it, the veto has already fired"
             );
-            FORCE_CLOSE_REQUESTED.store(previous, Ordering::SeqCst);
+
+            // Every hard exit on this path stops PG first. `process::exit`
+            // runs no destructors and no `RunEvent::Exit`, so this is the last
+            // chance either watchdog gets.
+            let hard_exits = body.matches("std::process::exit(0)").count();
+            let pg_stops = body.matches("stop_embedded_pg_before_hard_exit()").count();
+            assert!(hard_exits >= 2, "expected the watchdog and the teardown hard exits");
+            assert_eq!(
+                pg_stops, hard_exits,
+                "every hard exit must stop the embedded PostgreSQL first — {hard_exits} \
+                 exit(s), {pg_stops} stop(s); a missed one orphans a postgres holding the \
+                 data dir and port"
+            );
         }
 
         /// The force-close ceiling is the SAME number the X-button path arms.

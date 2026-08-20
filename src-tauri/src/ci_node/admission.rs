@@ -901,17 +901,40 @@ pub(crate) fn cancel(dispatch_id: &str) {
     }
 }
 
+/// Ceiling on the shutdown-path `ci_state` acquisition. See
+/// [`cancel_all_for_shutdown`] for why giving up is safe.
+const SHUTDOWN_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// App-shutdown seam: cancel every running build's token and drop the
 /// queue. Called from the `main.rs` window-close handler; the Windows Job
 /// Object (kill-on-close) is the hard backstop for the process trees.
 pub(crate) fn cancel_all_for_shutdown() {
-    // Poison-recovering. This runs on the app-close teardown path, and a
-    // `.unwrap()` here turned any earlier panic while holding `ci_state` into a
-    // SECOND panic on the shutdown thread — which, while this ran inline on the
-    // tao/UI thread, took the event loop down with it. The state behind a
-    // poisoned lock is still perfectly usable for what this does: cancel every
-    // token and drop the queue.
-    let mut state = ci_state().lock().unwrap_or_else(|p| p.into_inner());
+    // BOUNDED + poison-recovering — Phase 2 step 5 asked for BOTH, and this
+    // site only had the second.
+    //
+    // Poison-recovering: a `.unwrap()` here turned any earlier panic while
+    // holding `ci_state` into a SECOND panic on the shutdown thread — which,
+    // while this ran inline on the tao/UI thread, took the event loop down
+    // with it. The state behind a poisoned lock is perfectly usable for what
+    // this does.
+    //
+    // Bounded: `lock()` is unbounded, so a dispatch thread holding `ci_state`
+    // while it does something slow parks the whole teardown here with no
+    // ceiling. Cancellation is a courtesy — the Windows Job Object
+    // (kill-on-close) is the hard backstop for the build process trees, and
+    // coord's dispatch-lease sweeper covers a result that never makes it out —
+    // so giving up is strictly better than overrunning the budget.
+    let Some(mut state) = crate::safe_lock::lock_with_deadline(
+        ci_state(),
+        "ci_node ci_state",
+        SHUTDOWN_LOCK_TIMEOUT,
+    ) else {
+        warn!(
+            "ci_node: shutdown — could not acquire ci_state within {SHUTDOWN_LOCK_TIMEOUT:?}; \
+             leaving cancellation to the Job Object and coord's lease sweeper"
+        );
+        return;
+    };
     for (id, token) in state.running.iter() {
         info!("ci_node: shutdown — cancelling dispatch {id}");
         token.cancel();

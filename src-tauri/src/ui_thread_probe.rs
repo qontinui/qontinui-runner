@@ -157,35 +157,52 @@ pub fn main_hwnd() -> Option<isize> {
     Some(found)
 }
 
-/// The title the main window is built with
-/// (`webview_recovery::build_main_window`, `.title("Qontinui Runner")`). Used
-/// only to *prefer* the main window over a pop-out terminal window in the
-/// fallback sweep; a title mismatch degrades to "first visible titled window of
-/// this process", it does not fail the resolution.
-#[cfg(windows)]
-const MAIN_WINDOW_TITLE: &str = "Qontinui Runner";
-
-/// Sweep this process's own top-level windows and pick the main one.
+/// Sweep this process's own top-level windows and pick one to probe.
 ///
 /// Mirrors the `EnumWindows` + `GetWindowThreadProcessId` pattern already used
 /// at `window_manager.rs:132`/`:188` — with the one difference that those
 /// enumerate *other* processes' windows and this one deliberately matches only
 /// `GetCurrentProcessId()`.
 ///
+/// # Why this sweep reads NO window text — trap 1, and it bites here
+///
+/// This resolver used to prefer the window titled `"Qontinui Runner"`, via
+/// `GetWindowTextLengthW` + `GetWindowTextW`. Those two are safe on *other*
+/// processes' windows — where the OS hands back a cached caption — and are a
+/// **blocking, untimed `SendMessage`** for a window owned by the CALLING
+/// process: `WM_GETTEXTLENGTH`/`WM_GETTEXT` go to the owning thread's message
+/// queue and the caller waits, with no timeout and no `SMTO_ABORTIFHUNG`.
+/// Since the filter above selects exactly this process's windows, the title
+/// read was a blocking round-trip to the very thread the resolver exists to
+/// let a detector observe — and the sweep is the fallback that runs precisely
+/// when the startup cache is gone. Three consumers park on it:
+/// `health_monitor`'s detector rung (which would then share fate with its
+/// subject, taking `/livez` wedge detection down with it), the `close-request`
+/// verdict in `mcp/ui_bridge/page.rs`, and `ui_error::native_ui_probe_verdict`
+/// → every `derived_status` sink.
+///
+/// The remaining calls are all message-free window-table reads:
+/// `GetWindowThreadProcessId`, `IsWindowVisible`, and `IsWindow` (in
+/// [`main_hwnd`]).
+///
+/// **Losing the title match costs nothing.** Every window this process owns —
+/// the main window and every pop-out terminal — is created on the SAME tao
+/// thread and pumped by the SAME message loop, so a `WM_NULL` round-trip to a
+/// pop-out answers the identical liveness question. The first visible
+/// own-process top-level window is therefore a sufficient probe target, and
+/// the memo is self-healing via `IsWindow` if that window later goes away.
+///
 /// `allow(dead_code)`: reachable only through [`main_hwnd`]; see the note there.
 #[allow(dead_code)]
 #[cfg(windows)]
 fn resolve_own_main_window() -> Option<isize> {
-    use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-        IsWindowVisible,
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
     };
 
-    /// `(exact-title match, first visible titled window, our pid)`.
+    /// `(first visible own-process window, our pid)`.
     struct Sweep {
-        exact: Option<isize>,
         first: Option<isize>,
         pid: u32,
     }
@@ -196,6 +213,8 @@ fn resolve_own_main_window() -> Option<isize> {
         let sweep = unsafe { &mut *(lparam as *mut Sweep) };
 
         let mut wnd_pid: u32 = 0;
+        // SAFETY: read-only window-table queries. Neither sends a message, so
+        // neither can block on this process's own (possibly hung) UI thread.
         unsafe { GetWindowThreadProcessId(hwnd, &mut wnd_pid) };
         if wnd_pid != sweep.pid {
             return TRUE;
@@ -203,43 +222,21 @@ fn resolve_own_main_window() -> Option<isize> {
         if unsafe { IsWindowVisible(hwnd) } == 0 {
             return TRUE;
         }
-        let title_len = unsafe { GetWindowTextLengthW(hwnd) };
-        if title_len <= 0 {
-            // Untitled top-level windows of our own process are wry/WebView2
-            // internals, never the main window.
-            return TRUE;
-        }
-        let mut buf = vec![0u16; (title_len + 1) as usize];
-        let written = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
-        let title = std::ffi::OsString::from_wide(&buf[..written.max(0) as usize])
-            .to_string_lossy()
-            .into_owned();
 
-        let handle = hwnd as isize;
-        if sweep.first.is_none() {
-            sweep.first = Some(handle);
-        }
-        if title == MAIN_WINDOW_TITLE {
-            sweep.exact = Some(handle);
-            return 0; // stop enumerating — this is the one we wanted
-        }
-        TRUE
+        sweep.first = Some(hwnd as isize);
+        0 // stop enumerating — any window of ours rides the same message loop
     }
 
     let mut sweep = Sweep {
-        exact: None,
         first: None,
         pid: std::process::id(),
     };
     // SAFETY: `enum_callback` only dereferences `lparam` as `&mut Sweep`, and
     // `sweep` is alive for the whole synchronous call.
     unsafe {
-        EnumWindows(
-            Some(enum_callback),
-            &mut sweep as *mut Sweep as LPARAM,
-        );
+        EnumWindows(Some(enum_callback), &mut sweep as *mut Sweep as LPARAM);
     }
-    sweep.exact.or(sweep.first)
+    sweep.first
 }
 
 // ── Non-Windows stub ────────────────────────────────────────────────────────
@@ -332,6 +329,59 @@ mod tests {
         );
 
         MAIN_HWND.store(previous, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// REGRESSION (pre-PR review finding 1, trap 1 reintroduced).
+    ///
+    /// The fallback sweep must never read a window's TEXT. For a window owned
+    /// by the calling process, `GetWindowTextLengthW`/`GetWindowTextW` are a
+    /// blocking, untimed `SendMessage` (`WM_GETTEXTLENGTH`/`WM_GETTEXT`) to
+    /// the owning thread — and the sweep filters to `GetCurrentProcessId()`,
+    /// so it selects exactly the windows for which the call is a round-trip to
+    /// the thread the probe exists to observe. Three consumers park on it: the
+    /// health monitor's detector rung, `close-request`, and every
+    /// `derived_status` sink.
+    ///
+    /// This is a SOURCE assertion on purpose: the behavioural version needs a
+    /// genuinely hung UI thread, which no unit test can produce. It scans the
+    /// module's own text with the test module and all comments removed, so
+    /// neither the prose above nor these very assertions (both of which name
+    /// the banned calls deliberately) can make it vacuous — and the negative
+    /// control proves the stripping did not eat the code it is meant to check.
+    #[test]
+    fn the_hwnd_sweep_never_reads_window_text() {
+        // Spelled in halves so the needles themselves are not present in the
+        // scanned text — the test module is stripped below in any case, but a
+        // guard that can pass by quoting itself is not a guard.
+        let banned = [
+            concat!("GetWindow", "Text"),
+            concat!("Send", "Message"),
+            concat!("WM_", "GETTEXT"),
+        ];
+        let src = include_str!("ui_thread_probe.rs");
+        let production = src
+            .split_once("#[cfg(test)]")
+            .map(|(head, _)| head)
+            .expect("this module has a test block to split on");
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in banned {
+            assert!(
+                !code.contains(needle),
+                "`{needle}` is back in ui_thread_probe.rs — for an OWN-process window that \
+                 blocks, untimed, on the UI thread this module exists to observe"
+            );
+        }
+        // Negative control: the stripper must not have eaten the whole file.
+        assert!(
+            code.contains("GetWindowThreadProcessId")
+                && code.contains("IsWindowVisible")
+                && code.contains("fn resolve_own_main_window"),
+            "comment/test stripping ate the code — the assertions above would be vacuous"
+        );
     }
 
     #[cfg(not(windows))]

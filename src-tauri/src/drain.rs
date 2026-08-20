@@ -59,6 +59,21 @@ const CHECKPOINT_POLL_MS: u64 = 100;
 /// this is the ceiling, not the allowance.
 const GIT_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Floor under the `git update-ref` that PUBLISHES a stash object.
+///
+/// Same reasoning as `main.rs`'s `TASKKILL_FLOOR` and
+/// `terminal/session.rs`'s `KILL_FLOOR`, applied to the one drain step that
+/// is not free to skip. [`capture_wip_ref`] recomputes its budget between
+/// `git stash create` and `git update-ref`; if the deadline passed during the
+/// first, the second got zero and was killed immediately — leaving an
+/// UNREFERENCED stash commit (reaped by the next `gc`) and no
+/// `refs/wip/<id>`. The working tree is untouched so nothing is lost
+/// irrecoverably, but the drain's contract is not delivered, and it lands on
+/// the LAST session in the loop, which is the busiest one. `update-ref` is a
+/// ~10ms ref write; abandoning it throws away the work `stash create` just
+/// did.
+const WIP_REF_WRITE_FLOOR: Duration = Duration::from_millis(500);
+
 /// Safety-net cap for git calls that are NOT on the shutdown path — today the
 /// resume-side [`restore_wip_ref`]. Deliberately generous: `git stash apply` of
 /// a large captured worktree is legitimately slow, and killing it at the
@@ -410,10 +425,12 @@ pub fn capture_wip_ref(
 
     let ref_name = format!("refs/wip/{agent_session_id}");
     let msg = format!("qontinui-drain WIP for task_run_id={task_run_id}");
+    // FLOORED, unlike `stash create`: the object now exists and only this call
+    // makes it reachable. See [`WIP_REF_WRITE_FLOOR`].
     run_git_bounded(
         repo_dir,
         &["update-ref", "-m", &msg, &ref_name, stash_sha],
-        drain_git_budget(deadline),
+        std::cmp::max(drain_git_budget(deadline), WIP_REF_WRITE_FLOOR),
     )
     .map_err(|e| format!("git update-ref {ref_name} failed: {e}"))?;
 
