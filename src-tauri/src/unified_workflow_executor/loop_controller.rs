@@ -1386,6 +1386,7 @@ impl LoopController {
                     let agentic_context = build_resume_agentic_context(
                         &config.execution_id,
                         agentic_iteration,
+                        Some(stage_idx as u32),
                         &self.app_state.pg_db,
                     )
                     .await;

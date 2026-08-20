@@ -263,6 +263,15 @@ pub enum ClearVerdict {
     /// (checkpoints written, state row never persisted). Wiping there is the
     /// re-execute-and-re-bill defect this plan exists to close.
     KeptJournalNotEmpty,
+    /// The journal could not be READ (pool timeout, query error, no runtime,
+    /// panic). An absent answer is UNKNOWN, never zero — and the only
+    /// irreversible action on this path is the delete, so an unknown read must
+    /// never authorise it. This is why the delete path takes a FALLIBLE
+    /// accessor while the resume-point path keeps the soft-degrade one: for the
+    /// resume point, "empty" is the conservative direction (re-run work); for
+    /// the delete, it is exactly inverted (destroy the journal that would have
+    /// let the run skip work it already paid for).
+    KeptJournalUnknown,
 }
 
 impl ClearVerdict {
@@ -277,6 +286,9 @@ impl ClearVerdict {
             ClearVerdict::KeptJournalNotEmpty => {
                 "FromStart with journalled work: a crash before the state row was written"
             }
+            ClearVerdict::KeptJournalUnknown => {
+                "the step journal could not be read: unknown is not empty, refusing to delete"
+            }
         }
     }
 
@@ -290,10 +302,16 @@ impl ClearVerdict {
 ///
 /// `checkpoints` is invoked lazily and only when the cheap structural checks
 /// have not already answered, so a resume never pays for a read it will ignore.
+///
+/// It is FALLIBLE on purpose. This guard is the last thing standing between a
+/// transient database hiccup and an irreversible `clear_all_checkpoints`, and
+/// an infallible `Fn() -> Vec<_>` structurally cannot say "I could not find
+/// out" — every failure would arrive here indistinguishable from an empty
+/// journal, and empty is the one answer that authorises the delete.
 pub fn fresh_run_clear_verdict(
     execution_id: &str,
     resume_point: &ResumePoint,
-    checkpoints: &dyn Fn() -> Vec<StepCheckpoint>,
+    checkpoints: &dyn Fn() -> Result<Vec<StepCheckpoint>, String>,
 ) -> ClearVerdict {
     if !resume_point.is_fresh_start() {
         return ClearVerdict::KeptNotAFreshStart;
@@ -306,10 +324,10 @@ pub fn fresh_run_clear_verdict(
         return ClearVerdict::KeptComposedRunChild;
     }
 
-    if checkpoints().is_empty() {
-        ClearVerdict::Clear
-    } else {
-        ClearVerdict::KeptJournalNotEmpty
+    match checkpoints() {
+        Ok(cps) if cps.is_empty() => ClearVerdict::Clear,
+        Ok(_) => ClearVerdict::KeptJournalNotEmpty,
+        Err(_) => ClearVerdict::KeptJournalUnknown,
     }
 }
 
@@ -520,8 +538,23 @@ impl ResumeManager {
             }
 
             "setup_running" => {
-                // Was in setup phase
-                let completed_count = completed_steps("setup", None);
+                // Was in setup phase.
+                //
+                // `Some(0)`, NOT `None`: every setup write site stamps
+                // `iteration = Some(0)` on purpose (the upsert's conflict
+                // target is a unique index, and `NULL != NULL` would defeat
+                // it), and the read path maps the column with
+                // `iter_raw.map(|i| i as u32)`, so a stored 0 reads back as
+                // `Some(0)`. `count_completed_in` compares `cp.iteration ==
+                // iteration` exactly, so passing `None` matches ZERO real rows
+                // and the count is structurally always 0.
+                //
+                // Nothing consumes `from_step` for setup yet
+                // (`loop_controller` reads only `stage_index`/`iteration`), so
+                // this value is inert today — which is exactly why it has to be
+                // right now, before something wires it up on top of a count
+                // that can never be non-zero.
+                let completed_count = completed_steps("setup", Some(0));
                 Ok(ResumePoint::SetupPhase {
                     from_step: completed_count,
                     stage_index,
@@ -574,7 +607,11 @@ impl ResumeManager {
             }
 
             "completion_running" => {
-                let completed_count = completed_steps("completion", None);
+                // `Some(0)` for the same reason as `setup_running` above: the
+                // completion phase also writes `iteration = Some(0)` at every
+                // site, so `None` here would match no row that a writer ever
+                // produces. Also inert today, and fixed for the same reason.
+                let completed_count = completed_steps("completion", Some(0));
                 Ok(ResumePoint::CompletionPhase {
                     from_step: completed_count,
                 })
@@ -627,9 +664,14 @@ impl ResumeManager {
     /// + `catch_unwind` shape (`workflow_state/mod.rs`) rather than calling it:
     /// `restore` hard-errors on a missing or undeserializable `state_data` and on a
     /// workflow-type mismatch, and any of those would demote a perfectly resumable
-    /// row to the legacy re-execute-everything heuristic — the exact defect this
-    /// path exists to fix. Here every failure degrades softly to `None` (→ legacy),
-    /// and the type check is applied in `decide_resume_point` as a warning instead.
+    /// row to the legacy heuristic — which restarts the run at verification
+    /// iteration 1, step 0, re-executing and re-billing everything after it.
+    /// Here every failure degrades softly to `None` (→ legacy), and the type check
+    /// is applied in `decide_resume_point` as a warning instead.
+    ///
+    /// (Until `legacy_resume_point` was given the same `block_in_place` wrapper,
+    /// that demotion was even blunter: the heuristic could not run at all from a
+    /// worker thread, so every demotion landed on `FromStart`.)
     fn load_state_record(&self, execution_id: &str) -> Option<WorkflowExecutionStateRecord> {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
@@ -670,34 +712,38 @@ impl ResumeManager {
         }
     }
 
-    /// Read every step checkpoint for an execution (sync).
+    /// Read every step checkpoint for an execution (sync), REPORTING failure.
     ///
-    /// Same `block_in_place` shape as `load_state_record`. A read failure yields
-    /// an empty slice, which resolves to "nothing completed" — the conservative
-    /// direction (re-run work) rather than skipping work that never ran.
-    fn load_checkpoints(&self, execution_id: &str) -> Vec<StepCheckpoint> {
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => {
-                warn!(
-                    execution_id = %execution_id,
-                    "No tokio runtime available to read step checkpoints"
-                );
-                return Vec::new();
-            }
-        };
+    /// Same `block_in_place` shape as `load_state_record`. Every failure mode
+    /// (no runtime, pool error, query error, panic) comes back as `Err`, so a
+    /// caller that must distinguish "the journal is empty" from "I could not
+    /// read the journal" can. [`Self::clear_checkpoints_for_fresh_run`] is that
+    /// caller, because its action is an irreversible delete.
+    fn load_checkpoints_fallible(&self, execution_id: &str) -> Result<Vec<StepCheckpoint>, String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "no tokio runtime available to read step checkpoints".to_string())?;
 
         let pg = self.pg_db.clone();
         let eid = execution_id.to_string();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokio::task::block_in_place(|| {
                 handle.block_on(async move { pg.get_all_workflow_step_checkpoints(&eid).await })
             })
-        }));
+        }))
+        .unwrap_or_else(|_| Err("block_in_place panicked reading step checkpoints".to_string()))
+    }
 
-        match result {
-            Ok(Ok(checkpoints)) => checkpoints,
-            Ok(Err(e)) => {
+    /// Read every step checkpoint for an execution (sync), degrading softly.
+    ///
+    /// A read failure yields an empty slice, which resolves to "nothing
+    /// completed" — the conservative direction FOR THE RESUME POINT (re-run
+    /// work) rather than skipping work that never ran. Do NOT reuse this on any
+    /// path whose action is a delete: there, empty is the destructive answer.
+    /// See [`Self::load_checkpoints_fallible`].
+    fn load_checkpoints(&self, execution_id: &str) -> Vec<StepCheckpoint> {
+        match self.load_checkpoints_fallible(execution_id) {
+            Ok(checkpoints) => checkpoints,
+            Err(e) => {
                 warn!(
                     execution_id = %execution_id,
                     error = %e,
@@ -705,45 +751,73 @@ impl ResumeManager {
                 );
                 Vec::new()
             }
-            Err(_) => {
-                warn!(
-                    execution_id = %execution_id,
-                    "block_in_place panicked reading step checkpoints"
-                );
-                Vec::new()
-            }
         }
     }
 
-    /// Legacy resume point detection using session_count heuristic.
+    /// Legacy resume point detection using the `sessions_count` heuristic.
     ///
     /// This is used as a fallback when no explicit workflow state is saved.
     /// It's less accurate but provides backward compatibility.
     fn legacy_resume_point(&self, execution_id: &str) -> Result<ResumePoint, String> {
-        // Check if there's a task run with sessions_count > 0
-        // PG-primary: try PG first, fall back to SQLite
-        let task_run = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let pg = self.pg_db.clone();
-            let id = execution_id.to_string();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle.block_on(async move { pg.get_task_run(&id).await })
-            }))
-            .unwrap_or_else(|_| Err("block_on panicked".to_string()))?
-        } else {
-            Err("no tokio runtime".to_string())?
-        };
+        Self::legacy_point_from_read(execution_id, &|| self.load_sessions_count(execution_id))
+    }
 
-        match task_run {
-            Some(task) => {
+    /// Read `task_runs.sessions_count` for an execution (sync).
+    ///
+    /// Same `block_in_place` shape as [`Self::load_state_record`] and
+    /// [`Self::load_checkpoints`], and for the same reason: a bare
+    /// `Handle::block_on` PANICS when it is called from inside a runtime, and
+    /// this whole path runs on a worker thread under
+    /// `LoopController::run_inner`. Before that wrapper existed, the panic was
+    /// caught and turned into an `Err`, so the heuristic below never ran at all
+    /// in production.
+    fn load_sessions_count(&self, execution_id: &str) -> Result<Option<u32>, String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "no tokio runtime available to read the task run".to_string())?;
+
+        let pg = self.pg_db.clone();
+        let id = execution_id.to_string();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move { pg.get_task_run(&id).await })
+            })
+        }))
+        .unwrap_or_else(|_| Err("block_in_place panicked reading the task run".to_string()))
+        .map(|task_run| task_run.map(|task| task.sessions_count))
+    }
+
+    /// Pure decision half of the legacy heuristic: turn a `sessions_count` read
+    /// into a resume point.
+    ///
+    /// NEVER propagates the read failure. A failed heuristic read means "we do
+    /// not know where this run got to", and `FromStart` is precisely what the
+    /// caller (`LoopController::run_inner`) already substitutes for an `Err`.
+    /// Returning it here instead of `?`-ing removes a hard error from what is
+    /// already a fallback path, and keeps the failure visible as a warning
+    /// rather than as a resume-point error the caller silently rewrites.
+    fn legacy_point_from_read(
+        execution_id: &str,
+        read: &dyn Fn() -> Result<Option<u32>, String>,
+    ) -> Result<ResumePoint, String> {
+        match read() {
+            Ok(Some(sessions_count)) => {
                 info!(
                     execution_id = %execution_id,
-                    sessions_count = %task.sessions_count,
+                    sessions_count = %sessions_count,
                     "No workflow state row: using legacy sessions_count heuristic"
                 );
-                Ok(Self::legacy_point_from_sessions_count(task.sessions_count))
+                Ok(Self::legacy_point_from_sessions_count(sessions_count))
             }
-            None => {
-                // No task run found
+            Ok(None) => {
+                // No task run found.
+                Ok(ResumePoint::FromStart)
+            }
+            Err(e) => {
+                warn!(
+                    execution_id = %execution_id,
+                    error = %e,
+                    "Legacy sessions_count read failed, starting from the beginning"
+                );
                 Ok(ResumePoint::FromStart)
             }
         }
@@ -787,9 +861,18 @@ impl ResumeManager {
         execution_id: &str,
         resume_point: &ResumePoint,
     ) -> ClearVerdict {
+        // The FALLIBLE reader: a failed read must not look like an empty
+        // journal on the one path that deletes it.
         let verdict = fresh_run_clear_verdict(execution_id, resume_point, &|| {
-            self.load_checkpoints(execution_id)
+            self.load_checkpoints_fallible(execution_id)
         });
+
+        if matches!(verdict, ClearVerdict::KeptJournalUnknown) {
+            warn!(
+                execution_id = %execution_id,
+                "Could not read the step journal; refusing to clear it on an unknown read"
+            );
+        }
 
         if matches!(verdict, ClearVerdict::Clear) {
             if let Err(e) = self.clear_all_checkpoints(execution_id) {
@@ -968,13 +1051,19 @@ mod tests {
     }
 
     /// Previously unreachable variant #1: SetupPhase.
+    ///
+    /// The fixture stamps `iteration = Some(0)` because that is what every
+    /// setup write site actually writes (and what the read path hands back for
+    /// a stored 0). With the `None` these rows used to carry, the fixture
+    /// described a row shape no writer produces, and the assertion below passed
+    /// against a count that is structurally 0 for real data.
     #[test]
     fn test_setup_running_resumes_after_completed_setup_steps() {
         let cps = vec![
             checkpoint(
                 EXEC,
                 "setup",
-                None,
+                Some(0),
                 0,
                 Some(0),
                 StepCheckpointStatus::Success,
@@ -983,7 +1072,7 @@ mod tests {
             checkpoint(
                 EXEC,
                 "setup",
-                None,
+                Some(0),
                 1,
                 Some(0),
                 StepCheckpointStatus::Skipped,
@@ -992,7 +1081,7 @@ mod tests {
             checkpoint(
                 EXEC,
                 "setup",
-                None,
+                Some(0),
                 2,
                 Some(0),
                 StepCheckpointStatus::Failed,
@@ -1020,12 +1109,14 @@ mod tests {
     }
 
     /// Previously unreachable variant #2: CompletionPhase.
+    ///
+    /// `Some(0)` for the same reason as the setup fixture above.
     #[test]
     fn test_completion_running_resumes_after_completed_completion_steps() {
         let cps = vec![checkpoint(
             EXEC,
             "completion",
-            None,
+            Some(0),
             0,
             Some(0),
             StepCheckpointStatus::Success,
@@ -1359,6 +1450,50 @@ mod tests {
         }
     }
 
+    /// The `sessions_count` heuristic is REACHABLE.
+    ///
+    /// `legacy_resume_point` used to call a bare `Handle::block_on`, which
+    /// panics when it runs inside a runtime — and `determine_resume_point` is
+    /// only ever called from `LoopController::run_inner`, an async fn on a
+    /// worker thread. The `catch_unwind` turned that panic into `Err`, and the
+    /// `?` propagated it, so `legacy_point_from_sessions_count` never ran in
+    /// production and every legacy fallback landed on `FromStart`.
+    ///
+    /// This drives the whole chain — no state row → legacy arm →
+    /// `legacy_point_from_read` → `legacy_point_from_sessions_count` — rather
+    /// than calling the pure half directly, so the arm's reachability is what
+    /// is pinned, not just its arithmetic.
+    #[test]
+    fn test_legacy_sessions_count_heuristic_is_reachable_through_the_decision() {
+        let point = ResumeManager::decide_resume_point(EXEC, None, &no_checkpoints, &|| {
+            ResumeManager::legacy_point_from_read(EXEC, &|| Ok(Some(3)))
+        })
+        .unwrap();
+
+        match point {
+            ResumePoint::VerificationPhase {
+                iteration,
+                from_step,
+                stage_index,
+            } => assert_eq!((iteration, from_step, stage_index), (1, 0, None)),
+            other => panic!("expected VerificationPhase, got {:?}", other),
+        }
+    }
+
+    /// A failed heuristic read is "we do not know", not an error to propagate:
+    /// `FromStart` is what the caller substitutes for an `Err` anyway.
+    #[test]
+    fn test_legacy_read_failure_degrades_to_from_start_not_err() {
+        let point =
+            ResumeManager::legacy_point_from_read(EXEC, &|| Err("pool timeout".to_string()))
+                .expect("a failed heuristic read must not be a hard error");
+        assert!(point.is_fresh_start(), "got {:?}", point);
+
+        // No task run row at all is also a fresh start, and also not an error.
+        let point = ResumeManager::legacy_point_from_read(EXEC, &|| Ok(None)).unwrap();
+        assert!(point.is_fresh_start(), "got {:?}", point);
+    }
+
     #[test]
     fn test_agentic_complete_advances_to_next_iteration() {
         let point = ResumeManager::decide_resume_point(
@@ -1457,16 +1592,41 @@ mod tests {
         )]
     }
 
-    fn checkpoints_must_not_be_read() -> Vec<StepCheckpoint> {
+    fn checkpoints_must_not_be_read() -> Result<Vec<StepCheckpoint>, String> {
         panic!("the journal must not be read once a structural check has answered");
+    }
+
+    /// The journal read SUCCEEDED and found nothing.
+    fn journal_empty() -> Result<Vec<StepCheckpoint>, String> {
+        Ok(Vec::new())
+    }
+
+    /// The journal read FAILED — a pool timeout is the realistic instance on
+    /// this box, where `/health` has been sampled from 296ms to 10120ms under
+    /// load. Neither `no_checkpoints` nor `checkpoints_must_not_be_read` can
+    /// express this case: one is a successful empty read, the other never runs.
+    fn journal_read_failed() -> Result<Vec<StepCheckpoint>, String> {
+        Err("PG pool error: timed out waiting for a connection".to_string())
     }
 
     #[test]
     fn test_fresh_run_with_empty_journal_clears() {
         assert_eq!(
-            fresh_run_clear_verdict(EXEC, &ResumePoint::FromStart, &no_checkpoints),
+            fresh_run_clear_verdict(EXEC, &ResumePoint::FromStart, &journal_empty),
             ClearVerdict::Clear
         );
+    }
+
+    /// A failed READ must never authorise the delete. Before the accessor was
+    /// made fallible, this exact input arrived as `Vec::new()` — identical to a
+    /// genuinely empty journal — and the run wiped its own checkpoints, then
+    /// re-executed and re-billed everything while logging "Fresh run - cleared
+    /// old step checkpoints".
+    #[test]
+    fn test_unreadable_journal_is_never_cleared() {
+        let verdict = fresh_run_clear_verdict(EXEC, &ResumePoint::FromStart, &journal_read_failed);
+        assert_eq!(verdict, ClearVerdict::KeptJournalUnknown);
+        assert!(!verdict.cleared(), "an unknown read must not delete");
     }
 
     #[test]
@@ -1504,7 +1664,7 @@ mod tests {
     fn test_from_start_with_journalled_work_is_not_wiped() {
         let cps = setup_checkpoint(EXEC);
         assert_eq!(
-            fresh_run_clear_verdict(EXEC, &ResumePoint::FromStart, &|| cps.clone()),
+            fresh_run_clear_verdict(EXEC, &ResumePoint::FromStart, &|| Ok(cps.clone())),
             ClearVerdict::KeptJournalNotEmpty
         );
     }
@@ -1544,11 +1704,13 @@ mod tests {
         assert!(!ClearVerdict::KeptNotAFreshStart.cleared());
         assert!(!ClearVerdict::KeptComposedRunChild.cleared());
         assert!(!ClearVerdict::KeptJournalNotEmpty.cleared());
+        assert!(!ClearVerdict::KeptJournalUnknown.cleared());
         for v in [
             ClearVerdict::Clear,
             ClearVerdict::KeptNotAFreshStart,
             ClearVerdict::KeptComposedRunChild,
             ClearVerdict::KeptJournalNotEmpty,
+            ClearVerdict::KeptJournalUnknown,
         ] {
             assert!(!v.reason().is_empty());
         }

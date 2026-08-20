@@ -1537,11 +1537,27 @@ pub(crate) fn step_type_is_replayable(step_type: &str) -> bool {
     step_type != "wrapper_action"
 }
 
+/// Does a journalled row name the same step the caller is about to execute?
+///
+/// Only a gate when BOTH sides carry a name. An empty `step_name` from the
+/// caller, or a `NULL`/empty `step_name` on the row (what a journal written
+/// before the name was persisted looks like), is UNKNOWN — not a mismatch — and
+/// the type gate remains the only discriminator for those rows.
+pub(crate) fn journalled_name_matches(cp: &StepCheckpoint, step_name: &str) -> bool {
+    let journalled = cp.step_name.as_deref().unwrap_or("");
+    if journalled.is_empty() || step_name.is_empty() {
+        return true;
+    }
+    journalled == step_name
+}
+
 /// Look up the journalled result for a step that a resumed run is about to
 /// execute. `Some(cp)` means: return `cp.result_json` INSTEAD of executing.
 ///
 /// Returns `None` - i.e. execute the step - for an excluded phase, an excluded
-/// step type, a step that never completed, and a failed journal read. A read
+/// step type, a row of a different step type, a row naming a DIFFERENT step
+/// (see [`journalled_name_matches`]), a step that never completed, and a failed
+/// journal read. A read
 /// failure is warned about explicitly, because "we could not find out" is not
 /// the same as "it did not run" and the step is about to be re-executed and
 /// re-billed on the strength of that failure.
@@ -1576,6 +1592,32 @@ pub(crate) fn journalled_step(
                 journalled_type = %cp.step_type,
                 expected_type = %journal_step_type,
                 "Journalled step type does not match - step will be re-executed"
+            );
+            None
+        }
+        Ok(Some(cp)) if !journalled_name_matches(&cp, step_name) => {
+            // The type gate above is real but WEAK: `StepType::from_str_compat`
+            // flattens every unrecognised type to `Command`, so two adjacent
+            // shell/command steps are indistinguishable by type alone. Insert a
+            // step at index 0 of a setup phase and resume: the new index 1 looks
+            // up the slice the OLD index 1 wrote, the types match, and the
+            // wrong step's result is handed back as this step's own — the step
+            // itself never runs.
+            //
+            // `step_name` is written on EVERY checkpoint these paths journal
+            // (`.with_step_name(..)` in setup, completion and agentic) while
+            // `step_config_json` is written on none of them, so the name is the
+            // cheapest discriminator that is actually on the row. It is only a
+            // gate when BOTH sides carry one: a nameless caller or a nameless
+            // legacy row is not evidence of a mismatch, and refusing to replay
+            // there would silently disable crash recovery for older journals.
+            warn!(
+                execution_id = %execution_id,
+                phase = %phase,
+                step_index = %step_index,
+                journalled_name = ?cp.step_name,
+                expected_name = %step_name,
+                "Journalled step name does not match - step will be re-executed"
             );
             None
         }
@@ -1705,6 +1747,54 @@ mod replay_tests {
     fn undecodable_or_missing_results_fall_back_to_execution() {
         assert!(decode_journalled_step_result(&cp_with(None)).is_none());
         assert!(decode_journalled_step_result(&cp_with(Some("not json"))).is_none());
+    }
+
+    /// The shifted-index, same-type case the type gate cannot see.
+    ///
+    /// Setup journals `[0: command "npm ci", 1: command "npm test",
+    /// 2: command "deploy"]` and the run crashes after step 2. The operator
+    /// inserts a step at index 0 and resumes. The new index 1 IS `npm ci`, but
+    /// the slice `(setup, iter 0, stage 0, step 1)` holds `npm test`: same
+    /// `step_type`, so the type gate passes and `npm ci` would be skipped with
+    /// `npm test`'s result returned as its own.
+    #[test]
+    fn shifted_index_with_the_same_step_type_is_not_replayed() {
+        let journalled = |name: &str| {
+            let mut cp = StepCheckpoint::new("exec-1", "unified", "setup", Some(0), 1, "command")
+                .with_step_name(name);
+            cp.status = StepCheckpointStatus::Success;
+            cp
+        };
+
+        assert!(
+            !journalled_name_matches(&journalled("npm test"), "npm ci"),
+            "a row naming a different step must not be replayed"
+        );
+        assert!(
+            journalled_name_matches(&journalled("npm ci"), "npm ci"),
+            "the same step must still replay"
+        );
+    }
+
+    /// The name gate is a gate only when BOTH sides carry a name: a legacy row
+    /// with no `step_name`, or a nameless caller, is UNKNOWN, not a mismatch,
+    /// and must not silently disable crash recovery.
+    #[test]
+    fn a_missing_name_on_either_side_does_not_block_replay() {
+        let mut nameless = StepCheckpoint::new("exec-1", "unified", "setup", Some(0), 1, "command");
+        nameless.status = StepCheckpointStatus::Success;
+        assert!(nameless.step_name.is_none());
+        assert!(journalled_name_matches(&nameless, "npm ci"));
+
+        let named = StepCheckpoint::new("exec-1", "unified", "setup", Some(0), 1, "command")
+            .with_step_name("npm ci");
+        assert!(journalled_name_matches(&named, ""));
+
+        let mut empty_name =
+            StepCheckpoint::new("exec-1", "unified", "setup", Some(0), 1, "command")
+                .with_step_name("");
+        empty_name.status = StepCheckpointStatus::Success;
+        assert!(journalled_name_matches(&empty_name, "npm ci"));
     }
 
     #[test]
