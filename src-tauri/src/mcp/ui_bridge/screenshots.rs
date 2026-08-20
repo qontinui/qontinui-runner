@@ -205,7 +205,7 @@ pub(super) async fn capture_webview_contents(state: &Arc<ApiState>) -> Result<Ve
 
     let window = state
         .app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .get_webview_window(crate::get_main_window_label())
         .ok_or_else(|| "Runner window not found".to_string())?;
 
     // Physical inner size — logged against the CapturePreview dims on first
@@ -388,7 +388,7 @@ pub async fn capture_runner_window_base64(state: &Arc<ApiState>) -> Option<(Stri
 
     let window = state
         .app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())?;
+        .get_webview_window(crate::get_main_window_label())?;
 
     // BOUNDED (see `window_probe`): these four getters are blocking
     // event-loop round-trips, batched behind ONE timeout. Unbounded and

@@ -786,13 +786,12 @@ mod resolve {
 
     /// Coord resolve endpoint URL, or `None` when the runner is ISOLATED.
     ///
-    /// Connected-set ([`qontinui_runner_lib::profiles::connected_coord_base`]):
+    /// Connected-set ([`crate::profiles::connected_coord_base`]):
     /// fleet auto-response policies are a hosted-fleet feature, so a
     /// `qontinui_account`-tier runner with no explicit `coord_url` must still
     /// resolve against production — that is the shipped end-user config.
     fn resolve_endpoint_url() -> Option<String> {
-        qontinui_runner_lib::profiles::connected_coord_base()
-            .map(|base| format!("{base}/coord/policies/resolve"))
+        crate::profiles::connected_coord_base().map(|base| format!("{base}/coord/policies/resolve"))
     }
 
     /// Map a parsed resolve response to the response text to inject.
@@ -835,7 +834,7 @@ mod resolve {
         };
         // Device-JWT bearer on a POST — the same write-path attach the coord
         // producers use (collapses to anonymous when unpaired).
-        let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
+        let req = crate::auth::attach_device_auth(client.post(&url));
         let resp = match req.json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -897,7 +896,7 @@ mod report {
     /// belongs with the coordinator that resolved the injection, so it follows
     /// `resolve_endpoint_url`'s posture exactly.
     fn report_endpoint_url() -> Option<String> {
-        qontinui_runner_lib::profiles::connected_coord_base()
+        crate::profiles::connected_coord_base()
             .map(|base| format!("{base}/coord/prompt-injections/report"))
     }
 
@@ -945,7 +944,7 @@ mod report {
         };
         // Device-JWT bearer on the write path (collapses to anonymous when
         // unpaired), mirroring `mod resolve`.
-        let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
+        let req = crate::auth::attach_device_auth(client.post(&url));
         match req.json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {

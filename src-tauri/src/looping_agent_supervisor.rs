@@ -1,7 +1,7 @@
 //! Tier-0 looping-agent supervisor — the impure glue (plan
 //! `merge-shepherd-fixer-PLAN.md`, Phase 1).
 //!
-//! Composes the PURE cores in `qontinui_runner_lib::looping_agent` (registry,
+//! Composes the PURE cores in `crate::looping_agent` (registry,
 //! idle/context-low predicates, per-tick decision policy, bundled playbook +
 //! prompts) over the runner's existing substrate:
 //!
@@ -46,14 +46,14 @@ use std::time::Duration;
 use tauri::Manager;
 use tracing::{debug, info, warn};
 
-use qontinui_runner_lib::looping_agent::desired_state::{
+use crate::looping_agent::desired_state::{
     self, CoordDesiredState, DesiredSource, EffectiveDesired,
 };
-use qontinui_runner_lib::looping_agent::idle::{snapshot_context_low, snapshot_looks_idle};
-use qontinui_runner_lib::looping_agent::lease::{self, HeldSlot};
-use qontinui_runner_lib::looping_agent::playbook;
-use qontinui_runner_lib::looping_agent::policy::{self, Action, Liveness, SpawnReason, TickInput};
-use qontinui_runner_lib::looping_agent::registry::{
+use crate::looping_agent::idle::{snapshot_context_low, snapshot_looks_idle};
+use crate::looping_agent::lease::{self, HeldSlot};
+use crate::looping_agent::playbook;
+use crate::looping_agent::policy::{self, Action, Liveness, SpawnReason, TickInput};
+use crate::looping_agent::registry::{
     DesiredState, LoopingAgentDef, LoopingAgentRecord, LoopingAgentRegistry, MERGE_SHEPHERD_ID,
 };
 

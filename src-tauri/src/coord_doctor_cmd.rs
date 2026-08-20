@@ -1,7 +1,7 @@
 //! In-app `coord doctor` Tauri command (plan 2026-06-13 Phase 4).
 //!
 //! Thin runner-binary wrapper over the lib-crate self-check
-//! (`qontinui_runner_lib::coord_doctor`). The reusable logic — types, the
+//! (`crate::coord_doctor`). The reusable logic — types, the
 //! first-red-stops driver, the report formatter, and the 7-check wiring — lives
 //! in the lib so the standalone `coord_doctor` bin can share it. This module's
 //! only job is to inject the one fact only the LIVE runtime knows: the
@@ -14,7 +14,7 @@
 //! — that needs temp-runner visual verification and lands in a separate UI
 //! phase.
 
-use qontinui_runner_lib::coord_doctor::{diagnose, DoctorInputs, DoctorReport};
+use crate::coord_doctor::{diagnose, DoctorInputs, DoctorReport};
 
 /// Run the full `coord doctor` self-check and return the structured report.
 /// Reuses the live bound API port so check 6 (`.mcp.json` port == bound port)

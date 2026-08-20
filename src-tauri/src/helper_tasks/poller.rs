@@ -74,7 +74,7 @@ async fn tick() -> Result<(), String> {
         }
     };
 
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
 
     let client = reqwest::Client::builder()

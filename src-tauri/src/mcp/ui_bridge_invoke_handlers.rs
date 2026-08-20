@@ -185,7 +185,7 @@ pub(crate) async fn perform_invoke_round_trip(
     // and emits a duplicate `ui-bridge:invoke-response` for the same
     // request_id, fanning out side-effecting invokes and racing the oneshot.
     if let Err(e) = state.app_handle.emit_to(
-        qontinui_runner_lib::get_main_window_label(),
+        crate::get_main_window_label(),
         "ui-bridge:invoke-request",
         &payload,
     ) {

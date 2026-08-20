@@ -169,7 +169,7 @@ async fn post_commit_observation(coord_http_base: &str, body: &CommitObservation
     // unpaired / empty keychain collapses to the anonymous send coord accepts
     // today). Same write-path attach the Ξ_FS observer uses on its push, and it
     // feeds the data-plane auth-coverage metric. Must be `crate::auth`, not
-    // `qontinui_runner_lib::auth` — this module compiles into the bin target,
+    // `crate::auth` — this module compiles into the bin target,
     // and the lib path would bump the lib crate's separate counter statics,
     // invisible to the bin's `DATA_PLANE_TOTAL/AUTHED` coverage readout.
     let req = crate::auth::attach_device_auth(client.post(&url));
@@ -232,7 +232,7 @@ pub async fn forward_commit_event(event: &GitSupervisionEvent) {
     // default on a hosted qontinui_account-tier runner → dev-localhost guess
     // otherwise). This retires the one-off coord-base env var this site alone
     // honored — the policy fn is the single decision point.
-    let coord_base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let coord_base = crate::profiles::coord_base_with_source().0;
 
     post_commit_observation(&coord_base, &body).await;
 }

@@ -64,7 +64,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
-use qontinui_runner_lib::plan_workunit_adapter::body_push::ArtifactUpsert;
+use crate::plan_workunit_adapter::body_push::ArtifactUpsert;
 
 type ApiResult = Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)>;
 
@@ -528,9 +528,7 @@ fn source_path_roots() -> Vec<PathBuf> {
     // The active plans dir goes through the adapter's own precedence
     // (`QONTINUI_PLAN_ADAPTER_DIR` env override → setting) so this door and the
     // scan can never disagree about which directory is "the plans dir".
-    let plans = qontinui_runner_lib::plan_workunit_adapter::trigger::resolve_plans_dir(
-        paths.plans_dir.clone(),
-    );
+    let plans = crate::plan_workunit_adapter::trigger::resolve_plans_dir(paths.plans_dir.clone());
     [
         plans,
         paths.plans_archive_dir.clone(),

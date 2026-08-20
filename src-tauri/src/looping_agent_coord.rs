@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
-use qontinui_runner_lib::looping_agent::desired_state::CoordDesiredState;
-use qontinui_runner_lib::looping_agent::lease::{
+use crate::looping_agent::desired_state::CoordDesiredState;
+use crate::looping_agent::lease::{
     parse_acquire_result, parse_heartbeat_result, AcquireOutcome, HeartbeatOutcome,
     LEASE_CLAIM_KIND, LEASE_TTL_SECS,
 };
@@ -89,7 +89,7 @@ fn http_client() -> Result<&'static reqwest::Client, String> {
 
 fn coord_base() -> Result<String, String> {
     // String family: always yields a base (never errors).
-    Ok(qontinui_runner_lib::profiles::coord_base_with_source()
+    Ok(crate::profiles::coord_base_with_source()
         .0
         .trim_end_matches('/')
         .to_string())
@@ -336,7 +336,7 @@ pub async fn release_slot(resource_key: &str, machine_id: &uuid::Uuid, agent_id:
 /// `GET /coord/agent-playbook/:name` — the coord-served playbook body.
 ///
 /// `None` on ANY failure (unreachable / 404 / auth / decode), which the pure
-/// [`qontinui_runner_lib::looping_agent::playbook::resolve_playbook`] turns
+/// [`crate::looping_agent::playbook::resolve_playbook`] turns
 /// into the bundled fallback. A shepherd must always spawn with real
 /// instructions, even offline.
 pub async fn fetch_playbook(name: &str) -> Option<String> {

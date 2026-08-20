@@ -225,11 +225,11 @@ pub(crate) const SESSION_IDENTITY_ENABLE_FLAG: &str = "QONTINUI_SESSION_COORD_ID
 /// File name of the per-machine operator opt-in marker, under `~/.qontinui/`.
 /// Its mere existence is the signal; contents are never read.
 ///
-/// Re-exported from the LIB crate ([`qontinui_runner_lib::profile_cli`]) so this
+/// Re-exported from the LIB crate ([`crate::profile_cli`]) so this
 /// authoritative runner-side gate and the standalone `qontinui-shim` `.exe` share
 /// ONE source of truth for the marker — a rename can no longer silently desync
 /// the two processes.
-pub(crate) use qontinui_runner_lib::profile_cli::SESSION_IDENTITY_MARKER_FILE;
+pub(crate) use crate::profile_cli::SESSION_IDENTITY_MARKER_FILE;
 
 /// Absolute path of the opt-in marker (`~/.qontinui/allow-session-coord-identity`).
 /// `None` when the home dir is unresolvable — which [`session_identity_gate`]
@@ -237,7 +237,7 @@ pub(crate) use qontinui_runner_lib::profile_cli::SESSION_IDENTITY_MARKER_FILE;
 /// consent). Delegates to the shared lib resolver so the gate and the shim
 /// compute the identical path (directory + filename), not merely the filename.
 pub(crate) fn session_identity_marker_path() -> Option<std::path::PathBuf> {
-    qontinui_runner_lib::profile_cli::session_identity_marker_path()
+    crate::profile_cli::session_identity_marker_path()
 }
 
 /// Why the mint route refused. Typed rather than a bare bool so the route can
@@ -363,9 +363,8 @@ pub(crate) const COORD_MCP_PROXY_KEY_HEADER: &str = "x-coord-mcp-proxy-key";
 /// in `mcp_api`) so they all resolve the coord base identically — a proxy
 /// route must never re-derive it from env alone. The source is threaded into
 /// proxy 502 error bodies so a misconfigured upstream self-diagnoses.
-pub(crate) fn coord_base_url_with_source(
-) -> (String, qontinui_runner_lib::profiles::CoordBaseSource) {
-    let (base, source) = qontinui_runner_lib::profiles::coord_base_with_source();
+pub(crate) fn coord_base_url_with_source() -> (String, crate::profiles::CoordBaseSource) {
+    let (base, source) = crate::profiles::coord_base_with_source();
     (base.trim_end_matches('/').to_string(), source)
 }
 
@@ -378,8 +377,7 @@ pub(crate) fn coord_base_url() -> String {
 /// The full coord `/mcp` endpoint URL + source: [`coord_base_url_with_source`]
 /// with `/mcp` appended. Shared by the static-bearer `.mcp.json` writer (agent
 /// path) and the loopback proxy forwarder (`mcp_api::coord_mcp_proxy_handler`).
-pub(crate) fn coord_mcp_url_with_source() -> (String, qontinui_runner_lib::profiles::CoordBaseSource)
-{
+pub(crate) fn coord_mcp_url_with_source() -> (String, crate::profiles::CoordBaseSource) {
     let (base, source) = coord_base_url_with_source();
     (format!("{base}/mcp"), source)
 }
@@ -1721,12 +1719,12 @@ pub(crate) async fn session_bearer_and_tenant_or_refuse(
 ///
 /// Reads the legacy default slot — the only slot reachable without already
 /// knowing a tenant, which is precisely the situation this is resolving. Uses
-/// the existing unverified-payload decoder ([`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]);
+/// the existing unverified-payload decoder ([`crate::pair::tenant_id_from_oauth_claim`]);
 /// signature verification is coord's job, and the value is used only to pick a
 /// local credential slot, never as an authorization decision.
 fn device_jwt_claim_tenant() -> Option<Uuid> {
     let jwt = crate::auth::device_bearer_for(None)?;
-    let raw = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&jwt)?;
+    let raw = crate::pair::tenant_id_from_oauth_claim(&jwt)?;
     Uuid::parse_str(&raw).ok()
 }
 

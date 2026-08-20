@@ -621,7 +621,7 @@ async fn observe_verify_with_base<L: RegistryTokenLookup + ?Sized>(
 fn coord_base() -> Result<String, String> {
     // String family: always yields a base (never errors); the `Result` is kept
     // only because [`run_with_base`]'s test seam threads one.
-    Ok(qontinui_runner_lib::profiles::coord_base_with_source().0)
+    Ok(crate::profiles::coord_base_with_source().0)
 }
 
 // ===========================================================================

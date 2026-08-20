@@ -10,7 +10,7 @@
 use serde::Serialize;
 use tracing::info;
 
-use qontinui_runner_lib::env_agent::enroll::{self, EnrollParams};
+use crate::env_agent::enroll::{self, EnrollParams};
 
 use super::CommandResponse;
 
@@ -78,17 +78,17 @@ pub async fn devenv_enroll(
 /// Read the current enrollment status (mirrors `qontinui_profile env show`).
 #[tauri::command]
 pub fn devenv_enroll_status() -> Result<CommandResponse, String> {
-    use qontinui_runner_lib::env_agent::config::EnvAgentConfig;
+    use crate::env_agent::config::EnvAgentConfig;
 
     let cfg = EnvAgentConfig::load();
-    let has_key = qontinui_runner_lib::secure_storage::SecureStorage::new()
+    let has_key = crate::secure_storage::SecureStorage::new()
         .ok()
         .and_then(|s| s.get_agent_machine_key().ok().flatten())
         .map(|k| !k.is_empty())
         .unwrap_or(false);
     // Best-effort: a lookup failure just reports "not on PATH" (the button is a
     // no-op-safe re-run anyway).
-    let cli_on_path = qontinui_runner_lib::profile_cli::cli_dir_on_user_path().unwrap_or(false);
+    let cli_on_path = crate::profile_cli::cli_dir_on_user_path().unwrap_or(false);
 
     let status = match cfg {
         Some(c) => EnrollStatus {
@@ -126,10 +126,9 @@ pub fn devenv_enroll_status() -> Result<CommandResponse, String> {
 /// to add manually on other platforms).
 #[tauri::command]
 pub async fn devenv_install_cli_path() -> Result<CommandResponse, String> {
-    let outcome =
-        tokio::task::spawn_blocking(qontinui_runner_lib::profile_cli::install_cli_on_user_path)
-            .await
-            .map_err(|e| format!("PATH install task panicked: {e}"))??;
+    let outcome = tokio::task::spawn_blocking(crate::profile_cli::install_cli_on_user_path)
+        .await
+        .map_err(|e| format!("PATH install task panicked: {e}"))??;
     info!(
         "devenv_install_cli_path: added={} already_present={} dir={}",
         outcome.added, outcome.already_present, outcome.dir

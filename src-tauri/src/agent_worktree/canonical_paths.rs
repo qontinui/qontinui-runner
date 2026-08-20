@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use qontinui_runner_lib::observable_bridge::git_ops::repo_basename_from_url;
+use crate::observable_bridge::git_ops::repo_basename_from_url;
 
 /// Reduce a coord repo slug (or git URL) to the bare repo name used as a
 /// directory segment in the runner's flat canonical layout
@@ -28,7 +28,7 @@ use qontinui_runner_lib::observable_bridge::git_ops::repo_basename_from_url;
 /// error instead of silently building `<root>/`).
 ///
 /// The actual reduction is delegated to `repo_basename_from_url`
-/// (`qontinui_runner_lib::observable_bridge::git_ops`) — it already
+/// (`crate::observable_bridge::git_ops`) — it already
 /// splits on both `/` and `:`, strips a `.git` suffix, and so handles the SSH
 /// `git@github.com:owner/name.git` form that a naive `rsplit_once('/')` would
 /// mishandle (returning `name.git` from the colon-delimited shape). This

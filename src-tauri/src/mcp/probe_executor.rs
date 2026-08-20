@@ -364,7 +364,7 @@ async fn tick_once() -> Result<usize, String> {
         Some(d) => d,
         None => return Ok(0), // unpaired — nothing to do
     };
-    let base = match qontinui_runner_lib::profiles::connected_coord_base() {
+    let base = match crate::profiles::connected_coord_base() {
         Some(b) => b,
         None => return Ok(0),
     };
@@ -391,7 +391,7 @@ async fn tick_once() -> Result<usize, String> {
     for probe in &pull.probes {
         let result = execute_probe(&probe.probe_kind, &probe.probe_args).await;
         let result_url = format!("{base}/coord/probes/{}/result", probe.id);
-        match qontinui_runner_lib::auth::attach_device_auth(client.post(&result_url))
+        match crate::auth::attach_device_auth(client.post(&result_url))
             .json(&result)
             .send()
             .await

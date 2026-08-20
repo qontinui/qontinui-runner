@@ -12,9 +12,9 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::accessibility::model::UnifiedRole;
+use crate::accessibility::traits::ConnectionTarget;
 use crate::mcp::types::ApiState;
-use qontinui_runner_lib::accessibility::model::UnifiedRole;
-use qontinui_runner_lib::accessibility::traits::ConnectionTarget;
 
 // ============================================================================
 // Request / Response types

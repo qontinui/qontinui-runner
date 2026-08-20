@@ -360,7 +360,7 @@ fn resolve_tenant_id() -> Option<uuid::Uuid> {
 
 /// Report a completed branch-reset to coord's `git_ops` feed, reusing the
 /// SAME `POST /coord/git-ops/record` path
-/// (`qontinui_runner_lib::observable_bridge::git_ops_client`) the GitOpBridge
+/// (`crate::observable_bridge::git_ops_client`) the GitOpBridge
 /// AND `fleet::pull_executor` use (tenant via `X-Qontinui-Tenant-Id`; the
 /// record path resolves tenant from the header, not the JWT, so the
 /// device_token arg is passed empty exactly as `fleet.rs:1831` does).
@@ -371,14 +371,14 @@ async fn report_reset_git_op(
     default_branch: &str,
     instr: &MaintenanceInstruction,
 ) {
-    use qontinui_runner_lib::observable_bridge::git_ops_client;
+    use crate::observable_bridge::git_ops_client;
     use qontinui_types::git_ops::RecordGitOpRequest;
 
     let Some(tenant_id) = resolve_tenant_id() else {
         debug!("maintenance: no tenant_id — skipping git_op record for {repo_path}");
         return;
     };
-    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+    let Some(base) = crate::profiles::connected_coord_base() else {
         debug!("maintenance: no coord_url — skipping git_op record for {repo_path}");
         return;
     };
@@ -425,7 +425,7 @@ async fn report_reset_git_op(
 /// `repo_basename_from_url` (pub, crosses the lib↔bin boundary — the same
 /// function `agent_worktree::canonical_paths` imports).
 fn resolve_repo_name(repo_path: &str) -> String {
-    use qontinui_runner_lib::observable_bridge::git_ops::repo_basename_from_url;
+    use crate::observable_bridge::git_ops::repo_basename_from_url;
     let dir = Path::new(repo_path);
     let config = dir.join(".git").join("config");
     if let Ok(text) = std::fs::read_to_string(&config) {
@@ -502,7 +502,7 @@ pub async fn tick_once() -> Result<(), String> {
             return Ok(());
         }
     };
-    let base = match qontinui_runner_lib::profiles::connected_coord_base() {
+    let base = match crate::profiles::connected_coord_base() {
         Some(b) => b,
         None => {
             debug!("maintenance: no coord_url configured — skipping");

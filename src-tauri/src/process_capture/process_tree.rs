@@ -285,14 +285,13 @@ fn is_countable_claude(pid: u32, snapshot: &ProcessSnapshot) -> bool {
 
 /// The persistent identity-shim dir (`~/.qontinui/runner/identity-shim`) as a
 /// normalized-string, resolved once per process. Single source of truth is
-/// [`qontinui_runner_lib::profile_cli::identity_shim_dir`] — the same function
+/// [`crate::profile_cli::identity_shim_dir`] — the same function
 /// the shim materializer installs into, so the exclusion can never drift from
 /// the install location. `None` when the home dir is unresolvable.
 fn persistent_identity_shim_dir() -> Option<&'static str> {
     static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        qontinui_runner_lib::profile_cli::identity_shim_dir()
-            .map(|p| p.to_string_lossy().into_owned())
+        crate::profile_cli::identity_shim_dir().map(|p| p.to_string_lossy().into_owned())
     })
     .as_deref()
 }

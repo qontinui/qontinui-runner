@@ -409,7 +409,7 @@ async fn post_observations(coord_http_base: &str, body: &FsObservationsRequest) 
     // today). Same write-path attach the credential-helper uses, and it feeds
     // the data-plane auth-coverage metric ahead of multiuser Phase-2
     // enforcement on `/coord/fs/observations`. Must be `crate::auth`, not
-    // `qontinui_runner_lib::auth` — this module compiles into the bin target,
+    // `crate::auth` — this module compiles into the bin target,
     // and the lib path would bump the lib crate's separate counter statics,
     // invisible to the bin's `DATA_PLANE_TOTAL/AUTHED` coverage readout.
     let req = crate::auth::attach_device_auth(client.post(&url));

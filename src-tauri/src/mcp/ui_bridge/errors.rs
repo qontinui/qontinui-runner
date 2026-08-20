@@ -229,7 +229,7 @@ pub async fn ui_bridge_diagnostics_handler(
     // Check Tauri main window state
     let main_window = state
         .app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label());
+        .get_webview_window(crate::get_main_window_label());
     let window_exists = main_window.is_some();
     let window_visible = main_window
         .as_ref()

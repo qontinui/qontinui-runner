@@ -61,7 +61,7 @@ use tracing::{debug, error, info, warn};
 /// The runner's connected-vs-isolated decision, imported (not re-wrapped) from
 /// its single definition in `profiles`. Every coord surface in this module
 /// no-ops when it is `None` (the runner is standalone).
-use qontinui_runner_lib::profiles::connected_coord_base;
+use crate::profiles::connected_coord_base;
 
 // =============================================================================
 // Wire shapes (mirror of qontinui-coord/src/agents_spawn.rs)
@@ -1780,13 +1780,13 @@ struct TerminalFocusRequest<'a> {
 /// Uses `emit_to(get_main_window_label(), …)` — NOT the bare global `emit`
 /// (the `terminal-created` broadcast pattern) — so a pop-out webview is not
 /// yanked to this tab. The canonical main-window-label accessor
-/// (`qontinui_runner_lib::get_main_window_label()`, returns `"main"`) matches
+/// (`crate::get_main_window_label()`, returns `"main"`) matches
 /// the #473 `ui-bridge:invoke-request` scoping.
 pub(crate) fn emit_terminal_focus_request(app: &tauri::AppHandle, terminal_id: &str) {
     use tauri::Emitter;
     let payload = TerminalFocusRequest { terminal_id };
     if let Err(e) = app.emit_to(
-        qontinui_runner_lib::get_main_window_label(),
+        crate::get_main_window_label(),
         EVENT_TERMINAL_FOCUS_REQUEST,
         &payload,
     ) {
@@ -5423,8 +5423,8 @@ mod tests {
         let device = uuid::Uuid::nil();
         // The gate says connected…
         assert_eq!(
-            qontinui_runner_lib::profiles::connected_coord_base().as_deref(),
-            Some(qontinui_runner_lib::profiles::PROD_COORD_BASE),
+            crate::profiles::connected_coord_base().as_deref(),
+            Some(crate::profiles::PROD_COORD_BASE),
         );
         // …so the resolver behind it must agree, and produce exactly one `/ws`.
         assert_eq!(
@@ -5454,7 +5454,7 @@ mod tests {
             std::env::set_var("QONTINUI_CONFIG_DIR", dir.path());
             std::fs::write(dir.path().join("settings.json"), settings).unwrap();
             assert_eq!(
-                qontinui_runner_lib::profiles::connected_coord_base(),
+                crate::profiles::connected_coord_base(),
                 None,
                 "settings {settings:?}"
             );

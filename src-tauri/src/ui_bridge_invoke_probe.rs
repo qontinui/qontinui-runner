@@ -102,7 +102,7 @@ pub async fn probe_allowlist_wire_contracts(
         // for the same request_id, racing the probe oneshot and re-running the
         // probed command in each pop-out window.
         if let Err(e) = app_handle.emit_to(
-            qontinui_runner_lib::get_main_window_label(),
+            crate::get_main_window_label(),
             "ui-bridge:invoke-request",
             &payload,
         ) {

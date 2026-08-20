@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 // `RunnerObservableBridge` is in scope so `bridge.pull` / `bridge.reconcile`
 // resolve through the trait on the registry's `Arc<dyn …>` entries.
-use qontinui_runner_lib::observable_bridge::RunnerObservableBridge;
+use crate::observable_bridge::RunnerObservableBridge;
 
 use crate::claude_protocol::request_id::next_request_id;
 use crate::claude_protocol::types::{OutgoingControlRequest, UserInputMessage};
@@ -129,7 +129,7 @@ pub struct ClaudeSession {
     /// unconfigured — the session runs purely locally.
     ///
     /// Plan: `2026-05-24-federation-verify-and-gitop.md`.
-    federation_ctx: Option<qontinui_runner_lib::observable_bridge::SessionContext>,
+    federation_ctx: Option<crate::observable_bridge::SessionContext>,
     /// Worktree-isolation Phase 3 (restart-resilience): when a RESUMED chat
     /// session re-acquired its `kind=worktree` coord claim on startup, this
     /// carries the re-acquired `IsolatedEditContext`. The context's `Drop`
@@ -317,7 +317,7 @@ impl ClaudeSession {
             // The runner spawns Claude CLI as an automation tool, not as a nested session.
             .env_remove("CLAUDECODE")
             // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-            .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
+            .env_remove(crate::claude_env::CLAUDE_CHILD_SESSION_ENV)
             .env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -381,7 +381,7 @@ impl ClaudeSession {
             let federation_budget = std::time::Duration::from_secs(10);
             let federated = Self::block_on_async(async {
                 tokio::time::timeout(federation_budget, async {
-                    for b in qontinui_runner_lib::observable_bridge::global_registry() {
+                    for b in crate::observable_bridge::global_registry() {
                         match b.pull(&mut ctx).await {
                             Ok(()) => {
                                 if let Err(e) = std::sync::Arc::clone(b).start_watching(&ctx).await {
@@ -430,7 +430,7 @@ impl ClaudeSession {
                 // running for the lifetime of the runner process.
                 if let Some(ctx) = federation_ctx.as_ref() {
                     Self::block_on_async(async {
-                        for b in qontinui_runner_lib::observable_bridge::global_registry() {
+                        for b in crate::observable_bridge::global_registry() {
                             b.stop_watching(ctx.session_id).await;
                         }
                     });
@@ -1116,7 +1116,7 @@ impl ClaudeSession {
             // the watcher (idempotent), pushes any deltas the watcher
             // missed, and logs the per-bridge report.
             if let Some(ctx) = federation_ctx_for_waiter.as_ref() {
-                for b in qontinui_runner_lib::observable_bridge::global_registry() {
+                for b in crate::observable_bridge::global_registry() {
                     let category = b.category();
                     let report = Self::block_on_async(async {
                         b.stop_watching(ctx.session_id).await;

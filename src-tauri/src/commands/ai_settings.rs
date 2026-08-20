@@ -1470,7 +1470,7 @@ mod usage_twin_report {
         // `coord_url`. An isolated runner reports nothing (and the
         // `QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED` kill switch above still
         // opts a connected one out).
-        let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+        let Some(base) = crate::profiles::connected_coord_base() else {
             return;
         };
         let url = format!("{}/coord/claude-accounts/usage", base.trim_end_matches('/'));
@@ -1497,7 +1497,7 @@ mod usage_twin_report {
             Ok(c) => c,
             Err(_) => return,
         };
-        let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
+        let req = crate::auth::attach_device_auth(client.post(&url));
         match req.json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {
                 debug!(

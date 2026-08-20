@@ -308,7 +308,7 @@ pub(super) async fn direct_webview_evaluate_with_result(
 
     let window = state
         .app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .get_webview_window(crate::get_main_window_label())
         .ok_or_else(|| "WebView window 'main' not found".to_string())?;
 
     let request_id = uuid::Uuid::new_v4().to_string();

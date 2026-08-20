@@ -11,12 +11,12 @@
 //! errors via [`AppError`] internally, converting with
 //! `.map_err(String::from)`. See `commands/mod.rs` for the migration guide.
 
+use crate::accessibility::model::UnifiedRole;
+use crate::accessibility::traits::ConnectionTarget;
+use crate::accessibility::AccessibilityManager;
 use crate::error::AppError;
 use crate::event_system::AppEvent;
 use crate::settings::{self, AccessibilitySettings};
-use qontinui_runner_lib::accessibility::model::UnifiedRole;
-use qontinui_runner_lib::accessibility::traits::ConnectionTarget;
-use qontinui_runner_lib::accessibility::AccessibilityManager;
 
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Runtime};

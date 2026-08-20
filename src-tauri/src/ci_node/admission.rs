@@ -488,7 +488,7 @@ fn report_base(payload: &CiDispatchPayload) -> Option<String> {
     if !pinned.is_empty() {
         return Some(pinned.trim_end_matches('/').to_string());
     }
-    qontinui_runner_lib::profiles::connected_coord_base()
+    crate::profiles::connected_coord_base()
 }
 
 fn reject(payload: &CiDispatchPayload, reason: String) {

@@ -107,10 +107,10 @@ pub struct ObserveVerifyRequest {
 
 /// A requested spec on the route request (mirror of coord's [`PackageSpec`]
 /// with a friendlier route field name). Defined in the lib crate
-/// ([`qontinui_runner_lib::intercept_core::types`]) so the standalone
+/// ([`crate::intercept_core::types`]) so the standalone
 /// `qontinui-shim` stub shares the exact wire shape; re-exported here so the
 /// producer code reads it unchanged.
-pub use qontinui_runner_lib::intercept_core::types::PackageSpecInput;
+pub use crate::intercept_core::types::PackageSpecInput;
 
 impl From<&PackageSpecInput> for PackageSpec {
     fn from(p: &PackageSpecInput) -> Self {
@@ -228,10 +228,10 @@ pub struct InstallOutcome {
 
 /// Mirror of coord `install_effects::PackageManager`
 /// (`#[serde(rename_all = "snake_case")]`). NO `pipenv` variant by design.
-/// Defined in the lib crate ([`qontinui_runner_lib::intercept_core::types`]) so
+/// Defined in the lib crate ([`crate::intercept_core::types`]) so
 /// the standalone `qontinui-shim` stub shares the exact wire shape; re-exported
 /// here so the producer code reads it unchanged.
-pub use qontinui_runner_lib::intercept_core::types::PackageManager;
+pub use crate::intercept_core::types::PackageManager;
 
 /// Mirror of coord `install_effects::PackageSpec`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

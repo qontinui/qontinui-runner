@@ -1207,7 +1207,7 @@ fn redact_url(url: &str) -> String {
 /// GET the effective registry for this device.
 ///
 /// Auth is the repo's canonical device-JWT path — [`crate::coord_http::coord_get`]
-/// → `qontinui_runner_lib::auth::attach_device_auth` — the same bearer the
+/// → `crate::auth::attach_device_auth` — the same bearer the
 /// write path presents, so this read feeds the one auth-coverage metric. No
 /// token is minted here and none is logged.
 ///
@@ -1236,7 +1236,7 @@ fn classify_failure(status: reqwest::StatusCode, body: &str, safe_url: &str) -> 
 }
 
 async fn fetch_effective() -> Fetched {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     if !crate::coord_http::have_device_token() {
         return Fetched::Unpaired;
     }

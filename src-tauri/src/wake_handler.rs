@@ -113,7 +113,7 @@ fn handle_url(app: AppHandle, url: &Url, raw: &str) {
 /// user (or an automated dispatch from qontinui-web) wants the runner to act
 /// *now*, so an unminimize + focus gives a visible signal that the wake landed.
 fn focus_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
+    if let Some(window) = app.get_webview_window(crate::get_main_window_label()) {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }

@@ -748,7 +748,7 @@ enum CapabilityCheck {
 ///   longer fail to resolve: `profiles::coord_base_with_source` always yields
 ///   one.)
 async fn check_fleet_policy_capability() -> CapabilityCheck {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     let url = format!("{}/health", base.trim_end_matches('/'));
 
     let client = match reqwest::Client::builder()
@@ -1013,7 +1013,7 @@ async fn fetch_fleet_policy(domain: &str) -> Result<FleetPolicyResponse, FetchEr
 
     // coord base — identical source-of-truth chain to the producer's
     // `coord_base()` (env COORD_HTTP_URL → profile coord_url → default).
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     let url = format!(
         "{}/coord/fleet-policy?domain={domain}",
         base.trim_end_matches('/')

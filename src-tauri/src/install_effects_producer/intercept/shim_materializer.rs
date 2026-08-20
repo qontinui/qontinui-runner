@@ -724,7 +724,7 @@ pub const PERSISTENT_IDENTITY_TOOL: &str = "claude";
 /// no-op that reads as "enabled".
 #[cfg(target_os = "windows")]
 pub fn materialize_persistent_identity() -> Result<PathBuf, String> {
-    let dir = qontinui_runner_lib::profile_cli::identity_shim_dir()
+    let dir = crate::profile_cli::identity_shim_dir()
         .ok_or_else(|| "home directory unresolvable".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     copy_exe_stub(&dir, PERSISTENT_IDENTITY_TOOL);
@@ -750,7 +750,7 @@ pub fn materialize_persistent_identity() -> Result<PathBuf, String> {
 /// gate. Called AFTER the PATH entry is removed, so no window exists in which
 /// PATH names a dir whose stub is already gone.
 pub fn remove_persistent_identity() -> Result<(), String> {
-    let Some(dir) = qontinui_runner_lib::profile_cli::identity_shim_dir() else {
+    let Some(dir) = crate::profile_cli::identity_shim_dir() else {
         return Ok(()); // no home dir ⇒ nothing was ever materialized
     };
     match std::fs::remove_dir_all(&dir) {
@@ -763,7 +763,7 @@ pub fn remove_persistent_identity() -> Result<(), String> {
 /// Is the persistent identity shim fully installed — the stub materialized AND
 /// its dir on the USER PATH? Both are required: either alone does nothing.
 pub fn persistent_identity_installed() -> Result<bool, String> {
-    let Some(dir) = qontinui_runner_lib::profile_cli::identity_shim_dir() else {
+    let Some(dir) = crate::profile_cli::identity_shim_dir() else {
         return Ok(false);
     };
     #[cfg(target_os = "windows")]
@@ -775,7 +775,7 @@ pub fn persistent_identity_installed() -> Result<bool, String> {
     if !stub_present {
         return Ok(false);
     }
-    qontinui_runner_lib::profile_cli::dir_on_user_path(&dir)
+    crate::profile_cli::dir_on_user_path(&dir)
 }
 
 /// Mark a materialized shim executable (Unix). No-op on Windows (resolution is
@@ -1056,7 +1056,7 @@ mod tests {
     /// nothing.
     #[test]
     fn persistent_identity_dir_is_stable_and_never_swept() {
-        let Some(dir) = qontinui_runner_lib::profile_cli::identity_shim_dir() else {
+        let Some(dir) = crate::profile_cli::identity_shim_dir() else {
             return; // no home dir in this environment
         };
         assert!(
@@ -1081,7 +1081,7 @@ mod tests {
         // Never materialized (or already removed) ⇒ Ok, no panic. Runs against
         // the real path but only ever REMOVES what this feature owns, and only
         // when a previous test/opt-in put it there.
-        if qontinui_runner_lib::profile_cli::identity_shim_dir()
+        if crate::profile_cli::identity_shim_dir()
             .map(|d| d.exists())
             .unwrap_or(false)
         {
@@ -1097,7 +1097,7 @@ mod tests {
     #[test]
     fn persistent_identity_not_installed_without_the_stub() {
         let installed = persistent_identity_installed().unwrap_or(false);
-        let stub_present = qontinui_runner_lib::profile_cli::identity_shim_dir()
+        let stub_present = crate::profile_cli::identity_shim_dir()
             .map(|d| d.join("claude.exe").is_file())
             .unwrap_or(false);
         if !stub_present {

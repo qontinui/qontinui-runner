@@ -944,7 +944,7 @@ impl AgentLogEmitter {
 fn read_device_id_uuid() -> Option<Uuid> {
     // `pair` lives in the `qontinui_runner_lib` crate (this module compiles into
     // both the lib and the bin target, so the bin can't reach it via `crate::`).
-    let raw = qontinui_runner_lib::pair::read_device_id_from_disk().ok()?;
+    let raw = crate::pair::read_device_id_from_disk().ok()?;
     Uuid::parse_str(raw.trim()).ok()
 }
 
@@ -1013,7 +1013,7 @@ fn flush_batch(
     let Some(client) = client else {
         return; // client build failed earlier — keep buffering (capped).
     };
-    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+    let Some(base) = crate::profiles::connected_coord_base() else {
         return; // coord not configured — keep buffering (capped).
     };
 

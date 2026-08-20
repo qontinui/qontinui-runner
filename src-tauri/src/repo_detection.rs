@@ -70,7 +70,7 @@ fn parse_repo_slug(url: &str) -> Option<String> {
 }
 
 async fn fetch_registered_repos() -> Result<CanonicalRepos, String> {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/canonical-repos");
 
@@ -227,7 +227,7 @@ pub async fn check_and_emit_unregistered(
 
 #[tauri::command]
 pub async fn register_repo_with_coord(repo: String) -> Result<serde_json::Value, String> {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/canonical-repos");
 

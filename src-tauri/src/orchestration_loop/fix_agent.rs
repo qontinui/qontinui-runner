@@ -55,7 +55,7 @@ fn build_fix_agent_command(prompt_file: &str, model: &str) -> tokio::process::Co
     ])
     .env_remove("CLAUDECODE")
     // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-    .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
+    .env_remove(crate::claude_env::CLAUDE_CHILD_SESSION_ENV)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 

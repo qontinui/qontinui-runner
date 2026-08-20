@@ -90,7 +90,7 @@ use uuid::Uuid;
 
 /// The runner's connected-vs-isolated decision, imported (not re-wrapped)
 /// from its single definition in `profiles`.
-use qontinui_runner_lib::profiles::connected_coord_base;
+use crate::profiles::connected_coord_base;
 
 use super::canonical_paths::default_canonical_path;
 

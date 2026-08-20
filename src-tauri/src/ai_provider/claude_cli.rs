@@ -337,7 +337,7 @@ fn build_scorer_command(program: &str, config_dir: Option<&str>) -> std::process
     }
     cmd.env_remove("CLAUDECODE");
     // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-    cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+    cmd.env_remove(crate::claude_env::CLAUDE_CHILD_SESSION_ENV);
     cmd.env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string());
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())

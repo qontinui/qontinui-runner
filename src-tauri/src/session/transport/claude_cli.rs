@@ -22,7 +22,7 @@
 //!
 //! **The spawn-site strip rule.** Every Claude CLI spawn site must
 //! `env_remove` EVERY marker in
-//! `qontinui_runner_lib::claude_env::INHERITED_SESSION_MARKERS`
+//! `crate::claude_env::INHERITED_SESSION_MARKERS`
 //! — currently `CLAUDECODE` and `CLAUDE_CODE_CHILD_SESSION` — to keep Claude
 //! from detecting a "nested session". Both are process-topology markers that
 //! are inherited by the whole process tree with nothing clearing them, so a

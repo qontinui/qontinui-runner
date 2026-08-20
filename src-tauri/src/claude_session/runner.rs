@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 // `RunnerObservableBridge` is in scope so `bridge.pull`/`bridge.reconcile`
 // resolve through the trait on the registry's `Arc<dyn …>` entries.
-use qontinui_runner_lib::observable_bridge::RunnerObservableBridge;
+use crate::observable_bridge::RunnerObservableBridge;
 
 use crate::doctor::DoctorHandle;
 use crate::findings::{
@@ -319,7 +319,7 @@ fn build_inline_child_command(cli_args: &[String], working_dir: &str) -> std::pr
         // The runner spawns Claude CLI as an automation tool, not as a nested session.
         .env_remove("CLAUDECODE")
         // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-        .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
+        .env_remove(crate::claude_env::CLAUDE_CHILD_SESSION_ENV)
         .env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -552,7 +552,7 @@ fn run_claude_session_inline(
         // or the other bridges. Returns the ctx (with any post-pull
         // baselines recorded) so the exit path can reconcile.
         run_async_inline(async {
-            for b in qontinui_runner_lib::observable_bridge::global_registry() {
+            for b in crate::observable_bridge::global_registry() {
                 match b.pull(&mut ctx).await {
                     Ok(()) => {
                         if let Err(e) = std::sync::Arc::clone(b).start_watching(&ctx).await {
@@ -589,7 +589,7 @@ fn run_claude_session_inline(
             // spawn failure does not leak an orphan `notify` hook.
             if let Some(ctx) = federation_ctx_opt.as_ref() {
                 run_async_inline(async {
-                    for b in qontinui_runner_lib::observable_bridge::global_registry() {
+                    for b in crate::observable_bridge::global_registry() {
                         b.stop_watching(ctx.session_id).await;
                     }
                 });
@@ -2176,7 +2176,7 @@ fn run_claude_session_inline(
     // returns. Stops the per-session watcher (idempotent), pushes any
     // deltas the watcher missed, and logs the per-bridge report.
     if let Some(ctx) = federation_ctx_opt.as_ref() {
-        for b in qontinui_runner_lib::observable_bridge::global_registry() {
+        for b in crate::observable_bridge::global_registry() {
             let category = b.category();
             let report = run_async_inline(async {
                 b.stop_watching(ctx.session_id).await;

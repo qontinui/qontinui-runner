@@ -1759,11 +1759,11 @@ fn checkout_shared_branch(
 /// `qontinui-supervisor/src/fleet.rs::coord_http_base`.
 ///
 /// Thin re-export of the unified normalizer in
-/// [`qontinui_runner_lib::profiles::coord_ws_to_http`] — kept under this name
+/// [`crate::profiles::coord_ws_to_http`] — kept under this name
 /// so its existing ~6 call sites (and the doc-comment cross-refs) don't churn.
 /// The unified fn is the byte-identical superset of this fn's prior body.
 pub fn coord_ws_to_http(coord_url: &str) -> String {
-    qontinui_runner_lib::profiles::coord_ws_to_http(coord_url)
+    crate::profiles::coord_ws_to_http(coord_url)
 }
 
 #[cfg(test)]

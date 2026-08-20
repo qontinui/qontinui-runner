@@ -12,7 +12,7 @@
 //!
 //! This loop is a sibling of [`crate::fleet::spawn_tree_publisher`]:
 //! - Reuses [`crate::fleet::load_device_file`] for identity (`device_id`).
-//! - Reuses [`qontinui_runner_lib::profiles::connected_coord_base`] for the
+//! - Reuses [`crate::profiles::connected_coord_base`] for the
 //!   coord HTTP endpoint (the single connected-vs-isolated definition).
 //! - Reuses [`crate::terminal::transcript::session_transcript_path`] for the
 //!   `$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/<session-id>.jsonl` path so we
@@ -297,7 +297,7 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
             return Ok(());
         }
     };
-    let base = match qontinui_runner_lib::profiles::connected_coord_base() {
+    let base = match crate::profiles::connected_coord_base() {
         Some(b) => b,
         None => {
             info!(

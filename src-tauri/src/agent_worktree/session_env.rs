@@ -119,9 +119,9 @@ pub fn session_env(ctx: Option<&IsolatedEditContext>) -> Vec<(String, String)> {
     let paths = get_setting::<PathSettings>();
     build_session_env(
         ctx.and_then(|c| c.session_worktrees_env_value()),
-        qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(paths.plans_dir),
+        crate::plan_workunit_adapter::resolve_plans_dir(paths.plans_dir),
         non_blank(paths.plans_archive_dir),
-        qontinui_runner_lib::plan_workunit_adapter::resolve_prompts_dir(paths.prompts_dir),
+        crate::plan_workunit_adapter::resolve_prompts_dir(paths.prompts_dir),
     )
 }
 
@@ -232,7 +232,7 @@ mod tests {
         );
         assert!(build_session_env(None, None, non_blank(Some("   ".to_string())), None).is_empty());
         assert_eq!(
-            qontinui_runner_lib::plan_workunit_adapter::resolve_prompts_dir(Some("  ".to_string())),
+            crate::plan_workunit_adapter::resolve_prompts_dir(Some("  ".to_string())),
             None
         );
     }

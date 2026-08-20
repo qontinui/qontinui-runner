@@ -72,7 +72,7 @@ fn detect_window_geometry(
     override_scale: Option<f64>,
 ) -> (i32, i32, f64) {
     use tauri::Manager;
-    let window = app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label());
+    let window = app_handle.get_webview_window(crate::get_main_window_label());
     if let Some(win) = window {
         let detected_scale = win.scale_factor().unwrap_or(1.0);
         let pos = win.inner_position().unwrap_or_default();
@@ -102,7 +102,7 @@ fn detect_window_geometry(
 fn focus_runner_window(app_handle: &tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
     let win = app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .get_webview_window(crate::get_main_window_label())
         .ok_or_else(|| "runner main window not found".to_string())?;
     win.set_focus().map_err(|e| {
         error!("GUI Config: Failed to focus runner window: {}", e);
@@ -125,7 +125,7 @@ fn runner_window_has_foreground(app_handle: &tauri::AppHandle) -> Result<bool, S
     use tauri::Manager;
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     let win = app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .get_webview_window(crate::get_main_window_label())
         .ok_or_else(|| "runner main window not found".to_string())?;
     let hwnd = win
         .hwnd()

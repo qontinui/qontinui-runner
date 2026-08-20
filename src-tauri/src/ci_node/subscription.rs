@@ -94,7 +94,7 @@ pub(crate) fn build_ci_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String 
 /// (`profiles::coord_ws_to_http`); [`build_ci_ws_url`] flips the scheme and
 /// re-appends it idempotently.
 fn ci_ws_url(device_id: uuid::Uuid) -> Option<String> {
-    let coord_base = qontinui_runner_lib::profiles::connected_coord_base()?;
+    let coord_base = crate::profiles::connected_coord_base()?;
     Some(build_ci_ws_url(&coord_base, device_id))
 }
 
@@ -323,7 +323,7 @@ mod tests {
             std::env::set_var("QONTINUI_CONFIG_DIR", dir.path());
             std::fs::write(dir.path().join("settings.json"), settings).unwrap();
 
-            let gate = qontinui_runner_lib::profiles::connected_coord_base();
+            let gate = crate::profiles::connected_coord_base();
             let ws = ci_ws_url(device);
             assert_eq!(
                 gate.is_some(),

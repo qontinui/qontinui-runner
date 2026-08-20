@@ -664,7 +664,7 @@ async fn health(
         use tauri::Manager;
         state
             .app_handle
-            .get_webview_window(qontinui_runner_lib::get_main_window_label())
+            .get_webview_window(crate::get_main_window_label())
     };
     let frontend_state = crate::mcp::ui_bridge::request::classify_frontend_state(
         crate::mcp::ui_bridge::request::FrontendStateInputs {
@@ -3442,7 +3442,7 @@ async fn coord_claims_read_proxy_handler(
 async fn forward_claims_get(
     url: &str,
     bearer: &str,
-    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+    coord_base_source: crate::profiles::CoordBaseSource,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -3848,7 +3848,7 @@ async fn forward_coord_write_post(
     url: &str,
     bearer: &str,
     body: axum::body::Bytes,
-    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+    coord_base_source: crate::profiles::CoordBaseSource,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -4690,7 +4690,7 @@ pub fn create_router(
         knowledge_graph_cache: Arc::new(tokio::sync::RwLock::new(None)),
         graph_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         accessibility_manager: Arc::new(tokio::sync::Mutex::new(
-            qontinui_runner_lib::accessibility::AccessibilityManager::new(),
+            crate::accessibility::AccessibilityManager::new(),
         )),
         physical_device_registry: Arc::new(
             crate::mcp::physical_device::PhysicalDeviceRegistry::new(),
@@ -6549,8 +6549,7 @@ pub async fn start_server(
                         Some(name) => format!("Qontinui Runner — {} [:{}]", name, try_port),
                         None => format!("Qontinui Runner [:{}]", try_port),
                     };
-                    if let Some(window) =
-                        emitter.get_webview_window(qontinui_runner_lib::get_main_window_label())
+                    if let Some(window) = emitter.get_webview_window(crate::get_main_window_label())
                     {
                         if let Err(e) = window.set_title(&title) {
                             warn!("Failed to set window title: {}", e);
@@ -8402,7 +8401,7 @@ mod coord_claims_proxy_tests {
         let resp = forward_claims_get(
             &url,
             "test-device-jwt",
-            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            crate::profiles::CoordBaseSource::Profile,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -8418,7 +8417,7 @@ mod coord_claims_proxy_tests {
         let resp = forward_claims_get(
             &url,
             "test-device-jwt",
-            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            crate::profiles::CoordBaseSource::Profile,
         )
         .await;
         assert_eq!(resp.status(), 403);
@@ -8449,7 +8448,7 @@ mod coord_claims_proxy_tests {
         let resp = forward_claims_get(
             &url,
             "test-device-jwt",
-            qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
+            crate::profiles::CoordBaseSource::DevLocalhostFallback,
         )
         .await;
         assert_eq!(resp.status(), 502);
@@ -8939,7 +8938,7 @@ mod coord_write_proxy_tests {
             &url,
             "test-device-jwt",
             axum::body::Bytes::from_static(br#"{"resource_key":"work-units/u"}"#),
-            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            crate::profiles::CoordBaseSource::Profile,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -8959,7 +8958,7 @@ mod coord_write_proxy_tests {
             &url,
             "test-device-jwt",
             axum::body::Bytes::new(),
-            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            crate::profiles::CoordBaseSource::Profile,
         )
         .await;
         assert_eq!(resp.status(), 403);
@@ -8991,7 +8990,7 @@ mod coord_write_proxy_tests {
             &url,
             "test-device-jwt",
             axum::body::Bytes::new(),
-            qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
+            crate::profiles::CoordBaseSource::TierDefault,
         )
         .await;
         assert_eq!(resp.status(), 502);

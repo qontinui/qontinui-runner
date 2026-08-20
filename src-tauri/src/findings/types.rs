@@ -7,7 +7,7 @@
 //! the corresponding PG ENUMs), so drift is impossible at compile time.
 //!
 //! The Tauri event payload structs (`Finding`, `FindingCodeContext`,
-//! `FindingUserInput`) are re-exported from `qontinui_runner_lib::tauri_event_payloads`
+//! `FindingUserInput`) are re-exported from `crate::tauri_event_payloads`
 //! so the JSON-Schema → TypeScript pipeline (`schema_export::export_all_schemas`)
 //! sees the same Rust types the binary emits over the `finding_detected` /
 //! `finding_resolved` channels.
@@ -19,9 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use qontinui_runner_lib::tauri_event_payloads::{
-    Finding, FindingCodeContext, FindingUserInput,
-};
+pub use crate::tauri_event_payloads::{Finding, FindingCodeContext, FindingUserInput};
 
 pub use qontinui_types::task_run::{
     TaskRunFindingActionType as FindingActionType, TaskRunFindingCategory as FindingCategory,
@@ -170,13 +168,13 @@ impl FindingActionTypeExt for FindingActionType {
 }
 
 // `Finding`, `FindingCodeContext`, `FindingUserInput` are re-exported above
-// from `qontinui_runner_lib::tauri_event_payloads`. That module is the wire-
+// from `crate::tauri_event_payloads`. That module is the wire-
 // format source of truth and is what the schema export pipeline binds.
 
 /// Inherent helpers for the [`Finding`] payload type.
 ///
 /// Provided as an extension trait because the `Finding` struct lives in the
-/// library crate (`qontinui_runner_lib::tauri_event_payloads`) and these
+/// library crate (`crate::tauri_event_payloads`) and these
 /// helpers depend on the runner-local `FindingCategoryExt` trait below.
 /// Call sites are unaffected: `finding.compute_signature_hash()` works as
 /// long as `FindingExt` is in scope.

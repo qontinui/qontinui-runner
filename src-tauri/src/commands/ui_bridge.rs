@@ -404,7 +404,7 @@ pub async fn ui_bridge_reload_webview(app: tauri::AppHandle) -> Result<CommandRe
     info!("UI Bridge: Reloading webview");
 
     // Get all webview windows and reload the main one
-    if let Some(window) = app.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
+    if let Some(window) = app.get_webview_window(crate::get_main_window_label()) {
         window
             .eval("location.reload()")
             .map_err(|e| String::from(AppError::from(e)))?;

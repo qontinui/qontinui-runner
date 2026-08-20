@@ -101,7 +101,7 @@ pub fn get_monitors(app_handle: AppHandle) -> Result<CommandResponse, String> {
     info!("Detecting system monitors");
 
     let window = app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .get_webview_window(crate::get_main_window_label())
         .ok_or("Failed to get main window")?;
 
     // Get available monitors

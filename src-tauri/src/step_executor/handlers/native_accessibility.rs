@@ -10,10 +10,10 @@ use tauri::Manager;
 use tracing::{debug, info};
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
+use crate::accessibility::model::UnifiedRole;
+use crate::accessibility::traits::ConnectionTarget;
+use crate::accessibility::AccessibilityManager;
 use crate::step_executor::ExecutionStepConfig;
-use qontinui_runner_lib::accessibility::model::UnifiedRole;
-use qontinui_runner_lib::accessibility::traits::ConnectionTarget;
-use qontinui_runner_lib::accessibility::AccessibilityManager;
 
 /// Default timeout for connecting to an accessibility source (ms).
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5000;

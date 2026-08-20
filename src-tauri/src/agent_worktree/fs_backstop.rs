@@ -395,7 +395,7 @@ pub async fn tick_once() -> Result<(), String> {
             return Ok(());
         }
     };
-    let coord_base = match qontinui_runner_lib::profiles::connected_coord_base() {
+    let coord_base = match crate::profiles::connected_coord_base() {
         Some(b) => b,
         None => {
             debug!("fs_backstop: no coord_url configured — skipping");

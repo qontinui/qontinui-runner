@@ -911,7 +911,7 @@ pub async fn ui_bridge_list_runner_windows_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     use tauri::Manager;
-    let main_label = qontinui_runner_lib::get_main_window_label();
+    let main_label = crate::get_main_window_label();
     let mut windows: Vec<serde_json::Value> = state
         .app_handle
         .webview_windows()

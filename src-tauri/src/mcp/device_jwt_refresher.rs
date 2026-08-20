@@ -4,7 +4,7 @@
 //! Coord mints 4-hour device-JWTs. To avoid the user being signed out
 //! while the runner is idle, this loop checks the stored JWT's `exp`
 //! every [`REFRESH_CHECK_INTERVAL`] and re-pairs (via
-//! `qontinui_runner_lib::pair::pair_with_auth_token`) once we're within
+//! `crate::pair::pair_with_auth_token`) once we're within
 //! TTL/3 of expiry. The new JWT is persisted to the same encrypted
 //! `auth_tokens.enc` slot the backend relay reads, and the relay is
 //! kicked so it reconnects with the fresh credential.
@@ -394,7 +394,7 @@ async fn publish_coord_credential_status(
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().to_string())
-        .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+        .or_else(|| crate::pair::read_device_id_from_disk().ok());
     let Some(device_id) = device_id else {
         // No stable identity → coord can't key the row; skip silently-ish.
         warn!(
@@ -423,7 +423,7 @@ async fn publish_coord_credential_status(
             .get_access_token()
             .ok()
             .as_deref()
-            .and_then(qontinui_runner_lib::pair::tenant_id_from_oauth_claim)
+            .and_then(crate::pair::tenant_id_from_oauth_claim)
             .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
     });
 
@@ -591,7 +591,7 @@ pub(crate) fn resolve_pair_tenant_id(
     machine_tenant: Option<uuid::Uuid>,
 ) -> Option<(uuid::Uuid, TenantSource)> {
     let from_claim = |token: &str| {
-        qontinui_runner_lib::pair::tenant_id_from_oauth_claim(token)
+        crate::pair::tenant_id_from_oauth_claim(token)
             .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
     };
 
@@ -683,9 +683,7 @@ pub(crate) async fn try_refresh_once(
     // pair_with_auth_token_with_ids is reqwest::blocking — must run via
     // spawn_blocking or it stalls the tokio runtime.
     let pair_join = tokio::task::spawn_blocking(move || {
-        qontinui_runner_lib::pair::pair_with_auth_token_with_ids(
-            &base, &token, &did, &uid, tenant_id,
-        )
+        crate::pair::pair_with_auth_token_with_ids(&base, &token, &did, &uid, tenant_id)
     })
     .await;
 
@@ -1195,8 +1193,7 @@ pub(crate) async fn refresh_cognito_bearer(
         info!("device_jwt_refresher: Cognito access token stale — refreshing first");
         let rt = refresh_token.clone();
         let refreshed =
-            tokio::task::spawn_blocking(move || qontinui_runner_lib::cognito::refresh_tokens(&rt))
-                .await;
+            tokio::task::spawn_blocking(move || crate::cognito::refresh_tokens(&rt)).await;
         match refreshed {
             Ok(Ok(resp)) => {
                 let expires_at = chrono::Utc::now().timestamp() + resp.expires_in;
@@ -1301,7 +1298,7 @@ async fn refresher_loop(
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.trim().to_string())
-                .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+                .or_else(|| crate::pair::read_device_id_from_disk().ok());
             match mt_device_id {
                 Some(did) => {
                     let coord_base = crate::coord_mcp::coord_base_url();
@@ -1389,7 +1386,7 @@ async fn refresher_loop(
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .map(|s| s.trim().to_string())
-                    .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+                    .or_else(|| crate::pair::read_device_id_from_disk().ok());
                 if let Some(did) = self_refresh_device_id {
                     let coord_base = crate::coord_mcp::coord_base_url();
                     if let Some(new_jwt) =
@@ -1490,7 +1487,7 @@ async fn refresher_loop(
                 // Resolve device_id + user_id from disk. Phase 5 split:
                 // these reads live here (operator-facing files) so the
                 // factored `try_refresh_once` stays hermetic + testable.
-                let device_id = match qontinui_runner_lib::pair::read_device_id_from_disk() {
+                let device_id = match crate::pair::read_device_id_from_disk() {
                     Ok(d) => d,
                     Err(e) => {
                         warn!(
@@ -1505,7 +1502,7 @@ async fn refresher_loop(
                         continue;
                     }
                 };
-                let user_id = match qontinui_runner_lib::pair::read_paired_user_id_from_disk() {
+                let user_id = match crate::pair::read_paired_user_id_from_disk() {
                     Some(u) => u,
                     None => {
                         // No paired-user record yet — this runner hasn't
@@ -1600,7 +1597,7 @@ async fn refresher_loop(
                         .ok()
                         .filter(|s| !s.trim().is_empty())
                         .map(|s| s.trim().to_string())
-                        .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+                        .or_else(|| crate::pair::read_device_id_from_disk().ok());
                     if let Some(did) = dmk_device_id {
                         if let Some(new_jwt) =
                             try_device_machine_key_exchange(&auth_manager, &pair_base, &did).await

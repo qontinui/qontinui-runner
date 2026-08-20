@@ -57,7 +57,7 @@ fn unix_to_rfc3339(secs: i64) -> Option<String> {
 /// - `tenant_id` — `crate::session::dual_write::resolve_active_tenant_id()`
 ///   (a UUID read from `machine.json`; non-secret).
 /// - `cognito_client_id` — the runner's fixed, non-secret Cognito app client id
-///   (`qontinui_runner_lib::cognito::COGNITO_CLIENT_ID`), reported only when a
+///   (`crate::cognito::COGNITO_CLIENT_ID`), reported only when a
 ///   Cognito session is the active bearer source; `null` otherwise.
 /// - `bearer_kind` — which bearer the runner presents: `"access"` when a
 ///   Cognito (oauth) session is present (the runner presents the Cognito ACCESS
@@ -120,7 +120,7 @@ pub async fn ui_bridge_session_handler(
     // The client id is a compile-time constant identifier, not a credential.
     // Reported only when a Cognito session is the active bearer source.
     let cognito_client_id = if has_cognito_session {
-        Some(qontinui_runner_lib::cognito::COGNITO_CLIENT_ID)
+        Some(crate::cognito::COGNITO_CLIENT_ID)
     } else {
         None
     };

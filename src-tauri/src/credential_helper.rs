@@ -79,7 +79,7 @@ async fn fetch_push_token(coord_base: &str, session_id: &str) -> Result<String, 
         session_id
     );
 
-    let device_token = qontinui_runner_lib::auth::AuthManager::new()
+    let device_token = crate::auth::AuthManager::new()
         .get_access_token()
         .map_err(|e| format!("get device token: {e}"))?;
 
@@ -427,7 +427,7 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
         }
     };
 
-    let coord_base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let coord_base = crate::profiles::coord_base_with_source().0;
 
     let (push_token_result, repos_result) = tokio::join!(
         fetch_push_token(&coord_base, session_id),

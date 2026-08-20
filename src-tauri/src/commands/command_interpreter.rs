@@ -146,7 +146,7 @@ fn build_interpret_command(prompt: &str) -> Command {
         .arg(prompt)
         .env_remove("CLAUDECODE")
         // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-        .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+        .env_remove(crate::claude_env::CLAUDE_CHILD_SESSION_ENV);
 
     crate::terminal::scrub_credential_env_tokio(&mut cmd);
 

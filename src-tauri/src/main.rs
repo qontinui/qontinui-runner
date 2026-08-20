@@ -9,265 +9,265 @@
 // Allow many arguments: refactoring to structs is tracked separately
 #![allow(clippy::too_many_arguments)]
 
-mod action_service;
+pub use qontinui_runner_lib::action_service;
 // Plan `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c — runner-side
 // enforcement of the coord agent registry at every spawn funnel site.
 // Implements the served clause `agent-spawn-authorization`
 // (`policy/production-and-cost`).
-mod agent_authorization;
-mod agent_claims;
+pub use qontinui_runner_lib::agent_authorization;
+pub use qontinui_runner_lib::agent_claims;
 // Plan `2026-07-29-account-versioned-agent-commands.md` Phase 3 — resolves the
 // slash commands provisioned into a spawned session's `.claude/commands/`:
 // embedded defaults (`fleet_commands`), optionally overridden per account via
 // the qontinui-web HTTP API, with a disk cache so an offline start keeps the
 // user's own commands.
-mod agent_commands;
-mod agent_daemons;
+pub use qontinui_runner_lib::agent_commands;
+pub use qontinui_runner_lib::agent_daemons;
 // One process-wide pooled `reqwest::Client` for the per-agent coord
 // daemons. Replaces per-request `Client::new()` on the tick paths, which
 // reuses no connection and burned the machine's whole ephemeral port
 // range during the 2026-08-07 refresh storm (Tcpip 4231). See the module
 // doc for the incident.
-mod agent_http;
-mod agent_pusher;
+pub use qontinui_runner_lib::agent_http;
+pub use qontinui_runner_lib::agent_pusher;
 // Plan `2026-05-19-coordinator-production-readiness.md` Phase 4 —
 // coord-driven Claude Code subprocess runtime. Subscribes to spawn-
 // requests on coord WS, materializes worktrees, spawns the `claude`
 // CLI, heartbeats the claim, forwards stdout/stderr to coord logs.
-mod agent_runtime;
-mod agent_token;
-mod agent_worktree;
-mod agentic_verification;
-mod ai_pricing;
-mod ai_provider;
-mod ai_router;
-mod ai_workflows;
-pub mod api_config;
-mod api_request;
-mod asset_headers;
-mod auth;
-mod auto_commit;
-mod backup;
-mod build_drift;
-mod check_executor;
-mod check_generation;
-mod ci_node;
-mod claude_accounts;
-mod claude_protocol;
-mod claude_session;
-mod click_overlay;
-mod commands;
-mod comparison;
-mod config;
-mod config_facade;
-mod config_storage;
-mod constraint_engine;
-mod container;
-mod context;
-mod coord_doctor_cmd;
-mod coord_http;
-mod coord_mcp;
-mod coord_questions;
-mod coordinator;
-mod cost_management;
-mod crash_dumps;
-mod crash_observability;
-mod credential_helper;
-mod database;
-mod debug_lifecycle;
-mod demo_workflows;
-mod dev_services;
-mod dirty_poller;
-mod discoveries;
-mod display;
-mod doctor;
-mod dom_capture;
-mod drain;
-mod embedded_pg;
-mod error;
-mod error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
-mod event_system;
-mod execution_context;
-mod execution_core;
-mod executor;
-mod exploration;
-mod findings;
-mod fixer;
+pub use qontinui_runner_lib::agent_runtime;
+pub use qontinui_runner_lib::agent_token;
+pub use qontinui_runner_lib::agent_worktree;
+pub use qontinui_runner_lib::agentic_verification;
+pub use qontinui_runner_lib::ai_pricing;
+pub use qontinui_runner_lib::ai_provider;
+pub use qontinui_runner_lib::ai_router;
+pub use qontinui_runner_lib::ai_workflows;
+pub use qontinui_runner_lib::api_config;
+pub use qontinui_runner_lib::api_request;
+pub use qontinui_runner_lib::asset_headers;
+pub use qontinui_runner_lib::auth;
+pub use qontinui_runner_lib::auto_commit;
+pub use qontinui_runner_lib::backup;
+pub use qontinui_runner_lib::build_drift;
+pub use qontinui_runner_lib::check_executor;
+pub use qontinui_runner_lib::check_generation;
+pub use qontinui_runner_lib::ci_node;
+pub use qontinui_runner_lib::claude_accounts;
+pub use qontinui_runner_lib::claude_protocol;
+pub use qontinui_runner_lib::claude_session;
+pub use qontinui_runner_lib::click_overlay;
+pub use qontinui_runner_lib::commands;
+pub use qontinui_runner_lib::comparison;
+pub use qontinui_runner_lib::config;
+pub use qontinui_runner_lib::config_facade;
+pub use qontinui_runner_lib::config_storage;
+pub use qontinui_runner_lib::constraint_engine;
+pub use qontinui_runner_lib::container;
+pub use qontinui_runner_lib::context;
+pub use qontinui_runner_lib::coord_doctor_cmd;
+pub use qontinui_runner_lib::coord_http;
+pub use qontinui_runner_lib::coord_mcp;
+pub use qontinui_runner_lib::coord_questions;
+pub use qontinui_runner_lib::coordinator;
+pub use qontinui_runner_lib::cost_management;
+pub use qontinui_runner_lib::crash_dumps;
+pub use qontinui_runner_lib::crash_observability;
+pub use qontinui_runner_lib::credential_helper;
+pub use qontinui_runner_lib::database;
+pub use qontinui_runner_lib::debug_lifecycle;
+pub use qontinui_runner_lib::demo_workflows;
+pub use qontinui_runner_lib::dev_services;
+pub use qontinui_runner_lib::dirty_poller;
+pub use qontinui_runner_lib::discoveries;
+pub use qontinui_runner_lib::display;
+pub use qontinui_runner_lib::doctor;
+pub use qontinui_runner_lib::dom_capture;
+pub use qontinui_runner_lib::drain;
+pub use qontinui_runner_lib::embedded_pg;
+pub use qontinui_runner_lib::error;
+pub use qontinui_runner_lib::error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
+pub use qontinui_runner_lib::event_system;
+pub use qontinui_runner_lib::execution_context;
+pub use qontinui_runner_lib::execution_core;
+pub use qontinui_runner_lib::executor;
+pub use qontinui_runner_lib::exploration;
+pub use qontinui_runner_lib::findings;
+pub use qontinui_runner_lib::fixer;
 // Row 2 Phase 1 (fleet topology + per-device budget). Detects local
 // resources on startup and POSTs role + budget to `coord.devices`
 // (was `coord.machines` pre-Phase-3-Unified-Devices-Registry) so
 // `GET /coord/fleet` can answer "where do I have agent capacity?".
-mod fleet;
-mod fleet_commands;
-mod flow_control;
-mod follow_up;
-mod fs_atomic;
-mod fs_perms;
-mod git_status_subset;
+pub use qontinui_runner_lib::fleet;
+pub use qontinui_runner_lib::fleet_commands;
+pub use qontinui_runner_lib::flow_control;
+pub use qontinui_runner_lib::follow_up;
+pub use qontinui_runner_lib::fs_atomic;
+pub use qontinui_runner_lib::fs_perms;
+pub use qontinui_runner_lib::git_status_subset;
 // D5 Phase 1 — Git Supervision Channel. Consumes git/spec events from the
 // existing `trigger_system` (via the `SupervisionProposal` action variant)
 // and routes them into a bounded in-process ring buffer + Tauri event
 // channel for the frontend supervision hook.
-mod git_supervision;
+pub use qontinui_runner_lib::git_supervision;
 // D4+D6 Blind-Spot Recommender (Phase 2): proactive enumeration of regions
 // no live observer's scope covers, ranked by information value.
-mod blind_spots;
-mod graphql;
-mod health_monitor;
-mod heartbeat;
-mod helper_tasks;
-mod install_effects_producer;
-mod instance;
-mod instance_health;
-mod instance_manager;
-mod iteration_bundle;
+pub use qontinui_runner_lib::blind_spots;
+pub use qontinui_runner_lib::graphql;
+pub use qontinui_runner_lib::health_monitor;
+pub use qontinui_runner_lib::heartbeat;
+pub use qontinui_runner_lib::helper_tasks;
+pub use qontinui_runner_lib::install_effects_producer;
+pub use qontinui_runner_lib::instance;
+pub use qontinui_runner_lib::instance_health;
+pub use qontinui_runner_lib::instance_manager;
+pub use qontinui_runner_lib::iteration_bundle;
 #[cfg(windows)]
-mod job_object;
-mod knowledge_acquisition;
-mod known_issues;
-mod launch_env;
-mod log_consolidation;
-mod logging;
+pub use qontinui_runner_lib::job_object;
+pub use qontinui_runner_lib::knowledge_acquisition;
+pub use qontinui_runner_lib::known_issues;
+pub use qontinui_runner_lib::launch_env;
+pub use qontinui_runner_lib::log_consolidation;
+pub use qontinui_runner_lib::logging;
 // Tier-0 looping-agent supervisor GLUE (spawn/nudge/relaunch/respawn over the
 // continuation-terminal recipe). The PURE core (registry/idle/policy/playbook)
 // lives in the lib crate at `qontinui_runner_lib::looping_agent` so it is
 // covered by `cargo test --lib`.
-mod looping_agent_coord;
-mod looping_agent_supervisor;
-mod machine_identity;
-mod macros;
-mod mcp;
-mod mcp_api;
-mod mcp_client;
-mod mcp_embedded;
-mod memory;
-mod meta_optimizer;
-mod middleware;
-mod observer_registry;
-mod online_learning;
-mod orchestration_loop;
-mod orchestration_loop_configs;
-mod orchestrator;
-mod otel;
-mod outbound_trace; // Plan 2026-07-08-ui-bridge-reach-and-verify-gated-flows P5 — redacted outbound-call trace
-mod paths;
-mod planning_bridge;
-mod playwright;
-mod pm_detect;
-mod process_capture;
-mod process_helpers;
-mod productivity;
+pub use qontinui_runner_lib::looping_agent_coord;
+pub use qontinui_runner_lib::looping_agent_supervisor;
+pub use qontinui_runner_lib::machine_identity;
+pub use qontinui_runner_lib::macros;
+pub use qontinui_runner_lib::mcp;
+pub use qontinui_runner_lib::mcp_api;
+pub use qontinui_runner_lib::mcp_client;
+pub use qontinui_runner_lib::mcp_embedded;
+pub use qontinui_runner_lib::memory;
+pub use qontinui_runner_lib::meta_optimizer;
+pub use qontinui_runner_lib::middleware;
+pub use qontinui_runner_lib::observer_registry;
+pub use qontinui_runner_lib::online_learning;
+pub use qontinui_runner_lib::orchestration_loop;
+pub use qontinui_runner_lib::orchestration_loop_configs;
+pub use qontinui_runner_lib::orchestrator;
+pub use qontinui_runner_lib::otel;
+pub use qontinui_runner_lib::outbound_trace; // Plan 2026-07-08-ui-bridge-reach-and-verify-gated-flows P5 — redacted outbound-call trace
+pub use qontinui_runner_lib::paths;
+pub use qontinui_runner_lib::planning_bridge;
+pub use qontinui_runner_lib::playwright;
+pub use qontinui_runner_lib::pm_detect;
+pub use qontinui_runner_lib::process_capture;
+pub use qontinui_runner_lib::process_helpers;
+pub use qontinui_runner_lib::productivity;
 /// Projects dashboard — the server-side join over the saved-project
 /// registry (`ProjectSnapshot`). See `commands::saved_projects` for the
 /// registry itself.
-mod projects;
-mod prompt_library;
-mod prompt_snippets;
-mod prompts;
-mod rag;
-mod recording;
-mod reflection;
-mod regression_api;
-mod repo_detection;
+pub use qontinui_runner_lib::projects;
+pub use qontinui_runner_lib::prompt_library;
+pub use qontinui_runner_lib::prompt_snippets;
+pub use qontinui_runner_lib::prompts;
+pub use qontinui_runner_lib::rag;
+pub use qontinui_runner_lib::recording;
+pub use qontinui_runner_lib::reflection;
+pub use qontinui_runner_lib::regression_api;
+pub use qontinui_runner_lib::repo_detection;
 /// Spawn-time resource gate (plan
 /// `2026-08-07-runner-resource-guard-and-session-protection` §Part D). Top-level
 /// rather than under `terminal::` because both spawn seams it guards — the PTY
 /// (`terminal::session`) and the secondary runner process (`instance_manager`) —
 /// sit in different subtrees.
-mod resource_guard;
-mod restate;
-mod rework;
-mod routing;
-mod runtime_env;
-mod safe_lock;
-mod saved_api_requests;
-mod scenarios;
-mod scheduler;
-mod scheduler_service;
-mod schema_registry;
-mod screen;
-mod sdk_features;
-mod secure_storage;
-mod security;
-mod semantic_conventions;
-mod server_mode;
-mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
-mod session_pr_reconciler; // Runner-local per-session PR attribution → project.session_prs (Terminal dropdown)
-                           // Hook-free, runner-side WIP-attribution capture (mirrors fleet::tree_publisher).
-                           // Reads each hosted session's transcript and POSTs file-edit attribution to
-                           // coord. Gated OFF by default (COORD_SESSION_ATTRIBUTION_ENABLED).
-mod session_attribution;
-mod session_bus; // Session Bus Phase 3b — gated directed-message delivery executor
-mod settings;
+pub use qontinui_runner_lib::resource_guard;
+pub use qontinui_runner_lib::restate;
+pub use qontinui_runner_lib::rework;
+pub use qontinui_runner_lib::routing;
+pub use qontinui_runner_lib::runtime_env;
+pub use qontinui_runner_lib::safe_lock;
+pub use qontinui_runner_lib::saved_api_requests;
+pub use qontinui_runner_lib::scenarios;
+pub use qontinui_runner_lib::scheduler;
+pub use qontinui_runner_lib::scheduler_service;
+pub use qontinui_runner_lib::schema_registry;
+pub use qontinui_runner_lib::screen;
+pub use qontinui_runner_lib::sdk_features;
+pub use qontinui_runner_lib::secure_storage;
+pub use qontinui_runner_lib::security;
+pub use qontinui_runner_lib::semantic_conventions;
+pub use qontinui_runner_lib::server_mode;
+pub use qontinui_runner_lib::session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
+pub use qontinui_runner_lib::session_pr_reconciler; // Runner-local per-session PR attribution → project.session_prs (Terminal dropdown)
+                                                    // Hook-free, runner-side WIP-attribution capture (mirrors fleet::tree_publisher).
+                                                    // Reads each hosted session's transcript and POSTs file-edit attribution to
+                                                    // coord. Gated OFF by default (COORD_SESSION_ATTRIBUTION_ENABLED).
+pub use qontinui_runner_lib::session_attribution;
+pub use qontinui_runner_lib::session_bus; // Session Bus Phase 3b — gated directed-message delivery executor
+pub use qontinui_runner_lib::settings;
 // `startup_panic` is a minimal, dep-free panic-hook installer called from
 // the very top of `main()` so early-init crashes (DB connect, Tauri builder,
 // axum router construction) write a `runner-panic.log` the supervisor can
 // pick up. Must come before any module that panics during static init.
-mod skills;
-mod slash_commands;
-mod spawn_placement;
-mod spec_api;
-mod spec_experimentation;
-mod spec_utils;
-mod startup_panic;
-mod state_discovery;
-mod state_explorer;
-mod state_machine_configs;
-mod stats;
-mod step_event_builder;
-mod step_executor;
-mod step_injection;
-mod step_metadata;
-mod step_output;
-mod step_registry;
-mod step_types;
-mod steps;
-mod storage;
-pub(crate) mod str_utils;
-mod subagent;
-mod summary_generator;
-mod tauri_app_handle;
-mod tauri_command_audit;
-mod terminal;
-mod test_executor;
-mod test_orchestrator;
-mod ticket_system;
-mod tiered_info;
-mod timeout_config;
-mod trace_api;
-mod tracing_layers;
-mod trigger_system;
-mod tunnel;
-mod ui_bridge_evaluate;
-mod ui_bridge_invoke;
-mod ui_bridge_invoke_probe;
-mod ui_bridge_plugin;
-mod ui_error;
-mod unified_ai_session;
-mod unified_workflow_executor;
-mod unified_workflows;
-mod util;
-mod validation;
-mod verification;
-mod vga;
-mod video_recorder;
-mod vision;
-mod wake_handler; // Phase F.1 — qontinui:// custom-URL deep-link wake handler
-mod webview_recovery; // Dead-webview detection (WebView2 ProcessFailed) + in-process recovery
-mod win32_compat;
-mod window_assignments;
-mod window_manager;
-mod window_placement;
-mod workflow;
-mod workflow_event_bus;
-mod workflow_generation;
-mod workflow_queue;
-mod workflow_state;
+pub use qontinui_runner_lib::skills;
+pub use qontinui_runner_lib::slash_commands;
+pub use qontinui_runner_lib::spawn_placement;
+pub use qontinui_runner_lib::spec_api;
+pub use qontinui_runner_lib::spec_experimentation;
+pub use qontinui_runner_lib::spec_utils;
+pub use qontinui_runner_lib::startup_panic;
+pub use qontinui_runner_lib::state_discovery;
+pub use qontinui_runner_lib::state_explorer;
+pub use qontinui_runner_lib::state_machine_configs;
+pub use qontinui_runner_lib::stats;
+pub use qontinui_runner_lib::step_event_builder;
+pub use qontinui_runner_lib::step_executor;
+pub use qontinui_runner_lib::step_injection;
+pub use qontinui_runner_lib::step_metadata;
+pub use qontinui_runner_lib::step_output;
+pub use qontinui_runner_lib::step_registry;
+pub use qontinui_runner_lib::step_types;
+pub use qontinui_runner_lib::steps;
+pub use qontinui_runner_lib::storage;
+pub use qontinui_runner_lib::str_utils;
+pub use qontinui_runner_lib::subagent;
+pub use qontinui_runner_lib::summary_generator;
+pub use qontinui_runner_lib::tauri_app_handle;
+pub use qontinui_runner_lib::tauri_command_audit;
+pub use qontinui_runner_lib::terminal;
+pub use qontinui_runner_lib::test_executor;
+pub use qontinui_runner_lib::test_orchestrator;
+pub use qontinui_runner_lib::ticket_system;
+pub use qontinui_runner_lib::tiered_info;
+pub use qontinui_runner_lib::timeout_config;
+pub use qontinui_runner_lib::trace_api;
+pub use qontinui_runner_lib::tracing_layers;
+pub use qontinui_runner_lib::trigger_system;
+pub use qontinui_runner_lib::tunnel;
+pub use qontinui_runner_lib::ui_bridge_evaluate;
+pub use qontinui_runner_lib::ui_bridge_invoke;
+pub use qontinui_runner_lib::ui_bridge_invoke_probe;
+pub use qontinui_runner_lib::ui_bridge_plugin;
+pub use qontinui_runner_lib::ui_error;
+pub use qontinui_runner_lib::unified_ai_session;
+pub use qontinui_runner_lib::unified_workflow_executor;
+pub use qontinui_runner_lib::unified_workflows;
+pub use qontinui_runner_lib::util;
+pub use qontinui_runner_lib::validation;
+pub use qontinui_runner_lib::verification;
+pub use qontinui_runner_lib::vga;
+pub use qontinui_runner_lib::video_recorder;
+pub use qontinui_runner_lib::vision;
+pub use qontinui_runner_lib::wake_handler; // Phase F.1 — qontinui:// custom-URL deep-link wake handler
+pub use qontinui_runner_lib::webview_recovery; // Dead-webview detection (WebView2 ProcessFailed) + in-process recovery
+pub use qontinui_runner_lib::win32_compat;
+pub use qontinui_runner_lib::window_assignments;
+pub use qontinui_runner_lib::window_manager;
+pub use qontinui_runner_lib::window_placement;
+pub use qontinui_runner_lib::workflow;
+pub use qontinui_runner_lib::workflow_event_bus;
+pub use qontinui_runner_lib::workflow_generation;
+pub use qontinui_runner_lib::workflow_queue;
+pub use qontinui_runner_lib::workflow_state;
 // The single door to "where do the Qontinui repo checkouts live?" — the
 // `paths.workspace_root` setting, its one-time bridge migration, and the thin
 // wrapper over the shared `qontinui_types::paths` resolver. See
 // plans/2026-08-04-remove-hardcoded-machine-paths-from-product-code.md.
-mod workspace_paths;
+pub use qontinui_runner_lib::workspace_paths;
 
 // The sibling door to "where is this crate-bundled asset at runtime?" — the
 // Tauri resource resolver, the dev-checkout rung derived from `workspace_paths`,
@@ -275,23 +275,19 @@ mod workspace_paths;
 // asset shipped inside the installer and a file that exists only in a developer
 // checkout are different things, and resolving one as the other is a wrong
 // answer that looks right on the author's machine. Same plan, slice 5 Phase 6.
-mod bundled_resources;
+pub use qontinui_runner_lib::bundled_resources;
 
 // Stream E (Flywheel) Step 11 — end-to-end integration test module. The
 // file-level `#![cfg(all(test, feature = "spec-authoring"))]` ensures it
 // only compiles when running tests with the feature enabled.
-#[cfg(test)]
-mod flywheel_e2e_tests;
 
 // Phase 9 of the runner tier-decoupling rollout — calibration matrix
 // covering Tier 0 / 1 / 2 boundary invariants.
 // See plans/2026-05-20-runner-tier-decoupling.md.
-#[cfg(test)]
-mod tier_matrix_tests;
-mod turn_ending_shadow;
-mod worktree;
-mod wrappers;
-mod zombie_sweep;
+pub use qontinui_runner_lib::turn_ending_shadow;
+pub use qontinui_runner_lib::worktree;
+pub use qontinui_runner_lib::wrappers;
+pub use qontinui_runner_lib::zombie_sweep;
 
 /// Test-only: shared process-wide env lock for the runner-bin test binary.
 /// `std::env` is process-global, so two tests touching the same var in
@@ -301,44 +297,6 @@ mod zombie_sweep;
 /// binary is the correct granularity (the lib test binary defines its own in
 /// `lib.rs`). Poison-recovering so a panicking test can't cascade-fail the
 /// rest. Every test that touches `std::env` holds this for its whole body.
-#[cfg(test)]
-pub(crate) mod test_env {
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// RAII guard that restores the captured env vars to their pre-capture
-    /// values on drop (including the panic path). Use for tests that mutate a
-    /// process-global var which may already be set in the environment (e.g.
-    /// `QONTINUI_PORT`) so the test can't leak its value — or its removal — to
-    /// sibling tests in the same binary.
-    pub(crate) struct EnvVarRestore {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl EnvVarRestore {
-        pub(crate) fn capture(keys: &[&'static str]) -> Self {
-            let saved = keys.iter().map(|&k| (k, std::env::var_os(k))).collect();
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvVarRestore {
-        fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
-}
-
 use commands::AppState;
 use display::profiles::ActionLogProfile;
 use display::DisplayProcessor;

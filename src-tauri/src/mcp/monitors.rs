@@ -20,7 +20,7 @@ pub async fn get_monitors(
     let app_handle = state.app_handle.clone();
 
     let window = app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .get_webview_window(crate::get_main_window_label())
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

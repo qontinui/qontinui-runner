@@ -533,7 +533,7 @@ pub(crate) async fn publish_once() {
         debug!("fleet::resource_sample: no ~/.qontinui/machine.json — skipping");
         return;
     };
-    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+    let Some(base) = crate::profiles::connected_coord_base() else {
         debug!("fleet::resource_sample: no coord base configured — skipping");
         return;
     };

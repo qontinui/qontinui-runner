@@ -271,7 +271,7 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
     // session pay a pid probe — and, on a pid recycle, get an outright wrong
     // answer — for a runner that deliberately went away. A CRASH leaves it
     // behind, which is exactly what the record's `pid` lets a reader detect.
-    qontinui_runner_lib::runner_breadcrumb::remove_published();
+    crate::runner_breadcrumb::remove_published();
 
     info!(
         "drain: complete drained_sessions={} wip_refs={} claims={} timed_out={} elapsed_ms={}",

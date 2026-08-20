@@ -1,7 +1,7 @@
 //! Looping-agent control-surface commands (Tier-0 primitive, Phase 1).
 //!
 //! Thin wrappers only: all decision logic lives in the lib crate
-//! (`qontinui_runner_lib::looping_agent`) and the bin glue
+//! (`crate::looping_agent`) and the bin glue
 //! (`crate::looping_agent_supervisor`) — this module just resolves managed
 //! state and shapes the wire response, because the `commands` module is
 //! declared in `main.rs` (NOT `lib.rs`) and is therefore invisible to
@@ -17,8 +17,8 @@ use std::sync::Arc;
 use tauri::Manager;
 use tracing::info;
 
+use crate::looping_agent::registry::LoopingAgentRegistry;
 use crate::looping_agent_supervisor::{status_snapshot, LoopingAgentStatus};
-use qontinui_runner_lib::looping_agent::registry::LoopingAgentRegistry;
 
 /// Resolve the managed registry, or a stable error when the supervisor never
 /// started (e.g. its store failed to open).

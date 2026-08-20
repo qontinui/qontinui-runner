@@ -61,8 +61,7 @@ pub async fn session_identity_status() -> Result<CommandResponse, String> {
     let (installed, dir) = tokio::task::spawn_blocking(|| {
         (
             shim_materializer::persistent_identity_installed().unwrap_or(false),
-            qontinui_runner_lib::profile_cli::identity_shim_dir()
-                .map(|d| d.to_string_lossy().into_owned()),
+            crate::profile_cli::identity_shim_dir().map(|d| d.to_string_lossy().into_owned()),
         )
     })
     .await
@@ -92,7 +91,7 @@ pub async fn session_identity_install() -> Result<CommandResponse, String> {
             "session_identity_install: materialized the persistent identity shim at {}",
             dir.display()
         );
-        qontinui_runner_lib::profile_cli::install_identity_shim_on_user_path()
+        crate::profile_cli::install_identity_shim_on_user_path()
     })
     .await
     .map_err(|e| format!("session identity install task panicked: {e}"))??;
@@ -119,7 +118,7 @@ pub async fn session_identity_install() -> Result<CommandResponse, String> {
 #[tauri::command]
 pub async fn session_identity_uninstall() -> Result<CommandResponse, String> {
     let outcome = tokio::task::spawn_blocking(|| -> Result<_, String> {
-        let outcome = qontinui_runner_lib::profile_cli::uninstall_identity_shim_from_user_path()?;
+        let outcome = crate::profile_cli::uninstall_identity_shim_from_user_path()?;
         shim_materializer::remove_persistent_identity()?;
         Ok(outcome)
     })

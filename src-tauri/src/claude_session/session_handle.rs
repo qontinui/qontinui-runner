@@ -308,7 +308,7 @@ pub fn spawn_register(store: Arc<SessionLifecycleStore>, req: HandleRegisterRequ
 /// lets coord 401 — a normal best-effort failure, never fatal). Returns the
 /// minted/rebound handle on 2xx, `None` on any failure.
 fn register_blocking(req: &HandleRegisterRequest) -> Option<String> {
-    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+    let Some(base) = crate::profiles::connected_coord_base() else {
         // Coord not configured (dev box without a profile) — silent no-op.
         record_outcome(HandleRegisterOutcome::NoCoordBase);
         return None;

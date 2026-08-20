@@ -1,5 +1,5 @@
 //! Spawn-site glue between [`ClaudeSession`] / `run_claude_session_inline`
-//! and [`observable_bridge`](qontinui_runner_lib::observable_bridge).
+//! and [`observable_bridge`](crate::observable_bridge).
 //!
 //! Plan: `2026-05-22-memories-on-coord-cross-machine.md` Phase 5,
 //! generalized by `2026-05-24-federation-verify-and-gitop.md`. The
@@ -22,7 +22,7 @@
 //! reconcile. This module is the spawn-site adapter only.
 //!
 //! [`ClaudeSession`]: crate::claude_session::ClaudeSession
-//! [`SessionContext`]: qontinui_runner_lib::observable_bridge::SessionContext
+//! [`SessionContext`]: crate::observable_bridge::SessionContext
 
 use std::path::PathBuf;
 
@@ -30,8 +30,8 @@ use anyhow::Result;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::observable_bridge::{ReconcileReport, SessionContext};
 use crate::settings::ClaudeCliSettings;
-use qontinui_runner_lib::observable_bridge::{ReconcileReport, SessionContext};
 
 /// Why federation was skipped for a session. Returned by
 /// [`build_federation_ctx`] (as the `Err` arm) so the spawn site can log
@@ -205,7 +205,7 @@ fn resolve_session_context_tenant(session_tenant: Option<Uuid>) -> Option<Uuid> 
 /// Mirrors `fleet.rs::resolve_tenant_id` but that's private to `fleet`;
 /// the duplication here keeps the federation module self-contained.
 fn resolve_tenant_id() -> Option<Uuid> {
-    if let Some(s) = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk() {
+    if let Some(s) = crate::pair::read_paired_tenant_id_from_disk() {
         if let Ok(t) = Uuid::parse_str(s.trim()) {
             return Some(t);
         }
@@ -217,7 +217,7 @@ fn resolve_tenant_id() -> Option<Uuid> {
     if token.is_empty() {
         return None;
     }
-    let claim = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&token)?;
+    let claim = crate::pair::tenant_id_from_oauth_claim(&token)?;
     Uuid::parse_str(claim.trim()).ok()
 }
 

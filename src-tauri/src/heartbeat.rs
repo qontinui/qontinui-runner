@@ -245,10 +245,10 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // by `device_jwt_refresher`'s Phase-1b coord_credential status, so
             // the same `runner_coord_credentials_missing` alert lights up — we
             // do not invent a second signal here.
-            let check5 = qontinui_runner_lib::coord_doctor::device_jwt_live_check();
-            let readiness = qontinui_runner_lib::coord_doctor::provisioning_readiness(
+            let check5 = crate::coord_doctor::device_jwt_live_check();
+            let readiness = crate::coord_doctor::provisioning_readiness(
                 check5.ok,
-                qontinui_runner_lib::coord_doctor::provisioning_gate_enforce_enabled(),
+                crate::coord_doctor::provisioning_gate_enforce_enabled(),
             );
             let derived_status =
                 provisioning_gated_status(base_status, readiness, &check5.detail).to_string();
@@ -361,10 +361,10 @@ pub(crate) const PROVISIONING_INCOMPLETE_STATUS: &str = "provisioning_incomplete
 ///   runtime fault is never masked by the provisioning state.
 fn provisioning_gated_status(
     base_status: &'static str,
-    readiness: qontinui_runner_lib::coord_doctor::ProvisioningReadiness,
+    readiness: crate::coord_doctor::ProvisioningReadiness,
     check_detail: &str,
 ) -> &'static str {
-    use qontinui_runner_lib::coord_doctor::ProvisioningReadiness;
+    use crate::coord_doctor::ProvisioningReadiness;
     match readiness {
         ProvisioningReadiness::Ready => base_status,
         ProvisioningReadiness::IncompleteAdvisory => {
@@ -373,7 +373,7 @@ fn provisioning_gated_status(
                  (doctor check device_jwt_live: {check_detail}). Reporting ready anyway; \
                  set {} to withhold ready until a device JWT is live. \
                  Run `coord doctor` for the failing link + fix.",
-                qontinui_runner_lib::coord_doctor::PROVISIONING_GATE_ENFORCE_ENV,
+                crate::coord_doctor::PROVISIONING_GATE_ENFORCE_ENV,
             );
             base_status
         }
@@ -474,7 +474,7 @@ mod tests {
 
     // ---- Phase 5 — provisioning gate applied to derived_status ----
 
-    use qontinui_runner_lib::coord_doctor::ProvisioningReadiness;
+    use crate::coord_doctor::ProvisioningReadiness;
 
     #[test]
     fn provisioning_gate_ready_passes_base_status_through() {

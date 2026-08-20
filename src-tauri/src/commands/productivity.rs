@@ -416,12 +416,11 @@ pub async fn approve_recommendation(
                     review.task_id, e
                 );
             }
-            let payload =
-                qontinui_runner_lib::tauri_event_payloads::RecommendationReviewDecisionPayload {
-                    review_id: review.id,
-                    task_id: review.task_id,
-                    user_decision: "approved".to_string(),
-                };
+            let payload = crate::tauri_event_payloads::RecommendationReviewDecisionPayload {
+                review_id: review.id,
+                task_id: review.task_id,
+                user_decision: "approved".to_string(),
+            };
             if let Err(e) = app_handle.emit("review-approved", &payload) {
                 warn!("approve_recommendation: emit failed: {}", e);
             }
@@ -447,12 +446,11 @@ pub async fn reject_recommendation(
 
     if updated {
         if let Some(review) = app_state.pg_db.get_review_by_id(&review_id).await? {
-            let payload =
-                qontinui_runner_lib::tauri_event_payloads::RecommendationReviewDecisionPayload {
-                    review_id: review.id,
-                    task_id: review.task_id,
-                    user_decision: "rejected".to_string(),
-                };
+            let payload = crate::tauri_event_payloads::RecommendationReviewDecisionPayload {
+                review_id: review.id,
+                task_id: review.task_id,
+                user_decision: "rejected".to_string(),
+            };
             if let Err(e) = app_handle.emit("review-rejected", &payload) {
                 warn!("reject_recommendation: emit failed: {}", e);
             }
@@ -1919,7 +1917,7 @@ pub async fn add_task_dependency(
 /// dev-localhost base. Mirrors the `get_fleet_health` proxy pattern.
 #[tauri::command]
 pub fn get_coord_http_base() -> String {
-    qontinui_runner_lib::profiles::coord_base_with_source().0
+    crate::profiles::coord_base_with_source().0
 }
 
 /// Body for coord's `POST /agents/spawn`.
@@ -2054,7 +2052,7 @@ pub async fn spawn_from_plan(
 ) -> Result<serde_json::Value, String> {
     // Resolve the coord base the SAME way `get_coord_http_base` does
     // (env `COORD_HTTP_URL` → active profile `coord_url` → dev-localhost).
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/agents/spawn");
 
@@ -2143,7 +2141,7 @@ pub async fn spawn_from_plan(
 /// alerts stay best-effort `[]` for NON-auth failures.
 #[tauri::command]
 pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

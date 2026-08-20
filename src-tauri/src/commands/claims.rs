@@ -122,7 +122,7 @@ fn http_client() -> Result<&'static reqwest::Client, String> {
 /// `Err(String)` for the React layer's `.catch`.
 #[tauri::command]
 pub async fn claims_acquire(args: AcquireArgs) -> Result<AcquireResultDto, String> {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/claims/acquire");
 
@@ -168,7 +168,7 @@ pub async fn claims_acquire(args: AcquireArgs) -> Result<AcquireResultDto, Strin
 /// `Err`.
 #[tauri::command]
 pub async fn claims_release(args: ReleaseArgs) -> Result<ReleaseResultDto, String> {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/claims/release");
 
@@ -227,7 +227,7 @@ pub async fn claims_release(args: ReleaseArgs) -> Result<ReleaseResultDto, Strin
 /// remain functional.
 #[tauri::command]
 pub async fn claims_steal(args: StealArgs) -> Result<StealResultDto, String> {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/claims/steal");
 

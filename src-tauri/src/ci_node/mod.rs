@@ -149,7 +149,7 @@ pub fn spawn_ci_node_runtime() {
         );
         return;
     };
-    if qontinui_runner_lib::profiles::connected_coord_base().is_none() {
+    if crate::profiles::connected_coord_base().is_none() {
         info!("ci_node: runner is ISOLATED (no coord configured, not a hosted tier) — CI-node runtime disabled. Skipping.");
         return;
     }

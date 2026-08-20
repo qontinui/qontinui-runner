@@ -703,7 +703,7 @@ impl TerminalSession {
         // otherwise pass it to every `claude` typed into a pane. Defense in
         // depth — the supervisor strips it at the runner spawn, this covers a
         // runner started by any other means.
-        cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+        cmd.env_remove(crate::claude_env::CLAUDE_CHILD_SESSION_ENV);
 
         // Set TERM for proper color/capability support.
         // xterm.js is a full xterm-compatible terminal, so use xterm-256color on all

@@ -19,7 +19,7 @@
 //! per-machine pin). At first launch on a multi-tenant operator account
 //! the file may not yet hold the field; in that case we fall back to the
 //! DEFAULT binding available via the existing
-//! [`qontinui_runner_lib::pair::read_paired_tenant_id_from_disk`] reader
+//! [`crate::pair::read_paired_tenant_id_from_disk`] reader
 //! (v2-aware: `default_tenant_id`) so the runner UI can render before the
 //! operator has explicitly chosen.
 //!
@@ -162,7 +162,7 @@ fn write_active_tenant_id(path: &Path, tenant_id: &str) -> Result<(), String> {
     }
     // Unique-temp atomic write. The fixed `machine.json.tmp` this used to
     // share with the three other writers is raced by every runner instance.
-    qontinui_runner_lib::fs_atomic::atomic_write(path, &pretty)
+    crate::fs_atomic::atomic_write(path, &pretty)
         .map_err(|e| format!("tenant: atomic write machine.json failed: {e}"))?;
     Ok(())
 }
@@ -190,7 +190,7 @@ pub fn get_active_tenant() -> Result<CommandResponse, String> {
 
     let (tenant, source) = if let Some(t) = read_active_tenant_id(&machine_path) {
         (Some(t), Some("machine.json"))
-    } else if let Some(t) = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk() {
+    } else if let Some(t) = crate::pair::read_paired_tenant_id_from_disk() {
         (Some(t), Some("paired_user.json"))
     } else {
         (None, None)
@@ -198,7 +198,7 @@ pub fn get_active_tenant() -> Result<CommandResponse, String> {
 
     // The device's bound tenants live locally in `paired_user.json` v2 — the
     // switcher must render OFFLINE, so this is a local read, not a coord query.
-    let candidates: Vec<String> = qontinui_runner_lib::pair::read_paired_binding_tenant_ids()
+    let candidates: Vec<String> = crate::pair::read_paired_binding_tenant_ids()
         .into_iter()
         .map(|t| t.to_string())
         .collect();

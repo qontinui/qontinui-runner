@@ -457,7 +457,7 @@ async fn get_heatmap(
 async fn get_heatmap_live(
     State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base = crate::profiles::coord_base_with_source().0;
     let url = format!(
         "{}/coord/worktree-dirty?heatmap=true",
         base.trim_end_matches('/')

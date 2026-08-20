@@ -2,7 +2,7 @@
 //! on nothing.
 //!
 //! This is the impure half of the design. The pure classifier lives in the lib
-//! ([`qontinui_runner_lib::looping_agent::turn_ending`]); this module resolves a
+//! ([`crate::looping_agent::turn_ending`]); this module resolves a
 //! looping agent's Claude Code transcript, pulls the turn-final assistant text
 //! out of it, calls the classifier, and appends the verdict to the agent's
 //! durable journal. **It changes no behaviour.** The false-positive rate on real
@@ -48,9 +48,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use qontinui_runner_lib::looping_agent::turn_ending::{
-    classify_turn_ending, TurnEnding, UnreadReason,
-};
+use crate::looping_agent::turn_ending::{classify_turn_ending, TurnEnding, UnreadReason};
 
 use crate::terminal::transcript::{
     find_claude_config_dirs, parse_assistant_record, read_tail_bytes, session_transcript_path,
@@ -365,10 +363,9 @@ pub fn observe_turn_ending(
 
     match read_turn_final_text_at(&path, DEFAULT_READ_CAP_BYTES) {
         Ok(ft) => {
-            let paragraph =
-                qontinui_runner_lib::looping_agent::turn_ending::last_non_empty_paragraph(&ft.text)
-                    .unwrap_or_default()
-                    .to_string();
+            let paragraph = crate::looping_agent::turn_ending::last_non_empty_paragraph(&ft.text)
+                .unwrap_or_default()
+                .to_string();
             let ending = classify_turn_ending(&ft.text);
             let key = format!("uuid:{}", ft.uuid);
             record_if_new(
@@ -434,7 +431,7 @@ fn record_if_new(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qontinui_runner_lib::looping_agent::turn_ending::PatternId;
+    use crate::looping_agent::turn_ending::PatternId;
     use std::fs;
 
     /// Build a throwaway Claude-Code-shaped config dir with one transcript.

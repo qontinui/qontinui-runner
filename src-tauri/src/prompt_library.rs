@@ -387,7 +387,7 @@ fn stale_fallback(cached: Option<Vec<PromptTemplate>>, reason: String) -> Prompt
 /// local setup failures (HTTP client construction).
 #[tauri::command]
 pub async fn list_prompt_templates() -> Result<PromptLibraryResponse, String> {
-    let base_owned = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let base_owned = crate::profiles::coord_base_with_source().0;
     let base = base_owned.trim_end_matches('/');
 
     // 1. Fresh cache → serve without touching coord.

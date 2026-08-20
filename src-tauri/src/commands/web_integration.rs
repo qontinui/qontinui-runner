@@ -602,7 +602,7 @@ pub async fn redeem_pair_code(
     code: String,
     backend_url: Option<String>,
 ) -> Result<RedeemPairCodeResponse, String> {
-    use qontinui_runner_lib::pair::{
+    use crate::pair::{
         coord_http_base, derive_web_base_from_coord, pair_with_pair_code, persist_pairing,
         read_device_id_from_disk,
     };

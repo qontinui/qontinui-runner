@@ -46,12 +46,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::{engine::general_purpose::STANDARD, Engine};
-use futures_util::{SinkExt, StreamExt};
-use qontinui_runner_lib::env_agent::{
+use crate::env_agent::{
     config::EnvAgentConfig,
     enroll::{self, EnrollParams},
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tauri::Manager;
 use tokio::sync::{broadcast, watch, Mutex};
@@ -1397,12 +1397,12 @@ async fn handle_outbound<S>(
                     }
                 }
 
-                // Wire shapes are defined in `qontinui_runner_lib::relay_envelopes`
+                // Wire shapes are defined in `crate::relay_envelopes`
                 // (lib-side so the schema_export aggregator can register them) —
                 // see that module's docs for the discriminated-union contract
                 // shared with web + mobile consumers via
                 // `@qontinui/shared-types/tauri-events`.
-                use qontinui_runner_lib::relay_envelopes::RunnerRelayMessage;
+                use crate::relay_envelopes::RunnerRelayMessage;
                 let relay_msg = match channel {
                     "phase-result" => {
                         // event.payload = { execution_id, result }
@@ -2017,7 +2017,7 @@ where
             // provably cannot affect the ack, which reports the ENROLL. Nothing
             // is lost by detaching; the periodic tick covers a failure anyway.
             tokio::spawn(async {
-                if let Err(e) = qontinui_runner_lib::env_agent::capture_and_push().await {
+                if let Err(e) = crate::env_agent::capture_and_push().await {
                     warn!("devenv_enroll: post-enroll capture failed (will retry on tick): {e}");
                 }
             });

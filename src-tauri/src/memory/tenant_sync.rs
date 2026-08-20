@@ -833,7 +833,7 @@ pub(crate) fn resolve_web_base() -> Option<String> {
             return Some(b.trim_end_matches('/').to_string());
         }
     }
-    qontinui_runner_lib::env_agent::enroll::resolve_backend_base(None).ok()
+    crate::env_agent::enroll::resolve_backend_base(None).ok()
 }
 
 fn redact_text(s: &str) -> String {

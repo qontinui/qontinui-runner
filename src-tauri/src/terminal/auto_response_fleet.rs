@@ -160,13 +160,13 @@ fn cache_path_in(base: PathBuf) -> Option<PathBuf> {
 
 /// Rules endpoint on coord (`{coord_base}/coord/policies/runner-rules`).
 ///
-/// Resolves via [`qontinui_runner_lib::profiles::connected_coord_base`] — the
+/// Resolves via [`crate::profiles::connected_coord_base`] — the
 /// SINGLE connected-vs-isolated definition. `None` only when the runner is
 /// isolated, so the fetch tick cleanly skips (no localhost fallback, no web
 /// URL); a hosted-tier runner with no explicit `coord_url` still fetches its
 /// fleet rules from production, which is the shipped end-user config.
 fn rules_endpoint_url() -> Option<String> {
-    qontinui_runner_lib::profiles::connected_coord_base()
+    crate::profiles::connected_coord_base()
         .map(|base| format!("{base}/coord/policies/runner-rules"))
 }
 

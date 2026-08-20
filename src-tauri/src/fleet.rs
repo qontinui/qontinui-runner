@@ -41,7 +41,7 @@ use tracing::{debug, info, warn};
 
 /// The runner's connected-vs-isolated decision, imported (not re-wrapped) from
 /// its single definition. The heartbeat runs iff the runner is connected.
-use qontinui_runner_lib::profiles::connected_coord_base;
+use crate::profiles::connected_coord_base;
 
 use crate::database::pg::PgDb;
 
@@ -190,7 +190,7 @@ pub(crate) struct LocalBindingSet {
 ///    `default_tenant_id`/`tenant_id`.
 /// 2. JWT-claim fallback — decode `tenant_id` from the cached
 ///    device-token JWT via
-///    [`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]; the set
+///    [`crate::pair::tenant_id_from_oauth_claim`]; the set
 ///    is that single tenant. (The pre-8a opportunistic disk backfill is
 ///    gone — the register response's `tenant_ids` reconciliation is the
 ///    file's healer now, and per-tick resolution works without the
@@ -199,9 +199,9 @@ pub(crate) struct LocalBindingSet {
 ///    request (coord rejects with `400 tenant_id_required`).
 fn resolve_binding_set() -> Option<LocalBindingSet> {
     // Branch 1 — paired_user.json (v2-migrated view)
-    if let Some(s) = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk() {
+    if let Some(s) = crate::pair::read_paired_tenant_id_from_disk() {
         if let Ok(default_tenant) = uuid::Uuid::parse_str(s.trim()) {
-            let mut tenant_ids = qontinui_runner_lib::pair::read_paired_binding_tenant_ids();
+            let mut tenant_ids = crate::pair::read_paired_binding_tenant_ids();
             if !tenant_ids.contains(&default_tenant) {
                 tenant_ids.insert(0, default_tenant);
             }
@@ -220,7 +220,7 @@ fn resolve_binding_set() -> Option<LocalBindingSet> {
     if token.is_empty() {
         return None;
     }
-    let claim = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&token)?;
+    let claim = crate::pair::tenant_id_from_oauth_claim(&token)?;
     let parsed = uuid::Uuid::parse_str(claim.trim()).ok()?;
     Some(LocalBindingSet {
         default_tenant: parsed,
@@ -1419,7 +1419,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         // Best-effort throughout: a parse/IO miss just retries next tick.
         let body = resp.text().await.unwrap_or_default();
         if let Some(coord_set) = response_tenant_ids(&body) {
-            match qontinui_runner_lib::pair::reconcile_paired_bindings(&coord_set) {
+            match crate::pair::reconcile_paired_bindings(&coord_set) {
                 Ok(report) => {
                     if report.changed() {
                         info!(
@@ -1439,7 +1439,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         } else if let Some(resp_tenant) = response_tenant_id(&body) {
             // Legacy echo-heal (single-value; v2-file-aware no-op).
             // Scheduled for deletion in Phase 10 item 4.
-            if let Err(e) = qontinui_runner_lib::pair::backfill_paired_tenant_id(&resp_tenant) {
+            if let Err(e) = crate::pair::backfill_paired_tenant_id(&resp_tenant) {
                 tracing::debug!("fleet::heartbeat: tenant_id write-back non-fatal: {e}");
             }
         }
@@ -2949,7 +2949,7 @@ async fn record_git_op_fleet_feed(
     let Some(base) = connected_coord_base() else {
         return;
     };
-    let client = match qontinui_runner_lib::observable_bridge::git_ops_client::build_client() {
+    let client = match crate::observable_bridge::git_ops_client::build_client() {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -2961,10 +2961,8 @@ async fn record_git_op_fleet_feed(
         message,
         metadata: Some(serde_json::json!({"source": "repo_pull_executor"})),
     };
-    if let Err(e) = qontinui_runner_lib::observable_bridge::git_ops_client::record(
-        &client, &base, "", tenant_id, &req,
-    )
-    .await
+    if let Err(e) =
+        crate::observable_bridge::git_ops_client::record(&client, &base, "", tenant_id, &req).await
     {
         debug!("fleet::pull_executor: git_ops fleet-feed record failed: {e}");
     }

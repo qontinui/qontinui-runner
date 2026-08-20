@@ -128,7 +128,7 @@ static BOUND_PORT: AtomicU16 = AtomicU16::new(0);
 /// `2026-07-17-universal-coord-device-identity-for-any-session` §4). A separate
 /// process — the identity shim launching `claude` in a bare terminal — has no
 /// way to read [`BOUND_PORT`] or the managed `AppState`; the breadcrumb is its
-/// only honest answer. See `qontinui_runner_lib::runner_breadcrumb`.
+/// only honest answer. See `crate::runner_breadcrumb`.
 pub fn set_bound_port(port: u16) {
     BOUND_PORT.store(port, Ordering::Relaxed);
     // Skipped under `cfg(test)` so the bin crate's unit tests (which call this
@@ -139,7 +139,7 @@ pub fn set_bound_port(port: u16) {
     // default. The publish path itself is unit-tested in `runner_breadcrumb`
     // against a temp dir.
     if !cfg!(test) {
-        qontinui_runner_lib::runner_breadcrumb::publish(port);
+        crate::runner_breadcrumb::publish(port);
     }
 }
 

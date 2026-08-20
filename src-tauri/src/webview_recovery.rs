@@ -199,7 +199,7 @@ pub fn build_main_window(
     app: &tauri::AppHandle,
     spec: &MainWindowSpec,
 ) -> Result<tauri::WebviewWindow, String> {
-    let label = qontinui_runner_lib::get_main_window_label();
+    let label = crate::get_main_window_label();
     let url = tauri::WebviewUrl::App("index.html".into());
 
     let mut builder = tauri::WebviewWindowBuilder::new(app, label, url)
@@ -812,7 +812,7 @@ pub fn should_veto_exit(app: &tauri::AppHandle) -> ExitVeto {
 
     // Server mode has no window and no swap, so this reduces to
     // `AllowQuitRequested`/`AllowNoWindow` — a headless runner is never vetoed.
-    let label = qontinui_runner_lib::get_main_window_label();
+    let label = crate::get_main_window_label();
     decide_exit_veto(
         crate::commands::terminal_windows::is_app_quitting(),
         window_swap_in_progress(),
@@ -1103,7 +1103,7 @@ impl Drop for InProgressGuard {
 
 fn reload_main_webview(app: &tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
-    let label = qontinui_runner_lib::get_main_window_label();
+    let label = crate::get_main_window_label();
     let window = app
         .get_webview_window(label)
         .ok_or_else(|| format!("main window '{label}' not found"))?;
@@ -1123,7 +1123,7 @@ fn reload_main_webview(app: &tauri::AppHandle) -> Result<(), String> {
 async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
 
-    let label = qontinui_runner_lib::get_main_window_label();
+    let label = crate::get_main_window_label();
     let base_spec = main_window_spec()
         .ok_or_else(|| "no main window spec recorded — nothing to rebuild from".to_string())?;
 

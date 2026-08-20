@@ -447,7 +447,7 @@ pub async fn ui_bridge_page_hard_refresh_handler(
 
     if let Some(window) = state
         .app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .get_webview_window(crate::get_main_window_label())
     {
         // Use fetch cache-busting + location replacement to bypass browser cache.
         let js = r#"
@@ -483,7 +483,7 @@ pub async fn ui_bridge_page_close_request_handler(
 
     if let Some(window) = state
         .app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .get_webview_window(crate::get_main_window_label())
     {
         window.close().map_err(|e| {
             let msg = format!("Failed to close main window: {}", e);

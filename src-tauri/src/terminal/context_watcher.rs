@@ -7,7 +7,7 @@
 //!    auto-response grid-scan tick (`auto_response::spawn_grid_scan_loop`,
 //!    ~1.5s) and evaluates every live terminal's *rendered* VT grid with the
 //!    proven pure predicate
-//!    [`qontinui_runner_lib::looping_agent::idle::snapshot_context_low`]
+//!    [`crate::looping_agent::idle::snapshot_context_low`]
 //!    (the `"… until auto-compact: N%"` countdown, threshold-gated; plus the
 //!    bare `"context low"` marker). This covers sessions whose hooks died.
 //! 2. **PreCompact hook** — Claude Code fires `PreCompact` exactly when
@@ -71,8 +71,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use qontinui_runner_lib::looping_agent::idle::snapshot_context_low;
-use qontinui_runner_lib::looping_agent::registry::LifecyclePolicy;
+use crate::looping_agent::idle::snapshot_context_low;
+use crate::looping_agent::registry::LifecyclePolicy;
 
 use crate::mcp::continuation_verdict::Mode;
 

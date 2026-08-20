@@ -318,7 +318,7 @@ fn compute_freshness_deltas(
 pub async fn auth_freshness(State(_state): State<Arc<ApiState>>) -> Json<FreshnessResponse> {
     let auth_manager = crate::auth::AuthManager::new();
     let now = chrono::Utc::now().timestamp();
-    let paired = qontinui_runner_lib::pair::read_paired_user_id_from_disk().is_some();
+    let paired = crate::pair::read_paired_user_id_from_disk().is_some();
     Json(compute_freshness_deltas(
         auth_manager.access_token_exp(),
         auth_manager.oauth_expires_at(),

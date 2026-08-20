@@ -492,7 +492,7 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
 
     let window = state
         .app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .get_webview_window(crate::get_main_window_label())
         .ok_or_else(|| "Runner window not found".to_string())?;
     // BOUNDED (see `window_probe`): `scale_factor` / `inner_position` /
     // `inner_size` are blocking event-loop round-trips. Bare, from this

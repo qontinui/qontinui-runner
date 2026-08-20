@@ -772,7 +772,7 @@ async fn cognito_sign_in_impl(
     //    worker thread so it doesn't block the tokio runtime.
     info!("cognito_sign_in: starting RFC-8252 PKCE login");
     let login = tokio::task::spawn_blocking(move || {
-        qontinui_runner_lib::cognito::pkce_login(identity_provider.as_deref())
+        crate::cognito::pkce_login(identity_provider.as_deref())
     })
     .await
     .map_err(|e| {
@@ -812,10 +812,10 @@ async fn cognito_sign_in_impl(
 /// `runner-tier-changed` window event is dispatched by the FRONTEND on success
 /// (both call sites do this) — identical to the prior single-callsite behavior.
 async fn finalize_signed_in(
-    login: qontinui_runner_lib::cognito::CognitoLoginResult,
+    login: crate::cognito::CognitoLoginResult,
     base: String,
 ) -> Result<CognitoSignInResponse, AppError> {
-    use qontinui_runner_lib::pair::{
+    use crate::pair::{
         ensure_device_initialized, pair_with_auth_token_with_ids, persist_pairing,
         read_device_id_from_disk, tenant_id_from_oauth_claim,
     };
@@ -945,9 +945,7 @@ async fn finalize_signed_in(
     //     2026-07-16-runner-prod-coord-base-default-and-502-self-diagnosis,
     //     D2). Non-fatal: sign-in must never fail on this, and the tier
     //     default (D1) covers the HTTP side regardless.
-    if let Err(e) = qontinui_runner_lib::profiles::ensure_coord_url(
-        qontinui_runner_lib::profiles::PROD_COORD_WS_URL,
-    ) {
+    if let Err(e) = crate::profiles::ensure_coord_url(crate::profiles::PROD_COORD_WS_URL) {
         warn!(
             "finalize_signed_in: could not persist coord_url into profiles.json (non-fatal): {e}"
         );
@@ -1023,19 +1021,18 @@ async fn cognito_sign_in_password_impl(
 
     // Blocking reqwest call — run on a worker thread off the tokio runtime.
     // `password` is moved into the closure and dropped there; it is never logged.
-    let login = tokio::task::spawn_blocking(move || {
-        qontinui_runner_lib::cognito::password_login(&email, &password)
-    })
-    .await
-    .map_err(|e| {
-        error!("cognito_sign_in_password: login task panicked: {e}");
-        AppError::Raw(format!("password login task panicked: {e}"))
-    })?
-    .map_err(|e| {
-        // `e` is already a humanized Cognito message (no secrets).
-        error!("cognito_sign_in_password: InitiateAuth failed: {e}");
-        AppError::Raw(e)
-    })?;
+    let login =
+        tokio::task::spawn_blocking(move || crate::cognito::password_login(&email, &password))
+            .await
+            .map_err(|e| {
+                error!("cognito_sign_in_password: login task panicked: {e}");
+                AppError::Raw(format!("password login task panicked: {e}"))
+            })?
+            .map_err(|e| {
+                // `e` is already a humanized Cognito message (no secrets).
+                error!("cognito_sign_in_password: InitiateAuth failed: {e}");
+                AppError::Raw(e)
+            })?;
 
     info!(
         "cognito_sign_in_password: InitiateAuth succeeded (sub={}) — binding device",

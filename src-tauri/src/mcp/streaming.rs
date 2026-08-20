@@ -360,7 +360,7 @@ pub async fn post_focus(
             use tauri::Manager;
             let window = state
                 .app_handle
-                .get_webview_window(qontinui_runner_lib::get_main_window_label());
+                .get_webview_window(crate::get_main_window_label());
             match window {
                 Some(win) => {
                     let title = win
