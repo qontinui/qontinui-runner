@@ -2891,9 +2891,13 @@ mod tests {
 /// budget (`crate::shutdown_budget`), using only steps that are safe off the
 /// UI thread. It is written here rather than in `main.rs` because it must be
 /// callable from an HTTP handler when the event loop will never deliver
-/// `CloseRequested` at all. `main.rs`'s `WindowEvent::CloseRequested` worker
-/// body is the same sequence and **should call this function** — see the
-/// integration note on [`run_teardown`].
+/// `CloseRequested` at all.
+///
+/// It is the **only** copy of that ordering in the tree: `main.rs`'s
+/// `WindowEvent::CloseRequested` worker calls it too, so the X-button path and
+/// the force-close door cannot drift apart. That matters more than tidiness —
+/// the order is load-bearing, and an exit that races ahead of WIP-ref capture
+/// silently loses stashed work.
 pub mod emergency_quit {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -3019,14 +3023,18 @@ pub mod emergency_quit {
     /// better outcome than a runner that cannot be closed, and strictly better
     /// than `taskkill`, which loses it too *and* skips everything below.
     ///
-    /// # Integration note — this should be `main.rs`'s worker body too
+    /// # Both doors call this
     ///
-    /// `main.rs`'s `WindowEvent::CloseRequested` worker performs this same
-    /// sequence inline. It cannot call this function until its body is
-    /// extracted, which is a `main.rs` edit outside this change's scope; once
-    /// it is, the worker collapses to
-    /// `run_teardown(&worker_app_handle, &worker_app_state, &budget)` and there
-    /// is exactly one copy of the shutdown ordering in the tree.
+    /// `main.rs`'s `WindowEvent::CloseRequested` worker body is exactly
+    /// `run_teardown(&worker_app_handle, &worker_app_state, &budget)` followed
+    /// by `app_handle.exit(0)` and one `FORCE_EXIT_MARGIN`;
+    /// [`request_force_close`] does the same on its own thread. Nothing else in
+    /// the tree restates this order, and nothing new should: add a step HERE.
+    ///
+    /// Because both doors share it, the log lines below are written for
+    /// shutdown in general. Which door was taken is already in the log — the
+    /// close handler logs `Window close requested`, [`request_force_close`]
+    /// logs `FORCE-CLOSE accepted`.
     pub fn run_teardown(
         app_handle: &tauri::AppHandle,
         app_state: &Arc<AppState>,
@@ -3062,22 +3070,32 @@ pub mod emergency_quit {
                     rt.block_on(async {
                         let manager_guard = cleanup_state.bridge_manager.lock().await;
                         if let Some(ref manager) = *manager_guard {
-                            info!("Force-close: stopping all bridges");
+                            info!("Shutdown: stopping all bridges");
                             manager.remove_all().await;
                         }
                     });
                     rt.block_on(async {
+                        // Release the ADB forwards/reverses the USB scanner
+                        // installed so they don't linger in
+                        // `adb forward --list` / `adb reverse --list` across
+                        // runner restarts. Graceful path only — the supervisor
+                        // force-kills via `taskkill /F` and this code never
+                        // runs for temp runners. See plan
+                        // adb-forwarder-port.md §1.6a.
                         if let Some(usb) = cleanup_state.usb_transport.get() {
-                            info!("Force-close: releasing ADB forwards and reverses");
+                            info!("Shutdown: releasing ADB forwards and reverses");
                             usb.release_all().await;
                         }
                     });
                 }
-                Err(e) => error!("Force-close: failed to create cleanup runtime: {e}"),
+                Err(e) => error!("Shutdown: failed to create cleanup runtime: {e}"),
             }
+            // Safe to call here now that the executor no longer owns an
+            // `Arc<tokio::runtime::Runtime>` — `stop_internal()` is pure
+            // synchronous Python-subprocess teardown.
             if let Ok(mut guard) = cleanup_state.extraction_executor.lock() {
                 if let Some(mut ee) = guard.take() {
-                    info!("Force-close: stopping extraction executor");
+                    info!("Shutdown: stopping extraction executor");
                     let _ = ee.stop();
                 }
             }
@@ -3088,7 +3106,7 @@ pub mod emergency_quit {
         }
         if !cleanup.is_finished() {
             warn!(
-                "Force-close: bridge/ADB/extractor cleanup exceeded its {}s slice — continuing",
+                "Shutdown: bridge/ADB/extractor cleanup exceeded its {}s slice — continuing",
                 shutdown_budget::SHUTDOWN_JOIN_BUDGET.as_secs()
             );
         }
@@ -3103,7 +3121,7 @@ pub mod emergency_quit {
         );
         let summary = crate::drain::drain(app_handle, drain_timeout);
         info!(
-            "Force-close drain: drained={} wip_refs={} claims={} timed_out={} elapsed_ms={} \
+            "Shutdown drain: drained={} wip_refs={} claims={} timed_out={} elapsed_ms={} \
              already_drained={}",
             summary.drained_sessions,
             summary.wip_refs_written,
@@ -3113,16 +3131,20 @@ pub mod emergency_quit {
             summary.already_drained
         );
 
-        // A force-close is a PLANNED exit, not a crash: stamp the marker so the
-        // next boot classifies the restart as quiet, and retract the port
-        // advertisement so the runner stops advertising a port it is releasing.
-        // Both idempotent with `drain()`'s own stamping.
+        // An X-button close or a force-close is a PLANNED exit, not a crash —
+        // including the `already_drained` no-op and the zero-session case.
+        // Stamp the marker so the next boot classifies the restart as quiet,
+        // and retract the out-of-process port advertisement (plan 2026-07-17
+        // §4) so the runner stops advertising a port it is releasing. Both are
+        // idempotent backstops for `drain()`'s own stamping/retraction.
         let marker_path = crate::session::shutdown_marker::marker_path();
         crate::session::shutdown_marker::mark_clean_shutdown(&marker_path);
         qontinui_runner_lib::runner_breadcrumb::remove_published();
 
         // Cancel in-flight CI-node builds so their executors can attempt a
-        // best-effort `cancelled` POST.
+        // best-effort `cancelled` result POST; the Job Object (kill-on-close)
+        // is the hard backstop for the build process trees, and coord's
+        // dispatch-lease sweeper covers a result that never makes it out.
         crate::ci_node::shutdown_all();
 
         // Close interactive Claude sessions (µs each; does not kill children —
@@ -3132,7 +3154,11 @@ pub mod emergency_quit {
         }
 
         // Embedded terminal sessions, under a global cap. Per terminal this is
-        // `taskkill /F /T` plus two 2s joins plus a recursive `remove_dir_all`.
+        // `taskkill /F /T` plus two 2s joins plus a recursive `remove_dir_all`,
+        // i.e. ≈4s each and `O(terminals)` unbounded without the cap. Past the
+        // deadline the remaining sessions get a kill-only teardown: the child
+        // process tree still dies, the joins and the shim-dir sweep are
+        // skipped.
         if let Some(tm) = app_handle.try_state::<Arc<crate::terminal::TerminalManager>>() {
             tm.close_all(budget.sub_deadline(shutdown_budget::TERMINAL_CLOSE_BUDGET));
         }
@@ -3170,7 +3196,7 @@ pub mod emergency_quit {
                 if is_secondary {
                     let _ = pg.remove_runner_instance(&id).await;
                     let _ = pg.cleanup_dead_runner_instances(0).await;
-                    info!("Force-close: deregistered secondary instance (port={own_port})");
+                    info!("Shutdown: deregistered secondary instance (port={own_port})");
                     if let Some(pp) = primary_port {
                         if let Ok(client) = reqwest::Client::builder()
                             .timeout(Duration::from_secs(2))
@@ -3189,7 +3215,7 @@ pub mod emergency_quit {
                     let _ = pg
                         .update_runner_instance_heartbeat(&id, Some(0), "stopped")
                         .await;
-                    info!("Force-close: marked primary instance as stopped in DB");
+                    info!("Shutdown: marked primary instance as stopped in DB");
                 }
             });
         });
@@ -3216,7 +3242,7 @@ pub mod emergency_quit {
             return;
         }
         info!(
-            "Force-close: killing {} orphaned AI process(es): {:?}",
+            "Shutdown: killing {} orphaned AI process(es): {:?}",
             pids_to_kill.len(),
             pids_to_kill
         );
@@ -3224,7 +3250,7 @@ pub mod emergency_quit {
         for pid in &pids_to_kill {
             if Instant::now() >= kill_deadline {
                 warn!(
-                    "Force-close: AI-process kill loop hit its {}s cap — leaving the remaining \
+                    "Shutdown: AI-process kill loop hit its {}s cap — leaving the remaining \
                      PIDs to process exit",
                     shutdown_budget::AI_KILL_BUDGET.as_secs()
                 );
@@ -3249,16 +3275,16 @@ pub mod emergency_quit {
             match crate::drain::output_with_timeout(cmd, per_kill) {
                 Ok(Some(output)) => {
                     if output.status.success() {
-                        info!("Force-close: killed AI process tree for PID {pid}");
+                        info!("Shutdown: killed AI process tree for PID {pid}");
                     } else {
-                        info!("Force-close: AI process PID {pid} already exited");
+                        info!("Shutdown: AI process PID {pid} already exited");
                     }
                 }
                 Ok(None) => warn!(
-                    "Force-close: taskkill for PID {pid} exceeded its {per_kill:?} timeout — \
+                    "Shutdown: taskkill for PID {pid} exceeded its {per_kill:?} timeout — \
                      abandoned"
                 ),
-                Err(e) => error!("Force-close: failed to taskkill PID {pid}: {e}"),
+                Err(e) => error!("Shutdown: failed to taskkill PID {pid}: {e}"),
             }
         }
     }
@@ -3269,8 +3295,9 @@ pub mod emergency_quit {
         tauri::async_runtime::spawn(async move {
             let manager_lock = pcm.process_capture_manager.lock().await;
             if let Some(ref manager) = *manager_lock {
-                info!("Force-close: stopping all managed processes");
+                info!("Shutdown: stopping all managed processes");
                 manager.stop_all().await;
+                info!("Shutdown: all managed processes stopped");
             }
         });
 
@@ -3278,9 +3305,11 @@ pub mod emergency_quit {
         tauri::async_runtime::spawn(async move {
             let handle_lock = em.error_monitor_handle.lock().await;
             if let Some(ref handle) = *handle_lock {
-                info!("Force-close: stopping error monitor service");
+                info!("Shutdown: stopping error monitor service");
                 if let Err(e) = handle.stop().await {
-                    error!("Force-close: failed to stop error monitor service: {e}");
+                    error!("Shutdown: failed to stop error monitor service: {e}");
+                } else {
+                    info!("Shutdown: error monitor service stopped");
                 }
             }
         });
@@ -3289,9 +3318,11 @@ pub mod emergency_quit {
         tauri::async_runtime::spawn(async move {
             let handle_lock = doc.doctor_handle.lock().await;
             if let Some(ref handle) = *handle_lock {
-                info!("Force-close: stopping Doctor service");
+                info!("Shutdown: stopping Doctor service");
                 if let Err(e) = handle.shutdown().await {
-                    error!("Force-close: failed to stop Doctor service: {e}");
+                    error!("Shutdown: failed to stop Doctor service: {e}");
+                } else {
+                    info!("Shutdown: Doctor service stopped");
                 }
             }
         });

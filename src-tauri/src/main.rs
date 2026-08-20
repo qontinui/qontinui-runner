@@ -5347,12 +5347,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                 let app_state = window.state::<Arc<AppState>>();
 
-                // Intentional close — clear the session file so instances are NOT
-                // restored on the next normal startup.  (If the process is killed
-                // by a rebuild, this handler doesn't run and the file persists,
-                // which is exactly what we want.)
-                instance_manager::clear_active_instances();
-
                 // The window is prevented from closing, so make it disappear the
                 // way the user asked: hide it now (also a `send_user_message`
                 // that runs inline on this thread) and let teardown finish
@@ -5410,9 +5404,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // this change be exactly one change. Turning those releases on
                 // is a separate, deliberate follow-up.
                 //
-                // ORDER BELOW IS TODAY'S ORDER, UNCHANGED. Only the thread
-                // moves. Reordering could let the exit race ahead of WIP-ref
-                // capture and silently lose stashed work.
+                // The sequence itself lives in
+                // `mcp::ai_session::emergency_quit::run_teardown` — ONE copy,
+                // in today's order. Reordering it could let the exit race ahead
+                // of WIP-ref capture and silently lose stashed work.
                 let worker_app_handle = window.app_handle().clone();
                 let worker_app_state = app_state.inner().clone();
                 std::thread::spawn(move || {
@@ -5420,351 +5415,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         shutdown_budget::WORKER_BUDGET,
                     );
 
-                    // Deregister this instance from the runner_instances table.
-                    // For the primary: mark stopped so secondaries know it's gone.
-                    // For secondaries: remove the row entirely and notify the primary.
+                    // ── The teardown sequence — ONE implementation ──
                     //
-                    // Still its own inner thread, exactly as before: it is a
-                    // network round-trip that has never been part of the
-                    // sequential teardown and must not become part of it.
-                    {
-                        let pg = worker_app_state.pg_db.clone();
-                        let own_port = worker_app_state
-                            .api_port
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let is_secondary = instance::is_secondary();
-                        let primary_port = instance::primary_port();
-                        let id = format!(
-                            "{}-{}",
-                            if is_secondary { "ext" } else { "primary" },
-                            own_port
-                        );
-
-                        // Best-effort: spawn a quick runtime to clean up DB + HTTP
-                        std::thread::spawn(move || {
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build();
-                            if let Ok(rt) = rt {
-                                rt.block_on(async {
-                                    if is_secondary {
-                                        // Remove from DB
-                                        let _ = pg.remove_runner_instance(&id).await;
-                                        // Also try removing by port (covers different ID formats)
-                                        let _ = pg
-                                            .cleanup_dead_runner_instances(0)
-                                            .await;
-                                        info!(
-                                            "Deregistered secondary instance (port={}) from DB",
-                                            own_port
-                                        );
-
-                                        // Notify primary (best-effort)
-                                        if let Some(pp) = primary_port {
-                                            let client = reqwest::Client::builder()
-                                                .timeout(std::time::Duration::from_secs(2))
-                                                .build()
-                                                .ok();
-                                            if let Some(client) = client {
-                                                let url = format!(
-                                                    "http://127.0.0.1:{}/instances/{}/stop",
-                                                    pp, id
-                                                );
-                                                // coord-auth-exempt(not-coord):
-                                                // 127.0.0.1 loopback to the PRIMARY
-                                                // runner instance's own API, telling
-                                                // it this secondary is stopping.
-                                                // Same box, no coord involvement.
-                                                let _ = client.post(&url).send().await;
-                                            }
-                                        }
-                                    } else {
-                                        // Primary: mark as stopped (not delete — secondaries
-                                        // may query it to detect primary is gone)
-                                        let _ = pg
-                                            .update_runner_instance_heartbeat(
-                                                &id, Some(0), "stopped",
-                                            )
-                                            .await;
-                                        info!("Marked primary instance as stopped in DB");
-                                    }
-                                });
-                            }
-                        });
-                    }
-
-                    // ── Explicit shutdown ordering ──
-                    let app_state_clone = worker_app_state.clone();
-
-                    let shutdown_handle = std::thread::spawn(move || {
-                        // Build a small current-thread runtime for the cleanup work
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build();
-
-                        match rt {
-                            Ok(rt) => {
-                                // Stop all bridges via bridge manager
-                                rt.block_on(async {
-                                    let manager_guard =
-                                        app_state_clone.bridge_manager.lock().await;
-                                    if let Some(ref manager) = *manager_guard {
-                                        info!("Stopping all bridges via bridge manager");
-                                        manager.remove_all().await;
-                                    }
-                                });
-
-                                // Release ADB forwards and reverses installed by the
-                                // USB scanner so they don't linger in
-                                // `adb forward --list` / `adb reverse --list` across
-                                // runner restarts. Graceful path only — the
-                                // supervisor force-kills via taskkill /F and this
-                                // code never runs for temp runners. See plan
-                                // adb-forwarder-port.md §1.6a.
-                                rt.block_on(async {
-                                    if let Some(usb) =
-                                        app_state_clone.usb_transport.get()
-                                    {
-                                        info!("Releasing ADB forwards and reverses on shutdown");
-                                        usb.release_all().await;
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                error!("Failed to create shutdown runtime: {}", e);
-                            }
-                        }
-
-                        // Stop the extraction executor. Safe to call here now that it no longer
-                        // owns an Arc<tokio::runtime::Runtime> — stop_internal() is pure
-                        // synchronous Python-subprocess teardown.
-                        if let Ok(mut guard) = app_state_clone.extraction_executor.lock() {
-                            if let Some(mut ee) = guard.take() {
-                                info!("Stopping extraction executor");
-                                let _ = ee.stop();
-                            }
-                        }
-                    });
-
-                    // Wait for the dedicated bridge/ADB/extractor thread, but
-                    // with a hard upper bound taken out of the ONE shutdown
-                    // budget. Any cleanup still running past the deadline
-                    // continues in the background; the process exit below
-                    // reaps it.
-                    let join_deadline = budget.sub_deadline(
-                        shutdown_budget::SHUTDOWN_JOIN_BUDGET,
+                    // Integration step of plan
+                    // `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`.
+                    // This worker's body used to re-state the whole ordering
+                    // inline while `emergency_quit::run_teardown` held a second
+                    // copy of the same sequence for the force-close door
+                    // (`POST /ui-bridge/control/page/force-close`), which needs
+                    // it callable when the event loop will never deliver
+                    // `CloseRequested` at all. Two copies of a load-bearing
+                    // order drift silently, and a drift here is not cosmetic:
+                    // letting the exit race ahead of WIP-ref capture loses
+                    // stashed work. There is now exactly one copy.
+                    //
+                    // The three UI-thread-only steps stay ABOVE, outside this
+                    // worker: `mark_app_quitting`, `capture_open_geometry` and
+                    // `window.hide()`. `run_teardown` deliberately omits them
+                    // (trap 3 of the plan — off the main thread those window
+                    // getters stop short-circuiting to an inline Win32 call and
+                    // become an untimed `rx.recv()` that can park forever).
+                    crate::mcp::ai_session::emergency_quit::run_teardown(
+                        &worker_app_handle,
+                        &worker_app_state,
+                        &budget,
                     );
-                    // Poll instead of blocking `.join()` so we can bail out on
-                    // timeout. `JoinHandle::is_finished` is stable and doesn't
-                    // require `nightly`.
-                    while !shutdown_handle.is_finished()
-                        && std::time::Instant::now() < join_deadline
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                    if !shutdown_handle.is_finished() {
-                        warn!(
-                            "Shutdown thread did not finish within its {}s slice — continuing \
-                             teardown; any remaining cleanup will be killed by process exit",
-                            shutdown_budget::SHUTDOWN_JOIN_BUDGET.as_secs()
-                        );
-                    }
-
-                    // ── Graceful drain ──
-                    //
-                    // Before the hard session-close + taskkill below, run the
-                    // bounded drain so even a DIRECT exit (X button / programmatic
-                    // app.exit that didn't route through the supervisor's
-                    // POST /drain) flushes in-flight AI turns to output_log,
-                    // stashes dirty worktrees to refs/wip/*, and heartbeats coord
-                    // claims. `drain()` is idempotent: if the supervisor already
-                    // hit POST /drain, this returns instantly (already_drained).
-                    //
-                    // Its slice comes out of the same budget as everything else,
-                    // so the drain can never outlive the force-exit watchdog.
-                    {
-                        let exit_drain_timeout = std::cmp::min(
-                            drain::configured_timeout(),
-                            budget.slice(shutdown_budget::EXIT_DRAIN_BUDGET),
-                        );
-                        let summary = drain::drain(&worker_app_handle, exit_drain_timeout);
-                        info!(
-                            "Exit-seam drain: drained={} wip_refs={} claims={} timed_out={} \
-                             elapsed_ms={} already_drained={}",
-                            summary.drained_sessions,
-                            summary.wip_refs_written,
-                            summary.claims_persisted,
-                            summary.timed_out,
-                            summary.elapsed_ms,
-                            summary.already_drained
-                        );
-
-                        // Phase 4 — the ExitRequested seam is the catch-all CLEAN
-                        // shutdown signal: even a direct X-button / programmatic
-                        // app.exit that produced an `already_drained` no-op above
-                        // (or ran with zero sessions) is still a PLANNED exit, not
-                        // a crash. Stamp the marker `clean:true` here unconditionally
-                        // so the next boot's resume classifies a quiet (planned)
-                        // restart. `drain()` also stamps it on a fresh pass; this is
-                        // the idempotent backstop for the no-op / zero-session case.
-                        let marker_path = session::shutdown_marker::marker_path();
-                        session::shutdown_marker::mark_clean_shutdown(&marker_path);
-
-                        // Retract the out-of-process port advertisement (plan
-                        // 2026-07-17 §4). Same catch-all reasoning as the marker
-                        // above: an X-button / programmatic exit is a PLANNED exit,
-                        // so the runner must stop advertising a port it is about to
-                        // release. Idempotent with `drain()`'s own retraction.
-                        qontinui_runner_lib::runner_breadcrumb::remove_published();
-                    }
-
-                    // Cancel any in-flight CI-node builds so their executors can
-                    // attempt a best-effort `cancelled` result POST; the Job
-                    // Object (kill-on-close) is the hard backstop for the build
-                    // process trees, and coord's dispatch-lease sweeper covers a
-                    // result that never makes it out.
-                    ci_node::shutdown_all();
-
-                    // Close all interactive Claude sessions
-                    if let Some(sm) = worker_app_handle
-                        .try_state::<Arc<claude_session::SessionManager>>()
-                    {
-                        sm.close_all_sessions();
-                    }
-
-                    // Close all embedded terminal sessions, under a GLOBAL cap.
-                    // Per terminal this is `taskkill /F /T` + two 2 s thread
-                    // joins + a recursive `remove_dir_all` — i.e. ~4 s each with
-                    // no cap at all before this change, which is `O(terminals)`
-                    // unbounded. Past the deadline the remaining sessions get a
-                    // kill-only teardown (child process tree still dies; the
-                    // joins and the shim-dir sweep are skipped).
-                    if let Some(tm) =
-                        worker_app_handle.try_state::<Arc<terminal::TerminalManager>>()
-                    {
-                        tm.close_all(
-                            budget.sub_deadline(shutdown_budget::TERMINAL_CLOSE_BUDGET),
-                        );
-                    }
-
-                    // Kill any orphaned AI (Claude CLI) processes tracked by the PID tracker.
-                    // This catches processes that survived session close (e.g., cmd.exe /c claude).
-                    {
-                        let pids_to_kill: Vec<u32> = {
-                            // Poison-recovering: a panicked writer elsewhere must
-                            // not silently turn "kill the orphans" into a no-op.
-                            let mut pids = worker_app_state
-                                .ai_pid_tracker
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner());
-                            let copy = pids.clone();
-                            pids.clear();
-                            copy
-                        };
-                        if !pids_to_kill.is_empty() {
-                            info!(
-                                "Killing {} orphaned AI process(es) on shutdown: {:?}",
-                                pids_to_kill.len(),
-                                pids_to_kill
-                            );
-                            let kill_deadline =
-                                budget.sub_deadline(shutdown_budget::AI_KILL_BUDGET);
-                            for pid in &pids_to_kill {
-                                if std::time::Instant::now() >= kill_deadline {
-                                    warn!(
-                                        "AI-process kill loop hit its {}s cap — leaving the \
-                                         remaining PIDs to process exit",
-                                        shutdown_budget::AI_KILL_BUDGET.as_secs()
-                                    );
-                                    break;
-                                }
-                                // `/T` is CORRECT here and must stay: this kills a
-                                // CHILD AGENT'S OWN process tree (the `claude` CLI
-                                // and whatever it spawned), which is precisely the
-                                // semantics of quitting the app. It is categorically
-                                // different from `/T` on the RUNNER's own PID, which
-                                // is forbidden because it would take every live
-                                // Claude Code session on the box down with it.
-                                let mut cmd = crate::process_helpers::no_window("taskkill");
-                                cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-                                let per_kill = std::cmp::max(
-                                    std::cmp::min(
-                                        shutdown_budget::TASKKILL_TIMEOUT,
-                                        kill_deadline.saturating_duration_since(
-                                            std::time::Instant::now(),
-                                        ),
-                                    ),
-                                    // Floored: skipping a kill leaks a process
-                                    // tree that outlives the runner.
-                                    shutdown_budget::TASKKILL_FLOOR,
-                                );
-                                match drain::output_with_timeout(cmd, per_kill) {
-                                    Ok(Some(output)) => {
-                                        if output.status.success() {
-                                            info!("Killed AI process tree for PID {}", pid);
-                                        } else {
-                                            // Process may have already exited — not an error
-                                            info!("AI process PID {} already exited", pid);
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        warn!(
-                                            "taskkill for PID {} exceeded its {:?} timeout — \
-                                             abandoned",
-                                            pid, per_kill
-                                        );
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to taskkill PID {}: {}", pid, e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Stop all managed processes
-                    let app_state_pcm = worker_app_state.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let manager_lock = app_state_pcm.process_capture_manager.lock().await;
-                        if let Some(ref manager) = *manager_lock {
-                            info!("Stopping all managed processes");
-                            manager.stop_all().await;
-                            info!("All managed processes stopped");
-                        }
-                    });
-
-                    // Stop error monitor service
-                    let app_state_clone2 = worker_app_state.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let handle_lock = app_state_clone2.error_monitor_handle.lock().await;
-                        if let Some(ref handle) = *handle_lock {
-                            info!("Stopping error monitor service");
-                            if let Err(e) = handle.stop().await {
-                                error!("Failed to stop error monitor service: {}", e);
-                            } else {
-                                info!("Error monitor service stopped");
-                            }
-                        }
-                    });
-
-                    // Stop Doctor health monitoring service
-                    let app_state_clone3 = worker_app_state.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let handle_lock = app_state_clone3.doctor_handle.lock().await;
-                        if let Some(ref handle) = *handle_lock {
-                            info!("Stopping Doctor service");
-                            if let Err(e) = handle.shutdown().await {
-                                error!("Failed to stop Doctor service: {}", e);
-                            } else {
-                                info!("Doctor service stopped");
-                            }
-                        }
-                    });
-
-                    // Stop trigger service
-                    tauri::async_runtime::spawn(async move {
-                        crate::trigger_system::stop_trigger_service().await;
-                    });
 
                     // ── Explicit exit request, anchored to WORKER COMPLETION ──
                     //
@@ -5783,9 +5458,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // thread-safe `proxy.send_event` — but it is an ENQUEUE, so
                     // it only lands while the loop is healthy. Here it is, by
                     // construction: the close was merely prevented, not blocked.
-                    std::thread::sleep(
-                        budget.slice(shutdown_budget::ASYNC_CLEANUP_GRACE),
-                    );
+                    //
+                    // The `ASYNC_CLEANUP_GRACE` wait that used to sit here is
+                    // the LAST step of `run_teardown` — sleeping again would
+                    // double-charge the budget for one grace period.
                     info!(
                         "Shutdown worker finished in {}ms — requesting Tauri app exit",
                         budget.elapsed().as_millis()
