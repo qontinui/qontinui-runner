@@ -1267,6 +1267,14 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
         warn!("UI recovery: main window label was already free before recreate");
     }
 
+    // The cached main-window HWND now names a destroyed window. Forget it, or
+    // the native-hang probe (`health_monitor::ui_thread_pumping`) keeps
+    // `SendMessageTimeoutW`-ing a dead handle, reports UNKNOWN — which is
+    // deliberately never escalated — and native-hang detection is off for the
+    // rest of this process's life. `main_hwnd()` also self-heals via `IsWindow`;
+    // this is the explicit door, at the one site that knows the window is gone.
+    crate::ui_thread_probe::invalidate_main_hwnd();
+
     // Wait for the label to actually be retired.
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_millis(WINDOW_LABEL_RELEASE_TIMEOUT_MS);

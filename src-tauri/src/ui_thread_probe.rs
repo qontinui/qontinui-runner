@@ -38,6 +38,11 @@
 #[cfg(windows)]
 static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+/// Warn once — not on every 5 s tick — the first time the cache is found stale.
+#[cfg(windows)]
+static STALE_CACHE_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Record the main window's `HWND`.
 ///
 /// **Call this exactly once, from the UI thread, right after the main window is
@@ -54,35 +59,100 @@ pub fn set_main_hwnd(hwnd: isize) {
     tracing::info!("ui_thread_probe: cached main-window HWND {hwnd:#x}");
 }
 
+/// Forget the cached handle, so the next [`main_hwnd`] re-resolves from
+/// scratch.
+///
+/// **Call this from any path that destroys the main window** — today the one
+/// caller is `webview_recovery::recreate_main_window`, which does
+/// `existing.destroy()` and rebuilds. Without it the memo would keep handing
+/// out the handle of a window that no longer exists.
+///
+/// This is belt-and-braces, not the only defence: [`main_hwnd`] validates the
+/// cache with `IsWindow` on every read, so a missed invalidation costs one
+/// extra `EnumWindows` sweep rather than permanently disabling detection. Both
+/// exist because the failure mode is silent and terminal — a stale memo made
+/// the Phase 4 probe report UNKNOWN for the **rest of the process's life**,
+/// and UNKNOWN is deliberately never escalated.
+#[cfg(windows)]
+pub fn invalidate_main_hwnd() {
+    let previous = MAIN_HWND.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if previous != 0 {
+        tracing::info!(
+            "ui_thread_probe: invalidated cached main-window HWND {previous:#x} \
+             (window destroyed) — the next probe will re-resolve"
+        );
+    }
+    // A fresh window is a fresh reason to be told about staleness.
+    STALE_CACHE_LOGGED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The main window's `HWND` as a raw `isize`, or `None` if it cannot be
 /// established.
 ///
 /// Resolution order:
-/// 1. the value cached by [`set_main_hwnd`] at startup (the normal path);
+/// 1. the value cached by [`set_main_hwnd`] at startup, **validated with
+///    `IsWindow`** (the normal path);
 /// 2. an `EnumWindows` + `GetWindowThreadProcessId` sweep over **this process's
 ///    own** top-level windows, for the case where the startup cache did not run
-///    (headless/server mode, a window rebuilt by webview recovery, a detector
-///    that starts before window construction). A successful sweep is memoized
-///    into the same slot so the 5 s-cadence caller does not re-enumerate.
+///    or no longer names a live window (headless/server mode, a window rebuilt
+///    by webview recovery, a detector that starts before window construction).
+///    A successful sweep is memoized into the same slot so the 5 s-cadence
+///    caller does not re-enumerate.
 ///
 /// Never touches the Tauri event loop on either path.
 ///
-/// `allow(dead_code)`: the reader of this cache is the native-message-loop
-/// liveness rung in `health_monitor` (Phase 4 step 2 of the same plan), which
-/// lands separately. The cache and its writer are complete and exercised by the
-/// tests below; only the consumer is elsewhere.
+/// # Why the cache is validated rather than trusted
+///
+/// `set_main_hwnd` is called exactly once, from `main.rs`'s window-construction
+/// arm. `webview_recovery::recreate_main_window` then `destroy()`s that window
+/// and builds a new one — after which the memo names a dead handle,
+/// `SendMessageTimeoutW` fails with `ERROR_INVALID_WINDOW_HANDLE`, and the
+/// Phase 4 probe reports UNKNOWN. UNKNOWN is (correctly) never escalated, so
+/// without this validation **one webview recovery turns native-hang detection
+/// off for the remaining lifetime of the process** — the exact class of silent,
+/// permanent blindness this whole plan exists to remove.
+///
+/// `IsWindow` is cheap and non-blocking (it inspects the window table; it does
+/// not message the owning thread), so it is safe to call from the detector at
+/// its 5 s cadence and cannot inherit the hang. Its one documented weakness —
+/// a recycled handle value can make a dead handle look live — is covered by the
+/// sweep's own-PID filter on the re-resolve path, and is in any case a strictly
+/// better failure than the unconditional staleness it replaces.
+///
+/// `allow(dead_code)`: the periodic reader is the native-message-loop liveness
+/// rung in `health_monitor`; the HTTP reader is the close-door verdict in
+/// `mcp/ui_bridge/page.rs`. Both are `cfg`-independent callers, so this stays
+/// annotated for builds that compile neither.
 #[allow(dead_code)]
 #[cfg(windows)]
 pub fn main_hwnd() -> Option<isize> {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+
     let cached = MAIN_HWND.load(std::sync::atomic::Ordering::SeqCst);
     if cached != 0 {
-        return Some(cached);
+        // SAFETY: a read-only query against the OS window table. A stale or
+        // bogus handle is exactly what this call is for — it answers `FALSE`
+        // rather than faulting.
+        if unsafe { IsWindow(cached as HWND) } != 0 {
+            return Some(cached);
+        }
+        // Stale: the window was destroyed (a `webview_recovery` recreate, most
+        // likely) without anyone invalidating the memo. Drop it and re-resolve.
+        MAIN_HWND.store(0, std::sync::atomic::Ordering::SeqCst);
+        if !STALE_CACHE_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            tracing::warn!(
+                "ui_thread_probe: cached main-window HWND {cached:#x} no longer names a live \
+                 window — re-resolving via EnumWindows"
+            );
+        }
     }
     let found = resolve_own_main_window()?;
     // Memoize the fallback so a periodic caller pays the sweep once. Racing
     // writers necessarily agree (same process, same window), so a plain store
     // is fine.
     MAIN_HWND.store(found, std::sync::atomic::Ordering::SeqCst);
+    STALE_CACHE_LOGGED.store(false, std::sync::atomic::Ordering::SeqCst);
     tracing::info!("ui_thread_probe: resolved main-window HWND {found:#x} via EnumWindows");
     Some(found)
 }
@@ -185,6 +255,10 @@ fn resolve_own_main_window() -> Option<isize> {
 #[cfg(not(windows))]
 pub fn set_main_hwnd(_hwnd: isize) {}
 
+/// No-op on non-Windows: there is no HWND to invalidate.
+#[cfg(not(windows))]
+pub fn invalidate_main_hwnd() {}
+
 /// Always `None` on non-Windows: there is no HWND to resolve.
 #[allow(dead_code)]
 #[cfg(not(windows))]
@@ -196,20 +270,28 @@ pub fn main_hwnd() -> Option<isize> {
 mod tests {
     use super::*;
 
-    /// Two invariants of the cache slot, asserted in ONE test on purpose:
+    /// Every invariant of the cache slot, asserted in ONE test on purpose:
     /// `MAIN_HWND` is a process-global static, so two `#[test]` fns touching it
     /// would race under the default parallel test runner.
     ///
     /// 1. The null sentinel is never cached — storing it would make "cached a
     ///    bogus handle" indistinguishable from "startup never ran", and the
     ///    `EnumWindows` fallback would then be skipped forever.
-    /// 2. A real cached handle round-trips out of `main_hwnd()` verbatim,
-    ///    without any sweep.
+    /// 2. A cached handle is **validated, not trusted**: `0x4242` is not a live
+    ///    window, so `main_hwnd()` must NOT hand it back. This is the whole
+    ///    handback fix — before it, a `webview_recovery` recreate left a dead
+    ///    handle memoized and the native-hang probe reported UNKNOWN for the
+    ///    rest of the process's life.
+    /// 3. A failed validation clears the slot, so the next call re-resolves
+    ///    instead of re-validating a handle already known to be dead.
+    /// 4. [`invalidate_main_hwnd`] clears the slot outright — the explicit door
+    ///    `webview_recovery` calls when it destroys the window.
     #[cfg(windows)]
     #[test]
-    fn cache_slot_rejects_null_and_round_trips_a_real_handle() {
+    fn cache_slot_rejects_null_validates_and_can_be_invalidated() {
         let previous = MAIN_HWND.load(std::sync::atomic::Ordering::SeqCst);
 
+        // (1) the null sentinel is refused
         MAIN_HWND.store(0, std::sync::atomic::Ordering::SeqCst);
         set_main_hwnd(0);
         assert_eq!(
@@ -218,8 +300,36 @@ mod tests {
             "a null HWND must not be stored"
         );
 
+        // (2) a stored-but-dead handle is never handed out
         set_main_hwnd(0x4242);
-        assert_eq!(main_hwnd(), Some(0x4242));
+        assert_eq!(
+            MAIN_HWND.load(std::sync::atomic::Ordering::SeqCst),
+            0x4242,
+            "set_main_hwnd should store a non-null handle"
+        );
+        assert_ne!(
+            main_hwnd(),
+            Some(0x4242),
+            "a cached handle that is not a live window must not be returned — that is \
+             exactly the stale-memo bug this validation closes"
+        );
+
+        // (3) the failed validation cleared the slot (the EnumWindows sweep in
+        // a headless test process finds nothing to memoize in its place)
+        assert_ne!(
+            MAIN_HWND.load(std::sync::atomic::Ordering::SeqCst),
+            0x4242,
+            "a handle that failed IsWindow must not stay cached"
+        );
+
+        // (4) the explicit invalidation door empties the slot
+        set_main_hwnd(0x4343);
+        invalidate_main_hwnd();
+        assert_eq!(
+            MAIN_HWND.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "invalidate_main_hwnd must clear the cache"
+        );
 
         MAIN_HWND.store(previous, std::sync::atomic::Ordering::SeqCst);
     }
@@ -228,6 +338,7 @@ mod tests {
     #[test]
     fn non_windows_stub_is_always_none() {
         set_main_hwnd(0x4242);
+        invalidate_main_hwnd();
         assert_eq!(main_hwnd(), None);
     }
 }

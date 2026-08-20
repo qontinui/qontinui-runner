@@ -523,3 +523,137 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/health-signals"),
     ]
 }
+
+// ============================================================================
+// Native event-loop unresponsiveness
+// ============================================================================
+//
+// Plan `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 3 step 1.
+//
+// # Why this needed a coded body rather than the flat one
+//
+// There was **no coded-503 precedent in this route family**. The one surface
+// that could previously express "the UI thread is wedged" —
+// `/health/diagnostic-screenshot` — returns a flat, untyped
+// `{success:false, error:"…"}`, and the only coded 503 nearby is
+// [`UiBridgeErrorCode::FrontendNotReady`]. Both readings are wrong for this
+// condition:
+//
+// * the flat shape carries no machine-readable code at all, so an agent has to
+//   pattern-match prose to learn what happened;
+// * `FRONTEND_NOT_READY` says the frontend is still booting, which invites a
+//   readiness retry. In this failure the frontend is usually **healthy** — it
+//   is the native Win32 message loop underneath it that is wedged — so that
+//   retry can never succeed.
+//
+// Hence [`UiBridgeErrorCode::EventLoopUnresponsive`] and the builder below.
+// The variant itself has to live in `types.rs` beside the enum it belongs to;
+// everything about *this* condition lives here.
+
+use super::types::{RecoveryHint, UiBridgeError, UiBridgeErrorCode};
+
+impl UiBridgeError {
+    /// Body for a route that cannot honour a request because the native event
+    /// loop is not pumping.
+    ///
+    /// `reason` is a stable, machine-readable discriminator for *how* the
+    /// verdict was reached (see `page::EventLoopVerdict`), so a caller can tell
+    /// "the wedge detector has latched" from "the probe could not answer" —
+    /// both refuse the request, but only the first is a confirmed hang.
+    ///
+    /// `context.escapeHatch` names the door that still works in this state.
+    /// That is not decoration: the whole defect being fixed is a surface that
+    /// reported success and left the caller with nowhere to go.
+    pub fn event_loop_unresponsive(reason: &str, confirmed: bool) -> Self {
+        Self {
+            code: UiBridgeErrorCode::EventLoopUnresponsive,
+            message: if confirmed {
+                "The runner's native event loop is not pumping messages; the request would \
+                 queue behind the wedge instead of running"
+                    .to_string()
+            } else {
+                "The runner could not verify that its native event loop is pumping messages; \
+                 refusing rather than reporting a success it cannot confirm"
+                    .to_string()
+            },
+            recovery: Some(RecoveryHint::WaitForRecovery),
+            context: Some(serde_json::json!({
+                "code": "EVENT_LOOP_UNRESPONSIVE",
+                "reason": reason,
+                "confirmed": confirmed,
+                "escapeHatch": "POST /ui-bridge/control/page/force-close",
+            })),
+        }
+    }
+}
+
+#[cfg(test)]
+mod event_loop_unresponsive_tests {
+    //! The wire contract of the coded 503 the close door returns during a
+    //! native-event-loop hang.
+
+    use super::super::types::{recovery_hint_for, RecoveryHint, UiBridgeError, UiBridgeErrorCode};
+
+    /// The whole reason for a new variant rather than reusing
+    /// `FRONTEND_NOT_READY` is that an agent must be able to discriminate on
+    /// the code. If the serialized string ever changes, every caller that
+    /// matched on it silently falls through to its generic error path.
+    #[test]
+    fn code_serializes_to_the_documented_screaming_snake_string() {
+        let err = UiBridgeError::event_loop_unresponsive("wedge_detector_latched", true);
+        let body = serde_json::to_value(&err).expect("serialize");
+        assert_eq!(body["code"], "EVENT_LOOP_UNRESPONSIVE");
+    }
+
+    /// `confirmed` is the honest half of the contract: a latched wedge and a
+    /// probe that could not answer both refuse the request, but only the first
+    /// is an observation. The two must stay distinguishable on the wire, and
+    /// the prose must not claim more than the flag does.
+    #[test]
+    fn confirmed_flag_and_prose_agree_on_both_arms() {
+        let observed = UiBridgeError::event_loop_unresponsive("probe_no_round_trip", true);
+        let ctx = observed.context.as_ref().expect("context");
+        assert_eq!(ctx["confirmed"], true);
+        assert_eq!(ctx["reason"], "probe_no_round_trip");
+        assert!(
+            observed.message.contains("is not pumping"),
+            "a confirmed hang should state it: {}",
+            observed.message
+        );
+
+        let unverified = UiBridgeError::event_loop_unresponsive("probe_unavailable", false);
+        let ctx = unverified.context.as_ref().expect("context");
+        assert_eq!(ctx["confirmed"], false);
+        assert_eq!(ctx["reason"], "probe_unavailable");
+        assert!(
+            unverified.message.contains("could not verify"),
+            "an unverified refusal must not claim an observation: {}",
+            unverified.message
+        );
+    }
+
+    /// A refusal that names no way forward is the defect this route family had
+    /// (a `200` that did nothing). The body must point at the door that still
+    /// works while the loop is wedged.
+    #[test]
+    fn body_names_the_escape_hatch() {
+        let err = UiBridgeError::event_loop_unresponsive("wedge_detector_latched", true);
+        assert_eq!(
+            err.context.as_ref().expect("context")["escapeHatch"],
+            "POST /ui-bridge/control/page/force-close"
+        );
+    }
+
+    /// NOT `RetryAfterMs`: a fixed backoff cannot clear a wedge, and each retry
+    /// re-enqueues onto the same blocked queue. NOT `Unrecoverable` either: a
+    /// long synchronous handler does eventually return.
+    #[test]
+    fn recovery_hint_is_wait_for_recovery() {
+        assert!(matches!(
+            recovery_hint_for(&UiBridgeErrorCode::EventLoopUnresponsive),
+            RecoveryHint::WaitForRecovery
+        ));
+        let err = UiBridgeError::event_loop_unresponsive("wedge_detector_latched", true);
+        assert!(matches!(err.recovery, Some(RecoveryHint::WaitForRecovery)));
+    }
+}
