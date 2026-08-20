@@ -74,7 +74,7 @@ jobs:
       # of merge-train throughput on 2026-08-19.
       # Sizing: 11 successful runs of this nightly job, 2026-08-09..08-19:
       # p50 32s, max 50s outside the 08-19 apt incident (150s inside it).
-      # 10 min = ~12x the healthy median, matching the bound on the identical
+      # 10 min = ~19x the healthy median (~12x its max), matching the bound on the identical
       # package list in ci.yml so the two do not drift apart.
       - name: Install dependencies (Ubuntu)
         timeout-minutes: 10

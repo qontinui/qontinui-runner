@@ -234,12 +234,17 @@ jobs:
 
       # Bounded against a job-time apt hang — see the rationale on the
       # `Install dependencies (Ubuntu)` step in .github/workflows/ci.yml.
-      # Sizing: 8 successful runs, p50 6s, max 9s. Same 5-minute floor as
+      # Sizing: 8 successful runs, p50 6s, max 9s, newest 2026-08-08 — no
+      # sample inside the 08-18..08-20 mirror event. Same 10-minute bound as
       # atlas-exclude-fresh.yml's identical postgresql-client-16 install; see
-      # the comment there for why a 5-10x multiple of a 9-second step would be
-      # too tight to be safe.
+      # the comment there for why a 9-second download sample cannot size a
+      # bound that must also cover `apt-get update`.
+      #
+      # This one matters more: `schema-fresh` is a REQUIRED status check on
+      # main (ruleset 16044811), so a bound tight enough to fire on a merely
+      # congested mirror reds an innocent PR and keeps it out of the train.
       - name: Install Postgres client (for pg_dump)
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-client-16
