@@ -13,6 +13,16 @@
 //! the cached output is used and the node is not re-executed. This makes DAG
 //! execution idempotent across runner restarts.
 //!
+//! Loop-body work is journaled the same way, under the composite key
+//! `"<loop_node_id>/iter<N>/<body_node_id>"` (see `loop_body_journal_key`),
+//! so resuming a partially-run loop replays the iterations that already
+//! finished instead of re-executing — and re-billing — them.
+//!
+//! Journal writes are never discarded silently: every append goes through
+//! `journal_append`, which retries a bounded number of times and then logs.
+//! A lost `completed` append is logged at ERROR because it *guarantees*
+//! re-execution on resume.
+//!
 //! # Parallel execution
 //!
 //! All nodes within a single layer are dispatched concurrently via
@@ -27,7 +37,7 @@ use std::time::Instant;
 use futures::future::join_all;
 use serde_json::json;
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
@@ -121,14 +131,14 @@ pub async fn execute_dag_workflow(
 
                 // Log skipped nodes to the event log.
                 for s in &skipped {
-                    let _ = pg_db
-                        .event_log_append(
-                            &execution_id,
-                            &s.node_id,
-                            &EventType::Skipped,
-                            Some(&json!({ "reason": s.reason })),
-                        )
-                        .await;
+                    journal_append(
+                        &pg_db,
+                        &execution_id,
+                        &s.node_id,
+                        EventType::Skipped,
+                        Some(&json!({ "reason": s.reason })),
+                    )
+                    .await;
                 }
 
                 // Build per-node futures for parallel dispatch.
@@ -141,6 +151,18 @@ pub async fn execute_dag_workflow(
 
                     // ── Crash-recovery replay check ──────────────────────────
                     let cached = pg.event_log_node_completed(&exec_id, &node_id).await;
+
+                    if let Err(ref e) = cached {
+                        // Not knowing is not the same as "not completed": the
+                        // node is about to be re-executed (and re-billed) on
+                        // the strength of a failed query, so say so.
+                        warn!(
+                            execution_id = %exec_id,
+                            node_id = %node_id,
+                            error = %e,
+                            "Replay lookup failed — node will be re-executed and re-billed"
+                        );
+                    }
 
                     if let Ok(Some(cached_output)) = cached {
                         info!(
@@ -186,14 +208,16 @@ pub async fn execute_dag_workflow(
                                 error = %e,
                                 "Sub-workflow depth validation failed — marking node failed"
                             );
-                            let _ = pg
-                                .event_log_append(
-                                    &exec_id,
-                                    &node_id,
-                                    &EventType::Failed,
-                                    Some(&json!({ "error": e, "reason": "sub_workflow_depth_exceeded" })),
-                                )
-                                .await;
+                            journal_append(
+                                &pg,
+                                &exec_id,
+                                &node_id,
+                                EventType::Failed,
+                                Some(
+                                    &json!({ "error": e, "reason": "sub_workflow_depth_exceeded" }),
+                                ),
+                            )
+                            .await;
                             node_futures.push(Box::pin(async move {
                                 (node_id, NodeOutcome::Failed, None, 0u64, 0u32)
                             })
@@ -286,9 +310,7 @@ pub async fn execute_dag_workflow(
                         };
 
                     // ── Log Started event ────────────────────────────────────
-                    let _ = pg
-                        .event_log_append(&exec_id, &node_id, &EventType::Started, None)
-                        .await;
+                    journal_append(&pg, &exec_id, &node_id, EventType::Started, None).await;
 
                     // ── Feature 3: Loop node inline execution ────────────────
                     // dag_loop nodes are handled by the driver, not StepExecutor.
@@ -337,14 +359,17 @@ pub async fn execute_dag_workflow(
                                 "duration_ms": duration_ms,
                                 "output": output_data,
                             });
-                            let _ = pg_log_loop
-                                .event_log_append(
-                                    &exec_id_log_loop,
-                                    &node_id_log_loop,
-                                    &event_type,
-                                    Some(&event_data),
-                                )
-                                .await;
+                            // This is the ONLY journal write the loop node
+                            // itself gets, so losing it un-journals the entire
+                            // loop, not one event.
+                            journal_append(
+                                &pg_log_loop,
+                                &exec_id_log_loop,
+                                &node_id_log_loop,
+                                event_type,
+                                Some(&event_data),
+                            )
+                            .await;
 
                             (node_id_log_loop, outcome, output_data, duration_ms, 0u32)
                         };
@@ -408,14 +433,14 @@ pub async fn execute_dag_workflow(
                             }
 
                             // Log retry event before waiting.
-                            let _ = pg_log
-                                .event_log_append(
-                                    &exec_id_log,
-                                    &node_id_log,
-                                    &EventType::Retried,
-                                    Some(&json!({ "attempt": attempt, "error": error })),
-                                )
-                                .await;
+                            journal_append(
+                                &pg_log,
+                                &exec_id_log,
+                                &node_id_log,
+                                EventType::Retried,
+                                Some(&json!({ "attempt": attempt, "error": error })),
+                            )
+                            .await;
 
                             // Exponential backoff: delay_ms * backoff^(attempt-1)
                             let wait_ms =
@@ -449,14 +474,14 @@ pub async fn execute_dag_workflow(
                             "output": last_output,
                             "retries": retries,
                         });
-                        let _ = pg_log
-                            .event_log_append(
-                                &exec_id_log,
-                                &node_id_log,
-                                &event_type,
-                                Some(&event_data),
-                            )
-                            .await;
+                        journal_append(
+                            &pg_log,
+                            &exec_id_log,
+                            &node_id_log,
+                            event_type,
+                            Some(&event_data),
+                        )
+                        .await;
 
                         (
                             node_id_log,
@@ -512,14 +537,14 @@ pub async fn execute_dag_workflow(
                     "DAG workflow cancelled"
                 );
                 // Log the cancellation to the event log with a sentinel node_id.
-                let _ = pg_db
-                    .event_log_append(
-                        &execution_id,
-                        "__workflow__",
-                        &EventType::Cancelled,
-                        Some(&json!({ "reason": reason })),
-                    )
-                    .await;
+                journal_append(
+                    &pg_db,
+                    &execution_id,
+                    "__workflow__",
+                    EventType::Cancelled,
+                    Some(&json!({ "reason": reason })),
+                )
+                .await;
                 break;
             }
         }
@@ -559,8 +584,28 @@ pub fn dag_result_to_workflow_result(
 /// Execute a `dag_loop` node inline.
 ///
 /// Iterates over the loop body nodes sequentially for each iteration.
-/// Checks `until_bash` exit code to break early.  Prunes the event log at
-/// `commit_interval` checkpoints to keep memory usage bounded.
+/// Checks `until_bash` exit code to break early.
+///
+/// # Crash recovery
+///
+/// Every body-node execution is journaled under
+/// `loop_body_journal_key` — `"<loop_id>/iter<N>/<body_id>"` — and consulted
+/// before dispatch, so a resumed loop replays the iterations that already
+/// finished instead of re-running (and re-billing) them.
+///
+/// # The `commit_interval` prune is a real trade, not just memory hygiene
+///
+/// At each `commit_interval` checkpoint the loop prunes its **own** journal
+/// rows below the current cursor. That bounds journal growth for long loops,
+/// but it *deliberately gives up replay* for the iterations it discards: a
+/// crash after a checkpoint re-executes every body node completed since that
+/// checkpoint. The prune is scoped to this loop's key subtree
+/// ([`crate::database::pg::PgDb::event_log_prune_before`]), so it never costs
+/// any other node its replay — an execution-wide prune used to delete the
+/// whole upstream DAG's completions.
+///
+/// Setting `commit_interval` to 0 (the default) disables pruning entirely and
+/// keeps full replay fidelity.
 ///
 /// Returns `(outcome, last_output, total_duration_ms)`.
 #[allow(clippy::too_many_arguments)]
@@ -605,6 +650,40 @@ async fn execute_loop_node(
                 }
             };
 
+            // ── Crash-recovery replay check (per iteration) ──────────────
+            // Keyed so iteration 3 of a body node is distinct work from
+            // iteration 7 — see `loop_body_journal_key`.
+            let journal_key = loop_body_journal_key(node_id, iteration, body_id);
+
+            match pg_db
+                .event_log_node_completed(execution_id, &journal_key)
+                .await
+            {
+                Ok(Some(recorded)) => {
+                    info!(
+                        node_id,
+                        body_id,
+                        iteration,
+                        journal_key = %journal_key,
+                        "Replaying completed loop body node from event log (crash recovery)"
+                    );
+                    // Restore exactly what a fresh run would have produced:
+                    // the raw step output, not the journal envelope.
+                    last_output = recorded.get("output").cloned().filter(|v| !v.is_null());
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        node_id,
+                        body_id,
+                        iteration,
+                        error = %e,
+                        "Loop body replay lookup failed — body node will be re-executed and re-billed"
+                    );
+                }
+            }
+
             let mut executor = build_step_executor(
                 app_state.clone(),
                 config_storage.clone(),
@@ -615,9 +694,32 @@ async fn execute_loop_node(
             }
 
             let start = Instant::now();
-            let (success, _error, _screenshot, output) = executor.execute_single_step(&step).await;
-            total_duration_ms += start.elapsed().as_millis() as u64;
+            let (success, error, _screenshot, output) = executor.execute_single_step(&step).await;
+            let step_duration_ms = start.elapsed().as_millis() as u64;
+            total_duration_ms += step_duration_ms;
             last_output = output;
+
+            let event_type = if success {
+                EventType::Completed
+            } else {
+                EventType::Failed
+            };
+            journal_append(
+                pg_db,
+                execution_id,
+                &journal_key,
+                event_type,
+                Some(&json!({
+                    "success": success,
+                    "error": error,
+                    "duration_ms": step_duration_ms,
+                    "output": last_output,
+                    "loop_node_id": node_id,
+                    "body_node_id": body_id,
+                    "iteration": iteration,
+                })),
+            )
+            .await;
 
             if !success {
                 warn!(
@@ -663,13 +765,35 @@ async fn execute_loop_node(
             }
         }
 
-        // Commit interval: prune old event log entries to keep DB size bounded.
+        // Commit interval: discard this loop's superseded journal rows to keep
+        // DB size bounded for long loops. Scoped to `node_id` and its
+        // `"<node_id>/…"` subtree so sibling nodes keep their replay records.
         if commit_interval > 0 && (iteration + 1) % commit_interval == 0 {
-            let cursor = pg_db
-                .event_log_latest_cursor(execution_id)
-                .await
-                .unwrap_or(0);
-            let _ = pg_db.event_log_prune_before(execution_id, cursor).await;
+            match pg_db.event_log_latest_cursor(execution_id).await {
+                Ok(cursor) => {
+                    if let Err(e) = pg_db
+                        .event_log_prune_before(execution_id, node_id, cursor)
+                        .await
+                    {
+                        warn!(
+                            node_id,
+                            iteration,
+                            error = %e,
+                            "Loop checkpoint prune failed — journal keeps growing for this loop"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Pruning below a fabricated cursor of 0 is a no-op, so
+                    // skip rather than guess.
+                    warn!(
+                        node_id,
+                        iteration,
+                        error = %e,
+                        "Could not read event-log cursor — skipping loop checkpoint prune"
+                    );
+                }
+            }
         }
     }
 
@@ -679,6 +803,91 @@ async fn execute_loop_node(
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// How many times `journal_append` tries a single event-log write before
+/// giving up. Journal writes fail overwhelmingly for transient reasons (pool
+/// exhaustion, a connection reset mid-workflow), and a retry is far cheaper
+/// than the re-execution a lost record causes.
+const JOURNAL_APPEND_ATTEMPTS: u32 = 3;
+
+/// Journal key for one loop-body node execution.
+///
+/// The outer DAG journal is keyed `(execution_id, node_id)`, which is too
+/// coarse for a loop: a body node at iteration 3 is different work from the
+/// same node at iteration 7, and collapsing them would let a resume replay
+/// iteration 7 with iteration 3's output. The key therefore nests the
+/// iteration under the loop node:
+///
+/// ```text
+/// <loop_node_id>/iter<N>/<body_node_id>
+/// ```
+///
+/// The `<loop_node_id>/` prefix is load-bearing twice over: it makes the key
+/// unique per loop even when two loops share a body node, and it is exactly
+/// the subtree that `event_log_prune_before` scopes a checkpoint prune to.
+fn loop_body_journal_key(loop_node_id: &str, iteration: u32, body_node_id: &str) -> String {
+    format!("{}/iter{}/{}", loop_node_id, iteration, body_node_id)
+}
+
+/// Append an event to the workflow journal, retrying briefly and **never**
+/// discarding the failure.
+///
+/// A dropped append is not cosmetic: the journal is the only thing that stops
+/// a resumed workflow from re-executing work that already ran, so a lost
+/// `completed` record means the node runs again and is billed again.
+///
+/// A failed append deliberately does **not** fail the node. The work has
+/// already been done and paid for; marking a successful node failed would
+/// abort the run and discard every completed node with it, and the resumed run
+/// would re-execute this node anyway because the record is still missing. So
+/// failing converts a *possible* duplicate charge into a *certain* total loss.
+/// Instead the loss is made loud — ERROR for a `completed` append, WARN for
+/// the rest — so it is visible in the logs rather than inferred later from a
+/// double bill.
+async fn journal_append(
+    pg: &crate::database::pg::PgDb,
+    execution_id: &str,
+    node_id: &str,
+    event_type: EventType,
+    event_data: Option<&serde_json::Value>,
+) {
+    let mut last_error = String::new();
+
+    for attempt in 1..=JOURNAL_APPEND_ATTEMPTS {
+        match pg
+            .event_log_append(execution_id, node_id, &event_type, event_data)
+            .await
+        {
+            Ok(_) => return,
+            Err(e) => {
+                last_error = e;
+                if attempt < JOURNAL_APPEND_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(50 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+
+    if matches!(event_type, EventType::Completed) {
+        error!(
+            execution_id = %execution_id,
+            node_id = %node_id,
+            attempts = JOURNAL_APPEND_ATTEMPTS,
+            error = %last_error,
+            "Failed to journal COMPLETED event — this node is unrecorded and WILL re-execute \
+             and re-bill if the workflow resumes"
+        );
+    } else {
+        warn!(
+            execution_id = %execution_id,
+            node_id = %node_id,
+            event_type = event_type.as_str(),
+            attempts = JOURNAL_APPEND_ATTEMPTS,
+            error = %last_error,
+            "Failed to journal workflow event"
+        );
+    }
+}
 
 /// Build a fresh `StepExecutor` from the given dependency Arcs.
 ///
@@ -694,5 +903,53 @@ fn build_step_executor(
         StepExecutor::with_app_handle(app_state, config_storage, handle)
     } else {
         StepExecutor::new(app_state, config_storage)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_body_journal_key_distinguishes_iterations() {
+        let a = loop_body_journal_key("build", 3, "compile");
+        let b = loop_body_journal_key("build", 7, "compile");
+        assert_ne!(
+            a, b,
+            "the same body node at two iterations is two distinct units of work"
+        );
+        assert_eq!(a, "build/iter3/compile");
+    }
+
+    #[test]
+    fn loop_body_journal_key_distinguishes_body_nodes_and_loops() {
+        assert_ne!(
+            loop_body_journal_key("build", 0, "compile"),
+            loop_body_journal_key("build", 0, "test"),
+        );
+        assert_ne!(
+            loop_body_journal_key("build", 0, "compile"),
+            loop_body_journal_key("deploy", 0, "compile"),
+            "two loops sharing a body node must not share a journal key"
+        );
+    }
+
+    /// The checkpoint prune is scoped to `"<loop_id>"` plus its `"<loop_id>/"`
+    /// subtree, so every body key MUST sit under that prefix — otherwise the
+    /// prune stops bounding journal growth.
+    #[test]
+    fn loop_body_journal_key_is_nested_under_the_loop_node_prefix() {
+        let key = loop_body_journal_key("build", 12, "compile");
+        assert!(
+            key.starts_with("build/"),
+            "body key {} is not under the loop node's prune scope",
+            key
+        );
+        // A sibling node whose id merely shares a prefix is NOT in the subtree.
+        assert!(!"build-other".starts_with("build/"));
     }
 }
