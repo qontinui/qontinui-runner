@@ -147,7 +147,7 @@ mod platform {
     /// state at the moment of the call, so callers placing windows
     /// across DPI / theme boundaries should call this *after* the move
     /// (or after a `SetWindowPos` no-op refresh) to get accurate values.
-    pub fn frame_inset(hwnd: HWND) -> (i32, i32) {
+    pub(crate) fn frame_inset(hwnd: HWND) -> (i32, i32) {
         use windows_sys::Win32::Foundation::RECT;
         use windows_sys::Win32::Graphics::Dwm::{
             DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS,

@@ -94,7 +94,7 @@ pub fn init_job_object() {
 ///
 /// # Safety
 /// The `process_handle` must be a valid Windows process HANDLE.
-pub fn assign_process_to_job(process_handle: HANDLE) {
+pub(crate) fn assign_process_to_job(process_handle: HANDLE) {
     if let Some(job) = JOB_OBJECT.get() {
         if job.0.is_null() || job.0 == INVALID_HANDLE_VALUE {
             // Job Object failed to initialize — skip silently
@@ -181,7 +181,7 @@ impl ScopedMemoryLimitedJob {
     /// # Safety contract
     /// `process_handle` must be a valid Windows process HANDLE (the same
     /// contract as [`assign_process_to_job`]).
-    pub fn assign(&self, process_handle: HANDLE) {
+    pub(crate) fn assign(&self, process_handle: HANDLE) {
         unsafe {
             let result = AssignProcessToJobObject(self.0, process_handle);
             if result == 0 {

@@ -160,12 +160,17 @@ const DEFAULT_MODE: &str = "off";
 /// two-valued (`off` | `record`); everything else normalizes to
 /// [`DEFAULT_PLAN_CAPTURE_LEVEL`].
 ///
-/// `pub(crate)` because [`crate::terminal::runner_context`] compares the cached
-/// level against it to decide whether to append the capture clause. The word is
-/// the contract between the normalizer that WRITES the cache and the briefing
-/// that READS it, so it has exactly one definition rather than a matching pair
-/// that a rename could silently split.
-pub(crate) const PLAN_CAPTURE_RECORD: &str = "record";
+/// [`crate::terminal::runner_context`] compares the cached level against it to
+/// decide whether to append the capture clause. The word is the contract
+/// between the normalizer that WRITES the cache and the briefing that READS it,
+/// so it has exactly one definition rather than a matching pair that a rename
+/// could silently split.
+///
+/// `pub`, not `pub(crate)`: this module moved into the lib crate, and `main.rs`
+/// — now a separate crate — still reads it. It is exported TOGETHER with
+/// [`effective_plan_capture_level`] deliberately; the pairing below is the
+/// point, and neither should be exported without the other.
+pub const PLAN_CAPTURE_RECORD: &str = "record";
 
 /// The fail-safe default for [`PLAN_CAPTURE_DOMAIN`]. Spelled separately from
 /// [`DEFAULT_MODE`] even though both are `"off"`: they are different domains'
@@ -340,11 +345,12 @@ fn read_cached_level(cache: &RwLock<String>, fallback: &str) -> String {
 /// and must not do I/O. A poisoned lock degrades fail-safe to `"off"`, i.e. the
 /// capture clause is omitted.
 ///
-/// `pub(crate)` rather than `pub`: the level is only meaningful next to
-/// [`PLAN_CAPTURE_RECORD`], which is also crate-visible, so exporting the
-/// reader without the vocabulary would hand a caller a string it cannot
-/// correctly compare.
-pub(crate) fn effective_plan_capture_level() -> String {
+/// The level is only meaningful next to [`PLAN_CAPTURE_RECORD`], so the two are
+/// exported as a pair: handing a caller the reader without the vocabulary would
+/// give it a string it cannot correctly compare. Both were `pub(crate)` until
+/// this module moved into the lib crate; `main.rs` is a separate crate now and
+/// still calls this, so both widened together rather than one of them.
+pub fn effective_plan_capture_level() -> String {
     read_cached_level(plan_capture_cache(), DEFAULT_PLAN_CAPTURE_LEVEL)
 }
 

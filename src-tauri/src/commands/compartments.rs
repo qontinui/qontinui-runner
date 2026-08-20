@@ -50,6 +50,15 @@ use super::AppState;
 pub struct BridgeCompartment(pub(crate) Arc<AppState>);
 
 impl BridgeCompartment {
+    /// Wrap the shared state.
+    ///
+    /// Exists because `main.rs` builds these and now lives in a different
+    /// crate: the tuple field stays `pub(crate)` so the compartment keeps
+    /// exposing only its domain accessors instead of leaking `AppState`.
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self(state)
+    }
+
     pub fn bridge_manager(
         &self,
     ) -> &tokio::sync::Mutex<Option<Arc<crate::executor::BridgeManager>>> {
@@ -109,6 +118,15 @@ impl BridgeCompartment {
 pub struct ExecutionCompartment(pub(crate) Arc<AppState>);
 
 impl ExecutionCompartment {
+    /// Wrap the shared state.
+    ///
+    /// Exists because `main.rs` builds these and now lives in a different
+    /// crate: the tuple field stays `pub(crate)` so the compartment keeps
+    /// exposing only its domain accessors instead of leaking `AppState`.
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self(state)
+    }
+
     pub fn run_cost_trackers(
         &self,
     ) -> &tokio::sync::Mutex<
@@ -191,6 +209,15 @@ impl ExecutionCompartment {
 pub struct IntegrationCompartment(pub(crate) Arc<AppState>);
 
 impl IntegrationCompartment {
+    /// Wrap the shared state.
+    ///
+    /// Exists because `main.rs` builds these and now lives in a different
+    /// crate: the tuple field stays `pub(crate)` so the compartment keeps
+    /// exposing only its domain accessors instead of leaking `AppState`.
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self(state)
+    }
+
     pub fn sdk_connection(
         &self,
     ) -> &Arc<tokio::sync::Mutex<crate::mcp::sdk_client::SdkConnectionManager>> {
@@ -228,6 +255,15 @@ impl IntegrationCompartment {
 pub struct HealthCompartment(pub(crate) Arc<AppState>);
 
 impl HealthCompartment {
+    /// Wrap the shared state.
+    ///
+    /// Exists because `main.rs` builds these and now lives in a different
+    /// crate: the tuple field stays `pub(crate)` so the compartment keeps
+    /// exposing only its domain accessors instead of leaking `AppState`.
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self(state)
+    }
+
     pub fn doctor_handle(&self) -> &tokio::sync::Mutex<Option<crate::doctor::DoctorHandle>> {
         &self.0.doctor_handle
     }
@@ -265,6 +301,15 @@ impl HealthCompartment {
 pub struct StorageCompartment(pub(crate) Arc<AppState>);
 
 impl StorageCompartment {
+    /// Wrap the shared state.
+    ///
+    /// Exists because `main.rs` builds these and now lives in a different
+    /// crate: the tuple field stays `pub(crate)` so the compartment keeps
+    /// exposing only its domain accessors instead of leaking `AppState`.
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self(state)
+    }
+
     pub fn pg_db(&self) -> &Arc<crate::database::pg::PgDb> {
         &self.0.pg_db
     }

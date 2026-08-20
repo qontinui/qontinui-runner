@@ -1266,13 +1266,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Workstream C (Move 2B): compartment wrappers around Arc<AppState> so
     // per-module plugins can migrate from `State<Arc<AppState>>` to a scoped
     // `State<<Compartment>>`. Both forms coexist during the gradual migration.
-    let bridge_compartment = commands::compartments::BridgeCompartment(shared_app_state.clone());
+    let bridge_compartment =
+        commands::compartments::BridgeCompartment::new(shared_app_state.clone());
     let execution_compartment =
-        commands::compartments::ExecutionCompartment(shared_app_state.clone());
+        commands::compartments::ExecutionCompartment::new(shared_app_state.clone());
     let integration_compartment =
-        commands::compartments::IntegrationCompartment(shared_app_state.clone());
-    let health_compartment = commands::compartments::HealthCompartment(shared_app_state.clone());
-    let storage_compartment = commands::compartments::StorageCompartment(shared_app_state.clone());
+        commands::compartments::IntegrationCompartment::new(shared_app_state.clone());
+    let health_compartment =
+        commands::compartments::HealthCompartment::new(shared_app_state.clone());
+    let storage_compartment =
+        commands::compartments::StorageCompartment::new(shared_app_state.clone());
 
     // Frontend log-sync store. Holds the most recent batches of logs the React
     // UI mirrors back into Rust state for HTTP API consumption. Created here

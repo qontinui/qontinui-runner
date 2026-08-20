@@ -91,7 +91,7 @@ mod native_accessibility;
 pub mod restart_process;
 mod save_workflow_artifact;
 mod spec_check;
-pub(crate) mod ui_bridge;
+pub mod ui_bridge;
 mod ui_bridge_design_audit;
 mod ui_bridge_visual_assertion;
 mod vga_automate;
