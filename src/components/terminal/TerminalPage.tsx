@@ -267,7 +267,7 @@ function TerminalPageInner({
         id: "close-empty-terminal-windows",
         label: "Close Empty Terminal Windows",
         description:
-          "Close every pop-out OS window that has no live terminal tab and prune its record. Returns the labels closed.",
+          "Close every pop-out OS window that has no live terminal tab and prune its record; also prunes records for pop-outs whose OS window is already gone (the recovery path when a stale page binding is hiding a page and the grid shows zero zones). Returns the labels closed.",
         handler: async () => invoke("close_empty_terminal_windows"),
       },
     ],

@@ -705,11 +705,89 @@ async fn clear_sessions_handler() -> Json<ClearSessionsResponse> {
 /// them and the synthetic tabs cease to exist with no separate teardown.
 async fn clear_injected_handler() -> Json<ClearSessionsResponse> {
     let cleared_count = clear_all_sessions();
+    // The `identityEvidence` override is a fixture too, and it is PROCESS-GLOBAL
+    // and sticky — a gate that forgot to clear it would otherwise leave every
+    // later session-info read lying about its provenance. Teardown clears it
+    // with the same one call that drops the injected fakes.
+    crate::commands::session_info::set_forced_identity_evidence(None);
     emit_injected_changed("clear", cleared_count);
     Json(ClearSessionsResponse {
         success: true,
         cleared_count,
     })
+}
+
+// =============================================================================
+// /ui-bridge/test/force-identity-evidence
+// =============================================================================
+
+/// Body for `POST /ui-bridge/test/force-identity-evidence`.
+///
+/// `{"evidence":"provisional"}` forces every `session_info_get` /
+/// `GET /control/sessions/info` projection to report that classification;
+/// `{"evidence":null}` (or `{}`) clears the override and restores the real
+/// classifier.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ForceIdentityEvidenceRequest {
+    #[serde(default)]
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForceIdentityEvidenceResponse {
+    pub success: bool,
+    /// The override now in force (`null` = cleared, real classifier restored).
+    pub evidence: Option<String>,
+    /// What it replaced, so a gate can restore the prior state in teardown.
+    pub previous: Option<String>,
+}
+
+/// Force (or clear) the `identityEvidence` a session-info projection reports.
+///
+/// WHY this seam exists: the `provisional` treatment — the amber panel note
+/// plus the `— provisional` suffix on the account and Claude-id rows — had
+/// never been observed rendered. A bare terminal has no `claudeSessionId`, so
+/// no dropdown mounts for it at all; and a session that DOES bind is
+/// hook-confirmed within seconds, so the classifier never lingers on
+/// `provisional` long enough to look at. Forcing the classification drives the
+/// treatment through the REAL projection, the REAL command and the REAL
+/// component — no frontend fixture, no mocked hook, and nothing to keep in
+/// sync with production rendering.
+///
+/// Process-global and sticky: it stays in force until cleared explicitly, by
+/// `/ui-bridge/test/clear-injected`, or by the runner exiting. Rejects any
+/// value that is not one of the three real classifications with a 400 naming
+/// the accepted set, so a typo can never install an evidence string the
+/// frontend has no branch for.
+async fn force_identity_evidence_handler(
+    body: Option<Json<ForceIdentityEvidenceRequest>>,
+) -> Result<Json<ForceIdentityEvidenceResponse>, (StatusCode, Json<InjectSessionError>)> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let next = match req.evidence.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(v) if crate::commands::session_info::is_identity_evidence(v) => Some(v.to_string()),
+        Some(v) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(InjectSessionError {
+                    success: false,
+                    error: format!(
+                        "unknown identityEvidence '{v}' — expected one of: confirmed, transcript, provisional (or null to clear)"
+                    ),
+                }),
+            ));
+        }
+    };
+    let previous = crate::commands::session_info::set_forced_identity_evidence(next.clone());
+    info!(
+        "test_fixtures: identityEvidence override {:?} -> {:?}",
+        previous, next
+    );
+    Ok(Json(ForceIdentityEvidenceResponse {
+        success: true,
+        evidence: next,
+        previous,
+    }))
 }
 
 // =============================================================================
@@ -1342,6 +1420,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(seed_scenario_handler),
         )
         .route(
+            "/ui-bridge/test/force-identity-evidence",
+            post(force_identity_evidence_handler),
+        )
+        .route(
             "/ui-bridge/test/seed-lifecycle-store",
             post(seed_lifecycle_store_handler),
         )
@@ -1470,6 +1552,7 @@ mod tests {
             "/ui-bridge/test/clear-sessions",
             "/ui-bridge/test/clear-injected",
             "/ui-bridge/test/seed-terminal-scenario",
+            "/ui-bridge/test/force-identity-evidence",
             "/ui-bridge/test/seed-lifecycle-store",
             "/ui-bridge/test/list-lifecycle-open",
             "/ui-bridge/test/clear-lifecycle-store",
@@ -1481,6 +1564,68 @@ mod tests {
                 "route {route} must remain wired in test_fixtures::routes()",
             );
         }
+    }
+
+    /// The `identityEvidence` override seam: only the three real
+    /// classifications are installable, a blank/absent value clears, and the
+    /// previous value is reported back so a gate can restore it.
+    #[tokio::test]
+    async fn force_identity_evidence_accepts_only_real_classifications() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Start from a known-clear state regardless of what ran before.
+        crate::commands::session_info::set_forced_identity_evidence(None);
+
+        let res = force_identity_evidence_handler(Some(Json(ForceIdentityEvidenceRequest {
+            evidence: Some("provisional".into()),
+        })))
+        .await
+        .expect("provisional is a real classification");
+        assert_eq!(res.0.evidence.as_deref(), Some("provisional"));
+        assert_eq!(res.0.previous, None);
+        assert_eq!(
+            crate::commands::session_info::forced_identity_evidence().as_deref(),
+            Some("provisional"),
+        );
+
+        // A typo must not install an evidence string the frontend has no
+        // branch for — and must not disturb the override already in force.
+        let err = force_identity_evidence_handler(Some(Json(ForceIdentityEvidenceRequest {
+            evidence: Some("probational".into()),
+        })))
+        .await
+        .expect_err("an unknown classification is a 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            crate::commands::session_info::forced_identity_evidence().as_deref(),
+            Some("provisional"),
+        );
+
+        // Clearing reports what it replaced.
+        let cleared = force_identity_evidence_handler(Some(Json(ForceIdentityEvidenceRequest {
+            evidence: None,
+        })))
+        .await
+        .expect("clearing always succeeds");
+        assert_eq!(cleared.0.evidence, None);
+        assert_eq!(cleared.0.previous.as_deref(), Some("provisional"));
+        assert_eq!(
+            crate::commands::session_info::forced_identity_evidence(),
+            None
+        );
+    }
+
+    /// Teardown parity: `clear-injected` is the documented one-call teardown,
+    /// so it must drop the (process-global, sticky) evidence override too.
+    #[tokio::test]
+    async fn clear_injected_also_clears_the_evidence_override() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::commands::session_info::set_forced_identity_evidence(Some("provisional".into()));
+        let _ = clear_injected_handler().await;
+        assert_eq!(
+            crate::commands::session_info::forced_identity_evidence(),
+            None,
+            "clear-injected must clear the identityEvidence override",
+        );
     }
 
     /// Actually BUILD the router. `routes()` panics at construction on a bad
