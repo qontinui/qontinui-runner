@@ -121,6 +121,12 @@ const FIXTURE_APPEAR_BUDGET_MS = 120_000;
  * launch gate is answered.
  */
 const FIXTURE_CONFIRM_BUDGET_MS = 180_000;
+/**
+ * Budget for the info triggers to mount after fixtures exist. Sized above the
+ * frontend 30s `reconcileClaudeSessionIds` backfill, which is what binds a
+ * backend-created tab its `claudeSessionId` and therefore mounts the trigger.
+ */
+const TRIGGER_MOUNT_BUDGET_MS = 75_000;
 /** Budget for a transcript to exist on disk after the trivial prompt. */
 const FIXTURE_TRANSCRIPT_BUDGET_MS = 120_000;
 /** Gap between fixture-progress polls (buffer reads + restore-health). */
@@ -1859,9 +1865,42 @@ async function runDropdownPass(ctx, phase, ids) {
   return { info };
 }
 
+/**
+ * Wait until every session-bound zone has its info trigger registered.
+ *
+ * The trigger mounts only once the FRONTEND tab carries a `claudeSessionId`,
+ * and for a backend-created terminal that arrives on the periodic
+ * `reconcileClaudeSessionIds` backfill -- a 30s interval. The suite can finish
+ * building fixtures well inside one tick, so sampling immediately catches the
+ * UI mid-convergence: one run had all three triggers, the next had only zone 0
+ * and failed T2 for two zones that were merely not there YET (2026-08-20).
+ *
+ * T2 claims the trigger renders, which is a steady-state property, so waiting
+ * for convergence is the honest probe. This does NOT paper over a real absence:
+ * when the budget expires the assertions run against whatever is there and T2
+ * fails exactly as before, having given the UI more than one backfill tick.
+ */
+async function waitForTriggersToMount(budgetMs = TRIGGER_MOUNT_BUDGET_MS) {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    const z = await collectZones();
+    const bound = (z.zones || []).filter((x) => x.claudeSessionId);
+    if (bound.length > 0) {
+      const reg = await fetchElements();
+      if (reg.ok) {
+        const present = new Set(reg.elements.map((e) => String(e?.id ?? "")));
+        const missing = bound.filter((x) => !present.has(infoElementId("trigger", x.zoneIndex)));
+        if (missing.length === 0) return;
+      }
+    }
+    await sleep(FIXTURE_POLL_INTERVAL_MS);
+  }
+}
+
 async function runDropdownAssertions(ctx) {
   section("T1-T5 — dropdown");
 
+  await waitForTriggersToMount();
   const info = await fetchSessionsInfo();
   const z = await collectZones();
 
