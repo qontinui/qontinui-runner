@@ -905,7 +905,13 @@ pub(crate) fn cancel(dispatch_id: &str) {
 /// queue. Called from the `main.rs` window-close handler; the Windows Job
 /// Object (kill-on-close) is the hard backstop for the process trees.
 pub(crate) fn cancel_all_for_shutdown() {
-    let mut state = ci_state().lock().unwrap();
+    // Poison-recovering. This runs on the app-close teardown path, and a
+    // `.unwrap()` here turned any earlier panic while holding `ci_state` into a
+    // SECOND panic on the shutdown thread — which, while this ran inline on the
+    // tao/UI thread, took the event loop down with it. The state behind a
+    // poisoned lock is still perfectly usable for what this does: cancel every
+    // token and drop the queue.
+    let mut state = ci_state().lock().unwrap_or_else(|p| p.into_inner());
     for (id, token) in state.running.iter() {
         info!("ci_node: shutdown — cancelling dispatch {id}");
         token.cancel();

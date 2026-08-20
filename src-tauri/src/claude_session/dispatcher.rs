@@ -79,7 +79,7 @@ pub fn dispatch_line(
     pending_messages: &Arc<std::sync::Mutex<VecDeque<String>>>,
     accumulated_output: &Arc<std::sync::Mutex<String>>,
     user_has_interacted: &std::sync::atomic::AtomicBool,
-    turn_persist_tx: &Option<Sender<String>>,
+    turn_persist_tx: &Option<super::session::TurnPersistSender>,
     persisted_output_len: &AtomicUsize,
     // Fallback session ID for file locking when session_ctx is None
     fallback_session_id: Option<&str>,
@@ -201,7 +201,7 @@ pub fn dispatch_line(
                 if buf.len() > persisted {
                     let delta = buf[persisted..].to_string();
                     if !delta.trim().is_empty() {
-                        let _ = tx.send(delta);
+                        tx.send(delta);
                     }
                 }
                 // Drain buffer after persistence to prevent unbounded memory growth.
