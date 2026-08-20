@@ -170,7 +170,10 @@ fn default_journal_path(agent_id: &str) -> String {
 /// (DISABLED — the operator flips it on explicitly), manage the registry in
 /// Tauri state for the control-surface commands, and start the supervised
 /// tick loop. Call once from `main.rs` setup.
-pub(crate) fn start(app: &tauri::AppHandle) {
+///
+/// `pub` because that caller is in a different crate now: this module moved
+/// into the lib and `main.rs` did not.
+pub fn start(app: &tauri::AppHandle) {
     let path = registry_path();
     let registry = match LoopingAgentRegistry::open(&path) {
         Ok(r) => Arc::new(r),
