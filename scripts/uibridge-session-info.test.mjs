@@ -789,10 +789,30 @@ async function readTerminalText(terminalId) {
  *    the operator has not seen — so answering it automatically would launder a
  *    real security decision through a test.
  */
+/**
+ * Build a whitespace-TOLERANT matcher from a readable phrase.
+ *
+ * A TUI paints with cursor positioning rather than spaces, so once the escape
+ * sequences are stripped the prompt arrives with NO spaces at all:
+ * `Isthisaprojectyoucreatedoroneyoutrust?`. A pattern written with spaces
+ * therefore never matches, the gate is never answered, and the provider sits at
+ * the menu until the confirm budget expires — surfacing as the misleading
+ * "the provider never started".
+ *
+ * This hid for three green runs because both accounts already trusted the
+ * default `--fixture-cwd`, so no gate ever opened. It appeared the moment the
+ * suite was pointed at a FRESH directory (2026-08-20), which is the only
+ * configuration that exercises the gate path at all.
+ */
+function gatePhrase(phrase) {
+  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(escaped.trim().split(/\s+/).join("\\s*"), "i");
+}
+
 const KNOWN_LAUNCH_GATES = [
   {
     id: "folder-trust",
-    match: /Is this a project you created or one you trust/i,
+    match: gatePhrase("Is this a project you created or one you trust"),
     keys: ["1", "\r"],
     why: "the fixture cwd is a directory this script created, so trusting it is not a judgement about code the operator has not seen",
   },
@@ -802,7 +822,7 @@ const KNOWN_LAUNCH_GATES = [
 const REFUSED_LAUNCH_GATES = [
   {
     id: "external-claude-md-imports",
-    match: /Allow external CLAUDE\.md file imports/i,
+    match: gatePhrase("Allow external CLAUDE.md file imports"),
     why: "answering it would approve loading files from OUTSIDE the cwd, which is a security decision belonging to the operator rather than to a test. Use the default --fixture-cwd (an empty temp dir), which never opens this gate.",
   },
 ];
@@ -812,17 +832,23 @@ const REFUSED_LAUNCH_GATES = [
  * the caller can report it; an unknown or refused gate is an ERROR, never a
  * silent skip.
  */
-async function answerLaunchGates(terminalId) {
+async function answerLaunchGates(terminalId, alreadyAnswered = new Set()) {
   const buf = await readTerminalText(terminalId);
   if (!buf.ok) return { ok: false, answered: [], error: `buffer read: ${buf.error}` };
   const tail = buf.text.slice(-4000);
   for (const gate of REFUSED_LAUNCH_GATES) {
+    if (alreadyAnswered.has(gate.id)) continue;
     if (gate.match.test(tail)) {
       return { ok: false, answered: [], error: `launch gate ${gate.id} is open and ${gate.why}` };
     }
   }
   const answered = [];
   for (const gate of KNOWN_LAUNCH_GATES) {
+    // ONCE per terminal. The PTY buffer is scrollback, so a gate's text still
+    // matches after it has been answered and the provider has moved on —
+    // re-answering would type `1` and Enter into a LIVE session as ordinary
+    // input, spending tokens and polluting the very transcript T0.3 asserts on.
+    if (alreadyAnswered.has(gate.id)) continue;
     if (!gate.match.test(tail)) continue;
     for (const key of gate.keys) {
       const w = await writeTerminal(terminalId, key);
@@ -1055,7 +1081,7 @@ async function spawnFixtureSession(spec, ctx) {
       confirmed = true;
       break;
     }
-    const gate = await answerLaunchGates(terminalId);
+    const gate = await answerLaunchGates(terminalId, answered);
     if (!gate.ok) return { ok: false, error: `${taskName}: ${gate.error}` };
     for (const g of gate.answered) answered.add(g);
     await sleep(FIXTURE_POLL_INTERVAL_MS);
@@ -1168,6 +1194,16 @@ async function createFixtures(ctx) {
     { taskName: "uibridge-fixture-b", account: accounts[singleAccount ? 0 : 1] },
     { taskName: "uibridge-fixture-c", account: accounts[0] },
   ];
+  // Snapshot BEFORE creating anything, so a fixture that fails partway can be
+  // torn down. A failed fixture otherwise leaves a terminal and/or a durable
+  // record behind, and the NEXT run's T0.1 emptiness gate then refuses to build
+  // anything at all -- one orphaned record aborted the following run entirely
+  // (observed 2026-08-20). Cleaning up after ourselves keeps a single bad run
+  // from poisoning the suite until someone clears it by hand.
+  const beforeTerminals = new Set(((await fetchTerminals()).terminals || []).map((t) => t.id));
+  const beforeRecords = new Set(
+    ((await fetchRestoreHealth()).sessions || []).map((x) => x.claudeSessionId),
+  );
   const created = [];
   const problems = [];
   const gatesAnswered = new Set();
@@ -1181,6 +1217,38 @@ async function createFixtures(ctx) {
     created.push({ spec, session: r.session, terminalId: r.terminalId, zoneIndex: r.zoneIndex });
   }
   ctx.fixtures = created;
+
+  if (problems.length > 0) {
+    const keepTerminals = new Set(created.map((x) => x.terminalId));
+    const keepSessions = new Set(created.map((x) => x.session.identity?.claudeSessionId));
+    const nowTerminals = await fetchTerminals();
+    const strayTerminals = nowTerminals.ok
+      ? nowTerminals.terminals
+          .map((t) => t.id)
+          .filter((id) => !beforeTerminals.has(id) && !keepTerminals.has(id))
+      : [];
+    for (const id of strayTerminals) {
+      await getJson(`/terminals/${encodeURIComponent(id)}`, { method: "DELETE" });
+    }
+    const nowRecords = await fetchRestoreHealth();
+    const strayRecords = nowRecords.ok
+      ? nowRecords.sessions
+          .map((x) => x.claudeSessionId)
+          .filter((sid) => !beforeRecords.has(sid) && !keepSessions.has(sid))
+      : [];
+    for (const sid of strayRecords) {
+      await invokeTauri("terminal_session_record_close", {
+        claudeSessionId: sid,
+        reason: "orphaned by a failed uibridge fixture",
+      });
+    }
+    if (strayTerminals.length > 0 || strayRecords.length > 0) {
+      note(
+        `cleaned up after failed fixture(s): ${strayTerminals.length} terminal(s), ` +
+          `${strayRecords.length} durable record(s)`,
+      );
+    }
+  }
   // Every automated answer is reported. A launch gate answered silently is a
   // decision made on the operator's behalf without a record of it.
   if (gatesAnswered.size > 0) {
