@@ -15,7 +15,9 @@
 //!
 //! ## Runner discovery (port + loopback auth)
 //! The loopback route requires the per-session coord-mcp proxy nonce
-//! (`X-Coord-Mcp-Proxy-Key`), discovered by a **`.mcp.json` walk-up from cwd**.
+//! (`Authorization: Bearer <nonce>`, or the legacy `X-Coord-Mcp-Proxy-Key` —
+//! both are read here and the runner accepts either), discovered by a
+//! **`.mcp.json` walk-up from cwd**.
 //! The runner provisions every session workdir with a `.mcp.json` whose
 //! coord-mcp server entry carries BOTH the nonce header and a loopback URL on
 //! the ACTUALLY-BOUND API port (`coord_mcp::write_coord_mcp_proxy_config` /
@@ -43,6 +45,14 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 const PROXY_KEY_HEADER: &str = "X-Coord-Mcp-Proxy-Key";
+/// The Phase 2 shape (plan 2026-08-20): the runner now ALSO emits the proxy
+/// nonce as `Authorization: Bearer <nonce>`, because a static `Authorization`
+/// in the `.mcp.json` headers map is what stops the MCP client escalating a
+/// stale-key 401 into OAuth Dynamic Client Registration. This bin is a separate
+/// crate root and cannot reach `coord_mcp::COORD_MCP_PROXY_KEY_HEADER`, so it
+/// carries its own pair — kept in sync by shape, not by import.
+const AUTHORIZATION_HEADER: &str = "Authorization";
+const BEARER_PREFIX: &str = "Bearer ";
 const RUNNER_PORT_ENV: &str = "QONTINUI_RUNNER_API_PORT";
 
 fn main() -> ExitCode {
@@ -623,11 +633,31 @@ fn find_session_mcp_config(start: &Path) -> Option<SessionMcpConfig> {
     None
 }
 
+/// True iff `s` is JWT-shaped: three `.`-separated non-empty segments. Mirrors
+/// `coord_mcp::looks_like_jwt` — a proxy nonce is 64 hex chars with no `.`, so
+/// this cleanly separates "the nonce, in `Authorization`" from "a real static
+/// bearer, in `Authorization`" (the agent-path config shape, which this CLI has
+/// always deliberately SKIPPED rather than presenting as a proxy key).
+fn looks_like_jwt(s: &str) -> bool {
+    let mut parts = s.split('.');
+    let (a, b, c, extra) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next().is_some(),
+    );
+    !extra
+        && matches!((a, b, c), (Some(a), Some(b), Some(c))
+            if !a.is_empty() && !b.is_empty() && !c.is_empty())
+}
+
 /// Parse a `.mcp.json` payload: find a server entry whose URL points at a
-/// loopback `/coord-mcp` proxy and read its `X-Coord-Mcp-Proxy-Key` header
-/// (case-insensitive) + the port embedded in the URL. Entries without the
-/// nonce header (e.g. a static-bearer config) are SKIPPED per-entry — a
-/// non-nonce `/coord-mcp` entry must not mask a later valid one.
+/// loopback `/coord-mcp` proxy and read its proxy nonce — from
+/// `Authorization: Bearer <nonce>` (preferred; the Phase 2 shape) or the legacy
+/// `X-Coord-Mcp-Proxy-Key` header, both matched case-insensitively — plus the
+/// port embedded in the URL. Entries with NEITHER (e.g. a static-bearer config,
+/// whose `Authorization` holds a JWT) are SKIPPED per-entry — a non-nonce
+/// `/coord-mcp` entry must not mask a later valid one.
 fn parse_mcp_json(text: &str) -> Option<SessionMcpConfig> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let servers = v.get("mcpServers")?.as_object()?;
@@ -636,16 +666,26 @@ fn parse_mcp_json(text: &str) -> Option<SessionMcpConfig> {
         if !url.contains("/coord-mcp") {
             continue;
         }
-        let nonce = match server
-            .get("headers")
-            .and_then(|h| h.as_object())
-            .and_then(|h| {
-                h.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(PROXY_KEY_HEADER))
-                    .and_then(|(_, val)| val.as_str())
-            }) {
-            Some(n) => n.to_string(),
+        let headers = match server.get("headers").and_then(|h| h.as_object()) {
+            Some(h) => h,
             None => continue,
+        };
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .and_then(|(_, val)| val.as_str())
+        };
+        let from_auth = get(AUTHORIZATION_HEADER)
+            .and_then(|v| {
+                v.strip_prefix(BEARER_PREFIX)
+                    .or_else(|| v.strip_prefix("bearer "))
+            })
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && !looks_like_jwt(t));
+        let nonce = match from_auth.or_else(|| get(PROXY_KEY_HEADER).map(str::trim)) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
         };
         return Some(SessionMcpConfig {
             nonce,
@@ -959,6 +999,51 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         let cfg = find_session_mcp_config(&nested).unwrap();
         assert_eq!(cfg.nonce, "walkup");
+        assert_eq!(cfg.port, Some(9878));
+    }
+
+    /// Phase 2 (plan 2026-08-20): the runner now emits the nonce in
+    /// `Authorization: Bearer <nonce>` as well. This walk-up is a genuine
+    /// reader break if it only knows the legacy name — against an
+    /// Authorization-only config it would find NO key at all and the CLI would
+    /// have nothing to send, silently (`continue` → `None`).
+    #[test]
+    fn walk_up_reads_the_nonce_from_authorization_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"coord-mcp":{"url":"http://127.0.0.1:9878/coord-mcp","headers":{"Authorization":"Bearer authshape"}}}}"#,
+        )
+        .unwrap();
+        let cfg = find_session_mcp_config(root).unwrap();
+        assert_eq!(cfg.nonce, "authshape");
+        assert_eq!(cfg.port, Some(9878));
+    }
+
+    /// Both present → `Authorization` wins, matching the runner's request-side
+    /// resolver so the CLI can never present the losing key.
+    #[test]
+    fn walk_up_prefers_authorization_when_both_headers_are_present() {
+        let cfg = parse_mcp_json(
+            r#"{"mcpServers":{"coord-mcp":{"url":"http://127.0.0.1:9878/coord-mcp","headers":{"Authorization":"Bearer fromauth","X-Coord-Mcp-Proxy-Key":"fromlegacy"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.nonce, "fromauth");
+    }
+
+    /// A STATIC-BEARER entry (a real JWT in `Authorization`) is still skipped
+    /// per-entry rather than presented as a proxy key — and must not mask a
+    /// later valid entry.
+    #[test]
+    fn walk_up_skips_a_static_bearer_entry_and_keeps_scanning() {
+        assert!(looks_like_jwt("eyJhbGciOiJFZERTQSJ9.eyJhIjoxfQ.c2ln"));
+        assert!(!looks_like_jwt("authshape"));
+        let cfg = parse_mcp_json(
+            r#"{"mcpServers":{"coord-mcp":{"url":"https://coord.example.test/coord-mcp","headers":{"Authorization":"Bearer eyJhbGciOiJFZERTQSJ9.eyJhIjoxfQ.c2ln"}},"coord-mcp-proxy":{"url":"http://127.0.0.1:9878/coord-mcp","headers":{"Authorization":"Bearer realnonce"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.nonce, "realnonce");
         assert_eq!(cfg.port, Some(9878));
     }
 }

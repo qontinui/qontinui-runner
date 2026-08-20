@@ -78,6 +78,7 @@ pub mod claude_env;
 // modules (which compile into the runner binary too), so the bin and the
 // command produce an identical report.
 pub mod coord_doctor;
+pub mod coord_mcp_config;
 
 // Tier-0 "Looping Agent" pure core (plan `merge-shepherd-fixer-PLAN.md`
 // Phase 1): registry types + JSON store, rendered-grid idle/context-low

@@ -67,6 +67,7 @@ mod context;
 mod coord_doctor_cmd;
 mod coord_http;
 mod coord_mcp;
+mod coord_mcp_config;
 mod coord_questions;
 mod coordinator;
 mod cost_management;
