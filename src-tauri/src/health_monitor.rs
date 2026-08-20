@@ -41,6 +41,16 @@ const WEDGE_FAILURE_THRESHOLD: u32 = 3;
 /// so a long wedge stays visible without flooding the log.
 const WEDGE_REESCALATION_EVERY: u32 = 60;
 
+/// Per-sample timeout for the native message-loop probe, in milliseconds.
+///
+/// 3s deliberately matches `mcp::ui_bridge::window_probe`'s
+/// `WINDOW_GETTER_TIMEOUT` — the bound this tree already decided a healthy
+/// event loop must beat — so the two liveness surfaces cannot disagree about
+/// what "slow" means. It must stay strictly below the sample interval, or the
+/// probe would stretch the cadence of the loop it rides on; a unit test pins
+/// that ordering.
+const UI_THREAD_PROBE_TIMEOUT_MS: u32 = 3_000;
+
 /// Flag to control the health monitor
 static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -92,6 +102,10 @@ const WATCHDOG_MONITOR_STALL_SECS: i64 = 180;
 /// so a multi-hour wedge leaves a readable trail instead of a 15s-cadence
 /// flood.
 const WATCHDOG_REPEAT_SECS: i64 = 300;
+
+/// Set while the *native message loop* is believed hung, so other in-process
+/// surfaces can read it without waiting on the monitor thread.
+static UI_THREAD_WEDGED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the monitor currently believes the HTTP surface is wedged.
 ///
@@ -214,6 +228,15 @@ impl LivezProber {
     }
 }
 
+/// Whether the monitor currently believes the native UI thread has stopped
+/// pumping messages.
+///
+/// A plain atomic read: this is the one fact a wedged runner must be able to
+/// report from any thread, including one that cannot touch the event loop.
+pub fn ui_thread_wedged() -> bool {
+    UI_THREAD_WEDGED.load(Ordering::SeqCst)
+}
+
 /// Blocking `/livez` probe.
 ///
 /// Deliberately a plain blocking HTTP call on its own OS thread, NOT a
@@ -244,12 +267,201 @@ fn probe_livez_blocking() -> bool {
     }
 }
 
-/// Escalation state machine for consecutive `/livez` failures.
+// ───────────────── native message-loop liveness (Phase 4) ─────────────────
+//
+// Plan: `2026-08-19-runner-blocked-ui-thread-cannot-be-closed.md`, Phase 4.
+//
+// # This probe is the ONLY detector for the failure it watches
+//
+// That is not rhetoric, it is the vetted finding, and it is the reason this
+// rung exists at all rather than being folded into an existing one:
+//
+// * `/livez` and `/health` keep answering `200` while the native loop is
+//   wedged — measured 2026-08-19 on PID 148320, `Responding: False` with
+//   `/health` still returning `200`. So [`probe_livez_blocking`], the
+//   2026-08-07 detector, is blind here **by construction**.
+// * The WebView2 `ProcessFailed` push event (`webview_recovery`, 2026-08-01)
+//   cannot fire: **no process died**.
+// * The shipped `ui_stale` / `UI_DEAD_AFTER_MS` backstop is blind too. The
+//   frontend runs an *unconditional* 3s HTTP pong
+//   (`src/hooks/useUIBridgeEventHandler.ts` → `POST /ui-bridge/pong` →
+//   `mcp/ui_bridge/capabilities.rs`), and WebView2 services `fetch` in the
+//   browser/network process, not on the host's UI thread. So
+//   `ui_bridge_last_pong` stays fresh throughout the hang and
+//   `derived_status` stays `healthy`. Giving that atom provenance is a
+//   separate, later change — do not assume it has landed.
+//
+// There is therefore no 90s floor under this on Windows: without this probe
+// the condition is not detected late, it is **never detected**.
+
+/// One observation of the native message loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiThreadSample {
+    /// The loop answered a `WM_NULL` round-trip inside the timeout.
+    pub pumping: bool,
+    /// `IsHungAppWindow`'s independent verdict, sampled in the same tick as a
+    /// free cross-check. Its threshold is OS-internal and untunable, which is
+    /// why it corroborates rather than decides. `None` where the OS cannot be
+    /// asked at all.
+    pub os_reports_hung: Option<bool>,
+    /// `GetLastError` after a failed round-trip. Used only to tell a genuine
+    /// hang from *our own* defect — see [`ui_thread_pumping`].
+    pub last_error: u32,
+}
+
+/// Warn once, not every 5s, when the probe cannot ask the question.
+static UI_THREAD_PROBE_DEFECT_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Blocking native message-loop probe.
+///
+/// `SendMessageTimeoutW(hwnd, WM_NULL, …, SMTO_ABORTIFHUNG, timeout_ms, …)`.
+/// `WM_NULL` is defined to be ignored by every window procedure, so the round
+/// trip observes the loop without perturbing the application: it succeeds iff
+/// the thread that owns `hwnd` reached `GetMessage`/`DispatchMessage` within
+/// the timeout.
+///
+/// Deliberately a *blocking* call on the health monitor's own OS thread —
+/// bounded by `timeout_ms` and by `SMTO_ABORTIFHUNG`, which returns
+/// immediately when Windows has already flagged the window hung. Routing it
+/// through the async runtime (as `window_probe` does, correctly, on the async
+/// side) would make the detector share fate with the process it is measuring.
+#[cfg(windows)]
+fn probe_ui_thread_blocking(hwnd: isize, timeout_ms: u32) -> UiThreadSample {
+    use windows_sys::Win32::Foundation::{GetLastError, HWND};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsHungAppWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_NULL,
+    };
+
+    let hwnd = hwnd as HWND;
+    let mut round_trip_result: usize = 0;
+
+    // SAFETY: `hwnd` is the main window's handle, cached on the UI thread at
+    // startup by `ui_thread_probe` (never fetched via the unbounded
+    // `window.hwnd()` getter, which would park this thread during exactly the
+    // hang it is detecting). `round_trip_result` is a live stack local for the
+    // duration of the call. Both functions are read-only Win32 queries.
+    unsafe {
+        let lresult = SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            0,
+            0,
+            SMTO_ABORTIFHUNG,
+            timeout_ms,
+            &mut round_trip_result as *mut usize,
+        );
+        let last_error = if lresult == 0 { GetLastError() } else { 0 };
+        UiThreadSample {
+            pumping: lresult != 0,
+            os_reports_hung: Some(IsHungAppWindow(hwnd) != 0),
+            last_error,
+        }
+    }
+}
+
+/// Sample the native message loop, or report UNKNOWN.
+///
+/// `None` means "could not ask" — no cached HWND yet (startup, server mode,
+/// or a headless build) or a handle the OS rejects. UNKNOWN is **never** folded
+/// into the wedge detector: manufacturing a hang out of our own defect is the
+/// same failure `probe_livez_blocking` guards against when its client build
+/// fails.
+///
+/// Only `ERROR_INVALID_WINDOW_HANDLE` is read as our defect, and only when
+/// `IsHungAppWindow` disagrees. Everything else — including a `GetLastError`
+/// of `0`, which is what an `SMTO_ABORTIFHUNG` abort can leave behind — counts
+/// as a hang. The asymmetry is deliberate: under-reporting this failure means
+/// nobody ever learns of it, and over-reporting is already fenced off by the
+/// 3-consecutive-sample threshold.
+#[cfg(windows)]
+pub fn ui_thread_pumping() -> Option<UiThreadSample> {
+    use windows_sys::Win32::Foundation::ERROR_INVALID_WINDOW_HANDLE;
+
+    let hwnd = crate::ui_thread_probe::main_hwnd()?;
+    let sample = probe_ui_thread_blocking(hwnd, UI_THREAD_PROBE_TIMEOUT_MS);
+
+    if !sample.pumping
+        && sample.last_error == ERROR_INVALID_WINDOW_HANDLE
+        && !sample.os_reports_hung.unwrap_or(false)
+    {
+        if !UI_THREAD_PROBE_DEFECT_LOGGED.swap(true, Ordering::SeqCst) {
+            warn!(
+                hwnd,
+                last_error = sample.last_error,
+                "UI-thread probe: the cached main-window handle is no longer valid (a window \
+                 recreate, most likely). Reporting UNKNOWN rather than a hang."
+            );
+        }
+        return None;
+    }
+
+    Some(sample)
+}
+
+/// Non-Windows stub — **a deliberate no-op, not an oversight.**
+///
+/// There is no portable equivalent of `SendMessageTimeoutW`: the probe asks a
+/// Win32 message loop a Win32 question. This matches the precedent already set
+/// by the 2026-08-01 `ProcessFailed` detector in `webview_recovery`, which is
+/// `#[cfg(windows)]` with a stub for the same reason.
+///
+/// **What other platforms fall back to, stated so nobody has to guess:** the
+/// already-shipped, already-cross-platform heartbeat-staleness arm —
+/// `ui_error::ui_dead_now` at `UI_DEAD_AFTER_MS` (90s), consumed by
+/// `heartbeat.rs`, which calls `webview_recovery::trigger_ui_recovery` with
+/// `RecoveryReason::HeartbeatStale`. On macOS/Linux that arm really does cover
+/// this failure, because the webview's JS runs on the same blocked main
+/// thread, so a blocked loop stops the HTTP pong as well. The Windows-specific
+/// hole this probe fills is WebView2's out-of-process `fetch`, which keeps
+/// ponging while the host thread is dead. So off Windows the detection is
+/// **90s-latency, not absent**.
+#[cfg(not(windows))]
+pub fn ui_thread_pumping() -> Option<UiThreadSample> {
+    None
+}
+
+/// Which liveness rung an observation belongs to.
+///
+/// The two rungs share **one** state machine on purpose. The noise-floor
+/// argument is identical for both — [`WEDGE_FAILURE_THRESHOLD`] consecutive
+/// samples, so a single dropped connection or a single long repaint cannot
+/// escalate — and a second hand-rolled copy of it would be free to drift.
+/// Only the side effects at the escalation edge differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum WedgeKind {
+    /// `/livez` stopped answering: the async HTTP surface is starved
+    /// (2026-08-07 incident). The Rust backend cannot serve.
+    #[default]
+    Backend,
+    /// The native message loop stopped pumping (2026-08-19 incident). The
+    /// window does not repaint and the X button does nothing, while `/livez`
+    /// and `/health` keep answering `200`.
+    UiThread,
+}
+
+impl WedgeKind {
+    /// Stable machine-readable token written into `wedge-incidents.log`.
+    ///
+    /// **Do not reword these.** The breadcrumb file is the thing someone greps
+    /// after an unexplained outage, precisely because the logs that would have
+    /// answered the 2026-08-19 incident were destroyed within a day —
+    /// `runner-lifecycle.log` is truncated at every runner startup, so a
+    /// restart erases the record of the wedge that provoked it.
+    fn breadcrumb_reason(self) -> &'static str {
+        match self {
+            Self::Backend => "backend_wedged",
+            Self::UiThread => "ui_thread_wedged",
+        }
+    }
+}
+
+/// Escalation state machine for consecutive probe failures on one rung.
 ///
 /// Pure and side-effect free apart from the escalation callbacks, so the
 /// thresholds can be tested without a runtime, a socket, or a clock.
 #[derive(Debug, Default)]
 struct WedgeDetector {
+    kind: WedgeKind,
     consecutive_failures: u32,
     escalated: bool,
 }
@@ -268,6 +480,15 @@ enum WedgeAction {
 }
 
 impl WedgeDetector {
+    /// A detector for one rung. `Default` is the backend rung, which is what
+    /// the pre-existing call sites and tests mean.
+    fn new(kind: WedgeKind) -> Self {
+        Self {
+            kind,
+            ..Self::default()
+        }
+    }
+
     /// Fold one probe result into the state machine and return the action.
     fn step(&mut self, alive: bool) -> WedgeAction {
         if alive {
@@ -309,12 +530,19 @@ impl WedgeDetector {
     /// Called before any reporting side effect, so the watchdog can name
     /// `backend-wedged` even if the very next line parks this thread forever.
     fn publish(&self) {
-        BACKEND_WEDGED.store(
-            self.consecutive_failures >= WEDGE_FAILURE_THRESHOLD,
-            Ordering::SeqCst,
-        );
-        MONITOR_CONSECUTIVE_FAILURES.store(self.consecutive_failures, Ordering::SeqCst);
-        MONITOR_HEARTBEAT_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::SeqCst);
+        let wedged = self.consecutive_failures >= WEDGE_FAILURE_THRESHOLD;
+        match self.kind {
+            WedgeKind::Backend => {
+                BACKEND_WEDGED.store(wedged, Ordering::SeqCst);
+                // Only the backend rung publishes the watchdog's view of the
+                // probe loop. Both rungs ride ONE thread, so a second stamp
+                // per tick would not add liveness — it would only make a
+                // stalled backend detector look alive.
+                MONITOR_CONSECUTIVE_FAILURES.store(self.consecutive_failures, Ordering::SeqCst);
+                MONITOR_HEARTBEAT_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::SeqCst);
+            }
+            WedgeKind::UiThread => UI_THREAD_WEDGED.store(wedged, Ordering::SeqCst),
+        }
     }
 
     /// Fold in an observation, **publish the watchdog-visible state**, and
@@ -348,22 +576,68 @@ impl WedgeDetector {
                 // mutex — none of which is guaranteed to be schedulable in the
                 // condition we are reporting. The durable record must not sit
                 // behind it.
-                write_wedge_breadcrumb(secs);
-                error!(
-                    consecutive_failures,
-                    unresponsive_for_secs = secs,
-                    "BACKEND WEDGED: /livez has not answered for {secs}s. The HTTP surface is \
-                     not serving — every agent session on this box is affected, and coord-mcp \
-                     writes issued through this runner are being LOST. Not restarting: a \
-                     process restart destroys in-flight sessions and is an explicit non-goal.",
-                );
+                write_wedge_breadcrumb(self.kind, secs);
+                match self.kind {
+                    WedgeKind::Backend => {
+                        error!(
+                            consecutive_failures,
+                            unresponsive_for_secs = secs,
+                            "BACKEND WEDGED: /livez has not answered for {secs}s. The HTTP \
+                             surface is not serving — every agent session on this box is \
+                             affected, and coord-mcp writes issued through this runner are \
+                             being LOST. Not restarting: a process restart destroys in-flight \
+                             sessions and is an explicit non-goal.",
+                        );
+                    }
+                    WedgeKind::UiThread => {
+                        error!(
+                            consecutive_failures,
+                            unresponsive_for_secs = secs,
+                            "UI THREAD WEDGED: the native message loop has not answered a \
+                             WM_NULL round-trip for {secs}s. The window will not repaint and \
+                             the X button does nothing, while /livez and /health keep \
+                             answering 200 — this probe is the ONLY detector for that state. \
+                             Not restarting: a process restart destroys in-flight sessions \
+                             and is an explicit non-goal.",
+                        );
+                    }
+                }
+
+                if self.kind == WedgeKind::UiThread {
+                    // Third rung into the SHIPPED recovery surface, not a
+                    // fourth parallel mechanism: `webview_recovery` owns the
+                    // one user-visible escalation. It deliberately attempts no
+                    // recovery ACTION here — every rung of that ladder
+                    // dispatches through the loop that is wedged.
+                    if let Some(app) = crate::tauri_app_handle::current() {
+                        crate::webview_recovery::report_native_ui_thread_hang(&app, secs);
+                    }
+                    // No `AppHandle` means no Tauri runtime (still starting, or
+                    // a unit-test context). The breadcrumb above is already on
+                    // disk, so the incident is recorded either way.
+                }
             }
             WedgeAction::Recovered { was_failing_for } => {
                 let secs = was_failing_for as u64 * SELF_PROBE_INTERVAL_SECS;
-                warn!(
-                    was_failing_for_secs = secs,
-                    "Backend recovered: /livez is answering again after {secs}s of silence"
-                );
+                match self.kind {
+                    WedgeKind::Backend => {
+                        BACKEND_WEDGED.store(false, Ordering::SeqCst);
+                        warn!(
+                            was_failing_for_secs = secs,
+                            "Backend recovered: /livez is answering again after {secs}s of \
+                             silence"
+                        );
+                    }
+                    WedgeKind::UiThread => {
+                        UI_THREAD_WEDGED.store(false, Ordering::SeqCst);
+                        crate::webview_recovery::clear_native_ui_thread_hang();
+                        warn!(
+                            was_failing_for_secs = secs,
+                            "UI thread recovered: the native message loop is pumping again \
+                             after {secs}s"
+                        );
+                    }
+                }
             }
         }
     }
@@ -380,13 +654,23 @@ impl WedgeDetector {
 ///
 /// Best-effort by contract: the process is already sick, so a failure to
 /// write must never make it worse.
-fn write_wedge_breadcrumb(unresponsive_for_secs: u64) {
+fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
     let dir = crate::paths::get_dev_logs_dir();
     let path = dir.join("wedge-incidents.log");
+    let detail = match kind {
+        WedgeKind::Backend => {
+            format!("runner backend wedged — /livez silent for {unresponsive_for_secs}s")
+        }
+        WedgeKind::UiThread => format!(
+            "native UI thread wedged — no WM_NULL round-trip for {unresponsive_for_secs}s \
+             (the HTTP surface, including /livez, was still answering)"
+        ),
+    };
     let line = format!(
-        "{} runner backend wedged — /livez silent for {}s (pid {})\n",
+        "{} {} {} (pid {})\n",
         chrono::Utc::now().to_rfc3339(),
-        unresponsive_for_secs,
+        kind.breadcrumb_reason(),
+        detail,
         std::process::id()
     );
     use std::io::Write;
@@ -831,11 +1115,12 @@ pub fn start_health_monitor() {
 
     info!(
         "Starting health monitor (interval: {}s, memory_threshold: {}MB, thread_threshold: {}, \
-         livez_probe_every: {}s)",
+         livez_probe_every: {}s, ui_thread_probe_timeout: {}ms)",
         HEALTH_CHECK_INTERVAL_SECS,
         MEMORY_WARNING_THRESHOLD_MB,
         THREAD_WARNING_THRESHOLD,
-        SELF_PROBE_INTERVAL_SECS
+        SELF_PROBE_INTERVAL_SECS,
+        UI_THREAD_PROBE_TIMEOUT_MS
     );
 
     // Everything below runs on DEDICATED OS THREADS, never tokio tasks — and
@@ -868,7 +1153,12 @@ pub fn start_health_monitor() {
 
     // ── The probe loop: the wedge detector, and nothing that can block it ──
     std::thread::spawn(|| {
-        let mut wedge = WedgeDetector::default();
+        let mut wedge = WedgeDetector::new(WedgeKind::Backend);
+        // The SECOND rung rides the SAME thread and the SAME cadence on
+        // purpose. A dedicated monitor thread for the UI probe would double
+        // the thing whose survival is the entire point, and this loop is
+        // already proved to keep its cadence through a wedge.
+        let mut ui_wedge = WedgeDetector::new(WedgeKind::UiThread);
         let mut prober = LivezProber::new();
         while MONITOR_RUNNING.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(SELF_PROBE_INTERVAL_SECS));
@@ -879,6 +1169,21 @@ pub fn start_health_monitor() {
             // BACKEND_WEDGED *before* it writes the breadcrumb or logs, so a
             // blocked subscriber can no longer erase the evidence.
             wedge.observe(prober.probe());
+
+            // UNKNOWN (no cached HWND yet, non-Windows, a rejected handle)
+            // is skipped rather than folded in as a failure: it must not
+            // accumulate toward an escalation.
+            if let Some(sample) = ui_thread_pumping() {
+                if !sample.pumping {
+                    debug!(
+                        os_reports_hung = ?sample.os_reports_hung,
+                        last_error = sample.last_error,
+                        "UI-thread probe: no WM_NULL round-trip within \
+                         {UI_THREAD_PROBE_TIMEOUT_MS}ms"
+                    );
+                }
+                ui_wedge.observe(sample.pumping);
+            }
         }
         info!("Health monitor livez probe stopped");
     });
@@ -1317,6 +1622,123 @@ mod tests {
         let mut w = WatchdogState::default();
         let t0 = 1_000_000_000_000i64;
         assert_eq!(w.step(sample(t0, 0, false)), None);
+
+    // ---- Phase 4: the native message-loop rung ----
+    //
+    // Same state machine, second rung. These pin the two things that make the
+    // rung trustworthy: it shares the backend rung's noise floor exactly, and
+    // it cannot be confused with it in the durable record.
+
+    #[test]
+    fn ui_thread_rung_escalates_on_the_same_noise_floor() {
+        // A modal dialog or a large repaint blocks the loop for a moment. The
+        // 3-consecutive-sample threshold is what keeps that from being an
+        // incident, and it must be the SAME threshold the backend rung uses —
+        // one argument, one constant, one place to change it.
+        let mut d = WedgeDetector::new(WedgeKind::UiThread);
+        for _ in 1..WEDGE_FAILURE_THRESHOLD {
+            assert_eq!(d.step(false), WedgeAction::None, "escalated too early");
+        }
+        assert_eq!(
+            d.step(false),
+            WedgeAction::Escalate {
+                consecutive_failures: WEDGE_FAILURE_THRESHOLD
+            }
+        );
+        assert_eq!(d.step(false), WedgeAction::None);
+    }
+
+    #[test]
+    fn one_pumping_sample_clears_the_ui_thread_streak() {
+        // A UI thread that answers between two slow samples is busy, not hung.
+        let mut d = WedgeDetector::new(WedgeKind::UiThread);
+        for _ in 0..(WEDGE_FAILURE_THRESHOLD - 1) {
+            d.step(false);
+        }
+        assert_eq!(d.step(true), WedgeAction::None);
+        for _ in 0..(WEDGE_FAILURE_THRESHOLD - 1) {
+            assert_eq!(d.step(false), WedgeAction::None, "streak did not reset");
+        }
+    }
+
+    #[test]
+    fn ui_thread_rung_reports_recovery_only_after_escalating() {
+        let mut d = WedgeDetector::new(WedgeKind::UiThread);
+        d.step(false);
+        assert_eq!(d.step(true), WedgeAction::None);
+        for _ in 0..WEDGE_FAILURE_THRESHOLD {
+            d.step(false);
+        }
+        assert_eq!(
+            d.step(true),
+            WedgeAction::Recovered {
+                was_failing_for: WEDGE_FAILURE_THRESHOLD
+            }
+        );
+    }
+
+    #[test]
+    fn the_two_rungs_do_not_share_a_streak() {
+        // One wedged surface must never escalate the other. They are separate
+        // detectors over one type, and the 2026-08-19 incident is exactly the
+        // case where one is failing while the other is perfectly healthy.
+        let mut backend = WedgeDetector::new(WedgeKind::Backend);
+        let mut ui = WedgeDetector::new(WedgeKind::UiThread);
+        for _ in 0..(WEDGE_FAILURE_THRESHOLD * 3) {
+            assert_eq!(backend.step(true), WedgeAction::None);
+        }
+        for _ in 1..WEDGE_FAILURE_THRESHOLD {
+            assert_eq!(ui.step(false), WedgeAction::None);
+        }
+        assert!(matches!(ui.step(false), WedgeAction::Escalate { .. }));
+        assert_eq!(backend.step(true), WedgeAction::None);
+    }
+
+    #[test]
+    fn breadcrumb_reasons_are_distinct_and_stable() {
+        // `wedge-incidents.log` is the record that survives the restart which
+        // truncates `runner-lifecycle.log`. These tokens are its grep keys.
+        assert_eq!(WedgeKind::Backend.breadcrumb_reason(), "backend_wedged");
+        assert_eq!(WedgeKind::UiThread.breadcrumb_reason(), "ui_thread_wedged");
+        assert_ne!(
+            WedgeKind::Backend.breadcrumb_reason(),
+            WedgeKind::UiThread.breadcrumb_reason()
+        );
+    }
+
+    #[test]
+    fn the_default_rung_is_the_backend_rung() {
+        // `WedgeDetector::default()` predates the second rung; it must keep
+        // meaning what its existing call sites and tests mean.
+        assert_eq!(WedgeDetector::default().kind, WedgeKind::Backend);
+    }
+
+    #[test]
+    fn ui_thread_probe_timeout_stays_under_the_sample_interval() {
+        // The probe rides the 5s loop. A timeout at or above the interval
+        // would stretch the cadence of the loop it is measured against — and
+        // silently degrade the backend rung's clock along with it.
+        assert!(
+            (UI_THREAD_PROBE_TIMEOUT_MS as u64) < SELF_PROBE_INTERVAL_SECS * 1_000,
+            "ui-thread probe timeout {UI_THREAD_PROBE_TIMEOUT_MS}ms is not under the \
+             {SELF_PROBE_INTERVAL_SECS}s sample interval"
+        );
+    }
+
+    #[test]
+    fn ui_thread_detection_latency_stays_in_the_tens_of_seconds() {
+        // Worst case is threshold x (sleep + probe timeout): the probe runs
+        // after the sleep, and a hung loop costs the full timeout unless
+        // SMTO_ABORTIFHUNG short-circuits it (which is the common case, and
+        // faster). Guard the arithmetic so a later constant bump cannot
+        // quietly restore a coarse clock — there is no other detector for
+        // this failure to fall back on.
+        let worst_case_secs = WEDGE_FAILURE_THRESHOLD as u64
+            * (SELF_PROBE_INTERVAL_SECS + (UI_THREAD_PROBE_TIMEOUT_MS as u64).div_ceil(1_000));
+        assert!(
+            worst_case_secs <= 30,
+            "ui-thread wedge detection latency regressed to {worst_case_secs}s"
+        );
     }
 
     #[test]
