@@ -268,6 +268,28 @@ export function SessionInfoDropdown({
     <div className="relative shrink-0" ref={containerRef}>
       <button
         ref={triggerRef}
+        /*
+         * The trigger is the ONE node in this subtree that `useAutoRegister`'s
+         * DOM walker would otherwise claim (its `INTERACTIVE_SELECTORS` match
+         * `button`; the panel and its rows are plain divs and never match). The
+         * walker is debounced and runs off a MutationObserver, so whether it or
+         * this component's `useUIElement` effect registers FIRST is a race —
+         * and the registry is last-write-wins per id. Losing that race
+         * re-registered the trigger with `origin: "auto"` and the DOM-derived
+         * accessible label, dropping the `Session info (zone N)` label the
+         * `useUIElement` call above supplies (observed in MULTI-zone layouts,
+         * where the extra mount work reliably lost the race; single-zone
+         * happened to win it). Two attributes make the outcome deterministic
+         * instead of timing-dependent:
+         *   - `data-no-register` is App.tsx's `excludeSelectors` opt-out, so the
+         *     walker skips this node entirely and the hook is the only
+         *     registrant — origin is ALWAYS `"hook"`.
+         *   - `data-ui-bridge-id` pins the same id the hook uses, so any other
+         *     scanner that reaches this node reuses that id rather than minting
+         *     a competing `button-…` entry for the same element.
+         */
+        data-no-register="true"
+        data-ui-bridge-id={sessionInfoElementId("trigger", zoneIndex)}
         onClick={(e) => {
           e.stopPropagation();
           if (!open) state.refresh();
@@ -289,6 +311,7 @@ export function SessionInfoDropdown({
       {open && (
         <div
           ref={panelRef}
+          data-ui-bridge-id={sessionInfoElementId("panel", zoneIndex)}
           className="absolute left-0 top-full mt-0.5 w-72 rounded-lg shadow-xl z-50 overflow-hidden"
           style={{ backgroundColor: PANEL_BG, border: `1px solid ${PANEL_BORDER}` }}
         >

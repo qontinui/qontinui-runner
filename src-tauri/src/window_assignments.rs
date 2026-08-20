@@ -772,6 +772,59 @@ mod tests {
         assert!(!wa.snapshot().windows.contains_key(&w.label));
     }
 
+    /// `close_window` must be safely repeatable.
+    ///
+    /// `close_terminal_window` calls `handle_window_close` explicitly (because
+    /// `WebviewWindow::destroy()` emits no `CloseRequested`), and the OS-close
+    /// path calls it from the window-event handler — so on a window closed by
+    /// its titlebar X the teardown can legitimately run twice. The second call
+    /// must be a clean no-op rather than re-emitting reassignments for sessions
+    /// that already moved back to `"main"`.
+    #[test]
+    fn close_window_is_idempotent() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let w = wa.create_window(None, None, None, 10);
+        wa.assign_session("sess-A", &w.label);
+
+        let first = wa.close_window(&w.label);
+        assert!(first.removed);
+        assert_eq!(first.reassigned.len(), 1);
+
+        let second = wa.close_window(&w.label);
+        assert!(!second.removed, "second close must not claim a removal");
+        assert!(
+            second.reassigned.is_empty(),
+            "second close must not re-emit reassignments"
+        );
+        assert_eq!(wa.owner_of("sess-A"), "main");
+        assert!(!wa.snapshot().windows.contains_key(&w.label));
+    }
+
+    /// A PAGE-BOUND pop-out's record must go away when the window closes.
+    ///
+    /// While the record survives, the frontend's `pageId → windowLabel` mirror
+    /// (derived from this registry) keeps hiding that page in every live
+    /// window. With every page hidden, `useTerminalPages` mints a fresh empty
+    /// one and the zone grid renders ZERO zones permanently — a refresh cannot
+    /// recover, because the mirror is re-derived from this same registry.
+    #[test]
+    fn close_window_drops_the_page_binding() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let w = wa.create_window(None, None, Some("default".into()), 10);
+        assert_eq!(
+            wa.snapshot().windows[&w.label].bound_page.as_deref(),
+            Some("default")
+        );
+
+        wa.close_window(&w.label);
+        assert!(
+            !wa.snapshot().windows.contains_key(&w.label),
+            "a page-bound pop-out's record must not outlive its window",
+        );
+    }
+
     #[test]
     fn close_main_is_noop() {
         let (_d, wa) = store();

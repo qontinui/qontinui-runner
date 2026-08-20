@@ -593,14 +593,23 @@ export function useTerminalPages() {
     });
   }, []);
 
-  // Run reconciliation once on mount and on a debounced `terminal-created`
-  // event (a burst of continuations collapses to a single reconcile).
+  // Run reconciliation once on mount and on a debounced `terminal-created` OR
+  // `terminal-exit` event (a burst of continuations/exits collapses to a single
+  // reconcile).
+  //
+  // `terminal-exit` matters as much as `terminal-created`: occupancy is what
+  // decides whether the internal "default" page earns a visible tab
+  // (`computeVisiblePages`), and closing the last terminal on a page — or having
+  // one removed out-of-band by `DELETE /terminals/{id}` — changes it. Without
+  // the exit arm, `occupiedPageIds` kept asserting a page was occupied long
+  // after the backend disagreed, and nothing re-read the backend until the next
+  // create (2026-08-20 manual-test loop, item A).
   useEffect(() => {
     // A pinned pop-out renders one fixed page and must not touch the shared
     // page list — skip reconciliation entirely.
     if (isPinned) return;
 
-    let unlisten: (() => void) | null = null;
+    const unlisteners: Array<() => void> = [];
     let timer: ReturnType<typeof setTimeout> | null = null;
     let disposed = false;
 
@@ -611,24 +620,28 @@ export function useTerminalPages() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void reconcile();
 
-    listen("terminal-created", () => {
+    const schedule = () => {
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         timer = null;
         void reconcile();
       }, 400);
-    }).then((fn) => {
-      if (disposed) {
-        fn();
-      } else {
-        unlisten = fn;
-      }
-    });
+    };
+
+    for (const event of ["terminal-created", "terminal-exit"]) {
+      listen(event, schedule).then((fn) => {
+        if (disposed) {
+          fn();
+        } else {
+          unlisteners.push(fn);
+        }
+      });
+    }
 
     return () => {
       disposed = true;
       if (timer) clearTimeout(timer);
-      unlisten?.();
+      for (const fn of unlisteners) fn();
     };
   }, [reconcile, isPinned]);
 

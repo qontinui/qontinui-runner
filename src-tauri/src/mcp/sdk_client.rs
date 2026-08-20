@@ -5953,6 +5953,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/page/type-into", post(handle_type_into))
         .route("/ui-bridge/sdk/page/read-value", post(handle_read_value))
         .route(
+            "/ui-bridge/sdk/page/send-keys",
+            post(handle_send_keys_to_page),
+        )
+        .route(
             "/ui-bridge/sdk/page/find-by-text",
             post(handle_find_by_text),
         )
@@ -5980,6 +5984,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/control/page/read-value",
             post(handle_read_value),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page/send-keys",
+            post(handle_send_keys_to_page),
         )
         .route(
             "/ui-bridge/sdk/control/page/find-by-text",
@@ -6208,6 +6216,68 @@ async fn handle_read_value(
             match ui_bridge_request_sync(&state, "read_value", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
                 Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
+    }
+}
+
+/// POST /ui-bridge/sdk/page/send-keys — Dispatch a key sequence at the DOCUMENT
+/// level (not scoped to an element).
+///
+/// The SDK half of this shipped in `@qontinui/ui-bridge` PR #156
+/// (`sendKeysToPage` → `POST /control/page/send-keys`); without this dispatch
+/// the wrapper framework had nothing to forward it to, so a WS-transport app's
+/// `sendKeysToPage` never reached the app and the runner's own webview never
+/// saw the fallback either.
+///
+/// Body is forwarded VERBATIM (`keys`, `target`, `delay`) — normalization and
+/// the by-name rejection of an unknown `target` belong to whichever side
+/// executes the dispatch, and duplicating them here would be a fourth copy of
+/// the key vocabulary that could drift.
+async fn handle_send_keys_to_page(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
+    match dispatch_app_request(
+        &state,
+        "sendKeysToPage",
+        body.clone(),
+        Method::POST,
+        "/control/page/send-keys",
+        Some(body.clone()),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => {
+            // SDK app connected but rejected the action — surface the error
+            // rather than falling back to the runner's own webview.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
+            // Fall back to the runner's own webview by DELEGATING to the
+            // canonical `/control/page/send-keys` handler rather than
+            // re-emitting a bridge message. That handler owns the
+            // normalization, the `document` default and the by-name rejection
+            // of an unknown `target`, and it emits `dispatch_key` — the only
+            // message type the webview relay actually handles. Re-emitting a
+            // `send_keys_to_page` message here would be silently dropped.
+            // Same delegation pattern as `handle_list_windows` above.
+            match crate::mcp::ui_bridge::keyboard::ui_bridge_send_keys_to_page_handler(
+                State(state.clone()),
+                Json(body),
+            )
+            .await
+            {
+                Ok(Json(resp)) => Json(serde_json::to_value(resp).unwrap_or_else(|e| {
+                    serde_json::json!({ "success": false, "error": e.to_string() })
+                })),
+                Err((_status, Json(err))) => {
+                    Json(serde_json::to_value(err).unwrap_or_else(|e| {
+                        serde_json::json!({ "success": false, "error": e.to_string() })
+                    }))
+                }
             }
         }
     }

@@ -23,6 +23,8 @@ import {
   nextActiveIdAfterIngest,
   backfillClaudeSessionIds,
   resolveSpawnWorkingDir,
+  reconcileTabsWithBackend,
+  RESYNC_CREATE_GRACE_MS,
   type TerminalTab,
   type SessionIdsByTerminal,
 } from "./useTerminalManager";
@@ -318,5 +320,56 @@ describe("resolveSpawnWorkingDir (page defaultWorkingDir fallback)", () => {
   it("trims the value it forwards", () => {
     expect(resolveSpawnWorkingDir(` ${ROOT} `, undefined)).toBe(ROOT);
     expect(resolveSpawnWorkingDir(undefined, ` ${ROOT} `)).toBe(ROOT);
+  });
+});
+
+describe("reconcileTabsWithBackend", () => {
+  const NOW = 1_800_000_000_000;
+  const old = { createdAt: NOW - 60_000 };
+
+  it("adds a backend terminal that has no local tab (missed terminal-created)", () => {
+    const tabs = [tab("a", old)];
+    const next = reconcileTabsWithBackend(tabs, [createdEvent("a", "p"), createdEvent("b", "p")], NOW);
+    expect(next.map((t) => t.id)).toEqual(["a", "b"]);
+  });
+
+  it("drops a local tab the backend no longer lists (closed out-of-band)", () => {
+    const tabs = [tab("a", old), tab("gone", old)];
+    const next = reconcileTabsWithBackend(tabs, [createdEvent("a", "p")], NOW);
+    expect(next.map((t) => t.id)).toEqual(["a"]);
+  });
+
+  it("returns the SAME reference when the lists already agree", () => {
+    const tabs = [tab("a", old)];
+    expect(reconcileTabsWithBackend(tabs, [createdEvent("a", "p")], NOW)).toBe(tabs);
+  });
+
+  it("keeps a tab younger than the create grace (in-flight create)", () => {
+    const tabs = [tab("fresh", { createdAt: NOW - 100 })];
+    expect(reconcileTabsWithBackend(tabs, [], NOW)).toBe(tabs);
+    // …and drops it once the grace has elapsed.
+    const later = reconcileTabsWithBackend(tabs, [], NOW + RESYNC_CREATE_GRACE_MS + 1);
+    expect(later).toEqual([]);
+  });
+
+  it("never drops plan tabs or synthetic tabs (the backend cannot list them)", () => {
+    const tabs = [
+      tab("plan-123", { ...old, type: "plan", planFilePath: "/x.md" }),
+      tab("synth", { ...old, __synthetic: true }),
+    ];
+    expect(reconcileTabsWithBackend(tabs, [], NOW)).toBe(tabs);
+  });
+
+  it("preserves per-tab state on surviving tabs", () => {
+    const tabs = [tab("a", { ...old, claudeSessionId: "sid", taskRunId: "run-1" })];
+    const next = reconcileTabsWithBackend(tabs, [createdEvent("a", "p"), createdEvent("b", "p")], NOW);
+    expect(next[0]).toBe(tabs[0]);
+    expect(next[0].claudeSessionId).toBe("sid");
+    expect(next[0].taskRunId).toBe("run-1");
+  });
+
+  it("empties the list when the backend has nothing left on this page", () => {
+    const tabs = [tab("a", old), tab("b", old)];
+    expect(reconcileTabsWithBackend(tabs, [], NOW)).toEqual([]);
   });
 });

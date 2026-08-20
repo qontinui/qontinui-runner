@@ -100,6 +100,82 @@ pub fn classify_identity_evidence(confirmed: bool, transcript_exists: bool) -> &
     }
 }
 
+/// Is `v` one of the three `identityEvidence` values? Pure; shared by the
+/// debug seam's validation and its tests so the accepted set can never drift
+/// from the classifier's output set.
+pub fn is_identity_evidence(v: &str) -> bool {
+    matches!(
+        v,
+        IDENTITY_CONFIRMED | IDENTITY_TRANSCRIPT | IDENTITY_PROVISIONAL
+    )
+}
+
+/// Debug-only forced `identityEvidence`, driven by
+/// `POST /ui-bridge/test/force-identity-evidence` (see `mcp::test_fixtures`).
+///
+/// The `provisional` treatment (the amber panel note plus the `— provisional`
+/// row suffixes) was UNVERIFIABLE end-to-end before this seam existed: a bare
+/// terminal carries no `claudeSessionId` yet, so no dropdown mounts at all, and
+/// any session that DOES bind gets hook-confirmed within seconds — so the
+/// rendering had never once been observed. Forcing the classification is the
+/// only way to drive the treatment through the real projection, the real
+/// command, and the real component.
+///
+/// Cfg-gated to exactly the same builds as `mcp::test_fixtures` itself, so a
+/// release binary has no override slot, no setter and no read — the classifier
+/// result is returned unconditionally there.
+#[cfg(any(debug_assertions, feature = "test-fixtures"))]
+mod evidence_override {
+    use std::sync::{OnceLock, RwLock};
+
+    fn slot() -> &'static RwLock<Option<String>> {
+        static SLOT: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+        SLOT.get_or_init(|| RwLock::new(None))
+    }
+
+    /// Install (`Some`) or clear (`None`) the override; returns the PREVIOUS
+    /// value so a caller can report what it replaced. A poisoned lock is
+    /// treated as "no override" rather than panicking a request handler.
+    pub fn set(next: Option<String>) -> Option<String> {
+        match slot().write() {
+            Ok(mut guard) => std::mem::replace(&mut *guard, next),
+            Err(_) => None,
+        }
+    }
+
+    /// The current override, if any.
+    pub fn get() -> Option<String> {
+        slot().read().ok().and_then(|g| g.clone())
+    }
+}
+
+/// Install or clear the debug `identityEvidence` override. Returns the
+/// previous value. See [`evidence_override`].
+#[cfg(any(debug_assertions, feature = "test-fixtures"))]
+pub fn set_forced_identity_evidence(next: Option<String>) -> Option<String> {
+    evidence_override::set(next)
+}
+
+/// The debug `identityEvidence` override currently installed, if any.
+#[cfg(any(debug_assertions, feature = "test-fixtures"))]
+pub fn forced_identity_evidence() -> Option<String> {
+    evidence_override::get()
+}
+
+/// The `identityEvidence` this projection reports: the classifier's verdict,
+/// unless a debug seam has forced one.
+///
+/// Applied HERE (in the shared pure projection) rather than in the Tauri
+/// command so the HTTP twin and the command cannot disagree about what the
+/// panel is being shown.
+fn resolve_identity_evidence(confirmed: bool, transcript_exists: bool) -> String {
+    #[cfg(any(debug_assertions, feature = "test-fixtures"))]
+    if let Some(forced) = forced_identity_evidence() {
+        return forced;
+    }
+    classify_identity_evidence(confirmed, transcript_exists).to_string()
+}
+
 /// The four identifiers a session carries (D2). All four are shown rather than
 /// guessing which two the operator meant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -492,8 +568,7 @@ pub fn project_session_info(
                 close_reason: rec.close_reason.clone(),
                 confirmed,
                 transcript_exists,
-                identity_evidence: classify_identity_evidence(confirmed, transcript_exists)
-                    .to_string(),
+                identity_evidence: resolve_identity_evidence(confirmed, transcript_exists),
                 restorable: crate::session::snapshot_history::is_restorable_identity(
                     confirmed,
                     transcript_exists,

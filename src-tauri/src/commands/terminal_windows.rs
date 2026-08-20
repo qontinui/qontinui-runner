@@ -348,15 +348,52 @@ pub fn restore_pop_out_windows(
 /// `close()` only requests a close that the event loop may never finish
 /// destroying, leaving the OS window VISIBLE (observed live — `EnumWindows`
 /// still reports the window `[vis]` after `close()` returned `ok`). `destroy()`
-/// forces the teardown synchronously. The central `CloseRequested` handler still
-/// fires (so the usual reassign-to-main + `window-closed` path runs — a no-op
-/// reassign when empty), then we prune the now-dead records. Returns the labels
-/// closed/pruned. Never touches `"main"`.
+/// forces the teardown synchronously. `destroy()` fires NO events (tauri
+/// 2.11.1: "does not emit any events"), so the central `CloseRequested` handler
+/// does NOT run on this path — which is why the records are pruned explicitly
+/// below rather than left to it. Returns the labels closed/pruned. Never
+/// touches `"main"`.
+///
+/// Note this sweep deliberately skips PAGE-BOUND pop-outs, so it is not a
+/// backstop for their records; [`close_terminal_window`] owns that teardown.
 pub fn sweep_empty_pop_out_windows(
     app: &tauri::AppHandle,
     assignments: &Arc<WindowAssignments>,
 ) -> Vec<String> {
     let mut swept: Vec<String> = Vec::new();
+
+    // Pass 0 — DEAD RECORDS. A pop-out record whose OS window no longer exists
+    // can host nothing, and while it survives it actively strands state: a
+    // page-bound record keeps the frontend's `pageId → windowLabel` mirror
+    // hiding that page in every live window, which is how the grid ended up
+    // rendering zero zones permanently (see [`close_terminal_window`]). This
+    // sweep is operator-initiated (`close_empty_terminal_windows`), never
+    // automatic, so it cannot race boot-restore recreating those windows — and
+    // it is the recovery affordance for a runner already carrying a leaked
+    // record.
+    //
+    // Runs BEFORE the emptiness pass, and deliberately ignores the
+    // `bound_page` carve-out below: that carve-out protects a LIVE page-bound
+    // window from being swept for looking empty, which cannot apply to a window
+    // that is gone.
+    for record in assignments.pop_out_records() {
+        let label = &record.label;
+        if app.get_webview_window(label).is_some() {
+            continue;
+        }
+        let close = assignments.close_window(label);
+        if close.removed || !close.reassigned.is_empty() {
+            tracing::info!(
+                window = %label,
+                bound_page = ?record.bound_page,
+                reassigned = close.reassigned.len(),
+                "sweep_empty_pop_out_windows: pruned record for a window that no longer exists",
+            );
+            swept.push(label.clone());
+        }
+    }
+
+    // Pass 1 — LIVE but empty pop-outs.
     for record in assignments.pop_out_records() {
         let label = &record.label;
         if assignments.has_assigned_sessions(label) || record.bound_page.is_some() {
@@ -388,7 +425,11 @@ pub fn sweep_empty_pop_out_windows(
 
 /// Operator-initiated "close empty terminal windows" affordance (P2). Reuses
 /// [`sweep_empty_pop_out_windows`] — closes every pop-out that owns no live tab
-/// and prunes its record. Returns the labels swept (for an optional toast).
+/// and prunes its record, AND prunes the record of any pop-out whose OS window
+/// is already gone (including page-bound ones). The latter is the recovery
+/// affordance for a leaked record: while one survives, the page it was bound to
+/// stays hidden in every live window and the zone grid renders zero zones.
+/// Returns the labels swept (for an optional toast).
 #[tauri::command]
 pub async fn close_empty_terminal_windows(
     app: tauri::AppHandle,
@@ -507,25 +548,59 @@ pub fn capture_open_geometry(app: &tauri::AppHandle, assignments: &Arc<WindowAss
     }
 }
 
-/// Close a pop-out terminal window. The actual reassignment + events happen in
-/// the central `on_window_event` `CloseRequested` handler (so the OS close
-/// button takes the same path); here we force the teardown. We use `destroy()`
-/// rather than `close()` because `close()` only requests a close that WebView2
-/// may never finish, leaving the pop-out visible on screen (observed live:
-/// `EnumWindows` still reported it `[vis]` after a successful `close()`).
-/// `destroy()` forces the teardown while still firing `CloseRequested` (so the
-/// central handler emits `window-closed`). Closing `"main"` is rejected.
+/// Close a pop-out terminal window.
+///
+/// We use `destroy()` rather than `close()` because `close()` only REQUESTS a
+/// close that WebView2 may never finish, leaving the pop-out visible on screen
+/// (observed live: `EnumWindows` still reported it `[vis]` after a successful
+/// `close()`).
+///
+/// `destroy()` forces the teardown but — per its own tauri docs, "Similar to
+/// `close` but **does not emit any events** and force close the window instead"
+/// (tauri 2.11.1) — it does NOT fire `CloseRequested`. So the central
+/// `on_window_event` handler never runs on this path, and this function must
+/// invoke [`handle_window_close`] itself. It previously did not, and the
+/// consequences were severe and PERSISTENT (measured live on the runner
+/// 2026-08-20):
+///
+///  - the window's [`WindowRecord`] — including its `bound_page` — survived in
+///    `WindowAssignments` forever, and is PERSISTED, so it outlived a runner
+///    restart too;
+///  - the frontend derives its `pageId → windowLabel` mirror from exactly that
+///    registry, so the main window went on hiding a page bound to a window that
+///    no longer exists. With every page hidden, `useTerminalPages` minted a
+///    fresh empty one, and every terminal created afterwards landed on a page
+///    the main window refused to render: **the zone grid rendered zero zones,
+///    permanently, and neither a refresh, a navigation nor a tab switch
+///    recovered** (the P1 in the 2026-08-20 manual-test loop);
+///  - sessions the window owned were never reassigned to `"main"`, so their
+///    tabs were orphaned in every live window.
+///
+/// The sweep in [`sweep_empty_pop_out_windows`] does not cover this: it
+/// deliberately SKIPS page-bound pop-outs, which is exactly the case that
+/// strands a page.
+///
+/// [`handle_window_close`] is idempotent (a second call finds no record and no
+/// sessions to reassign), so the OS-close path — which still goes through
+/// `CloseRequested` — is unaffected, and a record left behind by an EARLIER
+/// destroy is healed by calling this on a window that is already gone.
+///
+/// Closing `"main"` is rejected.
 #[tauri::command]
 pub async fn close_terminal_window(app: tauri::AppHandle, label: String) -> Result<(), String> {
     if label == MAIN_WINDOW_LABEL {
         return Err("refusing to close the main window via close_terminal_window".to_string());
     }
-    match app.get_webview_window(&label) {
-        Some(win) => win
-            .destroy()
-            .map_err(|e| format!("Failed to destroy window {}: {}", label, e)),
-        None => Ok(()), // already gone — idempotent
+    if let Some(win) = app.get_webview_window(&label) {
+        win.destroy()
+            .map_err(|e| format!("Failed to destroy window {}: {}", label, e))?;
     }
+    // Registry teardown + `window-closed` / `session-assignment-changed`
+    // events. Runs whether or not a live window was found: the `None` arm is
+    // "already gone", which is precisely the state a previous `destroy()` left
+    // a stale record in.
+    handle_window_close(&app, &label);
+    Ok(())
 }
 
 /// Move a session (terminalId) to a window ("move tab to window N", or back to

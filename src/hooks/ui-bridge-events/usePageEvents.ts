@@ -681,7 +681,12 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "read_value": {
           try {
-            const { selector } = (payload.params || {}) as { selector?: string };
+            const params = (payload.params || {}) as {
+              selector?: string;
+              index?: number;
+              all?: unknown;
+            };
+            const { selector, index } = params;
             if (!selector) {
               await sendResponse({
                 requestId,
@@ -692,8 +697,41 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               });
               return true;
             }
-            const el = document.querySelector<HTMLElement>(selector);
-            if (!el) {
+            // `all` used to be accepted and silently DROPPED here — this relay
+            // case is a THIRD independent implementation of `readValue`
+            // (alongside the Rust JS-injection handler and the SDK primitive),
+            // so honouring `all` in `@qontinui/ui-bridge` (PR #156) did nothing
+            // for a caller whose request reached the webview through the relay.
+            // Validated and rejected BY NAME rather than reinterpreted, exactly
+            // as the SDK and the Rust handler do.
+            const all = params.all;
+            if (all !== undefined && all !== null && typeof all !== "boolean") {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `'all' must be a boolean (got ${typeof all})`,
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            if (all === true && index !== undefined && index !== null) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error:
+                  "'all' and 'index' are mutually exclusive — 'all' returns every match, 'index' selects one. Drop one of them.",
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+
+            const matches = Array.from(document.querySelectorAll<HTMLElement>(selector));
+            const readOne = (el: HTMLElement): string | null =>
+              "value" in el ? (el as HTMLInputElement).value : (el.textContent ?? null);
+
+            if (matches.length === 0) {
               await sendResponse({
                 requestId,
                 type,
@@ -703,12 +741,51 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               });
               return true;
             }
-            const value = "value" in el ? (el as HTMLInputElement).value : (el.textContent ?? null);
+
+            if (all === true) {
+              const values = matches.map((el, i) => {
+                const v = readOne(el);
+                return { index: i, value: v, length: v?.length ?? 0 };
+              });
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: {
+                  value: values[0].value,
+                  length: values[0].length,
+                  totalMatches: matches.length,
+                  values,
+                },
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+
+            const el = matches[index ?? 0];
+            if (!el) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `Index out of range (found ${matches.length})`,
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            const value = readOne(el);
+            // `totalMatches` is always reported: a caller that read one value
+            // out of N deserves to know that rather than inferring completeness
+            // from a shape that cannot express it.
             await sendResponse({
               requestId,
               type,
               success: true,
-              data: { value, length: value?.length ?? 0 },
+              data: {
+                value,
+                length: value?.length ?? 0,
+                totalMatches: matches.length,
+              },
               timestamp: Date.now(),
             });
           } catch (err) {

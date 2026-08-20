@@ -233,6 +233,85 @@ export function applyBypassMark(
   return { tabs: next, buffered: false };
 }
 
+/**
+ * Grace window (ms) protecting a JUST-created tab from the backend re-sync.
+ *
+ * `createTerminal` appends its tab from the `terminal_create` response, and the
+ * `terminal-created` listener can append one before a concurrently-issued
+ * `terminal_list` has observed it. Dropping a tab younger than this would race
+ * those two writers and delete a live pane. 5s is far longer than the
+ * create→list round trip and far shorter than any human close-then-look loop.
+ */
+export const RESYNC_CREATE_GRACE_MS = 5_000;
+
+/**
+ * Pure: reconcile the local tab list against the BACKEND's authoritative
+ * terminal list for this page.
+ *
+ * Local tab state is otherwise write-only after boot — `reconnectToExistingSessions`
+ * seeds it once and the `terminal-created` event is the only live-ingest path.
+ * A single missed event (or a PTY removed out-of-band via `DELETE /terminals/{id}`)
+ * therefore desyncs the list PERMANENTLY: the grid renders zones for tabs that
+ * no longer exist, or renders nothing for terminals that do, and no refresh,
+ * navigation or tab switch repairs it. This is the "never let local tab state be
+ * the only source" reconciler (2026-08-20 manual-test loop, item A).
+ *
+ * Rules, in both directions:
+ *  - ADD every backend terminal with no local tab (a missed `terminal-created`).
+ *  - DROP every local terminal tab with no backend terminal (closed out-of-band),
+ *    EXCEPT plan tabs (no PTY — the backend never lists them), synthetic tabs
+ *    (test fixtures, never backed by a PTY) and tabs younger than
+ *    `graceMs` (an in-flight create the backend list predates).
+ *  - Never touch a surviving tab's fields: `claudeSessionId`, worker/bypass
+ *    marks, `isReconnecting`, `resumeFailed` etc. are owned by other writers and
+ *    a re-sync must not clobber them.
+ *
+ * Returns the SAME array reference when nothing changed, so the caller can skip
+ * a render (same contract as `applyWorkerMark` / `reconcilePages`).
+ *
+ * `backendTerminals` MUST already be filtered to this page — the caller owns
+ * that filter because it also owns the `pageId || "default"` normalization.
+ * Callers must NOT invoke this at all when the backend list could not be read:
+ * an unreadable list is INDETERMINATE, and treating it as "no terminals" would
+ * drop every tab (same distinction `reconnectToExistingSessions` draws between
+ * `[]` and `null`).
+ *
+ * Exported so the two-way reconciliation is unit-testable without React/Tauri.
+ */
+export function reconcileTabsWithBackend(
+  tabs: TerminalTab[],
+  backendTerminals: readonly TerminalInfo[],
+  now: number = Date.now(),
+  graceMs: number = RESYNC_CREATE_GRACE_MS,
+): TerminalTab[] {
+  const backendById = new Map(backendTerminals.map((t) => [t.id, t]));
+
+  const kept = tabs.filter((t) => {
+    if (backendById.has(t.id)) return true;
+    // Tabs the backend structurally cannot list.
+    if (t.type === "plan" || t.id.startsWith("plan-")) return true;
+    if (t.__synthetic) return true;
+    // An in-flight create the list snapshot predates.
+    return now - (t.createdAt ?? 0) < graceMs;
+  });
+
+  const known = new Set(kept.map((t) => t.id));
+  const added = backendTerminals
+    .filter((info) => !known.has(info.id))
+    .map<TerminalTab>((info) => ({
+      id: info.id,
+      title: info.title,
+      pid: info.pid ?? null,
+      isAlive: info.isAlive,
+      exitCode: info.exitCode ?? null,
+      workingDir: info.workingDir || undefined,
+      createdAt: info.createdAt,
+    }));
+
+  if (added.length === 0 && kept.length === tabs.length) return tabs;
+  return [...kept, ...added];
+}
+
 /** The `terminal_id -> { claudeSessionId, configDir }` shape `terminal_list`
  * returns as `sessionIdsByTerminal`, derived from the durable lifecycle
  * store. */
@@ -678,6 +757,80 @@ export function useTerminalManager(
     return () => clearInterval(timer);
   }, [reconcileClaudeSessionIds]);
 
+  /**
+   * Re-sync `tabs` against the BACKEND terminal list for this page — the
+   * "backend is the source of truth" repair path (see
+   * `reconcileTabsWithBackend`).
+   *
+   * Runs on mount, after every close, and on every `terminal-exit`, which are
+   * exactly the moments local tab state can have diverged: a `terminal-created`
+   * missed while the listener was being (re)registered, a PTY removed
+   * out-of-band by `DELETE /terminals/{id}`, or a close that raced a create.
+   * Before this, the boot reconnect was the ONLY reader of the backend list, so
+   * any divergence after boot was permanent — the grid rendered zero zones (or
+   * stale ones) and no refresh, navigation or tab switch recovered it.
+   *
+   * Best-effort and INDETERMINATE-SAFE: a failed/malformed `terminal_list` is
+   * NOT "no terminals" — we return without touching `tabs` rather than dropping
+   * every tab (the same `[]`-vs-`null` distinction `reconnectToExistingSessions`
+   * draws).
+   */
+  const resyncTabs = useCallback(async () => {
+    let terminals: TerminalInfo[] | undefined;
+    try {
+      const result = await invoke<CommandResponse>("terminal_list");
+      if (!result.success || !result.data) return; // indeterminate — leave tabs alone
+      terminals = (result.data as { terminals?: TerminalInfo[] }).terminals;
+    } catch {
+      return; // indeterminate — leave tabs alone
+    }
+    if (!Array.isArray(terminals)) return; // malformed — never read as "empty"
+
+    const mine = terminals.filter((t) => (t.pageId || "default") === pageId);
+    setTabs((prev) => {
+      const next = reconcileTabsWithBackend(prev, mine);
+      if (next === prev) return prev;
+      logger.info(
+        `Tab re-sync on page ${pageId}: ${prev.length} → ${next.length} (backend has ${mine.length})`,
+      );
+      return next;
+    });
+  }, [pageId]);
+
+  // Mount + `terminal-exit` re-sync. `terminal-created` already has its own
+  // ingest path (which this only backstops), but an EXIT — and especially an
+  // out-of-band `DELETE /terminals/{id}` — has no other reader of the backend
+  // list at all.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    // Async: its `setTabs` runs in a later microtask, never during this
+    // effect's render pass (same reasoning as `useTerminalPages`'s reconcile).
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void resyncTabs();
+
+    listen("terminal-exit", () => {
+      // Debounced: a burst of exits (window close, batch kill) collapses into
+      // one list read.
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        void resyncTabs();
+      }, 400);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+      unlisten?.();
+    };
+  }, [resyncTabs]);
+
   const createTerminal = useCallback(
     async (title?: string, workingDir?: string, tenantId?: string): Promise<string | null> => {
       try {
@@ -795,11 +948,23 @@ export function useTerminalManager(
 
     // Only invoke Rust close for terminal tabs (plan tabs have no PTY)
     if (!id.startsWith("plan-")) {
-      invoke<CommandResponse>("terminal_close", { terminalId: id }).catch(() => {
-        // Terminal may already be gone
-      });
+      invoke<CommandResponse>("terminal_close", { terminalId: id })
+        .catch(() => {
+          // Terminal may already be gone (e.g. removed out-of-band by
+          // `DELETE /terminals/{id}`) — the re-sync below is what repairs the
+          // list either way.
+        })
+        .finally(() => {
+          // Re-read the authoritative list AFTER the close settles. The
+          // optimistic local removal above is a UI-responsiveness shortcut, not
+          // a source of truth: without this, a close that raced an out-of-band
+          // delete (or that closed the last tab the frontend knew about) left
+          // the tab list permanently diverged from the backend and the grid
+          // rendered zero zones forever.
+          void resyncTabs();
+        });
     }
-  }, []);
+  }, [resyncTabs]);
 
   const renameTab = useCallback((id: string, title: string) => {
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, title } : t)));
@@ -839,6 +1004,12 @@ export function useTerminalManager(
     renameTab,
     updateTab,
     reconnectToExistingSessions,
+    /**
+     * Force a backend re-sync of the tab list (see `reconcileTabsWithBackend`).
+     * Already wired to mount / close / `terminal-exit`; exposed so an operator
+     * affordance or a future recovery path can demand one.
+     */
+    resyncTabs,
     markReconnected,
     markAsWorker,
     markAsBypass,
