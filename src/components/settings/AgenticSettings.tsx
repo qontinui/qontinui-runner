@@ -17,6 +17,7 @@ import { SectionHeader } from "./SectionHeader";
 import { getAccentColors } from "@/design-system";
 import type { AgenticSettings as AgenticSettingsType, LogFunction } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { SessionBriefingPanel } from "./SessionBriefingPanel";
 
 interface TauriResult<T> {
   success: boolean;
@@ -268,6 +269,12 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
           </span>
         </div>
       )}
+
+      {/* The system-prompt text this runner actually injects into the sessions
+          it hosts. Read-only: the source of truth is a coord prompt document
+          edited in the web console (plan
+          2026-08-20-runner-session-briefing-versioned-and-operator-editable). */}
+      <SessionBriefingPanel />
 
       {/* Memory Compression Section */}
       <div className="rounded-lg bg-card/50 overflow-hidden">

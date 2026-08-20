@@ -6123,6 +6123,7 @@ pub fn create_router(
         // routes are gated by QONTINUI_PLAN_LIBRARY_WRITE (off by default);
         // the reads are ungated and advertise the flag.
         .merge(crate::mcp::plan_library::routes())
+        .merge(crate::mcp::session_briefing::routes())
         .merge(crate::mcp::coordinator::routes())
         .merge(crate::mcp::subagent_api::routes())
         .merge(crate::mcp::completion_reports::routes())

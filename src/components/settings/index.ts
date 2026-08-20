@@ -5,6 +5,7 @@ export { AdvancedSettings } from "./AdvancedSettings";
 export { UpdateSettings } from "./UpdateSettings";
 export { AiSettings } from "./AiSettings";
 export { AgenticSettings } from "./AgenticSettings";
+export { SessionBriefingPanel } from "./SessionBriefingPanel";
 export { SelfHealingSettings } from "./SelfHealingSettings";
 export { OtelSettings } from "./OtelSettings";
 export { ContainerSettings } from "./ContainerSettings";
