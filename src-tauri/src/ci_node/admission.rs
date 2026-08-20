@@ -924,11 +924,9 @@ pub(crate) fn cancel_all_for_shutdown() {
     // (kill-on-close) is the hard backstop for the build process trees, and
     // coord's dispatch-lease sweeper covers a result that never makes it out —
     // so giving up is strictly better than overrunning the budget.
-    let Some(mut state) = crate::safe_lock::lock_with_deadline(
-        ci_state(),
-        "ci_node ci_state",
-        SHUTDOWN_LOCK_TIMEOUT,
-    ) else {
+    let Some(mut state) =
+        crate::safe_lock::lock_with_deadline(ci_state(), "ci_node ci_state", SHUTDOWN_LOCK_TIMEOUT)
+    else {
         warn!(
             "ci_node: shutdown — could not acquire ci_state within {SHUTDOWN_LOCK_TIMEOUT:?}; \
              leaving cancellation to the Job Object and coord's lease sweeper"

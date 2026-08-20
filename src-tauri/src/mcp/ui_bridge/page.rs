@@ -3289,7 +3289,10 @@ mod close_door_tests {
     #[cfg(not(windows))]
     #[test]
     fn unknown_passes_off_windows_where_no_probe_exists() {
-        assert_eq!(EventLoopVerdict::Unknown("probe_unavailable").refusal(), None);
+        assert_eq!(
+            EventLoopVerdict::Unknown("probe_unavailable").refusal(),
+            None
+        );
     }
 
     /// The `spawn_blocking` join in [`event_loop_verdict`] must have a ceiling
