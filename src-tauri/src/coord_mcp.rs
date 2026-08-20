@@ -1593,23 +1593,6 @@ pub(crate) fn proxy_principal_for_nonce(nonce: &str) -> Option<ProxyPrincipal> {
     live.or_else(|| graced_nonce_is_valid(nonce).then_some(ProxyPrincipal::Device))
 }
 
-/// The tenant a DEVICE proxy nonce was provisioned under (B3), frozen at mint
-/// time on its [`NonceBinding`]. The `/coord-mcp` proxy handler feeds this into
-/// [`crate::auth::device_bearer_for`] so it injects the SESSION's tenant's
-/// device JWT — never blindly the legacy `access_token` slot (the default
-/// binding), which is the cross-tenant split-brain B3 closes.
-///
-/// `None` means "inject the legacy default slot" (`device_bearer_for(None)`),
-/// which is correct for every case that returns it: a nonce provisioned on a
-/// single-tenant install (no active pin), a restored nonce (tenant not
-/// persisted), or a graced nonce (no live binding). A miss for a live
-/// NON-default tenant is NOT this function's concern — that is enforced inside
-/// `device_bearer_for`, which returns `None` (→ the proxy's refresh/401 path)
-/// on a non-default slot miss rather than falling back to the legacy slot.
-pub(crate) fn proxy_session_tenant_for_nonce(nonce: &str) -> Option<Uuid> {
-    live_binding(nonce).and_then(|b| b.session_pin.pinned())
-}
-
 /// The typed pin a DEVICE proxy nonce was provisioned under.
 ///
 /// A nonce with no live binding (graced, or already reaped) reads
