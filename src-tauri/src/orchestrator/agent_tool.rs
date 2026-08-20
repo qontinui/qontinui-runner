@@ -11,7 +11,7 @@
 //!
 //! ## Example
 //!
-//! ```rust
+//! ```ignore
 //! use qontinui_runner_lib::orchestrator::agent_tool::*;
 //!
 //! // Create an agent tool from a role

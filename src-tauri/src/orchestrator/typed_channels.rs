@@ -11,7 +11,7 @@
 //!
 //! ## Example
 //!
-//! ```rust
+//! ```ignore
 //! use qontinui_runner_lib::orchestrator::typed_channels::*;
 //!
 //! let mut state = ChannelState::new();

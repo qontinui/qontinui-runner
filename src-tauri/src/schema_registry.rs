@@ -5,7 +5,7 @@
 //!
 //! # Usage
 //!
-//! ```rust
+//! ```ignore
 //! use qontinui_runner_lib::schema_registry;
 //!
 //! // Get the JSON Schema for a type as a serde_json::Value

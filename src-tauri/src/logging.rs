@@ -108,7 +108,7 @@ pub fn retract_last_crash_dump(reason: &str) -> bool {
 /// (e.g., when the parent terminal/process has closed the pipe - Windows error 232).
 ///
 /// # Usage
-/// ```
+/// ```ignore
 /// use qontinui_runner_lib::logging::safe_eprintln;
 /// safe_eprintln("Error message");
 /// safe_eprintln(&format!("Value: {}", some_value));

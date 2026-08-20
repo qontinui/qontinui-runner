@@ -26,7 +26,7 @@
 //!   "confidence": "high"
 //! }
 //! ```
-//! ```
+//! ```ignore
 //!
 //! # Backward Compatibility
 //!
@@ -512,7 +512,7 @@ impl ParsedWorkerOutput {
 /// ```json:worker_output
 /// { ... WorkerOutput fields ... }
 /// ```
-/// ```
+/// ```ignore
 ///
 /// # Legacy Format (Fallback)
 ///

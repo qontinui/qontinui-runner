@@ -38,21 +38,12 @@
 //!
 //! ## Usage
 //!
-//! ```rust
-//! use qontinui_runner_lib::orchestrator::{OrchestratorRuntime, EnhancedOrchestratorConfig, ConfigPresets};
-//!
-//! // Create runtime with default config
-//! let runtime = OrchestratorRuntime::new(EnhancedOrchestratorConfig::default());
-//!
-//! // Or use presets
-//! let runtime = OrchestratorRuntime::new(ConfigPresets::production());
-//!
-//! // Initialize and run task
-//! runtime.initialize_task("task-1", "Fix all type errors")?;
-//! runtime.start_iteration()?;
-//! // ... process work ...
-//! runtime.complete_task(true, None)?;
-//! ```
+//! No example here on purpose: the one that used to sit in this spot
+//! described an `OrchestratorRuntime` / `EnhancedOrchestratorConfig` /
+//! `ConfigPresets` API that does not exist anywhere in this crate. It was
+//! never compiled, because binary crates do not run doctests, so it went
+//! unnoticed. Removed rather than tagged `ignore` — a wrong example is
+//! worse than none. See the module items below for the real surface.
 
 pub mod agent_roles;
 pub mod agent_tool;

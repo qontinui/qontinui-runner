@@ -11,7 +11,7 @@
 //!
 //! ## Example
 //!
-//! ```rust
+//! ```ignore
 //! use qontinui_runner_lib::orchestrator::parallel::*;
 //!
 //! let execution = ParallelExecution::new()

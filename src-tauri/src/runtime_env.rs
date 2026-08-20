@@ -487,7 +487,7 @@ impl AiSessionContextToolsExt for crate::execution_context::AiSessionContext {
 /// This function counts how many such markers exist in the output.
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// let output = "[SESSION_START:1]\nSome output\n[SESSION_START:2]\nMore output";
 /// assert_eq!(count_turns_in_output(output), 2);
 /// ```

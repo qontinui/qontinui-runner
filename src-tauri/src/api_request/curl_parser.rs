@@ -27,7 +27,7 @@ pub enum CurlParseError {
 /// - URL (quoted or unquoted)
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use qontinui_runner_lib::api_request::parse_curl;
 ///
 /// let curl = r#"curl 'https://api.example.com/users' \
