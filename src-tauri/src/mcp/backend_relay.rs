@@ -1454,7 +1454,7 @@ async fn run_heartbeat_sender<S>(
                 has_ui_error: ui_error_snapshot.is_some(),
                 has_recent_crash: recent_crash_snapshot.is_some(),
                 ui_dead: Some(ui_dead),
-                native_ui_wedged: Some(native_ui.wedged),
+                native_ui_wedged: native_ui.wedged,
                 embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
                 relay_connected,
                 ..Default::default()

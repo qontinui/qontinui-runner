@@ -37,6 +37,67 @@ use tracing::error;
 
 use crate::error::AppError;
 
+// ---------------------------------------------------------------------------
+// Bounded acquisition (plan 2026-08-19 Phase 2 step 5)
+// ---------------------------------------------------------------------------
+
+/// Acquire `mutex` within `budget`, recovering from poison, or give up.
+///
+/// # Why a bounded acquire exists at all
+///
+/// `Mutex::lock()` is unbounded, and on the shutdown path "unbounded" is a
+/// budget violation with a name: a writer lock held by a thread blocked on a
+/// full PTY parks the shutdown worker past its slice, and the per-session
+/// deadline check one level up (`TerminalManager::close_all`, which only tests
+/// the clock BETWEEN sessions) cannot see it happen. Phase 2 step 5 of plan
+/// `2026-08-19-runner-blocked-ui-thread-cannot-be-closed` names these sites.
+///
+/// # Two properties, deliberately together
+///
+/// * **Bounded** — polls `try_lock` until `budget` is spent, then reports
+///   `None`. The caller decides what "could not acquire" means; on a teardown
+///   path it is almost always "skip this step, the process exit reaps it".
+/// * **Poison-recovering** — a thread that panicked while holding the lock must
+///   not silently turn a cleanup step into a no-op, which is precisely what a
+///   bare `if let Ok(g) = m.lock()` does. The data behind these locks is
+///   usable for what teardown does with it.
+///
+/// A zero budget still makes exactly one attempt: the overwhelmingly common
+/// case is an uncontended lock, and refusing to try would skip cleanup that
+/// costs nanoseconds.
+pub fn lock_with_deadline<'a, T>(
+    mutex: &'a Mutex<T>,
+    name: &str,
+    budget: std::time::Duration,
+) -> Option<MutexGuard<'a, T>> {
+    /// Short enough that the wait is dominated by the budget, long enough not
+    /// to spin a core while the holder finishes.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            // Poisoned: the data is still what teardown needs. Recover rather
+            // than skipping the step.
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                error!(
+                    "Mutex '{}' was poisoned by a panicked thread — recovering the guard \
+                     rather than skipping this step",
+                    name
+                );
+                return Some(p.into_inner());
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+    }
+}
+
 /// Safely acquire a Mutex lock, returning an error instead of panicking on poison.
 ///
 /// # Arguments

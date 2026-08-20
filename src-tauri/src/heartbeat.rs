@@ -100,8 +100,11 @@ impl From<crate::crash_dumps::RecentCrash> for HeartbeatRecentCrash {
 /// than absent) so consumers can assume the shape.
 #[derive(Debug, Clone, Serialize)]
 struct HeartbeatUiThread {
-    /// The verdict that fed `derived_status`.
-    wedged: bool,
+    /// The verdict that fed `derived_status`. **Tri-state**: `null` = UNKNOWN
+    /// (nothing was established — non-Windows, no cached HWND yet, monitor
+    /// stopped), which is NOT the same claim as `false` ("a round trip came
+    /// back"). See `ui_error::NativeUiLiveness::wedged`.
+    wedged: Option<bool>,
     /// `"pumping" | "unknown" | "native_probe_wedged" |
     /// "window_getter_unresponsive" | "events_undelivered"`.
     reason: &'static str,
@@ -258,7 +261,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     has_ui_error: ui_error_snapshot.is_some(),
                     has_recent_crash: recent_crash_snapshot.is_some(),
                     ui_dead: Some(ui_dead),
-                    native_ui_wedged: Some(native_ui.wedged),
+                    native_ui_wedged: native_ui.wedged,
                     embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
                     relay_connected,
                     ..Default::default()
@@ -677,7 +680,15 @@ mod tests {
         let json = serde_json::to_value(HeartbeatUiThread::from(native)).expect("serializes");
         assert_eq!(json["probe_wedged"], serde_json::Value::Null);
         assert_eq!(json["event_pong_age_ms"], serde_json::Value::Null);
-        assert_eq!(json["wedged"], serde_json::Value::Bool(false));
+        // FINDING 7: `wedged` is tri-state on the wire too. This used to
+        // assert `false` — the runner asserting "not wedged" about a fact it
+        // never established, on the one path by which a wedged UI thread is
+        // visible off-box.
+        assert_eq!(
+            json["wedged"],
+            serde_json::Value::Null,
+            "UNKNOWN must publish as null, not as a not-wedged claim"
+        );
         assert_eq!(json["reason"], "unknown");
     }
 }

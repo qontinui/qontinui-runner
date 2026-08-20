@@ -472,7 +472,7 @@ async fn diagnostic_screenshot(
     }
 }
 
-/// Bounded `is_visible()` for `/health`.
+/// Bounded, single-flight `is_visible()` for `/health`.
 ///
 /// `WebviewWindow::is_visible()` looks like a field read and is not: it posts
 /// to the tao event loop and blocks the caller on `rx.recv()` with **no
@@ -486,24 +486,159 @@ async fn diagnostic_screenshot(
 /// and `num_cpus` concurrent polls of it would have silenced the whole HTTP
 /// surface.
 ///
-/// Same shape as `window_probe::inner_size`, and it reuses that module's
-/// `WINDOW_GETTER_TIMEOUT` and error type so the two surfaces cannot drift
-/// about what "wedged" means. `Ok(None)` = the loop answered but the getter
-/// itself failed — the benign case the bare `.ok()` already produced;
+/// # The timeout alone LEAKED A THREAD PER POLL — pre-PR review finding 3
+///
+/// `tokio::time::timeout(_, handle)` bounds *this* `await`; it does **not**
+/// cancel the blocking task. The closure stays parked on tauri's untimed
+/// `getter!` → `rx.recv()` until the event loop resumes, so a wedge leaked one
+/// blocking thread per poll: measured at ~1 per 3 s of wedge per poller, i.e.
+/// ~25 min of continuous wedge to exhaust tokio's 512-thread default. Past
+/// that every `spawn_blocking` in the process queues and a UI-thread wedge
+/// becomes a full backend wedge — and `/health` is the hottest caller in the
+/// process (the supervisor and the fleet both poll it).
+///
+/// Two changes close it, in order of cheapness:
+///
+/// 1. **Do not ask at all when the answer is already known.** The health
+///    monitor's own OS thread maintains a latched verdict over
+///    `WEDGE_FAILURE_THRESHOLD` consecutive samples; read through
+///    `ui_error::native_ui_probe_verdict()` (the same guarded reader every
+///    `derived_status` sink uses, so the two cannot disagree). A latched wedge
+///    is *better* evidence than a fresh sample — it already survived the noise
+///    floor — and costs an atomic load.
+/// 2. **Single-flight the rest.** At most one getter is ever outstanding — for
+///    the whole duration of a wedge, not per caller. The slot is released by
+///    the BLOCKING CLOSURE when the getter actually returns, **never** when
+///    this `await` gives up: releasing on timeout would free the slot while
+///    the thread is still parked, and the next poll 3 s later would issue
+///    another, which is the leak verbatim.
+///
+/// So a wedge costs exactly ONE parked blocking thread in total, and it is
+/// reclaimed the moment the loop resumes and the getter returns. There is
+/// deliberately no expiry on the claim: while the getter is still parked the
+/// honest answer really is "the loop is not answering", and manufacturing a
+/// fresh probe would only add a second parked thread to prove the same thing.
+///
+/// # A coalesced caller WAITS; it does not report "fine"
+///
+/// The first cut of this returned a distinct `Coalesced` result immediately,
+/// and the 2026-08-20 runtime gate caught what that costs: mid-wedge samples
+/// alternated `errored` / **`healthy`**, because a coalesced sample reports no
+/// getter timeout and the wedge latch has not yet fired in the first ~15 s. A
+/// health endpoint that answers "healthy" every other poll during a hang is
+/// worse than a slow one.
+///
+/// So a caller that finds a getter outstanding waits out the REMAINDER of that
+/// getter's bound — no new thread, same total latency as before — and then:
+///
+/// * still outstanding ⇒ `EventLoopUnresponsive`. A getter parked past its
+///   ceiling IS the evidence; this is the identical verdict, at the identical
+///   moment, that this caller's own getter would have produced.
+/// * released while we waited ⇒ the loop answered inside the bound, so it is
+///   pumping. We do not have *that* getter's value and it is not worth a
+///   second round trip, so this reports `Ok(None)` — "the loop answered, the
+///   getter did not give us a value", the pre-existing benign arm.
+///
+/// `Ok(None)` = the loop answered but the getter itself failed — the benign
+/// case the bare `.ok()` already produced;
 /// `Err(EventLoopUnresponsive)` = the loop did not answer, which `/health`
-/// surfaces to the caller (`screenshots.rs`'s `:399` arm, not the `:221` one
-/// that warns and carries on with `None`).
+/// surfaces to the caller.
 async fn bounded_window_visible(
     window: &tauri::WebviewWindow,
 ) -> Result<Option<bool>, crate::mcp::ui_bridge::window_probe::WindowProbeError> {
     use crate::mcp::ui_bridge::window_probe::{WindowProbeError, WINDOW_GETTER_TIMEOUT};
+
+    // (1) Already-known wedge: skip the getter entirely.
+    if crate::ui_error::native_ui_probe_verdict() == Some(true) {
+        return Err(WindowProbeError::EventLoopUnresponsive);
+    }
+
+    // (2) Single-flight, with the wait described above.
+    if !window_getter_try_claim() {
+        let outstanding = window_getter_outstanding_for();
+        if outstanding >= WINDOW_GETTER_TIMEOUT {
+            warn!(
+                outstanding_ms = outstanding.as_millis() as u64,
+                "/health: a window-visibility getter has been parked past its bound — the \
+                 native UI thread is not pumping (not issuing another)"
+            );
+            return Err(WindowProbeError::EventLoopUnresponsive);
+        }
+        tokio::time::sleep(WINDOW_GETTER_TIMEOUT - outstanding).await;
+        return if window_getter_outstanding_for().is_zero() {
+            // It came back inside the bound: the loop is pumping. No value,
+            // but no wedge either.
+            Ok(None)
+        } else {
+            warn!(
+                "/health: the outstanding window-visibility getter did not return within its \
+                 bound — the native UI thread is not pumping"
+            );
+            Err(WindowProbeError::EventLoopUnresponsive)
+        };
+    }
+
     let window = window.clone();
-    let handle = tokio::task::spawn_blocking(move || window.is_visible().ok());
+    let handle = tokio::task::spawn_blocking(move || {
+        let visible = window.is_visible().ok();
+        // Released HERE, by the thread that was parked — not by the awaiting
+        // task. See the single-flight note above: this is the whole fix.
+        window_getter_release();
+        visible
+    });
     match tokio::time::timeout(WINDOW_GETTER_TIMEOUT, handle).await {
         Ok(Ok(visible)) => Ok(visible),
-        Ok(Err(join_err)) => Err(WindowProbeError::TaskFailed(join_err.to_string())),
+        Ok(Err(join_err)) => {
+            // The task panicked or was cancelled, so its release never ran.
+            // Free the slot from here or the next poll (and every poll after
+            // it, forever) reports a wedge that is not happening.
+            window_getter_release();
+            Err(WindowProbeError::TaskFailed(join_err.to_string()))
+        }
+        // NOTE: no release on this arm, deliberately. The blocking task is
+        // still parked on tauri's untimed `getter!`; the slot is its to free.
         Err(_elapsed) => Err(WindowProbeError::EventLoopUnresponsive),
     }
+}
+
+/// Wall-clock ms at which the one outstanding window getter was issued; `0` =
+/// none outstanding. See [`bounded_window_visible`] for the contract.
+static WINDOW_GETTER_INFLIGHT_SINCE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn window_getter_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Claim the single-flight slot. `false` = a getter is already outstanding.
+fn window_getter_try_claim() -> bool {
+    // `.max(1)` because `0` is the free sentinel.
+    let now = window_getter_now_ms().max(1);
+    WINDOW_GETTER_INFLIGHT_SINCE_MS
+        .compare_exchange(
+            0,
+            now,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+}
+
+/// Release the slot. Idempotent.
+fn window_getter_release() {
+    WINDOW_GETTER_INFLIGHT_SINCE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// How long the outstanding getter has been in flight; zero if none is.
+fn window_getter_outstanding_for() -> std::time::Duration {
+    let since = WINDOW_GETTER_INFLIGHT_SINCE_MS.load(std::sync::atomic::Ordering::SeqCst);
+    if since == 0 {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_millis(window_getter_now_ms().saturating_sub(since))
 }
 
 /// Health check endpoint (also served at `/ui-bridge/health` and
@@ -734,7 +869,7 @@ async fn health(
         has_ui_error: ui_error_snapshot.is_some(),
         has_recent_crash: recent_crash_snapshot.is_some(),
         ui_dead: Some(ui_dead),
-        native_ui_wedged: Some(native_ui.wedged),
+        native_ui_wedged: native_ui.wedged,
         embedding_reachable: embedding_reachable_cached(),
         pg_reachable,
         relay_connected,
@@ -7174,6 +7309,117 @@ pub async fn start_server(
     Err(Box::new(last_error.unwrap_or_else(|| {
         std::io::Error::other("All ports failed")
     })))
+}
+
+/// FINDING 3 — `/health` must not leak a tokio blocking thread per poll for
+/// the whole duration of a UI-thread wedge.
+///
+/// `tokio::time::timeout(_, handle)` bounds the await, not the task: the
+/// closure stays parked on tauri's untimed `getter!` until the loop resumes.
+/// Measured at ~1 leaked thread per 3s of wedge per poller, i.e. ~25 minutes
+/// of continuous wedge to exhaust tokio's 512-thread default — after which
+/// every `spawn_blocking` in the process queues and a UI-thread wedge becomes
+/// a full backend wedge.
+#[cfg(test)]
+mod window_getter_single_flight_tests {
+    use super::{
+        window_getter_outstanding_for, window_getter_release, window_getter_try_claim,
+        WINDOW_GETTER_INFLIGHT_SINCE_MS,
+    };
+    use std::sync::atomic::Ordering;
+
+    /// One claim at a time, and — the load-bearing half — the claim is NOT
+    /// freed by a caller giving up. A slot released on timeout would let the
+    /// next poll issue another getter, which is the leak verbatim.
+    #[test]
+    fn at_most_one_getter_is_outstanding_and_only_its_own_completion_frees_it() {
+        let previous = WINDOW_GETTER_INFLIGHT_SINCE_MS.swap(0, Ordering::SeqCst);
+
+        assert!(window_getter_try_claim(), "the first caller must win");
+        assert!(
+            !window_getter_try_claim(),
+            "a concurrent poller must NOT issue a second getter — that is the leak"
+        );
+        assert!(
+            !window_getter_try_claim(),
+            "…and every poller after it, for as long as the getter is parked"
+        );
+
+        // Only the blocking closure's own release frees the slot.
+        window_getter_release();
+        assert!(
+            window_getter_try_claim(),
+            "once the getter actually returned, the next poll may probe again"
+        );
+
+        window_getter_release();
+        WINDOW_GETTER_INFLIGHT_SINCE_MS.store(previous, Ordering::SeqCst);
+    }
+
+    /// A coalescing caller must resolve to a REAL answer, never to a third
+    /// "no verdict" outcome.
+    ///
+    /// The first cut of the single-flight guard returned its own
+    /// `WindowProbeError::Coalesced`, which `/health` mapped to "no getter
+    /// timeout". The 2026-08-20 runtime gate then showed mid-wedge samples
+    /// alternating `errored` / **`healthy`**, because the wedge latch has not
+    /// fired in the first ~15s and the coalesced sample contributed no
+    /// evidence. A coalescing caller now waits out the remainder of the
+    /// outstanding getter's bound and reports whichever of the two real
+    /// answers that establishes.
+    ///
+    /// Pinned as a SHAPE assertion because the alternative is an async test
+    /// that has to win a race with a 3s timer: `WindowProbeError` must carry
+    /// no "I did not look" variant for the mapping to fall back into.
+    #[test]
+    fn a_coalesced_probe_has_no_third_no_verdict_outcome() {
+        use crate::mcp::ui_bridge::window_probe::WindowProbeError;
+        // Exhaustive match: adding a variant breaks this on purpose.
+        fn is_a_real_answer(e: &WindowProbeError) -> bool {
+            match e {
+                WindowProbeError::EventLoopUnresponsive => true,
+                WindowProbeError::TaskFailed(_) => true,
+            }
+        }
+        assert!(is_a_real_answer(&WindowProbeError::EventLoopUnresponsive));
+        assert!(is_a_real_answer(&WindowProbeError::TaskFailed("x".into())));
+    }
+
+    /// The age of the outstanding claim is what turns "coalesced" into
+    /// "event_loop_unresponsive": a getter parked past its bound IS the
+    /// evidence, and reporting it costs no new thread.
+    #[test]
+    fn the_outstanding_age_is_zero_when_free_and_grows_while_claimed() {
+        let previous = WINDOW_GETTER_INFLIGHT_SINCE_MS.swap(0, Ordering::SeqCst);
+
+        assert_eq!(
+            window_getter_outstanding_for(),
+            std::time::Duration::ZERO,
+            "no claim ⇒ no age"
+        );
+
+        // A claim stamped in the past reads as old — this is the branch that
+        // answers `event_loop_unresponsive` without issuing a probe.
+        let long_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 30_000;
+        WINDOW_GETTER_INFLIGHT_SINCE_MS.store(long_ago, Ordering::SeqCst);
+        assert!(
+            window_getter_outstanding_for() >= std::time::Duration::from_secs(29),
+            "a claim stamped 30s ago must read as ~30s outstanding"
+        );
+        assert!(
+            window_getter_outstanding_for()
+                >= crate::mcp::ui_bridge::window_probe::WINDOW_GETTER_TIMEOUT,
+            "…and therefore past the bound, which is the unresponsive verdict"
+        );
+
+        window_getter_release();
+        assert_eq!(window_getter_outstanding_for(), std::time::Duration::ZERO);
+        WINDOW_GETTER_INFLIGHT_SINCE_MS.store(previous, Ordering::SeqCst);
+    }
 }
 
 /// Nonce-gated claims read passthrough (plan
