@@ -208,10 +208,11 @@ struct NonceBinding {
     /// adopt (neither persisted form carries a terminal). Those keep the
     /// workdir leg as their fallback. Read via [`terminal_id_for_nonce`].
     terminal_id: Option<String>,
-    /// Wall-clock time this binding entered the live registry — mint, adopt, or
-    /// boot restore alike. **Not** a credential property: nothing checks it to
-    /// decide validity (a Persistent nonce has no expiry, deliberately), and it
-    /// is never persisted.
+    /// Wall-clock time this binding was MINTED — its true age, carried across
+    /// restarts by [`crate::secure_storage::StoredNonceBinding::minted_at_unix`]
+    /// rather than reset at every boot. **Not** a credential property: nothing
+    /// checks it to decide validity (a Persistent nonce has no expiry,
+    /// deliberately).
     ///
     /// Its one job is to give [`device_nonce_snapshot`]'s bound a total,
     /// oldest-first eviction order. Before that bound existed, the persisted
@@ -226,11 +227,25 @@ struct NonceBinding {
     /// an encrypted store that is fully re-encrypted and rewritten on every
     /// mint, and an unbounded set of eternally-valid loopback keys.
     ///
-    /// A restored binding is stamped at RESTORE time, not at its original mint:
-    /// the store carries no timestamp, so all of one boot's restored bindings
-    /// tie and the bound falls back to its `nonce`-string tiebreak among them.
-    /// That is honest (their true ages are unrecoverable) and self-correcting
-    /// (every later mint sorts strictly newer).
+    /// A restored binding carries its PERSISTED mint time. It has to: stamping
+    /// the restore instant instead made every restored binding tie, so the
+    /// moment the restored pool alone exceeded the cap the "oldest-first" cut
+    /// fell entirely to the `nonce`-string tiebreak — a uniformly random pick
+    /// over hex strings, across a pool that mixes long-dead terminals with
+    /// sessions alive right now that survived the restart. That is precisely
+    /// the live-session orphaning the cap exists to prevent, and it engaged
+    /// exactly when the cap did.
+    ///
+    /// A binding whose store entry predates the timestamp field (a pre-Phase-4
+    /// bare string, or a modern entry written before the widening) restores as
+    /// [`std::time::SystemTime::UNIX_EPOCH`]: its true age is unrecoverable,
+    /// but it is certainly older than anything a timestamp-writing binary
+    /// minted, so ordering it OLDEST is the honest reading — and, unlike a
+    /// `now()` fallback, it does not promote unknown-age cruft above live
+    /// sessions. Such entries tie among themselves and still fall to the nonce
+    /// tiebreak; that residue is bounded to the one-time upgrade window,
+    /// because every subsequent snapshot persists a real time for every
+    /// binding minted since.
     minted_at: std::time::SystemTime,
 }
 
@@ -578,7 +593,17 @@ pub(crate) fn remove_agent_token(agent_id: Uuid) {
 /// Guards [`restore_proxy_nonces_from_store`] so a second boot-restore (e.g. an
 /// idempotent auto-start re-invocation) never re-loads over live in-memory
 /// nonces minted since the first restore.
+///
+/// Set ONLY on a call that actually reached the restore — a
+/// persistence-disabled call must not burn it (see
+/// [`PROXY_NONCES_RESTORE_DISABLED_LOGGED`]).
 static PROXY_NONCES_RESTORED: OnceLock<()> = OnceLock::new();
+
+/// One-shot for the persistence-DISABLED arm's aggregate `restore` line, held
+/// separately from [`PROXY_NONCES_RESTORED`] so the two properties do not fight:
+/// the log stays one-line-per-process-per-outcome, while a disabled call leaves
+/// the actual restore still available to a later enabled one.
+static PROXY_NONCES_RESTORE_DISABLED_LOGGED: OnceLock<()> = OnceLock::new();
 
 fn proxy_nonces() -> &'static Mutex<HashMap<String, NonceBinding>> {
     PROXY_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1147,6 +1172,13 @@ pub(crate) fn spawn_log_proxy_nonce_rejected(nonce: Option<&str>, cause: impl In
 ///   the nonce string so the emitted map is deterministic — `enqueue_nonce_persist`
 ///   compares snapshots for equality to skip no-op writes, and a
 ///   nondeterministic cut would rewrite the encrypted store on every mint.
+///   The age is itself persisted
+///   ([`crate::secure_storage::StoredNonceBinding::minted_at_unix`]), which is
+///   what makes "oldest" mean anything after a restart: stamping restored
+///   bindings with the restore instant made them all tie, so at the exact
+///   moment the cap first engaged the cut degenerated into a random pick over
+///   hex nonce strings — able to drop a live session's credential in favour of
+///   a long-dead terminal's.
 /// * It is the whole persisted surface: `device_nonce_snapshot` is the single
 ///   producer of the stored shape, so nothing can route around the bound.
 ///
@@ -1162,10 +1194,13 @@ fn device_nonce_snapshot(
         .filter(|(_, b)| b.principal == ProxyPrincipal::Device && !b.lifetime.is_ephemeral())
         .collect();
     if eligible.len() > MAX_PERSISTED_DEVICE_NONCES {
-        // Newest first, then keep the head. The `nonce` tiebreak makes the cut
-        // total and deterministic — a boot restore stamps every restored
-        // binding with the same `minted_at`, so ties are the normal case, not
-        // an edge.
+        // Newest first, then keep the head. Ages are real — a restored binding
+        // carries its PERSISTED mint time, not the restore instant — so this
+        // orders by true age across restarts. The `nonce` tiebreak makes the
+        // cut total and deterministic for the residual ties: two mints inside
+        // one second, and the unknown-age entries a pre-timestamp store
+        // restores at `UNIX_EPOCH` (which tie at the OLDEST end, so they are
+        // cut before any dated binding).
         eligible.sort_by(|(na, a), (nb, b)| b.minted_at.cmp(&a.minted_at).then_with(|| na.cmp(nb)));
         let dropped = eligible.len() - MAX_PERSISTED_DEVICE_NONCES;
         eligible.truncate(MAX_PERSISTED_DEVICE_NONCES);
@@ -1183,6 +1218,12 @@ fn device_nonce_snapshot(
                 crate::secure_storage::StoredNonceBinding {
                     workdir: b.workdir.clone(),
                     terminal_id: b.terminal_id.clone(),
+                    // The age goes to disk, so the next boot's eviction order is
+                    // by TRUE age instead of a restore-instant tie. An
+                    // unknown-age binding (restored at `UNIX_EPOCH`) re-emits as
+                    // `Some(0)`, which reads back as the same sentinel — unknown
+                    // stays unknown-and-oldest, never laundered into "just now".
+                    minted_at_unix: Some(minted_at_to_unix(b.minted_at)),
                 },
             )
         })
@@ -1192,14 +1233,59 @@ fn device_nonce_snapshot(
 /// How many device bindings [`device_nonce_snapshot`] will persist. See that
 /// function for why the bound lives at the snapshot rather than at revoke time.
 ///
-/// Sized well above any real working set — the heaviest measured box runs ~9
-/// concurrent sessions and the persist debounce exists because a boot can
-/// restore ~40 panes at once — so an operator never meets it, while the store
-/// stays bounded at roughly 256 × ~150 B ≈ 38 KB of nonce entries (the whole
-/// `auth_tokens.enc` was 9 KB before this). A cap the working set can reach
-/// would silently orphan live sessions across a restart, which is the failure
-/// this whole plan is about; a cap it cannot reach only bounds the pathology.
+/// **The bound is against CUMULATIVE terminal spawns, not the concurrent
+/// working set.** Nothing reaps the persisted set: `revoke_proxy_nonce` has no
+/// production caller, terminal close revokes nothing, and a persistent binding
+/// is evicted only by a re-mint for its own `(workdir, terminal_id)` slot —
+/// and terminal ids are per-PTY, so a slot is never reused. Every terminal ever
+/// spawned therefore adds one entry that lives forever. Sizing this against
+/// concurrency (~9 sessions on the heaviest measured box) would be sizing
+/// against the wrong quantity: at that rate 256 CUMULATIVE spawns is weeks, not
+/// never. **An operator on a long-lived install WILL meet this cap.**
+///
+/// What the cap guarantees, given persisted ages
+/// ([`crate::secure_storage::StoredNonceBinding::minted_at_unix`]): what it
+/// drops is the genuinely oldest — bindings minted furthest in the past, which
+/// on a box where sessions come and go are overwhelmingly dead terminals — and
+/// never a newer binding in favour of an older one. It cannot 401 anything in
+/// this process (the live map is untouched); it only decides what is still
+/// there after the NEXT restart. Without persisted ages this same cut was a
+/// coin flip over hex strings that could drop a live session's credential to
+/// keep a year-old dead terminal's, which is the orphaning the plan is about.
+///
+/// The size itself buys headroom, not immunity: 256 × ~150 B ≈ 38 KB of nonce
+/// entries in a store that was 9 KB before any of this, re-encrypted and
+/// rewritten on every mint. Higher costs store size and rewrite cost on a hot
+/// path for bindings that are almost all dead; lower shortens the time to the
+/// first eviction of something still useful.
 const MAX_PERSISTED_DEVICE_NONCES: usize = 256;
+
+/// [`NonceBinding::minted_at`] → the persisted form: whole seconds since the
+/// Unix epoch (see
+/// [`crate::secure_storage::StoredNonceBinding::minted_at_unix`] for why that
+/// form). A clock reading before the epoch — only reachable via a badly wrong
+/// system clock — collapses to `0`, i.e. "unknown, therefore oldest", rather
+/// than panicking on the persist path.
+fn minted_at_to_unix(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The persisted age → [`NonceBinding::minted_at`]. `None` (an entry written
+/// before the field existed, or a pre-Phase-4 bare string) becomes
+/// `UNIX_EPOCH`, which sorts OLDEST — the honest reading of "age unrecoverable,
+/// but certainly older than anything a timestamp-writing binary minted". A
+/// value so large it overflows `SystemTime` (corrupt store) lands on the same
+/// sentinel rather than panicking on the boot path.
+fn minted_at_from_unix(secs: Option<u64>) -> std::time::SystemTime {
+    match secs {
+        Some(s) => std::time::SystemTime::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(s))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        None => std::time::SystemTime::UNIX_EPOCH,
+    }
+}
 
 /// True unless `COORD_MCP_PERSIST_NONCES` is explicitly set to `0` — persistence
 /// is ON by default (resolved in the plan: the nonce is a loopback-only key, so
@@ -1411,20 +1497,41 @@ fn persist_proxy_nonces_with_store(
 /// practice — the persisted set predates this process). No-op when persistence
 /// is disabled. Wire this into the same startup path as the other auto-start
 /// tasks so already-written `.mcp.json` nonces keep validating post-restart.
-/// Returns the number of nonces in the live registry after the restore merge
-/// (0 when persistence is disabled, storage is unavailable, or nothing was
-/// persisted). The count is surfaced by the boot task (plan 2026-07-07 Change 2
-/// observability) so a future silent rotation — restore brought back 0 then
-/// self-heal had to mint fresh — is visible in the logs.
+/// Returns the number of nonces in the live registry after the restore merge —
+/// always **0** when persistence is disabled (on every call, not just the
+/// first), and 0 when storage is unavailable or nothing was persisted. The
+/// count is surfaced by the boot task (plan 2026-07-07 Change 2 observability)
+/// so a future silent rotation — restore brought back 0 then self-heal had to
+/// mint fresh — is visible in the logs.
+///
+/// "Run-once" is scoped to the arms that actually restore: a
+/// persistence-disabled call is a no-op that leaves the restore still
+/// available, so flipping `COORD_MCP_PERSIST_NONCES` on mid-process and calling
+/// again works. Each outcome still logs exactly one aggregate `restore` line
+/// per process.
 pub(crate) fn restore_proxy_nonces_from_store() -> usize {
-    // The run-once guard comes FIRST, ahead of every arm including the
-    // persistence-disabled one, so this function emits exactly ONE `restore`
-    // line per process on every path. It used to sit after the disabled check,
-    // which gave the stream two opposite defects at once: repeated calls with
-    // persistence off logged a `restore` line EVERY time (an aggregate line
-    // that cannot be attributed to a caller — see `log_restore_event`), while
-    // repeated calls with persistence ON logged nothing at all. One line per
-    // process, always, is what makes "did the boot restore run?" answerable.
+    // The persistence-disabled arm gets its OWN one-shot rather than consuming
+    // the restore guard. Both properties matter and they are not the same
+    // property:
+    //
+    //   * exactly ONE aggregate `restore` line per process per outcome — an
+    //     aggregate line cannot be attributed to a caller (see
+    //     `log_restore_event`), so repeating it on every call poisons the
+    //     stream. That is what the one-shots buy.
+    //   * a disabled call must not BURN the restore. Consuming
+    //     `PROXY_NONCES_RESTORED` here would mean a process that flips
+    //     `COORD_MCP_PERSIST_NONCES` on after a disabled call can never
+    //     restore at all, and would also make a second disabled call return
+    //     the live map size — contradicting this function's own "returns 0 when
+    //     persistence is disabled" contract. No caller does either today; a
+    //     guard that is wrong only for callers that do not exist yet is still
+    //     wrong, and costs one `OnceLock` to make right.
+    if !nonce_persistence_enabled() {
+        if PROXY_NONCES_RESTORE_DISABLED_LOGGED.set(()).is_ok() {
+            log_restore_event(0, 0, "persistence disabled (COORD_MCP_PERSIST_NONCES=0)");
+        }
+        return 0;
+    }
     if PROXY_NONCES_RESTORED.set(()).is_err() {
         // Already restored once this process — report the current live size so a
         // duplicate boot-task run still logs a coherent count.
@@ -1432,10 +1539,6 @@ pub(crate) fn restore_proxy_nonces_from_store() -> usize {
             .lock()
             .expect("proxy nonce map poisoned")
             .len();
-    }
-    if !nonce_persistence_enabled() {
-        log_restore_event(0, 0, "persistence disabled (COORD_MCP_PERSIST_NONCES=0)");
-        return 0;
     }
     let store = match crate::secure_storage::SecureStorage::new() {
         Ok(s) => s,
@@ -1548,9 +1651,16 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
                 // pre-Phase-4 store and a genuinely terminal-less binding
                 // restore as.
                 terminal_id: binding.terminal_id,
-                // Stamped at RESTORE, not at the original mint — the store
-                // carries no timestamp. See [`NonceBinding::minted_at`].
-                minted_at: std::time::SystemTime::now(),
+                // The TRUE mint time, from the store. Stamping the restore
+                // instant here (what this did before) made every restored
+                // binding tie, so the persisted-set cap's oldest-first cut fell
+                // entirely to the nonce-string tiebreak the moment the restored
+                // pool alone exceeded the cap — a random pick that could drop a
+                // live session's credential and keep a dead terminal's. An
+                // entry with no persisted age (pre-widening store) lands on
+                // `UNIX_EPOCH` and sorts OLDEST. See
+                // [`minted_at_from_unix`] and [`NonceBinding::minted_at`].
+                minted_at: minted_at_from_unix(binding.minted_at_unix),
             });
             if vacant {
                 inserted += 1;
@@ -2699,8 +2809,13 @@ pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
 /// write (one producer, no second shape to drift), and [`write_mcp_json`] still
 /// logs the `write` rotation line carrying the (unchanged) key prefix, so the
 /// forensics stream shows the rewrite without showing a rotation.
-fn rewrite_root_config_preserving_nonce(workdir: &str, bound_port: u16, nonce: &str) {
-    write_mcp_json(workdir, &coord_mcp_proxy_config_json(bound_port, nonce));
+///
+/// Returns whether the file was ACTUALLY written (a permission failure is
+/// warned about and swallowed by [`write_mcp_json`]), so a caller that reports
+/// the rewrite in its own forensics line reports what happened rather than what
+/// it intended.
+fn rewrite_root_config_preserving_nonce(workdir: &str, bound_port: u16, nonce: &str) -> bool {
+    write_mcp_json(workdir, &coord_mcp_proxy_config_json(bound_port, nonce))
 }
 
 /// THE coord-mcp proxy config document — the single writer of this JSON shape
@@ -2890,7 +3005,11 @@ pub(crate) fn probe_and_breadcrumb_proxy(workdir: &str, port: u16) {
 /// the boot root/session reconcile also provision through this writer. The
 /// compensating hardening: the write is owner-only (Task 6), so a leftover
 /// file is at least never world-readable.
-fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) {
+///
+/// Returns whether the write SUCCEEDED. Most callers ignore it (a failed write
+/// already warns, and there is no recovery), but the boot self-heal reports the
+/// rewrite in its own forensics line and must not assert one that never landed.
+fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) -> bool {
     let mcp_path = Path::new(primary_wt).join(".mcp.json");
     match crate::fs_perms::write_owner_only(
         &mcp_path,
@@ -2919,12 +3038,14 @@ fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) {
                 &key,
                 ".mcp.json rewritten (proxy shape)",
             );
+            true
         }
         Err(e) => {
             warn!(
                 "coord_mcp: failed to write .mcp.json in {}: {e}",
                 primary_wt
             );
+            false
         }
     }
 }
@@ -3668,8 +3789,8 @@ fn qontinui_root_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Re-register an EXISTING on-disk proxy nonce string into the live registry as
-/// a Device binding for `workdir`, WITHOUT minting a new nonce or rewriting the
-/// file (plan 2026-07-07-coord-mcp-nonce-survives-runner-restart, Change 1).
+/// a Device binding for `workdir`, WITHOUT minting a new nonce
+/// (plan 2026-07-07-coord-mcp-nonce-survives-runner-restart, Change 1).
 /// This is the restart-resilient self-heal: when the root `.mcp.json` proxy port
 /// still matches but its nonce was evicted / never restored, adopting the exact
 /// on-disk string keeps a live MCP client's CACHED nonce validating across the
@@ -3679,7 +3800,19 @@ fn qontinui_root_dir() -> Option<std::path::PathBuf> {
 /// the adoption itself survives the NEXT restart. DEVICE binding only — this
 /// path is never reached for an agent config (a static-bearer shape has no proxy
 /// URL, so [`read_proxy_port`] returns `None` and the resolver leaves it).
-fn adopt_on_disk_nonce(workdir: &str, nonce: &str) {
+///
+/// `file_rewritten` says whether the caller ALREADY rewrote `.mcp.json` while
+/// adopting — which the `AdoptNonce` arm of [`reconcile_root_config_at`] does
+/// whenever the on-disk file still carries the legacy header-only shape (the
+/// nonce is re-emitted verbatim, so the cached-nonce contract is untouched;
+/// what changes is the header shape the NEXT client reads). It exists only to
+/// keep the `adopt` forensics line's cause TRUE: this function used to assert
+/// "no file rewrite" unconditionally, which became the opposite of what
+/// happened the moment the header upgrade was folded into that arm. A cause
+/// string that contradicts the action is worse than no cause string — the
+/// adjacent `write` line makes the stream reconstructable, but only if the
+/// reader does not trust the cause.
+fn adopt_on_disk_nonce(workdir: &str, nonce: &str, file_rewritten: bool) {
     let (snapshot, evicted) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         // Persistent AND terminal-less only — an adopted nonce came from a
@@ -3738,7 +3871,12 @@ fn adopt_on_disk_nonce(workdir: &str, nonce: &str) {
         "adopt",
         workdir,
         nonce,
-        "re-registered the on-disk `.mcp.json` nonce (no file rewrite)",
+        if file_rewritten {
+            "re-registered the on-disk `.mcp.json` nonce (file REWRITTEN to \
+             upgrade the legacy header shape; same nonce re-emitted verbatim)"
+        } else {
+            "re-registered the on-disk `.mcp.json` nonce (no file rewrite)"
+        },
     );
     persist_proxy_nonces(&snapshot);
 }
@@ -3783,10 +3921,12 @@ fn read_static_authorization_presence(config_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// True iff the root `.mcp.json` at `root_dir` needs SOME self-heal action
-/// (adopt-nonce or rewrite) for the current `bound_port`. Returns `false` (leave
+/// True iff the root `.mcp.json` at `root_dir` needs SOME self-heal action —
+/// adopt-nonce, header-shape upgrade, or full rewrite — for the current
+/// `bound_port`. Returns `false` (leave
 /// it) for an absent file, a non-proxy (static-bearer) shape, or a proxy config
-/// whose port matches AND whose nonce is currently registered. Delegates to the
+/// whose port matches AND whose nonce is currently registered AND whose headers
+/// already carry the static `Authorization` shape. Delegates to the
 /// single-read [`resolve_root_reconcile`] so the "is anything to do" predicate
 /// and the "what to do" dispatch never diverge. Test-only convenience — the prod
 /// dispatch reads the action directly from [`resolve_root_reconcile`].
@@ -3875,14 +4015,23 @@ fn reconcile_root_config_gated(
 /// cached the nonce — break if the nonce was evicted or the port moved across a
 /// restart/instance change. Dispatches on [`resolve_root_reconcile`]:
 ///
+/// - `UpgradeHeaders` — port unchanged AND the on-disk nonce is registered, but
+///   the file carries only the legacy proxy-key header: rewrite it through
+///   [`rewrite_root_config_preserving_nonce`], **preserving the nonce
+///   verbatim**, so the next client launched against it stops escalating a 401
+///   into OAuth/DCR. Port and nonce both unchanged; only the headers map moves.
 /// - `AdoptNonce` — port unchanged, a nonce IS on disk but unregistered:
-///   re-register that EXACT string ([`adopt_on_disk_nonce`]), leaving the file
-///   byte-identical so a live client's cached nonce keeps validating. Returns
-///   `false` (no file rewrite).
+///   re-register that EXACT string ([`adopt_on_disk_nonce`]) so a live client's
+///   cached nonce keeps validating. The file is **also rewritten when it still
+///   carries the legacy header-only shape** — the same upgrade as the arm
+///   above, folded in because an adopted config was by definition written by an
+///   older runner and is the likeliest legacy shape on the box. The nonce is
+///   re-emitted verbatim either way, so this is never a rotation; when the
+///   shape is already current the file is left byte-identical.
 /// - `Rewrite` — port moved (client must reconnect regardless) or no nonce
-///   readable: mint fresh + rewrite via [`write_coord_mcp_proxy_config`].
-///   Returns `true`.
-/// - `Leave` — healthy or not ours. Returns `false`.
+///   readable: mint fresh + rewrite via [`write_coord_mcp_proxy_config`]. The
+///   only arm that rotates the nonce.
+/// - `Leave` — healthy or not ours. Nothing is written.
 ///
 /// Both mutating arms are guarded by [`coord_mcp_safe_to_write`] so a
 /// hand-rolled static-bearer root file is never clobbered. Returns the
@@ -3918,7 +4067,6 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             // was read from disk, so this Option is always Some here.
             let nonce = on_disk_nonce
                 .expect("AdoptNonce implies a readable on-disk nonce (resolver invariant)");
-            adopt_on_disk_nonce(&root, &nonce);
             // Same header-shape upgrade as the arm above, folded in here rather
             // than deferred: an adopted config is by definition one that was
             // written by an OLDER runner, so it is the most likely legacy-only
@@ -3927,14 +4075,21 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             // nonce is re-emitted verbatim, so the "live client's cached nonce
             // keeps validating" contract is untouched — what changes is the file
             // the NEXT client reads.
-            let upgraded = !read_static_authorization_presence(&root_dir.join(".mcp.json"));
-            if upgraded {
-                rewrite_root_config_preserving_nonce(&root, bound_port, &nonce);
-            }
+            //
+            // The rewrite runs BEFORE the adopt so `adopt_on_disk_nonce` can
+            // state in its forensics cause what actually happened to the file,
+            // not what was about to be attempted. Nothing is racing in between:
+            // the file already held this exact nonce, so the interval is a
+            // no-op for any reader.
+            let needs_upgrade = !read_static_authorization_presence(&root_dir.join(".mcp.json"));
+            let rewritten =
+                needs_upgrade && rewrite_root_config_preserving_nonce(&root, bound_port, &nonce);
+            adopt_on_disk_nonce(&root, &nonce, rewritten);
             info!(
                 "coord_mcp: boot self-heal ADOPTED on-disk root nonce for {root} \
                  (port :{bound_port} unchanged; nonce preserved verbatim; header shape \
-                 upgraded={upgraded}) — live MCP client cache preserved"
+                 needed_upgrade={needs_upgrade}, file_rewritten={rewritten}) — live \
+                 MCP client cache preserved"
             );
             RootReconcileAction::AdoptNonce
         }
@@ -4581,15 +4736,21 @@ mod tests {
     }
 
     /// Build one persisted-store value in whatever shape the store currently
-    /// takes, so the store-shape tests state their intent (workdir + terminal)
-    /// once rather than tracking the schema at every call site.
+    /// takes, so the store-shape tests state their intent (workdir + terminal +
+    /// age) once rather than tracking the schema at every call site.
+    ///
+    /// `minted_at_unix: None` is the LEGACY age — an entry written before the
+    /// field existed. It is not a neutral default: the restore leg orders it as
+    /// oldest.
     fn stored_binding(
         workdir: &str,
         terminal_id: Option<&str>,
+        minted_at_unix: Option<u64>,
     ) -> crate::secure_storage::StoredNonceBinding {
         crate::secure_storage::StoredNonceBinding {
             workdir: workdir.to_string(),
             terminal_id: terminal_id.map(str::to_string),
+            minted_at_unix,
         }
     }
 
@@ -5485,7 +5646,10 @@ mod tests {
         // round-trip test (it owns `StoredTokens`); here we pin the CONSUMER
         // half — a store holding a terminal-less binding restores as one.
         store
-            .store_coord_mcp_nonces(&HashMap::from([(nonce.clone(), stored_binding(&wd, None))]))
+            .store_coord_mcp_nonces(&HashMap::from([(
+                nonce.clone(),
+                stored_binding(&wd, None, None),
+            )]))
             .expect("write the legacy-equivalent store");
 
         restore_proxy_nonces_from(&store);
@@ -5642,6 +5806,189 @@ mod tests {
         assert_eq!(device_nonce_snapshot(&small).len(), small.len());
     }
 
+    /// The persisted AGE, end to end — the fix for the defect the bound
+    /// introduced.
+    ///
+    /// With no age in the store, `restore_proxy_nonces_from` stamped every
+    /// restored binding with `SystemTime::now()`, so they all TIED. The instant
+    /// `restored + minted_this_process` exceeded the cap, every eviction
+    /// candidate came from that tied pool and the "oldest-first" cut fell
+    /// entirely to the nonce-string tiebreak — a uniformly random pick over hex
+    /// strings, across a pool mixing long-dead terminals with sessions alive
+    /// right now that survived the restart. The cap could drop a live session's
+    /// credential to keep a year-old dead terminal's, which is exactly the
+    /// orphaning it exists to prevent, and it engaged precisely when the cap
+    /// did.
+    ///
+    /// Driven through the REAL producer (`device_nonce_snapshot`) and a REAL
+    /// encrypted store, for the same anti-inert reason as the terminal-id gate
+    /// test: widening only the struct and the restore leg would leave the age
+    /// never WRITTEN, every restore back on `now()`, and a hand-built store
+    /// test passing anyway.
+    #[test]
+    fn restored_bindings_carry_their_persisted_age_not_the_restore_instant() {
+        let _serial = restore_forensics_lock();
+        let (store_dir, store) = temp_store("nonce-age");
+
+        // Two bindings with distinct, deliberately ANCIENT ages — far enough
+        // back that a `now()` fallback is unmistakable.
+        let old_secs = 1_600_000_000u64; // 2020-09-13
+        let newer_secs = 1_700_000_000u64; // 2023-11-14
+        let wd = store_dir.join("aged-wd").to_string_lossy().to_string();
+        let n_old = format!("age-old-{}", uuid::Uuid::now_v7());
+        let n_new = format!("age-new-{}", uuid::Uuid::now_v7());
+        let n_legacy = format!("age-legacy-{}", uuid::Uuid::now_v7());
+        let mut map: HashMap<String, NonceBinding> = HashMap::new();
+        for (nonce, secs) in [(&n_old, old_secs), (&n_new, newer_secs)] {
+            map.insert(
+                nonce.clone(),
+                NonceBinding {
+                    workdir: wd.clone(),
+                    principal: ProxyPrincipal::Device,
+                    lifetime: NonceLifetime::Persistent,
+                    session_tenant: None,
+                    terminal_id: Some(format!("term-{secs}")),
+                    minted_at: minted_at_from_unix(Some(secs)),
+                },
+            );
+        }
+        // THROUGH THE REAL PRODUCER — an inert widening fails on the next two
+        // assertions, before any restore can mask it.
+        persist_proxy_nonces_with_store(&store, &map);
+
+        let mut persisted = store.load_coord_mcp_nonces();
+        assert_eq!(
+            persisted.get(&n_old).and_then(|b| b.minted_at_unix),
+            Some(old_secs),
+            "the PRODUCER must write the mint time — without it the cap's \
+             oldest-first cut is a coin flip after every restart"
+        );
+        assert_eq!(
+            persisted.get(&n_new).and_then(|b| b.minted_at_unix),
+            Some(newer_secs)
+        );
+
+        // Add a LEGACY entry: a store value written before the field existed.
+        // No migration — it simply carries no age.
+        persisted.insert(n_legacy.clone(), stored_binding(&wd, None, None));
+        store.store_coord_mcp_nonces(&persisted).unwrap();
+        assert_eq!(
+            store.load_coord_mcp_nonces().len(),
+            3,
+            "a mixed dated/undated store still deserializes in full — the \
+             widening is migration-free"
+        );
+
+        // The restart: the live map has none of them, then the boot restore
+        // merges all three back.
+        restore_proxy_nonces_from(&store);
+
+        assert_eq!(
+            live_binding(&n_old).map(|b| b.minted_at),
+            Some(minted_at_from_unix(Some(old_secs))),
+            "a restored binding must carry its TRUE mint time, not the restore \
+             instant"
+        );
+        assert_eq!(
+            live_binding(&n_new).map(|b| b.minted_at),
+            Some(minted_at_from_unix(Some(newer_secs)))
+        );
+        assert_eq!(
+            live_binding(&n_legacy).map(|b| b.minted_at),
+            Some(std::time::SystemTime::UNIX_EPOCH),
+            "an entry with no persisted age restores at UNIX_EPOCH — the honest \
+             'unrecoverable, but certainly older than anything dated'. A `now()` \
+             fallback would sort decade-old cruft as the NEWEST thing in the map"
+        );
+
+        // And the ages the restore recovered are what the next snapshot writes
+        // back: unknown stays unknown (0), dated stays dated.
+        let live_subset: HashMap<String, NonceBinding> = [&n_old, &n_new, &n_legacy]
+            .into_iter()
+            .filter_map(|n| live_binding(n).map(|b| (n.clone(), b)))
+            .collect();
+        let re_snapshot = device_nonce_snapshot(&live_subset);
+        assert_eq!(
+            re_snapshot.get(&n_old).and_then(|b| b.minted_at_unix),
+            Some(old_secs),
+            "a restored age must survive the NEXT persist unchanged"
+        );
+        assert_eq!(
+            re_snapshot.get(&n_legacy).and_then(|b| b.minted_at_unix),
+            Some(0),
+            "an unknown age re-persists as the 0 sentinel — it must never be \
+             laundered into 'minted just now' by a rewrite"
+        );
+
+        {
+            let mut m = proxy_nonces().lock().unwrap();
+            m.remove(&n_old);
+            m.remove(&n_new);
+            m.remove(&n_legacy);
+        }
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// The cut's ordering rule for the two age classes, at the cap.
+    ///
+    /// A pre-widening store restores every entry with NO age. Those are the
+    /// oldest things on the box by construction (they were written by a binary
+    /// that predates the field), so they must be cut BEFORE anything carrying a
+    /// real timestamp — never after. Asserted at the cap boundary, since that
+    /// is the only place the ordering has any effect.
+    ///
+    /// Built as a plain map rather than by minting, for the same reason as the
+    /// bound test: `mint_and_register_nonce` returns the whole process-global
+    /// map, which the parallel harness makes nondeterministic.
+    #[test]
+    fn unknown_age_bindings_are_cut_before_dated_ones() {
+        let dated = 40usize;
+        let undated = MAX_PERSISTED_DEVICE_NONCES - dated + 14; // 14 over the cap
+        let mut map: HashMap<String, NonceBinding> = HashMap::new();
+        let binding = |i: usize, minted_at: std::time::SystemTime| NonceBinding {
+            workdir: format!("D:/age-class/{i}"),
+            principal: ProxyPrincipal::Device,
+            lifetime: NonceLifetime::Persistent,
+            session_tenant: None,
+            terminal_id: Some(format!("term-{i}")),
+            minted_at,
+        };
+        // The undated pool: a legacy store's restore, all at the sentinel.
+        let undated_nonce = |i: usize| format!("undated-{i:06}");
+        for i in 0..undated {
+            map.insert(undated_nonce(i), binding(i, minted_at_from_unix(None)));
+        }
+        // The dated pool — every one of them ANCIENT (2001), so this cannot
+        // pass by accident on recency: the only thing that keeps them is being
+        // dated at all.
+        let dated_nonce = |i: usize| format!("dated-{i:06}");
+        for i in 0..dated {
+            map.insert(
+                dated_nonce(i),
+                binding(i, minted_at_from_unix(Some(1_000_000_000 + i as u64))),
+            );
+        }
+
+        let snapshot = device_nonce_snapshot(&map);
+        assert_eq!(snapshot.len(), MAX_PERSISTED_DEVICE_NONCES);
+        for i in 0..dated {
+            assert!(
+                snapshot.contains_key(&dated_nonce(i)),
+                "a DATED binding must outlive every unknown-age one — an entry \
+                 with no persisted age predates the field, so it is older than \
+                 anything that has one"
+            );
+        }
+        let surviving_undated = (0..undated)
+            .filter(|i| snapshot.contains_key(&undated_nonce(*i)))
+            .count();
+        assert_eq!(
+            surviving_undated,
+            MAX_PERSISTED_DEVICE_NONCES - dated,
+            "the whole overflow must come out of the unknown-age pool"
+        );
+    }
+
     /// Phase 3b — `persist_proxy_nonces` honors the `nonce_persistence_enabled`
     /// gate: when persistence is disabled (test default, `COORD_MCP_PERSIST_NONCES`
     /// unset under `cfg(test)`), the DEFAULT-store path is a no-op. We assert the
@@ -5671,6 +6018,39 @@ mod tests {
         assert!(
             proxy_nonce_is_valid(&nonce),
             "minting must register the nonce in-memory regardless of persistence"
+        );
+    }
+
+    /// A persistence-DISABLED `restore_proxy_nonces_from_store` returns 0 on
+    /// EVERY call and does not burn the run-once restore guard.
+    ///
+    /// Both properties were broken when the guard moved ahead of the disabled
+    /// check: the second disabled call returned the live map size (which under
+    /// the parallel harness is whatever peers happen to have minted),
+    /// contradicting this function's own "0 when persistence is disabled"
+    /// contract, and a process that later flipped `COORD_MCP_PERSIST_NONCES`
+    /// on could never restore at all. Neither is reachable from today's single
+    /// boot-task caller — which is why it is worth a test rather than a
+    /// comment.
+    ///
+    /// Test builds default persistence OFF (see `nonce_persistence_enabled`),
+    /// so this exercises the real arm with no env mutation.
+    #[test]
+    fn disabled_restore_returns_zero_every_time_and_keeps_the_guard_unburnt() {
+        // The first call emits the aggregate `restore` line.
+        let _serial = restore_forensics_lock();
+        assert!(!nonce_persistence_enabled(), "test-build precondition");
+
+        assert_eq!(restore_proxy_nonces_from_store(), 0);
+        assert_eq!(
+            restore_proxy_nonces_from_store(),
+            0,
+            "a repeated disabled call must still report 0, not the live map size"
+        );
+        assert!(
+            PROXY_NONCES_RESTORED.get().is_none(),
+            "a disabled call must leave the restore available — burning the \
+             guard here makes a later enabled call a permanent no-op"
         );
     }
 
@@ -6188,6 +6568,10 @@ mod tests {
     /// old one, which is the failure the whole plan is about.
     #[test]
     fn upgrade_in_place_adds_authorization_without_rotating_the_nonce() {
+        // Installed FIRST: file emission is off until some test asks for the
+        // shared dir, so a forensics assertion at the end of a test that armed
+        // it in the middle would read a file missing its own earlier lines.
+        let rot_dir = rotation_log_test_dir();
         let root = std::env::temp_dir().join(format!("coord-mcp-upg-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join(".mcp.json");
@@ -6272,6 +6656,30 @@ mod tests {
             "the adopted config must also stop being DCR-escalating"
         );
 
+        // The `adopt` forensics cause must say what happened to the FILE. It
+        // asserted "(no file rewrite)" unconditionally, which the folded-in
+        // header upgrade turned into the exact opposite of the truth — an
+        // adjacent `write` line keeps the stream reconstructable, but only for
+        // a reader who already distrusts the cause.
+        let root_str = root.to_string_lossy().to_string();
+        let log = std::fs::read_to_string(rot_dir.join(ROTATION_LOG_FILE)).unwrap();
+        let adopt_causes: Vec<String> = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["workdir"] == root_str.as_str() && v["event"] == "adopt")
+            .map(|v| v["cause"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            adopt_causes.len(),
+            1,
+            "exactly one adoption happened in this workdir"
+        );
+        assert!(
+            adopt_causes[0].contains("REWRITTEN"),
+            "the adopt cause must report the rewrite this arm performed, got {:?}",
+            adopt_causes[0]
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6288,7 +6696,7 @@ mod tests {
             "precondition: not registered"
         );
 
-        adopt_on_disk_nonce(&workdir, &nonce);
+        adopt_on_disk_nonce(&workdir, &nonce, false);
 
         assert!(
             proxy_nonce_is_valid(&nonce),
@@ -6444,7 +6852,7 @@ mod tests {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        adopt_on_disk_nonce(&wd, &adopted); // adopt (nothing left to evict)
+        adopt_on_disk_nonce(&wd, &adopted, false); // adopt (nothing left to evict)
 
         // A real `.mcp.json` write into a temp workdir → one "write" line.
         let wt = std::env::temp_dir().join(format!("coord-mcp-rot-wt-{}", uuid::Uuid::now_v7()));
@@ -6691,8 +7099,8 @@ mod tests {
         let wd_b = store_dir.join("wd-b").to_string_lossy().to_string();
         store
             .store_coord_mcp_nonces(&HashMap::from([
-                (a.clone(), stored_binding(&wd_a, None)),
-                (b.clone(), stored_binding(&wd_b, None)),
+                (a.clone(), stored_binding(&wd_a, None, None)),
+                (b.clone(), stored_binding(&wd_b, None, None)),
             ]))
             .expect("write the test store");
         // `b` is already live, so the restore must SKIP it and restore only `a`.

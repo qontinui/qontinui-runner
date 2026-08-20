@@ -126,6 +126,45 @@ pub struct StoredNonceBinding {
     /// binding restored from a pre-Phase-4 store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
+    /// When the binding was minted, as **whole seconds since the Unix epoch**.
+    ///
+    /// ## Why it is here
+    ///
+    /// `device_nonce_snapshot` caps the persisted set and evicts oldest-first.
+    /// Without a persisted age, every binding restored at boot was stamped with
+    /// the restore instant, so they all TIED — and once the restored pool alone
+    /// exceeded the cap, "oldest-first" degenerated into a lexicographic pick
+    /// over random hex nonce strings. That pool mixes long-dead terminals with
+    /// sessions that are alive right now and survived the restart, so the cut
+    /// could drop a live session's credential in favour of a year-old dead
+    /// one — the exact orphaning the cap exists to avoid. Carrying the age
+    /// makes the ordering mean what it says.
+    ///
+    /// ## Why unix SECONDS as `u64`
+    ///
+    /// It is an integer: no locale, no timezone, no float rounding, no parser
+    /// that can fail halfway and turn a readable store into an empty one. It
+    /// round-trips exactly through JSON, and it is monotone in true time, which
+    /// is the only property the comparator needs. Second granularity is far
+    /// finer than the quantity being ordered (terminal spawns), and mints
+    /// inside the same second simply fall to the existing nonce-string
+    /// tiebreak, which is already total. An RFC-3339 string would need a
+    /// parser and a dependency for no ordering benefit; a float would trade
+    /// exactness for nothing.
+    ///
+    /// ## Absent, and the `0` sentinel
+    ///
+    /// `#[serde(default)]` ⇒ **`None` for every entry written before this
+    /// field existed**, so the widening needs no `.enc` migration. `None` means
+    /// "age unrecoverable", and the restore leg maps it to
+    /// [`std::time::SystemTime::UNIX_EPOCH`] so it sorts as OLDER than anything
+    /// carrying a real timestamp — which is also true: any entry lacking the
+    /// field was written by a binary that predates it. `0` is the same
+    /// statement in the present shape and round-trips to the same instant, so
+    /// an unknown age stays unknown-and-oldest across arbitrarily many
+    /// rewrites instead of being laundered into "minted just now".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minted_at_unix: Option<u64>,
 }
 
 /// The on-disk value shape for `coord_mcp_nonces`, with the legacy arm kept
@@ -151,6 +190,10 @@ impl From<StoredNonceEntry> for StoredNonceBinding {
             StoredNonceEntry::Legacy(workdir) => StoredNonceBinding {
                 workdir,
                 terminal_id: None,
+                // Same reading as a modern entry written before `minted_at_unix`
+                // existed: the age is unrecoverable, and the restore leg reads
+                // `None` as "older than anything dated".
+                minted_at_unix: None,
             },
             StoredNonceEntry::Modern(b) => b,
         }
@@ -965,7 +1008,10 @@ impl SecureStorage {
 
     /// Load the persisted coord-mcp loopback proxy nonce map, normalizing both
     /// on-disk shapes to [`StoredNonceBinding`] (a pre-Phase-4 bare-string entry
-    /// reads back with `terminal_id: None`, exactly as it behaved before).
+    /// reads back with `terminal_id: None`, exactly as it behaved before, and a
+    /// modern entry written before the field existed reads back with
+    /// `minted_at_unix: None` — see that field for how an absent age is
+    /// ordered).
     /// Returns an empty map when the store is absent / unreadable / pre-Phase-3b
     /// — a missing nonce simply 401s and the next provisioning re-mints, so an
     /// empty restore is the safe default (today's in-memory-only behavior).
@@ -1945,6 +1991,69 @@ mod tests {
             "a legacy entry restores terminal-less — exactly the pre-Phase-4 \
              behaviour, not a downgrade"
         );
+        assert_eq!(
+            b.minted_at_unix, None,
+            "a legacy entry carries no age either — `None` is the honest \
+             'unrecoverable', which the restore leg orders as OLDEST"
+        );
+    }
+
+    /// A MODERN entry written before `minted_at_unix` existed still decodes —
+    /// the widening needs no `.enc` migration — and reads back as an absent
+    /// age rather than failing the whole document.
+    ///
+    /// Asserted at the SERDE level against raw JSON for the same reason as the
+    /// legacy-string test: the raw document is the on-disk contract, and a
+    /// hand-built modern value could not pin it.
+    #[test]
+    fn test_modern_entry_without_minted_at_still_deserializes() {
+        let raw = r#"{"coord_mcp_nonces":{
+                        "pre":{"workdir":"D:\\wd-pre","terminal_id":"term-3"}}}"#;
+        let parsed: StoredTokens =
+            serde_json::from_str(raw).expect("a pre-minted_at modern entry decodes");
+        let b: StoredNonceBinding = parsed.coord_mcp_nonces["pre"].clone().into();
+        assert_eq!(b.workdir, "D:\\wd-pre");
+        assert_eq!(b.terminal_id.as_deref(), Some("term-3"));
+        assert_eq!(
+            b.minted_at_unix, None,
+            "an absent age must deserialize as None, NOT fail the document — \
+             that is what makes this widening migration-free"
+        );
+    }
+
+    /// The age round-trips as a bare integer (unix seconds), and `0` — the
+    /// "unknown, therefore oldest" sentinel the restore leg re-emits — survives
+    /// a rewrite as `0` rather than being dropped or laundered.
+    #[test]
+    fn test_minted_at_unix_round_trips_as_seconds() {
+        let v = serde_json::to_value(StoredNonceEntry::Modern(StoredNonceBinding {
+            workdir: "D:\\wd-t".into(),
+            terminal_id: None,
+            minted_at_unix: Some(1_755_000_000),
+        }))
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"workdir": "D:\\wd-t", "minted_at_unix": 1_755_000_000u64}),
+            "the age is a plain integer — no locale, no timezone, no parser"
+        );
+        let back: StoredNonceBinding = serde_json::from_value::<StoredNonceEntry>(v)
+            .unwrap()
+            .into();
+        assert_eq!(back.minted_at_unix, Some(1_755_000_000));
+
+        let zero = serde_json::to_value(StoredNonceEntry::Modern(StoredNonceBinding {
+            workdir: "D:\\wd-z".into(),
+            terminal_id: None,
+            minted_at_unix: Some(0),
+        }))
+        .unwrap();
+        assert_eq!(
+            zero["minted_at_unix"],
+            serde_json::json!(0),
+            "the epoch sentinel must persist as 0, so an unknown age stays \
+             unknown-and-oldest across arbitrarily many rewrites"
+        );
     }
 
     /// The MODERN shape round-trips through the same untagged enum, and both
@@ -1968,6 +2077,7 @@ mod tests {
         let modern = serde_json::to_value(StoredNonceEntry::Modern(StoredNonceBinding {
             workdir: "D:\\wd-c".into(),
             terminal_id: None,
+            minted_at_unix: None,
         }))
         .unwrap();
         assert_eq!(modern, serde_json::json!({"workdir": "D:\\wd-c"}));
@@ -1984,6 +2094,7 @@ mod tests {
             StoredNonceBinding {
                 workdir: "D:\\wd".into(),
                 terminal_id: Some("term-1".into()),
+                minted_at_unix: Some(1_700_000_123),
             },
         );
         map.insert(
@@ -1991,6 +2102,7 @@ mod tests {
             StoredNonceBinding {
                 workdir: "D:\\wd".into(),
                 terminal_id: None,
+                minted_at_unix: None,
             },
         );
         storage.store_coord_mcp_nonces(&map).unwrap();
