@@ -642,6 +642,7 @@ pub async fn detect_regression(
 pub async fn build_resume_agentic_context(
     execution_id: &str,
     iteration: u32,
+    stage_index: Option<u32>,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
 ) -> String {
     // Strategy 1: Try loading the full verification phase result.
@@ -696,6 +697,18 @@ pub async fn build_resume_agentic_context(
     // anyway, because the upsert writes `result_json = NULL` on the failure
     // path (`database/pg/workflow_state.rs`).
     //
+    // The two readers agree on the SLICE as well as on the predicate.
+    // `get_completed_steps` filters on `(execution_id, phase, iteration)` only,
+    // and that key is NOT unique — it is precisely the key
+    // `CheckpointManager::completed_step` documents as insufficient. Every
+    // stage of a multi-stage workflow writes its verification steps under the
+    // same phase and iteration, so a stage-blind read hands a stage-2 resume
+    // stage 0's and stage 1's rows too: the "N of M passed" header counts
+    // every stage's steps, and the failed-steps list describes failures that an
+    // earlier stage already fixed. Hence the explicit `stage_index` filter
+    // below, normalized with `unwrap_or(0)` exactly as `select_replayable`
+    // does, because the write path COALESCEs a missing stage to 0.
+    //
     // NOTE: `get_completed_steps` does NOT remap a composed-run child to its
     // parent id — only the WRITE path does. A child therefore reads back
     // nothing here and falls through to Strategy 3, which is the correct
@@ -704,7 +717,8 @@ pub async fn build_resume_agentic_context(
     let checkpoint_mgr = crate::workflow_state::CheckpointManager::new("unified");
     match checkpoint_mgr.get_completed_steps(execution_id, "verification", Some(iteration)) {
         Ok(checkpoints) => {
-            if let Some(context) = narrate_verification_checkpoints(&checkpoints) {
+            let this_stage = checkpoints_in_stage(&checkpoints, stage_index);
+            if let Some(context) = narrate_verification_checkpoints(&this_stage) {
                 info!(
                     "RESUME: Built agentic context from step checkpoints ({} chars)",
                     context.len()
@@ -717,6 +731,7 @@ pub async fn build_resume_agentic_context(
             warn!(
                 execution_id = %execution_id,
                 iteration = %iteration,
+                stage_index = ?stage_index,
                 error = %e,
                 "RESUME: checkpoint read failed, falling back to the generic context"
             );
@@ -728,6 +743,25 @@ pub async fn build_resume_agentic_context(
     "Resuming agentic phase. No verification data is available. \
      Proceed with analysis based on the workflow context and instructions provided."
         .to_string()
+}
+
+/// Narrow a `(execution_id, phase, iteration)` checkpoint slice to ONE stage.
+///
+/// `get_completed_steps` cannot filter on stage — the column is not part of its
+/// key — but `(phase, iteration, step_index)` is not unique across stages, so
+/// the caller has to. A missing stage index and stage 0 are the same thing: the
+/// write path `COALESCE`s a missing stage to 0
+/// (`database/pg/workflow_state.rs`), which is the same normalization
+/// `workflow_state::checkpoint::select_replayable` applies on the replay side.
+pub(crate) fn checkpoints_in_stage(
+    checkpoints: &[crate::workflow_state::StepCheckpoint],
+    stage_index: Option<u32>,
+) -> Vec<crate::workflow_state::StepCheckpoint> {
+    checkpoints
+        .iter()
+        .filter(|cp| cp.stage_index.unwrap_or(0) == stage_index.unwrap_or(0))
+        .cloned()
+        .collect()
 }
 
 /// Narrate a verification iteration's checkpoints as agentic context.
@@ -946,6 +980,92 @@ mod resume_context_tests {
             cp(1, "b", StepCheckpointStatus::Pending, None, None),
         ];
         assert!(narrate_verification_checkpoints(&debris).is_none());
+    }
+
+    /// The narration slice is per-STAGE.
+    ///
+    /// `get_completed_steps` keys on `(execution_id, phase, iteration)` only,
+    /// and every stage writes its verification steps under the same phase and
+    /// iteration. Without the stage filter a stage-2 resume was narrated stage
+    /// 0's and stage 1's rows as well: the header counted all three stages, and
+    /// the failed-steps list handed the stage-2 model failures that stage 0 had
+    /// already fixed.
+    #[test]
+    fn narration_covers_only_the_resuming_stage() {
+        let staged = |step_index: usize,
+                      name: &str,
+                      status: StepCheckpointStatus,
+                      error: Option<&str>,
+                      stage: Option<u32>| {
+            let mut c = cp(step_index, name, status, error, None);
+            c.stage_index = stage;
+            c
+        };
+
+        let rows = vec![
+            staged(
+                0,
+                "stage 0 login broken",
+                StepCheckpointStatus::Failed,
+                Some("stage 0 boom"),
+                Some(0),
+            ),
+            staged(
+                1,
+                "stage 0 ok",
+                StepCheckpointStatus::Success,
+                None,
+                Some(0),
+            ),
+            staged(
+                0,
+                "stage 2 checkout broken",
+                StepCheckpointStatus::Failed,
+                Some("stage 2 boom"),
+                Some(2),
+            ),
+            staged(
+                1,
+                "stage 2 ok",
+                StepCheckpointStatus::Success,
+                None,
+                Some(2),
+            ),
+        ];
+
+        let this_stage = checkpoints_in_stage(&rows, Some(2));
+        assert_eq!(this_stage.len(), 2, "only stage 2's rows");
+
+        let context = narrate_verification_checkpoints(&this_stage).expect("stage 2 has a failure");
+        assert!(
+            context.contains("1 of 2 verification steps passed"),
+            "the header must count this stage only: {}",
+            context
+        );
+        assert!(context.contains("stage 2 checkout broken"), "{}", context);
+        assert!(
+            !context.contains("stage 0 login broken"),
+            "an earlier stage's failure must not be handed to this stage's model: {}",
+            context
+        );
+    }
+
+    /// A missing stage index and stage 0 are the same thing — the write path
+    /// `COALESCE`s a missing stage to 0, so a `None` caller and a `Some(0)` row
+    /// must match each other in both directions.
+    #[test]
+    fn missing_stage_index_is_stage_zero() {
+        let mut none_row = cp(0, "unstaged", StepCheckpointStatus::Success, None, None);
+        none_row.stage_index = None;
+        let mut zero_row = cp(1, "stage zero", StepCheckpointStatus::Success, None, None);
+        zero_row.stage_index = Some(0);
+        let mut one_row = cp(2, "stage one", StepCheckpointStatus::Success, None, None);
+        one_row.stage_index = Some(1);
+
+        let rows = vec![none_row, zero_row, one_row];
+        assert_eq!(checkpoints_in_stage(&rows, None).len(), 2);
+        assert_eq!(checkpoints_in_stage(&rows, Some(0)).len(), 2);
+        assert_eq!(checkpoints_in_stage(&rows, Some(1)).len(), 1);
     }
 
     /// A long error is truncated rather than blowing out the prompt.
