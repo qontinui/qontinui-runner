@@ -923,6 +923,12 @@ mod manifest_drift_tests {
             // `screenshots.rs::routes` — the entry is now part of the
             // contract and intentionally omitted here.
             ("POST", "/ui-bridge/control/page/close-request"),
+            // Force-close — runner-only by design (plan
+            // 2026-08-19-runner-blocked-ui-thread-cannot-be-closed, Phase 3).
+            // It is the in-process door out that does NOT route through the tao
+            // event loop, so it only means anything for a native desktop shell;
+            // the web and mobile SDK consumers have no process to force-exit.
+            ("POST", "/ui-bridge/control/page/force-close"),
             ("POST", "/ui-bridge/control/page/evaluate-batch"),
             ("POST", "/ui-bridge/control/page/evaluate-raw"),
             ("POST", "/ui-bridge/control/page/evaluate-safe"),
