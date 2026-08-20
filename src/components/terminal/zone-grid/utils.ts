@@ -45,3 +45,30 @@ export function countMatches(lines: string[], filter: string): number {
   const lower = filter.toLowerCase();
   return lines.filter((l) => l.toLowerCase().includes(lower)).length;
 }
+
+/**
+ * Whether a zone must carry the standalone session-info strip (D1 of
+ * `plans/2026-08-19-session-info-dropdown-mount-gaps-remediation.md`).
+ *
+ * `showLabels` gates the full `ZoneLabel` chrome — rename, pin, filter,
+ * output stats — on a MULTI-zone grid, because on a one-terminal page that
+ * chrome is redundant with the tab bar. The session-info trigger is not
+ * chrome: it is the only surface that answers "which Claude session is this,
+ * and what has it opened?", and a one-terminal page is the layout most
+ * operators actually run. Gating it on `showLabels` therefore made the whole
+ * feature invisible for them.
+ *
+ * So: mount it wherever `ZoneLabel` does NOT, provided the tab actually has a
+ * session to describe (a tab with no `claudeSessionId` has no session info to
+ * be unknown ABOUT — the same distinction `SessionInfoDropdown` makes when it
+ * returns `null`). The compact card is excluded because it replaces the whole
+ * zone body with its own summary UI.
+ */
+export function showSoloSessionInfo(opts: {
+  showLabels: boolean;
+  showCompactCard: boolean;
+  claudeSessionId?: string;
+}): boolean {
+  if (opts.showLabels || opts.showCompactCard) return false;
+  return !!opts.claudeSessionId;
+}

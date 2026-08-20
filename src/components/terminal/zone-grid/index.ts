@@ -13,4 +13,4 @@ export {
   STATE_BG_COLORS,
   TREND_ICONS,
 } from "./constants";
-export { formatUptime, countMatches } from "./utils";
+export { formatUptime, countMatches, showSoloSessionInfo } from "./utils";

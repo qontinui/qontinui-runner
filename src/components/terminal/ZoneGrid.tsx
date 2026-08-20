@@ -26,6 +26,7 @@ import {
   HiddenTerminal,
   formatUptime,
   countMatches,
+  showSoloSessionInfo,
 } from "./zone-grid";
 import {
   useTerminalSession,
@@ -1011,6 +1012,14 @@ function ZoneCellInner({
   // either the operator forced compact/auto-compact (instance stays mounted but
   // hidden) OR the zone is virtualized (no instance at all this render).
   const showCompactCard = useCompact || isVirtual;
+  // D1: does this zone need the standalone session-info strip? Computed once —
+  // the strip and the terminal body's top padding have to agree, or the strip
+  // covers the first output line.
+  const soloSessionInfo = showSoloSessionInfo({
+    showLabels,
+    showCompactCard,
+    claudeSessionId: tab?.claudeSessionId,
+  });
   const isFlashing = tab && flashingTabs?.has(tab.id);
   const isStale = tab && staleTabs?.has(tab.id);
   const searchMatch =
@@ -1228,10 +1237,24 @@ function ZoneCellInner({
               filterActive={!!zoneFilters[zoneIdx]}
             />
           )}
+          {/* D1: the single-zone layout renders no `ZoneLabel`, so before this
+              the session-info trigger had NO mount site on a one-terminal page
+              — the layout most operators run. This is the same 20px strip
+              `ZoneLabel` occupies, carrying only the trigger, and the terminal
+              body below gets the same 20px of top padding, so it displaces the
+              first output line rather than covering it. Left-anchored, matching
+              `ZoneLabel`: `ZoneHoverActions` owns the top-RIGHT corner
+              (`top-1 right-1 z-30`) and is NOT multi-zone gated, so a
+              right-anchored trigger would sit under it on every hover. */}
+          {soloSessionInfo && (
+            <div className="absolute top-0 left-0 right-0 flex items-center h-[20px] px-1 bg-[#13141f]/85 backdrop-blur-sm z-10">
+              <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIdx} />
+            </div>
+          )}
           {!showCompactCard && showFilterInput === zoneIdx && (
             <div
               className="absolute left-0 right-0 flex items-center gap-2 px-2 py-1 bg-[#1a1b26] border-b border-[#2a2d3d] z-10"
-              style={{ top: showLabels ? "20px" : "0px" }}
+              style={{ top: showLabels || soloSessionInfo ? "20px" : "0px" }}
             >
               <Filter className="w-3 h-3 text-[#565f89]" />
               <input
@@ -1293,9 +1316,12 @@ function ZoneCellInner({
             <div
               className={`h-full w-full ${showCompactCard ? "hidden" : ""}`}
               style={{
+                // The 20px header strip is `ZoneLabel` (multi-zone) OR the D1
+                // solo session-info strip (single-zone) — either way the body
+                // starts below it, and below the 26px filter bar when open.
                 paddingTop: showCompactCard
                   ? undefined
-                  : showLabels
+                  : showLabels || soloSessionInfo
                     ? showFilterInput === zoneIdx
                       ? "46px"
                       : "20px"

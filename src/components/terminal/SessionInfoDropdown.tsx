@@ -6,6 +6,7 @@ import {
   useSessionInfo,
   deriveTrigger,
   sessionInfoElementId,
+  sessionInfoTriggerLabel,
   isProvisionalIdentity,
   PROVISIONAL_NOTE,
   sessionInfoRows,
@@ -155,7 +156,13 @@ function SessionInfoPanelBody({
         <span className="text-[8px] text-[#565f89] shrink-0">name: {body.name.source}</span>
       </div>
 
-      <div className="max-h-64 overflow-y-auto scrollbar-dark py-0.5">
+      {/* D4: the cap has to clear the WHOLE row set, not most of it. Fourteen
+          rows measure 266px, so the previous `max-h-64` (256px) put the last
+          row (`PRs landed`) permanently below the fold — present in the DOM,
+          absent from every `visibleOnly` read, which reads as a missing field
+          rather than a scrolled-away one. `max-h-80` (320px) leaves headroom
+          for a row or two more before the scrollbar is needed again. */}
+      <div className="max-h-80 overflow-y-auto scrollbar-dark py-0.5">
         {rows.map((row) => (
           <InfoRow key={row.field} row={row} zoneIndex={zoneIndex} />
         ))}
@@ -219,7 +226,7 @@ export function SessionInfoDropdown({
   const { ref: triggerRef } = useUIElement({
     id: sessionInfoElementId("trigger", zoneIndex),
     type: "button",
-    label: `Session info (zone ${zoneIndex + 1}): ${trigger.summary}`,
+    label: sessionInfoTriggerLabel(zoneIndex, trigger),
   });
   const { ref: panelRef } = useUIElement({
     id: sessionInfoElementId("panel", zoneIndex),

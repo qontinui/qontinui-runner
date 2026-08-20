@@ -27,35 +27,48 @@ use crate::terminal::{strip_ansi, TerminalManager};
 // ============================================================================
 
 /// Request body for creating a new terminal session.
+///
+/// **Every multi-word field accepts BOTH `camelCase` and `snake_case`.** The
+/// struct is `rename_all = "camelCase"`, so before the aliases below a body of
+/// `{"working_dir": "C:/qontinui-root"}` deserialized to `None` — the field was
+/// dropped in silence and the PTY landed in the default project directory, with
+/// a 200 and a `workingDir` the caller never asked for (D6 of
+/// `plans/2026-08-19-session-info-dropdown-mount-gaps-remediation.md`,
+/// reproduced against a live runner: `workingDir` honoured, `working_dir`
+/// ignored). Serde's default for an unknown field is to skip it, so the only
+/// two honest options were "reject it" or "understand it"; scripts and MCP
+/// callers reach for the snake_case spelling because that is what the Rust
+/// field and every log line are called, so the aliases make them right rather
+/// than making them fail.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTerminalRequest {
     #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "working_dir")]
     pub working_dir: Option<String>,
     #[serde(default)]
     pub cols: Option<u16>,
     #[serde(default)]
     pub rows: Option<u16>,
     /// Which terminal page this session belongs to.
-    #[serde(default)]
+    #[serde(default, alias = "page_id")]
     pub page_id: Option<String>,
     /// Optional command to execute immediately after shell initialization.
-    #[serde(default)]
+    #[serde(default, alias = "initial_command")]
     pub initial_command: Option<String>,
     /// Phase 2 round 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
     /// When `Some(repo_slug)` AND `QONTINUI_AGENT_WORKTREE_MODE` is on,
     /// allocate an isolated worktree for that repo and use it as the
     /// PTY cwd instead of `working_dir`. Mirrors the `intent_repo`
     /// argument on the `terminal_create` Tauri command + HTTP-SDK proxy.
-    #[serde(default)]
+    #[serde(default, alias = "intent_repo")]
     pub intent_repo: Option<String>,
     /// Stable session id of the agent creating this terminal. Folded into
     /// the isolated-worktree claim's owner token so two different agent
     /// sessions on one machine are distinct holders. None for
     /// interactive/UI-created terminals (no session to attribute).
-    #[serde(default)]
+    #[serde(default, alias = "agent_session_id")]
     pub agent_session_id: Option<uuid::Uuid>,
     /// Optional per-request Claude account override — a friendly name
     /// (`"hotmail"`, matching `derive_account_name`) OR a full roster
@@ -87,7 +100,9 @@ pub struct ResizeTerminalRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MoveTerminalRequest {
-    #[serde(default)]
+    /// Aliased for the same reason as `CreateTerminalRequest` — see its doc
+    /// comment. Same struct-level `camelCase` rename, same silent drop.
+    #[serde(default, alias = "page_id")]
     pub page_id: Option<String>,
 }
 
@@ -201,6 +216,24 @@ pub async fn create_terminal_handler(
         "HTTP: Creating terminal session (title={:?}, working_dir={:?}, intent_repo={:?})",
         request.title, request.working_dir, request.intent_repo
     );
+
+    // The other half of D6: a `workingDir` the runner cannot use must come
+    // back as a refusal naming the path, not as a 200 whose `workingDir` is
+    // somewhere the caller never named. Checked here, on the REQUEST value,
+    // because that is the only point where the caller's own intent is still
+    // distinguishable from the defaults and worktree substitutions applied
+    // below.
+    if let Some(dir) = request.working_dir.as_deref().filter(|d| !d.is_empty()) {
+        if !std::path::Path::new(dir).is_dir() {
+            warn!("HTTP: rejecting terminal create — workingDir is not a directory: {dir}");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "workingDir is not an existing directory: {dir}"
+                ))),
+            ));
+        }
+    }
 
     // Phase 2 round 2 — route through the shared `acquire_for_terminal`
     // helper so this entry point matches the other five
@@ -826,5 +859,57 @@ mod tests {
         // hide cursor, move, clear line, set color, text, reset, show cursor.
         let input = "\x1b[?25l\x1b[1;1H\x1b[2K\x1b[36m> \x1b[0mready\x1b[?25h";
         assert_eq!(strip_ansi(input), "> ready");
+    }
+    // -----------------------------------------------------------------
+    // D6: `POST /terminals` must not drop a snake_case `working_dir`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn create_request_accepts_snake_case_working_dir() {
+        let req: CreateTerminalRequest =
+            serde_json::from_str(r#"{"working_dir":"C:/qontinui-root"}"#).unwrap();
+        assert_eq!(req.working_dir.as_deref(), Some("C:/qontinui-root"));
+    }
+
+    #[test]
+    fn create_request_still_accepts_camel_case_working_dir() {
+        let req: CreateTerminalRequest =
+            serde_json::from_str(r#"{"workingDir":"C:/qontinui-root"}"#).unwrap();
+        assert_eq!(req.working_dir.as_deref(), Some("C:/qontinui-root"));
+    }
+
+    #[test]
+    fn create_request_accepts_both_spellings_of_every_multiword_field() {
+        let snake: CreateTerminalRequest = serde_json::from_str(
+            r#"{"page_id":"p1","initial_command":"echo hi","intent_repo":"qontinui-runner"}"#,
+        )
+        .unwrap();
+        assert_eq!(snake.page_id.as_deref(), Some("p1"));
+        assert_eq!(snake.initial_command.as_deref(), Some("echo hi"));
+        assert_eq!(snake.intent_repo.as_deref(), Some("qontinui-runner"));
+
+        let camel: CreateTerminalRequest = serde_json::from_str(
+            r#"{"pageId":"p1","initialCommand":"echo hi","intentRepo":"qontinui-runner"}"#,
+        )
+        .unwrap();
+        assert_eq!(camel.page_id.as_deref(), Some("p1"));
+        assert_eq!(camel.initial_command.as_deref(), Some("echo hi"));
+        assert_eq!(camel.intent_repo.as_deref(), Some("qontinui-runner"));
+    }
+
+    #[test]
+    fn move_request_accepts_both_spellings_of_page_id() {
+        let snake: MoveTerminalRequest = serde_json::from_str(r#"{"page_id":"p2"}"#).unwrap();
+        assert_eq!(snake.page_id.as_deref(), Some("p2"));
+        let camel: MoveTerminalRequest = serde_json::from_str(r#"{"pageId":"p2"}"#).unwrap();
+        assert_eq!(camel.page_id.as_deref(), Some("p2"));
+    }
+
+    #[test]
+    fn create_request_omitting_working_dir_still_defaults_to_none() {
+        // The alias must not manufacture a value — absence stays absence, so
+        // the manager's project-root fallback keeps working.
+        let req: CreateTerminalRequest = serde_json::from_str(r#"{"title":"t"}"#).unwrap();
+        assert!(req.working_dir.is_none());
     }
 }
