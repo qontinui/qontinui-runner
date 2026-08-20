@@ -522,8 +522,12 @@ export function useControlEvents(
         }
 
         case "dispatch_key": {
-          // Document/window-level key dispatch — backs
-          // `POST /ui-bridge/control/key` (src-tauri/src/mcp/ui_bridge/keyboard.rs).
+          // Document/window-level key dispatch — backs BOTH
+          // `POST /ui-bridge/control/key` and the SDK-declared
+          // `POST /ui-bridge/control/page/send-keys`
+          // (src-tauri/src/mcp/ui_bridge/keyboard.rs). The two routes differ
+          // only in their request grammar and default `target`; the Rust layer
+          // normalizes both before they reach here.
           //
           // This lives here (and not in the element-scoped `execute_action`
           // path) because the runner's global shortcut listeners are attached
@@ -536,9 +540,10 @@ export function useControlEvents(
           // ⚠ `target: "activeElement"` is the ONE target that can type into a
           // focused field. On a runner that field is frequently a terminal
           // bound to a LIVE Claude/PowerShell session, so an unintended
-          // dispatch injects text into someone's real work. It is opt-in only;
-          // the Rust layer defaults `target` to `"window"`, which reaches the
-          // shortcut listeners but cannot land text anywhere.
+          // dispatch injects text into someone's real work. It is opt-in only
+          // on both routes: `/control/key` defaults `target` to `"window"` and
+          // `/control/page/send-keys` to `"document"` (the SDK contract's
+          // default) — neither can land text in a focused field.
           const params = (payload.params ?? {}) as {
             keys?: Array<{
               key?: string;
@@ -550,6 +555,8 @@ export function useControlEvents(
               };
             }>;
             target?: string;
+            /** Milliseconds between keys — SDK `sendKeysToPage` contract. */
+            delay?: number;
           };
           const keys = Array.isArray(params.keys) ? params.keys : [];
           if (keys.length === 0) {
@@ -600,8 +607,14 @@ export function useControlEvents(
             mods: { ctrl?: boolean; alt?: boolean; meta?: boolean },
           ) => key.length === 1 && !mods.ctrl && !mods.alt && !mods.meta;
 
+          const delay = typeof params.delay === "number" ? params.delay : 0;
           let dispatched = 0;
           let defaultPrevented = false;
+          const dispatchedKeys: string[] = [];
+          // Per-key outcome — the SDK's `sendKeysToPage` contract
+          // (ui-bridge core/key-events.ts `KeyDispatchOutcome`). A single
+          // last-keydown flag cannot say WHICH key a listener consumed.
+          const outcomes: Array<{ key: string; defaultPrevented: boolean }> = [];
           for (const keyDesc of keys) {
             const key = keyDesc?.key;
             if (!key) continue;
@@ -620,18 +633,31 @@ export function useControlEvents(
             // `dispatchEvent` returns false when a listener called
             // preventDefault() — i.e. a handler actually consumed the shortcut.
             defaultPrevented = keydown.defaultPrevented;
+            outcomes.push({ key, defaultPrevented: keydown.defaultPrevented });
+            dispatchedKeys.push(key);
             if (shouldKeypress(key, mods)) {
               target.dispatchEvent(new KeyboardEvent("keypress", eventInit));
             }
             target.dispatchEvent(new KeyboardEvent("keyup", eventInit));
             dispatched += 1;
+            if (delay > 0) {
+              await new Promise<void>((resolve) => setTimeout(resolve, delay));
+            }
           }
 
           await sendResponse({
             requestId,
             type,
             success: true,
-            data: { dispatched, target: targetName, defaultPrevented },
+            // `defaultPrevented` (last keydown) is kept alongside the new
+            // fields so existing `/control/key` callers are unaffected.
+            data: {
+              dispatched,
+              target: targetName,
+              defaultPrevented,
+              keys: dispatchedKeys,
+              outcomes,
+            },
             timestamp: Date.now(),
           });
           return true;
