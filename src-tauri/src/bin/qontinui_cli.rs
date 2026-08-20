@@ -44,15 +44,24 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-const PROXY_KEY_HEADER: &str = "X-Coord-Mcp-Proxy-Key";
-/// The Phase 2 shape (plan 2026-08-20): the runner now ALSO emits the proxy
-/// nonce as `Authorization: Bearer <nonce>`, because a static `Authorization`
-/// in the `.mcp.json` headers map is what stops the MCP client escalating a
-/// stale-key 401 into OAuth Dynamic Client Registration. This bin is a separate
-/// crate root and cannot reach `coord_mcp::COORD_MCP_PROXY_KEY_HEADER`, so it
-/// carries its own pair — kept in sync by shape, not by import.
-const AUTHORIZATION_HEADER: &str = "Authorization";
-const BEARER_PREFIX: &str = "Bearer ";
+/// The `.mcp.json` proxy-header contract — header names AND the resolver that
+/// reads a nonce back out of a `headers` object — IMPORTED from the shared
+/// module rather than re-implemented.
+///
+/// An earlier revision carried its own `PROXY_KEY_HEADER` /
+/// `AUTHORIZATION_HEADER` / `BEARER_PREFIX` / `looks_like_jwt` and a hand-rolled
+/// preference order, on the stated premise that "this bin is a separate crate
+/// root and cannot reach `coord_mcp::COORD_MCP_PROXY_KEY_HEADER`". The premise
+/// was false: `coord_mcp_config` is `pub mod` in `lib.rs` (it was extracted
+/// there precisely because `coord_doctor` needed it too), and a bin can depend
+/// on its own lib crate — this file already imports
+/// `qontinui_runner_lib::plan_workunit_adapter` outside `mod tests`. "Kept in
+/// sync by shape, not by import" is the five-silent-readers failure mode that
+/// module was created to eliminate.
+use qontinui_runner_lib::coord_mcp_config::{
+    proxy_nonce_from_header_object, COORD_MCP_PROXY_KEY_HEADER_JSON,
+};
+
 const RUNNER_PORT_ENV: &str = "QONTINUI_RUNNER_API_PORT";
 
 fn main() -> ExitCode {
@@ -302,7 +311,7 @@ fn pr_create(args: &[String]) -> ExitCode {
     // `/vcs/pull-requests`, authenticated by the session proxy nonce.
     let resp = match client
         .post(&url)
-        .header(PROXY_KEY_HEADER, &session.nonce)
+        .header(COORD_MCP_PROXY_KEY_HEADER_JSON, &session.nonce)
         .json(&payload)
         .send()
     {
@@ -633,24 +642,6 @@ fn find_session_mcp_config(start: &Path) -> Option<SessionMcpConfig> {
     None
 }
 
-/// True iff `s` is JWT-shaped: three `.`-separated non-empty segments. Mirrors
-/// `coord_mcp::looks_like_jwt` — a proxy nonce is 64 hex chars with no `.`, so
-/// this cleanly separates "the nonce, in `Authorization`" from "a real static
-/// bearer, in `Authorization`" (the agent-path config shape, which this CLI has
-/// always deliberately SKIPPED rather than presenting as a proxy key).
-fn looks_like_jwt(s: &str) -> bool {
-    let mut parts = s.split('.');
-    let (a, b, c, extra) = (
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next().is_some(),
-    );
-    !extra
-        && matches!((a, b, c), (Some(a), Some(b), Some(c))
-            if !a.is_empty() && !b.is_empty() && !c.is_empty())
-}
-
 /// Parse a `.mcp.json` payload: find a server entry whose URL points at a
 /// loopback `/coord-mcp` proxy and read its proxy nonce — from
 /// `Authorization: Bearer <nonce>` (preferred; the Phase 2 shape) or the legacy
@@ -658,6 +649,11 @@ fn looks_like_jwt(s: &str) -> bool {
 /// port embedded in the URL. Entries with NEITHER (e.g. a static-bearer config,
 /// whose `Authorization` holds a JWT) are SKIPPED per-entry — a non-nonce
 /// `/coord-mcp` entry must not mask a later valid one.
+///
+/// The nonce extraction itself is `coord_mcp_config::proxy_nonce_from_header_object`
+/// — the SAME function the runner's own config readers and `coord doctor` use,
+/// so the accepted shapes, the preference order and the nonce-vs-JWT
+/// discriminator cannot drift between the walk-up and the door it presents to.
 fn parse_mcp_json(text: &str) -> Option<SessionMcpConfig> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let servers = v.get("mcpServers")?.as_object()?;
@@ -666,26 +662,11 @@ fn parse_mcp_json(text: &str) -> Option<SessionMcpConfig> {
         if !url.contains("/coord-mcp") {
             continue;
         }
-        let headers = match server.get("headers").and_then(|h| h.as_object()) {
-            Some(h) => h,
-            None => continue,
-        };
-        let get = |name: &str| {
-            headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .and_then(|(_, val)| val.as_str())
-        };
-        let from_auth = get(AUTHORIZATION_HEADER)
-            .and_then(|v| {
-                v.strip_prefix(BEARER_PREFIX)
-                    .or_else(|| v.strip_prefix("bearer "))
-            })
-            .map(str::trim)
-            .filter(|t| !t.is_empty() && !looks_like_jwt(t));
-        let nonce = match from_auth.or_else(|| get(PROXY_KEY_HEADER).map(str::trim)) {
-            Some(n) if !n.is_empty() => n.to_string(),
-            _ => continue,
+        let Some(nonce) = server
+            .get("headers")
+            .and_then(proxy_nonce_from_header_object)
+        else {
+            continue;
         };
         return Some(SessionMcpConfig {
             nonce,
@@ -1037,8 +1018,6 @@ mod tests {
     /// later valid entry.
     #[test]
     fn walk_up_skips_a_static_bearer_entry_and_keeps_scanning() {
-        assert!(looks_like_jwt("eyJhbGciOiJFZERTQSJ9.eyJhIjoxfQ.c2ln"));
-        assert!(!looks_like_jwt("authshape"));
         let cfg = parse_mcp_json(
             r#"{"mcpServers":{"coord-mcp":{"url":"https://coord.example.test/coord-mcp","headers":{"Authorization":"Bearer eyJhbGciOiJFZERTQSJ9.eyJhIjoxfQ.c2ln"}},"coord-mcp-proxy":{"url":"http://127.0.0.1:9878/coord-mcp","headers":{"Authorization":"Bearer realnonce"}}}}"#,
         )

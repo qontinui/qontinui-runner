@@ -148,6 +148,30 @@ pub fn proxy_nonce_from_config_doc(doc: &serde_json::Value) -> Option<String> {
     proxy_nonce_from_header_object(doc.pointer("/mcpServers/coord-mcp/headers")?)
 }
 
+/// True iff the `coord-mcp` entry's `headers` object carries an `Authorization`
+/// key at all — whatever its value.
+///
+/// This is a question about the **static headers map's SHAPE**, not about the
+/// credential in it, and that is exactly the distinction the DCR escape turns
+/// on: the MCP client's exemption predicate reads whether the static map has an
+/// `Authorization` key, and attaches an OAuth provider when it does not. A
+/// config that is otherwise perfectly healthy — right port, live registered
+/// nonce — but carries only the legacy custom header is therefore still
+/// DCR-escalating for the next client launched against it.
+///
+/// Used by the boot self-heal to tell "healthy AND non-escalating" (leave it)
+/// from "healthy but still legacy-shaped" (rewrite in place, same nonce). See
+/// `coord_mcp::RootReconcileAction::UpgradeHeaders`.
+pub fn config_doc_has_static_authorization(doc: &serde_json::Value) -> bool {
+    doc.pointer("/mcpServers/coord-mcp/headers")
+        .and_then(|h| h.as_object())
+        .map(|o| {
+            o.keys()
+                .any(|k| k.eq_ignore_ascii_case(PROXY_AUTHORIZATION_HEADER_JSON))
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +358,46 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(proxy_nonce_from_config_doc(&doc), None);
+    }
+
+    /// The header-SHAPE predicate the boot self-heal's upgrade-in-place arm
+    /// keys on. It asks only whether the static map has the key — a legacy-only
+    /// config is what leaves the next client DCR-escalating, regardless of how
+    /// healthy its nonce is.
+    #[test]
+    fn static_authorization_presence_is_a_shape_question_not_a_credential_one() {
+        let n = nonce();
+        let doc: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"headers":{{"X-Coord-Mcp-Proxy-Key":"{n}"}}}}}}}}"#
+        ))
+        .unwrap();
+        assert!(
+            !config_doc_has_static_authorization(&doc),
+            "a legacy-only config is the DCR-escalating shape"
+        );
+
+        // Both shapes present (what the writer emits today).
+        let doc: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"headers":{{"Authorization":"Bearer {n}","X-Coord-Mcp-Proxy-Key":"{n}"}}}}}}}}"#
+        ))
+        .unwrap();
+        assert!(config_doc_has_static_authorization(&doc));
+
+        // A JWT counts too — the predicate is about the KEY, not the value.
+        let doc: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"headers":{{"Authorization":"Bearer {JWT_SHAPED}"}}}}}}}}"#
+        ))
+        .unwrap();
+        assert!(config_doc_has_static_authorization(&doc));
+
+        // Case-insensitive, and absent shapes are false rather than a panic.
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{"mcpServers":{"coord-mcp":{"headers":{"authorization":"x"}}}}"#,
+        )
+        .unwrap();
+        assert!(config_doc_has_static_authorization(&doc));
+        let doc: serde_json::Value = serde_json::from_str(r#"{"mcpServers":{}}"#).unwrap();
+        assert!(!config_doc_has_static_authorization(&doc));
     }
 
     #[test]

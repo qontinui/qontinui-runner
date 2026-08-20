@@ -208,6 +208,30 @@ struct NonceBinding {
     /// adopt (neither persisted form carries a terminal). Those keep the
     /// workdir leg as their fallback. Read via [`terminal_id_for_nonce`].
     terminal_id: Option<String>,
+    /// Wall-clock time this binding entered the live registry — mint, adopt, or
+    /// boot restore alike. **Not** a credential property: nothing checks it to
+    /// decide validity (a Persistent nonce has no expiry, deliberately), and it
+    /// is never persisted.
+    ///
+    /// Its one job is to give [`device_nonce_snapshot`]'s bound a total,
+    /// oldest-first eviction order. Before that bound existed, the persisted
+    /// device set was reaped by **nothing**: `revoke_proxy_nonce` has no
+    /// production caller, `evict_proxy_nonces_for_workdir` fires only on
+    /// relay-chat close for a per-session relay workdir, terminal close revokes
+    /// nothing, and — since Phase 4 carried `terminal_id` into the store — a
+    /// persistent binding is evicted only by a re-mint for its own
+    /// `(workdir, terminal_id)` slot. Terminal ids are per-PTY, so every
+    /// terminal ever spawned added one permanent entry, restored into the live
+    /// map at every boot, with no expiry column and no cap: unbounded growth in
+    /// an encrypted store that is fully re-encrypted and rewritten on every
+    /// mint, and an unbounded set of eternally-valid loopback keys.
+    ///
+    /// A restored binding is stamped at RESTORE time, not at its original mint:
+    /// the store carries no timestamp, so all of one boot's restored bindings
+    /// tie and the bound falls back to its `nonce`-string tiebreak among them.
+    /// That is honest (their true ages are unrecoverable) and self-correcting
+    /// (every later mint sorts strictly newer).
+    minted_at: std::time::SystemTime,
 }
 
 // ---------------------------------------------------------------------------
@@ -350,9 +374,9 @@ pub(crate) fn session_identity_gate() -> Result<(), SessionIdentityDenial> {
 // `crate::coord_mcp_config` because `coord_doctor` (a LIB module) reads the
 // same shape and cannot reach this bin-only module.
 pub(crate) use crate::coord_mcp_config::{
-    proxy_nonce_from_config_doc, proxy_nonce_from_header_object, proxy_nonce_from_request,
-    COORD_MCP_PROXY_KEY_HEADER, COORD_MCP_PROXY_KEY_HEADER_JSON, PROXY_AUTHORIZATION_HEADER_JSON,
-    PROXY_BEARER_PREFIX,
+    config_doc_has_static_authorization, proxy_nonce_from_config_doc,
+    proxy_nonce_from_header_object, proxy_nonce_from_request, COORD_MCP_PROXY_KEY_HEADER,
+    COORD_MCP_PROXY_KEY_HEADER_JSON, PROXY_AUTHORIZATION_HEADER_JSON, PROXY_BEARER_PREFIX,
 };
 
 /// The lead clause of every loopback-proxy "your key is dead" 401.
@@ -362,18 +386,22 @@ pub(crate) use crate::coord_mcp_config::{
 /// reader at the header Phase 2 deprecates, and the key is now accepted under
 /// two names anyway. What a reader needs first is WHICH credential died, not
 /// which envelope carried it.
-pub(crate) const STALE_PROXY_KEY_CAUSE: &str =
-    "stale or unrecognized coord-mcp proxy key: this session's loopback nonce is      not registered with the runner currently listening on this port";
+pub(crate) const STALE_PROXY_KEY_CAUSE: &str = "stale or unrecognized coord-mcp proxy key: \
+     this session's loopback nonce is not registered with the runner currently \
+     listening on this port";
 
 /// Same, for the doors that inject the DEVICE bearer and therefore refuse an
 /// AGENT-bound nonce outright (claims reads, the coord write forwarder).
 pub(crate) const NON_DEVICE_PROXY_KEY_CAUSE: &str =
-    "missing, stale, or non-device coord-mcp proxy key: this route injects the      device identity, so it serves device-bound nonces only";
+    "missing, stale, or non-device coord-mcp proxy key: this route injects the \
+     device identity, so it serves device-bound nonces only";
 
 /// The `AGENT_TOKENS`-slot-gone variant: the nonce IS registered, but the agent
 /// it is bound to no longer has a live token slot.
 pub(crate) const AGENT_GONE_PROXY_CAUSE: &str =
-    "no live agent token for this proxy session: the agent this nonce is bound      to has been torn down, or the runner restarted (agent tokens are      process-global and are NOT restored across a restart)";
+    "no live agent token for this proxy session: the agent this nonce is bound \
+     to has been torn down, or the runner restarted (agent tokens are \
+     process-global and are NOT restored across a restart)";
 
 /// The shared, verified recovery tail — the half a human actually acts on.
 ///
@@ -381,12 +409,33 @@ pub(crate) const AGENT_GONE_PROXY_CAUSE: &str =
 /// snapshots its headers at launch and never re-reads `.mcp.json`, so the
 /// obvious move (reconnect the server) cannot work. Measured 2026-08-20 at
 /// client 2.1.236/2.1.237 (plan
-/// `2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning`, Phase 1). It
-/// deliberately stops short of naming a credential-store repair command — that
-/// is Phase 5's to verify, and an unverified recovery instruction is what this
-/// plan exists to retire.
-pub(crate) const PROXY_KEY_RECOVERY_HINT: &str =
-    "The MCP client snapshots its headers at launch and never re-reads      .mcp.json, so reconnecting this server cannot pick up a fresh key.      Recovery: start a NEW session in this workdir (the runner provisions a      live key on spawn), or re-provision with POST      /coord-mcp/provision-session and relaunch the client. The key is accepted      as `Authorization: Bearer <nonce>` or the legacy `X-Coord-Mcp-Proxy-Key`.";
+/// `2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning`, Phase 1). Every
+/// step below is one Phase 5 **verified** end-to-end on an isolated
+/// `CLAUDE_CONFIG_DIR`; nothing here is inferred.
+///
+/// **What this string must never do is name an unverified repair** — that is
+/// the defect class the whole plan exists to retire. Two candidates were
+/// deliberately cut for exactly that reason:
+///
+/// * `POST /coord-mcp/provision-session` — it reads as the obvious recovery and
+///   is not one. The route is gated by [`session_identity_gate`], whose first
+///   arm is the default-OFF [`SESSION_IDENTITY_ENABLE_FLAG`], so in the shipped
+///   posture the advised recovery is a **denial**; and even with the flag on
+///   plus the opt-in marker it mints an EPHEMERAL, `terminal_id: None`,
+///   never-persisted nonce — a strictly weaker credential class than the
+///   persistent per-terminal one that just died, gone again at the next
+///   restart, and revocable mid-session by deleting the marker.
+/// * Restarting the runner — forbidden outright (served policy
+///   `production-and-cost` `runner-lifecycle`), and it orphans every OTHER
+///   session's key, which is the incident this plan was written from.
+pub(crate) const PROXY_KEY_RECOVERY_HINT: &str = "The MCP client snapshots its headers at \
+     launch and never re-reads .mcp.json, so reconnecting this server cannot pick up a fresh \
+     key. Recovery, in order: (1) keep working through another coord door (/coord-revive), \
+     and verify any write by reading it back; (2) start a NEW session in this workdir — the \
+     runner writes a fresh key on every session spawn; NEVER restart the runner to force it; \
+     (3) only if the client reports needs-auth while sending ZERO requests, run `claude mcp \
+     logout <server>`, then start a new session. The key is accepted as \
+     `Authorization: Bearer <nonce>` or the legacy `X-Coord-Mcp-Proxy-Key`.";
 
 /// Join a door-specific cause with the shared recovery tail. One function so
 /// the five proxy doors cannot drift into five different 2am stories.
@@ -1068,11 +1117,66 @@ pub(crate) fn spawn_log_proxy_nonce_rejected(nonce: Option<&str>, cause: impl In
 ///   into the stronger one across a restart. Non-persistence is also half of
 ///   what makes the TTL meaningful (a leaked nonce cannot be replayed against
 ///   the next runner).
+///
+/// ## The bound — the third drop, and why it has to live here
+///
+/// Phase 4 carried `terminal_id` into the store, which fixed the slot-collapse
+/// cascade but removed the only thing that was reaping the persisted set. It
+/// was an accidental GC and a destructive one — that is the bug Phase 4 fixed —
+/// but **nothing took its place**: `revoke_proxy_nonce` has no production
+/// caller (every reference is a test), `evict_proxy_nonces_for_workdir` fires
+/// only from `mcp/backend_relay.rs` on relay-chat close for a per-session relay
+/// workdir, `terminal/session.rs` provisions on spawn and revokes nothing on
+/// close, and a persistent binding is now evicted only by a re-mint for its own
+/// `(workdir, terminal_id)` slot. Terminal ids are per-PTY, so **every terminal
+/// ever spawned added one permanent entry**, restored into the live map at
+/// every boot, with no expiry column and no cap — unbounded growth in an
+/// encrypted store that is fully re-encrypted and rewritten on every mint, plus
+/// an unbounded set of eternally-valid loopback keys.
+///
+/// The bound is applied HERE, at the snapshot, rather than by revoking on
+/// terminal close, and that choice is the point:
+///
+/// * The **live map stays authoritative** for this process. Capping the
+///   snapshot cannot 401 a running session — it only decides which bindings are
+///   still there after the NEXT restart. Revoking on terminal close would kill
+///   a live credential, and the in-cwd `.mcp.json` that terminal wrote is read
+///   by other consumers (the `qontinui-pr` walk-up, hand-launched clients), so
+///   that shape can strand a session that is still using the file.
+/// * Eviction is **oldest-first** ([`NonceBinding::minted_at`]), tie-broken by
+///   the nonce string so the emitted map is deterministic — `enqueue_nonce_persist`
+///   compares snapshots for equality to skip no-op writes, and a
+///   nondeterministic cut would rewrite the encrypted store on every mint.
+/// * It is the whole persisted surface: `device_nonce_snapshot` is the single
+///   producer of the stored shape, so nothing can route around the bound.
+///
+/// What it does NOT bound is the in-memory map within one process lifetime.
+/// That is deliberate: those are credentials issued to PTYs this process
+/// actually spawned, and dropping one mid-life is the stranding case above. The
+/// bound is on what becomes *eternal*.
 fn device_nonce_snapshot(
     map: &HashMap<String, NonceBinding>,
 ) -> HashMap<String, crate::secure_storage::StoredNonceBinding> {
-    map.iter()
+    let mut eligible: Vec<(&String, &NonceBinding)> = map
+        .iter()
         .filter(|(_, b)| b.principal == ProxyPrincipal::Device && !b.lifetime.is_ephemeral())
+        .collect();
+    if eligible.len() > MAX_PERSISTED_DEVICE_NONCES {
+        // Newest first, then keep the head. The `nonce` tiebreak makes the cut
+        // total and deterministic — a boot restore stamps every restored
+        // binding with the same `minted_at`, so ties are the normal case, not
+        // an edge.
+        eligible.sort_by(|(na, a), (nb, b)| b.minted_at.cmp(&a.minted_at).then_with(|| na.cmp(nb)));
+        let dropped = eligible.len() - MAX_PERSISTED_DEVICE_NONCES;
+        eligible.truncate(MAX_PERSISTED_DEVICE_NONCES);
+        warn!(
+            "coord_mcp: persisted device nonce set capped at {MAX_PERSISTED_DEVICE_NONCES} \
+             — dropped the {dropped} oldest binding(s) from the encrypted store. They stay \
+             VALID in this process; they will simply not be restored after the next restart."
+        );
+    }
+    eligible
+        .into_iter()
         .map(|(n, b)| {
             (
                 n.clone(),
@@ -1084,6 +1188,18 @@ fn device_nonce_snapshot(
         })
         .collect()
 }
+
+/// How many device bindings [`device_nonce_snapshot`] will persist. See that
+/// function for why the bound lives at the snapshot rather than at revoke time.
+///
+/// Sized well above any real working set — the heaviest measured box runs ~9
+/// concurrent sessions and the persist debounce exists because a boot can
+/// restore ~40 panes at once — so an operator never meets it, while the store
+/// stays bounded at roughly 256 × ~150 B ≈ 38 KB of nonce entries (the whole
+/// `auth_tokens.enc` was 9 KB before this). A cap the working set can reach
+/// would silently orphan live sessions across a restart, which is the failure
+/// this whole plan is about; a cap it cannot reach only bounds the pathology.
+const MAX_PERSISTED_DEVICE_NONCES: usize = 256;
 
 /// True unless `COORD_MCP_PERSIST_NONCES` is explicitly set to `0` — persistence
 /// is ON by default (resolved in the plan: the nonce is a loopback-only key, so
@@ -1301,10 +1417,14 @@ fn persist_proxy_nonces_with_store(
 /// observability) so a future silent rotation — restore brought back 0 then
 /// self-heal had to mint fresh — is visible in the logs.
 pub(crate) fn restore_proxy_nonces_from_store() -> usize {
-    if !nonce_persistence_enabled() {
-        log_restore_event(0, 0, "persistence disabled (COORD_MCP_PERSIST_NONCES=0)");
-        return 0;
-    }
+    // The run-once guard comes FIRST, ahead of every arm including the
+    // persistence-disabled one, so this function emits exactly ONE `restore`
+    // line per process on every path. It used to sit after the disabled check,
+    // which gave the stream two opposite defects at once: repeated calls with
+    // persistence off logged a `restore` line EVERY time (an aggregate line
+    // that cannot be attributed to a caller — see `log_restore_event`), while
+    // repeated calls with persistence ON logged nothing at all. One line per
+    // process, always, is what makes "did the boot restore run?" answerable.
     if PROXY_NONCES_RESTORED.set(()).is_err() {
         // Already restored once this process — report the current live size so a
         // duplicate boot-task run still logs a coherent count.
@@ -1312,6 +1432,10 @@ pub(crate) fn restore_proxy_nonces_from_store() -> usize {
             .lock()
             .expect("proxy nonce map poisoned")
             .len();
+    }
+    if !nonce_persistence_enabled() {
+        log_restore_event(0, 0, "persistence disabled (COORD_MCP_PERSIST_NONCES=0)");
+        return 0;
     }
     let store = match crate::secure_storage::SecureStorage::new() {
         Ok(s) => s,
@@ -1337,12 +1461,16 @@ pub(crate) fn restore_proxy_nonces_from_store() -> usize {
 ///
 /// Aggregate, so it carries no key material and no workdir — the per-nonce
 /// detail is the `mint`/`write` trail those nonces already left before the
-/// restart.
+/// restart. The workdir field therefore carries [`ROTATION_UNKNOWN`], never the
+/// empty string: `"workdir":""` is the exact ambiguity Phase 3 introduced the
+/// sentinel to kill (671 production reject lines carried it, and none of them
+/// could be attributed), and an aggregate line is a *statement* that there is
+/// no single workdir — not a failure to record one.
 fn log_restore_event(restored: usize, skipped: usize, reason: &str) {
     log_rotation_event_with(
         "restore",
-        "",
-        "",
+        ROTATION_UNKNOWN,
+        ROTATION_UNKNOWN,
         reason,
         &[
             ("restored", serde_json::Value::from(restored)),
@@ -1420,6 +1548,9 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
                 // pre-Phase-4 store and a genuinely terminal-less binding
                 // restore as.
                 terminal_id: binding.terminal_id,
+                // Stamped at RESTORE, not at the original mint — the store
+                // carries no timestamp. See [`NonceBinding::minted_at`].
+                minted_at: std::time::SystemTime::now(),
             });
             if vacant {
                 inserted += 1;
@@ -1682,6 +1813,7 @@ fn mint_and_register_nonce(
                 // the deterministic leg of caller self-identification — see
                 // [`NonceBinding::terminal_id`] / [`terminal_id_for_nonce`].
                 terminal_id: terminal_id.map(str::to_string),
+                minted_at: std::time::SystemTime::now(),
             },
         );
         grace_evicted_device_nonces(&evicted_graceable);
@@ -2549,6 +2681,28 @@ pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
     write_mcp_json(primary_wt, &coord_mcp_proxy_config_json(bound_port, &nonce));
 }
 
+/// Rewrite `workdir`'s `.mcp.json` through the canonical producer while
+/// **preserving the nonce already on disk** — no mint, no eviction, no registry
+/// change at all.
+///
+/// The one legitimate reason to rewrite a config whose credential is fine: the
+/// file predates the Phase 2 header shape and so carries only
+/// `X-Coord-Mcp-Proxy-Key`, which leaves the next MCP client launched against it
+/// escalating a stale-key 401 into OAuth discovery → DCR → this runner's own
+/// 404 → a durable client-side poison entry. See
+/// [`RootReconcileAction::UpgradeHeaders`].
+///
+/// Deliberately NOT [`write_coord_mcp_proxy_config`]: that mints a fresh nonce
+/// and evicts the workdir's previous one, which would strand every live client
+/// holding the old one — the failure this whole plan is about. Going through
+/// [`coord_mcp_proxy_config_json`] keeps the emitted shape identical to a fresh
+/// write (one producer, no second shape to drift), and [`write_mcp_json`] still
+/// logs the `write` rotation line carrying the (unchanged) key prefix, so the
+/// forensics stream shows the rewrite without showing a rotation.
+fn rewrite_root_config_preserving_nonce(workdir: &str, bound_port: u16, nonce: &str) {
+    write_mcp_json(workdir, &coord_mcp_proxy_config_json(bound_port, nonce));
+}
+
 /// THE coord-mcp proxy config document — the single writer of this JSON shape
 /// (plan 2026-07-17 §2). Every emitter goes through here: the in-cwd
 /// `.mcp.json` writers ([`write_coord_mcp_proxy_config`],
@@ -3406,9 +3560,31 @@ pub(crate) fn reconcile_action(
 /// restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootReconcileAction {
-    /// Healthy (port matches AND the on-disk nonce is currently registered), or
-    /// not our config to touch (absent / static-bearer shape) — do nothing.
+    /// Healthy (port matches, the on-disk nonce is currently registered, AND the
+    /// file already carries the non-escalating header shape), or not our config
+    /// to touch (absent / static-bearer shape) — do nothing.
     Leave,
+    /// Port matches and the on-disk nonce IS registered — the credential is
+    /// perfectly healthy — but the file still carries ONLY the legacy
+    /// `X-Coord-Mcp-Proxy-Key` header. Rewrite it in place **with that same
+    /// nonce** so it gains the static `Authorization` key.
+    ///
+    /// **Why this needs its own arm.** The rest of this resolver keys on
+    /// `(port, nonce, registered)` — the header SHAPE is invisible to it — so on
+    /// the very deploy that ships the Phase 2 emitter (runner rebuild, same port
+    /// `:9876`), a healthy legacy-only config classified as `Leave` and an
+    /// unregistered one as `AdoptNonce`, and both deliberately left the file
+    /// byte-identical. Either way the in-workdir `.mcp.json` kept the
+    /// legacy-only shape, i.e. **still DCR-escalating for the next client
+    /// launched against it** — the exact class Phase 2 exists to close, missed
+    /// on every file already on disk. Runner-spawned terminals were fine (they
+    /// get a fresh app-data `--mcp-config`); the residual was the in-workdir
+    /// file read by the `qontinui-pr` walk-up and by hand-launched clients.
+    ///
+    /// It is safe precisely because the nonce does not change: a live MCP client
+    /// cached that nonce at launch and never re-reads the file, so rewriting the
+    /// bytes around an unchanged credential cannot strand it.
+    UpgradeHeaders,
     /// Adopt the exact on-disk nonce into the live registry as this workdir's
     /// Device binding — NO file rewrite. Produced only when the proxy port still
     /// matches, a non-empty nonce IS readable from disk, but that nonce is not in
@@ -3436,11 +3612,14 @@ pub(crate) enum RootReconcileAction {
 /// the proxy port currently written to the root file (`None` = absent /
 /// unparseable / static-bearer shape), the nonce string readable from that file
 /// (`None` = no proxy-key header), whether that nonce is currently in the live
-/// registry, and the instance's bound port.
+/// registry, whether the file's static `headers` map carries an `Authorization`
+/// key at all (the DCR-escape shape — see
+/// [`RootReconcileAction::UpgradeHeaders`]), and the instance's bound port.
 pub(crate) fn root_reconcile_action(
     current_proxy_port: Option<u16>,
     on_disk_nonce: Option<&str>,
     nonce_is_registered: bool,
+    has_static_authorization: bool,
     bound_port: u16,
 ) -> RootReconcileAction {
     let Some(port) = current_proxy_port else {
@@ -3458,8 +3637,17 @@ pub(crate) fn root_reconcile_action(
         // A non-empty nonce is readable but not registered → adopt it so the
         // live client's cached nonce validates again without a file change.
         Some(nonce) if !nonce.is_empty() && !nonce_is_registered => RootReconcileAction::AdoptNonce,
-        // A registered nonce → healthy, nothing to do.
-        Some(_) if nonce_is_registered => RootReconcileAction::Leave,
+        // A registered nonce → the CREDENTIAL is healthy. The file may still be
+        // the legacy-only shape though, which leaves the next client launched
+        // against it escalating a future 401 into OAuth/DCR — so healthy splits
+        // in two on the header shape.
+        Some(_) if nonce_is_registered => {
+            if has_static_authorization {
+                RootReconcileAction::Leave
+            } else {
+                RootReconcileAction::UpgradeHeaders
+            }
+        }
         // No nonce readable (or an empty one) → nothing to adopt; mint fresh.
         _ => RootReconcileAction::Rewrite,
     }
@@ -3532,6 +3720,7 @@ fn adopt_on_disk_nonce(workdir: &str, nonce: &str) {
                 // previous runner anyway. Caller self-identification falls back
                 // to the workdir leg for an adopted nonce.
                 terminal_id: None,
+                minted_at: std::time::SystemTime::now(),
             },
         );
         (map.clone(), evicted)
@@ -3575,9 +3764,23 @@ fn resolve_root_reconcile(
         current_port,
         on_disk_nonce.as_deref(),
         registered,
+        read_static_authorization_presence(&path),
         bound_port,
     );
     (action, on_disk_nonce)
+}
+
+/// Whether the `.mcp.json` at `config_path` carries a static `Authorization`
+/// key in its `coord-mcp` headers map. An unreadable / unparseable file is
+/// `false`, matching every other reader here (and harmlessly: a file that
+/// cannot be read cannot be classified as a healthy proxy config either, so the
+/// answer is never load-bearing on its own).
+fn read_static_authorization_presence(config_path: &Path) -> bool {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| config_doc_has_static_authorization(&v))
+        .unwrap_or(false)
 }
 
 /// True iff the root `.mcp.json` at `root_dir` needs SOME self-heal action
@@ -3690,6 +3893,23 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
     let root = root_dir.to_string_lossy().to_string();
     match action {
         RootReconcileAction::Leave => RootReconcileAction::Leave,
+        RootReconcileAction::UpgradeHeaders => {
+            if !coord_mcp_safe_to_write(&root) {
+                return RootReconcileAction::Leave;
+            }
+            // SAFETY: the resolver only yields UpgradeHeaders when a registered
+            // nonce was read from disk, so this Option is always Some here.
+            let nonce = on_disk_nonce
+                .expect("UpgradeHeaders implies a readable on-disk nonce (resolver invariant)");
+            rewrite_root_config_preserving_nonce(&root, bound_port, &nonce);
+            info!(
+                "coord_mcp: boot self-heal UPGRADED the header shape of root \
+                 {root}/.mcp.json (port :{bound_port} and nonce BOTH unchanged) — the \
+                 file carried only the legacy proxy-key header, which leaves the next \
+                 client launched against it escalating a 401 into OAuth/DCR"
+            );
+            RootReconcileAction::UpgradeHeaders
+        }
         RootReconcileAction::AdoptNonce => {
             if !coord_mcp_safe_to_write(&root) {
                 return RootReconcileAction::Leave;
@@ -3699,10 +3919,22 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             let nonce = on_disk_nonce
                 .expect("AdoptNonce implies a readable on-disk nonce (resolver invariant)");
             adopt_on_disk_nonce(&root, &nonce);
+            // Same header-shape upgrade as the arm above, folded in here rather
+            // than deferred: an adopted config is by definition one that was
+            // written by an OLDER runner, so it is the most likely legacy-only
+            // shape on the box, and deferring the upgrade to the next boot would
+            // leave it DCR-escalating for a whole runner lifetime. The adopted
+            // nonce is re-emitted verbatim, so the "live client's cached nonce
+            // keeps validating" contract is untouched — what changes is the file
+            // the NEXT client reads.
+            let upgraded = !read_static_authorization_presence(&root_dir.join(".mcp.json"));
+            if upgraded {
+                rewrite_root_config_preserving_nonce(&root, bound_port, &nonce);
+            }
             info!(
                 "coord_mcp: boot self-heal ADOPTED on-disk root nonce for {root} \
-                 (port :{bound_port} unchanged; .mcp.json byte-identical) — live \
-                 MCP client cache preserved"
+                 (port :{bound_port} unchanged; nonce preserved verbatim; header shape \
+                 upgraded={upgraded}) — live MCP client cache preserved"
             );
             RootReconcileAction::AdoptNonce
         }
@@ -3718,7 +3950,8 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             RootReconcileAction::Rewrite
         }
         // Unreachable in practice: the pure resolver ([`root_reconcile_action`])
-        // only ever yields Leave/AdoptNonce/Rewrite — `SkippedSecondary` is
+        // only ever yields Leave/UpgradeHeaders/AdoptNonce/Rewrite —
+        // `SkippedSecondary` is
         // produced solely by the instance gate in [`reconcile_root_config_gated`],
         // which returns BEFORE calling this function. Handle it as identity rather
         // than `unreachable!` so a future resolver change degrades to a no-op skip
@@ -3966,6 +4199,7 @@ mod tests {
                     },
                     session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
                     terminal_id: None,
+                    minted_at: std::time::SystemTime::now(),
                 },
             );
             map.insert(
@@ -3979,6 +4213,7 @@ mod tests {
                     },
                     session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
                     terminal_id: None,
+                    minted_at: std::time::SystemTime::now(),
                 },
             );
         }
@@ -4021,6 +4256,7 @@ mod tests {
                 },
                 session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
                 terminal_id: None,
+                minted_at: std::time::SystemTime::now(),
             },
         );
         assert!(
@@ -5331,6 +5567,81 @@ mod tests {
         }
     }
 
+    /// The BOUND on the persisted set (plan 2026-08-20 review finding 2).
+    ///
+    /// Phase 4 carried `terminal_id` into the store, which removed the only
+    /// thing reaping it: nothing else evicts a persistent device binding
+    /// (`revoke_proxy_nonce` has no production caller,
+    /// `evict_proxy_nonces_for_workdir` fires only on relay-chat close, terminal
+    /// close revokes nothing), so every terminal ever spawned added ONE
+    /// permanent entry, restored at every boot, with no expiry and no cap.
+    ///
+    /// Asserted against `device_nonce_snapshot` directly — it is the single
+    /// producer of the stored shape, so a bound anywhere else could be routed
+    /// around. Built as a plain map rather than by minting: `mint_and_register_nonce`
+    /// returns a clone of the WHOLE process-global map, which under the parallel
+    /// harness carries peer nonces and would make the count nondeterministic.
+    #[test]
+    fn device_nonce_snapshot_is_bounded_and_drops_the_oldest_first() {
+        let base = std::time::SystemTime::UNIX_EPOCH;
+        let mut map: HashMap<String, NonceBinding> = HashMap::new();
+        let over = MAX_PERSISTED_DEVICE_NONCES + 25;
+        // `i` doubles as the age rank: index 0 is the OLDEST.
+        let nonce_at = |i: usize| format!("bound-{i:06}");
+        for i in 0..over {
+            map.insert(
+                nonce_at(i),
+                NonceBinding {
+                    workdir: format!("D:/bounded-wt/{i}"),
+                    principal: ProxyPrincipal::Device,
+                    lifetime: NonceLifetime::Persistent,
+                    session_tenant: None,
+                    terminal_id: Some(format!("term-{i}")),
+                    minted_at: base + std::time::Duration::from_secs(i as u64),
+                },
+            );
+        }
+
+        let snapshot = device_nonce_snapshot(&map);
+        assert_eq!(
+            snapshot.len(),
+            MAX_PERSISTED_DEVICE_NONCES,
+            "the persisted set must be capped"
+        );
+        // The 25 OLDEST are the ones dropped; every newer one survives.
+        for i in 0..25 {
+            assert!(
+                !snapshot.contains_key(&nonce_at(i)),
+                "binding {i} is among the oldest and must not be persisted"
+            );
+        }
+        for i in 25..over {
+            assert!(
+                snapshot.contains_key(&nonce_at(i)),
+                "binding {i} is newer than the cut and must be persisted"
+            );
+        }
+        // Deterministic: `enqueue_nonce_persist` skips a write when the snapshot
+        // equals the last one written, so a nondeterministic cut would re-encrypt
+        // and rewrite the whole store on every single mint.
+        assert_eq!(
+            snapshot,
+            device_nonce_snapshot(&map),
+            "the cut must be deterministic for the same input map"
+        );
+        // The live map is untouched — capping decides what survives the NEXT
+        // restart, never what validates right now.
+        assert_eq!(map.len(), over, "the live registry is not evicted");
+
+        // At or below the cap nothing is dropped at all.
+        let mut small = map;
+        while small.len() > MAX_PERSISTED_DEVICE_NONCES {
+            let k = small.keys().next().unwrap().clone();
+            small.remove(&k);
+        }
+        assert_eq!(device_nonce_snapshot(&small).len(), small.len());
+    }
+
     /// Phase 3b — `persist_proxy_nonces` honors the `nonce_persistence_enabled`
     /// gate: when persistence is disabled (test default, `COORD_MCP_PERSIST_NONCES`
     /// unset under `cfg(test)`), the DEFAULT-store path is a no-op. We assert the
@@ -5530,10 +5841,17 @@ mod tests {
         // --- Case 3: matching port but UNREGISTERED nonce → ADOPT (no rewrite). ---
         // Plan 2026-07-07 Change 1 CORE FIX: re-register the EXACT on-disk nonce
         // rather than minting a fresh one, so a live MCP client's cached nonce
-        // keeps validating. The `.mcp.json` MUST stay byte-identical.
+        // keeps validating.
+        //
+        // The invariant is **the NONCE is preserved**, not the file's bytes —
+        // that is what a live client cached, and the file is what the NEXT
+        // client reads. This fixture is written in the Phase 2 shape so the
+        // adopt is a pure no-file-change; the legacy-only fixture (which adopt
+        // now ALSO upgrades in place, same nonce) is covered by
+        // `upgrade_in_place_adds_authorization_without_rotating_the_nonce`.
         let dead = std::env::temp_dir().join(format!("coord-mcp-root-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dead).unwrap();
-        let dead_body = r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"notregistered-9c3f"}}}}"#;
+        let dead_body = r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"Authorization":"Bearer notregistered-9c3f","X-Coord-Mcp-Proxy-Key":"notregistered-9c3f"}}}}"#;
         std::fs::write(dead.join(".mcp.json"), dead_body).unwrap();
         assert!(
             !proxy_nonce_is_valid("notregistered-9c3f"),
@@ -5553,11 +5871,12 @@ mod tests {
             proxy_nonce_is_valid("notregistered-9c3f"),
             "the on-disk nonce must be adopted verbatim so a cached client validates"
         );
-        // The file is byte-identical — no rewrite → live client cache preserved.
+        // Already the non-escalating shape, so there is nothing to upgrade and
+        // the file is byte-identical — no rewrite → live client cache preserved.
         assert_eq!(
             std::fs::read_to_string(dead.join(".mcp.json")).unwrap(),
             dead_body,
-            "adopt must NOT rewrite the root .mcp.json"
+            "adopt must NOT rewrite an already-current root .mcp.json"
         );
         // A second pass is now a no-op (the nonce is registered) → Leave.
         assert!(!root_config_is_stale(&dead, 9876));
@@ -5626,7 +5945,11 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         // A HEALTHY root config naming the primary's port — precisely what a
         // temp runner on a different port used to overwrite.
-        let healthy = r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"primary-owned-nonce"}}}}"#;
+        // Written in the CURRENT shape so the byte-identity assertions below
+        // isolate the instance gate: a legacy-only fixture would now also be
+        // header-upgraded by the primary's adopt arm, and this test is about WHO
+        // may write, not about what a write does.
+        let healthy = r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"Authorization":"Bearer primary-owned-nonce","X-Coord-Mcp-Proxy-Key":"primary-owned-nonce"}}}}"#;
         std::fs::write(root.join(".mcp.json"), healthy).unwrap();
 
         // The SECONDARY on :9877 — the reproduction. Must not touch the file.
@@ -5645,7 +5968,7 @@ mod tests {
         // healthy. A root config that IS stale for the secondary's port (the
         // `Rewrite` trigger) is still left alone.
         assert_eq!(
-            root_reconcile_action(Some(9876), Some("primary-owned-nonce"), false, 9877),
+            root_reconcile_action(Some(9876), Some("primary-owned-nonce"), false, true, 9877),
             RootReconcileAction::Rewrite,
             "precondition: ungated, this input would have REWRITTEN the root config"
         );
@@ -5792,39 +6115,164 @@ mod tests {
     /// Plan 2026-07-07 Change 1 — the pure `root_reconcile_action` resolver over
     /// explicit inputs, isolating the adopt-vs-rewrite-vs-leave decision from any
     /// file I/O or the process-global nonce map.
+    ///
+    /// The 4th argument is the header SHAPE (plan 2026-08-20): whether the file
+    /// carries a static `Authorization` key at all.
     #[test]
     fn root_reconcile_action_resolves_adopt_vs_rewrite_vs_leave() {
         // Not our shape (no readable proxy port) → Leave regardless of nonce.
         assert_eq!(
-            root_reconcile_action(None, Some("x"), false, 9876),
+            root_reconcile_action(None, Some("x"), false, true, 9876),
             RootReconcileAction::Leave
         );
         // Port moved → Rewrite (client's cached URL is stale too — reconnect).
         assert_eq!(
-            root_reconcile_action(Some(9999), Some("x"), true, 9876),
+            root_reconcile_action(Some(9999), Some("x"), true, true, 9876),
             RootReconcileAction::Rewrite,
             "a moved port must rewrite even with a registered nonce"
         );
         // Same port, nonce readable but UNregistered → Adopt (the core fix).
         assert_eq!(
-            root_reconcile_action(Some(9876), Some("abc"), false, 9876),
+            root_reconcile_action(Some(9876), Some("abc"), false, true, 9876),
             RootReconcileAction::AdoptNonce
         );
-        // Same port, nonce readable AND registered → Leave (healthy).
+        // Same port, nonce readable AND registered AND already non-escalating
+        // → Leave (healthy).
         assert_eq!(
-            root_reconcile_action(Some(9876), Some("abc"), true, 9876),
+            root_reconcile_action(Some(9876), Some("abc"), true, true, 9876),
             RootReconcileAction::Leave
         );
         // Same port, NO nonce readable → Rewrite (nothing to adopt).
         assert_eq!(
-            root_reconcile_action(Some(9876), None, false, 9876),
+            root_reconcile_action(Some(9876), None, false, false, 9876),
             RootReconcileAction::Rewrite
         );
         // Same port, EMPTY nonce string → Rewrite (empty is nothing to adopt).
         assert_eq!(
-            root_reconcile_action(Some(9876), Some(""), false, 9876),
+            root_reconcile_action(Some(9876), Some(""), false, false, 9876),
             RootReconcileAction::Rewrite
         );
+    }
+
+    /// The gap the credential-keyed resolver could not see (plan 2026-08-20
+    /// review finding 3): on the very deploy that ships the Phase 2 emitter the
+    /// runner rebuilds on the SAME port, so every `.mcp.json` already on disk
+    /// stays legacy-only — healthy nonce, no static `Authorization`, therefore
+    /// still DCR-escalating for the next client launched against it. That input
+    /// used to classify as `Leave`.
+    #[test]
+    fn a_healthy_but_legacy_only_config_is_upgraded_not_left() {
+        // The regression this pins: same port, REGISTERED nonce, legacy-only
+        // header shape.
+        assert_eq!(
+            root_reconcile_action(Some(9876), Some("abc"), true, false, 9876),
+            RootReconcileAction::UpgradeHeaders,
+            "a registered nonce in a legacy-only file must be upgraded in place"
+        );
+        // The shape question is orthogonal to every other input: a MOVED port
+        // still rewrites (fresh nonce), and an UNREGISTERED nonce is still
+        // adopted — the upgrade never pre-empts either.
+        assert_eq!(
+            root_reconcile_action(Some(9999), Some("abc"), true, false, 9876),
+            RootReconcileAction::Rewrite
+        );
+        assert_eq!(
+            root_reconcile_action(Some(9876), Some("abc"), false, false, 9876),
+            RootReconcileAction::AdoptNonce
+        );
+    }
+
+    /// End-to-end on the FILE: a healthy legacy-only root config is rewritten in
+    /// place, gains `Authorization`, and — the load-bearing half — keeps the
+    /// **same nonce**. Minting here would strand every live client holding the
+    /// old one, which is the failure the whole plan is about.
+    #[test]
+    fn upgrade_in_place_adds_authorization_without_rotating_the_nonce() {
+        let root = std::env::temp_dir().join(format!("coord-mcp-upg-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".mcp.json");
+
+        // A LIVE, registered nonce written in the pre-Phase-2 shape.
+        let live = register_proxy_nonce(&root.to_string_lossy(), None);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"{live}"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert!(
+            proxy_nonce_is_valid(&live),
+            "precondition: the nonce is live"
+        );
+        assert!(
+            !read_static_authorization_presence(&path),
+            "precondition: the file is the legacy-only shape"
+        );
+
+        assert_eq!(
+            reconcile_root_config_at(&root, 9876),
+            RootReconcileAction::UpgradeHeaders
+        );
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["mcpServers"]["coord-mcp"]["headers"][PROXY_AUTHORIZATION_HEADER_JSON],
+            serde_json::Value::from(format!("{PROXY_BEARER_PREFIX}{live}")),
+            "the upgraded file must carry the static Authorization key"
+        );
+        assert_eq!(
+            read_proxy_nonce(&path).as_deref(),
+            Some(live.as_str()),
+            "the nonce must be PRESERVED — an upgrade is not a rotation"
+        );
+        assert!(
+            proxy_nonce_is_valid(&live),
+            "the live registry is untouched by a header upgrade"
+        );
+
+        // Idempotent: the upgraded file is now healthy AND non-escalating.
+        assert_eq!(
+            reconcile_root_config_at(&root, 9876),
+            RootReconcileAction::Leave,
+            "an upgraded config must not be rewritten on every boot"
+        );
+
+        // And the ADOPT arm upgrades too — an adopted config was written by an
+        // older runner, so it is the likeliest legacy-only shape on the box.
+        let orphan = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"{orphan}"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert!(!proxy_nonce_is_valid(&orphan));
+        assert_eq!(
+            reconcile_root_config_at(&root, 9876),
+            RootReconcileAction::AdoptNonce
+        );
+        assert!(
+            proxy_nonce_is_valid(&orphan),
+            "the on-disk nonce is still adopted VERBATIM — the client cache contract"
+        );
+        assert_eq!(
+            read_proxy_nonce(&path).as_deref(),
+            Some(orphan.as_str()),
+            "adopt + upgrade must not rotate the nonce either"
+        );
+        assert!(
+            read_static_authorization_presence(&path),
+            "the adopted config must also stop being DCR-escalating"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Plan 2026-07-07 Change 1 — `adopt_on_disk_nonce` re-registers the EXACT
@@ -6184,9 +6632,11 @@ mod tests {
     /// (one `adopt` line, zero restores, in 5,486 lines).
     #[test]
     fn rotation_restore_event_reports_restored_and_skipped_counts() {
-        // The restore line is an AGGREGATE: it carries no workdir and no key
-        // prefix, so it cannot be filtered to this test the way every other
-        // forensics assertion here filters by its own workdir. Serialize the
+        // The restore line is an AGGREGATE: it carries no single workdir and no
+        // key prefix (both read `ROTATION_UNKNOWN` — a STATEMENT that there is
+        // none, never `""`, which reads as "the runner failed to populate it"),
+        // so it cannot be filtered to this test the way every other forensics
+        // assertion here filters by its own workdir. Serialize the
         // restore-emitting tests instead and read only the window this test
         // owns — see `restore_forensics_lock`.
         let _serial = restore_forensics_lock();
@@ -6214,6 +6664,10 @@ mod tests {
         assert_eq!(r.len(), 1, "an empty store still emits exactly one restore");
         assert_eq!(r[0]["restored"], 0);
         assert_eq!(r[0]["skipped"], 0);
+        // Never `""` — the aggregate says "no single workdir/key", it does not
+        // leave the field unpopulated (the 2026-08-19 reject-line ambiguity).
+        assert_eq!(r[0]["workdir"], ROTATION_UNKNOWN);
+        assert_eq!(r[0]["key_prefix"], ROTATION_UNKNOWN);
         assert!(
             r[0]["cause"].as_str().unwrap().contains("empty"),
             "the reason class must name the empty-store arm, got {:?}",
@@ -6252,6 +6706,7 @@ mod tests {
                     lifetime: NonceLifetime::Persistent,
                     session_tenant: None,
                     terminal_id: None,
+                    minted_at: std::time::SystemTime::now(),
                 },
             );
         }
@@ -6260,8 +6715,10 @@ mod tests {
         assert_eq!(r.len(), 2, "one restore line per restore call");
         assert_eq!(r[1]["restored"], 1, "only `a` was actually re-inserted");
         assert_eq!(r[1]["skipped"], 1, "`b` was already live and was skipped");
-        // Aggregate line: no key material at all.
-        assert_eq!(r[1]["key_prefix"], "");
+        // Aggregate line: no key material at all — and the field says so with
+        // the sentinel rather than being left empty.
+        assert_eq!(r[1]["key_prefix"], ROTATION_UNKNOWN);
+        assert_eq!(r[1]["workdir"], ROTATION_UNKNOWN);
         for n in [a.as_str(), b.as_str()] {
             assert!(
                 !r[1].to_string().contains(n),
@@ -6858,6 +7315,14 @@ mod phase2_proxy_header_shape_tests {
     /// this phase deprecates and said nothing about what to do. The replacement
     /// must name the cause, say why reconnecting cannot work, and give a
     /// concrete recovery.
+    ///
+    /// **This test used to assert `provision-session`** and so PINNED an
+    /// instruction that does not work: that route is gated by the default-OFF
+    /// `SESSION_IDENTITY_ENABLE_FLAG` (flag off ⇒ every request denied) and,
+    /// even enabled, hands back an ephemeral terminal-less nonce — a weaker
+    /// class than the one that just died. The assertions below now pin the
+    /// three Phase-5-VERIFIED steps instead, plus a negative that keeps the
+    /// falsified route from creeping back in.
     #[test]
     fn the_dead_key_error_string_is_actionable_and_names_no_deprecated_header_alone() {
         let msg = stale_proxy_key_error(STALE_PROXY_KEY_CAUSE);
@@ -6866,9 +7331,29 @@ mod phase2_proxy_header_shape_tests {
             msg.contains("never re-reads"),
             "must say why reconnecting the server cannot recover it"
         );
+        // The three verified steps, in order.
         assert!(
-            msg.contains("provision-session"),
-            "must name a concrete recovery route"
+            msg.contains("/coord-revive"),
+            "step 1: keep working through another coord door"
+        );
+        assert!(
+            msg.contains("start a NEW session"),
+            "step 2: the runner writes a fresh key on every session spawn"
+        );
+        assert!(
+            msg.contains("claude mcp logout"),
+            "step 3: the VERIFIED credential-store repair for a poisoned client"
+        );
+        assert!(
+            msg.contains("NEVER restart the runner"),
+            "the one recovery an operator must not reach for"
+        );
+        // Negative: the flag-gated, ephemeral-credential route must NOT be
+        // advertised as a recovery. An unverified (here: falsified) recovery
+        // instruction is the defect class this plan retires.
+        assert!(
+            !msg.contains("provision-session"),
+            "the default-OFF, ephemeral-nonce route is not a recovery"
         );
         // Both accepted header names appear, so a reader is never pointed at
         // one name as if it were the only one.
@@ -6881,6 +7366,25 @@ mod phase2_proxy_header_shape_tests {
             AGENT_GONE_PROXY_CAUSE,
         ] {
             assert!(stale_proxy_key_error(cause).contains(PROXY_KEY_RECOVERY_HINT));
+        }
+        // These strings are WIRE text, not source layout. Each was written as a
+        // wrapped multi-line literal and every one of them shipped with the line
+        // indentation baked into the value — the 401 body literally read
+        // `"...loopback nonce is      not registered..."`. A `\`-continued
+        // literal is the only shape that wraps in source without wrapping in the
+        // value, and this assertion is what keeps a later re-wrap honest.
+        for s in [
+            STALE_PROXY_KEY_CAUSE,
+            NON_DEVICE_PROXY_KEY_CAUSE,
+            AGENT_GONE_PROXY_CAUSE,
+            PROXY_KEY_RECOVERY_HINT,
+        ] {
+            assert!(
+                !s.contains("  "),
+                "operator-facing text must carry no run of spaces from source \
+                 wrapping, got: {s:?}"
+            );
+            assert!(!s.contains('\n'), "one line, no embedded newlines: {s:?}");
         }
         // And the gate itself now returns it rather than the old header name.
         let (status, gate_msg) = proxy_request_gate(None, None, &ProxyPrincipal::Device)
