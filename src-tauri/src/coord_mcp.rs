@@ -603,18 +603,64 @@ fn rotation_key_prefix(nonce: &str) -> String {
     nonce.chars().take(ROTATION_KEY_PREFIX_LEN).collect()
 }
 
+/// The sentinel every attribution field carries when the fact is genuinely not
+/// knowable at emission time — an unregistered/evicted nonce has no binding
+/// left to read. Spelled out rather than left empty because an empty string
+/// reads as "the runner did not populate this field", which is the ambiguity
+/// that made the 2026-08-19 reject lines unattributable (all 671 of them
+/// carried `"workdir":""` and nobody could tell absence from ignorance).
+const ROTATION_UNKNOWN: &str = "unknown";
+
+/// Which runner instance emitted a line. `None` (the primary) is spelled
+/// `"primary"` so every line carries a positive value; secondaries carry their
+/// `QONTINUI_INSTANCE_NAME`. Paired with the pid this disambiguates lines from
+/// two runners sharing one dev-logs dir, and — because the pid changes on every
+/// restart — makes the restart boundary itself readable off the stream.
+fn rotation_runner_id() -> String {
+    crate::instance::instance_name().unwrap_or_else(|| "primary".to_string())
+}
+
 /// Build one rotation-forensics JSONL line. Pure over its inputs (bar the
-/// timestamp) so the shape — and the prefix-only guarantee — is unit-testable
-/// without touching the filesystem.
-fn rotation_log_line(event: &str, workdir: &str, nonce: &str, cause: &str) -> String {
-    serde_json::json!({
+/// timestamp, the runner id and the pid) so the shape — and the prefix-only
+/// guarantee — is unit-testable without touching the filesystem.
+///
+/// `extra` carries the per-event attribution fields the base shape has no room
+/// for (`principal` / `terminal_id` on a `reject`, the counts on a `restore`).
+/// It is merged into the top-level object rather than nested so a `jq` filter
+/// over the stream stays flat.
+fn rotation_log_line_with(
+    event: &str,
+    workdir: &str,
+    nonce: &str,
+    cause: &str,
+    extra: &[(&str, serde_json::Value)],
+) -> String {
+    let mut line = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "event": event,
         "workdir": workdir,
         "key_prefix": rotation_key_prefix(nonce),
         "cause": cause,
-    })
-    .to_string()
+        // Phase 3 (plan 2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning):
+        // WHICH runner process wrote this. Secondary runners scope their own
+        // dev-logs dir, but a settings override can point several at one dir,
+        // and the pid is the only field that changes across a restart of the
+        // SAME instance — which is precisely the boundary the incident
+        // reconstruction had to infer from timestamps.
+        "runner_id": rotation_runner_id(),
+        "pid": std::process::id(),
+    });
+    if let Some(obj) = line.as_object_mut() {
+        for (k, v) in extra {
+            obj.insert((*k).to_string(), v.clone());
+        }
+    }
+    line.to_string()
+}
+
+/// [`rotation_log_line_with`] for the events that carry no extra attribution.
+fn rotation_log_line(event: &str, workdir: &str, nonce: &str, cause: &str) -> String {
+    rotation_log_line_with(event, workdir, nonce, cause, &[])
 }
 
 /// Shared `cause` text for a "grace" forensics line, naming the active TTL so
@@ -684,6 +730,20 @@ fn rotation_log_dir() -> Option<std::path::PathBuf> {
 /// `tracing_layers.rs`'s spans stream). Callers MUST NOT hold the
 /// nonce-registry lock — this does file I/O.
 fn log_rotation_event(event: &str, workdir: &str, nonce: &str, cause: &str) {
+    log_rotation_event_with(event, workdir, nonce, cause, &[]);
+}
+
+/// [`log_rotation_event`] carrying extra top-level attribution fields — the
+/// `principal` / `terminal_id` a `reject` can resolve, or the counts a
+/// `restore` reports. Same best-effort, same lock discipline, same one
+/// `write_all` per line.
+fn log_rotation_event_with(
+    event: &str,
+    workdir: &str,
+    nonce: &str,
+    cause: &str,
+    extra: &[(&str, serde_json::Value)],
+) {
     let prefix = rotation_key_prefix(nonce);
     info!("coord_mcp: rotation event={event} workdir={workdir} key_prefix={prefix} cause={cause}");
     let Some(dir) = rotation_log_dir() else {
@@ -700,9 +760,55 @@ fn log_rotation_event(event: &str, workdir: &str, nonce: &str, cause: &str) {
         // (each opens its own append handle) must never interleave a line —
         // `writeln!` would issue the payload and the newline as separate
         // writes, which corrupts the JSONL under concurrency.
-        let mut line = rotation_log_line(event, workdir, nonce, cause);
+        let mut line = rotation_log_line_with(event, workdir, nonce, cause, extra);
         line.push('\n');
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// The resolved absolute path of the rotation-forensics JSONL, or `None` when
+/// file emission is off (the test default).
+///
+/// Exists because the 2026-08-19 investigation searched `D:/qontinui-root` and
+/// `C:/claude` for this file, concluded it "does not exist", and wrote off its
+/// single best evidence source — while the file sat under `%LOCALAPPDATA%`
+/// with 5,486 lines of the incident in it. [`rotation_log_dir`] resolves
+/// through [`crate::paths::get_dev_logs_dir`] (settings override → app-data
+/// default → instance-scoped), so the path is not guessable from the repo.
+/// Nobody should have to guess it again: it is logged once at boot and served
+/// on `/health`.
+pub(crate) fn rotation_log_path() -> Option<std::path::PathBuf> {
+    rotation_log_dir().map(|d| d.join(ROTATION_LOG_FILE))
+}
+
+/// Emitted-once boot breadcrumb naming [`rotation_log_path`] at INFO. Called
+/// from the boot task alongside the nonce restore. Idempotent: a duplicate
+/// boot-task run logs nothing further.
+static ROTATION_LOG_PATH_LOGGED: OnceLock<()> = OnceLock::new();
+
+pub(crate) fn log_rotation_log_path_once() {
+    if ROTATION_LOG_PATH_LOGGED.set(()).is_err() {
+        return;
+    }
+    match rotation_log_path() {
+        Some(p) => info!(
+            "coord_mcp: rotation forensics log = {} (NOT in the workspace — \
+             resolved via paths::get_dev_logs_dir)",
+            p.display()
+        ),
+        None => info!("coord_mcp: rotation forensics log disabled (no dev-logs dir resolved)"),
+    }
+}
+
+/// The `/health` view of the rotation forensics stream: where it is and
+/// whether it is there. Two `null`s means file emission is off.
+pub(crate) fn rotation_log_health_json() -> serde_json::Value {
+    match rotation_log_path() {
+        Some(p) => serde_json::json!({
+            "path": p.to_string_lossy(),
+            "exists": p.try_exists().unwrap_or(false),
+        }),
+        None => serde_json::json!({ "path": serde_json::Value::Null, "exists": false }),
     }
 }
 
@@ -762,19 +868,78 @@ fn reject_throttle_admit(prefix: &str) -> Option<u64> {
     Some(0)
 }
 
-/// The workdir a nonce is currently bound to, read WITHOUT mutating the
-/// registry — unlike [`live_binding`], which lazily evicts an expired ephemeral
-/// as a side effect. The reject forensics line runs on the request path after
-/// the gate has already decided, so it must not change registry state.
-fn known_workdir_for_nonce(nonce: &str) -> Option<String> {
+/// What a `reject` line can say about WHOSE key just died. Every field is
+/// populated or explicitly [`ROTATION_UNKNOWN`] — never left empty, so a reader
+/// can tell "the runner does not know" from "the runner did not fill this in".
+struct RejectAttribution {
+    /// The bound workdir, or [`ROTATION_UNKNOWN`].
+    workdir: String,
+    /// `"device"` / `"agent"` / [`ROTATION_UNKNOWN`].
+    principal: String,
+    /// The bound terminal, [`ROTATION_UNKNOWN`] for an unknown nonce, or
+    /// `"none"` for a live binding that legitimately has no terminal (restored,
+    /// adopted, mint-route, agent, in-cwd writer) — a real, distinct fact.
+    terminal_id: String,
+}
+
+/// Resolve everything a rejected nonce can still be attributed to, read WITHOUT
+/// mutating either registry — unlike [`live_binding`], which lazily evicts an
+/// expired ephemeral as a side effect. The reject forensics line runs on the
+/// request path after the gate has already decided, so it must not change
+/// registry state.
+///
+/// Two sources, live registry first then the grace map, because those are the
+/// two places a nonce the handler just saw can still be known. A graced nonce
+/// has no binding left (grace is keyed by nonce alone), so it can name its
+/// principal — always DEVICE, grace is device-only — and nothing else.
+///
+/// **Neither lock is held on return**, which is the point: the caller feeds
+/// this into [`log_rotation_event_with`], which does file I/O, and
+/// `log_rotation_event` documents that callers must not hold the registry lock
+/// across it. The clones are the price of that discipline.
+fn reject_attribution_for_nonce(nonce: &str) -> RejectAttribution {
+    let unknown = || RejectAttribution {
+        workdir: ROTATION_UNKNOWN.to_string(),
+        principal: ROTATION_UNKNOWN.to_string(),
+        terminal_id: ROTATION_UNKNOWN.to_string(),
+    };
     if nonce.is_empty() {
-        return None;
+        return unknown();
     }
-    proxy_nonces()
+    let live = {
+        let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        map.get(nonce).map(|b| {
+            (
+                b.workdir.clone(),
+                match b.principal {
+                    ProxyPrincipal::Device => "device".to_string(),
+                    ProxyPrincipal::Agent { .. } => "agent".to_string(),
+                },
+                b.terminal_id.clone(),
+            )
+        })
+    };
+    if let Some((workdir, principal, terminal_id)) = live {
+        return RejectAttribution {
+            workdir,
+            principal,
+            terminal_id: terminal_id.unwrap_or_else(|| "none".to_string()),
+        };
+    }
+    // Grace map fallback: only DEVICE nonces are ever graced, so a hit here
+    // pins the principal class even though the binding itself is gone.
+    if graced_nonces()
         .lock()
-        .expect("proxy nonce map poisoned")
-        .get(nonce)
-        .map(|b| b.workdir.clone())
+        .expect("graced nonce map poisoned")
+        .contains_key(nonce)
+    {
+        return RejectAttribution {
+            workdir: ROTATION_UNKNOWN.to_string(),
+            principal: "device".to_string(),
+            terminal_id: ROTATION_UNKNOWN.to_string(),
+        };
+    }
+    unknown()
 }
 
 /// Record a coord-mcp proxy request REJECTED at the auth gate — the consumer
@@ -800,15 +965,26 @@ pub(crate) fn log_proxy_nonce_rejected(nonce: Option<&str>, cause: &str) {
         return;
     };
     // A still-registered nonce (bearer/principal mismatch, agent slot gone) can
-    // name its own workdir; an unregistered or evicted one cannot — that is
-    // what the prefix join is for.
-    let workdir = known_workdir_for_nonce(nonce).unwrap_or_default();
+    // name its own workdir, principal and terminal; an unregistered or evicted
+    // one cannot — that is what the prefix join, and the explicit
+    // `"unknown"`s, are for. Resolved WITHOUT holding either registry lock
+    // across the file I/O below.
+    let attr = reject_attribution_for_nonce(nonce);
     let cause = if suppressed > 0 {
         format!("{cause} [+{suppressed} identical rejects suppressed since the previous line]")
     } else {
         cause.to_string()
     };
-    log_rotation_event("reject", &workdir, nonce, &cause);
+    log_rotation_event_with(
+        "reject",
+        &attr.workdir,
+        nonce,
+        &cause,
+        &[
+            ("principal", serde_json::Value::from(attr.principal)),
+            ("terminal_id", serde_json::Value::from(attr.terminal_id)),
+        ],
+    );
 }
 
 /// [`log_proxy_nonce_rejected`] for an ASYNC caller. The emission opens and
@@ -1059,6 +1235,7 @@ fn persist_proxy_nonces_with_store(
 /// self-heal had to mint fresh — is visible in the logs.
 pub(crate) fn restore_proxy_nonces_from_store() -> usize {
     if !nonce_persistence_enabled() {
+        log_restore_event(0, 0, "persistence disabled (COORD_MCP_PERSIST_NONCES=0)");
         return 0;
     }
     if PROXY_NONCES_RESTORED.set(()).is_err() {
@@ -1073,10 +1250,38 @@ pub(crate) fn restore_proxy_nonces_from_store() -> usize {
         Ok(s) => s,
         Err(e) => {
             warn!("coord_mcp: secure storage unavailable, cannot restore proxy nonces: {e}");
+            log_restore_event(0, 0, "secure storage unavailable");
             return 0;
         }
     };
     restore_proxy_nonces_from(&store)
+}
+
+/// Emit the `restore` rotation event.
+///
+/// There was no restore event AT ALL before Phase 3 (the whole 5,490-line
+/// production log carried one `adopt` line and zero restores), so "did the boot
+/// restore run, and what did it recover?" was unanswerable from disk — the one
+/// question the 2026-08-19 reconstruction most needed. It is emitted on EVERY
+/// arm, the empty and disabled ones included: a `restore` line reading
+/// `restored: 0` is the loud signal that the persisted set was dropped, which
+/// is exactly what a deserialization regression in the store schema would look
+/// like. Silence would be indistinguishable from a healthy boot.
+///
+/// Aggregate, so it carries no key material and no workdir — the per-nonce
+/// detail is the `mint`/`write` trail those nonces already left before the
+/// restart.
+fn log_restore_event(restored: usize, skipped: usize, reason: &str) {
+    log_rotation_event_with(
+        "restore",
+        "",
+        "",
+        reason,
+        &[
+            ("restored", serde_json::Value::from(restored)),
+            ("skipped", serde_json::Value::from(skipped)),
+        ],
+    );
 }
 
 /// Merge the persisted nonce set from the GIVEN store into the live in-memory
@@ -1084,17 +1289,29 @@ pub(crate) fn restore_proxy_nonces_from_store() -> usize {
 /// restore path is unit-testable against a temp-dir store without the
 /// run-once `PROXY_NONCES_RESTORED` guard or any global-env mutation. Returns
 /// the live map size after the merge.
+///
+/// Emits one aggregate `restore` rotation event on every path
+/// ([`log_restore_event`]) — including the empty-store one, which is the
+/// signal a store-schema regression would show up as.
 fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> usize {
     let persisted = store.load_coord_mcp_nonces();
     if persisted.is_empty() {
+        log_restore_event(
+            0,
+            0,
+            "persisted nonce set empty (nothing to restore, or the store failed to deserialize)",
+        );
         return proxy_nonces()
             .lock()
             .expect("proxy nonce map poisoned")
             .len();
     }
+    let persisted_total = persisted.len();
+    let mut inserted = 0usize;
     let restored = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         for (nonce, workdir) in persisted {
+            let vacant = !map.contains_key(&nonce);
             // Only DEVICE bindings are ever persisted (OQ3), so a restored entry
             // is unconditionally a Device principal. An agent nonce can never be
             // restored — its slot is process-global and gone after a restart, so
@@ -1127,10 +1344,23 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
                 // with the previous runner process.
                 terminal_id: None,
             });
+            if vacant {
+                inserted += 1;
+            }
         }
         map.len()
     };
-    info!("coord_mcp: restored {restored} persisted proxy nonce(s) from secure storage");
+    // Honest counts: `inserted` is what the restore actually recovered,
+    // `skipped` is the persisted entries a live mint already occupied (the
+    // `or_insert` no-op). `restored` — the return value, kept unchanged — is
+    // the live map size afterwards, which is a THIRD number and is what the
+    // boot task's Change-2 observability reads.
+    let skipped = persisted_total.saturating_sub(inserted);
+    log_restore_event(inserted, skipped, "boot restore from encrypted store");
+    info!(
+        "coord_mcp: restored {inserted} persisted proxy nonce(s) from secure storage \
+         ({skipped} skipped as already-live; live map now {restored})"
+    );
     restored
 }
 
@@ -1742,12 +1972,13 @@ pub(crate) fn revoke_proxy_nonce(nonce: &str) {
     if nonce.is_empty() {
         return;
     }
-    let snapshot = {
+    // Capture the revoked binding's workdir under the lock so the forensics
+    // line below can name it — after the lock is released (file I/O).
+    let (snapshot, revoked_workdir) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        if map.remove(nonce).is_none() {
-            None
-        } else {
-            Some(map.clone())
+        match map.remove(nonce) {
+            None => (None, None),
+            Some(b) => (Some(map.clone()), Some(b.workdir)),
         }
     };
     let graced_removed = graced_nonces()
@@ -1755,11 +1986,28 @@ pub(crate) fn revoke_proxy_nonce(nonce: &str) {
         .expect("graced nonce map poisoned")
         .remove(nonce)
         .is_some();
-    if let Some(snapshot) = snapshot {
-        persist_proxy_nonces(&snapshot);
+    // Rotation forensics (Phase 3): an explicit revoke is the one way a key
+    // dies that leaves NO other trace — no mint, no evict, no grace. Without
+    // this line a revoked nonce's later `reject`s join to nothing.
+    if let Some(workdir) = &revoked_workdir {
+        log_rotation_event(
+            "revoke",
+            workdir,
+            nonce,
+            "explicit revoke (live registry; grace cleared too — revocation is total)",
+        );
         info!("coord_mcp: revoked proxy nonce (live registry)");
     } else if graced_removed {
+        log_rotation_event(
+            "revoke",
+            ROTATION_UNKNOWN,
+            nonce,
+            "explicit revoke (grace registry only — no live binding left to name a workdir)",
+        );
         info!("coord_mcp: revoked proxy nonce (grace registry only)");
+    }
+    if let Some(snapshot) = snapshot {
+        persist_proxy_nonces(&snapshot);
     }
 }
 
@@ -1768,14 +2016,33 @@ pub(crate) fn revoke_proxy_nonce(nonce: &str) {
 /// [`remove_agent_token`] so a torn-down agent's nonce disappears entirely
 /// instead of lingering as a permanently-401ing map entry.
 pub(crate) fn revoke_agent_proxy_nonces(agent_id: Uuid) {
-    let removed = {
+    // Collect (nonce, workdir) under the lock; emit the forensics lines after
+    // releasing it (`log_rotation_event` does file I/O).
+    let revoked: Vec<(String, String)> = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        let before = map.len();
-        map.retain(|_, b| b.principal != ProxyPrincipal::Agent { agent_id });
-        before - map.len()
+        let mut revoked = Vec::new();
+        map.retain(|n, b| {
+            if b.principal == (ProxyPrincipal::Agent { agent_id }) {
+                revoked.push((n.clone(), b.workdir.clone()));
+                return false;
+            }
+            true
+        });
+        revoked
     };
-    if removed > 0 {
-        info!("coord_mcp: revoked {removed} agent proxy nonce(s) for agent {agent_id}");
+    for (nonce, workdir) in &revoked {
+        log_rotation_event(
+            "revoke",
+            workdir,
+            nonce,
+            &format!("agent teardown (agent {agent_id} — never graced, never persisted)"),
+        );
+    }
+    if !revoked.is_empty() {
+        info!(
+            "coord_mcp: revoked {} agent proxy nonce(s) for agent {agent_id}",
+            revoked.len()
+        );
     }
 }
 
@@ -3930,6 +4197,32 @@ mod tests {
         (dir, store)
     }
 
+    /// Serializes every test that calls [`restore_proxy_nonces_from`].
+    ///
+    /// The `restore` forensics line is an AGGREGATE — no workdir, no key prefix
+    /// — so unlike every other line in this stream it cannot be filtered to the
+    /// test that produced it. Tests run concurrently in one process against one
+    /// shared log ([`rotation_log_test_dir`]), so without this a peer's restore
+    /// line lands inside another test's read window. Take it in ANY test that
+    /// triggers a restore, not only in the ones that read the log back.
+    static RESTORE_FORENSICS_LOCK: Mutex<()> = Mutex::new(());
+
+    fn restore_forensics_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking peer test must not cascade into unrelated failures here:
+        // the guard protects an ordering, not an invariant, so poison is
+        // recovered rather than propagated.
+        RESTORE_FORENSICS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Build one persisted-store value in whatever shape the store currently
+    /// takes, so the store-shape tests state their intent (workdir + terminal)
+    /// once rather than tracking the schema at every call site.
+    fn stored_binding(workdir: &str, _terminal_id: Option<&str>) -> String {
+        workdir.to_string()
+    }
+
     /// The DEVICE-path proxy shape: loopback URL built from the passed bound
     /// port, a registered per-session nonce header, and — critically — NO
     /// baked `Authorization` bearer (the proxy injects a live one per request).
@@ -4571,6 +4864,9 @@ mod tests {
     /// in-memory map so it still validates after a (simulated) restart.
     #[test]
     fn persisted_nonce_survives_restore_round_trip() {
+        // Emits a `restore` forensics line, which is unfilterable by workdir —
+        // serialize against the test that reads those lines back.
+        let _serial = restore_forensics_lock();
         // Inject a temp-dir store directly — NO process-global env mutation, so
         // this test cannot pollute sibling tests that read the default store.
         let (store_dir, store) = temp_store("nonce");
@@ -5417,8 +5713,11 @@ mod tests {
         };
         // A still-registered nonce names its workdir directly...
         assert_eq!(for_key(&live)["workdir"], wd.as_str());
-        // ...an unknown one cannot, and is joined on `key_prefix` instead.
-        assert_eq!(for_key(&stranger)["workdir"], "");
+        // ...an unknown one cannot, and says so EXPLICITLY (Phase 3: the
+        // pre-Phase-3 empty string was indistinguishable from "the runner did
+        // not populate this field", which is why all 671 production reject
+        // lines were unattributable). It is joined on `key_prefix` instead.
+        assert_eq!(for_key(&stranger)["workdir"], ROTATION_UNKNOWN);
 
         for n in [live.as_str(), stranger.as_str()] {
             assert!(
@@ -5426,6 +5725,251 @@ mod tests {
                 "a reject line leaked a full nonce — prefixes only"
             );
         }
+    }
+
+    /// Phase 3 (plan 2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning):
+    /// a `reject` line must attribute the dead key to a SESSION — workdir,
+    /// principal class and terminal — whenever the nonce is still knowable, and
+    /// say `"unknown"` in every field when it is not. Before this, every reject
+    /// line in production carried `"workdir":""` and no principal or terminal at
+    /// all, so the 2026-08-19 incident could not be pinned to a session.
+    #[test]
+    fn rotation_reject_line_carries_workdir_principal_and_terminal() {
+        let dir = rotation_log_test_dir();
+
+        // Arm 1 — a live DEVICE nonce minted for a named terminal.
+        let wd = format!("D:/rot-attr-wt-{}", uuid::Uuid::now_v7());
+        let term = format!("term-{}", uuid::Uuid::now_v7());
+        let live = register_proxy_nonce(&wd, Some(&term));
+
+        // Arm 2 — a live AGENT nonce (no terminal by construction).
+        let awd = format!("D:/rot-attr-agent-wt-{}", uuid::Uuid::now_v7());
+        let agent_nonce = register_agent_proxy_nonce(&awd, uuid::Uuid::new_v4());
+
+        // Arm 3 — a key this runner never minted: nothing is knowable.
+        let stranger = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+
+        log_proxy_nonce_rejected(Some(&live), "bound but gated (401)");
+        log_proxy_nonce_rejected(Some(&agent_nonce), "agent slot gone (401)");
+        log_proxy_nonce_rejected(Some(&stranger), "unregistered (401)");
+
+        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
+        let line_for = |n: &str| {
+            raw.lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
+                .filter(|v| v["event"] == "reject")
+                .find(|v| v["key_prefix"] == rotation_key_prefix(n).as_str())
+                .unwrap_or_else(|| panic!("a reject line for {}", rotation_key_prefix(n)))
+        };
+
+        let l = line_for(&live);
+        assert_eq!(l["workdir"], wd.as_str(), "a known nonce names its workdir");
+        assert_ne!(l["workdir"], "", "the workdir field is never left empty");
+        assert_eq!(l["principal"], "device");
+        assert_eq!(l["terminal_id"], term.as_str());
+
+        let a = line_for(&agent_nonce);
+        assert_eq!(a["workdir"], awd.as_str());
+        assert_eq!(a["principal"], "agent");
+        assert_eq!(
+            a["terminal_id"], "none",
+            "an agent nonce has no terminal BY CONSTRUCTION — a distinct fact \
+             from 'unknown', and the line must not conflate them"
+        );
+
+        let s = line_for(&stranger);
+        assert_eq!(s["workdir"], ROTATION_UNKNOWN);
+        assert_eq!(s["principal"], ROTATION_UNKNOWN);
+        assert_eq!(s["terminal_id"], ROTATION_UNKNOWN);
+
+        // Every line, whatever the arm, carries the emitting process.
+        for v in [&l, &a, &s] {
+            assert!(v["runner_id"].is_string(), "every line names its runner");
+            assert_eq!(
+                v["pid"].as_u64(),
+                Some(u64::from(std::process::id())),
+                "every line names the emitting pid — the only field that moves \
+                 across a restart of the same instance"
+            );
+        }
+
+        for n in [live.as_str(), agent_nonce.as_str(), stranger.as_str()] {
+            assert!(!raw.contains(n), "a reject line leaked a full nonce");
+        }
+    }
+
+    /// Phase 3: the boot restore must leave a `restore` line with honest counts
+    /// — on EVERY arm, the empty one included. A `restored: 0` line is the loud
+    /// signal that the persisted set was dropped (the shape a store-schema
+    /// deserialization regression takes); silence would read identically to a
+    /// healthy boot, which is the state the 2026-08-19 log was actually in
+    /// (one `adopt` line, zero restores, in 5,486 lines).
+    #[test]
+    fn rotation_restore_event_reports_restored_and_skipped_counts() {
+        // The restore line is an AGGREGATE: it carries no workdir and no key
+        // prefix, so it cannot be filtered to this test the way every other
+        // forensics assertion here filters by its own workdir. Serialize the
+        // restore-emitting tests instead and read only the window this test
+        // owns — see `restore_forensics_lock`.
+        let _serial = restore_forensics_lock();
+        let dir = rotation_log_test_dir();
+        let before = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE))
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+
+        let restores_since = || -> Vec<serde_json::Value> {
+            std::fs::read_to_string(dir.join(ROTATION_LOG_FILE))
+                .unwrap()
+                .lines()
+                .skip(before)
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
+                .filter(|v| v["event"] == "restore")
+                .collect()
+        };
+
+        // Arm 1 — an EMPTY store still emits, with zeroes. This is the arm that
+        // matters most: a store-schema deserialization regression drops every
+        // persisted nonce, and `restored: 0` is the only way that shows up.
+        let (empty_dir, empty_store) = temp_store("restore-empty");
+        restore_proxy_nonces_from(&empty_store);
+        let r = restores_since();
+        assert_eq!(r.len(), 1, "an empty store still emits exactly one restore");
+        assert_eq!(r[0]["restored"], 0);
+        assert_eq!(r[0]["skipped"], 0);
+        assert!(
+            r[0]["cause"].as_str().unwrap().contains("empty"),
+            "the reason class must name the empty-store arm, got {:?}",
+            r[0]["cause"]
+        );
+
+        // Arm 2 — a store written DIRECTLY with exactly two entries, one of
+        // which is already live. Direct, not via `persist_proxy_nonces_with_store`:
+        // a snapshot is a clone of the WHOLE live map, so under concurrent tests
+        // it carries peer nonces and the counts would not be deterministic.
+        let (store_dir, store) = temp_store("restore-counts");
+        let mint = || {
+            format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            )
+        };
+        let (a, b) = (mint(), mint());
+        let wd_a = store_dir.join("wd-a").to_string_lossy().to_string();
+        let wd_b = store_dir.join("wd-b").to_string_lossy().to_string();
+        store
+            .store_coord_mcp_nonces(&HashMap::from([
+                (a.clone(), stored_binding(&wd_a, None)),
+                (b.clone(), stored_binding(&wd_b, None)),
+            ]))
+            .expect("write the test store");
+        // `b` is already live, so the restore must SKIP it and restore only `a`.
+        {
+            let mut map = proxy_nonces().lock().unwrap();
+            map.insert(
+                b.clone(),
+                NonceBinding {
+                    workdir: wd_b.clone(),
+                    principal: ProxyPrincipal::Device,
+                    lifetime: NonceLifetime::Persistent,
+                    session_tenant: None,
+                    terminal_id: None,
+                },
+            );
+        }
+        restore_proxy_nonces_from(&store);
+        let r = restores_since();
+        assert_eq!(r.len(), 2, "one restore line per restore call");
+        assert_eq!(r[1]["restored"], 1, "only `a` was actually re-inserted");
+        assert_eq!(r[1]["skipped"], 1, "`b` was already live and was skipped");
+        // Aggregate line: no key material at all.
+        assert_eq!(r[1]["key_prefix"], "");
+        for n in [a.as_str(), b.as_str()] {
+            assert!(
+                !r[1].to_string().contains(n),
+                "the restore line must carry no nonce"
+            );
+        }
+
+        {
+            let mut map = proxy_nonces().lock().unwrap();
+            map.remove(&a);
+            map.remove(&b);
+        }
+        let _ = std::fs::remove_dir_all(&empty_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Phase 3: an explicit revoke is the one way a key dies that leaves no
+    /// other trace — no mint, no evict, no grace. It must emit its own line so
+    /// a later `reject` carrying that prefix joins to something.
+    #[test]
+    fn rotation_revoke_line_is_emitted_for_device_and_agent() {
+        let dir = rotation_log_test_dir();
+
+        let wd = format!("D:/rot-revoke-wt-{}", uuid::Uuid::now_v7());
+        let nonce = register_proxy_nonce(&wd, None);
+        revoke_proxy_nonce(&nonce);
+
+        let awd = format!("D:/rot-revoke-agent-wt-{}", uuid::Uuid::now_v7());
+        let agent_id = uuid::Uuid::new_v4();
+        let agent_nonce = register_agent_proxy_nonce(&awd, agent_id);
+        revoke_agent_proxy_nonces(agent_id);
+
+        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
+        let revokes: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
+            .filter(|v| v["event"] == "revoke")
+            .filter(|v| v["workdir"] == wd.as_str() || v["workdir"] == awd.as_str())
+            .collect();
+        assert_eq!(revokes.len(), 2, "one revoke line per revoked nonce");
+        assert_eq!(
+            revokes
+                .iter()
+                .find(|v| v["workdir"] == wd.as_str())
+                .unwrap()["key_prefix"],
+            rotation_key_prefix(&nonce).as_str()
+        );
+        assert_eq!(
+            revokes
+                .iter()
+                .find(|v| v["workdir"] == awd.as_str())
+                .unwrap()["key_prefix"],
+            rotation_key_prefix(&agent_nonce).as_str()
+        );
+        for n in [nonce.as_str(), agent_nonce.as_str()] {
+            assert!(!raw.contains(n), "a revoke line leaked a full nonce");
+        }
+    }
+
+    /// Phase 3: the resolved rotation-log path is discoverable without guessing.
+    /// The 2026-08-19 investigation searched `D:/qontinui-root` and `C:/claude`,
+    /// concluded the file did not exist, and discarded 5,486 lines of the
+    /// incident — it was under `%LOCALAPPDATA%` the whole time.
+    #[test]
+    fn rotation_log_path_is_surfaced_for_health() {
+        // Under `cfg(test)` the dir override is what resolves, so installing it
+        // is what makes the path non-null here — same code path as production,
+        // different resolver arm.
+        let dir = rotation_log_test_dir();
+        let path = rotation_log_path().expect("a resolvable dir yields a path");
+        assert_eq!(path, dir.join(ROTATION_LOG_FILE));
+
+        let health = rotation_log_health_json();
+        assert_eq!(health["path"], path.to_string_lossy().as_ref());
+        assert!(
+            health["exists"].is_boolean(),
+            "`exists` is always a boolean — a non-null path with exists:false \
+             means 'nothing emitted yet', NOT 'forensics are off'"
+        );
+        // Idempotent breadcrumb: a duplicate boot-task run must not re-log.
+        log_rotation_log_path_once();
+        log_rotation_log_path_once();
     }
 
     /// The reject path runs on the REQUEST path, so a client looping against a

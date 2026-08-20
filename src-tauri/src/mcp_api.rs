@@ -768,6 +768,16 @@ async fn health(
         // `no_lifecycle_record` verdict can be told apart from a
         // wrong-granularity one.
         "selfId": self_id_health_snapshot(),
+        // Where the coord-mcp rotation-forensics JSONL actually is (plan
+        // 2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning Phase 3).
+        // It resolves through `paths::get_dev_logs_dir` — settings override,
+        // else `%LOCALAPPDATA%\qontinui-runner\dev-logs`, instance-scoped for
+        // secondaries — so it is NOT guessable from the repo, and the
+        // 2026-08-19 investigation searched the workspace, found nothing, and
+        // wrote off the 5,486-line record of the incident as "not recording".
+        // `exists: false` with a non-null path means the stream has emitted
+        // nothing yet, NOT that forensics are off (a null path means off).
+        "coordMcpRotationLog": crate::coord_mcp::rotation_log_health_json(),
         // Semantic recall (plan 2026-07-30, Phase 3): how each proxied
         // `coord_memory_search` ended — did it get a query vector or not.
         // Non-search traffic is neither touched nor counted, so `enriched`
@@ -5337,6 +5347,14 @@ pub fn create_router(
             .load(std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            // Name the rotation-forensics log's resolved path once, BEFORE the
+            // restore that writes the boot's first line into it (plan
+            // 2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning Phase 3).
+            // It resolves under `%LOCALAPPDATA%`, not the workspace — the
+            // 2026-08-19 investigation searched `D:/` for it, concluded it did
+            // not exist, and discarded its single best evidence source.
+            crate::coord_mcp::log_rotation_log_path_once();
+
             // Phase 3b — restore the persisted nonce map FIRST (run-once). The
             // restored count is half of the Change-2 observability signal: if it
             // is 0 and root self-heal then has to Rewrite, a silent nonce
