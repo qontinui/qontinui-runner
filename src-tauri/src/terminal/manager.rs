@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::interceptor::OutputInterceptor;
 use super::session::TerminalSession;
@@ -396,8 +396,20 @@ impl TerminalManager {
         pairs
     }
 
-    /// Close all terminal sessions. Called on app shutdown.
-    pub fn close_all(&self) {
+    /// Close all terminal sessions, under a GLOBAL deadline. Called on app
+    /// shutdown.
+    ///
+    /// Plan `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 2
+    /// step 5. This used to be a bare `for` loop with no cap of any kind, while
+    /// each `session.close()` costs a blocking `taskkill /F /T` plus two 2 s
+    /// thread joins plus a recursive `remove_dir_all` — i.e. ≈ N × 4 s of
+    /// unbounded, `O(terminals)` work that ran inline on the native UI thread.
+    ///
+    /// Past `deadline` the remaining sessions get a kill-only teardown: the
+    /// child process tree still dies (that is the part whose omission would
+    /// leak processes), while the thread joins and the shim-dir sweep are
+    /// skipped. The imminent `process::exit` reclaims the rest.
+    pub fn close_all(&self, deadline: std::time::Instant) {
         let sessions: Vec<Arc<TerminalSession>> = {
             match self.sessions.lock() {
                 Ok(mut s) => s.drain().map(|(_, v)| v).collect(),
@@ -413,8 +425,22 @@ impl TerminalManager {
         }
 
         info!("Closing {} terminal session(s)", sessions.len());
+        let mut degraded = 0usize;
         for session in &sessions {
-            session.close();
+            if std::time::Instant::now() >= deadline {
+                session.close_kill_only();
+                degraded += 1;
+            } else {
+                session.close_with_deadline(Some(deadline));
+            }
+        }
+        if degraded > 0 {
+            warn!(
+                "close_all hit its global deadline — {} of {} terminal session(s) got a \
+                 kill-only teardown",
+                degraded,
+                sessions.len()
+            );
         }
         info!("All terminal sessions closed");
     }

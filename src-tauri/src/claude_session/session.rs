@@ -65,6 +65,50 @@ enum BuildReplayErr {
     NoPg,
 }
 
+/// Sender half of the AI-output persister channel, paired with the depth of
+/// its own queue.
+///
+/// Plan `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 2 step 7.
+///
+/// [`ClaudeSession::flush_pending_output`] does not persist anything: it hands
+/// a delta to a background persister thread over an `mpsc` channel that nothing
+/// joins or awaits. The exit seam ends in `std::process::exit(0)`, which runs
+/// no destructors and no `RunEvent::Exit` — so a queued delta at that instant
+/// is simply lost, and the drain's `drained_sessions=N` was reporting *sent*,
+/// not *persisted*. Moving the close handler off the UI thread SHORTENS the
+/// flush-to-exit window, which makes the discrepancy more likely, not less.
+///
+/// Joining the persister thread itself is not available: its receiver loop ends
+/// only when every sender is dropped, and the session holds one for its whole
+/// life. A queue-depth counter gives the same guarantee without changing the
+/// session's lifetime — `pending == 0` means every delta this session sent has
+/// been through `append_task_output_ex`.
+#[derive(Clone)]
+pub struct TurnPersistSender {
+    tx: mpsc::Sender<String>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl TurnPersistSender {
+    /// Enqueue a delta for persistence, accounting for it in the queue depth.
+    ///
+    /// A closed channel (persister thread gone) is not an error the caller can
+    /// act on — but it must not leave a phantom entry in the counter, or
+    /// [`ClaudeSession::await_persisted`] would block for its whole budget on a
+    /// delta that can never be drained.
+    pub fn send(&self, delta: String) {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        if self.tx.send(delta).is_err() {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// How many deltas have been sent but not yet written.
+    pub fn pending(&self) -> usize {
+        self.pending.load(Ordering::SeqCst)
+    }
+}
+
 /// An interactive Claude CLI session.
 pub struct ClaudeSession {
     /// Session identifier (typically the task_run_id + phase suffix).
@@ -116,8 +160,10 @@ pub struct ClaudeSession {
     completion_tx: Mutex<Option<mpsc::Sender<(bool, String)>>>,
     /// Tracks how many bytes of accumulated_output have been persisted to DB.
     persisted_output_len: Arc<AtomicUsize>,
-    /// Sender for AI output deltas to persist to DB after each turn.
-    turn_persist_tx: Option<mpsc::Sender<String>>,
+    /// Sender for AI output deltas to persist to DB after each turn, paired
+    /// with the queue-depth counter that makes [`Self::await_persisted`]
+    /// possible.
+    turn_persist_tx: Option<TurnPersistSender>,
     /// Worktree metadata when this session has been promoted into an isolated
     /// git worktree. `None` means the session is running in the original
     /// working directory (the default for fresh sessions).
@@ -507,11 +553,13 @@ impl ClaudeSession {
         // The persister thread receives output deltas and writes them with
         // [AI_RESPONSE] markers via append_task_output_ex.
         let (turn_persist_tx, turn_persist_rx) = mpsc::channel::<String>();
+        let turn_persist_pending = Arc::new(AtomicUsize::new(0));
         let turn_persist_tx_option = if session_ctx.is_some() {
             let persist_task_run_id = session_ctx
                 .as_ref()
                 .map(|c| c.task_run_id().to_string())
                 .unwrap_or_default();
+            let pending_for_thread = turn_persist_pending.clone();
 
             thread::spawn(move || {
                 let pg = crate::database::pg::PgDb::try_global();
@@ -520,14 +568,20 @@ impl ClaudeSession {
                     Some(pg) => pg,
                     None => {
                         warn!("Failed to get PG connection for AI output persistence");
-                        // Drain the channel so senders don't block
-                        while turn_persist_rx.recv().is_ok() {}
+                        // Drain the channel so senders don't block. Each
+                        // drained delta still decrements the pending counter —
+                        // otherwise a drain would wait out its whole budget for
+                        // deltas that can never be persisted on this box.
+                        while turn_persist_rx.recv().is_ok() {
+                            pending_for_thread.fetch_sub(1, Ordering::SeqCst);
+                        }
                         return;
                     }
                 };
 
                 while let Ok(delta) = turn_persist_rx.recv() {
                     if delta.is_empty() {
+                        pending_for_thread.fetch_sub(1, Ordering::SeqCst);
                         continue;
                     }
                     let formatted = format!("\n[AI_RESPONSE]\n{}\n[/AI_RESPONSE]\n", delta);
@@ -545,11 +599,18 @@ impl ClaudeSession {
                             persist_task_run_id
                         );
                     }
+                    // Decrement AFTER the write attempt (success or failure):
+                    // the delta has left the queue either way, and a drain must
+                    // not wait forever on a row PG keeps rejecting.
+                    pending_for_thread.fetch_sub(1, Ordering::SeqCst);
                 }
                 debug!("AI output persister thread exiting");
             });
 
-            Some(turn_persist_tx)
+            Some(TurnPersistSender {
+                tx: turn_persist_tx,
+                pending: turn_persist_pending,
+            })
         } else {
             // No session context — drop the receiver so channel is closed
             drop(turn_persist_rx);
@@ -1521,13 +1582,47 @@ impl ClaudeSession {
                 if buf.len() > persisted && persisted != usize::MAX {
                     let delta = buf[persisted..].to_string();
                     if !delta.trim().is_empty() {
-                        let _ = tx.send(delta);
+                        tx.send(delta);
                     }
                 }
                 // Do NOT clear the buffer — the session stays alive and may
                 // produce more output before the seam closes it (close() will
                 // flush the remainder and clear).
             }
+        }
+    }
+
+    /// How many output deltas this session has handed to the persister thread
+    /// but which have not yet been written to `output_log`.
+    ///
+    /// Always `0` for a session with no `session_ctx` (nothing is persisted for
+    /// those at all).
+    pub fn pending_persist_count(&self) -> usize {
+        self.turn_persist_tx
+            .as_ref()
+            .map(|tx| tx.pending())
+            .unwrap_or(0)
+    }
+
+    /// Block until every delta this session has flushed has actually reached
+    /// `output_log`, or `deadline` passes.
+    ///
+    /// Returns `true` if the queue drained, `false` on timeout. This is the
+    /// bounded stand-in for joining the never-joined persister thread (see
+    /// [`TurnPersistSender`]): without it, `drain` reports a session as drained
+    /// the moment it *enqueues* the delta, and `std::process::exit(0)` then
+    /// throws the queue away. Callers must treat `false` as "this session's
+    /// tail output was NOT persisted".
+    pub fn await_persisted(&self, deadline: Instant) -> bool {
+        const POLL: Duration = Duration::from_millis(20);
+        loop {
+            if self.pending_persist_count() == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(POLL);
         }
     }
 
@@ -1573,7 +1668,7 @@ impl ClaudeSession {
                 if buf.len() > persisted {
                     let delta = buf[persisted..].to_string();
                     if !delta.trim().is_empty() {
-                        let _ = tx.send(delta);
+                        tx.send(delta);
                     }
                 }
                 buf.clear(); // Free memory on close

@@ -48,6 +48,28 @@ const RESERVED_TAIL_MS: u64 = 4_000;
 /// Poll cadence while waiting for a session to leave `Processing`.
 const CHECKPOINT_POLL_MS: u64 = 100;
 
+/// Hard per-subprocess cap for the `git` calls the WIP-ref step shells out to
+/// ON THE SHUTDOWN PATH.
+///
+/// `run_git` used a bare `Command::output()`, which has no timeout at all: a
+/// `git stash create` against a repo whose index lock is held (or whose
+/// filesystem has gone away) blocks the drain — and, before the close handler
+/// moved off the UI thread, the whole application — indefinitely. Each call is
+/// additionally clamped to whatever is left of the drain's own deadline, so
+/// this is the ceiling, not the allowance.
+const GIT_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Safety-net cap for git calls that are NOT on the shutdown path — today the
+/// resume-side [`restore_wip_ref`]. Deliberately generous: `git stash apply` of
+/// a large captured worktree is legitimately slow, and killing it at the
+/// shutdown seam's 3 s would turn "restore is slow" into "restore failed and
+/// the ref was kept", which is a worse outcome than waiting. It exists only so
+/// that a wedged git can never hang a session forever.
+const GIT_RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Poll cadence while waiting for a bounded subprocess to exit.
+const SUBPROCESS_POLL_MS: u64 = 25;
+
 /// Fixed namespace UUID for deriving stable AI-session ids (UUIDv5).
 ///
 /// SHARED CONTRACT — Phase 3 re-derives the same id to re-acquire claims and
@@ -193,7 +215,6 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
         // persisted_output_len), so a turn that DID checkpoint flushes nothing
         // extra here.
         session.flush_pending_output();
-        summary.drained_sessions += 1;
         info!(
             "drain: flushed session task_run_id={} (state={})",
             task_run_id,
@@ -201,15 +222,56 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
         );
     }
 
-    // ── Step (c): auto-commit uncommitted worktree state to a WIP ref ──────
+    // ── Step (b2): WAIT for the flushed deltas to actually reach the DB ─────
+    //
+    // `flush_pending_output` does not persist anything — it `tx.send`s the
+    // delta into a channel drained by a background persister thread that
+    // nothing joins or awaits. The exit seam ends in `std::process::exit(0)`,
+    // which runs no destructors and no `RunEvent::Exit`, so a drain that
+    // counted a session the moment it flushed could report `drained_sessions=N`
+    // while those deltas sat queued — and they would then be lost. Moving the
+    // close handler off the UI thread SHORTENS the flush-to-exit window, which
+    // makes that worse, not better.
+    //
+    // So the counter now means what it says: a session counts as drained only
+    // once its persister queue is empty. A session that does not get there
+    // inside the flush budget is reported as NOT drained, loudly.
     for (task_run_id, session) in &sessions {
+        if session.await_persisted(flush_deadline) {
+            summary.drained_sessions += 1;
+        } else {
+            warn!(
+                "drain: session task_run_id={} still has {} unpersisted output \
+                 delta(s) at the flush deadline — NOT counted as drained",
+                task_run_id,
+                session.pending_persist_count()
+            );
+        }
+    }
+
+    // ── Step (c): auto-commit uncommitted worktree state to a WIP ref ──────
+    //
+    // This step used to consult NO deadline: it ran one blocking `git`
+    // subprocess per clean worktree session and two per dirty one, each via a
+    // `Command::output()` with no timeout, so `timed_out` could only ever be
+    // computed after the fact. It now stops starting sessions once the global
+    // deadline has passed, and each `git` call is separately capped.
+    for (task_run_id, session) in &sessions {
+        if Instant::now() >= deadline {
+            warn!(
+                "drain: deadline reached before WIP-ref capture for \
+                 task_run_id={} — skipping the remaining sessions",
+                task_run_id
+            );
+            break;
+        }
         let Some(wt) = session.worktree() else {
             // No isolated worktree (session runs in the shared cwd) — nothing
             // session-scoped to capture without polluting a shared checkout.
             continue;
         };
         let agent_session_id = stable_ai_session_id(task_run_id);
-        match capture_wip_ref(&wt.path, &agent_session_id, task_run_id) {
+        match capture_wip_ref(&wt.path, &agent_session_id, task_run_id, deadline) {
             Ok(true) => {
                 summary.wip_refs_written += 1;
                 info!(
@@ -238,6 +300,18 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
         app_handle.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
     {
         for (task_run_id, _session) in &sessions {
+            // Same deadline discipline as step (c): the registrar's
+            // heartbeat/progress calls are cheap but not free (each enqueues an
+            // outbox row and can contend a lock), and this step had no deadline
+            // check at all.
+            if Instant::now() >= deadline {
+                warn!(
+                    "drain: deadline reached before claim persistence for \
+                     task_run_id={} — skipping the remaining sessions",
+                    task_run_id
+                );
+                break;
+            }
             // Heartbeat the session's coord row (refreshes last_heartbeat_at
             // via the outbox → PATCH {heartbeat:true}). The session row +
             // worktree claim are already durable from register_session; this
@@ -316,12 +390,17 @@ fn wait_for_checkpoint(session: &ClaudeSession, deadline: Instant) {
 /// SHARED CONTRACT: the ref namespace is `refs/wip/<agent_session_id>` and the
 /// leaf is the stable v5 id. Phase 3 restores via `git stash apply <ref>` then
 /// deletes the ref.
+///
+/// `deadline` bounds the git subprocesses: each call gets
+/// `min(GIT_SUBPROCESS_TIMEOUT, time left)`, so capture can never run past the
+/// drain's own budget however wedged the repo is.
 pub fn capture_wip_ref(
     repo_dir: &std::path::Path,
     agent_session_id: &Uuid,
     task_run_id: &str,
+    deadline: Instant,
 ) -> Result<bool, String> {
-    let stash_sha = run_git(repo_dir, &["stash", "create"])
+    let stash_sha = run_git_bounded(repo_dir, &["stash", "create"], drain_git_budget(deadline))
         .map_err(|e| format!("git stash create failed: {e}"))?;
     let stash_sha = stash_sha.trim();
     if stash_sha.is_empty() {
@@ -331,8 +410,12 @@ pub fn capture_wip_ref(
 
     let ref_name = format!("refs/wip/{agent_session_id}");
     let msg = format!("qontinui-drain WIP for task_run_id={task_run_id}");
-    run_git(repo_dir, &["update-ref", "-m", &msg, &ref_name, stash_sha])
-        .map_err(|e| format!("git update-ref {ref_name} failed: {e}"))?;
+    run_git_bounded(
+        repo_dir,
+        &["update-ref", "-m", &msg, &ref_name, stash_sha],
+        drain_git_budget(deadline),
+    )
+    .map_err(|e| format!("git update-ref {ref_name} failed: {e}"))?;
 
     Ok(true)
 }
@@ -443,12 +526,35 @@ pub fn restore_wip_ref(
 /// Run a `git -C <repo_dir> <args...>` command, returning trimmed stdout on
 /// success or a descriptive error on non-zero exit / spawn failure.
 fn run_git(repo_dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    run_git_bounded(repo_dir, args, GIT_RESTORE_TIMEOUT)
+}
+
+/// The per-`git` budget the drain allows given its own `deadline`:
+/// `min(GIT_SUBPROCESS_TIMEOUT, time left)`.
+fn drain_git_budget(deadline: Instant) -> Duration {
+    std::cmp::min(
+        GIT_SUBPROCESS_TIMEOUT,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+}
+
+/// [`run_git`], with the subprocess capped at `budget`.
+///
+/// A git call that outlives its cap is killed and reported as an `Err` — the
+/// caller treats that exactly like any other git failure (log, keep going),
+/// which is the right degradation for a shutdown path: losing one session's
+/// WIP ref is bad, hanging the shutdown for every other session is worse.
+fn run_git_bounded(
+    repo_dir: &std::path::Path,
+    args: &[&str],
+    budget: Duration,
+) -> Result<String, String> {
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.arg("-C").arg(repo_dir);
     cmd.args(args);
-    let output = cmd
-        .output()
-        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    let output = output_with_timeout(cmd, budget)
+        .map_err(|e| format!("failed to spawn git: {e}"))?
+        .ok_or_else(|| format!("git {args:?} exceeded its {budget:?} timeout"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -461,9 +567,104 @@ fn run_git(repo_dir: &std::path::Path, args: &[&str]) -> Result<String, String> 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Run `cmd` to completion, capped at `timeout`.
+///
+/// `std::process::Command::output()` has no timeout — this is the bounded
+/// stand-in used everywhere the shutdown path shells out (`git` here, the
+/// orphaned-AI `taskkill` loop in `main.rs`). Returns:
+///
+/// - `Ok(Some(output))` — the child exited inside the budget;
+/// - `Ok(None)` — the budget expired; the child was killed and abandoned;
+/// - `Err(_)` — the child could not be spawned at all.
+///
+/// stdout/stderr are piped and read only AFTER the child has exited, so a child
+/// that writes more than the OS pipe buffer holds would block on its own write
+/// and be reported as a timeout rather than a success. That is acceptable for
+/// every caller here — a stash sha, a bare update-ref, a taskkill line — and it
+/// is the price of not spawning two reader threads per subprocess on a
+/// shutdown path. Do NOT reuse this for a command with large output.
+pub(crate) fn output_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::process::Stdio;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait()? {
+            Some(_) => {
+                // Exited — `wait_with_output` now just drains the pipes.
+                return child.wait_with_output().map(Some);
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    // Reap so the killed child does not linger as a zombie on
+                    // unix; ignore the result, we are abandoning it either way.
+                    let _ = child.wait();
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(SUBPROCESS_POLL_MS));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bounded-subprocess helper must return the child's real output when
+    /// it exits inside the budget...
+    #[test]
+    fn output_with_timeout_returns_a_fast_child() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "echo drained"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", "echo drained"]);
+            c
+        };
+        cmd.env("QONTINUI_TEST", "1");
+        let out = output_with_timeout(cmd, Duration::from_secs(10))
+            .expect("spawn ok")
+            .expect("child must finish inside a 10s budget");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("drained"));
+    }
+
+    /// ...and must give up — rather than block forever, which is what the bare
+    /// `Command::output()` it replaces did — when the child outlives it.
+    #[test]
+    fn output_with_timeout_abandons_a_slow_child() {
+        let cmd = if cfg!(windows) {
+            // `ping -n 30 127.0.0.1` is the portable-on-Windows sleep; no
+            // `timeout.exe`, which refuses to run without a console.
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", "sleep 30"]);
+            c
+        };
+        let started = Instant::now();
+        let result = output_with_timeout(cmd, Duration::from_millis(300)).expect("spawn ok");
+        assert!(result.is_none(), "a child that outlives the budget yields None");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the helper must return at its budget, not at the child's lifetime \
+             (took {:?})",
+            started.elapsed()
+        );
+    }
 
     use crate::test_env::env_lock;
 
@@ -536,7 +737,13 @@ mod tests {
         let dir = temp_dir("clean");
         init_repo(&dir);
         let sid = stable_ai_session_id("task-clean");
-        let wrote = capture_wip_ref(&dir, &sid, "task-clean").expect("capture ok");
+        let wrote = capture_wip_ref(
+            &dir,
+            &sid,
+            "task-clean",
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("capture ok");
         assert!(!wrote, "clean tree must not write a ref");
         assert!(
             !ref_exists(&dir, &format!("refs/wip/{sid}")),
@@ -561,7 +768,13 @@ mod tests {
             .unwrap();
 
         let sid = stable_ai_session_id("task-dirty");
-        let wrote = capture_wip_ref(&dir, &sid, "task-dirty").expect("capture ok");
+        let wrote = capture_wip_ref(
+            &dir,
+            &sid,
+            "task-dirty",
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("capture ok");
         assert!(wrote, "dirty tree must write a ref");
         let ref_name = format!("refs/wip/{sid}");
         assert!(
@@ -598,7 +811,13 @@ mod tests {
         let ref_name = format!("refs/wip/{sid}");
 
         // Capture → ref exists.
-        let wrote = capture_wip_ref(&dir, &sid, "task-roundtrip").expect("capture ok");
+        let wrote = capture_wip_ref(
+            &dir,
+            &sid,
+            "task-roundtrip",
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("capture ok");
         assert!(wrote, "dirty tree must capture a ref");
         assert!(ref_exists(&dir, &ref_name));
 

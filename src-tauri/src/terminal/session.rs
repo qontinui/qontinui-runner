@@ -3214,7 +3214,28 @@ impl TerminalSession {
     }
 
     /// Kill the shell process and clean up threads.
+    ///
+    /// Unbounded by design for the interactive single-close path (a user
+    /// closing one pane): the joins are already individually capped at 2 s each
+    /// and there is no competing work. The app-shutdown path uses
+    /// [`Self::close_with_deadline`] instead.
     pub fn close(&self) {
+        self.close_with_deadline(None);
+    }
+
+    /// Kill the shell process and clean up threads, optionally under a
+    /// deadline.
+    ///
+    /// Plan `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 2
+    /// step 5. `deadline = None` is today's behaviour, unchanged.
+    /// `Some(instant)` clamps every blocking step to what is left:
+    ///
+    /// - the `taskkill` gets `min(TASKKILL_TIMEOUT, remaining)` instead of an
+    ///   uncapped `Command::output()`;
+    /// - each thread join gets `min(2s, remaining)`;
+    /// - once nothing is left, the joins and the shim-dir sweep are skipped
+    ///   (the PTY child is already dead by then — that part always runs).
+    pub fn close_with_deadline(&self, deadline: Option<std::time::Instant>) {
         info!(terminal_id = %self.id, "Closing terminal session");
         self.is_alive.store(false, Ordering::Relaxed);
 
@@ -3226,13 +3247,30 @@ impl TerminalSession {
             slot.take();
         }
 
-        // Kill the child process via PID if still alive
+        // Kill the child process via PID if still alive.
+        //
+        // `/T` is CORRECT here: this is the terminal's OWN shell and whatever
+        // it spawned, and leaving that tree behind is precisely the process
+        // leak this call exists to prevent. It is categorically different from
+        // `/T` on the runner's own PID.
         if let Some(pid) = self.child_pid {
             #[cfg(target_os = "windows")]
             {
-                let _ = crate::process_helpers::no_window("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .output();
+                let mut cmd = crate::process_helpers::no_window("taskkill");
+                cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+                // Floored, unlike the joins: an exhausted budget may skip a
+                // thread join, but it must never skip the kill — that would
+                // leak the whole PTY child tree.
+                let budget =
+                    std::cmp::max(clamp_to_deadline(TASKKILL_TIMEOUT, deadline), KILL_FLOOR);
+                if let Ok(None) = crate::drain::output_with_timeout(cmd, budget) {
+                    warn!(
+                        terminal_id = %self.id,
+                        pid,
+                        "taskkill exceeded its {:?} budget — abandoned",
+                        budget
+                    );
+                }
             }
             #[cfg(not(target_os = "windows"))]
             {
@@ -3255,15 +3293,17 @@ impl TerminalSession {
             let _dropped = std::mem::replace(&mut *master, create_noop_master());
         }
 
-        // Join threads with a timeout so we never hang the UI
+        // Join threads with a timeout so we never hang the UI. Under a
+        // shutdown deadline the per-join cap shrinks with the remaining budget,
+        // and hits zero rather than adding 2 s per terminal past it.
         if let Ok(mut handle) = self.reader_join.lock() {
             if let Some(h) = handle.take() {
-                join_with_timeout(h, "reader", &self.id);
+                join_with_timeout(h, "reader", &self.id, clamp_to_deadline(JOIN_TIMEOUT, deadline));
             }
         }
         if let Ok(mut handle) = self.waiter_join.lock() {
             if let Some(h) = handle.take() {
-                join_with_timeout(h, "waiter", &self.id);
+                join_with_timeout(h, "waiter", &self.id, clamp_to_deadline(JOIN_TIMEOUT, deadline));
             }
         }
 
@@ -3277,17 +3317,99 @@ impl TerminalSession {
         // is shared by every terminal of this runner build (Phase 6, B2), so
         // deleting it here would pull the PATH shims out from under every other
         // live pane; `sweep_stale` owns its lifetime instead.
-        crate::install_effects_producer::intercept::shim_materializer::cleanup(
-            &std::env::temp_dir(),
-            &self.id,
-        );
+        //
+        // A recursive `remove_dir_all` is the one remaining unbounded step, so
+        // it is skipped once the shutdown budget is gone. `sweep_stale` reaps
+        // what is left at the next materialize — exactly as it already does
+        // after a crash.
+        if clamp_to_deadline(JOIN_TIMEOUT, deadline).is_zero() && deadline.is_some() {
+            debug!(
+                terminal_id = %self.id,
+                "Shutdown budget exhausted — leaving the shim dir to the stale sweep"
+            );
+        } else {
+            crate::install_effects_producer::intercept::shim_materializer::cleanup(
+                &std::env::temp_dir(),
+                &self.id,
+            );
+        }
 
         info!(terminal_id = %self.id, "Terminal session closed");
+    }
+
+    /// Kill the PTY child tree and nothing else.
+    ///
+    /// The app-shutdown fallback for terminals reached after
+    /// `TerminalManager::close_all`'s global deadline has already elapsed.
+    /// Killing the process tree is the only step whose omission LEAKS something
+    /// past process exit, so it is the only step kept; the thread joins, the
+    /// PTY-handle drop and the shim sweep are all reclaimed by the imminent
+    /// `process::exit` or by the next boot's stale sweep.
+    pub fn close_kill_only(&self) {
+        warn!(
+            terminal_id = %self.id,
+            "Shutdown deadline exhausted — kill-only terminal teardown"
+        );
+        self.is_alive.store(false, Ordering::Relaxed);
+
+        if let Some(pid) = self.child_pid {
+            #[cfg(target_os = "windows")]
+            {
+                // `/T`: the terminal's own child tree. See `close_with_deadline`.
+                let mut cmd = crate::process_helpers::no_window("taskkill");
+                cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+                if let Ok(None) = crate::drain::output_with_timeout(cmd, KILL_FLOOR) {
+                    warn!(
+                        terminal_id = %self.id,
+                        pid,
+                        "kill-only taskkill exceeded its {:?} budget — abandoned",
+                        KILL_FLOOR
+                    );
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+        }
+    }
+}
+
+/// Default per-thread join cap on the interactive close path.
+const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Default cap on the shutdown `taskkill` subprocess.
+const TASKKILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Floor under the `taskkill` cap. Every other step may be squeezed to nothing
+/// by an exhausted shutdown budget; the kill may not, because skipping it leaks
+/// a process tree that outlives the runner.
+const KILL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `min(default, time left before `deadline`)`, or just `default` when there is
+/// no deadline. Saturates at zero, never wraps.
+fn clamp_to_deadline(
+    default: std::time::Duration,
+    deadline: Option<std::time::Instant>,
+) -> std::time::Duration {
+    match deadline {
+        Some(d) => std::cmp::min(
+            default,
+            d.saturating_duration_since(std::time::Instant::now()),
+        ),
+        None => default,
     }
 }
 
 /// Join a thread with a timeout, logging a warning if it doesn't finish in time.
-fn join_with_timeout(handle: thread::JoinHandle<()>, name: &str, terminal_id: &str) {
+fn join_with_timeout(
+    handle: thread::JoinHandle<()>,
+    name: &str,
+    terminal_id: &str,
+    timeout: std::time::Duration,
+) {
     let (tx, rx) = std::sync::mpsc::channel();
     let thread_name = name.to_string();
     let tid = terminal_id.to_string();
@@ -3300,12 +3422,12 @@ fn join_with_timeout(handle: thread::JoinHandle<()>, name: &str, terminal_id: &s
             let _ = tx.send(());
         });
 
-    // Wait up to 2 seconds
-    if rx.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
+    if rx.recv_timeout(timeout).is_err() {
         warn!(
             terminal_id = %terminal_id,
             thread = %name,
-            "Thread did not finish within 2s timeout — detaching"
+            "Thread did not finish within its {:?} timeout — detaching",
+            timeout
         );
     }
 }
