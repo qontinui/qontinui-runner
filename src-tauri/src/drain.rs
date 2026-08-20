@@ -663,7 +663,10 @@ mod tests {
         };
         let started = Instant::now();
         let result = output_with_timeout(cmd, Duration::from_millis(300)).expect("spawn ok");
-        assert!(result.is_none(), "a child that outlives the budget yields None");
+        assert!(
+            result.is_none(),
+            "a child that outlives the budget yields None"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the helper must return at its budget, not at the child's lifetime \

@@ -3420,7 +3420,10 @@ pub mod emergency_quit {
             let previous = TEARDOWN_CLAIMED.swap(false, Ordering::SeqCst);
 
             // Door 1 (say, the X-button worker in `main.rs`) claims it.
-            assert!(try_claim_teardown(), "the first claimant must win the latch");
+            assert!(
+                try_claim_teardown(),
+                "the first claimant must win the latch"
+            );
             // Door 2 (a concurrent `POST force-close`) must be refused.
             assert!(
                 !try_claim_teardown(),
@@ -3486,7 +3489,10 @@ pub mod emergency_quit {
             // chance either watchdog gets.
             let hard_exits = body.matches("std::process::exit(0)").count();
             let pg_stops = body.matches("stop_embedded_pg_before_hard_exit()").count();
-            assert!(hard_exits >= 2, "expected the watchdog and the teardown hard exits");
+            assert!(
+                hard_exits >= 2,
+                "expected the watchdog and the teardown hard exits"
+            );
             assert_eq!(
                 pg_stops, hard_exits,
                 "every hard exit must stop the embedded PostgreSQL first — {hard_exits} \

@@ -3320,12 +3320,22 @@ impl TerminalSession {
         // and hits zero rather than adding 2 s per terminal past it.
         if let Ok(mut handle) = self.reader_join.lock() {
             if let Some(h) = handle.take() {
-                join_with_timeout(h, "reader", &self.id, clamp_to_deadline(JOIN_TIMEOUT, deadline));
+                join_with_timeout(
+                    h,
+                    "reader",
+                    &self.id,
+                    clamp_to_deadline(JOIN_TIMEOUT, deadline),
+                );
             }
         }
         if let Ok(mut handle) = self.waiter_join.lock() {
             if let Some(h) = handle.take() {
-                join_with_timeout(h, "waiter", &self.id, clamp_to_deadline(JOIN_TIMEOUT, deadline));
+                join_with_timeout(
+                    h,
+                    "waiter",
+                    &self.id,
+                    clamp_to_deadline(JOIN_TIMEOUT, deadline),
+                );
             }
         }
 

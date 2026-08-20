@@ -1696,7 +1696,7 @@ mod tests {
         let ui_dead = ui_stale(SOME_PONG, pong_age_ms, UI_DEAD_AFTER_MS);
         assert!(!ui_dead, "the shipped pong rung is blind to this failure");
         let native = classify_native_ui(NativeUiInputs {
-            probe_wedged: Some(true), // SendMessageTimeoutW(WM_NULL) timed out
+            probe_wedged: Some(true),         // SendMessageTimeoutW(WM_NULL) timed out
             window_getter_unresponsive: true, // /health's own getter timed out
             pong_age_ms,
             event_pong_age_ms: 25 * 60 * 1_000, // no ping delivered in 25 min
