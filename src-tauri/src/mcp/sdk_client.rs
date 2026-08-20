@@ -6270,14 +6270,12 @@ async fn handle_send_keys_to_page(
             )
             .await
             {
-                Ok(Json(resp)) => Json(serde_json::to_value(resp).unwrap_or_else(|e| {
-                    serde_json::json!({ "success": false, "error": e.to_string() })
-                })),
-                Err((_status, Json(err))) => {
-                    Json(serde_json::to_value(err).unwrap_or_else(|e| {
-                        serde_json::json!({ "success": false, "error": e.to_string() })
-                    }))
-                }
+                Ok(Json(resp)) => Json(serde_json::to_value(resp).unwrap_or_else(
+                    |e| serde_json::json!({ "success": false, "error": e.to_string() }),
+                )),
+                Err((_status, Json(err))) => Json(serde_json::to_value(err).unwrap_or_else(
+                    |e| serde_json::json!({ "success": false, "error": e.to_string() }),
+                )),
             }
         }
     }
