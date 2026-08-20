@@ -784,7 +784,7 @@ mod tests {
     fn close_window_is_idempotent() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, None, 10);
+        let w = create_window(&wa, None, None, None, 10);
         wa.assign_session("sess-A", &w.label);
 
         let first = wa.close_window(&w.label);
@@ -812,7 +812,7 @@ mod tests {
     fn close_window_drops_the_page_binding() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, Some("default".into()), 10);
+        let w = create_window(&wa, None, None, Some("default".into()), 10);
         assert_eq!(
             wa.snapshot().windows[&w.label].bound_page.as_deref(),
             Some("default")
