@@ -160,7 +160,13 @@ jobs:
       # for libwebkit2gtk-4.1, libsoup, libgtk etc. via pkg-config in
       # build scripts. Mirrors the canonical apt-get list from
       # .github/workflows/ci.yml.
+      #
+      # Bounded against a job-time apt hang — see the rationale on the same
+      # step in .github/workflows/ci.yml. Sizing: 20 successful runs,
+      # p50 33s, p90 73s, max 88s excluding one 1684s outlier. 10 min = ~8x the
+      # healthy p90, and the same bound ci.yml carries on the identical list.
       - name: Install Tauri Linux system deps
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y \

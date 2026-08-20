@@ -173,7 +173,16 @@ jobs:
       # therefore glib/gtk/webkit) even though the doc emit itself touches none
       # of it. Without these, cargo fails building `glib-sys` long before it
       # reaches the emit. Same list ci.yml installs for its ubuntu leg.
+      #
+      # Bounded against a job-time apt hang — see the rationale on the same
+      # step in .github/workflows/ci.yml. Sizing: this job is path-gated by
+      # `detect`, so it runs rarely; the 3 successful samples in
+      # 2026-08-07..08-14 are 28s / 30s / 41s. That is too thin a sample to
+      # size from on its own, so it takes ci.yml's 10-minute bound for the
+      # identical package list (there: healthy p90 57s over n=60) rather than
+      # inventing a tighter number off three points.
       - name: Install Tauri system dependencies (Ubuntu)
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y \

@@ -69,7 +69,15 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
+      # Bounded against a job-time apt hang — see the rationale on the same
+      # step in .github/workflows/ci.yml, where one cost qontinui-runner 3h45m
+      # of merge-train throughput on 2026-08-19.
+      # Sizing: 11 successful runs of this nightly job, 2026-08-09..08-19:
+      # p50 32s, max 50s outside the 08-19 apt incident (150s inside it).
+      # 10 min = ~12x the healthy median, matching the bound on the identical
+      # package list in ci.yml so the two do not drift apart.
       - name: Install dependencies (Ubuntu)
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -221,7 +229,15 @@ jobs:
         with:
           reviewdog_version: latest
 
+      # Bounded against a job-time apt hang — see the rationale on the same
+      # step in .github/workflows/ci.yml.
+      # Sizing: 76 successful runs of this job, 2026-08-08..08-20. Outside the
+      # 08-18..08-20 apt incident (n=52): p50 33s, p90 44s, max 75s. Inside it
+      # the tail is 115 / 185 / 226 / 273 / 318 / 367 / 750 / 981 / 2754s.
+      # 10 min = ~13x the healthy p90, matching ci.yml's bound on the identical
+      # package list.
       - name: Install dependencies (Ubuntu)
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y \

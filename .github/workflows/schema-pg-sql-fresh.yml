@@ -232,7 +232,14 @@ jobs:
           DATABASE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
         run: poetry run alembic upgrade head
 
+      # Bounded against a job-time apt hang — see the rationale on the
+      # `Install dependencies (Ubuntu)` step in .github/workflows/ci.yml.
+      # Sizing: 8 successful runs, p50 6s, max 9s. Same 5-minute floor as
+      # atlas-exclude-fresh.yml's identical postgresql-client-16 install; see
+      # the comment there for why a 5-10x multiple of a 9-second step would be
+      # too tight to be safe.
       - name: Install Postgres client (for pg_dump)
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-client-16

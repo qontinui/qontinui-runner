@@ -83,8 +83,13 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Bounded against a job-time apt hang — see the rationale on the same
+      # step in .github/workflows/ci.yml. Sizing: 19 successful runs, p50 29s,
+      # p90 42s, max 62s. 10 min = ~14x p90, and the same bound ci.yml carries
+      # on the identical package list.
       - name: Install Linux build deps
         if: matrix.platform == 'ubuntu-22.04'
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y \

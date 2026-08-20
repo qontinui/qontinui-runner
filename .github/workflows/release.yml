@@ -343,8 +343,13 @@ jobs:
         run: rustup target add ${{ matrix.target }}
         shell: bash
 
+      # Bounded against a job-time apt hang — see the rationale on the same
+      # step in .github/workflows/ci.yml. Sizing: 12 successful runs of this
+      # ubuntu build leg, p50 34s, p90 50s, max 53s. 10 min = ~12x p90, and the
+      # same bound ci.yml carries on the identical package list.
       - name: Install dependencies (Ubuntu)
         if: matrix.platform == 'ubuntu-22.04'
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y \

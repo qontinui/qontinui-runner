@@ -76,6 +76,17 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
 
+    # Backstop cap for any step in this job that is not individually bounded.
+    # This job previously had NO job-level timeout, so the 4h24m apt hang above
+    # was burning toward GitHub's *default* 360-minute ceiling — a value this
+    # repo never chose. One cap covers both matrix legs, so it is sized off the
+    # slower one. 90 successful job runs, 2026-08-08..08-20: ubuntu p50 52.8m /
+    # p90 62.5m / max 112.0m; windows p50 73.8m / p90 87.2m / p95 93.4m /
+    # max 102.2m. 150 min = windows p90 + ~60 min headroom, and 1.34x the worst
+    # observed success across either leg — well clear of normal variance while
+    # cutting the worst case from 6 h to 2.5 h.
+    timeout-minutes: 150
+
     steps:
       - uses: actions/checkout@v5
 
@@ -141,8 +152,27 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
+      # Bounded because an unbounded apt hang here stalls the whole REPO, not
+      # just this run. Run 32302655587 (2026-08-19, branch
+      # merge-candidate/01a01bdd-…) sat `in_progress` in this step for 4h24m
+      # while the sibling windows leg passed — steps 9-19 never reached. It
+      # pinned a coord merge slot; nothing landed in qontinui-runner for 3h45m
+      # with four CLEAN green PRs queued behind, and the PR itself showed
+      # OPEN/CLEAN/all-green the entire time. Cancelling it released the train
+      # in nine seconds, and the two candidates coord immediately re-proposed
+      # both cleared this same step normally.
+      #
+      # Sizing — same p90 + named-headroom method as `Run Rust tests` below.
+      # 88 successful samples, runs 2026-08-08..08-20. Outside the 08-18..08-20
+      # apt incident (n=60): p50 35s, p90 57s, max 115s. Inside it the tail is
+      # 201 / 344 / 442 / 532 / 564 / 624 / 1370 / 3634s. 10 min = ~10x the
+      # healthy p90 and ~5x the worst healthy sample: it still absorbs a
+      # degraded-but-progressing mirror (every 08-19 success up to 564s) while
+      # converting a hang into a fast, obvious failure and an immediate
+      # re-propose.
       - name: Install dependencies (Ubuntu)
         if: matrix.platform == 'ubuntu-22.04'
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -526,6 +556,10 @@ jobs:
   clippy-windows:
     name: Clippy (windows)
     runs-on: windows-latest
+    # 88 successful runs, 2026-08-08..08-20: p50 14.7m, p90 16.5m, max 19.4m.
+    # 45 min = p90 + ~28 min headroom (2.3x the worst observed success).
+    # Previously unbounded, i.e. GitHub's 360-minute default.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
@@ -655,6 +689,13 @@ jobs:
   seam-gate:
     runs-on: ubuntu-latest
 
+    # 90 successful runs, 2026-08-08..08-20: p50 0.1m, p90 0.2m, max 0.4m —
+    # a checkout plus three greps. 10 min is a floor rather than a multiple:
+    # a sub-minute job does not want a sub-minute cap (network jitter on the
+    # checkout alone would flake it), and 10 min is still 25x the worst
+    # observed. Previously unbounded, i.e. GitHub's 360-minute default.
+    timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v5
 
@@ -701,6 +742,11 @@ jobs:
 
   security:
     runs-on: ubuntu-latest
+
+    # 63 successful runs, 2026-08-08..08-20: p50 3.3m, p90 3.5m, max 4.3m.
+    # 20 min = ~5.7x p90 / 4.6x the worst observed success, leaving room for a
+    # slow advisory-DB fetch. Previously unbounded, i.e. the 360-minute default.
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v5
