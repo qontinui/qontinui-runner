@@ -1738,15 +1738,40 @@ const MAX_DIRTY_FILES_REPORTED: usize = 50;
 
 /// Machine-local artifacts the runner drops into a managed repo's working
 /// tree: the per-session coord-mcp proxy `.mcp.json` (holds device-scoped
-/// proxy keys — must never be committed) and the `agent-worktrees/` /
-/// `.agent-worktrees/` checkout roots. Left untracked they make `capture_tree`
+/// proxy keys — must never be committed), the `agent-worktrees/` /
+/// `.agent-worktrees/` checkout roots, and `.coord-mcp-status`, the breadcrumb
+/// `coord_mcp` writes on the DEGRADED provisioning path (no JWT, unresolvable
+/// port, failed reachability probe). Left untracked they make `capture_tree`
 /// report `dirty=true`, which on a default branch yields a permanent
 /// `wip_on_default` Hold from the pull-decision watcher — silently wedging the
 /// repo-pull executor. We exclude them per-repo via `.git/info/exclude` (see
 /// [`ensure_repo_info_exclude`]) rather than a committed `.gitignore`, so the
 /// heal is machine-local (no per-repo PR) and a secrets file never enters git
 /// history at all.
-const MANAGED_REPO_EXCLUDES: &[&str] = &[".mcp.json", "agent-worktrees/", ".agent-worktrees/"];
+///
+/// `.coord-mcp-status` wedges a SECOND consumer the same way: `/pull-scoped`
+/// scopes a repo on any `git status --porcelain` output, untracked included,
+/// and then refuses to pull a default-branch tree that is non-empty. Measured
+/// on the operator box 2026-08-20, the breadcrumb was present in 9 canonical
+/// checkouts and `qontinui-schemas` was pinned by it alone. It belongs here
+/// rather than in a separate sweep because this is already the component that
+/// writes the file and already heals every walked repo each publish cycle.
+///
+/// This roster and `agent_worktree::dirty::RUNNER_SCAFFOLDING` cover the same
+/// artifacts for DIFFERENT questions, and they deliberately DIFFER -- do not
+/// "sync" them. `RUNNER_SCAFFOLDING` asks "may we delete this disposable
+/// worktree?"; this asks "should git stop reporting it?". `.claude` is on that
+/// roster and must NEVER be added here: it is TRACKED in real repos
+/// (`qontinui-claude-config` carries 119 paths under it), and excluding it
+/// would hide every NEW `.claude/commands/*.md` from `git status` -- an
+/// intended commit silently going missing. Before adding any entry here,
+/// confirm `git ls-files -- <path>` is empty in every checkout.
+const MANAGED_REPO_EXCLUDES: &[&str] = &[
+    ".mcp.json",
+    "agent-worktrees/",
+    ".agent-worktrees/",
+    ".coord-mcp-status",
+];
 
 /// Header line bracketing the runner-managed block in a repo's
 /// `.git/info/exclude` — lets the operator see who added the entries.
@@ -4201,13 +4226,32 @@ mod tests {",
 
         // The stray machine artifacts already present BEFORE we exclude — the
         // retroactive-heal case that obviates a `.gitignore` sweep.
-        std::fs::write(dir.join(".mcp.json"), "{}").unwrap();
-        std::fs::create_dir_all(dir.join("agent-worktrees")).unwrap();
-        std::fs::write(dir.join("agent-worktrees").join("x"), "x").unwrap();
-        assert!(
-            tgit(&dir, &["status", "--porcelain"]).contains(".mcp.json"),
-            "precondition: artifacts make the tree dirty before excluding"
-        );
+        // Materialize a stray artifact for EVERY roster entry, so the
+        // "porcelain is empty afterwards" assertion below proves each pattern
+        // is actually honored by git -- not merely that its text reached the
+        // file. A future entry spelled `/target-agent` or `target-agent/**`
+        // would land in the exclude file and exclude nothing; only a fixture
+        // derived from the roster catches that.
+        for pat in MANAGED_REPO_EXCLUDES {
+            let p = dir.join(pat.trim_end_matches('/'));
+            if pat.ends_with('/') {
+                std::fs::create_dir_all(&p).unwrap();
+                std::fs::write(p.join("x"), "x").unwrap();
+            } else {
+                std::fs::write(&p, "x").unwrap();
+            }
+        }
+        let before = tgit(&dir, &["status", "--porcelain"]);
+        // Each entry must read dirty in its OWN right before the heal --
+        // otherwise a pattern could "pass" the post-heal check by never having
+        // been reported in the first place (a global core.excludesFile already
+        // covering it, say), and the test would prove nothing.
+        for pat in MANAGED_REPO_EXCLUDES {
+            assert!(
+                before.contains(pat.trim_end_matches('/')),
+                "precondition: {pat:?} must make the tree dirty before excluding"
+            );
+        }
 
         ensure_repo_info_exclude(&dir);
 
@@ -4217,7 +4261,15 @@ mod tests {",
         );
         let exclude =
             std::fs::read_to_string(dir.join(".git").join("info").join("exclude")).unwrap();
-        assert!(exclude.contains(".mcp.json") && exclude.contains("agent-worktrees/"));
+        // Every roster entry reached the file, matched as a WHOLE line -- the
+        // substring form this function's own comment warns about would accept
+        // `.mcp.json.bak` as covering `.mcp.json`.
+        for pat in MANAGED_REPO_EXCLUDES {
+            assert!(
+                exclude.lines().any(|l| l.trim() == *pat),
+                "roster entry {pat:?} missing from .git/info/exclude"
+            );
+        }
 
         // Idempotent: a second pass changes nothing (no duplicate lines/marker).
         let first = exclude;
