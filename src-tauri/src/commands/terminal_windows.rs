@@ -1006,7 +1006,9 @@ mod tests {
 
         let status = |has_ui_error: bool| {
             crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
-                has_ui_error: has_ui_error,
+                has_ui_error,
+                // `native_ui_wedged` is left at its `None` default: this
+                // pop-out test does not probe the native message loop.
                 embedding_reachable: Some(true),
                 pg_reachable: Some(true),
                 relay_connected: Some(true),
