@@ -204,9 +204,14 @@ struct NonceBinding {
     /// `None` for the bindings that genuinely have no terminal: the in-cwd
     /// `.mcp.json` writer (that file is shared by every session in the cwd by
     /// construction), the `/coord-mcp/provision-session` mint route (bare
-    /// sessions the runner did not spawn), the boot restore, and the on-disk
-    /// adopt (neither persisted form carries a terminal). Those keep the
-    /// workdir leg as their fallback. Read via [`terminal_id_for_nonce`].
+    /// sessions the runner did not spawn), and the on-disk adopt (that form
+    /// carries no terminal). Those keep the workdir leg as their fallback.
+    ///
+    /// The boot restore is NO LONGER in that list: the persisted store was
+    /// widened to carry the terminal, so a restored binding reproduces it.
+    /// That is an EVICTION-KEY fidelity fix, not an identity claim — the PTY
+    /// it names died with the previous runner process, so self-identification
+    /// still misses on a restored nonce. Read via [`terminal_id_for_nonce`].
     terminal_id: Option<String>,
     /// Wall-clock time this binding was MINTED — its true age, carried across
     /// restarts by [`crate::secure_storage::StoredNonceBinding::minted_at_unix`]
@@ -5759,7 +5764,7 @@ mod tests {
                     workdir: format!("D:/bounded-wt/{i}"),
                     principal: ProxyPrincipal::Device,
                     lifetime: NonceLifetime::Persistent,
-                    session_tenant: None,
+                    session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
                     terminal_id: Some(format!("term-{i}")),
                     minted_at: base + std::time::Duration::from_secs(i as u64),
                 },
@@ -5846,7 +5851,7 @@ mod tests {
                     workdir: wd.clone(),
                     principal: ProxyPrincipal::Device,
                     lifetime: NonceLifetime::Persistent,
-                    session_tenant: None,
+                    session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
                     terminal_id: Some(format!("term-{secs}")),
                     minted_at: minted_at_from_unix(Some(secs)),
                 },
@@ -5949,7 +5954,7 @@ mod tests {
             workdir: format!("D:/age-class/{i}"),
             principal: ProxyPrincipal::Device,
             lifetime: NonceLifetime::Persistent,
-            session_tenant: None,
+            session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
             terminal_id: Some(format!("term-{i}")),
             minted_at,
         };
@@ -7112,7 +7117,7 @@ mod tests {
                     workdir: wd_b.clone(),
                     principal: ProxyPrincipal::Device,
                     lifetime: NonceLifetime::Persistent,
-                    session_tenant: None,
+                    session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
                     terminal_id: None,
                     minted_at: std::time::SystemTime::now(),
                 },
