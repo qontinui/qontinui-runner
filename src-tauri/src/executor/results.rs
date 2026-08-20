@@ -9,7 +9,7 @@
 //! `ExecutionOutcome` using the `IntoOutcome` trait:
 //!
 //! ```ignore
-//! use crate::executor::results::IntoOutcome;
+//! use qontinui_runner_lib::executor::results::IntoOutcome;
 //!
 //! let step_result: StepExecutionResult = /* ... */;
 //! let outcome: ExecutionOutcome = step_result.into_outcome(step_result.duration_ms);

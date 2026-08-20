@@ -18,7 +18,7 @@
 //! ## Usage
 //!
 //! ```rust
-//! use crate::timeout_config::Timeouts;
+//! use qontinui_runner_lib::timeout_config::Timeouts;
 //!
 //! // Get timeout as Option<Duration> (None = disabled)
 //! if let Some(timeout) = Timeouts::action_execution() {

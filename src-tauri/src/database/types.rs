@@ -317,7 +317,7 @@ fn default_auto_continue() -> bool {
 /// Use the builder pattern to construct this:
 ///
 /// ```rust
-/// use crate::database::CreateTaskRunInput;
+/// use qontinui_runner_lib::database::CreateTaskRunInput;
 ///
 /// let input = CreateTaskRunInput::new("task-123", "My Task")
 ///     .with_prompt("Do something useful")

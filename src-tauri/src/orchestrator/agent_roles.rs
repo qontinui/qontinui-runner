@@ -15,7 +15,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use qontinui_runner::orchestrator::agent_roles::*;
+//! use qontinui_runner_lib::orchestrator::agent_roles::*;
 //!
 //! let debugger = AgentRole::debugger();
 //! let prompt = debugger.build_system_prompt();

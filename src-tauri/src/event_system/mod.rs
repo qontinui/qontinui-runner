@@ -14,7 +14,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! use crate::event_system::{EventEmitter, AppEvent};
+//! use qontinui_runner_lib::event_system::{EventEmitter, AppEvent};
 //!
 //! // Create an emitter from an AppHandle
 //! let emitter = EventEmitter::new(app_handle);

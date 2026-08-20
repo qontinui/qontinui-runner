@@ -109,7 +109,7 @@ pub fn retract_last_crash_dump(reason: &str) -> bool {
 ///
 /// # Usage
 /// ```
-/// use crate::logging::safe_eprintln;
+/// use qontinui_runner_lib::logging::safe_eprintln;
 /// safe_eprintln("Error message");
 /// safe_eprintln(&format!("Value: {}", some_value));
 /// ```

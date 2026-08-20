@@ -12,7 +12,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use qontinui_runner::orchestrator::checkpoint::*;
+//! use qontinui_runner_lib::orchestrator::checkpoint::*;
 //!
 //! let mut manager = CheckpointManager::new();
 //!

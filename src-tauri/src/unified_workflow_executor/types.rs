@@ -1065,7 +1065,7 @@ impl AgenticOutcome {
 /// # Examples
 ///
 /// ```
-/// use qontinui_runner::unified_workflow_executor::get_parent_task_id;
+/// use qontinui_runner_lib::unified_workflow_executor::get_parent_task_id;
 ///
 /// // Composed run child → parent
 /// assert_eq!(

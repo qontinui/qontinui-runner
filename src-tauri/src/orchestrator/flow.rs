@@ -13,7 +13,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use qontinui_runner::orchestrator::flow::*;
+//! use qontinui_runner_lib::orchestrator::flow::*;
 //!
 //! let flow = Flow::new("code_review_flow")
 //!     .add_step(FlowStep::agent("analyze", "code_reviewer", "Review the code"))

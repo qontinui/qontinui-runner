@@ -16,7 +16,7 @@ use tracing::{error, warn};
 /// # Example
 ///
 /// ```ignore
-/// use crate::event_system::{EventEmitter, AppEvent};
+/// use qontinui_runner_lib::event_system::{EventEmitter, AppEvent};
 ///
 /// let emitter = EventEmitter::new(app_handle);
 ///

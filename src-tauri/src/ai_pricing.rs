@@ -180,7 +180,7 @@ pub fn get_pricing(model_id: &str) -> Option<ModelPricing> {
 ///
 /// # Example
 /// ```
-/// use qontinui_runner::ai_pricing::calculate_cost_cents;
+/// use qontinui_runner_lib::ai_pricing::calculate_cost_cents;
 ///
 /// let cost = calculate_cost_cents(1000, 500, "claude-3-5-sonnet");
 /// assert!(cost.is_some());
@@ -233,7 +233,7 @@ pub fn calculate_cost_breakdown(
 ///
 /// # Example
 /// ```
-/// use qontinui_runner::ai_pricing::calculate_cost_usd;
+/// use qontinui_runner_lib::ai_pricing::calculate_cost_usd;
 ///
 /// let cost = calculate_cost_usd(10_000, 5_000, "claude-3-5-sonnet");
 /// assert!(cost > 0.0);

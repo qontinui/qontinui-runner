@@ -39,7 +39,7 @@
 //! ## Usage
 //!
 //! ```rust
-//! use crate::orchestrator::{OrchestratorRuntime, EnhancedOrchestratorConfig, ConfigPresets};
+//! use qontinui_runner_lib::orchestrator::{OrchestratorRuntime, EnhancedOrchestratorConfig, ConfigPresets};
 //!
 //! // Create runtime with default config
 //! let runtime = OrchestratorRuntime::new(EnhancedOrchestratorConfig::default());

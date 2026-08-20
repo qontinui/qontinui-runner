@@ -22,7 +22,7 @@ use tracing::{error, warn};
 /// # Example
 ///
 /// ```ignore
-/// use crate::event_system::{EventBroadcaster, AppEvent};
+/// use qontinui_runner_lib::event_system::{EventBroadcaster, AppEvent};
 ///
 /// let broadcaster = EventBroadcaster::new(app_handle);
 ///

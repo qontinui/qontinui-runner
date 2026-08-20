@@ -12,7 +12,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use crate::executor::unified_execution::{UnifiedStepRunner, execute_steps_with_outcomes};
+//! use qontinui_runner_lib::executor::unified_execution::{UnifiedStepRunner, execute_steps_with_outcomes};
 //!
 //! // Create a unified runner
 //! let runner = UnifiedStepRunner::new(app_state, config_storage, app_handle);

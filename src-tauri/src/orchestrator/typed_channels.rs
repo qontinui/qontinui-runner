@@ -12,7 +12,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use qontinui_runner::orchestrator::typed_channels::*;
+//! use qontinui_runner_lib::orchestrator::typed_channels::*;
 //!
 //! let mut state = ChannelState::new();
 //!

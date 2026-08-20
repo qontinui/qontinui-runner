@@ -15,7 +15,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use qontinui_runner::orchestrator::event_bus::*;
+//! use qontinui_runner_lib::orchestrator::event_bus::*;
 //!
 //! let mut bus = EventBus::new();
 //! bus.subscribe(EventType::WorkerStarted, LoggingHandler::new());

@@ -12,7 +12,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use qontinui_runner::orchestrator::parallel::*;
+//! use qontinui_runner_lib::orchestrator::parallel::*;
 //!
 //! let execution = ParallelExecution::new()
 //!     .with_branch(Branch::new("analyze_code", "code_analysis"))

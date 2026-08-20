@@ -13,7 +13,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use qontinui_runner::orchestrator::memory::*;
+//! use qontinui_runner_lib::orchestrator::memory::*;
 //!
 //! let mut memory = MemorySystem::new();
 //!

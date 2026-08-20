@@ -28,7 +28,7 @@ pub enum CurlParseError {
 ///
 /// # Example
 /// ```
-/// use qontinui_runner::api_request::parse_curl;
+/// use qontinui_runner_lib::api_request::parse_curl;
 ///
 /// let curl = r#"curl 'https://api.example.com/users' \
 ///   -H 'Authorization: Bearer token123' \

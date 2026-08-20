@@ -405,8 +405,8 @@ pub mod timeout_helper {
     /// This is useful for tracking execution time when building `ExecutionOutcome`:
     ///
     /// ```ignore
-    /// use crate::executor::execution_helpers::timeout_helper::timed_result;
-    /// use crate::executor::results::{ExecutionOutcome, IntoOutcome};
+    /// use qontinui_runner_lib::executor::execution_helpers::timeout_helper::timed_result;
+    /// use qontinui_runner_lib::executor::results::{ExecutionOutcome, IntoOutcome};
     ///
     /// let (result, duration_ms) = timed_result(|| {
     ///     // perform some operation
@@ -437,7 +437,7 @@ pub mod timeout_helper {
     /// # Example
     ///
     /// ```ignore
-    /// use crate::executor::execution_helpers::timeout_helper::timed_result_async;
+    /// use qontinui_runner_lib::executor::execution_helpers::timeout_helper::timed_result_async;
     ///
     /// let (result, duration_ms) = timed_result_async(async {
     ///     // perform async operation

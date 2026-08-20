@@ -289,7 +289,7 @@ fn consolidate_entries(entries: Vec<ParsedEntry>) -> Vec<AiOutputChunk> {
 /// grouped by source (claude responses vs user/system prompts).
 ///
 /// # Example output:
-/// ```markdown
+/// ````text
 /// ### Previous AI Output
 ///
 /// **[claude]** [14:58:42 - 14:59:15] (47 lines)
@@ -302,7 +302,7 @@ fn consolidate_entries(entries: Vec<ParsedEntry>) -> Vec<AiOutputChunk> {
 /// ```
 /// User provided additional context...
 /// ```
-/// ```
+/// ````
 pub fn format_consolidated_for_prompt(consolidated: &ConsolidatedAiOutput) -> String {
     if consolidated.chunks.is_empty() {
         return String::new();

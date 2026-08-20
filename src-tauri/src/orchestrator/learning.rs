@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```rust
-//! use crate::orchestrator::learning::{LearningSystem, TaskOutcome, AnalysisConfig};
+//! use qontinui_runner_lib::orchestrator::learning::{LearningSystem, TaskOutcome, AnalysisConfig};
 //!
 //! let mut learning = LearningSystem::new();
 

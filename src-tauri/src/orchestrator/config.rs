@@ -30,7 +30,7 @@
 //! # Example
 //!
 //! ```rust
-//! use crate::orchestrator::config::EnhancedOrchestratorConfig;
+//! use qontinui_runner_lib::orchestrator::config::EnhancedOrchestratorConfig;
 //!
 //! // Default config with all features enabled
 //! let config = EnhancedOrchestratorConfig::default();

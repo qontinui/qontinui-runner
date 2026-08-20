@@ -472,7 +472,7 @@ impl From<AppError> for String {
 ///
 /// # Example
 /// ```ignore
-/// use crate::error::wrap_io_error;
+/// use qontinui_runner_lib::error::wrap_io_error;
 ///
 /// std::fs::read_to_string("config.json")
 ///     .map_err(|e| wrap_io_error("reading configuration file", e))?;
@@ -488,7 +488,7 @@ pub fn wrap_io_error(context: &str, err: std::io::Error) -> AppError {
 ///
 /// # Example
 /// ```ignore
-/// use crate::error::wrap_json_error;
+/// use qontinui_runner_lib::error::wrap_json_error;
 ///
 /// serde_json::from_str::<Config>(json_str)
 ///     .map_err(|e| wrap_json_error("parsing workflow configuration", e))?;

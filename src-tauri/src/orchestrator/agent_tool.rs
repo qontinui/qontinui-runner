@@ -12,7 +12,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use qontinui_runner::orchestrator::agent_tool::*;
+//! use qontinui_runner_lib::orchestrator::agent_tool::*;
 //!
 //! // Create an agent tool from a role
 //! let security_scanner = AgentTool::from_role("security_analyst")

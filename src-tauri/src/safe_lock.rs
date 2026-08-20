@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Safe Lock Utilities
 //!
 //! This module provides utilities for safely acquiring locks on Mutex and RwLock
@@ -17,10 +18,8 @@
 //!
 //! ## Usage
 //!
-//! ```rust
-
-#![allow(dead_code)]
-//! use crate::safe_lock::{safe_lock, safe_read, safe_write};
+//! ```ignore
+//! use qontinui_runner_lib::safe_lock::{safe_lock, safe_read, safe_write};
 //!
 //! // For Mutex
 //! let guard = safe_lock(&my_mutex, "my_data")?;

@@ -5,9 +5,9 @@
 //!
 //! # Example Usage
 //!
-//! ```rust
-//! use crate::config_facade::{get_setting, save_setting, update_setting};
-//! use crate::settings::AiSettings;
+//! ```ignore
+//! use qontinui_runner_lib::config_facade::{get_setting, save_setting, update_setting};
+//! use qontinui_runner_lib::settings::AiSettings;
 //!
 //! // Get a setting
 //! let ai: AiSettings = get_setting();
@@ -291,7 +291,7 @@ impl SettingsField for crate::settings::HelperTasksSettings {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```ignore
 /// let ai: AiSettings = get_setting();
 /// ```
 pub fn get_setting<T: SettingsField>() -> T {
@@ -302,7 +302,7 @@ pub fn get_setting<T: SettingsField>() -> T {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```ignore
 /// save_setting(AiSettings::default())?;
 /// ```
 pub fn save_setting<T: SettingsField>(value: T) -> Result<(), String> {
@@ -317,7 +317,7 @@ pub fn save_setting<T: SettingsField>(value: T) -> Result<(), String> {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```ignore
 /// update_setting::<AiSettings, _>(|ai| {
 ///     ai.provider = AiProvider::ClaudeApi;
 /// })?;
@@ -345,7 +345,7 @@ where
 ///
 /// # Example
 ///
-/// ```rust
+/// ```ignore
 /// let keychain = KeychainHelper::new("com.qontinui.runner.ai");
 /// keychain.store("api_key", "sk-...")?;
 /// let key = keychain.get("api_key")?;

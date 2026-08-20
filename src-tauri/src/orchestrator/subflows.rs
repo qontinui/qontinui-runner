@@ -13,7 +13,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use qontinui_runner::orchestrator::subflows::*;
+//! use qontinui_runner_lib::orchestrator::subflows::*;
 //!
 //! // Define a reusable "run tests" subflow
 //! let run_tests = SubflowDef::new("run_tests", "Run Test Suite")

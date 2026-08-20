@@ -7,7 +7,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use crate::semantic_conventions::{spans, attributes, phases};
+//! use qontinui_runner_lib::semantic_conventions::{spans, attributes, phases};
 //!
 //! // Reference canonical span names
 //! assert_eq!(spans::WORKFLOW_EXECUTE, "qontinui.workflow");

@@ -6,7 +6,7 @@
 //! # Usage
 //!
 //! ```rust
-//! use crate::schema_registry;
+//! use qontinui_runner_lib::schema_registry;
 //!
 //! // Get the JSON Schema for a type as a serde_json::Value
 //! let schema = schema_registry::schema_as_json::<WorkerOutput>();

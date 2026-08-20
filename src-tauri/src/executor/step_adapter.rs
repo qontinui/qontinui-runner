@@ -17,7 +17,7 @@
 //! ### 1. Single Step Execution with Unified Outcome
 //!
 //! ```ignore
-//! use crate::executor::{StepExecutorAdapter, AdaptedStepConfig, IntoOutcome};
+//! use qontinui_runner_lib::executor::{StepExecutorAdapter, AdaptedStepConfig, IntoOutcome};
 //!
 //! let adapter = StepExecutorAdapter::new(app_state, config_storage, app_handle);
 //! let config = AdaptedStepConfig::from_execution_step(&step, "exec-123");
@@ -30,7 +30,7 @@
 //! ### 2. Batch Execution with Aggregated Results
 //!
 //! ```ignore
-//! use crate::executor::{StepExecutorAdapter, BatchStepExecutor};
+//! use qontinui_runner_lib::executor::{StepExecutorAdapter, BatchStepExecutor};
 //!
 //! let adapter = StepExecutorAdapter::new(app_state, config_storage, app_handle);
 //! let batch = BatchStepExecutor::new(adapter);
@@ -45,7 +45,7 @@
 //! ### 3. Lifecycle-Managed Execution (for Playwright, etc.)
 //!
 //! ```ignore
-//! use crate::executor::{StepExecutorAdapter, LifecycleStepAdapter, LifecycleExecutor};
+//! use qontinui_runner_lib::executor::{StepExecutorAdapter, LifecycleStepAdapter, LifecycleExecutor};
 //!
 //! let adapter = StepExecutorAdapter::new(app_state, config_storage, app_handle);
 //! let mut lifecycle = LifecycleStepAdapter::new(adapter)
@@ -67,7 +67,7 @@
 //! ### 4. Using FromContext for Dependency Injection
 //!
 //! ```ignore
-//! use crate::executor::{ExecutorContext, StepExecutorAdapter, FromContext};
+//! use qontinui_runner_lib::executor::{ExecutorContext, StepExecutorAdapter, FromContext};
 //!
 //! let context = ExecutorContext::minimal(app_state, app_handle)
 //!     .with_config_storage(storage)
@@ -79,7 +79,7 @@
 //! ### 5. Converting Results to Outcomes
 //!
 //! ```ignore
-//! use crate::executor::{results_to_outcomes, aggregate_outcomes, IntoOutcome};
+//! use qontinui_runner_lib::executor::{results_to_outcomes, aggregate_outcomes, IntoOutcome};
 //!
 //! // Convert existing step results
 //! let outcomes = results_to_outcomes(step_results);
