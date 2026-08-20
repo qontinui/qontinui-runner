@@ -523,19 +523,25 @@ impl ProcessFailureKind {
     }
 }
 
-/// Why recovery was asked for. Two callers by design:
+/// Why recovery was asked for. Callers by design:
 ///
 /// * [`RecoveryReason::ProcessFailed`] — the Phase 1a push event (this module).
 /// * [`RecoveryReason::HeartbeatStale`] — the Phase 1b staleness backstop,
 ///   wired by the coordinator during integration. **Not wired here**; this
 ///   variant exists so the signature is already right for it.
 /// * [`RecoveryReason::Manual`] — the operator/debug HTTP route.
+/// * [`RecoveryReason::NativeUiThreadHung`] — the native message-loop probe
+///   (`health_monitor::ui_thread_pumping`), plan
+///   `2026-08-19-runner-blocked-ui-thread-cannot-be-closed` Phase 4. **Detect
+///   and surface only**: see [`plan_action`] for why no action can help, and
+///   [`report_native_ui_thread_hang`] for the surface it does use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryReason {
     ProcessFailed(ProcessFailureKind),
     HeartbeatStale,
     Manual,
+    NativeUiThreadHung,
 }
 
 impl RecoveryReason {
@@ -544,6 +550,7 @@ impl RecoveryReason {
             Self::ProcessFailed(_) => "process_failed",
             Self::HeartbeatStale => "heartbeat_stale",
             Self::Manual => "manual",
+            Self::NativeUiThreadHung => "native_ui_thread_hung",
         }
     }
 }
@@ -582,6 +589,24 @@ pub fn plan_action(reason: RecoveryReason, attempt: u32) -> RecoveryAction {
         RecoveryReason::ProcessFailed(
             ProcessFailureKind::FrameRenderExited | ProcessFailureKind::Ancillary(_),
         ) => RecoveryAction::None,
+        // The native message loop itself stopped pumping (2026-08-19). `None`
+        // is not a gap in this ladder — it is a property of the failure, and
+        // both rungs were checked against the source rather than assumed:
+        //
+        // * **Reload** is `window.eval("location.reload()")`
+        //   ([`reload_main_webview`]), which dispatches through the very loop
+        //   that is wedged.
+        // * **Recreate** is `destroy()` + rebuild, and `destroy()` only
+        //   *enqueues* onto that same loop; [`recreate_main_window`]'s
+        //   label-release poll would then burn its full
+        //   [`WINDOW_LABEL_RELEASE_TIMEOUT_MS`] and return `Err`.
+        //
+        // Detect and surface; never attempt a recovery that cannot run. A
+        // force-exit is not on the table here either: the plan permits that
+        // only downstream of an explicit user close action, never on bare hang
+        // detection, because exiting destroys every in-flight session — 102 of
+        // them in the originating incident.
+        RecoveryReason::NativeUiThreadHung => RecoveryAction::None,
         // Renderer death, an unresponsive renderer, a stale heartbeat, or an
         // operator poke: try the cheap rung first, escalate if asked again.
         _ => {
@@ -695,6 +720,16 @@ static WINDOW_SWAP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// gone. Cleared by [`LoopGuard::decide`]'s incident reset, alongside the
 /// attempt counter it belongs to.
 static EXHAUSTION_SURFACED: AtomicBool = AtomicBool::new(false);
+
+/// Same idea, one rung over: latches once the user has been told the native
+/// message loop is hung.
+///
+/// A **separate** latch from [`EXHAUSTION_SURFACED`], deliberately. The two
+/// incidents are independent (a dead WebView2 host and a blocked host thread
+/// are different failures with different text), so neither may silence the
+/// other. Cleared by [`clear_native_ui_thread_hang`] when the loop starts
+/// pumping again, which is that rung's equivalent of the incident reset.
+static NATIVE_HANG_SURFACED: AtomicBool = AtomicBool::new(false);
 
 /// True while the recovery ladder is between `destroy()` and the rebuild of the
 /// main window.
@@ -858,16 +893,6 @@ fn now_ms() -> u64 {
 /// Best-effort by contract — a missing notification permission or a headless
 /// desktop must never turn "we could not tell the user" into a second failure.
 fn surface_exhaustion_to_user(app: &tauri::AppHandle, attempts: u32) {
-    // Server mode has no desktop to surface to. `trigger_ui_recovery` returns
-    // before reaching here, but this is defence in depth for any future caller.
-    if is_server_mode() {
-        return;
-    }
-    if EXHAUSTION_SURFACED.swap(true, Ordering::SeqCst) {
-        debug!("UI recovery: exhaustion already surfaced for this incident");
-        return;
-    }
-
     const TITLE: &str = "Qontinui Runner — the window stopped working";
     let body = format!(
         "The runner's UI host crashed and could not be restarted after {attempts} attempts.\n\n\
@@ -877,10 +902,109 @@ fn surface_exhaustion_to_user(app: &tauri::AppHandle, attempts: u32) {
          crash originates inside WebView2 rather than in Qontinui."
     );
 
+    if surface_incident_to_user(app, &EXHAUSTION_SURFACED, TITLE, &body) {
+        error!(
+            attempts,
+            "UI recovery exhausted — surfaced to the user natively (notification + dialog)"
+        );
+    }
+}
+
+/// The **third rung**: the native message loop has stopped pumping.
+///
+/// Called by `health_monitor`'s `WedgeKind::UiThread` detector once the probe
+/// has failed `WEDGE_FAILURE_THRESHOLD`-many consecutive samples, from that
+/// module's dedicated OS thread. Plan
+/// `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 4.
+///
+/// # Why this reports instead of recovering
+///
+/// [`plan_action`] maps [`RecoveryReason::NativeUiThreadHung`] to
+/// [`RecoveryAction::None`], so [`trigger_ui_recovery`] would (correctly) skip
+/// it as a no-op reason without telling anybody. Every rung of that ladder
+/// dispatches through the loop that is wedged, so attempting one would burn a
+/// timeout and change nothing — while spending attempt budget the
+/// [`LoopGuard`] is holding for a *real* webview crash, which is why this path
+/// deliberately does **not** consume it. What the user needs from this
+/// condition is the truth, delivered on a channel the hang cannot block.
+///
+/// # Which channels actually survive the hang
+///
+/// Checked in the plugin sources rather than assumed, because it decides
+/// whether this function does anything at all:
+///
+/// * **The breadcrumb** (`health_monitor`, `wedge-incidents.log`) always
+///   works — a plain file append from the monitor's own OS thread. It is the
+///   durable record, and the reason it matters is that `runner-lifecycle.log`
+///   is truncated at every runner startup, so a restart destroys the evidence
+///   of the wedge that provoked it.
+/// * **The notification** works on Windows 8+: `tauri-plugin-notification`'s
+///   `show()` goes to the OS toast API off the main thread.
+/// * **The dialog** does **not** work during the hang:
+///   `tauri-plugin-dialog`'s `show_message_dialog` wraps the whole call in
+///   `AppHandle::run_on_main_thread`, i.e. an enqueue onto the blocked loop.
+///   It is still dispatched (the enqueue is non-blocking and cannot make
+///   things worse) and will appear if the loop resumes — but it must never be
+///   counted on as *the* surface for this failure.
+///
+/// Best-effort by contract, like every other channel here.
+pub fn report_native_ui_thread_hang(app: &tauri::AppHandle, unresponsive_for_secs: u64) {
+    const TITLE: &str = "Qontinui Runner — the window has stopped responding";
+    let body = format!(
+        "The runner's window has not responded for {unresponsive_for_secs} seconds: its native \
+         message loop is blocked, so the window will not repaint and clicking it — including \
+         the X button — does nothing.\n\n\
+         Automation and the API on port 9876 are still running, and your sessions are NOT \
+         lost. The runner will not restart itself to clear this: that would destroy every \
+         session currently in flight.\n\n\
+         If the window does not come back on its own, end the Qontinui Runner process from \
+         Task Manager. An incident line has been written to wedge-incidents.log in the \
+         runner's dev-logs directory."
+    );
+
+    if surface_incident_to_user(app, &NATIVE_HANG_SURFACED, TITLE, &body) {
+        error!(
+            unresponsive_for_secs,
+            "Native UI thread hang surfaced to the user (notification always; dialog only if \
+             the loop resumes)"
+        );
+    }
+}
+
+/// Re-arm [`report_native_ui_thread_hang`] once the loop is pumping again.
+///
+/// Called from `health_monitor`'s recovery edge. Without it the first hang of
+/// a process's life would be the only one the user ever hears about.
+pub fn clear_native_ui_thread_hang() {
+    NATIVE_HANG_SURFACED.store(false, Ordering::SeqCst);
+}
+
+/// The one place an incident becomes an OS-native notification + dialog.
+///
+/// Returns `true` when this call is the one that surfaced it, so the caller
+/// can log exactly once. `latch` makes that at-most-once per incident:
+/// repeated detections must not stack dialogs on someone who already cannot
+/// use the app.
+fn surface_incident_to_user(
+    app: &tauri::AppHandle,
+    latch: &AtomicBool,
+    title: &str,
+    body: &str,
+) -> bool {
+    // Server mode has no desktop to surface to. `trigger_ui_recovery` returns
+    // before reaching here, but this is defence in depth for any future caller.
+    if is_server_mode() {
+        return false;
+    }
+    if latch.swap(true, Ordering::SeqCst) {
+        debug!(title, "UI incident already surfaced for this incident");
+        return false;
+    }
+
     {
         use tauri_plugin_notification::NotificationExt;
-        if let Err(e) = app.notification().builder().title(TITLE).body(&body).show() {
-            warn!(error = %e, "UI recovery: could not post the exhaustion notification");
+        if let Err(e) = app.notification().builder().title(title).body(body).show() {
+            warn!(error = %e, "UI incident: could not post the notification");
         }
     }
 
@@ -889,16 +1013,13 @@ fn surface_exhaustion_to_user(app: &tauri::AppHandle, attempts: u32) {
         // Non-blocking `show`: a modal `blocking_show` here would park a
         // runtime thread on user input during an active incident.
         app.dialog()
-            .message(&body)
-            .title(TITLE)
+            .message(body)
+            .title(title)
             .kind(tauri_plugin_dialog::MessageDialogKind::Error)
             .show(|_| {});
     }
 
-    error!(
-        attempts,
-        "UI recovery exhausted — surfaced to the user natively (notification + dialog)"
-    );
+    true
 }
 
 // ───────────────────────── the recovery entry point ──────────────────────
@@ -1586,7 +1707,11 @@ mod tests {
         // sound if the None classification is attempt-independent. Pin it.
         let all: Vec<RecoveryReason> = (-1..12)
             .map(|raw| RecoveryReason::ProcessFailed(ProcessFailureKind::from_raw(raw)))
-            .chain([RecoveryReason::HeartbeatStale, RecoveryReason::Manual])
+            .chain([
+                RecoveryReason::HeartbeatStale,
+                RecoveryReason::Manual,
+                RecoveryReason::NativeUiThreadHung,
+            ])
             .collect();
         for reason in all {
             let none_at_zero = plan_action(reason, 0) == RecoveryAction::None;
@@ -1603,6 +1728,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── the native message-loop rung (Phase 4) ─────────────────────────
+
+    #[test]
+    fn native_ui_thread_hang_never_attempts_a_recovery_action() {
+        // The whole point of the rung: DETECT and SURFACE, never act. Both
+        // ladder rungs dispatch through the loop that is wedged — `Reload` is
+        // `window.eval`, `Recreate` is `destroy()` + a label-release poll that
+        // would just burn `WINDOW_LABEL_RELEASE_TIMEOUT_MS` and fail. A future
+        // edit that "helpfully" gives this reason an action would ship a
+        // recovery that provably cannot run.
+        let reason = RecoveryReason::NativeUiThreadHung;
+        for attempt in 0..8 {
+            assert_eq!(
+                plan_action(reason, attempt),
+                RecoveryAction::None,
+                "attempt {attempt}"
+            );
+        }
+        assert!(is_no_op_reason(reason));
+    }
+
+    #[test]
+    fn native_ui_thread_hang_has_a_stable_distinct_reason_string() {
+        // The string reaches logs and the `/ui/recover` JSON, and the
+        // breadcrumb's `ui_thread_wedged` token is grepped alongside it.
+        assert_eq!(
+            RecoveryReason::NativeUiThreadHung.as_str(),
+            "native_ui_thread_hung"
+        );
+        for other in [
+            RecoveryReason::HeartbeatStale,
+            RecoveryReason::Manual,
+            RecoveryReason::ProcessFailed(ProcessFailureKind::BrowserExited),
+        ] {
+            assert_ne!(
+                RecoveryReason::NativeUiThreadHung.as_str(),
+                other.as_str(),
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_hang_surfacing_latch_is_independent_of_the_exhaustion_latch() {
+        // Two independent failures: a dead WebView2 host and a blocked host
+        // thread. Neither may silence the other's one-shot user notice.
+        EXHAUSTION_SURFACED.store(true, Ordering::SeqCst);
+        NATIVE_HANG_SURFACED.store(false, Ordering::SeqCst);
+        clear_native_ui_thread_hang();
+        assert!(!NATIVE_HANG_SURFACED.load(Ordering::SeqCst));
+        assert!(
+            EXHAUSTION_SURFACED.load(Ordering::SeqCst),
+            "clearing the native-hang latch must not clear the exhaustion latch"
+        );
+        // Leave the shared statics as we found them for the other tests.
+        EXHAUSTION_SURFACED.store(false, Ordering::SeqCst);
     }
 
     #[test]
