@@ -163,8 +163,22 @@ jobs:
       #
       # Bounded against a job-time apt hang — see the rationale on the same
       # step in .github/workflows/ci.yml. Sizing: 20 successful runs,
-      # p50 33s, p90 73s, max 88s excluding one 1684s outlier. 10 min = ~8x the
-      # healthy p90, and the same bound ci.yml carries on the identical list.
+      # p50 33s, p90 73s, max 88s across 82 of 83 successful samples.
+      #
+      # The 83rd is the reason this bound is 30 and not 10. Run 30897278865
+      # (2026-08-04, PR on feat/avac) ran this step for 28m04s and SUCCEEDED.
+      # A 10-minute bound would have FAILED a run that passed - and this
+      # workflow fires on `push: main`, where coord reads a red into
+      # `block_reason: "main-red"` and stops proposing. An over-tight bound
+      # here would recreate the merge-train stall this plan exists to close,
+      # arriving through a different door.
+      #
+      # 30 min = ~25x the healthy p90 and still covers that 28m04s observation,
+      # while converting an unbounded hang (GitHub's 360-minute default) into a
+      # bounded, obvious failure. Deliberately looser than ci.yml's 10 on the
+      # identical package list: ci.yml's step has 192 samples including a whole
+      # incident window, so its tail is characterised; this one has 83 samples
+      # and a single 19x outlier, which is not enough to cut against.
       - name: Install Tauri Linux system deps
         timeout-minutes: 10
         run: |

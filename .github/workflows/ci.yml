@@ -80,11 +80,12 @@ jobs:
     # This job previously had NO job-level timeout, so the 4h24m apt hang above
     # was burning toward GitHub's *default* 360-minute ceiling — a value this
     # repo never chose. One cap covers both matrix legs, so it is sized off the
-    # slower one. 90 successful job runs, 2026-08-08..08-20: ubuntu p50 52.8m /
-    # p90 62.5m / max 112.0m; windows p50 73.8m / p90 87.2m / p95 93.4m /
-    # max 102.2m. 150 min = windows p90 + ~60 min headroom, and 1.34x the worst
-    # observed success across either leg — well clear of normal variance while
-    # cutting the worst case from 6 h to 2.5 h.
+    # slower one. 90 sampled successful job runs, 2026-08-08..08-20: ubuntu
+    # p50 52.8m / p90 62.5m / max 112.0m; windows p50 73.8m / p90 87.2m /
+    # p95 93.4m / max 110.6m. 150 min = windows p90 + ~60 min headroom, and
+    # 1.34x the worst observed success across either leg — well clear of normal
+    # variance while cutting the worst case from 6 h to 2.5 h. (Sampled, not
+    # exhaustive: the full window holds ~348 successful legs.)
     timeout-minutes: 150
 
     steps:
@@ -167,7 +168,8 @@ jobs:
       # apt incident (n=60): p50 35s, p90 57s, max 115s. Inside it the tail is
       # 201 / 344 / 442 / 532 / 564 / 624 / 1370 / 3634s. 10 min = ~10x the
       # healthy p90 and ~5x the worst healthy sample: it still absorbs a
-      # degraded-but-progressing mirror (every 08-19 success up to 564s) while
+      # degraded-but-progressing mirror (08-19 successes up to 564s; the three
+      # above it — 624s, 1370s, 3634s — are deliberately cut) while
       # converting a hang into a fast, obvious failure and an immediate
       # re-propose.
       - name: Install dependencies (Ubuntu)

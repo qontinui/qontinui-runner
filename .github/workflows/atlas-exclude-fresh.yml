@@ -276,15 +276,20 @@ jobs:
 
       # Bounded against a job-time apt hang — see the rationale on the
       # `Install dependencies (Ubuntu)` step in .github/workflows/ci.yml.
-      # Sizing: 19 successful runs, p50 6s, p90 9s, max 10s. 5 min is
-      # deliberately NOT the 5-10x of a 10-second observation that would give
-      # ~60-100s: at that scale the bound sits inside ordinary apt-mirror
-      # jitter and becomes a new flake source (this plan's own Risk 3). 5 min
-      # is a floor — 30x the worst observed — and still turns a multi-hour hang
-      # into a fast failure. It matches the bound the same plan puts on
-      # qontinui-web's postgresql-client sites.
+      # Sizing: 19 successful runs, p50 6s, p90 9s, max 10s — but NONE of them
+      # falls inside the 2026-08-18..08-20 mirror event (this workflow is
+      # path-gated and barely ran), so that 10s max characterises the DOWNLOAD
+      # and says nothing about the tail.
+      #
+      # 10 min, not the 5 a 10-second sample would suggest, because the step
+      # runs `apt-get update` first and the index refresh is
+      # package-list-independent: qontinui-web's run 32294962345 spent ~32 min
+      # in `apt-get update` alone, having downloaded no packages at all. A
+      # 5-minute bound would fail that phase while ci.yml's 10-minute bound
+      # survives it (its worst surviving 08-19 sample was 564s) — i.e. the two
+      # bounds would disagree about an identical `apt-get update`. Aligned at 10.
       - name: Install Postgres client (native psql for the regen script)
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-client-16
