@@ -969,9 +969,7 @@ impl SecureStorage {
     /// Returns an empty map when the store is absent / unreadable / pre-Phase-3b
     /// — a missing nonce simply 401s and the next provisioning re-mints, so an
     /// empty restore is the safe default (today's in-memory-only behavior).
-    pub fn load_coord_mcp_nonces(
-        &self,
-    ) -> std::collections::HashMap<String, StoredNonceBinding> {
+    pub fn load_coord_mcp_nonces(&self) -> std::collections::HashMap<String, StoredNonceBinding> {
         self.load_tokens()
             .map(|t| {
                 t.coord_mcp_nonces

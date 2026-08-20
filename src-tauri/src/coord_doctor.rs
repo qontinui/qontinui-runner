@@ -908,8 +908,14 @@ fn resolve_tenant_for_doctor(bearer: &str) -> Option<(uuid::Uuid, &'static str)>
 
 /// Extract `(port, nonce)` from a session `.mcp.json`'s coord-mcp loopback
 /// proxy entry, if it is the proxy shape (`url` = `http://127.0.0.1:<port>/
-/// coord-mcp`, header `X-Coord-Mcp-Proxy-Key`). `None` for a static-bearer
-/// (agent-path) config or a non-coord config.
+/// coord-mcp` plus a proxy nonce). `None` for a static-bearer (agent-path)
+/// config or a non-coord config.
+///
+/// The nonce is resolved by [`crate::coord_mcp_config::proxy_nonce_from_header_object`],
+/// which accepts BOTH the Phase 2 `Authorization: Bearer <nonce>` shape and the
+/// legacy `X-Coord-Mcp-Proxy-Key` header — hardcoding either name here would
+/// make `coord doctor` blind to one half of the configs on disk, and silently
+/// (a `None` reads as "not a proxy config", not as an error).
 fn parse_mcp_json_proxy(path: &Path) -> Option<(u16, String)> {
     let bytes = std::fs::read(path).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
@@ -919,11 +925,7 @@ fn parse_mcp_json_proxy(path: &Path) -> Option<(u16, String)> {
     let after = url.strip_prefix("http://127.0.0.1:")?;
     let port_str = after.strip_suffix("/coord-mcp")?;
     let port: u16 = port_str.parse().ok()?;
-    let nonce = server
-        .get("headers")?
-        .get("X-Coord-Mcp-Proxy-Key")?
-        .as_str()?
-        .to_string();
+    let nonce = crate::coord_mcp_config::proxy_nonce_from_header_object(server.get("headers")?)?;
     Some((port, nonce))
 }
 
@@ -1310,6 +1312,41 @@ mod tests {
         let (port, nonce) = parse_mcp_json_proxy(&path).expect("parses proxy config");
         assert_eq!(port, 9877);
         assert_eq!(nonce, "abc123");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phase 2 (plan 2026-08-20): the runner also emits the nonce as
+    /// `Authorization: Bearer <nonce>`. Check 6 must keep recognising a proxy
+    /// config in that shape — a miss is SILENT here (a `None` reads as "not a
+    /// proxy config"), so `coord doctor` would simply stop reporting on exactly
+    /// the configs this phase produces.
+    #[test]
+    fn parse_mcp_json_proxy_reads_the_authorization_shape_too() {
+        let dir = std::env::temp_dir().join("qontinui_doctor_test_mcp_auth");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"coord-mcp":{"type":"http",
+               "url":"http://127.0.0.1:9877/coord-mcp",
+               "headers":{"Authorization":"Bearer noncefromauth"}}}}"#,
+        )
+        .unwrap();
+        let (port, nonce) = parse_mcp_json_proxy(&path).expect("parses the new shape");
+        assert_eq!(port, 9877);
+        assert_eq!(nonce, "noncefromauth");
+
+        // Both present, disagreeing → Authorization wins, matching the
+        // request-side resolver the runner authenticates with.
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"coord-mcp":{"type":"http",
+               "url":"http://127.0.0.1:9877/coord-mcp",
+               "headers":{"Authorization":"Bearer fromauth",
+                          "X-Coord-Mcp-Proxy-Key":"fromlegacy"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_mcp_json_proxy(&path).unwrap().1, "fromauth");
         let _ = std::fs::remove_file(&path);
     }
 

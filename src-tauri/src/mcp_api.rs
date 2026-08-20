@@ -943,7 +943,8 @@ async fn drain_handler(
 /// `AuthManager` on every request.
 ///
 /// Gate (`coord_mcp::proxy_request_gate`, 401 before any network I/O):
-/// registered `X-Coord-Mcp-Proxy-Key` nonce AND the live bearer decodes
+/// registered proxy nonce (from `Authorization: Bearer <nonce>` or the legacy
+/// `X-Coord-Mcp-Proxy-Key`) AND the live bearer decodes
 /// `sub_type == "device"` — the proxy must never attach a non-device token
 /// (agent-spawn sessions carry their own narrower JWT and never route here).
 ///
@@ -982,7 +983,7 @@ pub(crate) enum SelfIdOutcome {
     /// An agent-spawn session — out of scope by design; those carry their own
     /// scoped identity.
     NonDevicePrincipal,
-    /// No `X-Coord-Mcp-Proxy-Key` on the request.
+    /// No proxy nonce on the request (neither header shape).
     NoNonce,
     /// Terminal leg, gate 1: the binding NAMES a terminal, but no OPEN
     /// lifecycle record carries that `terminal_id`. Terminal-leg misses are
@@ -2745,6 +2746,35 @@ async fn enrich_memory_search_body_with(
     }
 }
 
+/// Which inbound request headers the `/coord-mcp` proxy MUST NOT copy upstream:
+/// the hop-by-hop / recomputed set, plus the three the runner owns.
+///
+/// A **pure extraction** of the `matches!` arm that has always lived inside
+/// `coord_mcp_proxy_handler`'s forwarding loop — same names, same semantics,
+/// no behaviour change. It is lifted out only so the invariant is testable:
+/// `coord_mcp_proxy_handler` needs a live `tauri::AppHandle` (via `ApiState`),
+/// so the loop itself cannot be driven from a unit test.
+///
+/// The invariant, which Phase 2 makes load-bearing in a second way: BOTH header
+/// names a session can present its loopback nonce under — `authorization` and
+/// `x-coord-mcp-proxy-key` — are dropped unconditionally, so a nonce can never
+/// reach coord as a bearer under either name. (`Authorization` upstream is the
+/// live per-request JWT this handler selects; the caller-session header is
+/// authoritative only when the RUNNER sets it, or a client could name a sibling
+/// session to spoof its identity.)
+fn coord_mcp_forward_header_is_dropped(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "content-length"
+            | "connection"
+            | "transfer-encoding"
+            | "accept-encoding"
+            | "authorization"
+    ) || name == crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER
+        || name == crate::coord_mcp::CALLER_SESSION_HEADER
+}
+
 async fn coord_mcp_proxy_handler(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     headers: axum::http::HeaderMap,
@@ -2752,10 +2782,14 @@ async fn coord_mcp_proxy_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let nonce = headers
-        .get(crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    // Phase 2 (plan 2026-08-20): resolved through THE shared request-side
+    // resolver, which prefers `Authorization: Bearer <nonce>` and keeps the
+    // legacy `X-Coord-Mcp-Proxy-Key` accepted. Carrying the nonce in
+    // `Authorization` is what stops the MCP client attaching an OAuth provider
+    // to this server, and therefore what stops a stale key's 401 escalating
+    // into OAuth discovery -> Dynamic Client Registration -> this runner's own
+    // 404 -> a durable `mcpOAuth` poison entry.
+    let nonce = crate::coord_mcp::proxy_nonce_from_request(&headers);
 
     // Resolve the principal FROM THE NONCE first — the binding (not the bearer)
     // decides which identity's token this session may inject. An unregistered /
@@ -2766,7 +2800,10 @@ async fn coord_mcp_proxy_handler(
     {
         Some(p) => p,
         None => {
-            warn!("coord-mcp proxy: missing or unrecognized X-Coord-Mcp-Proxy-Key");
+            warn!(
+                "coord-mcp proxy: {}",
+                crate::coord_mcp::STALE_PROXY_KEY_CAUSE
+            );
             // Rotation forensics: THE transport-death event. Everything the
             // rotation log records up to here is what the runner did to a key;
             // this is a client dying on one, and the `key_prefix` join is what
@@ -2779,7 +2816,9 @@ async fn coord_mcp_proxy_handler(
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": "missing or unrecognized X-Coord-Mcp-Proxy-Key",
+                    "error": crate::coord_mcp::stale_proxy_key_error(
+                        crate::coord_mcp::STALE_PROXY_KEY_CAUSE,
+                    ),
                     "code": "COORD_MCP_PROXY_UNAUTHORIZED",
                 })),
             )
@@ -2915,7 +2954,9 @@ async fn coord_mcp_proxy_handler(
                         axum::http::StatusCode::UNAUTHORIZED,
                         Json(serde_json::json!({
                             "success": false,
-                            "error": "no live agent token for this proxy session",
+                            "error": crate::coord_mcp::stale_proxy_key_error(
+                                crate::coord_mcp::AGENT_GONE_PROXY_CAUSE,
+                            ),
                             "code": "COORD_MCP_PROXY_AGENT_GONE",
                         })),
                     )
@@ -3016,17 +3057,7 @@ async fn coord_mcp_proxy_handler(
         // caller-session header is authoritative ONLY when the RUNNER sets it —
         // a client-supplied one must never pass through (it could otherwise name
         // a sibling session on the same device to spoof its identity).
-        if matches!(
-            n,
-            "host"
-                | "content-length"
-                | "connection"
-                | "transfer-encoding"
-                | "accept-encoding"
-                | "authorization"
-        ) || n == crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER
-            || n == crate::coord_mcp::CALLER_SESSION_HEADER
-        {
+        if coord_mcp_forward_header_is_dropped(n) {
             continue;
         }
         req = req.header(n, value.as_bytes());
@@ -3333,7 +3364,8 @@ fn claims_upstream_url(base: &str, target: ClaimsReadTarget, raw_query: Option<&
 /// two read-only claims routes in [`ClaimsReadTarget`].
 ///
 /// Gate (`coord_mcp::proxy_request_gate`, 401 before any network I/O):
-/// registered `X-Coord-Mcp-Proxy-Key` nonce AND the live bearer decodes
+/// registered proxy nonce (from `Authorization: Bearer <nonce>` or the legacy
+/// `X-Coord-Mcp-Proxy-Key`) AND the live bearer decodes
 /// `sub_type == "device"` — absent/wrong nonce or a missing/non-device token
 /// means the request is NEVER forwarded to coord.
 ///
@@ -3348,10 +3380,14 @@ async fn coord_claims_read_proxy_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let nonce = headers
-        .get(crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    // Phase 2 (plan 2026-08-20): resolved through THE shared request-side
+    // resolver, which prefers `Authorization: Bearer <nonce>` and keeps the
+    // legacy `X-Coord-Mcp-Proxy-Key` accepted. Carrying the nonce in
+    // `Authorization` is what stops the MCP client attaching an OAuth provider
+    // to this server, and therefore what stops a stale key's 401 escalating
+    // into OAuth discovery -> Dynamic Client Registration -> this runner's own
+    // 404 -> a durable `mcpOAuth` poison entry.
+    let nonce = crate::coord_mcp::proxy_nonce_from_request(&headers);
 
     // This route injects the DEVICE bearer, so it serves DEVICE-bound nonces
     // only — reject an agent nonce up front so it can never borrow the device
@@ -3362,12 +3398,17 @@ async fn coord_claims_read_proxy_handler(
     {
         Some(crate::coord_mcp::ProxyPrincipal::Device) => {}
         _ => {
-            warn!("coord-mcp claims proxy: missing/non-device X-Coord-Mcp-Proxy-Key");
+            warn!(
+                "coord-mcp claims proxy: {}",
+                crate::coord_mcp::NON_DEVICE_PROXY_KEY_CAUSE
+            );
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": "missing or non-device X-Coord-Mcp-Proxy-Key",
+                    "error": crate::coord_mcp::stale_proxy_key_error(
+                        crate::coord_mcp::NON_DEVICE_PROXY_KEY_CAUSE,
+                    ),
                     "code": "COORD_CLAIMS_PROXY_UNAUTHORIZED",
                 })),
             )
@@ -3738,7 +3779,8 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
 /// write routes in [`CoordWriteTarget`] with a validated dynamic segment.
 ///
 /// Gate (`coord_mcp::proxy_request_gate`, 401 before any network I/O):
-/// registered `X-Coord-Mcp-Proxy-Key` nonce AND the live bearer decodes
+/// registered proxy nonce (from `Authorization: Bearer <nonce>` or the legacy
+/// `X-Coord-Mcp-Proxy-Key`) AND the live bearer decodes
 /// `sub_type == "device"` — absent/wrong nonce or a missing/non-device token
 /// means the request is NEVER forwarded to coord.
 ///
@@ -3753,10 +3795,14 @@ async fn coord_write_proxy_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let nonce = headers
-        .get(crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    // Phase 2 (plan 2026-08-20): resolved through THE shared request-side
+    // resolver, which prefers `Authorization: Bearer <nonce>` and keeps the
+    // legacy `X-Coord-Mcp-Proxy-Key` accepted. Carrying the nonce in
+    // `Authorization` is what stops the MCP client attaching an OAuth provider
+    // to this server, and therefore what stops a stale key's 401 escalating
+    // into OAuth discovery -> Dynamic Client Registration -> this runner's own
+    // 404 -> a durable `mcpOAuth` poison entry.
+    let nonce = crate::coord_mcp::proxy_nonce_from_request(&headers);
 
     // This route injects the DEVICE bearer, so it serves DEVICE-bound nonces
     // only — reject an agent nonce up front so it can never borrow the device
@@ -3767,12 +3813,17 @@ async fn coord_write_proxy_handler(
     {
         Some(crate::coord_mcp::ProxyPrincipal::Device) => {}
         _ => {
-            warn!("coord-mcp write proxy: missing/non-device X-Coord-Mcp-Proxy-Key");
+            warn!(
+                "coord-mcp write proxy: {}",
+                crate::coord_mcp::NON_DEVICE_PROXY_KEY_CAUSE
+            );
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": "missing or non-device X-Coord-Mcp-Proxy-Key",
+                    "error": crate::coord_mcp::stale_proxy_key_error(
+                        crate::coord_mcp::NON_DEVICE_PROXY_KEY_CAUSE,
+                    ),
                     "code": "COORD_WRITE_PROXY_UNAUTHORIZED",
                 })),
             )
@@ -4070,7 +4121,7 @@ struct ProvisionSessionBody {
 /// # not "fix" the missing nonce check.
 ///
 /// Every OTHER `/coord-mcp/*` route is nonce-gated: `coord_mcp_proxy_handler`
-/// 401s an unrecognized `X-Coord-Mcp-Proxy-Key` *before any token I/O*, and the
+/// 401s an unrecognized proxy nonce *before any token I/O*, and the
 /// claims/work-unit/gate/PR forwarders all inherit that discipline. **This route
 /// cannot be nonce-gated — it is what ISSUES the nonce** (chicken-and-egg: a
 /// caller that already held a valid nonce would not need to call it). Its
@@ -4106,8 +4157,15 @@ struct ProvisionSessionBody {
 /// ```json
 /// {"mcpServers":{"coord-mcp":{"type":"http",
 ///   "url":"http://127.0.0.1:<bound_port>/coord-mcp",
-///   "headers":{"X-Coord-Mcp-Proxy-Key":"<nonce>"}}}}
+///   "headers":{"Authorization":"Bearer <nonce>",
+///              "X-Coord-Mcp-Proxy-Key":"<nonce>"}}}}
 /// ```
+///
+/// The nonce is emitted under BOTH names (Phase 2, plan 2026-08-20). The
+/// `Authorization` one is what stops the MCP client escalating a stale-key 401
+/// into OAuth Dynamic Client Registration; the custom header is kept so the
+/// existing `.mcp.json` consumers keep reading it. Either is accepted on the
+/// wire.
 ///
 /// The URL names THIS runner's own bound port, so the nonce↔port pairing is
 /// automatic and the caller must never re-derive the port (the load-bearing
@@ -4293,8 +4351,9 @@ fn vcs_pr_upstream_body(req: &VcsPullRequestBody) -> serde_json::Value {
 /// this loopback route lets any session that holds a per-session coord-mcp
 /// proxy nonce reach it — the `qontinui-pr create` CLI is the intended caller.
 ///
-/// Gate: exactly the coord-mcp proxy discipline — a registered
-/// `X-Coord-Mcp-Proxy-Key` nonce, Device- OR Agent-bound (coord-spawned agent
+/// Gate: exactly the coord-mcp proxy discipline — a registered proxy nonce
+/// (from `Authorization: Bearer <nonce>` or the legacy
+/// `X-Coord-Mcp-Proxy-Key`), Device- OR Agent-bound (coord-spawned agent
 /// sessions get Agent-bound nonces via `write_coord_mcp_agent_proxy_config`
 /// and are this feature's primary population), and a live bearer matched to
 /// the nonce's principal by [`crate::coord_mcp::proxy_request_gate`] (device
@@ -4312,10 +4371,14 @@ async fn vcs_create_pull_request_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let nonce = headers
-        .get(crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    // Phase 2 (plan 2026-08-20): resolved through THE shared request-side
+    // resolver, which prefers `Authorization: Bearer <nonce>` and keeps the
+    // legacy `X-Coord-Mcp-Proxy-Key` accepted. Carrying the nonce in
+    // `Authorization` is what stops the MCP client attaching an OAuth provider
+    // to this server, and therefore what stops a stale key's 401 escalating
+    // into OAuth discovery -> Dynamic Client Registration -> this runner's own
+    // 404 -> a durable `mcpOAuth` poison entry.
+    let nonce = crate::coord_mcp::proxy_nonce_from_request(&headers);
 
     // Resolve the principal FROM THE NONCE first — the binding decides which
     // identity's bearer this route injects (device JWT vs the agent's own
@@ -4327,12 +4390,14 @@ async fn vcs_create_pull_request_handler(
     {
         Some(p) => p,
         None => {
-            warn!("vcs pr proxy: missing or unrecognized X-Coord-Mcp-Proxy-Key");
+            warn!("vcs pr proxy: {}", crate::coord_mcp::STALE_PROXY_KEY_CAUSE);
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": "missing or unrecognized X-Coord-Mcp-Proxy-Key",
+                    "error": crate::coord_mcp::stale_proxy_key_error(
+                        crate::coord_mcp::STALE_PROXY_KEY_CAUSE,
+                    ),
                     "code": "VCS_PR_PROXY_UNAUTHORIZED",
                 })),
             )
@@ -4464,7 +4529,9 @@ async fn vcs_create_pull_request_handler(
                         axum::http::StatusCode::UNAUTHORIZED,
                         Json(serde_json::json!({
                             "success": false,
-                            "error": "no live agent token for this proxy session",
+                            "error": crate::coord_mcp::stale_proxy_key_error(
+                                crate::coord_mcp::AGENT_GONE_PROXY_CAUSE,
+                            ),
                             "code": "VCS_PR_PROXY_AGENT_GONE",
                         })),
                     )
@@ -6034,7 +6101,8 @@ pub fn create_router(
         // Loopback live-token proxy for coord /mcp — device-provisioned
         // sessions' `.mcp.json` points here so each MCP request carries a
         // freshly-read device JWT instead of a 4h-TTL snapshot. Nonce-gated
-        // (X-Coord-Mcp-Proxy-Key); see `coord_mcp_proxy_handler`.
+        // (Authorization: Bearer <nonce>, or the legacy X-Coord-Mcp-Proxy-Key);
+        // see `coord_mcp_proxy_handler`.
         .route("/coord-mcp", post(coord_mcp_proxy_handler))
         // Session coord-identity MINT route (plan
         // 2026-07-17-universal-coord-device-identity-for-any-session §1) — how a
@@ -9688,5 +9756,361 @@ mod envelope_coverage_tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+/// **The OAuth / Dynamic-Client-Registration surface must stay ABSENT.**
+///
+/// On 2026-08-19 a runner restart orphaned every session's proxy nonce. The
+/// resulting 401 sent the MCP client into RFC 9728 → RFC 8414 discovery and
+/// then into RFC 7591 Dynamic Client Registration at `<origin>/register`, which
+/// this router 404s — and that failed DCR wrote a durable `mcpOAuth` entry into
+/// the client's credential store, after which it sent the (healthy) server zero
+/// requests forever.
+///
+/// The fix (Phase 2) is to stop the escalation at the REQUEST shape — the nonce
+/// now travels in `Authorization`, so no auth provider is ever attached. The
+/// direction that was **rejected outright** is standing up the OAuth/DCR
+/// surface: it would put an unauthenticated client-registration route on the
+/// process that carries the fleet's coord write path, and it would make the
+/// failure quieter rather than fixing it.
+///
+/// So this module pins the absence three ways: the 404 message a client sees is
+/// byte-identical to the incident's, the fallback still answers those paths with
+/// the canonical envelope, and no route registration for them exists in this
+/// file's source.
+#[cfg(test)]
+mod oauth_dcr_surface_absent_tests {
+    use super::{not_found_handler, not_found_message};
+    use axum::{body::Body, http::Method, http::Request, Router};
+    use tower::ServiceExt;
+
+    /// The three paths an MCP client walks when it decides a server "needs
+    /// authentication": RFC 9728 protected-resource metadata, RFC 8414
+    /// authorization-server metadata, then DCR at the URL origin.
+    const OAUTH_PATHS: &[(&str, &str)] = &[
+        ("POST", "/register"),
+        ("GET", "/.well-known/oauth-protected-resource"),
+        ("GET", "/.well-known/oauth-authorization-server"),
+    ];
+
+    /// The exact string the operator saw. Kept as an assertion so a later edit
+    /// to `not_found_message` cannot quietly change what this failure looks
+    /// like in an incident log.
+    #[test]
+    fn register_404_message_is_byte_identical_to_the_incident() {
+        assert_eq!(
+            not_found_message(&Method::POST, "/register"),
+            "No route for POST /register"
+        );
+    }
+
+    /// Route level: the fallback answers every OAuth-discovery path with the
+    /// canonical 404 envelope — no metadata, no challenge, no registration.
+    #[tokio::test]
+    async fn oauth_discovery_and_dcr_paths_still_404() {
+        for (method, path) in OAUTH_PATHS {
+            let resp = Router::new()
+                .fallback(not_found_handler)
+                .oneshot(
+                    Request::builder()
+                        .method(*method)
+                        .uri(*path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{method} {path} must not be a route");
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["success"], false);
+            assert_eq!(v["code"], "NOT_FOUND");
+        }
+    }
+
+    /// The one that actually catches someone "fixing" this by standing up OAuth
+    /// later: no `.route("<oauth path>"` registration exists anywhere in this
+    /// file. The needle is composed at runtime so this test's own source cannot
+    /// match it.
+    #[test]
+    fn no_oauth_or_dcr_route_is_registered_in_this_router() {
+        let src = include_str!("mcp_api.rs");
+        for (_, path) in OAUTH_PATHS {
+            let needle = format!(".route(\"{path}\"");
+            assert!(
+                !src.contains(&needle),
+                "an OAuth/DCR route ({path}) was added to the runner's router. \
+                 That direction was rejected: it puts an unauthenticated \
+                 client-registration surface on the process carrying the \
+                 fleet's coord write path. Re-open the decision in plan \
+                 2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning \
+                 before removing this test."
+            );
+        }
+    }
+}
+
+/// Phase 2: every loopback proxy door accepts the session nonce from
+/// `Authorization: Bearer <nonce>` as well as from the legacy
+/// `X-Coord-Mcp-Proxy-Key`, prefers `Authorization`, and keeps its typed
+/// rejection code.
+///
+/// The VCS door carries the deterministic assertions: it is the one door that
+/// accepts an AGENT-bound nonce and then fails closed with a DISTINCT code
+/// (`VCS_PR_PROXY_AGENT_GONE`) before touching any credential store or the
+/// network — so "the header source was accepted" is observable without a live
+/// device JWT or a real coord.
+#[cfg(test)]
+mod proxy_key_header_source_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::Request,
+        routing::{get, post},
+        Router,
+    };
+    use tower::ServiceExt;
+
+    fn vcs_router() -> Router {
+        Router::new().route("/vcs/pull-requests", post(vcs_create_pull_request_handler))
+    }
+
+    fn claims_router() -> Router {
+        Router::new().route("/coord-mcp/claims/list", get(coord_claims_list_handler))
+    }
+
+    fn write_router() -> Router {
+        Router::new().route(
+            "/coord-mcp/register-gate",
+            post(
+                |headers: axum::http::HeaderMap, body: axum::body::Bytes| async move {
+                    coord_write_proxy_handler(CoordWriteTarget::RegisterGate, headers, body).await
+                },
+            ),
+        )
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn unregistered_nonce() -> String {
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    }
+
+    fn pr_body() -> Body {
+        Body::from(r#"{"repo":"o/r","head":"h","title":"t"}"#)
+    }
+
+    /// An agent-bound nonce presented in `Authorization: Bearer` reaches the
+    /// agent-token lookup — i.e. the new header source authenticates.
+    #[tokio::test]
+    async fn authorization_bearer_carries_the_proxy_nonce() {
+        let nonce = crate::coord_mcp::register_agent_proxy_nonce(
+            "/tmp/phase2-auth-header-source",
+            uuid::Uuid::new_v4(),
+        );
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("Authorization", format!("Bearer {nonce}"))
+                    .header("content-type", "application/json")
+                    .body(pr_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["code"], "VCS_PR_PROXY_AGENT_GONE",
+            "the nonce in Authorization must be recognised — an unrecognised \
+             one would return VCS_PR_PROXY_UNAUTHORIZED instead"
+        );
+    }
+
+    /// The legacy custom header keeps authenticating. Every `.mcp.json` already
+    /// on disk carries only that shape, and those files are rewritten on
+    /// session spawn — never periodically — so dropping it would 401 every live
+    /// session the moment this ships.
+    #[tokio::test]
+    async fn legacy_custom_header_still_carries_the_proxy_nonce() {
+        let nonce = crate::coord_mcp::register_agent_proxy_nonce(
+            "/tmp/phase2-legacy-header-source",
+            uuid::Uuid::new_v4(),
+        );
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("X-Coord-Mcp-Proxy-Key", &nonce)
+                    .header("content-type", "application/json")
+                    .body(pr_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "VCS_PR_PROXY_AGENT_GONE");
+    }
+
+    /// When both headers are present and DISAGREE, `Authorization` decides —
+    /// proved in both directions so the test cannot pass by accident.
+    #[tokio::test]
+    async fn authorization_wins_over_the_legacy_header_when_they_disagree() {
+        let good = crate::coord_mcp::register_agent_proxy_nonce(
+            "/tmp/phase2-both-headers",
+            uuid::Uuid::new_v4(),
+        );
+        let bad = unregistered_nonce();
+
+        // Good in Authorization, garbage in the legacy header → accepted.
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("Authorization", format!("Bearer {good}"))
+                    .header("X-Coord-Mcp-Proxy-Key", &bad)
+                    .header("content-type", "application/json")
+                    .body(pr_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["code"], "VCS_PR_PROXY_AGENT_GONE");
+
+        // Garbage in Authorization, good in the legacy header → REJECTED,
+        // because Authorization won.
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("Authorization", format!("Bearer {bad}"))
+                    .header("X-Coord-Mcp-Proxy-Key", &good)
+                    .header("content-type", "application/json")
+                    .body(pr_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["code"], "VCS_PR_PROXY_UNAUTHORIZED");
+    }
+
+    /// Rejection keeps each door's own typed `code` AND now carries an
+    /// actionable message — the old string named the header this phase
+    /// deprecates and told a 2am reader nothing.
+    #[tokio::test]
+    async fn every_door_preserves_its_typed_code_and_returns_the_actionable_message() {
+        let bad = unregistered_nonce();
+        let auth = format!("Bearer {bad}");
+
+        let cases: Vec<(axum::response::Response, &str)> = vec![
+            (
+                vcs_router()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/vcs/pull-requests")
+                            .header("Authorization", &auth)
+                            .header("content-type", "application/json")
+                            .body(pr_body())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                "VCS_PR_PROXY_UNAUTHORIZED",
+            ),
+            (
+                claims_router()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/coord-mcp/claims/list")
+                            .header("Authorization", &auth)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                "COORD_CLAIMS_PROXY_UNAUTHORIZED",
+            ),
+            (
+                write_router()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/coord-mcp/register-gate")
+                            .header("Authorization", &auth)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                "COORD_WRITE_PROXY_UNAUTHORIZED",
+            ),
+        ];
+
+        for (resp, code) in cases {
+            assert_eq!(resp.status(), 401, "{code} door must still 401");
+            let v = body_json(resp).await;
+            assert_eq!(v["success"], false);
+            assert_eq!(v["code"], code);
+            let err = v["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains(crate::coord_mcp::PROXY_KEY_RECOVERY_HINT),
+                "{code} must carry the shared recovery tail, got: {err}"
+            );
+            assert_ne!(
+                err, "missing or unrecognized X-Coord-Mcp-Proxy-Key",
+                "the deprecated-header-only message must be gone"
+            );
+        }
+    }
+
+    /// Regression pin for the invariant Phase 2 leans on but did not change:
+    /// the `/coord-mcp` forwarding loop drops BOTH names a loopback nonce can
+    /// arrive under, so moving the nonce into `Authorization` cannot leak it to
+    /// coord as a bearer.
+    #[test]
+    fn the_proxy_never_forwards_a_loopback_nonce_upstream_under_either_name() {
+        assert!(
+            coord_mcp_forward_header_is_dropped("authorization"),
+            "the Phase 2 nonce carrier must never reach coord"
+        );
+        assert!(coord_mcp_forward_header_is_dropped(
+            crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER
+        ));
+        assert!(coord_mcp_forward_header_is_dropped(
+            crate::coord_mcp::CALLER_SESSION_HEADER
+        ));
+        for h in [
+            "host",
+            "content-length",
+            "connection",
+            "transfer-encoding",
+            "accept-encoding",
+        ] {
+            assert!(coord_mcp_forward_header_is_dropped(h));
+        }
+        // ...and it is a drop-LIST, not a drop-everything: ordinary headers
+        // still travel, or the proxy would stop being a proxy.
+        for h in ["content-type", "accept", "user-agent", "x-request-id"] {
+            assert!(!coord_mcp_forward_header_is_dropped(h), "{h} must forward");
+        }
     }
 }

@@ -346,11 +346,53 @@ pub(crate) fn session_identity_gate() -> Result<(), SessionIdentityDenial> {
     resolve_session_identity_gate(flag_on, marker_exists)
 }
 
-/// Header carrying the per-session loopback nonce that authenticates a
-/// session's MCP client to the runner-local `/coord-mcp` proxy route.
-/// Lowercase — HTTP header names are case-insensitive and axum's `HeaderMap`
-/// keys are lowercased; the `.mcp.json` writer emits the canonical-case form.
-pub(crate) const COORD_MCP_PROXY_KEY_HEADER: &str = "x-coord-mcp-proxy-key";
+// Re-export of the `.mcp.json` proxy-header contract, which lives in
+// `crate::coord_mcp_config` because `coord_doctor` (a LIB module) reads the
+// same shape and cannot reach this bin-only module.
+pub(crate) use crate::coord_mcp_config::{
+    proxy_nonce_from_config_doc, proxy_nonce_from_header_object, proxy_nonce_from_request,
+    COORD_MCP_PROXY_KEY_HEADER, COORD_MCP_PROXY_KEY_HEADER_JSON, PROXY_AUTHORIZATION_HEADER_JSON,
+    PROXY_BEARER_PREFIX,
+};
+
+/// The lead clause of every loopback-proxy "your key is dead" 401.
+///
+/// Deliberately does NOT name a header: the old string was
+/// `"missing or unrecognized X-Coord-Mcp-Proxy-Key"`, which pointed a 2am
+/// reader at the header Phase 2 deprecates, and the key is now accepted under
+/// two names anyway. What a reader needs first is WHICH credential died, not
+/// which envelope carried it.
+pub(crate) const STALE_PROXY_KEY_CAUSE: &str =
+    "stale or unrecognized coord-mcp proxy key: this session's loopback nonce is      not registered with the runner currently listening on this port";
+
+/// Same, for the doors that inject the DEVICE bearer and therefore refuse an
+/// AGENT-bound nonce outright (claims reads, the coord write forwarder).
+pub(crate) const NON_DEVICE_PROXY_KEY_CAUSE: &str =
+    "missing, stale, or non-device coord-mcp proxy key: this route injects the      device identity, so it serves device-bound nonces only";
+
+/// The `AGENT_TOKENS`-slot-gone variant: the nonce IS registered, but the agent
+/// it is bound to no longer has a live token slot.
+pub(crate) const AGENT_GONE_PROXY_CAUSE: &str =
+    "no live agent token for this proxy session: the agent this nonce is bound      to has been torn down, or the runner restarted (agent tokens are      process-global and are NOT restored across a restart)";
+
+/// The shared, verified recovery tail — the half a human actually acts on.
+///
+/// Names the thing that makes this failure feel unrecoverable: the MCP client
+/// snapshots its headers at launch and never re-reads `.mcp.json`, so the
+/// obvious move (reconnect the server) cannot work. Measured 2026-08-20 at
+/// client 2.1.236/2.1.237 (plan
+/// `2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning`, Phase 1). It
+/// deliberately stops short of naming a credential-store repair command — that
+/// is Phase 5's to verify, and an unverified recovery instruction is what this
+/// plan exists to retire.
+pub(crate) const PROXY_KEY_RECOVERY_HINT: &str =
+    "The MCP client snapshots its headers at launch and never re-reads      .mcp.json, so reconnecting this server cannot pick up a fresh key.      Recovery: start a NEW session in this workdir (the runner provisions a      live key on spawn), or re-provision with POST      /coord-mcp/provision-session and relaunch the client. The key is accepted      as `Authorization: Bearer <nonce>` or the legacy `X-Coord-Mcp-Proxy-Key`.";
+
+/// Join a door-specific cause with the shared recovery tail. One function so
+/// the five proxy doors cannot drift into five different 2am stories.
+pub(crate) fn stale_proxy_key_error(cause: &str) -> String {
+    format!("{cause}. {PROXY_KEY_RECOVERY_HINT}")
+}
 
 /// The coord HTTP base (no path, no trailing slash) plus WHICH resolution arm
 /// produced it: env `COORD_HTTP_URL` → active profile's `coord_url` →
@@ -2287,10 +2329,7 @@ pub(crate) fn proxy_request_gate(
     principal: &ProxyPrincipal,
 ) -> Result<(), (u16, String)> {
     if !proxy_nonce_is_valid(nonce.unwrap_or("")) {
-        return Err((
-            401,
-            "missing or unrecognized X-Coord-Mcp-Proxy-Key".to_string(),
-        ));
+        return Err((401, stale_proxy_key_error(STALE_PROXY_KEY_CAUSE)));
     }
     let bearer = match bearer {
         Some(b) if !b.trim().is_empty() => b,
@@ -2521,9 +2560,33 @@ pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
 /// contract cannot drift between the path a runner-spawned session gets and the
 /// path a bare session gets.
 ///
-/// Note what is NOT here: an `Authorization` bearer. The proxy injects a live
-/// per-request one keyed off the nonce's principal — baking a static token is
-/// the failure this shape exists to avoid.
+/// Note what is NOT here: a baked **JWT** in `Authorization`. The proxy injects
+/// a live per-request one keyed off the nonce's principal — baking a static
+/// token is the failure this shape exists to avoid.
+///
+/// ## Why the nonce is emitted TWICE (Phase 2, plan 2026-08-20)
+///
+/// * `Authorization: Bearer <nonce>` is the load-bearing one. Its mere presence
+///   in the STATIC headers map is what stops the MCP client attaching an OAuth
+///   provider to this server, which is what stops a stale nonce's 401 escalating
+///   into OAuth discovery → Dynamic Client Registration → the runner's own 404 →
+///   a durable `mcpOAuth` poison entry that silences the client permanently.
+///   See [`PROXY_AUTHORIZATION_HEADER_JSON`] for the measured mechanism.
+/// * `X-Coord-Mcp-Proxy-Key` is kept because the consumer set for this file
+///   spans three layers, only one of which this change can reach: the
+///   `qontinui-claude-config` recovery doors (`/gate`, `/policy`,
+///   `/coord-revive`, `/pr-status` and ~10 `.claude/commands/*.md`) read the
+///   custom header out of `.mcp.json` by name, and a config that dropped it
+///   would blind exactly the tooling used to diagnose this failure. Emitting
+///   both makes the shape change strictly additive: nothing that reads either
+///   name breaks, and the escalation is closed regardless.
+///
+/// Emitting both costs no new exposure — same file, same loopback-only
+/// credential, same owner-only mode. (It does mean the nonce still appears in
+/// cleartext in `claude --debug mcp` logs, where custom headers are printed and
+/// `Authorization` comes back `[REDACTED]` — unchanged from before, not a
+/// regression, and the reason a later phase may drop the custom header once the
+/// config-repo layer accepts both.)
 fn coord_mcp_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Value {
     serde_json::json!({
         "mcpServers": {
@@ -2531,7 +2594,8 @@ fn coord_mcp_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Valu
                 "type": "http",
                 "url": format!("http://127.0.0.1:{bound_port}/coord-mcp"),
                 "headers": {
-                    "X-Coord-Mcp-Proxy-Key": nonce,
+                    (PROXY_AUTHORIZATION_HEADER_JSON): format!("{PROXY_BEARER_PREFIX}{nonce}"),
+                    (COORD_MCP_PROXY_KEY_HEADER_JSON): nonce,
                 }
             }
         }
@@ -2690,14 +2754,15 @@ fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) {
             // carries. Extraction is infallible-by-shape (the single writer
             // `coord_mcp_proxy_config_json` always sets the header); an
             // unexpected shape logs an empty prefix rather than nothing.
-            let key = mcp_config
-                .pointer("/mcpServers/coord-mcp/headers/X-Coord-Mcp-Proxy-Key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            // Resolved through `proxy_nonce_from_config_doc` so it survives the
+            // Phase 2 shape change — hardcoding the legacy header name here
+            // would log an EMPTY `key_prefix` on every write, gutting the
+            // mint→write→evict join this stream exists for.
+            let key = proxy_nonce_from_config_doc(mcp_config).unwrap_or_default();
             log_rotation_event(
                 "write",
                 primary_wt,
-                key,
+                &key,
                 ".mcp.json rewritten (proxy shape)",
             );
         }
@@ -3001,13 +3066,26 @@ fn coord_mcp_safe_to_write(workdir: &str) -> bool {
             if servers.len() == 1 && servers.contains_key("coord-mcp") {
                 // Our own coord-mcp config — refreshable, EXCEPT never downgrade an
                 // existing agent JWT (richer scopes) to a device JWT. If the current
-                // bearer decodes sub_type=agent, leave it. The device-path PROXY
-                // shape (loopback URL + nonce header) has NO Authorization header,
-                // so it deliberately falls through this check as ours-refreshable.
+                // bearer decodes sub_type=agent, leave it.
+                //
+                // **The PROXY shape now HAS an `Authorization` header too**
+                // (Phase 2, plan 2026-08-20 — see
+                // [`PROXY_AUTHORIZATION_HEADER_JSON`]), so the old comment here
+                // ("the device-path PROXY shape has NO Authorization header, so
+                // it deliberately falls through as ours-refreshable") is no
+                // longer true and has been removed. What keeps the behaviour
+                // correct is the SHAPE of the value, not its absence: a proxy
+                // nonce is 64 hex chars and fails the JWT decode outright, so
+                // `jwt_unverified_claim` yields `None` and `unwrap_or(false)`
+                // still classifies a proxy config as ours-refreshable. That is
+                // a real invariant rather than a coincidence — the same
+                // nonce-is-never-JWT-shaped fact [`looks_like_jwt`] rests on —
+                // but it is load-bearing enough to be pinned by a test
+                // (`coord_mcp_safe_to_write_*` below) rather than left implicit.
                 let existing_is_agent = parsed
                     .pointer("/mcpServers/coord-mcp/headers/Authorization")
                     .and_then(|v| v.as_str())
-                    .and_then(|h| h.strip_prefix("Bearer "))
+                    .and_then(|h| h.strip_prefix(PROXY_BEARER_PREFIX))
                     .and_then(|tok| jwt_unverified_claim(tok, "sub_type"))
                     .map(|st| st == "agent")
                     .unwrap_or(false);
@@ -3187,14 +3265,14 @@ pub(crate) fn provision_coord_mcp_config_file(
             // materialization carries a fresh key to identity-seam sessions
             // exactly like an in-cwd `.mcp.json` write does — give it the
             // same "write" line so those sessions get the full trail.
-            let key = mcp_config
-                .pointer("/mcpServers/coord-mcp/headers/X-Coord-Mcp-Proxy-Key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            // Same Phase 2 shape-independence as the in-cwd writer above: the
+            // key is resolved through `proxy_nonce_from_config_doc`, never by a
+            // hardcoded header name, so this line never logs an empty prefix.
+            let key = proxy_nonce_from_config_doc(&mcp_config).unwrap_or_default();
             log_rotation_event(
                 "write",
                 workdir,
-                key,
+                &key,
                 "app-data --mcp-config file materialized (proxy shape)",
             );
             Some(file)
@@ -3271,17 +3349,25 @@ pub(crate) fn provision_session_proxy_config(workdir: &str) -> Option<serde_json
 }
 
 /// Read the per-session proxy NONCE out of an existing coord-mcp `.mcp.json`, if
-/// the file holds the PROXY shape (an `X-Coord-Mcp-Proxy-Key` header). Returns
-/// `None` for an absent/unparseable file or a non-proxy shape. Used by the
-/// root-config self-heal: a nonce no longer in the live registry (evicted on a
-/// re-provision, or simply never restored) means the config would 401 the
-/// proxy, so it must be rewritten even when the port still matches.
+/// the file holds the PROXY shape (the nonce in `Authorization: Bearer <nonce>`
+/// or in the legacy `X-Coord-Mcp-Proxy-Key` header — see
+/// [`proxy_nonce_from_config_doc`]). Returns `None` for an absent/unparseable
+/// file or a non-proxy shape (including the static-bearer agent shape, whose
+/// `Authorization` carries a real JWT). Used by the root-config self-heal: a
+/// nonce no longer in the live registry (evicted on a re-provision, or simply
+/// never restored) means the config would 401 the proxy, so it must be
+/// rewritten even when the port still matches.
+///
+/// **Must accept both shapes** — reading only the legacy header would return
+/// `None` for the runner's OWN freshly written config, so `resolve_root_reconcile`
+/// would set `on_disk_nonce = None` / `registered = false` and
+/// `root_reconcile_action` would classify it as a non-proxy shape and leave it
+/// alone: boot self-heal and adopt-on-disk would go dead on exactly the configs
+/// Phase 2 produces.
 fn read_proxy_nonce(config_path: &Path) -> Option<String> {
     let s = std::fs::read_to_string(config_path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&s).ok()?;
-    v.pointer("/mcpServers/coord-mcp/headers/X-Coord-Mcp-Proxy-Key")
-        .and_then(|n| n.as_str())
-        .map(String::from)
+    proxy_nonce_from_config_doc(&v)
 }
 
 /// Boot-time reconcile decision for one session's `.mcp.json` (Phase 3c). Pure
@@ -4112,9 +4198,16 @@ mod tests {
         assert_eq!(server["type"], "http");
         assert_eq!(server["url"], "http://127.0.0.1:9877/coord-mcp");
         assert_eq!(server["headers"]["X-Coord-Mcp-Proxy-Key"], "abc123");
+        // Phase 2 (plan 2026-08-20): the nonce ALSO travels in `Authorization`,
+        // because a static `Authorization` in the headers map is what stops the
+        // MCP client attaching an OAuth provider — and therefore what stops a
+        // stale key's 401 escalating into DCR. The invariant this assertion has
+        // always been protecting is unchanged and now stated exactly: the value
+        // is the NONCE, never a baked JWT.
+        assert_eq!(server["headers"]["Authorization"], "Bearer abc123");
         assert!(
-            server["headers"].get("Authorization").is_none(),
-            "the proxy shape must never bake a static bearer"
+            !crate::coord_mcp_config::looks_like_jwt("abc123"),
+            "the proxy shape must never bake a static bearer TOKEN"
         );
     }
 
@@ -4295,10 +4388,18 @@ mod tests {
             "the written nonce must be registered for the proxy gate"
         );
 
-        // NO baked bearer — the whole point is the proxy injects a live one.
+        // NO baked bearer TOKEN — the whole point is the proxy injects a live
+        // one per request. Since Phase 2 the `Authorization` header IS present,
+        // carrying the same nonce (the OAuth-provider suppressor); what must
+        // never appear there is a JWT.
+        assert_eq!(
+            server["headers"]["Authorization"],
+            serde_json::Value::from(format!("Bearer {nonce}")),
+            "proxy shape must carry the nonce as a bearer: {written}"
+        );
         assert!(
-            server["headers"].get("Authorization").is_none(),
-            "proxy shape must NOT bake a static Authorization bearer: {written}"
+            !crate::coord_mcp_config::looks_like_jwt(nonce),
+            "proxy shape must NOT bake a static Authorization TOKEN: {written}"
         );
 
         // Re-provisioning the same workdir mints a FRESH nonce and moves the
@@ -4606,9 +4707,14 @@ mod tests {
             .as_str()
             .expect("agent proxy config must carry the nonce header");
         assert!(!nonce.is_empty());
+        assert_eq!(
+            server["headers"]["Authorization"],
+            serde_json::Value::from(format!("Bearer {nonce}")),
+            "agent proxy shape carries the nonce as a bearer too (Phase 2): {written}"
+        );
         assert!(
-            server["headers"].get("Authorization").is_none(),
-            "agent proxy shape must NOT bake a static bearer: {written}"
+            !crate::coord_mcp_config::looks_like_jwt(nonce),
+            "agent proxy shape must NOT bake a static bearer TOKEN: {written}"
         );
         // The nonce is bound to THIS agent.
         assert_eq!(
@@ -4773,8 +4879,11 @@ mod tests {
             "device path must carry a registered per-session nonce"
         );
         assert!(
-            server["headers"].get("Authorization").is_none(),
-            "device path must NOT bake a static bearer (the proxy injects it live)"
+            server["headers"]["Authorization"]
+                .as_str()
+                .and_then(crate::coord_mcp_config::proxy_nonce_from_authorization)
+                .is_some_and(proxy_nonce_is_valid),
+            "device path must carry the registered NONCE as its bearer (Phase 2),              never a baked static token — the proxy injects the real one live"
         );
         let _ = std::fs::remove_dir_all(&d);
 
@@ -4796,8 +4905,11 @@ mod tests {
             "agent path now emits the per-agent loopback proxy URL"
         );
         assert!(
-            server["headers"].get("Authorization").is_none(),
-            "agent path must NOT bake a static bearer (the proxy injects it live)"
+            server["headers"]["Authorization"]
+                .as_str()
+                .and_then(crate::coord_mcp_config::proxy_nonce_from_authorization)
+                .is_some(),
+            "agent path must carry the NONCE as its bearer (Phase 2), never a              baked static token — the proxy injects the agent's live one"
         );
         let nonce = server["headers"]["X-Coord-Mcp-Proxy-Key"]
             .as_str()
@@ -5077,12 +5189,8 @@ mod tests {
         // None`, so `None == None` matched all of them and one mint took the
         // lot — 33 of them in five seconds against `D:\qontinui-root` on
         // 2026-08-19.
-        let (terminalless, _) = mint_and_register_nonce(
-            &wd,
-            ProxyPrincipal::Device,
-            NonceLifetime::Persistent,
-            None,
-        );
+        let (terminalless, _) =
+            mint_and_register_nonce(&wd, ProxyPrincipal::Device, NonceLifetime::Persistent, None);
         assert!(
             live_binding(&a).is_some() && live_binding(&b).is_some(),
             "a terminal-less re-mint must not collapse the restored per-terminal \
@@ -5141,10 +5249,7 @@ mod tests {
         // round-trip test (it owns `StoredTokens`); here we pin the CONSUMER
         // half — a store holding a terminal-less binding restores as one.
         store
-            .store_coord_mcp_nonces(&HashMap::from([(
-                nonce.clone(),
-                stored_binding(&wd, None),
-            )]))
+            .store_coord_mcp_nonces(&HashMap::from([(nonce.clone(), stored_binding(&wd, None))]))
             .expect("write the legacy-equivalent store");
 
         restore_proxy_nonces_from(&store);
@@ -5395,13 +5500,15 @@ mod tests {
             "the rewritten root config must carry a freshly-registered nonce"
         );
         assert_ne!(new_nonce, "deadnonce");
-        // And NO baked Authorization bearer (proxy shape).
+        // And no baked static TOKEN: `Authorization` is present (Phase 2 — the
+        // OAuth-provider suppressor) but carries the freshly minted nonce.
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(root.join(".mcp.json")).unwrap())
                 .unwrap();
-        assert!(v["mcpServers"]["coord-mcp"]["headers"]
-            .get("Authorization")
-            .is_none());
+        assert_eq!(
+            v["mcpServers"]["coord-mcp"]["headers"]["Authorization"],
+            serde_json::Value::from(format!("Bearer {new_nonce}"))
+        );
 
         // --- Case 2: matching port + LIVE nonce → Leave (no rewrite). ---
         // The case-1 rewrite left a live nonce on port 9876; a second pass is a
@@ -6481,5 +6588,304 @@ mod tests {
 
         revoke_proxy_nonce(&n_other);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Phase 2 of plan `2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning`:
+/// the proxy nonce now also travels in `Authorization: Bearer <nonce>`, which
+/// is what stops a stale key's 401 escalating into OAuth Dynamic Client
+/// Registration (and the durable `mcpOAuth` poison entry a failed DCR leaves
+/// behind).
+///
+/// The emitter change is one line. The tests here exist for the READERS: five
+/// of them derived the header name from a hardcoded literal, and every one
+/// degraded SILENTLY on the new shape — a `None`, a `continue`, an
+/// `unwrap_or("")`. Nothing in the build or the old test suite would have
+/// failed.
+#[cfg(test)]
+mod phase2_proxy_header_shape_tests {
+    use super::*;
+
+    /// A JWT-SHAPED string (three non-empty dot-separated segments) whose
+    /// payload decodes `sub_type=agent` — the static-bearer agent config's
+    /// shape, which every reader must keep treating as NOT a proxy nonce.
+    /// `{"sub_type":"agent"}` base64url-no-pad.
+    const AGENT_JWT: &str = "eyJhbGciOiJFZERTQSJ9.eyJzdWJfdHlwZSI6ImFnZW50In0.c2ln";
+
+    fn new_shape_config(port: u16, nonce: &str) -> String {
+        format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:{port}/coord-mcp","headers":{{"Authorization":"Bearer {nonce}"}}}}}}}}"#
+        )
+    }
+
+    /// The emitter writes BOTH names. `Authorization` is the load-bearing one
+    /// (its presence in the STATIC headers map is what stops the client
+    /// attaching an OAuth provider); the legacy custom header stays because the
+    /// `qontinui-claude-config` recovery doors — `/gate`, `/policy`,
+    /// `/coord-revive`, `/pr-status` — read this file by that name, and
+    /// dropping it would blind exactly the tooling used to diagnose this
+    /// failure.
+    #[test]
+    fn proxy_config_emits_both_header_shapes() {
+        let nonce = register_proxy_nonce(
+            &format!("D:/phase2-emit-{}", uuid::Uuid::now_v7()),
+            Some("terminal-emit"),
+        );
+        let doc = coord_mcp_proxy_config_json(9876, &nonce);
+        let headers = &doc["mcpServers"]["coord-mcp"]["headers"];
+        assert_eq!(
+            headers["Authorization"],
+            serde_json::Value::from(format!("Bearer {nonce}")),
+            "the OAuth-suppressing header must carry the nonce as a bearer"
+        );
+        assert_eq!(
+            headers["X-Coord-Mcp-Proxy-Key"],
+            serde_json::Value::from(nonce.as_str()),
+            "the legacy header must keep carrying the raw nonce"
+        );
+        // No baked JWT: the value in `Authorization` is a nonce, never a token.
+        assert!(
+            !crate::coord_mcp_config::looks_like_jwt(&nonce),
+            "a proxy nonce must never be JWT-shaped — every reader's \
+             nonce-vs-bearer discriminator depends on it"
+        );
+    }
+
+    /// `read_proxy_nonce` must resolve the runner's OWN new-shape output.
+    ///
+    /// If it did not, `resolve_root_reconcile` would set `on_disk_nonce=None` /
+    /// `registered=false`, and `root_reconcile_action` would classify a fresh,
+    /// healthy config as a non-proxy shape and LEAVE it — killing the boot
+    /// self-heal and the adopt-on-disk path on exactly the configs this phase
+    /// produces.
+    #[test]
+    fn read_proxy_nonce_resolves_every_shape_the_writer_can_produce() {
+        let dir = std::env::temp_dir().join(format!("phase2-read-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".mcp.json");
+        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None);
+
+        // (a) The real emitter's output, round-tripped through the real writer.
+        write_mcp_json(
+            &dir.to_string_lossy(),
+            &coord_mcp_proxy_config_json(9876, &nonce),
+        );
+        assert_eq!(
+            read_proxy_nonce(&path).as_deref(),
+            Some(nonce.as_str()),
+            "the writer's own output must read back"
+        );
+
+        // (b) Authorization-only (the shape a later phase may narrow to).
+        std::fs::write(&path, new_shape_config(9876, &nonce)).unwrap();
+        assert_eq!(read_proxy_nonce(&path).as_deref(), Some(nonce.as_str()));
+
+        // (c) Legacy custom-header-only — every `.mcp.json` written before this
+        // phase, which keeps working because configs are rewritten on session
+        // spawn, never periodically.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"{nonce}"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(read_proxy_nonce(&path).as_deref(), Some(nonce.as_str()));
+
+        // (d) The static-bearer AGENT shape must still read as NOT-a-proxy —
+        // otherwise the reconcile would treat a user/agent config as ours.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"https://coord.example.test/mcp","headers":{{"Authorization":"Bearer {AGENT_JWT}"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_proxy_nonce(&path),
+            None,
+            "a real bearer is not a proxy nonce"
+        );
+    }
+
+    /// End-to-end on the self-heal predicate itself: a new-shape config on the
+    /// bound port whose nonce is REGISTERED is healthy (`Leave`); the same
+    /// config with an unregistered nonce is adopted, not silently ignored.
+    #[test]
+    fn resolve_root_reconcile_still_self_heals_a_new_shape_config() {
+        let dir = std::env::temp_dir().join(format!("phase2-reconcile-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".mcp.json");
+        let bound = 9876u16;
+
+        let live = register_proxy_nonce(&dir.to_string_lossy(), Some("terminal-reconcile"));
+        std::fs::write(&path, new_shape_config(bound, &live)).unwrap();
+        let (action, seen) = resolve_root_reconcile(&dir, bound);
+        assert_eq!(seen.as_deref(), Some(live.as_str()));
+        assert_eq!(
+            action,
+            RootReconcileAction::Leave,
+            "a registered nonce on the bound port is healthy"
+        );
+
+        // An UNREGISTERED nonce in the new shape must still be adopted — the
+        // regression that would otherwise hide here is `Leave`, because an
+        // unreadable nonce classifies as a non-proxy shape.
+        let orphan = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        std::fs::write(&path, new_shape_config(bound, &orphan)).unwrap();
+        let (action, seen) = resolve_root_reconcile(&dir, bound);
+        assert_eq!(seen.as_deref(), Some(orphan.as_str()));
+        assert_eq!(
+            action,
+            RootReconcileAction::AdoptNonce,
+            "an unregistered new-shape nonce must be ADOPTED, not left alone"
+        );
+    }
+
+    /// The revoked-config reaper is nonce-keyed via `read_proxy_nonce`, so a
+    /// new-shape config must still be matched. A miss here is silent (`let
+    /// Some(..) else { continue }`) and leaves dead credential files on disk.
+    #[test]
+    fn revoked_config_reaper_matches_a_new_shape_config() {
+        let dir = std::env::temp_dir().join(format!("phase2-reap-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let revoked_new = format!("{}", uuid::Uuid::new_v4().simple()).repeat(2);
+        let revoked_legacy = format!("{}", uuid::Uuid::new_v4().simple()).repeat(2);
+        let survivor = format!("{}", uuid::Uuid::new_v4().simple()).repeat(2);
+
+        let f_new = dir.join("new-shape.json");
+        let f_legacy = dir.join("legacy-shape.json");
+        let f_keep = dir.join("survivor.json");
+        std::fs::write(&f_new, new_shape_config(9876, &revoked_new)).unwrap();
+        std::fs::write(
+            &f_legacy,
+            format!(
+                r#"{{"mcpServers":{{"coord-mcp":{{"url":"http://127.0.0.1:9876/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"{revoked_legacy}"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(&f_keep, new_shape_config(9876, &survivor)).unwrap();
+
+        let removed =
+            reap_configs_for_revoked_nonces(&dir, &[revoked_new.clone(), revoked_legacy.clone()]);
+        assert_eq!(removed, 2, "both shapes must be reaped");
+        assert!(!f_new.exists(), "the new-shape config must be reaped");
+        assert!(!f_legacy.exists(), "the legacy config must still be reaped");
+        assert!(f_keep.exists(), "an unrevoked nonce's config is untouched");
+    }
+
+    /// A rotation `write` line must carry a NON-EMPTY `key_prefix` for a
+    /// new-shape config. The old extraction was `pointer(...legacy header...)
+    /// .unwrap_or("")`, which would have logged an empty prefix on every single
+    /// write — silently destroying the mint→write→evict join that made the
+    /// 2026-08-19 incident reconstructible at all.
+    #[test]
+    fn rotation_write_line_carries_a_non_empty_key_prefix_for_the_new_shape() {
+        let log_dir = rotation_log_test_dir();
+        let wt = std::env::temp_dir().join(format!("phase2-write-line-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_string_lossy().to_string();
+
+        let nonce = register_proxy_nonce(&wt_str, Some("terminal-write-line"));
+        write_mcp_json(&wt_str, &coord_mcp_proxy_config_json(9876, &nonce));
+
+        let raw = std::fs::read_to_string(log_dir.join(ROTATION_LOG_FILE)).unwrap();
+        let writes: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["workdir"] == wt_str.as_str() && v["event"] == "write")
+            .collect();
+        assert_eq!(writes.len(), 1, "one write line for this workdir");
+        let prefix = writes[0]["key_prefix"].as_str().unwrap_or("");
+        assert!(
+            !prefix.is_empty(),
+            "the write line's key_prefix must not be empty for a new-shape config"
+        );
+        assert_eq!(
+            prefix,
+            &nonce[..ROTATION_KEY_PREFIX_LEN],
+            "and it must be THIS write's key, so the mint→write join still holds"
+        );
+    }
+
+    /// `coord_mcp_safe_to_write`'s agent-JWT guard used to rest on the proxy
+    /// shape having NO `Authorization` header at all. It has one now, so the
+    /// guard rests instead on the VALUE's shape: a 64-hex nonce fails the JWT
+    /// decode, a real agent token does not. Pinned here because that is the
+    /// only thing standing between "refresh our own config" and "clobber a
+    /// session's richer agent credential".
+    #[test]
+    fn safe_to_write_keeps_a_nonce_bearing_proxy_config_refreshable() {
+        let dir = std::env::temp_dir().join(format!("phase2-safe-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wd = dir.to_string_lossy().to_string();
+        let mcp = dir.join(".mcp.json");
+        let nonce = register_proxy_nonce(&wd, Some("terminal-safe"));
+
+        // The real emitter's output — Authorization present, value a nonce.
+        std::fs::write(
+            &mcp,
+            serde_json::to_string_pretty(&coord_mcp_proxy_config_json(9876, &nonce)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            coord_mcp_safe_to_write(&wd),
+            "a proxy config whose Authorization carries a NONCE is ours — refreshable"
+        );
+
+        // A real agent JWT in the same slot is still refused (never downgrade
+        // an agent credential to a device one).
+        std::fs::write(
+            &mcp,
+            format!(
+                r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"https://coord.example.test/mcp","headers":{{"Authorization":"Bearer {AGENT_JWT}"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert!(
+            !coord_mcp_safe_to_write(&wd),
+            "an agent JWT must still block the write"
+        );
+    }
+
+    /// The 2am string. The old one was literally
+    /// `"missing or unrecognized X-Coord-Mcp-Proxy-Key"` — it named the header
+    /// this phase deprecates and said nothing about what to do. The replacement
+    /// must name the cause, say why reconnecting cannot work, and give a
+    /// concrete recovery.
+    #[test]
+    fn the_dead_key_error_string_is_actionable_and_names_no_deprecated_header_alone() {
+        let msg = stale_proxy_key_error(STALE_PROXY_KEY_CAUSE);
+        assert!(msg.contains("stale or unrecognized coord-mcp proxy key"));
+        assert!(
+            msg.contains("never re-reads"),
+            "must say why reconnecting the server cannot recover it"
+        );
+        assert!(
+            msg.contains("provision-session"),
+            "must name a concrete recovery route"
+        );
+        // Both accepted header names appear, so a reader is never pointed at
+        // one name as if it were the only one.
+        assert!(msg.contains("Authorization: Bearer"));
+        assert!(msg.contains(COORD_MCP_PROXY_KEY_HEADER_JSON));
+        // Every door's message shares the recovery tail — five doors, one story.
+        for cause in [
+            STALE_PROXY_KEY_CAUSE,
+            NON_DEVICE_PROXY_KEY_CAUSE,
+            AGENT_GONE_PROXY_CAUSE,
+        ] {
+            assert!(stale_proxy_key_error(cause).contains(PROXY_KEY_RECOVERY_HINT));
+        }
+        // And the gate itself now returns it rather than the old header name.
+        let (status, gate_msg) = proxy_request_gate(None, None, &ProxyPrincipal::Device)
+            .expect_err("an absent nonce must be rejected");
+        assert_eq!(status, 401);
+        assert_eq!(gate_msg, msg);
     }
 }
