@@ -96,20 +96,22 @@ describe("clampPerfCaps", () => {
 
 describe("honesty labelling", () => {
   /**
-   * The three knobs whose consumers ship in still-open earlier-phase PRs must
-   * SAY so. If a consumer lands and the label is not removed, the panel
-   * under-promises — annoying but safe; if a knob is added without a label and
-   * without a consumer, the panel lies. This pins the current set.
+   * A knob whose consumer has not landed must SAY so. If a consumer lands and
+   * the label is not removed, the panel under-promises — annoying but safe; if
+   * a knob is added without a label and without a consumer, the panel lies.
+   * This pins the current set.
+   *
+   * The two flush intervals left this list when the merge-train plan's D3
+   * wired them into `TerminalSession::spawn`. They had been mislabelled in the
+   * other direction for a while: the label named Phase 5, Phase 5 landed, and
+   * the knobs stayed inert because the emission path read a compiled-in
+   * 250 ms constant instead of the setting.
    */
   it("marks exactly the not-yet-consumed knobs", () => {
     const pending = PERF_CAP_FIELDS.filter((f) => f.pendingPhase)
       .map((f) => f.key)
       .sort();
-    expect(pending).toEqual([
-      "background_flush_interval_ms",
-      "max_webgl_panes",
-      "unwatched_flush_interval_ms",
-    ]);
+    expect(pending).toEqual(["max_webgl_panes"]);
   });
 
   it("marks the grid-scan knob as needing a restart", () => {

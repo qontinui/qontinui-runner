@@ -39,6 +39,14 @@ repos:
       # every repo but this one. Bypass a single push with
       # `SKIP=gen-events-drift git push` — never `--no-verify`, which also
       # disables the cargo fmt/clippy gate below.
+      #
+      # That same range is why the hook no longer blames every pusher for the
+      # drift it finds: a PEER's schema commit inside the pushed range fires it
+      # while the pusher's own diff is unrelated. `lib/gen-events-attribution.sh`
+      # splits the verdict into pusher-caused (hard failure, unchanged) and
+      # pre-existing (reported in full, not blocking; STRICT still blocks), and
+      # fails closed when it cannot tell. Its tests need no Rust toolchain:
+      #   bash .pre-commit-hooks/gen-events-drift-attribution-test.sh
       - id: gen-events-drift
         name: Tauri Event Bindings Drift Guard
         entry: bash .pre-commit-hooks/gen-events-drift.sh

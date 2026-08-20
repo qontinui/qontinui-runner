@@ -31,6 +31,15 @@
  * what an unmounted tab actually got, since there is no xterm buffer to read)
  * accumulated overdrawn frames as if they were new lines.
  *
+ * One case produces no digests at all: an operator who sets the
+ * `unwatched_flush_interval_ms` performance cap puts `unwatched` sessions back
+ * on `terminal-output` at that cadence, and the runner then stands the digest
+ * down for them (`TerminalSession::emit_activity_digest_if_due`) so the page
+ * tap is not double-counted. Tracking is fed by the tap in that configuration,
+ * exactly as it is for `background`. Nothing here needs to change for it —
+ * this module simply never runs — but "unwatched implies digest" is no longer
+ * the whole story.
+ *
  * Pure leaf (no React, no Tauri) so the replacement can be tested against the
  * behavior it replaces — same rationale as `flowControl.ts`,
  * `scrollbackReplay.ts` and `paneVisibilityService.ts`.
