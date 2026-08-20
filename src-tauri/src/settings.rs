@@ -2609,6 +2609,19 @@ pub struct Settings {
     /// settings.json without the key behaves exactly as it did.
     #[serde(default)]
     pub performance: PerformanceSettings,
+    /// Per-run AI cost cap (plan
+    /// `2026-08-20-workflow-resume-reexecutes-and-rebills`, Phase 5).
+    ///
+    /// `$5.00 / 500,000 tokens` used to be a hardcoded constant reachable only
+    /// through a `RunCostTrackers::with_budget` constructor that no production
+    /// code called — configurable-looking, configured by nothing. That
+    /// constructor has been deleted in favour of this key. Every field
+    /// defaults to exactly that constant, so a `settings.json` without this
+    /// key behaves identically. Read once per task run (via
+    /// [`crate::cost_management::budget::TokenBudget::from_settings`]), so a
+    /// change is live for the next run with no restart.
+    #[serde(default)]
+    pub cost_budget: crate::cost_management::budget::TokenBudget,
 }
 
 fn default_session_metadata_sync_enabled() -> bool {

@@ -494,17 +494,88 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Register cost trackers for a new run.
+    /// Register cost trackers for a run, seeded from what that run has
+    /// **already** spent.
+    ///
+    /// Called once per entry into `LoopController::run_inner` — and a resume
+    /// builds a brand-new `LoopController` and re-enters it, so this runs
+    /// again on every resumed attempt. Before the seeding below, that meant a
+    /// resumed run restarted its cost budget at $0.00 consumed: a
+    /// crash-looping run re-executed, re-billed, reset its budget, and
+    /// repeated.
+    ///
+    /// The spend is already durable — every AI call writes a
+    /// `phase_token_usage` row keyed by `task_run_id` (which *is* the
+    /// `execution_id`). So this is a **reload**, not a second persistence
+    /// layer: persisting the budget state separately would create a second
+    /// write path for the same number that can disagree with the ledger,
+    /// whereas reading the ledger cannot.
+    ///
+    /// A fresh execution has no ledger rows and seeds zero, so there is no
+    /// "is this a resume" branch.
+    ///
+    /// **Ledger-read failure does not fail the run**, but it does not silently
+    /// hand out a full budget either: the read error is logged at `error` and
+    /// the tracker seeds zero, which is the pre-existing behaviour. Refusing
+    /// to start a workflow because an analytics-shaped read failed would be a
+    /// worse trade than one attempt with an over-generous cap, and the
+    /// circuit breaker plus the anomaly detector still apply.
     pub async fn register_cost_trackers(
         &self,
         execution_id: &str,
     ) -> Arc<crate::cost_management::RunCostTrackers> {
-        let trackers = Arc::new(crate::cost_management::RunCostTrackers::new());
+        let budget = crate::cost_management::budget::TokenBudget::from_settings();
+        let prior = self.prior_consumption(execution_id).await;
+        if !prior.is_empty() {
+            tracing::info!(
+                "Cost budget for {} seeded from the durable ledger: {} tokens / \
+                 ${:.4} already billed against a ${:.2} / {} cap",
+                execution_id,
+                prior.total_tokens,
+                prior.total_cost_usd,
+                budget.max_cost_per_run_usd,
+                budget.max_tokens_per_run
+            );
+        }
+        let trackers = Arc::new(crate::cost_management::RunCostTrackers::seeded(
+            budget, prior,
+        ));
         self.run_cost_trackers
             .lock()
             .await
             .insert(execution_id.to_string(), trackers.clone());
         trackers
+    }
+
+    /// Read this execution's already-billed spend out of `phase_token_usage`
+    /// and convert it into the DB-agnostic shape `cost_management` consumes.
+    ///
+    /// Cents -> USD happens here, at the boundary, so `cost_management` keeps
+    /// no database dependency and stays unit-testable without Postgres.
+    async fn prior_consumption(
+        &self,
+        execution_id: &str,
+    ) -> crate::cost_management::budget::PriorConsumption {
+        use crate::cost_management::budget::PriorConsumption;
+        match self.pg_db.get_execution_phase_spend(execution_id).await {
+            Ok(rows) => PriorConsumption::from_phases(rows.into_iter().map(|r| {
+                (
+                    r.phase,
+                    r.input_tokens + r.output_tokens,
+                    r.cost_cents as f64 / 100.0,
+                )
+            })),
+            Err(e) => {
+                tracing::error!(
+                    "Cost budget for {}: could not read prior spend from \
+                     phase_token_usage ({}) — seeding 0. A resumed run may get a \
+                     fuller budget than it has earned.",
+                    execution_id,
+                    e
+                );
+                PriorConsumption::default()
+            }
+        }
     }
 
     /// Get cost trackers for an active run.
