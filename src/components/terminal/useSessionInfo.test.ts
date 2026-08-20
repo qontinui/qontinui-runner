@@ -35,6 +35,7 @@ import {
   prRowChip,
   sessionInfoElementId,
   sessionInfoRows,
+  sessionInfoTriggerLabel,
   sortPrsUnlandedFirst,
   summarizePrs,
   TONE_COLORS,
@@ -671,9 +672,7 @@ describe("provisional identity (the phantom-shell defect)", () => {
   });
 
   it("qualifies the account and Claude id rows, and only those", () => {
-    const rows = sessionInfoRows(
-      provisionalBody(),
-    );
+    const rows = sessionInfoRows(provisionalBody());
     const byField = Object.fromEntries(rows.map((r) => [r.field, r]));
     expect(byField["account"].display).toContain(PROVISIONAL_SUFFIX.trim());
     expect(byField["claude-session-id"].display).toContain(PROVISIONAL_SUFFIX.trim());
@@ -682,10 +681,37 @@ describe("provisional identity (the phantom-shell defect)", () => {
   });
 
   it("leaves rows unqualified when the identity is confirmed", () => {
-    const rows = sessionInfoRows(
-      evidenceBody("confirmed"),
-    );
+    const rows = sessionInfoRows(evidenceBody("confirmed"));
     const acct = rows.find((r) => r.field === "account");
     expect(acct?.display).not.toContain(PROVISIONAL_SUFFIX.trim());
+  });
+});
+
+describe("sessionInfoTriggerLabel (D5)", () => {
+  const states = [
+    { status: "loading", reason: null, body: null } as const,
+    { status: "unavailable", reason: "session_not_found", body: null } as const,
+  ];
+
+  it("states 'Session info' exactly once, on every trigger state", () => {
+    for (const state of states) {
+      const label = sessionInfoTriggerLabel(2, deriveTrigger(state));
+      expect(label.match(/Session info/g)).toHaveLength(1);
+    }
+    for (const state of [okState(body()), okState(provisionalBody())]) {
+      const label = sessionInfoTriggerLabel(2, deriveTrigger(state));
+      expect(label.match(/Session info/g)).toHaveLength(1);
+    }
+  });
+
+  it("still qualifies the trigger with its (1-based) zone and the summary text", () => {
+    const label = sessionInfoTriggerLabel(2, deriveTrigger(states[1]));
+    expect(label).toBe("Session info (zone 3): unavailable — session_not_found");
+  });
+
+  it("keeps the human title/aria summary unchanged (it carries its own lead-in)", () => {
+    const trigger = deriveTrigger(states[1]);
+    expect(trigger.summary).toBe("Session info unavailable — session_not_found");
+    expect(trigger.summary.match(/Session info/g)).toHaveLength(1);
   });
 });

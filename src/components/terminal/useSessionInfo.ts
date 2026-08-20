@@ -273,10 +273,28 @@ export interface TriggerState {
   /** What the glyph shows. `"?"` (unknown) and `"0"` (a known-empty ledger)
    * are deliberately different characters — that is G5's whole point. */
   countText: string;
-  /** Human summary for `title` / `aria-label`. */
+  /** Human summary for `title` / `aria-label`. Carries its own
+   * `Session info…` lead-in, so a consumer that prefixes it AGAIN produces
+   * `"Session info (zone 3): Session info: provisional — …"` (D5). */
   summary: string;
+  /** The same human sentence with the `Session info` lead-in removed, for
+   * consumers that supply their own prefix (e.g. the UI-Bridge registration,
+   * which qualifies it with the zone). Keeping both spellings on the state —
+   * rather than having each consumer slice the prefix off `summary` — is what
+   * makes "exactly one `Session info`" a property of this module instead of a
+   * convention every call site has to remember. */
+  detail: string;
   /** Machine summary for `data-session-info-summary`. */
   dataSummary: string;
+}
+
+/**
+ * The UI-Bridge registration label for a zone's session-info trigger.
+ * Qualifies the trigger with its zone and states `Session info` EXACTLY ONCE
+ * (D5) — pure, so the accessible-name contract is unit-testable without a DOM.
+ */
+export function sessionInfoTriggerLabel(zoneIndex: number, trigger: TriggerState): string {
+  return `Session info (zone ${zoneIndex + 1}): ${trigger.detail}`;
 }
 
 /**
@@ -291,6 +309,7 @@ export function deriveTrigger(state: SessionInfoState): TriggerState {
       color: TONE_COLORS.loading,
       countText: "…",
       summary: "Session info: loading…",
+      detail: "loading…",
       dataSummary: "loading",
     };
   }
@@ -301,6 +320,7 @@ export function deriveTrigger(state: SessionInfoState): TriggerState {
       color: TONE_COLORS.unknown,
       countText: "?",
       summary: `Session info unavailable — ${reason}`,
+      detail: `unavailable — ${reason}`,
       dataSummary: `unavailable:${reason}`,
     };
   }
@@ -320,6 +340,7 @@ export function deriveTrigger(state: SessionInfoState): TriggerState {
       color: TONE_COLORS.partial,
       countText: "~",
       summary: `Session info: provisional — ${PROVISIONAL_NOTE}`,
+      detail: `provisional — ${PROVISIONAL_NOTE}`,
       dataSummary: "identity-provisional",
     };
   }
@@ -330,6 +351,7 @@ export function deriveTrigger(state: SessionInfoState): TriggerState {
       color: TONE_COLORS.unknown,
       countText: "?",
       summary: `Session info: ${who} — ${summary.text}`,
+      detail: `${who} — ${summary.text}`,
       dataSummary: `prs-unavailable:${prs.reason ?? UNKNOWN_TEXT}`,
     };
   }
@@ -348,6 +370,7 @@ export function deriveTrigger(state: SessionInfoState): TriggerState {
     color: TONE_COLORS[tone],
     countText: String(summary.openCount),
     summary: `Session info: ${who} — ${summary.text}`,
+    detail: `${who} — ${summary.text}`,
     dataSummary: summary.text,
   };
 }
@@ -464,9 +487,7 @@ export type IdentityEvidence = "confirmed" | "transcript" | "provisional";
 /** Is this identity merely predicted? Treats an ABSENT field as NOT provisional
  * — an older runner that does not send `identityEvidence` must not have every
  * session relabelled; unknown provenance is not the same as known-provisional. */
-export function isProvisionalIdentity(lifecycle: {
-  identityEvidence?: IdentityEvidence;
-}): boolean {
+export function isProvisionalIdentity(lifecycle: { identityEvidence?: IdentityEvidence }): boolean {
   return lifecycle.identityEvidence === "provisional";
 }
 
