@@ -218,11 +218,37 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
     "]"
 );
 
-/// The canonical "you are inside the Qontinui Runner" briefing appended to the
+/// Render the "you are inside the Qontinui Runner" briefing appended to the
 /// system prompt of every `claude` session the runner hosts.
 ///
-/// This is the SINGLE SOURCE OF TRUTH for the briefing text. Both launch paths
-/// render it from here so they can never drift:
+/// # This function is a RENDERER, not the text
+///
+/// The briefing's source of truth is a coord prompt document —
+/// `session_briefing/runner-session` — which an operator edits at
+/// `/admin/coord/prompt-documents` with a version log, a diff and a
+/// restore-to-default (plan
+/// `2026-08-20-runner-session-briefing-versioned-and-operator-editable`). The
+/// compiled-in text in [`builtin_briefing_body`] is a labelled **FALLBACK**,
+/// deliberately allowed to age and drift; it is NOT a mirror of the document
+/// and must never be read as the authority on what a session was told.
+///
+/// What this function does, synchronously and with **zero I/O** (it runs on the
+/// spawn path):
+///
+/// 1. line 1 — [`RUNNER_CONTEXT_SOURCE_MARKER`], byte-identical, always;
+/// 2. line 2 — the provenance label, e.g.
+///    `[briefing: coord session_briefing/runner-session v7]` or
+///    `[briefing: builtin-fallback]`;
+/// 3. the base body: the cached coord document with the closed placeholder
+///    vocabulary substituted, or the builtin;
+/// 4. the fleet-gated plan-capture clause, on the same condition as before.
+///
+/// Every degradation — coord unreachable, unpaired runner, absent document, a
+/// body that fails the render-time guard — falls back to the builtin and SAYS
+/// so on line 2. The one thing that must never happen is claiming a coord
+/// version while serving the builtin.
+///
+/// Both launch paths render from here so they can never drift:
 ///   - Interactive panes (a human types `claude`) read it via the
 ///     `QONTINUI_RUNNER_CONTEXT` env var that [`session`] injects at spawn; the
 ///     `shell-integration.{ps1,bash,zsh}` wrapper passes it to
@@ -237,12 +263,20 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// in coord's versioned prompt documents and are fetched on demand, so editing
 /// a policy never requires a runner release. It also carries NO narration
 /// instructions — transparency is structural (tool calls land in the
-/// transcript).
+/// transcript). Making the briefing itself an editable document is NOT licence
+/// to grow it: the 16 KiB render-time ceiling is a bound on the damage, never a
+/// target.
 ///
-/// It deliberately carries NO tenant/agent identity — that is an RCE-class
-/// invariant (a prompt must never cross tenants) and is deferred to the vetted
-/// session-identity fabric plan. Only tenant-agnostic protocol guidance lives
-/// here.
+/// It carries NO tenant/agent identity — an RCE-class invariant (a prompt must
+/// never cross tenants). **Be precise about what kind of guarantee that now
+/// is.** While the text was a static format string the invariant was
+/// STRUCTURAL: there was no way to interpolate an identity. With an editable
+/// body it is ENFORCED — by coord's write-time validator and again by this
+/// crate's render-time guard, which refuses a body carrying a named identity
+/// key or a UUID-shaped literal. That is a weaker class of guarantee,
+/// deliberately accepted, and it is the reason enforcement lives at BOTH ends
+/// rather than one. Tenant scoping comes from the device JWT the fetch is made
+/// with and from `(tenant_id, kind, name)` — never from the text.
 ///
 /// Attributable source marker (part of the contract): the FIRST line of the
 /// appended briefing is always [`RUNNER_CONTEXT_SOURCE_MARKER`]. An instruction
@@ -253,9 +287,28 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// function. Note this is the first line of the text the runner *appends* — the
 /// harness's own system prompt still precedes it.
 ///
+/// The marker line is **equality**, not a prefix, and the provenance label is
+/// therefore its own SECOND line rather than a same-line suffix: several tests
+/// in this crate assert line-1 equality, and `/whereami` parses line 1 for the
+/// spawn SHA with no hex shape-guard, so a suffix would silently corrupt an
+/// external parser instead of failing loudly. The marker is also runner-owned:
+/// an editable body that opens with a `[source: …]` line is refused by the
+/// render-time guard, so it can never be forged from a document.
+///
 /// # Conditional clauses
 ///
-/// One trailing clause is fleet-gated: the plan/prompt **capture** protocol is
+/// TWO trailing clauses are gated, on different things, and neither gate is
+/// the document that supplies its text:
+///
+/// 1. **plan capture** — a FLEET dial (below). The dial is the authorization;
+///    the coord document is only the content, so creating a row must never by
+///    itself turn an instruction on for a whole tenant.
+/// 2. **coord memory** — a PROVISIONING fact, [`crate::coord_mcp::coord_mcp_deliverable`].
+///    It fails to FALSE with no Tauri runtime, so a session that cannot be
+///    given the memory tools is never told to use them. Unlike everything else
+///    here it is compiled-in ONLY, deliberately: see the note at its call site.
+///
+/// The first, in full: the plan/prompt **capture** protocol is
 /// appended only when [`crate::mcp::fleet_policy_poller::effective_plan_capture_level`]
 /// reads `record` (plan `2026-08-10-plan-and-prompt-library-in-web` Phase 4).
 /// At `off` — which is the resting value, the value after any coord 404/401,
@@ -283,11 +336,91 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// opening the door are two separate operator acts. **Flip the dial only for a
 /// fleet whose runners carry the routes.**
 pub fn runner_context(api_port: u16) -> String {
+    use crate::mcp::fleet_policy_poller::{BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION};
+    use crate::mcp::session_briefing;
+
     // Coord HTTP base for the tool-less fallback links. Resolved the same way
     // every coord proxy route resolves it (COORD_HTTP_URL env → active
     // profile → localhost fallback) so the prompt never disagrees with the
     // runner's own coord client.
     let coord_url = crate::coord_mcp::coord_base_url();
+    let api_base = session_briefing::runner_api_base(api_port);
+
+    // The base body: the cached coord document, or the compiled-in fallback.
+    // Pure cache read + string substitution — no I/O, no await.
+    let base = session_briefing::resolve(
+        BRIEFING_RUNNER_SESSION,
+        &builtin_briefing_body(api_port, &coord_url),
+        &api_base,
+        &coord_url,
+    );
+
+    // Line 2 collects the provenance of every DOCUMENT-BACKED block in this
+    // render, so `head -2` answers "which text am I running under". The
+    // plan-capture clause is a separate document with its own version, and a
+    // render that named only the base would leave half the injected text
+    // unattributed.
+    //
+    // The memory clause below is deliberately absent from line 2: it is
+    // compiled-in only, so a token for it would read `builtin` on every render
+    // forever — noise on the one line that has to stay worth reading.
+    let mut provenance = base.provenance.line();
+
+    let mut briefing = String::new();
+
+    // Fleet-gated clause. Read synchronously from the poller's process-global
+    // cache — `off` before the first successful poll, on a coord 404/401, on an
+    // unpaired runner and on a poisoned lock, so the default is "no clause".
+    if crate::mcp::fleet_policy_poller::effective_plan_capture_level()
+        == crate::mcp::fleet_policy_poller::PLAN_CAPTURE_RECORD
+    {
+        let clause = session_briefing::resolve(
+            BRIEFING_PLAN_CAPTURE_CLAUSE,
+            &plan_capture_clause_body(api_port, &coord_url),
+            &api_base,
+            &coord_url,
+        );
+        provenance.push_str(&format!(" [clause: {}]", clause.provenance.describe()));
+        briefing.push_str("\n\n");
+        briefing.push_str(&clause.text);
+    }
+
+    // Provisioning-gated clause. `coord_mcp_deliverable()` is a pure in-process
+    // read (no I/O — this function runs on the spawn path) and fails to FALSE
+    // when no Tauri runtime is reachable, so a session that cannot be given the
+    // memory tools is never told to use them and keeps the local-file fallback.
+    //
+    // Deliberately NOT a `session_briefing` document, and therefore carrying no
+    // provenance token: its wording is load-bearing EVIDENCE, not an editorial
+    // choice. `memory_clause`'s own docs record that it is the winning arm of a
+    // measured two-arm A/B, verbatim — "reword it and the evidence no longer
+    // applies to what ships". Making it operator-editable would hand that
+    // guarantee away for the one clause whose entire justification IS the
+    // measurement. Moving it to coord is a separate decision with its own
+    // evidence bar, and it is not this plan.
+    if crate::coord_mcp::coord_mcp_deliverable() {
+        briefing.push_str(&memory_clause());
+    }
+
+    format!(
+        "{RUNNER_CONTEXT_SOURCE_MARKER}\n{provenance}\n{}{briefing}",
+        base.text
+    )
+}
+
+/// The compiled-in FALLBACK briefing body — everything after the marker and
+/// provenance lines.
+///
+/// Not the source of truth (see [`runner_context`]): it is what the runner
+/// injects when coord has never been reached, when the document is absent or
+/// unauthorized, or when the served body fails the render-time guard. It is
+/// allowed to age relative to `session_briefing/runner-session`; that drift is
+/// harmless precisely because line 2 always says which one was used.
+///
+/// Kept as a `format!` over `api_port` + `coord_url` rather than moved to the
+/// placeholder vocabulary: this text never travels over the wire, so it has no
+/// reason to carry `{{tokens}}` a human would then have to mentally expand.
+pub(crate) fn builtin_briefing_body(api_port: u16, coord_url: &str) -> String {
     // The HTTP fallbacks below name `/coord/agent-prompt-documents`, coord's
     // device/agent (`require_jwt`) door — NOT the sibling
     // `/coord/prompt-documents`, which is the OPERATOR door and 403s a device
@@ -298,9 +431,8 @@ pub fn runner_context(api_port: u16) -> String {
     // when it is needed. `policy/session-protocol` Step 0 names the agent door
     // for this reason; the briefing now agrees with it.
     // (plan `2026-08-08-runner-enforced-policy-pull.md` Phase 1.8)
-    let mut briefing = format!(
-        "{RUNNER_CONTEXT_SOURCE_MARKER}
-You are running inside the Qontinui Runner — an autonomous multi-agent \
+    format!(
+        "You are running inside the Qontinui Runner — an autonomous multi-agent \
 development environment. Runner HTTP API: http://127.0.0.1:{api_port}.
 
 You work autonomously. No human is watching this session; do not wait for \
@@ -333,27 +465,8 @@ record your own scope.
 
 If context runs low, act BEFORE exhaustion: request a handoff \
 (coord_request_handoff) or spawn a continuation session seeded with a \
-summary via POST http://127.0.0.1:{api_port}/sessions/spawn.",
-    );
-
-    // Fleet-gated clause. Read synchronously from the poller's process-global
-    // cache — `off` before the first successful poll, on a coord 404/401, on an
-    // unpaired runner and on a poisoned lock, so the default is "no clause".
-    if crate::mcp::fleet_policy_poller::effective_plan_capture_level()
-        == crate::mcp::fleet_policy_poller::PLAN_CAPTURE_RECORD
-    {
-        briefing.push_str(&plan_capture_clause(api_port, &coord_url));
-    }
-
-    // Provisioning-gated clause. `coord_mcp_deliverable()` is a pure in-process
-    // read (no I/O — this function runs on the spawn path) and fails to FALSE
-    // when no Tauri runtime is reachable, so a session that cannot be given the
-    // memory tools is never told to use them and keeps the local-file fallback.
-    if crate::coord_mcp::coord_mcp_deliverable() {
-        briefing.push_str(&memory_clause());
-    }
-
-    briefing
+summary via POST http://127.0.0.1:{api_port}/sessions/spawn."
+    )
 }
 
 /// The plan/prompt capture clause — PROTOCOL + LINKS ONLY.
@@ -365,13 +478,17 @@ summary via POST http://127.0.0.1:{api_port}/sessions/spawn.",
 /// editing it never requires a runner release (the pull-first lean protocol this
 /// whole briefing follows).
 ///
-/// Returned with a LEADING blank line so it appends onto the base briefing as a
-/// new paragraph and can never disturb the source marker on line 1.
-fn plan_capture_clause(api_port: u16, coord_url: &str) -> String {
+/// Returned as a BARE paragraph with no leading blank line: [`runner_context`]
+/// owns the paragraph separator, so the coord document and this fallback
+/// compose identically and neither can disturb the source marker on line 1.
+///
+/// Like [`builtin_briefing_body`], this is the compiled-in FALLBACK for
+/// `session_briefing/plan-capture-clause`, not its source of truth. The fleet
+/// dial stays the AUTHORIZATION (see the ordering note on [`runner_context`]);
+/// the document is only the content.
+pub(crate) fn plan_capture_clause_body(api_port: u16, coord_url: &str) -> String {
     format!(
-        "
-
-Plan-library capture is ON for this fleet. Save the work artifacts you author \
+        "Plan-library capture is ON for this fleet. Save the work artifacts you author \
 to the plan library: investigation prompts, plan-authoring prompts, \
 implementation prompts, findings reports, and plans. Write each one when you \
 author it, and write it again when its status changes. \
@@ -475,7 +592,10 @@ mod tests {
         memory_clause, runner_context, scrub_credential_env_pty, scrub_credential_env_std,
         scrub_credential_env_tokio, CREDENTIAL_VALUE_ENV_VARS, RUNNER_CONTEXT_SOURCE_MARKER,
     };
-    use crate::mcp::fleet_policy_poller::{pin_plan_capture_level_for_test, PLAN_CAPTURE_RECORD};
+    use crate::mcp::fleet_policy_poller::{
+        briefing_for_test, pin_plan_capture_level_for_test, BriefingProvenance,
+        BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION, PLAN_CAPTURE_RECORD,
+    };
 
     // =======================================================================
     // Session credential-env scrub (plan
@@ -701,6 +821,40 @@ mod tests {
         );
     }
 
+    /// The same invariant, for the arm the three assertions above can no longer
+    /// reach. Once the body is a coord document those assertions only prove the
+    /// BUILTIN is clean — an operator edit could re-open the bug
+    /// `2026-08-08` Phase 1.8 fixed and every one of them would still pass. So
+    /// the guarantee moved into the render-time guard: an edited body naming
+    /// the operator door is REFUSED and the builtin renders instead.
+    ///
+    /// Coord rejects the same body at write time (Phase 2 step 6). Both ends,
+    /// deliberately: coord has more than one write door, and a runner that
+    /// renders whatever it is handed has no structural guarantee left at the
+    /// point where the prompt is actually built.
+    #[test]
+    fn an_edited_body_naming_the_operator_door_is_refused_at_render() {
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_RUNNER_SESSION,
+            briefing_for_test(
+                "Fetch policy over GET https://coord.example.com/coord/prompt-documents",
+                12,
+                BriefingProvenance::Coord,
+            ),
+        );
+
+        let briefing = runner_context(9876);
+        assert!(
+            !briefing.contains("/coord/prompt-documents"),
+            "an edited body must not be able to advertise the operator door: {briefing}"
+        );
+        assert!(
+            briefing.contains("[briefing: builtin-fallback (rejected coord v12)]"),
+            "the refusal must be visible on line 2: {briefing}"
+        );
+    }
+
     /// The marker must actually discriminate builds — a bare package/version
     /// stamp moves only once per release, so every locally-built runner on the
     /// fleet would attribute to the same string. Guards the `+<git-sha>`
@@ -753,6 +907,15 @@ mod tests {
     /// At `record` the clause is present, and carries the four things it is
     /// contracted to carry: what to save, when, the exact endpoints, and the
     /// provenance edge. Everything else stays in the linked coord document.
+    ///
+    /// Scope note since the clause became editable: these eleven literal
+    /// phrases now pin the BUILTIN fallback, which is what this test renders
+    /// (nothing is cached under the pin). They are no longer a statement about
+    /// whatever a tenant has edited `session_briefing/plan-capture-clause` to
+    /// say — that body is bounded by the render-time guard, not by this list.
+    /// What did NOT change is the authorization: the fleet dial still decides
+    /// whether ANY clause appears, so `plan_capture_clause_is_absent_at_level_off`
+    /// below remains a statement about every render.
     #[test]
     fn plan_capture_clause_is_present_at_level_record() {
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
@@ -812,12 +975,16 @@ mod tests {
     /// routes and a document, and the org comes from the device JWT the runner
     /// attaches to the write, never from the prompt.
     ///
-    /// Scope note: this is a NAMED-FIELD scan, not a proof of tenant-agnosticism.
-    /// It catches the realistic regression — someone interpolating an id into
-    /// the clause under one of these names — but a bare UUID pasted in as a
-    /// literal would pass. The structural guarantee is upstream: the clause is
-    /// a static format string whose only inputs are `api_port` and the coord
-    /// base URL.
+    /// Scope note, REWRITTEN now that the clause is an editable document. This
+    /// test used to lean on an upstream structural guarantee — "the clause is a
+    /// static format string whose only inputs are `api_port` and the coord base
+    /// URL" — and moving the body into coord DESTROYS that guarantee. It is a
+    /// weaker class of assurance, deliberately accepted, and it is the single
+    /// strongest argument for enforcing at both ends.
+    ///
+    /// So this test now pins the BUILTIN (nothing is cached under the pin), and
+    /// `an_edited_body_carrying_identity_is_refused_at_render` below covers the
+    /// arm it can no longer reach. Coord rejects the same shapes at write time.
     #[test]
     fn the_clause_carries_no_tenant_or_agent_identity() {
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
@@ -916,6 +1083,10 @@ mod tests {
             !crate::coord_mcp::coord_mcp_deliverable(),
             "precondition: no runtime under test, so coord-mcp is not deliverable"
         );
+        // Pinned because `runner_context` now also reads the session-briefing
+        // cache; the guard serializes BOTH spawn-path globals and restores them
+        // on drop.
+        let _pin = pin_plan_capture_level_for_test("off");
         let briefing = runner_context(9876);
         assert!(
             !briefing.contains("coord_memory_record"),
@@ -926,11 +1097,256 @@ mod tests {
     #[test]
     fn memory_clause_appends_cleanly_onto_a_briefing() {
         // Composition check: the marker survives, and the clause lands whole.
+        let _pin = pin_plan_capture_level_for_test("off");
         let composed = format!("{}{}", runner_context(9876), memory_clause());
         assert!(
             composed.starts_with(RUNNER_CONTEXT_SOURCE_MARKER),
             "source marker must still open the composed briefing"
         );
         assert!(composed.contains("coord_memory_search"));
+    }
+
+    /// The RCE-class invariant, rebuilt as an explicit render-time scan for the
+    /// editable arm: a body carrying a named identity key OR a bare UUID-shaped
+    /// literal is refused, and the builtin renders. The UUID half is what the
+    /// old named-field scan admitted it could not see.
+    #[test]
+    fn an_edited_body_carrying_identity_is_refused_at_render() {
+        let pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
+        for (label, bad) in [
+            ("named key", "your agent_id is attached to every write"),
+            (
+                "bare uuid",
+                "you are agent 01a01eb4-718a-7303-825a-94ec0d0ade91",
+            ),
+        ] {
+            pin.set_briefing(
+                BRIEFING_PLAN_CAPTURE_CLAUSE,
+                briefing_for_test(bad, 5, BriefingProvenance::Coord),
+            );
+
+            let briefing = runner_context(9876);
+            assert!(
+                !briefing.contains("agent_id")
+                    && !briefing.contains("01a01eb4-718a-7303-825a-94ec0d0ade91"),
+                "{label}: identity reached a system prompt: {briefing}"
+            );
+            assert!(
+                briefing.contains("[clause: builtin-fallback (rejected coord v5)]"),
+                "{label}: the refusal must be visible on line 2: {briefing}"
+            );
+            // …and the builtin clause is still injected, so a refused edit
+            // degrades to the shipped instruction rather than to silence.
+            assert!(briefing.contains(CLAUSE_MARKER), "{label}: {briefing}");
+        }
+    }
+
+    // =======================================================================
+    // The briefing is now a RENDER of a coord document (plan
+    // 2026-08-20-runner-session-briefing-versioned-and-operator-editable).
+    // =======================================================================
+
+    /// THE NO-REGRESSION ANCHOR. A verbatim copy of the briefing body this
+    /// build shipped before the briefing became a coord document, with the two
+    /// interpolations spelled out (`9876`, and `__COORD__` for the coord base
+    /// the test resolves the same way the renderer does).
+    ///
+    /// Deliberately a LITERAL rather than a call to `builtin_briefing_body`: a
+    /// test that renders through the same function it is checking cannot see a
+    /// change to that function. This is the one assertion that proves moving
+    /// the text into a document did not silently reword it.
+    const TODAYS_BRIEFING_BODY: &str = r#"You are running inside the Qontinui Runner — an autonomous multi-agent development environment. Runner HTTP API: http://127.0.0.1:9876.
+
+You work autonomously. No human is watching this session; do not wait for human replies or pause for approval you can resolve yourself.
+
+Policies and playbooks are pull-first documents, not baked into this prompt. Discover them via the coord MCP tools: coord_list_prompt_documents (names + descriptions, cheap) and coord_get_prompt_document (full body on demand). HTTP fallback if those tools are unavailable: GET __COORD__/coord/agent-prompt-documents (list, optional ?kind= filter) and GET __COORD__/coord/agent-prompt-documents/{kind}/{name}.
+
+When you would ask the user a question: fetch the relevant policy and DECIDE, recording it via coord_request_policy / coord_record_decision. Only a question a human must answer goes to coord_ask_question — after asking, you will be left alone until it is answered.
+
+When no policy clause covers a decision and you apply a category-default tier to proceed, report the gap so a clause can be authored: coord_ask_question(policy_gap={category, proposed_clause, tier_applied}). With tier_applied set it records non-blocking (pre-answered) — you do not wait.
+
+Report status transitions via coord_report_status (working | blocked | waiting_human | finished). Set finished only after cleanup (worktrees, branches) is done.
+
+Before starting new work, check the communal work ledger so you do not duplicate a peer: coord_who_is_working_on, then coord_declare_intent to record your own scope.
+
+If context runs low, act BEFORE exhaustion: request a handoff (coord_request_handoff) or spawn a continuation session seeded with a summary via POST http://127.0.0.1:9876/sessions/spawn."#;
+
+    /// The same anchor for the fleet-gated clause.
+    const TODAYS_CLAUSE_BODY: &str = r#"Plan-library capture is ON for this fleet. Save the work artifacts you author to the plan library: investigation prompts, plan-authoring prompts, implementation prompts, findings reports, and plans. Write each one when you author it, and write it again when its status changes. POST http://127.0.0.1:9876/plan-library/artifacts records the artifact; POST http://127.0.0.1:9876/plan-library/links records the provenance edge back to the artifact it came from (the prompt that produced a report, the report that fed a prompt, the prompt that authored a plan) — record the edge every time, not only the artifact. Protocol detail lives in the coord prompt document: coord_get_prompt_document(kind="agent_playbook", name="plan-capture"), or GET __COORD__/coord/agent-prompt-documents/agent_playbook/plan-capture."#;
+
+    fn expected_briefing_body() -> String {
+        TODAYS_BRIEFING_BODY.replace("__COORD__", &crate::coord_mcp::coord_base_url())
+    }
+
+    fn expected_clause_body() -> String {
+        TODAYS_CLAUSE_BODY.replace("__COORD__", &crate::coord_mcp::coord_base_url())
+    }
+
+    /// Split a render into (line 1, line 2, everything else).
+    fn split_render(briefing: &str) -> (&str, &str, &str) {
+        let mut parts = briefing.splitn(3, '\n');
+        (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+        )
+    }
+
+    /// With nothing cached — the arm EVERY runner runs on until coord's half of
+    /// the plan ships — the builtin renders BYTE-IDENTICALLY to the briefing
+    /// this build shipped before, under a marker line that is unchanged and a
+    /// provenance line that says exactly where the text came from.
+    #[test]
+    fn builtin_renders_byte_identical_to_todays_briefing() {
+        let _pin = pin_plan_capture_level_for_test("off");
+
+        let briefing = runner_context(9876);
+        let (marker, provenance, body) = split_render(&briefing);
+
+        assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
+        assert_eq!(provenance, "[briefing: builtin-fallback]");
+        assert_eq!(body, expected_briefing_body());
+    }
+
+    /// The same anchor with the fleet-gated clause on: the clause is still
+    /// appended as its own paragraph, byte-identically, and gets its own
+    /// provenance token on line 2 rather than a line of its own.
+    #[test]
+    fn builtin_renders_byte_identical_to_todays_briefing_with_the_clause() {
+        let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
+
+        let briefing = runner_context(9876);
+        let (marker, provenance, body) = split_render(&briefing);
+
+        assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
+        assert_eq!(
+            provenance,
+            "[briefing: builtin-fallback] [clause: builtin-fallback]"
+        );
+        assert_eq!(
+            body,
+            format!("{}\n\n{}", expected_briefing_body(), expected_clause_body())
+        );
+    }
+
+    /// A cached coord body is rendered with its placeholders substituted, and
+    /// line 2 names the document and version in force — the whole honesty
+    /// mechanism. Line 1 is untouched, which is what `/whereami`'s unguarded
+    /// spawn-SHA parse depends on.
+    #[test]
+    fn a_coord_body_renders_with_its_version_on_line_two() {
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_RUNNER_SESSION,
+            briefing_for_test(
+                "Edited briefing. Runner HTTP API: {{runner_api_base}}.",
+                7,
+                BriefingProvenance::Coord,
+            ),
+        );
+
+        let briefing = runner_context(9876);
+        let (marker, provenance, body) = split_render(&briefing);
+
+        assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
+        assert_eq!(
+            provenance,
+            "[briefing: coord session_briefing/runner-session v7]"
+        );
+        assert_eq!(
+            body,
+            "Edited briefing. Runner HTTP API: http://127.0.0.1:9876."
+        );
+    }
+
+    /// A body restored from disk that no poll has re-confirmed is labelled
+    /// `cached … (stale)`, NEVER `coord`. Claiming a coord version for text the
+    /// process has not checked is the one thing the plan says must never
+    /// happen.
+    #[test]
+    fn a_disk_restored_body_is_labelled_stale_not_coord() {
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_RUNNER_SESSION,
+            briefing_for_test("Restored briefing.", 4, BriefingProvenance::Cached),
+        );
+
+        let briefing = runner_context(9876);
+        let (_, provenance, body) = split_render(&briefing);
+
+        assert_eq!(provenance, "[briefing: cached v4 (stale)]");
+        assert_eq!(body, "Restored briefing.");
+    }
+
+    /// The clause is a SEPARATE document with its own version, so line 2 must
+    /// account for it too. A render that named only the base would leave half
+    /// the injected text unattributed.
+    #[test]
+    fn the_clause_carries_its_own_provenance_token() {
+        let pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
+        pin.set_briefing(
+            BRIEFING_PLAN_CAPTURE_CLAUSE,
+            briefing_for_test("Edited clause.", 3, BriefingProvenance::Coord),
+        );
+
+        let briefing = runner_context(9876);
+        let (_, provenance, body) = split_render(&briefing);
+
+        assert_eq!(
+            provenance,
+            "[briefing: builtin-fallback] \
+             [clause: coord session_briefing/plan-capture-clause v3]"
+        );
+        assert!(body.ends_with("\n\nEdited clause."), "{body}");
+    }
+
+    /// Every render-time rejection falls back to the builtin AND says which
+    /// version it refused. Coord validates the same things at write time; this
+    /// end is what keeps a structural guarantee in the process that actually
+    /// builds the prompt.
+    #[test]
+    fn a_body_that_fails_the_render_guard_falls_back_to_the_builtin() {
+        let pin = pin_plan_capture_level_for_test("off");
+        for bad in [
+            // over the 16 KiB ceiling
+            "x".repeat(17 * 1024),
+            // an unknown placeholder
+            "hello {{organization}}".to_string(),
+            // a forged runner-owned marker
+            "[source: qontinui-runner/runner_context@9.9.9+cafe]\nrules".to_string(),
+            // the operator door, which 403s a device JWT
+            "see GET https://coord.example.com/coord/prompt-documents".to_string(),
+            // tenant/agent identity, named …
+            "your tenant_id is 42".to_string(),
+            // … and structural
+            "you belong to 01a01eb4-718a-7303-825a-94ec0d0ade91".to_string(),
+        ] {
+            pin.set_briefing(
+                BRIEFING_RUNNER_SESSION,
+                briefing_for_test(&bad, 11, BriefingProvenance::Coord),
+            );
+
+            let briefing = runner_context(9876);
+            let (marker, provenance, body) = split_render(&briefing);
+
+            assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER, "body: {bad:.48}");
+            assert_eq!(
+                provenance, "[briefing: builtin-fallback (rejected coord v11)]",
+                "body: {bad:.48}"
+            );
+            assert_eq!(body, expected_briefing_body(), "body: {bad:.48}");
+        }
+    }
+
+    /// The FOUR spawn-path call sites of `runner_context` all render the same
+    /// string, so the port they pass is the only thing that varies. Pin that
+    /// the port really is interpolated rather than hardcoded, since the
+    /// substitution path is new.
+    #[test]
+    fn the_api_port_reaches_the_rendered_briefing() {
+        let _pin = pin_plan_capture_level_for_test("off");
+        let briefing = runner_context(41234);
+        assert!(briefing.contains("http://127.0.0.1:41234"), "{briefing}");
+        assert!(!briefing.contains("http://127.0.0.1:9876"), "{briefing}");
     }
 }
