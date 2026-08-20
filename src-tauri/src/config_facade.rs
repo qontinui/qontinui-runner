@@ -269,6 +269,20 @@ impl SettingsField for crate::step_output::script_emitter::ScriptedOutputSetting
     }
 }
 
+impl SettingsField for crate::cost_management::budget::TokenBudget {
+    fn get_from(settings: &Settings) -> &Self {
+        &settings.cost_budget
+    }
+
+    fn set_in(settings: &mut Settings, value: Self) {
+        settings.cost_budget = value;
+    }
+
+    fn field_name() -> &'static str {
+        "cost_budget"
+    }
+}
+
 impl SettingsField for crate::settings::HelperTasksSettings {
     fn get_from(settings: &Settings) -> &Self {
         &settings.helper_tasks
