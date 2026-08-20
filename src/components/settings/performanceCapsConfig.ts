@@ -125,22 +125,20 @@ export const PERF_CAP_FIELDS: readonly PerfCapField[] = [
     type: "number",
     label: "Background pane flush interval",
     description:
-      "Output flush cadence for a pane that is mounted but not the one you are looking at. Higher means less render work and choppier updates on those panes.",
+      "Output flush cadence for a pane that is mounted but not the one you are looking at. Higher means less render work and choppier updates on those panes; 0 disables coalescing entirely. Applies to terminals opened after the save.",
     min: 0,
     max: 10_000,
     unit: "ms",
-    pendingPhase: "visibility-tiered emission (perf plan Phase 5)",
   },
   {
     key: "unwatched_flush_interval_ms",
     type: "number",
     label: "Unwatched session flush interval",
     description:
-      "Flush cadence for a session with no mounted pane at all. 0 means no webview emit — output accumulates in the scrollback ring and replays when you reveal the pane, which is the cheapest and the default.",
+      "Flush cadence for a session with no mounted pane at all. 0 means no webview emit — output accumulates in the scrollback ring and replays when you reveal the pane, which is the cheapest and the default. A positive value keeps such sessions streaming at that cadence instead, so a reveal needs no replay. Applies to terminals opened after the save.",
     min: 0,
     max: 60_000,
     unit: "ms",
-    pendingPhase: "visibility-tiered emission (perf plan Phase 5)",
   },
   {
     key: "scrollback_capacity_bytes",

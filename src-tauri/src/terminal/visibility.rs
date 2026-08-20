@@ -15,8 +15,8 @@
 //! | tier         | webview `terminal-output`                  | state tracking fed by |
 //! |--------------|--------------------------------------------|-----------------------|
 //! | `focused`    | every coalesced frame (unchanged)          | the pane + page tap   |
-//! | `background` | coalesced to ≥ [`BACKGROUND_FLUSH_INTERVAL`] flushes | the page tap |
-//! | `unwatched`  | nothing at all                             | [`ACTIVITY_EVENT`]    |
+//! | `background` | coalesced to ≥ the background flush interval | the page tap |
+//! | `unwatched`  | nothing at all, or coalesced to ≥ the unwatched flush interval | [`ACTIVITY_EVENT`], or the page tap |
 //!
 //! **Only the webview leg is tiered.** The SSE broadcast
 //! (`GET /terminals/{id}/stream`), the WS relay used by the mobile client and
@@ -56,10 +56,17 @@ use tracing::{info, warn};
 /// `{ terminalId, totalBytesProduced, bytesDelta, lines }`.
 pub const ACTIVITY_EVENT: &str = "terminal-activity";
 
-/// Minimum spacing between webview `terminal-output` events for a
+/// DEFAULT minimum spacing between webview `terminal-output` events for a
 /// `background` session. Chunks that arrive inside the window accumulate and
 /// leave as ONE event, so a hidden pane costs at most 4 IPC dispatches per
 /// second no matter how fast its PTY talks.
+///
+/// This is the **default**, not the value in force: the spacing actually used
+/// is [`crate::settings::PerformanceSettings::background_flush_interval`],
+/// resolved once per session at spawn and passed into
+/// [`BackgroundHold::take_if_due`]. This constant is what
+/// `default_background_flush_interval_ms` returns, so "no `performance` key in
+/// settings.json" and "the constant the tier always used" cannot drift apart.
 pub const BACKGROUND_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Byte cap for a held `background` window: flush early rather than ship one
@@ -80,6 +87,14 @@ pub const ACTIVITY_DIGEST_LINES: usize = 20;
 /// ([`BACKGROUND_FLUSH_INTERVAL`]); the digest is spaced by its own
 /// per-session elapsed check, so a faster tick never emits digests faster
 /// than [`ACTIVITY_DIGEST_INTERVAL`].
+///
+/// Deliberately NOT tied to the operator's configured flush interval. It is
+/// the resolution of the *quiet-tail* path only — the reader thread flushes a
+/// due window on the very next chunk, so a configured interval below this tick
+/// is served at full precision while a session is talking, and rounded up to
+/// the tick only for the tail of a burst. Driving the sweep from a per-session
+/// setting would mean one timer per session, which is the cost this single
+/// process-wide sweeper exists to avoid.
 const SWEEP_TICK: Duration = Duration::from_millis(250);
 
 /// How much of a session's per-chunk service the operator is actually
@@ -96,11 +111,16 @@ pub enum VisibilityTier {
     Focused,
     /// A pane is mounted but hidden (parked, compacted, non-maximized zone):
     /// nothing renders it, but the page-level output tap still feeds state
-    /// tracking from it, so emission continues — coalesced to
-    /// [`BACKGROUND_FLUSH_INTERVAL`].
+    /// tracking from it, so emission continues — coalesced to the configured
+    /// background flush interval (default [`BACKGROUND_FLUSH_INTERVAL`]).
     Background,
-    /// No pane is mounted for this terminal in any window. The webview leg is
-    /// off entirely; state tracking is fed by [`ACTIVITY_EVENT`].
+    /// No pane is mounted for this terminal in any window. By default the
+    /// webview leg is off entirely and state tracking is fed by
+    /// [`ACTIVITY_EVENT`]; a positive
+    /// `PerformanceSettings::unwatched_flush_interval_ms` instead coalesces to
+    /// that cadence, and the page tap feeds tracking as it does for
+    /// `background` (the digest stands down — see
+    /// `TerminalSession::emit_activity_digest_if_due`).
     Unwatched,
 }
 
@@ -263,19 +283,29 @@ impl BackgroundHold {
         self.pending.is_empty()
     }
 
-    /// Whether the held window should leave now: the ≥250 ms spacing elapsed,
-    /// or the byte cap tripped (flush early rather than ship one huge event).
-    pub fn is_due(&self, now: Instant) -> bool {
+    /// Whether the held window should leave now: `interval` elapsed since the
+    /// last flush, or the byte cap tripped (flush early rather than ship one
+    /// huge event).
+    ///
+    /// The spacing is a PARAMETER rather than a constant because it is
+    /// operator-tunable per tier
+    /// ([`crate::settings::PerformanceSettings::background_flush_interval`] /
+    /// [`crate::settings::PerformanceSettings::unwatched_flush_interval`]) and
+    /// a session's tier can change under a non-empty hold. Passing it in keeps
+    /// this type interval-injected as well as clock-injected, so both cadences
+    /// are unit-testable without a PTY. `Duration::ZERO` is meaningful: it
+    /// means "no coalescing", every chunk leaves as it arrives.
+    pub fn is_due(&self, now: Instant, interval: Duration) -> bool {
         if self.pending.is_empty() {
             return false;
         }
         self.pending.len() >= BACKGROUND_HOLD_BYTE_CAP
-            || now.saturating_duration_since(self.last_flush) >= BACKGROUND_FLUSH_INTERVAL
+            || now.saturating_duration_since(self.last_flush) >= interval
     }
 
     /// Take the held window if it is due, restarting the spacing clock.
-    pub fn take_if_due(&mut self, now: Instant) -> Option<(Vec<u8>, u64)> {
-        if !self.is_due(now) {
+    pub fn take_if_due(&mut self, now: Instant, interval: Duration) -> Option<(Vec<u8>, u64)> {
+        if !self.is_due(now, interval) {
             return None;
         }
         self.take_now(now)
@@ -365,7 +395,7 @@ pub struct TerminalActivityWire<'a> {
     pub lines: Vec<String>,
 }
 
-/// One sweep: flush any `background` window whose ≥250 ms deadline has passed
+/// One sweep: flush any held window whose configured flush deadline has passed
 /// and emit any due `unwatched` digest. Both are per-session no-ops with a
 /// couple of relaxed atomic loads when there is nothing outstanding.
 pub fn sweep_once(live_windows: &BTreeSet<String>, windows_changed: bool) {
@@ -551,10 +581,12 @@ mod tests {
         hold.push(b"alpha", 100);
         hold.push(b"beta", 105);
         hold.push(b"gamma", 109);
-        assert!(hold.take_if_due(t0 + Duration::from_millis(249)).is_none());
+        assert!(hold
+            .take_if_due(t0 + Duration::from_millis(249), BACKGROUND_FLUSH_INTERVAL)
+            .is_none());
 
         let (payload, offset) = hold
-            .take_if_due(t0 + Duration::from_millis(250))
+            .take_if_due(t0 + Duration::from_millis(250), BACKGROUND_FLUSH_INTERVAL)
             .expect("the 250 ms window elapsed");
         assert_eq!(payload, b"alphabetagamma");
         assert_eq!(offset, 100, "stamped at the first held byte");
@@ -569,14 +601,17 @@ mod tests {
         let mut hold = BackgroundHold::new(t0);
         hold.push(b"one", 0);
         let t1 = t0 + Duration::from_millis(300);
-        assert!(hold.take_if_due(t1).is_some());
+        assert!(hold.take_if_due(t1, BACKGROUND_FLUSH_INTERVAL).is_some());
 
         hold.push(b"two", 3);
         assert!(
-            hold.take_if_due(t1 + Duration::from_millis(200)).is_none(),
+            hold.take_if_due(t1 + Duration::from_millis(200), BACKGROUND_FLUSH_INTERVAL)
+                .is_none(),
             "only 200 ms since the last flush"
         );
-        assert!(hold.take_if_due(t1 + Duration::from_millis(260)).is_some());
+        assert!(hold
+            .take_if_due(t1 + Duration::from_millis(260), BACKGROUND_FLUSH_INTERVAL)
+            .is_some());
     }
 
     /// A firehose must not buffer unboundedly waiting for the clock.
@@ -586,7 +621,7 @@ mod tests {
         let mut hold = BackgroundHold::new(t0);
         hold.push(&vec![b'x'; BACKGROUND_HOLD_BYTE_CAP], 0);
         let (payload, _) = hold
-            .take_if_due(t0)
+            .take_if_due(t0, BACKGROUND_FLUSH_INTERVAL)
             .expect("the byte cap trips regardless of elapsed time");
         assert_eq!(payload.len(), BACKGROUND_HOLD_BYTE_CAP);
     }
@@ -597,8 +632,13 @@ mod tests {
     fn background_hold_is_never_due_while_empty() {
         let t0 = Instant::now();
         let mut hold = BackgroundHold::new(t0);
-        assert!(!hold.is_due(t0 + Duration::from_secs(60)));
-        assert!(hold.take_if_due(t0 + Duration::from_secs(60)).is_none());
+        assert!(!hold.is_due(t0 + Duration::from_secs(60), BACKGROUND_FLUSH_INTERVAL));
+        assert!(hold
+            .take_if_due(t0 + Duration::from_secs(60), BACKGROUND_FLUSH_INTERVAL)
+            .is_none());
+        // ...and an interval of zero does not turn "empty" into "due": no
+        // coalescing still means nothing to ship when nothing was pushed.
+        assert!(!hold.is_due(t0, Duration::ZERO));
     }
 
     /// A tier change out of `background` ships held bytes immediately, so
@@ -612,6 +652,38 @@ mod tests {
         assert_eq!(payload, b"held");
         assert_eq!(offset, 7);
         assert!(hold.take_now(t0).is_none(), "nothing left to ship");
+    }
+
+    /// The spacing honoured is the one PASSED IN, not the compiled-in default
+    /// — the whole point of making it a parameter. An operator who raises
+    /// `background_flush_interval_ms` to 1 s must not get a 250 ms flush.
+    #[test]
+    fn background_hold_honours_a_caller_supplied_interval() {
+        let t0 = Instant::now();
+        let mut hold = BackgroundHold::new(t0);
+        hold.push(b"slow", 0);
+        let slow = Duration::from_millis(1000);
+        assert!(
+            hold.take_if_due(t0 + Duration::from_millis(400), slow)
+                .is_none(),
+            "400 ms is due under the 250 ms default but NOT under a 1 s setting"
+        );
+        assert!(hold.take_if_due(t0 + slow, slow).is_some());
+    }
+
+    /// `0` is the documented "no coalescing" setting: a held chunk is due
+    /// immediately. It must not be read as "never due" (a `>=` vs `>` slip),
+    /// which would buffer an emitting tier forever.
+    #[test]
+    fn background_hold_zero_interval_is_due_immediately() {
+        let t0 = Instant::now();
+        let mut hold = BackgroundHold::new(t0);
+        hold.push(b"now", 0);
+        let (payload, offset) = hold
+            .take_if_due(t0, Duration::ZERO)
+            .expect("a zero interval means no coalescing");
+        assert_eq!(payload, b"now");
+        assert_eq!(offset, 0);
     }
 
     // ---- activity digest cadence ----

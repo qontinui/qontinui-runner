@@ -2678,15 +2678,21 @@ pub struct PerformanceSettings {
     #[serde(default = "default_max_webgl_panes")]
     pub max_webgl_panes: u32,
     /// Flush cadence (ms) for the `background` emission tier — a pane that
-    /// is mounted but not the one the operator is looking at. Consumed by
-    /// the visibility-tiered emission path.
+    /// is mounted but not the one the operator is looking at. Chunks arriving
+    /// inside the window accumulate and leave as one `terminal-output` event.
+    /// `0` means no coalescing (every chunk leaves as it arrives); the
+    /// [`crate::terminal::visibility::BACKGROUND_HOLD_BYTE_CAP`] early flush
+    /// applies at every setting. Read through
+    /// [`Self::background_flush_interval`] by `TerminalSession::spawn`.
     #[serde(default = "default_background_flush_interval_ms")]
     pub background_flush_interval_ms: u64,
     /// Flush cadence (ms) for the `unwatched` emission tier — a session with
     /// no mounted pane at all. `0` (the default) means **no webview emit**:
-    /// output accumulates in the scrollback ring and replays on reveal.
-    /// A positive value emits at that cadence instead. Consumed by the
-    /// visibility-tiered emission path.
+    /// output accumulates in the scrollback ring and replays on reveal, and
+    /// state tracking is fed by the `terminal-activity` digest instead.
+    /// A positive value emits at that cadence instead, and the digest stands
+    /// down for that session so the page tap does not double-count it. Read
+    /// through [`Self::unwatched_flush_interval`] by `TerminalSession::spawn`.
     #[serde(default)]
     pub unwatched_flush_interval_ms: u64,
     /// Per-session scrollback ring capacity in bytes. This ring is the
@@ -2738,8 +2744,11 @@ fn default_max_webgl_panes() -> u32 {
     8
 }
 
+/// The `background` tier's historical spacing, so "no `performance` key in
+/// settings.json" and "the constant the tier always used" cannot drift apart —
+/// the same tie `default_scrollback_capacity_bytes` makes.
 fn default_background_flush_interval_ms() -> u64 {
-    250
+    crate::terminal::visibility::BACKGROUND_FLUSH_INTERVAL.as_millis() as u64
 }
 
 /// The reader thread's historical ring size, so "no `performance` key in
@@ -2781,6 +2790,32 @@ impl PerformanceSettings {
     /// Scrollback ring capacity with the floor applied.
     pub fn effective_scrollback_capacity(&self) -> usize {
         self.scrollback_capacity_bytes.max(MIN_SCROLLBACK_CAPACITY)
+    }
+
+    /// The `background` tier's flush spacing, as the emission path wants it.
+    ///
+    /// No floor, deliberately: unlike the grid scanners and the scrollback
+    /// ring, a too-small value here cannot starve anything or allocate — `0`
+    /// simply means "no coalescing", which is a coherent (if unhelpful)
+    /// choice, and the byte cap still bounds a single event either way. The
+    /// settings panel declares `min: 0` for the same reason.
+    pub fn background_flush_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.background_flush_interval_ms)
+    }
+
+    /// The `unwatched` tier's flush spacing, or `None` when the tier emits
+    /// nothing to the webview at all.
+    ///
+    /// `0` is not "flush immediately" here — it is the tier's documented OFF
+    /// switch and the stock default, which is why this returns an `Option`
+    /// rather than a bare `Duration`. Collapsing the two would turn every
+    /// stock install's silent `unwatched` tier into an uncoalesced firehose,
+    /// i.e. the exact regression Phase 5 exists to prevent.
+    pub fn unwatched_flush_interval(&self) -> Option<std::time::Duration> {
+        match self.unwatched_flush_interval_ms {
+            0 => None,
+            ms => Some(std::time::Duration::from_millis(ms)),
+        }
     }
 }
 
@@ -5015,6 +5050,56 @@ mod performance_settings_tests {
         assert_eq!(p.effective_scrollback_capacity(), MIN_SCROLLBACK_CAPACITY);
         let stock = PerformanceSettings::default();
         assert_eq!(stock.effective_scrollback_capacity(), 1_048_576);
+    }
+
+    /// The `background` knob reaches the emission path as the operator's own
+    /// value — no floor, no rounding. The regression this pins is the one the
+    /// merge-train plan's D3 found: the field existed, was persisted and was
+    /// documented as consumed, while the tier used a compiled-in 250 ms.
+    #[test]
+    fn background_flush_interval_is_the_stored_value() {
+        use std::time::Duration;
+        assert_eq!(
+            PerformanceSettings::default().background_flush_interval(),
+            crate::terminal::visibility::BACKGROUND_FLUSH_INTERVAL,
+            "the stock value must still be the constant the tier used before"
+        );
+        let p = PerformanceSettings {
+            background_flush_interval_ms: 1000,
+            ..PerformanceSettings::default()
+        };
+        assert_eq!(p.background_flush_interval(), Duration::from_millis(1000));
+        let none = PerformanceSettings {
+            background_flush_interval_ms: 0,
+            ..PerformanceSettings::default()
+        };
+        assert_eq!(
+            none.background_flush_interval(),
+            Duration::ZERO,
+            "0 is 'no coalescing', not a floor to be clamped away"
+        );
+    }
+
+    /// `unwatched_flush_interval_ms` is tri-state-ish: `0` is the tier's OFF
+    /// switch (and the stock default), anything positive is a cadence. A
+    /// `Duration::ZERO` leaking out here would turn every stock install's
+    /// silent tier into an uncoalesced emitter.
+    #[test]
+    fn unwatched_flush_interval_zero_means_no_webview_emit() {
+        use std::time::Duration;
+        assert_eq!(
+            PerformanceSettings::default().unwatched_flush_interval(),
+            None,
+            "stock behavior: the unwatched tier emits nothing to the webview"
+        );
+        let p = PerformanceSettings {
+            unwatched_flush_interval_ms: 2000,
+            ..PerformanceSettings::default()
+        };
+        assert_eq!(
+            p.unwatched_flush_interval(),
+            Some(Duration::from_millis(2000))
+        );
     }
 
     /// The pin seam serves what it was given, so the tests that exercise a

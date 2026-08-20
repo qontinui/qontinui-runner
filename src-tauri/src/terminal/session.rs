@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, oneshot};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -75,6 +75,25 @@ pub(crate) const SCROLLBACK_CAPACITY: usize = 1_048_576;
 /// megabyte per open session.
 fn resolved_scrollback_capacity() -> usize {
     crate::settings::get_performance_settings().effective_scrollback_capacity()
+}
+
+/// The visibility-tier flush cadences this process should give a session
+/// spawned now: `(background, unwatched)`, where the second is `None` when the
+/// `unwatched` tier is to emit nothing at all (the stock default).
+///
+/// Resolved once per spawn from the same process-cached snapshot
+/// [`resolved_scrollback_capacity`] reads, and for the same reason: no
+/// settings-file I/O on the spawn path, and a saved change applies to the next
+/// terminal rather than mutating the cadence a live reader thread and the
+/// sweeper have already agreed on. Both halves of a session's emission — the
+/// reader thread's on-chunk flush and the sweeper's quiet-tail flush — read the
+/// session's own copy, so they can never disagree mid-life.
+fn resolved_flush_intervals() -> (Duration, Option<Duration>) {
+    let perf = crate::settings::get_performance_settings();
+    (
+        perf.background_flush_interval(),
+        perf.unwatched_flush_interval(),
+    )
 }
 
 /// Append a chunk of processed PTY output to a session's scrollback ring
@@ -227,8 +246,8 @@ impl EmissionGate {
 enum WebviewAdmission {
     /// Emit this payload as its own `terminal-output` event now.
     Now,
-    /// Accumulate it into the session's background window; it leaves with the
-    /// next flush (≥250 ms, or the byte cap).
+    /// Accumulate it into the session's hold window; it leaves with the next
+    /// flush (the tier's configured interval, or the byte cap).
     Hold,
     /// Do not deliver it to the webview at all. The chunk still reached the
     /// scrollback ring, SSE, WS and coord upstream of this decision.
@@ -248,12 +267,17 @@ enum WebviewAdmission {
 ///   nothing render-acks; the gate has no ack source and would wedge at the
 ///   high watermark (which is precisely why the frontend used to synthesize
 ///   proxy-acks for it). The tier itself is the flow control instead: at most
-///   one event per [`BACKGROUND_FLUSH_INTERVAL`], bounded by
-///   [`BACKGROUND_HOLD_BYTE_CAP`]. Deterministic, and one fewer IPC round trip
-///   per frame than the acks it replaces.
-/// - `Unwatched` — no pane anywhere: nothing is emitted. `Skip` reports back
-///   whether the caller should raise `emission_skipped`, which is what makes a
-///   later upgrade emit a resume marker and pull a ring resync.
+///   one event per configured flush interval (default
+///   [`BACKGROUND_FLUSH_INTERVAL`]), bounded by [`BACKGROUND_HOLD_BYTE_CAP`].
+///   Deterministic, and one fewer IPC round trip per frame than the acks it
+///   replaces.
+/// - `Unwatched` — no pane anywhere. By default nothing is emitted; `Skip`
+///   reports back whether the caller should raise `emission_skipped`, which is
+///   what makes a later upgrade emit a resume marker and pull a ring resync.
+///   When the operator has set a positive
+///   `PerformanceSettings::unwatched_flush_interval_ms` (`unwatched_holds`),
+///   the tier coalesces at that cadence instead of going dark — so nothing is
+///   ever missed, and no resume marker is owed.
 ///
 /// `gated` is false only for the reader's exit flush: a dying terminal's final
 /// frame has no successor chunk to reveal a gap, so it ships regardless of tier
@@ -263,11 +287,13 @@ fn admit_to_webview(
     gated: bool,
     gate: &mut EmissionGate,
     gap: u64,
+    unwatched_holds: bool,
 ) -> WebviewAdmission {
     if !gated {
         return WebviewAdmission::Now;
     }
     match tier {
+        VisibilityTier::Unwatched if unwatched_holds => WebviewAdmission::Hold,
         VisibilityTier::Unwatched => WebviewAdmission::Skip,
         VisibilityTier::Background => WebviewAdmission::Hold,
         VisibilityTier::Focused => {
@@ -277,6 +303,24 @@ fn admit_to_webview(
                 WebviewAdmission::Skip
             }
         }
+    }
+}
+
+/// The flush spacing that governs a held window for `tier`.
+///
+/// A session's hold is one buffer shared by both tiers that can fill it, and
+/// the tier can change while bytes sit in it — so the interval is resolved per
+/// call from the CURRENT tier rather than fixed on the hold. `Focused` cannot
+/// hold (its bytes go out under the gate, draining the hold first), so the
+/// background cadence is the harmless fallback rather than a claim about it.
+fn hold_interval(
+    tier: VisibilityTier,
+    background: Duration,
+    unwatched: Option<Duration>,
+) -> Duration {
+    match tier {
+        VisibilityTier::Unwatched => unwatched.unwrap_or(background),
+        VisibilityTier::Background | VisibilityTier::Focused => background,
     }
 }
 
@@ -633,6 +677,16 @@ pub struct TerminalSession {
     /// also the serialization point for this session's webview emission, which
     /// is what keeps held bytes ahead of anything emitted after a tier change.
     background_hold: Arc<Mutex<BackgroundHold>>,
+    /// Flush spacing for the `background` tier, resolved once at spawn from
+    /// `settings.performance` (many-sessions plan Phase 8). Read by the
+    /// sweeper's quiet-tail flush; the reader thread carries its own copy.
+    background_flush_interval: Duration,
+    /// Flush spacing for the `unwatched` tier, or `None` (the stock default)
+    /// when that tier emits nothing to the webview at all. `Some` turns
+    /// [`Self::emit_activity_digest_if_due`] off for this session — the page
+    /// tap is then feeding tracking from real output and a digest would
+    /// double-count the activity sparkline.
+    unwatched_flush_interval: Option<Duration>,
     /// Cadence gate for the `terminal-activity` digest that feeds state
     /// tracking while this session is `unwatched`.
     activity_digest: Arc<Mutex<ActivityDigestState>>,
@@ -906,6 +960,11 @@ impl TerminalSession {
         let emission_skipped = Arc::new(AtomicBool::new(false));
         let visibility = Arc::new(VisibilityState::new());
         let background_hold = Arc::new(Mutex::new(BackgroundHold::new(Instant::now())));
+        // Operator-tunable emission cadences (Phase 8), resolved ONCE here for
+        // the same reason the ring size is: the reader thread and the sweeper
+        // must agree for this session's whole life even if the setting changes
+        // underneath them.
+        let (background_flush_interval, unwatched_flush_interval) = resolved_flush_intervals();
         let activity_digest = Arc::new(Mutex::new(ActivityDigestState::new(Instant::now())));
         // Operator-tunable ring size (Phase 8). Resolved ONCE here, then
         // carried by the reader thread — the ring is allocated to it and the
@@ -953,6 +1012,8 @@ impl TerminalSession {
         let reader_emission_skipped = emission_skipped.clone();
         let reader_visibility = visibility.clone();
         let reader_background_hold = background_hold.clone();
+        let reader_background_flush_interval = background_flush_interval;
+        let reader_unwatched_flush_interval = unwatched_flush_interval;
         let reader_scrollback = scrollback_buffer.clone();
         let reader_total_bytes = total_bytes_produced.clone();
         let reader_output_tx = output_tx.clone();
@@ -1038,6 +1099,7 @@ impl TerminalSession {
                         gated,
                         &mut emission_gate.borrow_mut(),
                         gap,
+                        reader_unwatched_flush_interval.is_some(),
                     );
                     if admission == WebviewAdmission::Skip {
                         // The webview is missing these bytes; raise the flag
@@ -1054,7 +1116,7 @@ impl TerminalSession {
 
                     // A held chunk is not the payload the webview will receive
                     // (the flush ships the whole accumulated window), so it
-                    // does not need encoding here — one encode per ≥250 ms
+                    // does not need encoding here — one encode per flush
                     // window instead of one per chunk.
                     let encoded = if to_sse || to_ws || admission == WebviewAdmission::Now {
                         Some(STANDARD.encode(payload))
@@ -1094,7 +1156,14 @@ impl TerminalSession {
                     match admission {
                         WebviewAdmission::Hold => {
                             hold.push(payload, offset);
-                            if let Some((window, window_offset)) = hold.take_if_due(now) {
+                            let interval = hold_interval(
+                                tier,
+                                reader_background_flush_interval,
+                                reader_unwatched_flush_interval,
+                            );
+                            if let Some((window, window_offset)) =
+                                hold.take_if_due(now, interval)
+                            {
                                 emit_terminal_output(
                                     &reader_app,
                                     &reader_id,
@@ -1423,6 +1492,8 @@ impl TerminalSession {
             emission_skipped,
             visibility,
             background_hold,
+            background_flush_interval,
+            unwatched_flush_interval,
             activity_digest,
             scrollback_buffer,
             total_bytes_produced,
@@ -2405,15 +2476,25 @@ impl TerminalSession {
         if before == after {
             return;
         }
-        // Leaving `background` with bytes still held: ship them now, so
+        // Leaving a tier that holds, with bytes still held: ship them now, so
         // nothing emitted under the new tier can overtake them.
-        if before == VisibilityTier::Background {
-            self.flush_background_window(true);
-        }
-        // Leaving `unwatched`: the webview missed everything produced while
-        // the session was dark. Emit the resume marker so the frontend's gap
-        // detection pulls a ring replay, and re-baseline the digest so the
+        //
+        // Unconditional rather than `before == Background`, because
+        // `unwatched` holds too once the operator configures a cadence for it.
+        // Making it conditional on the *previous* tier's holding-ness would
+        // read the setting a second time to decide, for no gain: the hold is
+        // empty on the `focused` edge anyway (that tier drains it before every
+        // emit), so `take_now` is a no-op there.
+        self.flush_background_window(true);
+        // Leaving `unwatched`: the webview may have missed everything produced
+        // while the session was dark. Emit the resume marker so the frontend's
+        // gap detection pulls a ring replay, and re-baseline the digest so the
         // next dark window reports only what it actually misses.
+        //
+        // Both are correctly no-ops when the tier was configured to emit:
+        // `emission_skipped` was never raised (nothing was `Skip`ped) so no
+        // marker goes out, and the digest never fired so its baseline is
+        // already current.
         if before == VisibilityTier::Unwatched {
             self.emit_resume_marker_if_skipped();
             if let Ok(mut st) = self.activity_digest.lock() {
@@ -2425,11 +2506,11 @@ impl TerminalSession {
         }
     }
 
-    /// Flush the held `background` window if its ≥250 ms spacing has elapsed
-    /// (or its byte cap tripped). Driven by the visibility sweeper so the tail
-    /// of a burst still lands when the session goes quiet mid-window — the
-    /// reader thread is parked in a blocking `read()` at exactly that moment
-    /// and could only act on the next byte, which may never come.
+    /// Flush the held window if its configured spacing has elapsed (or its
+    /// byte cap tripped). Driven by the visibility sweeper so the tail of a
+    /// burst still lands when the session goes quiet mid-window — the reader
+    /// thread is parked in a blocking `read()` at exactly that moment and could
+    /// only act on the next byte, which may never come.
     pub fn flush_background_window_if_due(&self) {
         self.flush_background_window(false);
     }
@@ -2446,7 +2527,14 @@ impl TerminalSession {
         let taken = if force {
             hold.take_now(now)
         } else {
-            hold.take_if_due(now)
+            hold.take_if_due(
+                now,
+                hold_interval(
+                    self.visibility.tier(),
+                    self.background_flush_interval,
+                    self.unwatched_flush_interval,
+                ),
+            )
         };
         // Emit under the lock: it is this session's webview ordering point.
         if let Some((window, offset)) = taken {
@@ -2461,7 +2549,16 @@ impl TerminalSession {
     /// still deliver `terminal-output`, which is what the page-level tap feeds
     /// state tracking from. Emitting for them too would duplicate that feed and
     /// double-count the activity sparkline.
+    ///
+    /// An operator who sets `unwatched_flush_interval_ms` puts this session's
+    /// `unwatched` tier back on `terminal-output` — so the page tap is feeding
+    /// tracking again and the digest falls under exactly the same
+    /// double-counting rule as `background`. It stands down for the session's
+    /// whole life, matching the cadence resolved at spawn.
     pub fn emit_activity_digest_if_due(&self) {
+        if self.unwatched_flush_interval.is_some() {
+            return;
+        }
         if self.visibility.tier() != VisibilityTier::Unwatched {
             return;
         }
@@ -2992,6 +3089,8 @@ mod tests {
             emission_skipped: Arc::new(AtomicBool::new(false)),
             visibility: Arc::new(VisibilityState::new()),
             background_hold: Arc::new(Mutex::new(BackgroundHold::new(Instant::now()))),
+            background_flush_interval: crate::terminal::visibility::BACKGROUND_FLUSH_INTERVAL,
+            unwatched_flush_interval: None,
             activity_digest: Arc::new(Mutex::new(ActivityDigestState::new(Instant::now()))),
             scrollback_buffer: Arc::new(Mutex::new(VecDeque::new())),
             total_bytes_produced: Arc::new(AtomicU64::new(0)),
@@ -3035,7 +3134,7 @@ mod tests {
     fn focused_tier_defers_entirely_to_the_flow_control_gate() {
         let mut gate = EmissionGate::new();
         assert_eq!(
-            admit_to_webview(VisibilityTier::Focused, true, &mut gate, 0),
+            admit_to_webview(VisibilityTier::Focused, true, &mut gate, 0, false),
             WebviewAdmission::Now
         );
         // Cross the high watermark → the gate pauses, as before Phase 5.
@@ -3044,7 +3143,8 @@ mod tests {
                 VisibilityTier::Focused,
                 true,
                 &mut gate,
-                FLOW_HIGH_WATERMARK + 1
+                FLOW_HIGH_WATERMARK + 1,
+                false
             ),
             WebviewAdmission::Skip
         );
@@ -3054,12 +3154,19 @@ mod tests {
                 VisibilityTier::Focused,
                 true,
                 &mut gate,
-                FLOW_LOW_WATERMARK + 1
+                FLOW_LOW_WATERMARK + 1,
+                false
             ),
             WebviewAdmission::Skip
         );
         assert_eq!(
-            admit_to_webview(VisibilityTier::Focused, true, &mut gate, FLOW_LOW_WATERMARK),
+            admit_to_webview(
+                VisibilityTier::Focused,
+                true,
+                &mut gate,
+                FLOW_LOW_WATERMARK,
+                false
+            ),
             WebviewAdmission::Now
         );
     }
@@ -3067,20 +3174,20 @@ mod tests {
     /// `background` never consults the gate: nothing renders a hidden pane, so
     /// no render-ack can ever arrive and an ack-gated tier would wedge at the
     /// high watermark (the wedge the frontend proxy-ack existed to paper over).
-    /// The ≥250 ms hold is the flow control instead.
+    /// The configured flush-interval hold is the flow control instead.
     #[test]
     fn background_tier_holds_and_never_wedges_on_acks() {
         let mut gate = EmissionGate::new();
         for gap in [0, FLOW_LOW_WATERMARK, FLOW_HIGH_WATERMARK * 100] {
             assert_eq!(
-                admit_to_webview(VisibilityTier::Background, true, &mut gate, gap),
+                admit_to_webview(VisibilityTier::Background, true, &mut gate, gap, false),
                 WebviewAdmission::Hold,
                 "gap {gap} must not change the background decision"
             );
         }
         // The gate was never advanced, so a return to `focused` starts open.
         assert_eq!(
-            admit_to_webview(VisibilityTier::Focused, true, &mut gate, 0),
+            admit_to_webview(VisibilityTier::Focused, true, &mut gate, 0, false),
             WebviewAdmission::Now
         );
     }
@@ -3092,10 +3199,61 @@ mod tests {
         let mut gate = EmissionGate::new();
         for gap in [0, 1, FLOW_LOW_WATERMARK, FLOW_HIGH_WATERMARK * 100] {
             assert_eq!(
-                admit_to_webview(VisibilityTier::Unwatched, true, &mut gate, gap),
+                admit_to_webview(VisibilityTier::Unwatched, true, &mut gate, gap, false),
                 WebviewAdmission::Skip
             );
         }
+    }
+
+    /// The knob D3 wired through: a positive
+    /// `unwatched_flush_interval_ms` turns the dark tier into a coalescing
+    /// one. `Hold`, never `Now` — an unwatched pane render-acks nothing, so
+    /// consulting the gate would wedge it exactly as it would for
+    /// `background`.
+    #[test]
+    fn a_configured_unwatched_interval_holds_instead_of_skipping() {
+        let mut gate = EmissionGate::new();
+        for gap in [0, 1, FLOW_LOW_WATERMARK, FLOW_HIGH_WATERMARK * 100] {
+            assert_eq!(
+                admit_to_webview(VisibilityTier::Unwatched, true, &mut gate, gap, true),
+                WebviewAdmission::Hold,
+                "gap {gap} must not change the configured-unwatched decision"
+            );
+        }
+        // The gate was never advanced, so a return to `focused` starts open —
+        // the same property `background` has.
+        assert_eq!(
+            admit_to_webview(VisibilityTier::Focused, true, &mut gate, 0, false),
+            WebviewAdmission::Now
+        );
+    }
+
+    /// Which cadence a held window is measured against follows the CURRENT
+    /// tier, because one hold buffer serves both tiers and the tier can change
+    /// with bytes still in it. Stock config (`unwatched` = `None`) falls back
+    /// to the background cadence, which is unreachable in practice but must
+    /// never be a zero-length window.
+    #[test]
+    fn hold_interval_follows_the_tier() {
+        let bg = Duration::from_millis(250);
+        let unwatched = Duration::from_millis(4000);
+        assert_eq!(
+            hold_interval(VisibilityTier::Unwatched, bg, Some(unwatched)),
+            unwatched
+        );
+        assert_eq!(
+            hold_interval(VisibilityTier::Background, bg, Some(unwatched)),
+            bg
+        );
+        assert_eq!(
+            hold_interval(VisibilityTier::Focused, bg, Some(unwatched)),
+            bg
+        );
+        assert_eq!(
+            hold_interval(VisibilityTier::Unwatched, bg, None),
+            bg,
+            "stock config must not yield a zero window"
+        );
     }
 
     /// The reader's exit flush is ungated on purpose: after the child exits no
@@ -3110,7 +3268,7 @@ mod tests {
             VisibilityTier::Unwatched,
         ] {
             assert_eq!(
-                admit_to_webview(tier, false, &mut gate, FLOW_HIGH_WATERMARK * 100),
+                admit_to_webview(tier, false, &mut gate, FLOW_HIGH_WATERMARK * 100, false),
                 WebviewAdmission::Now,
                 "{tier:?}"
             );
@@ -3125,7 +3283,7 @@ mod tests {
         let state = VisibilityState::new();
         let mut gate = EmissionGate::new();
         let decide = |state: &VisibilityState, gate: &mut EmissionGate| {
-            admit_to_webview(state.tier(), true, gate, 0)
+            admit_to_webview(state.tier(), true, gate, 0, false)
         };
 
         assert_eq!(decide(&state, &mut gate), WebviewAdmission::Now);
