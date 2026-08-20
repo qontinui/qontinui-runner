@@ -22,6 +22,7 @@ use super::super::phase_configs::{SetupConfig, SetupResult};
 use super::super::phase_helpers::{
     build_llm_metrics, execute_prompt_response_mode, record_phase_token_usage,
 };
+use super::{decode_journalled_ai_output, decode_journalled_step_result, journalled_step};
 
 /// Executes the setup phase (runs once at the start).
 ///
@@ -143,74 +144,150 @@ impl SetupExecutor {
                 automation_steps.len()
             );
 
-            // Checkpoint each automation step
+            // Crash-recovery replay: any automation step already journalled
+            // as complete returns its recorded result instead of running
+            // again. Only the remainder is handed to the executor.
+            let mut merged: Vec<Option<StepExecutionResult>> = vec![None; automation_steps.len()];
+            let mut pending: Vec<ExecutionStepConfig> = Vec::new();
+            let mut pending_idx: Vec<usize> = Vec::new();
+
             for (idx, step) in automation_steps.iter().enumerate() {
-                let step_type =
-                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
                 let step_name = step.name.as_deref().unwrap_or(&step.step_type);
-
-                // Use Some(0) instead of None for iteration to ensure SQLite's
-                // UNIQUE constraint works correctly (NULL != NULL in SQLite)
-                let mut checkpoint = StepCheckpoint::new(
+                let journal_type =
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
+                let replayed = journalled_step(
+                    &checkpoint_mgr,
                     execution_id,
-                    "unified",
                     "setup",
                     Some(0),
+                    stage_index,
                     idx,
-                    step_type.as_str(),
+                    &step.step_type,
+                    journal_type.as_str(),
+                    step_name,
                 )
-                .with_step_name(step_name)
-                .with_stage_index(stage_index);
-                checkpoint.mark_started();
-                if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
-                    warn!("Failed to save setup step checkpoint: {}", e);
+                .as_ref()
+                .and_then(decode_journalled_step_result);
+
+                match replayed {
+                    Some(mut result) => {
+                        // The journalled index is relative to the run that
+                        // wrote it; re-anchor it to this phase ordering.
+                        result.step_index = idx;
+                        merged[idx] = Some(result);
+                    }
+                    None => {
+                        pending.push(step.clone());
+                        pending_idx.push(idx);
+                    }
                 }
             }
 
-            let (result, _has_gui) = self
-                .executor
-                .execute_setup_phase(automation_steps, execution_id, &[])
-                .await;
+            let replayed_count = automation_steps.len() - pending.len();
+            if replayed_count > 0 {
+                info!(
+                    "SETUP-PHASE: Replayed {} of {} automation steps from the checkpoint journal",
+                    replayed_count,
+                    automation_steps.len()
+                );
+            }
 
-            // Checkpoint completion for each step
-            for (idx, step_result) in result.steps.iter().enumerate() {
-                let step = &automation_steps[idx];
-                let step_type =
-                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
-                let step_name = step.name.as_deref().unwrap_or(&step.step_type);
+            let mut batch_success = true;
+            if pending.is_empty() {
+                info!("SETUP-PHASE: All automation steps already journalled, nothing to execute");
+            } else {
+                // Checkpoint each automation step that is actually going to run
+                for (pos, step) in pending.iter().enumerate() {
+                    let idx = pending_idx[pos];
+                    let step_type =
+                        StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
+                    let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
-                // Use Some(0) instead of None for iteration to ensure SQLite's
-                // UNIQUE constraint works correctly (NULL != NULL in SQLite)
-                let mut checkpoint = StepCheckpoint::new(
-                    execution_id,
-                    "unified",
-                    "setup",
-                    Some(0),
-                    idx,
-                    step_type.as_str(),
-                )
-                .with_step_name(step_name)
-                .with_stage_index(stage_index);
-
-                let duration_ms = step_result.duration_ms as i64;
-                if step_result.success {
-                    checkpoint.mark_success(serde_json::to_string(step_result).ok(), duration_ms);
-                } else {
-                    checkpoint.mark_failed(
-                        step_result.error.as_deref().unwrap_or("Unknown error"),
-                        duration_ms,
-                    );
+                    // Use Some(0) instead of None for iteration to ensure SQLite
+                    // UNIQUE constraint works correctly (NULL != NULL in SQLite)
+                    let mut checkpoint = StepCheckpoint::new(
+                        execution_id,
+                        "unified",
+                        "setup",
+                        Some(0),
+                        idx,
+                        step_type.as_str(),
+                    )
+                    .with_step_name(step_name)
+                    .with_stage_index(stage_index);
+                    checkpoint.mark_started();
+                    if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
+                        warn!("Failed to save setup step checkpoint: {}", e);
+                    }
                 }
 
-                if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
-                    warn!("Failed to save setup step completion checkpoint: {}", e);
+                let (result, _has_gui) = self
+                    .executor
+                    .execute_setup_phase(&pending, execution_id, &[])
+                    .await;
+
+                batch_success = result.success;
+
+                // Checkpoint completion for each step, keyed on the step index
+                // in the FULL phase, not its index in the pending slice.
+                for (pos, step_result) in result.steps.iter().enumerate() {
+                    let idx = match pending_idx.get(pos) {
+                        Some(i) => *i,
+                        None => {
+                            warn!(
+                                "SETUP-PHASE: executor returned {} results for {} dispatched steps",
+                                result.steps.len(),
+                                pending_idx.len()
+                            );
+                            break;
+                        }
+                    };
+                    let step = &automation_steps[idx];
+                    let step_type =
+                        StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
+                    let step_name = step.name.as_deref().unwrap_or(&step.step_type);
+
+                    // Use Some(0) instead of None for iteration to ensure SQLite
+                    // UNIQUE constraint works correctly (NULL != NULL in SQLite)
+                    let mut checkpoint = StepCheckpoint::new(
+                        execution_id,
+                        "unified",
+                        "setup",
+                        Some(0),
+                        idx,
+                        step_type.as_str(),
+                    )
+                    .with_step_name(step_name)
+                    .with_stage_index(stage_index);
+
+                    let duration_ms = step_result.duration_ms as i64;
+                    if step_result.success {
+                        checkpoint
+                            .mark_success(serde_json::to_string(step_result).ok(), duration_ms);
+                    } else {
+                        checkpoint.mark_failed(
+                            step_result.error.as_deref().unwrap_or("Unknown error"),
+                            duration_ms,
+                        );
+                    }
+
+                    if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
+                        warn!("Failed to save setup step completion checkpoint: {}", e);
+                    }
+                }
+
+                for (pos, mut step_result) in result.steps.into_iter().enumerate() {
+                    if let Some(&idx) = pending_idx.get(pos) {
+                        step_result.step_index = idx;
+                        merged[idx] = Some(step_result);
+                    }
                 }
             }
 
-            overall_success = overall_success && result.success;
-            all_results.extend(result.steps);
+            overall_success = overall_success && batch_success;
+            all_results.extend(merged.into_iter().flatten());
 
-            if !result.success {
+            if !batch_success {
                 warn!("SETUP-PHASE: Automation steps failed");
                 return (false, all_results);
             }
@@ -240,8 +317,63 @@ impl SetupExecutor {
                         step_name
                     );
 
-                    // Checkpoint the response-mode prompt step as "running"
                     let step_idx = automation_steps.len() + response_step_count;
+
+                    // Crash-recovery replay: a response-mode prompt already
+                    // journalled as complete returns its recorded output rather
+                    // than calling (and paying for) the model again.
+                    if let Some(output) = journalled_step(
+                        &checkpoint_mgr,
+                        execution_id,
+                        "setup",
+                        Some(0),
+                        stage_index,
+                        step_idx,
+                        &step.step_type,
+                        "prompt",
+                        step_name,
+                    )
+                    .as_ref()
+                    .and_then(decode_journalled_ai_output)
+                    {
+                        info!(
+                            "SETUP-PHASE: Reusing journalled response-mode step '{}' ({} bytes), not re-billing",
+                            step_name,
+                            output.len()
+                        );
+                        // Deliberately NOT re-appending to the task output
+                        // stream: the run that produced this output already
+                        // appended it, and `append_task_output_ex` also
+                        // increments `sessions_count`, so replaying it would
+                        // both duplicate the text and double-count the session.
+                        response_step_count += 1;
+                        all_results.push(StepExecutionResult {
+                            step_index: all_results.len(),
+                            step_type: "prompt".to_string(),
+                            step_name: step_name.to_string(),
+                            step_id: step.id.clone(),
+                            success: true,
+                            error: None,
+                            screenshot_path: None,
+                            started_at: None,
+                            ended_at: None,
+                            duration_ms: 0,
+                            config: crate::step_executor::StepExecutionConfig::default(),
+                            verification_details: None,
+                            output_data: Some(serde_json::json!({
+                                "output": output,
+                                "replayed_from_checkpoint": true,
+                            })),
+                            required: step.required,
+                            resolved_inputs: None,
+                            extracted_values: None,
+                            failure_category: None,
+                            interrupted: None,
+                        });
+                        continue;
+                    }
+
+                    // Checkpoint the response-mode prompt step as "running"
                     let mut resp_checkpoint = StepCheckpoint::new(
                         execution_id,
                         "unified",
@@ -524,64 +656,31 @@ impl SetupExecutor {
                     "Setup AI Task",
                 );
 
-                // Use Some(0) instead of None for iteration to ensure SQLite's
-                // UNIQUE constraint works correctly (NULL != NULL in SQLite)
-                let mut ai_checkpoint = StepCheckpoint::new(
+                // Crash-recovery replay: the consolidated setup AI session is
+                // the single most expensive step in the phase. If it is already
+                // journalled as complete, skip it outright rather than paying
+                // for the same session twice.
+                let replayed_ai = journalled_step(
+                    &checkpoint_mgr,
                     execution_id,
-                    "unified",
                     "setup",
                     Some(0),
+                    stage_index,
                     ai_step_idx,
                     "ai_session",
+                    "ai_session",
+                    &step_name,
                 )
-                .with_step_name(&step_name)
-                .with_stage_index(stage_index);
-                ai_checkpoint.mark_started();
-                if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
-                    warn!("Failed to save setup AI step checkpoint: {}", e);
-                }
+                .as_ref()
+                .and_then(decode_journalled_ai_output);
 
-                // Log start event for Active Dashboard visibility
-                {
-                    let metadata = StepMetadata::setup(
-                        execution_id,
-                        StepType::Prompt,
-                        &step_name,
-                        ai_step_idx,
+                if let Some(output) = replayed_ai {
+                    info!(
+                        "SETUP-PHASE: Reusing journalled AI setup session '{}' ({} bytes), not re-billing",
+                        step_name,
+                        output.len()
                     );
-                    if let Err(e) = logger.log_start(
-                        StepEventKind::SetupAiStart,
-                        metadata,
-                        StepDetails::default(),
-                    ) {
-                        warn!("Failed to log setup AI session start event: {}", e);
-                    }
-                }
-
-                // Use structured prompts for granular sub-step tracking
-                let (setup_prompt, sub_step_metadata) =
-                    prompt_builder::consolidate_prompts_structured(&session_prompt_steps, "setup");
-
-                if !setup_prompt.is_empty() {
-                    // Use the unified AI session executor with sub-step metadata
-                    let config = AiSessionConfig::setup(execution_id, workflow_name, &step_name)
-                        .with_checkpoint_id(&ai_checkpoint.id)
-                        .with_sub_step_metadata(sub_step_metadata)
-                        .with_model_override(model_override.clone());
-
-                    let (result, duration_ms) = timeout_helper::timed_result_async(
-                        self.ai_executor.execute(&config, &setup_prompt, logger),
-                    )
-                    .await;
-                    let duration_ms = duration_ms as i64;
-                    // Only fail overall setup if at least one session-mode step is required.
-                    // Non-required steps failing should not block the setup phase.
-                    let any_required = session_prompt_steps
-                        .iter()
-                        .any(|s| s.required.unwrap_or(true));
-                    if any_required {
-                        overall_success = overall_success && result.success;
-                    }
+                } else {
                     // Use Some(0) instead of None for iteration to ensure SQLite's
                     // UNIQUE constraint works correctly (NULL != NULL in SQLite)
                     let mut ai_checkpoint = StepCheckpoint::new(
@@ -594,18 +693,12 @@ impl SetupExecutor {
                     )
                     .with_step_name(&step_name)
                     .with_stage_index(stage_index);
-
-                    if result.success {
-                        ai_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
-                    } else {
-                        ai_checkpoint.mark_failed("AI session failed", duration_ms);
-                    }
-
+                    ai_checkpoint.mark_started();
                     if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
-                        warn!("Failed to save setup AI step completion checkpoint: {}", e);
+                        warn!("Failed to save setup AI step checkpoint: {}", e);
                     }
 
-                    // Log complete/error event for Active Dashboard visibility
+                    // Log start event for Active Dashboard visibility
                     {
                         let metadata = StepMetadata::setup(
                             execution_id,
@@ -613,28 +706,97 @@ impl SetupExecutor {
                             &step_name,
                             ai_step_idx,
                         );
-                        if result.success {
-                            if let Err(e) = logger.log_complete(
-                                StepEventKind::SetupAiComplete,
-                                metadata,
-                                StepDetails::default(),
-                                duration_ms,
-                            ) {
-                                warn!("Failed to log setup AI session complete event: {}", e);
-                            }
-                        } else if let Err(e) = logger.log_error(
-                            StepEventKind::SetupAiError,
+                        if let Err(e) = logger.log_start(
+                            StepEventKind::SetupAiStart,
                             metadata,
                             StepDetails::default(),
-                            duration_ms,
-                            Some("AI session failed"),
                         ) {
-                            warn!("Failed to log setup AI session error event: {}", e);
+                            warn!("Failed to log setup AI session start event: {}", e);
                         }
                     }
 
-                    if !result.success {
-                        warn!("SETUP-PHASE: AI prompt steps failed");
+                    // Use structured prompts for granular sub-step tracking
+                    let (setup_prompt, sub_step_metadata) =
+                        prompt_builder::consolidate_prompts_structured(
+                            &session_prompt_steps,
+                            "setup",
+                        );
+
+                    if !setup_prompt.is_empty() {
+                        // Use the unified AI session executor with sub-step metadata
+                        let config =
+                            AiSessionConfig::setup(execution_id, workflow_name, &step_name)
+                                .with_checkpoint_id(&ai_checkpoint.id)
+                                .with_sub_step_metadata(sub_step_metadata)
+                                .with_model_override(model_override.clone());
+
+                        let (result, duration_ms) = timeout_helper::timed_result_async(
+                            self.ai_executor.execute(&config, &setup_prompt, logger),
+                        )
+                        .await;
+                        let duration_ms = duration_ms as i64;
+                        // Only fail overall setup if at least one session-mode step is required.
+                        // Non-required steps failing should not block the setup phase.
+                        let any_required = session_prompt_steps
+                            .iter()
+                            .any(|s| s.required.unwrap_or(true));
+                        if any_required {
+                            overall_success = overall_success && result.success;
+                        }
+                        // Use Some(0) instead of None for iteration to ensure SQLite's
+                        // UNIQUE constraint works correctly (NULL != NULL in SQLite)
+                        let mut ai_checkpoint = StepCheckpoint::new(
+                            execution_id,
+                            "unified",
+                            "setup",
+                            Some(0),
+                            ai_step_idx,
+                            "ai_session",
+                        )
+                        .with_step_name(&step_name)
+                        .with_stage_index(stage_index);
+
+                        if result.success {
+                            ai_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
+                        } else {
+                            ai_checkpoint.mark_failed("AI session failed", duration_ms);
+                        }
+
+                        if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
+                            warn!("Failed to save setup AI step completion checkpoint: {}", e);
+                        }
+
+                        // Log complete/error event for Active Dashboard visibility
+                        {
+                            let metadata = StepMetadata::setup(
+                                execution_id,
+                                StepType::Prompt,
+                                &step_name,
+                                ai_step_idx,
+                            );
+                            if result.success {
+                                if let Err(e) = logger.log_complete(
+                                    StepEventKind::SetupAiComplete,
+                                    metadata,
+                                    StepDetails::default(),
+                                    duration_ms,
+                                ) {
+                                    warn!("Failed to log setup AI session complete event: {}", e);
+                                }
+                            } else if let Err(e) = logger.log_error(
+                                StepEventKind::SetupAiError,
+                                metadata,
+                                StepDetails::default(),
+                                duration_ms,
+                                Some("AI session failed"),
+                            ) {
+                                warn!("Failed to log setup AI session error event: {}", e);
+                            }
+                        }
+
+                        if !result.success {
+                            warn!("SETUP-PHASE: AI prompt steps failed");
+                        }
                     }
                 }
             }

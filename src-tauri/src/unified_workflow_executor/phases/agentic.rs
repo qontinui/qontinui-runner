@@ -18,8 +18,9 @@ use super::super::output_parser;
 use super::super::types::{get_parent_task_id, AgenticOutcome, LoopConfig};
 use super::{
     build_compressed_iteration_history, build_execution_timing_context, build_llm_metrics,
-    execute_prompt_response_mode, extract_and_preread_failure_files, get_active_sdk_app_name,
-    preread_previously_edited_files, record_phase_token_usage, record_phase_token_usage_with_cache,
+    decode_journalled_ai_output, execute_prompt_response_mode, extract_and_preread_failure_files,
+    get_active_sdk_app_name, journalled_step, preread_previously_edited_files,
+    record_phase_token_usage, record_phase_token_usage_with_cache,
     record_phase_token_usage_with_target, REFLECTION_MODE_PREAMBLE,
 };
 
@@ -217,8 +218,46 @@ impl AgenticExecutor {
 
                 let step_name = step.name.as_deref().unwrap_or("Agentic Response Prompt");
 
-                // Checkpoint the response-mode agentic step as "running"
                 let checkpoint_mgr = CheckpointManager::new("unified");
+
+                // Crash-recovery replay: a response-mode agentic prompt already
+                // journalled as complete returns its recorded output rather than
+                // calling (and paying for) the model again. Token usage is
+                // reported as None: this resume spends nothing, and attributing
+                // the original call's tokens again would double-bill the run.
+                if let Some(output) = journalled_step(
+                    &checkpoint_mgr,
+                    &config.execution_id,
+                    "agentic",
+                    Some(iteration),
+                    config.stage_index,
+                    0,
+                    &step.step_type,
+                    "prompt",
+                    step_name,
+                )
+                .as_ref()
+                .and_then(decode_journalled_ai_output)
+                {
+                    info!(
+                        "AGENTIC-PHASE: Reusing journalled response-mode step '{}' ({} bytes), not re-billing",
+                        step_name,
+                        output.len()
+                    );
+                    return (
+                        AgenticOutcome::Success {
+                            output,
+                            parsed: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                            tools_used: Vec::new(),
+                            tools_rejected: Vec::new(),
+                        },
+                        Vec::new(),
+                    );
+                }
+
+                // Checkpoint the response-mode agentic step as "running"
                 let mut resp_checkpoint = StepCheckpoint::new(
                     &config.execution_id,
                     "unified",
@@ -574,6 +613,49 @@ impl AgenticExecutor {
 
         // Create checkpoint manager for step-level checkpointing
         let checkpoint_mgr = CheckpointManager::new("unified");
+
+        // Crash-recovery replay: the agentic AI session is the single most
+        // expensive step in the whole workflow, and it is the one a resume used
+        // to re-run and re-bill unconditionally. If it is already journalled as
+        // complete, hand back the recorded output instead of running it again.
+        //
+        // KNOWN LOSS: dynamically injected verification steps
+        // (`result.injected_steps`) are produced inside the session executor and
+        // are NOT journalled, so a replayed session contributes none. That is a
+        // deliberate trade: one iteration without its dynamic steps, against
+        // paying for an entire agentic session a second time.
+        if let Some(output) = journalled_step(
+            &checkpoint_mgr,
+            &config.execution_id,
+            "agentic",
+            Some(iteration),
+            config.stage_index,
+            0,
+            "ai_session",
+            "ai_session",
+            "AI Fixing Issues",
+        )
+        .as_ref()
+        .and_then(decode_journalled_ai_output)
+        {
+            info!(
+                "AGENTIC-PHASE: Reusing journalled AI session for iteration {} ({} bytes), not re-billing",
+                iteration,
+                output.len()
+            );
+            let parsed = Some(output_parser::parse_agentic_output(&output));
+            return (
+                AgenticOutcome::Success {
+                    output,
+                    parsed,
+                    input_tokens: None,
+                    output_tokens: None,
+                    tools_used: Vec::new(),
+                    tools_rejected: Vec::new(),
+                },
+                Vec::new(),
+            );
+        }
 
         // Try to get the latest progress marker from previous checkpoints
         // This helps the AI understand where to resume if a previous session was interrupted

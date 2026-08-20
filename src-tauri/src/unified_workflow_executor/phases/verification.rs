@@ -163,6 +163,37 @@ impl VerificationExecutor {
         // Create checkpoint manager for step-level checkpointing
         let checkpoint_mgr = CheckpointManager::new("unified");
 
+        // Crash-recovery replay is DELIBERATELY NOT wired into this phase.
+        // `super::phase_is_replayable` excludes "verification" and carries the
+        // full reasoning; in short, a verification step is a MEASUREMENT of the
+        // system under test, so its journalled result describes a world the
+        // resumed process never observed, and it costs no AI tokens to take the
+        // measurement again. The journal is still read here so that a resumed
+        // run which re-observes says so, instead of looking like the silent
+        // re-execution this plan exists to close.
+        debug_assert!(
+            !super::phase_is_replayable("verification"),
+            "verification must stay out of the replay set"
+        );
+        match checkpoint_mgr.get_completed_steps(execution_id, "verification", Some(iteration)) {
+            Ok(prior) => {
+                let already_journalled =
+                    prior.iter().filter(|cp| cp.status.is_replayable()).count();
+                if already_journalled > 0 {
+                    info!(
+                        "VERIFICATION-PHASE: {} step(s) of iteration {} are journalled as complete and will be RE-OBSERVED (a verification result is a measurement, not a reusable output)",
+                        already_journalled, iteration
+                    );
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "VERIFICATION-PHASE: could not read prior checkpoints: {}",
+                    e
+                );
+            }
+        }
+
         // Log START events and save checkpoints for each step before execution
         for (idx, step) in steps.iter().enumerate() {
             let step_type =

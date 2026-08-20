@@ -1475,3 +1475,245 @@ fn preread_previously_edited_files(
 
     result
 }
+
+// =============================================================================
+// Journalled-step replay (crash recovery)
+// =============================================================================
+//
+// A resumed workflow used to re-execute every step of the phase it re-entered,
+// including AI steps that had already completed and been paid for. The step
+// checkpoint journal has always recorded the result; nothing read it back.
+// These helpers are that read point, and they mirror the DAG driver's working
+// replay (`workflow/dag_driver.rs`): same "not knowing is not the same as not
+// completed" warning, same "replaying completed ..." info marker.
+
+use crate::workflow_state::{CheckpointManager, StepCheckpoint};
+use tracing::warn;
+
+/// Phases whose steps must ALWAYS re-execute on resume, never replay.
+///
+/// **`verification` is excluded.** A verification step is an OBSERVATION of the
+/// system under test, not a state transition: its journalled result describes
+/// the world at journal time, and after a crash the runner (and usually the app
+/// under test) has been restarted, so replaying a pass asserts a measurement
+/// that was never taken in the resumed process. Three consequences make the
+/// exclusion mandatory rather than merely cautious:
+///
+/// * Verification results are the evidence chain for
+///   `health_monitor::build_resume_agentic_context`, the regression detector
+///   and the convergence detector. A replayed pass would enter all three
+///   unmarked, and the agentic phase would be told to fix a world that no
+///   longer exists.
+/// * Verification steps are playwright / command / ui-bridge assertions. They
+///   spend no AI tokens, so replaying them buys nothing against the harm this
+///   plan exists to close (re-execution AND re-billing).
+/// * Keeping the whole phase out of the replay set is what makes the two
+///   journal readers provably disjoint - Phase 2 replays the phases that
+///   MUTATE, `build_resume_agentic_context` narrates the phase that OBSERVES.
+pub(crate) fn phase_is_replayable(phase: &str) -> bool {
+    phase != "verification"
+}
+
+/// Step types whose observable effect is NOT fully determined by the journalled
+/// `result_json`, so replaying the result would silently drop part of the work.
+///
+/// **`wrapper_action` is excluded.** Its handler writes the dispatch result
+/// into the in-memory `SharedVariableStore`
+/// (`step_executor/handlers/wrapper_action.rs`, via `wrapper_result_variable`),
+/// which later phases substitute into prompts
+/// (`loop_controller.rs` -> `setup_executor.shared_variables()`). That store is
+/// process-local and dies with the crash, and the value is not recoverable from
+/// the journal either: `execute_setup_phase` discards the handler's
+/// `output_data` (`step_executor/executor.rs`), so the checkpoint holds a
+/// `StepExecutionResult` with `output_data: None`. Replaying it would leave the
+/// variable unset and the downstream prompt carrying a literal placeholder.
+/// The step is a local HTTP dispatch, so re-executing costs no AI tokens.
+///
+/// Note this must be tested against the RAW `ExecutionStepConfig::step_type`
+/// string: `wrapper_action` has no `StepType` variant, so `from_str_compat`
+/// flattens it to `Command` and the checkpoint's own `step_type` cannot
+/// distinguish it.
+pub(crate) fn step_type_is_replayable(step_type: &str) -> bool {
+    step_type != "wrapper_action"
+}
+
+/// Look up the journalled result for a step that a resumed run is about to
+/// execute. `Some(cp)` means: return `cp.result_json` INSTEAD of executing.
+///
+/// Returns `None` - i.e. execute the step - for an excluded phase, an excluded
+/// step type, a step that never completed, and a failed journal read. A read
+/// failure is warned about explicitly, because "we could not find out" is not
+/// the same as "it did not run" and the step is about to be re-executed and
+/// re-billed on the strength of that failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn journalled_step(
+    checkpoint_mgr: &CheckpointManager,
+    execution_id: &str,
+    phase: &str,
+    iteration: Option<u32>,
+    stage_index: Option<u32>,
+    step_index: usize,
+    config_step_type: &str,
+    journal_step_type: &str,
+    step_name: &str,
+) -> Option<StepCheckpoint> {
+    if !phase_is_replayable(phase) || !step_type_is_replayable(config_step_type) {
+        return None;
+    }
+
+    match checkpoint_mgr.completed_step(execution_id, phase, iteration, stage_index, step_index) {
+        Ok(Some(cp)) if cp.step_type != journal_step_type => {
+            // The slice key does not carry the step type, and step indices are
+            // positional: the agentic phase writes both its response-mode
+            // prompt and its AI session at index 0, and editing a workflow
+            // shifts every later index. A row of a different type at this
+            // index is a DIFFERENT step, so re-execute rather than hand back
+            // some other step result.
+            warn!(
+                execution_id = %execution_id,
+                phase = %phase,
+                step_index = %step_index,
+                journalled_type = %cp.step_type,
+                expected_type = %journal_step_type,
+                "Journalled step type does not match - step will be re-executed"
+            );
+            None
+        }
+        Ok(Some(cp)) => {
+            info!(
+                execution_id = %execution_id,
+                phase = %phase,
+                iteration = ?iteration,
+                stage_index = ?stage_index,
+                step_index = %step_index,
+                step_name = %step_name,
+                "Replaying completed step from checkpoint journal (crash recovery)"
+            );
+            Some(cp)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            warn!(
+                execution_id = %execution_id,
+                phase = %phase,
+                step_index = %step_index,
+                error = %e,
+                "Replay lookup failed - step will be re-executed and re-billed"
+            );
+            None
+        }
+    }
+}
+
+/// Decode a journalled automation-step result back into a `StepExecutionResult`.
+///
+/// Setup and completion automation steps journal
+/// `serde_json::to_string(&StepExecutionResult)`, so the row round-trips. A row
+/// that does not decode (or carries no result at all, which is what a `Skipped`
+/// checkpoint looks like) yields `None` and the step re-executes: a replay we
+/// cannot reconstruct is strictly worse than doing the work again.
+pub(crate) fn decode_journalled_step_result(
+    cp: &StepCheckpoint,
+) -> Option<crate::step_executor::StepExecutionResult> {
+    let raw = cp.result_json.as_deref()?;
+    match serde_json::from_str::<crate::step_executor::StepExecutionResult>(raw) {
+        Ok(result) => Some(result),
+        Err(e) => {
+            warn!(
+                execution_id = %cp.execution_id,
+                phase = %cp.phase,
+                step_index = %cp.step_index,
+                error = %e,
+                "Journalled step result did not decode - step will be re-executed"
+            );
+            None
+        }
+    }
+}
+
+/// Decode a journalled AI-step result: prompt and `ai_session` checkpoints
+/// journal the model's raw output text, not JSON.
+///
+/// An empty or absent output is not replayable - the caller cannot tell it
+/// apart from "the model returned nothing", and a resumed run that hands the
+/// next phase an empty AI output has lost the work either way.
+pub(crate) fn decode_journalled_ai_output(cp: &StepCheckpoint) -> Option<String> {
+    cp.result_json
+        .as_deref()
+        .filter(|out| !out.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use crate::workflow_state::StepCheckpointStatus;
+
+    fn cp_with(result_json: Option<&str>) -> StepCheckpoint {
+        let mut cp = StepCheckpoint::new("exec-1", "unified", "setup", Some(0), 0, "command");
+        cp.status = StepCheckpointStatus::Success;
+        cp.result_json = result_json.map(str::to_string);
+        cp
+    }
+
+    #[test]
+    fn verification_phase_never_replays() {
+        assert!(!phase_is_replayable("verification"));
+        for phase in ["setup", "agentic", "completion"] {
+            assert!(phase_is_replayable(phase), "{} should replay", phase);
+        }
+    }
+
+    #[test]
+    fn wrapper_action_never_replays() {
+        assert!(!step_type_is_replayable("wrapper_action"));
+        for st in ["command", "prompt", "ai_session", "playwright", "workflow"] {
+            assert!(step_type_is_replayable(st), "{} should replay", st);
+        }
+    }
+
+    #[test]
+    fn automation_result_round_trips_through_the_journal() {
+        let original = crate::step_executor::StepExecutionResult {
+            step_index: 3,
+            step_type: "command".to_string(),
+            step_name: "Install deps".to_string(),
+            step_id: Some("s3".to_string()),
+            success: true,
+            error: None,
+            screenshot_path: None,
+            started_at: None,
+            ended_at: None,
+            duration_ms: 4321,
+            config: crate::step_executor::StepExecutionConfig::default(),
+            verification_details: None,
+            output_data: None,
+            required: Some(true),
+            resolved_inputs: None,
+            extracted_values: None,
+            failure_category: None,
+            interrupted: None,
+        };
+        let json = serde_json::to_string(&original).expect("serializes");
+        let decoded = decode_journalled_step_result(&cp_with(Some(&json))).expect("decodes");
+        assert_eq!(decoded.step_name, "Install deps");
+        assert_eq!(decoded.duration_ms, 4321);
+        assert!(decoded.success);
+    }
+
+    #[test]
+    fn undecodable_or_missing_results_fall_back_to_execution() {
+        assert!(decode_journalled_step_result(&cp_with(None)).is_none());
+        assert!(decode_journalled_step_result(&cp_with(Some("not json"))).is_none());
+    }
+
+    #[test]
+    fn ai_output_replays_only_when_non_empty() {
+        assert_eq!(
+            decode_journalled_ai_output(&cp_with(Some("the model said this"))).as_deref(),
+            Some("the model said this")
+        );
+        assert!(decode_journalled_ai_output(&cp_with(Some(""))).is_none());
+        assert!(decode_journalled_ai_output(&cp_with(None)).is_none());
+    }
+}
