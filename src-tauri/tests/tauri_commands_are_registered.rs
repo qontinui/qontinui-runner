@@ -234,14 +234,35 @@ fn handler_list(source: &str) -> BTreeSet<String> {
         }
     }
 
-    for raw in source[body_start..end].split(',') {
+    // Strip `//` comments BEFORE splitting on commas. Splitting first is a
+    // false-NEGATIVE bug, not a cosmetic one: a comma inside a comment (prose
+    // commas are ordinary — "in a single shot, so the panel…") ends the chunk
+    // mid-comment, so the NEXT chunk opens with the comment's own tail, which
+    // no longer starts with `//`. That tail wins `find()`, fails the ident
+    // check, and the real `commands::mod::name` on the following line is never
+    // examined — the command reads as UNREGISTERED though it is registered
+    // (observed 2026-08-20: `session_info_get`). The same shift can equally
+    // MASK a genuinely unregistered command, which is this guard's whole job.
+    let decommented: String = source[body_start..end]
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+
+    for raw in decommented.split(',') {
         let line = raw
             .lines()
             .map(str::trim)
-            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .find(|l| !l.is_empty())
             .unwrap_or("")
             .trim();
-        if line.is_empty() || line.starts_with("//") {
+        if line.is_empty() {
             continue;
         }
         if let Some(ident) = line.rsplit("::").next() {
