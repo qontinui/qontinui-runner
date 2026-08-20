@@ -523,7 +523,9 @@ export function useControlEvents(
 
         case "dispatch_key": {
           // Document/window-level key dispatch — backs
-          // `POST /ui-bridge/control/key` (src-tauri/src/mcp/ui_bridge/keyboard.rs).
+          // `POST /ui-bridge/control/page/send-keys`
+          // (src-tauri/src/mcp/ui_bridge/keyboard.rs), the SDK's
+          // `sendKeysToPage` contract method.
           //
           // This lives here (and not in the element-scoped `execute_action`
           // path) because the runner's global shortcut listeners are attached
@@ -600,8 +602,14 @@ export function useControlEvents(
             mods: { ctrl?: boolean; alt?: boolean; meta?: boolean },
           ) => key.length === 1 && !mods.ctrl && !mods.alt && !mods.meta;
 
+          // The SDK's `sendKeysToPage` response is
+          // `{ dispatched, target, keys, outcomes }`, where `outcomes` carries
+          // one `{ key, defaultPrevented }` per dispatched key. `keys` echoes
+          // the keys actually dispatched (entries without a `key` are skipped),
+          // so `keys.length === outcomes.length === dispatched` always holds.
           let dispatched = 0;
-          let defaultPrevented = false;
+          const dispatchedKeys: string[] = [];
+          const outcomes: Array<{ key: string; defaultPrevented: boolean }> = [];
           for (const keyDesc of keys) {
             const key = keyDesc?.key;
             if (!key) continue;
@@ -617,13 +625,17 @@ export function useControlEvents(
             };
             const keydown = new KeyboardEvent("keydown", eventInit);
             target.dispatchEvent(keydown);
-            // `dispatchEvent` returns false when a listener called
-            // preventDefault() — i.e. a handler actually consumed the shortcut.
-            defaultPrevented = keydown.defaultPrevented;
+            // `KeyboardEvent.defaultPrevented` is true when a listener called
+            // preventDefault() — i.e. a handler actually consumed this key.
+            // Recorded per key, not just for the last one, so a caller can tell
+            // WHICH key in a sequence was handled.
+            const defaultPrevented = keydown.defaultPrevented;
             if (shouldKeypress(key, mods)) {
               target.dispatchEvent(new KeyboardEvent("keypress", eventInit));
             }
             target.dispatchEvent(new KeyboardEvent("keyup", eventInit));
+            dispatchedKeys.push(key);
+            outcomes.push({ key, defaultPrevented });
             dispatched += 1;
           }
 
@@ -631,7 +643,12 @@ export function useControlEvents(
             requestId,
             type,
             success: true,
-            data: { dispatched, target: targetName, defaultPrevented },
+            data: {
+              dispatched,
+              target: targetName,
+              keys: dispatchedKeys,
+              outcomes,
+            },
             timestamp: Date.now(),
           });
           return true;

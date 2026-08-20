@@ -773,16 +773,11 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/render-log"),
             ("POST", "/ui-bridge/control/assert"),
             ("GET", "/ui-bridge/control/keyboard-shortcuts"),
-            // (b) Document/window-level key dispatch (mcp/ui_bridge/keyboard.rs).
-            // The SDK's `keyboard` action is element-scoped and therefore
-            // cannot fire a global shortcut whose listener is on `window`
-            // (e.g. Ctrl+Shift+B → session-manager sidebar). The runner ships
-            // the element-free equivalent first because a runner-side route
-            // works immediately, whereas an SDK change reaches nothing until
-            // @qontinui/ui-bridge is published AND consumers bump their pin.
-            // PROMOTE to the SDK's UI_BRIDGE_ROUTES (and delete this entry)
-            // when the SDK side is wired.
-            ("POST", "/ui-bridge/control/key"),
+            // NOTE: `/control/key` was here (runner-only allow-list) until
+            // the SDK declared document-level key dispatch in UI_BRIDGE_ROUTES
+            // as `sendKeysToPage` (ui-bridge 912a3e3). The runner handler was
+            // promoted to the SDK path `/control/page/send-keys`, so the route
+            // is now part of the contract and intentionally omitted here.
             ("GET", "/ui-bridge/control/element/{}/tree"),
             ("POST", "/ui-bridge/control/element/{}/assert"),
             ("POST", "/ui-bridge/control/batch-actions"),

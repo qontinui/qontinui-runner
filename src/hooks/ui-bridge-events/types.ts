@@ -205,7 +205,7 @@ export type UIBridgeRequestType =
   // Runner-specific
   | "navigate_tab"
   | "clear_storage"
-  // Document/window-level key dispatch (POST /ui-bridge/control/key).
+  // Document/window-level key dispatch (POST /ui-bridge/control/page/send-keys).
   // Element-free by design: global shortcut listeners live on `window`, so
   // the element-scoped `execute_action` + `keyboard` path cannot reach them.
   | "dispatch_key"

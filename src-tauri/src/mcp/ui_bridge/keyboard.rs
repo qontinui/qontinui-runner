@@ -1,7 +1,7 @@
 //! Document/window-level key dispatch.
 //!
 //! Covers:
-//!   - `POST /ui-bridge/control/key`
+//!   - `POST /ui-bridge/control/page/send-keys`
 //!
 //! # Why this family exists
 //!
@@ -72,7 +72,7 @@ use super::request::{target_window_payload, ui_bridge_request_sync, wrap_ipc_res
 /// land text in a focused input.
 pub const DEFAULT_KEY_TARGET: &str = "window";
 
-/// Dispatch targets accepted by `POST /ui-bridge/control/key`, in canonical
+/// Dispatch targets accepted by `POST /ui-bridge/control/page/send-keys`, in canonical
 /// spelling. See the module docs for the `activeElement` hazard.
 pub const ALLOWED_KEY_TARGETS: [&str; 4] = ["window", "document", "body", "activeElement"];
 
@@ -97,7 +97,7 @@ pub struct KeyStroke {
     pub modifiers: KeyModifiers,
 }
 
-/// Normalized `POST /ui-bridge/control/key` request — always the array form
+/// Normalized `POST /ui-bridge/control/page/send-keys` request — always the array form
 /// with a canonical, validated `target`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DispatchKeyRequest {
@@ -156,7 +156,7 @@ fn parse_target(body: &serde_json::Map<String, serde_json::Value>) -> Result<Str
     }
 }
 
-/// Normalize an incoming `POST /ui-bridge/control/key` body.
+/// Normalize an incoming `POST /ui-bridge/control/page/send-keys` body.
 ///
 /// Accepts the array form (`{"keys":[…]}`), the single-object shorthand
 /// (`{"key":"B","modifiers":{…}}`), a single object under `keys`, and bare
@@ -205,7 +205,7 @@ const MISSING_KEYS_MESSAGE: &str = "`keys` is required and must be a non-empty a
      {\"keys\":[{\"key\":\"B\",\"modifiers\":{\"ctrl\":true,\"shift\":true}}]}. \
      The single-object shorthand {\"key\":\"B\",\"modifiers\":{…}} is also accepted.";
 
-/// POST /ui-bridge/control/key
+/// POST /ui-bridge/control/page/send-keys
 ///
 /// Dispatch a document/window-level `KeyboardEvent` sequence (`keydown`,
 /// `keypress` for printable keys only, `keyup`) in the runner webview. This is
@@ -221,9 +221,11 @@ const MISSING_KEYS_MESSAGE: &str = "`keys` is required and must be a non-empty a
 /// so an unintended dispatch injects text into real work. It is opt-in only;
 /// `window` (the default) cannot do this. See the module docs.
 ///
-/// Returns `{"dispatched": <n>, "target": "<canonical>", "defaultPrevented": <bool>}`,
-/// where `defaultPrevented` reflects the LAST `keydown` and tells the caller
-/// whether a handler actually consumed the shortcut.
+/// Returns the SDK's `sendKeysToPage` shape:
+/// `{"dispatched": <n>, "target": "<canonical>", "keys": [<key>, …],
+/// "outcomes": [{"key": <key>, "defaultPrevented": <bool>}, …]}`, where each
+/// `defaultPrevented` reflects that key's own `keydown` and tells the caller
+/// whether a handler actually consumed that shortcut.
 pub async fn ui_bridge_dispatch_key_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
@@ -260,13 +262,13 @@ pub async fn ui_bridge_dispatch_key_handler(
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::post;
     axum::Router::new().route(
-        "/ui-bridge/control/key",
+        "/ui-bridge/control/page/send-keys",
         post(ui_bridge_dispatch_key_handler),
     )
 }
 
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {
-    &[("POST", "/ui-bridge/control/key")]
+    &[("POST", "/ui-bridge/control/page/send-keys")]
 }
 
 // ============================================================================
