@@ -786,7 +786,8 @@ struct PolicyContextQuery {
 /// falling back to the Claude session id), resolved through the same
 /// [`resolve_session_key`]; all policy lives in
 /// [`crate::mcp::policy_context`]; and it is flag-gated
-/// (`QONTINUI_POLICY_INJECTION`, default `off`).
+/// (`QONTINUI_POLICY_INJECTION`, default **`on`** — only the literal `off`
+/// disables it).
 ///
 /// **Always 200, never 5xx.** Two distinct 200s:
 ///

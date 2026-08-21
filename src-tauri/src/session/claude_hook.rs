@@ -83,8 +83,11 @@ const PRECOMPACT_HOOK_SCRIPT: &str =
 /// (`QONTINUI_TERMINAL_ID`, `QONTINUI_RUNNER_API_PORT`) and prints the runner's
 /// response verbatim; every decision lives in the runner's
 /// `GET /sessions/{id}/policy-context` endpoint — flag-gated
-/// `QONTINUI_POLICY_INJECTION` default `off`, which answers an EMPTY body, so
-/// shipping the hook to every session is behaviorally inert until armed.
+/// `QONTINUI_POLICY_INJECTION` — which, unlike its Stop/PreCompact siblings,
+/// defaults to **`on`**: this hook IS live for every session unless the flag
+/// says `off` out loud. (It was `off` when the hook shipped, so that the
+/// unproven SessionStart seam could land safely; the default was flipped once
+/// delivering the policy became the desired baseline.)
 const POLICY_HOOK_SCRIPT: &str =
     include_str!("../../resources/session-restore/claude_policy_hook.sh");
 /// Settings template (bundled). [`build_settings`] parses it and resolves each

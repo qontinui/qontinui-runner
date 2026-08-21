@@ -121,9 +121,18 @@ use tracing::{debug, info, warn};
 // Flag + constants
 // ===========================================================================
 
-/// Env flag gating the whole feature. `off` (default) ⇒ no injection and zero
-/// coord traffic; `observe` ⇒ render + log what WOULD be injected, inject
-/// nothing; `on` ⇒ inject.
+/// Env flag gating the whole feature. **`on` is the DEFAULT** — unset means
+/// inject. `off` ⇒ no injection and zero coord traffic; `observe` ⇒ render +
+/// log what WOULD be injected, inject nothing; `on` ⇒ inject.
+///
+/// DELIBERATELY NOT the fail-safe-to-`off` convention its siblings
+/// (`continuation_verdict`, `context_handoff`) use, and the divergence is the
+/// point: those flags add BEHAVIOUR, so silence should mean "do nothing". This
+/// one delivers the tenant's POLICY, and a session that silently runs without
+/// it is the exact incident this module exists to prevent — a full `/vet-imp`
+/// cycle shipped with no policy pulled and nothing objected. "Do nothing" is
+/// the failure here, not the safe state, so the default is `on` and the only
+/// way to disable is to say `off` out loud.
 pub const FLAG_ENV: &str = "QONTINUI_POLICY_INJECTION";
 
 /// The coord `prompt_documents.kind` this module serves.
@@ -182,12 +191,27 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Parse the flag value. `None`/empty/unknown ⇒ `Off` (fail-safe).
+    /// Parse the flag value. Unset / empty / UNRECOGNISED ⇒ `On` (the default);
+    /// only the exact literal `off` disables.
+    ///
+    /// An unrecognised value resolves to the DEFAULT rather than to `off`, so a
+    /// typo cannot quietly switch policy delivery off and leave every session
+    /// running unpoliced — the silent-omission failure this module was built
+    /// for. It is logged at `warn` so the typo is visible rather than absorbed.
     pub fn from_flag(raw: Option<&str>) -> Self {
         match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") => Mode::On,
             Some("on") => Mode::On,
             Some("observe") => Mode::Observe,
-            _ => Mode::Off,
+            Some("off") => Mode::Off,
+            Some(other) => {
+                warn!(
+                    flag = FLAG_ENV,
+                    value = other,
+                    "unrecognised policy-injection mode; only the literal `off` disables — defaulting to `on`"
+                );
+                Mode::On
+            }
         }
     }
 
@@ -970,23 +994,41 @@ mod tests {
         }
     }
 
-    // ── Flag parse (fail-safe) ──────────────────────────────────────────
+    // ── Flag parse (defaults to ON) ─────────────────────────────────────
 
     #[test]
-    fn mode_parses_the_three_values_and_fails_safe_to_off() {
+    fn mode_parses_the_three_values_and_defaults_to_on() {
         assert_eq!(Mode::from_flag(Some("on")), Mode::On);
         assert_eq!(Mode::from_flag(Some("observe")), Mode::Observe);
         assert_eq!(Mode::from_flag(Some("off")), Mode::Off);
         // Case + whitespace tolerant, exactly like the continuation flag.
         assert_eq!(Mode::from_flag(Some("  ON  ")), Mode::On);
         assert_eq!(Mode::from_flag(Some("Observe")), Mode::Observe);
-        // Everything else is DARK. A typo must never arm an injection.
-        assert_eq!(Mode::from_flag(None), Mode::Off);
-        assert_eq!(Mode::from_flag(Some("")), Mode::Off);
-        assert_eq!(Mode::from_flag(Some("   ")), Mode::Off);
-        assert_eq!(Mode::from_flag(Some("true")), Mode::Off);
-        assert_eq!(Mode::from_flag(Some("enabled")), Mode::Off);
-        assert_eq!(Mode::from_flag(Some("onn")), Mode::Off);
+
+        // THE HEADLINE: an unconfigured runner INJECTS. This is the assertion a
+        // mutant restoring `_ => Mode::Off` has to fail.
+        assert_eq!(Mode::from_flag(None), Mode::On, "unset ⇒ inject");
+        assert_eq!(Mode::from_flag(Some("")), Mode::On, "empty ⇒ inject");
+        assert_eq!(Mode::from_flag(Some("   ")), Mode::On, "blank ⇒ inject");
+
+        // This REVERSES the invariant the flag shipped with — "everything else
+        // is DARK; a typo must never arm an injection". With the default at
+        // `on` a typo can no longer ARM anything, it is already armed, so the
+        // only reachable typo hazard is the opposite one: silently DISARMING
+        // policy delivery, which is the incident this module exists to prevent.
+        for typo in ["true", "enabled", "onn", "0", "false", "no", "of"] {
+            assert_eq!(
+                Mode::from_flag(Some(typo)),
+                Mode::On,
+                "{typo:?}: only the literal `off` disables injection"
+            );
+        }
+
+        // ...and the disable path still works, case- and space-tolerant, or the
+        // escape hatch this design rests on would be unusable.
+        for disable in ["off", "OFF", "  Off  "] {
+            assert_eq!(Mode::from_flag(Some(disable)), Mode::Off, "{disable:?}");
+        }
     }
 
     #[test]
