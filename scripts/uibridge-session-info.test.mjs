@@ -577,7 +577,19 @@ async function measureEmptiness(owned) {
     };
   }
   const alive = terms.terminals.filter((t) => t.isAlive !== false);
-  const foreignAlive = alive.filter((t) => !ownedTerminals.has(t.id));
+  // A terminal is OURS if it hosts one of our sessions, whatever its id.
+  // Restore recreates every terminal with a NEW id, so the pre-restart
+  // `terminalId` stops matching the moment T7 has run -- which made T10
+  // abort on the suite's own three restored fixtures while correctly
+  // reporting `0 not ours` for the sessions in the very same line
+  // (measured 2026-08-21). The session id survives the restart; the
+  // terminal id does not, so ownership has to be keyed on the session.
+  const ownedTerminalsNow = new Set(
+    health.sessions.filter((x) => ownedSessions.has(x.claudeSessionId)).map((x) => x.terminalId),
+  );
+  const foreignAlive = alive.filter(
+    (t) => !ownedTerminals.has(t.id) && !ownedTerminalsNow.has(t.id),
+  );
   const foreignSessions = health.sessions.filter((x) => !ownedSessions.has(x.claudeSessionId));
   const empty = foreignAlive.length === 0 && foreignSessions.length === 0;
   const mine = ownedSessions.size > 0 ? ` (plus ${ownedSessions.size} of this run's own)` : "";
@@ -1735,7 +1747,7 @@ async function runDropdownPass(ctx, phase, ids) {
   // tabs re-acquire their `claudeSessionId` through the same periodic backfill,
   // so a post-restore pass sampled immediately reports triggers and panels
   // absent for sessions that simply had not re-bound yet.
-  await waitForTriggersToMount();
+  await waitForTriggersToMount(ctx?.fixtures?.length ?? 0);
   const label = phase === "post-restore" ? " (post-restore)" : "";
 
   const info = await fetchSessionsInfo();
@@ -1914,12 +1926,19 @@ async function runDropdownPass(ctx, phase, ids) {
  * when the budget expires the assertions run against whatever is there and T2
  * fails exactly as before, having given the UI more than one backfill tick.
  */
-async function waitForTriggersToMount(budgetMs = TRIGGER_MOUNT_BUDGET_MS) {
+async function waitForTriggersToMount(expected = 0, budgetMs = TRIGGER_MOUNT_BUDGET_MS) {
   const deadline = Date.now() + budgetMs;
   while (Date.now() < deadline) {
     const z = await collectZones();
     const bound = (z.zones || []).filter((x) => x.claudeSessionId);
-    if (bound.length > 0) {
+    // Waiting only for the triggers of ALREADY-bound zones is satisfied
+    // trivially while most zones are still unbound: the tab acquires its
+    // `claudeSessionId` on the same periodic backfill, so a zone that has not
+    // bound yet is simply absent from `bound`. That let a pass run against ONE
+    // bound zone out of three -- T1 saw 3 headers, T2 saw 1 subject, and T5
+    // SKIPped for want of a second session to compare (measured 2026-08-21).
+    // So wait for the fixtures to become bound, not just for what is bound now.
+    if (bound.length >= expected && bound.length > 0) {
       const reg = await fetchElements();
       if (reg.ok) {
         const present = new Set(reg.elements.map((e) => String(e?.id ?? "")));
@@ -1937,7 +1956,7 @@ async function runDropdownAssertions(ctx) {
   // T1/T2 read the zone headers and triggers directly, BEFORE runDropdownPass
   // gets its own wait, so they need this too. Idempotent: it returns at once
   // when everything is already mounted.
-  await waitForTriggersToMount();
+  await waitForTriggersToMount(ctx?.fixtures?.length ?? 0);
 
   const info = await fetchSessionsInfo();
   const z = await collectZones();
