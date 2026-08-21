@@ -127,6 +127,12 @@ const FIXTURE_CONFIRM_BUDGET_MS = 180_000;
  * backend-created tab its `claudeSessionId` and therefore mounts the trigger.
  */
 const TRIGGER_MOUNT_BUDGET_MS = 75_000;
+/**
+ * Budget for RESTORE to finish after a restart. Each restored session
+ * re-launches a real provider with `--resume`, so this is provider-boot time
+ * multiplied by the fixture count, not a round trip.
+ */
+const RESTORE_SETTLE_BUDGET_MS = 300_000;
 /** Budget for a transcript to exist on disk after the trivial prompt. */
 const FIXTURE_TRANSCRIPT_BUDGET_MS = 120_000;
 /** Gap between fixture-progress polls (buffer reads + restore-health). */
@@ -545,7 +551,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * whether a non-empty runner is a FAIL (it is, for any mutating mode) or merely
  * a reported measurement (read-only mode, where nothing is conditional on it).
  */
-async function measureEmptiness() {
+async function measureEmptiness(owned) {
+  // `owned` carries the fixtures THIS RUN built. At T0 it is empty, so this is
+  // the strict "is the runner empty" gate it has always been. Before a RESTART
+  // it is not, and that distinction is load-bearing: the plan's carve-out is
+  // conditional on "an empty runner the implementer itself emptied", whose
+  // PURPOSE is that no work belonging to someone else is destroyed. Read as
+  // literal emptiness it makes T7/T10 unreachable in the only configuration
+  // that can exercise them, and T8 impossible outright — T8 asserts sessions
+  // were RESTORED, which requires sessions to exist before the restart
+  // (measured 2026-08-21: T7 and T10 both aborted on this suite's OWN three
+  // fixtures). A foreign terminal or record still blocks every mutation,
+  // exactly as before; our own fixtures no longer do.
+  const ownedSessions = owned?.sessions ?? new Set();
+  const ownedTerminals = owned?.terminals ?? new Set();
   const terms = await fetchTerminals();
   const health = await fetchRestoreHealth();
   if (!terms.ok)
@@ -558,12 +577,16 @@ async function measureEmptiness() {
     };
   }
   const alive = terms.terminals.filter((t) => t.isAlive !== false);
-  const empty = alive.length === 0 && health.sessions.length === 0;
+  const foreignAlive = alive.filter((t) => !ownedTerminals.has(t.id));
+  const foreignSessions = health.sessions.filter((x) => !ownedSessions.has(x.claudeSessionId));
+  const empty = foreignAlive.length === 0 && foreignSessions.length === 0;
+  const mine = ownedSessions.size > 0 ? ` (plus ${ownedSessions.size} of this run's own)` : "";
   const detail =
-    `/terminals: ${terms.terminals.length} record(s), ${alive.length} alive; ` +
-    `restore-health: ${health.sessions.length} session(s)` +
-    (health.sessions.length
-      ? `\nsessions: ${health.sessions.map((s) => `${String(s.claudeSessionId).slice(0, 8)}@${String(s.terminalId).slice(0, 8)}`).join(", ")}`
+    `/terminals: ${terms.terminals.length} record(s), ${alive.length} alive, ` +
+    `${foreignAlive.length} not ours; restore-health: ${health.sessions.length} session(s), ` +
+    `${foreignSessions.length} not ours${mine}` +
+    (foreignSessions.length
+      ? `\nforeign sessions: ${foreignSessions.map((x) => `${String(x.claudeSessionId).slice(0, 8)}@${String(x.terminalId).slice(0, 8)}`).join(", ")}`
       : "");
   return { empty, evaluable: true, detail, health };
 }
@@ -687,8 +710,14 @@ async function walkProcessAncestry() {
  * once in T0 and AGAIN immediately before every restart in T7/T10 — the plan's
  * "every restart re-runs the emptiness check from T0 first", made mechanical.
  */
-async function gatesAllowMutation(label) {
-  const e = await measureEmptiness();
+async function gatesAllowMutation(label, ctx) {
+  const owned = {
+    sessions: new Set(
+      (ctx?.fixtures ?? []).map((x) => x.session?.identity?.claudeSessionId).filter(Boolean),
+    ),
+    terminals: new Set((ctx?.fixtures ?? []).map((x) => x.terminalId).filter(Boolean)),
+  };
+  const e = await measureEmptiness(owned);
   const s = await measureSelfHosting(e.health);
   const ok = e.evaluable && e.empty && s.evaluable && s.safe;
   return {
@@ -1702,6 +1731,11 @@ async function ensurePanelOpen(zoneIndex) {
 
 async function runDropdownPass(ctx, phase, ids) {
   const { opts } = ctx;
+  // Both passes need this, not just the pre-restart one: after a restart the
+  // tabs re-acquire their `claudeSessionId` through the same periodic backfill,
+  // so a post-restore pass sampled immediately reports triggers and panels
+  // absent for sessions that simply had not re-bound yet.
+  await waitForTriggersToMount();
   const label = phase === "post-restore" ? " (post-restore)" : "";
 
   const info = await fetchSessionsInfo();
@@ -1900,7 +1934,11 @@ async function waitForTriggersToMount(budgetMs = TRIGGER_MOUNT_BUDGET_MS) {
 async function runDropdownAssertions(ctx) {
   section("T1-T5 — dropdown");
 
+  // T1/T2 read the zone headers and triggers directly, BEFORE runDropdownPass
+  // gets its own wait, so they need this too. Idempotent: it returns at once
+  // when everything is already mounted.
   await waitForTriggersToMount();
+
   const info = await fetchSessionsInfo();
   const z = await collectZones();
 
@@ -2143,6 +2181,41 @@ function skipT9Pass(why) {
   skip("T9.T5", "account and name are correct and distinct across sessions (post-restore)", why);
 }
 
+/**
+ * Wait for RESTORE to finish, not merely for the runner to answer /health.
+ *
+ * `waitForHealthy` returns as soon as the process serves requests, but restore
+ * runs on after that: the runner recreates each terminal and re-launches its
+ * provider with `--resume`, and a session sits in the census's `missing[]` as
+ * `resume-failed` until its provider comes back. Sampling at `healthy` catches
+ * that in flight and reports a restore that had not finished as one that had
+ * FAILED.
+ *
+ * Measured 2026-08-21: T8 read `verdict='mismatch'` with all six sessions
+ * `resume-failed`; the same census a few minutes later read `match`, 6 restored,
+ * 0 missing, every session confirmed with a transcript. Nothing was wrong except
+ * when it was asked.
+ *
+ * Settles on the census reaching a terminal shape (no `resume-failed` still
+ * pending) or the budget expiring. It hides nothing: a restore that genuinely
+ * fails still fails, having been given time to succeed first.
+ */
+async function waitForRestoreToSettle(budgetMs = RESTORE_SETTLE_BUDGET_MS) {
+  const deadline = Date.now() + budgetMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    const c = await fetchCensus();
+    last = c;
+    if (c.ok) {
+      const missing = c.census?.missing ?? [];
+      const pending = missing.filter((m) => String(m.reason ?? "").includes("resume"));
+      if (pending.length === 0) return c;
+    }
+    await sleep(FIXTURE_POLL_INTERVAL_MS);
+  }
+  return last ?? (await fetchCensus());
+}
+
 async function runRestoreAssertions(ctx) {
   section("T6-T9 — restore");
   const { opts } = ctx;
@@ -2260,7 +2333,7 @@ async function runRestoreAssertions(ctx) {
     return;
   }
 
-  const gate = await gatesAllowMutation("T7 pre-restart");
+  const gate = await gatesAllowMutation("T7 pre-restart", ctx);
   if (!gate.ok) {
     fail(
       "T7",
@@ -2351,7 +2424,8 @@ async function runRestoreAssertions(ctx) {
   }
   // "A clean shutdown marker was written" is asserted through the census's own
   // report of the boundary it read, rather than by guessing the marker's path.
-  const post = await fetchCensus();
+  // Restore continues after /health answers — wait for it before judging it.
+  const post = await waitForRestoreToSettle();
   const clean = post.ok && post.census?.cleanShutdown === true && post.census?.shutdownAt != null;
   if (clean) {
     pass(
@@ -2570,7 +2644,7 @@ async function runHonestyAssertions(ctx) {
         "and that is inside the plan's §0 carve-out ONLY for an empty runner the implementer itself emptied.",
     );
   } else {
-    const gate = await gatesAllowMutation("T10 pre-crash");
+    const gate = await gatesAllowMutation("T10 pre-crash", ctx);
     if (!gate.ok) {
       fail(
         "T10",
