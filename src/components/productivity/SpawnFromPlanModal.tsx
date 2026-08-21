@@ -29,6 +29,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { AlertCircle, CheckCircle2, Loader2, Rocket, X } from "lucide-react";
 import { spawnFromPlan, type SpawnAgentResult } from "./coordinatorApi";
+import { useCoordMode, type CoordGating } from "@/contexts/CoordModeContext";
+import { CoordConnectionRequired } from "@/components/shared/CoordConnectionRequired";
 
 export interface SpawnFromPlanModalProps {
   /** Whether the modal is open. */
@@ -54,6 +56,49 @@ const KNOWN_REPOS = [
   "qontinui-dev-notes",
 ] as const;
 
+/** Inputs to {@link deriveSpawnFormState}. */
+export interface SpawnFormInput {
+  busy: boolean;
+  workUnitSlug: string;
+  phase: string;
+  intent: string;
+  initialPrompt: string;
+  selectedRepos: string[];
+  otherRepos: string;
+  /** The runner's coord mode. Omitted = fail open (see CoordModeContext). */
+  gating?: CoordGating;
+}
+
+/**
+ * Derive the form's enablement from its inputs and the runner's coord mode.
+ *
+ * Split out as a pure function so the isolated-mode behaviour is testable
+ * under the runner's `environment: "node"` vitest config (no jsdom — see
+ * FleetHealthPanel.test.tsx for the same constraint).
+ *
+ * Spawning posts to coord's `POST /agents/spawn`. On an isolated runner
+ * there is no coord to post to, so every field and the submit button are
+ * genuinely `disabled` rather than merely greyed: a form that accepts input
+ * it can never send is the "click and nothing happens" failure this gate
+ * exists to remove.
+ */
+export function deriveSpawnFormState(input: SpawnFormInput): {
+  coordDisabled: boolean;
+  fieldsEnabled: boolean;
+  canSubmit: boolean;
+} {
+  const coordDisabled = input.gating?.isolated ?? false;
+  const fieldsEnabled = !input.busy && !coordDisabled;
+  const canSubmit =
+    fieldsEnabled &&
+    input.workUnitSlug.trim().length > 0 &&
+    input.phase.trim().length > 0 &&
+    input.intent.trim().length > 0 &&
+    input.initialPrompt.trim().length > 0 &&
+    (input.selectedRepos.length > 0 || input.otherRepos.trim().length > 0);
+  return { coordDisabled, fieldsEnabled, canSubmit };
+}
+
 export function SpawnFromPlanModal({
   open,
   onClose,
@@ -61,6 +106,7 @@ export function SpawnFromPlanModal({
   initialPhase,
   onSuccess,
 }: SpawnFromPlanModalProps) {
+  const coord = useCoordMode();
   const [workUnitSlug, setWorkUnitSlug] = useState("");
   const [phase, setPhase] = useState("");
   const [selectedRepos, setSelectedRepos] = useState<string[]>([]);
@@ -153,13 +199,17 @@ export function SpawnFromPlanModal({
 
   if (!open) return null;
 
-  const canSubmit =
-    !busy &&
-    workUnitSlug.trim().length > 0 &&
-    phase.trim().length > 0 &&
-    intent.trim().length > 0 &&
-    initialPrompt.trim().length > 0 &&
-    (selectedRepos.length > 0 || otherRepos.trim().length > 0);
+  const { coordDisabled, fieldsEnabled, canSubmit } = deriveSpawnFormState({
+    busy,
+    workUnitSlug,
+    phase,
+    intent,
+    initialPrompt,
+    selectedRepos,
+    otherRepos,
+    gating: coord,
+  });
+  const fieldsDisabled = !fieldsEnabled;
 
   return (
     <div
@@ -168,11 +218,7 @@ export function SpawnFromPlanModal({
       aria-modal="true"
       aria-label="Spawn from plan"
     >
-      <div
-        className="absolute inset-0 bg-black/40"
-        onClick={onClose}
-        aria-hidden="true"
-      />
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} aria-hidden="true" />
       <div
         className="relative w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-lg border border-border bg-background shadow-2xl"
         data-ui-bridge-id="productivity.spawn-from-plan-modal"
@@ -180,9 +226,7 @@ export function SpawnFromPlanModal({
         <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-border bg-card/40 sticky top-0">
           <div className="flex items-center gap-2">
             <Rocket className="w-4 h-4 text-primary" />
-            <h2 className="text-sm font-semibold text-foreground">
-              Spawn agent from plan
-            </h2>
+            <h2 className="text-sm font-semibold text-foreground">Spawn agent from plan</h2>
           </div>
           <button
             onClick={onClose}
@@ -196,58 +240,61 @@ export function SpawnFromPlanModal({
 
         <form onSubmit={handleSubmit} className="p-4 space-y-3">
           <p className="text-xs text-muted-foreground">
-            Mint a coord agent pinned to this device. Coord acquires claims
-            and delivers the initial prompt on first tick.
+            Mint a coord agent pinned to this device. Coord acquires claims and delivers the initial
+            prompt on first tick.
           </p>
 
+          {/* §6.4 — the whole form is inert without a coord to post to.
+              The notice sits ahead of the fields in the reading order
+              because the fields it explains are `disabled` and therefore
+              unreachable by keyboard and screen reader. */}
+          {coordDisabled ? (
+            <CoordConnectionRequired
+              source={coord.source}
+              surface="Spawn from Plan"
+              uiBridgeId="productivity.spawn-from-plan-modal-isolated"
+            />
+          ) : null}
+
           <label className="block">
-            <span className="block text-xs font-medium text-foreground mb-1">
-              Work unit slug
-            </span>
+            <span className="block text-xs font-medium text-foreground mb-1">Work unit slug</span>
             <input
               type="text"
               value={workUnitSlug}
               onChange={(e) => setWorkUnitSlug(e.target.value)}
               placeholder="2026-05-19-coordinator-production-readiness"
               className="w-full px-2 py-1.5 rounded border border-border bg-background text-sm text-foreground font-mono placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary/40"
-              disabled={busy}
+              disabled={fieldsDisabled}
               data-ui-bridge-id="productivity.spawn-from-plan-modal-slug"
             />
           </label>
 
           <label className="block">
-            <span className="block text-xs font-medium text-foreground mb-1">
-              Phase
-            </span>
+            <span className="block text-xs font-medium text-foreground mb-1">Phase</span>
             <input
               type="text"
               value={phase}
               onChange={(e) => setPhase(e.target.value)}
               placeholder='4 — coord stores a phase NUMBER ("Phase 4" also works)'
               className="w-full px-2 py-1.5 rounded border border-border bg-background text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary/40"
-              disabled={busy}
+              disabled={fieldsDisabled}
               data-ui-bridge-id="productivity.spawn-from-plan-modal-phase"
             />
           </label>
 
           <fieldset className="block">
-            <legend className="block text-xs font-medium text-foreground mb-1">
-              Repos
-            </legend>
+            <legend className="block text-xs font-medium text-foreground mb-1">Repos</legend>
             <div
               className="grid grid-cols-2 gap-1.5 rounded border border-border p-2"
               data-ui-bridge-id="productivity.spawn-from-plan-modal-repos"
             >
               {KNOWN_REPOS.map((repo) => (
-                <label
-                  key={repo}
-                  className="flex items-center gap-2 text-xs cursor-pointer"
-                >
+                <label key={repo} className="flex items-center gap-2 text-xs cursor-pointer">
                   <input
                     type="checkbox"
                     checked={selectedRepos.includes(repo)}
                     onChange={() => toggleRepo(repo)}
-                    disabled={busy}
+                    disabled={fieldsDisabled}
                     data-ui-bridge-id={`productivity.spawn-from-plan-modal-repo-${repo}`}
                   />
                   <span className="font-mono">{repo}</span>
@@ -260,22 +307,20 @@ export function SpawnFromPlanModal({
               onChange={(e) => setOtherRepos(e.target.value)}
               placeholder="other repos (comma-separated)"
               className="mt-1 w-full px-2 py-1.5 rounded border border-border bg-background text-xs text-foreground font-mono placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary/40"
-              disabled={busy}
+              disabled={fieldsDisabled}
               data-ui-bridge-id="productivity.spawn-from-plan-modal-other-repos"
             />
           </fieldset>
 
           <label className="block">
-            <span className="block text-xs font-medium text-foreground mb-1">
-              Intent
-            </span>
+            <span className="block text-xs font-medium text-foreground mb-1">Intent</span>
             <input
               type="text"
               value={intent}
               onChange={(e) => setIntent(e.target.value)}
               placeholder="One-liner describing what this agent will do"
               className="w-full px-2 py-1.5 rounded border border-border bg-background text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary/40"
-              disabled={busy}
+              disabled={fieldsDisabled}
               data-ui-bridge-id="productivity.spawn-from-plan-modal-intent"
             />
           </label>
@@ -290,22 +335,20 @@ export function SpawnFromPlanModal({
               rows={3}
               placeholder={"backend/app/api/v1/endpoints/operations.py"}
               className="w-full px-2 py-1.5 rounded border border-border bg-background text-xs text-foreground font-mono placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary/40"
-              disabled={busy}
+              disabled={fieldsDisabled}
               data-ui-bridge-id="productivity.spawn-from-plan-modal-overlap-paths"
             />
           </label>
 
           <label className="block">
-            <span className="block text-xs font-medium text-foreground mb-1">
-              Initial prompt
-            </span>
+            <span className="block text-xs font-medium text-foreground mb-1">Initial prompt</span>
             <textarea
               value={initialPrompt}
               onChange={(e) => setInitialPrompt(e.target.value)}
               rows={6}
               placeholder="You are Wave N of plan X. Your scope: ..."
               className="w-full px-2 py-1.5 rounded border border-border bg-background text-xs text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary/40"
-              disabled={busy}
+              disabled={fieldsDisabled}
               data-ui-bridge-id="productivity.spawn-from-plan-modal-initial-prompt"
             />
           </label>
@@ -332,9 +375,7 @@ export function SpawnFromPlanModal({
             >
               <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 shrink-0 text-emerald-400" />
               <div className="min-w-0 flex-1">
-                <p className="font-medium">
-                  Spawned {result.agentId ?? "agent"}
-                </p>
+                <p className="font-medium">Spawned {result.agentId ?? "agent"}</p>
                 <p className="mt-0.5 text-muted-foreground font-mono break-all">
                   session: {result.agentSessionId ?? "(unknown)"}
                 </p>

@@ -25,6 +25,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, AlertOctagon, AlertTriangle, Info, RefreshCw, Server } from "lucide-react";
 import { createLogger } from "@/lib/logger";
+import { useCoordMode, type CoordGating } from "@/contexts/CoordModeContext";
+import { CoordConnectionRequired } from "@/components/shared/CoordConnectionRequired";
 import {
   getFleetHealth,
   type FleetAlert,
@@ -77,7 +79,10 @@ function ago(ts: string | null): string {
  *  the stale machine grid as if current. coord is anonymous today so
  *  `auth.state` is `ok` in practice; an absent `auth` (older backend
  *  during dev) is treated as `ok` for back-compat. */
-export function deriveFleetView(data: FleetHealth | null): {
+export function deriveFleetView(
+  data: FleetHealth | null,
+  gating?: CoordGating,
+): {
   authState: FleetAuth["state"];
   isUnauthorized: boolean;
   isUnpaired: boolean;
@@ -85,30 +90,53 @@ export function deriveFleetView(data: FleetHealth | null): {
   machines: FleetMachineSnapshot[];
   alerts: FleetAlert[];
   rollup: { critical: number; warning: number; info: number };
+  /** True when the runner is positively isolated: render the notice
+   *  instead of any fleet content. */
+  coordDisabled: boolean;
+  /** Whether the 1 Hz coord poll should run at all. An isolated runner
+   *  has no coord to poll, so polling it once a second is pure waste
+   *  that also manufactures a permanent error banner. */
+  pollingEnabled: boolean;
+  /** Whether the panel's own controls (Refresh) accept input. */
+  controlsEnabled: boolean;
 } {
   const authState = data?.auth?.state ?? "ok";
   const isUnauthorized = authState === "unauthorized";
   const isUnpaired = authState === "unpaired";
   const isAuthBlocked = isUnauthorized || isUnpaired;
+  // `gating` absent (a caller that predates the §6.4 gate, or a panel
+  // rendered outside CoordModeProvider) fails OPEN — see
+  // CoordModeContext's header on why a wrongly-disabled panel is worse
+  // than a wrongly-enabled one.
+  const coordDisabled = gating?.isolated ?? false;
   return {
     authState,
     isUnauthorized,
     isUnpaired,
     isAuthBlocked,
     // When auth-blocked, drop any stale grid/alerts so we never render
-    // them as if current.
-    machines: isAuthBlocked ? [] : data?.health?.machines ?? [],
-    alerts: isAuthBlocked ? [] : data?.alerts ?? [],
-    rollup: data?.health?.alerts ?? { critical: 0, warning: 0, info: 0 },
+    // them as if current. Same for isolated: there is no fleet.
+    machines: isAuthBlocked || coordDisabled ? [] : (data?.health?.machines ?? []),
+    alerts: isAuthBlocked || coordDisabled ? [] : (data?.alerts ?? []),
+    rollup: coordDisabled
+      ? { critical: 0, warning: 0, info: 0 }
+      : (data?.health?.alerts ?? { critical: 0, warning: 0, info: 0 }),
+    coordDisabled,
+    pollingEnabled: !coordDisabled,
+    controlsEnabled: !coordDisabled,
   };
 }
 
 export function FleetHealthPanel() {
+  const coord = useCoordMode();
   const [data, setData] = useState<FleetHealth | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   // Avoid overlapping polls if coord is slow.
   const inFlight = useRef(false);
+
+  const { isUnauthorized, isUnpaired, isAuthBlocked, machines, alerts, rollup, coordDisabled } =
+    deriveFleetView(data, coord);
 
   const load = useCallback(async () => {
     if (inFlight.current) return;
@@ -131,13 +159,16 @@ export function FleetHealthPanel() {
   }, []);
 
   useEffect(() => {
+    // An isolated runner has no coord: polling a phantom base once a
+    // second would burn a request per second and manufacture a permanent
+    // "coord unreachable" banner for a condition that is configuration,
+    // not an outage. The mode is config-derived, so this is not a
+    // reachability heuristic — it never flips back on a network blip.
+    if (coordDisabled) return;
     void load();
     const id = window.setInterval(() => void load(), POLL_MS);
     return () => window.clearInterval(id);
-  }, [load]);
-
-  const { isUnauthorized, isUnpaired, isAuthBlocked, machines, alerts, rollup } =
-    deriveFleetView(data);
+  }, [load, coordDisabled]);
 
   return (
     <section
@@ -172,7 +203,8 @@ export function FleetHealthPanel() {
         <button
           type="button"
           onClick={() => void load()}
-          disabled={loading}
+          disabled={loading || coordDisabled}
+          title={coordDisabled ? "Disabled — no qontinui account is connected" : undefined}
           data-ui-bridge-id="productivity.fleet-health-refresh"
           className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 disabled:opacity-50"
         >
@@ -186,7 +218,7 @@ export function FleetHealthPanel() {
           banner. Suppressed when coord returned an auth rejection: that
           gets its own honest auth state below, not a "coord unreachable"
           message. */}
-      {error && !isAuthBlocked && (
+      {error && !isAuthBlocked && !coordDisabled && (
         <div className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400">
           coord unreachable — showing last known state. ({error})
         </div>
@@ -195,15 +227,21 @@ export function FleetHealthPanel() {
       {/* Auth-rejected: token present but coord rejected/expired it. Honest
           about the cause — this is NOT a network blip — and does not show
           the stale machine grid as if it were current. */}
-      {isUnauthorized ? (
+      {coordDisabled ? (
+        <CoordConnectionRequired
+          source={coord.source}
+          surface="Fleet health"
+          uiBridgeId="productivity.fleet-health-isolated"
+        />
+      ) : isUnauthorized ? (
         <div
           className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-400"
           data-ui-bridge-id="productivity.fleet-health-unauthorized"
         >
           <div className="font-semibold text-foreground">Fleet view requires sign-in</div>
           <p className="mt-1 text-amber-400/90">
-            This device&apos;s coord token was rejected or expired. Re-pair the
-            device to restore the fleet view.
+            This device&apos;s coord token was rejected or expired. Re-pair the device to restore
+            the fleet view.
           </p>
         </div>
       ) : isUnpaired ? (
@@ -212,9 +250,7 @@ export function FleetHealthPanel() {
           data-ui-bridge-id="productivity.fleet-health-unpaired"
         >
           <div className="font-semibold text-foreground">Device not paired</div>
-          <p className="mt-1 text-amber-400/90">
-            Pair this device with coord to see fleet health.
-          </p>
+          <p className="mt-1 text-amber-400/90">Pair this device with coord to see fleet health.</p>
         </div>
       ) : machines.length === 0 ? (
         /* Per-machine state grid */
@@ -230,12 +266,8 @@ export function FleetHealthPanel() {
               data-ui-bridge-id="productivity.fleet-health-machine"
             >
               <div className="flex items-center justify-between gap-2">
-                <span className="font-mono text-xs font-semibold truncate">
-                  {m.hostname}
-                </span>
-                <span className="text-[10px] uppercase tracking-wide font-semibold">
-                  {m.state}
-                </span>
+                <span className="font-mono text-xs font-semibold truncate">{m.hostname}</span>
+                <span className="text-[10px] uppercase tracking-wide font-semibold">{m.state}</span>
               </div>
               <div className="mt-1 flex items-center gap-3 text-[11px] text-muted-foreground">
                 <span className="inline-flex items-center gap-1">

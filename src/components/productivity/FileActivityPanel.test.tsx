@@ -47,10 +47,16 @@ import {
   ageLabel,
   barFor,
   buildYieldRequestBody,
+  deriveLiveHeatmapGate,
   hasExclusiveLock,
   lockYieldCooldownKey,
   lockYieldCooldownRemainingSecs,
 } from "./FileActivityPanel";
+import {
+  COORD_SOURCE_NO_ACCOUNT,
+  COORD_SOURCE_SETTINGS_UNREADABLE,
+  deriveCoordGating,
+} from "@/contexts/CoordModeContext";
 import {
   DEFAULT_WINDOW_SECS,
   WINDOW_OPTIONS,
@@ -333,14 +339,11 @@ function makeYieldClickSimulator(fetchImpl: typeof fetch): YieldClickSimulator {
     async click({ filePath, holderTaskRunId }) {
       const key = lockYieldCooldownKey(filePath, holderTaskRunId);
       cooldowns.set(key, Date.now() + REQUEST_YIELD_COOLDOWN_MS);
-      await fetchImpl(
-        `http://127.0.0.1:${mockGetApiPort()}/file-locks/yield-request`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(buildYieldRequestBody(filePath, holderTaskRunId)),
-        },
-      );
+      await fetchImpl(`http://127.0.0.1:${mockGetApiPort()}/file-locks/yield-request`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildYieldRequestBody(filePath, holderTaskRunId)),
+      });
     },
     isInCooldown({ filePath, holderTaskRunId, nowMs }) {
       const key = lockYieldCooldownKey(filePath, holderTaskRunId);
@@ -375,9 +378,7 @@ describe("yield-request POST dispatch — Phase 4 wire contract", () => {
     expect(url).toBe("http://127.0.0.1:9876/file-locks/yield-request");
     expect(init).toBeDefined();
     expect(init!.method).toBe("POST");
-    expect((init!.headers as Record<string, string>)["Content-Type"]).toBe(
-      "application/json",
-    );
+    expect((init!.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
     // EXACT body shape — must match the Phase 1 Rust handler's
     // `YieldRequestRequest` deserializer. Any drift breaks the wire
     // contract. §Open Q5 (synthetic Coordinator Dashboard identity) is
@@ -394,14 +395,10 @@ describe("yield-request POST dispatch — Phase 4 wire contract", () => {
 
   it("uses the dynamic port from getApiPort()", async () => {
     mockGetApiPort.mockReturnValue(54321);
-    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response("{}", { status: 200 }),
-    );
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(new Response("{}", { status: 200 }));
     const sim = makeYieldClickSimulator(fetchSpy);
     await sim.click({ filePath: "src/foo.rs", holderTaskRunId: "tab-B" });
-    expect(fetchSpy.mock.calls[0][0]).toBe(
-      "http://127.0.0.1:54321/file-locks/yield-request",
-    );
+    expect(fetchSpy.mock.calls[0][0]).toBe("http://127.0.0.1:54321/file-locks/yield-request");
   });
 });
 
@@ -419,9 +416,7 @@ describe("yield cooldown lifecycle — per-(file, holder) keying", () => {
   });
 
   it("disables the clicked row for 30s and re-enables after the cooldown expires", async () => {
-    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response("{}", { status: 200 }),
-    );
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(new Response("{}", { status: 200 }));
     const sim = makeYieldClickSimulator(fetchSpy);
     const target = { filePath: "src/foo.rs", holderTaskRunId: "tab-B" };
 
@@ -448,9 +443,7 @@ describe("yield cooldown lifecycle — per-(file, holder) keying", () => {
   });
 
   it("keeps other rows enabled when one row is in cooldown (per-pair keying)", async () => {
-    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response("{}", { status: 200 }),
-    );
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(new Response("{}", { status: 200 }));
     const sim = makeYieldClickSimulator(fetchSpy);
     const row1 = { filePath: "src/foo.rs", holderTaskRunId: "tab-B" };
     const row2 = { filePath: "src/bar.rs", holderTaskRunId: "tab-B" };
@@ -527,11 +520,81 @@ describe("fetchLockInfo — Phase 4 lock-info endpoint wrapper", () => {
   });
 
   it("throws when the response is not ok", async () => {
-    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response("oops", { status: 500 }),
-    );
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(new Response("oops", { status: 500 }));
     vi.stubGlobal("fetch", fetchSpy);
 
     await expect(fetchLockInfo()).rejects.toThrow(/HTTP 500/);
+  });
+});
+
+/**
+ * §6.4 — plan
+ * `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`.
+ *
+ * This panel is deliberately only PARTLY gated. The live worktree heatmap
+ * proxies coord's Redis dirty-state cache and is meaningless without a
+ * fleet; the live-holdings / hot-files / hot-sessions sections read the
+ * in-process FileRegistryManager and the runner's own embedded Postgres and
+ * stay fully live on a standalone runner.
+ */
+describe("deriveLiveHeatmapGate — coord-mode gating (§6.4)", () => {
+  const connected = deriveCoordGating({
+    data: { mode: "connected", base: "https://coord.qontinui.io", source: "profile" },
+    error: null,
+    loading: false,
+  });
+  const isolated = deriveCoordGating({
+    data: { mode: "isolated", base: null, source: COORD_SOURCE_NO_ACCOUNT },
+    error: null,
+    loading: false,
+  });
+  const isolatedUnreadable = deriveCoordGating({
+    data: { mode: "isolated", base: null, source: COORD_SOURCE_SETTINGS_UNREADABLE },
+    error: null,
+    loading: false,
+  });
+  const unknown = deriveCoordGating({
+    data: null,
+    error: "Command get_coord_mode not found",
+    loading: false,
+  });
+
+  it("connected → heatmap section live and polling", () => {
+    expect(deriveLiveHeatmapGate({ testSeam: false, gating: connected })).toEqual({
+      coordDisabled: false,
+      pollEnabled: true,
+    });
+  });
+
+  it("isolated → heatmap section disabled and its 5s poll stopped", () => {
+    expect(deriveLiveHeatmapGate({ testSeam: false, gating: isolated })).toEqual({
+      coordDisabled: true,
+      pollEnabled: false,
+    });
+    expect(deriveLiveHeatmapGate({ testSeam: false, gating: isolatedUnreadable })).toEqual({
+      coordDisabled: true,
+      pollEnabled: false,
+    });
+  });
+
+  it("unknown mode → section STAYS live rather than being falsely disabled", () => {
+    expect(deriveLiveHeatmapGate({ testSeam: false, gating: unknown })).toEqual({
+      coordDisabled: false,
+      pollEnabled: true,
+    });
+  });
+
+  it("no gating supplied → unchanged pre-§6.4 behaviour (fails open)", () => {
+    expect(deriveLiveHeatmapGate({ testSeam: false })).toEqual({
+      coordDisabled: false,
+      pollEnabled: true,
+    });
+  });
+
+  it("the deterministic test seam still suppresses the poll on a connected runner", () => {
+    expect(deriveLiveHeatmapGate({ testSeam: true, gating: connected })).toEqual({
+      coordDisabled: false,
+      pollEnabled: false,
+    });
   });
 });

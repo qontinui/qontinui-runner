@@ -58,6 +58,8 @@ import {
   type Recommendation,
 } from "./reviewsApi";
 import { acknowledgeAdvisory } from "./reflectionApi";
+import { useCoordMode, type CoordGating } from "@/contexts/CoordModeContext";
+import { CoordConnectionRequired } from "@/components/shared/CoordConnectionRequired";
 import { PlanRecommendations } from "./PlanRecommendations";
 import { BlindSpotsPanel } from "./BlindSpotsPanel";
 import { WorkersPanel } from "./WorkersPanel";
@@ -695,9 +697,7 @@ function DeferralsPanel({ rows, loading, error, onRefresh, onForceAssign }: Defe
                   <div className="flex items-center gap-2 text-xs">
                     <span className="font-mono text-amber-300">{row.taskId}</span>
                     <span className="text-muted-foreground">·</span>
-                    <span className="text-muted-foreground">
-                      deferred until {row.blockerLabel}
-                    </span>
+                    <span className="text-muted-foreground">deferred until {row.blockerLabel}</span>
                   </div>
                   <div className="text-xs text-muted-foreground">
                     last advised{" "}
@@ -1002,9 +1002,19 @@ interface OverlapPanelProps {
   loading: boolean;
   error: string | null;
   onRefresh: () => void;
+  /**
+   * The runner's coord mode. `coord.agent_worktrees` rows are written
+   * ONLY by coord replication — the runner never inserts into that table
+   * — so on an isolated runner this panel is structurally empty forever.
+   * Rendering it live would tell the operator "no L2 contention right
+   * now", which is a false statement of fact about a fleet that does not
+   * exist.
+   */
+  coord: CoordGating;
 }
 
-function OverlapPanel({ rows, loading, error, onRefresh }: OverlapPanelProps) {
+function OverlapPanel({ rows, loading, error, onRefresh, coord }: OverlapPanelProps) {
+  const disabled = coord.isolated;
   return (
     <section
       role="region"
@@ -1026,7 +1036,8 @@ function OverlapPanel({ rows, loading, error, onRefresh }: OverlapPanelProps) {
         <button
           type="button"
           onClick={onRefresh}
-          disabled={loading}
+          disabled={loading || disabled}
+          title={disabled ? "Disabled — no qontinui account is connected" : undefined}
           data-ui-bridge-id="productivity.coord-overlapping-intents-refresh"
           className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 disabled:opacity-50"
         >
@@ -1035,14 +1046,20 @@ function OverlapPanel({ rows, loading, error, onRefresh }: OverlapPanelProps) {
         </button>
       </header>
 
-      {error ? (
+      {disabled ? (
+        <CoordConnectionRequired
+          source={coord.source}
+          surface="Overlapping intents"
+          uiBridgeId="productivity.coord-overlapping-intents-isolated"
+        />
+      ) : error ? (
         <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-400">
           {error}
         </div>
       ) : rows.length === 0 ? (
         <div className="rounded-md border border-border/40 bg-muted/10 p-3 text-xs text-muted-foreground">
-          No overlapping agent intents detected. Agents declare paths at allocation; coord
-          flags pairs whose declared sets intersect. Empty here = no L2 contention right now.
+          No overlapping agent intents detected. Agents declare paths at allocation; coord flags
+          pairs whose declared sets intersect. Empty here = no L2 contention right now.
         </div>
       ) : (
         <ul className="flex flex-col gap-2">
@@ -1106,6 +1123,9 @@ function OverlapPanel({ rows, loading, error, onRefresh }: OverlapPanelProps) {
 // ---------------------------------------------------------------------------
 
 export function CoordinatorDashboard() {
+  // §6.4 — one shared, config-derived answer for every coord-backed
+  // surface on this page. Never a reachability probe.
+  const coord = useCoordMode();
   const [decisions, setDecisions] = useState<CoordinatorDecision[]>([]);
   const [escalations, setEscalations] = useState<Escalation[]>([]);
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
@@ -1267,12 +1287,16 @@ export function CoordinatorDashboard() {
   // iteration could swap to a WS subscription on
   // events.coord.overlap.detected for sub-second freshness.
   useEffect(() => {
+    // Isolated runners have no coord replicating `coord.agent_worktrees`,
+    // so this poll can only ever return an empty list. Skip it — the
+    // panel states the reason instead of implying "no contention".
+    if (coord.isolated) return;
     void loadOverlap();
     const id = setInterval(() => {
       void loadOverlap();
     }, 30_000);
     return () => clearInterval(id);
-  }, [loadOverlap]);
+  }, [loadOverlap, coord.isolated]);
 
   // Subscribe to `review-completed` so a finished /auto-review surfaces
   // here without forcing the user to refresh. Tauri may not be present in
@@ -1609,6 +1633,12 @@ export function CoordinatorDashboard() {
               type="button"
               className={outlineBtnClass}
               onClick={() => setSpawnFromPlanOpen(true)}
+              disabled={coord.isolated}
+              title={
+                coord.isolated
+                  ? "Spawning an agent posts to coord — connect a qontinui account to enable"
+                  : undefined
+              }
               data-ui-bridge-id="productivity.spawn-from-plan"
             >
               <Rocket className="w-3 h-3" />
@@ -1616,6 +1646,22 @@ export function CoordinatorDashboard() {
             </button>
           </div>
         </div>
+        {/*
+         * "Spawn from Plan" is the one launch control that leaves this
+         * machine — it POSTs to coord's `/agents/spawn`. A `disabled`
+         * button is not focusable, so its tooltip is unreachable by
+         * keyboard and screen reader; the reason has to live in the
+         * reading order as content. The other launch buttons stay live:
+         * they start local sessions and work fine without coord.
+         */}
+        {coord.isolated ? (
+          <CoordConnectionRequired
+            source={coord.source}
+            surface="Spawn from Plan"
+            uiBridgeId="productivity.spawn-from-plan-isolated"
+          />
+        ) : null}
+
         {launchError ? (
           <div
             className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400"
@@ -1750,14 +1796,12 @@ export function CoordinatorDashboard() {
           loading={overlapLoading}
           error={overlapError}
           onRefresh={loadOverlap}
+          coord={coord}
         />
       </div>
       {/* Wave 4 — Spawn from Plan modal. Mounted at the dashboard root
           so the overlay covers the whole pane. */}
-      <SpawnFromPlanModal
-        open={spawnFromPlanOpen}
-        onClose={() => setSpawnFromPlanOpen(false)}
-      />
+      <SpawnFromPlanModal open={spawnFromPlanOpen} onClose={() => setSpawnFromPlanOpen(false)} />
     </div>
   );
 }

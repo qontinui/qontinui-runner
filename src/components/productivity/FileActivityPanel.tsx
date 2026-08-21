@@ -46,6 +46,8 @@ import {
 } from "./fileActivityApi";
 
 import { REQUEST_YIELD_COOLDOWN_MS } from "@/lib/lock-yield";
+import { useCoordMode, type CoordGating } from "@/contexts/CoordModeContext";
+import { CoordConnectionRequired } from "@/components/shared/CoordConnectionRequired";
 
 const logger = createLogger("FileActivityPanel");
 
@@ -70,18 +72,13 @@ export function hasExclusiveLock(
 ): boolean {
   if (!lockInfo) return false;
   return lockInfo.some(
-    (l) =>
-      l.file_path === entry.file_path &&
-      l.holder_task_run_id === entry.holder_task_run_id,
+    (l) => l.file_path === entry.file_path && l.holder_task_run_id === entry.holder_task_run_id,
   );
 }
 
 /** Compute cooldown's remaining seconds (rounded UP to mirror
  *  `WaitingLockBanner.cooldownRemainingSecs`). Pure / exported for tests. */
-export function lockYieldCooldownRemainingSecs(
-  cooldownUntilMs: number,
-  nowMs: number,
-): number {
+export function lockYieldCooldownRemainingSecs(cooldownUntilMs: number, nowMs: number): number {
   if (cooldownUntilMs <= nowMs) return 0;
   return Math.ceil((cooldownUntilMs - nowMs) / 1000);
 }
@@ -145,13 +142,7 @@ interface PanelHeaderProps {
   error: string | null;
 }
 
-function PanelHeader({
-  windowSecs,
-  onWindowChange,
-  onRefresh,
-  isStale,
-  error,
-}: PanelHeaderProps) {
+function PanelHeader({ windowSecs, onWindowChange, onRefresh, isStale, error }: PanelHeaderProps) {
   return (
     <header className="flex items-center justify-between">
       <div className="flex items-center gap-2">
@@ -229,9 +220,7 @@ function LiveSnapshotSection({
   // Value: epoch ms at which the cooldown ends. Entries are never pruned
   // — the map grows with each click but stays bounded by the live row
   // count (no leak on the time-scale of a single panel mount).
-  const [cooldowns, setCooldowns] = useState<Map<string, number>>(
-    () => new Map(),
-  );
+  const [cooldowns, setCooldowns] = useState<Map<string, number>>(() => new Map());
 
   // Phase 2 (stuck-session heartbeat) — subscribe to the shared 1Hz
   // broadcast so the cooldown countdown stays visually accurate. The
@@ -275,14 +264,11 @@ function LiveSnapshotSection({
 
       try {
         const f = fetchImpl ?? globalThis.fetch;
-        const resp = await f(
-          `http://127.0.0.1:${getApiPort()}/file-locks/yield-request`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(buildYieldRequestBody(filePath, holderTaskRunId)),
-          },
-        );
+        const resp = await f(`http://127.0.0.1:${getApiPort()}/file-locks/yield-request`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(buildYieldRequestBody(filePath, holderTaskRunId)),
+        });
         if (!resp.ok) {
           logger.warn(
             `yield-request POST returned ${resp.status} for ${filePath} (holder=${holderTaskRunId})`,
@@ -307,15 +293,9 @@ function LiveSnapshotSection({
   }
 
   return (
-    <ul
-      className="flex flex-col gap-2"
-      data-ui-bridge-id="productivity.file-activity-live"
-    >
+    <ul className="flex flex-col gap-2" data-ui-bridge-id="productivity.file-activity-live">
       {grouped.map(({ holder, entries }) => (
-        <li
-          key={holder}
-          className="rounded-md border border-border/40 bg-background/40 p-2"
-        >
+        <li key={holder} className="rounded-md border border-border/40 bg-background/40 p-2">
           <button
             type="button"
             onClick={() => onJumpToHolder(holder)}
@@ -330,10 +310,7 @@ function LiveSnapshotSection({
               const yieldable = hasExclusiveLock(e, lockInfo);
               const key = lockYieldCooldownKey(e.file_path, e.holder_task_run_id);
               const cooldownUntil = cooldowns.get(key) ?? 0;
-              const cooldownLeft = lockYieldCooldownRemainingSecs(
-                cooldownUntil,
-                nowMs,
-              );
+              const cooldownLeft = lockYieldCooldownRemainingSecs(cooldownUntil, nowMs);
               const inCooldown = cooldownLeft > 0;
               const buttonTitle = inCooldown
                 ? `Cooldown — request again in ${cooldownLeft}s`
@@ -357,9 +334,7 @@ function LiveSnapshotSection({
                       data-file-path={e.file_path}
                       data-holder-task-run-id={e.holder_task_run_id}
                       disabled={inCooldown}
-                      onClick={() =>
-                        void handleRequestYield(e.file_path, e.holder_task_run_id)
-                      }
+                      onClick={() => void handleRequestYield(e.file_path, e.holder_task_run_id)}
                       title={buttonTitle}
                       className={
                         inCooldown
@@ -398,10 +373,7 @@ function HotFilesSection({ rows }: HotFilesSectionProps) {
     );
   }
   return (
-    <table
-      className="w-full text-xs"
-      data-ui-bridge-id="productivity.file-activity-hot-files"
-    >
+    <table className="w-full text-xs" data-ui-bridge-id="productivity.file-activity-hot-files">
       <thead className="text-muted-foreground">
         <tr>
           <th className="text-left font-normal pb-1">Path</th>
@@ -420,9 +392,7 @@ function HotFilesSection({ rows }: HotFilesSectionProps) {
               {r.file_path}
             </td>
             <td>
-              <span className="font-mono text-foreground/90 mr-2">
-                {r.distinct_sessions}
-              </span>
+              <span className="font-mono text-foreground/90 mr-2">{r.distinct_sessions}</span>
               <span className="font-mono text-muted-foreground">
                 {barFor(r.distinct_sessions, max)}
               </span>
@@ -452,10 +422,7 @@ function HotSessionsSection({ rows }: HotSessionsSectionProps) {
     );
   }
   return (
-    <table
-      className="w-full text-xs"
-      data-ui-bridge-id="productivity.file-activity-hot-sessions"
-    >
+    <table className="w-full text-xs" data-ui-bridge-id="productivity.file-activity-hot-sessions">
       <thead className="text-muted-foreground">
         <tr>
           <th className="text-left font-normal pb-1">Session</th>
@@ -525,20 +492,18 @@ function LiveDirtyHeatmapSection({ cells }: { cells: LiveHeatCell[] }) {
       a.file.localeCompare(b.file),
   );
   return (
-    <ul className="flex flex-col gap-0.5" data-ui-bridge-id="productivity.file-activity-live-heatmap-list">
+    <ul
+      className="flex flex-col gap-0.5"
+      data-ui-bridge-id="productivity.file-activity-live-heatmap-list"
+    >
       {sorted.map((c) => (
-        <li
-          key={`${c.repo}:${c.file}`}
-          className="flex items-center justify-between gap-2 text-xs"
-        >
+        <li key={`${c.repo}:${c.file}`} className="flex items-center justify-between gap-2 text-xs">
           <span className="truncate font-mono" title={`${c.repo}/${c.file}`}>
             <span className="text-muted-foreground">{c.repo}/</span>
             {c.file}
           </span>
           <span className="flex items-center gap-1 shrink-0">
-            {c.agents.length > 1 && (
-              <Flame className="w-3 h-3 text-orange-500" />
-            )}
+            {c.agents.length > 1 && <Flame className="w-3 h-3 text-orange-500" />}
             <span className="text-muted-foreground">
               {c.agents.length} agent{c.agents.length === 1 ? "" : "s"}
             </span>
@@ -552,14 +517,46 @@ function LiveDirtyHeatmapSection({ cells }: { cells: LiveHeatCell[] }) {
   );
 }
 
+/**
+ * §6.4 gate for the ONE coord-backed sub-section of this panel.
+ *
+ * `GET /file-activity/heatmap-live` is a proxy over coord's per-agent
+ * `git status` cache (`agent:<id>:dirty` in coord's Redis). Everything else
+ * the panel renders — the live holdings snapshot, hot files, hot sessions —
+ * comes from the in-process `FileRegistryManager` and the runner's own
+ * embedded Postgres, and is fully useful on a standalone runner. So the
+ * panel stays enabled and only this section is gated.
+ *
+ * Without the gate an isolated runner renders "No agents with dirty
+ * worktrees right now" — a confident statement of fact about a fleet that
+ * does not exist.
+ *
+ * Pure, so it is testable under `environment: "node"`.
+ */
+export function deriveLiveHeatmapGate(input: {
+  /** True when the panel is being driven by its deterministic test seam. */
+  testSeam: boolean;
+  /** The runner's coord mode. Omitted = fail open (see CoordModeContext). */
+  gating?: CoordGating;
+}): { coordDisabled: boolean; pollEnabled: boolean } {
+  const coordDisabled = input.gating?.isolated ?? false;
+  return { coordDisabled, pollEnabled: !input.testSeam && !coordDisabled };
+}
+
 export function FileActivityPanel({
   initialDataForTest,
   initialLockInfoForTest,
   onJumpToHolder,
 }: FileActivityPanelProps) {
+  const coord = useCoordMode();
   // Phase 6 live heatmap — the primary file-activity surface. Disabled
-  // under the test seam (deterministic snapshot rendering).
-  const liveHeatmap = useLiveDirtyHeatmap(initialDataForTest == null);
+  // under the test seam (deterministic snapshot rendering) and on an
+  // isolated runner, where coord publishes no dirty-worktree snapshot.
+  const liveGate = deriveLiveHeatmapGate({
+    testSeam: initialDataForTest != null,
+    gating: coord,
+  });
+  const liveHeatmap = useLiveDirtyHeatmap(liveGate.pollEnabled);
   const [windowSecs, setWindowSecsState] = useState<number>(() =>
     initialDataForTest ? DEFAULT_WINDOW_SECS : loadStoredWindowSecs(),
   );
@@ -570,9 +567,7 @@ export function FileActivityPanel({
   });
 
   const snapshot = initialDataForTest ?? data;
-  const effectiveLockInfo = initialDataForTest
-    ? (initialLockInfoForTest ?? null)
-    : lockInfo;
+  const effectiveLockInfo = initialDataForTest ? (initialLockInfoForTest ?? null) : lockInfo;
 
   const handleWindowChange = useCallback((secs: number) => {
     setWindowSecsState(secs);
@@ -617,20 +612,28 @@ export function FileActivityPanel({
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-1">
             <Flame className="w-3 h-3" />
             Live worktree heatmap
-            {liveHeatmap.isStale && (
+            {!liveGate.coordDisabled && liveHeatmap.isStale && (
               <span title={liveHeatmap.error ?? "coord degraded — showing last good"}>
                 <Clock className="w-3 h-3 text-amber-500" />
               </span>
             )}
           </div>
-          <LiveDirtyHeatmapSection cells={liveHeatmap.data?.heatmap ?? []} />
+          {liveGate.coordDisabled ? (
+            <CoordConnectionRequired
+              source={coord.source}
+              surface="Live worktree heatmap"
+              uiBridgeId="productivity.file-activity-live-heatmap-isolated"
+            />
+          ) : (
+            <LiveDirtyHeatmapSection cells={liveHeatmap.data?.heatmap ?? []} />
+          )}
         </section>
 
         {/* Legacy `coord.session_touched_files` sections below — kept
             live during the Phase 6 pivot; Phase 7 removes them. */}
         <p className="text-[10px] text-muted-foreground italic">
-          Legacy session-touched-files view (deprecated — Phase 7 removes;
-          misses reads-vs-edits, deletes, and renames):
+          Legacy session-touched-files view (deprecated — Phase 7 removes; misses reads-vs-edits,
+          deletes, and renames):
         </p>
         <section
           aria-label="Live file holdings"
