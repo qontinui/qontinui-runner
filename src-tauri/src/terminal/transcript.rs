@@ -849,7 +849,7 @@ pub(crate) fn parse_assistant_record(record: &serde_json::Value) -> Option<Trans
 // share the same `serde_json::Value` walking style and timestamp field.
 //
 // Consumed by `terminal::transcript_watcher` to populate
-// `coord.session_touched_files` for PTY-launched AI tabs (the SDK
+// `project.session_touched_files` for PTY-launched AI tabs (the SDK
 // `auto_register_file` path covers SDK chat sessions).
 
 /// One file-edit observation extracted from a single tool-use block in a

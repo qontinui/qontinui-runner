@@ -11,7 +11,7 @@
 //!
 //! [`backfill_tasks`] is a one-shot maintenance helper for the
 //! `coord-task-status-hygiene` plan (Phase 3): it cross-references stuck
-//! `coord.tasks` rows against `git log` on `main` and flips matches to
+//! `project.tasks` rows against `git log` on `main` and flips matches to
 //! `done`. Dry-run by default.
 
 pub mod backfill_tasks;

@@ -1350,7 +1350,7 @@ pub async fn get_session_commit_state(
 /// One row of the file-ownership heatmap (Phase 3 of
 /// `conflict-tooling-pauses-aligned-plan.md`).
 ///
-/// Mirrors a single `coord.session_touched_files` row, with `recorded_at`
+/// Mirrors a single `project.session_touched_files` row, with `recorded_at`
 /// flattened to epoch milliseconds so the frontend can compute decay
 /// without a date-parsing detour.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1361,7 +1361,7 @@ pub struct TouchedFileRow {
     pub recorded_at_ms: u64,
 }
 
-/// Recent rows from `coord.session_touched_files` for the file-ownership
+/// Recent rows from `project.session_touched_files` for the file-ownership
 /// heatmap panel.
 ///
 /// Returns up to 5000 most-recent rows whose `recorded_at` falls inside the
@@ -1396,7 +1396,7 @@ pub async fn recent_session_touched_files(
             r#"SELECT file_path,
                       task_run_id,
                       (EXTRACT(EPOCH FROM recorded_at) * 1000)::bigint AS recorded_at_ms
-               FROM coord.session_touched_files
+               FROM project.session_touched_files
                WHERE recorded_at > NOW() - make_interval(secs => $1)
                ORDER BY recorded_at DESC
                LIMIT 5000"#,
@@ -1412,7 +1412,7 @@ pub async fn recent_session_touched_files(
             task_run_id: r.get::<_, String>(1),
             // Saturating cast: `recorded_at_ms` is computed by PG as a
             // bigint; pre-1970 timestamps would be negative, but
-            // `coord.session_touched_files` is append-only with NOW() so
+            // `project.session_touched_files` is append-only with NOW() so
             // this is defensive only.
             recorded_at_ms: r.get::<_, i64>(2).max(0) as u64,
         })
@@ -1509,7 +1509,7 @@ async fn reacquire_and_restore_session_worktree(
     let mut notes: Vec<String> = Vec::new();
 
     // 1. Which repo(s)/worktree(s) was this session editing? Sourced from the
-    //    persisted `coord.worktrees` rows keyed by task_run_id (written by
+    //    persisted `project.worktrees` rows keyed by task_run_id (written by
     //    `promote_to_worktree`). No row → the session ran in the shared cwd;
     //    nothing session-scoped to re-acquire.
     let worktree_rows = match pg.get_worktrees_for_task_run(task_run_id).await {

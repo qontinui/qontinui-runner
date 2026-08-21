@@ -1,4 +1,4 @@
-//! PostgreSQL CRUD operations for the `reviews` table (migration v31).
+//! PostgreSQL CRUD operations for the `project.reviews` table.
 //!
 //! See §2 of `qontinui-dev-notes/plans/productivity-stack.md` for the data
 //! model. Each row is a verdict from an `/auto-review` reviewer agent over a
@@ -14,6 +14,21 @@
 //! UUID columns are cast to/from TEXT in queries because the runner does
 //! not enable tokio-postgres `with-uuid-1`. Same convention as
 //! `pg::plans` / `pg::tasks` / `pg::coordinator_decisions`.
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
@@ -152,7 +167,7 @@ impl PgDb {
             .query_one(
                 &format!(
                     r#"
-                    INSERT INTO coord.reviews (
+                    INSERT INTO project.reviews (
                         task_id, reviewer_session_id, reviewed_session_id,
                         verdict, confidence, reasoning,
                         diff_summary, test_results
@@ -194,7 +209,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 &format!(
-                    "SELECT {} FROM coord.reviews WHERE id = $1::uuid",
+                    "SELECT {} FROM project.reviews WHERE id = $1::uuid",
                     SELECT_COLS
                 ),
                 &[&review_uuid],
@@ -223,7 +238,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.reviews
+                    FROM project.reviews
                     WHERE reviewed_session_id = $1
                     ORDER BY created_at DESC
                     LIMIT 1
@@ -254,7 +269,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.reviews
+                    FROM project.reviews
                     WHERE task_id = $1::uuid
                     ORDER BY created_at DESC
                     "#,
@@ -287,7 +302,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.reviews
+                    FROM project.reviews
                     WHERE created_at >= NOW() - make_interval(secs => $1::double precision)
                     ORDER BY created_at DESC
                     LIMIT $2
@@ -317,7 +332,7 @@ impl PgDb {
             .query_one(
                 r#"
                 SELECT COUNT(*)::bigint
-                FROM coord.reviews
+                FROM project.reviews
                 WHERE task_id = $1::uuid AND verdict = 'needs_fix'
                 "#,
                 &[&task_uuid],
@@ -343,7 +358,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.reviews
+                    FROM project.reviews
                     WHERE verdict = 'approved'
                       AND confidence >= 0.7
                       AND confidence < 0.85
@@ -385,7 +400,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.reviews
+                UPDATE project.reviews
                 SET user_decision = $2,
                     user_decided_at = NOW()
                 WHERE id = $1::uuid

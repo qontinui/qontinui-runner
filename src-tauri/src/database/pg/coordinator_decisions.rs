@@ -1,4 +1,4 @@
-//! PostgreSQL CRUD for the `coordinator_decisions` table (migration v29).
+//! PostgreSQL CRUD for the `project.coordinator_decisions` table.
 //!
 //! See §4 of `qontinui-dev-notes/plans/productivity-stack.md`. Every decision
 //! the Coordinator makes — cheap-rule fires, escalations, and even no-ops —
@@ -12,6 +12,21 @@
 //!
 //! UUIDs round-trip as TEXT because tokio-postgres in this crate does not
 //! enable `with-uuid-1` — same convention as `pg::plans` / `pg::tasks`.
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
@@ -114,7 +129,7 @@ impl PgDb {
             .query_one(
                 &format!(
                     r#"
-                    INSERT INTO coord.coordinator_decisions
+                    INSERT INTO project.coordinator_decisions
                         (session_id, iteration, rule, action, target_id,
                          reasoning, auto_acted, observation_hash)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -155,7 +170,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 &format!(
-                    "SELECT {} FROM coord.coordinator_decisions WHERE id = $1::uuid",
+                    "SELECT {} FROM project.coordinator_decisions WHERE id = $1::uuid",
                     SELECT_COLS
                 ),
                 &[&decision_uuid],
@@ -188,7 +203,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.coordinator_decisions
+                    FROM project.coordinator_decisions
                     WHERE ($2::text IS NULL OR rule = $2)
                       AND ($3::text IS NULL OR action = $3)
                     ORDER BY created_at DESC
@@ -221,7 +236,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.coordinator_decisions
+                    FROM project.coordinator_decisions
                     WHERE session_id = $1
                     ORDER BY created_at DESC
                     LIMIT $2
@@ -251,7 +266,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.coordinator_decisions
+                    FROM project.coordinator_decisions
                     WHERE resolved = FALSE
                       AND auto_acted = FALSE
                       AND action IN ('escalate', 'kill-session', 'force-promote-to-worktree')
@@ -286,7 +301,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.coordinator_decisions
+                UPDATE project.coordinator_decisions
                 SET resolved = TRUE,
                     resolution = $2,
                     resolved_at = NOW()

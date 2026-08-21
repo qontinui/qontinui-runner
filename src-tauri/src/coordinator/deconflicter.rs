@@ -3,10 +3,10 @@
 //!
 //! Listens on a `tokio::sync::broadcast::Sender<TouchEvent>` that
 //! `claude_session::dispatcher::auto_register_file` fires every time it
-//! UPSERTs a row into `coord.session_touched_files`. For each touch we
+//! UPSERTs a row into `project.session_touched_files`. For each touch we
 //! query the table for any *other* recent toucher of the same path whose
 //! task is still in flight; if a non-empty set comes back we emit an
-//! advisory row into `coord.coordinator_decisions` (rule=`deconflict`,
+//! advisory row into `project.coordinator_decisions` (rule=`deconflict`,
 //! action=`advise-with-text`, session_id=`deconflicter-rust`) and fire a
 //! `coordinator-decision-created` Tauri event so the in-session banner
 //! can pick it up.
@@ -48,7 +48,7 @@ use crate::database::pg::PgDb;
 /// generous enough to absorb burst writes during decompose-and-spawn.
 #[derive(Debug, Clone)]
 pub struct TouchEvent {
-    /// `task_run_id` column from `coord.session_touched_files` — for
+    /// `task_run_id` column from `project.session_touched_files` — for
     /// terminal-launched AI sessions this is also the Claude session id;
     /// for workers it is the worker's task_run_id (which doubles as the
     /// session id in `SessionManager`).
@@ -84,11 +84,11 @@ const DEDUP_MAX_ENTRIES: usize = 4096;
 const MAX_CONFLICTS_PER_ADVISORY: usize = 5;
 
 /// One row of the "who else recently touched this file" query result.
-/// `task_id` is the `coord.tasks.id` cast to text; `other_session_id`
-/// is the foreign session's `task_run_id` (`coord.tasks.assigned_session_id`);
+/// `task_id` is the `project.tasks.id` cast to text; `other_session_id`
+/// is the foreign session's `task_run_id` (`project.tasks.assigned_session_id`);
 /// `recorded_at` is the timestamp from the touch row.
 struct ConflictRow {
-    /// `coord.tasks.id::text` — currently unused at the rendering layer
+    /// `project.tasks.id::text` — currently unused at the rendering layer
     /// but kept for the eventual "click to jump to the conflicting
     /// session's tab" affordance. Plus, having it in scope here makes the
     /// SELECT shape match the SQL in plan §3.3 verbatim.
@@ -220,9 +220,9 @@ impl DeconflicterLoop {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         // SQL is the §3.3 post-vet shape:
-        //   - `coord.tasks` has no `task_run_id` column — sessions
+        //   - `project.tasks` has no `task_run_id` column — sessions
         //     attach via `assigned_session_id` (text).
-        //   - Recency column on `coord.session_touched_files` is
+        //   - Recency column on `project.session_touched_files` is
         //     `recorded_at`, not `last_touched_at`.
         //   - Emergent-task statuses (`in_progress`, `assigned`,
         //     `running`) are the "still in flight" set.
@@ -234,8 +234,8 @@ impl DeconflicterLoop {
                     t.id::text          AS task_id,
                     t.assigned_session_id AS other_session_id,
                     stf.recorded_at     AS recorded_at
-                FROM coord.session_touched_files stf
-                JOIN coord.tasks t
+                FROM project.session_touched_files stf
+                JOIN project.tasks t
                   ON t.assigned_session_id = stf.task_run_id
                 WHERE stf.file_path = $1
                   AND stf.task_run_id != $2

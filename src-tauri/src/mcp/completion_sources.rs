@@ -12,7 +12,7 @@
 //! - `POST /completion-sources/github-merge` — translate a merged PR into a
 //!   completion report. Resolves the target task either by the explicit
 //!   `target_task_id` body field or by JSONB containment scan over
-//!   `coord.tasks.completion_report->'deliverables'` for a `kind="pr",
+//!   `project.tasks.completion_report->'deliverables'` for a `kind="pr",
 //!   reference=<pr_url>` entry. Parses `## Breaking changes` / `## Follow-ups`
 //!   sections from the PR body.
 //! - `POST /completion-sources/manual-user-fire` — dashboard-issued path. The
@@ -71,7 +71,7 @@ pub struct GithubMergeBody {
     #[serde(default)]
     pub head_sha: Option<String>,
     /// Explicit target task. Optional — when omitted, the server resolves by
-    /// scanning `coord.tasks.completion_report->'deliverables'` for an entry
+    /// scanning `project.tasks.completion_report->'deliverables'` for an entry
     /// with `kind="pr"` AND `reference == pr_url`.
     #[serde(default)]
     pub target_task_id: Option<String>,
@@ -81,7 +81,7 @@ pub struct GithubMergeBody {
 ///
 /// Logic:
 /// 1. If `target_task_id` is `Some`, return that task (404 if missing).
-/// 2. Otherwise containment-scan `coord.tasks.completion_report->'deliverables'`
+/// 2. Otherwise containment-scan `project.tasks.completion_report->'deliverables'`
 ///    for `[{kind:"pr", reference:<pr_url>}]`. 0 hits → 404. >1 hits → 409.
 async fn resolve_target_task(
     state: &Arc<ApiState>,
@@ -118,7 +118,7 @@ async fn resolve_target_task(
         .query(
             r#"
             SELECT id::text
-            FROM coord.tasks
+            FROM project.tasks
             WHERE completion_report->'deliverables' @> $1::jsonb
             "#,
             &[&containment],
@@ -814,7 +814,7 @@ mod tests {
     //   cargo test -p qontinui-runner completion_sources::tests::github_merge_resolves -- --ignored
 
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL with cr01a2b3c4d5 applied)"]
+    #[ignore = "needs a live PG fixture (DATABASE_URL; project.* self-healed by PgDb::verify_and_provision)"]
     async fn github_merge_resolves_via_jsonb_containment() {
         use crate::database::pg::completion_reports::{CompletionSource, Deliverable};
         use crate::database::pg::tasks::InsertTaskInput;
@@ -826,9 +826,9 @@ mod tests {
         let plan_row = conn
             .query_one(
                 r#"
-                INSERT INTO coord.plans (markdown_path, plan_version_hash, status)
+                INSERT INTO project.plans (markdown_path, version_hash, status)
                 VALUES ($1, $2, $3)
-                RETURNING id::text, plan_version_hash
+                RETURNING id::text, version_hash
                 "#,
                 &[&"/tmp/gh-merge-test.md", &"cafefeed", &"decomposed"],
             )
@@ -884,7 +884,7 @@ mod tests {
             .query(
                 r#"
                 SELECT id::text
-                FROM coord.tasks
+                FROM project.tasks
                 WHERE completion_report->'deliverables' @> $1::jsonb
                 "#,
                 &[&serde_json::json!([{"kind": "pr", "reference": pr_url}])],
@@ -903,7 +903,7 @@ mod tests {
             .await
             .expect("conn")
             .execute(
-                "DELETE FROM coord.plans WHERE id = $1::uuid",
+                "DELETE FROM project.plans WHERE id = $1::uuid",
                 &[&plan_cleanup_uuid],
             )
             .await;

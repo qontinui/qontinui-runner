@@ -102,7 +102,7 @@ pub struct ProbeConflictsRequest {
 }
 
 /// A historical (non-live) editor of a probed file, derived from
-/// `coord.session_touched_files`. Surfaces "the last session that touched
+/// `project.session_touched_files`. Surfaces "the last session that touched
 /// this file is X" hints when no live registration exists.
 #[derive(Debug, Serialize)]
 pub struct RecentEditor {
@@ -389,7 +389,7 @@ pub struct HeatmapResponse {
 /// GET /file-activity/heatmap?window_secs=3600&limit=25
 ///
 /// Composes the live `FileRegistryManager.info()` snapshot with two
-/// windowed aggregates over `coord.session_touched_files`:
+/// windowed aggregates over `project.session_touched_files`:
 ///   - top files by distinct-toucher count
 ///   - top sessions by distinct-file count
 ///
@@ -452,7 +452,7 @@ async fn get_heatmap(
 /// as the legacy heatmap).
 ///
 /// Phase 6 is the *pivot*: `/file-activity/heatmap` (above) and its
-/// `coord.session_touched_files` substrate stay live until Phase 7's
+/// `project.session_touched_files` substrate stay live until Phase 7's
 /// deletion sweep.
 async fn get_heatmap_live(
     State(_state): State<Arc<ApiState>>,
@@ -1357,7 +1357,7 @@ mod tests {
         let pg_db = pg_for_test().await;
 
         // Pick a path that's unique to this test run so we don't collide
-        // with leftover rows in `coord.session_touched_files`.
+        // with leftover rows in `project.session_touched_files`.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())

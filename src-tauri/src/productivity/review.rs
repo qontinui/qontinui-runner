@@ -642,7 +642,7 @@ async fn run_git(repo_path: &str, args: &[&str]) -> Result<String, String> {
 /// Files touched by the worker that are NOT in `expected_file_claims`.
 /// Used as "scope creep" hints for the LLM. Comparison is done on the
 /// path string verbatim (no normalization) — claims lists in
-/// `coord.tasks` are stored canonically by `/decompose-plan`.
+/// `project.tasks` are stored canonically by `/decompose-plan`.
 fn scope_creep_candidates(touched: &[String], claims: &[String]) -> Vec<String> {
     use std::collections::HashSet;
     let claim_set: HashSet<&str> = claims.iter().map(|s| s.as_str()).collect();

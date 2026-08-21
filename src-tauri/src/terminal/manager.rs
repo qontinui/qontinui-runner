@@ -273,7 +273,7 @@ impl TerminalManager {
     /// both the in-memory `TerminalSession.title` AND the UI tab strip
     /// via `ZoneGrid::onTitleChange → invoke("terminal_set_title")`.
     /// `Worker N` is the at-a-glance identifier operators (and the
-    /// Coordinator's `coord.tasks.assigned_session_id` join) use to
+    /// Coordinator's `project.tasks.assigned_session_id` join) use to
     /// triage workers — preserving it requires gating the post-spawn
     /// title mutations from worker-backed ptys.
     ///

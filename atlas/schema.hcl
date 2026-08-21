@@ -3,7 +3,8 @@
 // Source of truth for the table/index/FK definitions the runner's
 // Rust code used to create imperatively via `database/pg/mod.rs::PgDb::new`
 // (regression_* tables) and `database/pg/coordinator_shadow_decisions.rs::
-// ensure_shadow_decisions_table` (coord.coordinator_shadow_decisions).
+// ensure_shadow_decisions_table` (project.coordinator_shadow_decisions,
+// re-homed from coord.* by P3 of the embedded-PG parity plan).
 //
 // Row 3 schema-half pilot per
 // `plans/2026-05-14-branch-per-agent-bottlenecks-tracker.md` Row 3 schema-half.
@@ -12,7 +13,7 @@
 // idiomatic bootstrap-vs-schema split.
 //
 // Tables ALSO covered by historical alembic migrations
-// (project.regression_* by f9d3e8a4c1b6, coord.coordinator_shadow_decisions
+// (project.regression_* by f9d3e8a4c1b6, the retired coord.coordinator_shadow_decisions
 // implicit via earlier coord migrations). The alembic files stay in
 // `qontinui-web/backend/alembic/versions/` as frozen history; new alembic
 // autogenerate runs exclude these tables via the env.py include_object
@@ -389,13 +390,20 @@ table "proposal_events" {
 }
 
 // ---------------------------------------------------------------
-// coord.coordinator_shadow_decisions — soak comparison of shadow vs live
-// scheduler decisions. Created by Rust ensure_shadow_decisions_table; this
-// HCL is now source of truth.
+// project.coordinator_shadow_decisions — soak comparison of shadow vs live
+// scheduler decisions. This HCL is the source of truth; the runner also
+// self-heals the same shape in `database/pg/mod.rs`
+// (MACHINE_LOCAL_TABLES_DDL) so a fresh PG without Atlas applied boots.
+//
+// RE-HOMED coord -> project by P3 of plan
+// `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`: this is
+// machine-local runner state, and `coord.*` is authored solely by
+// qontinui-web alembic, which never runs on an end-user box where the
+// runner's bundled PostgreSQL is the production database.
 // ---------------------------------------------------------------
 
 table "coordinator_shadow_decisions" {
-  schema = schema.coord
+  schema = schema.project
   column "id" {
     null    = false
     type    = uuid

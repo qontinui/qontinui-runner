@@ -12,7 +12,7 @@
 //! runner to ask it for coord identity. This file is the only out-of-process
 //! answer; nothing else advertises the BOUND port (`settings.json`'s
 //! `runner_instances[].port` is the *configured* port, the supervisor's
-//! `GET /runners` reports the port it *assigned*, and `coord.runner_instances`
+//! `GET /runners` reports the port it *assigned*, and `project.runner_instances`
 //! is fleet state reachable only via SQL — none is the port a runner confirmed
 //! it bound).
 //!

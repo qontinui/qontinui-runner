@@ -25,7 +25,7 @@
 //!
 //! ## Why it exists
 //!
-//! It replaces `coord.session_touched_files` as the heatmap's data
+//! It replaces `project.session_touched_files` as the heatmap's data
 //! source. That signal is fed by Edit/Write tool intercepts and is
 //! structurally lossy (memory
 //! `proj_arch_coord_session_touched_files_signal`): reads are

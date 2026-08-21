@@ -37,7 +37,7 @@ use crate::terminal::TerminalManager;
 /// reason" digest. `worker_session_meta` remains `None` until Phase 5.
 ///
 /// `completion_report` / `completion_source` / `has_assignment_brief_extras`
-/// are populated from `coord.tasks` directly (Phase 4 of the
+/// are populated from `project.tasks` directly (Phase 4 of the
 /// productivity-coordinator-completion-reports plan) so the TaskDetailPanel
 /// can render the structured handoff payload without a second round-trip.
 #[derive(Debug, Clone, Serialize)]
@@ -48,12 +48,12 @@ pub struct TaskDetail {
     pub latest_review_summary: Option<String>,
     pub worker_session_meta: Option<serde_json::Value>,
     /// Structured completion report for this task, if one has been written.
-    /// `None` when `coord.tasks.completion_report` is null.
+    /// `None` when `project.tasks.completion_report` is null.
     pub completion_report: Option<CompletionReport>,
     /// Tag identifying the actor that produced the report. `None` when no
     /// report exists.
     pub completion_source: Option<CompletionSource>,
-    /// True when `coord.tasks.assignment_brief_extras` is non-null — the
+    /// True when `project.tasks.assignment_brief_extras` is non-null — the
     /// briefing-preview panel uses this as a cheap gate before invoking
     /// `preview_assignment_brief`.
     pub has_assignment_brief_extras: bool,
@@ -1401,7 +1401,7 @@ pub async fn spawn_worker_session(
     }
 
     // "Coord as Deconflicter, not Dispatcher" Phase 1 (§4.3): create an
-    // emergent `coord.tasks` row keyed by this worker's task_run_id so
+    // emergent `project.tasks` row keyed by this worker's task_run_id so
     // the deconflicter and in-session advisory banner have something to
     // attach to. Best-effort — never block worker spawn on this. The
     // partial unique index `idx_tasks_emergent_per_session` (alembic-owned)
@@ -1535,7 +1535,7 @@ pub async fn list_workers(
 // Backfill stuck tasks — coord-task-status-hygiene plan, Phase 3
 // ============================================================================
 //
-// One-shot cross-reference of non-terminal `coord.tasks` rows against
+// One-shot cross-reference of non-terminal `project.tasks` rows against
 // `git log` on `main` in the known qontinui ecosystem repos. Flags rows
 // whose `expected_file_claims` overlap commits as candidates and emits the
 // preview SQL. When `options.apply == true`, executes the UPDATEs inside a
@@ -1544,7 +1544,7 @@ pub async fn list_workers(
 // Companion to Phase 2 of the same plan (the github-merge listener that
 // catches FUTURE merges); this command addresses the EXISTING backlog.
 
-/// Walk non-terminal `coord.tasks` rows, look at each row's
+/// Walk non-terminal `project.tasks` rows, look at each row's
 /// `expected_file_claims`, and ask `git log` whether any commit on `main`
 /// in the scanned repos touched those paths. Newest matching commit per
 /// task wins.

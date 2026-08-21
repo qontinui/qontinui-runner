@@ -39,7 +39,7 @@ pub struct WorkerInfo {
     /// defensively map anything unexpected to `"closed"` so the dashboard
     /// doesn't have to handle a wider variant set.
     pub state: String,
-    /// The `coord.tasks.id` (uuid string) currently assigned to this
+    /// The `project.tasks.id` (uuid string) currently assigned to this
     /// worker, if any. `None` when the worker is idle or when the lookup
     /// failed (best-effort — failures are logged and treated as no
     /// assignment so a transient PG hiccup doesn't blank the whole list).

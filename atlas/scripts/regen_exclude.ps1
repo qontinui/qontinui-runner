@@ -88,9 +88,17 @@ $PilotTables = [ordered]@{
         'regression_diagnoses',
         'regression_assertion_executions',
         'spec_proposals',
-        'proposal_events'
+        'proposal_events',
+        'coordinator_shadow_decisions'
     )
-    coord         = @('coordinator_shadow_decisions')
+    # `coord` is still in $PilotSchemas (so its objects keep getting
+    # excluded and never become DROP candidates), but Atlas no longer
+    # OWNS anything there: `coordinator_shadow_decisions` was re-homed to
+    # `project` by P3 of plan
+    # `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`,
+    # because the runner authors it and alembic -- the sole author of the
+    # coord schema -- never runs on an end-user machine.
+    coord         = @()
     orchestration = @('runs', 'subtasks')
 }
 

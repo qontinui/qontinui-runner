@@ -4039,7 +4039,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Phase 1.5 — transcript-tail populator. Watches Claude CLI's
             // per-session JSONL transcripts and writes Edit/Write/MultiEdit
-            // touches into `coord.session_touched_files` so the per-terminal
+            // touches into `project.session_touched_files` so the per-terminal
             // commit traffic light has rows to read for PTY-launched AI tabs
             // (the dominant launch path; SDK chat sessions populate via
             // `auto_register_file` and don't need this watcher).
