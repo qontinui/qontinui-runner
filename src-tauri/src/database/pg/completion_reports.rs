@@ -1,4 +1,4 @@
-//! PostgreSQL CRUD for `coord.tasks.completion_report` and the worker-declared
+//! PostgreSQL CRUD for `project.tasks.completion_report` and the worker-declared
 //! emergent-dependency edge.
 //!
 //! Phase 1 of the productivity-coordinator-completion-reports plan
@@ -11,16 +11,31 @@
 //! - Walking the upstream graph to detect cycles before adding a new edge
 //!   (`detect_dependency_cycle`, implementing the §4 recursive CTE with
 //!   PG14's `CYCLE … SET … USING …` clause and a `depth <= 64` backstop).
-//! - Appending an edge to `coord.tasks.depends_on` (`add_task_dependency`).
+//! - Appending an edge to `project.tasks.depends_on` (`add_task_dependency`).
 //! - Phase 2 hooks for `assignment_brief_extras` (`write_assignment_brief_extras`,
 //!   `clear_assignment_brief_extras`).
 //!
 //! Search-path note: the runner's PG pool sets `search_path TO project, public`
 //! (`database/pg/mod.rs:165`). `coord` is NOT in search_path, so every SQL
-//! statement here MUST schema-qualify `coord.tasks` and friends.
+//! statement here MUST schema-qualify `project.tasks` and friends.
 //!
 //! UUID round-trip convention matches the rest of `database/pg/`: text in,
 //! text out, `$x::uuid` casts inside the SQL.
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 use schemars::JsonSchema;
@@ -122,7 +137,7 @@ pub struct FollowUp {
 }
 
 /// Enum tag identifying who wrote the report. Stored as TEXT in
-/// `coord.tasks.completion_source`.
+/// `project.tasks.completion_source`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompletionSource {
@@ -348,7 +363,7 @@ fn validate_report(report: &CompletionReport) -> Result<(), String> {
 // ============================================================================
 
 impl PgDb {
-    /// Persist a structured completion report to `coord.tasks` and tag the
+    /// Persist a structured completion report to `project.tasks` and tag the
     /// `completion_source`. Validates the report shape (see `validate_report`)
     /// before issuing the UPDATE; returns `Err("validation: …")` on cap
     /// violation so HTTP handlers can map cleanly to 400.
@@ -376,7 +391,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET completion_report = $1::jsonb,
                     completion_source = $2,
                     updated_at = NOW()
@@ -412,7 +427,7 @@ impl PgDb {
             .query_opt(
                 r#"
                 SELECT completion_report, completion_source
-                FROM coord.tasks
+                FROM project.tasks
                 WHERE id = $1::uuid
                 "#,
                 &[&task_uuid],
@@ -439,7 +454,7 @@ impl PgDb {
         }
     }
 
-    /// Walk `coord.tasks.depends_on` recursively starting at
+    /// Walk `project.tasks.depends_on` recursively starting at
     /// `proposed_upstream_id`. Returns `Some(path)` (as UUID strings) if
     /// adding the edge `task_id -> proposed_upstream_id` would close a cycle
     /// (i.e. the walk reaches `task_id`); `None` if the edge is safe.
@@ -484,7 +499,7 @@ impl PgDb {
                     SELECT t.id::uuid    AS task_id,
                            dep_id::uuid  AS upstream_id,
                            1             AS depth
-                    FROM coord.tasks t,
+                    FROM project.tasks t,
                          unnest(t.depends_on) AS dep_id
                     WHERE t.id = $1::uuid
 
@@ -495,7 +510,7 @@ impl PgDb {
                            dep_id::uuid               AS upstream_id,
                            c.depth + 1                AS depth
                     FROM upstream_chain c
-                    JOIN coord.tasks t ON t.id = c.upstream_id,
+                    JOIN project.tasks t ON t.id = c.upstream_id,
                          unnest(t.depends_on) AS dep_id
                     WHERE c.depth <= 64
                 )
@@ -543,7 +558,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET depends_on = depends_on || $1::uuid,
                     updated_at = NOW()
                 WHERE id = $2::uuid
@@ -578,7 +593,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET assignment_brief_extras = $1::jsonb,
                     updated_at = NOW()
                 WHERE id = $2::uuid
@@ -608,7 +623,7 @@ impl PgDb {
             Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         conn.execute(
             r#"
-            UPDATE coord.tasks
+            UPDATE project.tasks
             SET assignment_brief_extras = NULL,
                 updated_at = NOW()
             WHERE id = $1::uuid
@@ -641,7 +656,7 @@ impl PgDb {
             .query_opt(
                 r#"
                 SELECT assignment_brief_extras
-                FROM coord.tasks
+                FROM project.tasks
                 WHERE id = $1::uuid
                 "#,
                 &[&task_uuid],
@@ -803,7 +818,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET status = 'ready',
                     assignment_brief_extras = $2::jsonb,
                     updated_at = NOW()
@@ -849,13 +864,13 @@ impl PgDb {
             .query(
                 r#"
                 SELECT t.id::text
-                FROM coord.tasks t
+                FROM project.tasks t
                 WHERE t.plan_id = $1::uuid
                   AND t.status = 'pending'
                   AND NOT EXISTS (
                       SELECT 1 FROM unnest(t.depends_on) AS dep_id
                       WHERE NOT EXISTS (
-                          SELECT 1 FROM coord.tasks d
+                          SELECT 1 FROM project.tasks d
                           WHERE d.id = dep_id AND d.status = 'done'
                       )
                   )
@@ -903,7 +918,7 @@ impl PgDb {
                     reasoning, auto_acted, resolved, resolution,
                     resolved_at::text, created_at::text,
                     COALESCE(observation_hash, '')
-                FROM coord.coordinator_decisions
+                FROM project.coordinator_decisions
                 WHERE rule = 'WORKER_ADDED_DEPENDENCY'
                   AND target_id = $1
                 ORDER BY created_at DESC
@@ -964,7 +979,7 @@ impl PgDb {
 
         let sql = if to == "pending" {
             r#"
-            UPDATE coord.tasks
+            UPDATE project.tasks
             SET status = $3,
                 assigned_session_id = NULL,
                 updated_at = NOW()
@@ -972,7 +987,7 @@ impl PgDb {
             "#
         } else {
             r#"
-            UPDATE coord.tasks
+            UPDATE project.tasks
             SET status = $3,
                 updated_at = NOW()
             WHERE id = $1::uuid AND status = $2
@@ -989,7 +1004,7 @@ impl PgDb {
         Ok(n > 0)
     }
 
-    /// Write a single key into `coord.tasks.completion_report -> 'artifacts'`
+    /// Write a single key into `project.tasks.completion_report -> 'artifacts'`
     /// using `jsonb_set`. Phase 5 cache primitive (plan §9 "Token budget on
     /// aggregated briefs"): `dispatch_assignment_brief` calls this with
     /// `key = "condensedSummaryMd"` after computing a condensed summary so
@@ -1025,7 +1040,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET completion_report = jsonb_set(
                     completion_report,
                     $2::text[],
@@ -1067,7 +1082,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET assignment_brief_extras = NULL,
                     updated_at = NOW()
                 WHERE status <> 'pending'
@@ -1110,7 +1125,7 @@ impl PgDb {
             Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let exists = conn
             .query_opt(
-                r#"SELECT 1 FROM coord.tasks WHERE id = $1::uuid"#,
+                r#"SELECT 1 FROM project.tasks WHERE id = $1::uuid"#,
                 &[&task_uuid],
             )
             .await
@@ -1122,7 +1137,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET status = 'done',
                     completed_at = COALESCE(completed_at, NOW()),
                     updated_at = NOW()
@@ -1490,9 +1505,10 @@ mod tests {
     ///
     /// Marked `#[ignore]` because it needs a live PG fixture; run manually
     /// with `cargo test -p qontinui-runner completion_reports::tests::cycle_detection_three_task -- --ignored --nocapture`
-    /// after an alembic upgrade head against a temp DB.
+    /// against a temp DB provisioned by `PgDb::verify_and_provision`
+    /// (which self-heals `project.plans` / `project.tasks`).
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL with cr01a2b3c4d5 applied)"]
+    #[ignore = "needs a live PG fixture (DATABASE_URL; project.* self-healed by PgDb::verify_and_provision)"]
     async fn cycle_detection_three_task() {
         use crate::database::pg::tasks::InsertTaskInput;
 
@@ -1504,9 +1520,9 @@ mod tests {
         let plan_row = conn
             .query_one(
                 r#"
-                INSERT INTO coord.plans (markdown_path, plan_version_hash, status)
+                INSERT INTO project.plans (markdown_path, version_hash, status)
                 VALUES ($1, $2, $3)
-                RETURNING id::text, plan_version_hash
+                RETURNING id::text, version_hash
                 "#,
                 &[&"/tmp/cycle-test.md", &"deadbeef", &"decomposed"],
             )
@@ -1595,7 +1611,7 @@ mod tests {
         let plan_cleanup_uuid = Uuid::parse_str(&plan_id).expect("test plan_id must be uuid");
         let _ = conn
             .execute(
-                "DELETE FROM coord.plans WHERE id = $1::uuid",
+                "DELETE FROM project.plans WHERE id = $1::uuid",
                 &[&plan_cleanup_uuid],
             )
             .await;
@@ -1604,7 +1620,7 @@ mod tests {
     /// Non-cycle case: a linear chain A → B → C is fine; adding D as a new
     /// upstream of C must not flag.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL with cr01a2b3c4d5 applied)"]
+    #[ignore = "needs a live PG fixture (DATABASE_URL; project.* self-healed by PgDb::verify_and_provision)"]
     async fn cycle_detection_linear_chain_is_safe() {
         use crate::database::pg::tasks::InsertTaskInput;
 
@@ -1613,9 +1629,9 @@ mod tests {
         let plan_row = conn
             .query_one(
                 r#"
-                INSERT INTO coord.plans (markdown_path, plan_version_hash, status)
+                INSERT INTO project.plans (markdown_path, version_hash, status)
                 VALUES ($1, $2, $3)
-                RETURNING id::text, plan_version_hash
+                RETURNING id::text, version_hash
                 "#,
                 &[&"/tmp/linear-test.md", &"feedface", &"decomposed"],
             )
@@ -1661,7 +1677,7 @@ mod tests {
         let plan_cleanup_uuid = Uuid::parse_str(&plan_id).expect("test plan_id must be uuid");
         let _ = conn
             .execute(
-                "DELETE FROM coord.plans WHERE id = $1::uuid",
+                "DELETE FROM project.plans WHERE id = $1::uuid",
                 &[&plan_cleanup_uuid],
             )
             .await;

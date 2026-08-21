@@ -14,6 +14,21 @@
 //! The dispatcher writes here fire-and-forget on every Edit/Write tool call
 //! (see `claude_session::dispatcher::auto_register_file`), in parallel with the
 //! existing `registry.register(...)` call.
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 use serde::Serialize;
@@ -72,7 +87,7 @@ impl PgDb {
         // into a worktree mid-flight (Phase 2 promote method); the latest
         // observed scope wins.
         conn.execute(
-            r#"INSERT INTO coord.session_touched_files
+            r#"INSERT INTO project.session_touched_files
                    (task_run_id, file_path, worktree_id, recorded_at)
                VALUES ($1, $2, $3, NOW())
                ON CONFLICT (task_run_id, file_path) DO UPDATE
@@ -100,7 +115,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"SELECT file_path
-                   FROM coord.session_touched_files
+                   FROM project.session_touched_files
                    WHERE task_run_id = $1
                    ORDER BY recorded_at ASC, file_path ASC"#,
                 &[&task_run_id],
@@ -137,7 +152,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"SELECT file_path, task_run_id
-                   FROM coord.session_touched_files
+                   FROM project.session_touched_files
                    WHERE file_path = ANY($1)
                    ORDER BY recorded_at DESC, file_path ASC"#,
                 &[&file_paths],
@@ -163,7 +178,7 @@ impl PgDb {
 
         let n = conn
             .execute(
-                "DELETE FROM coord.session_touched_files WHERE task_run_id = $1",
+                "DELETE FROM project.session_touched_files WHERE task_run_id = $1",
                 &[&task_run_id],
             )
             .await
@@ -190,7 +205,7 @@ impl PgDb {
             .query(
                 r#"WITH windowed AS (
                        SELECT file_path, task_run_id, recorded_at
-                       FROM coord.session_touched_files
+                       FROM project.session_touched_files
                        WHERE recorded_at >= NOW() - make_interval(secs => $1::double precision)
                    ),
                    per_file_latest AS (
@@ -244,7 +259,7 @@ impl PgDb {
                 r#"SELECT task_run_id,
                           COUNT(DISTINCT file_path)::bigint AS distinct_files,
                           MAX(recorded_at) AS latest_recorded_at
-                   FROM coord.session_touched_files
+                   FROM project.session_touched_files
                    WHERE recorded_at >= NOW() - make_interval(secs => $1::double precision)
                    GROUP BY task_run_id
                    ORDER BY distinct_files DESC, latest_recorded_at DESC
@@ -458,7 +473,7 @@ mod tests {
         let conn = db.pool().get().await.expect("pool");
         let rows = conn
             .query(
-                "SELECT file_path, worktree_id FROM coord.session_touched_files \
+                "SELECT file_path, worktree_id FROM project.session_touched_files \
                  WHERE task_run_id = $1 ORDER BY file_path ASC",
                 &[&task_run_id],
             )
@@ -501,7 +516,7 @@ mod tests {
         let conn = db.pool().get().await.unwrap();
         let row = conn
             .query_one(
-                "SELECT worktree_id FROM coord.session_touched_files \
+                "SELECT worktree_id FROM project.session_touched_files \
                  WHERE task_run_id = $1 AND file_path = $2",
                 &[&task_run_id, &"/repo/promoted.rs"],
             )

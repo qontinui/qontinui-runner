@@ -40,7 +40,7 @@ pub(crate) struct LiveSession {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HeatmapSnapshot {
     /// task_run_id → distinct file paths touched in window. Sourced from
-    /// `HotSessionRow.distinct_files`. The `coord.session_touched_files`
+    /// `HotSessionRow.distinct_files`. The `project.session_touched_files`
     /// table UPSERTs on `(task_run_id, file_path)`, so re-edits don't
     /// inflate — this is breadth-of-activity, not raw frequency.
     pub session_distinct_files: HashMap<String, u64>,

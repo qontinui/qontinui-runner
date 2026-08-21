@@ -1172,7 +1172,7 @@ mod tests {
     #[cfg(windows)]
     fn normalize_all_four_live_spellings_agree() {
         // The exact finding from the Phase-0 probe: one workspace root with
-        // four spellings in `coord.session_touched_files`.
+        // four spellings in `project.session_touched_files`.
         let spellings = [
             "D:\\qontinui-root\\qontinui-runner\\src\\main.rs",
             "D:/qontinui-root/qontinui-runner/src/main.rs",

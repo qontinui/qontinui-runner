@@ -566,7 +566,7 @@ pub struct ResetStaleTasksResponse {
 /// `assigned_session_id` is no longer present in the live SessionManager
 /// set. Useful between test runs against pre-decomposed plan fixtures —
 /// the prior runner's worker session ids are dead weight in
-/// `coord.tasks.assigned_session_id` and prevent the next coordinator
+/// `project.tasks.assigned_session_id` and prevent the next coordinator
 /// iteration from picking the task back up.
 ///
 /// Reusable across the HTTP handler and the scheduler's startup sweep

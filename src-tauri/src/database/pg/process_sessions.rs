@@ -1,4 +1,20 @@
-//! PostgreSQL process_sessions and process_session_output operations (raw SQL).
+//! PostgreSQL CRUD for `project.process_sessions` and
+//! `project.process_session_output` (raw SQL).
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 use crate::database::types::{ProcessLogSearchHit, ProcessSession, ProcessSessionOutputLine};
@@ -25,7 +41,7 @@ impl PgDb {
 
         conn.execute(
             r#"
-            INSERT INTO coord.process_sessions (id, process_config_id, process_name, started_at, state)
+            INSERT INTO project.process_sessions (id, process_config_id, process_name, started_at, state)
             VALUES ($1, $2, $3, $4, 'running')
             "#,
             &[&id, &config_id, &name, &now],
@@ -54,7 +70,7 @@ impl PgDb {
 
         conn.execute(
             r#"
-            UPDATE coord.process_sessions
+            UPDATE project.process_sessions
             SET stopped_at = $1, state = $2, exit_code = $3, error_count = $4
             WHERE id = $5
             "#,
@@ -89,7 +105,7 @@ impl PgDb {
             conn.query(
                 r#"
                 SELECT id, process_config_id, process_name, started_at, stopped_at, exit_code, state, error_count
-                FROM coord.process_sessions
+                FROM project.process_sessions
                 WHERE process_config_id = $1
                 ORDER BY started_at DESC
                 LIMIT $2
@@ -101,7 +117,7 @@ impl PgDb {
             conn.query(
                 r#"
                 SELECT id, process_config_id, process_name, started_at, stopped_at, exit_code, state, error_count
-                FROM coord.process_sessions
+                FROM project.process_sessions
                 ORDER BY started_at DESC
                 LIMIT $1
                 "#,
@@ -152,7 +168,7 @@ impl PgDb {
         // Build a single INSERT with N value tuples: ($1,$2,$3,$4),($5,$6,$7,$8),...
         // Each row has 4 params: session_id, timestamp, stream, line.
         let mut sql = String::from(
-            "INSERT INTO coord.process_session_output (session_id, timestamp, stream, line) VALUES ",
+            "INSERT INTO project.process_session_output (session_id, timestamp, stream, line) VALUES ",
         );
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
         for (i, (timestamp, stream, line)) in lines.iter().enumerate() {
@@ -199,7 +215,7 @@ impl PgDb {
             .query(
                 r#"
                 SELECT id, session_id, timestamp, stream, line
-                FROM coord.process_session_output
+                FROM project.process_session_output
                 WHERE session_id = $1
                 ORDER BY id ASC
                 LIMIT $2 OFFSET $3
@@ -244,7 +260,7 @@ impl PgDb {
         let session_row = conn
             .query_opt(
                 r#"
-                SELECT id FROM coord.process_sessions
+                SELECT id FROM project.process_sessions
                 WHERE process_name = $1
                   AND started_at <= $2
                   AND (stopped_at IS NULL OR stopped_at >= $2)
@@ -274,7 +290,7 @@ impl PgDb {
                 r#"
                 (
                     SELECT id, session_id, timestamp, stream, line
-                    FROM coord.process_session_output
+                    FROM project.process_session_output
                     WHERE session_id = $1
                       AND timestamp <= $2
                     ORDER BY id DESC
@@ -283,7 +299,7 @@ impl PgDb {
                 UNION ALL
                 (
                     SELECT id, session_id, timestamp, stream, line
-                    FROM coord.process_session_output
+                    FROM project.process_session_output
                     WHERE session_id = $1
                       AND timestamp > $2
                     ORDER BY id ASC
@@ -332,8 +348,8 @@ impl PgDb {
                 r#"
                 SELECT pso.id, pso.session_id, pso.timestamp, pso.stream, pso.line,
                        ps.process_config_id, ps.process_name
-                FROM coord.process_session_output pso
-                JOIN coord.process_sessions ps ON pso.session_id = ps.id
+                FROM project.process_session_output pso
+                JOIN project.process_sessions ps ON pso.session_id = ps.id
                 WHERE pso.line ILIKE $1
                   AND ps.process_config_id = $2
                 ORDER BY pso.id DESC
@@ -347,8 +363,8 @@ impl PgDb {
                 r#"
                 SELECT pso.id, pso.session_id, pso.timestamp, pso.stream, pso.line,
                        ps.process_config_id, ps.process_name
-                FROM coord.process_session_output pso
-                JOIN coord.process_sessions ps ON pso.session_id = ps.id
+                FROM project.process_session_output pso
+                JOIN project.process_sessions ps ON pso.session_id = ps.id
                 WHERE pso.line ILIKE $1
                 ORDER BY pso.id DESC
                 LIMIT $2
@@ -401,7 +417,7 @@ impl PgDb {
         let now = Utc::now();
         let affected = conn
             .execute(
-                "UPDATE coord.process_sessions \
+                "UPDATE project.process_sessions \
                  SET state = 'failed', \
                      stopped_at = COALESCE(stopped_at, $1) \
                  WHERE state NOT IN ('stopped', 'failed') \
@@ -426,7 +442,7 @@ impl PgDb {
         let days = retention_days as f64;
         let affected = conn
             .execute(
-                "DELETE FROM coord.process_sessions \
+                "DELETE FROM project.process_sessions \
                  WHERE started_at < NOW() - ($1 || ' days')::interval",
                 &[&days.to_string()],
             )
@@ -452,10 +468,10 @@ impl PgDb {
         let affected = conn
             .execute(
                 r#"
-                DELETE FROM coord.process_session_output
+                DELETE FROM project.process_session_output
                 WHERE session_id = $1
                 AND id NOT IN (
-                    SELECT id FROM coord.process_session_output
+                    SELECT id FROM project.process_session_output
                     WHERE session_id = $1
                     ORDER BY id DESC
                     LIMIT $2

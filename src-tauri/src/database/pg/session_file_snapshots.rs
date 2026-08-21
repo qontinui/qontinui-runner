@@ -1,4 +1,4 @@
-//! PostgreSQL CRUD for the `session_file_snapshots` table (migration v30).
+//! PostgreSQL CRUD for the `project.session_file_snapshots` table.
 //!
 //! See §2 of `qontinui-dev-notes/plans/productivity-stack.md`. Each row
 //! represents a content-addressed copy of a file taken at the moment a
@@ -12,6 +12,21 @@
 //! The pruner (`prune_older_than`) is invoked on a 24h interval from
 //! `database/pg/scheduler.rs::start_session_snapshot_pruner` — see Phase
 //! 4 §8 for the cadence rationale.
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
@@ -76,7 +91,7 @@ impl PgDb {
             .query_one(
                 &format!(
                     r#"
-                    INSERT INTO coord.session_file_snapshots
+                    INSERT INTO project.session_file_snapshots
                         (session_id, file_path, snapshot_blob_path, blob_sha256,
                          captured_before)
                     VALUES ($1, $2, $3, $4, $5)
@@ -115,7 +130,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.session_file_snapshots
+                    FROM project.session_file_snapshots
                     WHERE session_id = $1
                     ORDER BY taken_at ASC
                     "#,
@@ -149,7 +164,7 @@ impl PgDb {
             .query_one(
                 r#"
                 SELECT EXISTS(
-                    SELECT 1 FROM coord.session_file_snapshots
+                    SELECT 1 FROM project.session_file_snapshots
                     WHERE session_id = $1
                       AND file_path = $2
                       AND captured_before = TRUE
@@ -187,7 +202,7 @@ impl PgDb {
             .query(
                 r#"
                 SELECT id::text, snapshot_blob_path
-                FROM coord.session_file_snapshots
+                FROM project.session_file_snapshots
                 WHERE taken_at < NOW() - ($1 || ' days')::interval
                 "#,
                 &[&days.to_string()],
@@ -217,7 +232,7 @@ impl PgDb {
         let deleted =
             conn.execute(
                 r#"
-                DELETE FROM coord.session_file_snapshots
+                DELETE FROM project.session_file_snapshots
                 WHERE taken_at < NOW() - ($1 || ' days')::interval
                 "#,
                 &[&days.to_string()],

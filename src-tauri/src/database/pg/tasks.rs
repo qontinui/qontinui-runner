@@ -1,4 +1,17 @@
-//! PostgreSQL CRUD operations for the `tasks` table (migration v28).
+//! PostgreSQL CRUD operations for the `project.tasks` table.
+//!
+//! `plan_id` is part of this table again: alembic revision
+//! `coord_p4_03_drop_plans` DROPPED `coord.tasks.plan_id` (and
+//! `coord.plans` outright) when coord moved onto `coord.work_units`,
+//! which left every `plan_id`-keyed query in this module —
+//! `insert_task`, `list_tasks_for_plan`, `list_active_tasks_for_plan`,
+//! `mark_ready_for_unblocked` and the `WITH RECURSIVE depends_on` walk —
+//! broken on every cluster. `project.tasks` restores the column, its
+//! index and its FK to `project.plans` under the runner's own
+//! authorship. coord keeps its own `coord.tasks` for the work-unit-linked
+//! rows its merge train writes; the two populations are disjoint (the
+//! runner never sets `work_unit_id`, and coord's merge->done UPDATE
+//! matches only rows that have one).
 //!
 //! See §2 of `qontinui-dev-notes/plans/productivity-stack.md`. Each row is a
 //! task decomposed from a plan, with file claims that populate the in-memory
@@ -14,6 +27,21 @@
 //!
 //! UUID columns are cast to/from TEXT in queries because the runner does
 //! not enable tokio-postgres `with-uuid-1`. UUIDs flow as canonical strings.
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
@@ -145,7 +173,7 @@ impl PgDb {
             .query_one(
                 &format!(
                     r#"
-                    INSERT INTO coord.tasks (
+                    INSERT INTO project.tasks (
                         plan_id, plan_version_hash, phase_name, sequence_in_phase,
                         description, expected_file_claims, expected_dirs,
                         depends_on, status, notes, identity_hash
@@ -179,7 +207,7 @@ impl PgDb {
         Ok(task_row_from_pg(&row))
     }
 
-    /// Insert a `session_emergent` row in `coord.tasks` for an AI session
+    /// Insert a `session_emergent` row in `project.tasks` for an AI session
     /// that didn't come from a plan decomposition. Idempotent via the
     /// partial unique index `idx_tasks_emergent_per_session` (alembic-owned);
     /// a second call for the same `assigned_session_id` returns `Ok(None)`.
@@ -209,7 +237,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 r#"
-                INSERT INTO coord.tasks (
+                INSERT INTO project.tasks (
                     assigned_session_id, status, origin, plan_id,
                     plan_version_hash, phase_name, sequence_in_phase, description
                 )
@@ -261,7 +289,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.tasks
+                    FROM project.tasks
                     WHERE assigned_session_id = $1::text
                       AND status NOT IN ('done', 'cancelled', 'abandoned')
                     ORDER BY started_at DESC NULLS LAST
@@ -290,7 +318,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 &format!(
-                    "SELECT {} FROM coord.tasks WHERE id = $1::uuid",
+                    "SELECT {} FROM project.tasks WHERE id = $1::uuid",
                     SELECT_TASK_COLUMNS
                 ),
                 &[&task_uuid],
@@ -316,7 +344,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.tasks
+                    FROM project.tasks
                     WHERE plan_id = $1::uuid
                     ORDER BY phase_name, sequence_in_phase
                     "#,
@@ -346,7 +374,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.tasks
+                    FROM project.tasks
                     WHERE plan_id = $1::uuid
                       AND status = ANY($2::text[])
                     ORDER BY phase_name, sequence_in_phase
@@ -375,7 +403,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.tasks
+                    FROM project.tasks
                     WHERE status = ANY($1::text[])
                     ORDER BY created_at ASC
                     "#,
@@ -406,14 +434,14 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"
-                UPDATE coord.tasks t
+                UPDATE project.tasks t
                 SET status = 'ready', updated_at = NOW()
                 WHERE t.plan_id = $1::uuid
                   AND t.status = 'pending'
                   AND NOT EXISTS (
                       SELECT 1 FROM unnest(t.depends_on) AS dep_id
                       WHERE NOT EXISTS (
-                          SELECT 1 FROM coord.tasks d
+                          SELECT 1 FROM project.tasks d
                           WHERE d.id = dep_id AND d.status = 'done'
                       )
                   )
@@ -449,7 +477,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET assigned_session_id = $2,
                     status = CASE WHEN status IN ('ready', 'needs_fix')
                                   THEN 'assigned' ELSE status END,
@@ -487,7 +515,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET status = 'ready',
                     assigned_session_id = NULL,
                     started_at = NULL,
@@ -533,7 +561,7 @@ impl PgDb {
         let sql = match to {
             "running" => {
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET status = $3,
                     started_at = COALESCE(started_at, NOW()),
                     updated_at = NOW()
@@ -542,7 +570,7 @@ impl PgDb {
             }
             "done" | "cancelled" => {
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET status = $3,
                     completed_at = NOW(),
                     updated_at = NOW()
@@ -551,7 +579,7 @@ impl PgDb {
             }
             _ => {
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET status = $3, updated_at = NOW()
                 WHERE id = $1::uuid AND status = $2
                 "#
@@ -568,11 +596,12 @@ impl PgDb {
         Ok(n > 0)
     }
 
-    /// Test-only fixture: provision the `coord.tasks.identity_hash` column +
-    /// partial unique index on a throwaway PG whose alembic chain may not
-    /// have reached `coord_tasks_identity_hash` yet. alembic is the sole
-    /// author of this column in production; this exists purely so the
-    /// `#[ignore]`d round-trip tests can self-provision their fixture DB.
+    /// Test-only fixture: provision the `project.tasks.identity_hash` column
+    /// + partial unique index on a throwaway PG that has not had
+    /// `PgDb::verify_and_provision` run against it. The self-heal DDL in
+    /// `database/pg/mod.rs` is the production authority for this column;
+    /// this exists purely so the `#[ignore]`d round-trip tests can
+    /// self-provision their fixture DB.
     #[cfg(test)]
     pub async fn create_tasks_identity_hash_for_test(&self) -> Result<(), String> {
         let conn = self
@@ -583,10 +612,10 @@ impl PgDb {
 
         conn.batch_execute(
             r#"
-            ALTER TABLE coord.tasks
+            ALTER TABLE project.tasks
                 ADD COLUMN IF NOT EXISTS identity_hash TEXT;
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_plan_identity_hash
-                ON coord.tasks(plan_id, identity_hash)
+                ON project.tasks(plan_id, identity_hash)
                 WHERE identity_hash IS NOT NULL;
             "#,
         )
@@ -670,7 +699,7 @@ mod tests {
     /// with `cargo test -p qontinui-runner database::pg::tasks::tests::uuid_param_round_trip -- --ignored --nocapture`
     /// against a temp DB whose alembic head includes v28+.
     #[tokio::test]
-    #[ignore = "needs PG fixture (DATABASE_URL with v28+ tasks/plans applied)"]
+    #[ignore = "needs a live PG fixture (DATABASE_URL; project.* self-healed by PgDb::verify_and_provision)"]
     async fn uuid_param_round_trip() {
         let pg = PgDb::new_blocking_for_test();
         let conn = pg.pool().get().await.expect("conn");
@@ -679,9 +708,9 @@ mod tests {
         let plan_row = conn
             .query_one(
                 r#"
-                INSERT INTO coord.plans (markdown_path, plan_version_hash, status)
+                INSERT INTO project.plans (markdown_path, version_hash, status)
                 VALUES ($1, $2, $3)
-                RETURNING id::text, plan_version_hash
+                RETURNING id::text, version_hash
                 "#,
                 &[&"/tmp/uuid-param-round-trip.md", &"deadbe11", &"decomposed"],
             )
@@ -737,7 +766,7 @@ mod tests {
         let plan_cleanup_uuid = uuid::Uuid::parse_str(&plan_id).expect("test plan_id must be uuid");
         let _ = conn
             .execute(
-                "DELETE FROM coord.plans WHERE id = $1::uuid",
+                "DELETE FROM project.plans WHERE id = $1::uuid",
                 &[&plan_cleanup_uuid],
             )
             .await;

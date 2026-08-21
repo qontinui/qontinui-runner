@@ -518,7 +518,7 @@ fn auto_register_file(
             // (broadcast channel) so it can run right here without
             // spawning. Sent AFTER the record_file_touched spawn above
             // so the deconflicter's SQL query (which reads
-            // `coord.session_touched_files`) is racing the same writer
+            // `project.session_touched_files`) is racing the same writer
             // it depends on — but the dedup window plus the 15-minute
             // recent-touch lookback make the order non-load-bearing:
             // a brand-new path will simply have one row when the

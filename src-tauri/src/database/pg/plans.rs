@@ -1,4 +1,11 @@
-//! PostgreSQL CRUD operations for the `plans` table (migration v28).
+//! PostgreSQL CRUD operations for the `project.plans` table.
+//!
+//! This table is not merely re-homed — `coord.plans` was DROPPED from the
+//! shared cluster by alembic revision `coord_p4_03_drop_plans` (coord
+//! migrated its own plan model onto `coord.work_units`), so every
+//! statement in this module was failing on EVERY cluster, not only the
+//! embedded one. `project.plans` restores the shape from that revision's
+//! `downgrade()` under the runner's own authorship.
 //!
 //! See §2 of `qontinui-dev-notes/plans/productivity-stack.md` for the data
 //! model. Each row corresponds to a decomposed `.md` plan in
@@ -10,6 +17,21 @@
 //! `$N::uuid`) because tokio-postgres in this crate does not have the
 //! `with-uuid-1` feature enabled. UUID identity is preserved on the wire as
 //! the canonical `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` string form.
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
@@ -56,7 +78,7 @@ impl PgDb {
         let row = conn
             .query_one(
                 r#"
-                INSERT INTO coord.plans (markdown_path, version_hash, status, title, summary)
+                INSERT INTO project.plans (markdown_path, version_hash, status, title, summary)
                 VALUES ($1, $2, $3, $4, $5)
                 RETURNING id::text, markdown_path, version_hash, status, title, summary,
                           created_at::text, updated_at::text
@@ -98,7 +120,7 @@ impl PgDb {
                 r#"
                 SELECT id::text, markdown_path, version_hash, status, title, summary,
                        created_at::text, updated_at::text
-                FROM coord.plans
+                FROM project.plans
                 WHERE markdown_path = $1
                 "#,
                 &[&markdown_path],
@@ -133,7 +155,7 @@ impl PgDb {
                 r#"
                 SELECT id::text, markdown_path, version_hash, status, title, summary,
                        created_at::text, updated_at::text
-                FROM coord.plans
+                FROM project.plans
                 WHERE id = $1::uuid
                 "#,
                 &[&plan_uuid],
@@ -178,14 +200,14 @@ impl PgDb {
             r#"
             SELECT id::text, markdown_path, version_hash, status, title, summary,
                    created_at::text, updated_at::text
-            FROM coord.plans
+            FROM project.plans
             ORDER BY created_at DESC
             "#
         } else {
             r#"
             SELECT id::text, markdown_path, version_hash, status, title, summary,
                    created_at::text, updated_at::text
-            FROM coord.plans
+            FROM project.plans
             WHERE status NOT IN ('done', 'abandoned')
             ORDER BY created_at DESC
             "#
@@ -232,7 +254,7 @@ impl PgDb {
             Uuid::parse_str(plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
         let task_count: i64 = conn
             .query_one(
-                "SELECT COUNT(*)::bigint FROM coord.tasks WHERE plan_id = $1::uuid",
+                "SELECT COUNT(*)::bigint FROM project.tasks WHERE plan_id = $1::uuid",
                 &[&plan_uuid],
             )
             .await
@@ -260,7 +282,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.plans
+                UPDATE project.plans
                 SET status = $2, updated_at = NOW()
                 WHERE id = $1::uuid
                 "#,
@@ -286,7 +308,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                DELETE FROM coord.plans WHERE id = $1::uuid
+                DELETE FROM project.plans WHERE id = $1::uuid
                 "#,
                 &[&plan_uuid],
             )

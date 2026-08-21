@@ -37,7 +37,7 @@ pub struct CoordinatorSchedulerConfig {
     /// Shadow mode (sd01 migration). When `true`, the scheduler runs
     /// observe→decide on every tick but does NOT acquire the lease and
     /// does NOT call `act::apply`. Decisions are written to
-    /// `coord.coordinator_shadow_decisions` instead, tagged with the
+    /// `project.coordinator_shadow_decisions` instead, tagged with the
     /// observation hash so the diff endpoint can join shadow ↔ live
     /// rows produced by the live `/coordinate` skill in the same window.
     /// `rust_scheduler_enabled` is independent — both can be true (rare:

@@ -1,4 +1,4 @@
-//! PostgreSQL CRUD for the `coord.coordinator_leader` singleton (migration v29).
+//! PostgreSQL CRUD for the `project.coordinator_leader` singleton.
 //!
 //! Per productivity-stack §6 ("Multi-instance awareness"), only one
 //! `/coordinate` session may run at a time across the runner's PG-shared
@@ -15,6 +15,21 @@
 //! - `renew_lease(instance_id, ttl)` — extends the lease only if the caller
 //!   already owns it. Returns `false` if another instance has stolen it.
 //! - `current_leader()` — read-only inspection for the dashboard.
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
@@ -58,19 +73,19 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                INSERT INTO coord.coordinator_leader (id, instance_id, leased_until, acquired_at, renewed_at)
+                INSERT INTO project.coordinator_leader (id, instance_id, leased_until, acquired_at, renewed_at)
                 VALUES (TRUE, $1, NOW() + ($2::bigint || ' seconds')::interval, NOW(), NOW())
                 ON CONFLICT (id) DO UPDATE
                     SET instance_id   = EXCLUDED.instance_id,
                         leased_until  = EXCLUDED.leased_until,
                         acquired_at   = CASE
-                            WHEN coord.coordinator_leader.instance_id = EXCLUDED.instance_id
-                                THEN coord.coordinator_leader.acquired_at
+                            WHEN project.coordinator_leader.instance_id = EXCLUDED.instance_id
+                                THEN project.coordinator_leader.acquired_at
                             ELSE NOW()
                         END,
                         renewed_at    = NOW()
-                    WHERE coord.coordinator_leader.leased_until <= NOW()
-                       OR coord.coordinator_leader.instance_id = EXCLUDED.instance_id
+                    WHERE project.coordinator_leader.leased_until <= NOW()
+                       OR project.coordinator_leader.instance_id = EXCLUDED.instance_id
                 "#,
                 &[&instance_id, &ttl_seconds],
             )
@@ -97,7 +112,7 @@ impl PgDb {
         let n = conn
             .execute(
                 r#"
-                UPDATE coord.coordinator_leader
+                UPDATE project.coordinator_leader
                 SET leased_until = NOW() + ($2::bigint || ' seconds')::interval,
                     renewed_at   = NOW()
                 WHERE id = TRUE
@@ -127,7 +142,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 r#"
-                DELETE FROM coord.coordinator_leader
+                DELETE FROM project.coordinator_leader
                 WHERE id = TRUE
                   AND leased_until <= NOW() - INTERVAL '60 seconds'
                 RETURNING instance_id
@@ -153,7 +168,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 r#"
-                DELETE FROM coord.coordinator_leader
+                DELETE FROM project.coordinator_leader
                 WHERE id = TRUE
                 RETURNING instance_id
                 "#,
@@ -182,7 +197,7 @@ impl PgDb {
                        leased_until::text,
                        acquired_at::text,
                        renewed_at::text
-                FROM coord.coordinator_leader
+                FROM project.coordinator_leader
                 WHERE id = TRUE
                 "#,
                 &[],

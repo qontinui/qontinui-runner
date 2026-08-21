@@ -1,5 +1,5 @@
 //! Phase 3 — one-shot Tauri-callable backfill that clears the backlog of
-//! stuck `coord.tasks` rows by cross-referencing each row's
+//! stuck `project.tasks` rows by cross-referencing each row's
 //! `expected_file_claims` against `git log` on `main` in the known qontinui
 //! ecosystem repos.
 //!
@@ -156,7 +156,7 @@ pub fn default_repos() -> Vec<String> {
 /// to any one task's intent.
 pub const REFORMAT_SUBJECT_TOKENS: &[&str] = &["prettier", "rustfmt", "reformat", "format files"];
 
-/// Tag stored in `coord.tasks.completion_source` when this command flips
+/// Tag stored in `project.tasks.completion_source` when this command flips
 /// a row to `done`. Not a member of the [`CompletionSource`] enum — it's
 /// an opaque marker so the read path's forward-compat branch (`unknown
 /// value → None`) surfaces "this was a backfill" without blowing up the
@@ -363,7 +363,7 @@ async fn fetch_stuck_tasks(pg: &Arc<PgDb>) -> Result<Vec<StuckTask>, BackfillErr
                 sequence_in_phase,
                 description,
                 expected_file_claims
-            FROM coord.tasks
+            FROM project.tasks
             WHERE status IN ('pending','ready','assigned','running','review','needs_fix')
               AND array_length(expected_file_claims, 1) > 0
             ORDER BY created_at ASC
@@ -657,7 +657,7 @@ pub fn build_sql_preview(candidates: &[BackfillCandidate], since: &str) -> Strin
         let subj_esc = sql_escape(&c.matched_commit_subject);
         let repo_esc = sql_escape(&c.repo_path);
         out.push_str(&format!(
-            "UPDATE coord.tasks\n\
+            "UPDATE project.tasks\n\
              SET status = 'done',\n    \
                  completion_source = '{src}',\n    \
                  completion_report = jsonb_build_object(\n        \
@@ -742,7 +742,7 @@ async fn apply_updates(
         let res = txn
             .execute(
                 r#"
-                UPDATE coord.tasks
+                UPDATE project.tasks
                 SET status = 'done',
                     completion_source = $1,
                     completion_report = $2::jsonb,
@@ -1142,7 +1142,7 @@ src/a.rs\n\
         assert!(sql.contains("BEGIN;"));
         assert!(sql.ends_with("COMMIT;\n"));
         // Two UPDATE statements.
-        let updates = sql.matches("UPDATE coord.tasks").count();
+        let updates = sql.matches("UPDATE project.tasks").count();
         assert_eq!(updates, 2);
         // Each contains the expected guard.
         assert_eq!(

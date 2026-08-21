@@ -14,14 +14,14 @@
 //! |---|---|
 //! | `ProcessConfig` (settings) | `cwd` |
 //! | Terminal manager | `TerminalInfo.working_dir` |
-//! | AI sessions | `coord.session_touched_files.file_path` |
+//! | AI sessions | `project.session_touched_files.file_path` |
 //! | `deferred_questions` | (via its `task_run_id`'s touched files) |
 //! | `phase_token_usage` | (via its `task_run_id`'s touched files) |
 //! | git | the root itself |
 //!
 //! # Three things the Phase-0 probe forced (plan §6.1)
 //!
-//! 1. The table is **`coord.session_touched_files`**, not `public.`, and
+//! 1. The table is **`project.session_touched_files`**, not `public.`, and
 //!    `recorded_at` is **on the row** — no `task_runs` join is needed for
 //!    recency, only for a session's name and status.
 //! 2. **Backslash is Postgres's `LIKE` escape character**, so
@@ -328,7 +328,7 @@ struct TouchedRow {
     recorded_at_ms: i64,
 }
 
-/// Run the coarse prefix filter against `coord.session_touched_files`.
+/// Run the coarse prefix filter against `project.session_touched_files`.
 ///
 /// The `WHERE` is an OR-chain of `starts_with(lower(file_path), $n)` — never
 /// `LIKE`, because a Windows path's backslashes are `LIKE` escape characters
@@ -374,7 +374,7 @@ async fn fetch_touched_rows(
         r#"SELECT stf.task_run_id,
                   stf.file_path,
                   (extract(epoch from stf.recorded_at) * 1000)::bigint AS recorded_at_ms
-           FROM coord.session_touched_files stf
+           FROM project.session_touched_files stf
            WHERE ({prefix_clause})
              AND stf.recorded_at >= NOW() - make_interval(days => ${window_param}::int)
              AND {noise_clause}

@@ -1,5 +1,9 @@
-//! PostgreSQL CRUD for the `coord.coordinator_shadow_decisions` table
-//! (alembic revision `sd01_coord_coordinator_shadow_decisions`).
+//! PostgreSQL CRUD for the `project.coordinator_shadow_decisions` table.
+//!
+//! Declared in `atlas/schema.hcl` and mirrored by the self-heal DDL in
+//! `database/pg/mod.rs`. The historical alembic revision
+//! `sd01_coord_coordinator_shadow_decisions` created the retired
+//! `coord.`-qualified table and is frozen history, not the authority.
 //!
 //! Backs the soak window comparing the in-process Rust coordinator
 //! scheduler against the legacy `/coordinate` Claude-skill loop. When
@@ -8,16 +12,31 @@
 //! `coordinator/act::apply`; instead it inserts the would-be-action here.
 //!
 //! The diff endpoint (`mcp/coordinator.rs::shadow_diff`) joins shadow
-//! rows against live `coord.coordinator_decisions` rows by
+//! rows against live `project.coordinator_decisions` rows by
 //! `observation_hash` to surface per-rule agreement / disagreement rates.
 //!
 //! UUIDs round-trip as TEXT for the same reason as `coordinator_decisions`
 //! — tokio-postgres in this crate doesn't enable `with-uuid-1`.
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
 
-/// One row from `coord.coordinator_shadow_decisions`. Mirrors the live
+/// One row from `project.coordinator_shadow_decisions`. Mirrors the live
 /// `CoordinatorDecisionRow` shape minus the resolution columns (shadow
 /// rows are never resolved — they're audit-only).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,7 +128,7 @@ impl PgDb {
             .query_one(
                 &format!(
                     r#"
-                    INSERT INTO coord.coordinator_shadow_decisions
+                    INSERT INTO project.coordinator_shadow_decisions
                         (instance_id, iteration, observation_hash, rule,
                          action, target_id, reasoning, would_have_acted)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -150,7 +169,7 @@ impl PgDb {
                 &format!(
                     r#"
                     SELECT {}
-                    FROM coord.coordinator_shadow_decisions
+                    FROM project.coordinator_shadow_decisions
                     ORDER BY taken_at DESC
                     LIMIT $1
                     "#,
@@ -192,13 +211,13 @@ impl PgDb {
                 r#"
                 WITH window_shadow AS (
                     SELECT rule, action, observation_hash
-                    FROM coord.coordinator_shadow_decisions
+                    FROM project.coordinator_shadow_decisions
                     WHERE taken_at > NOW() - make_interval(secs => $1::float)
                       AND observation_hash <> ''
                 ),
                 window_live AS (
                     SELECT rule, action, observation_hash
-                    FROM coord.coordinator_decisions
+                    FROM project.coordinator_decisions
                     WHERE created_at > NOW() - make_interval(secs => $1::float)
                       AND observation_hash <> ''
                 ),
@@ -290,8 +309,8 @@ impl PgDb {
                         {select_shadow},
                         l.rule AS live_rule,
                         l.action AS live_action
-                    FROM coord.coordinator_shadow_decisions s
-                    INNER JOIN coord.coordinator_decisions l
+                    FROM project.coordinator_shadow_decisions s
+                    INNER JOIN project.coordinator_decisions l
                         ON l.observation_hash = s.observation_hash
                     WHERE s.taken_at > NOW() - make_interval(secs => $1::float)
                       AND s.observation_hash <> ''

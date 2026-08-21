@@ -2,7 +2,7 @@
 //!
 //! Periodically observes the productivity-stack state, applies the cheap
 //! rules A–E from `qontinui-claude-config/.claude/commands/coordinate.md`,
-//! and writes a `coord.coordinator_decisions` row per fired rule (and an
+//! and writes a `project.coordinator_decisions` row per fired rule (and an
 //! `idle-no-action` row when no rule fires). Mirrors the loop the
 //! `/coordinate` Claude session runs today, minus the LLM callout — that
 //! ships in Phase 2.
@@ -118,9 +118,9 @@ pub fn start_coordinator_scheduler(
         // be present and aborts the scheduler with an actionable error if the
         // migrations haven't been applied. The set mirrors the tables the
         // scheduler + its downstream paths read/write:
-        //   - coord.coordinator_shadow_decisions (shadow-mode inserts only)
-        //   - coord.tasks (task state machine, identity_hash, emergent rows)
-        //   - coord.session_touched_files (deconflicter lookup)
+        //   - project.coordinator_shadow_decisions (shadow-mode inserts only)
+        //   - project.tasks (task state machine, identity_hash, emergent rows)
+        //   - project.session_touched_files (deconflicter lookup)
         //   - coord.agent_worktrees (branch-per-agent allocation)
         //   - coord.merge_proposals + coord.merge_proposal_repos (merge API)
         //   - coord.agent_sessions (Claude Code session lineage)
@@ -746,7 +746,7 @@ async fn log_decision_with_hash(
 }
 
 /// Shadow-mode tick. Runs observe→decide but does NOT call `act::apply`;
-/// instead writes the chosen action into `coord.coordinator_shadow_decisions`
+/// instead writes the chosen action into `project.coordinator_shadow_decisions`
 /// tagged with the same observation_hash the live scheduler would use, so
 /// the diff endpoint can join shadow vs live decisions over the soak window.
 ///

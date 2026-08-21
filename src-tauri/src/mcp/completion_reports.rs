@@ -8,7 +8,7 @@
 //!
 //! - `POST /tasks/{id}/report` — worker self-attestation of completion.
 //!   Validates the body shape, verifies the calling session via the
-//!   `task_run_id` header against `coord.tasks.assigned_session_id`, writes
+//!   `task_run_id` header against `project.tasks.assigned_session_id`, writes
 //!   `completion_report` + `completion_source = 'session-self-report'`,
 //!   emits `completion-report-written` Tauri event.
 //! - `POST /tasks/{id}/add-dependency` — declare an emergent upstream edge.
@@ -45,7 +45,7 @@ use crate::mcp::types::ApiState;
 /// Returns 400 on missing/malformed header.
 ///
 /// Per plan §9.5 hygiene rules, the value is UUID-parsed before being
-/// returned: the field stores `coord.tasks.assigned_session_id`, which is a
+/// returned: the field stores `project.tasks.assigned_session_id`, which is a
 /// `uuid` column. A non-UUID header value can never match the column and used
 /// to silently fall through to the 403 ownership check, masking the actual
 /// "garbage header" failure mode. We now reject with 400 + a descriptive

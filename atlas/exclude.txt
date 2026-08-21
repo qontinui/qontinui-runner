@@ -419,6 +419,7 @@ coord.continuation_dispatches
 coord.continuation_poll_status
 coord.coordinator_decisions
 coord.coordinator_leader
+coord.coordinator_shadow_decisions
 coord.correlation_topics
 coord.dependency_observations
 coord.dependency_observations_id_seq

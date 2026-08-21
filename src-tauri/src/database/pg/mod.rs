@@ -156,6 +156,310 @@ pub(crate) fn parse_optional_workflow_id(id: Option<&str>) -> Result<Option<uuid
         .transpose()
 }
 
+/// The machine-local tables the runner re-homed out of `coord.*` into
+/// `project.*` — plan
+/// `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration` (P3).
+///
+/// WHY THIS LIST EXISTS. The runner ships a private per-machine PostgreSQL
+/// (`postgresql_embedded`). On an end-user machine that embedded cluster IS
+/// the production database — and qontinui-web's alembic, the sole author of
+/// the `coord.*` schema, never runs there. So every `coord.*` statement the
+/// runner issued was either a hard error against a table that was never
+/// provisioned, or a write into a private table no fleet member would ever
+/// read. It is invisible on a dev box (which reaches an external cluster
+/// whose `coord.*` schema alembic really does own) and load-bearing exactly
+/// where users are. Tables the runner reads back as its OWN operational
+/// state therefore belong in `project.*`, where the runner is allowed to be
+/// their author, and are provisioned by [`MACHINE_LOCAL_TABLES_DDL`].
+///
+/// DELIBERATELY NOT IN THIS LIST: `coord.agent_worktrees`, the single
+/// exclusion. coord genuinely authors those rows (`POST /agents/allocate`),
+/// so it stays `coord.*`; a later phase moves the runner off it to HTTP.
+pub const REHOMED_MACHINE_LOCAL_TABLES: [&str; 12] = [
+    "plans",
+    "tasks",
+    "reviews",
+    "worktrees",
+    "runner_instances",
+    "process_sessions",
+    "process_session_output",
+    "session_touched_files",
+    "session_file_snapshots",
+    "coordinator_leader",
+    "coordinator_decisions",
+    "coordinator_shadow_decisions",
+];
+
+/// Idempotent self-provision DDL for [`REHOMED_MACHINE_LOCAL_TABLES`].
+///
+/// Same `CREATE SCHEMA` / `CREATE TABLE IF NOT EXISTS` idiom as the
+/// `project.apps`, `project.session_prs` and `orchestration.*` self-heals in
+/// [`PgDb::verify_and_provision`] — and it is the load-bearing half of the
+/// re-home: without it a fresh embedded cluster has none of these tables and
+/// re-qualifying the SQL changes nothing.
+///
+/// Statement order is FK order: `plans` → `tasks` → `reviews`, and
+/// `process_sessions` → `process_session_output`.
+///
+/// COLUMN PROVENANCE.
+/// - `plans` — recreated from the `downgrade()` of alembic revision
+///   `coord_p4_03_drop_plans`, whose `upgrade()` DROPPED `coord.plans` (and
+///   `coord.tasks.plan_id`, and `coord.plan_status_history`) on the shared
+///   cluster. The runner's plan/task subsystem still binds both, so this
+///   table is not merely re-homed — it is the only place `plans` exists at
+///   all for the runner, and provisioning it here repairs a second live
+///   defect that was independent of the embedded-PG one.
+///   `plan_status_history` is NOT recreated: nothing in the runner reads it.
+/// - `tasks` — the live `coord.tasks` shape (`schema.pg.sql.generated`) PLUS
+///   the `plan_id UUID` column, its FK and `idx_tasks_plan`, all of which the
+///   same alembic revision dropped. `insert_task`, `list_tasks_for_plan`,
+///   `list_active_tasks_for_plan`, `mark_ready_for_unblocked` and the
+///   `WITH RECURSIVE depends_on` walk every one of them bind `plan_id`; the
+///   FK is now a within-schema one (`project.plans`), which is what
+///   `delete_plan`'s "tasks cascade-delete via FK" contract needs.
+/// - the other ten — the live shapes in `schema.pg.sql.generated`, checked
+///   column by column against everything the owning `database/pg/*.rs`
+///   module SELECTs, INSERTs or binds.
+///
+/// ONE DELIBERATE OMISSION from the live `coord.*` shapes:
+/// `coordinator_decisions.agent_session_id` (and its partial index). Its
+/// only purpose was an FK to `coord.agent_sessions`, which stays coord-owned
+/// and does not exist on an embedded cluster; no runner code binds it.
+pub const MACHINE_LOCAL_TABLES_DDL: &str = r#"
+CREATE SCHEMA IF NOT EXISTS project;
+
+CREATE TABLE IF NOT EXISTS project.plans (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    markdown_path   TEXT,
+    version_hash    TEXT,
+    status          TEXT NOT NULL DEFAULT 'draft',
+    title           TEXT,
+    summary         TEXT,
+    slug            TEXT,
+    content         TEXT,
+    authored_by     TEXT,
+    origin_path     TEXT,
+    archive_path    TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ingested_status TEXT,
+    tenant_id       UUID,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_plans_slug
+    ON project.plans (slug) WHERE slug IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_plans_updated_at
+    ON project.plans (updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS project.tasks (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id                 UUID REFERENCES project.plans(id) ON DELETE CASCADE,
+    plan_version_hash       TEXT,
+    phase_name              TEXT,
+    sequence_in_phase       INTEGER,
+    description             TEXT,
+    expected_file_claims    TEXT[] NOT NULL DEFAULT '{}'::text[],
+    expected_dirs           TEXT[] NOT NULL DEFAULT '{}'::text[],
+    depends_on              UUID[] NOT NULL DEFAULT '{}'::uuid[],
+    status                  TEXT NOT NULL DEFAULT 'pending',
+    assigned_session_id     TEXT,
+    started_at              TIMESTAMPTZ,
+    completed_at            TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    notes                   TEXT,
+    completion_report       JSONB,
+    completion_source       TEXT,
+    assignment_brief_extras JSONB,
+    identity_hash           TEXT,
+    origin                  TEXT,
+    work_unit_id            UUID,
+    CONSTRAINT tasks_done_requires_report CHECK (
+        status <> 'done'
+        OR (completion_report IS NOT NULL AND completion_source IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_plan ON project.tasks (plan_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON project.tasks (status);
+CREATE INDEX IF NOT EXISTS idx_tasks_assigned_session
+    ON project.tasks (assigned_session_id) WHERE assigned_session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_completion_source
+    ON project.tasks (completion_source) WHERE completion_source IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_completion_report_gin
+    ON project.tasks USING gin (completion_report jsonb_path_ops)
+    WHERE completion_report IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_work_unit
+    ON project.tasks (work_unit_id) WHERE work_unit_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_emergent_per_session
+    ON project.tasks (assigned_session_id) WHERE origin = 'session_emergent';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_plan_identity_hash
+    ON project.tasks (plan_id, identity_hash) WHERE identity_hash IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS project.reviews (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id             UUID NOT NULL REFERENCES project.tasks(id) ON DELETE CASCADE,
+    reviewer_session_id TEXT NOT NULL,
+    reviewed_session_id TEXT NOT NULL,
+    verdict             TEXT NOT NULL,
+    confidence          DOUBLE PRECISION NOT NULL,
+    reasoning           TEXT NOT NULL,
+    diff_summary        JSONB,
+    test_results        JSONB,
+    user_decision       TEXT,
+    user_decided_at     TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_task ON project.reviews (task_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_verdict ON project.reviews (verdict);
+CREATE INDEX IF NOT EXISTS idx_reviews_reviewed_session
+    ON project.reviews (reviewed_session_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_pending_recommendations
+    ON project.reviews (created_at DESC)
+    WHERE verdict = 'approved'
+      AND confidence >= 0.7
+      AND confidence < 0.85
+      AND user_decision IS NULL;
+
+CREATE TABLE IF NOT EXISTS project.worktrees (
+    id            TEXT PRIMARY KEY,
+    worktree_path TEXT NOT NULL,
+    branch_name   TEXT NOT NULL,
+    source_branch TEXT NOT NULL,
+    source_commit TEXT NOT NULL,
+    repo_path     TEXT NOT NULL,
+    task_run_id   TEXT,
+    workflow_name TEXT,
+    status        TEXT NOT NULL DEFAULT 'active',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_worktrees_status ON project.worktrees (status);
+CREATE INDEX IF NOT EXISTS idx_worktrees_task_run ON project.worktrees (task_run_id);
+
+CREATE TABLE IF NOT EXISTS project.runner_instances (
+    id             TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    port           INTEGER NOT NULL UNIQUE,
+    hostname       TEXT NOT NULL DEFAULT 'localhost',
+    is_primary     BOOLEAN NOT NULL DEFAULT false,
+    pid            INTEGER,
+    status         TEXT NOT NULL DEFAULT 'starting',
+    last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    running_tasks  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ri_heartbeat ON project.runner_instances (last_heartbeat);
+CREATE INDEX IF NOT EXISTS idx_ri_port ON project.runner_instances (port);
+CREATE INDEX IF NOT EXISTS idx_ri_status ON project.runner_instances (status);
+
+CREATE TABLE IF NOT EXISTS project.process_sessions (
+    id                TEXT PRIMARY KEY,
+    process_config_id TEXT NOT NULL,
+    process_name      TEXT NOT NULL,
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    stopped_at        TIMESTAMPTZ,
+    exit_code         INTEGER,
+    state             TEXT NOT NULL DEFAULT 'running',
+    error_count       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_process_sessions_config_id
+    ON project.process_sessions (process_config_id);
+CREATE INDEX IF NOT EXISTS idx_process_sessions_started_at
+    ON project.process_sessions (started_at);
+
+CREATE TABLE IF NOT EXISTS project.process_session_output (
+    id          BIGSERIAL PRIMARY KEY,
+    session_id  TEXT NOT NULL
+        REFERENCES project.process_sessions(id) ON DELETE CASCADE,
+    "timestamp" TEXT NOT NULL,
+    stream      TEXT NOT NULL,
+    line        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_process_session_output_session
+    ON project.process_session_output (session_id);
+
+CREATE TABLE IF NOT EXISTS project.session_touched_files (
+    task_run_id TEXT NOT NULL,
+    file_path   TEXT NOT NULL,
+    worktree_id TEXT,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_run_id, file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_session_touched_files_task_run
+    ON project.session_touched_files (task_run_id);
+CREATE INDEX IF NOT EXISTS idx_session_touched_files_recorded_at
+    ON project.session_touched_files (recorded_at);
+
+CREATE TABLE IF NOT EXISTS project.session_file_snapshots (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id         TEXT NOT NULL,
+    file_path          TEXT NOT NULL,
+    snapshot_blob_path TEXT NOT NULL,
+    blob_sha256        TEXT NOT NULL,
+    captured_before    BOOLEAN NOT NULL,
+    taken_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sfs_session
+    ON project.session_file_snapshots (session_id);
+CREATE INDEX IF NOT EXISTS idx_sfs_session_file
+    ON project.session_file_snapshots (session_id, file_path);
+
+CREATE TABLE IF NOT EXISTS project.coordinator_leader (
+    id           BOOLEAN PRIMARY KEY DEFAULT true,
+    instance_id  TEXT NOT NULL,
+    leased_until TIMESTAMPTZ NOT NULL,
+    acquired_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    renewed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT coordinator_leader_singleton CHECK (id = true)
+);
+
+CREATE TABLE IF NOT EXISTS project.coordinator_decisions (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id       TEXT NOT NULL,
+    iteration        BIGINT NOT NULL,
+    rule             TEXT NOT NULL,
+    action           TEXT NOT NULL,
+    target_id        TEXT,
+    reasoning        TEXT NOT NULL,
+    auto_acted       BOOLEAN NOT NULL,
+    resolved         BOOLEAN NOT NULL DEFAULT false,
+    resolution       TEXT,
+    resolved_at      TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    observation_hash TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_cd_created
+    ON project.coordinator_decisions (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cd_rule_action
+    ON project.coordinator_decisions (rule, action);
+CREATE INDEX IF NOT EXISTS idx_cd_session
+    ON project.coordinator_decisions (session_id);
+CREATE INDEX IF NOT EXISTS idx_cd_open_escalations
+    ON project.coordinator_decisions (created_at DESC)
+    WHERE resolved = false
+      AND auto_acted = false
+      AND action IN ('escalate', 'kill-session', 'force-promote-to-worktree');
+
+CREATE TABLE IF NOT EXISTS project.coordinator_shadow_decisions (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    instance_id      TEXT NOT NULL,
+    iteration        BIGINT NOT NULL,
+    observation_hash TEXT NOT NULL,
+    rule             TEXT NOT NULL,
+    action           TEXT NOT NULL,
+    target_id        TEXT,
+    reasoning        TEXT NOT NULL,
+    would_have_acted BOOLEAN NOT NULL,
+    taken_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_csd_taken_at
+    ON project.coordinator_shadow_decisions (taken_at DESC);
+CREATE INDEX IF NOT EXISTS idx_csd_obs_hash
+    ON project.coordinator_shadow_decisions (observation_hash);
+CREATE INDEX IF NOT EXISTS idx_csd_instance
+    ON project.coordinator_shadow_decisions (instance_id, taken_at DESC);
+"#;
+
 /// PostgreSQL connection pool backed by deadpool-postgres.
 pub struct PgDb {
     pool: deadpool_postgres::Pool,
@@ -670,6 +974,21 @@ impl PgDb {
         .await
         .map_err(|e| format!("Phase 1 orchestration schema self-heal failed: {}", e))?;
 
+        // P3 of plan
+        // `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`:
+        // provision the 12 machine-local tables re-homed out of `coord.*`
+        // into `project.*`. See [`REHOMED_MACHINE_LOCAL_TABLES`] for the list
+        // and [`MACHINE_LOCAL_TABLES_DDL`] for the per-column provenance.
+        //
+        // This is the load-bearing half of the re-home: the runner ships a
+        // private per-machine PostgreSQL, alembic (the sole author of
+        // `coord.*`) never runs on a user's box, so without this DDL a fresh
+        // embedded cluster has none of these tables and re-qualifying the SQL
+        // would change nothing.
+        conn.batch_execute(MACHINE_LOCAL_TABLES_DDL)
+            .await
+            .map_err(|e| format!("P3 machine-local project.* self-heal failed: {}", e))?;
+
         info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 
         Ok(())
@@ -851,5 +1170,201 @@ impl PgDb {
             .create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
             .expect("noop pool creation should not fail (no connection attempted)");
         std::sync::Arc::new(Self { pool })
+    }
+}
+
+#[cfg(test)]
+mod machine_local_schema_tests {
+    use super::{MACHINE_LOCAL_TABLES_DDL, REHOMED_MACHINE_LOCAL_TABLES};
+
+    /// Every `database/pg` module whose SQL was re-homed by P3, paired with
+    /// its source text. `include_str!` pins the *shipped* SQL, so this is a
+    /// real regression guard and not a restatement of the constant below.
+    const REHOMED_MODULE_SOURCES: [(&str, &str); 12] = [
+        ("plans.rs", include_str!("plans.rs")),
+        ("tasks.rs", include_str!("tasks.rs")),
+        ("reviews.rs", include_str!("reviews.rs")),
+        ("worktrees.rs", include_str!("worktrees.rs")),
+        ("instances.rs", include_str!("instances.rs")),
+        ("process_sessions.rs", include_str!("process_sessions.rs")),
+        (
+            "session_touched_files.rs",
+            include_str!("session_touched_files.rs"),
+        ),
+        (
+            "session_file_snapshots.rs",
+            include_str!("session_file_snapshots.rs"),
+        ),
+        (
+            "coordinator_leader.rs",
+            include_str!("coordinator_leader.rs"),
+        ),
+        (
+            "coordinator_decisions.rs",
+            include_str!("coordinator_decisions.rs"),
+        ),
+        (
+            "coordinator_shadow_decisions.rs",
+            include_str!("coordinator_shadow_decisions.rs"),
+        ),
+        (
+            "completion_reports.rs",
+            include_str!("completion_reports.rs"),
+        ),
+    ];
+
+    /// THE FRESH-CLUSTER CHECK. This is the test that would have caught the
+    /// original defect: the runner issued SQL against `coord.*` tables that
+    /// alembic — which never runs on an end-user box — was the sole author
+    /// of, so on a fresh embedded cluster they simply did not exist. Assert
+    /// the self-heal DDL provisions every re-homed table by name.
+    #[test]
+    fn self_heal_ddl_creates_every_rehomed_table() {
+        for table in REHOMED_MACHINE_LOCAL_TABLES {
+            let needle = format!("CREATE TABLE IF NOT EXISTS project.{} (", table);
+            assert!(
+                MACHINE_LOCAL_TABLES_DDL.contains(&needle),
+                "self-heal DDL is missing `{}` — a fresh embedded cluster \
+                 would have no such table and every statement against it \
+                 would fail at runtime on a user's machine",
+                needle
+            );
+        }
+    }
+
+    /// The DDL must not create anything the list does not declare, and vice
+    /// versa — otherwise the list stops being a usable inventory.
+    #[test]
+    fn self_heal_ddl_creates_exactly_the_listed_tables() {
+        let created = MACHINE_LOCAL_TABLES_DDL
+            .matches("CREATE TABLE IF NOT EXISTS project.")
+            .count();
+        assert_eq!(
+            created,
+            REHOMED_MACHINE_LOCAL_TABLES.len(),
+            "DDL creates {} tables but REHOMED_MACHINE_LOCAL_TABLES lists {}",
+            created,
+            REHOMED_MACHINE_LOCAL_TABLES.len()
+        );
+    }
+
+    /// The schema itself has to exist before any of the tables can. On a
+    /// fresh embedded cluster nothing else will have created it.
+    #[test]
+    fn self_heal_ddl_creates_the_project_schema_first() {
+        let schema_at = MACHINE_LOCAL_TABLES_DDL
+            .find("CREATE SCHEMA IF NOT EXISTS project;")
+            .expect("DDL must create the project schema");
+        let first_table_at = MACHINE_LOCAL_TABLES_DDL
+            .find("CREATE TABLE IF NOT EXISTS project.")
+            .expect("DDL must create at least one table");
+        assert!(
+            schema_at < first_table_at,
+            "CREATE SCHEMA must precede the first CREATE TABLE"
+        );
+    }
+
+    /// `verify_and_provision` re-runs on every boot and on every degraded-mode
+    /// reconnect, so every statement has to be a no-op the second time.
+    #[test]
+    fn self_heal_ddl_is_idempotent() {
+        for (n, line) in MACHINE_LOCAL_TABLES_DDL.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("CREATE TABLE")
+                || t.starts_with("CREATE INDEX")
+                || t.starts_with("CREATE UNIQUE INDEX")
+                || t.starts_with("CREATE SCHEMA")
+            {
+                assert!(
+                    t.contains("IF NOT EXISTS"),
+                    "line {} is not idempotent: {}",
+                    n + 1,
+                    t
+                );
+            }
+        }
+    }
+
+    /// FK targets must be created before the tables that reference them —
+    /// `batch_execute` runs the statements in order in one round trip.
+    #[test]
+    fn self_heal_ddl_orders_tables_after_their_fk_targets() {
+        let at = |t: &str| {
+            MACHINE_LOCAL_TABLES_DDL
+                .find(&format!("CREATE TABLE IF NOT EXISTS project.{} (", t))
+                .unwrap_or_else(|| panic!("missing CREATE TABLE for {}", t))
+        };
+        assert!(at("plans") < at("tasks"), "tasks.plan_id references plans");
+        assert!(at("tasks") < at("reviews"), "reviews.task_id references tasks");
+        assert!(
+            at("process_sessions") < at("process_session_output"),
+            "process_session_output.session_id references process_sessions"
+        );
+    }
+
+    /// The whole point of the re-home is that the runner's own DDL never
+    /// depends on the alembic-owned `coord.*` namespace.
+    #[test]
+    fn self_heal_ddl_references_no_coord_object() {
+        assert!(
+            !MACHINE_LOCAL_TABLES_DDL.contains("coord."),
+            "self-heal DDL must not reference the alembic-owned coord schema"
+        );
+    }
+
+    /// `coord.agent_worktrees` is the ONE table deliberately left behind:
+    /// coord authors those rows via `POST /agents/allocate`, and a later
+    /// phase moves the runner off it to HTTP.
+    #[test]
+    fn agent_worktrees_is_deliberately_not_rehomed() {
+        assert!(
+            !REHOMED_MACHINE_LOCAL_TABLES.contains(&"agent_worktrees"),
+            "agent_worktrees is coord-authored and must stay in coord.*"
+        );
+        assert!(!MACHINE_LOCAL_TABLES_DDL.contains("project.agent_worktrees"));
+    }
+
+    /// Schema-qualification pin: no re-homed module may issue SQL against a
+    /// re-homed table under the `coord.` prefix again. Comment lines are
+    /// skipped — `tasks.rs` legitimately narrates the alembic drop of the
+    /// old `coord.plans` in prose.
+    #[test]
+    fn rehomed_modules_issue_no_coord_qualified_sql() {
+        for (name, src) in REHOMED_MODULE_SOURCES {
+            for (n, line) in src.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                for table in REHOMED_MACHINE_LOCAL_TABLES {
+                    let needle = format!("coord.{}", table);
+                    assert!(
+                        !t.contains(&needle),
+                        "{}:{} still issues SQL against `{}` — that table is \
+                         absent from a fresh embedded cluster; it must be \
+                         `project.{}`",
+                        name,
+                        n + 1,
+                        needle,
+                        table
+                    );
+                }
+            }
+        }
+    }
+
+    /// The re-homed modules must actually be talking to `project.*` now —
+    /// a module that lost its `coord.` prefix but gained no `project.` one
+    /// would pass the negative test above while issuing unqualified SQL that
+    /// silently resolves through `search_path`.
+    #[test]
+    fn rehomed_modules_are_project_qualified() {
+        for (name, src) in REHOMED_MODULE_SOURCES {
+            assert!(
+                src.contains("project."),
+                "{} issues no project-qualified SQL after the re-home",
+                name
+            );
+        }
     }
 }

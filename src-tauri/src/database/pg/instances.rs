@@ -1,4 +1,20 @@
-//! PostgreSQL coord.runner_instances operations for multi-instance coordination.
+//! PostgreSQL CRUD for `project.runner_instances` — multi-instance
+//! coordination across the runners sharing this machine's cluster.
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 use serde::Serialize;
@@ -41,7 +57,7 @@ impl PgDb {
         // Remove any stale entry on the same port (from a previous runner with a different id)
         // before upserting. This avoids a unique-constraint violation on the port column.
         conn.execute(
-            "DELETE FROM coord.runner_instances WHERE port = $1 AND id != $2",
+            "DELETE FROM project.runner_instances WHERE port = $1 AND id != $2",
             &[
                 &port_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
                 &id as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -52,7 +68,7 @@ impl PgDb {
 
         conn.execute(
             r#"
-            INSERT INTO coord.runner_instances (id, name, port, hostname, is_primary, pid, status, last_heartbeat, started_at, running_tasks)
+            INSERT INTO project.runner_instances (id, name, port, hostname, is_primary, pid, status, last_heartbeat, started_at, running_tasks)
             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), 0)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
@@ -92,7 +108,7 @@ impl PgDb {
                 r#"
                 SELECT id, name, port, hostname, is_primary, pid, status,
                        last_heartbeat::TEXT, started_at::TEXT, running_tasks
-                FROM coord.runner_instances
+                FROM project.runner_instances
                 ORDER BY is_primary DESC, port ASC
                 "#,
                 &[],
@@ -126,7 +142,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         let count = conn
-            .execute("DELETE FROM coord.runner_instances WHERE id = $1", &[&id])
+            .execute("DELETE FROM project.runner_instances WHERE id = $1", &[&id])
             .await
             .map_err(|e| format!("PG remove_runner_instance: {}", e))?;
 
@@ -150,7 +166,7 @@ impl PgDb {
         let count = conn
             .execute(
                 r#"
-                UPDATE coord.runner_instances
+                UPDATE project.runner_instances
                 SET last_heartbeat = NOW(),
                     status = $2,
                     running_tasks = COALESCE($3, running_tasks)
@@ -183,7 +199,7 @@ impl PgDb {
         let count = conn
             .execute(
                 r#"
-                UPDATE coord.runner_instances
+                UPDATE project.runner_instances
                 SET status = 'unhealthy'
                 WHERE status = 'healthy'
                   AND is_primary = FALSE
@@ -212,7 +228,7 @@ impl PgDb {
         let count = conn
             .execute(
                 r#"
-                DELETE FROM coord.runner_instances
+                DELETE FROM project.runner_instances
                 WHERE status IN ('stopped', 'unhealthy')
                   AND last_heartbeat < NOW() - ($1 * INTERVAL '1 second')
                 "#,

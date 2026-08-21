@@ -4,7 +4,7 @@
 //! (`<config_dir>/projects/<encoded-project>/<session_id>.jsonl`), parses
 //! `Edit` / `Write` / `MultiEdit` `tool_use` blocks out of them, and calls
 //! `pg.record_file_touched(session_id, file_path, None)` so that the
-//! `coord.session_touched_files` table populates for PTY tabs the same way
+//! `project.session_touched_files` table populates for PTY tabs the same way
 //! it already does for SDK chat sessions via `auto_register_file`.
 //!
 //! Why this exists: the dominant terminal-AI launch path
@@ -180,7 +180,7 @@ async fn run_orchestrator(
 
     // ── 1a. Transcript-absence symptom check ──────────────────────────────
     //
-    // This watcher is the ONLY populator of `coord.session_touched_files` for
+    // This watcher is the ONLY populator of `project.session_touched_files` for
     // PTY-launched AI tabs, so "no transcripts" means coord's cross-session
     // file-conflict traffic light is blind for the dominant session type —
     // with no second writer to cover it. Nothing used to notice: a 2026-07-28
@@ -210,7 +210,7 @@ async fn run_orchestrator(
             config_dirs = %searched.join(", "),
             workspace_paths = %workspace_paths.join(", "),
             "transcript_watcher: ZERO Claude transcripts found for any watched workspace path. \
-             coord.session_touched_files will not populate for PTY tabs, so cross-session file \
+             project.session_touched_files will not populate for PTY tabs, so cross-session file \
              conflict detection is blind for them. Verify the config dirs listed here are the \
              ones the CLI actually writes to (CLAUDE_CONFIG_DIR is set per account) BEFORE \
              concluding that transcript persistence is off."

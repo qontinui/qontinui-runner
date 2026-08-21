@@ -1,4 +1,26 @@
-//! PostgreSQL worktree operations.
+//! PostgreSQL CRUD for `project.worktrees` — the runner's own record of
+//! the git worktrees it created for task runs and workflows.
+//!
+//! NOT to be confused with `coord.agent_worktrees` (see
+//! `database/pg/agent_worktrees.rs`), which coord allocates via
+//! `POST /agents/allocate` and which deliberately stays coord-owned, nor
+//! with the disk-walking worktree census in `agent_worktree/census.rs`,
+//! which reads neither table.
+//!
+//! ## Schema authority — the runner authors this table
+//!
+//! Re-homed from `coord.*` to `project.*` by P3 of plan
+//! `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`. The
+//! `coord.*` schema is authored SOLELY by qontinui-web's alembic, which
+//! never runs on an end-user machine — and on such a machine the runner's
+//! bundled per-machine PostgreSQL (`postgresql_embedded`) IS the production
+//! database. So the old `coord.`-qualified SQL here either errored against a
+//! table that was never provisioned or wrote to a private table no fleet
+//! member could read. This table is machine-local operational state the
+//! runner reads back itself, so the runner is now its author: the shape is
+//! defined by the `CREATE TABLE IF NOT EXISTS` self-heal in
+//! `database/pg/mod.rs` (`MACHINE_LOCAL_TABLES_DDL`), not by any alembic
+//! revision.
 
 use super::PgDb;
 
@@ -18,7 +40,7 @@ impl PgDb {
             conn.query(
                 r#"SELECT id, worktree_path, branch_name, source_branch, source_commit,
                           repo_path, task_run_id, workflow_name, status, created_at, updated_at
-                   FROM coord.worktrees WHERE status = $1 ORDER BY created_at DESC"#,
+                   FROM project.worktrees WHERE status = $1 ORDER BY created_at DESC"#,
                 &[&s],
             )
             .await
@@ -27,7 +49,7 @@ impl PgDb {
             conn.query(
                 r#"SELECT id, worktree_path, branch_name, source_branch, source_commit,
                           repo_path, task_run_id, workflow_name, status, created_at, updated_at
-                   FROM coord.worktrees ORDER BY created_at DESC"#,
+                   FROM project.worktrees ORDER BY created_at DESC"#,
                 &[],
             )
             .await
@@ -80,7 +102,7 @@ impl PgDb {
             .query(
                 r#"SELECT id, worktree_path, branch_name, source_branch, source_commit,
                           repo_path, task_run_id, workflow_name, status, created_at, updated_at
-                   FROM coord.worktrees
+                   FROM project.worktrees
                    WHERE task_run_id = $1 AND status = 'active'
                    ORDER BY created_at DESC"#,
                 &[&task_run_id],
@@ -124,7 +146,7 @@ impl PgDb {
         let status_str = record.status.to_string();
 
         conn.execute(
-            r#"INSERT INTO coord.worktrees
+            r#"INSERT INTO project.worktrees
                (id, worktree_path, branch_name, source_branch, source_commit, repo_path,
                 task_run_id, workflow_name, status, created_at, updated_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $11::timestamptz)"#,
