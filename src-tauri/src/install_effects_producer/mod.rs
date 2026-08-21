@@ -635,12 +635,10 @@ async fn post_run(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<RunRequest>,
 ) -> Result<Json<ApiResponse<RunResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let base = coord_base().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("coord URL not configured: {e}"))),
-        )
-    })?;
+    // String family: `coord_base_with_source` always yields a base, so there is
+    // no "not configured" arm to map here. Tests inject a mock-server base
+    // through the `run_with_base` seam instead.
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     // The typecheck loopback targets THIS runner's own HTTP listener — resolve
     // the actually-bound port from AppState (correct for secondary/temp runners
     // on non-default ports). Injectable so tests point it at a mock.
@@ -664,12 +662,7 @@ async fn post_observe_verify(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<ObserveVerifyRequest>,
 ) -> Result<Json<ApiResponse<VerifyOutcome>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let base = coord_base().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("coord URL not configured: {e}"))),
-        )
-    })?;
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let loopback_base = crate::mcp::types::get_self_base_url(&state.app_state);
     let store = RegistryCredentialStore;
     observe_verify_with_base(req, &base, &loopback_base, &store)
@@ -766,15 +759,6 @@ async fn observe_verify_with_base<L: RegistryTokenLookup + ?Sized>(
     .await?;
 
     Ok(ApiResponse::success(verify))
-}
-
-/// Resolve the coord base URL (reuses the runner's existing source-of-truth
-/// chain). Split out so tests inject a mock-server base directly via
-/// [`run_with_base`].
-fn coord_base() -> Result<String, String> {
-    // String family: always yields a base (never errors); the `Result` is kept
-    // only because [`run_with_base`]'s test seam threads one.
-    Ok(qontinui_runner_lib::profiles::coord_base_with_source().0)
 }
 
 // ===========================================================================

@@ -87,14 +87,6 @@ fn http_client() -> Result<&'static reqwest::Client, String> {
         .ok_or_else(|| "build http client".to_string())
 }
 
-fn coord_base() -> Result<String, String> {
-    // String family: always yields a base (never errors).
-    Ok(qontinui_runner_lib::profiles::coord_base_with_source()
-        .0
-        .trim_end_matches('/')
-        .to_string())
-}
-
 // ===========================================================================
 // Desired state
 // ===========================================================================
@@ -138,7 +130,7 @@ pub async fn desired_state_rules() -> Option<Vec<CoordDesiredState>> {
 
 /// One `GET /coord/agent-desired-state`.
 async fn fetch_desired_state() -> Result<Vec<CoordDesiredState>, String> {
-    let base = coord_base()?;
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let url = format!("{base}/coord/agent-desired-state");
     let client = http_client()?;
 
@@ -230,10 +222,7 @@ pub async fn acquire_slot(
     agent_id: &str,
     claude_session_id: Option<&str>,
 ) -> AcquireOutcome {
-    let base = match coord_base() {
-        Ok(b) => b,
-        Err(e) => return AcquireOutcome::Unavailable(format!("coord base unresolved: {e}")),
-    };
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => return AcquireOutcome::Unavailable(e),
@@ -277,10 +266,7 @@ pub async fn heartbeat_slot(
     agent_id: &str,
     claude_session_id: Option<&str>,
 ) -> HeartbeatOutcome {
-    let base = match coord_base() {
-        Ok(b) => b,
-        Err(e) => return HeartbeatOutcome::Unavailable(format!("coord base unresolved: {e}")),
-    };
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => return HeartbeatOutcome::Unavailable(e),
@@ -312,7 +298,8 @@ pub async fn heartbeat_slot(
 /// stop so a peer can fill it without waiting out the TTL. A failure is
 /// harmless: the TTL is the backstop.
 pub async fn release_slot(resource_key: &str, machine_id: &uuid::Uuid, agent_id: &str) {
-    let (Ok(base), Ok(client)) = (coord_base(), http_client()) else {
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let Ok(client) = http_client() else {
         return;
     };
     let url = format!("{base}/claims/release");
@@ -340,7 +327,7 @@ pub async fn release_slot(resource_key: &str, machine_id: &uuid::Uuid, agent_id:
 /// into the bundled fallback. A shepherd must always spawn with real
 /// instructions, even offline.
 pub async fn fetch_playbook(name: &str) -> Option<String> {
-    let base = coord_base().ok()?;
+    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
     let client = http_client().ok()?;
     let url = format!("{base}/coord/agent-playbook/{name}");
 

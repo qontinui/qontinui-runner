@@ -795,6 +795,20 @@ pub(crate) fn detect_os_version() -> Option<String> {
 /// Thin wrapper around [`coord_http_base_from_url`] — separated for
 /// testability (the wrapper hits the filesystem; the conversion is
 /// pure).
+///
+/// # NOT the connected-vs-isolated door
+///
+/// This reads ONE arm — the active profile's `coord_url` — and errors when it
+/// is absent. It applies no env arm and no tier policy, so on the shipped
+/// hosted configuration (a `qontinui_account`-tier runner that has never had a
+/// `coord_url` written) it returns `Err` even though the runner IS connected.
+/// That is deliberate and load-bearing for its callers: pairing and env-agent
+/// enrollment must bind to the coord the operator explicitly named, and a
+/// tier-defaulted guess would silently enroll a device against production.
+///
+/// Every other caller wants [`crate::profiles::connected_coord_base`] (mode)
+/// or [`crate::profiles::coord_base_with_source`] (always-a-string). Do not
+/// reach for this one to ask "is this runner connected" — it cannot answer.
 pub fn coord_http_base() -> Result<String, String> {
     let coord_url = crate::profiles::load_strict()
         .map_err(|e| format!("active profile load failed: {}", e))?
