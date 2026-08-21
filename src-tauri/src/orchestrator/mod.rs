@@ -39,13 +39,14 @@
 //! ## Usage
 //!
 //! ```rust
-//! use crate::orchestrator::{OrchestratorRuntime, EnhancedOrchestratorConfig, ConfigPresets};
+//! use crate::orchestrator::config::{ConfigPresets, EnhancedOrchestratorConfig};
+//! use crate::orchestrator::runtime::OrchestratorRuntime;
 //!
 //! // Create runtime with default config
-//! let runtime = OrchestratorRuntime::new(EnhancedOrchestratorConfig::default());
+//! let mut runtime = OrchestratorRuntime::new(EnhancedOrchestratorConfig::default());
 //!
 //! // Or use presets
-//! let runtime = OrchestratorRuntime::new(ConfigPresets::production());
+//! let mut runtime = OrchestratorRuntime::new(ConfigPresets::autonomous());
 //!
 //! // Initialize and run task
 //! runtime.initialize_task("task-1", "Fix all type errors")?;

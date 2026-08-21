@@ -20,7 +20,7 @@
 //!     .add_step(FlowStep::conditional("has_issues",
 
 #![allow(dead_code)]
-//!         Condition::output_equals("analyze.issues_count", 0),
+//!         Condition::equals("analyze.issues_count", serde_json::json!(0)),
 //!         "complete",
 //!         "fix_issues"
 //!     ))
