@@ -60,3 +60,24 @@ export {
   useMonitorDetection,
   useExecutionControl,
 } from "../hooks";
+
+// Coord mode (connected vs isolated) — plan
+// 2026-08-18-runner-embedded-pg-parity-and-coord-http-migration §6.4.
+export {
+  CoordModeProvider,
+  useCoordMode,
+  fetchCoordModeOnce,
+  resetCoordModeCache,
+  deriveCoordAvailability,
+  deriveCoordGating,
+  COORD_SOURCE_NO_ACCOUNT,
+  COORD_SOURCE_SETTINGS_UNREADABLE,
+} from "./CoordModeContext";
+export type {
+  CoordMode,
+  CoordModeName,
+  CoordAvailability,
+  CoordModeSnapshot,
+  CoordGating,
+  CoordModeContextValue,
+} from "./CoordModeContext";

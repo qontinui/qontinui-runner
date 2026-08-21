@@ -12,6 +12,7 @@ import { RenderLogWrapper, UIBridgeHooks } from "./lib/ui-bridge";
 import { AuthProvider, useAuth } from "./components/AuthProvider";
 import { TutorialProvider } from "./contexts/TutorialContext";
 import { TenantProvider } from "./contexts/TenantContext";
+import { CoordModeProvider } from "./contexts/CoordModeContext";
 import { SessionProvider } from "./contexts/SessionContext";
 import { ContextualTutorial } from "./components/tutorial";
 import { DemoVisualOverlay } from "./components/demo-video/DemoVisualOverlay";
@@ -385,13 +386,7 @@ function AppContent() {
   // CONTENT here re-rendered the entire app (terminal tree included) on every
   // AI/log line; the three panels that render logs subscribe themselves via
   // `useLogData()` (plan `2026-07-28-runner-many-sessions-performance` §0 A2).
-  const {
-    addLog,
-    clearGeneralLogs,
-    clearImageLogs,
-    clearAiOutputLogs,
-    copyLogs,
-  } = useLogActions();
+  const { addLog, clearGeneralLogs, clearImageLogs, clearAiOutputLogs, copyLogs } = useLogActions();
 
   const {
     viewData: actionLogViewData,
@@ -1338,6 +1333,16 @@ export default function App() {
           >
             <AuthProvider>
               {/*
+              CoordModeProvider — plan
+              2026-08-18-runner-embedded-pg-parity-and-coord-http-migration
+              §6.4. Resolves connected-vs-isolated ONCE for the whole app and
+              shares it; every coord-backed surface reads `useCoordMode()`
+              rather than invoking per-component. Sits high enough that the
+              Productivity dashboard, the settings panels and any future
+              fleet surface all see the same answer.
+            */}
+              <CoordModeProvider>
+                {/*
               Plan 2026-05-22-coord-native-session-coordination §D12 + §Phase 4.
               TenantProvider wraps SessionProvider per plan: the active tenant
               is the default stamp for new sessions started via SessionContext.
@@ -1345,23 +1350,24 @@ export default function App() {
               future auth state (paired_user.json reads happen at the Rust
               layer; placement here is for symmetry with NavigationProvider).
             */}
-              <TenantProvider>
-                <SessionProvider>
-                  <NavigationProvider>
-                    <EventManagerProvider>
-                      <ExecutionProvider
-                        onLog={(_level, _message) => {
-                          // Logs are handled by LogManager through event handlers
-                        }}
-                      >
-                        <AutoContinueProvider>
-                          <AppWithTutorials />
-                        </AutoContinueProvider>
-                      </ExecutionProvider>
-                    </EventManagerProvider>
-                  </NavigationProvider>
-                </SessionProvider>
-              </TenantProvider>
+                <TenantProvider>
+                  <SessionProvider>
+                    <NavigationProvider>
+                      <EventManagerProvider>
+                        <ExecutionProvider
+                          onLog={(_level, _message) => {
+                            // Logs are handled by LogManager through event handlers
+                          }}
+                        >
+                          <AutoContinueProvider>
+                            <AppWithTutorials />
+                          </AutoContinueProvider>
+                        </ExecutionProvider>
+                      </EventManagerProvider>
+                    </NavigationProvider>
+                  </SessionProvider>
+                </TenantProvider>
+              </CoordModeProvider>
             </AuthProvider>
           </AutoRegisterProvider>
         </UIBridgeWindowProvider>

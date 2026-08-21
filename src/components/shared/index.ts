@@ -16,3 +16,10 @@ export {
   type AiMessageDisplayProps,
 } from "./AiMessageDisplay";
 export { StreamingMessageView, type StreamingMessageViewProps } from "./StreamingMessageView";
+export {
+  CoordConnectionRequired,
+  coordDisabledCopy,
+  type CoordDisabledReason,
+  type CoordDisabledCopy,
+  type CoordConnectionRequiredProps,
+} from "./CoordConnectionRequired";
