@@ -232,10 +232,18 @@ fn legacy_env_fallback() -> ResolvedProfile {
 
 /// Outcome of resolving the coord HTTP base, before any dev-localhost policy
 /// is applied. Lets each caller family pick its own fallback posture:
-/// - String family: `coord_base_with_source().0`
-/// - Option family: `Configured | TierDefault ⇒ Some`, otherwise `None`
-///   (no-op when unconfigured on a non-hosted runner)
-/// - Result family: map as appropriate, preserving the call site's contract.
+/// - String family: [`coord_base_with_source`] — always yields a base, so it
+///   CANNOT express "isolated";
+/// - Option family: [`connected_coord_base`] — the single connected-vs-isolated
+///   door. It keys on the `(base, source)` PAIR, not on this variant alone,
+///   because [`Self::TierDefault`] is produced by two different inputs and only
+///   one of them means connected. Do not re-derive the rule from a bare
+///   variant match: that is the defect that classified the entire hosted fleet
+///   as isolated.
+///
+/// There is deliberately no third "Result family" policy. A call site that
+/// wants a `Result` maps one of the two above at the boundary; a private
+/// per-module wrapper is what let three policies coexist in the first place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordBase {
     /// A coord base was explicitly configured (env `COORD_HTTP_URL` or the
@@ -245,11 +253,21 @@ pub enum CoordBase {
     /// (`http://localhost:9870`). Treated as "configured enough" for the
     /// String family but as "unconfigured" (None) for the Option family.
     DevLocalhost(String),
-    /// Nothing was configured, but the runner tier is `qontinui_account`
-    /// (hosted fleet), so the production coord base ([`PROD_COORD_BASE`])
-    /// applies. A real, dialable coord: the String family uses it AND the
-    /// Option family maps it to `Some` (unlike `DevLocalhost`) — a hosted
-    /// runner with no profile must still heartbeat/forward against prod.
+    /// Nothing was configured, but the production coord base
+    /// ([`PROD_COORD_BASE`]) applies anyway. **Two different inputs produce
+    /// this variant, and the accompanying [`CoordBaseSource`] is the only
+    /// thing that tells them apart:**
+    ///
+    /// - [`CoordBaseSource::TierDefault`] — the runner tier was READ and it
+    ///   says `qontinui_account` (hosted fleet). A real, dialable coord: the
+    ///   String family uses it AND [`connected_coord_base`] maps it to `Some`
+    ///   (unlike `DevLocalhost`) — a hosted runner with no profile must still
+    ///   heartbeat/forward against prod.
+    /// - [`CoordBaseSource::UnknownTierProdDefault`] — `settings.json` could
+    ///   not be read, so the tier is UNKNOWN and prod was a GUESS. The String
+    ///   family still uses it (it wants the loud failure);
+    ///   [`connected_coord_base`] maps it to `None`, because an unknown tier
+    ///   must not authorize egress to production.
     TierDefault(String),
     /// Nothing configured AND the caller did not want a localhost guess.
     Unset,
@@ -703,7 +721,22 @@ pub fn coord_base_with_source() -> (String, CoordBaseSource) {
 /// express "isolated" at all, so it is never the right door for a feature that
 /// must no-op when the runner is standalone.
 pub fn connected_coord_base() -> Option<String> {
-    match coord_base_policy() {
+    let (base, source) = coord_base_policy();
+    classify_connected(base, source)
+}
+
+/// The connected-vs-isolated rule itself, as a PURE fn over one
+/// [`coord_base_policy`] reading.
+///
+/// Split out so [`connected_coord_base`] and [`coord_mode`] cannot drift, and
+/// so neither has to read `settings.json` twice. That second read is not
+/// hypothetical: [`coord_base_policy`] re-reads the file on every call with no
+/// caching, and [`read_runner_tier`] returns [`TierRead::Unknown`] whenever it
+/// loses a race with another runner instance's atomic rewrite — so a
+/// two-call implementation could report `mode: "isolated"` alongside a
+/// `source` that says `tier_default`, from the same instant.
+fn classify_connected(base: CoordBase, source: CoordBaseSource) -> Option<String> {
+    match (base, source) {
         // Explicitly configured — env `COORD_HTTP_URL` or the profile's
         // `coord_url`. The tier is irrelevant; the operator named the coord.
         (CoordBase::Configured(base), _) => Some(base.trim_end_matches('/').to_string()),
@@ -718,6 +751,72 @@ pub fn connected_coord_base() -> Option<String> {
         // and `Unset` (structurally unreachable — `coord_base_policy` never
         // yields it).
         _ => None,
+    }
+}
+
+/// The two modes a runner can be in, as the frontend sees them.
+///
+/// Serialized in `snake_case`, i.e. `"connected"` / `"isolated"` on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordConnectionMode {
+    /// A real coordinator is configured (or implied by the hosted tier): every
+    /// coord-backed surface is live.
+    Connected,
+    /// No coordinator: plan / task / review / worktree surfaces must render
+    /// DISABLED with an explicit reason, not broken or silently empty.
+    Isolated,
+}
+
+impl CoordConnectionMode {
+    /// Stable wire string, matching the serde representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CoordConnectionMode::Connected => "connected",
+            CoordConnectionMode::Isolated => "isolated",
+        }
+    }
+}
+
+/// The runner's coord mode plus the evidence behind it — the shape the
+/// frontend consumes (plan
+/// `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration` §6.4).
+///
+/// `get_coord_http_base` cannot express this: it belongs to the always-yields-a-
+/// base String family, so an isolated runner gets back `http://localhost:9870`
+/// and the UI cannot tell "coord lives there" from "there is no coord". The UI
+/// requirement is to show the plan / task / review / worktree surfaces DISABLED
+/// with an explicit "connect a qontinui account to enable" reason, which needs a
+/// mode, not a string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordModeReport {
+    /// `connected` iff [`connected_coord_base`] would yield `Some`.
+    pub mode: CoordConnectionMode,
+    /// The connected base, `None` iff `mode == Isolated`. Deliberately NOT the
+    /// String family's answer: surfacing the dev-localhost guess (or a
+    /// prod base guessed off an unreadable `settings.json`) here would let a
+    /// caller dial exactly the endpoint the mode says not to.
+    pub base: Option<String>,
+    /// Which arm of the resolution chain decided it — [`CoordBaseSource::as_str`].
+    /// Present in BOTH modes, because it is what makes the isolated reason
+    /// actionable: `dev_localhost_fallback` means "no account configured",
+    /// while `unknown_tier_prod_default` means "settings.json is unreadable —
+    /// fix that file", which is a different message to show the operator.
+    pub source: String,
+}
+
+/// One reading of the runner's coord mode. Derived from CONFIGURATION ONLY, so
+/// it never flips on a network blip — see [`connected_coord_base`].
+pub fn coord_mode() -> CoordModeReport {
+    let (base, source) = coord_base_policy();
+    let base = classify_connected(base, source);
+    CoordModeReport {
+        mode: match base {
+            Some(_) => CoordConnectionMode::Connected,
+            None => CoordConnectionMode::Isolated,
+        },
+        base,
+        source: source.as_str().to_string(),
     }
 }
 
@@ -1343,6 +1442,148 @@ mod tests {
                 connected_coord_base(),
                 Some("https://explicit.example".to_string()),
                 "explicit COORD_HTTP_URL must win on tier {tier} (and be slash-trimmed)"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // coord_mode — the frontend-facing projection (plan §6.4). These pin the
+    // MAPPING, not the policy: the policy is already covered above, and what
+    // could silently rot here is the report drifting from
+    // `connected_coord_base` (a UI that renders "connected" while every
+    // Option-family call site no-ops is worse than one that renders nothing).
+    // ------------------------------------------------------------------
+
+    /// The shipped hosted configuration reports CONNECTED, carries the base,
+    /// and names the arm that decided it.
+    #[test]
+    fn coord_mode_hosted_tier_is_connected_with_a_base() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        let dir = tempfile::tempdir().unwrap();
+        isolate_coord_env(
+            dir.path(),
+            Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)),
+        );
+        let got = coord_mode();
+        assert_eq!(
+            got,
+            CoordModeReport {
+                mode: CoordConnectionMode::Connected,
+                base: Some(PROD_COORD_BASE.to_string()),
+                source: "tier_default".to_string(),
+            }
+        );
+    }
+
+    /// A non-hosted runner with nothing configured reports ISOLATED — and
+    /// `base` is `None`, NOT the dev-localhost guess the String family would
+    /// have handed back. A UI that received that guess could dial exactly the
+    /// endpoint the mode just told it does not exist.
+    #[test]
+    fn coord_mode_isolated_carries_no_base_and_names_the_guess() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        let dir = tempfile::tempdir().unwrap();
+        isolate_coord_env(dir.path(), Some(r#"{"tier":"local"}"#));
+        let got = coord_mode();
+        assert_eq!(got.mode, CoordConnectionMode::Isolated);
+        assert_eq!(got.base, None);
+        assert_eq!(got.source, "dev_localhost_fallback");
+        // The String family DOES have a base on this same input — which is why
+        // it cannot express this mode.
+        assert_eq!(coord_base_with_source().0, DEV_LOCALHOST_COORD_BASE);
+    }
+
+    /// An unreadable settings.json reports ISOLATED with the
+    /// `unknown_tier_prod_default` source, so the UI can say "fix
+    /// settings.json" rather than "connect an account" — a different, and
+    /// actionable, reason.
+    #[test]
+    fn coord_mode_unknown_tier_is_isolated_with_a_distinguishable_reason() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        let dir = tempfile::tempdir().unwrap();
+        isolate_coord_env(dir.path(), Some("{not json"));
+        let got = coord_mode();
+        assert_eq!(got.mode, CoordConnectionMode::Isolated);
+        assert_eq!(got.base, None);
+        assert_eq!(
+            got.source, "unknown_tier_prod_default",
+            "the isolated reason must distinguish an unreadable settings.json              from a runner that simply has no account"
+        );
+    }
+
+    /// An explicit `COORD_HTTP_URL` reports CONNECTED with source `env`, on a
+    /// tier that would otherwise isolate.
+    #[test]
+    fn coord_mode_explicit_env_is_connected() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        let dir = tempfile::tempdir().unwrap();
+        isolate_coord_env(dir.path(), Some(r#"{"tier":"local"}"#));
+        std::env::set_var("COORD_HTTP_URL", "https://explicit.example/");
+        let got = coord_mode();
+        assert_eq!(got.mode, CoordConnectionMode::Connected);
+        assert_eq!(got.base.as_deref(), Some("https://explicit.example"));
+        assert_eq!(got.source, "env");
+    }
+
+    /// The report must never disagree with the resolver every coord call site
+    /// actually uses. Both read the same policy, so this pins the projection
+    /// across every tier the policy distinguishes.
+    #[test]
+    fn coord_mode_agrees_with_connected_coord_base_on_every_tier() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        for settings in [
+            None,
+            Some(format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)),
+            Some(r#"{"tier":"local"}"#.to_string()),
+            Some(r#"{"tier":"local_provider"}"#.to_string()),
+            Some(r#"{"tier":"something_new"}"#.to_string()),
+            Some("{not json".to_string()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            isolate_coord_env(dir.path(), settings.as_deref());
+            let expected = connected_coord_base();
+            let got = coord_mode();
+            assert_eq!(got.base, expected, "settings {settings:?}");
+            assert_eq!(
+                got.mode == CoordConnectionMode::Connected,
+                expected.is_some(),
+                "settings {settings:?}"
+            );
+        }
+    }
+
+    /// The wire strings the frontend switches on. A rename here silently
+    /// breaks a `mode === "connected"` check in TypeScript, which no Rust test
+    /// would otherwise catch.
+    #[test]
+    fn coord_mode_serializes_to_the_documented_wire_strings() {
+        let report = CoordModeReport {
+            mode: CoordConnectionMode::Isolated,
+            base: None,
+            source: "dev_localhost_fallback".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::json!({
+                "mode": "isolated",
+                "base": null,
+                "source": "dev_localhost_fallback",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(CoordConnectionMode::Connected).unwrap(),
+            serde_json::json!("connected")
+        );
+        // `as_str` and the serde representation must not drift apart.
+        for m in [CoordConnectionMode::Connected, CoordConnectionMode::Isolated] {
+            assert_eq!(
+                serde_json::to_value(m).unwrap(),
+                serde_json::Value::String(m.as_str().to_string())
             );
         }
     }

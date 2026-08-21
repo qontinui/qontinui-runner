@@ -2038,6 +2038,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::productivity::get_fleet_health,
             prompt_library::list_prompt_templates,
             commands::productivity::get_coord_http_base,
+            commands::productivity::get_coord_mode,
             commands::productivity::spawn_from_plan,
             commands::productivity::get_plan_recommendations,
             commands::productivity::get_plan_tasks,
