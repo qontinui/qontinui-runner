@@ -233,6 +233,36 @@ pub fn session_transcript_path(config_dir: &Path, project_path: &str, session_id
 // recover it. Kept separate from `display_name` (still the useful first-message
 // preview).
 
+/// Turn a raw transcript-sourced string into a displayable TITLE: strip ANSI
+/// escapes, trim, and reject what is left if it is empty.
+///
+/// Titles come out of a terminal transcript, so they can carry raw SGR/OSC
+/// escapes verbatim — a `/rename` whose argument was pasted from colored
+/// output, or an auto-`summary` derived from one. Nothing downstream renders a
+/// terminal: the session manager, the previous-sessions rows and the tab
+/// titles all put the string into DOM text, where `[1;32m` shows up as
+/// literal garbage in the label (and lands verbatim in every UI-Bridge element
+/// `text`).
+///
+/// Reuses [`crate::terminal::strip_ansi`] — the runner's ONE ANSI stripper,
+/// already used by the Tauri command surface and the MCP HTTP API for
+/// scrollback previews. A second escape scanner here would be a second spelling
+/// of one thing, free to drift on exactly the sequences that matter.
+///
+/// Applied at every point a raw string BECOMES a title
+/// ([`last_custom_title`], [`last_summary`], [`generate_display_name`]) rather
+/// than at the public projections, so no future caller can reach an
+/// unsanitized one.
+fn sanitize_title(raw: &str) -> Option<String> {
+    let cleaned = crate::terminal::strip_ansi(raw);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Scan `lines` for the LAST `custom-title` record and return its
 /// `customTitle`. A cheap substring pre-check avoids parsing every line.
 fn last_custom_title<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
@@ -245,9 +275,8 @@ fn last_custom_title<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String>
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             if v.get("type").and_then(|t| t.as_str()) == Some("custom-title") {
                 if let Some(title) = v.get("customTitle").and_then(|t| t.as_str()) {
-                    let t = title.trim();
-                    if !t.is_empty() {
-                        found = Some(t.to_string());
+                    if let Some(t) = sanitize_title(title) {
+                        found = Some(t);
                     }
                 }
             }
@@ -267,9 +296,8 @@ fn last_summary<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             if v.get("type").and_then(|t| t.as_str()) == Some("summary") {
                 if let Some(s) = v.get("summary").and_then(|t| t.as_str()) {
-                    let s = s.trim();
-                    if !s.is_empty() {
-                        found = Some(s.to_string());
+                    if let Some(s) = sanitize_title(s) {
+                        found = Some(s);
                     }
                 }
             }
@@ -1346,8 +1374,12 @@ const GENERIC_PREFIXES: &[&str] = &[
 /// for short or uninformative messages (slash commands, "continue", etc.).
 fn generate_display_name(first_preview: &Option<String>, last_modified: &str) -> String {
     if let Some(preview) = first_preview {
+        // Strip ANSI FIRST: an escape run left in place survives `strip_xml_tags`
+        // and the 50-char truncation below, which can even cut a CSI sequence in
+        // half. See `sanitize_title`.
+        let preview = crate::terminal::strip_ansi(preview);
         // Strip XML tags and clean up
-        let stripped = strip_xml_tags(preview);
+        let stripped = strip_xml_tags(&preview);
         let trimmed = stripped.trim();
 
         // Skip short/uninformative messages
@@ -1796,6 +1828,51 @@ pub fn find_external_claude_processes(exclude_pids: &[u32]) -> Vec<ExternalClaud
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Transcript-sourced titles can carry raw SGR/OSC escapes (a `/rename`
+    /// pasted from colored output, or a summary derived from one). Nothing
+    /// downstream renders a terminal, so the escape shows up as literal
+    /// garbage in the label — and in every UI-Bridge element `text`.
+    #[test]
+    fn titles_are_stripped_of_ansi_escapes() {
+        // The escapes are spelled `\u001b` INSIDE the JSON, which is how a real
+        // transcript carries them — JSON forbids a raw control character in a
+        // string, so a literal ESC here would fail the parse and the test would
+        // pass for the wrong reason.
+        let renamed =
+            "{\"type\":\"custom-title\",\"customTitle\":\"\\u001b[1;32mgreen\\u001b[0m build\"}";
+        let name = extract_resume_name(renamed).expect("custom-title wins");
+        assert_eq!(name, "green build");
+        assert!(!name.contains('\u{1b}'));
+
+        let summarized =
+            "{\"type\":\"summary\",\"summary\":\"\\u001b[31mfix\\u001b[0m the runner\"}";
+        let name = extract_resume_name(summarized).expect("summary fallback");
+        assert_eq!(name, "fix the runner");
+        assert!(!name.contains('\u{1b}'));
+
+        // A title that is NOTHING but escapes has no name left — it must fall
+        // through to the next source, not surface as an empty label.
+        assert_eq!(
+            extract_resume_name("{\"type\":\"custom-title\",\"customTitle\":\"\\u001b[0m\"}"),
+            None
+        );
+    }
+
+    /// The first-message preview is the other title source, and it truncates at
+    /// 50 chars — long enough to slice a CSI sequence in half if the strip runs
+    /// after rather than before.
+    #[test]
+    fn display_name_preview_is_stripped_of_ansi_escapes() {
+        let preview =
+            Some("\u{1b}[1mrefactor the terminal session lifecycle store\u{1b}[0m".to_string());
+        let name = generate_display_name(&preview, "");
+        assert!(!name.contains('\u{1b}'), "got {name:?}");
+        assert!(
+            name.starts_with("refactor the terminal session"),
+            "got {name:?}"
+        );
+    }
 
     #[test]
     fn test_encode_project_path() {

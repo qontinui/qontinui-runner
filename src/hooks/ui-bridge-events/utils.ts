@@ -474,10 +474,11 @@ function splitTrailingStatement(expression: string): string[] {
  *    comment-safe at both ends. Covers the overwhelming majority.
  * 2. `return <expr>` with leading whitespace stripped — expressions that
  *    are valid after `return` but not inside parens, chiefly ones ending
- *    in a semicolon (`document.title;`) or a trailing statement
- *    (`foo(); bar()`). `trimStart()` is what keeps the ASI bug from
- *    sneaking back in through this arm for a leading-newline expression
- *    that also ends in `;`.
+ *    in a semicolon (`document.title;`). `trimStart()` is what keeps the
+ *    ASI bug from sneaking back in through this arm for a leading-newline
+ *    expression that also ends in `;`. SKIPPED ENTIRELY whenever the
+ *    expression has a top-level statement break with a non-blank tail —
+ *    see below.
  * 3. Statement list whose LAST top-level fragment is returned — the
  *    completion-value arm. `var q = 1 + 1; q` is a statement list (arms 1
  *    and 2 are both SyntaxErrors) whose author plainly means "give me
@@ -495,10 +496,32 @@ function splitTrailingStatement(expression: string): string[] {
  * `return (…)` is a hard SyntaxError), a `;` inside a regex literal (the one
  * literal kind the scanner does not track), a trailing fragment that is a
  * statement rather than an expression (`let x = 1; return x + 1`) — fails to
- * compile and falls through to arm 4, reproducing today's `undefined` exactly.
- * A silently WRONG value would be far worse than the bug this closes, so the
- * transform is never trusted unparsed. Arm 3 also sits after arm 2, so it can
- * only ever catch input that already fell through to arm 4.
+ * compile and falls through to arm 4, yielding `undefined`. A silently WRONG
+ * value would be far worse than the bug this closes, so the transform is
+ * never trusted unparsed.
+ *
+ * WHY ARM 2 IS SKIPPED WHENEVER ARM 3 HAS A CANDIDATE.
+ *
+ * Arm 2 is `return <statements>`, which for a statement LIST returns the value
+ * of the FIRST statement and silently discards the rest: `new Function("return
+ * 1+1; 2+2")()` is `2`, not `4`. That compiles, so it wins before arm 3 is ever
+ * reached — the wrong-value bug this ordering exists to close. Measured on the
+ * unguarded build: `1+1; 2+2`→2, `10; 20; 30`→10, `({a:1}); 7`→`{a:1}`,
+ * `function f(){return 9}; f()`→the function object. `var`-prefixed probes mask
+ * it completely (`return var q = …` is a SyntaxError), which is why it survived
+ * the arm-3 landing.
+ *
+ * So the skip is UNCONDITIONAL on {@link splitTrailingStatement} producing a
+ * candidate, not conditional on that candidate compiling. Merely reordering the
+ * arms would not do: `f(); if(x){g()}` has an arm-3 candidate that does NOT
+ * compile, so arm 2 would still catch it and return `f()`'s value. Skipping
+ * outright sends it to arm 4 and `undefined` instead — losing the value rather
+ * than reporting a wrong one.
+ *
+ * Nothing legitimate is lost. Arm 2's real job is the semicolon-terminated
+ * single expression (`document.title;`), and for those the tail after the last
+ * top-level break is blank, so `splitTrailingStatement` returns nothing and
+ * arm 2 stays in the list.
  *
  * Compilation is deliberately separated from invocation. The previous code
  * compiled-and-called inside one `try`, so an expression that merely THREW
@@ -508,12 +531,12 @@ function splitTrailingStatement(expression: string): string[] {
  * runtime throw of any type propagates to the caller's error envelope.
  */
 export function compileEvaluateExpression(expression: string): () => unknown {
-  const candidates = [
-    "return (" + expression + "\n)",
-    "return " + expression.trimStart(),
-    ...splitTrailingStatement(expression),
-    expression,
-  ];
+  const trailing = splitTrailingStatement(expression);
+  const candidates =
+    trailing.length > 0
+      ? // Statement list: arm 2 would return the FIRST statement's value.
+        ["return (" + expression + "\n)", ...trailing, expression]
+      : ["return (" + expression + "\n)", "return " + expression.trimStart(), expression];
   let lastSyntaxError: SyntaxError | undefined;
   for (const body of candidates) {
     try {

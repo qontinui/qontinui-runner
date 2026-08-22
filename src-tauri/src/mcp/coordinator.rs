@@ -98,12 +98,14 @@ async fn get_coordinator_state(
         .pg_db
         .list_tasks_by_status(NON_TERMINAL_STATUSES)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("list_tasks_by_status: {}", e),
-            )
-        })?;
+        // Surfaced VERBATIM. `list_tasks_by_status` already formats its failure
+        // through `pg_err`, which names the operation AND the SQLSTATE
+        // (`Failed to list tasks by status: [42703] undefined_column: column
+        // "x" does not exist`). Re-prefixing it with the Rust method name
+        // pushed the only searchable part — the bracketed SQLSTATE — off the
+        // end of the Coordinator panel's error line behind two redundant
+        // restatements of the same operation.
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let active_file_registry = app.file_registry_manager.info().await;
     let upcoming_file_registry = app.upcoming_file_registry.snapshot().await;
@@ -582,11 +584,11 @@ pub(crate) async fn sweep_stale_assignments(
     let app = state.app_state.clone();
 
     // 1. Pull every non-terminal task — same source the dashboard uses.
+    // Error surfaced VERBATIM, for the same reason as `get_coordinator_state`.
     let tasks = app
         .pg_db
         .list_tasks_by_status(NON_TERMINAL_STATUSES)
-        .await
-        .map_err(|e| format!("list_tasks_by_status: {}", e))?;
+        .await?;
 
     // 2. Resolve the live session set. If SessionManager isn't registered
     //    (test harness, or runner shutting down), treat the live set as

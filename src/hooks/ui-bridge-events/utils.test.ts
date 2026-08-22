@@ -230,6 +230,48 @@ describe("compileEvaluateExpression — page_evaluate wrapping", () => {
   });
 
   it.each([
+    ["1+1; 2+2", 4],
+    ["10; 20; 30", 30],
+    ["function f(){return 9}; f()", 9],
+    ["'x'; 'y'", "y"],
+  ])(
+    "returns the LAST statement's value, not the first, for %j",
+    (expression, expected) => {
+      // THE ARM-2 WRONG-VALUE BUG. `new Function("return 1+1; 2+2")()` compiles
+      // and returns 2 — the FIRST statement — so the unguarded arm 2 won ahead
+      // of the completion-value arm and the caller got a confidently wrong
+      // number under `success: true`. Measured on the shipped build:
+      // `1+1; 2+2`->2, `10; 20; 30`->10, `function f(){return 9}; f()`->the
+      // function object. A `var` prefix masks it entirely (`return var q = …`
+      // is a SyntaxError), which is why every earlier probe missed it.
+      expect(compileEvaluateExpression(expression as string)()).toBe(expected);
+    },
+  );
+
+  it("returns the LAST statement's value for a leading object literal", () => {
+    // Same bug, object-valued: arm 2 returned `{a:1}` for input whose last
+    // statement is `7`.
+    expect(compileEvaluateExpression("({a:1}); 7")()).toBe(7);
+  });
+
+  it("skips arm 2 unconditionally, not merely after arm 3", () => {
+    // Reordering the arms is NOT equivalent to skipping. `1; if(true){2}` has
+    // an arm-3 candidate (`return (if(true){2})`) that does not compile, so a
+    // reorder would fall back to arm 2 and return `1` — wrong. The skip sends
+    // it to the raw body instead, which is `undefined`: the value is lost, not
+    // misreported.
+    expect(compileEvaluateExpression("1; if (true) { 2 }")()).toBeUndefined();
+  });
+
+  it("keeps arm 2 for a semicolon-terminated single expression", () => {
+    // The skip is gated on a NON-BLANK tail after the last top-level break, so
+    // arm 2's actual job — `document.title;`, which arm 1 cannot parenthesise —
+    // is untouched.
+    expect(compileEvaluateExpression("2 + 2;")()).toBe(4);
+    expect(compileEvaluateExpression("({a:1});")()).toEqual({ a: 1 });
+  });
+
+  it.each([
     // A final BLOCK statement: `return (if(x){f()})` is a hard SyntaxError, so
     // the guarded transform must be DISCARDED and the raw body kept. Wrong is
     // worse than undefined, which is why the candidate is compiled before it
@@ -237,6 +279,16 @@ describe("compileEvaluateExpression — page_evaluate wrapping", () => {
     "var hit = false; if (1) { hit = true; }",
     // Same, with a loop.
     "var n = 0; for (var i = 0; i < 2; i++) { n++; }",
+    // No `var` prefix: before the arm-2 skip this compiled as
+    // `return 1; if (true) { 2 }` and returned 1.
+    "1; if (true) { 2 }",
+    // A `;` inside a regex literal is the ONE literal kind the scanner does not
+    // track, so the only split it finds is inside the literal and the candidate
+    // is an unterminated regex. Previously arm 2 answered `1` here.
+    "1; /a;b/",
+    // ASI: the trailing fragment is a statement, not an expression, so
+    // `return (return …)` cannot compile.
+    "1; do { } while (false)",
   ])("falls back to the raw body when the rewrite cannot compile: %j", (expression) => {
     // Not a throw and not a wrong value — exactly today's behaviour.
     expect(compileEvaluateExpression(expression)()).toBeUndefined();

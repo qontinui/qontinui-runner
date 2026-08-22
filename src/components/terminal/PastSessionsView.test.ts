@@ -32,6 +32,8 @@ import {
   pastSessionCopyId,
   pastSessionDisplayName,
   pastSessionResumeId,
+  pastSessionRestoreBadge,
+  pastSessionRowId,
   pastSessionTooltip,
   pastSessionsCohortToggleId,
 } from "./PastSessionsView";
@@ -251,5 +253,48 @@ describe("past-sessions JSX stamps", () => {
     for (const button of buttons) {
       expect(button).toContain("data-ui-bridge-id=");
     }
+  });
+});
+
+describe("past-session rows — restore verdict + row registration", () => {
+  it("shows the in-flight verdict verbatim", () => {
+    // The whole point of the backend projection: an attempted-but-unlanded
+    // restore must not read as `failed`.
+    expect(pastSessionRestoreBadge("pending (not yet confirmed)")).toBe(
+      "pending (not yet confirmed)",
+    );
+  });
+
+  it.each(["resumed", "terminal-only", "failed"])("shows the settled verdict %j", (verdict) => {
+    expect(pastSessionRestoreBadge(verdict)).toBe(verdict);
+  });
+
+  it("renders nothing for the two silences", () => {
+    // `undefined` = a runner build without the field (UNKNOWN — never claim
+    // `not-restored`); `"not-restored"` = the backend's own "nothing to say",
+    // true of nearly every row, so badging it is pure noise.
+    expect(pastSessionRestoreBadge(undefined)).toBeNull();
+    expect(pastSessionRestoreBadge("not-restored")).toBeNull();
+    expect(pastSessionRestoreBadge("   ")).toBeNull();
+  });
+
+  it("keys the row id on the session, not on position", () => {
+    // Cohorts re-sort newest-first on every refresh, so an ordinal-derived id
+    // would name a different row after each poll.
+    expect(pastSessionRowId("sess-a")).toBe("terminal.past-session-row-sess-a");
+    expect(pastSessionRowId("sess-a")).not.toBe(pastSessionRowId("sess-b"));
+  });
+
+  it("stamps the card container so the row's TEXT reaches the snapshot", () => {
+    // The scanner registers `[data-ui-bridge-id]` regardless of tag/role. A
+    // card carrying only `data-page-element` is scrapeable by `read-value` but
+    // absent from `/ui-bridge/control/snapshot`, so nothing the row says was
+    // checkable through elements.
+    expect(SOURCE).toContain("data-ui-bridge-id={pastSessionRowId(session.claudeSessionId)}");
+  });
+
+  it("renders the verdict into the row rather than only carrying it", () => {
+    expect(SOURCE).toContain("pastSessionRestoreBadge(session.restoreStatus)");
+    expect(SOURCE).toContain("{restoreBadge}");
   });
 });
