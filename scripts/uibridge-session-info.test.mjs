@@ -2485,10 +2485,36 @@ async function runRestoreAssertions(ctx) {
     }
     const missing = Array.isArray(census.missing) ? census.missing : [];
     const unexpected = Array.isArray(census.unexpected) ? census.unexpected : [];
-    if (missing.length)
+    if (missing.length) {
       problems.push(
         `missing[]: ${missing.map((m) => `${m.claudeSessionId}(${m.reason})`).join(", ")}`,
       );
+      // Say WHY, not just THAT. A `resume-failed` row means the frontend never
+      // typed a resume into the terminal restore rebuilt for it, and
+      // `classifyRestoreAction` decides that from exactly two record fields:
+      // `confirmedAt == null` or `transcriptExists === false` demote the row to
+      // `terminal-only`, which by design types nothing. Reporting those two
+      // alongside the failure turns "one session did not come back" into a
+      // diagnosis, and distinguishes a genuine dispatch bug from the documented
+      // fail-closed transcript probe (`probe_transcript_exists` demotes when it
+      // cannot resolve the path, and the record carries the PTY's spawn cwd
+      // while the transcript follows the PROVIDER's cwd).
+      const rh = await fetchRestoreHealth();
+      if (rh.ok) {
+        for (const m of missing) {
+          const row = rh.sessions.find((x) => x.claudeSessionId === m.claudeSessionId);
+          problems.push(
+            row
+              ? `  ${String(m.claudeSessionId).slice(0, 8)} deciding inputs: confirmed=${row.confirmed} ` +
+                  `transcriptExists=${row.transcriptExists} origin=${row.origin} restorable=${row.restorable} ` +
+                  `workingDir=${row.workingDir}`
+              : `  ${String(m.claudeSessionId).slice(0, 8)}: no restore-health row — the record is gone, not merely unresumed`,
+          );
+        }
+      } else {
+        problems.push(`  (could not read restore-health for the deciding inputs: ${rh.error})`);
+      }
+    }
     if (unexpected.length) {
       problems.push(
         `unexpected[]: ${unexpected.map((u) => `${u.claudeSessionId}(${u.reason})`).join(", ")}`,
