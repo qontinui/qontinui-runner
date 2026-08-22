@@ -1580,7 +1580,10 @@ mod tests {
             serde_json::json!("connected")
         );
         // `as_str` and the serde representation must not drift apart.
-        for m in [CoordConnectionMode::Connected, CoordConnectionMode::Isolated] {
+        for m in [
+            CoordConnectionMode::Connected,
+            CoordConnectionMode::Isolated,
+        ] {
             assert_eq!(
                 serde_json::to_value(m).unwrap(),
                 serde_json::Value::String(m.as_str().to_string())
