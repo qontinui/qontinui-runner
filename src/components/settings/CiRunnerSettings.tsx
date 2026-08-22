@@ -10,12 +10,32 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Play, Square, Info, X, Check, CircleDot } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
-import { getAccentColors } from "@/design-system";
+import { getAccentColors, type AccentColor } from "@/design-system";
 import type { LogFunction } from "./types";
 
 // --- Types ---
 
-type CiRunnerState = "idle" | "busy" | "offline";
+/**
+ * The wire values of `runner_status` in the supervisor's
+ * `GET /ci-runner/status` response.
+ *
+ * `distro_down` and `probe_failed` arrive from the supervisor half of plan
+ * `2026-08-21-supervisor-watchdog-observer-effect`. The probe used to collapse
+ * "WSL was unreachable" into "the service is inactive" (`.unwrap_or(false)`),
+ * so an operator reading "Offline" could not tell whether the runner had
+ * crashed or the probe had simply been unable to ask:
+ *
+ * - `distro_down`  — the WSL distro is not running, so no runner can be online.
+ *   The probe deliberately issues no `wsl -e` command in this state; waking the
+ *   distro to measure it is the observer effect the plan exists to remove.
+ * - `probe_failed` — the probe itself failed. Explicitly NOT "offline": it is a
+ *   cause, not a verdict about the runner.
+ *
+ * Both are REPORTED states — the supervisor was reached and told us this. That
+ * is a different fact from the transport-level `"unknown"` below, and the two
+ * are deliberately kept distinct (see {@link CiRunnerDisplayState}).
+ */
+type CiRunnerState = "idle" | "busy" | "offline" | "distro_down" | "probe_failed";
 
 /**
  * NO-DOWNGRADE (L3): what we DISPLAY. `status?.runner_status ?? "offline"`
@@ -23,6 +43,12 @@ type CiRunnerState = "idle" | "busy" | "offline";
  * CI runner derived from a failure to reach the thing that would know. A
  * supervisor we cannot reach means UNKNOWN, and both actions are disabled in
  * that state rather than acting on a guess.
+ *
+ * `"unknown"` is a statement about OUR hop: we could not reach the supervisor.
+ * It must never absorb the supervisor's own `probe_failed`, which says the
+ * supervisor WAS reached and reported that it could not ask WSL. Collapsing
+ * them would recreate, one layer up, exactly the conflation the server-side
+ * change removes — so they carry separate labels, colours and copy.
  */
 type CiRunnerDisplayState = CiRunnerState | "unknown";
 
@@ -120,17 +146,62 @@ function ToggleSwitch({
   );
 }
 
+/**
+ * The states in which the runner's service state is a FACT we can act on.
+ * Everything else — the transport-level `"unknown"`, and the supervisor's own
+ * `distro_down` / `probe_failed` — is either an absence of evidence or a
+ * condition no button on this panel can clear, so the controls are disabled
+ * rather than firing at a guess.
+ */
+function isServiceStateKnown(status: CiRunnerDisplayState): boolean {
+  return status === "idle" || status === "busy" || status === "offline";
+}
+
+/**
+ * Operator-facing explanation for the two REPORTED degraded states. Neither is
+ * actionable by retry from this panel: nothing the Enable/Start/Stop controls
+ * do reaches a distro that is not running, and a failed probe is an absence of
+ * evidence, not a verdict to act on.
+ */
+const DEGRADED_STATE_NOTES: Record<
+  "distro_down" | "probe_failed",
+  { accent: AccentColor; text: string }
+> = {
+  distro_down: {
+    accent: "orange",
+    text:
+      "The WSL distro hosting the CI runner is not running, so no runner can be online. " +
+      "The supervisor will not start it — a monitor that wakes its subject cannot observe it. " +
+      "Bring the distro up on the host (or check the WSL keepalive); runner controls stay " +
+      "disabled until it is.",
+  },
+  probe_failed: {
+    accent: "red",
+    text:
+      "The supervisor was reached, but its CI-runner probe failed — the runner's state is " +
+      "unknown, which is NOT the same as Offline. Runner controls are disabled rather than " +
+      "acting on a guess; the supervisor log carries the probe error.",
+  },
+};
+
 function StatusBadge({ status }: { status: CiRunnerDisplayState }) {
-  const colors: Record<string, string> = {
+  const colors: Record<CiRunnerDisplayState, string> = {
     idle: "text-green-400",
     busy: "text-yellow-400",
     offline: "text-zinc-400",
+    // Reported degraded states: a host-level condition (orange) and a failed
+    // measurement (red). Kept off amber, which is the supervisor-unreachable
+    // "unknown" colour — different hop, different signal.
+    distro_down: "text-orange-400",
+    probe_failed: "text-red-400",
     unknown: "text-amber-400",
   };
-  const labels: Record<string, string> = {
+  const labels: Record<CiRunnerDisplayState, string> = {
     idle: "Idle",
     busy: "Busy",
     offline: "Offline",
+    distro_down: "Distro Down",
+    probe_failed: "Probe Failed",
     unknown: "Unknown",
   };
   return (
@@ -179,9 +250,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
       if (err instanceof DOMException && err.name === "AbortError") {
         setChecking(true);
       } else {
-        setError(
-          `Failed to reach supervisor: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        setError(`Failed to reach supervisor: ${err instanceof Error ? err.message : String(err)}`);
         setChecking(false);
       }
     } finally {
@@ -336,6 +405,16 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     ? "unknown"
     : (status?.runner_status ?? "offline");
   const labels = status?.labels ?? [];
+  // The supervisor reported a degraded state (as opposed to us failing to
+  // reach it). Rendered with its own note so the operator sees the CAUSE, and
+  // gates the controls the same way `statusUnknown` does.
+  const degradedNote =
+    runnerStatus === "distro_down" || runnerStatus === "probe_failed"
+      ? DEGRADED_STATE_NOTES[runnerStatus]
+      : null;
+  // Enable/disable, start and stop all mutate the runner through WSL. Allow
+  // them only when the runner's service state is an observed fact.
+  const controlsEnabled = !actionLoading && isServiceStateKnown(runnerStatus);
 
   return (
     <div className="space-y-6">
@@ -355,8 +434,19 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
       {checking && !error && (
         <div className={`p-3 ${getAccentColors("amber").bg} rounded-lg flex items-start gap-2`}>
           <CircleDot className={`w-4 h-4 ${getAccentColors("amber").text} shrink-0 mt-0.5`} />
-          <span className={`${getAccentColors("amber").text} text-xs`}>
-            Checking supervisor…
+          <span className={`${getAccentColors("amber").text} text-xs`}>Checking supervisor…</span>
+        </div>
+      )}
+
+      {degradedNote && (
+        <div
+          className={`p-3 ${getAccentColors(degradedNote.accent).bg} rounded-lg flex items-start gap-2`}
+        >
+          <Info
+            className={`w-4 h-4 ${getAccentColors(degradedNote.accent).text} shrink-0 mt-0.5`}
+          />
+          <span className={`${getAccentColors(degradedNote.accent).text} text-xs`}>
+            {degradedNote.text}
           </span>
         </div>
       )}
@@ -381,7 +471,9 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            {(installed || statusUnknown) && <StatusBadge status={runnerStatus} />}
+            {(installed || statusUnknown || degradedNote !== null) && (
+              <StatusBadge status={runnerStatus} />
+            )}
             <ToggleSwitch
               checked={installed}
               onChange={(checked) => {
@@ -391,7 +483,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
                   void handleDisable();
                 }
               }}
-              disabled={actionLoading || statusUnknown}
+              disabled={!controlsEnabled}
             />
           </div>
         </div>
@@ -430,7 +522,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
                 <div className="flex items-center gap-2">
                   <button
                     onClick={handleStart}
-                    disabled={actionLoading || runnerStatus !== "offline"}
+                    disabled={!controlsEnabled || runnerStatus !== "offline"}
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white rounded-md text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {actionLoading ? (
@@ -442,7 +534,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
                   </button>
                   <button
                     onClick={handleStop}
-                    disabled={actionLoading || runnerStatus === "offline"}
+                    disabled={!controlsEnabled || runnerStatus === "offline"}
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-md text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {actionLoading ? (
