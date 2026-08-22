@@ -3,7 +3,7 @@
  * `conflict-tooling-pauses-aligned-plan.md`).
  *
  * Surfaces a panel-level view of "who's editing what across all active AI
- * sessions" by querying `coord.session_touched_files` over a sliding
+ * sessions" by querying `project.session_touched_files` over a sliding
  * window. Rows = unique file paths, sorted contention-first then
  * recency-descending. Each row is tinted by max recency (10-minute
  * decay-ish via `Math.exp`) and gets a red left border when the file is

@@ -1295,7 +1295,10 @@ mod machine_local_schema_tests {
                 .unwrap_or_else(|| panic!("missing CREATE TABLE for {}", t))
         };
         assert!(at("plans") < at("tasks"), "tasks.plan_id references plans");
-        assert!(at("tasks") < at("reviews"), "reviews.task_id references tasks");
+        assert!(
+            at("tasks") < at("reviews"),
+            "reviews.task_id references tasks"
+        );
         assert!(
             at("process_sessions") < at("process_session_output"),
             "process_session_output.session_id references process_sessions"

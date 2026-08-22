@@ -164,7 +164,7 @@ export async function fetchLockInfo(
 // ---------------------------------------------------------------------------
 // Coordination Phase 6 (§4.8) — live-state heatmap.
 //
-// Replaces the `coord.session_touched_files`-derived data above with
+// Replaces the `project.session_touched_files`-derived data above with
 // the *real working-tree state* of each agent's worktree: coord caches
 // per-agent `git status` (key `agent:<id>:dirty`, 30s TTL) and fans it
 // out on `events.worktree.dirty.*`. The runner proxies coord's Redis

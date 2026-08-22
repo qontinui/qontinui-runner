@@ -6,7 +6,7 @@
  * Rendered above the terminal cell grid when the Rust deconflicter loop
  * (`src-tauri/src/coordinator/deconflicter.rs`) decides that this
  * session's recent file edit overlaps with another live session's recent
- * touches. The deconflicter writes one `coord.coordinator_decisions` row
+ * touches. The deconflicter writes one `project.coordinator_decisions` row
  * per fire (rule=`deconflict`, action=`advise-with-text`,
  * session_id=`deconflicter-*`, target_id=this tab's `task_run_id`) and
  * emits a `coordinator-decision-created` Tauri event with the row

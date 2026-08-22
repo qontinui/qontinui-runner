@@ -1441,7 +1441,7 @@ function TerminalPageInner({
               )}
 
             {/* Coord-as-Deconflicter Phase 1 (§4.4) — in-session
-                advisory banner that surfaces `coord.coordinator_decisions`
+                advisory banner that surfaces `project.coordinator_decisions`
                 rows fired by the Rust deconflicter loop. Gated on
                 `claudeSessionId` per `proj_holding_banner_pty_gate` — the
                 emergent-task wiring (commands/productivity.rs:1082 +
