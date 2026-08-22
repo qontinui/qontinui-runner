@@ -2555,8 +2555,7 @@ mod overlap_tests {
                 let _ = sock.flush().await;
             }
         });
-        let pairs =
-            overlapping_intents_for_base(Some(format!("http://{addr}")), 200).await;
+        let pairs = overlapping_intents_for_base(Some(format!("http://{addr}")), 200).await;
         assert!(pairs.is_empty());
         server.abort();
     }
