@@ -1,9 +1,19 @@
 //! PostgreSQL workflow execution state operations via Clorinde-generated queries.
 
+use super::optional_column::OptionalColumn;
 use super::PgDb;
 use crate::workflow_state::{
     StepCheckpoint, StepCheckpointStatus, StepProgressMarker, WorkflowExecutionStateRecord,
 };
+
+/// `project.workflow_step_checkpoints.step_fingerprint` (alembic
+/// `wf_resume_fingerprint_01`) may not exist in the live schema yet — the
+/// runner can ship ahead of the migration's deploy. Every statement that names
+/// it falls back to a column-free form on `42703`, so a missing column costs
+/// replay validation (every lookup becomes a MISS, and the step re-executes)
+/// rather than costing the journal write itself.
+static CHECKPOINT_FINGERPRINT: OptionalColumn =
+    OptionalColumn::new("project.workflow_step_checkpoints.step_fingerprint");
 
 fn non_empty(s: String) -> Option<String> {
     if s.is_empty() {
@@ -46,6 +56,14 @@ macro_rules! row_to_step_checkpoint {
                 Some($r.duration_ms as i64)
             },
             error: non_empty($r.error),
+            // The checked-in Clorinde bindings are generated in CI from
+            // `queries/*.sql`, so this row type has no `step_fingerprint`
+            // member until that regeneration runs. `None` is the SAFE value by
+            // the column's own contract: no fingerprint means cache MISS, so a
+            // consumer of a Clorinde-sourced row re-executes rather than
+            // replaying blind. Only the raw-SQL readers below feed the replay
+            // path, and they do select the column.
+            step_fingerprint: None,
         }
     }};
 }
@@ -509,43 +527,55 @@ impl PgDb {
         let duration_ms_i64: Option<i64> = checkpoint.duration_ms;
         let status_str = checkpoint.status.to_string();
 
-        conn.execute(
-            r#"INSERT INTO workflow_step_checkpoints (
-                id, execution_id, workflow_type, phase, iteration, step_index,
-                stage_index, step_type, step_name, status, result_json, step_config_json,
-                started_at, completed_at, duration_ms, error
-            ) VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 0), $8, $9, $10, $11, $12, $13, $14, $15, $16)
-            ON CONFLICT(execution_id, phase, iteration, step_index, stage_index) DO UPDATE SET
-                status = $10,
-                result_json = $11,
-                step_config_json = COALESCE($12, workflow_step_checkpoints.step_config_json),
-                started_at = COALESCE($13, workflow_step_checkpoints.started_at),
-                completed_at = $14,
-                duration_ms = $15,
-                error = $16"#,
-            &[
-                &checkpoint.id as &(dyn tokio_postgres::types::ToSql + Sync),
-                &checkpoint.execution_id as &(dyn tokio_postgres::types::ToSql + Sync),
-                &checkpoint.workflow_type as &(dyn tokio_postgres::types::ToSql + Sync),
-                &checkpoint.phase as &(dyn tokio_postgres::types::ToSql + Sync),
-                &iter_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
-                &step_index_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
-                &stage_index_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
-                &checkpoint.step_type as &(dyn tokio_postgres::types::ToSql + Sync),
-                &checkpoint.step_name as &(dyn tokio_postgres::types::ToSql + Sync),
-                &status_str as &(dyn tokio_postgres::types::ToSql + Sync),
-                &checkpoint.result_json as &(dyn tokio_postgres::types::ToSql + Sync),
-                &checkpoint.step_config_json as &(dyn tokio_postgres::types::ToSql + Sync),
-                &checkpoint.started_at as &(dyn tokio_postgres::types::ToSql + Sync),
-                &checkpoint.completed_at as &(dyn tokio_postgres::types::ToSql + Sync),
-                &duration_ms_i64 as &(dyn tokio_postgres::types::ToSql + Sync),
-                &checkpoint.error as &(dyn tokio_postgres::types::ToSql + Sync),
-            ],
-        )
-        .await
-        .map_err(|e| format!("PG save_workflow_step_checkpoint: {}", e))?;
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
+            &checkpoint.id,
+            &checkpoint.execution_id,
+            &checkpoint.workflow_type,
+            &checkpoint.phase,
+            &iter_i32,
+            &step_index_i32,
+            &stage_index_i32,
+            &checkpoint.step_type,
+            &checkpoint.step_name,
+            &status_str,
+            &checkpoint.result_json,
+            &checkpoint.step_config_json,
+            &checkpoint.started_at,
+            &checkpoint.completed_at,
+            &duration_ms_i64,
+            &checkpoint.error,
+            &checkpoint.step_fingerprint,
+        ];
 
-        Ok(())
+        // `step_fingerprint` is written on the UPDATE arm too, unconditionally:
+        // the upsert is how a row moves running -> success, and a stale
+        // fingerprint left behind on a rewritten row would be a stale hit on
+        // the NEXT resume. Writing NULL when the caller has none is correct —
+        // by the column's contract that is a miss, not a wildcard.
+        let with_fingerprint = CHECKPOINT_FINGERPRINT.is_believed_present();
+        let sql = if with_fingerprint {
+            SAVE_CHECKPOINT_SQL_WITH_FINGERPRINT
+        } else {
+            SAVE_CHECKPOINT_SQL
+        };
+        let bind = if with_fingerprint {
+            &params[..]
+        } else {
+            &params[..16]
+        };
+
+        match conn.execute(sql, bind).await {
+            Ok(_) => Ok(()),
+            Err(e) if with_fingerprint && CHECKPOINT_FINGERPRINT.note_error(&e) => {
+                // The live schema predates `wf_resume_fingerprint_01`. Retry
+                // without the column so the checkpoint is still journalled.
+                conn.execute(SAVE_CHECKPOINT_SQL, &params[..16])
+                    .await
+                    .map_err(|e| format!("PG save_workflow_step_checkpoint: {}", e))?;
+                Ok(())
+            }
+            Err(e) => Err(format!("PG save_workflow_step_checkpoint: {}", e)),
+        }
     }
 
     /// Get workflow step checkpoints by phase/iteration (sync wrapper).
@@ -578,32 +608,37 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         let iter_i32: Option<i32> = iteration.map(|i| i as i32);
 
-        // Cast TIMESTAMPTZ columns to TEXT so they deserialize into String without
-        // panicking on driver-type drift (same pattern as step_type_knowledge.rs fix).
-        let rows = if let Some(iter_val) = iter_i32 {
-            conn.query(
-                r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
-                          stage_index, step_type, step_name, status, result_json, step_config_json,
-                          started_at::TEXT, completed_at::TEXT, duration_ms, error
-                   FROM workflow_step_checkpoints
-                   WHERE execution_id = $1 AND phase = $2 AND iteration = $3
-                   ORDER BY step_index ASC"#,
-                &[&execution_id, &phase, &iter_val],
-            )
-            .await
+        // This is the REPLAY read: `select_replayable` compares the fingerprint
+        // it returns, so a row read without the column degrades to a miss and
+        // the step re-executes (never a stale hit).
+        let where_clause = if iter_i32.is_some() {
+            "WHERE execution_id = $1 AND phase = $2 AND iteration = $3"
         } else {
-            conn.query(
-                r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
-                          stage_index, step_type, step_name, status, result_json, step_config_json,
-                          started_at::TEXT, completed_at::TEXT, duration_ms, error
-                   FROM workflow_step_checkpoints
-                   WHERE execution_id = $1 AND phase = $2 AND iteration IS NULL
-                   ORDER BY step_index ASC"#,
-                &[&execution_id, &phase],
+            "WHERE execution_id = $1 AND phase = $2 AND iteration IS NULL"
+        };
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = match iter_i32 {
+            Some(ref v) => vec![&execution_id, &phase, v],
+            None => vec![&execution_id, &phase],
+        };
+
+        let mut with_fingerprint = CHECKPOINT_FINGERPRINT.is_believed_present();
+        let mut result = conn
+            .query(
+                &checkpoint_select_sql(where_clause, with_fingerprint),
+                &params,
             )
-            .await
+            .await;
+        if let Err(ref e) = result {
+            if with_fingerprint && CHECKPOINT_FINGERPRINT.note_error(e) {
+                with_fingerprint = false;
+                result = conn
+                    .query(&checkpoint_select_sql(where_clause, false), &params)
+                    .await;
+            }
         }
-        .map_err(|e| format!("PG get_workflow_step_checkpoints_by_phase: {}", e))?;
+        let rows =
+            result.map_err(|e| format!("PG get_workflow_step_checkpoints_by_phase: {}", e))?;
+        let fingerprint_col = with_fingerprint;
 
         Ok(rows
             .into_iter()
@@ -642,6 +677,15 @@ impl PgDb {
                     }),
                     duration_ms: dur,
                     error: r.get(15),
+                    // Absent column -> `None` -> cache MISS by contract.
+                    step_fingerprint: if fingerprint_col {
+                        r.try_get(16).unwrap_or_else(|e| {
+                            tracing::warn!("step_fingerprint decode drift: {}", e);
+                            None
+                        })
+                    } else {
+                        None
+                    },
                 }
             })
             .collect())
@@ -659,18 +703,26 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         // Cast TIMESTAMPTZ columns to TEXT + try_get below to guard against
         // driver-type drift (same pattern as step_type_knowledge.rs fix).
-        let rows = conn
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&execution_id];
+        let where_clause = "WHERE execution_id = $1";
+
+        let mut with_fingerprint = CHECKPOINT_FINGERPRINT.is_believed_present();
+        let mut result = conn
             .query(
-                r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
-                      stage_index, step_type, step_name, status, result_json, step_config_json,
-                      started_at::TEXT, completed_at::TEXT, duration_ms, error
-               FROM workflow_step_checkpoints
-               WHERE execution_id = $1
-               ORDER BY step_index ASC"#,
-                &[&execution_id],
+                &checkpoint_select_sql(where_clause, with_fingerprint),
+                &params,
             )
-            .await
-            .map_err(|e| format!("PG get_all_workflow_step_checkpoints: {}", e))?;
+            .await;
+        if let Err(ref e) = result {
+            if with_fingerprint && CHECKPOINT_FINGERPRINT.note_error(e) {
+                with_fingerprint = false;
+                result = conn
+                    .query(&checkpoint_select_sql(where_clause, false), &params)
+                    .await;
+            }
+        }
+        let rows = result.map_err(|e| format!("PG get_all_workflow_step_checkpoints: {}", e))?;
+        let fingerprint_col = with_fingerprint;
 
         Ok(rows
             .into_iter()
@@ -708,6 +760,15 @@ impl PgDb {
                     }),
                     duration_ms: dur,
                     error: r.get(15),
+                    // Absent column -> `None` -> cache MISS by contract.
+                    step_fingerprint: if fingerprint_col {
+                        r.try_get(16).unwrap_or_else(|e| {
+                            tracing::warn!("step_fingerprint decode drift: {}", e);
+                            None
+                        })
+                    } else {
+                        None
+                    },
                 }
             })
             .collect())
@@ -770,4 +831,70 @@ impl PgDb {
 
         Ok(())
     }
+}
+
+// ============================================================================
+// Raw SQL for the step-checkpoint journal
+// ============================================================================
+//
+// Spelled out rather than added as a Clorinde `--!` block: the checked-in
+// bindings are generated in CI from `queries/*.sql` against a live Postgres
+// (`.github/workflows/clorinde-bindings-fresh.yml`), so a new query block does
+// not compile locally until that regeneration runs. Same precedent as
+// `database/pg/token_usage.rs`.
+
+/// Upsert WITHOUT `step_fingerprint` — the pre-`wf_resume_fingerprint_01`
+/// shape, used when the live schema does not have the column yet.
+const SAVE_CHECKPOINT_SQL: &str = r#"INSERT INTO workflow_step_checkpoints (
+    id, execution_id, workflow_type, phase, iteration, step_index,
+    stage_index, step_type, step_name, status, result_json, step_config_json,
+    started_at, completed_at, duration_ms, error
+) VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 0), $8, $9, $10, $11, $12, $13, $14, $15, $16)
+ON CONFLICT(execution_id, phase, iteration, step_index, stage_index) DO UPDATE SET
+    status = $10,
+    result_json = $11,
+    step_config_json = COALESCE($12, workflow_step_checkpoints.step_config_json),
+    started_at = COALESCE($13, workflow_step_checkpoints.started_at),
+    completed_at = $14,
+    duration_ms = $15,
+    error = $16"#;
+
+/// Upsert WITH `step_fingerprint`.
+///
+/// The conflict target is unchanged: the fingerprint is a NON-KEY validation
+/// column and adding it to `workflow_step_checkpoints_uniq` would turn this
+/// upsert into an append-only log (one row per edit per step).
+const SAVE_CHECKPOINT_SQL_WITH_FINGERPRINT: &str = r#"INSERT INTO workflow_step_checkpoints (
+    id, execution_id, workflow_type, phase, iteration, step_index,
+    stage_index, step_type, step_name, status, result_json, step_config_json,
+    started_at, completed_at, duration_ms, error, step_fingerprint
+) VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 0), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+ON CONFLICT(execution_id, phase, iteration, step_index, stage_index) DO UPDATE SET
+    status = $10,
+    result_json = $11,
+    step_config_json = COALESCE($12, workflow_step_checkpoints.step_config_json),
+    started_at = COALESCE($13, workflow_step_checkpoints.started_at),
+    completed_at = $14,
+    duration_ms = $15,
+    error = $16,
+    step_fingerprint = $17"#;
+
+/// Build a checkpoint SELECT, optionally including `step_fingerprint` as the
+/// 17th column (index 16).
+///
+/// TIMESTAMPTZ columns are cast to TEXT so they deserialize into `String`
+/// without panicking on driver-type drift.
+fn checkpoint_select_sql(where_clause: &str, with_fingerprint: bool) -> String {
+    format!(
+        "SELECT id, execution_id, workflow_type, phase, iteration, step_index, \
+                stage_index, step_type, step_name, status, result_json, step_config_json, \
+                started_at::TEXT, completed_at::TEXT, duration_ms, error{} \
+         FROM workflow_step_checkpoints {} ORDER BY step_index ASC",
+        if with_fingerprint {
+            ", step_fingerprint"
+        } else {
+            ""
+        },
+        where_clause,
+    )
 }

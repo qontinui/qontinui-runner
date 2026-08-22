@@ -11,7 +11,9 @@ use crate::executor::timeout_helper;
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
 use crate::unified_ai_session::{AiSessionConfig, UnifiedAiSessionExecutor};
-use crate::workflow_state::{CheckpointManager, StepCheckpoint};
+use crate::workflow_state::{
+    config_fingerprint, CheckpointManager, StepCheckpoint, StepFingerprint,
+};
 use crate::AppState;
 
 use super::super::output_parser;
@@ -220,6 +222,22 @@ impl AgenticExecutor {
 
                 let checkpoint_mgr = CheckpointManager::new("unified");
 
+                // One fingerprint for this step, shared by the replay lookup
+                // and every checkpoint write below.
+                //
+                // Taken from `step`, NOT from the `modified_step` that actually
+                // runs: the verification `failure_context` appended to the
+                // prompt further down is deliberately excluded. Verification is
+                // non-replayable, so a resumed run re-observes the world and
+                // produces a different failure list even when nothing about the
+                // workflow changed - hashing it would miss on every resume and
+                // re-bill the model. See `crate::workflow_state::fingerprint`.
+                let resp_fp = config_fingerprint(
+                    step,
+                    config.resolve_model_for_phase("agentic").as_deref(),
+                    config.resolve_provider_for_phase("agentic").as_deref(),
+                );
+
                 // Crash-recovery replay: a response-mode agentic prompt already
                 // journalled as complete returns its recorded output rather than
                 // calling (and paying for) the model again. Token usage is
@@ -235,6 +253,7 @@ impl AgenticExecutor {
                     &step.step_type,
                     "prompt",
                     step_name,
+                    &resp_fp,
                 )
                 .as_ref()
                 .and_then(decode_journalled_ai_output)
@@ -267,7 +286,8 @@ impl AgenticExecutor {
                     "prompt",
                 )
                 .with_step_name(step_name)
-                .with_stage_index(config.stage_index);
+                .with_stage_index(config.stage_index)
+                .with_fingerprint(&resp_fp);
                 resp_checkpoint.mark_started();
                 if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                     warn!(
@@ -461,7 +481,8 @@ impl AgenticExecutor {
                             "prompt",
                         )
                         .with_step_name(step_name)
-                        .with_stage_index(config.stage_index);
+                        .with_stage_index(config.stage_index)
+                        .with_fingerprint(&resp_fp);
                         resp_checkpoint.mark_success(Some(output.clone()), duration_ms as i64);
                         if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                             warn!("Failed to save agentic response-mode step completion checkpoint: {}", e);
@@ -549,7 +570,8 @@ impl AgenticExecutor {
                             "prompt",
                         )
                         .with_step_name(step_name)
-                        .with_stage_index(config.stage_index);
+                        .with_stage_index(config.stage_index)
+                        .with_fingerprint(&resp_fp);
                         resp_checkpoint.mark_failed(&e, duration_ms as i64);
                         if let Err(e2) = checkpoint_mgr.save_step(&resp_checkpoint) {
                             warn!(
@@ -614,6 +636,10 @@ impl AgenticExecutor {
         // Create checkpoint manager for step-level checkpointing
         let checkpoint_mgr = CheckpointManager::new("unified");
 
+        // Fingerprint for the consolidated session, shared by the replay lookup
+        // and both checkpoint writes.
+        let agentic_fp = agentic_session_fingerprint(config, agentic_steps);
+
         // Crash-recovery replay: the agentic AI session is the single most
         // expensive step in the whole workflow, and it is the one a resume used
         // to re-run and re-bill unconditionally. If it is already journalled as
@@ -634,6 +660,7 @@ impl AgenticExecutor {
             "ai_session",
             "ai_session",
             "AI Fixing Issues",
+            &agentic_fp,
         )
         .as_ref()
         .and_then(decode_journalled_ai_output)
@@ -671,7 +698,8 @@ impl AgenticExecutor {
             "ai_session",
         )
         .with_step_name("AI Fixing Issues")
-        .with_stage_index(config.stage_index);
+        .with_stage_index(config.stage_index)
+        .with_fingerprint(&agentic_fp);
         checkpoint.mark_started();
         if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
             warn!("Failed to save agentic step checkpoint: {}", e);
@@ -1298,7 +1326,8 @@ impl AgenticExecutor {
             "ai_session",
         )
         .with_step_name("AI Fixing Issues")
-        .with_stage_index(config.stage_index);
+        .with_stage_index(config.stage_index)
+        .with_fingerprint(&agentic_fp);
 
         let injected_steps = result.injected_steps;
 
@@ -1724,4 +1753,40 @@ impl AgenticExecutor {
         // Progress marker context removed — all persistence now via PgDb.
         None
     }
+}
+
+/// Content fingerprint for the consolidated agentic AI session.
+///
+/// **Included:** the workflow's `base_prompt`, the resolved model and provider
+/// (first agentic step's override beats the phase-level one, exactly as
+/// `agentic_model` is resolved at the call site), and every agentic step
+/// definition in order.
+///
+/// **Excluded, deliberately:** `failure_context` and the resume progress-marker
+/// context. Both are re-derived on every resume — verification is
+/// non-replayable by design, so the failure list legitimately differs even when
+/// the workflow did not change. Hashing them would turn every crash-recovery
+/// resume into a miss and re-bill the single most expensive step in the
+/// product, which is exactly the harm this plan exists to close. The iteration
+/// number is likewise excluded: it is already part of the checkpoint's
+/// positional key.
+fn agentic_session_fingerprint(
+    config: &LoopConfig,
+    agentic_steps: &[ExecutionStepConfig],
+) -> String {
+    let model = agentic_steps
+        .first()
+        .and_then(|s| s.model.clone())
+        .or_else(|| config.resolve_model_for_phase("agentic"));
+    let provider = agentic_steps
+        .first()
+        .and_then(|s| s.provider.clone())
+        .or_else(|| config.resolve_provider_for_phase("agentic"));
+
+    StepFingerprint::new()
+        .with_prompt(config.base_prompt.as_str())
+        .with_model(model.as_deref())
+        .with_provider(provider.as_deref())
+        .with_definitions(agentic_steps)
+        .digest()
 }

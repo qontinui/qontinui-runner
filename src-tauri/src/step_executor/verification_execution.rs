@@ -10,7 +10,7 @@ use crate::step_metadata::{StepDetails, StepMetadata};
 use crate::step_types::StepType;
 use crate::test_executor::TestStatus;
 use crate::unified_workflow_executor::get_parent_task_id;
-use crate::workflow_state::{CheckpointManager, StepCheckpoint};
+use crate::workflow_state::{config_fingerprint, CheckpointManager, StepCheckpoint};
 
 use super::executor::StepExecutor;
 use super::executor_types::*;
@@ -627,7 +627,15 @@ impl StepExecutor {
                     cp_step_type.as_str(),
                 )
                 .with_step_name(&result.step_name)
-                .with_stage_index(None);
+                .with_stage_index(None)
+                // Nothing replays a verification checkpoint
+                // (`phases::phase_is_replayable` excludes the whole phase), but
+                // this is the SECOND writer of these rows — `phases/
+                // verification.rs` is the other — and a writer that left the
+                // column NULL would make "no fingerprint" ambiguous between
+                // "this phase never records one" and "this build predates the
+                // column". Same arguments as the other writer.
+                .with_fingerprint(config_fingerprint(step, None, None));
 
                 let result_json_str = serde_json::to_string(&result).ok();
                 if result.success {

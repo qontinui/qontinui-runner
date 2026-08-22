@@ -36,11 +36,17 @@
 //! ```
 
 mod checkpoint;
+pub mod fingerprint;
 mod progress;
 mod progress_parser;
 mod transitions;
 
-pub use checkpoint::{select_replayable, CheckpointManager, StepCheckpoint, StepCheckpointStatus};
+pub use checkpoint::{
+    select_replayable, CheckpointManager, ReplayLookup, StepCheckpoint, StepCheckpointStatus,
+};
+pub use fingerprint::{
+    config_fingerprint, configs_fingerprint, StepFingerprint, STEP_FINGERPRINT_ALGO,
+};
 pub use progress::StepProgressMarker;
 pub use progress_parser::{ParsedProgress, ProgressParser};
 pub mod progress_markers {

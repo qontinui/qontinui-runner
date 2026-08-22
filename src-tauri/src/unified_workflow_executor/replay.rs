@@ -257,8 +257,14 @@ mod tests {
         c.stage_index = stage_index;
         c.status = StepCheckpointStatus::Success;
         c.result_json = Some("{}".to_string());
+        c.step_fingerprint = Some(FP.to_string());
         c
     }
+
+    /// The fingerprint every fixture row carries. A replay lookup is
+    /// fingerprint-gated, so a fixture with none would miss for the WRONG
+    /// reason and the test below would pass vacuously.
+    const FP: &str = "sf1:fixture";
 
     /// A user-requested replay must land back in the stage the iteration
     /// actually ran in. Phase 1 made `stage_index` drive `start_from_stage`,
@@ -325,7 +331,7 @@ mod tests {
                 iteration
             );
             assert!(
-                crate::workflow_state::select_replayable(
+                !crate::workflow_state::select_replayable(
                     &after
                         .iter()
                         .filter(|c| c.iteration == Some(iteration))
@@ -333,8 +339,9 @@ mod tests {
                         .collect::<Vec<_>>(),
                     Some(1),
                     0,
+                    FP,
                 )
-                .is_none(),
+                .is_hit(),
                 "the replay lookup must miss for iteration {}",
                 iteration
             );
@@ -342,6 +349,6 @@ mod tests {
 
         // Iterations BEFORE the target keep their journal, so setup work and
         // earlier iterations are not re-run or re-billed.
-        assert!(crate::workflow_state::select_replayable(&after, Some(1), 0).is_some());
+        assert!(crate::workflow_state::select_replayable(&after, Some(1), 0, FP).is_hit());
     }
 }

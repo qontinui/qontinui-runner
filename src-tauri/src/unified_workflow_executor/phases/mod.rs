@@ -1487,7 +1487,7 @@ fn preread_previously_edited_files(
 // replay (`workflow/dag_driver.rs`): same "not knowing is not the same as not
 // completed" warning, same "replaying completed ..." info marker.
 
-use crate::workflow_state::{CheckpointManager, StepCheckpoint};
+use crate::workflow_state::{CheckpointManager, ReplayLookup, StepCheckpoint};
 use tracing::warn;
 
 /// Phases whose steps must ALWAYS re-execute on resume, never replay.
@@ -1556,11 +1556,25 @@ pub(crate) fn journalled_name_matches(cp: &StepCheckpoint, step_name: &str) -> b
 ///
 /// Returns `None` - i.e. execute the step - for an excluded phase, an excluded
 /// step type, a row of a different step type, a row naming a DIFFERENT step
-/// (see [`journalled_name_matches`]), a step that never completed, and a failed
+/// (see [`journalled_name_matches`]), a row whose CONTENT FINGERPRINT no longer
+/// matches the step about to run, a step that never completed, and a failed
 /// journal read. A read
 /// failure is warned about explicitly, because "we could not find out" is not
 /// the same as "it did not run" and the step is about to be re-executed and
 /// re-billed on the strength of that failure.
+///
+/// # `expected_fingerprint`
+///
+/// The content hash of the inputs that determine this step's output — prompt
+/// text, model, provider, the step's own definition, its declared upstream
+/// inputs. Compute it with the same `crate::workflow_state::fingerprint`
+/// adapter the SAVE path for this step uses; producer and consumer disagreeing
+/// does not break loudly, it silently disables replay for that step.
+///
+/// The type and name gates below are kept even though the fingerprint subsumes
+/// both. They are cheap, they survive a row written by an older build that has
+/// no fingerprint, and they say something more specific in the logs than
+/// "content changed".
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn journalled_step(
     checkpoint_mgr: &CheckpointManager,
@@ -1572,13 +1586,64 @@ pub(crate) fn journalled_step(
     config_step_type: &str,
     journal_step_type: &str,
     step_name: &str,
+    expected_fingerprint: &str,
 ) -> Option<StepCheckpoint> {
     if !phase_is_replayable(phase) || !step_type_is_replayable(config_step_type) {
         return None;
     }
 
-    match checkpoint_mgr.completed_step(execution_id, phase, iteration, stage_index, step_index) {
-        Ok(Some(cp)) if cp.step_type != journal_step_type => {
+    match checkpoint_mgr.completed_step(
+        execution_id,
+        phase,
+        iteration,
+        stage_index,
+        step_index,
+        expected_fingerprint,
+    ) {
+        Ok(ReplayLookup::FingerprintMismatch { stored }) => {
+            // Deliberately distinguishable from `NoRow`, which logs nothing:
+            // this slice DID complete, but the row does not vouch for the
+            // current definition. Without this line, "replay skipped because
+            // the definition changed" is indistinguishable from "nothing was
+            // ever journalled here".
+            //
+            // The two arms are NOT the same cause. `stored: None` means the row
+            // carries no fingerprint at all - a legacy row, or (while the
+            // `step_fingerprint` migration is merged but not yet DEPLOYED)
+            // every row, because the optional-column read degrades to absent.
+            // Attributing that to "the inputs changed" would make the whole
+            // undeployed-migration window look like a stream of real edits, and
+            // during that window it is the only thing this log would say.
+            if stored.is_none() {
+                info!(
+                    execution_id = %execution_id,
+                    phase = %phase,
+                    iteration = ?iteration,
+                    stage_index = ?stage_index,
+                    step_index = %step_index,
+                    step_name = %step_name,
+                    journalled_fingerprint = ?stored,
+                    expected_fingerprint = %expected_fingerprint,
+                    "Replay skipped: no journalled fingerprint (legacy row, or the \
+                     step_fingerprint migration is not yet deployed) - step will be re-executed"
+                );
+            } else {
+                info!(
+                    execution_id = %execution_id,
+                    phase = %phase,
+                    iteration = ?iteration,
+                    stage_index = ?stage_index,
+                    step_index = %step_index,
+                    step_name = %step_name,
+                    journalled_fingerprint = ?stored,
+                    expected_fingerprint = %expected_fingerprint,
+                    "Replay skipped: the step definition or its inputs changed since the \
+                     journalled run - step will be re-executed"
+                );
+            }
+            None
+        }
+        Ok(ReplayLookup::Hit(cp)) if cp.step_type != journal_step_type => {
             // The slice key does not carry the step type, and step indices are
             // positional: the agentic phase writes both its response-mode
             // prompt and its AI session at index 0, and editing a workflow
@@ -1595,7 +1660,7 @@ pub(crate) fn journalled_step(
             );
             None
         }
-        Ok(Some(cp)) if !journalled_name_matches(&cp, step_name) => {
+        Ok(ReplayLookup::Hit(cp)) if !journalled_name_matches(&cp, step_name) => {
             // The type gate above is real but WEAK: `StepType::from_str_compat`
             // flattens every unrecognised type to `Command`, so two adjacent
             // shell/command steps are indistinguishable by type alone. Insert a
@@ -1621,7 +1686,7 @@ pub(crate) fn journalled_step(
             );
             None
         }
-        Ok(Some(cp)) => {
+        Ok(ReplayLookup::Hit(cp)) => {
             info!(
                 execution_id = %execution_id,
                 phase = %phase,
@@ -1633,7 +1698,7 @@ pub(crate) fn journalled_step(
             );
             Some(cp)
         }
-        Ok(None) => None,
+        Ok(ReplayLookup::NoRow) => None,
         Err(e) => {
             warn!(
                 execution_id = %execution_id,

@@ -90,7 +90,11 @@ impl std::str::FromStr for StepCheckpointStatus {
 }
 
 /// A checkpoint for a single step execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` is derived so [`ReplayLookup`] — which wraps a checkpoint — can
+/// be compared in tests; the replay logic itself never compares whole
+/// checkpoints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepCheckpoint {
     /// Unique ID for this checkpoint.
     pub id: String,
@@ -125,6 +129,20 @@ pub struct StepCheckpoint {
     pub duration_ms: Option<i64>,
     /// Error message if failed.
     pub error: Option<String>,
+    /// Content hash of the inputs that determine this step's output — prompt
+    /// text, model, provider, the step's own definition, and its declared
+    /// upstream input values. See [`crate::workflow_state::fingerprint`].
+    ///
+    /// **NON-KEY validation column** (alembic `wf_resume_fingerprint_01`): it is
+    /// deliberately NOT part of `workflow_step_checkpoints_uniq`. The row is
+    /// located by the existing positional key and the fingerprint is then
+    /// COMPARED.
+    ///
+    /// `None` means the row carries no fingerprint — every row written before
+    /// this shipped, and every row written while the runner is talking to a
+    /// database whose migration has not deployed yet. `None` is a cache MISS,
+    /// **never a wildcard**: see [`select_replayable`].
+    pub step_fingerprint: Option<String>,
 }
 
 impl StepCheckpoint {
@@ -154,6 +172,7 @@ impl StepCheckpoint {
             completed_at: None,
             duration_ms: None,
             error: None,
+            step_fingerprint: None,
         }
     }
 
@@ -179,6 +198,19 @@ impl StepCheckpoint {
     /// Set the step configuration JSON from a raw string.
     pub fn with_step_config_json(mut self, config_json: impl Into<String>) -> Self {
         self.step_config_json = Some(config_json.into());
+        self
+    }
+
+    /// Set the content fingerprint of the inputs that determine this step's
+    /// output.
+    ///
+    /// The value MUST come from the same
+    /// [`crate::workflow_state::fingerprint`] adapter the replay lookup for
+    /// this step calls. If the producer and the consumer compute it
+    /// differently the row can never match, and replay is silently disabled
+    /// for that step rather than loudly broken.
+    pub fn with_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.step_fingerprint = Some(fingerprint.into());
         self
     }
 
@@ -350,6 +382,10 @@ impl CheckpointManager {
     ///    outcome independent of the asymmetry, because a read made symmetric
     ///    with the write would hand a child its SIBLING's result — which is
     ///    not evidence about this workflow at all.
+    /// 3. **Fingerprint-gated.** The positional key says WHERE a step ran, not
+    ///    WHAT it ran. `expected_fingerprint` is the content hash of the step
+    ///    about to execute; a row whose `step_fingerprint` differs — or that
+    ///    carries none at all — is a MISS. See [`select_replayable`].
     pub fn completed_step(
         &self,
         execution_id: &str,
@@ -357,7 +393,8 @@ impl CheckpointManager {
         iteration: Option<u32>,
         stage_index: Option<u32>,
         step_index: usize,
-    ) -> Result<Option<StepCheckpoint>, String> {
+        expected_fingerprint: &str,
+    ) -> Result<ReplayLookup<StepCheckpoint>, String> {
         if get_parent_task_id(execution_id) != execution_id {
             debug!(
                 execution_id = %execution_id,
@@ -365,30 +402,109 @@ impl CheckpointManager {
                 step_index = %step_index,
                 "Composed-run child: checkpoints are keyed under the shared parent id, not replaying"
             );
-            return Ok(None);
+            return Ok(ReplayLookup::NoRow);
         }
 
         let checkpoints = self.get_completed_steps(execution_id, phase, iteration)?;
-        Ok(select_replayable(&checkpoints, stage_index, step_index).cloned())
+        Ok(
+            select_replayable(&checkpoints, stage_index, step_index, expected_fingerprint)
+                .into_owned(),
+        )
+    }
+}
+
+/// The outcome of a replay lookup.
+///
+/// A plain `Option` cannot express the distinction this plan turns on: "no
+/// journal row" and "a journal row for work that has since CHANGED" both mean
+/// re-execute, but only the second means an edit was honoured, and conflating
+/// them in the logs is how a silently-disabled replay path goes unnoticed.
+///
+/// Generic over the checkpoint holder so the pure selector can borrow
+/// (`ReplayLookup<&StepCheckpoint>`) while [`CheckpointManager::completed_step`]
+/// returns owned (`ReplayLookup<StepCheckpoint>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayLookup<C> {
+    /// A replayable row exists AND its fingerprint matches: reuse its result.
+    Hit(C),
+    /// No replayable row for this slice — the step has not run (or did not
+    /// finish) here.
+    NoRow,
+    /// A replayable row exists for this slice but describes DIFFERENT work.
+    /// `stored` is what the row carried (`None` when the row predates the
+    /// fingerprint column, or was written against a schema without it).
+    FingerprintMismatch { stored: Option<String> },
+}
+
+impl<C> ReplayLookup<C> {
+    /// The checkpoint to replay, if this is a hit.
+    pub fn hit(self) -> Option<C> {
+        match self {
+            ReplayLookup::Hit(cp) => Some(cp),
+            _ => None,
+        }
+    }
+
+    pub fn is_hit(&self) -> bool {
+        matches!(self, ReplayLookup::Hit(_))
+    }
+}
+
+impl ReplayLookup<&StepCheckpoint> {
+    /// Clone the borrowed checkpoint out, for callers that need to own it.
+    pub fn into_owned(self) -> ReplayLookup<StepCheckpoint> {
+        match self {
+            ReplayLookup::Hit(cp) => ReplayLookup::Hit(cp.clone()),
+            ReplayLookup::NoRow => ReplayLookup::NoRow,
+            ReplayLookup::FingerprintMismatch { stored } => {
+                ReplayLookup::FingerprintMismatch { stored }
+            }
+        }
     }
 }
 
 /// Pure half of [`CheckpointManager::completed_step`]: pick the replayable
-/// checkpoint for one `(stage_index, step_index)` slice.
+/// checkpoint for one `(stage_index, step_index)` slice, then check that it
+/// describes the SAME work the caller is about to do.
 ///
 /// A missing stage index and stage 0 are the same thing: the write path
 /// `COALESCE`s a missing stage to 0 (`database/pg/workflow_state.rs`), so a row
 /// read back always carries `Some(0)` where the caller passed `None`.
-pub fn select_replayable(
-    checkpoints: &[StepCheckpoint],
+///
+/// # The NULL contract
+///
+/// The comparison is plain equality on a supplied value. A stored fingerprint
+/// that is `None`, empty, or different is a MISS. It is deliberately NOT
+/// written as "no stored fingerprint means it matches whatever we ask for":
+/// that is the natural SQL instinct (`fingerprint IS NULL OR fingerprint = $1`)
+/// and it would serve exactly the stale cached outputs the column exists to
+/// prevent. An empty `expected_fingerprint` is likewise a miss, so a caller
+/// that could not compute one re-executes rather than replaying blind.
+pub fn select_replayable<'a>(
+    checkpoints: &'a [StepCheckpoint],
     stage_index: Option<u32>,
     step_index: usize,
-) -> Option<&StepCheckpoint> {
-    checkpoints.iter().find(|cp| {
+    expected_fingerprint: &str,
+) -> ReplayLookup<&'a StepCheckpoint> {
+    let row = checkpoints.iter().find(|cp| {
         cp.step_index == step_index
             && cp.stage_index.unwrap_or(0) == stage_index.unwrap_or(0)
             && cp.status.is_replayable()
-    })
+    });
+
+    match row {
+        None => ReplayLookup::NoRow,
+        Some(cp) => {
+            let stored = cp.step_fingerprint.as_deref().filter(|f| !f.is_empty());
+            if !expected_fingerprint.is_empty() && stored == Some(expected_fingerprint) {
+                ReplayLookup::Hit(cp)
+            } else {
+                ReplayLookup::FingerprintMismatch {
+                    stored: stored.map(str::to_string),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -438,16 +554,29 @@ mod tests {
         assert_eq!(checkpoint.duration_ms, Some(2500));
     }
 
+    /// The fingerprint every fixture row carries unless a test says otherwise.
+    const FP: &str = "sf1:aaaa";
+
     fn cp(
         step_index: usize,
         stage_index: Option<u32>,
         status: StepCheckpointStatus,
+    ) -> StepCheckpoint {
+        cp_fp(step_index, stage_index, status, Some(FP))
+    }
+
+    fn cp_fp(
+        step_index: usize,
+        stage_index: Option<u32>,
+        status: StepCheckpointStatus,
+        fingerprint: Option<&str>,
     ) -> StepCheckpoint {
         let mut c =
             StepCheckpoint::new("exec-1", "unified", "setup", Some(0), step_index, "command")
                 .with_stage_index(stage_index);
         c.status = status;
         c.result_json = Some(format!("{{\"step\":{}}}", step_index));
+        c.step_fingerprint = fingerprint.map(str::to_string);
         c
     }
 
@@ -491,17 +620,31 @@ mod tests {
             cp(2, Some(0), StepCheckpointStatus::Running),
             cp(3, Some(0), StepCheckpointStatus::Skipped),
         ];
-        assert_eq!(select_replayable(&rows, None, 0).unwrap().step_index, 0);
-        assert!(
-            select_replayable(&rows, None, 1).is_none(),
+        assert_eq!(
+            select_replayable(&rows, None, 0, FP)
+                .hit()
+                .unwrap()
+                .step_index,
+            0
+        );
+        assert_eq!(
+            select_replayable(&rows, None, 1, FP),
+            ReplayLookup::NoRow,
             "failed step must re-execute"
         );
-        assert!(
-            select_replayable(&rows, None, 2).is_none(),
+        assert_eq!(
+            select_replayable(&rows, None, 2, FP),
+            ReplayLookup::NoRow,
             "crash debris must re-execute"
         );
-        assert_eq!(select_replayable(&rows, None, 3).unwrap().step_index, 3);
-        assert!(select_replayable(&rows, None, 9).is_none());
+        assert_eq!(
+            select_replayable(&rows, None, 3, FP)
+                .hit()
+                .unwrap()
+                .step_index,
+            3
+        );
+        assert_eq!(select_replayable(&rows, None, 9, FP), ReplayLookup::NoRow);
     }
 
     /// `(phase, iteration, step_index)` repeats across the stages of a
@@ -513,15 +656,20 @@ mod tests {
             cp(0, Some(1), StepCheckpointStatus::Failed),
         ];
         assert_eq!(
-            select_replayable(&rows, Some(0), 0).unwrap().status,
+            select_replayable(&rows, Some(0), 0, FP)
+                .hit()
+                .unwrap()
+                .status,
             StepCheckpointStatus::Success
         );
-        assert!(
-            select_replayable(&rows, Some(1), 0).is_none(),
+        assert_eq!(
+            select_replayable(&rows, Some(1), 0, FP),
+            ReplayLookup::NoRow,
             "stage 1 must not replay stage 0's result"
         );
-        assert!(
-            select_replayable(&rows, Some(2), 0).is_none(),
+        assert_eq!(
+            select_replayable(&rows, Some(2), 0, FP),
+            ReplayLookup::NoRow,
             "an unwritten stage has nothing to replay"
         );
     }
@@ -531,9 +679,92 @@ mod tests {
     #[test]
     fn select_replayable_treats_missing_stage_as_stage_zero() {
         let rows = vec![cp(0, None, StepCheckpointStatus::Success)];
-        assert!(select_replayable(&rows, Some(0), 0).is_some());
-        assert!(select_replayable(&rows, None, 0).is_some());
-        assert!(select_replayable(&rows, Some(1), 0).is_none());
+        assert!(select_replayable(&rows, Some(0), 0, FP).is_hit());
+        assert!(select_replayable(&rows, None, 0, FP).is_hit());
+        assert_eq!(
+            select_replayable(&rows, Some(1), 0, FP),
+            ReplayLookup::NoRow
+        );
+    }
+
+    // -- Fingerprint gate ---------------------------------------------------
+
+    /// Identical inputs replay.
+    #[test]
+    fn matching_fingerprint_is_a_hit() {
+        let rows = vec![cp(0, Some(0), StepCheckpointStatus::Success)];
+        assert!(select_replayable(&rows, Some(0), 0, FP).is_hit());
+    }
+
+    /// The defect this closes: the row is in the right slice with the right
+    /// status, but describes work that has since been edited.
+    #[test]
+    fn changed_fingerprint_is_a_miss_not_a_hit() {
+        let rows = vec![cp(0, Some(0), StepCheckpointStatus::Success)];
+        assert_eq!(
+            select_replayable(&rows, Some(0), 0, "sf1:bbbb"),
+            ReplayLookup::FingerprintMismatch {
+                stored: Some(FP.to_string())
+            },
+            "an edited step must re-execute, and must be distinguishable from 'no row'"
+        );
+    }
+
+    /// **NULL is a MISS, never a wildcard.** A row written before the
+    /// fingerprint column existed carries none; the SQL instinct
+    /// `fingerprint IS NULL OR fingerprint = $1` would replay it, which is
+    /// exactly the stale hit the column exists to prevent.
+    #[test]
+    fn null_stored_fingerprint_is_a_miss_never_a_wildcard() {
+        let rows = vec![cp_fp(0, Some(0), StepCheckpointStatus::Success, None)];
+        assert_eq!(
+            select_replayable(&rows, Some(0), 0, FP),
+            ReplayLookup::FingerprintMismatch { stored: None }
+        );
+        assert!(!select_replayable(&rows, Some(0), 0, FP).is_hit());
+        // ...and it does not match an empty expectation either, which would be
+        // the same wildcard by another spelling.
+        assert!(!select_replayable(&rows, Some(0), 0, "").is_hit());
+    }
+
+    /// An empty stored fingerprint is treated exactly like a NULL one -- a
+    /// `TEXT` column can hold the empty string, and it is no more evidence
+    /// than `NULL`.
+    #[test]
+    fn empty_stored_fingerprint_is_a_miss() {
+        let rows = vec![cp_fp(0, Some(0), StepCheckpointStatus::Success, Some(""))];
+        assert_eq!(
+            select_replayable(&rows, Some(0), 0, FP),
+            ReplayLookup::FingerprintMismatch { stored: None }
+        );
+    }
+
+    /// A caller that could not compute a fingerprint re-executes rather than
+    /// replaying blind.
+    #[test]
+    fn empty_expected_fingerprint_never_hits() {
+        let rows = vec![cp(0, Some(0), StepCheckpointStatus::Success)];
+        assert!(!select_replayable(&rows, Some(0), 0, "").is_hit());
+    }
+
+    /// Editing step 2 must not stop steps 0 and 1 replaying -- the fingerprint
+    /// is per-step, so an edit's re-billing stays bounded.
+    #[test]
+    fn editing_a_later_step_does_not_invalidate_earlier_checkpoints() {
+        let rows = vec![
+            cp_fp(0, Some(0), StepCheckpointStatus::Success, Some("sf1:s0")),
+            cp_fp(1, Some(0), StepCheckpointStatus::Success, Some("sf1:s1")),
+            cp_fp(2, Some(0), StepCheckpointStatus::Success, Some("sf1:s2")),
+        ];
+        // Step 2 was edited; steps 0 and 1 were not.
+        assert!(select_replayable(&rows, Some(0), 0, "sf1:s0").is_hit());
+        assert!(select_replayable(&rows, Some(0), 1, "sf1:s1").is_hit());
+        assert_eq!(
+            select_replayable(&rows, Some(0), 2, "sf1:s2-edited"),
+            ReplayLookup::FingerprintMismatch {
+                stored: Some("sf1:s2".to_string())
+            }
+        );
     }
 
     #[test]
