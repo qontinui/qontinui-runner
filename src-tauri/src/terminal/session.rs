@@ -443,19 +443,103 @@ const SUBMIT_ENTER: &[u8] = b"\r";
 /// Tunable: bump if E2E shows submits still racing.
 const POST_PASTE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// Does `next` legitimately introduce an ANSI escape sequence?
+///
+/// Used by [`sanitize_submit_body`] to tell a real escape sequence (which
+/// must survive — agents paste coloured build logs and diffs) from a bare
+/// `ESC` control byte (which must not reach the PTY). Deliberately a
+/// whitelist of the standard introducers rather than "any printable", so
+/// `ESC b` is treated as a stray control byte and dropped.
+fn is_escape_introducer(next: char) -> bool {
+    matches!(
+        next,
+        // CSI, OSC, DCS, SOS, PM, APC
+        '[' | ']' | 'P' | 'X' | '^' | '_'
+        // charset designators
+        | '(' | ')' | '*' | '+'
+        // line-size / charset selection
+        | '#' | '%'
+        // save/restore cursor, keypad mode
+        | '7' | '8' | '=' | '>'
+        // IND, NEL, HTS, RI, SS2, SS3, DECID, RIS
+        | 'D' | 'E' | 'H' | 'M' | 'N' | 'O' | 'Z' | 'c'
+    )
+}
+
+/// Neutralize a message body before it is framed into a bracketed-paste
+/// block by [`paste_block`].
+///
+/// This is a **narrow** neutralizer, deliberately NOT
+/// [`crate::terminal::strip_ansi`]: that one drops every CSI/OSC/two-char
+/// escape and is correct for the OUTBOUND reader, but applied inbound it
+/// would silently corrupt exactly the content agents legitimately send
+/// (coloured build logs, diffs). Two things are removed and nothing else:
+///
+/// 1. **The bracketed-paste END marker (`\x1b[201~`)**, which would
+///    otherwise terminate the paste block early and leave the remaining
+///    bytes to be interpreted as terminal INPUT rather than pasted text.
+///    The `ESC` is dropped, so the text reads as a literal `[201~`.
+/// 2. **C0/C1 control characters other than `\n`, `\r`, `\t`** — plus
+///    `DEL`, and any `ESC` not introducing a real escape sequence.
+///
+/// The END-marker rule is enforced as an *invariant on the output*, checked
+/// after every push, rather than as a search over the input: stripping a
+/// control byte can otherwise reconstitute the marker (`\x1b[2\x0001~`).
+fn sanitize_submit_body(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut chars = message.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\r' | '\t' => out.push(c),
+            '\u{1b}' => match chars.peek() {
+                Some(&next) if is_escape_introducer(next) => out.push(c),
+                // Bare or dangling ESC: a control byte, not a sequence.
+                _ => {}
+            },
+            // C0 controls, DEL, and C1 controls.
+            c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => {}
+            c => out.push(c),
+        }
+        // Invariant: the sanitized body never contains the paste END
+        // marker. Only the just-pushed char can have completed one, so a
+        // check here is exhaustive; drop the ESC that starts it.
+        while out.as_bytes().ends_with(BRACKETED_PASTE_END) {
+            let esc_at = out.len() - BRACKETED_PASTE_END.len();
+            out.remove(esc_at);
+        }
+    }
+    out
+}
+
+/// Frame a message as a bracketed-paste block: begin marker, the
+/// [`sanitize_submit_body`]-neutralized body, end marker.
+///
+/// The single choke point through which every inbound prompt reaches the
+/// PTY — [`TerminalSession::submit_prompt`] (production) and
+/// [`build_submit_payload`] (tests) both go through here, so the framing
+/// cannot drift between them and the sanitizer cannot be bypassed by any
+/// of the inbound producers (coord session-bus injection, the
+/// caller-supplied `POST /terminals/{id}/submit-prompt` route, and the
+/// regex auto-responder).
+fn paste_block(message: &str) -> Vec<u8> {
+    let body = sanitize_submit_body(message);
+    let mut out =
+        Vec::with_capacity(BRACKETED_PASTE_BEGIN.len() + body.len() + BRACKETED_PASTE_END.len());
+    out.extend_from_slice(BRACKETED_PASTE_BEGIN);
+    out.extend_from_slice(body.as_bytes());
+    out.extend_from_slice(BRACKETED_PASTE_END);
+    out
+}
+
 /// Build the exact byte sequence [`TerminalSession::submit_prompt`] writes.
 /// Exposed so tests (and the worker_session unit test) can assert the
 /// submit framing without spinning up a real PTY.
+///
+/// Shares [`paste_block`] with the production path so the two shapes cannot
+/// drift; the trailing CR is appended here because production writes it in a
+/// separate lock acquisition after [`POST_PASTE_DELAY`].
 pub(crate) fn build_submit_payload(message: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        BRACKETED_PASTE_BEGIN.len()
-            + message.len()
-            + BRACKETED_PASTE_END.len()
-            + SUBMIT_ENTER.len(),
-    );
-    out.extend_from_slice(BRACKETED_PASTE_BEGIN);
-    out.extend_from_slice(message.as_bytes());
-    out.extend_from_slice(BRACKETED_PASTE_END);
+    let mut out = paste_block(message);
     out.extend_from_slice(SUBMIT_ENTER);
     out
 }
@@ -2114,6 +2198,13 @@ impl TerminalSession {
     /// after the end marker reliably triggers send. See Phase 6 §6
     /// remediation plan, Issue 1.
     pub fn submit_prompt(&self, message: &str) -> Result<(), String> {
+        // Frame + neutralize BEFORE taking the writer lock — the body is
+        // untrusted (the `POST /terminals/{id}/submit-prompt` route is
+        // caller-supplied) and an embedded `\x1b[201~` would otherwise
+        // close the paste block early, turning the remainder into
+        // terminal INPUT. See [`sanitize_submit_body`].
+        let block = paste_block(message);
+
         // Phase 1: write the bracketed-paste block, flush, release the
         // writer lock. The lock release lets concurrent reads on this
         // pty (output drain) interleave during the post-paste delay.
@@ -2123,14 +2214,8 @@ impl TerminalSession {
                 .lock()
                 .map_err(|e| format!("Writer lock poisoned: {}", e))?;
             writer
-                .write_all(BRACKETED_PASTE_BEGIN)
-                .map_err(|e| format!("Failed to write paste begin: {}", e))?;
-            writer
-                .write_all(message.as_bytes())
-                .map_err(|e| format!("Failed to write paste body: {}", e))?;
-            writer
-                .write_all(BRACKETED_PASTE_END)
-                .map_err(|e| format!("Failed to write paste end: {}", e))?;
+                .write_all(&block)
+                .map_err(|e| format!("Failed to write paste block: {}", e))?;
             writer
                 .flush()
                 .map_err(|e| format!("Failed to flush PTY: {}", e))?;
@@ -3370,6 +3455,123 @@ mod tests {
     fn build_submit_payload_handles_empty_message() {
         let payload = build_submit_payload("");
         assert_eq!(payload, b"\x1b[200~\x1b[201~\r");
+    }
+
+    // ---- Inbound prompt sanitization (2026-08-20 ci-nudge-dedup Phase 1) ----
+    //
+    // Every literal below is spelled out as raw bytes on purpose. Asserting
+    // against `BRACKETED_PASTE_END` would re-derive the expectation from the
+    // same constant the implementation uses and pin nothing.
+
+    /// NEGATIVE CONTROL. An over-broad stripper (e.g. the outbound
+    /// `terminal::strip_ansi`) fails this: colour codes and diffs are exactly
+    /// what agents legitimately paste, and must survive byte-for-byte.
+    #[test]
+    fn sanitize_submit_body_leaves_sgr_and_unicode_untouched() {
+        assert_eq!(
+            sanitize_submit_body("\x1b[31mred\x1b[0m"),
+            "\x1b[31mred\x1b[0m"
+        );
+        // A coloured diff with tabs, newlines and non-ASCII text.
+        let diff = "\x1b[32m+\tnéw ✓\x1b[0m\n\x1b[31m-\told\x1b[0m\n";
+        assert_eq!(sanitize_submit_body(diff), diff);
+    }
+
+    #[test]
+    fn sanitize_submit_body_strips_control_bytes_but_keeps_whitespace() {
+        // \x00 NUL, \x07 BEL, a bare ESC (not introducing a sequence), and
+        // \u{85} (C1 NEL) are removed; \t \n \r survive.
+        assert_eq!(
+            sanitize_submit_body("a\u{0}b\u{7}c\u{1b}d\u{85}e\tf\ng\rh"),
+            "abcde\tf\ng\rh"
+        );
+        // A dangling ESC at end-of-string has no successor at all.
+        assert_eq!(sanitize_submit_body("tail\u{1b}"), "tail");
+        // DEL is a control byte too.
+        assert_eq!(sanitize_submit_body("x\u{7f}y"), "xy");
+    }
+
+    #[test]
+    fn sanitize_submit_body_neutralizes_embedded_paste_end() {
+        assert_eq!(sanitize_submit_body("a\x1b[201~b"), "a[201~b");
+    }
+
+    /// Stripping a control byte must not be able to *create* the end marker.
+    /// `\x1b[2<NUL>01~` becomes `\x1b[201~` under a naive strip-then-scan
+    /// implementation; the output invariant catches it.
+    #[test]
+    fn sanitize_submit_body_cannot_be_reconstituted_by_control_byte_removal() {
+        assert_eq!(sanitize_submit_body("\x1b[2\u{0}01~"), "[201~");
+    }
+
+    /// The falsifiable core: assert what `submit_prompt` ACTUALLY writes to
+    /// the PTY, not what the test-only `build_submit_payload` returns.
+    #[test]
+    fn submit_prompt_neutralizes_embedded_paste_end_marker() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        session
+            .submit_prompt("before\x1b[201~after")
+            .expect("submit_prompt failed");
+        let written = buf.lock().unwrap().clone();
+
+        assert_eq!(written, b"\x1b[200~before[201~after\x1b[201~\r");
+
+        // Count + position, stated independently of the equality above.
+        let end_marker: &[u8] = b"\x1b[201~";
+        let occurrences: Vec<usize> = written
+            .windows(end_marker.len())
+            .enumerate()
+            .filter(|(_, w)| *w == end_marker)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            occurrences.len(),
+            1,
+            "exactly one paste-end marker expected, got {:?} in {:?}",
+            occurrences,
+            String::from_utf8_lossy(&written)
+        );
+        assert_eq!(
+            occurrences[0],
+            written.len() - end_marker.len() - 1,
+            "the only paste-end marker must be the trailing terminator, \
+             immediately before the bare CR"
+        );
+        assert!(written.starts_with(b"\x1b[200~"));
+        assert!(written.ends_with(b"\r"));
+    }
+
+    #[test]
+    fn submit_prompt_strips_control_bytes_from_the_body() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        session
+            .submit_prompt("ok\u{0}\u{7}\u{1b}zdone")
+            .expect("submit_prompt failed");
+        let written = buf.lock().unwrap().clone();
+        // 'z' is not an escape introducer, so the ESC is a stray control byte.
+        assert_eq!(written, b"\x1b[200~okzdone\x1b[201~\r");
+    }
+
+    /// `build_submit_payload` must go through the same choke point, or the
+    /// test-only shape drifts from production again.
+    #[test]
+    fn build_submit_payload_shares_the_sanitizer_with_submit_prompt() {
+        assert_eq!(
+            build_submit_payload("x\x1b[201~y"),
+            b"\x1b[200~x[201~y\x1b[201~\r"
+        );
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        session
+            .submit_prompt("x\x1b[201~y")
+            .expect("submit_prompt failed");
+        assert_eq!(
+            buf.lock().unwrap().clone(),
+            build_submit_payload("x\x1b[201~y")
+        );
     }
 
     #[test]
