@@ -93,7 +93,41 @@ pub struct Grid {
     sync_output: bool,
     alt_screen: bool,
     dirty: bool,
+    /// Latest OSC 9999 agent-status sideband payload (raw, UNPARSED).
+    /// Latest-wins: a payload that arrives before the reader thread drains
+    /// the previous one supersedes it. See [`OSC_AGENT_STATUS`].
+    agent_status_sideband: Option<String>,
+    /// Bumped on every ACCEPTED OSC 9999 payload. The reader thread compares
+    /// this across a chunk feed to detect "a new payload arrived" without
+    /// locking twice or cloning on the common (no-sideband) path — the same
+    /// cheap before/after shape the first-OSC-title detection already uses.
+    /// Never reset, so a drained-then-refilled slot is still detectable.
+    agent_status_sideband_seq: u64,
 }
+
+// ---- OSC 9999 agent-status sideband --------------------------------------
+
+/// OSC number carrying the agent-status sideband (plan
+/// `2026-08-11-coord-hook-sourced-agent-status` §3.3, Channel 2).
+///
+/// Channel 1 is a Claude Code `PostToolUse` hook that POSTs tool-grain status
+/// straight to coord. This sideband is the INDEPENDENT second channel: a
+/// session whose hooks failed to install is then *degraded*, not invisible.
+/// It rides the VT stream we already parse, so it costs one match arm rather
+/// than a second transport.
+pub const OSC_AGENT_STATUS: &[u8] = b"9999";
+
+/// Hard cap on an accepted sideband payload.
+///
+/// A payload over the cap is DROPPED WHOLE, never truncated: a truncated JSON
+/// document either fails to parse or — worse — parses as a *different* status
+/// than the writer meant, and a wrong status is worse than no status. The
+/// payload arrives over a PTY from whatever is running in the terminal, so it
+/// is untrusted input and the cap is a bound, not a hint.
+///
+/// (`vte`'s own OSC buffer is a `Vec` under the `std` feature, i.e. unbounded,
+/// so this cap is the only one in the path once the sequence is dispatched.)
+pub const MAX_AGENT_STATUS_SIDEBAND_BYTES: usize = 8192;
 
 impl Grid {
     pub fn new(cols: u16, rows: u16) -> Self {
@@ -119,6 +153,8 @@ impl Grid {
             sync_output: false,
             alt_screen: false,
             dirty: false,
+            agent_status_sideband: None,
+            agent_status_sideband_seq: 0,
         }
     }
 
@@ -144,6 +180,23 @@ impl Grid {
     /// killing mid-frame overdraw. Observe-only in the grid itself.
     pub fn sync_output(&self) -> bool {
         self.sync_output
+    }
+
+    /// Monotonic counter of ACCEPTED OSC 9999 sideband payloads. Read either
+    /// side of a [`Grid::feed`] to learn whether a new payload arrived without
+    /// taking a second lock or cloning the payload on the common path (no
+    /// sideband at all). See [`OSC_AGENT_STATUS`].
+    pub fn agent_status_sideband_seq(&self) -> u64 {
+        self.agent_status_sideband_seq
+    }
+
+    /// Drain the latest OSC 9999 sideband payload, leaving the slot empty.
+    /// The payload is RAW and UNTRUSTED — it came off a PTY. Parse and bound
+    /// it (`terminal::agent_status_sideband`) before doing anything with it,
+    /// and never log it verbatim. The seq counter is deliberately NOT reset:
+    /// it counts arrivals, not pending items.
+    pub fn take_agent_status_sideband(&mut self) -> Option<String> {
+        self.agent_status_sideband.take()
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -228,6 +281,43 @@ impl Grid {
     }
 
     // ---- internal helpers ------------------------------------------------
+
+    /// Accept (or reject) one OSC 9999 payload.
+    ///
+    /// `parts` is everything after the `9999;` introducer. `vte` splits an OSC
+    /// on `;`, and a JSON payload may legitimately contain one (inside a tool
+    /// name, say), so the parts are rejoined with `;` to reconstruct the
+    /// writer's bytes verbatim rather than silently keeping only the first
+    /// segment.
+    ///
+    /// Two rejections, both silent and both leaving the slot AND the seq
+    /// counter untouched — an unaccepted payload must be indistinguishable
+    /// from no payload for the reader thread's before/after check:
+    ///
+    /// * over [`MAX_AGENT_STATUS_SIDEBAND_BYTES`] — dropped whole, not
+    ///   truncated (a truncated JSON body can parse as a *different* status);
+    /// * not valid UTF-8.
+    fn accept_agent_status_sideband(&mut self, parts: &[&[u8]]) {
+        // Size check BEFORE allocating the joined payload: `parts.len() - 1`
+        // is the count of `;` separators the rejoin puts back.
+        let joined_len: usize =
+            parts.iter().map(|p| p.len()).sum::<usize>() + parts.len().saturating_sub(1);
+        if joined_len > MAX_AGENT_STATUS_SIDEBAND_BYTES {
+            return;
+        }
+        let mut raw = Vec::with_capacity(joined_len);
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                raw.push(b';');
+            }
+            raw.extend_from_slice(part);
+        }
+        let Ok(text) = String::from_utf8(raw) else {
+            return;
+        };
+        self.agent_status_sideband = Some(text);
+        self.agent_status_sideband_seq = self.agent_status_sideband_seq.wrapping_add(1);
+    }
 
     fn idx(&self, row: u16, col: u16) -> usize {
         (row as usize) * (self.cols as usize) + col as usize
@@ -837,6 +927,8 @@ impl<'a> Perform for GridPerformer<'a> {
             if let Ok(s) = std::str::from_utf8(params[1]) {
                 self.grid.title = Some(s.to_string());
             }
+        } else if kind == OSC_AGENT_STATUS {
+            self.grid.accept_agent_status_sideband(&params[1..]);
         }
     }
 
@@ -988,6 +1080,169 @@ mod tests {
         let mut grid = Grid::new(80, 24);
         feed(&mut grid, b"\x1b]0;Hello Title\x07");
         assert_eq!(grid.title(), Some("Hello Title"));
+    }
+
+    // ---- OSC 9999 agent-status sideband ----------------------------------
+
+    #[test]
+    fn osc9999_sets_slot_bumps_seq_and_drains_once() {
+        let mut grid = Grid::new(80, 24);
+        assert_eq!(grid.agent_status_sideband_seq(), 0);
+        feed(
+            &mut grid,
+            b"\x1b]9999;{\"state\":\"working\",\"tool_name\":\"Bash\"}\x1b\\",
+        );
+        assert_eq!(grid.agent_status_sideband_seq(), 1, "seq bumped on accept");
+        assert_eq!(
+            grid.take_agent_status_sideband().as_deref(),
+            Some(r#"{"state":"working","tool_name":"Bash"}"#)
+        );
+        assert!(
+            grid.take_agent_status_sideband().is_none(),
+            "slot is drained by the first take"
+        );
+        assert_eq!(
+            grid.agent_status_sideband_seq(),
+            1,
+            "seq counts arrivals, not pending items — a drain does not reset it"
+        );
+    }
+
+    #[test]
+    fn osc9999_both_terminators_accepted() {
+        // BEL-terminated.
+        let mut grid = Grid::new(80, 24);
+        feed(&mut grid, b"\x1b]9999;{\"state\":\"blocked\"}\x07");
+        assert_eq!(
+            grid.take_agent_status_sideband().as_deref(),
+            Some(r#"{"state":"blocked"}"#)
+        );
+        // ST-terminated (ESC \).
+        let mut grid = Grid::new(80, 24);
+        feed(&mut grid, b"\x1b]9999;{\"state\":\"finished\"}\x1b\\");
+        assert_eq!(
+            grid.take_agent_status_sideband().as_deref(),
+            Some(r#"{"state":"finished"}"#)
+        );
+    }
+
+    #[test]
+    fn osc9999_and_titles_do_not_clobber_each_other() {
+        let mut grid = Grid::new(80, 24);
+        feed(&mut grid, b"\x1b]0;Title Zero\x07");
+        feed(&mut grid, b"\x1b]9999;{\"state\":\"working\"}\x07");
+        assert_eq!(
+            grid.title(),
+            Some("Title Zero"),
+            "OSC 9999 left title alone"
+        );
+        assert_eq!(
+            grid.take_agent_status_sideband().as_deref(),
+            Some(r#"{"state":"working"}"#)
+        );
+
+        // And the other direction: OSC 2 does not disturb a pending sideband.
+        feed(&mut grid, b"\x1b]9999;{\"state\":\"blocked\"}\x07");
+        feed(&mut grid, b"\x1b]2;Title Two\x07");
+        assert_eq!(grid.title(), Some("Title Two"));
+        assert_eq!(
+            grid.take_agent_status_sideband().as_deref(),
+            Some(r#"{"state":"blocked"}"#)
+        );
+    }
+
+    #[test]
+    fn osc9999_survives_a_split_mid_escape() {
+        // The whole reason this rides the EXISTING `vte::Parser` instead of a
+        // hand-rolled scanner: OSC state carries across `advance` calls, so a
+        // payload split across two PTY reads needs no partial-prefix buffer.
+        let mut grid = Grid::new(80, 24);
+        let mut parser = vte::Parser::new();
+        grid.feed(&mut parser, b"\x1b]9999;{\"state\":\"wor");
+        assert_eq!(
+            grid.agent_status_sideband_seq(),
+            0,
+            "nothing dispatched until the terminator"
+        );
+        grid.feed(&mut parser, b"king\",\"model\":\"opus\"}\x07");
+        assert_eq!(grid.agent_status_sideband_seq(), 1);
+        assert_eq!(
+            grid.take_agent_status_sideband().as_deref(),
+            Some(r#"{"state":"working","model":"opus"}"#)
+        );
+    }
+
+    #[test]
+    fn osc9999_rejoins_semicolons_inside_the_payload() {
+        // `vte` splits OSC params on `;`; a JSON payload may contain one.
+        let mut grid = Grid::new(80, 24);
+        feed(&mut grid, b"\x1b]9999;{\"tool_name\":\"a;b\"}\x07");
+        assert_eq!(
+            grid.take_agent_status_sideband().as_deref(),
+            Some(r#"{"tool_name":"a;b"}"#)
+        );
+    }
+
+    #[test]
+    fn osc9999_over_cap_is_dropped_whole() {
+        let mut grid = Grid::new(80, 24);
+        // Seed an accepted payload so we can prove the over-cap one neither
+        // replaces it nor bumps the counter.
+        feed(&mut grid, b"\x1b]9999;{\"state\":\"working\"}\x07");
+        let seq_before = grid.agent_status_sideband_seq();
+
+        let mut huge = Vec::from(&b"\x1b]9999;"[..]);
+        huge.extend(std::iter::repeat_n(
+            b'x',
+            MAX_AGENT_STATUS_SIDEBAND_BYTES + 1,
+        ));
+        huge.push(0x07);
+        feed(&mut grid, &huge);
+
+        assert_eq!(
+            grid.agent_status_sideband_seq(),
+            seq_before,
+            "over-cap payload does not bump the seq"
+        );
+        assert_eq!(
+            grid.take_agent_status_sideband().as_deref(),
+            Some(r#"{"state":"working"}"#),
+            "over-cap payload left the previous slot untouched (dropped, not truncated)"
+        );
+    }
+
+    #[test]
+    fn osc9999_at_exactly_the_cap_is_accepted() {
+        let mut grid = Grid::new(80, 24);
+        let mut exact = Vec::from(&b"\x1b]9999;"[..]);
+        exact.extend(std::iter::repeat_n(b'x', MAX_AGENT_STATUS_SIDEBAND_BYTES));
+        exact.push(0x07);
+        feed(&mut grid, &exact);
+        assert_eq!(grid.agent_status_sideband_seq(), 1, "the cap is inclusive");
+        assert_eq!(
+            grid.take_agent_status_sideband().map(|s| s.len()),
+            Some(MAX_AGENT_STATUS_SIDEBAND_BYTES)
+        );
+    }
+
+    #[test]
+    fn osc9999_non_utf8_is_dropped() {
+        let mut grid = Grid::new(80, 24);
+        feed(&mut grid, b"\x1b]9999;\xff\xfe\x07");
+        assert_eq!(grid.agent_status_sideband_seq(), 0);
+        assert!(grid.take_agent_status_sideband().is_none());
+    }
+
+    #[test]
+    fn osc9999_latest_wins_when_undrained() {
+        let mut grid = Grid::new(80, 24);
+        feed(&mut grid, b"\x1b]9999;{\"state\":\"working\"}\x07");
+        feed(&mut grid, b"\x1b]9999;{\"state\":\"finished\"}\x07");
+        assert_eq!(grid.agent_status_sideband_seq(), 2);
+        assert_eq!(
+            grid.take_agent_status_sideband().as_deref(),
+            Some(r#"{"state":"finished"}"#)
+        );
     }
 
     #[test]
