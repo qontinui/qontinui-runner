@@ -127,6 +127,18 @@
 //! fails provisioning loudly instead of landing a shim that silently does
 //! nothing.
 //!
+//! **The shim's NAME is a third curated field, and it is the one consumers
+//! see.** A Python distribution has a distribution name (what pip installs), a
+//! module name (what `-m` imports) and a console-script name (what ends up on
+//! PATH), and all three can differ. Naming the shim after the registry entry
+//! looked right for `poetry` and `twine`, where all three agree, and was wrong
+//! for `datamodel-code-generator`, whose only entry point is
+//! `datamodel-codegen` — so the tool provisioned, verified and cached under a
+//! name that appears nowhere in the fleet, and the gate it exists to unblock
+//! (qontinui-schemas' `check-drift`, which probes for `datamodel-codegen` on
+//! PATH) still failed. Verification runs the console-script name for the same
+//! reason: proving a name nothing calls proves nothing.
+//!
 //! # No Python interpreter is a REFUSAL, never a skip
 //!
 //! [`Installer::PythonPackage`] needs a host Python 3 to build the venv from.
@@ -203,6 +215,20 @@ pub(crate) enum Installer {
         /// distribution has a dash (`datamodel-code-generator` →
         /// `datamodel_code_generator`).
         module: &'static str,
+        /// The name the shim takes on the step PATH — the distribution's own
+        /// **console script**, which is what a repo's steps and scripts
+        /// actually invoke.
+        ///
+        /// A THIRD curated name, because Python distributions routinely use
+        /// three different ones and only two of them are derivable from each
+        /// other. Measured against a real install of
+        /// `datamodel-code-generator==0.28.5` (2026-08-21): the venv's
+        /// `Scripts/` contains exactly one entry point, and it is
+        /// `datamodel-codegen` — neither the distribution name nor the module
+        /// name. Deriving this field instead of curating it would have to
+        /// guess, and a wrong guess is silent: the tool provisions green and
+        /// the step fails with "command not found" minutes later.
+        command: &'static str,
     },
 }
 
@@ -249,7 +275,24 @@ const PACKAGE_INSTALL_TIMEOUT: Duration = Duration::from_secs(900);
 const STAGING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Interpreters tried, in order, for [`Installer::PythonPackage`]. A missing
 /// one is a refusal naming this list — never a silent skip.
-const PYTHON_CANDIDATES: &[&str] = &["python3", "python"];
+///
+/// Each entry is a full argv PREFIX rather than a bare program name, because
+/// the third one needs an argument to mean anything. `py` is the Windows
+/// launcher, and it is the candidate that survives the configuration this
+/// lane is most likely to meet on a user's machine: python.org's installer
+/// leaves "Add python.exe to PATH" **unchecked** by default, so `python` and
+/// `python3` resolve to nothing (or, worse, to the Microsoft Store
+/// app-execution alias that prints "Python was not found") while `py` is
+/// always installed and always on PATH. `-3` is not optional on it — bare `py`
+/// honours a `py.ini`/shebang default that can still select a Python 2.
+///
+/// Windows-only by construction: several Linux distributions package an
+/// unrelated `py` (pythonpy), and this list feeds `-m venv`, so a name
+/// collision here would build a venv out of the wrong program.
+#[cfg(target_os = "windows")]
+const PYTHON_CANDIDATES: &[&[&str]] = &[&["python3"], &["python"], &["py", "-3"]];
+#[cfg(not(target_os = "windows"))]
+const PYTHON_CANDIDATES: &[&[&str]] = &[&["python3"], &["python"]];
 
 /// cargo-nextest publishes one asset per platform under a
 /// `cargo-nextest-<version>` release tag. Names verified live against
@@ -410,6 +453,8 @@ static KNOWN_TOOLS: &[ToolSpec] = &[
         install: Installer::PythonPackage {
             distribution: "poetry",
             module: "poetry",
+            // Distribution, module and console script all agree here.
+            command: "poetry",
         },
     },
     ToolSpec {
@@ -422,6 +467,7 @@ static KNOWN_TOOLS: &[ToolSpec] = &[
         install: Installer::PythonPackage {
             distribution: "twine",
             module: "twine",
+            command: "twine",
         },
     },
     ToolSpec {
@@ -434,6 +480,15 @@ static KNOWN_TOOLS: &[ToolSpec] = &[
         install: Installer::PythonPackage {
             distribution: "datamodel-code-generator",
             module: "datamodel_code_generator",
+            // THREE different names, and this is the one that goes on PATH.
+            // The distribution ships exactly one console script and it is
+            // `datamodel-codegen` (measured 2026-08-21 against a real
+            // `datamodel-code-generator==0.28.5` venv). Every consumer uses
+            // that spelling — qontinui-schemas' check-generated-drift.sh
+            // probes for `datamodel-codegen` on PATH before it will run, and
+            // schema-drift.yml invokes it by that name — so a shim called
+            // anything else provisions green and leaves the gate failing.
+            command: "datamodel-codegen",
         },
     },
 ];
@@ -581,12 +636,18 @@ fn resolve(spec: &'static ToolSpec, version: &str, triple: &str) -> Result<Resol
         Installer::PythonPackage {
             distribution,
             module,
+            command,
         } => Ok(Resolved {
             // NEVER the venv's own Scripts/bin: those console scripts do not
             // survive the atomic rename, and putting them on PATH would shadow
             // the shim that does. See the module docs.
             bin_dir: PathBuf::from("bin"),
-            primary: spec.name.to_string(),
+            // The CONSOLE SCRIPT name, not the registry entry's name. They are
+            // the same for poetry and twine and differ for
+            // datamodel-code-generator, and it is the console script every
+            // consumer invokes — so it is also the name verification must run
+            // under, or provisioning would prove a name nothing calls.
+            primary: (*command).to_string(),
             companions: Vec::new(),
             source: Source::PythonPackage {
                 requirement: format!("{distribution}=={version}"),
@@ -1621,19 +1682,26 @@ fn write_tree_entry(
 
 /// Locate a host Python 3. A miss is a REFUSAL naming what is missing and what
 /// was tried — never a silent skip, and never an install of one.
-async fn find_python() -> Result<String, String> {
+///
+/// Returns the argv PREFIX that invokes it — `["python3"]`, `["python"]` or
+/// `["py", "-3"]` — rather than a program name, because the launcher's version
+/// selector has to ride along on every later call, not just the probe.
+async fn find_python() -> Result<&'static [&'static str], String> {
     let mut tried = Vec::new();
     for candidate in PYTHON_CANDIDATES {
-        match run_capture(candidate, &["--version"], VERIFY_TIMEOUT, None).await {
+        let mut argv: Vec<&str> = candidate[1..].to_vec();
+        argv.push("--version");
+        let shown = candidate.join(" ");
+        match run_capture(candidate[0], &argv, VERIFY_TIMEOUT, None).await {
+            // The Store alias answers `--version` with "Python was not found",
+            // which is exactly why the match is on `Python 3` and not on a
+            // zero exit status.
             Ok(text) if text.contains("Python 3") => {
-                info!(
-                    "ci_node: using {candidate} ({}) for Python tools",
-                    text.trim()
-                );
-                return Ok((*candidate).to_string());
+                info!("ci_node: using {shown} ({}) for Python tools", text.trim());
+                return Ok(*candidate);
             }
-            Ok(text) => tried.push(format!("{candidate}: reported {:?}", text.trim())),
-            Err(e) => tried.push(format!("{candidate}: {e}")),
+            Ok(text) => tried.push(format!("{shown}: reported {:?}", text.trim())),
+            Err(e) => tried.push(format!("{shown}: {e}")),
         }
     }
     Err(no_python_refusal(&tried))
@@ -1649,7 +1717,11 @@ fn no_python_refusal(tried: &[String]) -> String {
          The runner will never install a Python, and never installs packages into \
          the host interpreter: the distribution goes into a private venv under \
          .ci-tools/. A missing interpreter is a refusal, not a skip",
-        PYTHON_CANDIDATES.join(", "),
+        PYTHON_CANDIDATES
+            .iter()
+            .map(|c| c.join(" "))
+            .collect::<Vec<_>>()
+            .join(", "),
         tried.join("; ")
     )
 }
@@ -1667,19 +1739,17 @@ async fn install_python_package(
     let python = find_python().await?;
     let venv = staging.join("venv");
     let venv_str = venv.to_string_lossy().to_string();
-    run_capture(
-        &python,
-        &["-m", "venv", venv_str.as_str()],
-        VENV_TIMEOUT,
-        None,
-    )
-    .await
-    .map_err(|e| {
-        format!(
-            "creating a private venv with `{python} -m venv` failed: {e}. \
-                 On Debian/Ubuntu the venv module ships separately (python3-venv)"
-        )
-    })?;
+    let mut venv_argv: Vec<&str> = python[1..].to_vec();
+    venv_argv.extend(["-m", "venv", venv_str.as_str()]);
+    run_capture(python[0], &venv_argv, VENV_TIMEOUT, None)
+        .await
+        .map_err(|e| {
+            format!(
+                "creating a private venv with `{} -m venv` failed: {e}. \
+                 On Debian/Ubuntu the venv module ships separately (python3-venv)",
+                python.join(" ")
+            )
+        })?;
     let venv_bin = venv.join(if cfg!(target_os = "windows") {
         "Scripts"
     } else {
@@ -1687,7 +1757,8 @@ async fn install_python_package(
     });
     let venv_python = resolve_executable(&venv_bin, "python").ok_or_else(|| {
         format!(
-            "`{python} -m venv` produced no python under {}",
+            "`{} -m venv` produced no python under {}",
+            python.join(" "),
             venv_bin.display()
         )
     })?;
@@ -2249,6 +2320,89 @@ mod tests {
         );
     }
 
+    /// What each entry puts ON THE STEP PATH, pinned as a whole.
+    ///
+    /// Two properties, and the registry gained both the moment it stopped
+    /// being one entry. First, the PATH name is what a repo's steps and
+    /// scripts type, so it — not the manifest-facing entry name — is the
+    /// registry's real contract with a gate; `datamodel-code-generator`
+    /// shipped provisioning `datamodel-code-generator` while every consumer
+    /// invokes `datamodel-codegen`, which is green provisioning and a red
+    /// gate. Second, every provisioned bin directory is prepended to one
+    /// PATH, so two entries exporting the same name would SHADOW each other
+    /// by declaration order — a silent, order-dependent wrong tool.
+    #[test]
+    fn registry_path_surface_is_pinned_and_collision_free() {
+        fn exported(spec: &'static ToolSpec) -> Vec<&'static str> {
+            match &spec.install {
+                Installer::PrebuiltBinary { binary, .. } => vec![*binary],
+                Installer::PrebuiltTree {
+                    primary,
+                    companions,
+                    ..
+                } => {
+                    let mut v = vec![*primary];
+                    v.extend(companions.iter().copied());
+                    v
+                }
+                Installer::PythonPackage { command, .. } => vec![*command],
+            }
+        }
+        let surface: Vec<(&str, Vec<&str>)> = KNOWN_TOOLS
+            .iter()
+            .map(|spec| (spec.name, exported(spec)))
+            .collect();
+        assert_eq!(
+            surface,
+            vec![
+                ("cargo-nextest", vec!["cargo-nextest"]),
+                ("node", vec!["node", "npm", "npx"]),
+                ("poetry", vec!["poetry"]),
+                ("twine", vec!["twine"]),
+                // The entry a manifest names is NOT the command a step runs.
+                ("datamodel-code-generator", vec!["datamodel-codegen"]),
+            ]
+        );
+        let mut seen: Vec<&str> = Vec::new();
+        for (name, names) in &surface {
+            for exported in names {
+                assert!(
+                    !seen.contains(exported),
+                    "{name} exports {exported:?}, which another entry already puts on PATH"
+                );
+                seen.push(*exported);
+            }
+        }
+    }
+
+    /// A Python entry's PATH name must be the distribution's console script,
+    /// and the ONLY way to know that is to install the distribution and look.
+    ///
+    /// This test cannot install anything, so it pins the measurement instead
+    /// (2026-08-21, this box, a real venv per distribution) and asserts the
+    /// registry still agrees with it. The interesting column is the last one:
+    /// two of the three agree with the entry name and one does not, which is
+    /// exactly why deriving this field would have looked correct in review.
+    #[test]
+    fn python_path_names_match_the_measured_console_scripts() {
+        // (entry name, the console scripts the venv actually holds)
+        let measured = [
+            ("poetry", &["poetry"][..]),
+            ("twine", &["twine"][..]),
+            ("datamodel-code-generator", &["datamodel-codegen"][..]),
+        ];
+        for (name, scripts) in measured {
+            let spec = lookup(name).expect("curated entry");
+            let Installer::PythonPackage { command, .. } = &spec.install else {
+                panic!("{name} must be a PythonPackage");
+            };
+            assert!(
+                scripts.contains(command),
+                "{name}: registry puts {command:?} on PATH; distribution ships {scripts:?}"
+            );
+        }
+    }
+
     /// Asset URLs are derived, not hand-listed, so this pins the derivation
     /// against the names verified live on release `cargo-nextest-0.9.98`.
     #[test]
@@ -2408,8 +2562,8 @@ mod tests {
     #[test]
     fn python_entries_pin_distribution_and_module() {
         let cases = [
-            ("poetry", "2.1.3", "poetry==2.1.3", "poetry"),
-            ("twine", "6.1.0", "twine==6.1.0", "twine"),
+            ("poetry", "2.1.3", "poetry==2.1.3", "poetry", "poetry"),
+            ("twine", "6.1.0", "twine==6.1.0", "twine", "twine"),
             (
                 "datamodel-code-generator",
                 "0.28.5",
@@ -2417,16 +2571,24 @@ mod tests {
                 // Dashed distribution, underscored module — the reason
                 // `module` is its own curated field.
                 "datamodel_code_generator",
+                // …and a console script that is neither of them, which is the
+                // reason `command` is a third one. Measured 2026-08-21: a real
+                // `datamodel-code-generator==0.28.5` venv ships exactly one
+                // entry point and it is `datamodel-codegen`. This is the name
+                // qontinui-schemas' check-generated-drift.sh probes for.
+                "datamodel-codegen",
             ),
         ];
-        for (name, version, want_req, want_module) in cases {
+        for (name, version, want_req, want_module, want_command) in cases {
             let spec = lookup(name).expect("curated entry");
             // A Python package is host-independent: it resolves the same on
             // every triple, including one no archive publishes for.
             for triple in ["x86_64-pc-windows-msvc", "riscv64gc-unknown-linux-gnu"] {
                 let r = resolve(spec, version, triple).expect("python entries are portable");
                 assert_eq!(r.bin_dir, PathBuf::from("bin"), "{name}");
-                assert_eq!(r.primary, name, "{name}");
+                // The PATH name is the console script, NOT the registry entry
+                // name — and it is also what gets verified.
+                assert_eq!(r.primary, want_command, "{name}");
                 match r.source {
                     Source::PythonPackage {
                         requirement,
@@ -3045,7 +3207,14 @@ mod tests {
     fn missing_python_refusal_names_what_is_missing() {
         let msg = no_python_refusal(&["python3: not found".to_string()]);
         for candidate in PYTHON_CANDIDATES {
-            assert!(msg.contains(candidate), "must name {candidate}: {msg}");
+            let shown = candidate.join(" ");
+            assert!(msg.contains(&shown), "must name {shown}: {msg}");
+        }
+        // The launcher's version selector is part of the name, not a detail
+        // the message may drop: `py` alone is a different (and wrong)
+        // instruction to a user reading this.
+        if cfg!(target_os = "windows") {
+            assert!(msg.contains("py -3"), "{msg}");
         }
         assert!(msg.contains("refusal, not a skip"), "{msg}");
         assert!(msg.contains("never installs packages into"), "{msg}");
