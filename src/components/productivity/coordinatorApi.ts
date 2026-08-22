@@ -499,7 +499,11 @@ export interface OverlappingIntentPair {
   overlappingPaths: string[];
 }
 
-/** Fetch the L2 overlapping-intents snapshot from coord.agent_worktrees.
+/** Fetch the L2 overlapping-intents snapshot.
+ *  Coord computes the pairs and serves them over HTTP
+ *  (GET /coord/agent-worktrees/overlapping-intents); the runner no longer
+ *  queries coord.agent_worktrees itself. An isolated or unreachable coord
+ *  yields an empty list, never an error.
  *  Read-only — the panel is informational, no actions taken from
  *  client-side. */
 export async function listOverlappingIntents(limit = 200): Promise<OverlappingIntentPair[]> {

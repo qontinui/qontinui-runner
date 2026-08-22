@@ -2274,13 +2274,37 @@ pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
 
 // ============================================================================
 // Coordination Phase 1B (§4.10) — Overlapping intents panel
+//
+// Coord owns this answer end to end. `coord.agent_worktrees` is authored by
+// COORD, server-side, in `POST /agents/allocate`; alembic (qontinui-web) is
+// the sole author of the `coord.*` SCHEMA and never runs on an end-user's
+// box, where the runner's Postgres is a private embedded cluster. So the
+// table is simply absent there — and a local copy of it would be a table
+// coord never writes to, i.e. permanently empty. The panel therefore reads
+// coord over HTTP rather than SQL-ing a mirror that cannot exist
+// (plan `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`,
+// P2c). The pairwise overlap computation moved with it: coord already ran
+// `detect_overlap` on every intent write, so the runner was recomputing an
+// answer coord had.
 // ============================================================================
 
-/// One pair of agents whose declared_overlap_paths intersect. Computed
-/// in-process from the active-agents list so the dashboard reads a
-/// single coherent snapshot per refresh — no race between "list" and
-/// "for each, compute peer overlaps."
-#[derive(Debug, Clone, Serialize)]
+/// Cap on the live-agent set the panel asks coord to consider when the
+/// frontend does not pass one. Coord clamps this to its own hard maximum.
+const OVERLAPPING_INTENTS_DEFAULT_LIMIT: i64 = 200;
+
+/// Deadline for the panel's coord read. Bounded on purpose: an unreachable
+/// coord must leave the panel empty promptly, never stall the dashboard.
+/// Matches the 5s the neighbouring fleet-health read uses.
+const OVERLAPPING_INTENTS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One pair of agents whose `declared_overlap_paths` intersect, as coord
+/// computed it.
+///
+/// The wire shape is coord's `agent_worktrees::OverlappingIntentPair`
+/// verbatim (both sides are `camelCase`), and this type re-serializes it to
+/// the frontend unchanged — the Productivity panel's contract is the same
+/// as before the read moved to coord.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlappingIntentPair {
     pub agent_a: String,
@@ -2290,101 +2314,124 @@ pub struct OverlappingIntentPair {
     pub overlapping_paths: Vec<String>,
 }
 
+/// Coord's response envelope. Only `pairs` is load-bearing here; coord also
+/// reports `count` / `agentsConsidered` / `agentsTruncated` / `truncated`,
+/// which the panel does not render today. `#[serde(default)]` means a body
+/// without the key deserializes to an empty panel rather than an error.
+#[derive(Debug, Default, serde::Deserialize)]
+struct OverlappingIntentsResponse {
+    #[serde(default)]
+    pairs: Vec<OverlappingIntentPair>,
+}
+
+/// The coord URL this panel reads. Split out so the query-string contract
+/// (the `limit` coord clamps) is testable without a live coord.
+fn overlapping_intents_url(base: &str, limit: i64) -> String {
+    format!(
+        "{}/coord/agent-worktrees/overlapping-intents?limit={limit}",
+        base.trim_end_matches('/')
+    )
+}
+
+/// GET the pairs from a KNOWN coord base. `Err` is any reason the answer
+/// could not be obtained — no client, transport failure, non-2xx (including
+/// a 403 from coord's fail-closed `FleetPrincipal` gate on an unpaired
+/// runner), or an unparseable body. The caller decides what a failure means
+/// for the panel; this fn never panics and never blocks past
+/// [`OVERLAPPING_INTENTS_TIMEOUT`].
+async fn fetch_overlapping_intents(
+    base: &str,
+    limit: i64,
+) -> Result<Vec<OverlappingIntentPair>, String> {
+    // The process-wide coord client — one connection pool, one resolver. It
+    // carries no global timeout by design, so set the deadline here.
+    let Some(client) = crate::coord_http::coord_client() else {
+        return Err("shared coord HTTP client unavailable".to_string());
+    };
+    let resp = crate::coord_http::coord_get(client, overlapping_intents_url(base, limit))
+        .timeout(OVERLAPPING_INTENTS_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("GET overlapping-intents: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("coord returned HTTP {}", status.as_u16()));
+    }
+    let body: OverlappingIntentsResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse overlapping-intents: {e}"))?;
+    Ok(body.pairs)
+}
+
+/// Degradation core: turn "the coord base, if this runner has one" into the
+/// panel's rows. Never fails — every arm that cannot produce an answer
+/// produces an EMPTY panel and a log line, because the Productivity
+/// dashboard must keep rendering when coord does not answer.
+///
+/// The governing precedent is `fleet::publish_on_startup`: a coord outage
+/// degrades the feature, never the boot.
+///
+/// - `None` base — the runner is ISOLATED (no `COORD_HTTP_URL`, no profile
+///   `coord_url`, not a hosted tier). Not an error, not worth a `warn!`:
+///   a standalone install has no fleet to overlap with. `debug!`.
+/// - `Err` from the fetch — coord is configured but did not answer (down,
+///   unreachable, 403 from an unpaired runner, garbage body). That IS worth
+///   a `warn!`, and still leaves the panel empty.
+///
+/// Split from the Tauri command so both arms are testable without touching
+/// process env or standing up a coord.
+async fn overlapping_intents_for_base(
+    base: Option<String>,
+    limit: i64,
+) -> Vec<OverlappingIntentPair> {
+    let Some(base) = base else {
+        tracing::debug!(
+            "list_overlapping_intents: runner is isolated (no coord configured) — \
+             the overlapping-intents panel stays empty"
+        );
+        return Vec::new();
+    };
+    match fetch_overlapping_intents(&base, limit).await {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            warn!(
+                "list_overlapping_intents: coord read failed ({e}) — the \
+                 overlapping-intents panel stays empty; the rest of the \
+                 dashboard is unaffected"
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// List unique unordered pairs of active agents whose declared
 /// overlap-path sets intersect. Drives the Productivity dashboard's
 /// "Overlapping intents" panel (Phase 1B §4.10).
 ///
-/// Each pair is reported once: agents are ordered lexically so
-/// (agent_a, agent_b) is stable across calls.
+/// Coord computes the pairs (`GET
+/// /coord/agent-worktrees/overlapping-intents`), tenant-scoped from the
+/// runner's device-JWT and bounded server-side. Each pair is reported once,
+/// ordered by agent id, so `(agentA, agentB)` is stable across calls.
 ///
-/// `limit` caps the underlying active-agents fetch — the panel is
-/// informational and bounding it keeps the dashboard cheap even at
-/// 300+ agents.
+/// `limit` caps the live-agent set coord pairs over — the panel is
+/// informational and bounding it keeps the dashboard cheap even at 300+
+/// agents. Coord clamps it to its own hard maximum.
+///
+/// Always `Ok`: an isolated or unreachable coord yields an empty panel, not
+/// an error dialog. See [`overlapping_intents_for_base`].
 #[tauri::command]
 pub async fn list_overlapping_intents(
-    app_handle: tauri::AppHandle,
     limit: Option<i64>,
 ) -> Result<Vec<OverlappingIntentPair>, String> {
-    let app_state = require_app_state(&app_handle)?;
-    let cap = limit.unwrap_or(200);
-    let agents = app_state.pg_db.list_active_agents_with_paths(cap).await?;
-
-    let mut pairs: Vec<OverlappingIntentPair> = Vec::new();
-    for i in 0..agents.len() {
-        for j in (i + 1)..agents.len() {
-            let a = &agents[i];
-            let b = &agents[j];
-            let Some(a_paths) = a.declared_overlap_paths.as_ref() else {
-                continue;
-            };
-            let Some(b_paths) = b.declared_overlap_paths.as_ref() else {
-                continue;
-            };
-            let overlap = compute_overlap(a_paths, b_paths);
-            if overlap.is_empty() {
-                continue;
-            }
-            // Stable lexical pair ordering.
-            let (agent_a, agent_b, intent_a, intent_b) = if a.agent_id <= b.agent_id {
-                (
-                    a.agent_id.clone(),
-                    b.agent_id.clone(),
-                    a.intent.clone(),
-                    b.intent.clone(),
-                )
-            } else {
-                (
-                    b.agent_id.clone(),
-                    a.agent_id.clone(),
-                    b.intent.clone(),
-                    a.intent.clone(),
-                )
-            };
-            pairs.push(OverlappingIntentPair {
-                agent_a,
-                agent_b,
-                intent_a,
-                intent_b,
-                overlapping_paths: overlap,
-            });
-        }
-    }
-    Ok(pairs)
-}
-
-/// Two-pass glob-set intersection — same shape as the coord-side
-/// `detect_overlap` so the dashboard's view matches what coord
-/// publishes on `events.coord.overlap.detected`.
-fn compute_overlap(a_paths: &[String], b_paths: &[String]) -> Vec<String> {
-    use std::collections::BTreeSet;
-    let a_set: BTreeSet<&String> = a_paths.iter().collect();
-    let mut hits: BTreeSet<String> = BTreeSet::new();
-    for p in b_paths {
-        if a_set.contains(p) {
-            hits.insert(p.clone());
-        }
-    }
-    if hits.is_empty() {
-        // Glob expansion: each a-side glob tested against each
-        // b-side literal, and vice versa. Uses the same `glob-match`
-        // crate as the trigger-system file watchers, so glob semantics
-        // are consistent across the runner.
-        for a_pat in a_paths {
-            for p in b_paths {
-                if glob_match::glob_match(a_pat, p) {
-                    hits.insert(p.clone());
-                }
-            }
-        }
-        for b_pat in b_paths {
-            for p in a_paths {
-                if glob_match::glob_match(b_pat, p) {
-                    hits.insert(p.clone());
-                }
-            }
-        }
-    }
-    hits.into_iter().collect()
+    // `connected_coord_base` — the Option-family policy resolver, and the
+    // right door here precisely because it can express ISOLATED. Its
+    // String-family sibling `coord_base_with_source` always yields a base
+    // (guessing dev-localhost when nothing is configured), which would have
+    // this panel dial a phantom coord on every standalone install.
+    let base = qontinui_runner_lib::profiles::connected_coord_base();
+    let cap = limit.unwrap_or(OVERLAPPING_INTENTS_DEFAULT_LIMIT);
+    Ok(overlapping_intents_for_base(base, cap).await)
 }
 
 #[cfg(test)]
@@ -2392,30 +2439,155 @@ mod overlap_tests {
     use super::*;
 
     #[test]
-    fn literal_intersection() {
-        let r = compute_overlap(
-            &["a/b.rs".to_string(), "c/d.rs".to_string()],
-            &["x.rs".to_string(), "a/b.rs".to_string()],
-        );
-        assert_eq!(r, vec!["a/b.rs".to_string()]);
-    }
-
-    #[test]
-    fn glob_intersection() {
-        let r = compute_overlap(
-            &["qontinui-web/backend/app/auth/**".to_string()],
-            &["qontinui-web/backend/app/auth/token.py".to_string()],
-        );
+    fn url_carries_the_limit_and_normalizes_a_trailing_slash() {
         assert_eq!(
-            r,
-            vec!["qontinui-web/backend/app/auth/token.py".to_string()]
+            overlapping_intents_url("https://coord.qontinui.io", 200),
+            "https://coord.qontinui.io/coord/agent-worktrees/overlapping-intents?limit=200"
+        );
+        // A profile `coord_url` with a trailing slash must not produce `//`.
+        assert_eq!(
+            overlapping_intents_url("http://localhost:9870/", 7),
+            "http://localhost:9870/coord/agent-worktrees/overlapping-intents?limit=7"
         );
     }
 
     #[test]
-    fn disjoint_empty() {
-        let r = compute_overlap(&["a/b.rs".to_string()], &["x/y.rs".to_string()]);
-        assert!(r.is_empty());
+    fn parses_coords_pair_shape() {
+        // Byte-for-byte the envelope coord's `get_overlapping_intents`
+        // emits. A field rename on either side breaks this test rather than
+        // silently emptying the panel in production.
+        let body = r#"{
+            "pairs": [
+                {
+                    "agentA": "0190000a-0000-7000-8000-000000000001",
+                    "agentB": "0190000a-0000-7000-8000-000000000002",
+                    "intentA": "refactor the executor",
+                    "intentB": null,
+                    "overlappingPaths": ["src-tauri/src/executor/mod.rs"]
+                }
+            ],
+            "count": 1,
+            "agentsConsidered": 2,
+            "agentLimit": 200,
+            "agentsTruncated": false,
+            "truncated": false
+        }"#;
+        let parsed: OverlappingIntentsResponse =
+            serde_json::from_str(body).expect("coord envelope must parse");
+        assert_eq!(parsed.pairs.len(), 1);
+        let p = &parsed.pairs[0];
+        assert_eq!(p.agent_a, "0190000a-0000-7000-8000-000000000001");
+        assert_eq!(p.agent_b, "0190000a-0000-7000-8000-000000000002");
+        assert_eq!(p.intent_a.as_deref(), Some("refactor the executor"));
+        assert_eq!(p.intent_b, None);
+        assert_eq!(p.overlapping_paths, vec!["src-tauri/src/executor/mod.rs"]);
+    }
+
+    #[test]
+    fn a_body_without_pairs_is_an_empty_panel_not_a_parse_error() {
+        let parsed: OverlappingIntentsResponse =
+            serde_json::from_str("{}").expect("a keyless body must still parse");
+        assert!(parsed.pairs.is_empty());
+    }
+
+    #[test]
+    fn pairs_reserialize_to_the_frontends_camel_case_contract() {
+        // The Tauri command hands this straight to the React panel; the key
+        // names are the contract that did NOT change when the read moved to
+        // coord.
+        let pair = OverlappingIntentPair {
+            agent_a: "a".into(),
+            agent_b: "b".into(),
+            intent_a: Some("x".into()),
+            intent_b: None,
+            overlapping_paths: vec!["p".into()],
+        };
+        let v = serde_json::to_value(&pair).expect("serialize");
+        assert_eq!(v["agentA"], "a");
+        assert_eq!(v["agentB"], "b");
+        assert_eq!(v["intentA"], "x");
+        assert!(v["intentB"].is_null());
+        assert_eq!(v["overlappingPaths"][0], "p");
+    }
+
+    #[tokio::test]
+    async fn an_isolated_runner_gets_an_empty_panel() {
+        // `connected_coord_base()` yields `None` on a standalone install.
+        // That is a supported configuration, not a failure: empty panel, no
+        // dial, no error.
+        let pairs = overlapping_intents_for_base(None, 200).await;
+        assert!(pairs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_coord_degrades_to_an_empty_panel_promptly() {
+        // Port 1 on loopback refuses immediately; the assertion that matters
+        // is that the failure DEGRADES (no panic, no `Err`, no hang) and
+        // stays inside the bounded deadline.
+        let started = std::time::Instant::now();
+        let pairs = overlapping_intents_for_base(Some("http://127.0.0.1:1".to_string()), 200).await;
+        assert!(pairs.is_empty());
+        assert!(
+            started.elapsed() < OVERLAPPING_INTENTS_TIMEOUT * 3,
+            "an unreachable coord must not stall the dashboard: took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_2xx_from_coord_degrades_rather_than_erroring() {
+        // Coord's gate is fail-closed: an unpaired runner gets 403
+        // `auth_required`. The panel must treat that like any other
+        // unavailable answer — empty, logged, never a dialog.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\
+                          Content-Length: 27\r\n\r\n{\"error\":\"auth_required\"}\r\n",
+                    )
+                    .await;
+                let _ = sock.flush().await;
+            }
+        });
+        let pairs =
+            overlapping_intents_for_base(Some(format!("http://{addr}")), 200).await;
+        assert!(pairs.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_healthy_coord_answer_reaches_the_panel() {
+        // The happy path end-to-end over real HTTP: coord's envelope in,
+        // the panel's rows out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let body = r#"{"pairs":[{"agentA":"a1","agentB":"a2","intentA":"i1","intentB":"i2","overlappingPaths":["src/x.rs"]}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let pairs = overlapping_intents_for_base(Some(format!("http://{addr}")), 200).await;
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].agent_a, "a1");
+        assert_eq!(pairs[0].overlapping_paths, vec!["src/x.rs"]);
+        server.abort();
     }
 }
 
