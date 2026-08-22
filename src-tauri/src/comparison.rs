@@ -24,11 +24,15 @@ pub struct ComparisonConfig {
 }
 
 /// What differs between comparison runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ComparisonVariation {
     /// Identical config — tests implementation variance / non-determinism.
     Same,
+    /// The three workflow architectures, side by side. This is the default the
+    /// HTTP surface has always used; it lives in the enum now rather than only
+    /// in two hand-written string matches.
+    Architecture,
     /// One run with multi_agent_mode on, one off.
     MultiAgent,
     /// Different AI models for each run.
@@ -291,43 +295,134 @@ fn build_metric_delta(name: &str, values: Vec<(String, f64)>, best: &str) -> Met
 // Coordinator
 // =============================================================================
 
-/// Build config overrides for each run based on the variation type.
+/// One arm of a comparison: a human label plus the config overrides applied to
+/// that run.
+///
+/// The label is a SIBLING of the overrides, never a key inside them. Burying it
+/// in the override JSON is what made `label` a spurious treatment axis on the
+/// custom path (see [`DEFAULT_IGNORED_AXIS_PATHS`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComparisonArm {
+    /// Human-readable arm name.
+    pub label: String,
+    /// The config overrides applied to this run.
+    pub overrides: serde_json::Value,
+}
+
+/// Build the arms of a comparison from the declared variation.
+///
+/// **This is the single derivation path.** The HTTP surface
+/// (`mcp::comparison_api`) and the Tauri command (`commands::comparison`) both
+/// call it, so `variation_type` means exactly one thing across the tree instead
+/// of being re-interpreted by three divergent string matches.
+///
+/// `use_worktree` is injected identically into every arm — it is a run-wide
+/// setting, not a treatment, which is why it can never register as a differing
+/// axis.
+pub fn build_comparison_arms(
+    variation: &ComparisonVariation,
+    run_count: usize,
+    use_worktree: bool,
+) -> Vec<ComparisonArm> {
+    let arch = |label: &str, kind: &str| ComparisonArm {
+        label: label.to_string(),
+        overrides: serde_json::json!({ "workflow_architecture": kind }),
+    };
+
+    let mut arms = match variation {
+        ComparisonVariation::Architecture => vec![
+            arch("Traditional", "traditional"),
+            arch("Agentic Verification", "agentic_verification"),
+            arch("Multi-Agent Pipeline", "multi_agent_pipeline"),
+        ],
+        ComparisonVariation::Same => (0..run_count)
+            .map(|i| ComparisonArm {
+                label: format!("Run {}", i + 1),
+                overrides: serde_json::json!({}),
+            })
+            .collect(),
+        ComparisonVariation::MultiAgent => vec![
+            ComparisonArm {
+                label: "multi-agent".to_string(),
+                overrides: serde_json::json!({"multi_agent_mode": true}),
+            },
+            ComparisonArm {
+                label: "monolithic".to_string(),
+                overrides: serde_json::json!({"multi_agent_mode": false}),
+            },
+        ],
+        ComparisonVariation::Model { models } => models
+            .iter()
+            .map(|m| ComparisonArm {
+                label: m.clone(),
+                overrides: serde_json::json!({ "model": m }),
+            })
+            .collect(),
+        ComparisonVariation::ContextTokens { limits } => limits
+            .iter()
+            .map(|l| ComparisonArm {
+                label: format!("{}K", l / 1000),
+                overrides: serde_json::json!({ "max_context_tokens": l }),
+            })
+            .collect(),
+        ComparisonVariation::Custom { overrides } => overrides
+            .iter()
+            .enumerate()
+            .map(|(i, ov)| ComparisonArm {
+                label: ov
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("Custom {}", i + 1)),
+                overrides: ov.clone(),
+            })
+            .collect(),
+    };
+
+    for arm in &mut arms {
+        if let Some(obj) = arm.overrides.as_object_mut() {
+            obj.insert(
+                "use_worktree".to_string(),
+                serde_json::Value::Bool(use_worktree),
+            );
+        }
+    }
+    arms
+}
+
+/// The per-arm override blobs alone, without labels.
+///
+/// A thin projection of [`build_comparison_arms`] — kept because the axis
+/// computation consumes overrides, not arms.
 pub fn build_run_overrides(
     variation: &ComparisonVariation,
     run_count: usize,
 ) -> Vec<serde_json::Value> {
-    match variation {
-        ComparisonVariation::Same => (0..run_count).map(|_| serde_json::json!({})).collect(),
-        ComparisonVariation::MultiAgent => {
-            vec![
-                serde_json::json!({"multi_agent_mode": true, "label": "multi-agent"}),
-                serde_json::json!({"multi_agent_mode": false, "label": "monolithic"}),
-            ]
-        }
-        ComparisonVariation::Model { models } => models
-            .iter()
-            .map(|m| serde_json::json!({"model": m, "label": m}))
-            .collect(),
-        ComparisonVariation::ContextTokens { limits } => limits
-            .iter()
-            .map(
-                |l| serde_json::json!({"max_context_tokens": l, "label": format!("{}K", l / 1000)}),
-            )
-            .collect(),
-        ComparisonVariation::Custom { overrides } => overrides.clone(),
+    build_comparison_arms(variation, run_count, true)
+        .into_iter()
+        .map(|arm| arm.overrides)
+        .collect()
+}
+
+/// Parse the wire `variation_type` string into the typed variation.
+///
+/// This is the ONLY place a `variation_type` string becomes a variation. Both
+/// call sites use it, so an unknown token is rejected identically everywhere —
+/// previously the HTTP surface accepted `custom` and the Tauri command rejected
+/// it, for the same input.
+pub fn parse_variation(
+    variation_type: &str,
+    custom_overrides: Vec<serde_json::Value>,
+) -> Result<ComparisonVariation, String> {
+    match variation_type.trim().to_ascii_lowercase().as_str() {
+        "architecture" => Ok(ComparisonVariation::Architecture),
+        "same" => Ok(ComparisonVariation::Same),
+        "multi_agent" => Ok(ComparisonVariation::MultiAgent),
+        "custom" => Ok(ComparisonVariation::Custom {
+            overrides: custom_overrides,
+        }),
+        other => Err(format!("Unknown variation_type: {}", other)),
     }
-}
-
-/// Check if all entries in a comparison are done (completed or failed).
-pub fn all_entries_done(entries: &[ComparisonEntry]) -> bool {
-    entries.iter().all(|e| {
-        e.status == ComparisonEntryStatus::Completed || e.status == ComparisonEntryStatus::Failed
-    })
-}
-
-/// Build a comparison summary for the AI comparison prompt.
-pub fn build_entry_summaries(entries: &[ComparisonEntry]) -> Vec<(String, String, String)> {
-    Vec::new()
 }
 
 // =============================================================================
@@ -1279,5 +1374,185 @@ mod tests {
         let (adjusted, reason) = axis_adjusted_confidence(0.99, AxisDriftClass::Unknown);
         assert!(adjusted < AUTO_CANARY_CONFIDENCE_THRESHOLD);
         assert!(reason.is_some());
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 4 — one grammar, one derivation path
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parse_variation_accepts_every_wire_token_both_call_sites_use() {
+        assert_eq!(
+            parse_variation("architecture", vec![]).unwrap(),
+            ComparisonVariation::Architecture
+        );
+        assert_eq!(
+            parse_variation("same", vec![]).unwrap(),
+            ComparisonVariation::Same
+        );
+        assert_eq!(
+            parse_variation("multi_agent", vec![]).unwrap(),
+            ComparisonVariation::MultiAgent
+        );
+        assert_eq!(
+            parse_variation("custom", vec![json!({"model": "opus"})]).unwrap(),
+            ComparisonVariation::Custom {
+                overrides: vec![json!({"model": "opus"})]
+            }
+        );
+        // Case/whitespace tolerated identically for both callers.
+        assert_eq!(
+            parse_variation("  ARCHITECTURE ", vec![]).unwrap(),
+            ComparisonVariation::Architecture
+        );
+        // Unknown is rejected with the same message everywhere.
+        let err = parse_variation("teleportation", vec![]).unwrap_err();
+        assert_eq!(err, "Unknown variation_type: teleportation");
+    }
+
+    /// The regression this phase exists for: `custom` used to be accepted over
+    /// HTTP and REJECTED by the Tauri command, for byte-identical input. Both
+    /// now resolve through this one function, so parity is structural.
+    #[test]
+    fn custom_is_no_longer_rejected_by_one_call_site_and_accepted_by_the_other() {
+        assert!(parse_variation("custom", vec![json!({"a": 1})]).is_ok());
+    }
+
+    #[test]
+    fn architecture_arms_are_the_three_the_http_route_always_built() {
+        let arms = build_comparison_arms(&ComparisonVariation::Architecture, 3, true);
+        let labels: Vec<&str> = arms.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Traditional",
+                "Agentic Verification",
+                "Multi-Agent Pipeline"
+            ]
+        );
+        let kinds: Vec<&str> = arms
+            .iter()
+            .map(|a| a.overrides["workflow_architecture"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "traditional",
+                "agentic_verification",
+                "multi_agent_pipeline"
+            ]
+        );
+        // ...and the declared axis is exactly the one that moved.
+        let overrides: Vec<serde_json::Value> = arms.iter().map(|a| a.overrides.clone()).collect();
+        assert_eq!(
+            computed_treatment_axes(&overrides),
+            vec!["workflow_architecture".to_string()]
+        );
+        assert_eq!(
+            classify_axis_drift("architecture", &overrides),
+            AxisDriftClass::None
+        );
+    }
+
+    #[test]
+    fn use_worktree_is_injected_identically_into_every_arm() {
+        for flag in [true, false] {
+            for variation in [
+                ComparisonVariation::Architecture,
+                ComparisonVariation::Same,
+                ComparisonVariation::MultiAgent,
+            ] {
+                let arms = build_comparison_arms(&variation, 3, flag);
+                assert!(!arms.is_empty());
+                for arm in &arms {
+                    assert_eq!(
+                        arm.overrides["use_worktree"],
+                        serde_json::Value::Bool(flag),
+                        "every arm carries the run-wide use_worktree"
+                    );
+                }
+                // Being identical across arms, it can never be a treatment axis.
+                let overrides: Vec<serde_json::Value> =
+                    arms.iter().map(|a| a.overrides.clone()).collect();
+                assert!(!computed_treatment_axes(&overrides).contains(&"use_worktree".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn label_is_a_sibling_of_the_overrides_not_a_key_inside_them() {
+        // The old builder buried `label` INSIDE the override JSON on three arms,
+        // which is what made it a spurious axis. It must not be there now.
+        for variation in [
+            ComparisonVariation::MultiAgent,
+            ComparisonVariation::Model {
+                models: vec!["opus".to_string(), "sonnet".to_string()],
+            },
+            ComparisonVariation::ContextTokens {
+                limits: vec![100_000, 200_000],
+            },
+            ComparisonVariation::Same,
+            ComparisonVariation::Architecture,
+        ] {
+            for arm in build_comparison_arms(&variation, 2, true) {
+                assert!(
+                    arm.overrides.get("label").is_none(),
+                    "label leaked into the overrides of arm {:?}",
+                    arm.label
+                );
+                assert!(!arm.label.is_empty(), "every arm needs a label");
+            }
+        }
+    }
+
+    #[test]
+    fn custom_arms_take_their_label_from_the_caller_or_fall_back_by_index() {
+        let arms = build_comparison_arms(
+            &ComparisonVariation::Custom {
+                overrides: vec![
+                    json!({"label": "baseline", "config_override": "a"}),
+                    json!({"config_override": "b"}),
+                ],
+            },
+            2,
+            true,
+        );
+        assert_eq!(arms[0].label, "baseline");
+        assert_eq!(arms[1].label, "Custom 2");
+        // The caller's own `label` stays inside its overrides on this path, which
+        // is exactly why the ignore-list is not optional.
+        assert_eq!(arms[0].overrides["label"], json!("baseline"));
+        let overrides: Vec<serde_json::Value> = arms.iter().map(|a| a.overrides.clone()).collect();
+        assert_eq!(
+            computed_treatment_axes(&overrides),
+            vec!["config_override".to_string()],
+            "label must not surface as an axis even when the caller embeds it"
+        );
+    }
+
+    #[test]
+    fn same_emits_run_count_identical_arms() {
+        let arms = build_comparison_arms(&ComparisonVariation::Same, 3, true);
+        assert_eq!(arms.len(), 3);
+        assert_eq!(arms[0].label, "Run 1");
+        assert_eq!(arms[2].label, "Run 3");
+        let overrides: Vec<serde_json::Value> = arms.iter().map(|a| a.overrides.clone()).collect();
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(computed_treatment_axes(&overrides), empty);
+        assert_eq!(
+            classify_axis_drift("same", &overrides),
+            AxisDriftClass::None
+        );
+    }
+
+    #[test]
+    fn build_run_overrides_is_the_label_free_projection_of_the_arms() {
+        let variation = ComparisonVariation::Model {
+            models: vec!["opus".to_string(), "sonnet".to_string()],
+        };
+        let arms = build_comparison_arms(&variation, 2, true);
+        let projected = build_run_overrides(&variation, 2);
+        let from_arms: Vec<serde_json::Value> = arms.into_iter().map(|a| a.overrides).collect();
+        assert_eq!(projected, from_arms);
     }
 }

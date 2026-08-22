@@ -20,54 +20,30 @@ pub async fn start_comparison(
     workflow_id: String,
     variation_type: String,
     use_worktree: Option<bool>,
+    // Only meaningful for `variation_type = "custom"`. Present so the desktop
+    // UI can express everything the HTTP route can.
+    custom_overrides: Option<Vec<serde_json::Value>>,
 ) -> Result<String, String> {
     let use_wt = use_worktree.unwrap_or(true);
+    let custom_overrides = custom_overrides.unwrap_or_default();
 
-    // Build entries based on variation type
-    let entries: Vec<ComparisonEntryJson> = match variation_type.as_str() {
-        "architecture" => vec![
-            ComparisonEntryJson {
-                label: "Traditional".to_string(),
-                overrides: serde_json::json!({
-                    "workflow_architecture": "traditional",
-                    "use_worktree": use_wt,
-                }),
-                task_run_id: None,
-                status: "pending".to_string(),
-                result: None,
-            },
-            ComparisonEntryJson {
-                label: "Agentic Verification".to_string(),
-                overrides: serde_json::json!({
-                    "workflow_architecture": "agentic_verification",
-                    "use_worktree": use_wt,
-                }),
-                task_run_id: None,
-                status: "pending".to_string(),
-                result: None,
-            },
-            ComparisonEntryJson {
-                label: "Multi-Agent Pipeline".to_string(),
-                overrides: serde_json::json!({
-                    "workflow_architecture": "multi_agent_pipeline",
-                    "use_worktree": use_wt,
-                }),
-                task_run_id: None,
-                status: "pending".to_string(),
-                result: None,
-            },
-        ],
-        "same" => (0..3)
-            .map(|i| ComparisonEntryJson {
-                label: format!("Run {}", i + 1),
-                overrides: serde_json::json!({ "use_worktree": use_wt }),
+    // Build entries from the TYPED variation — the same single derivation path
+    // the HTTP surface uses. This command used to carry its own string match
+    // that handled only "architecture" | "same" and rejected "custom", so the
+    // very same variation_type was accepted over HTTP and refused from the
+    // desktop UI. It now accepts exactly what the HTTP route accepts.
+    let variation = crate::comparison::parse_variation(&variation_type, custom_overrides)?;
+    let entries: Vec<ComparisonEntryJson> =
+        crate::comparison::build_comparison_arms(&variation, 3, use_wt)
+            .into_iter()
+            .map(|arm| ComparisonEntryJson {
+                label: arm.label,
+                overrides: arm.overrides,
                 task_run_id: None,
                 status: "pending".to_string(),
                 result: None,
             })
-            .collect(),
-        other => return Err(format!("Unknown variation_type: {}", other)),
-    };
+            .collect();
 
     let comparison_id = format!("cmp-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();

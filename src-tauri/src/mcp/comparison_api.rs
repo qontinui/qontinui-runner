@@ -118,89 +118,28 @@ pub async fn start_comparison(
         }
     };
 
-    // Build entries based on variation type
-    let entries: Vec<ComparisonEntryJson> = match req.variation_type.as_str() {
-        "architecture" => vec![
-            ComparisonEntryJson {
-                label: "Traditional".to_string(),
-                overrides: serde_json::json!({
-                    "workflow_architecture": "traditional",
-                    "use_worktree": req.use_worktree,
-                }),
-                task_run_id: None,
-                status: "pending".to_string(),
-                result: None,
-            },
-            ComparisonEntryJson {
-                label: "Agentic Verification".to_string(),
-                overrides: serde_json::json!({
-                    "workflow_architecture": "agentic_verification",
-                    "use_worktree": req.use_worktree,
-                }),
-                task_run_id: None,
-                status: "pending".to_string(),
-                result: None,
-            },
-            ComparisonEntryJson {
-                label: "Multi-Agent Pipeline".to_string(),
-                overrides: serde_json::json!({
-                    "workflow_architecture": "multi_agent_pipeline",
-                    "use_worktree": req.use_worktree,
-                }),
-                task_run_id: None,
-                status: "pending".to_string(),
-                result: None,
-            },
-        ],
-        "same" => {
-            // 3 identical runs to test repeatability
-            (0..3)
-                .map(|i| ComparisonEntryJson {
-                    label: format!("Run {}", i + 1),
-                    overrides: serde_json::json!({
-                        "use_worktree": req.use_worktree,
-                    }),
-                    task_run_id: None,
-                    status: "pending".to_string(),
-                    result: None,
-                })
-                .collect()
-        }
-        "custom" => req
-            .custom_overrides
-            .iter()
-            .enumerate()
-            .map(|(i, ov)| ComparisonEntryJson {
-                label: ov
-                    .get("label")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&format!("Custom {}", i + 1))
-                    .to_string(),
-                overrides: {
-                    let mut merged = ov.clone();
-                    if let Some(obj) = merged.as_object_mut() {
-                        obj.insert(
-                            "use_worktree".to_string(),
-                            serde_json::Value::Bool(req.use_worktree),
-                        );
-                    }
-                    merged
-                },
+    // Build entries from the TYPED variation — the single derivation path in
+    // `crate::comparison`. This route used to hand-roll a string match here, and
+    // `commands::comparison` hand-rolled a second, narrower one; both are gone.
+    let variation =
+        match crate::comparison::parse_variation(&req.variation_type, req.custom_overrides.clone())
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Err((StatusCode::BAD_REQUEST, Json(api_error(e))));
+            }
+        };
+    let entries: Vec<ComparisonEntryJson> =
+        crate::comparison::build_comparison_arms(&variation, 3, req.use_worktree)
+            .into_iter()
+            .map(|arm| ComparisonEntryJson {
+                label: arm.label,
+                overrides: arm.overrides,
                 task_run_id: None,
                 status: "pending".to_string(),
                 result: None,
             })
-            .collect(),
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(api_error(format!(
-                    "Unknown variation_type: {}",
-                    req.variation_type
-                ))),
-            ));
-        }
-    };
+            .collect();
 
     let comparison_id = format!("cmp-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
