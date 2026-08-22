@@ -30,7 +30,10 @@ import { useCallback, useEffect, useState } from "react";
 import { AlertCircle, CheckCircle2, Loader2, Rocket, X } from "lucide-react";
 import { spawnFromPlan, type SpawnAgentResult } from "./coordinatorApi";
 import { useCoordMode, type CoordGating } from "@/contexts/CoordModeContext";
-import { CoordConnectionRequired } from "@/components/shared/CoordConnectionRequired";
+import {
+  CoordConnectionRequired,
+  type CoordConnectionRequiredProps,
+} from "@/components/shared/CoordConnectionRequired";
 
 export interface SpawnFromPlanModalProps {
   /** Whether the modal is open. */
@@ -97,6 +100,36 @@ export function deriveSpawnFormState(input: SpawnFormInput): {
     input.initialPrompt.trim().length > 0 &&
     (input.selectedRepos.length > 0 || input.otherRepos.trim().length > 0);
   return { coordDisabled, fieldsEnabled, canSubmit };
+}
+
+/** Operator-facing name of this surface. */
+export const SPAWN_SURFACE = "Spawn from Plan";
+
+/**
+ * Props for the isolated-mode notice rendered INSIDE the modal.
+ *
+ * Split out as a pure function purely so the dismiss wiring is testable
+ * under `environment: "node"` (no jsdom, so the notice's button cannot be
+ * clicked). `onDismiss` MUST be the modal's own close handler: the modal is
+ * a `fixed inset-0` overlay with `aria-modal="true"`, so if the notice's
+ * "Open Settings → Account" action navigated without closing it, the tab
+ * switch would happen BEHIND an opaque overlay and the operator would see
+ * nothing happen — the exact failure this notice exists to remove.
+ *
+ * That can genuinely be reached: the gate fails open, so if the mode is
+ * still `unknown` at mount the button that opens this modal is enabled; the
+ * mode can then resolve `isolated` while the modal is on screen.
+ */
+export function spawnNoticeProps(
+  source: string | null,
+  onClose: () => void,
+): CoordConnectionRequiredProps {
+  return {
+    source,
+    surface: SPAWN_SURFACE,
+    onDismiss: onClose,
+    uiBridgeId: "productivity.spawn-from-plan-modal-isolated",
+  };
 }
 
 export function SpawnFromPlanModal({
@@ -248,13 +281,7 @@ export function SpawnFromPlanModal({
               The notice sits ahead of the fields in the reading order
               because the fields it explains are `disabled` and therefore
               unreachable by keyboard and screen reader. */}
-          {coordDisabled ? (
-            <CoordConnectionRequired
-              source={coord.source}
-              surface="Spawn from Plan"
-              uiBridgeId="productivity.spawn-from-plan-modal-isolated"
-            />
-          ) : null}
+          {coordDisabled ? <CoordConnectionRequired {...spawnNoticeProps(coord.source, onClose)} /> : null}
 
           <label className="block">
             <span className="block text-xs font-medium text-foreground mb-1">Work unit slug</span>

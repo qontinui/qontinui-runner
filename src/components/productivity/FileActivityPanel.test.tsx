@@ -539,25 +539,22 @@ describe("fetchLockInfo — Phase 4 lock-info endpoint wrapper", () => {
  */
 describe("deriveLiveHeatmapGate — coord-mode gating (§6.4)", () => {
   const connected = deriveCoordGating({
-    data: { mode: "connected", base: "https://coord.qontinui.io", source: "profile" },
-    error: null,
-    loading: false,
+    mode: "connected",
+    base: "https://coord.qontinui.io",
+    source: "profile",
   });
   const isolated = deriveCoordGating({
-    data: { mode: "isolated", base: null, source: COORD_SOURCE_NO_ACCOUNT },
-    error: null,
-    loading: false,
+    mode: "isolated",
+    base: null,
+    source: COORD_SOURCE_NO_ACCOUNT,
   });
   const isolatedUnreadable = deriveCoordGating({
-    data: { mode: "isolated", base: null, source: COORD_SOURCE_SETTINGS_UNREADABLE },
-    error: null,
-    loading: false,
+    mode: "isolated",
+    base: null,
+    source: COORD_SOURCE_SETTINGS_UNREADABLE,
   });
-  const unknown = deriveCoordGating({
-    data: null,
-    error: "Command get_coord_mode not found",
-    loading: false,
-  });
+  // `null` = the invoke rejected, or the first load is still in flight.
+  const unknown = deriveCoordGating(null);
 
   it("connected → heatmap section live and polling", () => {
     expect(deriveLiveHeatmapGate({ testSeam: false, gating: connected })).toEqual({

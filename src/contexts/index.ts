@@ -77,7 +77,6 @@ export type {
   CoordMode,
   CoordModeName,
   CoordAvailability,
-  CoordModeSnapshot,
   CoordGating,
   CoordModeContextValue,
 } from "./CoordModeContext";

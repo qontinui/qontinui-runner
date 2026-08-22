@@ -19,7 +19,11 @@
  *     honest about why the feature is inert.
  *
  * ONE component, not per-panel ad-hoc copy: two runners disagreeing about
- * why the same thing is off is its own predictability failure.
+ * why the same thing is off is its own predictability failure. That applies
+ * to TOOLTIPS too — `coordDisabledCopy` owns the `tooltip` string, and every
+ * disabled control reads it from here rather than hard-coding one. A
+ * hard-coded "connect an account" tooltip beside a body that says "this is
+ * NOT a missing account" puts two contradictory diagnoses on one screen.
  *
  * Two distinct reasons, because they are two distinct problems with two
  * distinct fixes — see `coordDisabledCopy`.
@@ -41,6 +45,12 @@ export interface CoordDisabledCopy {
   /** What is actually wrong and what the operator should do about it. */
   body: string;
   /**
+   * One-line `title=` for the surface's own disabled controls. Derived from
+   * the SAME `source` as {@link CoordDisabledCopy.body} so a tooltip can
+   * never contradict the notice beside it.
+   */
+  tooltip: string;
+  /**
    * Label of the in-app action, or `null` when the fix is not in the app.
    * A settings.json repair happens on disk; offering a button that cannot
    * perform it would be the same dishonesty this component exists to end.
@@ -49,6 +59,32 @@ export interface CoordDisabledCopy {
   /** Runner tab id the action button activates. `null` when no action. */
   actionTab: string | null;
 }
+
+/** Shape options for {@link coordDisabledCopy}. */
+export interface CoordDisabledCopyOptions {
+  /**
+   * Whether the disabled surface actually has controls the operator could
+   * have clicked. Default `true`. A read-only section (the File Activity
+   * live heatmap) has none, and telling its reader there is "nothing for
+   * these controls to act on" names controls that do not exist.
+   */
+  hasControls?: boolean;
+}
+
+/**
+ * Where the runner's `settings.json` lives, phrased so it stays true on a
+ * supervisor-spawned secondary instance.
+ *
+ * `settings::get_config_dir()` honours a `QONTINUI_CONFIG_DIR` override, so
+ * naming `com.qontinui.runner/settings.json` unconditionally would point a
+ * secondary runner's operator at the wrong file. The frontend has no
+ * resolved path to show — surfacing the real one needs a backend command,
+ * and this PR touches no Rust — so the wording names both possibilities
+ * instead of asserting one.
+ */
+const SETTINGS_PATH_HINT =
+  "its settings.json (under com.qontinui.runner/ in your OS config directory, " +
+  "or wherever QONTINUI_CONFIG_DIR points if this instance sets it)";
 
 /**
  * Map a `CoordMode.source` onto operator-facing copy.
@@ -64,32 +100,82 @@ export interface CoordDisabledCopy {
  * Pure, so it is testable under the runner's `environment: "node"` vitest
  * config (no jsdom — see FleetHealthPanel.test.tsx for the same constraint).
  */
-export function coordDisabledCopy(source: string | null, surface: string): CoordDisabledCopy {
+export function coordDisabledCopy(
+  source: string | null,
+  surface: string,
+  options: CoordDisabledCopyOptions = {},
+): CoordDisabledCopy {
+  const hasControls = options.hasControls ?? true;
+
   if (source === COORD_SOURCE_SETTINGS_UNREADABLE) {
     return {
       reason: "settings-unreadable",
       title: `${surface} is off — this runner could not read its settings.json`,
       body:
         `${surface} needs a connected qontinui account, and this runner cannot tell whether it ` +
-        "has one: its settings.json could not be read or parsed, so its tier is unknown and it " +
-        "refused to assume fleet membership. This is NOT a missing account — connecting one " +
-        "will not fix it. Repair or restore com.qontinui.runner/settings.json in your OS " +
-        "config directory, then restart the runner.",
+        `has one: ${SETTINGS_PATH_HINT} could not be read or parsed, so its tier is unknown and ` +
+        "it refused to assume fleet membership. This is NOT a missing account — connecting one " +
+        "will not fix it. Repair or restore that file, then restart the runner.",
+      tooltip:
+        "Disabled — this runner could not read its settings.json, so its tier is unknown. " +
+        "Repair that file and restart; connecting an account will not fix it.",
       actionLabel: null,
       actionTab: null,
     };
   }
+
+  const nothingToActOn = hasControls
+    ? `and nothing for these controls to act on`
+    : `and nothing for it to show`;
+
   return {
     reason: "no-account",
     title: `${surface} needs a connected qontinui account`,
     body:
       `This runner is in isolated mode — no qontinui account is connected, so there is no ` +
-      `fleet behind ${surface.toLowerCase()} and nothing for these controls to act on. Connect ` +
-      "an account under Settings → Account (or point COORD_HTTP_URL at a coordinator) and this " +
-      "surface enables itself; nothing else about the runner changes.",
+      `fleet behind ${surface.toLowerCase()} ${nothingToActOn}. Connect an account under ` +
+      "Settings → Account (or point COORD_HTTP_URL at a coordinator) and this surface enables " +
+      "itself; nothing else about the runner changes.",
+    tooltip:
+      "Disabled — no qontinui account is connected. Connect one under Settings → Account to " +
+      "enable this.",
     actionLabel: "Open Settings → Account",
     actionTab: "settings-account",
   };
+}
+
+/**
+ * Fire the notice's in-app action.
+ *
+ * `onDismiss` runs FIRST and unconditionally. The action navigates the
+ * runner to another tab, and a host that is an overlay — `SpawnFromPlanModal`
+ * is `fixed inset-0` with `aria-modal="true"` — would otherwise keep covering
+ * the tab it just switched to, so the operator sees nothing happen. That is
+ * precisely the failure this component exists to remove, so the dismiss is
+ * part of the action rather than an optional extra.
+ *
+ * `dispatch` is injected so the ordering contract is testable under
+ * `environment: "node"` (no jsdom, so the button cannot be clicked).
+ */
+export function runCoordDisabledAction(args: {
+  copy: CoordDisabledCopy;
+  onDismiss?: () => void;
+  dispatch: (tab: string) => void;
+}): void {
+  const { copy, onDismiss, dispatch } = args;
+  if (!copy.actionTab) return;
+  onDismiss?.();
+  dispatch(copy.actionTab);
+}
+
+/** Default `dispatch` — the same window event `Settings.tsx` fires for its
+ *  own sub-tab switches; `useAppNavigation` resolves it against the
+ *  `MainTabId` union. Avoids threading a navigate callback through every
+ *  gated panel. */
+function dispatchSetTab(tab: string): void {
+  window.dispatchEvent(
+    new CustomEvent<{ tab: string }>("ui-bridge-set-tab", { detail: { tab } }),
+  );
 }
 
 export interface CoordConnectionRequiredProps {
@@ -101,6 +187,14 @@ export interface CoordConnectionRequiredProps {
    * which panel the notice belongs to when several are stacked.
    */
   surface: string;
+  /** See {@link CoordDisabledCopyOptions.hasControls}. */
+  hasControls?: boolean;
+  /**
+   * Run immediately before the action navigates away. A host that covers the
+   * screen (a modal) MUST pass its close handler, or the navigation lands
+   * behind it. See {@link runCoordDisabledAction}.
+   */
+  onDismiss?: () => void;
   /** UI Bridge id for the notice block. */
   uiBridgeId?: string;
   className?: string;
@@ -119,11 +213,13 @@ export interface CoordConnectionRequiredProps {
 export function CoordConnectionRequired({
   source,
   surface,
+  hasControls,
+  onDismiss,
   uiBridgeId = "coord.connection-required",
   className,
 }: CoordConnectionRequiredProps) {
   const titleId = useId();
-  const copy = coordDisabledCopy(source, surface);
+  const copy = coordDisabledCopy(source, surface, { hasControls });
   const Icon = copy.reason === "settings-unreadable" ? FileWarning : PlugZap;
 
   return (
@@ -147,17 +243,7 @@ export function CoordConnectionRequired({
         <div>
           <button
             type="button"
-            onClick={() => {
-              // Same window event Settings.tsx fires for its own sub-tab
-              // switches; `useAppNavigation` resolves it against the
-              // MainTabId union. Avoids threading a navigate callback
-              // through every gated panel.
-              window.dispatchEvent(
-                new CustomEvent<{ tab: string }>("ui-bridge-set-tab", {
-                  detail: { tab: copy.actionTab as string },
-                }),
-              );
-            }}
+            onClick={() => runCoordDisabledAction({ copy, onDismiss, dispatch: dispatchSetTab })}
             data-ui-bridge-id={`${uiBridgeId}-action`}
             className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/20 px-2 py-1 text-xs text-foreground hover:bg-muted/40"
           >

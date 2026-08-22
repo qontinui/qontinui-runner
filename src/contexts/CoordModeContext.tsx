@@ -43,10 +43,12 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { createLogger } from "@/lib/logger";
 
@@ -89,6 +91,13 @@ export interface CoordMode {
 export const COORD_SOURCE_NO_ACCOUNT = "dev_localhost_fallback";
 export const COORD_SOURCE_SETTINGS_UNREADABLE = "unknown_tier_prod_default";
 
+/**
+ * Tauri event emitted when the browser loopback callback applies new web
+ * integration settings — i.e. a Cognito sign-in completed. Mirrors
+ * `WEB_INTEGRATION_CHANGED_EVENT` in `commands/web_integration.rs`.
+ */
+const WEB_INTEGRATION_CHANGED_EVENT = "web-integration-changed";
+
 // ---------------------------------------------------------------------------
 // Fetch-once singleton
 // ---------------------------------------------------------------------------
@@ -99,18 +108,26 @@ let inFlight: Promise<CoordMode> | null = null;
  * Invoke `get_coord_mode` at most once per app lifetime and share the result
  * with every caller.
  *
- * The mode is config-derived and cannot change without a restart or an
- * explicit account action, so N consumers must NOT mean N invokes. On
- * rejection the cache is cleared so an explicit `refresh()` can retry — a
- * cached rejection would pin the app in `unknown` for the rest of the
- * session even after the operator fixed the cause.
+ * The mode is config-derived, so N consumers must NOT mean N invokes. On
+ * rejection the cache is cleared so a retry is possible — a cached rejection
+ * would pin the app in `unknown` for the rest of the session even after the
+ * operator fixed the cause.
+ *
+ * The rejection handler clears the slot **only if it still owns it**. Without
+ * that ownership check a slow first call that is superseded by
+ * {@link resetCoordModeCache} (which the refresh path uses) would, on
+ * rejecting later, null out the slot holding its own SUCCESSOR — breaking
+ * at-most-once and letting a third invoke start.
  */
 export function fetchCoordModeOnce(): Promise<CoordMode> {
   if (!inFlight) {
-    inFlight = invoke<CoordMode>("get_coord_mode").catch((err: unknown) => {
-      inFlight = null;
+    const p: Promise<CoordMode> = invoke<CoordMode>("get_coord_mode").catch((err: unknown) => {
+      if (inFlight === p) {
+        inFlight = null;
+      }
       throw err;
     });
+    inFlight = p;
   }
   return inFlight;
 }
@@ -133,19 +150,12 @@ export function resetCoordModeCache(): void {
  */
 export type CoordAvailability = CoordModeName | "unknown";
 
-/** Raw provider state, split out so the derivations below stay pure. */
-export interface CoordModeSnapshot {
-  data: CoordMode | null;
-  error: string | null;
-  loading: boolean;
-}
-
-/** Map a raw snapshot onto the availability the UI branches on. */
-export function deriveCoordAvailability(snapshot: CoordModeSnapshot): CoordAvailability {
-  if (snapshot.data) {
-    return snapshot.data.mode;
-  }
-  return "unknown";
+/**
+ * Map a resolved mode (or its absence) onto the availability the UI branches
+ * on. `null` — not yet loaded, or the invoke rejected — is `unknown`.
+ */
+export function deriveCoordAvailability(data: CoordMode | null): CoordAvailability {
+  return data ? data.mode : "unknown";
 }
 
 /** The gate a coord-backed surface reads. */
@@ -162,15 +172,15 @@ export interface CoordGating {
   source: string | null;
 }
 
-/** Derive the gate from a raw snapshot. Pure. */
-export function deriveCoordGating(snapshot: CoordModeSnapshot): CoordGating {
-  const availability = deriveCoordAvailability(snapshot);
+/** Derive the gate from the resolved mode (or its absence). Pure. */
+export function deriveCoordGating(data: CoordMode | null): CoordGating {
+  const availability = deriveCoordAvailability(data);
   const isolated = availability === "isolated";
   return {
     enabled: !isolated,
     isolated,
     availability,
-    source: snapshot.data?.source ?? null,
+    source: data?.source ?? null,
   };
 }
 
@@ -210,14 +220,24 @@ export function CoordModeProvider({ children }: { children: ReactNode }) {
   const [data, setData] = useState<CoordMode | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  /**
+   * Monotonic generation. A `load()` only writes state if it is still the
+   * NEWEST load — otherwise a slow in-flight call that rejects after a
+   * successful refresh would discard the refresh's result and put the app
+   * back into `unknown`.
+   */
+  const generation = useRef(0);
 
   const load = useCallback(async (force: boolean) => {
     if (force) {
       resetCoordModeCache();
     }
+    generation.current += 1;
+    const mine = generation.current;
     setLoading(true);
     try {
       const fresh = await fetchCoordModeOnce();
+      if (mine !== generation.current) return;
       setData(fresh);
       setError(null);
     } catch (err) {
@@ -225,11 +245,14 @@ export function CoordModeProvider({ children }: { children: ReactNode }) {
       // backend half of §6.4. That is UNKNOWN, not isolated — the gate
       // stays open and the surfaces keep working exactly as before.
       const msg = err instanceof Error ? err.message : String(err);
+      if (mine !== generation.current) return;
       setData(null);
       setError(msg);
       logger.debug("get_coord_mode unavailable; coord surfaces stay enabled", { msg });
     } finally {
-      setLoading(false);
+      if (mine === generation.current) {
+        setLoading(false);
+      }
     }
   }, []);
 
@@ -242,8 +265,59 @@ export function CoordModeProvider({ children }: { children: ReactNode }) {
     await load(true);
   }, [load]);
 
+  /**
+   * Re-resolve the mode whenever the runner's account binding changes.
+   *
+   * Without this the isolated notice's own promise — "connect an account and
+   * this surface enables itself" — would be a lie: the mode is cached for the
+   * app's lifetime, so an operator who signed in from Settings → Account came
+   * back to panels still disabled and still blaming a missing account. The
+   * BACKEND would answer `connected` on the very next call (`coord_base_policy`
+   * re-reads settings.json every time); only this cache held it stale.
+   *
+   * Two signals, because the two sign-in paths announce differently:
+   *
+   *  - `runner-tier-changed` (window event) is the fleet-wide "the tier or the
+   *    account binding just moved" nudge, dispatched by `LoginScreen`,
+   *    `AccountSettings` (Cognito sign-in AND sign-out), `WebIntegrationSettings`,
+   *    `TierStep` and `GithubRepoPicker`.
+   *  - `web-integration-changed` (Tauri event, `WEB_INTEGRATION_CHANGED_EVENT`
+   *    in `commands/web_integration.rs`) fires from the browser loopback
+   *    callback. `AccountSettings` re-fires it as `runner-tier-changed`, but
+   *    only while that panel is mounted — subscribing here directly means the
+   *    refresh happens wherever the operator is standing.
+   *
+   * Sign-OUT is covered by the same listener, so a runner that drops to
+   * isolated starts telling the truth immediately too.
+   */
+  useEffect(() => {
+    const onTierChanged = () => {
+      void refresh();
+    };
+    window.addEventListener("runner-tier-changed", onTierChanged);
+
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    // Tauri may be absent (tests, a plain browser preview) — tolerate it.
+    listen(WEB_INTEGRATION_CHANGED_EVENT, onTierChanged)
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+          return;
+        }
+        unlisten = fn;
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("runner-tier-changed", onTierChanged);
+      unlisten?.();
+    };
+  }, [refresh]);
+
   const value = useMemo<CoordModeContextValue>(() => {
-    const gating = deriveCoordGating({ data, error, loading });
+    const gating = deriveCoordGating(data);
     return {
       ...gating,
       base: data?.base ?? null,

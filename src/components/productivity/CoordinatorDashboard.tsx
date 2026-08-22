@@ -59,7 +59,10 @@ import {
 } from "./reviewsApi";
 import { acknowledgeAdvisory } from "./reflectionApi";
 import { useCoordMode, type CoordGating } from "@/contexts/CoordModeContext";
-import { CoordConnectionRequired } from "@/components/shared/CoordConnectionRequired";
+import {
+  CoordConnectionRequired,
+  coordDisabledCopy,
+} from "@/components/shared/CoordConnectionRequired";
 import { PlanRecommendations } from "./PlanRecommendations";
 import { BlindSpotsPanel } from "./BlindSpotsPanel";
 import { WorkersPanel } from "./WorkersPanel";
@@ -68,6 +71,12 @@ import { FleetHealthPanel } from "./FleetHealthPanel";
 import { SpawnFromPlanModal } from "./SpawnFromPlanModal";
 
 const DECISION_LOG_LIMIT = 200;
+
+/** Operator-facing names of the two coord-backed surfaces on this page.
+ *  Shared by each notice and its sibling disabled control's tooltip so the
+ *  two can never state different reasons — see `coordDisabledCopy`. */
+const OVERLAP_SURFACE = "Overlapping intents";
+const SPAWN_SURFACE = "Spawn from Plan";
 
 /** Static action filter list — keeps the dropdown stable even if the
  *  feed is empty. Matches the `CoordinatorActionName` union. */
@@ -1015,6 +1024,11 @@ interface OverlapPanelProps {
 
 function OverlapPanel({ rows, loading, error, onRefresh, coord }: OverlapPanelProps) {
   const disabled = coord.isolated;
+  // Same `source` as the notice below — a hard-coded "connect an account"
+  // tooltip would contradict the settings-unreadable body 8px away.
+  const disabledTooltip = disabled
+    ? coordDisabledCopy(coord.source, OVERLAP_SURFACE).tooltip
+    : undefined;
   return (
     <section
       role="region"
@@ -1037,7 +1051,7 @@ function OverlapPanel({ rows, loading, error, onRefresh, coord }: OverlapPanelPr
           type="button"
           onClick={onRefresh}
           disabled={loading || disabled}
-          title={disabled ? "Disabled — no qontinui account is connected" : undefined}
+          title={disabled ? disabledTooltip : undefined}
           data-ui-bridge-id="productivity.coord-overlapping-intents-refresh"
           className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 disabled:opacity-50"
         >
@@ -1049,7 +1063,7 @@ function OverlapPanel({ rows, loading, error, onRefresh, coord }: OverlapPanelPr
       {disabled ? (
         <CoordConnectionRequired
           source={coord.source}
-          surface="Overlapping intents"
+          surface={OVERLAP_SURFACE}
           uiBridgeId="productivity.coord-overlapping-intents-isolated"
         />
       ) : error ? (
@@ -1576,6 +1590,12 @@ export function CoordinatorDashboard() {
   const primaryBtnClass = `${baseBtnClass} bg-primary text-primary-foreground hover:bg-primary/90`;
   const outlineBtnClass = `${baseBtnClass} border border-border text-foreground hover:bg-muted/30`;
 
+  // Read from the same `coordDisabledCopy` as the notice rendered under the
+  // button row, so the tooltip and the notice always name the same problem.
+  const spawnDisabledTooltip = coord.isolated
+    ? coordDisabledCopy(coord.source, SPAWN_SURFACE).tooltip
+    : undefined;
+
   return (
     <div className="h-full overflow-auto bg-background" data-page-id="productivity-coordinator">
       <div className="flex flex-col gap-4 p-4 max-w-5xl mx-auto">
@@ -1634,11 +1654,7 @@ export function CoordinatorDashboard() {
               className={outlineBtnClass}
               onClick={() => setSpawnFromPlanOpen(true)}
               disabled={coord.isolated}
-              title={
-                coord.isolated
-                  ? "Spawning an agent posts to coord — connect a qontinui account to enable"
-                  : undefined
-              }
+              title={spawnDisabledTooltip}
               data-ui-bridge-id="productivity.spawn-from-plan"
             >
               <Rocket className="w-3 h-3" />
@@ -1657,7 +1673,7 @@ export function CoordinatorDashboard() {
         {coord.isolated ? (
           <CoordConnectionRequired
             source={coord.source}
-            surface="Spawn from Plan"
+            surface={SPAWN_SURFACE}
             uiBridgeId="productivity.spawn-from-plan-isolated"
           />
         ) : null}

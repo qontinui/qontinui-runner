@@ -622,6 +622,9 @@ export function FileActivityPanel({
             <CoordConnectionRequired
               source={coord.source}
               surface="Live worktree heatmap"
+              // Read-only section: it renders a list and owns no controls,
+              // so the copy must not refer to any.
+              hasControls={false}
               uiBridgeId="productivity.file-activity-live-heatmap-isolated"
             />
           ) : (
