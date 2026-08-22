@@ -494,6 +494,7 @@ coord.memory_jobs
 coord.memory_links
 coord.memory_observations
 coord.memory_records
+coord.memory_records_seq_seq
 coord.merge_batches
 coord.merge_bypass_audit
 coord.merge_decisions
@@ -505,6 +506,8 @@ coord.migration_observations
 coord.migration_observations_id_seq
 coord.migration_reservations
 coord.migration_revisions
+coord.notification_reads
+coord.notifications
 coord.onboarding_connect_states
 coord.operator_audit
 coord.operator_membership_sync
@@ -538,6 +541,7 @@ coord.prompt_documents
 coord.prompt_injection_events
 coord.release_observations
 coord.release_observations_id_seq
+coord.replica_presence
 coord.repo_branches
 coord.restack_cascades
 coord.restack_log

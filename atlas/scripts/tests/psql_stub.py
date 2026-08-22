@@ -41,6 +41,7 @@ RELATIONS = {
     "project": [
         "alembic_version",
         "apps",
+        "coordinator_shadow_decisions",
         "proposal_events",
         "regression_assertion_executions",
         "regression_diagnoses",
@@ -51,7 +52,6 @@ RELATIONS = {
     ],
     "coord": [
         "agents",
-        "coordinator_shadow_decisions",
         "gates",
     ],
     "orchestration": [
