@@ -97,6 +97,24 @@ pub struct PastSession {
     /// Whether this id is `--resume`-able NOW (`confirmed` AND
     /// `transcript_exists`) — re-computed from disk.
     pub restorable: bool,
+    /// The RENDERED restore verdict for this row — see
+    /// [`crate::session::session_lifecycle_store::describe_restore_status`].
+    /// `"resumed"` | `"terminal-only"` | `"failed"` |
+    /// `"pending (not yet confirmed)"` | `"not-restored"`.
+    ///
+    /// Projected here rather than left to the reader because the raw
+    /// `restore_tier` is deliberately PESSIMISTIC: `mark_restore_pending`
+    /// stamps `failed` the instant a resume is attempted, so any consumer
+    /// reading the tier directly reports a terminal failure for a restore that
+    /// is merely still in flight. `restore-health` already projects the same
+    /// verdict from the same helper; this row carried neither field, so the
+    /// previous-sessions panel could not tell an unfinished restore from a
+    /// failed one at all.
+    ///
+    /// Snapshot-sourced rows carry no restore evidence (the snapshot schema has
+    /// no tier/pending fields), so they render `"not-restored"` — "no restore
+    /// was ever recorded", which is exactly what is known about them.
+    pub restore_status: String,
     /// Synthetic id grouping sessions that share a dense `last_seen_at` band
     /// (single-linkage at [`COHORT_GAP_MS`]); the band's earliest timestamp.
     pub cohort_id: i64,
@@ -213,6 +231,8 @@ fn build_enriched(
     confirmed_at: Option<i64>,
     confirmed: bool,
     title: Option<String>,
+    restore_tier: Option<&str>,
+    restore_pending_at: Option<i64>,
 ) -> PastSession {
     let transcript_path = resolve_transcript_path(
         config_dir.as_deref(),
@@ -252,6 +272,10 @@ fn build_enriched(
         confirmed,
         transcript_exists,
         restorable,
+        restore_status: crate::session::session_lifecycle_store::describe_restore_status(
+            restore_tier,
+            restore_pending_at,
+        ),
         cohort_id: 0,
     }
 }
@@ -274,6 +298,8 @@ fn past_from_record(rec: &TerminalSessionRecord) -> PastSession {
         rec.confirmed_at,
         confirmed,
         rec.title.clone(),
+        rec.restore_tier.as_deref(),
+        rec.restore_pending_at,
     )
 }
 
@@ -294,6 +320,10 @@ fn past_from_snapshot(s: &SnapshotSession) -> PastSession {
         None, // no confirmed_at on the snapshot (only the derived bool below)
         s.confirmed,
         s.title.clone(),
+        // The snapshot schema carries no restore evidence — "not-restored",
+        // never a guessed tier.
+        None,
+        None,
     )
 }
 
@@ -416,6 +446,8 @@ mod tests {
             None,
             false,
             Some("Fix build".to_string()),
+            None,
+            None,
         );
         assert_eq!(ps.resume_command, "clh --resume sess-1");
         assert_eq!(ps.account.label, "hotmail");
@@ -423,6 +455,46 @@ mod tests {
         assert!(!ps.transcript_exists);
         assert!(!ps.restorable);
         assert_eq!(ps.resume_name, "Fix build");
+    }
+
+    /// The raw `restore_tier` is stamped `failed` the moment a resume is
+    /// ATTEMPTED, so a row rendering the tier verbatim tells the operator a
+    /// restore failed while it is still in flight. The projected verdict is the
+    /// honest one, and it is what the previous-sessions panel renders.
+    #[test]
+    fn restore_status_projects_the_pending_verdict_not_the_pessimistic_tier() {
+        use crate::session::session_lifecycle_store::RESTORE_TIER_FAILED;
+        let enriched = |tier: Option<&str>, pending: Option<i64>| {
+            build_enriched(
+                "sess-1".to_string(),
+                None,
+                None,
+                "default".to_string(),
+                0,
+                "open".to_string(),
+                None,
+                None,
+                "claude".to_string(),
+                1_000,
+                1_000,
+                None,
+                None,
+                false,
+                None,
+                tier,
+                pending,
+            )
+            .restore_status
+        };
+        // Attempt recorded, landing unproven — NOT a failure verdict.
+        assert_eq!(
+            enriched(Some(RESTORE_TIER_FAILED), Some(1_700_000_000_000)),
+            "pending (not yet confirmed)"
+        );
+        // Marker cleared without an upgrade — the attempt really is over.
+        assert_eq!(enriched(Some(RESTORE_TIER_FAILED), None), "failed");
+        // Never restored is not a failed restore.
+        assert_eq!(enriched(None, None), "not-restored");
     }
 
     #[test]
@@ -450,6 +522,7 @@ mod tests {
             confirmed: true,
             transcript_exists: true,
             restorable: true,
+            restore_status: "not-restored".to_string(),
             cohort_id: 0,
         };
         // Two tight bands separated by a > 5 min gap.

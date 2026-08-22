@@ -129,6 +129,62 @@ pub fn pg_available() -> bool {
     PG_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The PostgreSQL condition name for a SQLSTATE, or `None` when the code is one
+/// this table does not know.
+///
+/// The five characters of a SQLSTATE are searchable but not READABLE: an
+/// operator scanning the Coordinator panel sees `[42703]` and has to go look it
+/// up before knowing whether the runner hit a schema drift, a constraint
+/// violation, or a dead connection — which is the same "go read something else"
+/// step [`pg_err`] exists to remove.
+///
+/// Every string here is PostgreSQL's OWN condition name from its errcodes table
+/// (Appendix A), never a phrase invented for this codebase, so the gloss stays
+/// greppable against the upstream docs. An unknown code gets NO gloss rather
+/// than a guessed one — the raw code is still printed, and inventing a
+/// plausible-but-wrong name would be worse than the lookup it saves.
+///
+/// Exact codes first, then a CLASS fallback on the two-character prefix (also
+/// PostgreSQL's own class names), so a code outside the exact list still says
+/// what KIND of failure it was.
+fn sqlstate_gloss(code: &str) -> Option<&'static str> {
+    let exact = match code {
+        "42P01" => Some("undefined_table"),
+        "42703" => Some("undefined_column"),
+        "42883" => Some("undefined_function"),
+        "42P07" => Some("duplicate_table"),
+        "42701" => Some("duplicate_column"),
+        "42601" => Some("syntax_error"),
+        "42501" => Some("insufficient_privilege"),
+        "23502" => Some("not_null_violation"),
+        "23503" => Some("foreign_key_violation"),
+        "23505" => Some("unique_violation"),
+        "23514" => Some("check_violation"),
+        "22P02" => Some("invalid_text_representation"),
+        "3D000" => Some("invalid_catalog_name"),
+        "28P01" => Some("invalid_password"),
+        "40001" => Some("serialization_failure"),
+        "40P01" => Some("deadlock_detected"),
+        "53300" => Some("too_many_connections"),
+        "57014" => Some("query_canceled"),
+        "57P03" => Some("cannot_connect_now"),
+        _ => None,
+    };
+    exact.or_else(|| match code.get(..2) {
+        Some("08") => Some("connection_exception"),
+        Some("22") => Some("data_exception"),
+        Some("23") => Some("integrity_constraint_violation"),
+        Some("40") => Some("transaction_rollback"),
+        Some("42") => Some("syntax_error_or_access_rule_violation"),
+        Some("53") => Some("insufficient_resources"),
+        Some("54") => Some("program_limit_exceeded"),
+        Some("57") => Some("operator_intervention"),
+        Some("58") => Some("system_error"),
+        Some("XX") => Some("internal_error"),
+        _ => None,
+    })
+}
+
 /// Render a `tokio_postgres::Error` as something an operator can act on.
 ///
 /// THE DEFECT: `tokio_postgres::Error`'s `Display` prints the bare string
@@ -140,15 +196,20 @@ pub fn pg_available() -> bool {
 /// panel as the identical two words, and the operator's only next move was to
 /// go read the server log by hand.
 ///
-/// Output shape: `<ctx>: [42P01] relation "coord.tasks" does not exist
-/// (table=tasks) (hint: …)` — SQLSTATE first because it is the part that
-/// searches cleanly. A client-side error (connection closed, TLS, encode) has
+/// Output shape: `<ctx>: [42P01] undefined_table: relation "coord.tasks" does
+/// not exist (table=tasks) (hint: …)` — SQLSTATE first because it is the part
+/// that searches cleanly, then its PostgreSQL condition name
+/// ([`sqlstate_gloss`]) so the line is readable without a lookup. A client-side error (connection closed, TLS, encode) has
 /// no `DbError`, so it falls back to `Display` plus the source chain, which for
 /// those variants IS informative.
 pub fn pg_err(ctx: &str, e: &tokio_postgres::Error) -> String {
     match e.as_db_error() {
         Some(db) => {
-            let mut out = format!("{}: [{}] {}", ctx, db.code().code(), db.message());
+            let code = db.code().code();
+            let mut out = match sqlstate_gloss(code) {
+                Some(gloss) => format!("{}: [{}] {}: {}", ctx, code, gloss, db.message()),
+                None => format!("{}: [{}] {}", ctx, code, db.message()),
+            };
             if let Some(table) = db.table() {
                 out.push_str(&format!(" (table={table})"));
             }
@@ -1415,5 +1476,41 @@ mod machine_local_schema_tests {
                 name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sqlstate_gloss_tests {
+    use super::sqlstate_gloss;
+
+    /// The gloss must not displace the bracketed code — `[42703]` is what an
+    /// operator greps for, and the Coordinator panel is checked for exactly
+    /// that literal.
+    #[test]
+    fn exact_codes_map_to_postgres_condition_names() {
+        assert_eq!(sqlstate_gloss("42703"), Some("undefined_column"));
+        assert_eq!(sqlstate_gloss("42P01"), Some("undefined_table"));
+        assert_eq!(sqlstate_gloss("23505"), Some("unique_violation"));
+        assert_eq!(sqlstate_gloss("40P01"), Some("deadlock_detected"));
+    }
+
+    /// A code outside the exact table still says what KIND of failure it was,
+    /// using PostgreSQL's own class name.
+    #[test]
+    fn unlisted_codes_fall_back_to_their_class() {
+        assert_eq!(
+            sqlstate_gloss("42P18"),
+            Some("syntax_error_or_access_rule_violation")
+        );
+        assert_eq!(sqlstate_gloss("08003"), Some("connection_exception"));
+    }
+
+    /// An unrecognized code gets NO gloss. The raw code is still printed; a
+    /// guessed name would be worse than the lookup it saves.
+    #[test]
+    fn unknown_codes_get_no_invented_gloss() {
+        assert_eq!(sqlstate_gloss("99999"), None);
+        assert_eq!(sqlstate_gloss(""), None);
+        assert_eq!(sqlstate_gloss("4"), None);
     }
 }

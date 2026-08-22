@@ -355,9 +355,16 @@ pub fn parse_restore_health_include(spec: Option<&str>) -> Result<RestoreHealthF
                 filter.failed = true;
             }
             other => {
+                // One logical sentence, split with a `\` line-continuation so
+                // the source wraps without smuggling the indentation into the
+                // string. Written as a plain wrapped literal it carried the
+                // leading whitespace of the continuation line verbatim, and the
+                // 400 body reached the operator as
+                // `…failed,                      all (comma-separated…`.
                 return Err(format!(
-                    "unknown include value '{other}'. Valid: open, closed, pending, failed,                      all (comma-separated; omit for open only)"
-                ))
+                    "unknown include value '{other}'. Valid: open, closed, pending, \
+                     failed, all (comma-separated; omit for open only)"
+                ));
             }
         }
     }
@@ -1873,6 +1880,23 @@ mod tests {
         );
         let all = parse_restore_health_include(Some("all")).unwrap();
         assert!(all.open && all.closed && all.pending && all.failed);
+    }
+
+    /// The 400 body is the only place the valid-bucket list is published, so it
+    /// has to read as a sentence. A plain wrapped string literal carried the
+    /// continuation line's indentation verbatim and shipped a 22-space gap
+    /// mid-list (`…failed,                      all…`).
+    #[test]
+    fn unknown_include_error_lists_the_buckets_without_a_gap() {
+        let err = parse_restore_health_include(Some("faield")).unwrap_err();
+        assert!(
+            err.contains("failed, all (comma-separated"),
+            "message must read as one sentence, got {err:?}"
+        );
+        assert!(
+            !err.contains("  "),
+            "no run of spaces anywhere in the message, got {err:?}"
+        );
     }
 
     /// An empty registry is a clean, honest report — never an error.

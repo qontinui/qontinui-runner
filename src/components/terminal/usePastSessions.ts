@@ -63,6 +63,21 @@ export interface PastSession {
   /** Whether this session can actually be resumed (transcript present). */
   restorable: boolean;
   /**
+   * The RENDERED restore verdict: `"resumed"` | `"terminal-only"` |
+   * `"failed"` | `"pending (not yet confirmed)"` | `"not-restored"`.
+   *
+   * Already projected backend-side by `describe_restore_status`, so the UI must
+   * NOT re-derive it from a raw tier. The stored tier is deliberately
+   * pessimistic — it reads `failed` the instant a resume is ATTEMPTED — and the
+   * projection is what separates "the attempt is still in flight" from "the
+   * attempt is over and did not land".
+   *
+   * Optional on the wire: a runner build predating the field simply omits it,
+   * and an absent verdict must read as UNKNOWN (render nothing) rather than as
+   * `not-restored`, which is a positive claim.
+   */
+  restoreStatus?: string;
+  /**
    * Sessions sharing a dense `lastSeenAt` band get the same `cohortId` — a
    * crash cohort (many sessions stranded at once) renders as one group.
    */

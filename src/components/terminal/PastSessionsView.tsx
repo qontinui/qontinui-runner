@@ -59,6 +59,58 @@ export function pastSessionResumeId(claudeSessionId: string): string {
 }
 
 /**
+ * Stable control id for one card's ROW CONTAINER.
+ *
+ * The card was addressable only as a raw CSS selector
+ * (`[data-page-element=past-session-card]`), which `read-value` can scrape but
+ * which never appears in `GET /ui-bridge/control/snapshot` — the scanner
+ * registers interactive elements plus anything carrying `data-ui-bridge-id`,
+ * and a `<div>` has neither a role nor a tag that qualifies. So everything a
+ * row SAYS (name, account, page/zone, last-active, state, restore verdict) was
+ * invisible to any check that reads elements rather than scraping the DOM.
+ * Stamping the row registers it with its own text, keyed by session id rather
+ * than by position — the same reason the per-card buttons carry hand-written
+ * ids (cohorts re-sort on every refresh, so ordinals shift).
+ */
+export function pastSessionRowId(claudeSessionId: string): string {
+  return `terminal.past-session-row-${claudeSessionId}`;
+}
+
+/**
+ * The restore verdict a row should DISPLAY, or `null` when there is nothing to
+ * say.
+ *
+ * Two distinct silences collapse to `null`, and both are correct:
+ *   - `undefined` — a runner build that predates the field. Absent evidence is
+ *     UNKNOWN; rendering `not-restored` for it would invent a positive claim.
+ *   - `"not-restored"` — the backend's explicit "no restore was ever recorded".
+ *     True of nearly every row in a healthy list, so badging it would add a
+ *     chip to every card while carrying no information.
+ *
+ * Everything else (`resumed`, `terminal-only`, `failed`, and the in-flight
+ * `pending (not yet confirmed)`) is a real verdict about a restore that was
+ * actually attempted, and is shown.
+ *
+ * Pure + exported: the runner's vitest env is `node`, so the display rule is
+ * tested here rather than through a DOM.
+ */
+export function pastSessionRestoreBadge(restoreStatus: string | undefined): string | null {
+  const trimmed = restoreStatus?.trim();
+  if (!trimmed || trimmed === "not-restored") return null;
+  return trimmed;
+}
+
+/**
+ * Badge colour for a restore verdict: amber for anything unresolved or failed,
+ * green for a landed restore. Keyed on the RENDERED verdict, which is why the
+ * in-flight `pending (not yet confirmed)` is not painted like a failure.
+ */
+function restoreBadgeClass(verdict: string): string {
+  if (verdict === "resumed") return "bg-[#9ece6a]/15 text-[#9ece6a]";
+  return "bg-[#e0af68]/15 text-[#e0af68]";
+}
+
+/**
  * Stable control id for a cohort's "Show N more" / "Collapse" button. The same
  * button carries both states, so one id covers both — and the id is keyed on
  * the cohort rather than on the label, which changes as the count changes.
@@ -241,10 +293,12 @@ function PastSessionCard({
 
   const closed = session.state === "closed";
   const displayName = pastSessionDisplayName(session, registryNames);
+  const restoreBadge = pastSessionRestoreBadge(session.restoreStatus);
 
   return (
     <div
       data-page-element={PAST_SESSION_CARD_ELEMENT}
+      data-ui-bridge-id={pastSessionRowId(session.claudeSessionId)}
       data-session-id={session.claudeSessionId}
       className="group relative border-l-2 border-l-transparent hover:bg-[#1a1b26] px-3 py-2"
     >
@@ -290,6 +344,14 @@ function PastSessionCard({
         >
           {closed ? `closed${session.closeReason ? ` · ${session.closeReason}` : ""}` : "open"}
         </span>
+        {restoreBadge && (
+          <span
+            className={`px-1 rounded text-[9px] font-medium ${restoreBadgeClass(restoreBadge)}`}
+            title={`restore: ${restoreBadge}`}
+          >
+            {restoreBadge}
+          </span>
+        )}
       </div>
 
       {/* Row 3: resume command (mono, copyable reference) */}
