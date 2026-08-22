@@ -207,6 +207,38 @@ pub const RESTORE_TIER_TERMINAL_ONLY: &str = "terminal-only";
 /// Restore tier: a resume was attempted for this record and did not land.
 pub const RESTORE_TIER_FAILED: &str = "failed";
 
+/// The rendered restore verdict for one record — what a reader should be TOLD,
+/// as opposed to the raw `restore_tier` byte that is stored.
+///
+/// `mark_restore_pending` deliberately stamps [`RESTORE_TIER_FAILED`] the
+/// instant a resume is ATTEMPTED, because the census must never claim a
+/// restore landed when it might not have. That pessimism is right for the
+/// stored value and wrong for the rendered one: every reader — the session-info
+/// projection, the restore-health report — printed the bare word `failed` while
+/// the resume was still in flight, which reads as a terminal verdict on a
+/// restore that is merely unfinished. An operator seeing `failed` reaches for
+/// recovery; the honest statement is "not yet confirmed".
+///
+/// `restore_pending_at` is the discriminator, and it is already durable and
+/// backend-owned. `failed` survives as the verdict only once the pending
+/// marker is CLEARED without the tier being upgraded to
+/// [`RESTORE_TIER_RESUMED`] — i.e. the attempt really is over and really did
+/// not land.
+pub fn describe_restore_status(
+    restore_tier: Option<&str>,
+    restore_pending_at: Option<i64>,
+) -> String {
+    match (restore_tier, restore_pending_at) {
+        // A restore in flight. `failed` here means "attempt recorded, landing
+        // unproven" — say exactly that.
+        (Some(RESTORE_TIER_FAILED), Some(_)) => "pending (not yet confirmed)".to_string(),
+        (Some(tier), _) => tier.to_string(),
+        // Never restored is NOT a failed restore.
+        (None, Some(_)) => "pending (not yet confirmed)".to_string(),
+        (None, None) => "not-restored".to_string(),
+    }
+}
+
 /// [`TerminalSessionRecord::name_source`] value meaning "an operator chose this
 /// name" (a `/rename`, or a launch-time name).
 pub const NAME_SOURCE_OPERATOR: &str = "operator";

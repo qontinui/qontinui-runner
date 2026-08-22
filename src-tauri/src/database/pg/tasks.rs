@@ -174,7 +174,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("Failed to insert task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to insert task", &e))?;
 
         Ok(task_row_from_pg(&row))
     }
@@ -220,20 +220,10 @@ impl PgDb {
                 &[&assigned_session_id, &status, &origin, &description],
             )
             .await
-            .map_err(|e| {
-                // `tokio_postgres::Error`'s Display prints only "db error" for
-                // server-side failures (it ignores the alternate `{:#}` flag);
-                // the real SQLSTATE + message live in the db-error cause. Surface
-                // them so a failure like 42P10 is diagnosable instead of opaque.
-                match e.as_db_error() {
-                    Some(db) => format!(
-                        "Failed to create emergent task: [{}] {}",
-                        db.code().code(),
-                        db
-                    ),
-                    None => format!("Failed to create emergent task: {e}"),
-                }
-            })?;
+            // Was a hand-rolled `as_db_error()` match — the same job the shared
+            // `pg_err` now does for every query in this module (and it also
+            // surfaces table/detail/hint, which the local copy dropped).
+            .map_err(|e| crate::database::pg::pg_err("Failed to create emergent task", &e))?;
 
         Ok(row.map(|r| r.get(0)))
     }
@@ -272,7 +262,9 @@ impl PgDb {
                 &[&session_id],
             )
             .await
-            .map_err(|e| format!("Failed to find task by assigned session: {}", e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to find task by assigned session", &e)
+            })?;
 
         Ok(row.as_ref().map(task_row_from_pg))
     }
@@ -296,7 +288,7 @@ impl PgDb {
                 &[&task_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to get task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get task", &e))?;
 
         Ok(row.as_ref().map(task_row_from_pg))
     }
@@ -325,7 +317,7 @@ impl PgDb {
                 &[&plan_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to list tasks for plan: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list tasks for plan", &e))?;
 
         Ok(rows.iter().map(task_row_from_pg).collect())
     }
@@ -356,7 +348,7 @@ impl PgDb {
                 &[&plan_uuid, &NON_TERMINAL_STATUSES],
             )
             .await
-            .map_err(|e| format!("Failed to list active tasks: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list active tasks", &e))?;
 
         Ok(rows.iter().map(task_row_from_pg).collect())
     }
@@ -384,7 +376,7 @@ impl PgDb {
                 &[&statuses],
             )
             .await
-            .map_err(|e| format!("Failed to list tasks by status: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list tasks by status", &e))?;
 
         Ok(rows.iter().map(task_row_from_pg).collect())
     }
@@ -422,7 +414,7 @@ impl PgDb {
                 &[&plan_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to mark tasks ready: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to mark tasks ready", &e))?;
 
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
@@ -459,7 +451,7 @@ impl PgDb {
                 &[&task_uuid, &session_id],
             )
             .await
-            .map_err(|e| format!("Failed to assign task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to assign task", &e))?;
 
         Ok(n > 0)
     }
@@ -499,7 +491,7 @@ impl PgDb {
                 &[&task_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to force-reset task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to force-reset task", &e))?;
 
         Ok(n > 0)
     }
@@ -563,7 +555,7 @@ impl PgDb {
         let n = conn
             .execute(sql, &[&task_uuid, &from, &to])
             .await
-            .map_err(|e| format!("Failed to transition task status: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to transition task status", &e))?;
 
         Ok(n > 0)
     }
@@ -592,10 +584,7 @@ impl PgDb {
         )
         .await
         .map_err(|e| {
-            format!(
-                "Failed to create tasks.identity_hash column for test: {}",
-                e
-            )
+            crate::database::pg::pg_err("Failed to create tasks.identity_hash column for test", &e)
         })
     }
 }

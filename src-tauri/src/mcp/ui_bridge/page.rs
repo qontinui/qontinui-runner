@@ -169,12 +169,6 @@ pub struct PageEvaluateRequest {
     /// success envelope carrying no data.
     #[serde(default)]
     pub await_promise: bool,
-    /// When true, the frontend returns a consistent discriminated
-    /// `{value, type}` shape regardless of result type. When false/absent,
-    /// the legacy conditional-wrapping shape is preserved for backward
-    /// compatibility.
-    #[serde(default)]
-    pub unwrap: Option<bool>,
     /// EXPLICIT opt-in. When true, the frontend evaluate handler relaxes
     /// only the four network-related blocks (fetch / XMLHttpRequest /
     /// sendBeacon / WebSocket) so test assertions can hit runner APIs
@@ -665,7 +659,6 @@ async fn tagged_page_evaluate(
     state: &Arc<ApiState>,
     expression: &str,
     timeout_ms: Option<u64>,
-    unwrap: bool,
     allow_network_requests: bool,
     window_label: &str,
 ) -> Result<serde_json::Value, String> {
@@ -708,11 +701,6 @@ async fn tagged_page_evaluate(
         // fallback in `helpers.rs`, which can legitimately report
         // `"[object Promise]"`.
         "timeout_ms": timeout_ms,
-        // Forward unwrap so the frontend evaluate handler can emit the
-        // discriminated {value, type} shape when requested. When unwrap is
-        // true we skip the legacy conditional-wrap conversion below — the
-        // frontend already produced the final payload.
-        "unwrap": unwrap,
         // Forward the explicit network-request opt-in to the frontend
         // blocklist gate. snake_case to match the rest of this IPC payload's
         // convention (await_promise / timeout_ms / request_id).
@@ -773,20 +761,13 @@ async fn tagged_page_evaluate(
     match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), receiver).await {
         Ok(Ok(resp)) => {
             if resp.ok {
-                let result_value = resp.result.unwrap_or(serde_json::Value::Null);
-                let data = if unwrap {
-                    // Frontend already emitted the {value, type} shape —
-                    // pass it through verbatim.
-                    result_value
-                } else if result_value.is_object() {
-                    result_value
-                } else {
-                    serde_json::json!({
-                        "success": true,
-                        "result": { "value": result_value }
-                    })
-                };
-                Ok(data)
+                // The frontend emits ONE shape — the discriminated
+                // `{value, type}` envelope — so it rides through verbatim.
+                // There is no longer a conditional re-wrap here: the old
+                // "objects bare, everything else boxed" conversion is what
+                // made `data.result.value` unparseable without a try/except,
+                // and it reported a genuine `undefined` as an empty object.
+                Ok(resp.result.unwrap_or(serde_json::Value::Null))
             } else {
                 let err = resp.error.unwrap_or_else(|| {
                     "page/evaluate: frontend reported failure without an error message".to_string()
@@ -825,7 +806,6 @@ async fn page_evaluate_inner(
     expression: String,
     timeout_ms: Option<u64>,
     await_promise: bool,
-    unwrap: bool,
     allow_network_requests: bool,
     window_label: &str,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -843,7 +823,6 @@ async fn page_evaluate_inner(
         &state,
         &expression,
         timeout_ms,
-        unwrap,
         allow_network_requests,
         window_label,
     )
@@ -910,29 +889,23 @@ async fn page_evaluate_inner(
             .await
             {
                 Ok(result) => {
-                    // Direct-eval fallback: when unwrap is requested, we
-                    // build the {value, type} shape ourselves since the
-                    // direct-eval path never reached the frontend handler
-                    // that would otherwise produce it. `result` is a JSON-
-                    // encoded string (direct_webview_evaluate_with_result
+                    // Direct-eval fallback: build the {value, type} shape
+                    // here, since this path never reached the frontend
+                    // handler that would otherwise produce it. `result` is a
+                    // JSON-encoded string (direct_webview_evaluate_with_result
                     // sends the serialised value back over HTTP) — parse it
                     // before classifying so null/objects/arrays get the
-                    // correct discriminator.
-                    let data = if unwrap {
-                        let parsed: serde_json::Value = serde_json::from_str(&result)
-                            .unwrap_or_else(|_| serde_json::Value::String(result.clone()));
-                        let (value, type_name) = classify_direct_eval_value(parsed);
-                        serde_json::json!({
-                            "value": value,
-                            "type": type_name,
-                        })
-                    } else {
-                        serde_json::json!({
-                            "result": { "value": result },
-                            "source": "direct_eval"
-                        })
-                    };
-                    Ok(Json(ApiResponse::success(data)))
+                    // correct discriminator. The fallback must not report a
+                    // DIFFERENT envelope than the tagged path: a caller can't
+                    // tell which one served it.
+                    let parsed: serde_json::Value = serde_json::from_str(&result)
+                        .unwrap_or_else(|_| serde_json::Value::String(result.clone()));
+                    let (value, type_name) = classify_direct_eval_value(parsed);
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "value": value,
+                        "type": type_name,
+                        "source": "direct_eval",
+                    }))))
                 }
                 Err(direct_err) => {
                     error!(
@@ -1108,7 +1081,6 @@ pub async fn ui_bridge_page_evaluate_handler(
     UiBridgeJson(request): UiBridgeJson<PageEvaluateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let timeout = request.timeout_ms.map(|ms| ms.clamp(1000, 600_000));
-    let unwrap = request.unwrap.unwrap_or(false);
     let allow_network_requests = request.allow_network_requests.unwrap_or(false);
     let window_label = resolve_evaluate_window(
         query.window_label.as_deref(),
@@ -1119,7 +1091,6 @@ pub async fn ui_bridge_page_evaluate_handler(
         request.expression,
         timeout,
         request.await_promise,
-        unwrap,
         allow_network_requests,
         &window_label,
     )
@@ -1143,7 +1114,7 @@ pub async fn ui_bridge_page_evaluate_raw_handler(
         ));
     }
     let window_label = resolve_evaluate_window(query.window_label.as_deref(), None);
-    page_evaluate_inner(state, body, None, false, false, false, &window_label).await
+    page_evaluate_inner(state, body, None, false, false, &window_label).await
 }
 
 /// POST /ui-bridge/control/page/evaluate-safe
@@ -1234,14 +1205,25 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
 
     match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
         Ok(data) => {
-            let result_str = data
-                .get("result")
-                .and_then(|r| r.get("value"))
+            // The batch expression returns a JSON STRING, so the envelope's
+            // value is a string to be parsed. Reading it through the shared
+            // `evaluate_ipc_value` keeps this in step with the single
+            // `{value, type}` shape the frontend emits.
+            //
+            // A missing/unparseable value is reported per-expression rather
+            // than as `[]`: an empty array under `success: true` is
+            // indistinguishable from "every expression legitimately returned
+            // nothing", which is the false-green this route must not produce.
+            let results: Vec<BatchExpressionResult> = super::helpers::evaluate_ipc_value(&data)
                 .and_then(|v| v.as_str())
-                .unwrap_or("[]");
-
-            let results: Vec<BatchExpressionResult> = serde_json::from_str(result_str)
-                .unwrap_or_else(|_| {
+                .and_then(|s| serde_json::from_str::<Vec<BatchExpressionResult>>(s).ok())
+                .unwrap_or_else(|| {
+                    let reason = format!(
+                        "Failed to parse batch result from evaluate envelope (keys: {})",
+                        data.as_object()
+                            .map(|o| o.keys().cloned().collect::<Vec<_>>().join(","))
+                            .unwrap_or_else(|| "<not an object>".to_string())
+                    );
                     request
                         .expressions
                         .iter()
@@ -1249,7 +1231,7 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
                             id: e.id.clone(),
                             success: false,
                             value: serde_json::Value::Null,
-                            error: Some("Failed to parse batch result".to_string()),
+                            error: Some(reason.clone()),
                         })
                         .collect()
                 });

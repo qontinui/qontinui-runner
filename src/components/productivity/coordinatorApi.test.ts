@@ -19,7 +19,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { spawnFromPlan } from "./coordinatorApi";
+import { extractApiErrorMessage, spawnFromPlan } from "./coordinatorApi";
 
 const mockInvoke = invoke as ReturnType<typeof vi.fn>;
 
@@ -83,5 +83,42 @@ describe("spawnFromPlan", () => {
     await expect(
       spawnFromPlan("bogus", "phase", ["repo"], "intent", "prompt"),
     ).rejects.toThrow(/HTTP 400/);
+  });
+});
+
+describe("extractApiErrorMessage", () => {
+  it("renders the envelope's error only — not the wire JSON", () => {
+    // THE DEFECT: the whole 500 body was spliced into the thrown message and
+    // rendered verbatim in the Workers panel.
+    const body = '{"success":false,"data":null,"error":"db error","code":"PG_QUERY"}';
+    const msg = extractApiErrorMessage(body, "Internal Server Error");
+    expect(msg).toBe("db error");
+    expect(msg).not.toContain('{"success":false');
+    expect(msg).not.toContain('"code":');
+  });
+
+  it("appends the envelope hint when the runner supplies one", () => {
+    const body = '{"success":false,"error":"relation does not exist","hint":"run migrations"}';
+    expect(extractApiErrorMessage(body, "")).toBe("relation does not exist (run migrations)");
+  });
+
+  it("reads a nested {error:{message}} shape", () => {
+    expect(extractApiErrorMessage('{"error":{"message":"nope"}}', "")).toBe("nope");
+  });
+
+  it("falls back to the raw body for a non-envelope response", () => {
+    // Losing the message is worse than showing it ugly — an HTML 502 from a
+    // proxy still has to reach the operator.
+    expect(extractApiErrorMessage("<html>502 Bad Gateway</html>", "Bad Gateway")).toBe(
+      "<html>502 Bad Gateway</html>",
+    );
+  });
+
+  it("falls back to the status text for an empty body", () => {
+    expect(extractApiErrorMessage("", "Service Unavailable")).toBe("Service Unavailable");
+  });
+
+  it("keeps an unrecognised JSON object visible rather than dropping it", () => {
+    expect(extractApiErrorMessage('{"weird":1}', "x")).toBe('{"weird":1}');
   });
 });

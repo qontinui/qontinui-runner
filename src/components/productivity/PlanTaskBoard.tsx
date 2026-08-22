@@ -183,6 +183,54 @@ interface PlansListProps {
   onShowArchivedChange: (next: boolean) => void;
 }
 
+/**
+ * Does this invoke error actually mean "the Tauri command isn't registered in
+ * this build"?
+ *
+ * Phase 1 of this board shipped with every pane hardcoding that diagnosis for
+ * ANY failure — "Plan registry unavailable. The backend command may not be
+ * registered yet." — while throwing the backend's real message away. So a
+ * registered command failing on a missing table, a bad column, a timeout or a
+ * permission error all rendered as the one wrong sentence, and the operator's
+ * next debugging step was aimed at a build problem that did not exist.
+ *
+ * Tauri v2 reports an unknown command as `Command <name> not found`; the
+ * capability layer reports a blocked one as `... not allowed`. Anything else
+ * is a real backend error and must be shown verbatim.
+ */
+export function isUnregisteredCommandError(message: string): boolean {
+  return /command\s+\S+\s+not\s+found|not\s+allowed|unknown\s+command|not\s+registered/i.test(
+    message,
+  );
+}
+
+/**
+ * One pane-level error renderer: the backend's own string first, and the
+ * not-registered-yet hint ONLY when the message actually has that shape.
+ */
+function PaneError({
+  error,
+  testId,
+}: {
+  error: string;
+  testId: string;
+}) {
+  return (
+    <div
+      className="m-3 rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-400"
+      data-ui-bridge-id={testId}
+      role="alert"
+    >
+      <p className="break-words whitespace-pre-wrap">{error}</p>
+      {isUnregisteredCommandError(error) && (
+        <p className="mt-1 italic text-muted-foreground">
+          This backend command may not be registered in this runner build.
+        </p>
+      )}
+    </div>
+  );
+}
+
 function PlansList({
   plans,
   selectedPlanId,
@@ -231,9 +279,7 @@ function PlansList({
       </div>
       <div className="flex-1 overflow-y-auto">
         {error ? (
-          <div className="p-3 text-xs text-muted-foreground italic">
-            Plan registry unavailable. The backend command may not be registered yet.
-          </div>
+          <PaneError error={error} testId="productivity.plan-list-error" />
         ) : loading && plans.length === 0 ? (
           <div className="p-3 flex items-center gap-2 text-xs text-muted-foreground">
             <Loader2 className="w-3 h-3 animate-spin" /> Loading plans…
@@ -406,9 +452,7 @@ function TasksList({
             Select a plan on the left to see its tasks.
           </div>
         ) : error ? (
-          <div className="p-3 text-xs text-muted-foreground italic">
-            Could not load tasks for this plan.
-          </div>
+          <PaneError error={error} testId="productivity.task-list-error" />
         ) : loading && tasks.length === 0 ? (
           <div className="p-3 flex items-center gap-2 text-xs text-muted-foreground">
             <Loader2 className="w-3 h-3 animate-spin" /> Loading tasks…
@@ -776,7 +820,7 @@ function TaskDetailPanel({ detail, loading, error, onReloadDetail }: TaskDetailP
             Select a task to see its claims, dependencies, and review history.
           </p>
         ) : error ? (
-          <p className="text-xs text-muted-foreground italic">Could not load task detail.</p>
+          <PaneError error={error} testId="productivity.task-detail-error" />
         ) : loading || !detail ? (
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <Loader2 className="w-3 h-3 animate-spin" /> Loading detail…
@@ -956,7 +1000,9 @@ export function PlanTaskBoard() {
         return rows[0]?.id ?? null;
       });
     } catch (err) {
-      // Backend command may not be registered in Phase 1 — treat as empty.
+      // Keep the real message: the pane renders it, and only adds the
+      // not-registered-yet hint when the error actually has that shape
+      // (see `isUnregisteredCommandError`).
       setPlans([]);
       setPlansError(String(err));
       console.warn("[productivity] list_plans_filtered failed (treating as empty):", err);

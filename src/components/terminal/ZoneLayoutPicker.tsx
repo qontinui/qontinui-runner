@@ -80,21 +80,15 @@ export function ZoneLayoutPicker({
     description:
       "Selects the multi-zone terminal layout preset. Use select-layout to switch layouts " +
       "or list-layouts to enumerate available options.",
+    // NO `open` / `close` actions. This component is mounted inside a
+    // `display: none` container (see TerminalPage's Phase-9c note) purely so
+    // its wire contract survives the tab-bar demolition — there is no dropdown
+    // on screen to open. Both actions flipped local state, resolved, and were
+    // reported as SUCCESS, so an agent's "open the layout picker, then read
+    // it" sequence got a green light for a UI that never appeared and could
+    // not appear. The layout surface is fully reachable without them:
+    // `list-layouts` enumerates, `select-layout` switches.
     actions: [
-      {
-        id: "open",
-        label: "Open dropdown",
-        handler: () => {
-          setOpen(true);
-        },
-      },
-      {
-        id: "close",
-        label: "Close dropdown",
-        handler: () => {
-          setOpen(false);
-        },
-      },
       {
         id: "select-layout",
         label: "Select Layout",

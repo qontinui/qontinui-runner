@@ -444,6 +444,23 @@ pub(super) async fn direct_webview_evaluate_with_result(
     }
 }
 
+/// Read the evaluated value out of a legacy-IPC `page_evaluate` response.
+///
+/// The frontend handler (`usePageEvents.ts::page_evaluate`) now emits exactly
+/// ONE envelope — `{value, type}` — for every result. It used to vary the shape
+/// by result type (objects bare at the top level, everything else boxed as
+/// `{result: {value}}`), so each consumer here hand-rolled the same
+/// `data["result"]["value"]` walk and silently fell through to its own default
+/// whenever the walk missed. One reader now, so the walk cannot drift per site.
+///
+/// `None` means the expression evaluated to `undefined` (JSON drops the key;
+/// the `type` discriminant is what still says so) or the payload is not an
+/// evaluate envelope at all. Callers must treat `None` as "no value", never as
+/// a value.
+pub(super) fn evaluate_ipc_value(data: &serde_json::Value) -> Option<&serde_json::Value> {
+    data.get("value")
+}
+
 /// Evaluate a JS expression via IPC with automatic error wrapping.
 /// This is the safe version of page_evaluate that wraps expressions in try/catch
 /// so errors return as JSON instead of crashing the connection.
@@ -462,11 +479,7 @@ pub(super) async fn safe_evaluate(
     match ui_bridge_request_sync(state, "page_evaluate", payload).await {
         Ok(data) => {
             // Try to parse the inner result
-            if let Some(result) = data
-                .get("result")
-                .and_then(|r| r.get("value"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(result) = evaluate_ipc_value(&data).and_then(|v| v.as_str()) {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result) {
                     if parsed.get("success") == Some(&serde_json::Value::Bool(false)) {
                         let error_msg = parsed
@@ -614,7 +627,7 @@ pub(super) async fn evaluate_js_expression(
                 return direct_webview_evaluate_with_result(state, expression, None, false).await;
             }
             // Extract the result value from the IPC response
-            if let Some(result) = data.get("result").and_then(|r| r.get("value")) {
+            if let Some(result) = evaluate_ipc_value(&data) {
                 match result {
                     serde_json::Value::String(s) => Ok(s.clone()),
                     other => Ok(other.to_string()),
@@ -676,7 +689,7 @@ pub(super) async fn evaluate_js_expression_in_window(
             .unwrap_or("evaluation failed in target window");
         return Err(msg.to_string());
     }
-    if let Some(result) = data.get("result").and_then(|r| r.get("value")) {
+    if let Some(result) = evaluate_ipc_value(&data) {
         match result {
             serde_json::Value::String(s) => Ok(s.clone()),
             other => Ok(other.to_string()),

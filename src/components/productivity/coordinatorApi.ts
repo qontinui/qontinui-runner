@@ -199,6 +199,57 @@ export interface ResetStaleTasksResponse {
   dryRun: boolean;
 }
 
+/**
+ * Pull the human-readable message out of a runner error body.
+ *
+ * The runner answers a failed control-plane call with its `ApiResponse`
+ * envelope — `{"success":false,"error":"…","code":"…","hint":"…"}` — and the
+ * three fetch wrappers below used to splice that WHOLE body into the thrown
+ * message. It then reached the operator verbatim, so the Workers panel showed
+ * JSON punctuation and internal keys (`{"success":false`, `"code":`) around
+ * the one sentence that mattered, and a long body pushed that sentence off the
+ * visible row entirely.
+ *
+ * Envelope-first, raw-body-last: anything that isn't a recognisable envelope
+ * still surfaces (an HTML 502 from a proxy, a bare string) rather than being
+ * swallowed — losing the message is strictly worse than showing it ugly.
+ */
+export function extractApiErrorMessage(body: string, statusText: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return statusText || "request failed";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return trimmed;
+  }
+  if (typeof parsed === "string") return parsed || statusText || trimmed;
+  if (!parsed || typeof parsed !== "object") return trimmed;
+  const obj = parsed as Record<string, unknown>;
+  const nested = obj.error;
+  const candidates: unknown[] = [
+    typeof nested === "string" ? nested : undefined,
+    nested && typeof nested === "object"
+      ? (nested as Record<string, unknown>).message
+      : undefined,
+    obj.message,
+    obj.detail,
+  ];
+  const message = candidates.find((c): c is string => typeof c === "string" && c.trim() !== "");
+  if (!message) return trimmed;
+  const hint = typeof obj.hint === "string" && obj.hint.trim() !== "" ? obj.hint : null;
+  return hint ? `${message.trim()} (${hint.trim()})` : message.trim();
+}
+
+/**
+ * Shared throw site for the runner-port fetch wrappers. One place decides how
+ * a non-2xx becomes an Error, so the three call sites can't drift on it.
+ */
+async function throwApiError(res: Response): Promise<never> {
+  const body = await res.text().catch(() => "");
+  throw new Error(`HTTP ${res.status}: ${extractApiErrorMessage(body, res.statusText)}`);
+}
+
 /** Flip stale `assigned`/`needs_fix` tasks back to `ready` when the worker
  *  they're pinned to is no longer alive in SessionManager. Pass
  *  `{ dryRun: true }` to preview without writing. Mirrors the runner-port
@@ -216,8 +267,7 @@ export async function resetStaleTasks(
     body: "",
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
+    await throwApiError(res);
   }
   return (await res.json()) as ResetStaleTasksResponse;
 }
@@ -268,8 +318,7 @@ export async function getCoordinatorState(): Promise<CoordinatorState> {
     headers: { Accept: "application/json" },
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
+    await throwApiError(res);
   }
   return (await res.json()) as CoordinatorState;
 }
@@ -382,8 +431,7 @@ export async function dispatchCoordinatorAction(
     body: JSON.stringify({ action, reasoning }),
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
+    await throwApiError(res);
   }
 }
 

@@ -32,7 +32,10 @@ function Evaluate-JS {
         $body = @{ expression = $Expr } | ConvertTo-Json -Compress
         $r = Invoke-WebRequest -Uri "$BASE/control/page/evaluate" -Method POST `
              -ContentType 'application/json' -Body $body -UseBasicParsing -ErrorAction Stop
-        return ($r.Content | ConvertFrom-Json).data.result.value
+        # `page/evaluate` answers with ONE envelope now: {value, type}.
+        # The old {result:{value}} boxing is gone (it varied by result type
+        # and dropped `value` entirely for undefined).
+        return ($r.Content | ConvertFrom-Json).data.value
     } catch {
         return $null
     }

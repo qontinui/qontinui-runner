@@ -49,13 +49,21 @@
 //!
 //! ### The five buckets and how each is reached
 //!
+//! Every body below is COMPLETE and POSTs as-is. `task_run_id` and `name`
+//! are REQUIRED by [`InjectSessionRequest`] (no `#[serde(default)]`), so the
+//! abbreviated `{liveStatus:"…"}` forms this table used to show were not
+//! bodies at all — copy-pasting one produced a 422/400 on deserialize before
+//! any fixture logic ran, and the failure named a missing field rather than
+//! the doc that omitted it. Give each fake a distinct `task_run_id`; the
+//! runner uses it as the session id too.
+//!
 //! | StatusStrip bucket | `liveStatus` | mechanism | inject body |
 //! |--------------------|--------------|-----------|-------------|
-//! | working            | `active-in-zone` | short-circuit (`injected_live_status`) | `{liveStatus:"active-in-zone"}` |
-//! | needs-input        | `needs-input`    | short-circuit | `{liveStatus:"needs-input"}` |
-//! | idle               | `frozen` (live tab) | **tab-backed**: a synthetic tab pre-aged past the 60s staleness sweep | `{liveStatus:"idle", tab_backed:true}` |
-//! | error              | `error`          | **tab-backed**: a dead synthetic tab, exit_code != 0 | `{liveStatus:"error", tab_backed:true}` |
-//! | completed          | `completed`      | **tab-backed**: a dead synthetic tab, exit_code 0 | `{liveStatus:"completed", tab_backed:true}` |
+//! | working            | `active-in-zone` | short-circuit (`injected_live_status`) | `{"task_run_id":"fx-working","name":"fx working","liveStatus":"active-in-zone"}` |
+//! | needs-input        | `needs-input`    | short-circuit | `{"task_run_id":"fx-needs-input","name":"fx needs input","liveStatus":"needs-input"}` |
+//! | idle               | `frozen` (live tab) | **tab-backed**: a synthetic tab pre-aged past the 60s staleness sweep | `{"task_run_id":"fx-idle","name":"fx idle","liveStatus":"idle","tab_backed":true}` |
+//! | error              | `error`          | **tab-backed**: a dead synthetic tab, exit_code != 0 | `{"task_run_id":"fx-error","name":"fx error","liveStatus":"error","tab_backed":true}` |
+//! | completed          | `completed`      | **tab-backed**: a dead synthetic tab, exit_code 0 | `{"task_run_id":"fx-completed","name":"fx completed","liveStatus":"completed","tab_backed":true}` |
 //!
 //! Two projection modes back these (see `project_test_session`):
 //!   - **short-circuit** — `working` / `needs-input` (and the orphan-demo
@@ -1459,6 +1467,46 @@ mod tests {
     /// sequences (cargo runs tests in parallel by default). A test-only
     /// mutex serializes them without forcing the suite-wide `--test-threads=1`.
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// F2: every inject body printed in this module's CONSUMER CONTRACT table
+    /// must actually POST. The table used to show `{liveStatus:"idle",
+    /// tab_backed:true}` — no `task_run_id`, no `name`, both REQUIRED — so a
+    /// verification agent copying a documented body got a deserialize failure
+    /// before any fixture logic ran.
+    ///
+    /// The bodies are read back OUT of this file's own doc comment rather than
+    /// restated here, so the test cannot pass while the documentation it is
+    /// vouching for says something else.
+    #[test]
+    fn every_documented_inject_body_is_postable() {
+        let src = include_str!("test_fixtures.rs");
+        let bodies: Vec<&str> = src
+            .lines()
+            .filter(|l| l.starts_with("//! |") && l.contains("liveStatus\":"))
+            .filter_map(|l| {
+                let start = l.find("`{")?;
+                let end = l.rfind("}`")?;
+                Some(&l[start + 1..end + 1])
+            })
+            .collect();
+        assert_eq!(
+            bodies.len(),
+            5,
+            "the contract table documents one body per StatusStrip bucket;              found {bodies:?}"
+        );
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for body in bodies {
+            let req: InjectSessionRequest = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("documented body does not deserialize: {body} — {e}"));
+            // …and it must also survive the validation guards the same doc
+            // describes, i.e. reach a 200 rather than a 400.
+            insert_session(req).unwrap_or_else(|(code, err)| {
+                panic!("documented body {body} → {code}: {}", err.error)
+            });
+        }
+        clear_all_sessions();
+    }
 
     // =========================================================================
     // Phase 3 / F2: release-build gate regression canaries.
