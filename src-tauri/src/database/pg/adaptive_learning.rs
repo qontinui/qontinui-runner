@@ -478,6 +478,20 @@ impl PgDb {
     // GEPA Optimization Runs
     // =========================================================================
 
+    /// Record one prompt-optimization run.
+    ///
+    /// `status` carries the held-out validation gate's outcome. Write it from
+    /// `workflow_generation::gepa_optimizer::OptimizationOutcome::status_str`,
+    /// which yields exactly four values:
+    ///
+    /// * `"accepted"` — the paired held-out comparison accepted the new prompt
+    /// * `"rejected"` — it decided against the new prompt
+    /// * `"insufficient_data"` — it **could not decide**; distinct from
+    ///   `"rejected"`, and must never be collapsed into it
+    /// * `"skipped"` — the gate never ran (disabled, cooldown, too few examples)
+    ///
+    /// `improvement` here is the sidecar's display-only mean delta; it is not
+    /// what the gate decided on.
     pub async fn insert_gepa_run(
         &self,
         id: &str,
