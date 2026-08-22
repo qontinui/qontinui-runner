@@ -35,10 +35,37 @@ on:
   # pushes to main while the partner PR sat blocked — a genuinely-fixed drift
   # would have looked identical, because nothing could re-run the check.
   #
-  # `gh workflow run qontinui-types-drift.yml --ref main` refreshes the visible
-  # status without forcing a noop commit. This mirrors the escape hatch
-  # qontinui-schemas/.github/workflows/schema-drift.yml already has, whose own
-  # comment describes exactly this scenario in the opposite direction.
+  # `gh workflow run qontinui-types-drift.yml --ref main` refreshes the
+  # GITHUB-VISIBLE status without forcing a noop commit. This mirrors the escape
+  # hatch qontinui-schemas/.github/workflows/schema-drift.yml already has, whose
+  # own comment describes exactly this scenario in the opposite direction.
+  #
+  # ⚠️ BUT THAT DISPATCH DOES NOT THAW COORD'S BASELINE, AND COORD IS THE
+  # CONSUMER THAT GATES THE MERGE TRAIN. `coord.ci_baselines` accepts a
+  # `push` event and nothing else — pinned by coord's own tests
+  # (`crates/coord/src/ci_baseline.rs`):
+  #
+  #     assert!(establishes_main_baseline(Some("push")));
+  #     assert!(!establishes_main_baseline(Some("workflow_dispatch")));
+  #     assert!(!establishes_main_baseline(Some("schedule")));
+  #
+  # So a dispatched green makes this gate look fixed in the GitHub UI while
+  # coord still scores main as RED. Measured 2026-08-22: the newest `push` run
+  # here was the 2026-08-12 failure at 5e46988e, four dispatched greens had
+  # landed since (the newest at c5162d55, 2026-08-21), and coord was still
+  # blocking runner PRs with `block_reason_code: "main-red"`,
+  # `detail.failing_workflows: ["qontinui-types drift"]` — for a drift those
+  # four greens prove was already fixed. Ten days frozen.
+  #
+  # It reads as benign from the GitHub side, which is the trap: lands keep
+  # flowing because main-red is consulted at ENQUEUE, not at land, so
+  # already-queued PRs sail through while NEW ones are blocked. "PRs are
+  # landing" is therefore NOT evidence this gate is clear.
+  #
+  # THE ONLY THING THAT RE-BASELINES IS A `push` RUN, i.e. a commit landing on
+  # main that touches one of the paths below — which now includes this file, so
+  # editing this comment is itself a valid thaw. Use the dispatch to learn
+  # whether the drift is really fixed; use a push to tell coord.
   #
   # Safe by construction — STILL TRUE, now for a stronger reason.
   # `checkout-sibling` keys on `github.event.pull_request.number`, which is
