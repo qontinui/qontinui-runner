@@ -54,29 +54,19 @@ beforeEach(() => {
 
 describe("deriveCoordAvailability", () => {
   it("reports the mode the backend resolved", () => {
-    expect(deriveCoordAvailability({ data: CONNECTED, error: null, loading: false })).toBe(
-      "connected",
-    );
-    expect(deriveCoordAvailability({ data: ISOLATED, error: null, loading: false })).toBe(
-      "isolated",
-    );
+    expect(deriveCoordAvailability(CONNECTED)).toBe("connected");
+    expect(deriveCoordAvailability(ISOLATED)).toBe("isolated");
   });
 
   it("reports UNKNOWN while loading and after an invoke failure", () => {
-    expect(deriveCoordAvailability({ data: null, error: null, loading: true })).toBe("unknown");
-    expect(
-      deriveCoordAvailability({
-        data: null,
-        error: "command get_coord_mode not found",
-        loading: false,
-      }),
-    ).toBe("unknown");
+    expect(deriveCoordAvailability(null)).toBe("unknown");
+    expect(deriveCoordAvailability(null)).toBe("unknown");
   });
 });
 
 describe("deriveCoordGating", () => {
   it("leaves coord-backed surfaces live on a connected runner", () => {
-    const gating = deriveCoordGating({ data: CONNECTED, error: null, loading: false });
+    const gating = deriveCoordGating(CONNECTED);
     expect(gating).toEqual({
       enabled: true,
       isolated: false,
@@ -86,14 +76,14 @@ describe("deriveCoordGating", () => {
   });
 
   it("closes the gate on a positive isolated mode and carries the source through", () => {
-    const gating = deriveCoordGating({ data: ISOLATED, error: null, loading: false });
+    const gating = deriveCoordGating(ISOLATED);
     expect(gating.enabled).toBe(false);
     expect(gating.isolated).toBe(true);
     expect(gating.source).toBe(COORD_SOURCE_NO_ACCOUNT);
   });
 
   it("distinguishes the unreadable-settings isolated arm by source", () => {
-    const gating = deriveCoordGating({ data: ISOLATED_UNREADABLE, error: null, loading: false });
+    const gating = deriveCoordGating(ISOLATED_UNREADABLE);
     expect(gating.isolated).toBe(true);
     expect(gating.source).toBe(COORD_SOURCE_SETTINGS_UNREADABLE);
   });
@@ -103,11 +93,7 @@ describe("deriveCoordGating", () => {
     // `get_coord_mode`. A wrongly-disabled panel on a connected runner
     // removes a working feature; a wrongly-enabled one on an isolated
     // runner just shows the panel's normal error. So unknown stays live.
-    const gating = deriveCoordGating({
-      data: null,
-      error: "Command get_coord_mode not found",
-      loading: false,
-    });
+    const gating = deriveCoordGating(null);
     expect(gating.enabled).toBe(true);
     expect(gating.isolated).toBe(false);
     expect(gating.availability).toBe("unknown");
@@ -115,7 +101,7 @@ describe("deriveCoordGating", () => {
   });
 
   it("FAILS OPEN while the first resolution is still in flight", () => {
-    const gating = deriveCoordGating({ data: null, error: null, loading: true });
+    const gating = deriveCoordGating(null);
     expect(gating.enabled).toBe(true);
     expect(gating.isolated).toBe(false);
   });
