@@ -930,6 +930,13 @@ impl TerminalSession {
             .try_clone_reader()
             .map_err(|e| format!("Failed to clone PTY reader: {}", e))?;
 
+        // Coord mirror identity, populated by `terminal_create` after
+        // `register_external` returns. Declared HERE (ahead of the reader
+        // thread) rather than beside the waiter below because the reader needs
+        // a clone for the OSC 9999 agent-status sideband: a payload for a
+        // terminal with no coord mirror has nowhere to go and is dropped.
+        let coord_session_id: Arc<Mutex<Option<uuid::Uuid>>> = Arc::new(Mutex::new(None));
+
         // Spawn reader thread: reads PTY output → interceptor → scrollback + Tauri event
         let reader_id = id.clone();
         let reader_app = app_handle.clone();
@@ -945,6 +952,14 @@ impl TerminalSession {
         let reader_grid = grid.clone();
         let reader_grid_generation = grid_generation.clone();
         let reader_osc_title_tx = first_osc_title_tx.clone();
+        let reader_coord_session_id = coord_session_id.clone();
+        // Per-session OSC 9999 coalescer — see
+        // `terminal::agent_status_sideband::SidebandRateLimiter`. Lives on the
+        // reader thread (plus its deferred-flush tasks), NOT in a
+        // process-global map, so it dies with the terminal and needs no reaping.
+        let reader_agent_status_limiter = Arc::new(Mutex::new(
+            crate::terminal::agent_status_sideband::SidebandRateLimiter::new(),
+        ));
         let reader_handle = thread::Builder::new()
             .name(format!("terminal-reader-{}", &id))
             .spawn(move || {
@@ -1149,11 +1164,20 @@ impl TerminalSession {
                             // title changes don't re-fire. Worker dispatch
                             // gating in `spawn_worker_session` only needs
                             // the one-shot signal.
-                            let title_was_none = reader_grid
+                            //
+                            // The OSC 9999 agent-status sideband (plan
+                            // `2026-08-11-coord-hook-sourced-agent-status`
+                            // Channel 2) rides the SAME before/after shape: read
+                            // the monotonic sideband seq here, compare it after
+                            // the advance, and only clone/drain the payload when
+                            // it actually moved. The common case — no sideband in
+                            // this chunk — costs one extra `u64` read inside a
+                            // lock we were already taking, and no allocation.
+                            let (title_was_none, sideband_seq_before) = reader_grid
                                 .lock()
                                 .ok()
-                                .map(|g| g.title().is_none())
-                                .unwrap_or(false);
+                                .map(|g| (g.title().is_none(), g.agent_status_sideband_seq()))
+                                .unwrap_or((false, 0));
                             advance_grid(
                                 &reader_grid,
                                 &reader_grid_generation,
@@ -1185,11 +1209,36 @@ impl TerminalSession {
                             // if a `?2026h` is still open we're mid-frame, so
                             // accumulate and defer the emit; otherwise flush
                             // (any held prefix + this chunk) as one event.
-                            let in_sync = reader_grid
+                            // The sideband's "after" read piggybacks on this
+                            // same lock so the no-sideband path takes no extra
+                            // one.
+                            let (in_sync, sideband_seq_after) = reader_grid
                                 .lock()
                                 .ok()
-                                .map(|g| g.sync_output())
-                                .unwrap_or(false);
+                                .map(|g| (g.sync_output(), g.agent_status_sideband_seq()))
+                                .unwrap_or((false, sideband_seq_before));
+
+                            // OSC 9999 agent-status sideband — drain + forward.
+                            // Only reached when a payload actually arrived in
+                            // this chunk. `dispatch` parses in-thread (cheap,
+                            // panic-free, never logs the raw payload) and hands
+                            // everything past the rate limiter to the async
+                            // runtime, so the PTY hot path is never stalled by a
+                            // coord write.
+                            if sideband_seq_after != sideband_seq_before {
+                                let payload = reader_grid
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mut g| g.take_agent_status_sideband());
+                                if let Some(payload) = payload {
+                                    crate::terminal::agent_status_sideband::dispatch(
+                                        &reader_id,
+                                        &reader_coord_session_id,
+                                        &reader_agent_status_limiter,
+                                        payload,
+                                    );
+                                }
+                            }
 
                             // Coalesce sync-output frames (Phase 4). The
                             // scrollback ring + total counter were already fed
@@ -1223,8 +1272,8 @@ impl TerminalSession {
         // populated AFTER spawn by
         // `terminal_create` once `register_external` returns the coord id,
         // so the waiter reads them at exit time rather than capturing a
-        // value that isn't known yet at spawn.
-        let coord_session_id: Arc<Mutex<Option<uuid::Uuid>>> = Arc::new(Mutex::new(None));
+        // value that isn't known yet at spawn. (`coord_session_id` itself is
+        // declared above the reader thread, which also needs a clone of it.)
         let on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid) + Send + Sync>>>> =
             Arc::new(Mutex::new(None));
 

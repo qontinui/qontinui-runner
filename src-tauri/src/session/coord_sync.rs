@@ -1174,6 +1174,16 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
 /// coord's `UpdateSessionRequest` nests them under `progress` and stamps
 /// `last_progress_at = now()` when omitted. Advances the work-progress axis
 /// (`coord.sessions.last_progress_at`), independent of the liveness heartbeat.
+///
+/// `tool_name` / `tool_input_digest` / `model` are the TOOL-GRAIN half (plan
+/// `2026-08-11-coord-hook-sourced-agent-status`), written by the OSC 9999
+/// sideband (`terminal::agent_status_sideband`) and by the Claude Code
+/// `PostToolUse` hook. **Coord accepts them only once that plan's Phase 2
+/// widens `ProgressUpdate`.** Forwarding them before then is safe and inert,
+/// not a 4xx: coord's `ProgressUpdate` carries no `deny_unknown_fields`, so
+/// serde drops an unknown key rather than rejecting the body. (Verified
+/// against `qontinui-coord/src/sessions.rs`.) The three pre-existing keys
+/// above are byte-identical to what they were.
 fn progress_body(payload: &JsonValue) -> JsonValue {
     let mut progress = serde_json::Map::new();
     if let Some(status) = payload.get("session_status") {
@@ -1184,6 +1194,15 @@ fn progress_body(payload: &JsonValue) -> JsonValue {
     }
     if let Some(detail) = payload.get("progress_detail") {
         progress.insert("progress_detail".into(), detail.clone());
+    }
+    if let Some(tool_name) = payload.get("tool_name") {
+        progress.insert("tool_name".into(), tool_name.clone());
+    }
+    if let Some(digest) = payload.get("tool_input_digest") {
+        progress.insert("tool_input_digest".into(), digest.clone());
+    }
+    if let Some(model) = payload.get("model") {
+        progress.insert("model".into(), model.clone());
     }
     json!({ "progress": JsonValue::Object(progress) })
 }
@@ -2472,6 +2491,42 @@ mod tests {
         assert_eq!(body["progress"]["last_progress_at"], "2026-06-28T10:30:00Z");
         assert_eq!(body["progress"]["progress_detail"]["pct"], 60);
         assert!(body["progress"].get("unrelated").is_none());
+    }
+
+    /// Tool-grain half (plan `2026-08-11-coord-hook-sourced-agent-status`):
+    /// `tool_name` / `tool_input_digest` / `model` pass through into the nested
+    /// `progress` object ALONGSIDE the pre-existing three, which must keep
+    /// behaving exactly as before.
+    #[test]
+    fn progress_body_passes_tool_grain_fields_through() {
+        let payload = json!({
+            "session_status": "working",
+            "tool_name": "Bash",
+            "tool_input_digest": "9f86d081884c7d65",
+            "model": "opus",
+        });
+        let body = progress_body(&payload);
+        assert_eq!(body["progress"]["session_status"], "working");
+        assert_eq!(body["progress"]["tool_name"], "Bash");
+        assert_eq!(body["progress"]["tool_input_digest"], "9f86d081884c7d65");
+        assert_eq!(body["progress"]["model"], "opus");
+
+        // Absent tool-grain fields are omitted, not nulled — a `progress`
+        // report from the older writers is byte-identical to what it was.
+        let legacy = json!({
+            "session_status": "blocked",
+            "last_progress_at": "2026-06-28T10:30:00Z",
+            "progress_detail": { "step": "tests" },
+        });
+        let body = progress_body(&legacy);
+        assert_eq!(
+            body,
+            json!({ "progress": {
+                "session_status": "blocked",
+                "last_progress_at": "2026-06-28T10:30:00Z",
+                "progress_detail": { "step": "tests" },
+            }})
+        );
     }
 
     /// `claim_stolen` body carries `reason` + the runner's machine_id.
