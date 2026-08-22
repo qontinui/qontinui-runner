@@ -7,11 +7,11 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::comparison::{
-    axis_adjusted_confidence, classify_axis_drift, ComparisonRecommendation,
-    ComparisonRun, ComparisonStatus,
+    axis_adjusted_confidence, classify_axis_drift, ComparisonRecommendation, ComparisonRun,
+    ComparisonStatus,
 };
-use crate::mcp::comparison_api::ComparisonEntryJson;
 use crate::database::pg::PgDb;
+use crate::mcp::comparison_api::ComparisonEntryJson;
 
 /// Convert a completed comparison run's winner into a meta-optimizer recommendation.
 ///
@@ -30,7 +30,11 @@ pub fn comparison_to_recommendation(
     // `variation_type` and the per-arm override blobs come out alongside the
     // `ComparisonRun` because Phase 3 needs the DECLARED label and the ACTUAL
     // arms together — see the axis check below.
-    let (comparison, variation_type, arm_overrides): (ComparisonRun, String, Vec<serde_json::Value>) = {
+    let (comparison, variation_type, arm_overrides): (
+        ComparisonRun,
+        String,
+        Vec<serde_json::Value>,
+    ) = {
         let row = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(pg_db.get_comparison_run_for_bridge(&comp_id))

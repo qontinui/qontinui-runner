@@ -583,7 +583,12 @@ pub enum DeclaredAxes {
 /// `mcp::comparison_api`'s arm construction.
 pub fn declared_axes(variation_type: &str) -> DeclaredAxes {
     let exact = |paths: &[&str]| {
-        DeclaredAxes::Exact(paths.iter().map(|p| (*p).to_string()).collect::<BTreeSet<_>>())
+        DeclaredAxes::Exact(
+            paths
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect::<BTreeSet<_>>(),
+        )
     };
     match variation_type.trim().to_ascii_lowercase().as_str() {
         "same" => DeclaredAxes::Exact(BTreeSet::new()),
@@ -965,7 +970,10 @@ mod tests {
         assert_eq!(AxisDriftClass::BenignAdd.as_wire_str(), "benign_add");
         assert_eq!(AxisDriftClass::Pending.as_wire_str(), "pending");
         assert_eq!(AxisDriftClass::InPlace.as_wire_str(), "in_place");
-        assert_eq!(AxisDriftClass::ActiveNegation.as_wire_str(), "active_negation");
+        assert_eq!(
+            AxisDriftClass::ActiveNegation.as_wire_str(),
+            "active_negation"
+        );
         assert_eq!(AxisDriftClass::Divergent.as_wire_str(), "divergent");
         assert_eq!(AxisDriftClass::Unknown.as_wire_str(), "unknown");
     }
@@ -984,7 +992,10 @@ mod tests {
             assert_eq!(AxisDriftClass::from_wire_str(class.as_wire_str()), class);
         }
         // Case and whitespace tolerated.
-        assert_eq!(AxisDriftClass::from_wire_str("  In_Place "), AxisDriftClass::InPlace);
+        assert_eq!(
+            AxisDriftClass::from_wire_str("  In_Place "),
+            AxisDriftClass::InPlace
+        );
         // Anything unrecognized fails CLOSED to Unknown, never to None.
         for token in ["", "   ", "no", "NONE_OF_IT", "clean", "ok"] {
             assert_eq!(
@@ -1018,10 +1029,16 @@ mod tests {
             other => panic!("{} should be Exact, got {:?}", v, other),
         };
         assert_eq!(exact("same"), Vec::<String>::new());
-        assert_eq!(exact("architecture"), vec!["workflow_architecture".to_string()]);
+        assert_eq!(
+            exact("architecture"),
+            vec!["workflow_architecture".to_string()]
+        );
         assert_eq!(exact("multi_agent"), vec!["multi_agent_mode".to_string()]);
         assert_eq!(exact("model"), vec!["model".to_string()]);
-        assert_eq!(exact("context_tokens"), vec!["max_context_tokens".to_string()]);
+        assert_eq!(
+            exact("context_tokens"),
+            vec!["max_context_tokens".to_string()]
+        );
         assert_eq!(declared_axes("custom"), DeclaredAxes::Unconstrained);
         assert_eq!(declared_axes("ARCHITECTURE"), declared_axes("architecture"));
         assert_eq!(declared_axes("nonsense"), DeclaredAxes::Unrecognized);
@@ -1263,5 +1280,4 @@ mod tests {
         assert!(adjusted < AUTO_CANARY_CONFIDENCE_THRESHOLD);
         assert!(reason.is_some());
     }
-
 }
