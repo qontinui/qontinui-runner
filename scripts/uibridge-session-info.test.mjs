@@ -2526,8 +2526,44 @@ async function runRestoreAssertions(ctx) {
     const surprise = [...restoredIds].filter((id) => !oracleIds.has(id));
     if (notBack.length)
       problems.push(`in the oracle's expected set but not restored: ${notBack.join(", ")}`);
-    if (surprise.length)
-      problems.push(`restored but absent from the oracle's expected set: ${surprise.join(", ")}`);
+    if (surprise.length) {
+      // Name the CAUSE, because these two look identical in the output and only
+      // one is a restore defect.
+      //
+      // A session restored that this run never created is almost always a
+      // PRECONDITION violation, not a restore bug: `pty-exit` / `poll-dead`
+      // closes stay restorable for 10 minutes by design
+      // (RESTORABLE_PTY_EXIT_MS), and `restore-health` reports OPEN rows only —
+      // so T0.1 can pass on a genuinely empty runner while restorable-CLOSED
+      // rows from a previous run sit invisible, waiting to be resurrected by the
+      // very restart this test performs. Measured 2026-08-22: three back-to-back
+      // runs, the middle one inheriting two such rows and failing T1, T4, T8 and
+      // T10 while T0.1 reported `0 session(s), 0 not ours`.
+      //
+      // Reporting that as "the correct sessions were restored" failing invites
+      // exactly the wrong conclusion — it reads as a restore defect, and it was
+      // twice mistaken for one.
+      const ownFixtures = new Set(
+        (ctx.fixtures ?? []).map((x) => x.session?.identity?.claudeSessionId).filter(Boolean),
+      );
+      const inherited = surprise.filter((id) => !ownFixtures.has(id));
+      const ours = surprise.filter((id) => ownFixtures.has(id));
+      if (ours.length) {
+        problems.push(
+          `restored but absent from the oracle's expected set (created by THIS run — a real ` +
+            `discrepancy): ${ours.join(", ")}`,
+        );
+      }
+      if (inherited.length) {
+        problems.push(
+          `PRECONDITION, not a restore defect — ${inherited.length} session(s) this run never ` +
+            `created were resurrected: ${inherited.join(", ")}. They are restorable-CLOSED rows ` +
+            `left by an earlier run (pty-exit/poll-dead stays restorable for 10 minutes) and are ` +
+            `INVISIBLE to T0.1, which sees open rows only. Leave >10 minutes between runs that ` +
+            `use --allow-restart, or start from a runner whose store has no recent fixture rows.`,
+        );
+      }
+    }
     // Placement: zoneIndex AND pageId must survive the restart.
     const byId = new Map((ctx.oracle.expected || []).map((e) => [e.claudeSessionId, e]));
     const info = await fetchSessionsInfo();
