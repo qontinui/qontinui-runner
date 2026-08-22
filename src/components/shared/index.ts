@@ -19,7 +19,9 @@ export { StreamingMessageView, type StreamingMessageViewProps } from "./Streamin
 export {
   CoordConnectionRequired,
   coordDisabledCopy,
+  runCoordDisabledAction,
   type CoordDisabledReason,
   type CoordDisabledCopy,
+  type CoordDisabledCopyOptions,
   type CoordConnectionRequiredProps,
 } from "./CoordConnectionRequired";

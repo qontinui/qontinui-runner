@@ -26,7 +26,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, AlertOctagon, AlertTriangle, Info, RefreshCw, Server } from "lucide-react";
 import { createLogger } from "@/lib/logger";
 import { useCoordMode, type CoordGating } from "@/contexts/CoordModeContext";
-import { CoordConnectionRequired } from "@/components/shared/CoordConnectionRequired";
+import {
+  CoordConnectionRequired,
+  coordDisabledCopy,
+} from "@/components/shared/CoordConnectionRequired";
 import {
   getFleetHealth,
   type FleetAlert,
@@ -36,6 +39,10 @@ import {
 } from "./coordinatorApi";
 
 const logger = createLogger("FleetHealthPanel");
+
+/** Operator-facing name of this surface, shared by the notice and the
+ *  disabled control's tooltip so both read from one `coordDisabledCopy`. */
+const FLEET_HEALTH_SURFACE = "Fleet health";
 
 /** Poll cadence. coord's watcher tick is 30s but it republishes the KV
  *  snapshot every tick; a 1 Hz panel poll keeps render latency under
@@ -90,15 +97,12 @@ export function deriveFleetView(
   machines: FleetMachineSnapshot[];
   alerts: FleetAlert[];
   rollup: { critical: number; warning: number; info: number };
-  /** True when the runner is positively isolated: render the notice
-   *  instead of any fleet content. */
+  /** True when the runner is positively isolated. Drives all three of:
+   *  render the notice instead of any fleet content, skip the 1 Hz poll
+   *  (an isolated runner has no coord to poll, so polling it once a
+   *  second is pure waste that also manufactures a permanent error
+   *  banner), and disable the panel's own Refresh control. */
   coordDisabled: boolean;
-  /** Whether the 1 Hz coord poll should run at all. An isolated runner
-   *  has no coord to poll, so polling it once a second is pure waste
-   *  that also manufactures a permanent error banner. */
-  pollingEnabled: boolean;
-  /** Whether the panel's own controls (Refresh) accept input. */
-  controlsEnabled: boolean;
 } {
   const authState = data?.auth?.state ?? "ok";
   const isUnauthorized = authState === "unauthorized";
@@ -122,8 +126,6 @@ export function deriveFleetView(
       ? { critical: 0, warning: 0, info: 0 }
       : (data?.health?.alerts ?? { critical: 0, warning: 0, info: 0 }),
     coordDisabled,
-    pollingEnabled: !coordDisabled,
-    controlsEnabled: !coordDisabled,
   };
 }
 
@@ -137,6 +139,11 @@ export function FleetHealthPanel() {
 
   const { isUnauthorized, isUnpaired, isAuthBlocked, machines, alerts, rollup, coordDisabled } =
     deriveFleetView(data, coord);
+  // Derived from the SAME `source` as the notice body below, so the two can
+  // never disagree about why the panel is off.
+  const disabledTooltip = coordDisabled
+    ? coordDisabledCopy(coord.source, FLEET_HEALTH_SURFACE).tooltip
+    : undefined;
 
   const load = useCallback(async () => {
     if (inFlight.current) return;
@@ -204,7 +211,7 @@ export function FleetHealthPanel() {
           type="button"
           onClick={() => void load()}
           disabled={loading || coordDisabled}
-          title={coordDisabled ? "Disabled — no qontinui account is connected" : undefined}
+          title={coordDisabled ? disabledTooltip : undefined}
           data-ui-bridge-id="productivity.fleet-health-refresh"
           className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 disabled:opacity-50"
         >
@@ -230,7 +237,7 @@ export function FleetHealthPanel() {
       {coordDisabled ? (
         <CoordConnectionRequired
           source={coord.source}
-          surface="Fleet health"
+          surface={FLEET_HEALTH_SURFACE}
           uiBridgeId="productivity.fleet-health-isolated"
         />
       ) : isUnauthorized ? (

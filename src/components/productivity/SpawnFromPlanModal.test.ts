@@ -35,25 +35,22 @@ function filled(overrides: Partial<SpawnFormInput> = {}): SpawnFormInput {
 }
 
 const connected = deriveCoordGating({
-  data: { mode: "connected", base: "https://coord.qontinui.io", source: "env" },
-  error: null,
-  loading: false,
+  mode: "connected",
+  base: "https://coord.qontinui.io",
+  source: "env",
 });
 const isolatedNoAccount = deriveCoordGating({
-  data: { mode: "isolated", base: null, source: COORD_SOURCE_NO_ACCOUNT },
-  error: null,
-  loading: false,
+  mode: "isolated",
+  base: null,
+  source: COORD_SOURCE_NO_ACCOUNT,
 });
 const isolatedUnreadable = deriveCoordGating({
-  data: { mode: "isolated", base: null, source: COORD_SOURCE_SETTINGS_UNREADABLE },
-  error: null,
-  loading: false,
+  mode: "isolated",
+  base: null,
+  source: COORD_SOURCE_SETTINGS_UNREADABLE,
 });
-const unknown = deriveCoordGating({
-  data: null,
-  error: "Command get_coord_mode not found",
-  loading: false,
-});
+// `null` = the invoke rejected, or the first load is still in flight.
+const unknown = deriveCoordGating(null);
 
 describe("deriveSpawnFormState — coord-mode gating (§6.4)", () => {
   it("connected → form live and submittable", () => {

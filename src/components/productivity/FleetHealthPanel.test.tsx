@@ -140,31 +140,26 @@ describe("deriveFleetView — fleet-auth P2 auth-state mapping", () => {
  */
 describe("deriveFleetView — coord-mode gating (§6.4)", () => {
   const connected = deriveCoordGating({
-    data: { mode: "connected", base: "https://coord.qontinui.io", source: "tier_default" },
-    error: null,
-    loading: false,
+    mode: "connected",
+    base: "https://coord.qontinui.io",
+    source: "tier_default",
   });
   const isolatedNoAccount = deriveCoordGating({
-    data: { mode: "isolated", base: null, source: COORD_SOURCE_NO_ACCOUNT },
-    error: null,
-    loading: false,
+    mode: "isolated",
+    base: null,
+    source: COORD_SOURCE_NO_ACCOUNT,
   });
   const isolatedUnreadable = deriveCoordGating({
-    data: { mode: "isolated", base: null, source: COORD_SOURCE_SETTINGS_UNREADABLE },
-    error: null,
-    loading: false,
+    mode: "isolated",
+    base: null,
+    source: COORD_SOURCE_SETTINGS_UNREADABLE,
   });
-  const unknown = deriveCoordGating({
-    data: null,
-    error: "Command get_coord_mode not found",
-    loading: false,
-  });
+  // `null` = the invoke rejected, or the first load is still in flight.
+  const unknown = deriveCoordGating(null);
 
   it("connected → live: polling on, controls on, fleet data rendered", () => {
     const v = deriveFleetView(okPayload(), connected);
     expect(v.coordDisabled).toBe(false);
-    expect(v.pollingEnabled).toBe(true);
-    expect(v.controlsEnabled).toBe(true);
     expect(v.machines).toHaveLength(1);
     expect(v.alerts).toHaveLength(1);
   });
@@ -172,8 +167,6 @@ describe("deriveFleetView — coord-mode gating (§6.4)", () => {
   it("isolated → disabled: notice instead of data, no poll, controls inert", () => {
     const v = deriveFleetView(okPayload(), isolatedNoAccount);
     expect(v.coordDisabled).toBe(true);
-    expect(v.pollingEnabled).toBe(false);
-    expect(v.controlsEnabled).toBe(false);
     // A stale frame must never render as if it were current fleet state.
     expect(v.machines).toEqual([]);
     expect(v.alerts).toEqual([]);
@@ -183,7 +176,6 @@ describe("deriveFleetView — coord-mode gating (§6.4)", () => {
   it("isolated via unreadable settings.json → disabled the same way", () => {
     const v = deriveFleetView(okPayload(), isolatedUnreadable);
     expect(v.coordDisabled).toBe(true);
-    expect(v.pollingEnabled).toBe(false);
     // The reason text differs — that split is pinned in
     // CoordConnectionRequired.test.ts — but the gate itself is the same.
     expect(isolatedUnreadable.source).toBe(COORD_SOURCE_SETTINGS_UNREADABLE);
@@ -192,15 +184,12 @@ describe("deriveFleetView — coord-mode gating (§6.4)", () => {
   it("unknown mode (invoke rejected) → stays ENABLED, never falsely disabled", () => {
     const v = deriveFleetView(okPayload(), unknown);
     expect(v.coordDisabled).toBe(false);
-    expect(v.pollingEnabled).toBe(true);
-    expect(v.controlsEnabled).toBe(true);
     expect(v.machines).toHaveLength(1);
   });
 
   it("no gating argument at all → unchanged pre-§6.4 behaviour (fails open)", () => {
     const v = deriveFleetView(okPayload());
     expect(v.coordDisabled).toBe(false);
-    expect(v.pollingEnabled).toBe(true);
     expect(v.machines).toHaveLength(1);
   });
 });
