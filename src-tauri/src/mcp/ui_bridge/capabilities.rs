@@ -511,6 +511,11 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                     "discover", "find", "components", "component/:id/state", "navigate-and-wait",
                     "page/navigate", "page/refresh",
                     "page/back", "page/forward", "page/evaluate", "forms", "fill", "forms/snapshot", "forms/diff",
+                    // Document/window-level key dispatch (mcp/ui_bridge/keyboard.rs).
+                    // `page/send-keys` is the SDK-declared route; `key` is the
+                    // runner's own literal-key form. Both were missing here, so
+                    // this manifest advertised no key dispatch at all.
+                    "page/send-keys", "key",
                     "workflows", "specs", "query-selector", "keyboard-shortcuts", "batch"],
                 "batch": {
                     "method": "POST",

@@ -205,7 +205,11 @@ export type UIBridgeRequestType =
   // Runner-specific
   | "navigate_tab"
   | "clear_storage"
-  // Document/window-level key dispatch (POST /ui-bridge/control/key).
+  // Document/window-level key dispatch. Backs BOTH
+  // `POST /ui-bridge/control/key` and the SDK-declared
+  // `POST /ui-bridge/control/page/send-keys`; the Rust layer normalizes the
+  // two request grammars (and their differing default `target`) before they
+  // reach this one message type.
   // Element-free by design: global shortcut listeners live on `window`, so
   // the element-scoped `execute_action` + `keyboard` path cannot reach them.
   | "dispatch_key"

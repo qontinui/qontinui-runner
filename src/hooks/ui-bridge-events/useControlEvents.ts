@@ -607,6 +607,24 @@ export function useControlEvents(
             mods: { ctrl?: boolean; alt?: boolean; meta?: boolean },
           ) => key.length === 1 && !mods.ctrl && !mods.alt && !mods.meta;
 
+          // `KeyboardEvent.code` is the PHYSICAL key, and it is how a
+          // layout-independent shortcut is bound. Leaving it unset (as this
+          // loop did) ships every synthetic event with `code: ""`, so any
+          // listener that reads `e.code` can never match one — a dispatch that
+          // reports success while reaching nothing. Mirrors the SDK's
+          // `keyToCode` (ui-bridge `core/key-events.ts`), which both the
+          // element-scoped `sendKeys` action and `sendKeysToPage` use, so the
+          // event shape is the same whichever side executes the dispatch.
+          const keyToCode = (key: string): string => {
+            if (key.length === 1) {
+              const upper = key.toUpperCase();
+              if (upper >= "A" && upper <= "Z") return `Key${upper}`;
+              if (upper >= "0" && upper <= "9") return `Digit${upper}`;
+              if (key === " ") return "Space";
+            }
+            return key;
+          };
+
           const delay = typeof params.delay === "number" ? params.delay : 0;
           let dispatched = 0;
           let defaultPrevented = false;
@@ -621,6 +639,7 @@ export function useControlEvents(
             const mods = keyDesc.modifiers ?? {};
             const eventInit: KeyboardEventInit = {
               key,
+              code: keyToCode(key),
               bubbles: true,
               cancelable: true,
               ctrlKey: !!mods.ctrl,

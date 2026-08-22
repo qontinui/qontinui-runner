@@ -70,7 +70,9 @@ use tracing::info;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
-use super::request::{target_window_payload, ui_bridge_request_sync, wrap_ipc_result};
+use super::request::{
+    get_ui_bridge_timeout_ms, target_window_payload, ui_bridge_request_sync, wrap_ipc_result,
+};
 
 /// Default dispatch target. `window` is the safe default: the runner's global
 /// shortcut listeners live on `window`, and a `window`-dispatched event cannot
@@ -320,9 +322,15 @@ fn is_known_key_name(key: &str) -> bool {
     if KNOWN_KEY_NAMES.contains(&key) {
         return true;
     }
-    // F1–F24
+    // F1–F24. The SDK spells this as /^F([1-9]|1[0-9]|2[0-4])$/, which admits
+    // no leading zero — so `"F01"` is REJECTED there. Rejecting it here too is
+    // the point of the strict grammar: `"F01"` is not a DOM `KeyboardEvent.key`
+    // value, so dispatching it verbatim would "succeed" while matching no
+    // listener. Parsing the digits alone would silently accept it.
     match key.strip_prefix('F') {
-        Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+        Some(n)
+            if !n.is_empty() && !n.starts_with('0') && n.chars().all(|c| c.is_ascii_digit()) =>
+        {
             matches!(n.parse::<u32>(), Ok(v) if (1..=24).contains(&v))
         }
         _ => false,
@@ -387,6 +395,60 @@ pub struct SendKeysToPageRequest {
 const SEND_KEYS_REQUIRED_MESSAGE: &str =
     "`keys` is required and must be a string (\"Escape\", \"ctrl+Enter\"), an array of such \
      strings, or an array of {\"key\":\"…\",\"modifiers\":{…}} descriptors";
+
+/// Largest `delay` a browser can honour: `setTimeout` stores its delay in a
+/// signed 32-bit int, and anything above this WRAPS and fires immediately —
+/// so a pace the caller asked for would silently not happen.
+pub const MAX_KEY_DELAY_MS: u64 = i32::MAX as u64;
+
+/// Reject a `delay` the dispatch cannot actually honour.
+///
+/// `delay` paces the sequence INSIDE the webview, while the HTTP request that
+/// carries it is blocked on the synchronous UI-Bridge IPC round trip. Nothing
+/// tied the two together: `{"keys":["a","b","c"],"delay":5000}` asks the
+/// frontend for 15 s of pacing against a 10 s IPC budget
+/// (`Timeouts::ui_bridge_ipc`), so the caller gets a transport timeout — and a
+/// circuit-breaker failure — while the webview happily keeps dispatching the
+/// rest of the sequence. That is a request reported as failed that in fact
+/// half-succeeded, which is worse than a refusal.
+///
+/// The frontend sleeps after the LAST key too (the SDK's `dispatchKeySequence`
+/// does the same), so the budget is `delay × keys.len()`, not `× (len - 1)`.
+///
+/// `budget_ms` is passed in rather than read here so the check is testable
+/// against a fixed budget; the handler supplies the live IPC timeout.
+pub fn check_key_delay_budget(
+    request: &SendKeysToPageRequest,
+    budget_ms: u64,
+) -> Result<(), String> {
+    let Some(delay) = request.delay else {
+        return Ok(());
+    };
+    if delay > MAX_KEY_DELAY_MS {
+        return Err(format!(
+            "`delay` {delay}ms exceeds the {MAX_KEY_DELAY_MS}ms a browser timer can hold — \
+             a larger value wraps and fires immediately, so the pacing would silently not happen"
+        ));
+    }
+    // A 0-length `keys` never reaches here (both parse paths reject it), and
+    // the product is bounded by MAX_KEY_DELAY_MS × array length, so saturate
+    // rather than risk a release-mode wrap.
+    let total = delay.saturating_mul(request.keys.len() as u64);
+    // `budget_ms == 0` means the IPC timeout was configured off
+    // (QONTINUI_TIMEOUT_UI_BRIDGE_IPC=0). Every IPC call is already broken in
+    // that state; refusing every paced dispatch on top of it would only
+    // mislabel the cause, so leave the check to the caller's own timeout.
+    if budget_ms > 0 && total >= budget_ms {
+        return Err(format!(
+            "`delay` {delay}ms × {} key(s) = {total}ms of pacing, which does not fit the \
+             {budget_ms}ms UI Bridge IPC budget — the request would time out while the keys \
+             kept dispatching. Lower `delay`, send fewer keys per call, or raise \
+             QONTINUI_TIMEOUT_UI_BRIDGE_IPC.",
+            request.keys.len()
+        ));
+    }
+    Ok(())
+}
 
 /// Normalize an incoming `POST /ui-bridge/control/page/send-keys` body against
 /// the SDK contract: `keys` accepts the combo-string grammar, `target` defaults
@@ -513,6 +575,12 @@ pub async fn ui_bridge_send_keys_to_page_handler(
         Ok(r) => r,
         Err(msg) => return Err((StatusCode::BAD_REQUEST, Json(api_error(msg)))),
     };
+    // `delay` is honoured inside the webview while this request blocks on the
+    // IPC round trip, so a pace that outlasts the IPC budget half-succeeds:
+    // the caller times out, the keys keep going. Refuse it up front instead.
+    if let Err(msg) = check_key_delay_budget(&request, get_ui_bridge_timeout_ms()) {
+        return Err((StatusCode::BAD_REQUEST, Json(api_error(msg))));
+    }
 
     info!(
         "UI Bridge API: send_keys_to_page ({} key(s) → {})",
@@ -827,6 +895,64 @@ mod tests {
         let err =
             parse_send_keys_to_page_request(&json!({ "keys": "a", "delay": "fast" })).unwrap_err();
         assert!(err.contains("`delay`"), "got: {err}");
+    }
+
+    #[test]
+    fn send_keys_delay_that_outlasts_the_ipc_budget_is_refused_not_timed_out() {
+        // 3 keys × 5000ms = 15s of frontend pacing against a 10s IPC budget.
+        // Without this check the caller sees a transport timeout while the
+        // webview keeps dispatching the rest of the sequence.
+        let req = parse_send_keys_to_page_request(&json!({
+            "keys": ["a", "b", "c"],
+            "delay": 5000
+        }))
+        .unwrap();
+        let err = check_key_delay_budget(&req, 10_000).unwrap_err();
+        assert!(err.contains("15000ms of pacing"), "got: {err}");
+        assert!(err.contains("10000ms UI Bridge IPC budget"), "got: {err}");
+    }
+
+    #[test]
+    fn send_keys_delay_within_the_ipc_budget_is_allowed() {
+        let req =
+            parse_send_keys_to_page_request(&json!({ "keys": ["a", "b"], "delay": 100 })).unwrap();
+        check_key_delay_budget(&req, 10_000).unwrap();
+        // No `delay` at all is always fine, whatever the key count.
+        let req = parse_send_keys_to_page_request(&json!({ "keys": ["a", "b", "c"] })).unwrap();
+        check_key_delay_budget(&req, 10_000).unwrap();
+    }
+
+    #[test]
+    fn send_keys_budget_counts_the_trailing_sleep() {
+        // The frontend sleeps after the LAST key too (matching the SDK's
+        // `dispatchKeySequence`), so 1 key × 10s does NOT fit a 10s budget.
+        let req =
+            parse_send_keys_to_page_request(&json!({ "keys": "Escape", "delay": 10_000 })).unwrap();
+        assert!(check_key_delay_budget(&req, 10_000).is_err());
+    }
+
+    #[test]
+    fn send_keys_rejects_a_delay_a_browser_timer_cannot_hold() {
+        // setTimeout stores its delay in a signed 32-bit int; anything larger
+        // wraps and fires immediately, so the pacing silently would not happen.
+        let req = parse_send_keys_to_page_request(
+            &json!({ "keys": "Escape", "delay": MAX_KEY_DELAY_MS + 1 }),
+        )
+        .unwrap();
+        // Checked even against a budget generous enough to admit it.
+        let err = check_key_delay_budget(&req, u64::MAX).unwrap_err();
+        assert!(err.contains("browser timer"), "got: {err}");
+    }
+
+    #[test]
+    fn send_keys_rejects_a_function_key_with_a_leading_zero() {
+        // The SDK's /^F([1-9]|1[0-9]|2[0-4])$/ admits no leading zero. "F01"
+        // is not a DOM KeyboardEvent.key value, so dispatching it verbatim
+        // would match no listener while reporting success.
+        let err = parse_send_keys_to_page_request(&json!({ "keys": "F01" })).unwrap_err();
+        assert!(err.contains("unknown key name"), "got: {err}");
+        // The canonical spelling still parses.
+        parse_send_keys_to_page_request(&json!({ "keys": "F1" })).unwrap();
     }
 
     #[test]
