@@ -473,7 +473,7 @@ export interface FileActivityPanelProps {
  * Coordination Phase 6 (§4.8) — the live-state heatmap. Renders
  * `(repo, file) → agents-currently-modifying` from real `git status`
  * working-tree state (coord's `events.worktree.dirty.*` snapshot),
- * not the lossy `coord.session_touched_files` tool-intercept signal.
+ * not the lossy `project.session_touched_files` tool-intercept signal.
  * Deletes/renames count; reads never appear; in-flight stash shows.
  */
 function LiveDirtyHeatmapSection({ cells }: { cells: LiveHeatCell[] }) {
@@ -632,7 +632,7 @@ export function FileActivityPanel({
           )}
         </section>
 
-        {/* Legacy `coord.session_touched_files` sections below — kept
+        {/* Legacy `project.session_touched_files` sections below — kept
             live during the Phase 6 pivot; Phase 7 removes them. */}
         <p className="text-[10px] text-muted-foreground italic">
           Legacy session-touched-files view (deprecated — Phase 7 removes; misses reads-vs-edits,
