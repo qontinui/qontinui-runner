@@ -19,6 +19,11 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { writeClipboard } from "@/lib/clipboard";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
+import {
+  buildWriteFailure,
+  throwIfWriteFailed,
+  type TerminalWriteResult,
+} from "./terminalWriteResult";
 import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
 import { matchScrollShortcut } from "./scrollKeys";
 import {
@@ -42,10 +47,18 @@ import { declarePaneTier } from "./terminalVisibilityTiers";
 import { PaneVisibilityService, routeOutputChunk } from "./paneVisibilityService";
 import { setWebglSlotVisible } from "./backends/webglContextLru";
 
+export type { TerminalWriteResult } from "./terminalWriteResult";
+
 export interface TerminalInstanceHandle {
   getSelection: () => string;
   hasSelection: () => boolean;
-  writeToTerminal: (text: string) => void;
+  /**
+   * Write to the PTY. Resolves with a {@link TerminalWriteResult} — it does
+   * NOT throw, and it does NOT silently succeed on a dead terminal. Callers
+   * that don't care may ignore the promise; the ones that report to an
+   * operator or an automation client must not.
+   */
+  writeToTerminal: (text: string) => Promise<TerminalWriteResult>;
   /**
    * Write raw output data directly to the terminal display without sending to the PTY.
    * Used for replaying saved scrollback buffers on session restore.
@@ -364,14 +377,62 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       backendRef.current?.focus();
     }, []);
 
+    // ── PTY write path ────────────────────────────────────────────────────
+    //
+    // Set by the `terminal-exit` handler further down; read by every write so
+    // a refused write can say WHY instead of resolving into the void.
+    const exitedRef = useRef<{ exitCode: number | null } | null>(null);
+    // One inline notice per exit — automation that retries a write must not
+    // paper the dead pane with duplicate banners.
+    const refusalNoticeShownRef = useRef(false);
+
+    /**
+     * The single write path to this pane's PTY. Every caller — the imperative
+     * handle, the UI Bridge `writeToTerminal` / `sendKeys` / `paste` custom
+     * actions — goes through it, so none of them can quietly reacquire the
+     * `.catch(() => {})` that made a write to a dead terminal look successful.
+     *
+     * On a refused write it also paints the INLINE RESTART AFFORDANCE into the
+     * pane itself: the operator who just clicked Approve-all sees, in the
+     * terminal they are looking at, that the input went nowhere and what to do
+     * about it.
+     */
+    const writePty = useCallback(
+      async (text: string): Promise<TerminalWriteResult> => {
+        const exit = exitedRef.current;
+        if (exit) {
+          if (!refusalNoticeShownRef.current) {
+            refusalNoticeShownRef.current = true;
+            backendRef.current?.write(
+              "\r\n\x1b[33m[input refused \u2014 this process exited with code " +
+                (exit.exitCode ?? "unknown") +
+                ". Restart the session (zone hover \u2192 Restart, or /restart) to send " +
+                "input.]\x1b[0m\r\n",
+            );
+          }
+          return buildWriteFailure(terminalId, exit, null);
+        }
+        const bytes = encoder.encode(text);
+        try {
+          await invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) });
+          return { success: true, bytes: bytes.length };
+        } catch (err) {
+          return buildWriteFailure(terminalId, exitedRef.current, err);
+        }
+      },
+      [terminalId],
+    );
+    // Stable indirection so the UI Bridge registration effect can reach the
+    // current writer without taking it as a dependency (that effect tears down
+    // and re-registers every element it owns when it re-runs).
+    const writePtyRef = useRef(writePty);
+    writePtyRef.current = writePty;
+
     // Expose selection, write, and scrollback API to parent components
     useImperativeHandle(ref, () => ({
       getSelection: () => backendRef.current?.getSelection() ?? "",
       hasSelection: () => backendRef.current?.hasSelection() ?? false,
-      writeToTerminal: (text: string) => {
-        const bytes = encoder.encode(text);
-        invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(() => {});
-      },
+      writeToTerminal: (text: string) => writePtyRef.current(text),
       writeToDisplay: (data: string) => {
         backendRef.current?.write(data);
       },
@@ -1236,28 +1297,24 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             customActions: {
               sendKeys: {
                 id: "sendKeys",
-                description: "Send key sequences to the terminal",
-                handler: (params?: unknown) => {
+                description:
+                  "Send key sequences to the terminal. Fails with TERMINAL_EXITED " +
+                  "when the pane's process is gone.",
+                handler: async (params?: unknown) => {
                   const { keys } = (params || {}) as { keys?: string };
-                  if (!keys) return;
-                  const bytes = encoder.encode(keys);
-                  invoke("terminal_write", {
-                    terminalId: termId,
-                    data: uint8ToBase64(bytes),
-                  }).catch(() => {});
+                  if (!keys) throw new Error("sendKeys: 'keys' is required");
+                  return throwIfWriteFailed(await writePtyRef.current(keys));
                 },
               },
               writeToTerminal: {
                 id: "writeToTerminal",
-                description: "Write text directly to the PTY (no keyboard events)",
-                handler: (params?: unknown) => {
+                description:
+                  "Write text directly to the PTY (no keyboard events). Fails with " +
+                  "TERMINAL_EXITED when the pane's process is gone.",
+                handler: async (params?: unknown) => {
                   const { text } = (params || {}) as { text?: string };
-                  if (!text) return;
-                  const bytes = encoder.encode(text);
-                  invoke("terminal_write", {
-                    terminalId: termId,
-                    data: uint8ToBase64(bytes),
-                  }).catch(() => {});
+                  if (!text) throw new Error("writeToTerminal: 'text' is required");
+                  return throwIfWriteFailed(await writePtyRef.current(text));
                 },
               },
               paste: {
@@ -1265,32 +1322,26 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
                 description: "Read clipboard and write to PTY (same as Ctrl+V)",
                 handler: async () => {
                   const text = await navigator.clipboard.readText().catch(() => "");
-                  if (text) {
-                    // Same bracketed-paste + newline normalization as the
-                    // Ctrl+V path (see `preparePaste.ts`).
-                    const prepared = preparePasteData(text, backend.bracketedPasteMode);
-                    const bytes = encoder.encode(prepared);
-                    invoke("terminal_write", {
-                      terminalId: termId,
-                      data: uint8ToBase64(bytes),
-                    }).catch(() => {});
-                  }
+                  if (!text) return { success: true, bytes: 0 };
+                  // Same bracketed-paste + newline normalization as the
+                  // Ctrl+V path (see `preparePaste.ts`).
+                  const prepared = preparePasteData(text, backend.bracketedPasteMode);
+                  return throwIfWriteFailed(await writePtyRef.current(prepared));
                 },
               },
               pasteText: {
                 id: "pasteText",
                 description:
                   "Paste literal text through the Ctrl+V path (bracketed-paste aware); no clipboard/keyboard. For automated tests.",
-                handler: (params?: unknown) => {
+                handler: async (params?: unknown) => {
                   const { text } = (params || {}) as { text?: string };
-                  if (!text) return;
+                  if (!text) throw new Error("pasteText: 'text' is required");
                   const b = backendRef.current;
                   const prepared = preparePasteData(text, b?.bracketedPasteMode ?? false);
-                  const bytes = encoder.encode(prepared);
-                  invoke("terminal_write", {
-                    terminalId: termId,
-                    data: uint8ToBase64(bytes),
-                  }).catch(() => {});
+                  // Same envelope as sendKeys / writeToTerminal: this is an
+                  // automation surface, so a write that reached no process must
+                  // not answer `success: true`.
+                  return throwIfWriteFailed(await writePtyRef.current(prepared));
                 },
               },
               getScrollback: {
@@ -1527,7 +1578,16 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // window installs one `terminal-exit` listener no matter how many
         // panes are mounted. Runs in every visibility tier: a hidden pane
         // must still record the exit and release its scrollback.
+        // Fresh backend for this pane → no recorded exit yet. (A restart
+        // allocates a NEW terminal id, but a reconnect re-runs this setup for
+        // the same one, and a stale `exitedRef` would refuse writes forever.)
+        exitedRef.current = null;
+        refusalNoticeShownRef.current = false;
         exitUnsub = registerTerminalExitHandler(terminalId, (payload) => {
+          // Record it BEFORE painting: every write path reads this to refuse
+          // (and explain) instead of resolving into a dead PTY.
+          exitedRef.current = { exitCode: payload.exitCode ?? null };
+          refusalNoticeShownRef.current = false;
           backend.write(
             `\r\n\x1b[90m[Process exited with code ${payload.exitCode ?? "unknown"}]\x1b[0m\r\n`,
           );

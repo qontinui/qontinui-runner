@@ -325,6 +325,120 @@ export function checkEvaluateBlocklist(
 }
 
 /**
+ * Skip over a quoted run (`'`, `"` or a template literal) starting at
+ * `start`, returning the index of its closing quote, or -1 if unterminated.
+ *
+ * Template literals recurse through `${…}` interpolations (which can contain
+ * further strings and templates) so a `;` or newline buried in one is never
+ * mistaken for a statement break.
+ */
+function skipQuotedRun(source: string, start: number): number {
+  const quote = source[start];
+  for (let i = start + 1; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "\\") {
+      i++;
+      continue;
+    }
+    if (ch === quote) return i;
+    if (quote === "`" && ch === "$" && source[i + 1] === "{") {
+      let depth = 1;
+      let j = i + 2;
+      for (; j < source.length && depth > 0; j++) {
+        const c = source[j];
+        if (c === "\\") {
+          j++;
+        } else if (c === '"' || c === "'" || c === "`") {
+          const end = skipQuotedRun(source, j);
+          if (end === -1) return -1;
+          j = end;
+        } else if (c === "{") {
+          depth++;
+        } else if (c === "}") {
+          depth--;
+        }
+      }
+      if (depth > 0) return -1;
+      i = j - 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Indices of every TOP-LEVEL statement break (`;` or newline) in `source` —
+ * top-level meaning outside all brackets, strings, template interpolations
+ * and comments.
+ *
+ * Deliberately a scanner and not a parser. Its only consumer is
+ * {@link splitTrailingStatement}, whose output is handed to `new Function`
+ * for validation, so a mis-scan (an unrecognised regex literal containing a
+ * `;`, say) produces a body that fails to compile and falls through to the
+ * next arm. Wrong-but-compiling is not reachable: the rewrite only ever
+ * moves a `return (` in front of a trailing fragment of the SAME source, so
+ * if it compiles, it runs the same statements in the same order.
+ */
+function topLevelStatementBreaks(source: string): number[] {
+  const breaks: number[] = [];
+  let depth = 0;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    const next = source[i + 1];
+    if (ch === "/" && next === "/") {
+      const nl = source.indexOf("\n", i + 2);
+      if (nl === -1) break;
+      i = nl - 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const end = source.indexOf("*/", i + 2);
+      if (end === -1) break;
+      i = end + 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const end = skipQuotedRun(source, i);
+      if (end === -1) return [];
+      i = end;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}") depth--;
+    else if (depth === 0 && (ch === ";" || ch === "\n")) breaks.push(i);
+  }
+  return breaks;
+}
+
+/**
+ * Completion-value rewrite for a statement list: `var q = 1 + 1; q` becomes
+ * `var q = 1 + 1;\nreturn ( q\n)`.
+ *
+ * A function body has no completion value — `new Function("var q=1+1; q")()`
+ * is `undefined` — so statement-style input whose author ended on a bare
+ * expression used to come back as `success: true` with nothing in it. That
+ * is the same silent false green the paren wrap fixes for leading newlines,
+ * reached from the statement side instead.
+ *
+ * Returns zero or one candidate body: the split at the LAST top-level
+ * statement break with a non-blank tail. Zero when there is no top-level
+ * break, or nothing but blanks after the last one (`1 + 1;`, already handled
+ * by arm 2).
+ */
+function splitTrailingStatement(expression: string): string[] {
+  const breaks = topLevelStatementBreaks(expression);
+  for (let i = breaks.length - 1; i >= 0; i--) {
+    const at = breaks[i];
+    // A trailing `;` (and any trailing blanks) can't ride inside the paren
+    // wrap — `return (q;)` is a SyntaxError — so `var q = 1 + 1; q;` would
+    // otherwise fall through to arm 4 while its semicolon-less twin worked.
+    const tail = expression.slice(at + 1).replace(/[;\s]+$/, "");
+    if (tail.length === 0) continue;
+    return [expression.slice(0, at + 1) + "\nreturn (" + tail + "\n)"];
+  }
+  return [];
+}
+
+/**
  * Compile a caller-supplied `page_evaluate` expression into a zero-arg
  * function, WITHOUT executing it. Used by both `page_evaluate` call sites
  * (`usePageEvents.ts` legacy IPC branch, `useUIBridgeEvaluateHandler.ts`
@@ -354,7 +468,7 @@ export function checkEvaluateBlocklist(
  * closing paren guards the mirror case: a TRAILING line comment would
  * otherwise swallow the `)`.
  *
- * Three compile attempts, most-specific first:
+ * Four compile attempts, most-specific first:
  *
  * 1. `return (<expr>\n)` — parenthesisable expressions. Newline- and
  *    comment-safe at both ends. Covers the overwhelming majority.
@@ -364,9 +478,27 @@ export function checkEvaluateBlocklist(
  *    (`foo(); bar()`). `trimStart()` is what keeps the ASI bug from
  *    sneaking back in through this arm for a leading-newline expression
  *    that also ends in `;`.
- * 3. The raw expression as a function body — genuine statement-style input
+ * 3. Statement list whose LAST top-level fragment is returned — the
+ *    completion-value arm. `var q = 1 + 1; q` is a statement list (arms 1
+ *    and 2 are both SyntaxErrors) whose author plainly means "give me
+ *    `q`", but a raw function body has no completion value, so arm 4
+ *    returned `undefined` under `success: true` — the same silent false
+ *    green the paren wrap exists to prevent, just reached from the other
+ *    side. See {@link splitTrailingStatement}.
+ * 4. The raw expression as a function body — genuine statement-style input
  *    with top-level `let`/`const` and an explicit `return`
  *    (`let x = 1; return x + 1`), which is not parenthesisable at all.
+ *
+ * Arm 3 is a GUARDED transform, and the guard is the load-bearing part: the
+ * rewrite is COMPILED first and kept only if it parses. Every shape the
+ * scanner can misread — a trailing block statement (`if(x){f()}`, where
+ * `return (…)` is a hard SyntaxError), a `;` inside a regex literal (the one
+ * literal kind the scanner does not track), a trailing fragment that is a
+ * statement rather than an expression (`let x = 1; return x + 1`) — fails to
+ * compile and falls through to arm 4, reproducing today's `undefined` exactly.
+ * A silently WRONG value would be far worse than the bug this closes, so the
+ * transform is never trusted unparsed. Arm 3 also sits after arm 2, so it can
+ * only ever catch input that already fell through to arm 4.
  *
  * Compilation is deliberately separated from invocation. The previous code
  * compiled-and-called inside one `try`, so an expression that merely THREW
@@ -379,6 +511,7 @@ export function compileEvaluateExpression(expression: string): () => unknown {
   const candidates = [
     "return (" + expression + "\n)",
     "return " + expression.trimStart(),
+    ...splitTrailingStatement(expression),
     expression,
   ];
   let lastSyntaxError: SyntaxError | undefined;
@@ -421,24 +554,6 @@ export function describeEvaluateResult(resolved: unknown): UnwrappedEvaluateResu
   }
   if (typeof resolved === "object") return { value: resolved, type: "object" };
   return { value: resolved, type: "scalar" };
-}
-
-/**
- * Shape an evaluated result into the DEFAULT (non-`unwrap`) envelope, where
- * objects ride through bare and everything else is boxed as `{value: x}`.
- *
- * `null` is boxed, not passed through. The two call sites had drifted on
- * exactly this point — `typeof null === "object"`, so the legacy IPC branch
- * returned a bare `result: null` while the tagged handler (which spelled out
- * `&& resolved !== null`) returned `result: {value: null}`. Same expression,
- * two different envelopes depending on which route the caller happened to
- * take, and a driver reading `data.result.value` threw on one of them.
- * Boxing is the correct arm: it matches how every other non-object result is
- * reported, and `result: null` carries no more information while breaking the
- * documented access path.
- */
-export function boxEvaluateResult(resolved: unknown): unknown {
-  return typeof resolved === "object" && resolved !== null ? resolved : { value: resolved };
 }
 
 /**

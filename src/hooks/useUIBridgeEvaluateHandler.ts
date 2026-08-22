@@ -47,7 +47,6 @@ import { createLogger } from "@/lib/logger";
 import { getErrorMessage } from "@/lib/utils";
 import {
   awaitWithTimeout,
-  boxEvaluateResult,
   checkEvaluateBlocklist,
   compileEvaluateExpression,
   describeEvaluateResult,
@@ -78,12 +77,6 @@ interface EvaluateRequestPayload {
    * `"[object Promise]"` instead.
    */
   timeout_ms?: number;
-  /**
-   * When true, emit the discriminated `{value, type}` shape instead of
-   * the legacy `{success, result}` envelope. Matches the sibling unwrap
-   * branch in usePageEvents.ts::page_evaluate.
-   */
-  unwrap?: boolean;
   /**
    * EXPLICIT opt-in. When true, relaxes only the four network-related
    * blocks (fetch / XMLHttpRequest / sendBeacon / WebSocket) so test
@@ -182,7 +175,7 @@ export async function handleEvaluateRequest(
   payload: EvaluateRequestPayload,
   deps: EvaluateHandlerDeps,
 ): Promise<boolean> {
-  const { request_id, expression, unwrap, allow_network_requests } = payload;
+  const { request_id, expression, allow_network_requests } = payload;
 
   // Multi-window addressing — the load-bearing scoping mechanism. The Rust
   // dispatcher targets a window via `emit_to(EventTarget::labeled(target), …)`,
@@ -225,27 +218,17 @@ export async function handleEvaluateRequest(
         expression,
         resolveEvaluateTimeoutMs(payload.timeout_ms),
       );
-      if (unwrap === true) {
-        // Opt-in consistent shape: always `{ value, type }`. The SAME shaper
-        // the legacy `usePageEvents.ts::page_evaluate` branch uses, so the two
-        // routes can't report different discriminants for one value. Rust
-        // passes this shape through verbatim when unwrap=true so the HTTP
-        // caller sees `{success: true, data: {value, type}}`.
-        response = {
-          request_id,
-          ok: true,
-          result: describeEvaluateResult(resolved),
-        };
-      } else {
-        // Match the legacy IPC page_evaluate shape so the Rust
-        // `tagged_page_evaluate` helper can pass the `data` field through
-        // unchanged: `{ result: object | { value: primitive } }`.
-        response = {
-          request_id,
-          ok: true,
-          result: { success: true, result: boxEvaluateResult(resolved) },
-        };
-      }
+      // ONE shape, always: `{ value, type }`. The SAME shaper the legacy
+      // `usePageEvents.ts::page_evaluate` branch uses, so the two routes
+      // cannot report different discriminants for one value. Rust passes it
+      // through verbatim, so the HTTP caller always sees
+      // `{success: true, data: {value, type}}` — including for `undefined`,
+      // which the retired default envelope reported as a bare `{}`.
+      response = {
+        request_id,
+        ok: true,
+        result: describeEvaluateResult(resolved),
+      };
     } catch (err) {
       const message = getErrorMessage(err);
       log.debug(`evaluate(${request_id}) threw:`, message);

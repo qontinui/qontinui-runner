@@ -20,7 +20,6 @@ import {
   getUIBridgeGlobal,
   toTabCanonical,
   awaitWithTimeout,
-  boxEvaluateResult,
   checkEvaluateBlocklist,
   compileEvaluateExpression,
   describeEvaluateResult,
@@ -399,7 +398,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
           // evaluated expression. Every structural code-injection block
           // (import, require, eval, Function, __proto__, document.cookie,
           // location mutation, crypto.subtle, …) stays in force regardless.
-          const { expression, unwrap, allowNetworkRequests } = payload;
+          const { expression, allowNetworkRequests } = payload;
           if (!expression) {
             await sendResponse({
               requestId,
@@ -446,25 +445,20 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               result,
               PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
             );
-            if (unwrap) {
-              // Opt-in consistent shape: always `{ value, type }`. Shared with
-              // the tagged handler so the two routes can't disagree.
-              await sendResponse({
-                requestId,
-                type,
-                success: true,
-                data: describeEvaluateResult(resolvedResult),
-                timestamp: Date.now(),
-              });
-            } else {
-              await sendResponse({
-                requestId,
-                type,
-                success: true,
-                data: { result: boxEvaluateResult(resolvedResult) },
-                timestamp: Date.now(),
-              });
-            }
+            // ONE shape, always: `{ value, type }`. Shared with the tagged
+            // handler so the two routes can't disagree. There is deliberately
+            // no opt-out — the old default varied its envelope by result type
+            // (objects bare, everything else boxed) AND dropped the `value`
+            // key entirely for `undefined`, so a caller got `success: true`
+            // with an empty object and no way to tell "returned undefined"
+            // from "shape you didn't expect". The discriminant answers that.
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: describeEvaluateResult(resolvedResult),
+              timestamp: Date.now(),
+            });
           } catch (err) {
             await sendResponse({
               requestId,

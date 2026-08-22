@@ -546,12 +546,6 @@ export interface UIBridgeRequestPayload {
   /** JavaScript expression for page_evaluate requests */
   expression?: string;
   /**
-   * When true, page_evaluate returns a consistent discriminated
-   * `{ value, type }` shape regardless of result type. When false/omitted,
-   * the legacy conditional-wrapping shape is preserved for backward-compat.
-   */
-  unwrap?: boolean;
-  /**
    * Explicit opt-in for page_evaluate expressions that perform network I/O
    * (fetch / XMLHttpRequest / sendBeacon / WebSocket). Default (false)
    * blocks those as data-exfiltration risks. Setting true relaxes ONLY the

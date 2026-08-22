@@ -256,8 +256,17 @@ pub struct SessionLifecycleInfo {
     /// signal.
     pub restored_from_boot_at: Option<i64>,
     /// `"resumed"` | `"terminal-only"` | `"failed"`; `None` = never restored,
-    /// which is NOT the same claim as `"failed"`.
+    /// which is NOT the same claim as `"failed"`. RAW stored evidence — read
+    /// `restore_status` for the verdict a human should be shown.
     pub restore_tier: Option<String>,
+    /// Set while a boot-restore's `--resume` is in flight and unverified.
+    /// Never projected before, which is why `restore_tier`'s deliberately
+    /// pessimistic `failed` had to be read as terminal.
+    pub restore_pending_at: Option<i64>,
+    /// The RENDERED restore verdict — see
+    /// [`crate::session::session_lifecycle_store::describe_restore_status`].
+    /// A restore still in flight reads `pending (not yet confirmed)`.
+    pub restore_status: String,
     /// `None` ⇒ never reported (unknown), not `false`.
     pub bypass_permissions: Option<bool>,
 }
@@ -574,7 +583,12 @@ pub fn project_session_info(
                     transcript_exists,
                 ),
                 restored_from_boot_at: rec.restored_from_boot_at,
+                restore_status: crate::session::session_lifecycle_store::describe_restore_status(
+                    rec.restore_tier.as_deref(),
+                    rec.restore_pending_at,
+                ),
                 restore_tier: rec.restore_tier.clone(),
+                restore_pending_at: rec.restore_pending_at,
                 bypass_permissions: rec.bypass_permissions,
             },
             prs,
@@ -934,6 +948,32 @@ mod tests {
         assert_eq!(v["placement"]["zoneIndex"], serde_json::json!(3));
         assert_eq!(v["lifecycle"]["transcriptExists"], serde_json::json!(true));
         assert_eq!(v["lifecycle"]["restoreTier"], serde_json::Value::Null);
+        // A record that was never restored says so — it does NOT borrow the
+        // `failed` word, and it carries no pending marker.
+        assert_eq!(
+            v["lifecycle"]["restoreStatus"],
+            serde_json::json!("not-restored")
+        );
+        assert_eq!(v["lifecycle"]["restorePendingAt"], serde_json::Value::Null);
+
+        // M2: mid-restore, the stored tier is the pessimistic `failed` and the
+        // RENDERED verdict must not read as terminal.
+        let mut mid = rec.clone();
+        mid.restore_tier = Some("failed".to_string());
+        mid.restore_pending_at = Some(9_000);
+        mid.restored_from_boot_at = Some(9_000);
+        let mv = serde_json::to_value(project_session_info(
+            &mid,
+            None,
+            true,
+            project_prs(&[pr_row(1, true, "ff-land")]),
+        ))
+        .unwrap();
+        assert_eq!(mv["lifecycle"]["restoreTier"], serde_json::json!("failed"));
+        assert_eq!(
+            mv["lifecycle"]["restoreStatus"],
+            serde_json::json!("pending (not yet confirmed)")
+        );
         assert_eq!(v["prs"]["status"], serde_json::json!("ok"));
         assert_eq!(v["prs"]["landedCount"], serde_json::json!(1));
         assert_eq!(

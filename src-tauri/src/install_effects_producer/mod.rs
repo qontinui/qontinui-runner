@@ -61,7 +61,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -271,29 +271,141 @@ pub struct SessionRestoreHealth {
     pub restorable: bool,
     pub title: Option<String>,
     pub working_dir: Option<String>,
+    /// `"open"` | `"closed"` — which registry bucket this row came from. Always
+    /// `"open"` before the `include` filter existed, which is exactly why it
+    /// was never reported.
+    pub state: String,
+    /// Raw stored tier: `"resumed"` | `"terminal-only"` | `"failed"`; `None` =
+    /// never restored, which is NOT the same claim as `"failed"`.
+    pub restore_tier: Option<String>,
+    /// Set while a boot-restore's `--resume` is in flight and unverified.
+    pub restore_pending_at: Option<i64>,
+    /// The RENDERED verdict — see
+    /// [`crate::session::session_lifecycle_store::describe_restore_status`]. A
+    /// pending restore reads `pending (not yet confirmed)` rather than the
+    /// pessimistically-stored `failed`.
+    pub restore_status: String,
+}
+
+/// Which registry rows `GET /control/sessions/restore-health` should report.
+///
+/// The route answered with OPEN rows only and said so nowhere in its output,
+/// so the two rows an operator most needs during a restore incident — the
+/// failed one and the in-flight one, whose `confirmed` / `transcriptExists`
+/// are the whole diagnosis — were simply unreachable over HTTP. Every field
+/// was already on the record; nothing but this filter was missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RestoreHealthFilter {
+    /// `state == "open"` (the historical default).
+    pub open: bool,
+    /// `state == "closed"`.
+    pub closed: bool,
+    /// `restore_pending_at.is_some()` — a restore in flight.
+    pub pending: bool,
+    /// `restore_tier == "failed"` — a resume attempt whose landing is unproven
+    /// or disproven.
+    pub failed: bool,
+}
+
+impl RestoreHealthFilter {
+    /// The back-compatible default: OPEN rows only.
+    pub fn open_only() -> Self {
+        Self {
+            open: true,
+            ..Self::default()
+        }
+    }
+
+    /// Does this record match any requested bucket? Union, not intersection —
+    /// `?include=failed,pending` means "show me both kinds".
+    fn matches(
+        &self,
+        rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+    ) -> bool {
+        use crate::session::session_lifecycle_store::RESTORE_TIER_FAILED;
+        (self.open && rec.state == "open")
+            || (self.closed && rec.state == "closed")
+            || (self.pending && rec.restore_pending_at.is_some())
+            || (self.failed && rec.restore_tier.as_deref() == Some(RESTORE_TIER_FAILED))
+    }
+}
+
+/// Parse `?include=failed,pending` into a [`RestoreHealthFilter`].
+///
+/// Absent / empty → OPEN only, preserving the previous contract. `all` selects
+/// every bucket. An unrecognised token is an ERROR, not a silent fallback: a
+/// typo'd `?include=faield` that quietly reported open rows would hand the
+/// operator a confident empty answer to the wrong question.
+pub fn parse_restore_health_include(spec: Option<&str>) -> Result<RestoreHealthFilter, String> {
+    let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(RestoreHealthFilter::open_only());
+    };
+    let mut filter = RestoreHealthFilter::default();
+    for token in spec.split(',') {
+        match token.trim() {
+            "" => continue,
+            "open" => filter.open = true,
+            "closed" => filter.closed = true,
+            "pending" => filter.pending = true,
+            "failed" => filter.failed = true,
+            "all" => {
+                filter.open = true;
+                filter.closed = true;
+                filter.pending = true;
+                filter.failed = true;
+            }
+            other => {
+                return Err(format!(
+                    "unknown include value '{other}'. Valid: open, closed, pending, failed,                      all (comma-separated; omit for open only)"
+                ))
+            }
+        }
+    }
+    if filter == RestoreHealthFilter::default() {
+        // e.g. `?include=,` — nothing selected. Same reasoning as above.
+        return Err(
+            "include selected no buckets. Valid: open, closed, pending, failed, all".to_string(),
+        );
+    }
+    Ok(filter)
+}
+
+/// Query params for `GET /control/sessions/restore-health`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct RestoreHealthQuery {
+    /// Comma-separated buckets — see [`parse_restore_health_include`].
+    #[serde(default)]
+    pub include: Option<String>,
 }
 
 /// Response body of `GET /control/sessions/restore-health`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreHealthResponse {
-    /// Every OPEN registry record, healthy or phantom.
+    /// Every registry record the `include` filter selected, healthy or phantom.
     pub sessions: Vec<SessionRestoreHealth>,
-    /// Count of open sessions that are NOT restorable — the number an operator
-    /// actually wants: `0` means restore works right now.
+    /// Count of REPORTED sessions that are NOT restorable — the number an
+    /// operator actually wants: `0` means restore works for everything asked
+    /// about. Scoped to `sessions`, so it moves with `include`.
     pub unrestorable: usize,
+    /// Echo of the buckets actually applied, so a reader never has to guess
+    /// which population `unrestorable` was counted over.
+    pub included: Vec<String>,
 }
 
 /// Pure projection of the open records + a transcript probe into the health
 /// report. Separated from the route so the join is unit-testable without a
 /// Tauri app handle or a live disk.
 pub fn project_restore_health(
-    open: Vec<crate::session::session_lifecycle_store::TerminalSessionRecord>,
+    records: Vec<crate::session::session_lifecycle_store::TerminalSessionRecord>,
     probe: &dyn crate::session::snapshot_history::TranscriptProbe,
+    filter: RestoreHealthFilter,
 ) -> RestoreHealthResponse {
+    use crate::session::session_lifecycle_store::describe_restore_status;
     use crate::session::snapshot_history::is_restorable_identity;
-    let mut sessions: Vec<SessionRestoreHealth> = open
+    let mut sessions: Vec<SessionRestoreHealth> = records
         .into_iter()
+        .filter(|rec| filter.matches(rec))
         .map(|rec| {
             let confirmed = rec.confirmed_at.is_some();
             let transcript_exists =
@@ -307,6 +419,13 @@ pub fn project_restore_health(
                 restorable: is_restorable_identity(confirmed, transcript_exists),
                 title: rec.title,
                 working_dir: rec.working_dir,
+                state: rec.state,
+                restore_status: describe_restore_status(
+                    rec.restore_tier.as_deref(),
+                    rec.restore_pending_at,
+                ),
+                restore_tier: rec.restore_tier,
+                restore_pending_at: rec.restore_pending_at,
             }
         })
         .collect();
@@ -317,26 +436,53 @@ pub fn project_restore_health(
             .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
     });
     let unrestorable = sessions.iter().filter(|s| !s.restorable).count();
+    let mut included = Vec::new();
+    if filter.open {
+        included.push("open".to_string());
+    }
+    if filter.closed {
+        included.push("closed".to_string());
+    }
+    if filter.pending {
+        included.push("pending".to_string());
+    }
+    if filter.failed {
+        included.push("failed".to_string());
+    }
     RestoreHealthResponse {
         sessions,
         unrestorable,
+        included,
     }
 }
 
-/// `GET /control/sessions/restore-health`. Reports, per OPEN session, whether it
-/// can actually be restored — `{confirmed, transcriptExists, restorable}` joined
-/// against the transcript store.
+/// `GET /control/sessions/restore-health[?include=open,closed,pending,failed|all]`.
+/// Reports, per selected session, whether it can actually be restored —
+/// `{confirmed, transcriptExists, restorable}` joined against the transcript
+/// store, plus the record's own `state` / `restoreTier` / `restorePendingAt`
+/// and the rendered `restoreStatus`.
+///
+/// `include` defaults to `open`, which is what this route used to hard-code.
+/// That default made the FAILED and PENDING rows — the ones whose `confirmed` /
+/// `transcriptExists` pair IS the diagnosis during a restore incident —
+/// unreadable over HTTP even though every field was already on the record.
 ///
 /// Read-only: it stats the disk and touches no registry state, so probing it is
 /// always safe. Degrades to an empty report (200) when the lifecycle store isn't
 /// in Tauri state, matching the other `/control/*` handlers — a diagnostic must
-/// never be the thing that errors.
+/// never be the thing that errors. An unparseable `include` IS a 400, though:
+/// answering a typo'd question with a confident empty list is the failure mode
+/// this route exists to close.
 async fn get_sessions_restore_health(
     State(state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<RestoreHealthResponse>> {
+    Query(query): Query<RestoreHealthQuery>,
+) -> Result<Json<ApiResponse<RestoreHealthResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     use crate::session::reconcile::DiskTranscriptIndex;
     use crate::session::session_lifecycle_store::SessionLifecycleStore;
     use tauri::Manager;
+
+    let filter = parse_restore_health_include(query.include.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
 
     let store = state
         .app_handle
@@ -344,16 +490,20 @@ async fn get_sessions_restore_health(
         .map(|s| s.inner().clone());
     let Some(store) = store else {
         warn!("control/sessions/restore-health: lifecycle store not in Tauri state — empty report");
-        return Json(ApiResponse::success(RestoreHealthResponse {
-            sessions: Vec::new(),
-            unrestorable: 0,
-        }));
+        return Ok(Json(ApiResponse::success(project_restore_health(
+            Vec::new(),
+            &crate::session::reconcile::DiskTranscriptIndex::discover(),
+            filter,
+        ))));
     };
     let index = DiskTranscriptIndex::discover();
-    Json(ApiResponse::success(project_restore_health(
-        store.open_records(),
+    // `all_records()` (not `open_records()`) — the filter decides what is
+    // reported, so the read has to be able to see every bucket.
+    Ok(Json(ApiResponse::success(project_restore_health(
+        store.all_records(),
         &index,
-    )))
+        filter,
+    ))))
 }
 
 /// `GET /control/sessions/info`. Every OPEN session's full identity projection
@@ -1589,6 +1739,7 @@ mod tests {
                 health_rec("real-sess", "aaa11111", true),
             ],
             &probe,
+            RestoreHealthFilter::open_only(),
         );
 
         assert_eq!(report.sessions.len(), 2);
@@ -1611,7 +1762,11 @@ mod tests {
     #[test]
     fn restore_health_wire_shape_and_confirmed_without_transcript() {
         let probe = FakeProbe(std::collections::HashSet::new());
-        let report = project_restore_health(vec![health_rec("vanished", "term-1", true)], &probe);
+        let report = project_restore_health(
+            vec![health_rec("vanished", "term-1", true)],
+            &probe,
+            RestoreHealthFilter::open_only(),
+        );
         assert!(
             !report.sessions[0].restorable,
             "confirmed but no transcript ⇒ --resume would find nothing"
@@ -1631,11 +1786,100 @@ mod tests {
         assert_eq!(wire.get("unrestorable").and_then(|v| v.as_u64()), Some(1));
     }
 
+    /// M1: the FAILED and PENDING rows were unreachable over HTTP even though
+    /// every field they carry was already on the record. `?include=` reaches
+    /// them, and their `confirmed` / `transcriptExists` pair — the actual
+    /// diagnosis — comes back non-null.
+    #[test]
+    fn include_reaches_failed_and_pending_rows_the_open_default_hid() {
+        use crate::session::session_lifecycle_store::RESTORE_TIER_FAILED;
+        let probe = FakeProbe(["live".to_string()].into_iter().collect());
+        let mut failed = health_rec("dead-restore", "term-failed", true);
+        failed.state = "closed".to_string();
+        failed.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
+        failed.restored_from_boot_at = Some(10);
+        let mut pending = health_rec("in-flight", "term-pending", false);
+        pending.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
+        pending.restore_pending_at = Some(11);
+        pending.restored_from_boot_at = Some(11);
+        let open = health_rec("live", "term-open", true);
+        let records = vec![failed, pending, open];
+
+        // The historical default still answers with the open row alone.
+        let default_report =
+            project_restore_health(records.clone(), &probe, RestoreHealthFilter::open_only());
+        assert_eq!(default_report.sessions.len(), 2, "open + the pending row");
+        assert!(default_report.sessions.iter().all(|r| r.state == "open"));
+
+        let filter = parse_restore_health_include(Some("failed,pending")).unwrap();
+        let report = project_restore_health(records, &probe, filter);
+        let ids: Vec<&str> = report
+            .sessions
+            .iter()
+            .map(|r| r.claude_session_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["dead-restore", "in-flight"], "no open-only row");
+        let failed_row = &report.sessions[0];
+        // `confirmed` is the whole point: it was unreadable before.
+        assert!(failed_row.confirmed, "confirmed is reported, not hidden");
+        assert!(!failed_row.transcript_exists);
+        assert_eq!(failed_row.state, "closed");
+        assert_eq!(report.included, vec!["pending", "failed"]);
+    }
+
+    /// M2: a restore in flight must not read as a terminal verdict. The stored
+    /// tier stays pessimistic (`failed`); the RENDERED one says pending, and
+    /// flips to `resumed` once the handshake clears the marker.
+    #[test]
+    fn pending_restore_renders_pending_not_failed() {
+        use crate::session::session_lifecycle_store::{RESTORE_TIER_FAILED, RESTORE_TIER_RESUMED};
+        let probe = FakeProbe(["mid".to_string()].into_iter().collect());
+        let mut mid = health_rec("mid", "term-1", true);
+        mid.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
+        mid.restore_pending_at = Some(7);
+        let during =
+            project_restore_health(vec![mid.clone()], &probe, RestoreHealthFilter::open_only());
+        assert_eq!(
+            during.sessions[0].restore_status,
+            "pending (not yet confirmed)"
+        );
+        assert_eq!(
+            during.sessions[0].restore_tier.as_deref(),
+            Some(RESTORE_TIER_FAILED),
+            "the raw stored evidence is unchanged — only the rendering is honest"
+        );
+        assert_eq!(during.sessions[0].restore_pending_at, Some(7));
+
+        // …after `clear_restore_pending` upgraded the tier.
+        let mut after = mid;
+        after.restore_pending_at = None;
+        after.restore_tier = Some(RESTORE_TIER_RESUMED.to_string());
+        let done = project_restore_health(vec![after], &probe, RestoreHealthFilter::open_only());
+        assert_eq!(done.sessions[0].restore_status, "resumed");
+    }
+
+    /// A typo must not be answered with a confident empty list.
+    #[test]
+    fn unknown_include_token_is_an_error_not_a_silent_default() {
+        assert!(parse_restore_health_include(Some("faield")).is_err());
+        assert!(parse_restore_health_include(Some(",")).is_err());
+        assert_eq!(
+            parse_restore_health_include(None).unwrap(),
+            RestoreHealthFilter::open_only()
+        );
+        assert_eq!(
+            parse_restore_health_include(Some("  ")).unwrap(),
+            RestoreHealthFilter::open_only()
+        );
+        let all = parse_restore_health_include(Some("all")).unwrap();
+        assert!(all.open && all.closed && all.pending && all.failed);
+    }
+
     /// An empty registry is a clean, honest report — never an error.
     #[test]
     fn project_restore_health_empty_registry() {
         let probe = FakeProbe(std::collections::HashSet::new());
-        let report = project_restore_health(Vec::new(), &probe);
+        let report = project_restore_health(Vec::new(), &probe, RestoreHealthFilter::open_only());
         assert!(report.sessions.is_empty());
         assert_eq!(report.unrestorable, 0);
     }

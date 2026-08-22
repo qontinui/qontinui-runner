@@ -216,23 +216,12 @@ export function ZoneProfilePicker({
     description:
       "Saves and loads named zone-layout profiles (labels, notes, pins, sessions). " +
       "Use load-profile / save-profile / delete-profile to manage profiles programmatically.",
+    // NO `open` / `close` actions — same reason as `zone-layout-picker`: this
+    // component mounts inside a `display: none` container, so an action that
+    // reports success for "opened the dropdown" is reporting on a dropdown
+    // that does not render. The profile surface is fully reachable through
+    // load-profile / save-profile / delete-profile.
     actions: [
-      {
-        id: "open",
-        label: "Open dropdown",
-        handler: () => {
-          setOpen(true);
-        },
-      },
-      {
-        id: "close",
-        label: "Close dropdown",
-        handler: () => {
-          setOpen(false);
-          setShowSaveInput(false);
-          setSaveName("");
-        },
-      },
       {
         id: "load-profile",
         label: "Load Profile",

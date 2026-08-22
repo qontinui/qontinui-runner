@@ -187,9 +187,7 @@ pub async fn ui_bridge_structured_assert_handler(
 
     match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
         Ok(data) => {
-            let result_str = data
-                .get("result")
-                .and_then(|r| r.get("value"))
+            let result_str = super::helpers::evaluate_ipc_value(&data)
                 .and_then(|v| v.as_str())
                 .unwrap_or("{}");
 
@@ -329,10 +327,7 @@ pub async fn ui_bridge_expect_text_handler(
             Ok(data) => {
                 consecutive_errors = 0;
                 last_error = None;
-                let raw = data
-                    .get("result")
-                    .and_then(|r| r.get("value"))
-                    .or_else(|| data.get("value"));
+                let raw = super::helpers::evaluate_ipc_value(&data);
                 let value = raw
                     .and_then(|v| v.as_bool())
                     .or_else(|| raw.and_then(|v| v.as_str()).map(|s| s == "true"))

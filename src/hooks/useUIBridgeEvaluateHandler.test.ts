@@ -31,7 +31,7 @@ describe("handleEvaluateRequest", () => {
     expect(deps.emit).toHaveBeenCalledWith("ui-bridge:evaluate-response", {
       request_id: "r1",
       ok: true,
-      result: { success: true, result: { value: 3 } },
+      result: { value: 3, type: "scalar" },
     });
   });
 
@@ -136,7 +136,7 @@ describe("handleEvaluateRequest", () => {
       expect(deps.emit).toHaveBeenCalledWith("ui-bridge:evaluate-response", {
         request_id: "read",
         ok: true,
-        result: { success: true, result: { value: "/probe" } },
+        result: { value: "/probe", type: "scalar" },
       });
     } finally {
       delete (globalThis as Record<string, unknown>).location;
@@ -156,14 +156,14 @@ describe("handleEvaluateRequest", () => {
       deps,
     );
     expect(handled).toBe(true);
-    // Object results ride the envelope raw (primitives get boxed as
-    // `{value: x}`), so pre-fix this emitted `result: {}` — the boxed
-    // `{value: undefined}` — under `ok: true`, indistinguishable from an
-    // expression that legitimately returned an empty object.
+    // Pre-fix this emitted `result: {}` under `ok: true`, indistinguishable
+    // from an expression that legitimately returned an empty object. The
+    // discriminated shape is now the ONLY shape, so the `type` tag also
+    // separates a real `undefined` from a shape surprise.
     expect(deps.emit).toHaveBeenCalledWith("ui-bridge:evaluate-response", {
       request_id: "nl",
       ok: true,
-      result: { success: true, result: { a: 1 } },
+      result: { value: { a: 1 }, type: "object" },
     });
   });
 
@@ -175,7 +175,7 @@ describe("handleEvaluateRequest", () => {
     expect(payload).toEqual({
       request_id: "nl-multi",
       ok: true,
-      result: { success: true, result: { a: 1 } },
+      result: { value: { a: 1 }, type: "object" },
     });
   });
 
@@ -206,7 +206,7 @@ describe("handleEvaluateRequest", () => {
       expect(deps.emit).toHaveBeenCalledWith("ui-bridge:evaluate-response", {
         request_id: "slow",
         ok: true,
-        result: { success: true, result: { done: true } },
+        result: { value: { done: true }, type: "object" },
       });
     } finally {
       delete (globalThis as Record<string, unknown>).__slowProbe;
@@ -244,17 +244,45 @@ describe("handleEvaluateRequest", () => {
     expect(deps.emit).toHaveBeenCalledWith("ui-bridge:evaluate-response", {
       request_id: "stmt",
       ok: true,
-      result: { success: true, result: { value: 2 } },
+      result: { value: 2, type: "scalar" },
     });
   });
 
-  it("emits the discriminated {value,type} shape when unwrap=true", async () => {
+  it("emits the discriminated {value,type} shape unconditionally — no opt-in", async () => {
+    // The `unwrap` opt-in is gone: the varying legacy envelope was the defect,
+    // not a feature, and a caller that still sends `unwrap` gets the same one
+    // shape (the field is simply not read any more).
     const deps = makeDeps();
-    await handleEvaluateRequest({ request_id: "u1", expression: "42", unwrap: true }, deps);
+    await handleEvaluateRequest({ request_id: "u1", expression: "42" }, deps);
     expect(deps.emit).toHaveBeenCalledWith("ui-bridge:evaluate-response", {
       request_id: "u1",
       ok: true,
       result: { value: 42, type: "scalar" },
+    });
+  });
+
+  it("returns the completion value of a statement list instead of undefined", async () => {
+    // `var q = 1 + 1; q` is not parenthesisable and not valid after a bare
+    // `return`, so it landed on the raw-body arm — which has no completion
+    // value and yielded `undefined`, serialised as a success envelope with
+    // the `value` key dropped entirely.
+    const deps = makeDeps();
+    await handleEvaluateRequest({ request_id: "comp", expression: "var q = 1 + 1; q" }, deps);
+    expect(deps.emit).toHaveBeenCalledWith("ui-bridge:evaluate-response", {
+      request_id: "comp",
+      ok: true,
+      result: { value: 2, type: "scalar" },
+    });
+  });
+
+  it("types a genuine undefined instead of emitting an empty success", async () => {
+    const deps = makeDeps();
+    await handleEvaluateRequest({ request_id: "undef", expression: "void 0" }, deps);
+    const [, payload] = deps.emit.mock.calls[0];
+    expect(payload).toEqual({
+      request_id: "undef",
+      ok: true,
+      result: { value: undefined, type: "undefined" },
     });
   });
 });

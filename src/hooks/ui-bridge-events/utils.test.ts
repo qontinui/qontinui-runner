@@ -18,7 +18,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   awaitWithTimeout,
-  boxEvaluateResult,
   compileEvaluateExpression,
   describeEvaluateResult,
   isThenable,
@@ -215,6 +214,79 @@ describe("compileEvaluateExpression — page_evaluate wrapping", () => {
     },
   );
 
+  it.each([
+    ["var q = 1 + 1; q", 2],
+    ["var q = 1 + 1; q;", 2],
+    ["var q = 1 + 1;\nq", 2],
+    ["let a = 1; let b = 2; a + b", 3],
+    ["const o = {a: {b: 7}}; o.a.b", 7],
+  ])("returns the completion value of the statement list %j", (expression, expected) => {
+    // THE ARM-3 GAP. A function body has no completion value, so
+    // `new Function("var q = 1 + 1; q")()` is `undefined` — the caller got
+    // `success: true` with an empty result for input whose intent is
+    // unambiguous. Arms 1 and 2 are both SyntaxErrors here, so before the
+    // completion-value rewrite every one of these landed on the raw-body arm.
+    expect(compileEvaluateExpression(expression as string)()).toBe(expected);
+  });
+
+  it.each([
+    // A final BLOCK statement: `return (if(x){f()})` is a hard SyntaxError, so
+    // the guarded transform must be DISCARDED and the raw body kept. Wrong is
+    // worse than undefined, which is why the candidate is compiled before it
+    // is trusted.
+    "var hit = false; if (1) { hit = true; }",
+    // Same, with a loop.
+    "var n = 0; for (var i = 0; i < 2; i++) { n++; }",
+  ])("falls back to the raw body when the rewrite cannot compile: %j", (expression) => {
+    // Not a throw and not a wrong value — exactly today's behaviour.
+    expect(compileEvaluateExpression(expression)()).toBeUndefined();
+  });
+
+  it("still returns the completion value when a trailing line comment follows it", () => {
+    // The `\n` before the closing paren is what keeps `// done` from
+    // commenting the `)` out.
+    expect(compileEvaluateExpression("var q = 1 + 1; q // done")()).toBe(2);
+  });
+
+  it("does not mis-split on a `;` inside a regex literal", () => {
+    // The scanner does not track regex literals, so a split AT a regex-internal
+    // `;` produces an unterminated-regex head — a SyntaxError, which is
+    // discarded. It can never produce a different, compiling program.
+    expect(compileEvaluateExpression('var r = /a;b/; r.test("a;b")')()).toBe(true);
+    // Regex at the very end: the only split point IS inside the literal, so the
+    // rewrite is rejected and the raw body's `undefined` stands.
+    expect(compileEvaluateExpression("var ok = true; /a;b/")()).toBeUndefined();
+  });
+
+  it("never executes the statements twice when the rewrite is tried", () => {
+    // Compilation is separated from invocation, so a rejected candidate costs
+    // a `new Function` parse and nothing else.
+    let calls = 0;
+    (globalThis as Record<string, unknown>).__sideEffect = () => {
+      calls += 1;
+      return calls;
+    };
+    try {
+      const fn = compileEvaluateExpression("var v = globalThis.__sideEffect(); v");
+      expect(calls).toBe(0);
+      expect(fn()).toBe(1);
+      expect(calls).toBe(1);
+    } finally {
+      delete (globalThis as Record<string, unknown>).__sideEffect;
+    }
+  });
+
+  it.each([
+    ['const s = "a;b"; s', "a;b"],
+    ["const t = `x${1};y`; t", "x1;y"],
+    ["const f = (a, b) => { return a; }; f(1, 2)", 1],
+  ])("ignores a %j break that is inside a string, template or bracket", (expression, expected) => {
+    // The split scanner must not treat a `;` inside a string/template/bracket
+    // as a statement break — splitting there produces a head that is either a
+    // SyntaxError (benign, falls through) or, worse, a different program.
+    expect(compileEvaluateExpression(expression as string)()).toBe(expected);
+  });
+
   it("falls back to a raw function body for statement-style input", () => {
     // Not parenthesisable and not valid after a bare `return` either — this
     // is the case the original SyntaxError fallback existed for, and it must
@@ -251,31 +323,6 @@ describe("compileEvaluateExpression — page_evaluate wrapping", () => {
     } finally {
       delete (globalThis as Record<string, unknown>).__compileProbe;
     }
-  });
-});
-
-describe("boxEvaluateResult — default (non-unwrap) page/evaluate envelope", () => {
-  it("boxes null instead of passing it through — THE DIVERGENCE", () => {
-    // `typeof null === "object"`, so the legacy IPC branch's bare
-    // `typeof x === "object" ? x : {value: x}` returned `result: null` while
-    // the tagged handler's `&& x !== null` variant returned
-    // `result: {value: null}`. One expression, two envelopes depending on the
-    // route, and `data.result.value` threw on one of them.
-    expect(boxEvaluateResult(null)).toEqual({ value: null });
-  });
-
-  it("passes real objects and arrays through bare", () => {
-    const obj = { a: 1 };
-    expect(boxEvaluateResult(obj)).toBe(obj);
-    const arr = [1, 2];
-    expect(boxEvaluateResult(arr)).toBe(arr);
-  });
-
-  it("boxes every non-object result", () => {
-    expect(boxEvaluateResult(3)).toEqual({ value: 3 });
-    expect(boxEvaluateResult("s")).toEqual({ value: "s" });
-    expect(boxEvaluateResult(false)).toEqual({ value: false });
-    expect(boxEvaluateResult(undefined)).toEqual({ value: undefined });
   });
 });
 

@@ -357,14 +357,17 @@ there. To answer "did my panel render?":
   selector's `textContent`/`value`.
 - **`find-by-text`** (`elements.rs:3158`) locates elements by visible text.
 
-### `page/evaluate` result envelope: pass `unwrap: true` for a stable shape
-By default the result shape varies by type (scalars get wrapped as
-`{success, result:{value}}`; objects pass through bare), which breaks naive
-`data.result.value` parsing. Pass **`unwrap: true`** and the frontend returns a
-consistent discriminated `{value, type}` shape for every result type
-(`page.rs:159` field, applied at `page.rs:752`). The varying `unwrap:false`
-shape is the legacy default kept for back-compat — prefer `unwrap:true` for
-parse-without-try/except.
+### `page/evaluate` result envelope: ONE discriminated shape, always
+`data` is always `{value, type}`, where `type` is one of
+`scalar | object | null | undefined | function`. There is no opt-in and no
+opt-out. The retired default varied the envelope by result type (scalars
+boxed as `{success, result:{value}}`, objects bare), which broke naive
+`data.result.value` parsing, and it reported an expression returning
+`undefined` as a bare `{}` — `success: true` with the `value` key dropped by
+JSON serialisation, indistinguishable from an empty object. The `type` tag is
+what makes "returned undefined" readable. An `unwrap` field on the request is
+accepted and ignored (no `deny_unknown_fields`), so old callers keep working.
+The direct-eval fallback emits the same shape plus `source: "direct_eval"`.
 
 ## Contract test surface
 

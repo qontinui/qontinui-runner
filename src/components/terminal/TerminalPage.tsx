@@ -16,6 +16,7 @@ import { PromptModal } from "./PromptModal";
 import { usePromptLibrary } from "./usePromptLibrary";
 import { usePromptLibraryCommands } from "./commands/usePromptLibraryCommands";
 import { writeToTerminalById } from "./writeToTerminalById";
+import { buildTerminalSessionRoster } from "./terminalSessionRoster";
 import { compareByUsageHeadroom } from "../settings/types";
 import { ZoneMinimap } from "./ZoneMinimap";
 import { ZoneProfilePicker } from "./ZoneProfilePicker";
@@ -750,6 +751,19 @@ function TerminalPageInner({
   // `claudeSessionId`; they are still listed (with `claudeSessionId: null`)
   // so the roster is a faithful census of all tracked terminals.
   //
+  // Each row carries `state` / `isAlive` / `exitCode` — the SAME three fields,
+  // sources and defaults this component already publishes as
+  // `TerminalSessionEntry` a few dozen lines above (served by
+  // `GET /control/terminal-sessions`). Without them the roster answered "which
+  // terminals exist" and never "which of them are usable": an exited PTY read
+  // `isReconnecting: false` exactly like a live one. Reusing the existing
+  // spelling rather than adding a `dead` flag keeps ONE answer to tab liveness
+  // in this component instead of a second one that can disagree.
+  //
+  // `sessionStates` is therefore a real dependency of the memo below — reading
+  // liveness through a memo keyed only on `[tabs, assignments]` would publish a
+  // stale row, i.e. a dead PTY still rendering alive.
+  //
   // Flow-grid virtualization (Phase 3) note: a far-offscreen ("assigned-virtual")
   // zone renders only a CompactZoneCard and mounts NO TerminalInstance, so it has
   // no `terminal-input-<id>` interactive element to type into. This roster still
@@ -761,22 +775,17 @@ function TerminalPageInner({
   // (base64 payload), which addresses the PTY by id and is unaffected by mount
   // state. The frontend's own quick-approve/reject/send actions already take
   // route (b) automatically via `writeToTerminalById`.
-  const terminalSessionRoster = useMemo(() => {
-    const assignments = zoneLayout.assignments;
-    const roster = tabs.map((t) => {
-      const zoneIndex = Number(
-        Object.entries(assignments).find(([, id]) => id === t.id)?.[0] ?? -1,
-      );
-      return {
-        claudeSessionId: t.claudeSessionId ?? null,
-        terminalId: t.id,
-        zoneIndex,
-        title: t.title,
-        isReconnecting: Boolean(t.isReconnecting),
-      };
-    });
-    return JSON.stringify(roster);
-  }, [tabs, zoneLayout.assignments]);
+  const terminalSessionRoster = useMemo(
+    () =>
+      JSON.stringify(
+        buildTerminalSessionRoster(
+          tabs,
+          zoneLayout.assignments,
+          stateTracking.sessionStates,
+        ),
+      ),
+    [tabs, zoneLayout.assignments, stateTracking.sessionStates],
+  );
 
   const transitionEffects = useTransitionEffects();
   const { handleRestartInZone } = transitionEffects;

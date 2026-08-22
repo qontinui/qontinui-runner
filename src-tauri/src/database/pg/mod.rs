@@ -129,6 +129,52 @@ pub fn pg_available() -> bool {
     PG_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Render a `tokio_postgres::Error` as something an operator can act on.
+///
+/// THE DEFECT: `tokio_postgres::Error`'s `Display` prints the bare string
+/// `db error` for every server-side failure — it ignores the alternate `{:#}`
+/// flag too, so `format!("{e}")` and `format!("{e:#}")` are equally useless.
+/// The SQLSTATE, the message, the offending relation and the server's own hint
+/// all live in the `DbError` cause, which `Display` never walks. So a missing
+/// table, a type mismatch and a permission denial all reached the Coordinator
+/// panel as the identical two words, and the operator's only next move was to
+/// go read the server log by hand.
+///
+/// Output shape: `<ctx>: [42P01] relation "coord.tasks" does not exist
+/// (table=tasks) (hint: …)` — SQLSTATE first because it is the part that
+/// searches cleanly. A client-side error (connection closed, TLS, encode) has
+/// no `DbError`, so it falls back to `Display` plus the source chain, which for
+/// those variants IS informative.
+pub fn pg_err(ctx: &str, e: &tokio_postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(db) => {
+            let mut out = format!("{}: [{}] {}", ctx, db.code().code(), db.message());
+            if let Some(table) = db.table() {
+                out.push_str(&format!(" (table={table})"));
+            }
+            if let Some(detail) = db.detail() {
+                out.push_str(&format!(" (detail: {detail})"));
+            }
+            if let Some(hint) = db.hint() {
+                out.push_str(&format!(" (hint: {hint})"));
+            }
+            out
+        }
+        None => {
+            // No DbError cause ⇒ client-side (connect/TLS/encode/decode). Its
+            // Display is real, and the source chain names the underlying io
+            // error, which is the diagnosable part.
+            let mut out = format!("{}: {}", ctx, e);
+            let mut src = std::error::Error::source(e);
+            while let Some(cause) = src {
+                out.push_str(&format!(" <- {cause}"));
+                src = cause.source();
+            }
+            out
+        }
+    }
+}
+
 /// Parse a workflow id string into the uuid `project.unified_workflows.id`
 /// (and its inbound FK columns) actually require — see migration
 /// `d7a3f1c8e024_realign_unified_workflows_to_model`. Runner-generated ids

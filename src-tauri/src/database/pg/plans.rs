@@ -92,7 +92,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("Failed to insert plan: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to insert plan", &e))?;
 
         Ok(PlanRow {
             id: row.get(0),
@@ -126,7 +126,7 @@ impl PgDb {
                 &[&markdown_path],
             )
             .await
-            .map_err(|e| format!("Failed to load plan by path: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to load plan by path", &e))?;
 
         Ok(row.map(|r| PlanRow {
             id: r.get(0),
@@ -161,7 +161,7 @@ impl PgDb {
                 &[&plan_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to load plan by id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to load plan by id", &e))?;
 
         Ok(row.map(|r| PlanRow {
             id: r.get(0),
@@ -216,7 +216,7 @@ impl PgDb {
         let rows = conn
             .query(sql, &[])
             .await
-            .map_err(|e| format!("Failed to list plans: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list plans", &e))?;
 
         Ok(rows
             .into_iter()
@@ -258,7 +258,7 @@ impl PgDb {
                 &[&plan_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to count tasks for plan: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("Failed to count tasks for plan", &e))?
             .get(0);
 
         let target = if task_count > 0 {
@@ -289,7 +289,7 @@ impl PgDb {
                 &[&plan_uuid, &status],
             )
             .await
-            .map_err(|e| format!("Failed to update plan status: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to update plan status", &e))?;
 
         Ok(n > 0)
     }
@@ -313,7 +313,7 @@ impl PgDb {
                 &[&plan_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to delete plan: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to delete plan", &e))?;
 
         Ok(n > 0)
     }
