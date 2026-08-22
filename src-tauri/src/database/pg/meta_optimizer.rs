@@ -2165,6 +2165,7 @@ impl PgDb {
             String,
             String,
             String,
+            String,
         )>,
         String,
     > {
@@ -2176,7 +2177,8 @@ impl PgDb {
         let row = conn
             .query_opt(
                 r#"SELECT entries_json, comparison_report, recommendation_json,
-                          status, workflow_id, workflow_name, created_at
+                          status, workflow_id, workflow_name, created_at,
+                          variation_type
                    FROM comparison_runs WHERE id = $1"#,
                 &[&comparison_id],
             )
@@ -2191,6 +2193,7 @@ impl PgDb {
                 r.get::<_, String>(4),
                 r.get::<_, String>(5),
                 r.get::<_, String>(6),
+                r.get::<_, String>(7),
             )
         }))
     }
