@@ -203,6 +203,12 @@ $BODY_FIXTURES = @{
     "POST /control/page/read-value"           = '{"selector":"#smoke"}'
     "POST /control/page/find-by-text"         = '{"text":"smoke"}'
     "POST /control/page/navigate-to"          = '{"route":"/"}'
+    # F13 is inside the grammar's F1-F24 range, so this exercises the combo
+    # parser AND the live dispatch -- but the runner binds no F13 shortcut, so
+    # unlike "Escape" it cannot close a panel out from under another probe.
+    # Without a fixture this route was probed with {} and passed on the
+    # validation 400, proving only that it was registered.
+    "POST /control/page/send-keys"            = '{"keys":"F13"}'
     "POST /control/states/find-path"          = '{"to":"smoke"}'
     "POST /control/states/navigate"           = '{"to":"smoke"}'
 }
