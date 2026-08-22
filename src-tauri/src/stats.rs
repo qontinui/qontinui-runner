@@ -96,6 +96,49 @@ pub fn welch_t_test(a: &[f64], b: &[f64]) -> f64 {
     p.clamp(0.0, 1.0)
 }
 
+/// Paired t-test on per-observation deltas (**one-sided**).
+///
+/// Tests H₁: `mean(deltas) > 0`, i.e. "the experimental arm beats the control
+/// arm on the *same* observations". Returns a **one-sided** p-value, matching
+/// the contract [`StatisticalAnalysis::p_value`] documents and that
+/// [`compute_verdict`] relies on when it derives `p_regression = 1 - p`.
+///
+/// Deliberately *not* [`welch_t_test`]: that test is **unpaired and two-sided**,
+/// so feeding its p-value into [`compute_verdict`] silently converts a
+/// significant regression into `Verdict::Neutral`.
+///
+/// `deltas[i]` must be `experiment[i] - control[i]` for the same observation
+/// `i`. Positions where either arm is missing must be **excluded by the caller**
+/// before the call — never imputed as `0.0`, which fabricates a "no change"
+/// observation.
+///
+/// Degenerate inputs:
+/// * `n < 2` — no variance is estimable, so the test cannot run: returns `1.0`
+///   ("no evidence of improvement"), never `0.0`.
+/// * zero variance — every delta is identical, so the direction is certain:
+///   returns `0.0` for a strictly positive mean and `1.0` otherwise.
+pub fn paired_t_test(deltas: &[f64]) -> f64 {
+    let n = deltas.len();
+    if n < 2 {
+        return 1.0;
+    }
+
+    let n_f = n as f64;
+    let mean = deltas.iter().sum::<f64>() / n_f;
+    let var = deltas.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n_f - 1.0);
+
+    if var <= 0.0 {
+        return if mean > 0.0 { 0.0 } else { 1.0 };
+    }
+
+    let se = (var / n_f).sqrt();
+    let t = mean / se;
+    let df = n_f - 1.0;
+
+    // One-sided p-value: P(T_df > t)
+    (1.0 - t_cdf_signed(t, df)).clamp(0.0, 1.0)
+}
+
 // =============================================================================
 // Effect size measures
 // =============================================================================
@@ -226,6 +269,71 @@ pub fn proportion_analysis(
     }
 }
 
+/// Compute p-value, confidence interval, and effect size for a **paired**
+/// continuous comparison.
+///
+/// The continuous counterpart of [`proportion_analysis`], shaped so its output
+/// can be handed straight to [`compute_verdict`]:
+///
+/// * `p_value` — **one-sided** ([`paired_t_test`]), as
+///   [`StatisticalAnalysis::p_value`] documents and [`compute_verdict`] relies on.
+/// * `confidence_interval` — the 95% CI of the **mean delta**.
+/// * `effect_size` — Cohen's dz for paired samples (`mean(delta) / sd(delta)`),
+///   *not* Cohen's h, which is a proportion-only measure.
+///
+/// # UNITS — read this before calling
+///
+/// `StatisticalAnalysis` is documented in **percentage points**, and
+/// [`compute_verdict`]'s `sr_delta_pp` argument plus every field of
+/// [`VerdictThresholds`] are in pp. This function does **no** scaling: the
+/// returned `confidence_interval` is in exactly the units of `deltas`.
+///
+/// So a caller comparing a continuous score on a `0.0..=1.0` scale must scale
+/// each delta by 100 **before** calling — a raw `0..1` delta is 100× smaller
+/// than a pp delta, and passing it unscaled silently changes the meaning of
+/// every threshold. (`p_value` and `effect_size` are scale-invariant; only the
+/// CI and the `sr_delta_pp` you pass alongside it are not.)
+///
+/// `deltas[i]` must be `experiment[i] - control[i]` for the same observation.
+/// Unpaired positions are the caller's job to exclude — see [`paired_t_test`].
+///
+/// Returns all-`None` when fewer than `min_samples` (or fewer than 2) paired
+/// observations are supplied, which drives [`compute_verdict`] into its
+/// fallback arm; pair that with a non-zero `VerdictThresholds::min_runs` to get
+/// `Verdict::InsufficientData` instead.
+pub fn paired_analysis(deltas: &[f64], min_samples: usize) -> StatisticalAnalysis {
+    if deltas.len() < min_samples.max(2) {
+        return StatisticalAnalysis {
+            p_value: None,
+            confidence_interval: None,
+            effect_size: None,
+        };
+    }
+
+    let n = deltas.len() as f64;
+    let mean = deltas.iter().sum::<f64>() / n;
+    let var = deltas.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let sd = var.sqrt();
+
+    let p = paired_t_test(deltas);
+
+    // Zero variance: the mean delta is known exactly, so the CI collapses to a
+    // point and Cohen's dz (mean/sd) is undefined rather than infinite.
+    let (ci, effect_size) = if sd > 0.0 {
+        let se = sd / n.sqrt();
+        let t_crit = t_quantile(0.975, n - 1.0);
+        ((mean - t_crit * se, mean + t_crit * se), Some(mean / sd))
+    } else {
+        ((mean, mean), None)
+    };
+
+    StatisticalAnalysis {
+        p_value: Some(p),
+        confidence_interval: Some(ci),
+        effect_size,
+    }
+}
+
 /// Configurable thresholds for statistical verdict decisions.
 #[derive(Debug, Clone)]
 pub struct VerdictThresholds {
@@ -265,6 +373,31 @@ impl VerdictThresholds {
             fallback_regression_pp: -5.0,
             fallback_improvement_pp: 3.0,
             min_runs: 5,
+        }
+    }
+
+    /// Thresholds for a **held-out validation gate** on prompt optimization
+    /// (see `workflow_generation::gepa_optimizer`).
+    ///
+    /// Units are the same percentage points every other constructor here uses;
+    /// a caller scoring on a `0.0..=1.0` scale scales its deltas by 100 first
+    /// (see [`paired_analysis`]).
+    ///
+    /// Stricter on the accept side than [`Self::recommendation`] because there
+    /// is no canary stage behind this gate — the decision adopts the prompt
+    /// outright, so it demands a significant gain of at least 5 pp rather than
+    /// 2 pp. `min_runs` is the **held-out floor**: below 10 *paired* examples
+    /// the gate reports `Verdict::InsufficientData` rather than deciding, which
+    /// is also what keeps an all-excluded (zero paired) run from reading as a
+    /// 0.0 delta, i.e. "no change".
+    pub fn held_out_gate() -> Self {
+        Self {
+            alpha: 0.05,
+            regression_delta_pp: -2.0,
+            improvement_delta_pp: 5.0,
+            fallback_regression_pp: -5.0,
+            fallback_improvement_pp: 10.0,
+            min_runs: 10,
         }
     }
 }
@@ -464,6 +597,44 @@ pub(crate) fn normal_quantile(p: f64) -> f64 {
 pub fn t_cdf(t: f64, df: f64) -> f64 {
     let x = df / (df + t * t);
     1.0 - 0.5 * regularized_incomplete_beta(x, df / 2.0, 0.5)
+}
+
+/// Student's t CDF valid over the **whole** real line.
+///
+/// [`t_cdf`] is only correct for `t >= 0`: its `x = df / (df + t²)` is even in
+/// `t`, so `t_cdf(-2.0, 4.0) == t_cdf(2.0, 4.0)` — always `>= 0.5`. Callers
+/// that can see a negative statistic (any one-sided test) must go through here.
+pub fn t_cdf_signed(t: f64, df: f64) -> f64 {
+    if t >= 0.0 {
+        t_cdf(t, df)
+    } else {
+        1.0 - t_cdf(-t, df)
+    }
+}
+
+/// Inverse Student's t CDF (quantile function), by bisection on [`t_cdf_signed`].
+///
+/// There is no closed form; 100 bisection steps over `[-1e3, 1e3]` converge far
+/// below the precision of the CDF approximation itself.
+pub fn t_quantile(p: f64, df: f64) -> f64 {
+    if p <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if p >= 1.0 {
+        return f64::INFINITY;
+    }
+
+    let mut lo = -1e3;
+    let mut hi = 1e3;
+    for _ in 0..100 {
+        let mid = 0.5 * (lo + hi);
+        if t_cdf_signed(mid, df) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
 }
 
 /// Regularized incomplete beta function I_x(a, b) via continued fraction (Lentz's method).
@@ -832,5 +1003,235 @@ mod tests {
         // Small delta is neutral
         let v = compute_verdict(1.0, &analysis, 10, &VerdictThresholds::recommendation());
         assert_eq!(v, Verdict::Neutral);
+    }
+
+    // =========================================================================
+    // Paired continuous tests
+    //
+    // Expected p-values below are LITERALS derived by hand from the closed form
+    // of the t distribution at df = 4, not by re-running the code under test.
+    //
+    // For df = 4 the density is f(t) = (3/8)(1 + t²/4)^(-5/2), so with
+    // θ = arctan(t/2),   P(T > t) = 1/2 - (3/4)·(sinθ - sin³θ/3).
+    //
+    // deltas = [0.1, 0.2, 0.3, 0.4, 0.5]:
+    //   mean = 0.3, s² = 0.025, se = sqrt(0.025/5) = sqrt(0.005),
+    //   t = 0.3/sqrt(0.005) = 3√2 = 4.242640687…, df = 4.
+    //   tanθ = t/2 = 3/√2 ⇒ sin²θ = 9/11 ⇒ sinθ = 3/√11, so
+    //   P(T > t) = 1/2 - (3/4)·(24/(11√11)) = 1/2 - 18/(11√11) = 0.00661793…
+    // =========================================================================
+
+    /// One-sided p for a fixed vector, against a hand-derived literal.
+    #[test]
+    fn test_paired_t_test_literal_one_sided_p() {
+        let deltas = [0.1, 0.2, 0.3, 0.4, 0.5];
+        let p = paired_t_test(&deltas);
+        assert!(
+            (p - 0.006_617_933_3).abs() < 1e-6,
+            "expected one-sided p ≈ 0.0066179333 for t = 3√2 at df = 4, got {p}"
+        );
+    }
+
+    /// One-sidedness, proven directly: the SAME magnitude of effect in the two
+    /// directions must land on OPPOSITE sides of 0.5 and sum to 1.
+    ///
+    /// A two-sided test (e.g. `welch_t_test`) would return the same small p for
+    /// both, which is exactly the misuse `compute_verdict` cannot survive.
+    #[test]
+    fn test_paired_t_test_is_one_sided_not_two_sided() {
+        let up = [0.1, 0.2, 0.3, 0.4, 0.5];
+        let down = [-0.1, -0.2, -0.3, -0.4, -0.5];
+
+        let p_up = paired_t_test(&up);
+        let p_down = paired_t_test(&down);
+
+        assert!((p_up - 0.006_617_933_3).abs() < 1e-6, "p_up = {p_up}");
+        assert!((p_down - 0.993_382_066_7).abs() < 1e-6, "p_down = {p_down}");
+
+        assert!(p_up < 0.5, "improvement must give p < 0.5, got {p_up}");
+        assert!(p_down > 0.5, "regression must give p > 0.5, got {p_down}");
+        assert!(
+            (p_up + p_down - 1.0).abs() < 1e-9,
+            "one-sided p-values must be complementary: {p_up} + {p_down}"
+        );
+    }
+
+    #[test]
+    fn test_paired_t_test_degenerate_inputs() {
+        // n < 2: no variance estimable — "no evidence", never 0.0.
+        assert_eq!(paired_t_test(&[]), 1.0);
+        assert_eq!(paired_t_test(&[5.0]), 1.0);
+
+        // Zero variance: the direction is certain.
+        assert_eq!(paired_t_test(&[0.25, 0.25, 0.25]), 0.0);
+        assert_eq!(paired_t_test(&[-0.25, -0.25, -0.25]), 1.0);
+        assert_eq!(paired_t_test(&[0.0, 0.0, 0.0]), 1.0);
+    }
+
+    /// `t_cdf` alone is even in `t`; `t_cdf_signed` must not be.
+    #[test]
+    fn test_t_cdf_signed_handles_negative_t() {
+        // The bug this wrapper exists to avoid:
+        assert!((t_cdf(-2.0, 4.0) - t_cdf(2.0, 4.0)).abs() < 1e-12);
+        // The corrected behaviour:
+        assert!((t_cdf_signed(-2.0, 4.0) + t_cdf_signed(2.0, 4.0) - 1.0).abs() < 1e-9);
+        assert!(t_cdf_signed(-2.0, 4.0) < 0.5);
+        assert!(t_cdf_signed(2.0, 4.0) > 0.5);
+        assert!((t_cdf_signed(0.0, 4.0) - 0.5).abs() < 1e-9);
+    }
+
+    /// Literal table values for the Student-t quantile.
+    #[test]
+    fn test_t_quantile_literal_table_values() {
+        // t(0.975, df=4) = 2.776445 ; t(0.95, df=9) = 1.833113
+        assert!(
+            (t_quantile(0.975, 4.0) - 2.776_445).abs() < 1e-4,
+            "got {}",
+            t_quantile(0.975, 4.0)
+        );
+        assert!(
+            (t_quantile(0.95, 9.0) - 1.833_113).abs() < 1e-4,
+            "got {}",
+            t_quantile(0.95, 9.0)
+        );
+    }
+
+    /// CI of the MEAN DELTA and Cohen's dz, against hand-computed literals.
+    ///
+    /// mean = 0.3, sd = sqrt(0.025) = 0.15811388…, se = 0.07071068…,
+    /// t(0.975, 4) = 2.776445 ⇒ half-width = 0.19632448…
+    /// ⇒ CI = (0.10367552, 0.49632448); dz = 0.3 / 0.15811388 = 1.8973666…
+    #[test]
+    fn test_paired_analysis_literal_ci_and_effect_size() {
+        let deltas = [0.1, 0.2, 0.3, 0.4, 0.5];
+        let a = paired_analysis(&deltas, 2);
+
+        let p = a.p_value.expect("p_value");
+        assert!((p - 0.006_617_933_3).abs() < 1e-6, "p = {p}");
+
+        let (lo, hi) = a.confidence_interval.expect("ci");
+        assert!((lo - 0.103_675_5).abs() < 1e-5, "ci lower = {lo}");
+        assert!((hi - 0.496_324_5).abs() < 1e-5, "ci upper = {hi}");
+
+        let d = a.effect_size.expect("effect_size");
+        assert!((d - 1.897_366_6).abs() < 1e-6, "cohen's dz = {d}");
+    }
+
+    #[test]
+    fn test_paired_analysis_below_min_samples_is_all_none() {
+        let a = paired_analysis(&[0.1, 0.2, 0.3], 10);
+        assert!(a.p_value.is_none());
+        assert!(a.confidence_interval.is_none());
+        assert!(a.effect_size.is_none());
+
+        // n < 2 is all-None regardless of min_samples.
+        let a = paired_analysis(&[0.1], 1);
+        assert!(a.p_value.is_none());
+        let a = paired_analysis(&[], 0);
+        assert!(a.p_value.is_none());
+    }
+
+    /// Zero variance: the CI collapses to a point and dz is undefined (`None`),
+    /// not infinite.
+    #[test]
+    fn test_paired_analysis_zero_variance() {
+        let a = paired_analysis(&[2.0, 2.0, 2.0, 2.0], 2);
+        assert_eq!(a.p_value, Some(0.0));
+        assert_eq!(a.confidence_interval, Some((2.0, 2.0)));
+        assert!(a.effect_size.is_none());
+    }
+
+    /// End-to-end: a clear regression must reach `Verdict::Negative` through
+    /// `compute_verdict` — the arm the plan says a two-sided p silently loses.
+    #[test]
+    fn test_paired_regression_reaches_negative_verdict_end_to_end() {
+        // Ten paired deltas in percentage points, mean = -9.5 pp.
+        let deltas_pp: Vec<f64> = (5..15).map(|i| -(i as f64)).collect();
+        let mean_pp = deltas_pp.iter().sum::<f64>() / deltas_pp.len() as f64;
+        assert!((mean_pp - -9.5).abs() < 1e-12);
+
+        let analysis = paired_analysis(&deltas_pp, 10);
+        let p = analysis.p_value.expect("p_value");
+        assert!(
+            p > 0.99,
+            "a regression must give a LARGE one-sided p, got {p}"
+        );
+
+        let v = compute_verdict(
+            mean_pp,
+            &analysis,
+            deltas_pp.len() as u64,
+            &VerdictThresholds::held_out_gate(),
+        );
+        assert_eq!(v, Verdict::Negative);
+        assert_eq!(v.as_recommendation_str(), "regressed");
+    }
+
+    /// The mirror image reaches `Positive`.
+    #[test]
+    fn test_paired_improvement_reaches_positive_verdict_end_to_end() {
+        let deltas_pp: Vec<f64> = (5..15).map(|i| i as f64).collect();
+        let mean_pp = deltas_pp.iter().sum::<f64>() / deltas_pp.len() as f64;
+        assert!((mean_pp - 9.5).abs() < 1e-12);
+
+        let analysis = paired_analysis(&deltas_pp, 10);
+        let p = analysis.p_value.expect("p_value");
+        assert!(
+            p < 0.01,
+            "an improvement must give a SMALL one-sided p, got {p}"
+        );
+
+        let v = compute_verdict(
+            mean_pp,
+            &analysis,
+            deltas_pp.len() as u64,
+            &VerdictThresholds::held_out_gate(),
+        );
+        assert_eq!(v, Verdict::Positive);
+    }
+
+    /// Pins the misuse the plan warns about: substituting `welch_t_test`'s
+    /// TWO-SIDED p for the one-sided one turns the very same clear regression
+    /// into `Neutral`. This is why `paired_t_test` exists.
+    #[test]
+    fn test_two_sided_p_would_downgrade_a_regression_to_neutral() {
+        let ctrl: Vec<f64> = (0..10).map(|i| 50.0 + i as f64).collect();
+        let exp: Vec<f64> = ctrl.iter().map(|c| c - 9.5).collect();
+
+        let two_sided = welch_t_test(&exp, &ctrl);
+        let wrong = StatisticalAnalysis {
+            p_value: Some(two_sided),
+            confidence_interval: Some((-14.0, -5.0)),
+            effect_size: None,
+        };
+        let v = compute_verdict(-9.5, &wrong, 10, &VerdictThresholds::held_out_gate());
+        assert_eq!(
+            v,
+            Verdict::Neutral,
+            "a two-sided p must NOT be fed to compute_verdict — it hides regressions"
+        );
+
+        // The one-sided paired test on the same data does not lose it.
+        let deltas: Vec<f64> = exp.iter().zip(ctrl.iter()).map(|(e, c)| e - c).collect();
+        let right = paired_analysis(&deltas, 10);
+        let v = compute_verdict(-9.5, &right, 10, &VerdictThresholds::held_out_gate());
+        assert_eq!(v, Verdict::Negative);
+    }
+
+    /// `held_out_gate`'s `min_runs` is what stops a zero-paired run (every
+    /// example excluded — today's actual state of the world) from reading as a
+    /// 0.0 delta, i.e. "no change".
+    #[test]
+    fn test_held_out_gate_min_runs_yields_insufficient_data() {
+        let empty = paired_analysis(&[], 10);
+        let v = compute_verdict(0.0, &empty, 0, &VerdictThresholds::held_out_gate());
+        assert_eq!(v, Verdict::InsufficientData);
+        assert_eq!(v.as_recommendation_str(), "insufficient_data");
+
+        // Still insufficient just below the floor.
+        let nine: Vec<f64> = vec![1.0; 9];
+        let a = paired_analysis(&nine, 10);
+        let v = compute_verdict(1.0, &a, 9, &VerdictThresholds::held_out_gate());
+        assert_eq!(v, Verdict::InsufficientData);
     }
 }
