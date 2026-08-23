@@ -402,6 +402,142 @@ export function decideColdResume(
   return liveSessionIds.has(claudeSessionId) ? "skip-alive" : "respawn";
 }
 
+/**
+ * What a DRAIN-TIME skip must do to the record + tab it is walking away from.
+ *
+ * ## THE DEFECT (the loop's oldest, and the reason this is a pure function)
+ *
+ * The classify loop stamps a durable `restore_pending_at` marker on every
+ * `auto-resume` record before the drain runs. At drain time
+ * `fetchLiveClaudeSessionIds()` returns `null` on ANY IPC failure, which
+ * {@link decideColdResume} maps to `"skip-unknown"` — and the drain simply
+ * `continue`d. Nothing was typed, `resumeFailed` was never set (so
+ * `ResumeFailedBanner` never rendered), and the record kept its DEAD
+ * pre-restart `terminal_id`.
+ *
+ * That last part is what made it permanent. The backend poll matches records
+ * to live terminals by `terminal_id`; a dead one matches nothing, so
+ * `live_is_alive` is `None`, so `classify`
+ * (`session_lifecycle_store.rs`) can never reach `KeepAlive` — and the
+ * restore-pending guard arm turns every other outcome into `Skip`. The
+ * KeepAlive branch is the ONLY place the poll clears a stale marker, so the
+ * row sat at `tier=failed, pendingAt=set` forever, invisible in the UI.
+ *
+ * The in-code claim that "the restore-pending marker self-heals via the
+ * liveness poll" was therefore FALSE for exactly the rows that reach here, and
+ * has been removed rather than left standing as a documented invariant.
+ *
+ * ## The disposition
+ *
+ * Both skips REBIND the record to the tab the restore just created. That is
+ * what un-freezes the poll: the record points at a terminal that exists, so
+ * classification produces a real verdict instead of `Skip`-forever. `rebind`
+ * never refreshes `last_seen_at` (unlike a `record_open` re-assert), so it
+ * cannot resurrect a ghost row — the reason the auto-resume track defers its
+ * re-assert does not apply to it. Rebinding also stamps the honest
+ * `terminal-only` restore tier: the terminal came back, the conversation did
+ * not.
+ *
+ * They then diverge on what the operator is told, because the two skips mean
+ * different things:
+ *
+ * - `skip-alive` — a live process already hosts this conversation. Typing
+ *   `--resume` would FORK its transcript, so there is nothing to retry: the
+ *   honest surface is the informational "terminal restored — fresh
+ *   conversation" note, and the marker is CLEARED because no resume is or will
+ *   be pending.
+ * - `skip-unknown` — the live registry was unreadable, so we failed closed and
+ *   did not resume. The conversation may well still be resumable, so this gets
+ *   the actionable `resumeFailed` banner whose Retry re-runs
+ *   {@link runVerifiedResume}. The marker is cleared here too: leaving it set
+ *   is precisely the stranding this fixes, and the rebind has already given
+ *   the poll a live terminal to classify against.
+ *
+ * Pure + exported so the disposition is unit-testable; {@link applyDrainSkip}
+ * applies it.
+ */
+export interface DrainSkipDisposition {
+  /** Tab-state patch — always clears the spinner, never leaves it spinning. */
+  tabUpdates: { isReconnecting: boolean; resumeFailed?: boolean; restoreTerminalOnly?: boolean };
+  /** Re-point the record at the tab the restore created (also stamps the tier). */
+  rebindToRestoredTab: boolean;
+  /** Clear `restore_pending_at` — nothing else is scheduled to. */
+  clearRestorePending: boolean;
+}
+
+export function decideDrainSkipDisposition(
+  decision: Exclude<ColdResumeDecision, "respawn">,
+): DrainSkipDisposition {
+  return {
+    tabUpdates:
+      decision === "skip-alive"
+        ? { isReconnecting: false, restoreTerminalOnly: true }
+        : { isReconnecting: false, resumeFailed: true },
+    rebindToRestoredTab: true,
+    clearRestorePending: true,
+  };
+}
+
+/**
+ * Apply a {@link decideDrainSkipDisposition} verdict: patch the tab, then
+ * rebind + clear the durable marker.
+ *
+ * The two IPC calls are ORDERED, not fire-and-forget-in-parallel:
+ * `terminal_session_rebind_terminal` stamps the `terminal-only` tier, and
+ * `terminal_session_clear_restore_pending` promotes a `failed` tier to
+ * `resumed` — running them the other way round would label a skipped restore
+ * as a successful resume. Awaiting the rebind first makes that impossible.
+ *
+ * Never throws: a failed IPC is logged and the remaining steps still run. The
+ * worst case is the pre-fix behaviour for one record, and the operator can
+ * still see the banner.
+ *
+ * `invokeFn` is injectable so the wiring — not just the decision — is testable
+ * without booting React or Tauri.
+ */
+export async function applyDrainSkip(params: {
+  decision: Exclude<ColdResumeDecision, "respawn">;
+  tabId: string;
+  claudeSessionId: string;
+  zoneIndex: number;
+  updateTab: (
+    id: string,
+    updates: Partial<{
+      isReconnecting?: boolean;
+      resumeFailed?: boolean;
+      restoreTerminalOnly?: boolean;
+    }>,
+  ) => void;
+  invokeFn?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+}): Promise<DrainSkipDisposition> {
+  const { decision, tabId, claudeSessionId, zoneIndex, updateTab } = params;
+  const call = params.invokeFn ?? ((cmd, args) => invoke(cmd, args));
+  const disposition = decideDrainSkipDisposition(decision);
+  updateTab(tabId, disposition.tabUpdates);
+  if (disposition.rebindToRestoredTab) {
+    try {
+      await call("terminal_session_rebind_terminal", {
+        claudeSessionId,
+        terminalId: tabId,
+        zoneIndex,
+      });
+    } catch (err) {
+      console.warn(`[TerminalPage] drain-skip rebind failed for ${claudeSessionId}:`, err);
+    }
+  }
+  if (disposition.clearRestorePending) {
+    try {
+      await call("terminal_session_clear_restore_pending", { claudeSessionId });
+    } catch (err) {
+      console.warn(
+        `[TerminalPage] drain-skip clear restore-pending failed for ${claudeSessionId}:`,
+        err,
+      );
+    }
+  }
+  return disposition;
+}
+
 /** Validate session IDs before interpolating into shell commands. */
 const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
 function isValidSessionId(id: string): boolean {
@@ -1049,15 +1185,18 @@ export function useTerminalInitialization({
                   // one IPC read per resume is cheap), with the same
                   // fail-closed polarity as classify time: `null` =
                   // indeterminate = skip. A skipped record gets the same
-                  // treatment as classify-time skip-alive — left untouched in
-                  // the registry (no resume typed, no `record_open` re-assert;
-                  // the restore-pending marker self-heals via the liveness
-                  // poll) — only the tab's "resuming" affordance is cleared so
-                  // it doesn't spin forever. (Wiring is not unit-testable
-                  // here: the drain is an inline timer closure over React
-                  // refs; the decision itself is `decideColdResume`, whose
-                  // polarity — including null → skip-unknown — is covered by
-                  // its pure tests.)
+                  // treatment as classify-time skip-alive: no resume typed and
+                  // no `record_open` re-assert. What it must NOT get is the
+                  // old bare `continue` — that stranded the durable
+                  // restore-pending marker on a record still pointing at its
+                  // dead pre-restart terminal, which the liveness poll can
+                  // never clear (it only self-heals a marker on the KeepAlive
+                  // branch, which an unmatched record cannot reach). See
+                  // `decideDrainSkipDisposition` for the full mechanism; the
+                  // skip now rebinds, clears the marker, and surfaces an
+                  // honest banner. The decision (`decideColdResume`) and the
+                  // disposition + its IPC wiring (`applyDrainSkip`) are both
+                  // covered by pure tests; only this timer closure is not.
                   const liveNow = await fetchLiveClaudeSessionIds();
                   const drainDecision = decideColdResume(liveNow, restore.claudeSessionId);
                   if (drainDecision !== "respawn") {
@@ -1067,7 +1206,13 @@ export function useTerminalInitialization({
                           ? "a live Claude process now hosts this id (typing --resume would fork it)"
                           : "live-session registry unreadable at drain time — failing closed toward not-respawning"),
                     );
-                    updateTab(restore.tabId, { isReconnecting: false });
+                    await applyDrainSkip({
+                      decision: drainDecision,
+                      tabId: restore.tabId,
+                      claudeSessionId: restore.claudeSessionId,
+                      zoneIndex: restore.recordOpen?.zoneIndex ?? -1,
+                      updateTab,
+                    });
                     continue;
                   }
                   // Type the resume and VERIFY the handshake (retry once on
