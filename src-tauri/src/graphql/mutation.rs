@@ -45,13 +45,34 @@ impl MutationRoot {
     // Page Navigation
     // ======================================================================
 
-    /// Navigate to a URL.
+    /// Navigate to a URL. Unrouted targets are rejected, not reported as success.
     async fn ui_bridge_page_navigate(
         &self,
         ctx: &Context<'_>,
         url: String,
     ) -> Result<ActionResult> {
         let state = ctx.data::<Arc<ApiState>>()?;
+        // Gated on the same `PAGE_TO_TAB`-derived route table the REST
+        // `page/navigate` uses. Without it this mutation reproduces the defect
+        // that route just closed — reporting success for a page the app never
+        // navigated to, with the snapshot's `route` echoing the request back as
+        // its own evidence.
+        //
+        // Surfaced as a GraphQL error rather than an `ActionResult` with a
+        // code: an unrouted target is a bad ARGUMENT, settled before any action
+        // runs, and `UiBridgeErrorCode` has no `InvalidRequest` variant to
+        // widen the published schema with for it. (The doc comment above stays
+        // one line for the same reason — it is the SDL description.)
+        let trimmed = url.trim();
+        if trimmed.starts_with('/') {
+            if let Err(rejected) = crate::mcp::ui_bridge::page::resolve_navigate_page(trimmed) {
+                return Err(async_graphql::Error::new(format!(
+                    "page/navigate: `{trimmed}` resolves to page `{rejected}`, which the runner \
+                     has no route for. See PAGE_TO_TAB in \
+                     src/components/app/useAppNavigation.ts for the navigable pages."
+                )));
+            }
+        }
         bridge_mutation(state, "page_navigate", serde_json::json!({ "url": url })).await
     }
 

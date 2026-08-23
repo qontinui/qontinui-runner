@@ -19,6 +19,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { writeClipboard } from "@/lib/clipboard";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
+import { registerWhenReady } from "./registerWhenReady";
 import {
   buildWriteFailure,
   throwIfWriteFailed,
@@ -242,6 +243,21 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
     ref,
   ) {
     const uiBridge = useUIBridgeOptional();
+    /**
+     * Live mirror of the bridge context for the mount effect.
+     *
+     * That effect deliberately does not list `uiBridge` in its deps (it is
+     * stable context), so anything it captures is frozen at mount — including
+     * a `registry` that was still `null` at that instant. The bridge-element
+     * retry loop must read the CURRENT value on every attempt, or it would
+     * poll a stale null forever and defeat its own purpose. Updated in an
+     * effect declared ABOVE the mount effect, so it is already current the
+     * first time the loop runs.
+     */
+    const uiBridgeRef = useRef(uiBridge);
+    useEffect(() => {
+      uiBridgeRef.current = uiBridge;
+    }, [uiBridge]);
     // Resolve backend type: explicit prop > instanceStorage > "xterm"
     const backendType: BackendType =
       backendTypeProp ??
@@ -494,6 +510,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       let blockNativePaste: ((e: Event) => void) | null = null;
       let wheelScrollOverride: ((e: WheelEvent) => void) | null = null;
       let contextMenuCopyPaste: ((e: MouseEvent) => void) | null = null;
+      let cancelBridgeRegistration: (() => void) | null = null;
       // Ensure the dev instrumentation hook (window.__qontinuiTerminal) exists
       // so it's discoverable from the console even before any paint fires.
       getTerminalDebug();
@@ -1287,10 +1304,31 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         container.addEventListener("contextmenu", contextMenuCopyPaste);
 
         // Register terminal input with UI Bridge for external automation.
-        const bridgeRegistry = uiBridge?.registry;
-        if (bridgeRegistry && inputEl) {
-          const termId = terminalId; // capture for closures
-          bridgeRegistry.registerElement(`terminal-input-${termId}`, inputEl, {
+        //
+        // This used to be a ONE-SHOT `if (uiBridge?.registry && inputEl)` at
+        // this exact point in mount. Both halves of that guard can be false
+        // here — the xterm helper textarea is renderer-created (and a Ghostty
+        // backend attaches `term.textarea` later still), and the bridge
+        // registry is context state that a fast-mounting pane can beat. Lose
+        // either race and the pane runs for its whole life with NO registered
+        // element, which silently removes every terminal custom action
+        // (`writeToTerminal`, `sendKeys`, `pasteText`, `getScrollback`) from
+        // the automation surface for that pane. Nothing retried and nothing
+        // reported it: the pane looked healthy and answered
+        // `ELEMENT_NOT_FOUND` forever.
+        //
+        // Now: attempt synchronously (the common case, no timer allocated),
+        // and otherwise keep attempting until the input attaches AND the
+        // registry exists. See `./registerWhenReady.ts`.
+        const termId = terminalId; // capture for closures
+        const registerBridgeInput = (): boolean => {
+          const registry = uiBridgeRef.current?.registry;
+          // Re-read the input element every attempt — this is the half that
+          // is usually late, and a stale null captured at mount is precisely
+          // the bug.
+          const el = backendRef.current?.getInputElement();
+          if (!registry || !el) return false;
+          registry.registerElement(`terminal-input-${termId}`, el, {
             type: "textarea",
             label: `Terminal input (${termId.slice(0, 8)})`,
             actions: ["focus", "blur"],
@@ -1363,7 +1401,22 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               },
             },
           });
-        }
+          return true;
+        };
+
+        cancelBridgeRegistration = registerWhenReady({
+          attempt: registerBridgeInput,
+          onGiveUp: (elapsedMs) => {
+            // Loud, not silent: a pane with no registered element is
+            // invisible to every terminal custom action, and the whole point
+            // of this item was that the failure left no trace.
+            console.error(
+              `[Terminal ${termId}] UI Bridge registration never landed after ${elapsedMs}ms — ` +
+                `terminal-input-${termId} is NOT registered; custom actions on this pane will ` +
+                `answer ELEMENT_NOT_FOUND`,
+            );
+          },
+        });
 
         // Forward user input to PTY + track first input line for auto-naming
         // + emit every non-empty line to `onUserInputLine` for mid-session
@@ -1653,7 +1706,8 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         if (inputEl && blockNativePaste) {
           inputEl.removeEventListener("paste", blockNativePaste, true);
         }
-        uiBridge?.registry?.unregisterElement(`terminal-input-${terminalId}`);
+        cancelBridgeRegistration?.();
+        uiBridgeRef.current?.registry?.unregisterElement(`terminal-input-${terminalId}`);
         outputUnsub?.();
         exitUnsub?.();
         // Hand consumption over to the per-page tap: this pane's render-acks
@@ -1672,7 +1726,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         }
         backendRef.current = null;
       };
-      // eslint-disable-next-line react-hooks/exhaustive-deps -- uiBridge is stable context
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-once effect; the bridge is read through `uiBridgeRef`, refreshed by its own effect above
     }, [terminalId, backendType, fitTerminal]);
 
     /**

@@ -17,9 +17,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, EventTarget};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-use super::types::UiBridgeError;
+use super::types::{RecoveryHint, UiBridgeError, UiBridgeErrorCode};
 use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
@@ -306,6 +306,45 @@ impl RequestHints for TabActivateRequest {
 // stricter than CI. Hence the plain `//` block.)
 include!(concat!(env!("OUT_DIR"), "/valid_tab_ids.rs"));
 
+// `VALID_NAVIGATE_PAGES` — the page keys `POST /control/page/navigate` can
+// actually reach. GENERATED at build time from the TypeScript `PAGE_TO_TAB`
+// map in `src/components/app/useAppNavigation.ts` (see
+// `src-tauri/build.rs::generate_valid_navigate_pages`), for the same
+// one-source-of-truth reason `VALID_TAB_IDS` above is generated.
+//
+// NOT the same set as `VALID_TAB_IDS`: `PAGE_TO_TAB` also carries navigation
+// aliases that are not tab ids (`home`, `run`, `ai`, `history`, `logs`,
+// `run-summary`, …), and `page/navigate` is routed through `PAGE_TO_TAB`
+// alone — the `ui-bridge-navigate` listener in `useAppNavigation.ts` looks up
+// nothing else. Gating on tab ids would reject real pages.
+include!(concat!(env!("OUT_DIR"), "/valid_navigate_pages.rs"));
+
+/// Map a `page/navigate` URL onto the page key the frontend will look up in
+/// `PAGE_TO_TAB`, then answer whether that key resolves to anything.
+///
+/// The transform MIRRORS `usePageEvents.ts`'s `page_navigate` case byte for
+/// byte — strip leading slashes, turn the remaining `/` into `-`, empty means
+/// `gui-automation`. Deliberately no query/hash stripping: the frontend does
+/// not strip them either, so `/terminal?x=1` genuinely does NOT navigate, and
+/// a gate that accepted it would go straight back to reporting success for a
+/// navigation that never happened. The gate's job is to predict the
+/// frontend's behaviour exactly, not to be more generous than it.
+///
+/// Returns the resolved page key on success, or the rejected key on failure.
+pub(crate) fn resolve_navigate_page(url: &str) -> Result<String, String> {
+    let page = url.trim_start_matches('/').replace('/', "-");
+    let page = if page.is_empty() {
+        "gui-automation".to_string()
+    } else {
+        page
+    };
+    if VALID_NAVIGATE_PAGES.contains(&page.as_str()) {
+        Ok(page)
+    } else {
+        Err(page)
+    }
+}
+
 // ============================================================================
 // Navigate-and-wait
 // ============================================================================
@@ -554,6 +593,69 @@ pub async fn ui_bridge_page_navigate_handler(
                     "Only relative URLs (starting with /) or localhost URLs are allowed, got: {}",
                     url
                 ))),
+            ));
+        }
+    }
+
+    // ── Unrouted-target gate ────────────────────────────────────────────
+    //
+    // Reject a path the app cannot reach, INSTEAD of reporting `success:
+    // true` for a navigation that never happens. The runner has no URL
+    // router: `usePageEvents.ts` turns the path into a page key and dispatches
+    // `ui-bridge-navigate`, whose only listener looks the key up in
+    // `PAGE_TO_TAB` and silently does nothing when it is absent — after
+    // `history.pushState(url)` has already moved the address bar. So the
+    // snapshot's `route` (which the SDK reads from `window.location.pathname`)
+    // came back echoing `/zzz`, and the caller had a `success: true` plus a
+    // matching `route` for a page that was never rendered.
+    //
+    // That is not merely a wrong status code: it is a false-PASS SOURCE. Any
+    // automated run that navigates and then asserts on `route` was reading its
+    // own request back as evidence, so every such assertion passed regardless
+    // of what the app did.
+    //
+    // Of the two available fixes — validate the target, or report the RESOLVED
+    // route in the snapshot — this is the first. The second is not available
+    // to the runner: `route` is produced by the UI Bridge SDK's
+    // `createSnapshotAsync` from `window.location.pathname`, and the SDK is a
+    // separate package. Validating is also the better answer on its own
+    // merits: not performing a `pushState` to a page that does not exist
+    // leaves nothing to misreport in the first place, and the caller gets the
+    // rejected key back so it can self-correct.
+    //
+    // Absolute localhost URLs are deliberately NOT gated here — the frontend
+    // ignores them entirely ("ignoring absolute URL navigation in runner"),
+    // which is a separate pre-existing behaviour, not this route table.
+    if url.starts_with('/') {
+        if let Err(rejected) = resolve_navigate_page(url) {
+            let preview: Vec<&str> = VALID_NAVIGATE_PAGES.iter().take(12).copied().collect();
+            warn!(
+                "UI Bridge API: page navigate to {} rejected — `{}` is not in PAGE_TO_TAB",
+                url, rejected
+            );
+            let detail = UiBridgeError {
+                code: UiBridgeErrorCode::InvalidRequest,
+                message: format!(
+                    "page/navigate: `{}` resolves to page `{}`, which the runner has no route \
+                     for. Known pages include: {} (and {} more — see PAGE_TO_TAB in \
+                     src/components/app/useAppNavigation.ts for the full list).",
+                    url,
+                    rejected,
+                    preview.join(", "),
+                    VALID_NAVIGATE_PAGES.len() - preview.len()
+                ),
+                recovery: Some(RecoveryHint::Unrecoverable),
+                context: Some(serde_json::json!({
+                    "code": "INVALID_REQUEST",
+                    "url": url,
+                    "page": rejected,
+                    "knownPages": VALID_NAVIGATE_PAGES,
+                })),
+            };
+            let message = detail.message.clone();
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error_detailed(message, detail)),
             ));
         }
     }
@@ -1760,6 +1862,146 @@ mod page_navigate_mode_tests {
         let req: PageNavigateRequest =
             serde_json::from_str(r#"{"url": "/fleet", "mode": "soft"}"#).expect("parse");
         assert_eq!(req.mode.as_deref(), Some("soft"));
+    }
+}
+
+#[cfg(test)]
+mod navigate_route_gate_tests {
+    //! `page/navigate` must not report arriving somewhere it never went.
+    //!
+    //! The runner has no URL router. A path is turned into a page key and
+    //! looked up in `PAGE_TO_TAB`; a key that is not there navigates nowhere
+    //! — but `history.pushState` had already moved the address bar, so the
+    //! snapshot's `route` (read by the SDK from `window.location.pathname`)
+    //! echoed the caller's own unrouted request back at it, alongside
+    //! `success: true`. Any automated check that navigated and then asserted
+    //! on `route` was therefore self-confirming.
+    //!
+    //! These tests exercise `resolve_navigate_page`, the pure predicate the
+    //! handler's gate is built on, in BOTH directions — a gate that rejected
+    //! everything would end navigation entirely.
+    use super::{resolve_navigate_page, VALID_NAVIGATE_PAGES, VALID_TAB_IDS};
+
+    #[test]
+    fn a_real_page_resolves() {
+        assert_eq!(resolve_navigate_page("/terminal"), Ok("terminal".into()));
+        assert_eq!(resolve_navigate_page("/settings"), Ok("settings".into()));
+        assert_eq!(resolve_navigate_page("/runs"), Ok("runs".into()));
+    }
+
+    #[test]
+    fn a_nested_path_collapses_the_way_the_frontend_collapses_it() {
+        // `usePageEvents.ts`: strip leading slashes, `/` -> `-`.
+        assert_eq!(
+            resolve_navigate_page("/settings/world-state-verifier"),
+            Ok("settings-world-state-verifier".into())
+        );
+    }
+
+    #[test]
+    fn the_root_path_resolves_to_the_default_page() {
+        assert_eq!(
+            resolve_navigate_page("/"),
+            Ok("gui-automation".into()),
+            "the frontend defaults an empty key to gui-automation; the gate must agree"
+        );
+        assert_eq!(resolve_navigate_page("///"), Ok("gui-automation".into()));
+    }
+
+    /// The gate is `PAGE_TO_TAB`, not `VALID_TAB_IDS`.
+    ///
+    /// `PAGE_TO_TAB` carries navigation aliases that are NOT tab ids. Gating
+    /// on the tab registry instead would 400 these perfectly real pages.
+    #[test]
+    fn navigation_aliases_that_are_not_tab_ids_still_resolve() {
+        let aliases = ["home", "run", "ai", "history", "logs", "run-summary"];
+        for alias in aliases {
+            assert_eq!(
+                resolve_navigate_page(&format!("/{alias}")),
+                Ok(alias.to_string()),
+                "`{alias}` is a PAGE_TO_TAB key and must remain navigable"
+            );
+        }
+        // The two registries really are different sets — this is why the gate
+        // could not just reuse `VALID_TAB_IDS`.
+        assert!(
+            aliases.iter().any(|a| !VALID_TAB_IDS.contains(a)),
+            "at least one PAGE_TO_TAB alias must be absent from VALID_TAB_IDS, otherwise \
+             this gate has no reason to exist separately"
+        );
+    }
+
+    /// The regression itself.
+    #[test]
+    fn an_unrouted_path_is_rejected_rather_than_reported_as_success() {
+        assert_eq!(resolve_navigate_page("/zzz"), Err("zzz".into()));
+        assert_eq!(resolve_navigate_page("/page-zzz"), Err("page-zzz".into()));
+        assert_eq!(
+            resolve_navigate_page("/settings/nope"),
+            Err("settings-nope".into())
+        );
+    }
+
+    /// A path the frontend cannot handle is rejected even when its PREFIX is
+    /// real: `usePageEvents.ts` does not strip query strings, so
+    /// `/terminal?x=1` produces the key `terminal?x=1`, which resolves to
+    /// nothing and navigates nowhere. Accepting it would put the false PASS
+    /// straight back.
+    #[test]
+    fn a_query_string_is_not_quietly_forgiven() {
+        assert_eq!(
+            resolve_navigate_page("/terminal?x=1"),
+            Err("terminal?x=1".into())
+        );
+    }
+
+    #[test]
+    fn the_generated_table_is_populated() {
+        assert!(
+            VALID_NAVIGATE_PAGES.len() > 50,
+            "VALID_NAVIGATE_PAGES has only {} entries — build.rs codegen is stale or broken",
+            VALID_NAVIGATE_PAGES.len()
+        );
+        assert!(!VALID_NAVIGATE_PAGES.contains(&"zzz"));
+    }
+
+    /// The generated slice must equal the TypeScript `PAGE_TO_TAB` keys
+    /// verbatim (same keys, same order) — the same staleness proof
+    /// `valid_tab_ids_match_typescript_union` gives the tab gate.
+    #[test]
+    fn valid_navigate_pages_match_the_typescript_map() {
+        // cargo runs tests with CWD = crate root (src-tauri).
+        let source = std::fs::read_to_string("../src/components/app/useAppNavigation.ts")
+            .expect("useAppNavigation.ts must be readable from the crate root");
+        let decl = source
+            .find("const PAGE_TO_TAB")
+            .expect("`const PAGE_TO_TAB` must exist in useAppNavigation.ts");
+        let rest = &source[decl..];
+        let open = rest.find("= {").expect("object literal") + 3;
+        let close = rest[open..].find("\n};").expect("object terminator") + open;
+
+        let ts_keys: Vec<String> = rest[open..close]
+            .lines()
+            .filter_map(|raw| {
+                let line = raw.split("//").next().unwrap_or("").trim();
+                let colon = line.find(':')?;
+                let key = line[..colon].trim().trim_matches('"');
+                (!key.is_empty()).then(|| key.to_string())
+            })
+            .collect();
+
+        assert_eq!(
+            ts_keys.len(),
+            VALID_NAVIGATE_PAGES.len(),
+            "Rust VALID_NAVIGATE_PAGES ({}) and TS PAGE_TO_TAB ({}) differ in length — build.rs \
+             codegen is stale",
+            VALID_NAVIGATE_PAGES.len(),
+            ts_keys.len(),
+        );
+        assert_eq!(
+            ts_keys, VALID_NAVIGATE_PAGES,
+            "Rust VALID_NAVIGATE_PAGES must be generated verbatim from PAGE_TO_TAB",
+        );
     }
 }
 

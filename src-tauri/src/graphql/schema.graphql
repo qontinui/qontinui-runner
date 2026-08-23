@@ -463,7 +463,7 @@ type MutationRoot {
 	"""
 	uiBridgeExecuteAction(elementId: String!, action: String!, params: JSON): ActionResult!
 	"""
-	Navigate to a URL.
+	Navigate to a URL. Unrouted targets are rejected, not reported as success.
 	"""
 	uiBridgePageNavigate(url: String!): ActionResult!
 	"""

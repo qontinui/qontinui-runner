@@ -2487,6 +2487,43 @@ async fn handle_page_navigate(
     {
         Ok(data) => Json(data),
         Err(_) => {
+            // Runner-local fallback: `dispatch_app_request` failing means no
+            // wrapper app claimed this navigation, so the target is a RUNNER
+            // route — and the unrouted-target gate the control route applies
+            // has to apply here too. Otherwise the SDK surface (which is what
+            // automation actually dials) keeps the exact false PASS the
+            // control route just closed: `success: true` for a page the app
+            // never navigated to, with the snapshot's `route` echoing the
+            // request back as its own evidence. Deliberately NOT applied above
+            // the dispatch: a wrapper app has its own route table, and gating
+            // it on the runner's `PAGE_TO_TAB` would reject that app's real
+            // pages.
+            if let Some(url) = body.get("url").and_then(|v| v.as_str()) {
+                let url = url.trim();
+                if url.starts_with('/') {
+                    if let Err(rejected) = crate::mcp::ui_bridge::page::resolve_navigate_page(url) {
+                        let message = format!(
+                            "page/navigate: `{url}` resolves to page `{rejected}`, which the \
+                             runner has no route for. See PAGE_TO_TAB in \
+                             src/components/app/useAppNavigation.ts for the navigable pages."
+                        );
+                        return Json(serde_json::json!({
+                            "success": false,
+                            "error": message,
+                            "error_detail": {
+                                "code": "INVALID_REQUEST",
+                                "message": message,
+                                "recovery": "UNRECOVERABLE",
+                                "context": {
+                                    "code": "INVALID_REQUEST",
+                                    "url": url,
+                                    "page": rejected,
+                                },
+                            },
+                        }));
+                    }
+                }
+            }
             // Fall back to IPC
             match ui_bridge_request_sync(&state, "page_navigate", body).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
