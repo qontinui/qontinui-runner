@@ -981,7 +981,7 @@ pub fn build_provider_settings(ai_settings: &crate::settings::AiSettings) -> ser
                 settings::CliExecutionMode::Wsl => "wsl",
                 settings::CliExecutionMode::Native => "native",
             };
-            let effective_config_dir =
+            let (effective_config_dir, _config_dir_source) =
                 crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
             serde_json::json!({
                 "execution_mode": execution_mode,

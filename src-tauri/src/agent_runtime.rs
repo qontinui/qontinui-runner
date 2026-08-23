@@ -3147,7 +3147,7 @@ async fn run_continuation_terminal(
     // build so its per-account command can layer in. spawn_blocking: the
     // selector reads settings + cooldown state.
     let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
-    let selected_config_dir = {
+    let (selected_config_dir, _config_dir_source) = {
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
     };
@@ -3469,7 +3469,7 @@ async fn run_condition_check_terminal(
     // Resolved BEFORE the argv build so its per-account launch command can layer
     // into the shared launch seam.
     let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
-    let selected_config_dir = {
+    let (selected_config_dir, _config_dir_source) = {
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
     };
@@ -4417,7 +4417,7 @@ fn pick_autonomous_git_identity(
 /// Extracted from [`spawn_claude_child`] because that function spawns a real
 /// process and cannot run in a unit test — with the scrub inlined there,
 /// deleting it reddened nothing.
-fn finalize_headless_child_env(cmd: &mut tokio::process::Command, runner_api_port: u16) {
+pub(crate) fn finalize_headless_child_env(cmd: &mut tokio::process::Command, runner_api_port: u16) {
     cmd.env(
         "QONTINUI_RUNNER_CONTEXT",
         crate::terminal::runner_context(runner_api_port),
@@ -4450,7 +4450,9 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
     // Fail loud with an actionable reason (the callers turn this `Err` into a
     // `report_spawn_failed` lifecycle post) rather than starting a dead `claude`.
     let ai = crate::settings::get_ai_settings();
-    match crate::ai_provider::get_effective_config_dir(&ai.claude_cli) {
+    let (resolved_config_dir, _config_dir_source) =
+        crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
+    match resolved_config_dir {
         Some(dir) => {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
         }

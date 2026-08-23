@@ -404,7 +404,7 @@ pub(super) fn coord_client_parts() -> Result<(String, String), String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| "no device JWT (unpaired)".to_string())?;
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     Ok((base.trim_end_matches('/').to_string(), jwt))
 }
 

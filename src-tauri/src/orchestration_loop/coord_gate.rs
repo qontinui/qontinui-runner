@@ -442,7 +442,7 @@ impl LiveCoordGateClient {
     }
 
     /// Issue a coord `/mcp` JSON-RPC `tools/call` with the device JWT and return
-    /// the tool's structured result `Value`. Reuses `coord_mcp::coord_mcp_url`.
+    /// the tool's structured result `Value`. Reuses `coord_mcp::coord_mcp_url_with_source`.
     async fn mcp_tools_call(
         &self,
         tool_name: &str,
@@ -450,7 +450,7 @@ impl LiveCoordGateClient {
     ) -> Result<serde_json::Value, String> {
         let jwt = Self::device_jwt()
             .ok_or_else(|| "coord_gate: runner has no device JWT (unpaired)".to_string())?;
-        let url = crate::coord_mcp::coord_mcp_url();
+        let (url, _coord_base_source) = crate::coord_mcp::coord_mcp_url_with_source();
         let client = self.http_client()?;
         let body = json!({
             "jsonrpc": "2.0",
@@ -561,7 +561,7 @@ impl CoordGateClient for LiveCoordGateClient {
         // REST GET resolves the tenant from the device-bearer context).
         let jwt = Self::device_jwt()
             .ok_or_else(|| "coord_gate: runner has no device JWT (unpaired)".to_string())?;
-        let base = crate::coord_mcp::coord_base_url();
+        let (base, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
         let url = format!("{base}/coord/gates?limit=500");
         let client = self.http_client()?;
         let resp = client

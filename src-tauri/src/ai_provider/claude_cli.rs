@@ -32,7 +32,7 @@ pub(super) fn run_claude_cli(
     };
 
     let claude_program = settings.custom_path.as_deref().unwrap_or("claude");
-    let effective_dir = get_effective_config_dir(settings);
+    let (effective_dir, _config_dir_source) = get_effective_config_dir(settings);
     let config_dir = effective_dir.as_deref();
 
     // Silently refresh OAuth credentials if expired before spawning the subprocess.
@@ -322,7 +322,10 @@ fn scorer_claude_program(settings: &ClaudeCliSettings) -> String {
 ///
 /// Returned by value (rather than the env work being inlined at the call site)
 /// so the constructed environment is unit-testable without spawning `claude`.
-fn build_scorer_command(program: &str, config_dir: Option<&str>) -> std::process::Command {
+pub(crate) fn build_scorer_command(
+    program: &str,
+    config_dir: Option<&str>,
+) -> std::process::Command {
     let mut cmd = if std::env::consts::OS == "windows" {
         let mut c = crate::process_helpers::cmd_no_window();
         c.args(["/c", program, "--print"]);
@@ -354,7 +357,7 @@ pub(crate) fn score_options_via_cli(
     timeout: Duration,
 ) -> Option<String> {
     let program = scorer_claude_program(settings);
-    let config_dir = get_effective_config_dir(settings);
+    let (config_dir, _config_dir_source) = get_effective_config_dir(settings);
 
     // Refresh OAuth before spawning, same as run_claude_cli.
     super::oauth_refresh::try_ensure_valid_credentials(config_dir.as_deref());

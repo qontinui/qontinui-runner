@@ -103,7 +103,7 @@ fn store() -> &'static Mutex<StoreState> {
 fn store_path() -> Option<std::path::PathBuf> {
     crate::settings::get_config_dir()
         .ok()
-        .map(|d| d.join(STORE_FILE))
+        .map(|(dir, _config_dir_source)| dir.join(STORE_FILE))
 }
 
 /// Restore the persisted store at boot (answers + task metadata + emit

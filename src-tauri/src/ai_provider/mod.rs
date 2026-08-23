@@ -15,7 +15,7 @@ pub mod cache_aware_builder;
 pub mod circuit_breaker;
 mod claude_api;
 pub(crate) mod claude_api_warm;
-mod claude_cli;
+pub(crate) mod claude_cli;
 pub(crate) use claude_cli::score_options_via_cli;
 pub mod compaction_middleware;
 mod config;
@@ -32,7 +32,7 @@ pub mod prepaid_balance;
 // pub(crate): the subagent dispatch layer (Phase 4) calls
 // `pi_cli::run_pi_cli_in_dir` directly to stage a temp working dir.
 pub(crate) mod pi_cli;
-mod process;
+pub(crate) mod process;
 pub mod retry;
 pub(crate) mod routing;
 mod types;
@@ -47,7 +47,7 @@ pub use config::{
     account_known_exhausted, get_account_statuses, get_effective_config_dir,
     get_effective_config_dir_with_override, get_resolved_config_dir,
     mark_account_rate_limited_with_duration, record_account_usage, rotate_account_on_rate_limit,
-    set_resolved_config_dir, switch_to_account,
+    set_resolved_config_dir, switch_to_account, ClaudeConfigDirSource,
 };
 pub use multimodal::{ContentBlock, ImageSource, MultimodalPrompt};
 pub use oneshot::{

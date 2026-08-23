@@ -803,7 +803,7 @@ async fn post_run(
     // String family: `coord_base_with_source` always yields a base, so there is
     // no "not configured" arm to map here. Tests inject a mock-server base
     // through the `run_with_base` seam instead.
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     // The typecheck loopback targets THIS runner's own HTTP listener — resolve
     // the actually-bound port from AppState (correct for secondary/temp runners
     // on non-default ports). Injectable so tests point it at a mock.
@@ -827,7 +827,7 @@ async fn post_observe_verify(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<ObserveVerifyRequest>,
 ) -> Result<Json<ApiResponse<VerifyOutcome>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let loopback_base = crate::mcp::types::get_self_base_url(&state.app_state);
     let store = RegistryCredentialStore;
     observe_verify_with_base(req, &base, &loopback_base, &store)

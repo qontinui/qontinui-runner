@@ -320,6 +320,67 @@ fn cache_touch() {
 }
 
 // ===========================================================================
+// Layer 9 of the config report — what the process-global cache holds NOW.
+//
+// Plan `2026-08-20-effective-config-provenance-and-env-generation` Phase 4.
+// ===========================================================================
+
+/// The cache's own account of itself, for the config report's layer 9.
+///
+/// # Why the AGE and not a wall-clock timestamp
+///
+/// [`CacheEntry::at`] is an [`Instant`] — a monotonic point with no wall-clock
+/// meaning — and there is no honest lossless conversion. What the cache
+/// genuinely knows is "how long ago", so that is what it reports, and the
+/// consumer pairs it with the reading's own `captured_at` rather than being
+/// handed a fabricated absolute stamp.
+///
+/// This is the fact that makes layer 9 worth a row at all. The config report's
+/// `captured_at` says WHEN THE REPORT LOOKED; [`age_ms`](Self::age_ms) says
+/// when the value it looked at was last confirmed against coord. Those are
+/// different facts about a coord-served, network-fetched layer, and collapsing
+/// them would let a report taken now vouch for a document fetched an hour ago.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptLibraryCacheHealth {
+    /// `false` when nothing has ever been cached in this process — no fetch has
+    /// succeeded, which is UNKNOWN about coord's library, never "the library is
+    /// empty".
+    pub populated: bool,
+    /// How long ago the entry was last stored or TTL-refreshed by a 304.
+    /// `None` iff `!populated`.
+    pub age_ms: Option<u128>,
+    /// Whether that age is still inside [`CACHE_TTL`] — i.e. whether the next
+    /// read serves from cache without touching the network.
+    pub fresh: bool,
+    /// The TTL itself, so a reader can judge the age without knowing the
+    /// constant.
+    pub ttl_ms: u128,
+    /// How many prompt documents the cached entry holds.
+    pub documents: usize,
+    /// Whether a list `ETag` is stored — a conditional refetch is possible, so
+    /// a steady state costs one 304 rather than a full N+1 rehydrate.
+    pub has_etag: bool,
+}
+
+/// Snapshot the process-global prompt-document cache WITHOUT fetching.
+///
+/// Read-only by construction: it takes the same lock [`cache_snapshot`] takes
+/// and touches nothing. A config report must never be the thing that populates
+/// the cache it is describing — that would make the report's own act change the
+/// answer, and a diagnostic that perturbs its subject is worse than none.
+pub fn cache_health() -> PromptLibraryCacheHealth {
+    let (fresh, etag, any) = cache_snapshot();
+    PromptLibraryCacheHealth {
+        populated: any.is_some(),
+        age_ms: any.as_ref().map(|e| e.at.elapsed().as_millis()),
+        fresh: fresh.is_some(),
+        ttl_ms: CACHE_TTL.as_millis(),
+        documents: any.as_ref().map(|e| e.prompts.len()).unwrap_or(0),
+        has_etag: etag.is_some(),
+    }
+}
+
+// ===========================================================================
 // Response-shape helpers
 // ===========================================================================
 
@@ -387,7 +448,7 @@ fn stale_fallback(cached: Option<Vec<PromptTemplate>>, reason: String) -> Prompt
 /// local setup failures (HTTP client construction).
 #[tauri::command]
 pub async fn list_prompt_templates() -> Result<PromptLibraryResponse, String> {
-    let base_owned = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base_owned, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let base = base_owned.trim_end_matches('/');
 
     // 1. Fresh cache → serve without touching coord.

@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 ///
 /// Extracted from [`spawn_and_wait_with_doctor`] so the scrub call site is
 /// unit-testable without spawning a real subprocess.
-fn prepare_ai_child_env(cmd: &mut Command) {
+pub(crate) fn prepare_ai_child_env(cmd: &mut Command) {
     // Remove CLAUDECODE env var so nested Claude CLI sessions don't refuse to start.
     // The runner legitimately needs to spawn Claude CLI as a subprocess, not as a nested session.
     cmd.env_remove("CLAUDECODE");

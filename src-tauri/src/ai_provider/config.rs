@@ -83,7 +83,74 @@ pub fn get_resolved_config_dir() -> Option<String> {
         .and_then(|cached| cached.clone())
 }
 
-/// Get the effective config directory, considering account selection mode.
+/// Which arm of [`get_effective_config_dir`] decided the answer — including
+/// the two arms that decide there is NO answer.
+///
+/// The house `(value, source)` shape (`profiles::CoordBaseSource`,
+/// `api_config::ApiBaseUrlArm`), applied to the per-account
+/// `CLAUDE_CONFIG_DIR` selection. It exists because this resolver's `None` is
+/// the most expensive value it can return — it is what makes a session spawn
+/// fail loud — and `None` alone does not say WHY:
+///
+/// - a `LeastUsage` runner that has never run the usage probe and has no
+///   manual `config_dir` has nothing configured at all, and
+/// - a runner whose selected account's `.credentials.json` expired past
+///   refresh HAS an account and lost it,
+///
+/// which are different machines needing different fixes and were, until now,
+/// the same `None`. The arm is also what distinguishes the two *successful*
+/// paths that produce an identical string: a `LeastUsage` runner whose picker
+/// resolved to the manual dir anyway reads exactly like `Manual` mode.
+///
+/// The names are stable wire strings: they appear verbatim in the config
+/// report (layer 11) and are meant to be greppable across machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeConfigDirSource {
+    /// A per-request account override was supplied and returned verbatim. Only
+    /// reachable through [`get_effective_config_dir_with_override`].
+    RequestOverride,
+    /// `LeastUsage` mode; the credential-aware picker's resolved dir won
+    /// ([`get_resolved_config_dir`]).
+    LeastUsageResolved,
+    /// `LeastUsage` mode, but no resolved dir had been set (the usage probe has
+    /// not run yet, or picked nothing) — the manual `config_dir` was used as
+    /// the fallback. Deliberately NOT reported as `Manual`: the runner is in
+    /// least-usage mode and is not doing least-usage selection.
+    LeastUsageConfigDirFallback,
+    /// `Manual` mode; the configured `config_dir`.
+    Manual,
+    /// A candidate dir existed but [`has_valid_credentials`]
+    /// (super::oauth_refresh::has_valid_credentials) rejected it, so the
+    /// resolver yields `None` rather than pinning `CLAUDE_CONFIG_DIR` to a dead
+    /// account.
+    RejectedNoCredentials,
+    /// No candidate at all: neither a resolved dir nor a configured
+    /// `config_dir`.
+    Unconfigured,
+}
+
+impl ClaudeConfigDirSource {
+    /// Stable wire string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClaudeConfigDirSource::RequestOverride => "request_override",
+            ClaudeConfigDirSource::LeastUsageResolved => "least_usage_resolved",
+            ClaudeConfigDirSource::LeastUsageConfigDirFallback => "least_usage_config_dir_fallback",
+            ClaudeConfigDirSource::Manual => "manual_config_dir",
+            ClaudeConfigDirSource::RejectedNoCredentials => "rejected_no_credentials",
+            ClaudeConfigDirSource::Unconfigured => "unconfigured",
+        }
+    }
+}
+
+impl std::fmt::Display for ClaudeConfigDirSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Get the effective config directory, considering account selection mode,
+/// plus WHICH arm produced it.
 ///
 /// Returns a config dir ONLY when it has live credentials (a `.credentials.json`
 /// that is unexpired or refreshable — see
@@ -95,36 +162,61 @@ pub fn get_resolved_config_dir() -> Option<String> {
 /// ([`pick_best_account`](super::account_usage::pick_best_account)) is already
 /// credential-filtered; the recheck here also covers `Manual` mode, whose
 /// `config_dir` is never run through the picker.
-pub fn get_effective_config_dir(cli_settings: &settings::ClaudeCliSettings) -> Option<String> {
-    let candidate = match cli_settings.account_selection_mode {
-        AccountSelectionMode::LeastUsage => {
-            // The resolved dir (set by the credential-aware picker) wins; else
-            // fall back to the manual config_dir.
-            get_resolved_config_dir().or_else(|| cli_settings.config_dir.clone())
-        }
-        AccountSelectionMode::Manual => cli_settings.config_dir.clone(),
+///
+/// The [`ClaudeConfigDirSource`] is produced by the SAME traversal that
+/// produces the dir — one walk, both outputs — so nothing downstream (the
+/// config report included) is ever entitled to re-derive the selection rule.
+/// See that type for why the `None` arms are as load-bearing as the `Some`
+/// ones.
+pub fn get_effective_config_dir(
+    cli_settings: &settings::ClaudeCliSettings,
+) -> (Option<String>, ClaudeConfigDirSource) {
+    let (candidate, source) = match cli_settings.account_selection_mode {
+        AccountSelectionMode::LeastUsage => match get_resolved_config_dir() {
+            // The resolved dir (set by the credential-aware picker) wins.
+            Some(dir) => (Some(dir), ClaudeConfigDirSource::LeastUsageResolved),
+            // else fall back to the manual config_dir.
+            None => (
+                cli_settings.config_dir.clone(),
+                ClaudeConfigDirSource::LeastUsageConfigDirFallback,
+            ),
+        },
+        AccountSelectionMode::Manual => (
+            cli_settings.config_dir.clone(),
+            ClaudeConfigDirSource::Manual,
+        ),
     };
 
     match candidate {
-        Some(dir) if super::oauth_refresh::has_valid_credentials(&dir) => Some(dir),
-        _ => None,
+        Some(dir) if super::oauth_refresh::has_valid_credentials(&dir) => (Some(dir), source),
+        // A candidate that failed the credential check is a DIFFERENT failure
+        // from having no candidate, and the arm says which.
+        Some(_) => (None, ClaudeConfigDirSource::RejectedNoCredentials),
+        None => (None, ClaudeConfigDirSource::Unconfigured),
     }
 }
 
 /// Like [`get_effective_config_dir`], but honours an explicit per-request
-/// account override.
+/// account override. Same `(value, source)` shape.
 ///
-/// When `override_dir` is `Some`, it is returned verbatim — the caller is
-/// responsible for validating it first (per-request account selection resolves
-/// it via [`super::account_usage::resolve_requested_account`], which restricts
-/// the choice to credential-valid roster dirs). When `None`, delegates to the
-/// global [`get_effective_config_dir`] resolution (unchanged default behaviour).
+/// When `override_dir` is `Some`, it is returned verbatim with
+/// [`ClaudeConfigDirSource::RequestOverride`] — the caller is responsible for
+/// validating it first (per-request account selection resolves it via
+/// [`super::account_usage::resolve_requested_account`], which restricts the
+/// choice to credential-valid roster dirs), which is exactly why the arm must
+/// name it: this is the one path that did NOT go through the credential check
+/// here, and a reader of the report has to be able to tell.
+/// When `None`, delegates to the global [`get_effective_config_dir`] resolution
+/// (unchanged default behaviour).
 pub fn get_effective_config_dir_with_override(
     cli_settings: &settings::ClaudeCliSettings,
     override_dir: Option<&str>,
-) -> Option<String> {
+) -> (Option<String>, ClaudeConfigDirSource) {
     match override_dir {
-        Some(dir) => Some(dir.to_string()),
+        Some(dir) => (
+            Some(dir.to_string()),
+            ClaudeConfigDirSource::RequestOverride,
+        ),
         None => get_effective_config_dir(cli_settings),
     }
 }
@@ -505,6 +597,87 @@ mod tests {
                 map.remove(dir);
             }
         }
+    }
+
+    /// `Manual` mode with nothing configured, and `Manual` mode whose
+    /// configured dir has no live credentials, both return `None` — and the
+    /// ARM is the only thing that tells them apart. Before Phase 2 of
+    /// `2026-08-20-effective-config-provenance-and-env-generation` they were
+    /// indistinguishable, so "no account" was one message covering a runner
+    /// that was never set up and a runner whose login expired.
+    ///
+    /// Deliberately `Manual`-only: the `LeastUsage` arms read the process-global
+    /// `RESOLVED_CONFIG_DIR`, and a test that mutated it would race every other
+    /// test in this crate. The arms exercised here touch no shared state.
+    #[test]
+    fn effective_config_dir_distinguishes_unconfigured_from_dead_credentials() {
+        let unconfigured = settings::ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::Manual,
+            config_dir: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            get_effective_config_dir(&unconfigured),
+            (None, ClaudeConfigDirSource::Unconfigured)
+        );
+
+        // A path that certainly holds no `.credentials.json`.
+        let dead = settings::ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::Manual,
+            config_dir: Some(
+                "/qontinui-test/no-such-account-dir/effective_config_dir_arms".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            get_effective_config_dir(&dead),
+            (None, ClaudeConfigDirSource::RejectedNoCredentials)
+        );
+    }
+
+    /// A per-request override is returned VERBATIM and names itself — it is the
+    /// one path that skips the credential check here, so a report that showed
+    /// it as `manual_config_dir` would be claiming a validation that did not
+    /// happen.
+    #[test]
+    fn effective_config_dir_override_is_verbatim_and_names_itself() {
+        let cli = settings::ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::Manual,
+            config_dir: Some("/configured/but/ignored".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            get_effective_config_dir_with_override(&cli, Some("/pinned/by/request")),
+            (
+                Some("/pinned/by/request".to_string()),
+                ClaudeConfigDirSource::RequestOverride
+            )
+        );
+    }
+
+    /// The arm vocabulary is a WIRE contract (it is printed verbatim in
+    /// `config report` layer 11 and compared across machines), so it is pinned
+    /// to LITERALS rather than to the enum's own `as_str`.
+    #[test]
+    fn claude_config_dir_source_wire_strings_are_stable() {
+        assert_eq!(
+            ClaudeConfigDirSource::RequestOverride.as_str(),
+            "request_override"
+        );
+        assert_eq!(
+            ClaudeConfigDirSource::LeastUsageResolved.as_str(),
+            "least_usage_resolved"
+        );
+        assert_eq!(
+            ClaudeConfigDirSource::LeastUsageConfigDirFallback.as_str(),
+            "least_usage_config_dir_fallback"
+        );
+        assert_eq!(ClaudeConfigDirSource::Manual.as_str(), "manual_config_dir");
+        assert_eq!(
+            ClaudeConfigDirSource::RejectedNoCredentials.as_str(),
+            "rejected_no_credentials"
+        );
+        assert_eq!(ClaudeConfigDirSource::Unconfigured.as_str(), "unconfigured");
     }
 
     #[test]

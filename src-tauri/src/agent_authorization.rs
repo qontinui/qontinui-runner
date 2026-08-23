@@ -1236,7 +1236,7 @@ fn classify_failure(status: reqwest::StatusCode, body: &str, safe_url: &str) -> 
 }
 
 async fn fetch_effective() -> Fetched {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     if !crate::coord_http::have_device_token() {
         return Fetched::Unpaired;
     }

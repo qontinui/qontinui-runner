@@ -3008,17 +3008,92 @@ fn default_app_mode() -> String {
     "advanced".to_string()
 }
 
-/// Resolve (and create if missing) the app config directory that holds
-/// `settings.json` and small sibling state files (e.g. the helper-answers
-/// poll cursor). Honors the per-instance `QONTINUI_CONFIG_DIR` override the
-/// supervisor sets for spawned runners.
-pub(crate) fn get_config_dir() -> Result<PathBuf, String> {
-    let app_data_dir = std::env::var("QONTINUI_CONFIG_DIR")
-        .ok()
+/// Which arm produced the app config directory.
+///
+/// The house `(value, source)` shape (`profiles::CoordBaseSource`,
+/// `api_config::ApiBaseUrlArm`) applied to the directory that decides where
+/// `settings.json` — and therefore most of the rest of this runner's
+/// configuration — is read from. `config_report`'s layer 2 asks this resolver
+/// for the arm instead of re-reading the env var itself, so the report cannot
+/// carry a second, drifting copy of the override rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigDirSource {
+    /// Env `QONTINUI_CONFIG_DIR` was set to a NON-EMPTY value (the per-instance
+    /// override the supervisor sets for spawned runners).
+    ///
+    /// The emptiness filter is load-bearing and is NOT shared with
+    /// `profiles::settings_json_path`, the lib-side reader of the same file —
+    /// see `profiles::SettingsJsonPathSource::EnvConfigDir`. An
+    /// exported-but-empty variable takes this reader to the platform dir and
+    /// that one to a CWD-relative path.
+    EnvConfigDir,
+    /// No usable `QONTINUI_CONFIG_DIR`; the platform config dir +
+    /// `com.qontinui.runner`.
+    PlatformConfigDir,
+}
+
+impl ConfigDirSource {
+    /// Stable wire string.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ConfigDirSource::EnvConfigDir => "env:QONTINUI_CONFIG_DIR",
+            ConfigDirSource::PlatformConfigDir => "platform_config_dir",
+        }
+    }
+}
+
+/// Resolve the app config directory + WHICH arm produced it, **creating
+/// nothing**. This is the ONE definition of the precedence rule; both
+/// [`get_config_dir`] (which additionally ensures the directory exists) and
+/// every read-only caller go through it.
+///
+/// The split exists because "resolve" and "ensure" are different operations and
+/// only one of them is safe for an observer. `config_report`'s layer 2 must be
+/// able to say *"`QONTINUI_CONFIG_DIR` names `D:/typo` and that directory does
+/// NOT exist"* — a diagnostic that called the ensuring variant would silently
+/// `create_dir_all` the typo and then report `exists: true`, materializing the
+/// thing it is describing and destroying the only evidence of the fault. Same
+/// discipline `config_report_cmd::claude_settings_carrier_reading` states for
+/// `materialize`.
+///
+/// The `Err` arm is a genuine "could not resolve", never a fallback: a caller
+/// (and `config_report` layer 2) gets an error string naming what failed rather
+/// than a plausible-looking directory nothing was actually read from.
+pub(crate) fn resolve_config_dir() -> Result<(PathBuf, ConfigDirSource), String> {
+    resolve_config_dir_from(
+        std::env::var("QONTINUI_CONFIG_DIR").ok(),
+        dirs::config_dir(),
+    )
+}
+
+/// [`resolve_config_dir`] as a PURE function of its two inputs, so the
+/// precedence rule — and, load-bearingly, the fact that resolving creates
+/// NOTHING — is testable against a path the test controls, with no
+/// `set_var("QONTINUI_CONFIG_DIR")` racing every sibling test that reads real
+/// settings.
+pub(crate) fn resolve_config_dir_from(
+    env_config_dir: Option<String>,
+    platform_config_dir: Option<PathBuf>,
+) -> Result<(PathBuf, ConfigDirSource), String> {
+    env_config_dir
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::config_dir().map(|d| d.join("com.qontinui.runner")))
-        .ok_or("Failed to get config directory")?;
+        .map(|s| (PathBuf::from(s), ConfigDirSource::EnvConfigDir))
+        .or_else(|| {
+            platform_config_dir.map(|d| {
+                (
+                    d.join("com.qontinui.runner"),
+                    ConfigDirSource::PlatformConfigDir,
+                )
+            })
+        })
+        .ok_or_else(|| "Failed to get config directory".to_string())
+}
+
+/// [`resolve_config_dir`] **plus** `create_dir_all` — for callers that are about
+/// to WRITE into the directory. Never call this from a read or a diagnostic; use
+/// [`resolve_config_dir`] there.
+pub(crate) fn get_config_dir() -> Result<(PathBuf, ConfigDirSource), String> {
+    let (app_data_dir, source) = resolve_config_dir()?;
 
     // Create directory if it doesn't exist
     if !app_data_dir.exists() {
@@ -3026,12 +3101,27 @@ pub(crate) fn get_config_dir() -> Result<PathBuf, String> {
             .map_err(|e| format!("Failed to create app data directory: {}", e))?;
     }
 
-    Ok(app_data_dir)
+    Ok((app_data_dir, source))
 }
 
-/// Get the settings file path in the app data directory
-fn get_settings_path() -> Result<PathBuf, String> {
-    Ok(get_config_dir()?.join(SETTINGS_FILE))
+/// The settings file path, **creating nothing** — [`resolve_config_dir`] joined
+/// with [`SETTINGS_FILE`].
+///
+/// `pub(crate)` so `config_report` layer 1 can name the file whose provenance it
+/// is reporting. Callers must use THIS helper (or [`get_settings_path`]) rather
+/// than joining a directory with [`SETTINGS_FILE`] themselves: a second copy of
+/// the join would agree today and start lying the first time the real one moved,
+/// which is the defect class that whole report exists to expose.
+pub(crate) fn resolve_settings_path() -> Result<PathBuf, String> {
+    let (dir, _config_dir_source) = resolve_config_dir()?;
+    Ok(dir.join(SETTINGS_FILE))
+}
+
+/// [`resolve_settings_path`] **plus** the `create_dir_all` of its parent — for
+/// callers about to write the file ([`save_settings`]).
+pub(crate) fn get_settings_path() -> Result<PathBuf, String> {
+    let (dir, _config_dir_source) = get_config_dir()?;
+    Ok(dir.join(SETTINGS_FILE))
 }
 
 // ============================================================================
@@ -3119,7 +3209,7 @@ impl LoadedSettings {
 }
 
 fn settings_path_for_display() -> String {
-    get_settings_path()
+    resolve_settings_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| SETTINGS_FILE.to_string())
 }
@@ -3241,8 +3331,24 @@ fn invalidate_settings_cache() {
 /// `Loaded` result is ever cached — a fresh install, an unresolvable path and
 /// an unreadable/corrupt file all re-check the disk every call, so the
 /// "settings unreadable" banner still clears the instant the file is fixed.
-fn read_settings_from_disk() -> LoadedSettings {
-    let path = match get_settings_path() {
+///
+/// # This function does not WRITE, and that is a contract
+///
+/// It resolves through [`resolve_settings_path`] (which creates no directory),
+/// it never runs the tier / `local_user_id` migration, it never calls
+/// [`save_settings`], it never touches `claude-accounts.json`, and it never
+/// reaches the OS keyring. [`load_settings_full`] does all four, which is why
+/// `config_report`'s layer 1 asks THIS function instead: a diagnostic that
+/// mints a `local_user_id` UUID into the operator's real `settings.json` has
+/// changed the answer by asking the question. `pub(crate)` exists for exactly
+/// that caller.
+///
+/// The one process-global effect it retains is [`record_settings_fault`], which
+/// stores the CURRENT truth about the file (or clears it) for the UI banner —
+/// idempotent with respect to reality, and the same value any concurrent load
+/// would record.
+pub(crate) fn read_settings_from_disk() -> LoadedSettings {
+    let path = match resolve_settings_path() {
         Ok(p) => p,
         Err(e) => {
             let error = format!("cannot resolve settings path: {e}");
@@ -3349,7 +3455,20 @@ fn read_settings_from_path(path: &std::path::Path) -> LoadedSettings {
                 error: None,
             }
         }
-        Err(e) => unreadable(format!("parse failed: {e}")),
+        // BOUNDED, deliberately not `{e}`. `serde_json::Error`'s Display for a
+        // DATA error (`invalid type`, `invalid value`) QUOTES THE OFFENDING
+        // VALUE OUT OF THE FILE — and this file carries
+        // `web_integration.runner_token` and `qontinui_user_id`. That string
+        // reaches the user-facing `unreadable_message()` banner and
+        // `config_report`'s layer 1, so the category + position is the whole of
+        // what may cross: it is everything a reader needs to fix the file, and
+        // it cannot carry a credential.
+        Err(e) => unreadable(format!(
+            "parse failed: JSON {:?} error at line {} column {}",
+            e.classify(),
+            e.line(),
+            e.column()
+        )),
     }
 }
 
@@ -3365,9 +3484,97 @@ pub fn load_settings() -> Settings {
     load_settings_full().settings
 }
 
+/// Web-integration env-var overrides (Phase 3G) — the ONE definition.
+///
+/// In-memory overlay only; never persisted to disk. If either variable is set
+/// via env and a non-empty value is present in settings, the env wins. If both
+/// env vars are set and the persisted `enabled` flag is false, default to
+/// enabled (headless deploys shouldn't have to save settings to activate web
+/// integration).
+///
+/// Extracted out of [`load_settings_full`] so a caller holding a document from
+/// the NON-MUTATING [`read_settings_from_disk`] can reach the same
+/// `web_integration` values the full loader would have produced without paying
+/// that loader's writes (`claude-accounts.json`, a minted `local_user_id`, a
+/// `save_settings` of the operator's real file, an OS-keyring read).
+/// `config_report_cmd::settings_derived_inputs` is that caller, and
+/// `api_config::api_base_url_inputs_from` documents why those two fields are all
+/// its rung needs. Restating this overlay at the call site instead would be a
+/// second copy of a precedence rule — the defect class the config report exists
+/// to expose.
+///
+/// The whitespace case is the one that makes this an extraction rather than a
+/// convenience: `QONTINUI_WEB_BACKEND_URL="  "` is non-empty HERE (so it
+/// overwrites `backend_url`) while `resolve_api_base_url` treats it as unset. A
+/// reader that skipped this overlay would resolve the DISK url on that machine
+/// and the runner would resolve the build default.
+pub(crate) fn apply_web_integration_env_overlay(settings: &mut Settings) {
+    let env_backend_url = std::env::var("QONTINUI_WEB_BACKEND_URL").ok();
+    let env_runner_token = std::env::var("QONTINUI_RUNNER_TOKEN").ok();
+    if let Some(v) = env_backend_url.as_ref() {
+        if !v.is_empty() {
+            settings.web_integration.backend_url = v.clone();
+        }
+    }
+    if let Some(v) = env_runner_token.as_ref() {
+        if !v.is_empty() {
+            settings.web_integration.runner_token = v.clone();
+        }
+    }
+    let has_env_pair = env_backend_url
+        .as_deref()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+        && env_runner_token
+            .as_deref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+    if has_env_pair && !settings.web_integration.enabled {
+        settings.web_integration.enabled = true;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// TEST-ONLY entry counter for [`load_settings_full`], **per thread**.
+    ///
+    /// [`load_settings_full`] is the runner's only settings
+    /// WRITER-by-side-effect: it runs `claude_accounts::load_with_migration()`
+    /// (writing `claude-accounts.json`), can mint a `local_user_id` UUID and
+    /// call [`save_settings`] on the operator's real file, and reaches the OS
+    /// keyring. `config_report` is required never to reach it, and the
+    /// fingerprint test that was supposed to enforce that passes vacuously on
+    /// any machine where boot already ran the one-shot migration
+    /// (`needs_persist` false, `MIGRATE_ONCE` fired) — which is every dev box,
+    /// so it could only ever pass.
+    ///
+    /// Counting entries makes the invariant directly falsifiable without the two
+    /// things that would make the test unusable: a process-global
+    /// `set_var("QONTINUI_CONFIG_DIR")` (which races every sibling test that
+    /// reads real settings — the documented cause of an existing flake) and a
+    /// process-global counter (which every parallel test calling this function
+    /// would perturb). A `thread_local!` is immune to both: each `#[test]` runs
+    /// on its own thread, so the count a test observes is exactly what that
+    /// test's own call graph did.
+    ///
+    /// Read it with [`settings_full_load_count`]; the assertion lives in
+    /// `config_report_cmd::tests::config_report_never_reaches_the_settings_writer`.
+    static SETTINGS_FULL_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times [`load_settings_full`] has been entered on THIS thread. See
+/// [`SETTINGS_FULL_LOADS`].
+#[cfg(test)]
+pub(crate) fn settings_full_load_count() -> usize {
+    SETTINGS_FULL_LOADS.with(|c| c.get())
+}
+
 /// Load settings from file, reporting whether the values are the user's real
 /// persisted state ([`SettingsProvenance`]).
 pub fn load_settings_full() -> LoadedSettings {
+    #[cfg(test)]
+    SETTINGS_FULL_LOADS.with(|c| c.set(c.get() + 1));
+
     let LoadedSettings {
         mut settings,
         provenance,
@@ -3402,35 +3609,7 @@ pub fn load_settings_full() -> LoadedSettings {
         settings.restate.external_ingress_url = Some(u);
     }
 
-    // Web-integration env-var overrides (Phase 3G).
-    // In-memory overlay only; never persisted to disk. If either variable
-    // is set via env and a non-empty value is present in settings, the env
-    // wins. If both env vars are set and the persisted `enabled` flag is
-    // false, default to enabled (headless deploys shouldn't have to save
-    // settings to activate web integration).
-    let env_backend_url = std::env::var("QONTINUI_WEB_BACKEND_URL").ok();
-    let env_runner_token = std::env::var("QONTINUI_RUNNER_TOKEN").ok();
-    if let Some(v) = env_backend_url.as_ref() {
-        if !v.is_empty() {
-            settings.web_integration.backend_url = v.clone();
-        }
-    }
-    if let Some(v) = env_runner_token.as_ref() {
-        if !v.is_empty() {
-            settings.web_integration.runner_token = v.clone();
-        }
-    }
-    let has_env_pair = env_backend_url
-        .as_deref()
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-        && env_runner_token
-            .as_deref()
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
-    if has_env_pair && !settings.web_integration.enabled {
-        settings.web_integration.enabled = true;
-    }
+    apply_web_integration_env_overlay(&mut settings);
 
     // Machine-global Claude account roster overlay (claude-accounts.json).
     // The roster (config dirs, selection mode, manual config_dir pin, launch
@@ -4021,7 +4200,7 @@ fn performance_cache() -> &'static std::sync::RwLock<Option<CachedPerformance>> 
 /// (missing file, unresolvable path). `None` is treated as "no evidence the
 /// cache is still valid", which forces a re-read rather than trusting it.
 fn settings_mtime() -> Option<std::time::SystemTime> {
-    let path = get_settings_path().ok()?;
+    let path = resolve_settings_path().ok()?;
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
@@ -4592,6 +4771,97 @@ mod openai_compatible_defaults_tests {
             repaired.settings.claude_default_launch_command.as_deref(),
             Some("good")
         );
+    }
+
+    /// **F5 regression.** Resolving the config dir CREATES NOTHING.
+    ///
+    /// `get_config_dir` `create_dir_all`s, and `config_report`'s layer 2 used
+    /// to call it — so a typo'd `QONTINUI_CONFIG_DIR` was brought into
+    /// existence by the very report asked to explain why the runner could not
+    /// find its settings, and then printed as though the machine had always
+    /// been configured that way. The pure `resolve_config_dir_from` exists so
+    /// this is assertable against a path the test owns, with no
+    /// `set_var("QONTINUI_CONFIG_DIR")` racing every sibling test.
+    #[test]
+    fn resolve_config_dir_creates_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let typo = tmp.path().join("qonitnui-typo");
+        assert!(!typo.exists(), "fixture precondition");
+
+        let (dir, source) = resolve_config_dir_from(Some(typo.to_string_lossy().to_string()), None)
+            .expect("an env override always resolves");
+        assert_eq!(dir, typo);
+        assert_eq!(source.as_str(), "env:QONTINUI_CONFIG_DIR");
+        assert!(
+            !typo.exists(),
+            "resolving must not materialize the directory it names"
+        );
+
+        // The platform arm, same property, and the `com.qontinui.runner` join
+        // is asserted as a LITERAL because it is the on-disk contract.
+        let platform = tmp.path().join("platform-config");
+        let (dir, source) = resolve_config_dir_from(None, Some(platform.clone()))
+            .expect("a platform dir always resolves");
+        assert_eq!(dir, platform.join("com.qontinui.runner"));
+        assert_eq!(source.as_str(), "platform_config_dir");
+        assert!(!dir.exists(), "the platform arm must not create either");
+
+        // An exported-but-EMPTY override falls through to the platform arm —
+        // the documented emptiness filter, pinned here because the split above
+        // is where it could have been dropped.
+        let (dir, source) =
+            resolve_config_dir_from(Some(String::new()), Some(platform.clone())).expect("resolves");
+        assert_eq!(dir, platform.join("com.qontinui.runner"));
+        assert_eq!(source.as_str(), "platform_config_dir");
+
+        // Neither input available is a genuine failure, never a fallback.
+        assert!(resolve_config_dir_from(None, None).is_err());
+    }
+
+    /// **F6 regression.** The parse error a corrupt `settings.json` produces
+    /// carries NO content from the file.
+    ///
+    /// `serde_json::Error`'s Display for a DATA error (`invalid type`,
+    /// `invalid value`) quotes the offending value — and this file holds
+    /// `web_integration.runner_token` and `qontinui_user_id`. That string
+    /// reaches both the user-facing `unreadable_message()` banner and
+    /// `config_report`'s layer 1, so it is bounded at the source to category +
+    /// position.
+    #[test]
+    fn settings_parse_error_carries_no_content_from_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        // A type mismatch on a field, with a secret-shaped value in the slot.
+        // This is the shape whose Display quotes the value back.
+        // Split so the source carries no contiguous high-entropy literal next to a
+        // credential keyword — gitleaks' `generic-api-key` fires on that shape.
+        // `concat!` is compile-time, so the value and type are unchanged.
+        let secret = concat!("AbCdEf0123456789", "AbCdEf0123456789xyz");
+        std::fs::write(
+            &path,
+            format!(r#"{{"restate":{{"ingress_port":"{secret}"}}}}"#),
+        )
+        .expect("write");
+
+        let loaded = read_settings_from_path(&path);
+        assert_eq!(loaded.provenance, SettingsProvenance::Unreadable);
+        // The user-facing banner is built from the same string, so checking it
+        // covers both consumers at once.
+        let banner = loaded.unreadable_message();
+        let error = loaded
+            .error
+            .clone()
+            .expect("an unreadable load records its error");
+        assert!(
+            !error.contains(secret),
+            "the parse error quoted the file's own value: {error}"
+        );
+        assert!(
+            error.starts_with("parse failed: JSON ") && error.contains(" error at line "),
+            "the error must be category + position: {error}"
+        );
+        assert!(!banner.contains(secret), "the banner leaked it: {banner}");
     }
 
     /// Fresh install: no `openai_compatible` key at all → serde `default`

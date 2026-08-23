@@ -74,7 +74,7 @@ async fn tick() -> Result<(), String> {
         }
     };
 
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let base = base.trim_end_matches('/');
 
     let client = reqwest::Client::builder()
@@ -163,7 +163,7 @@ fn overlapped_since(cursor: &str) -> String {
 fn cursor_path() -> Option<std::path::PathBuf> {
     crate::settings::get_config_dir()
         .ok()
-        .map(|d| d.join(CURSOR_FILE))
+        .map(|(dir, _config_dir_source)| dir.join(CURSOR_FILE))
 }
 
 /// Load the persisted `since` cursor (RFC 3339). `None` on first run or any

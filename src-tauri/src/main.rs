@@ -60,6 +60,10 @@ mod commands;
 mod comparison;
 mod config;
 mod config_facade;
+/// In-app layered configuration report. The driver + formatter live in the lib
+/// (`qontinui_runner_lib::config_report`); this module injects the readings for
+/// the BIN-only layers, the way `coord_doctor_cmd` injects the bound API port.
+mod config_report_cmd;
 mod config_storage;
 mod constraint_engine;
 mod container;
@@ -1681,6 +1685,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             crash_dumps::dismiss_recent_crash,
             coord_doctor_cmd::coord_doctor_run,
             coord_doctor_cmd::coord_doctor_text,
+            config_report_cmd::config_report_run,
+            config_report_cmd::config_report_text,
             commands::dag_workflows::export_dag_workflow,
             commands::dag_workflows::import_dag_workflow,
             commands::dag_workflows::import_dag_workflows_from_project,

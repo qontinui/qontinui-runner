@@ -778,10 +778,8 @@ async fn deliver_once(
         }
     };
 
-    let base = qontinui_runner_lib::profiles::coord_base_with_source()
-        .0
-        .trim_end_matches('/')
-        .to_string();
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
+    let base = base.trim_end_matches('/').to_string();
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))

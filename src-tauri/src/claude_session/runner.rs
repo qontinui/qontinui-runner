@@ -311,7 +311,10 @@ fn run_async_inline<F: std::future::Future>(fut: F) -> F::Output {
 ///
 /// Returned by value so the constructed environment is unit-testable without
 /// spawning `claude`.
-fn build_inline_child_command(cli_args: &[String], working_dir: &str) -> std::process::Command {
+pub(crate) fn build_inline_child_command(
+    cli_args: &[String],
+    working_dir: &str,
+) -> std::process::Command {
     let mut cmd = crate::process_helpers::cmd_no_window();
     cmd.args(cli_args)
         .current_dir(working_dir)
@@ -494,9 +497,9 @@ fn run_claude_session_inline(
     };
     let launch_cfg = {
         let ai = crate::settings::get_ai_settings();
-        crate::claude_session::launch_spec::LaunchConfig::from_settings(
-            crate::ai_provider::get_effective_config_dir(&ai.claude_cli).as_deref(),
-        )
+        let (config_dir, _config_dir_source) =
+            crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
+        crate::claude_session::launch_spec::LaunchConfig::from_settings(config_dir.as_deref())
     };
     let mut cli_args = vec!["/c".to_string()];
     cli_args.extend(crate::claude_session::launch_spec::render_argv(

@@ -1222,7 +1222,7 @@ pub async fn spawn_worker_session(
     // at session.rs:187.
     {
         let ai_settings = crate::settings::get_ai_settings();
-        let effective_config_dir =
+        let (effective_config_dir, _config_dir_source) =
             crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
         crate::ai_provider::oauth_refresh::try_ensure_valid_credentials(
             effective_config_dir.as_deref(),
@@ -1925,7 +1925,12 @@ pub async fn add_task_dependency(
 /// when the runner is standalone.
 #[tauri::command]
 pub fn get_coord_http_base() -> String {
-    qontinui_runner_lib::profiles::coord_base_with_source().0
+    // The frontend contract here is a bare string, so the arm is bound and
+    // dropped in the open. A surface that needs the arm calls `get_coord_mode`,
+    // which carries it as `source` — this command deliberately does not grow a
+    // second, differently-shaped provenance channel.
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
+    base
 }
 
 /// `get_coord_mode` — the runner's connected-vs-isolated mode, for the
@@ -2086,7 +2091,7 @@ pub async fn spawn_from_plan(
 ) -> Result<serde_json::Value, String> {
     // Resolve the coord base the SAME way `get_coord_http_base` does
     // (env `COORD_HTTP_URL` → active profile `coord_url` → dev-localhost).
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let base = base.trim_end_matches('/');
     let url = format!("{base}/agents/spawn");
 
@@ -2175,7 +2180,7 @@ pub async fn spawn_from_plan(
 /// alerts stay best-effort `[]` for NON-auth failures.
 #[tauri::command]
 pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let base = base.trim_end_matches('/');
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

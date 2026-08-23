@@ -127,7 +127,7 @@ Return only the JSON object.";
 ///
 /// Returned by value so the constructed environment is unit-testable without
 /// spawning `claude`.
-fn build_interpret_command(prompt: &str) -> Command {
+pub(crate) fn build_interpret_command(prompt: &str) -> Command {
     let mut cmd = crate::process_helpers::tokio_no_window("claude");
     cmd.arg("-p")
         .arg("--output-format")
