@@ -275,6 +275,13 @@ pub struct SessionRestoreHealth {
     /// `"open"` before the `include` filter existed, which is exactly why it
     /// was never reported.
     pub state: String,
+    /// Why the session was closed (`"explicit"`, `"pty-exit"`, `"poll-dead"`,
+    /// `"superseded"`, …); `None` for an open row, or for a closed row that
+    /// recorded no reason. Reporting `state == "closed"` without it forced the
+    /// operator to guess whether a row was closed deliberately or lost its pty
+    /// — the single most load-bearing distinction in a restore incident, since
+    /// a `"pty-exit"` close stays restorable and an `"explicit"` one does not.
+    pub close_reason: Option<String>,
     /// Raw stored tier: `"resumed"` | `"terminal-only"` | `"failed"`; `None` =
     /// never restored, which is NOT the same claim as `"failed"`.
     pub restore_tier: Option<String>,
@@ -427,6 +434,7 @@ pub fn project_restore_health(
                 title: rec.title,
                 working_dir: rec.working_dir,
                 state: rec.state,
+                close_reason: rec.close_reason,
                 restore_status: describe_restore_status(
                     rec.restore_tier.as_deref(),
                     rec.restore_pending_at,
@@ -1896,6 +1904,58 @@ mod tests {
         assert!(
             !err.contains("  "),
             "no run of spaces anywhere in the message, got {err:?}"
+        );
+    }
+
+    /// A closed row without its `closeReason` forces the operator to guess the
+    /// one distinction the bucket exists to make: closed ON PURPOSE versus lost
+    /// its pty. Both reasons are already on the record; only the projection
+    /// dropped them.
+    #[test]
+    fn restore_health_reports_close_reason_for_closed_rows() {
+        let probe = FakeProbe(
+            ["bye".to_string(), "lost".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let mut explicit = health_rec("bye", "term-explicit", true);
+        explicit.state = "closed".to_string();
+        explicit.closed_at = Some(99);
+        explicit.close_reason = Some("explicit".to_string());
+        let mut pty = health_rec("lost", "term-pty", true);
+        pty.state = "closed".to_string();
+        pty.closed_at = Some(100);
+        pty.close_reason = Some("pty-exit".to_string());
+        let open = health_rec("still-here", "term-open", true);
+
+        let filter = parse_restore_health_include(Some("all")).unwrap();
+        let report = project_restore_health(vec![explicit, pty, open], &probe, filter);
+        let by_id = |id: &str| {
+            report
+                .sessions
+                .iter()
+                .find(|r| r.claude_session_id == id)
+                .unwrap_or_else(|| panic!("{id} reported"))
+        };
+        assert_eq!(by_id("bye").close_reason.as_deref(), Some("explicit"));
+        assert_eq!(by_id("lost").close_reason.as_deref(), Some("pty-exit"));
+        assert_eq!(
+            by_id("still-here").close_reason,
+            None,
+            "an open row has no close reason to report"
+        );
+
+        // …and it reaches the wire under the route's camelCase convention.
+        let wire = serde_json::to_value(&report).unwrap();
+        let reasons: Vec<Option<&str>> = wire["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.get("closeReason").unwrap().as_str())
+            .collect();
+        assert!(
+            reasons.contains(&Some("explicit")) && reasons.contains(&Some("pty-exit")),
+            "closeReason on the wire, got {reasons:?}"
         );
     }
 

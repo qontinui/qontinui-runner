@@ -143,6 +143,63 @@ pub fn parse_suggested_actions(data: &serde_json::Value) -> Vec<RecoverySuggesti
     }
 }
 
+/// Env var gating the LLM-driven recovery fallback. **Unset means OFF.**
+///
+/// The fallback hands a free-text instruction to an on-page NL executor that
+/// searched the WHOLE element tree, so a failed action could — and did — end
+/// up typing into an unrelated element (a command-palette input picked up a
+/// value from a failed write elsewhere on the page). Guessing which element
+/// the operator meant is not a recovery primitive, so the path is opt-in:
+/// nothing runs it unless a human sets this variable.
+pub const LLM_RECOVERY_ENV: &str = "QONTINUI_UI_BRIDGE_LLM_RECOVERY";
+
+/// Parse the [`LLM_RECOVERY_ENV`] value. Split from the `std::env` read so the
+/// default-OFF decision is unit-testable without mutating process env.
+pub fn llm_recovery_flag_enabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Whether the LLM recovery fallback is enabled for this process.
+fn llm_recovery_enabled() -> bool {
+    llm_recovery_flag_enabled(std::env::var(LLM_RECOVERY_ENV).ok().as_deref())
+}
+
+/// Actions that MUTATE input state. A recovery step may never dispatch one.
+///
+/// Recovery exists to make a previously-addressed action possible again —
+/// scroll it into view, wait for it to enable, refresh stale refs. Writing on
+/// the caller behalf is not that: it invents input the caller never asked
+/// for, and (before the scoping fix) could land it on an element the caller
+/// never addressed. Repositioning stays allowed; writes do not.
+pub fn is_write_action(action: &str) -> bool {
+    let a = action.trim().to_ascii_lowercase();
+    matches!(
+        a.as_str(),
+        "type"
+            | "settext"
+            | "setvalue"
+            | "fill"
+            | "input"
+            | "paste"
+            | "append"
+            | "clear"
+            | "select"
+            | "selectoption"
+            | "check"
+            | "uncheck"
+            | "toggle"
+            | "submit"
+            | "upload"
+            | "setfiles"
+            | "sendkeys"
+            | "presskey"
+            | "writetoterminal"
+    )
+}
+
 /// Map a recovery `command` string to a UI Bridge IPC dispatch against the
 /// failing element, and execute it via the runner's existing IPC action path
 /// (`ui_bridge_request_sync`). Returns `Ok` on dispatch success.
@@ -207,6 +264,18 @@ async fn execute_recovery_command(
         }
         other if other.starts_with("execute_action:") => {
             let action = other.trim_start_matches("execute_action:").trim();
+            // The escape hatch is the one Tier-1 command that can name an
+            // arbitrary action, so it is where an auto-write would get in.
+            if is_write_action(action) {
+                warn!(
+                    "recovery_executor: refusing write-class recovery action '{}' — \
+                     recovery never writes on the caller behalf",
+                    action
+                );
+                return Err(format!(
+                    "recovery refused: '{action}' mutates input state; recovery may not write"
+                ));
+            }
             ui_bridge_request_sync(
                 state,
                 "execute_action",
@@ -246,9 +315,14 @@ fn is_ipc_success(data: &serde_json::Value) -> bool {
 async fn llm_fallback(
     state: &Arc<ApiState>,
     instruction: &str,
+    element_id: &str,
 ) -> Result<serde_json::Value, String> {
+    // `elementId` is REQUIRED, not decorative: the frontend handler scopes its
+    // element search to this id and refuses to run unscoped. Without it the
+    // executor searched every discovered element and could act on one the
+    // caller never addressed.
     let payload = serde_json::json!({
-        "params": { "instruction": instruction }
+        "params": { "instruction": instruction, "elementId": element_id }
     });
     let resp = ui_bridge_request_sync(state, "ai_recovery_attempt", payload).await?;
     if is_ipc_success(&resp) {
@@ -346,24 +420,56 @@ pub async fn attempt_recovery(
         );
     }
 
-    // ── Tier 2: existing LLM-driven recovery path ────────────────────────
+    // ── Tier 2: existing LLM-driven recovery path (opt-in) ───────────────
+    outcome.command_chosen = chosen_command.clone();
+    if !llm_recovery_enabled() {
+        info!(
+            "recovery_executor: LLM fallback disabled (set {}=1 to enable); \
+             reporting the original failure for {:?}",
+            LLM_RECOVERY_ENV, error_code
+        );
+        outcome.via = RecoveryVia::None;
+        emit_telemetry(state, &error_code, &chosen_command, false, task_run_id).await;
+        return outcome;
+    }
+
     let instruction = failure
         .get("error")
         .and_then(|v| v.as_str())
         .map(|s| format!("recover from: {}", s))
         .unwrap_or_else(|| "recover from error state".to_string());
-    match llm_fallback(state, &instruction).await {
+    match llm_fallback(state, &instruction, element_id).await {
         Ok(resp) => {
-            outcome.recovered = true;
-            outcome.via = RecoveryVia::LlmFallback;
-            outcome.command_chosen = chosen_command.clone();
-            outcome.result = Some(resp);
-            emit_telemetry(state, &error_code, &chosen_command, true, task_run_id).await;
+            // `recovered` is NOT "the recovery IPC answered". It is "the
+            // original action now succeeds" — the same bar Tier 1 clears
+            // above. Hardcoding it true reported success for an LLM step that
+            // had touched an unrelated element and left the addressed action
+            // just as broken as before.
+            let retry = ui_bridge_request_sync(state, "execute_action", original_action.clone())
+                .await
+                .ok()
+                .filter(is_ipc_success);
+            match retry {
+                Some(retry) => {
+                    outcome.recovered = true;
+                    outcome.via = RecoveryVia::LlmFallback;
+                    outcome.result = Some(retry);
+                    emit_telemetry(state, &error_code, &chosen_command, true, task_run_id).await;
+                }
+                None => {
+                    warn!(
+                        "recovery_executor: LLM fallback ran but the original action still \
+                         fails — reporting recovered:false ({:?})",
+                        resp.get("error")
+                    );
+                    outcome.via = RecoveryVia::None;
+                    emit_telemetry(state, &error_code, &chosen_command, false, task_run_id).await;
+                }
+            }
         }
         Err(e) => {
             warn!("recovery_executor: LLM fallback also failed: {}", e);
             outcome.via = RecoveryVia::None;
-            outcome.command_chosen = chosen_command.clone();
             emit_telemetry(state, &error_code, &chosen_command, false, task_run_id).await;
         }
     }
@@ -545,6 +651,59 @@ mod tests {
             ]
         });
         assert_eq!(parse_suggested_actions(&data).len(), 1);
+    }
+
+    /// The LLM fallback is OPT-IN. Unset — the state every runner ships in —
+    /// must read as OFF, and so must every not-quite-yes spelling: a fallback
+    /// that writes to elements the caller never addressed does not get to
+    /// enable itself on a typo.
+    #[test]
+    fn llm_recovery_defaults_off_and_only_explicit_yes_enables_it() {
+        assert!(!llm_recovery_flag_enabled(None), "unset is OFF");
+        for off in ["", "  ", "0", "false", "no", "off", "maybe", "tru"] {
+            assert!(
+                !llm_recovery_flag_enabled(Some(off)),
+                "{off:?} must not enable the LLM fallback"
+            );
+        }
+        for on in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(
+                llm_recovery_flag_enabled(Some(on)),
+                "{on:?} must enable the LLM fallback"
+            );
+        }
+    }
+
+    /// Recovery may reposition, wait, and resnapshot — it may never write.
+    /// The `execute_action:<name>` escape hatch was the one Tier-1 command
+    /// able to name an arbitrary action, i.e. the way an auto-write got in.
+    #[test]
+    fn write_class_actions_are_refused_as_recovery_steps() {
+        for w in [
+            "type",
+            "setValue",
+            "fill",
+            "paste",
+            "clear",
+            "sendKeys",
+            "writeToTerminal",
+            "  TYPE  ",
+        ] {
+            assert!(is_write_action(w), "{w:?} mutates input state");
+        }
+        for ok in [
+            "click",
+            "focus",
+            "blur",
+            "scrollIntoView",
+            "hover",
+            "discover",
+        ] {
+            assert!(
+                !is_write_action(ok),
+                "{ok:?} is a repositioning action, not a write"
+            );
+        }
     }
 
     #[test]
