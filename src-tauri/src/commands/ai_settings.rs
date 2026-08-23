@@ -1610,7 +1610,8 @@ pub struct CliAuthStatus {
 pub(crate) fn find_claude_credentials_path() -> Option<std::path::PathBuf> {
     // 1. Check effective config_dir from runner AI settings (respects least-usage mode)
     let ai_settings = settings::get_ai_settings();
-    let effective_dir = crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
+    let (effective_dir, _config_dir_source) =
+        crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
     if let Some(ref dir) = effective_dir {
         let path = std::path::PathBuf::from(dir).join(".credentials.json");
         if path.exists() {
@@ -1771,7 +1772,8 @@ pub async fn refresh_claude_cli_auth() -> Result<CommandResponse, String> {
         .as_deref()
         .unwrap_or("claude");
 
-    let effective_dir = crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
+    let (effective_dir, _config_dir_source) =
+        crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
     let config_env = effective_dir
         .as_ref()
         .map(|dir| format!("$env:CLAUDE_CONFIG_DIR = '{}'; ", dir))

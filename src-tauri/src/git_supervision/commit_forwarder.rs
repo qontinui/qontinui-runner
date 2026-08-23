@@ -232,7 +232,7 @@ pub async fn forward_commit_event(event: &GitSupervisionEvent) {
     // default on a hosted qontinui_account-tier runner → dev-localhost guess
     // otherwise). This retires the one-off coord-base env var this site alone
     // honored — the policy fn is the single decision point.
-    let coord_base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (coord_base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
 
     post_commit_observation(&coord_base, &body).await;
 }

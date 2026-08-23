@@ -157,7 +157,8 @@ impl CoordSync {
     /// Construct a CoordSync with all settings resolved from env. Used at
     /// app startup; tests prefer [`CoordSync::new_for_test`].
     pub fn new(outbox: Arc<OutboxWriter>) -> Self {
-        let coord_url = qontinui_runner_lib::profiles::coord_base_with_source().0;
+        let (coord_url, _coord_base_source) =
+            qontinui_runner_lib::profiles::coord_base_with_source();
         let heartbeat = Duration::from_secs(env_u64(
             "QONTINUI_SESSION_HEARTBEAT_SECS",
             DEFAULT_HEARTBEAT_SECS,

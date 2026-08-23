@@ -145,9 +145,11 @@
 //!   process that actually builds the prompt.
 //! - Degradation is logged ONCE, on a transition, PER DOCUMENT.
 //!
-//! **Disk persistence is PER RUNNER INSTANCE.** The store lives in
-//! [`crate::settings::get_config_dir`], which honours `$QONTINUI_CONFIG_DIR` —
-//! a variable the supervisor sets per spawned runner. So "a restart does not
+//! **Disk persistence is PER RUNNER INSTANCE.** The store lives in the
+//! directory [`crate::settings::resolve_config_dir`] names — the NON-creating
+//! resolver, because every door into the cache is a read (see
+//! [`briefing_store_path`]) — which honours `$QONTINUI_CONFIG_DIR`, a variable
+//! the supervisor sets per spawned runner. So "a restart does not
 //! silently revert a tenant's edited briefing" holds for a given instance, and
 //! a freshly spawned temp/secondary runner legitimately starts on the builtin
 //! until its first poll. It is not machine-wide state.
@@ -584,7 +586,9 @@ pub(crate) const BRIEFING_NAMES: [&str; 3] = [
     BRIEFING_AI_SESSION_RULES,
 ];
 
-/// The on-disk last-good store, under [`crate::settings::get_config_dir`].
+/// The on-disk last-good store, under the directory
+/// [`crate::settings::resolve_config_dir`] names — see [`briefing_store_path`]
+/// for why it is the non-creating resolver.
 const BRIEFING_STORE_FILE: &str = "session-briefing.cache.json";
 
 /// How far a cached body has travelled from coord.
@@ -678,21 +682,190 @@ fn briefing_snapshot() -> BriefingCache {
         .unwrap_or_default()
 }
 
+// ===========================================================================
+// Layer 10 of the config report — the dial, as it stands RIGHT NOW.
+//
+// Plan `2026-08-20-effective-config-provenance-and-env-generation` Phase 4.
+// ===========================================================================
+
+/// One cached `session_briefing` document, reduced to what a report may say.
+///
+/// The BODY is deliberately absent. It is operator-authored prose that lands
+/// verbatim in a system prompt, it can be arbitrarily long, and none of it is
+/// needed to answer "which generation of the briefing is this session getting?"
+/// — which is `version` + `fetched_at` + `provenance`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BriefingDial {
+    /// One of [`BRIEFING_NAMES`].
+    pub(crate) name: &'static str,
+    /// `false` ⇒ no cached document under this name, so the renderer falls back
+    /// to the compiled-in builtin. That is a reading about the CACHE, not a
+    /// statement that coord has no such document.
+    pub(crate) present: bool,
+    /// The row's `current_version` as the cache holds it.
+    pub(crate) version: Option<i64>,
+    /// **The cache's own last-refresh time** (RFC 3339), as coord confirmed it.
+    /// This is the sub-fact caches 1-3 cannot supply — see
+    /// [`FleetPolicyDial::caches_expose_refresh_time`].
+    pub(crate) fetched_at: Option<String>,
+    /// `coord` (confirmed by a live poll in this process) vs `cached` (restored
+    /// from the on-disk last-good and not yet re-confirmed).
+    pub(crate) provenance: Option<&'static str>,
+}
+
+/// Everything the fleet-policy dial currently holds, in one atomic-enough read.
+///
+/// # The freshness asymmetry this type exists to make visible
+///
+/// Four process-global caches sit behind ONE poll loop, and they do NOT agree
+/// about what they can tell you:
+///
+/// - Caches 1-3 (interception mode, session floors, plan-capture level) are a
+///   bare `RwLock<T>`. They hold a VALUE and nothing else — no stamp, no
+///   generation counter. So "when did this last change?" is genuinely
+///   unanswerable from here, and [`caches_expose_refresh_time`](Self::caches_expose_refresh_time)
+///   says `false` rather than letting a consumer substitute the read time. A
+///   read time presented as a refresh time would make every reading look
+///   perfectly fresh, which is the precise lie a time-varying layer's row
+///   exists to prevent.
+/// - Cache 4 (the session briefings) DOES carry `fetched_at` + `provenance`
+///   per document, because it is persisted across restarts and a restored
+///   last-good must be distinguishable from a live confirmation.
+///
+/// Reporting both halves under one honest shape is why this is a struct and
+/// not four getters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FleetPolicyDial {
+    /// [`POLL_INTERVAL`] in milliseconds — the upper bound on how stale any of
+    /// these values can be while the loop is running.
+    pub(crate) poll_interval_ms: u128,
+    /// Cache 1 — the effective install-interception mode.
+    pub(crate) install_intercept_mode: String,
+    /// Cache 1's resting value. Equal to `install_intercept_mode` means EITHER
+    /// "the fleet says off" OR "no poll has ever succeeded", and the two are
+    /// indistinguishable from this cache — which is itself worth reporting.
+    pub(crate) install_intercept_default: &'static str,
+    /// Cache 2 — the host lane's warn floor, in bytes. `None` = the fleet has
+    /// no opinion (never `0`, which would disable the guard it names).
+    pub(crate) host_warn_free_bytes: Option<u64>,
+    /// Cache 2 — the host lane's critical floor, in bytes.
+    pub(crate) host_critical_free_bytes: Option<u64>,
+    /// Cache 2 — the WSL lane's warn floor, in bytes. NEVER interchangeable
+    /// with the host lane's.
+    pub(crate) wsl_warn_free_bytes: Option<u64>,
+    /// Cache 2 — the WSL lane's critical floor, in bytes.
+    pub(crate) wsl_critical_free_bytes: Option<u64>,
+    /// Cache 3 — the plan-capture level (`off` | `record`).
+    pub(crate) plan_capture_level: String,
+    /// Cache 3's resting value.
+    pub(crate) plan_capture_default: &'static str,
+    /// Cache 3's ON word, so a reader can tell whether the level is armed
+    /// without knowing the vocabulary.
+    pub(crate) plan_capture_record_level: &'static str,
+    /// Cache 4 — one entry per name in [`BRIEFING_NAMES`], always all three
+    /// (an absent document is `present: false`, never a missing entry).
+    pub(crate) briefings: Vec<BriefingDial>,
+    /// `false`, always, for caches 1-3 — see the type docs. Kept as a FIELD
+    /// rather than a comment so the consumer's honesty is data-driven: a future
+    /// stamp on those caches flips this and the report gains the fact without
+    /// the consumer inventing one in the meantime.
+    pub(crate) caches_expose_refresh_time: bool,
+}
+
+/// Snapshot every cache this poller owns, WITHOUT polling.
+///
+/// Lock-only and side-effect-free, exactly like the four production readers —
+/// a config report must never be what makes a dial move, or the act of
+/// observing changes the answer.
+///
+/// Not atomic across the four locks, and deliberately not made so: the poll
+/// loop writes them within microseconds of each other once per
+/// [`POLL_INTERVAL`], and taking a cross-cache lock here would put the config
+/// report on the spawn path's critical section to buy a guarantee no reader of
+/// the report can use.
+pub(crate) fn dial_snapshot() -> FleetPolicyDial {
+    use crate::fleet::resource_sample::Lane;
+
+    let host = fleet_session_floors(Lane::Host.as_str());
+    let wsl = fleet_session_floors(Lane::Wsl.as_str());
+    let cache = briefing_snapshot();
+
+    FleetPolicyDial {
+        poll_interval_ms: POLL_INTERVAL.as_millis(),
+        install_intercept_mode: effective_install_intercept_mode(),
+        install_intercept_default: DEFAULT_MODE,
+        host_warn_free_bytes: host.warn_free_bytes,
+        host_critical_free_bytes: host.critical_free_bytes,
+        wsl_warn_free_bytes: wsl.warn_free_bytes,
+        wsl_critical_free_bytes: wsl.critical_free_bytes,
+        plan_capture_level: effective_plan_capture_level(),
+        plan_capture_default: DEFAULT_PLAN_CAPTURE_LEVEL,
+        plan_capture_record_level: PLAN_CAPTURE_RECORD,
+        briefings: BRIEFING_NAMES
+            .iter()
+            .map(|name| match cache.get(*name) {
+                Some(doc) => BriefingDial {
+                    name,
+                    present: true,
+                    version: Some(doc.version),
+                    // Empty string is the serde default for a store written by
+                    // a build that predates the field — report that as UNKNOWN
+                    // rather than as an empty timestamp.
+                    fetched_at: Some(doc.fetched_at.clone()).filter(|s| !s.is_empty()),
+                    provenance: Some(match doc.provenance {
+                        BriefingProvenance::Coord => "coord",
+                        BriefingProvenance::Cached => "cached",
+                    }),
+                },
+                None => BriefingDial {
+                    name,
+                    present: false,
+                    version: None,
+                    fetched_at: None,
+                    provenance: None,
+                },
+            })
+            .collect(),
+        caches_expose_refresh_time: false,
+    }
+}
+
 // ---- disk persistence (the `helper_tasks::store_path` posture) -------------
 
-/// The last-good store path.
+/// The last-good store path, resolved **without creating anything**.
 ///
-/// [`crate::settings::get_config_dir`] honours `$QONTINUI_CONFIG_DIR`, which
+/// [`crate::settings::resolve_config_dir`] honours `$QONTINUI_CONFIG_DIR`, which
 /// the supervisor sets PER RUNNER INSTANCE. So "a restart does not revert the
 /// tenant's edited briefing" is true per instance, and a freshly spawned
 /// temp/secondary runner legitimately starts on the builtin until its first
 /// poll. This is NOT machine-wide persistence, and `dirs::config_dir()` is
 /// deliberately not used (`claude_accounts.rs:92-97` documents that as the
 /// unscoped path).
+///
+/// # Why the NON-creating resolver, and why that matters here of all places
+///
+/// This function used to call `settings`' ensuring variant, whose doc says in
+/// so many words *"Never call this from a read or a diagnostic"* — and this is
+/// reached from a READ. [`briefing_cache`] initialises the `OnceLock` from
+/// [`load_persisted_briefings`], so whichever caller touches the cache FIRST in
+/// a process pays the resolution, and `config_report`'s layer 11 is one of them
+/// (`config_report_cmd` → `dial_snapshot` → `briefing_snapshot` →
+/// [`briefing_cache`]), as is its env-generation section by a second route
+/// (`pty_child_command` → `apply_base_child_env` → `terminal::runner_context` →
+/// [`cached_briefing`]). Both run BEFORE the report stats the config directory,
+/// so a runner launched with a typo'd `QONTINUI_CONFIG_DIR` had that directory
+/// brought into existence by the report, which then printed `on disk: true` —
+/// the report materializing the fault it was opened to explain. That is the
+/// same defect `settings::resolve_config_dir`'s own F5 regression test closed
+/// on layer 2, arriving through a third door.
+///
+/// Non-creation is the invariant, so the WRITER creates the directory
+/// explicitly at its own call site ([`persist_briefings`]) rather than as a
+/// side effect of asking where the file is.
 fn briefing_store_path() -> Option<std::path::PathBuf> {
-    crate::settings::get_config_dir()
+    crate::settings::resolve_config_dir()
         .ok()
-        .map(|d| d.join(BRIEFING_STORE_FILE))
+        .map(|(dir, _config_dir_source)| dir.join(BRIEFING_STORE_FILE))
 }
 
 /// Restore the persisted last-good briefings. Best-effort: a missing file is
@@ -703,7 +876,21 @@ fn load_persisted_briefings() -> BriefingCache {
     let Some(path) = briefing_store_path() else {
         return BriefingCache::new();
     };
-    let raw = match std::fs::read_to_string(&path) {
+    load_persisted_briefings_from(&path)
+}
+
+/// [`load_persisted_briefings`] against an EXPLICIT path.
+///
+/// Compiled in both cfgs, and the reason is the guard above: the `#[cfg(test)]`
+/// twin of [`initial_briefing_cache`] means no test build ever reaches the real
+/// store, so "the read path creates nothing" was a claim nothing could check.
+/// Pointing this half at a root the test owns makes it checkable without
+/// mutating `$QONTINUI_CONFIG_DIR` out from under every sibling test.
+///
+/// It READS ONLY. A missing file — and a missing parent DIRECTORY — are both
+/// "first boot", never a reason to create either.
+fn load_persisted_briefings_from(path: &std::path::Path) -> BriefingCache {
+    let raw = match std::fs::read_to_string(path) {
         Ok(r) => r,
         Err(_) => return BriefingCache::new(), // first boot
     };
@@ -753,11 +940,25 @@ fn restore_briefings_from_str(raw: &str) -> BriefingCache {
 ///
 /// Called only when CONTENT changed, never on every 304: the store is up to
 /// three 16 KiB bodies and rewriting it every 45s forever would be pure churn.
+///
+/// This is the ONLY place in this module allowed to create the config
+/// directory, and it does so with an explicit `create_dir_all` rather than by
+/// asking an ensuring resolver where the file lives — see
+/// [`briefing_store_path`] for why that distinction is load-bearing.
+/// `fs_atomic::atomic_write` writes its temp file into the parent, so the
+/// parent has to exist first; a create failure is best-effort like every other
+/// failure on this path.
 #[cfg(not(test))]
 fn persist_briefings() {
     let Some(path) = briefing_store_path() else {
         return;
     };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!("session_briefing: store dir create failed (best-effort): {e}");
+            return;
+        }
+    }
     let snapshot = briefing_snapshot();
     let body = match serde_json::to_vec(&snapshot) {
         Ok(b) => b,
@@ -976,7 +1177,7 @@ async fn fetch_briefing_list() -> BriefingListOutcome {
         return BriefingListOutcome::Kept("shared coord client unavailable".to_string());
     };
 
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let mut req = crate::coord_http::coord_get(client, briefing_list_url(&base))
         .timeout(Duration::from_secs(10));
     if let Some(etag) = briefing_list_etag() {
@@ -1026,7 +1227,7 @@ async fn fetch_briefing_body(name: &str) -> Result<(String, i64), BodyFetchError
             "shared coord client unavailable".to_string(),
         ));
     };
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let resp = crate::coord_http::coord_get(client, briefing_url(&base, name))
         .timeout(Duration::from_secs(10))
         .send()
@@ -1636,7 +1837,7 @@ enum CapabilityCheck {
 ///   longer fail to resolve: `profiles::coord_base_with_source` always yields
 ///   one.)
 async fn check_fleet_policy_capability() -> CapabilityCheck {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let url = format!("{}/health", base.trim_end_matches('/'));
 
     let client = match reqwest::Client::builder()
@@ -1915,7 +2116,7 @@ async fn fetch_fleet_policy(domain: &str) -> Result<FleetPolicyResponse, FetchEr
 
     // coord base — identical source-of-truth chain to the producer's
     // `coord_base()` (env COORD_HTTP_URL → profile coord_url → default).
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let url = format!(
         "{}/coord/fleet-policy?domain={domain}",
         base.trim_end_matches('/')
@@ -2866,6 +3067,146 @@ mod tests {
             BriefingProvenance::Cached,
             "a claimed `coord` must be force-relabelled"
         );
+    }
+
+    /// **The briefing store's READ path creates nothing** — driven against a
+    /// root the test owns, so the real [`load_persisted_briefings_from`] body
+    /// runs rather than the `#[cfg(test)]` twin of [`initial_briefing_cache`].
+    ///
+    /// This is the half that used to be untestable. `briefing_store_path` went
+    /// through `settings`' ensuring resolver, and every door into
+    /// [`briefing_cache`] is a READ: `config_report`'s layer 11 reaches it via
+    /// `dial_snapshot` → `briefing_snapshot`, and its env-generation section
+    /// reaches it a second way via `pty_child_command` →
+    /// `terminal::runner_context` → [`cached_briefing`]. Whichever gets there
+    /// first initialises the `OnceLock`, both before the report stats the
+    /// directory — so a typo'd `QONTINUI_CONFIG_DIR` was CREATED by the
+    /// diagnostic and then reported as present.
+    #[test]
+    fn the_briefing_store_read_path_creates_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // (1) An absent store under an absent parent is "first boot", and
+        // neither is brought into existence by asking for it.
+        let typo = tmp.path().join("qonitnui-typo");
+        let absent = typo.join(BRIEFING_STORE_FILE);
+        assert!(!typo.exists(), "fixture precondition");
+        assert!(
+            load_persisted_briefings_from(&absent).is_empty(),
+            "an absent store is first boot"
+        );
+        assert!(
+            !typo.exists(),
+            "reading the store must not materialize the config directory"
+        );
+        assert!(!absent.exists(), "nor the store file");
+
+        // (2) A REAL store under a root the test owns restores — so (1) is a
+        // statement about non-creation, not about the reader being inert.
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let store = real.join(BRIEFING_STORE_FILE);
+        std::fs::write(
+            &store,
+            br#"{"runner-session":{"body":"restored","version":3,"provenance":"coord"}}"#,
+        )
+        .expect("write store");
+        let restored = load_persisted_briefings_from(&store);
+        let doc = restored.get("runner-session").expect("restored");
+        assert_eq!(doc.body, "restored");
+        assert_eq!(doc.version, 3);
+        assert_eq!(doc.provenance, BriefingProvenance::Cached);
+    }
+
+    /// …and the path RESOLUTION itself goes through the non-creating resolver —
+    /// asserted BOTH on the source and on the behaviour, because neither half
+    /// is sufficient alone.
+    ///
+    /// The behavioural test above owns its path, so it cannot see which
+    /// resolver [`briefing_store_path`] picks — and that choice IS the defect:
+    /// the two resolvers return the same `PathBuf` and differ only in a side
+    /// effect, which no equality assertion over the RETURN VALUE can
+    /// distinguish. So part (1) asserts on the source of the resolution, the way
+    /// `agent_worktree::census` and `ci_node::services` already assert source
+    /// invariants in this crate. Restore the ensuring call and it fails.
+    ///
+    /// But a source invariant bans a SPELLING, not a behaviour, and this body
+    /// reintroduces the whole defect while satisfying every needle in part (1):
+    ///
+    /// ```ignore
+    /// let (dir, _) = crate::settings::resolve_config_dir().ok()?;
+    /// std::fs::create_dir_all(&dir).ok();
+    /// Some(dir.join(BRIEFING_STORE_FILE))
+    /// ```
+    ///
+    /// So part (2) drives the real function against a config dir the test owns
+    /// and asserts the directory is still absent afterwards — the property
+    /// itself, immune to how the creation is spelled. `create_dir_all` is added
+    /// to the banned needles as well, but as belt-and-braces behind the
+    /// behavioural check, not in place of it.
+    ///
+    /// Part (2) holds `env_lock` for its whole body, which is what makes the
+    /// `set_var("QONTINUI_CONFIG_DIR", …)` safe: the flake class this test's
+    /// previous round avoided (cf.
+    /// `agent_runtime::…::coord_ws_url_resolves_on_hosted_tier_with_no_profile_coord_url`)
+    /// comes from reading or writing a process-global variable WITHOUT the lock,
+    /// not from touching it at all. `EnvVarRestore` puts the variable back on
+    /// the panic path too.
+    #[test]
+    fn briefing_store_path_resolves_the_config_dir_without_creating_it() {
+        // ---- (1) the SOURCE invariant: which resolver the body names -------
+        const SRC: &str = include_str!("fleet_policy_poller.rs");
+        let body: Vec<&str> = SRC
+            .lines()
+            .skip_while(|l| !l.contains("fn briefing_store_path()"))
+            .skip(1)
+            .take_while(|l| !l.starts_with('}'))
+            .collect();
+        assert!(
+            !body.is_empty(),
+            "briefing_store_path not found — re-derive this test against the renamed function"
+        );
+        let body = body.join("\n");
+        assert!(
+            body.contains("settings::resolve_config_dir()"),
+            "the store path must resolve through the NON-creating resolver, got:\n{body}"
+        );
+        for banned in [
+            // Split so these needles are not the thing they find.
+            concat!("settings::get_", "config_dir"),
+            concat!("create_dir", "_all"),
+        ] {
+            assert!(
+                !body.contains(banned),
+                "{banned} creates the config directory, and every caller of this function is a \
+                 read — see its docs. Got:\n{body}"
+            );
+        }
+
+        // ---- (2) the BEHAVIOURAL invariant: nothing is created -------------
+        // Held for the whole of part (2): `QONTINUI_CONFIG_DIR` is
+        // process-global, and this is the only safe way to point the REAL
+        // resolver at a directory the test owns.
+        let _env = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CONFIG_DIR"]);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let typo = tmp.path().join("qonitnui-typo");
+        assert!(!typo.exists(), "fixture precondition");
+        std::env::set_var("QONTINUI_CONFIG_DIR", &typo);
+
+        // The join is the on-disk contract, asserted as a LITERAL — and now as
+        // a WHOLE path, because the lock above makes the directory half stable
+        // for the duration of this body.
+        assert_eq!(BRIEFING_STORE_FILE, "session-briefing.cache.json");
+        let path = briefing_store_path().expect("an env override always resolves");
+        assert_eq!(path, typo.join("session-briefing.cache.json"));
+        assert!(
+            !typo.exists(),
+            "asking WHERE the briefing store lives must not create the config directory — that \
+             is the fault `config_report` opens to explain, and creating it destroys the evidence"
+        );
+        assert!(!path.exists(), "nor the store file itself");
     }
 
     /// A corrupt store is logged and ignored — never a panic, never a partial.

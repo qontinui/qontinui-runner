@@ -161,7 +161,7 @@ pub(crate) fn runner_rules_prefix(supervisor_available: bool, api_port: u16) -> 
     use crate::mcp::fleet_policy_poller::BRIEFING_AI_SESSION_RULES;
     use crate::mcp::session_briefing;
 
-    let coord_url = crate::coord_mcp::coord_base_url();
+    let (coord_url, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let api_base = session_briefing::runner_api_base(api_port);
 
     let block = if supervisor_available {

@@ -179,6 +179,31 @@ impl StopHookRegistration {
             StopHookRegistration::Omitted => HOOK_SETTINGS_NAME_NOSTOP,
         }
     }
+
+    /// Stable wire string for the variant, for diagnostics that must name WHICH
+    /// carrier a session would get. Distinct vocabulary from
+    /// [`crate::mcp::continuation_verdict::Mode::as_str`] on purpose: two of the
+    /// three modes collapse to one registration, so reporting the mode would not
+    /// name the file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StopHookRegistration::Registered => "registered",
+            StopHookRegistration::Omitted => "omitted",
+        }
+    }
+}
+
+/// The absolute path of the `--settings` carrier `base_dir` holds for `reg`.
+///
+/// THE one definition of that path. [`materialize_from_template`] writes it,
+/// [`hook_files`] stats it and `config_report_cmd::claude_settings_carrier_reading`
+/// REPORTS it, all through here — so a diagnostic that names the carrier cannot
+/// name a different file than the spawn seam writes. A second copy of
+/// `base_dir.join(reg.settings_name())` would compile, agree on the day it was
+/// written, and start lying the first time either half moved, which is exactly
+/// the defect class the config report exists to expose.
+pub fn settings_path(base_dir: &Path, reg: StopHookRegistration) -> PathBuf {
+    base_dir.join(reg.settings_name())
 }
 
 /// Env var the runner injects at spawn carrying the absolute path of the
@@ -311,13 +336,13 @@ fn materialize_from_template(
         Some(s) => s,
         None => {
             tracing::warn!(
-                path = %base_dir.join(stop.settings_name()).display(),
+                path = %settings_path(base_dir, stop).display(),
                 "session-restore: claude hook settings template malformed — --settings hook delivery off (identity still pinned)"
             );
             return None;
         }
     };
-    let settings_path = base_dir.join(stop.settings_name());
+    let settings_path = settings_path(base_dir, stop);
     if let Err(e) = std::fs::write(&settings_path, settings.as_bytes()) {
         tracing::warn!(error = %e, path = %settings_path.display(), "session-restore: claude hook settings write failed");
         return None;
@@ -482,7 +507,7 @@ fn hook_files(base_dir: &Path, reg: StopHookRegistration) -> [PathBuf; 5] {
         base_dir.join(STOP_HOOK_SCRIPT_NAME),
         base_dir.join(PRECOMPACT_HOOK_SCRIPT_NAME),
         base_dir.join(POLICY_HOOK_SCRIPT_NAME),
-        base_dir.join(reg.settings_name()),
+        settings_path(base_dir, reg),
     ]
 }
 

@@ -329,6 +329,17 @@ path = "src/bin/qontinui_cli.rs"
 name = "coord_doctor"
 path = "src/bin/coord_doctor.rs"
 
+# `config report` headless dump of the effective configuration by layer, with
+# per-value provenance (plan
+# 2026-08-20-effective-config-provenance-and-env-generation, Phases 1-2). Reuses
+# the lib-crate `config_report` module (layer table + driver + formatter) so it
+# produces the same report as the in-app Tauri command — differing only where a
+# BIN-only layer genuinely is not observable from a lib-linking bin, which it
+# reports as UNKNOWN rather than omitting.
+[[bin]]
+name = "config_report"
+path = "src/bin/config_report.rs"
+
 # Install-interception Windows `.exe` shadow stub (plan §6). The materializer
 # copies this binary into the per-terminal shim dir as cargo.exe/pip.exe/pip3.exe
 # so it can shadow the real `.exe` under PowerShell/cmd (a `.cmd` cannot — `.EXE`

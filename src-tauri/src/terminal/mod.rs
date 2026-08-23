@@ -64,6 +64,16 @@ pub use manager::TerminalManager;
 /// Phase 1 + follow-up), so deleting a `scrub_*` call reddens a test rather
 /// than silently reopening the leak.
 ///
+/// **All eight are `pub(crate)`** so `config_report_cmd::seam_reports` can
+/// OBSERVE them (plan
+/// `2026-08-20-effective-config-provenance-and-env-generation` Phase 3): the
+/// report calls each one on a throwaway `Command` and reads the overrides back,
+/// rather than restating in a second place what each seam does to a child env.
+/// A second copy of that knowledge is the exact defect class a provenance
+/// report exists to expose, so the report is not allowed to contain one. None
+/// of the eight spawns, and the spawn path itself is untouched — the widened
+/// visibility is the whole change.
+///
 /// **Which spawn sites deliberately do NOT scrub, and why.** Three `claude`
 /// spawn sites carry the `CLAUDECODE` marker or a claude/gemini program name
 /// but are not session seams, so a scrub there would buy nothing:
@@ -344,7 +354,7 @@ pub fn runner_context(api_port: u16) -> String {
     // every coord proxy route resolves it (COORD_HTTP_URL env → active
     // profile → localhost fallback) so the prompt never disagrees with the
     // runner's own coord client.
-    let coord_url = crate::coord_mcp::coord_base_url();
+    let (coord_url, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let api_base = session_briefing::runner_api_base(api_port);
 
     // The base body: the cached coord document, or the compiled-in fallback.
@@ -1176,11 +1186,13 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     const TODAYS_CLAUSE_BODY: &str = r#"Plan-library capture is ON for this fleet. Save the work artifacts you author to the plan library: investigation prompts, plan-authoring prompts, implementation prompts, findings reports, and plans. Write each one when you author it, and write it again when its status changes. POST http://127.0.0.1:9876/plan-library/artifacts records the artifact; POST http://127.0.0.1:9876/plan-library/links records the provenance edge back to the artifact it came from (the prompt that produced a report, the report that fed a prompt, the prompt that authored a plan) — record the edge every time, not only the artifact. Protocol detail lives in the coord prompt document: coord_get_prompt_document(kind="agent_playbook", name="plan-capture"), or GET __COORD__/coord/agent-prompt-documents/agent_playbook/plan-capture."#;
 
     fn expected_briefing_body() -> String {
-        TODAYS_BRIEFING_BODY.replace("__COORD__", &crate::coord_mcp::coord_base_url())
+        let (coord_url, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
+        TODAYS_BRIEFING_BODY.replace("__COORD__", &coord_url)
     }
 
     fn expected_clause_body() -> String {
-        TODAYS_CLAUSE_BODY.replace("__COORD__", &crate::coord_mcp::coord_base_url())
+        let (coord_url, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
+        TODAYS_CLAUSE_BODY.replace("__COORD__", &coord_url)
     }
 
     /// Split a render into (line 1, line 2, everything else).

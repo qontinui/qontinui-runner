@@ -102,24 +102,50 @@ pub fn derive_web_base_url(backend_url: &str) -> String {
 ///    `PROD_API_BASE_URL`.
 ///
 /// A trailing slash is trimmed so callers can safely `format!("{base}/api/...")`.
+///
+/// # Why this returns the arm and not just the URL
+///
+/// The value alone cannot be attributed: `https://api.qontinui.io` is what you
+/// get from `QONTINUI_API_URL`, from the persisted paired backend, AND from a
+/// release build with nothing configured at all — three completely different
+/// remediations behind one identical string. Phase 1 of
+/// `2026-08-20-effective-config-provenance-and-env-generation` derived the arm
+/// in a SECOND function walking the same rungs; that second copy of the
+/// precedence rule is exactly the divergence hazard the plan names as its
+/// dominant correctness risk, so Phase 2 folded it back in here. There is now
+/// ONE traversal of the four rungs, and it emits the value and the arm together
+/// — they can no longer disagree by construction, because nothing computes them
+/// separately.
+///
+/// This is the same `(value, source)` shape `profiles::coord_base_with_source`
+/// already has; the config report ASKS this function rather than re-deriving.
 pub(crate) fn resolve_api_base_url(
     env_web: Option<String>,
     env_api: Option<String>,
     persisted: Option<String>,
     is_debug: bool,
-) -> String {
-    let pick = env_web
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| env_api.filter(|v| !v.trim().is_empty()))
-        .or_else(|| persisted.filter(|v| !v.trim().is_empty()))
+) -> (String, ApiBaseUrlArm) {
+    // Blank/whitespace at any rung is "unset", not "configured to empty" — an
+    // exported-but-empty env var is how a shell communicates absence.
+    let usable = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    let (pick, arm) = usable(env_web)
+        .map(|v| (v, ApiBaseUrlArm::EnvWebBackendUrl))
+        .or_else(|| usable(env_api).map(|v| (v, ApiBaseUrlArm::EnvApiUrl)))
+        .or_else(|| usable(persisted).map(|v| (v, ApiBaseUrlArm::PersistedBackendUrl)))
         .unwrap_or_else(|| {
             if is_debug {
-                format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT)
+                (
+                    format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT),
+                    ApiBaseUrlArm::BuildDefaultDebug,
+                )
             } else {
-                PROD_API_BASE_URL.to_string()
+                (
+                    PROD_API_BASE_URL.to_string(),
+                    ApiBaseUrlArm::BuildDefaultRelease,
+                )
             }
         });
-    pick.trim().trim_end_matches('/').to_string()
+    (pick.trim().trim_end_matches('/').to_string(), arm)
 }
 
 /// Get API base URL for qontinui-web backend.
@@ -138,21 +164,172 @@ pub(crate) fn resolve_api_base_url(
 /// there is no recursion; an absent/unparseable settings file yields
 /// `Settings::default()`, whose `backend_url` == the build default, collapsing
 /// step 3 into step 4.
+///
+/// The ~70 call sites of this function want a URL to dial, not provenance, so
+/// the arm is bound and dropped HERE — visibly, at the one place that does the
+/// I/O — rather than in a `.0` wrapper that hides the discard from every reader.
+/// Anything that does care (the config report, a diagnostic, an error body)
+/// calls [`get_api_base_url_with_source`] and gets the arm from the resolver
+/// itself.
 pub fn get_api_base_url() -> String {
-    let s = crate::settings::load_settings();
-    // Only honor the persisted backend when web-integration is enabled — a
-    // disabled integration means "don't reach web", so its stored URL must not
-    // override the build default.
-    let persisted = s
-        .web_integration
-        .enabled
-        .then(|| s.web_integration.backend_url.clone());
+    let (url, _arm) = get_api_base_url_with_source();
+    url
+}
+
+/// [`get_api_base_url`] plus WHICH of the four documented rungs produced it.
+///
+/// This is the live-I/O door: it gathers the four inputs from this process and
+/// hands them to [`resolve_api_base_url`], so a caller asking "where did the
+/// backend URL come from?" is answered by the same traversal that produced the
+/// URL every other subsystem is using. No consumer — the config report
+/// included — is allowed a second implementation of the precedence order.
+pub(crate) fn get_api_base_url_with_source() -> (String, ApiBaseUrlArm) {
+    let inputs = gather_api_base_url_inputs();
     resolve_api_base_url(
-        std::env::var("QONTINUI_WEB_BACKEND_URL").ok(),
-        std::env::var("QONTINUI_API_URL").ok(),
-        persisted,
-        cfg!(debug_assertions),
+        inputs.env_web,
+        inputs.env_api,
+        inputs.persisted,
+        inputs.is_debug,
     )
+}
+
+/// The four inputs [`resolve_api_base_url`] weighs, gathered from the live
+/// process in one place.
+///
+/// Extracted so that "what are the four inputs, and where does each come from?"
+/// is answered exactly ONCE. [`get_api_base_url`] and the config report both
+/// consume this, so the report can never be looking at a different set of
+/// inputs than the value every other subsystem actually resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApiBaseUrlInputs {
+    /// `QONTINUI_WEB_BACKEND_URL` — operator/test explicit override.
+    pub env_web: Option<String>,
+    /// `QONTINUI_API_URL` — legacy explicit override.
+    pub env_api: Option<String>,
+    /// The persisted paired backend, present only when web-integration is
+    /// ENABLED (a disabled integration means "don't reach web", so its stored
+    /// URL must not override the build default).
+    pub persisted: Option<String>,
+    /// Whether this is a debug build (selects which build default applies).
+    pub is_debug: bool,
+}
+
+/// Read the four inputs from env + settings. The only I/O in the resolution.
+///
+/// **This is not a read.** `load_settings()` is `load_settings_full()`, which
+/// runs `claude_accounts::load_with_migration()` (writing
+/// `claude-accounts.json`), can mint a `local_user_id` UUID and call
+/// `save_settings` — rewriting the operator's real `settings.json` — and reaches
+/// the OS keyring. That is correct for the ~70 runtime callers, which want the
+/// same fully-overlaid document every other subsystem resolves against; it is
+/// disqualifying for a diagnostic. Anything holding an already-read `Settings`
+/// must call [`api_base_url_inputs_from`] instead — see its docs.
+pub(crate) fn gather_api_base_url_inputs() -> ApiBaseUrlInputs {
+    api_base_url_inputs_from(&crate::settings::load_settings())
+}
+
+/// [`gather_api_base_url_inputs`] over a `Settings` the caller already holds —
+/// the READ-ONLY twin, whose only I/O is two `std::env::var` calls.
+///
+/// # Why this exists
+///
+/// `config_report`'s layer 1 was deliberately moved off `load_settings_full` and
+/// onto the non-mutating `settings::read_settings_from_disk`, precisely because
+/// the full loader writes `claude-accounts.json`, mints a `local_user_id` UUID
+/// into the operator's real `settings.json` and reaches the OS keyring. Layer 5
+/// then undid all of it one line later by calling
+/// [`gather_api_base_url_inputs`], whose first statement is `load_settings()` —
+/// the same loader, reached through a different door. The report's layer-1 row
+/// still said `settings::read_settings_from_disk`, so the report ACTIVELY
+/// CONCEALED the write it had just performed.
+///
+/// # Why a disk-read `Settings` yields the same rung here
+///
+/// The persisted rung reads exactly two fields —
+/// `web_integration.{enabled, backend_url}` — and the only overlay
+/// `load_settings_full` applies to either is
+/// [`crate::settings::apply_web_integration_env_overlay`], which a caller
+/// handing in a disk-read document is expected to have applied itself (the
+/// config report does, in `config_report_cmd::settings_derived_inputs`). The
+/// tier/`local_user_id` migration, the Restate port overrides and the tier
+/// overlays — the three things that make the full loader a writer — touch no
+/// `web_integration` field, so with that one overlay applied the two doors
+/// resolve the same rung and the same value. Nothing here re-implements the
+/// overlay; that would be the second-copy defect this module's `(value, arm)`
+/// shape exists to prevent.
+pub(crate) fn api_base_url_inputs_from(s: &crate::settings::Settings) -> ApiBaseUrlInputs {
+    ApiBaseUrlInputs {
+        env_web: std::env::var("QONTINUI_WEB_BACKEND_URL").ok(),
+        env_api: std::env::var("QONTINUI_API_URL").ok(),
+        persisted: s
+            .web_integration
+            .enabled
+            .then(|| s.web_integration.backend_url.clone()),
+        is_debug: cfg!(debug_assertions),
+    }
+}
+
+/// Which rung of [`resolve_api_base_url`]'s documented four-rung order produced
+/// the value — the house `(value, source)` shape that `profiles::CoordBaseSource`
+/// already has and this resolver does not.
+///
+/// The arm names are stable wire strings: they appear verbatim in the config
+/// report and are meant to be greppable and comparable across machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiBaseUrlArm {
+    /// Env `QONTINUI_WEB_BACKEND_URL` won.
+    EnvWebBackendUrl,
+    /// Env `QONTINUI_API_URL` won.
+    EnvApiUrl,
+    /// The persisted paired backend won (web-integration enabled).
+    PersistedBackendUrl,
+    /// Nothing configured; the debug build default (`127.0.0.1:8000`) applied.
+    BuildDefaultDebug,
+    /// Nothing configured; the release build default ([`PROD_API_BASE_URL`])
+    /// applied.
+    BuildDefaultRelease,
+}
+
+impl ApiBaseUrlArm {
+    /// Stable wire string.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ApiBaseUrlArm::EnvWebBackendUrl => "env:QONTINUI_WEB_BACKEND_URL",
+            ApiBaseUrlArm::EnvApiUrl => "env:QONTINUI_API_URL",
+            ApiBaseUrlArm::PersistedBackendUrl => "persisted:web_integration.backend_url",
+            ApiBaseUrlArm::BuildDefaultDebug => "build_default:debug",
+            ApiBaseUrlArm::BuildDefaultRelease => "build_default:release",
+        }
+    }
+
+    /// The NAME of the slot this rung's value came out of — what a credential
+    /// classifier has to be told in order to judge the value.
+    ///
+    /// `env_generations::classify_env_var` is a function of `(name, value)`, and
+    /// one of its three arms is joint: a `*_URL` / `*_URI` / `*_DSN` NAME whose
+    /// VALUE carries URL userinfo at all (not merely a password). A caller that
+    /// classified this rung's value under a made-up label would silently lose
+    /// that arm — `scheme://ops@host` would print the account name — so the name
+    /// handed to the classifier is the real slot: the env variable for the two
+    /// env rungs, the settings field path for the persisted rung, and a
+    /// field-shaped label for the build defaults so all five are judged under
+    /// the same connection-string rule.
+    ///
+    /// Every one of the five ends in `_URL` once upper-cased, which is what makes
+    /// the joint arm reachable for all of them. That is a property of this
+    /// mapping, not a coincidence, and
+    /// `config_report_cmd::tests::config_report_api_arm_origin_names_are_url_named`
+    /// asserts it against literals.
+    pub(crate) fn value_origin_name(self) -> &'static str {
+        match self {
+            ApiBaseUrlArm::EnvWebBackendUrl => "QONTINUI_WEB_BACKEND_URL",
+            ApiBaseUrlArm::EnvApiUrl => "QONTINUI_API_URL",
+            ApiBaseUrlArm::PersistedBackendUrl => "web_integration.backend_url",
+            ApiBaseUrlArm::BuildDefaultDebug | ApiBaseUrlArm::BuildDefaultRelease => {
+                "build_default.backend_url"
+            }
+        }
+    }
 }
 
 /// MCP API base URL for the runner's own HTTP server.
@@ -311,17 +488,23 @@ mod tests {
         // env_web wins over everything.
         assert_eq!(
             resolve_api_base_url(web(), api(), persisted(), true),
-            "https://web.example"
+            (
+                "https://web.example".to_string(),
+                ApiBaseUrlArm::EnvWebBackendUrl
+            )
         );
         // env_api wins over persisted + default.
         assert_eq!(
             resolve_api_base_url(None, api(), persisted(), true),
-            "https://api.example"
+            ("https://api.example".to_string(), ApiBaseUrlArm::EnvApiUrl)
         );
         // persisted wins over the build default.
         assert_eq!(
             resolve_api_base_url(None, None, persisted(), true),
-            "https://persisted.example"
+            (
+                "https://persisted.example".to_string(),
+                ApiBaseUrlArm::PersistedBackendUrl
+            )
         );
     }
 
@@ -330,12 +513,18 @@ mod tests {
         // All absent → debug default is the IPv4-pinned localhost.
         assert_eq!(
             resolve_api_base_url(None, None, None, true),
-            format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT)
+            (
+                "http://127.0.0.1:8000".to_string(),
+                ApiBaseUrlArm::BuildDefaultDebug
+            )
         );
         // All absent → release default is prod.
         assert_eq!(
             resolve_api_base_url(None, None, None, false),
-            PROD_API_BASE_URL
+            (
+                "https://api.qontinui.io".to_string(),
+                ApiBaseUrlArm::BuildDefaultRelease
+            )
         );
     }
 
@@ -349,17 +538,26 @@ mod tests {
                 Some("https://persisted.example".to_string()),
                 true,
             ),
-            "https://persisted.example"
+            (
+                "https://persisted.example".to_string(),
+                ApiBaseUrlArm::PersistedBackendUrl
+            )
         );
         // A blank persisted with no env falls through to the build default.
         assert_eq!(
             resolve_api_base_url(None, None, Some("  ".to_string()), true),
-            format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT)
+            (
+                "http://127.0.0.1:8000".to_string(),
+                ApiBaseUrlArm::BuildDefaultDebug
+            )
         );
         // Trailing slash is trimmed on the chosen value.
         assert_eq!(
             resolve_api_base_url(Some("https://web.example/".to_string()), None, None, true),
-            "https://web.example"
+            (
+                "https://web.example".to_string(),
+                ApiBaseUrlArm::EnvWebBackendUrl
+            )
         );
     }
 
@@ -367,11 +565,44 @@ mod tests {
     /// debug build whose user signed into a non-default backend must resolve
     /// to THAT backend, not the localhost build default — so the relay
     /// verifies against the same coord that minted the device JWT.
+    ///
+    /// The ARM is what makes this regression legible: the returned string is
+    /// byte-identical to the release build default, so a report that printed
+    /// only the value could not tell "the user paired with prod" from "this is
+    /// a release build with nothing configured" — two different bugs.
     #[test]
     fn resolve_api_base_url_debug_honors_persisted_prod() {
         assert_eq!(
             resolve_api_base_url(None, None, Some(PROD_API_BASE_URL.to_string()), true),
-            PROD_API_BASE_URL
+            (
+                "https://api.qontinui.io".to_string(),
+                ApiBaseUrlArm::PersistedBackendUrl
+            )
+        );
+    }
+
+    /// The arm vocabulary is a WIRE contract — it is printed verbatim in the
+    /// config report and compared across machines — so it is pinned to
+    /// literals here rather than to the enum's own `as_str`, which would pin
+    /// nothing.
+    #[test]
+    fn api_base_url_arm_wire_strings_are_stable() {
+        assert_eq!(
+            ApiBaseUrlArm::EnvWebBackendUrl.as_str(),
+            "env:QONTINUI_WEB_BACKEND_URL"
+        );
+        assert_eq!(ApiBaseUrlArm::EnvApiUrl.as_str(), "env:QONTINUI_API_URL");
+        assert_eq!(
+            ApiBaseUrlArm::PersistedBackendUrl.as_str(),
+            "persisted:web_integration.backend_url"
+        );
+        assert_eq!(
+            ApiBaseUrlArm::BuildDefaultDebug.as_str(),
+            "build_default:debug"
+        );
+        assert_eq!(
+            ApiBaseUrlArm::BuildDefaultRelease.as_str(),
+            "build_default:release"
         );
     }
 

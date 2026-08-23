@@ -199,10 +199,11 @@ impl ClaudeSession {
         let pinned_config_dir = session_ctx
             .as_ref()
             .and_then(|c| c.pinned_config_dir.as_deref());
-        let effective_config_dir = crate::ai_provider::get_effective_config_dir_with_override(
-            &ai_settings.claude_cli,
-            pinned_config_dir,
-        );
+        let (effective_config_dir, _config_dir_source) =
+            crate::ai_provider::get_effective_config_dir_with_override(
+                &ai_settings.claude_cli,
+                pinned_config_dir,
+            );
 
         // Required trailing flags for the interactive stream-json chat. The
         // shared launch seam (below) layers the operator template + the
@@ -1829,9 +1830,9 @@ impl ClaudeSession {
             return;
         }
 
-        let new_config_dir =
-            get_effective_config_dir(&crate::settings::get_ai_settings().claude_cli)
-                .unwrap_or_else(|| "unknown".to_string());
+        let (resolved_config_dir, _config_dir_source) =
+            get_effective_config_dir(&crate::settings::get_ai_settings().claude_cli);
+        let new_config_dir = resolved_config_dir.unwrap_or_else(|| "unknown".to_string());
         let label = std::path::Path::new(&new_config_dir)
             .file_name()
             .and_then(|n| n.to_str())
@@ -1967,7 +1968,7 @@ impl ClaudeSession {
     /// Extracted from [`Self::spawn`] because that function spawns a real
     /// `claude` and cannot run in a unit test — with the scrub inlined there,
     /// deleting it reddened nothing.
-    fn finalize_child_env(
+    pub(crate) fn finalize_child_env(
         cmd: &mut std::process::Command,
         effective_config_dir: Option<&str>,
         session_id: &str,

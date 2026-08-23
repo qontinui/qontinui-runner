@@ -427,7 +427,7 @@ async fn publish_coord_credential_status(
             .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
     });
 
-    let base = crate::coord_mcp::coord_base_url();
+    let (base, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = format!("{base}/coord/status");
     let mut body = serde_json::json!({
         "device_id": device_uuid,
@@ -1304,7 +1304,8 @@ async fn refresher_loop(
                 .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
             match mt_device_id {
                 Some(did) => {
-                    let coord_base = crate::coord_mcp::coord_base_url();
+                    let (coord_base, _coord_base_source) =
+                        crate::coord_mcp::coord_base_url_with_source();
                     let outcomes = refresh_tenant_slots(&auth_manager, &coord_base, &did).await;
                     if !outcomes.is_empty() {
                         let refreshed = outcomes
@@ -1391,7 +1392,8 @@ async fn refresher_loop(
                     .map(|s| s.trim().to_string())
                     .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
                 if let Some(did) = self_refresh_device_id {
-                    let coord_base = crate::coord_mcp::coord_base_url();
+                    let (coord_base, _coord_base_source) =
+                        crate::coord_mcp::coord_base_url_with_source();
                     if let Some(new_jwt) =
                         try_device_self_refresh(&auth_manager, &coord_base, &did).await
                     {

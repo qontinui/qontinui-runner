@@ -103,9 +103,37 @@ const RUNNER_REPO_DIR: &str = "qontinui-runner";
 /// Most callers want [`workspace_root`] (degrade) or [`require_workspace_root`]
 /// (fail closed) instead of this raw form.
 pub fn runner_workspace_root() -> WorkspaceRoot {
-    let configured = get_setting::<PathSettings>().workspace_root;
+    runner_workspace_root_from(get_setting::<PathSettings>().workspace_root.as_deref())
+}
+
+/// [`runner_workspace_root`] over a `paths.workspace_root` the caller already
+/// holds — the READ-ONLY twin, whose only I/O is `current_exe()`.
+///
+/// # Why this split exists
+///
+/// [`get_setting`] is `T::get_from(&load_settings())`, and `load_settings()` is
+/// `load_settings_full()` — the runner's one settings writer-by-side-effect: it
+/// runs `claude_accounts::load_with_migration()` (writing
+/// `claude-accounts.json`), can mint a `local_user_id` UUID and `save_settings`
+/// the operator's real file, and reaches the OS keyring. So **resolving the
+/// workspace root is a WRITE on a machine whose `local_user_id` is empty**, and
+/// nothing in the resolver's name says so.
+///
+/// That is fine for the ~40 runtime callers, which want the same fully-overlaid
+/// document every other subsystem resolves against. It is disqualifying for
+/// `config_report`, whose layer 14 reaches this twice through
+/// `coord_mcp::mcp_json_report` (once for the path, once for the write guard) —
+/// so opening a diagnostic minted a UUID into `settings.json` and then reported
+/// on the file it had just rewritten. The report resolves the root ONCE, here,
+/// from the document it already read non-mutatingly, and injects it.
+///
+/// Nothing about the RESOLUTION differs between the two doors: the ordering and
+/// the probes belong to `qontinui_types::paths::qontinui_workspace_root`, which
+/// both call, and `$QONTINUI_ROOT` is read live inside it either way. The only
+/// difference is who supplies the setting.
+pub fn runner_workspace_root_from(configured: Option<&str>) -> WorkspaceRoot {
     let exe = std::env::current_exe().ok();
-    qontinui_workspace_root(configured.as_deref(), exe_anchor(exe.as_deref()))
+    qontinui_workspace_root(configured, exe_anchor(exe.as_deref()))
 }
 
 /// The workspace root for a **discovery** surface: the census sweep, the fleet
@@ -122,7 +150,14 @@ pub fn runner_workspace_root() -> WorkspaceRoot {
 /// [`require_workspace_root`] instead: materialising a git worktree at a
 /// fabricated location is strictly worse than a loud error.
 pub fn workspace_root() -> Option<PathBuf> {
-    let resolved = runner_workspace_root();
+    workspace_root_from(get_setting::<PathSettings>().workspace_root.as_deref())
+}
+
+/// [`workspace_root`] over a `paths.workspace_root` the caller already holds.
+/// The read-only door — see [`runner_workspace_root_from`] for why resolving
+/// the root through [`get_setting`] is a write.
+pub fn workspace_root_from(configured: Option<&str>) -> Option<PathBuf> {
+    let resolved = runner_workspace_root_from(configured);
     if let Some(rejected) = resolved.rejected {
         warn!(
             "workspace_paths: {} — continuing with the next resolution rung",

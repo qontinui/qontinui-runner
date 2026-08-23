@@ -2063,6 +2063,80 @@ fn coord_mcp_withholding_is_deliberate(name: &str) -> bool {
             .any(|p| name.starts_with(p))
 }
 
+// ===========================================================================
+// Runtime introspection for the compiled tool allowlist (plan
+// `2026-08-20-effective-config-provenance-and-env-generation` Phase 4, D3).
+// ===========================================================================
+
+/// The compiled coord-mcp tool policy of the RUNNING binary, as JSON.
+///
+/// # Why this endpoint has to exist
+///
+/// [`COORD_MCP_ALLOWED_TOOLS`] and [`COORD_MCP_DELIBERATE_EXCLUSIONS`] are Rust
+/// `const`s, not env vars, not settings, and not anything a `.mcp.json` carries
+/// — yet `tools/list` **is** filtered through them
+/// ([`coord_mcp_filter_tools_list_response`]) and `tools/call` **is** refused by
+/// them. So they are configuration in every sense that matters to a session,
+/// and until now the only way to observe them was to read the source of a
+/// checkout and HOPE it is the source this binary was built from.
+///
+/// That hope is exactly what the allowlist's own doc comment refuses to extend:
+/// a `-32601` from this door reports the list compiled into the RUNNING binary,
+/// which was 83 commits behind `origin/main` on the primary when that note was
+/// written. A refusal observed live is a rebuild question first and a policy
+/// question second.
+///
+/// # Why `buildDrift` is in the SAME response and not left to `/health`
+///
+/// The two facts are only useful together. "This binary allows 79 tools" is
+/// unfalsifiable on its own; "this binary allows 79 tools **and** is 12 commits
+/// behind origin/main" is a complete answer, and so is "…and is current". A
+/// reader who has to correlate two endpoints by hand will correlate them
+/// wrongly, or skip it — which is how a stale allowlist reads as a deliberate
+/// exclusion.
+///
+/// The drift half is [`crate::build_drift::health_fields`] verbatim, the same
+/// call `/health` makes. It is NOT re-derived here: a second copy of the drift
+/// computation could disagree with `/health` about the same binary, which would
+/// be worse than not reporting it.
+///
+/// # What it does not carry
+///
+/// No credential, no nonce, no bearer, no port — the response is a function of
+/// compile-time constants plus the background drift checker's cached verdict.
+/// That is why it is not nonce-gated while the rest of the `/coord-mcp/*`
+/// family is: there is nothing here a gate would be protecting, and gating a
+/// diagnostic behind the credential whose delivery it helps debug is how a
+/// diagnostic becomes unreachable exactly when it is needed.
+fn coord_mcp_tool_policy_json() -> serde_json::Value {
+    let (main_sha, build_drift) = crate::build_drift::health_fields();
+    serde_json::json!({
+        "allowedTools": COORD_MCP_ALLOWED_TOOLS,
+        "allowedToolPrefixes": COORD_MCP_ALLOWED_TOOL_PREFIXES,
+        "allowedToolCount": COORD_MCP_ALLOWED_TOOLS.len(),
+        "deliberateExclusions": COORD_MCP_DELIBERATE_EXCLUSIONS,
+        "deliberateExclusionPrefixes": COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES,
+        "deliberateExclusionCount": COORD_MCP_DELIBERATE_EXCLUSIONS.len(),
+        // The provenance half. Identical fields to `/health`'s, from the same
+        // producer, so the two can never disagree about this binary.
+        "gitSha": env!("QONTINUI_GIT_SHA"),
+        "buildId": env!("RUNNER_BUILD_ID"),
+        "mainSha": main_sha,
+        "buildDrift": build_drift,
+        // Say what the numbers mean, in the response, because a reader who has
+        // to go find the rule will assume the wrong one.
+        "readThis": "These are the lists COMPILED INTO THE RUNNING BINARY. A -32601 from \
+                     /coord-mcp reports THIS allowlist, not the source's — check buildDrift \
+                     before concluding a tool is withheld by policy. A tool coord grants this \
+                     device that appears in neither list is drift, not a decision.",
+    })
+}
+
+/// `GET /coord-mcp/tool-policy` — [`coord_mcp_tool_policy_json`] over HTTP.
+async fn coord_mcp_tool_policy_handler() -> Json<serde_json::Value> {
+    Json(coord_mcp_tool_policy_json())
+}
+
 /// Is this request body a `tools/list` (single or anywhere in a batch)?
 ///
 /// Deliberately permissive about the batch case: only a `tools/list` response
@@ -2932,9 +3006,11 @@ async fn coord_mcp_proxy_handler(
         crate::coord_mcp::ProxyPrincipal::Agent { agent_id } => {
             match crate::coord_mcp::lookup_agent_token(*agent_id) {
                 Some(slot) => {
+                    let (coord_base, _coord_base_source) =
+                        crate::coord_mcp::coord_base_url_with_source();
                     let _ = crate::agent_token::maybe_refresh(
                         &slot,
-                        &crate::coord_mcp::coord_base_url(),
+                        &coord_base,
                         *agent_id,
                         "agent_mcp",
                     )
@@ -4511,9 +4587,11 @@ async fn vcs_create_pull_request_handler(
         crate::coord_mcp::ProxyPrincipal::Agent { agent_id } => {
             match crate::coord_mcp::lookup_agent_token(*agent_id) {
                 Some(slot) => {
+                    let (coord_base, _coord_base_source) =
+                        crate::coord_mcp::coord_base_url_with_source();
                     let _ = crate::agent_token::maybe_refresh(
                         &slot,
-                        &crate::coord_mcp::coord_base_url(),
+                        &coord_base,
                         *agent_id,
                         "vcs_pr_proxy",
                     )
@@ -4560,7 +4638,8 @@ async fn vcs_create_pull_request_handler(
 
     // Same coord-base resolution as every other loopback forwarder
     // (`COORD_HTTP_URL` override → profiles resolver → dev localhost).
-    let url = vcs_pr_upstream_url(&crate::coord_mcp::coord_base_url(), owner, name);
+    let (coord_base, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
+    let url = vcs_pr_upstream_url(&coord_base, owner, name);
     let upstream_body = vcs_pr_upstream_body(&req);
     forward_vcs_pr_post(&url, &bearer, &upstream_body).await
 }
@@ -6104,6 +6183,19 @@ pub fn create_router(
         // (Authorization: Bearer <nonce>, or the legacy X-Coord-Mcp-Proxy-Key);
         // see `coord_mcp_proxy_handler`.
         .route("/coord-mcp", post(coord_mcp_proxy_handler))
+        // Runtime introspection for the COMPILED tool allowlist + the
+        // deliberate exclusions, reported alongside `/health`'s `buildDrift`
+        // so a reader can tell whether the constants reflect the source
+        // (plan 2026-08-20-effective-config-provenance-and-env-generation,
+        // Phase 4 / D3). Deliberately on THIS router rather than under
+        // `mcp/ui_bridge/<family>`: the UI Bridge families carry a hard
+        // three-layer wire-through contract (routes() + route_entries() +
+        // SDK/WS wrappers + the frontend IPC bridge) policed by
+        // `manifest_matches_route_calls`, and a diagnostic that reads two
+        // compile-time consts gains nothing from it while owing all of it.
+        // Unauthenticated for the same reason `/health` is — see the handler's
+        // doc comment.
+        .route("/coord-mcp/tool-policy", get(coord_mcp_tool_policy_handler))
         // Session coord-identity MINT route (plan
         // 2026-07-17-universal-coord-device-identity-for-any-session §1) — how a
         // session the runner did NOT spawn (a bare terminal, a cron-fired agent)
@@ -8311,6 +8403,179 @@ mod coord_mcp_body_gate_tests {
             "the offending element's id is echoed"
         );
         assert!(gate(serde_json::json!([])).is_err(), "empty batch refused");
+    }
+}
+
+/// The runtime introspection endpoint for the COMPILED tool allowlist
+/// (plan `2026-08-20-effective-config-provenance-and-env-generation` Phase 4,
+/// D3).
+///
+/// Every assertion below is against a LITERAL — a tool name, a prefix string, a
+/// JSON key. Comparing the response to `COORD_MCP_ALLOWED_TOOLS` itself would
+/// pin nothing at all: the handler builds the response FROM that constant, so
+/// such a test passes for any content whatsoever, including an empty list.
+#[cfg(test)]
+mod coord_mcp_tool_policy_tests {
+    use super::coord_mcp_tool_policy_json;
+
+    /// Serve the real route on an ephemeral port and CALL it. A handler that
+    /// has only ever been invoked as a function has not been shown to be
+    /// reachable — the route registration, the method, the path and the JSON
+    /// content type are all part of what this endpoint is, and none of them are
+    /// exercised by calling the builder directly.
+    async fn get_tool_policy() -> (axum::http::StatusCode, serde_json::Value) {
+        let app = axum::Router::new().route(
+            "/coord-mcp/tool-policy",
+            axum::routing::get(super::coord_mcp_tool_policy_handler),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // 127.0.0.1 literal, never `localhost`: Windows resolves `localhost`
+        // to ::1 first and pays a doomed IPv6 connect before the socket that
+        // answers.
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/coord-mcp/tool-policy"))
+            .send()
+            .await
+            .expect("the route must answer");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("a JSON body");
+        (
+            axum::http::StatusCode::from_u16(status.as_u16()).unwrap(),
+            body,
+        )
+    }
+
+    fn names(v: &serde_json::Value, key: &str) -> Vec<String> {
+        v[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key} must be an array: {v}"))
+            .iter()
+            .map(|s| s.as_str().expect("string").to_string())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tool_policy_route_answers_with_the_compiled_lists() {
+        let (status, body) = get_tool_policy().await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let allowed = names(&body, "allowedTools");
+        // LITERAL membership. These four are load-bearing grants a session
+        // depends on, and one of them (`coord_session_worktrees`) was found by
+        // diffing coord's grant rather than by anyone tripping over a -32601.
+        for name in [
+            "coord_register_gate",
+            "coord_memory_search",
+            "coord_session_worktrees",
+            "coord_agent_registry_effective",
+        ] {
+            assert!(
+                allowed.iter().any(|a| a == name),
+                "{name} must be in the compiled allowlist"
+            );
+        }
+
+        let excluded = names(&body, "deliberateExclusions");
+        for name in ["coord_request_merge", "coord_reevaluate", "coord_create_pr"] {
+            assert!(
+                excluded.iter().any(|e| e == name),
+                "{name} must be a DELIBERATE exclusion"
+            );
+        }
+
+        // The two lists must be disjoint, or "deliberately excluded" would be
+        // describing a tool the door actually allows.
+        for name in &excluded {
+            assert!(
+                !allowed.contains(name),
+                "{name} is both allowed and deliberately excluded"
+            );
+        }
+
+        // The prefix families, as literals.
+        assert_eq!(names(&body, "allowedToolPrefixes"), vec!["coord_query_"]);
+        assert_eq!(
+            names(&body, "deliberateExclusionPrefixes"),
+            vec!["coord_onboard"]
+        );
+
+        // The counts describe the arrays that are actually in the response.
+        assert_eq!(
+            body["allowedToolCount"].as_u64().unwrap() as usize,
+            allowed.len()
+        );
+        assert_eq!(
+            body["deliberateExclusionCount"].as_u64().unwrap() as usize,
+            excluded.len()
+        );
+    }
+
+    /// **The point of the endpoint.** A `-32601` reports the allowlist compiled
+    /// into the RUNNING binary, so the lists are worthless without a statement
+    /// of whether that binary reflects the source. `buildDrift` must therefore
+    /// travel in the SAME response, under `/health`'s own field names — a
+    /// reader who has to correlate two endpoints by hand will get it wrong or
+    /// skip it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tool_policy_route_reports_build_drift_alongside_the_lists() {
+        let (_, body) = get_tool_policy().await;
+
+        let drift = body
+            .get("buildDrift")
+            .and_then(|d| d.as_object())
+            .expect("buildDrift must be an object in the SAME response as the lists");
+        // `/health`'s literal field names — this is the contract a reader
+        // already knows, and reusing it is what makes the two comparable.
+        for key in ["behind", "checkedAt", "commitsBehind"] {
+            assert!(drift.contains_key(key), "buildDrift.{key} missing: {body}");
+        }
+        assert!(body.get("mainSha").is_some(), "mainSha key must be present");
+
+        assert!(
+            !body["gitSha"].as_str().unwrap_or_default().is_empty(),
+            "the running binary's git sha must be stated"
+        );
+        assert!(
+            !body["buildId"].as_str().unwrap_or_default().is_empty(),
+            "the running binary's build id must be stated"
+        );
+        assert!(
+            body["readThis"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("COMPILED INTO THE RUNNING BINARY"),
+            "the response must say what it is describing: {body}"
+        );
+
+        // Run with `--nocapture` to read the endpoint's real answer for this
+        // binary — the same bytes an operator gets from
+        // `curl http://127.0.0.1:9876/coord-mcp/tool-policy`.
+        println!(
+            "\n[coord-mcp tool-policy evidence]\n{}",
+            serde_json::to_string_pretty(&body).expect("serializes")
+        );
+    }
+
+    /// The JSON builder and the served body agree, so the direct-call unit
+    /// tests above and the over-the-wire ones cannot drift apart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_served_body_matches_the_builder_except_for_live_drift() {
+        let (_, served) = get_tool_policy().await;
+        let direct = coord_mcp_tool_policy_json();
+        for key in [
+            "allowedTools",
+            "allowedToolPrefixes",
+            "deliberateExclusions",
+            "deliberateExclusionPrefixes",
+            "gitSha",
+            "buildId",
+        ] {
+            assert_eq!(served[key], direct[key], "{key} differs over the wire");
+        }
     }
 }
 

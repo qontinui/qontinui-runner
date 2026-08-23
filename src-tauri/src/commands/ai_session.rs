@@ -1455,9 +1455,10 @@ fn transcript_exists_for(working_dir: &str, cli_session_id: &str) -> bool {
     // The effective config dir for the active account, plus all discovered
     // config dirs (multi-account). Any hit means the transcript is resumable.
     let mut config_dirs: Vec<std::path::PathBuf> = transcript::find_claude_config_dirs();
-    if let Some(eff) =
-        crate::ai_provider::get_effective_config_dir(&crate::settings::get_ai_settings().claude_cli)
-    {
+    let (effective_config_dir, _config_dir_source) = crate::ai_provider::get_effective_config_dir(
+        &crate::settings::get_ai_settings().claude_cli,
+    );
+    if let Some(eff) = effective_config_dir {
         let p = std::path::PathBuf::from(eff);
         if !config_dirs.iter().any(|d| d == &p) {
             config_dirs.push(p);

@@ -812,7 +812,7 @@ pub async fn generate_shell_command_with_ai(
                 settings::CliExecutionMode::Wsl => "wsl",
                 settings::CliExecutionMode::Native => "native",
             };
-            let effective_config_dir =
+            let (effective_config_dir, _config_dir_source) =
                 crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
             serde_json::json!({
                 "execution_mode": execution_mode,

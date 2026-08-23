@@ -130,7 +130,7 @@ async fn check_and_warn(
         .ok_or_else(|| "working_dir not under a known repo / no git toplevel".to_string())?;
 
     // 2. Resolve coord HTTP base + our device id.
-    let coord_base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (coord_base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let our_machine_id = read_device_id().map_err(|e| format!("device_id unavailable: {e}"))?;
 
     // 3. GET the live worktree-claim holder for this repo.

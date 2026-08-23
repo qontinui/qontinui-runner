@@ -41,7 +41,7 @@ pub fn should_rebuild(fixes: &[serde_json::Value]) -> bool {
 ///
 /// Returned by value so the constructed environment is unit-testable without
 /// spawning `claude`.
-fn build_fix_agent_command(prompt_file: &str, model: &str) -> tokio::process::Command {
+pub(crate) fn build_fix_agent_command(prompt_file: &str, model: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("claude");
     cmd.args([
         "--print",

@@ -38,8 +38,9 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use chrono::{DateTime, Utc};
 use qontinui_types::wire::runner_kind::RunnerKind;
 
 /// Window-placement hints injected by the supervisor on spawn.
@@ -134,13 +135,59 @@ impl Default for RunnerLaunchEnv {
     }
 }
 
+/// The FIRST [`RunnerLaunchEnv::read`] of this process, and when it happened.
+///
+/// # Why this exists (plan `2026-08-20-effective-config-provenance-and-env-generation`, Phase 3)
+///
+/// "Read once in `main()`" is the property that makes this snapshot a
+/// *generation*: every consumer pulls the typed value from here, so the runner
+/// acts on the environment as it stood at boot for as long as it lives. A
+/// config report that wants to say "your flag flip has not reached the runner
+/// yet" has to compare that snapshot against a fresh read — and it cannot,
+/// because the snapshot lives on Tauri app state, reachable only from a command
+/// that threads `State<SharedLaunchEnv>` through every caller.
+///
+/// A `OnceLock` set by `read()` itself is the smaller mechanism: the FIRST call
+/// is `main`'s, so this captures exactly the value `main` stored, and every
+/// later call (the report's re-read) leaves it untouched. Nothing about the
+/// existing Tauri-state path changes.
+///
+/// It is `None` in any process that never called `read()` — a test binary, or
+/// the headless `config_report` bin, which does not link this module at all.
+/// The report renders that as UNKNOWN, never as "no drift".
+static FIRST_READ: OnceLock<(RunnerLaunchEnv, DateTime<Utc>)> = OnceLock::new();
+
+/// The launch snapshot `main()` took, with its capture time — or `None` if
+/// [`RunnerLaunchEnv::read`] has never run in this process.
+///
+/// Deliberately returns the STORED value rather than re-reading: the whole
+/// point of the accessor is to expose the generation, and a helpful re-read
+/// here would silently make every staleness check pass.
+pub fn first_read() -> Option<&'static (RunnerLaunchEnv, DateTime<Utc>)> {
+    FIRST_READ.get()
+}
+
 impl RunnerLaunchEnv {
     /// Read every relevant env var from the current process environment.
     ///
     /// Called exactly once in `main.rs::main()`. Uses `crate::instance::*`
     /// helpers as the canonical parsing point for instance-related vars
     /// so there is still a single source of truth per var.
+    ///
+    /// The first call in a process is also recorded in [`FIRST_READ`] so the
+    /// config report can compare the launch generation against a later re-read
+    /// (see that static's docs). Recording is `set`-once and side-effect free
+    /// for every caller.
     pub fn read() -> Self {
+        let value = Self::read_uncached();
+        let _ = FIRST_READ.set((value.clone(), Utc::now()));
+        value
+    }
+
+    /// The read itself, with no snapshot recording — so the config report can
+    /// take a FRESH reading to compare against the launch snapshot without
+    /// racing to become the launch snapshot itself.
+    pub fn read_uncached() -> Self {
         let instance_name = crate::instance::instance_name();
         let primary_port = crate::instance::primary_port();
         let kind = crate::instance::runner_kind();
@@ -282,5 +329,34 @@ mod tests {
         let env = RunnerLaunchEnv::read();
         let _ = env.is_secondary();
         let _ = env.kind;
+    }
+
+    /// The launch snapshot is recorded on the FIRST `read()` and never moves —
+    /// which is the property that makes it a *generation* the config report can
+    /// compare a fresh read against. `read_uncached()` must agree on the same
+    /// env while recording nothing.
+    ///
+    /// Order-independent by construction: whichever test in this binary calls
+    /// `read()` first sets the lock, and every reading here is taken from the
+    /// same (unchanged) process env, so the assertions hold either way.
+    #[test]
+    fn first_read_records_the_launch_generation_and_never_moves() {
+        let at_launch = RunnerLaunchEnv::read();
+        let (snapshot, first_ts) = first_read()
+            .expect("read() must record the first call")
+            .clone();
+        assert_eq!(snapshot, at_launch);
+
+        // A second read leaves the recorded generation alone — otherwise the
+        // report would compare the snapshot against itself and every staleness
+        // check would pass vacuously.
+        let _ = RunnerLaunchEnv::read();
+        let (again, ts_again) = first_read().expect("still recorded");
+        assert_eq!(*again, snapshot);
+        assert_eq!(*ts_again, first_ts);
+
+        // The uncached read is the same parser, recording nothing.
+        assert_eq!(RunnerLaunchEnv::read_uncached(), at_launch);
+        assert_eq!(first_read().expect("unchanged").1, first_ts);
     }
 }

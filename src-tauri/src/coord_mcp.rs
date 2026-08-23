@@ -474,16 +474,21 @@ pub(crate) fn stale_proxy_key_error(cause: &str) -> String {
 /// in `mcp_api`) so they all resolve the coord base identically — a proxy
 /// route must never re-derive it from env alone. The source is threaded into
 /// proxy 502 error bodies so a misconfigured upstream self-diagnoses.
+///
+/// # There is deliberately no source-dropping companion
+///
+/// This module used to carry `coord_base_url()` and `coord_mcp_url()`, whose
+/// entire bodies were `.0` on the `_with_source` form. Phase 2 of
+/// `2026-08-20-effective-config-provenance-and-env-generation` deleted both.
+/// A wrapper like that is not a convenience — it is a discard LAYER: every one
+/// of its call sites drops the arm invisibly, so nothing at the call site, and
+/// nothing in a grep for `.0`, shows that provenance was thrown away. The
+/// eleven call sites now bind `(base, _coord_base_source)` and the discard is
+/// legible where it happens. Do not reintroduce a `.0` wrapper here.
 pub(crate) fn coord_base_url_with_source(
 ) -> (String, qontinui_runner_lib::profiles::CoordBaseSource) {
     let (base, source) = qontinui_runner_lib::profiles::coord_base_with_source();
     (base.trim_end_matches('/').to_string(), source)
-}
-
-/// [`coord_base_url_with_source`] without the source, for call sites that
-/// only need the base.
-pub(crate) fn coord_base_url() -> String {
-    coord_base_url_with_source().0
 }
 
 /// The full coord `/mcp` endpoint URL + source: [`coord_base_url_with_source`]
@@ -493,11 +498,6 @@ pub(crate) fn coord_mcp_url_with_source() -> (String, qontinui_runner_lib::profi
 {
     let (base, source) = coord_base_url_with_source();
     (format!("{base}/mcp"), source)
-}
-
-/// [`coord_mcp_url_with_source`] without the source.
-pub(crate) fn coord_mcp_url() -> String {
-    coord_mcp_url_with_source().0
 }
 
 /// In-memory nonce registry for the loopback `/coord-mcp` proxy:
@@ -3315,11 +3315,8 @@ fn shared_root_write_allowed_at(
 /// temp runner rewrites root to the temp port with no boot reconcile involved.
 /// Guarding only the self-heal would leave that hole wide open.
 fn coord_mcp_safe_to_write(workdir: &str) -> bool {
-    if !shared_root_write_allowed_at(
-        workdir,
-        qontinui_root_dir().as_deref(),
-        crate::instance::owns_shared_root_state(),
-    ) {
+    let verdict = coord_mcp_write_verdict(workdir);
+    if verdict == McpWriteVerdict::RefusedSharedRoot {
         warn!(
             "coord_mcp: REFUSING to write {workdir}/.mcp.json — this runner is a \
              SECONDARY instance (name={:?}, port={}) and the umbrella-root \
@@ -3329,9 +3326,70 @@ fn coord_mcp_safe_to_write(workdir: &str) -> bool {
             crate::instance::instance_name(),
             crate::mcp::types::get_mcp_api_port(),
         );
-        return false;
     }
+    verdict == McpWriteVerdict::Allowed
+}
 
+/// Why a `.mcp.json` write is allowed or refused — [`coord_mcp_safe_to_write`]'s
+/// decision WITHOUT its log line.
+///
+/// Split out for the config report. Layer 14 exists to make the guard's refusal
+/// observable, and it asked the guard directly — so opening the report on a
+/// SECONDARY emitted `coord_mcp: REFUSING to write …` into the runner log the
+/// operator was about to read, describing a write nobody had attempted. A
+/// diagnostic that manufactures the log line it is reporting on is the same
+/// class as one that materializes the directory it describes: it changes the
+/// evidence by asking for it.
+///
+/// The report therefore calls [`coord_mcp_write_verdict`], and the WARNING —
+/// which is genuinely useful when a real writer is turned away — stays with
+/// [`coord_mcp_safe_to_write`], the door every writer already funnels through.
+/// This is a split, not a copy: there is still exactly one implementation of the
+/// rule, and the report is still reading the guard's own verdict rather than
+/// re-deriving a primary/secondary test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpWriteVerdict {
+    /// Writing `<workdir>/.mcp.json` is safe.
+    Allowed,
+    /// A secondary instance was turned away from the umbrella root — the
+    /// shared-root guard. This is the arm that carries a `warn!` at the
+    /// write-attempt door.
+    RefusedSharedRoot,
+    /// The file on disk is a foreign or unparseable config, or an agent-JWT
+    /// config a device-JWT refresh must not downgrade. Refused silently: this is
+    /// the ordinary "leave it alone" outcome, not a misconfiguration.
+    RefusedExistingConfig,
+}
+
+/// The pure verdict. See [`McpWriteVerdict`] for why the log line is not here.
+fn coord_mcp_write_verdict(workdir: &str) -> McpWriteVerdict {
+    coord_mcp_write_verdict_at(workdir, qontinui_root_dir().as_deref())
+}
+
+/// [`coord_mcp_write_verdict`] over a root the caller already resolved.
+///
+/// [`qontinui_root_dir`] is `workspace_paths::workspace_root()`, which reads
+/// `paths.workspace_root` through `config_facade::get_setting` →
+/// `settings::load_settings_full` — a WRITER (see
+/// `workspace_paths::runner_workspace_root_from`). `config_report`'s layer 14
+/// resolved it twice per report, once here and once in [`mcp_json_report`], so
+/// opening the diagnostic could mint a `local_user_id` into the operator's
+/// `settings.json`. Taking the root as an argument lets the report resolve it
+/// ONCE, off the non-mutating door, and hand the same value to both.
+fn coord_mcp_write_verdict_at(workdir: &str, root_dir: Option<&Path>) -> McpWriteVerdict {
+    if !shared_root_write_allowed_at(workdir, root_dir, crate::instance::owns_shared_root_state()) {
+        return McpWriteVerdict::RefusedSharedRoot;
+    }
+    if coord_mcp_existing_config_allows_write(workdir) {
+        McpWriteVerdict::Allowed
+    } else {
+        McpWriteVerdict::RefusedExistingConfig
+    }
+}
+
+/// The second half of the guard: does whatever is ALREADY at
+/// `<workdir>/.mcp.json` permit a rewrite?
+fn coord_mcp_existing_config_allows_write(workdir: &str) -> bool {
     let path = Path::new(workdir).join(".mcp.json");
     let existing = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -3397,6 +3455,292 @@ fn read_proxy_port_from(path: &Path) -> Option<u16> {
     let rest = url.strip_prefix("http://127.0.0.1:")?;
     let port_str = rest.strip_suffix("/coord-mcp")?;
     port_str.parse::<u16>().ok()
+}
+
+// ===========================================================================
+// Layer 14 of the config report — `.mcp.json`, WITHOUT its credentials.
+//
+// Plan `2026-08-20-effective-config-provenance-and-env-generation` Phase 4, D2.
+// ===========================================================================
+
+/// What the shared-root `.mcp.json` currently holds — SHAPE only, never
+/// content.
+///
+/// Every field here is a fact about the file's identity, existence, ownership
+/// or classification. There is deliberately no field able to carry the
+/// `Authorization` bearer or the proxy nonce this file exists to deliver: the
+/// same structural refusal `env_generations::EnvValue::Withheld` encodes, and
+/// for the same reason — a redaction pass over rendered text is a courtesy
+/// backstop, not a boundary, and this file is the single most
+/// credential-dense artifact the runner writes.
+///
+/// The port is NOT withheld. A loopback port number is not a secret (it is in
+/// `/health`, in the process table and in every log line), and it is the one
+/// value that makes a stale root config diagnosable at a glance — a root file
+/// naming a port that no live runner holds is precisely the "stranded on a
+/// corpse" state [`coord_mcp_safe_to_write`]'s shared-root guard exists to
+/// prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpJsonReport {
+    /// The resolved umbrella root, or `None` when
+    /// `workspace_paths::workspace_root()` yields nothing — in which case
+    /// there is no shared root config on this machine at all, and that is a
+    /// reading rather than a failure.
+    pub(crate) root: Option<String>,
+    /// `<root>/.mcp.json`. `None` exactly when `root` is.
+    pub(crate) path: Option<String>,
+    /// Whether that file is on disk RIGHT NOW.
+    pub(crate) exists: bool,
+    /// This instance's name (`QONTINUI_INSTANCE_NAME`), or `None` for the
+    /// primary.
+    pub(crate) instance_name: Option<String>,
+    /// Whether THIS runner is the instance allowed to own shared machine-wide
+    /// state — `instance::owns_shared_root_state`, which is a stronger test
+    /// than "has no instance name" (a nameless secondary fails closed).
+    pub(crate) owns_shared_root_state: bool,
+    /// This runner's ACTUALLY-BOUND API port, for comparison against
+    /// [`proxy_port`](Self::proxy_port). `None` when no Tauri runtime /
+    /// managed `AppState` is reachable — see [`resolve_bound_api_port`].
+    ///
+    /// # Why this is not `mcp::types::get_mcp_api_port()`
+    ///
+    /// That function returns the **desired** port
+    /// (`QONTINUI_PORT` or the `MCP_API_PORT` default). The port this runner
+    /// actually LISTENS on comes from `AppState.api_port`, and
+    /// `mcp_api`'s bind loop tries `[port, port+1, port+2]`, logging
+    /// *"Primary port {} was blocked, using fallback port {}"* — which is the
+    /// Windows zombie-socket path THIS LAYER EXISTS TO DIAGNOSE. Comparing
+    /// against the desired port inverts the row in both directions on a runner
+    /// that fell back to 9877: a correct `.mcp.json` naming 9877 reads as
+    /// "NOT this runner's bound API port (9876)" (a false alarm on a healthy
+    /// runner), and a stale one naming 9876 reads as "IS this runner's bound
+    /// API port" — a false all-clear on exactly the stranded-on-a-corpse state
+    /// the guard exists to prevent.
+    ///
+    /// `None` must therefore render as UNKNOWN. The row may never assert a
+    /// port match it could not establish, and substituting the env value to
+    /// get a comparison is the specific mistake this field's type forbids.
+    pub(crate) this_runner_port: Option<u16>,
+    /// The loopback proxy port the on-disk file currently names, when it holds
+    /// the proxy shape. `None` for an absent file, an unparseable one, or the
+    /// static-bearer (agent) shape.
+    pub(crate) proxy_port: Option<u16>,
+    /// How the file classifies — see [`McpJsonShape`].
+    pub(crate) shape: McpJsonShape,
+    /// Why the file could not be read, when [`exists`](Self::exists) is `true`
+    /// and the read still failed (a permission denial, an exclusive lock, a
+    /// non-UTF-8 payload). `None` when the read succeeded or the file is
+    /// genuinely absent.
+    ///
+    /// Kept because "present but unreadable" and "absent" send a reader to two
+    /// different places, and the OS message is the whole of the difference.
+    pub(crate) read_error: Option<String>,
+    /// **The guard's verdict**, taken from [`coord_mcp_write_verdict`] — the
+    /// pure core [`coord_mcp_safe_to_write`] itself decides on — rather than
+    /// re-derived: may this runner write the shared root config?
+    ///
+    /// This is the whole point of the layer. The decision was previously
+    /// observable only as a `warn!` line in the runner log, so a secondary
+    /// silently declining to touch root looked identical to a secondary that
+    /// had never tried.
+    ///
+    /// The report reads the CORE and not the `warn!`-emitting wrapper on
+    /// purpose: see [`McpWriteVerdict`].
+    pub(crate) safe_to_write: bool,
+}
+
+/// How a `.mcp.json` classifies, by shape alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpJsonShape {
+    /// No umbrella root resolved — there is no shared root config to describe.
+    NoRoot,
+    /// The file is not on disk. **`NotFound` only** — a read that failed for
+    /// any other reason is [`Unparseable`](Self::Unparseable), because a
+    /// present-but-unreadable file rendered as `absent` next to `on disk: true`
+    /// is self-contradictory and sends the reader hunting the wrong fault.
+    Absent,
+    /// On disk and not usable: not valid JSON, no `mcpServers` object, or
+    /// unreadable at all (permission denied, an exclusive lock, non-UTF-8
+    /// bytes). A foreign or damaged artifact the guard refuses to clobber. The
+    /// reason rides in [`McpJsonReport::read_error`].
+    Unparseable,
+    /// `mcpServers` is solely `coord-mcp` in the loopback PROXY shape.
+    OursProxy,
+    /// `mcpServers` is solely `coord-mcp` but not the proxy shape — the
+    /// static-bearer (agent JWT) config the reconcile must never touch.
+    OursStaticBearer,
+    /// `mcpServers` holds servers other than (or in addition to) `coord-mcp` —
+    /// an operator's own config.
+    Foreign,
+}
+
+impl McpJsonShape {
+    /// Stable wire string.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            McpJsonShape::NoRoot => "no_workspace_root",
+            McpJsonShape::Absent => "absent",
+            McpJsonShape::Unparseable => "unparseable_or_no_mcp_servers",
+            McpJsonShape::OursProxy => "ours_proxy",
+            McpJsonShape::OursStaticBearer => "ours_static_bearer",
+            McpJsonShape::Foreign => "foreign",
+        }
+    }
+}
+
+/// Classify a `.mcp.json` document by shape, reading no value that could be a
+/// credential.
+///
+/// Takes the PARSED document rather than a path so every arm is unit-testable
+/// against a literal — the classification is the part a report can get wrong,
+/// and it must not need a real umbrella root to exercise.
+fn classify_mcp_json_doc(doc: &serde_json::Value) -> McpJsonShape {
+    let Some(servers) = doc.get("mcpServers").and_then(|m| m.as_object()) else {
+        return McpJsonShape::Unparseable;
+    };
+    if servers.len() != 1 || !servers.contains_key("coord-mcp") {
+        return McpJsonShape::Foreign;
+    }
+    // Proxy shape iff the URL is our loopback proxy. Read through the same
+    // `url` pointer `read_proxy_port_from` uses; nothing else about the entry
+    // is touched, and in particular not `headers`.
+    let is_proxy = doc
+        .pointer("/mcpServers/coord-mcp/url")
+        .and_then(|u| u.as_str())
+        .map(|u| u.starts_with("http://127.0.0.1:") && u.ends_with("/coord-mcp"))
+        .unwrap_or(false);
+    if is_proxy {
+        McpJsonShape::OursProxy
+    } else {
+        McpJsonShape::OursStaticBearer
+    }
+}
+
+/// Map the result of reading `.mcp.json` to `(exists, shape, reason)`.
+///
+/// Pure over the `io::Result`, so the arm that matters — a file that IS on disk
+/// and cannot be read — is testable without a locked file or a permission
+/// fixture.
+///
+/// **Only `NotFound` is [`McpJsonShape::Absent`].** A permission denial, an
+/// exclusive lock or a non-UTF-8 payload is a file that exists and is unusable,
+/// which is exactly what [`McpJsonShape::Unparseable`] means. Folding them into
+/// `Absent` produced `on disk: true; shape: absent` — a self-contradictory row
+/// that sends the reader hunting a missing file instead of a locked one.
+///
+/// # Why `exists` comes out of THIS function and not a second `stat`
+///
+/// The first fix for that contradiction removed only one polarity of it. The
+/// report kept taking `exists` from a separate `path.is_file()` while `shape`
+/// came from here, so a `.mcp.json` that is a **directory** rendered
+/// `on disk: false; … The file IS on disk and could not be read` — the same
+/// self-contradiction, inverted: `is_file()` is false for a directory, while the
+/// read fails with a non-`NotFound` error and lands in `Unparseable`.
+///
+/// Two predicates over one path can always be made to disagree, and the second
+/// syscall is also a TOCTOU window (the file can be created or removed between
+/// the `stat` and the read). So existence is DERIVED FROM THE SAME `io::Result`:
+/// a successful read, or any failure that is not `NotFound`, means the path is
+/// there. The two facts are now incapable of disagreeing because there is only
+/// one observation behind them.
+///
+/// The reason for a PARSE failure is bounded to category + position rather than
+/// `serde_json`'s Display: that Display quotes the offending token out of the
+/// document, and this document carries the `Authorization` bearer and the proxy
+/// nonce.
+fn shape_from_read(read: std::io::Result<String>) -> (bool, McpJsonShape, Option<String>) {
+    match read {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, McpJsonShape::Absent, None),
+        Err(e) => (true, McpJsonShape::Unparseable, Some(e.to_string())),
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Err(e) => (
+                true,
+                McpJsonShape::Unparseable,
+                Some(format!(
+                    "JSON {:?} error at line {} column {}",
+                    e.classify(),
+                    e.line(),
+                    e.column()
+                )),
+            ),
+            Ok(doc) => (true, classify_mcp_json_doc(&doc), None),
+        },
+    }
+}
+
+/// Describe the shared-root `.mcp.json` for the config report.
+///
+/// ASKS rather than re-derives: the write verdict comes from
+/// [`coord_mcp_write_verdict`] — the pure core of the guard every writer funnels
+/// through — so the report and the guard cannot disagree. Re-implementing the
+/// secondary/primary test here would compile, agree today, and start lying the
+/// first time the guard moved.
+///
+/// Read-only and side-effect-free: it never mints a nonce, never writes, never
+/// touches the credential slots of the document it parses, and — since the
+/// verdict comes from the core rather than from [`coord_mcp_safe_to_write`] —
+/// emits no `warn!` about a write nobody attempted.
+///
+/// # The umbrella root is INJECTED, not resolved here
+///
+/// [`qontinui_root_dir`] is `workspace_paths::workspace_root()`, which reads
+/// `paths.workspace_root` through `config_facade::get_setting` →
+/// `settings::load_settings_full` — the runner's one settings
+/// writer-by-side-effect. This function needed the root TWICE (its own path, and
+/// the write guard's), so a single config report entered that writer twice: on a
+/// machine whose `local_user_id` is empty, opening the diagnostic minted a UUID
+/// into `settings.json` and rewrote it, then reported on the file it had just
+/// changed. The caller now resolves the root ONCE off the non-mutating door
+/// (`workspace_paths::workspace_root_from` over an already-read `Settings`) and
+/// hands the same value to both halves — which also means the report cannot
+/// describe two different roots in one row.
+pub(crate) fn mcp_json_report(root: Option<std::path::PathBuf>) -> McpJsonReport {
+    // The ACTUALLY-BOUND port, from the same resolver `coord_doctor` uses.
+    // `None` (no Tauri runtime / managed state) stays `None` all the way into
+    // the row — see the field doc for why substituting
+    // `mcp::types::get_mcp_api_port()` here inverts the layer's verdict.
+    let this_runner_port = resolve_bound_api_port();
+    let instance_name = crate::instance::instance_name();
+    let owns_shared_root_state = crate::instance::owns_shared_root_state();
+
+    let Some(root_dir) = root else {
+        return McpJsonReport {
+            root: None,
+            path: None,
+            exists: false,
+            instance_name,
+            owns_shared_root_state,
+            this_runner_port,
+            proxy_port: None,
+            shape: McpJsonShape::NoRoot,
+            read_error: None,
+            // No shared root config exists, so the guard's own `None` arm
+            // ("nothing to protect") is the honest verdict.
+            safe_to_write: true,
+        };
+    };
+    let root_str = root_dir.to_string_lossy().to_string();
+    let path = root_dir.join(".mcp.json");
+    // ONE observation behind both `exists` and `shape` — see `shape_from_read`
+    // on why a second `is_file()` stat could contradict it (and did).
+    let (exists, shape, read_error) = shape_from_read(std::fs::read_to_string(&path));
+
+    McpJsonReport {
+        root: Some(root_str.clone()),
+        path: Some(path.to_string_lossy().to_string()),
+        exists,
+        instance_name,
+        owns_shared_root_state,
+        this_runner_port,
+        proxy_port: read_proxy_port_from(&path),
+        shape,
+        read_error,
+        // The verdict, WITHOUT the `warn!` its write-attempt door emits — see
+        // `McpWriteVerdict`. Reporting on a refusal must not manufacture the log
+        // line that records one.
+        safe_to_write: coord_mcp_write_verdict_at(&root_str, Some(&root_dir))
+            == McpWriteVerdict::Allowed,
+    }
 }
 
 /// True iff `<workdir>/.mcp.json` already declares a `coord-mcp` server (ANY
@@ -5125,6 +5469,366 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Layer 14's shape classifier, arm by arm, against LITERAL documents.
+    ///
+    /// The classification is the part a report can get wrong — it is what
+    /// decides whether an operator reads "your config is fine" or "something
+    /// else owns this file" — so every arm is pinned against a document written
+    /// out here rather than against a real umbrella root, which would make the
+    /// verdict depend on the machine the test runs on.
+    #[test]
+    fn classify_mcp_json_doc_separates_ours_foreign_and_unparseable() {
+        use serde_json::json;
+
+        // Our loopback PROXY shape.
+        assert_eq!(
+            classify_mcp_json_doc(&json!({
+                "mcpServers": {"coord-mcp": {"url": "http://127.0.0.1:9876/coord-mcp"}}
+            })),
+            McpJsonShape::OursProxy
+        );
+        // Ours, but the static-bearer (agent JWT) shape — no proxy URL.
+        assert_eq!(
+            classify_mcp_json_doc(&json!({
+                "mcpServers": {"coord-mcp": {"url": "https://coord.qontinui.io/mcp"}}
+            })),
+            McpJsonShape::OursStaticBearer
+        );
+        // A second server means the operator owns this file.
+        assert_eq!(
+            classify_mcp_json_doc(&json!({
+                "mcpServers": {
+                    "coord-mcp": {"url": "http://127.0.0.1:9876/coord-mcp"},
+                    "some-other": {"command": "node"}
+                }
+            })),
+            McpJsonShape::Foreign
+        );
+        // One server that is not ours at all.
+        assert_eq!(
+            classify_mcp_json_doc(&json!({"mcpServers": {"some-other": {"command": "node"}}})),
+            McpJsonShape::Foreign
+        );
+        // Valid JSON with no `mcpServers` object.
+        assert_eq!(
+            classify_mcp_json_doc(&json!({"hello": "world"})),
+            McpJsonShape::Unparseable
+        );
+
+        // The wire strings are a contract a reader compares across machines —
+        // literals, not `as_str()` round-trips.
+        assert_eq!(McpJsonShape::OursProxy.as_str(), "ours_proxy");
+        assert_eq!(
+            McpJsonShape::OursStaticBearer.as_str(),
+            "ours_static_bearer"
+        );
+        assert_eq!(McpJsonShape::Foreign.as_str(), "foreign");
+        assert_eq!(McpJsonShape::Absent.as_str(), "absent");
+        assert_eq!(McpJsonShape::NoRoot.as_str(), "no_workspace_root");
+        assert_eq!(
+            McpJsonShape::Unparseable.as_str(),
+            "unparseable_or_no_mcp_servers"
+        );
+    }
+
+    /// The report NEVER carries the bearer or the proxy nonce.
+    ///
+    /// **F7 regression.** `exists: true; shape: absent` was a state the report
+    /// could print, and it is self-contradictory: only a `NotFound` read is an
+    /// ABSENT file. A permission denial, an exclusive lock or non-UTF-8 bytes
+    /// are a file that IS there and cannot be read — `unparseable` — and the
+    /// reason must survive, because "go find the missing file" and "go find
+    /// what is holding the lock" are different jobs.
+    ///
+    /// Asserted against LITERAL wire strings, not `as_str()` round-trips.
+    ///
+    /// **The F7 fix reopened with the polarity flipped, and this is the
+    /// regression for the second one.** `exists` was still taken from a separate
+    /// `path.is_file()` while `shape` came from `shape_from_read`, so a
+    /// `.mcp.json` that is a DIRECTORY rendered `on disk: false` next to
+    /// `The file IS on disk and could not be read` — the same self-contradiction,
+    /// inverted. `exists` now comes out of the SAME `io::Result`, so every case
+    /// below asserts both, and the two are incapable of disagreeing.
+    #[test]
+    fn mcp_json_read_error_is_unparseable_not_absent_unless_it_is_notfound() {
+        use std::io::{Error, ErrorKind};
+
+        // The ONLY arm that may be `absent` — and the only one that is not on
+        // disk.
+        let (exists, shape, reason) = shape_from_read(Err(Error::new(ErrorKind::NotFound, "nope")));
+        assert_eq!(shape.as_str(), "absent");
+        assert!(!exists, "a NotFound read is the one absent case");
+        assert_eq!(reason, None, "an absent file has no read failure to report");
+
+        // Everything else is a PRESENT file that could not be read.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData, // non-UTF-8 bytes
+            ErrorKind::Other,       // Windows sharing violation surfaces here
+            // A DIRECTORY at `.mcp.json`: `is_file()` says false, the read
+            // fails non-NotFound. This is the exact pair that contradicted.
+            ErrorKind::IsADirectory,
+        ] {
+            let (exists, shape, reason) =
+                shape_from_read(Err(Error::new(kind, "held by another process")));
+            assert_eq!(
+                shape.as_str(),
+                "unparseable_or_no_mcp_servers",
+                "{kind:?} names a file that exists and cannot be read"
+            );
+            assert!(
+                exists,
+                "{kind:?}: `unparseable` means present-and-unusable, so `exists` must agree"
+            );
+            assert_eq!(
+                reason.as_deref(),
+                Some("held by another process"),
+                "{kind:?}: the reason is the whole difference from `absent`"
+            );
+        }
+
+        // A syntactically broken document is `unparseable` too, and its reason
+        // is BOUNDED — this file carries a bearer and a proxy nonce, and
+        // `serde_json`'s Display quotes the offending token out of the source.
+        let bearer = "eyJhbGciOiJFZERTQSJ9.cGF5bG9hZA.c2ln";
+        let (exists, shape, reason) = shape_from_read(Ok(format!(
+            "{{\"mcpServers\": {{\"coord-mcp\": {{\"headers\": {{\"Authorization\": \"Bearer {bearer}\"}}"
+        )));
+        assert_eq!(shape.as_str(), "unparseable_or_no_mcp_servers");
+        assert!(
+            exists,
+            "a document that parsed badly was still read off disk"
+        );
+        let reason = reason.expect("a parse failure records its reason");
+        assert!(
+            !reason.contains(bearer),
+            "the parse reason leaked the bearer: {reason}"
+        );
+        assert!(
+            reason.starts_with("JSON ") && reason.contains(" error at line "),
+            "the reason must be category + position: {reason}"
+        );
+
+        // A well-formed document still classifies normally, with no reason.
+        let (exists, shape, reason) = shape_from_read(Ok(
+            "{\"mcpServers\": {\"coord-mcp\": {\"url\": \"http://127.0.0.1:9876/coord-mcp\"}}}"
+                .to_string(),
+        ));
+        assert_eq!(shape.as_str(), "ours_proxy");
+        assert!(exists);
+        assert_eq!(reason, None);
+
+        // THE CONTRADICTION CONTROL, stated as an invariant over every arm:
+        // `absent` iff not on disk. A row can no longer say "on disk: false"
+        // beside "The file IS on disk", in either direction.
+        for read in [
+            Err(Error::new(ErrorKind::NotFound, "x")),
+            Err(Error::new(ErrorKind::IsADirectory, "x")),
+            Err(Error::new(ErrorKind::PermissionDenied, "x")),
+            Ok("{}".to_string()),
+            Ok("{\"mcpServers\":{\"other\":{}}}".to_string()),
+        ] {
+            let (exists, shape, _) = shape_from_read(read);
+            assert_eq!(
+                exists,
+                shape != McpJsonShape::Absent,
+                "`exists` and `absent` must be exact complements, got exists={exists} shape={}",
+                shape.as_str()
+            );
+        }
+    }
+
+    /// **A real directory at `<root>/.mcp.json`**, driven through the filesystem
+    /// rather than a synthesized `io::Result` — because the whole point of the
+    /// defect was that the OS answers `is_file()` and `read_to_string()`
+    /// differently for this one shape, and a hand-built `Err` cannot prove the
+    /// platform actually does that.
+    #[test]
+    fn mcp_json_shape_for_a_directory_at_the_path_agrees_with_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".mcp.json");
+        std::fs::create_dir(&path).expect("mkdir .mcp.json");
+
+        // The pair the old code combined: they disagree, which is why deriving
+        // BOTH from one observation is the fix and not a style preference.
+        assert!(!path.is_file(), "a directory is not a file");
+        let read = std::fs::read_to_string(&path);
+        assert!(read.is_err(), "reading a directory fails");
+        assert_ne!(
+            read.as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "…and it fails as something other than NotFound"
+        );
+
+        let (exists, shape, reason) = shape_from_read(read);
+        assert!(exists, "the path IS on disk");
+        assert_eq!(shape.as_str(), "unparseable_or_no_mcp_servers");
+        assert!(reason.is_some(), "present-and-unusable carries its reason");
+    }
+
+    /// Structural, not textual: [`McpJsonReport`] has no field able to hold
+    /// either, so this asserts against a document stuffed with both and checks
+    /// the whole `Debug` rendering — the widest surface the struct can leak
+    /// through, and the one a `serde_json` or a panic message would use.
+    #[test]
+    fn mcp_json_report_shape_cannot_carry_the_bearer_or_the_nonce() {
+        use serde_json::json;
+
+        let nonce = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bearer = "eyJhbGciOiJFZERTQSJ9.PAYLOAD.SIGNATURE";
+        let doc = json!({
+            "mcpServers": {"coord-mcp": {
+                "url": "http://127.0.0.1:9876/coord-mcp",
+                "headers": {"Authorization": format!("Bearer {bearer}"),
+                            "X-Coord-Mcp-Proxy-Key": nonce}
+            }}
+        });
+        assert_eq!(classify_mcp_json_doc(&doc), McpJsonShape::OursProxy);
+
+        let report = McpJsonReport {
+            root: Some("D:/qontinui-root".to_string()),
+            path: Some("D:/qontinui-root/.mcp.json".to_string()),
+            exists: true,
+            instance_name: None,
+            owns_shared_root_state: true,
+            this_runner_port: Some(9876),
+            proxy_port: Some(9876),
+            shape: classify_mcp_json_doc(&doc),
+            read_error: None,
+            safe_to_write: true,
+        };
+        let rendered = format!("{report:?}");
+        assert!(
+            !rendered.contains(nonce),
+            "the proxy nonce leaked: {rendered}"
+        );
+        assert!(!rendered.contains(bearer), "the bearer leaked: {rendered}");
+    }
+
+    /// **The split introduced for the config report is not a divergence.**
+    ///
+    /// Layer 14 stopped asking [`coord_mcp_safe_to_write`] and started asking
+    /// [`coord_mcp_write_verdict`], so that opening the report on a secondary no
+    /// longer emits `coord_mcp: REFUSING to write …` into the runner log the
+    /// operator is about to read — a log line describing a write nobody
+    /// attempted. The hazard that trade introduces is the one this whole report
+    /// exists to expose: two doors onto one rule, free to drift apart.
+    ///
+    /// They cannot, because the wrapper IS the core plus a log line — and this
+    /// asserts it over every shape the guard classifies, including the two that
+    /// hinge on JWT `sub_type` and the proxy shape whose 64-hex nonce must fail
+    /// the JWT decode.
+    #[test]
+    fn the_report_verdict_core_agrees_with_the_warning_wrapper() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let dir = std::env::temp_dir().join(format!("coord-mcp-split-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wd = dir.to_string_lossy().to_string();
+        let mcp = dir.join(".mcp.json");
+
+        let agent_jwt = format!("h.{}.s", URL_SAFE_NO_PAD.encode(br#"{"sub_type":"agent"}"#));
+        // Built rather than written whole: a contiguous 64-hex literal beside the
+        // `X-Coord-Mcp-Proxy-Key` keyword is exactly what gitleaks' `generic-api-key`
+        // rule matches. The value is unchanged.
+        let proxy_nonce = "0123456789abcdef".repeat(4);
+        let device_jwt = format!(
+            "h.{}.s",
+            URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#)
+        );
+
+        // (absent) plus every on-disk shape, and the expected verdict for each
+        // — LITERAL, so the split cannot be "proved" by comparing the two doors
+        // to each other while both are wrong.
+        let mut cases: Vec<(Option<String>, McpWriteVerdict, bool)> =
+            vec![(None, McpWriteVerdict::Allowed, true)];
+        for (doc, verdict, allowed) in [
+            (
+                r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"https://c/mcp"}}}"#.to_string(),
+                McpWriteVerdict::Allowed,
+                true,
+            ),
+            (
+                r#"{"mcpServers":{"my-server":{"type":"http","url":"https://x/mcp"}}}"#.to_string(),
+                McpWriteVerdict::RefusedExistingConfig,
+                false,
+            ),
+            (
+                r#"{"mcpServers":{"coord-mcp":{"url":"https://c/mcp"},"other":{"url":"x"}}}"#
+                    .to_string(),
+                McpWriteVerdict::RefusedExistingConfig,
+                false,
+            ),
+            (
+                "not json {{{".to_string(),
+                McpWriteVerdict::RefusedExistingConfig,
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"mcpServers":{{"coord-mcp":{{"url":"https://c/mcp","headers":{{"Authorization":"Bearer {agent_jwt}"}}}}}}}}"#
+                ),
+                McpWriteVerdict::RefusedExistingConfig,
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"mcpServers":{{"coord-mcp":{{"url":"https://c/mcp","headers":{{"Authorization":"Bearer {device_jwt}"}}}}}}}}"#
+                ),
+                McpWriteVerdict::Allowed,
+                true,
+            ),
+            (
+                format!(
+                    r#"{{"mcpServers":{{"coord-mcp":{{"url":"http://127.0.0.1:9876/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"{proxy_nonce}"}}}}}}}}"#
+                ),
+                McpWriteVerdict::Allowed,
+                true,
+            ),
+        ] {
+            cases.push((Some(doc), verdict, allowed));
+        }
+
+        for (i, (doc, expected_verdict, expected_bool)) in cases.into_iter().enumerate() {
+            match &doc {
+                Some(d) => std::fs::write(&mcp, d).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&mcp);
+                }
+            }
+            // `wd` is a temp dir, never the umbrella root, so the shared-root arm
+            // is out of the picture and this compares the existing-config half.
+            let verdict = coord_mcp_write_verdict(&wd);
+            assert_eq!(verdict, expected_verdict, "case {i}: doc={doc:?}");
+            assert_eq!(
+                coord_mcp_safe_to_write(&wd),
+                expected_bool,
+                "case {i}: the warn!-emitting wrapper disagreed with its own core"
+            );
+            assert_eq!(
+                verdict == McpWriteVerdict::Allowed,
+                coord_mcp_safe_to_write(&wd),
+                "case {i}: the two doors must be the same rule"
+            );
+        }
+
+        // The shared-root arm, which the loop above cannot reach: this test
+        // process owns shared root state (no `QONTINUI_INSTANCE_NAME`), so the
+        // guard's first branch never fires for it. Asserted at the pure core
+        // both doors call — that arm is the ONE that carries a `warn!`, which is
+        // exactly why the report must not take the wrapper.
+        assert!(
+            !shared_root_write_allowed_at(&wd, Some(&dir), false),
+            "a runner that does NOT own shared root state is refused AT the root"
+        );
+        assert!(
+            shared_root_write_allowed_at(&wd, Some(&dir), true),
+            "…and the owner is not — or the negative above is vacuous"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `coord_mcp_safe_to_write` — the non-clobber guard for the continuation

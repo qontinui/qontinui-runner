@@ -1010,7 +1010,7 @@ async fn spawn_looping_agent_terminal(
     // Resolved BEFORE the argv build so its per-account launch command can layer
     // into the shared launch seam.
     let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
-    let selected_config_dir = {
+    let (selected_config_dir, _config_dir_source) = {
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
     };

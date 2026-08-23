@@ -136,7 +136,8 @@ pub fn build_federation_ctx(
         }
     };
 
-    let effective_config_dir = crate::ai_provider::get_effective_config_dir(cli_settings);
+    let (effective_config_dir, _config_dir_source) =
+        crate::ai_provider::get_effective_config_dir(cli_settings);
     let config_dir_str = match effective_config_dir {
         Some(s) => s,
         None => {

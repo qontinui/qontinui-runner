@@ -273,8 +273,56 @@ pub fn materialize(
 /// handled explicitly: teardown no longer deletes it ([`cleanup`]), the orphan
 /// reaper now actually runs ([`maybe_sweep_stale`]), and staleness across a
 /// runner update is an explicit check ([`identity_build_tag`]).
+/// The BASENAME of this runner build's identity-shim directory — the ONE
+/// definition of the `prefix + build tag` rule.
+///
+/// Every producer of that name goes through here or through [`identity_dir`]:
+/// [`materialize_identity`], [`identity_dir_if_materialized`],
+/// [`touch_identity_liveness`] and [`sweep_stale`]'s own-dir exclusion. The
+/// claim used to be made in [`identity_dir`]'s doc while `touch_identity_liveness`
+/// and `sweep_stale` each hand-rolled the same `format!` two hundred lines
+/// apart — a stated invariant that was already false in its own file, which is
+/// the exact second-copy hazard the config report exists to expose.
+///
+/// It is not cosmetic. If the prefix rule moved and the liveness toucher kept
+/// the old spelling, it would silently stop refreshing the marker of the dir
+/// every live pane has PATH-prepended, and [`sweep_stale`] would reap it out
+/// from under them after [`STALE_SHIM_MAX_AGE`]; if the exclusion in
+/// `sweep_stale` kept the old spelling, the sweep would reap this build's own
+/// dir immediately.
+fn identity_dir_name() -> String {
+    format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag())
+}
+
+/// The identity-shim directory for THIS runner build — resolved, never
+/// materialized. The name comes from [`identity_dir_name`], so nothing can
+/// carry a second copy of the `prefix + build tag` rule.
+pub fn identity_dir(base_dir: &Path) -> PathBuf {
+    base_dir.join(identity_dir_name())
+}
+
+/// The identity-shim directory **iff it is already materialized for this
+/// build** — a pure `stat` of the completion marker, with none of
+/// [`materialize_identity`]'s effects: it writes no scripts, copies no exes,
+/// does not refresh the liveness mtime, and never triggers the orphan sweep.
+///
+/// Exists for `config_report`'s G3 generation. G3 answers "what does a PTY
+/// child spawned RIGHT NOW inherit?", and the single most consequential answer
+/// is `PATH` — it decides which binary a child resolves, which is why an
+/// operator asking "why does `cargo` in a runner pane hit the interception
+/// shim?" must not be told the runner's own `PATH` is what a child gets. But
+/// the seam that installs it MATERIALIZES, and a diagnostic that materializes
+/// the thing it describes changes the answer by asking the question. So the
+/// report asks this instead, and reports the prepend only when the spawn seam
+/// would actually perform it — a `None` here is exactly the fail-open case
+/// where the real seam prepends nothing either.
+pub fn identity_dir_if_materialized(base_dir: &Path) -> Option<PathBuf> {
+    let dir = identity_dir(base_dir);
+    dir.join(IDENTITY_MARKER).is_file().then_some(dir)
+}
+
 pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
-    let dir = base_dir.join(format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag()));
+    let dir = identity_dir(base_dir);
     let marker = dir.join(IDENTITY_MARKER);
 
     // FAST PATH — a complete dir for THIS build already exists. Zero writes:
@@ -360,9 +408,7 @@ pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
 /// real signal. Costs one `stat` per tick and (at most) one marker write per
 /// [`IDENTITY_TOUCH_INTERVAL`].
 pub fn touch_identity_liveness(base_dir: &Path) {
-    let marker = base_dir
-        .join(format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag()))
-        .join(IDENTITY_MARKER);
+    let marker = identity_dir(base_dir).join(IDENTITY_MARKER);
     if let Ok(md) = std::fs::metadata(&marker) {
         refresh_identity_liveness(&marker, &md);
     }
@@ -840,7 +886,7 @@ pub fn sweep_stale(base_dir: &Path, max_age: std::time::Duration) {
     // leave the dir present but missing files, with no marker, and the dir is
     // shared by every live pane), whereas "this is the directory I am currently
     // handing out on PATH" is a fact this process knows for certain.
-    let own_identity_dir = format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag());
+    let own_identity_dir = identity_dir_name();
     let mut removed = 0usize;
     for entry in entries.flatten() {
         if removed >= STALE_SWEEP_CAP {
@@ -1281,6 +1327,70 @@ mod tests {
                 .join(format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag()))
                 .exists(),
             "the touch must never CREATE the dir — materialize owns that"
+        );
+    }
+
+    /// **F-second-pass-5 regression.** The poll-driven toucher refreshes the
+    /// SAME directory `materialize_identity` handed out and `sweep_stale`
+    /// excludes.
+    ///
+    /// [`identity_dir`] documented itself as "the ONE definition of the name"
+    /// while [`touch_identity_liveness`] and [`sweep_stale`] each hand-rolled
+    /// `format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag())` of their own.
+    /// No divergence had occurred yet — which is precisely why no test caught
+    /// it — but the consequence of one is severe and silent: the toucher would
+    /// refresh a directory nobody is using, the real one would age past
+    /// [`STALE_SHIM_MAX_AGE`], and the sweep would `remove_dir_all` the dir every
+    /// live pane has PATH-prepended, so the next `claude` would resolve the real
+    /// binary, lose its `--session-id` pin, and become unrestorable.
+    ///
+    /// `poll_driven_touch_refreshes_identity_liveness` above CANNOT catch that:
+    /// a toucher aimed at a non-existent directory is a silent no-op, and every
+    /// one of its assertions ("the marker still exists", "the bytes are
+    /// unchanged") passes for a no-op. So this test BACKDATES the marker past
+    /// [`IDENTITY_TOUCH_INTERVAL`] and asserts the mtime actually MOVES — an
+    /// assertion only a toucher resolving the same directory can satisfy.
+    #[test]
+    fn touch_and_sweep_resolve_the_same_identity_dir_as_materialize() {
+        use std::time::{Duration, SystemTime};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = materialize_identity(tmp.path()).expect("materialize");
+        let marker = dir.join(IDENTITY_MARKER);
+
+        // Backdate well past IDENTITY_TOUCH_INTERVAL so the refresh is DUE.
+        let backdated = SystemTime::now() - Duration::from_secs(6 * 60 * 60);
+        filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(backdated))
+            .expect("backdate the marker");
+        let before = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        assert!(
+            before < SystemTime::now() - Duration::from_secs(60 * 60),
+            "the fixture must actually be stale, or the touch has nothing to do"
+        );
+
+        touch_identity_liveness(tmp.path());
+
+        let after = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        assert!(
+            after > before,
+            "the poll-driven toucher did not refresh the dir materialize handed out — the two \
+             resolved DIFFERENT names"
+        );
+
+        // And the sweep's own-dir exclusion names that same directory: with
+        // "everything is stale" it survives, while a foreign identity dir of the
+        // same prefix does not.
+        let foreign = tmp.path().join(format!("{IDENTITY_DIR_PREFIX}0ldbu1ld"));
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join(IDENTITY_MARKER), b"old").unwrap();
+        sweep_stale(tmp.path(), Duration::from_secs(0));
+        assert!(
+            dir.exists() && marker.is_file(),
+            "the sweep reaped the dir the toucher had just refreshed"
+        );
+        assert!(
+            !foreign.exists(),
+            "…and the sweep must still be doing its job, or the survival above is vacuous"
         );
     }
 

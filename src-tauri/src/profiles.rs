@@ -383,7 +383,14 @@ pub const QONTINUI_ACCOUNT_TIER: &str = "qontinui_account";
 /// Reach for this one only to inspect what was *explicitly configured*, with
 /// no policy applied.
 pub fn resolve_coord_base() -> CoordBase {
-    resolve_coord_base_with_source().0
+    // The arm is bound and dropped in the open rather than hidden behind a
+    // `.0`: this fn's whole contract is "no policy applied", so a caller who
+    // wants to know WHICH configured arm matched is asking a different question
+    // and must call `resolve_coord_base_with_source` (or `coord_base_policy`)
+    // directly. See the coord_mcp.rs note on why a `.0`-only wrapper is a
+    // discard layer rather than a convenience.
+    let (base, _configured_source) = resolve_coord_base_with_source();
+    base
 }
 
 /// [`resolve_coord_base`] plus WHICH configured arm matched: `Some(Env)` /
@@ -419,15 +426,70 @@ fn resolve_coord_base_with_source() -> (CoordBase, Option<CoordBaseSource>) {
 // is exactly why this reads the JSON file instead of importing the type.
 // ---------------------------------------------------------------------------
 
+/// Which arm produced the lib-side `settings.json` path.
+///
+/// The house `(value, source)` shape (`CoordBaseSource`,
+/// `api_config::ApiBaseUrlArm`) applied to this reader, so the config report's
+/// layer 3 can ASK where the path came from rather than re-deriving the
+/// override rule — the second copy of a precedence rule being the thing the
+/// whole report is built to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsJsonPathSource {
+    /// Env `QONTINUI_CONFIG_DIR` was set and was used as the directory.
+    ///
+    /// **Note the asymmetry this arm exists to expose.** This reader accepts
+    /// the variable whatever it contains; `settings::get_config_dir` — the BIN
+    /// reader of the same file — additionally `.filter(|s| !s.is_empty())`. So
+    /// an exported-but-empty `QONTINUI_CONFIG_DIR` sends this reader to a
+    /// CWD-relative `settings.json` while the bin reader goes to the platform
+    /// config dir: two readers, same variable, different files. That is exactly
+    /// the disagreement layer 3 is in the report's inventory to surface, and
+    /// with both readers now naming their arm the report shows the fork as two
+    /// rows with two different values instead of hiding it.
+    EnvConfigDir,
+    /// No `QONTINUI_CONFIG_DIR`; the platform config dir +
+    /// `com.qontinui.runner` was used.
+    PlatformConfigDir,
+    /// Neither available — `dirs::config_dir()` returned `None`, so there is no
+    /// path at all. The value is `None`, never a guess.
+    Unresolvable,
+}
+
+impl SettingsJsonPathSource {
+    /// Stable wire string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SettingsJsonPathSource::EnvConfigDir => "env:QONTINUI_CONFIG_DIR",
+            SettingsJsonPathSource::PlatformConfigDir => "platform_config_dir",
+            SettingsJsonPathSource::Unresolvable => "unresolvable",
+        }
+    }
+}
+
+impl std::fmt::Display for SettingsJsonPathSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Path of the runner's `settings.json` (`QONTINUI_CONFIG_DIR` override →
-/// platform config dir + `com.qontinui.runner`). The same file
-/// `settings::load_settings()` reads.
-pub fn settings_json_path() -> Option<PathBuf> {
-    let dir = std::env::var("QONTINUI_CONFIG_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| dirs::config_dir().map(|d| d.join("com.qontinui.runner")))?;
-    Some(dir.join("settings.json"))
+/// platform config dir + `com.qontinui.runner`), plus WHICH arm produced it.
+/// The same file `settings::load_settings()` reads — by a different code path,
+/// which is the point: see [`SettingsJsonPathSource::EnvConfigDir`].
+pub fn settings_json_path() -> (Option<PathBuf>, SettingsJsonPathSource) {
+    if let Ok(dir) = std::env::var("QONTINUI_CONFIG_DIR") {
+        return (
+            Some(PathBuf::from(dir).join("settings.json")),
+            SettingsJsonPathSource::EnvConfigDir,
+        );
+    }
+    match dirs::config_dir() {
+        Some(d) => (
+            Some(d.join("com.qontinui.runner").join("settings.json")),
+            SettingsJsonPathSource::PlatformConfigDir,
+        ),
+        None => (None, SettingsJsonPathSource::Unresolvable),
+    }
 }
 
 /// Outcome of reading `settings.json::tier` — a tri-state, because "we could
@@ -474,7 +536,8 @@ impl TierRead {
 /// otherwise a hosted install would read as `Absent` during the one boot
 /// before the migration persists.
 pub fn read_runner_tier() -> TierRead {
-    let Some(path) = settings_json_path() else {
+    let (path, _path_source) = settings_json_path();
+    let Some(path) = path else {
         return TierRead::Unknown("cannot resolve settings.json path".to_string());
     };
     if !path.exists() {
@@ -630,6 +693,25 @@ pub fn coord_base_policy() -> (CoordBase, CoordBaseSource) {
                 );
             });
         }
+        // Silence here is DELIBERATE, and it is not an oversight to be fixed by
+        // adding two more `call_once` lines.
+        //
+        // The three arms above log because each is an ANOMALY: nothing was
+        // configured and the runner had to guess. `Env` and `Profile` are the
+        // arms that fire on a correctly-configured machine — every healthy
+        // runner in the fleet takes one of them on every call — so a log line
+        // here would be pure noise on exactly the machines that have nothing
+        // wrong with them, while still answering the operator's real question
+        // ("which arm won?") only for whoever happens to be reading the log at
+        // the moment the process first resolved it.
+        //
+        // Attribution is the REPORT's job, not the log's. `config_report`'s
+        // layer 4 asks this function directly and prints
+        // `CoordBaseSource::as_str()` for whichever arm won, on demand, at a
+        // stamped instant — which is a strictly better answer than a one-shot
+        // line buried in a rotating log, and it covers these two arms with no
+        // logging at all. See
+        // `2026-08-20-effective-config-provenance-and-env-generation` Phase 2.
         CoordBaseSource::Env | CoordBaseSource::Profile => {}
     }
     (base, source)
@@ -1387,8 +1469,17 @@ mod tests {
         let (base, source) = coord_base_policy();
         assert_eq!(base, CoordBase::TierDefault(PROD_COORD_BASE.to_string()));
         assert_eq!(source, CoordBaseSource::UnknownTierProdDefault);
-        // …and the String family keeps its fail-loud posture unchanged.
-        assert_eq!(coord_base_with_source().0, PROD_COORD_BASE);
+        // …and the String family keeps its fail-loud posture unchanged —
+        // asserted as the full (value, source) pair, because the base alone is
+        // byte-identical to the genuine `tier_default` answer and only the arm
+        // distinguishes "your tier says hosted" from "we could not read it".
+        assert_eq!(
+            coord_base_with_source(),
+            (
+                PROD_COORD_BASE.to_string(),
+                CoordBaseSource::UnknownTierProdDefault
+            )
+        );
     }
 
     /// A non-hosted runner with nothing configured is ISOLATED — and must NOT
@@ -1492,7 +1583,13 @@ mod tests {
         assert_eq!(got.source, "dev_localhost_fallback");
         // The String family DOES have a base on this same input — which is why
         // it cannot express this mode.
-        assert_eq!(coord_base_with_source().0, DEV_LOCALHOST_COORD_BASE);
+        assert_eq!(
+            coord_base_with_source(),
+            (
+                DEV_LOCALHOST_COORD_BASE.to_string(),
+                CoordBaseSource::DevLocalhostFallback
+            )
+        );
     }
 
     /// An unreadable settings.json reports ISOLATED with the

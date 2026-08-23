@@ -694,90 +694,11 @@ impl TerminalSession {
         };
         cmd.cwd(&cwd);
 
-        // Remove CLAUDECODE env var so Claude CLI works inside the terminal
-        cmd.env_remove("CLAUDECODE");
-        // Same reason, same class of marker: CLAUDE_CODE_CHILD_SESSION says
-        // "you are a nested session". A PTY tab is a TOP-LEVEL session, but the
-        // runner inherits the marker from whatever launched it (typically the
-        // supervisor, which inherits it from a Claude Code session) and would
-        // otherwise pass it to every `claude` typed into a pane. Defense in
-        // depth — the supervisor strips it at the runner spawn, this covers a
-        // runner started by any other means.
-        cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
-
-        // Set TERM for proper color/capability support.
-        // xterm.js is a full xterm-compatible terminal, so use xterm-256color on all
-        // platforms. The previous "cygwin" setting on Windows caused issues with tools
-        // like Claude Code that check TERM for capability detection.
-        cmd.env("TERM", "xterm-256color");
-
-        // Mark this terminal as running inside the Qontinui Runner so that tools
-        // (e.g. Claude Code via the shell integration wrapper) can detect the context.
-        cmd.env("QONTINUI_RUNNER_TERMINAL", "1");
-        let runner_api_port = crate::mcp::types::get_mcp_api_port();
-        cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
-
-        // Forward the continuation-verdict mode to the bundled `Stop` hook so it
-        // can skip its `curl` + `python` round trip while the feature is dark.
-        //
-        // `claude_stop_hook.sh` USED to fire on every assistant turn of every
-        // session in this terminal, and with the flag at its `off` default the
-        // endpoint "answers `allow` with zero coord traffic" — so those spawns
-        // bought nothing. Measured 1.0-3.4s per turn on this fleet
-        // (Windows/MSYS process creation is 0.5-2.3s per spawn).
-        //
-        // The hook is now gated at REGISTRATION time (`session::claude_hook`):
-        // in the default dark posture the delivered `--settings` file carries no
-        // `hooks.Stop` key at all, so the per-turn `bash` spawn does not happen
-        // in the first place. This forward is therefore belt-and-braces — it
-        // still covers a HAND-STARTED `claude` that picks up a settings file
-        // written by a previously-ARMED runner, where the script's own dark-mode
-        // short-circuit is the only thing standing between the turn and a `curl`.
-        //
-        // Forward the PARSED mode, not the raw env string: `Mode::from_flag` maps
-        // an unknown value to `Off`, so the hook receives the same fail-safe
-        // value the runner itself resolved rather than re-parsing it in bash.
-        //
-        // Freshness, stated rather than hidden: a terminal started before the
-        // operator flips the flag keeps the value it was spawned with. That is
-        // NOT a regression — `Mode::from_env()` reads the RUNNER's own process
-        // env, which itself only changes on a runner restart, so the PTY value is
-        // exactly as fresh as the runner's has ever been.
-        //
-        // Plan: 2026-08-06-stop-hook-per-turn-latency (P3).
-        cmd.env(
-            crate::mcp::continuation_verdict::FLAG_ENV,
-            crate::mcp::continuation_verdict::Mode::from_env().as_str(),
-        );
-        // Canonical runner-context briefing (pull-first autonomy protocol +
-        // links), rendered from the SINGLE source of truth. The shell
-        // integration wrapper reads this env var and passes it to
-        // `--append-system-prompt` for interactive `claude` panes. Autonomous
-        // direct-exec spawns bypass shell integration and inject the same text
-        // into their argv instead (see
-        // `agent_runtime::build_continuation_claude_command`). Purely additive
-        // and fail-open: an empty/unset value simply means no briefing.
-        cmd.env(
-            "QONTINUI_RUNNER_CONTEXT",
-            crate::terminal::runner_context(runner_api_port),
-        );
-
-        // P7 — non-interactive GitHub credential posture (plan Phase 6). Stops a
-        // git op run from this terminal (ANY cwd, incl. the non-repo umbrella
-        // root or an unregistered repo) from reaching Git Credential Manager's
-        // blocking GUI popup FOR GITHUB: github.com is made GCM-non-interactive
-        // and falls back to the user's `gh` auth. Scope is GithubOnly — this is
-        // an interactive human terminal, so other hosts (gitlab/azure/bitbucket)
-        // keep their normal interactive auth. Set BEFORE `extra_env` below so a
-        // caller may override, and BEFORE the per-session `--local` coord helper
-        // (installed elsewhere) which — read earlier in git's config precedence —
-        // still wins for coord-registered repos. See
-        // `credential_helper::non_interactive_git_env` for the precedence rationale.
-        for (k, v) in crate::credential_helper::non_interactive_git_env(
-            crate::credential_helper::GitCredentialScope::GithubOnly,
-        ) {
-            cmd.env(k, v);
-        }
+        // The terminal-invariant half of the child env: markers, TERM, the
+        // runner port + briefing, and the non-interactive git posture. Extracted
+        // so `config_report`'s G3 generation can CALL it instead of restating
+        // what it does — the same reason `finalize_child_env` below is extracted.
+        Self::apply_base_child_env(&mut cmd);
 
         // Phase 2c — caller-supplied launch env (e.g.
         // `QONTINUI_SESSION_WORKTREES`, the agent-agnostic pointer to every
@@ -814,7 +735,9 @@ impl TerminalSession {
                 tracing::debug_span!("terminal_spawn.resolve_config_dir", terminal_id = %id)
                     .entered();
             let ai_settings = crate::settings::get_ai_settings();
-            crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli)
+            let (dir, _config_dir_source) =
+                crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
+            dir
         });
 
         // ---- ALWAYS-ON session-restore identity seam (plan §3b) -------------
@@ -1433,11 +1356,127 @@ impl TerminalSession {
         })
     }
 
+    /// The terminal-INVARIANT half of the PTY child's environment: the nested-
+    /// session markers this seam strips, `TERM`, the runner-context markers and
+    /// port, the continuation-verdict forward, the runner briefing, and the
+    /// non-interactive GitHub credential posture.
+    ///
+    /// Runs FIRST, before the caller-supplied `extra_env`, so a caller can
+    /// intentionally override any of it; the credential scrub in
+    /// [`Self::finalize_child_env`] runs LAST and cannot be overridden.
+    ///
+    /// # Why it is a function
+    ///
+    /// Exactly [`Self::finalize_child_env`]'s argument, plus one more.
+    /// `spawn` opens a real PTY and cannot run in a unit test, so anything
+    /// inlined there is untested by construction. And `config_report`'s G3
+    /// generation ("what a PTY child spawned RIGHT NOW inherits") has to be able
+    /// to CALL this seam rather than restate it: a G3 built from
+    /// `new_default_prog()` + `finalize_child_env` alone omitted `TERM`,
+    /// `QONTINUI_RUNNER_TERMINAL`, `QONTINUI_RUNNER_API_PORT`, the briefing, the
+    /// git posture and both marker strips — so the G1→G3 divergence, whose
+    /// heading reads *"anything listed above is a variable the runner process
+    /// itself does NOT hold the current value of"*, silently under-reported.
+    ///
+    /// Every value here is a pure function of the runner's own process state
+    /// (env reads and `terminal::runner_context`, whose contract forbids I/O),
+    /// which is what makes it safe for a diagnostic to call. The parts of the
+    /// spawn seam that are NOT — the identity-shim and install-interception
+    /// materializers, the coord-mcp provisioning, the lifecycle record — stay in
+    /// [`Self::apply_identity_seam`] / [`Self::apply_install_intercept_env`],
+    /// and G3 names them as excluded rather than pretending they are not there.
+    pub(crate) fn apply_base_child_env(cmd: &mut CommandBuilder) {
+        // Remove CLAUDECODE env var so Claude CLI works inside the terminal
+        cmd.env_remove("CLAUDECODE");
+        // Same reason, same class of marker: CLAUDE_CODE_CHILD_SESSION says
+        // "you are a nested session". A PTY tab is a TOP-LEVEL session, but the
+        // runner inherits the marker from whatever launched it (typically the
+        // supervisor, which inherits it from a Claude Code session) and would
+        // otherwise pass it to every `claude` typed into a pane. Defense in
+        // depth — the supervisor strips it at the runner spawn, this covers a
+        // runner started by any other means.
+        cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+
+        // Set TERM for proper color/capability support.
+        // xterm.js is a full xterm-compatible terminal, so use xterm-256color on all
+        // platforms. The previous "cygwin" setting on Windows caused issues with tools
+        // like Claude Code that check TERM for capability detection.
+        cmd.env("TERM", "xterm-256color");
+
+        // Mark this terminal as running inside the Qontinui Runner so that tools
+        // (e.g. Claude Code via the shell integration wrapper) can detect the context.
+        cmd.env("QONTINUI_RUNNER_TERMINAL", "1");
+        let runner_api_port = crate::mcp::types::get_mcp_api_port();
+        cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
+
+        // Forward the continuation-verdict mode to the bundled `Stop` hook so it
+        // can skip its `curl` + `python` round trip while the feature is dark.
+        //
+        // `claude_stop_hook.sh` USED to fire on every assistant turn of every
+        // session in this terminal, and with the flag at its `off` default the
+        // endpoint "answers `allow` with zero coord traffic" — so those spawns
+        // bought nothing. Measured 1.0-3.4s per turn on this fleet
+        // (Windows/MSYS process creation is 0.5-2.3s per spawn).
+        //
+        // The hook is now gated at REGISTRATION time (`session::claude_hook`):
+        // in the default dark posture the delivered `--settings` file carries no
+        // `hooks.Stop` key at all, so the per-turn `bash` spawn does not happen
+        // in the first place. This forward is therefore belt-and-braces — it
+        // still covers a HAND-STARTED `claude` that picks up a settings file
+        // written by a previously-ARMED runner, where the script's own dark-mode
+        // short-circuit is the only thing standing between the turn and a `curl`.
+        //
+        // Forward the PARSED mode, not the raw env string: `Mode::from_flag` maps
+        // an unknown value to `Off`, so the hook receives the same fail-safe
+        // value the runner itself resolved rather than re-parsing it in bash.
+        //
+        // Freshness, stated rather than hidden: a terminal started before the
+        // operator flips the flag keeps the value it was spawned with. That is
+        // NOT a regression — `Mode::from_env()` reads the RUNNER's own process
+        // env, which itself only changes on a runner restart, so the PTY value is
+        // exactly as fresh as the runner's has ever been.
+        //
+        // Plan: 2026-08-06-stop-hook-per-turn-latency (P3).
+        cmd.env(
+            crate::mcp::continuation_verdict::FLAG_ENV,
+            crate::mcp::continuation_verdict::Mode::from_env().as_str(),
+        );
+        // Canonical runner-context briefing (pull-first autonomy protocol +
+        // links), rendered from the SINGLE source of truth. The shell
+        // integration wrapper reads this env var and passes it to
+        // `--append-system-prompt` for interactive `claude` panes. Autonomous
+        // direct-exec spawns bypass shell integration and inject the same text
+        // into their argv instead (see
+        // `agent_runtime::build_continuation_claude_command`). Purely additive
+        // and fail-open: an empty/unset value simply means no briefing.
+        cmd.env(
+            "QONTINUI_RUNNER_CONTEXT",
+            crate::terminal::runner_context(runner_api_port),
+        );
+
+        // P7 — non-interactive GitHub credential posture (plan Phase 6). Stops a
+        // git op run from this terminal (ANY cwd, incl. the non-repo umbrella
+        // root or an unregistered repo) from reaching Git Credential Manager's
+        // blocking GUI popup FOR GITHUB: github.com is made GCM-non-interactive
+        // and falls back to the user's `gh` auth. Scope is GithubOnly — this is
+        // an interactive human terminal, so other hosts (gitlab/azure/bitbucket)
+        // keep their normal interactive auth. Set BEFORE `extra_env` below so a
+        // caller may override, and BEFORE the per-session `--local` coord helper
+        // (installed elsewhere) which — read earlier in git's config precedence —
+        // still wins for coord-registered repos. See
+        // `credential_helper::non_interactive_git_env` for the precedence rationale.
+        for (k, v) in crate::credential_helper::non_interactive_git_env(
+            crate::credential_helper::GitCredentialScope::GithubOnly,
+        ) {
+            cmd.env(k, v);
+        }
+    }
+
     /// The final env mutations applied to a PTY child before it is spawned:
     /// the resolved-account pin, then the credential-value scrub.
     ///
     /// **Why the scrub is last.** Same class as the `CLAUDECODE` /
-    /// `CLAUDE_CHILD_SESSION_ENV` strips earlier in [`Self::spawn`], but for
+    /// `CLAUDE_CHILD_SESSION_ENV` strips in [`Self::apply_base_child_env`], but for
     /// credential VALUES: the runner inherits plaintext passwords (Windows
     /// USER-scope vars; the supervisor's forwarded auto-login password) and
     /// would otherwise hand them to every `claude` typed into a pane, where an
@@ -1460,7 +1499,7 @@ impl TerminalSession {
     /// respawns). That pin is a deliberate per-session account choice and must
     /// not be clobbered by the process-global resolved dir, which may point at a
     /// different (or freshly-exhausted) account.
-    fn finalize_child_env(
+    pub(crate) fn finalize_child_env(
         cmd: &mut CommandBuilder,
         effective_claude_config_dir: Option<&str>,
         caller_pinned_config_dir: bool,
@@ -1587,6 +1626,36 @@ impl TerminalSession {
         cmd.env_remove("Path");
         cmd.env_remove("path");
         cmd.env(Self::PATH_ENV_KEY, value);
+    }
+
+    /// Install `identity_dir` at the head of the child's path and tell the shim
+    /// its own dir, under the single canonical key (see [`Self::set_child_path`]).
+    ///
+    /// The `identity_dir` is supplied rather than resolved here because the two
+    /// callers get it differently and only one of them may write:
+    /// [`Self::apply_identity_seam`] passes the dir
+    /// `shim_materializer::materialize_identity` just brought into existence,
+    /// and `config_report`'s G3 passes
+    /// `shim_materializer::identity_dir_if_materialized`'s pure `stat`. The
+    /// env mutation is one definition either way, so the report cannot carry a
+    /// drifting second copy of what the PATH seam does — which matters more
+    /// here than anywhere else in the seam, since `PATH` is the variable that
+    /// decides which binary a child resolves.
+    pub(crate) fn apply_identity_path_shim(
+        cmd: &mut CommandBuilder,
+        identity_dir: &std::path::Path,
+    ) {
+        use crate::install_effects_producer::intercept::shim_materializer;
+
+        let current_path = std::env::var("PATH").ok();
+        let new_path = shim_materializer::prepend_path(identity_dir, current_path.as_deref());
+        Self::set_child_path(cmd, &new_path);
+        // The identity shim reads this to skip its own dir in the
+        // real-tool scan (reusing the install shim's env contract).
+        cmd.env(
+            "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR",
+            identity_dir.to_string_lossy().as_ref(),
+        );
     }
 
     /// Extract the explicit session id a built PTY child command's argv NAMES,
@@ -1944,16 +2013,7 @@ impl TerminalSession {
         drop(shim_span);
         match identity {
             Some(identity_dir) => {
-                let current_path = std::env::var("PATH").ok();
-                let new_path =
-                    shim_materializer::prepend_path(&identity_dir, current_path.as_deref());
-                Self::set_child_path(cmd, &new_path);
-                // The identity shim reads this to skip its own dir in the
-                // real-tool scan (reusing the install shim's env contract).
-                cmd.env(
-                    "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR",
-                    identity_dir.to_string_lossy().as_ref(),
-                );
+                Self::apply_identity_path_shim(cmd, &identity_dir);
                 info!(
                     terminal_id = %terminal_id,
                     identity_dir = %identity_dir.display(),

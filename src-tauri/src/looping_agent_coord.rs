@@ -130,7 +130,7 @@ pub async fn desired_state_rules() -> Option<Vec<CoordDesiredState>> {
 
 /// One `GET /coord/agent-desired-state`.
 async fn fetch_desired_state() -> Result<Vec<CoordDesiredState>, String> {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let url = format!("{base}/coord/agent-desired-state");
     let client = http_client()?;
 
@@ -222,7 +222,7 @@ pub async fn acquire_slot(
     agent_id: &str,
     claude_session_id: Option<&str>,
 ) -> AcquireOutcome {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => return AcquireOutcome::Unavailable(e),
@@ -266,7 +266,7 @@ pub async fn heartbeat_slot(
     agent_id: &str,
     claude_session_id: Option<&str>,
 ) -> HeartbeatOutcome {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => return HeartbeatOutcome::Unavailable(e),
@@ -298,7 +298,7 @@ pub async fn heartbeat_slot(
 /// stop so a peer can fill it without waiting out the TTL. A failure is
 /// harmless: the TTL is the backstop.
 pub async fn release_slot(resource_key: &str, machine_id: &uuid::Uuid, agent_id: &str) {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let Ok(client) = http_client() else {
         return;
     };
@@ -327,7 +327,7 @@ pub async fn release_slot(resource_key: &str, machine_id: &uuid::Uuid, agent_id:
 /// into the bundled fallback. A shepherd must always spawn with real
 /// instructions, even offline.
 pub async fn fetch_playbook(name: &str) -> Option<String> {
-    let base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let client = http_client().ok()?;
     let url = format!("{base}/coord/agent-playbook/{name}");
 

@@ -78,7 +78,30 @@ pub mod claude_env;
 // modules (which compile into the runner binary too), so the bin and the
 // command produce an identical report.
 pub mod coord_doctor;
+
+// `config report` — the effective configuration by layer, with per-value
+// provenance (plan 2026-08-20-effective-config-provenance-and-env-generation).
+// In the lib for the SAME reason as `coord_doctor`: the standalone
+// `config_report` bin and the in-app Tauri command share one layer table, one
+// driver and one formatter. Ten of the fifteen layers live in BIN-only modules,
+// so their readings are injected as data via `ConfigReportInputs` — the
+// `DoctorInputs` pattern — and the headless bin honestly reports them as
+// `Unknown` rather than omitting the rows.
+pub mod config_report;
 pub mod coord_mcp_config;
+
+// Env GENERATIONS — the Phase 3 half of the same plan. The runner's process
+// env, the once-in-`main()` launch snapshot and the env a PTY child actually
+// receives are three different ages of the same variable (on Windows the PTY
+// one is genuinely FRESHER: `portable-pty` re-reads the HKCU/HKLM `Environment`
+// registry keys over the process env), which is why an operator's flag flip is
+// three restarts deep. This module models those generations, diffs them, and —
+// the security-critical part — withholds credential-classed values at the MODEL
+// layer, so a value that must not be printed never reaches a renderer at all.
+// In the lib for the same reason as `config_report`: shared types + one
+// byte-stable formatter; the CAPTURE of each generation is bin-side, since
+// `launch_env` and `terminal` are BIN-only modules.
+pub mod env_generations;
 
 // Tier-0 "Looping Agent" pure core (plan `merge-shepherd-fixer-PLAN.md`
 // Phase 1): registry types + JSON store, rendered-grid idle/context-low
