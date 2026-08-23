@@ -19,6 +19,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { writeClipboard } from "@/lib/clipboard";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
+import { attachBridgeInputRegistration } from "./bridgeInputRegistration";
 import {
   buildWriteFailure,
   throwIfWriteFailed,
@@ -242,6 +243,21 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
     ref,
   ) {
     const uiBridge = useUIBridgeOptional();
+    /**
+     * Live mirror of the bridge context for the mount effect.
+     *
+     * That effect deliberately does not list `uiBridge` in its deps (it is
+     * stable context), so anything it captures is frozen at mount — including
+     * a `registry` that was still `null` at that instant. The bridge-element
+     * retry loop must read the CURRENT value on every attempt, or it would
+     * poll a stale null forever and defeat its own purpose. Updated in an
+     * effect declared ABOVE the mount effect, so it is already current the
+     * first time the loop runs.
+     */
+    const uiBridgeRef = useRef(uiBridge);
+    useEffect(() => {
+      uiBridgeRef.current = uiBridge;
+    }, [uiBridge]);
     // Resolve backend type: explicit prop > instanceStorage > "xterm"
     const backendType: BackendType =
       backendTypeProp ??
@@ -1286,85 +1302,6 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         };
         container.addEventListener("contextmenu", contextMenuCopyPaste);
 
-        // Register terminal input with UI Bridge for external automation.
-        const bridgeRegistry = uiBridge?.registry;
-        if (bridgeRegistry && inputEl) {
-          const termId = terminalId; // capture for closures
-          bridgeRegistry.registerElement(`terminal-input-${termId}`, inputEl, {
-            type: "textarea",
-            label: `Terminal input (${termId.slice(0, 8)})`,
-            actions: ["focus", "blur"],
-            customActions: {
-              sendKeys: {
-                id: "sendKeys",
-                description:
-                  "Send key sequences to the terminal. Fails with TERMINAL_EXITED " +
-                  "when the pane's process is gone.",
-                handler: async (params?: unknown) => {
-                  const { keys } = (params || {}) as { keys?: string };
-                  if (!keys) throw new Error("sendKeys: 'keys' is required");
-                  return throwIfWriteFailed(await writePtyRef.current(keys));
-                },
-              },
-              writeToTerminal: {
-                id: "writeToTerminal",
-                description:
-                  "Write text directly to the PTY (no keyboard events). Fails with " +
-                  "TERMINAL_EXITED when the pane's process is gone.",
-                handler: async (params?: unknown) => {
-                  const { text } = (params || {}) as { text?: string };
-                  if (!text) throw new Error("writeToTerminal: 'text' is required");
-                  return throwIfWriteFailed(await writePtyRef.current(text));
-                },
-              },
-              paste: {
-                id: "paste",
-                description: "Read clipboard and write to PTY (same as Ctrl+V)",
-                handler: async () => {
-                  const text = await navigator.clipboard.readText().catch(() => "");
-                  if (!text) return { success: true, bytes: 0 };
-                  // Same bracketed-paste + newline normalization as the
-                  // Ctrl+V path (see `preparePaste.ts`).
-                  const prepared = preparePasteData(text, backend.bracketedPasteMode);
-                  return throwIfWriteFailed(await writePtyRef.current(prepared));
-                },
-              },
-              pasteText: {
-                id: "pasteText",
-                description:
-                  "Paste literal text through the Ctrl+V path (bracketed-paste aware); no clipboard/keyboard. For automated tests.",
-                handler: async (params?: unknown) => {
-                  const { text } = (params || {}) as { text?: string };
-                  if (!text) throw new Error("pasteText: 'text' is required");
-                  const b = backendRef.current;
-                  const prepared = preparePasteData(text, b?.bracketedPasteMode ?? false);
-                  // Same envelope as sendKeys / writeToTerminal: this is an
-                  // automation surface, so a write that reached no process must
-                  // not answer `success: true`.
-                  return throwIfWriteFailed(await writePtyRef.current(prepared));
-                },
-              },
-              getScrollback: {
-                id: "getScrollback",
-                description: "Read the terminal scrollback buffer as plain text",
-                handler: (params?: unknown) => {
-                  const { maxLines = 500 } = (params || {}) as { maxLines?: number };
-                  const b = backendRef.current;
-                  if (!b) return "";
-                  const totalLines = b.getBufferLength();
-                  const startLine = Math.max(0, totalLines - maxLines);
-                  const lines: string[] = [];
-                  for (let i = startLine; i < totalLines; i++) {
-                    const line = b.getBufferLine(i);
-                    if (line) lines.push(line);
-                  }
-                  return lines.join("\n");
-                },
-              },
-            },
-          });
-        }
-
         // Forward user input to PTY + track first input line for auto-naming
         // + emit every non-empty line to `onUserInputLine` for mid-session
         // probes. The accumulator logic lives in the pure `consumeInputChunk`
@@ -1629,7 +1566,16 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             }
           }),
         );
-      })();
+      })().catch((err) => {
+        // The init IIFE used to be fire-and-forget. Anything it threw —
+        // `createTerminalBackend` rejecting on WASM/WebGL, a link-provider or
+        // key-handler wiring failure — vanished into an unhandled rejection,
+        // leaving a half-built pane and no log line. The UI Bridge
+        // registration no longer rides inside this path (see
+        // `./bridgeInputRegistration.ts`), but the pane is still degraded and
+        // that must be visible.
+        console.error(`[Terminal ${terminalId}] backend initialization failed:`, err);
+      });
 
       // Cleanup
       return () => {
@@ -1653,7 +1599,6 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         if (inputEl && blockNativePaste) {
           inputEl.removeEventListener("paste", blockNativePaste, true);
         }
-        uiBridge?.registry?.unregisterElement(`terminal-input-${terminalId}`);
         outputUnsub?.();
         exitUnsub?.();
         // Hand consumption over to the per-page tap: this pane's render-acks
@@ -1672,8 +1617,129 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         }
         backendRef.current = null;
       };
-      // eslint-disable-next-line react-hooks/exhaustive-deps -- uiBridge is stable context
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-once effect; the bridge is read through `uiBridgeRef`, refreshed by its own effect above
     }, [terminalId, backendType, fitTerminal]);
+
+    /**
+     * UI Bridge input registration — its OWN effect, deliberately not part of
+     * the backend-init IIFE above.
+     *
+     * Iteration 12 gave the registration a retry ladder but left it buried in
+     * that IIFE, i.e. on the terminal *creation* path. Three exits in that path
+     * skip everything after them — the `if (disposed) return` right after
+     * `await createTerminalBackend(...)`, a rejection from
+     * `createTerminalBackend` itself, and any throw in the wiring in between —
+     * and the IIFE had no `.catch`, so all three were silent. The ladder was
+     * never *called*, so it could not warn either. Restored panes lose exactly
+     * those races: on a page reload every pane builds its backend at once into
+     * a layout that is still settling, which is why 0 of 3 rehydrated panes were
+     * registered while fresh spawns looked fine.
+     *
+     * Running from a separate mount effect decouples the two: this fires on
+     * EVERY mount, fresh or rehydrated, and polls `backendRef` for the input
+     * element rather than being handed one by the init path. Cleanup is
+     * instance-keyed (see `./bridgeInputRegistration.ts`) so a stale unmount
+     * can't evict the element a live instance just registered.
+     */
+    useEffect(() => {
+      const termId = terminalId; // capture for closures
+      return attachBridgeInputRegistration({
+        elementId: `terminal-input-${termId}`,
+        // Read CURRENT values every attempt: the registry is context state a
+        // fast-mounting pane can beat, and the xterm helper textarea is
+        // renderer-created (a Ghostty backend attaches `term.textarea` later
+        // still). A null captured at mount was the original defect.
+        getRegistry: () => uiBridgeRef.current?.registry,
+        getInputElement: () => backendRef.current?.getInputElement(),
+        buildDescriptor: () => ({
+          type: "textarea",
+          label: `Terminal input (${termId.slice(0, 8)})`,
+          actions: ["focus", "blur"],
+          customActions: {
+            sendKeys: {
+              id: "sendKeys",
+              description:
+                "Send key sequences to the terminal. Fails with TERMINAL_EXITED " +
+                "when the pane's process is gone.",
+              handler: async (params?: unknown) => {
+                const { keys } = (params || {}) as { keys?: string };
+                if (!keys) throw new Error("sendKeys: 'keys' is required");
+                return throwIfWriteFailed(await writePtyRef.current(keys));
+              },
+            },
+            writeToTerminal: {
+              id: "writeToTerminal",
+              description:
+                "Write text directly to the PTY (no keyboard events). Fails with " +
+                "TERMINAL_EXITED when the pane's process is gone.",
+              handler: async (params?: unknown) => {
+                const { text } = (params || {}) as { text?: string };
+                if (!text) throw new Error("writeToTerminal: 'text' is required");
+                return throwIfWriteFailed(await writePtyRef.current(text));
+              },
+            },
+            paste: {
+              id: "paste",
+              description: "Read clipboard and write to PTY (same as Ctrl+V)",
+              handler: async () => {
+                const text = await navigator.clipboard.readText().catch(() => "");
+                if (!text) return { success: true, bytes: 0 };
+                // Same bracketed-paste + newline normalization as the Ctrl+V
+                // path (see `preparePaste.ts`).
+                const prepared = preparePasteData(
+                  text,
+                  backendRef.current?.bracketedPasteMode ?? false,
+                );
+                return throwIfWriteFailed(await writePtyRef.current(prepared));
+              },
+            },
+            pasteText: {
+              id: "pasteText",
+              description:
+                "Paste literal text through the Ctrl+V path (bracketed-paste aware); no clipboard/keyboard. For automated tests.",
+              handler: async (params?: unknown) => {
+                const { text } = (params || {}) as { text?: string };
+                if (!text) throw new Error("pasteText: 'text' is required");
+                const b = backendRef.current;
+                const prepared = preparePasteData(text, b?.bracketedPasteMode ?? false);
+                // Same envelope as sendKeys / writeToTerminal: this is an
+                // automation surface, so a write that reached no process must
+                // not answer `success: true`.
+                return throwIfWriteFailed(await writePtyRef.current(prepared));
+              },
+            },
+            getScrollback: {
+              id: "getScrollback",
+              description: "Read the terminal scrollback buffer as plain text",
+              handler: (params?: unknown) => {
+                const { maxLines = 500 } = (params || {}) as { maxLines?: number };
+                const b = backendRef.current;
+                if (!b) return "";
+                const totalLines = b.getBufferLength();
+                const startLine = Math.max(0, totalLines - maxLines);
+                const lines: string[] = [];
+                for (let i = startLine; i < totalLines; i++) {
+                  const line = b.getBufferLine(i);
+                  if (line) lines.push(line);
+                }
+                return lines.join("\n");
+              },
+            },
+          },
+        }),
+        onGiveUp: (elapsedMs, lastError) => {
+          // Loud, not silent: a pane with no registered element is invisible
+          // to every terminal custom action, and the whole point of this item
+          // is that the failure left no trace.
+          console.error(
+            `[Terminal ${termId}] UI Bridge registration never landed after ${elapsedMs}ms — ` +
+              `terminal-input-${termId} is NOT registered; custom actions on this pane will ` +
+              `answer ELEMENT_NOT_FOUND`,
+            lastError ?? "(no error thrown; the input element or the registry never appeared)",
+          );
+        },
+      });
+    }, [terminalId]);
 
     /**
      * Drive the visibility tier (Phase 2 / A4). Hidden ⇒ the pane stops its

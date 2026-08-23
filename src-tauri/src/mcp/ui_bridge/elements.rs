@@ -679,6 +679,31 @@ pub(crate) fn validate_action_name(raw: &str) -> Result<&str, UiBridgeError> {
     Err(UiBridgeError::invalid_action(raw, SUPPORTED_ACTION_NAMES))
 }
 
+/// True when a `get_element` IPC reply is the frontend's "there is no such
+/// element" shape rather than a real element.
+///
+/// The frontend's `get_element` handler answers a miss with a SUCCESSFUL IPC
+/// carrying `{ success: false, error: "" }` (or a "not found" / "no element"
+/// prose) — it does NOT fail the transport. So a caller that only matches on
+/// `Err(_)` sees a miss as "probe worked, element has no metadata", which is
+/// exactly how a typoed element id used to walk past both action gates, get
+/// dispatched to IPC, and come back re-coded `ACTION_FAILED`.
+///
+/// This is the same predicate `ui_bridge_get_element_handler` already applies
+/// before `wrap_ipc_result`, lifted out so `execute_action` resolves the
+/// element with identical semantics instead of a second, divergent copy.
+pub(crate) fn is_element_miss_reply(data: &serde_json::Value) -> bool {
+    if data.get("success").and_then(|v| v.as_bool()) != Some(false) {
+        return false;
+    }
+    let error_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    let lower = error_msg.to_lowercase();
+    error_msg.is_empty()
+        || lower.contains("not found")
+        || lower.contains("no element")
+        || lower.contains("never registered or discovered")
+}
+
 /// Extract the element's advertised `actions` list from a `get_element` IPC
 /// payload. The frontend snapshots elements with an `actions` array whose
 /// entries are either plain strings (action names) or objects with a `name` /
@@ -1172,6 +1197,102 @@ pub async fn ui_bridge_execute_action_handler(
         }
     }
 
+    // ── Resolve the ELEMENT before validating the ACTION ────────────────
+    //
+    // Order matters, and it used to be wrong. Both action gates below (the
+    // deferred unknown-action gate and the pre-IPC `ACTION_NOT_SUPPORTED`
+    // gate) key off the element's advertised action list, which is fetched by
+    // a `get_element` probe. A MISSING element makes that probe come back
+    // "no metadata", which both gates read permissively — so a request naming
+    // a bogus id plus a custom action (`writeToTerminal`) sailed past them,
+    // got dispatched to IPC, failed there for the obvious reason, and was
+    // re-coded `ACTION_FAILED` by the post-dispatch branch. The caller was
+    // told its ACTION failed when in truth its ELEMENT does not exist — the
+    // one fact that would have let it self-correct.
+    //
+    // A miss is now settled here, first, with the same `ELEMENT_NOT_FOUND`
+    // 404 that `GET /control/element/<id>` returns for the same id. Note the
+    // asymmetry that caused the bug: the frontend answers a miss with a
+    // SUCCESSFUL IPC carrying `{success:false, error:""}`, so `Err(_)` never
+    // fired for it (see `is_element_miss_reply`).
+    //
+    // Settling it here must not DELETE the two recoveries the post-dispatch
+    // path already had for a stale id, so this mirrors them rather than
+    // pre-empting them:
+    //
+    //   1. a first miss triggers the same `discover` refresh + re-probe the
+    //      stale-registry retry does (a React unmount/remount leaves an entry
+    //      that a discover repairs), and
+    //   2. a caller carrying `X-UI-Bridge-Stable-Ref` is never 404'd here —
+    //      `resolve_stable_ref` downstream can still map it onto the element's
+    //      new id, and refusing before that would turn a recoverable request
+    //      into a hard failure.
+    //
+    // A probe that genuinely FAILS (transport error) yields `None` and falls
+    // through permissively — we never manufacture a rejection out of a failed
+    // probe, matching `is_action_advertised`'s `None` semantics. The surviving
+    // reply is reused by both consumers below, so the common path costs one
+    // FEWER IPC round-trip than the two probes it replaces.
+    let probe_payload =
+        super::request::target_window_payload(serde_json::json!({ "elementId": id }), window_label);
+    let element_probe: Option<serde_json::Value> = {
+        let first = ui_bridge_request_sync(&state, "get_element", probe_payload.clone()).await;
+        match first {
+            Ok(data) if !is_element_miss_reply(&data) => Some(data),
+            Ok(_) => {
+                warn!(
+                    "execute_action: element {} missing on first probe — refreshing the registry \
+                     via discover before deciding",
+                    id
+                );
+                let _ = ui_bridge_request_sync(
+                    &state,
+                    "discover",
+                    super::request::target_window_payload(
+                        serde_json::json!({ "options": { "interactiveOnly": false } }),
+                        window_label,
+                    ),
+                )
+                .await;
+                match ui_bridge_request_sync(&state, "get_element", probe_payload.clone()).await {
+                    Ok(data) if !is_element_miss_reply(&data) => Some(data),
+                    _ if headers.contains_key("X-UI-Bridge-Stable-Ref") => {
+                        // Still missing, but the caller gave us something the
+                        // stable-ref fallback can resolve. Leave that path its
+                        // chance instead of answering 404 now.
+                        warn!(
+                            "execute_action: element {} still missing after discover; deferring to \
+                             the stable-ref fallback",
+                            id
+                        );
+                        None
+                    }
+                    _ => {
+                        warn!(
+                            "execute_action: element {} is not in the registry — returning \
+                             ELEMENT_NOT_FOUND before the action-name gates",
+                            id
+                        );
+                        let detail = UiBridgeError::element_not_found_by_id(&id);
+                        let message = detail.message.clone();
+                        return Err((
+                            StatusCode::NOT_FOUND,
+                            Json(api_error_detailed(message, detail)),
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "execute_action: get_element probe for {} failed ({}); continuing without \
+                     element metadata rather than inventing a rejection",
+                    id, e
+                );
+                None
+            }
+        }
+    };
+
     // ── Invalid-action gate (built-in vs. custom) ──────────────────────
     // Reject genuinely unknown action names BEFORE the registry lookup, the
     // stale-registry retry, and the Phase 5 RecoveryExecutor. Without this
@@ -1245,17 +1366,8 @@ pub async fn ui_bridge_execute_action_handler(
     ) {
         // Check if target is an input-like element (clicks on inputs just
         // focus; the "change" signal would be misleading).
-        let is_input = match ui_bridge_request_sync(
-            &state,
-            "get_element",
-            super::request::target_window_payload(
-                serde_json::json!({ "elementId": id }),
-                window_label,
-            ),
-        )
-        .await
-        {
-            Ok(data) => {
+        let is_input = match element_probe.as_ref() {
+            Some(data) => {
                 let tag = data
                     .get("element_type")
                     .or_else(|| data.get("tagName"))
@@ -1263,7 +1375,7 @@ pub async fn ui_bridge_execute_action_handler(
                     .unwrap_or("");
                 matches!(tag.to_uppercase().as_str(), "INPUT" | "TEXTAREA" | "SELECT")
             }
-            Err(_) => false, // can't tell — default to enabling detector
+            None => false, // probe failed — can't tell; default to enabling detector
         };
         if is_input {
             None
@@ -1356,14 +1468,8 @@ pub async fn ui_bridge_execute_action_handler(
     // of THIS element's custom actions, which drives the deferred
     // "Unknown action" rejection below for non-built-in names.
     let mut action_is_registered_custom = false;
-    let element_supported_actions: Option<Vec<String>> = match ui_bridge_request_sync(
-        &state,
-        "get_element",
-        super::request::target_window_payload(serde_json::json!({ "elementId": id }), window_label),
-    )
-    .await
-    {
-        Ok(elem_data) => {
+    let element_supported_actions: Option<Vec<String>> = match element_probe.as_ref() {
+        Some(elem_data) => {
             let is_disabled = {
                 let props = elem_data
                     .get("properties")
@@ -1422,13 +1528,13 @@ pub async fn ui_bridge_execute_action_handler(
             // names. `customActions` is the SDK's separate field; absent → no
             // custom actions on this element. Record whether the requested name
             // is one of them for the deferred unknown-action gate below.
-            let custom = extract_custom_actions(&elem_data);
+            let custom = extract_custom_actions(elem_data);
             if let Some(ref custom_names) = custom {
                 if custom_names.iter().any(|c| c == &action_name) {
                     action_is_registered_custom = true;
                 }
             }
-            match (extract_supported_actions(&elem_data), custom) {
+            match (extract_supported_actions(elem_data), custom) {
                 (Some(mut builtin), Some(custom_names)) => {
                     builtin.extend(custom_names);
                     Some(builtin)
@@ -1441,7 +1547,7 @@ pub async fn ui_bridge_execute_action_handler(
                 (None, None) => None,
             }
         }
-        Err(_) => None,
+        None => None,
     };
 
     // ── Deferred unknown-action gate ────────────────────────────────────
@@ -5317,6 +5423,106 @@ mod validate_action_name_tests {
         // and prevents downstream "no handler" silent failures.
         let err = validate_action_name("Click").expect_err("Click must not be accepted");
         assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
+    }
+}
+
+#[cfg(test)]
+mod element_resolution_tests {
+    //! A MISSING element and a FAILING action are different answers.
+    //!
+    //! `POST /control/element/{id}/action` resolves the element before it
+    //! validates the action name. `is_element_miss_reply` is the predicate
+    //! that decides which of the two a `get_element` reply is, and it has to
+    //! be right in BOTH directions:
+    //!
+    //! * a bogus id must answer `ELEMENT_NOT_FOUND` / 404 even when the
+    //!   action name is a custom one the runner cannot know about, and
+    //! * a real element whose action genuinely fails must NOT be relabelled
+    //!   as missing — a gate that answers `ELEMENT_NOT_FOUND` for everything
+    //!   is a different bug, not a fix.
+    //!
+    //! The trap the predicate exists for: the frontend reports a registry
+    //! miss through a SUCCESSFUL IPC (`{success:false, error:""}`), so
+    //! matching on the transport `Err(_)` never sees it.
+    use super::{api_error_detailed, is_element_miss_reply, UiBridgeError};
+    use serde_json::json;
+
+    #[test]
+    fn the_empty_error_miss_shape_is_recognised() {
+        // The exact reply the frontend's `get_element` handler sends for an
+        // id that was never registered: transport OK, `error` empty.
+        assert!(is_element_miss_reply(
+            &json!({ "success": false, "error": "" })
+        ));
+        assert!(is_element_miss_reply(&json!({ "success": false })));
+    }
+
+    #[test]
+    fn the_prose_miss_shapes_are_recognised() {
+        for prose in [
+            "Element not found",
+            "No element found matching criteria bogus",
+            "element bogus was never registered or discovered",
+        ] {
+            assert!(
+                is_element_miss_reply(&json!({ "success": false, "error": prose })),
+                "{prose:?} must read as a registry miss"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_element_reply_is_not_a_miss() {
+        // A live element carries no `success` field at all — it IS the data.
+        let elem = json!({
+            "id": "terminal-input-abc",
+            "element_type": "TEXTAREA",
+            "actions": ["focus", "blur"],
+            "customActions": ["writeToTerminal", "sendKeys"],
+        });
+        assert!(!is_element_miss_reply(&elem));
+    }
+
+    /// The discriminator that keeps this from becoming "always 404".
+    ///
+    /// A present element whose action failed for its own reason reports
+    /// `success:false` too — with a typed prose the caller needs. Reading
+    /// that as a registry miss would destroy `TERMINAL_EXITED` on the way to
+    /// the wire and send the caller hunting for an element that is right
+    /// there.
+    #[test]
+    fn a_genuine_action_failure_is_not_a_miss() {
+        for prose in [
+            "TERMINAL_EXITED: the pane's process is gone",
+            "clipboard read was denied",
+            "writeToTerminal: 'text' is required",
+        ] {
+            assert!(
+                !is_element_miss_reply(&json!({ "success": false, "error": prose })),
+                "{prose:?} is an action failure, not a missing element"
+            );
+        }
+    }
+
+    #[test]
+    fn the_miss_envelope_carries_the_canonical_code_and_id() {
+        let detail = UiBridgeError::element_not_found_by_id("bogus");
+        let message = detail.message.clone();
+        let body = api_error_detailed(message, detail);
+        let detail = body.error_detail.expect("error_detail must be populated");
+        assert_eq!(
+            serde_json::to_value(&detail.code).unwrap(),
+            json!("ELEMENT_NOT_FOUND")
+        );
+        assert_eq!(
+            detail
+                .context
+                .as_ref()
+                .and_then(|c| c.get("elementId"))
+                .and_then(|v| v.as_str()),
+            Some("bogus"),
+            "the rejected id must come back so the caller can self-correct"
+        );
     }
 }
 
