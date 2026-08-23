@@ -869,6 +869,112 @@ pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>
     }
 }
 
+/// True only for a recovery that actually did something and worked: a command
+/// was chosen AND the original action succeeded on the retry.
+///
+/// `recovered:true` with `command_chosen:None` is the shape the LLM fallback
+/// used to produce — it asserted a recovery while admitting no recovery step
+/// was selected. That is not a recovery, so the caller must see the ORIGINAL
+/// failure, not a synthesized verdict about it.
+pub(crate) fn recovery_is_genuine(recovery: &super::recovery_executor::RecoveryOutcome) -> bool {
+    recovery.recovered && recovery.command_chosen.is_some()
+}
+
+/// Alias for the `execute_action` handler's own return type — the value that
+/// travels from `wrap_ipc_result` through the retry/recovery ladder.
+type ActionResult =
+    Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>;
+
+/// Re-code a POST-DISPATCH failure as `ACTION_FAILED`, preserving the
+/// handler's own error text verbatim and attaching the recovery audit trail.
+///
+/// Why this exists: the action was dispatched, so "not supported" is already
+/// settled — the pre-IPC gate rejects unadvertised actions with the element's
+/// supported-action list. What arrives here is a genuine failure, and the
+/// typed body the handler returned (`TERMINAL_EXITED: …`, and its siblings) is
+/// the entire diagnosis. Relabelling it destroyed that.
+///
+/// Only the UNCLASSIFIED case is re-coded. `classify_transport_error` falls
+/// through to `INTERNAL_ERROR` for any message it doesn't recognise, which is
+/// wrong for a dispatched action that failed — the runner is fine, the action
+/// is not. A message that DID classify (element-not-found, not-visible,
+/// timeout, …) keeps its more specific code; this only ever adds information.
+///
+/// Transport-level failures (HTTP 500 / 503 — the frontend never answered)
+/// are left alone: those are not action outcomes at all.
+pub(crate) fn as_action_failure(
+    result: ActionResult,
+    action_name: &str,
+    element_id: &str,
+    recovery: serde_json::Value,
+) -> ActionResult {
+    let attach = |context: Option<serde_json::Value>| -> serde_json::Value {
+        let mut obj = match context {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        obj.entry("requested_action")
+            .or_insert_with(|| serde_json::Value::String(action_name.to_string()));
+        obj.entry("element_id")
+            .or_insert_with(|| serde_json::Value::String(element_id.to_string()));
+        obj.insert("recovery".to_string(), recovery.clone());
+        serde_json::Value::Object(obj)
+    };
+
+    match result {
+        Err((status, Json(mut body))) => {
+            if status == StatusCode::BAD_REQUEST {
+                let message = body
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("Action '{action_name}' failed"));
+                let detail = match body.error_detail.take() {
+                    // Unclassified — the classifier's fallthrough. A dispatched
+                    // action that failed is an ACTION failure, not an internal
+                    // runner error.
+                    Some(d) if matches!(d.code, super::types::UiBridgeErrorCode::InternalError) => {
+                        UiBridgeError {
+                            code: super::types::UiBridgeErrorCode::ActionFailed,
+                            message: d.message,
+                            recovery: Some(super::types::RecoveryHint::Resnapshot),
+                            context: Some(attach(d.context)),
+                        }
+                    }
+                    Some(mut d) => {
+                        d.context = Some(attach(d.context));
+                        d
+                    }
+                    None => UiBridgeError {
+                        code: super::types::UiBridgeErrorCode::ActionFailed,
+                        message: message.clone(),
+                        recovery: Some(super::types::RecoveryHint::Resnapshot),
+                        context: Some(attach(None)),
+                    },
+                };
+                // `error` is NOT rewritten: the handler's own text (e.g. the
+                // terminal's `TERMINAL_EXITED: …` envelope) is what the caller
+                // needs to read.
+                body.error_detail = Some(detail);
+            }
+            Err((status, Json(body)))
+        }
+        // A `success:false` body that reached HTTP 200 (a later stage in the
+        // ladder can produce one). Same treatment, in the envelope it has.
+        Ok(Json(mut resp)) if !resp.success => {
+            if resp.code.is_none() {
+                resp.code = Some("ACTION_FAILED".to_string());
+            }
+            if let Some(serde_json::Value::Object(ref mut m)) = resp.data {
+                m.entry("code")
+                    .or_insert_with(|| serde_json::Value::String("ACTION_FAILED".to_string()));
+                m.insert("recovery".to_string(), recovery.clone());
+            }
+            Ok(Json(resp))
+        }
+        ok => ok,
+    }
+}
+
 /// Outcome of [`validate_type_action_params`] — the closed set of param-shape
 /// rejections the `type` action recognises. Carried as the `Err` arm so the
 /// handler can short-circuit with the matching HTTP-400 envelope before
@@ -1692,60 +1798,31 @@ pub async fn ui_bridge_execute_action_handler(
 
         if let Some(failure) = failure_body {
             let recovery = attempt_recovery(&state, &failure, &id, &payload, task_run_id).await;
-            // ── Loop B Item A — ACTION_NOT_SUPPORTED discriminator ──────
+            // ── A post-dispatch failure is a FAILURE, never "not supported" ──
             //
-            // Contract: `success:true, data.recovery.commandChosen:null` is
-            // a misleading shape — it claims "we recovered" while admitting
-            // no structured command was selected and no original-action
-            // retry succeeded. That can only happen when the LLM fallback
-            // synthesized a side-action (or no-op) against an element that
-            // doesn't actually advertise the requested action.
+            // "Not supported" is settled BEFORE IPC: the pre-IPC gate above
+            // already rejects every action the element does not advertise,
+            // with the supported-action list in the body. Anything that
+            // reaches here was dispatched, so the only honest label for it is
+            // an action FAILURE — and the handler's own typed body (e.g. the
+            // terminal's `TERMINAL_EXITED: …` envelope) is the whole
+            // diagnosis.
             //
-            // Invariant we now enforce: when `recovery.recovered` AND
-            // `recovery.command_chosen` is None, return `success:false`
-            // with `code: ACTION_NOT_SUPPORTED` and
-            // `data.supported_actions: [...]` from the element's metadata.
-            // The recovery audit trail (`recovery.commandChosen:null`) is
-            // still surfaced so callers can see what was attempted.
+            // This branch used to relabel such a failure `ACTION_NOT_SUPPORTED`
+            // whenever the recovery outcome read `recovered:true` with no
+            // command chosen. That claim contradicted the runner's OWN
+            // advertised supported-action list — `writeToTerminal` IS
+            // supported by a terminal element; the pty behind it had exited —
+            // and it destroyed the typed error on its way to the wire, so
+            // `TERMINAL_EXITED` existed at the handler and was unobservable
+            // over HTTP.
             //
-            // If `command_chosen` IS set, keep the existing
-            // success-on-recovery envelope — that's a structured retry,
-            // not the contract-violating no-op path.
-            let contract_violation = recovery.recovered && recovery.command_chosen.is_none();
-            if contract_violation {
-                warn!(
-                    "execute_action: rejecting misleading recovered:true,commandChosen:null \
-                     for element {} action '{}' — returning ACTION_NOT_SUPPORTED",
-                    id, action_name
-                );
-                let supported: Vec<String> = element_supported_actions.clone().unwrap_or_default();
-                let recovery_json =
-                    serde_json::to_value(&recovery).unwrap_or(serde_json::Value::Null);
-                // Body carries the contract fields. `code` is hoisted into
-                // `data` so callers can match on it without parsing the
-                // outer envelope, mirroring the `data.code` shape that
-                // `wrap_ipc_result` already emits for IPC failure responses.
-                let body = serde_json::json!({
-                    "code": "ACTION_NOT_SUPPORTED",
-                    "supported_actions": supported,
-                    "requested_action": action_name,
-                    "recovery": recovery_json,
-                });
-                let envelope = ApiResponse::<serde_json::Value> {
-                    success: false,
-                    data: Some(body),
-                    error: Some(format!(
-                        "Action '{}' is not supported by element '{}'. \
-                         Element advertises: {:?}",
-                        action_name, id, supported
-                    )),
-                    error_detail: None,
-                    hint: None,
-                    code: None,
-                    suggestions: None,
-                };
-                result = Ok(Json(envelope));
-            } else if recovery.recovered {
+            // A recovery counts only when it chose and ran a command AND the
+            // original action then succeeded. Everything else surfaces the
+            // original failure, re-coded `ACTION_FAILED` (the variant that
+            // already existed for exactly this) with the recovery audit trail
+            // attached so callers still see what was attempted.
+            if recovery_is_genuine(&recovery) {
                 info!(
                     "execute_action: RecoveryExecutor recovered element {} via {:?} (command={:?})",
                     id, recovery.via, recovery.command_chosen
@@ -1766,9 +1843,13 @@ pub async fn ui_bridge_execute_action_handler(
                 result = Ok(Json(ok));
             } else {
                 warn!(
-                    "execute_action: RecoveryExecutor could not recover element {} ({:?})",
-                    id, recovery.error_code
+                    "execute_action: RecoveryExecutor could not recover element {} \
+                     (code={:?}, recovered={}, command={:?}) — surfacing the original failure",
+                    id, recovery.error_code, recovery.recovered, recovery.command_chosen
                 );
+                let recovery_json =
+                    serde_json::to_value(&recovery).unwrap_or(serde_json::Value::Null);
+                result = as_action_failure(result, &action_name, &id, recovery_json);
             }
         }
     }
@@ -5241,20 +5322,26 @@ mod validate_action_name_tests {
 
 #[cfg(test)]
 mod action_not_supported_tests {
-    //! Loop B Item A — `setValue` against an element that doesn't advertise it
-    //! must NOT come back as `success:true, recovery.commandChosen:null`. This
-    //! module exercises the pure helpers (`extract_supported_actions`,
-    //! `is_action_advertised`) plus the ApiResponse envelope shape that the
-    //! handler builds on the contract-violation branch. The handler itself
-    //! is too IPC-coupled to spin up in a unit test (it needs `ApiState`,
-    //! the IPC dispatcher, the recovery executor's PG telemetry sink),
-    //! so we lock down the envelope by reconstructing it from the same
-    //! `serde_json::json!{...}` recipe the handler uses — if the body
-    //! template changes here, this test must change in lockstep, which
-    //! is exactly the regression guard we want.
+    //! Which failures are "not supported" and which are genuine FAILURES.
+    //!
+    //! `setValue` against an element that doesn't advertise it is rejected
+    //! PRE-IPC with `ACTION_NOT_SUPPORTED` and the advertised list. A failure
+    //! that arrives POST-dispatch is the opposite case: the action was
+    //! supported, it ran, and it failed — so it keeps its own typed error and
+    //! is coded `ACTION_FAILED`. This module exercises the pure helpers
+    //! (`extract_supported_actions`, `is_action_advertised`,
+    //! `recovery_is_genuine`, `as_action_failure`) plus the pre-IPC envelope
+    //! shape. The handler itself is too IPC-coupled to spin up in a unit test
+    //! (it needs `ApiState`, the IPC dispatcher, the recovery executor's PG
+    //! telemetry sink), so the pre-IPC envelope is locked down by
+    //! reconstructing it from the same `serde_json::json!{...}` recipe the
+    //! handler uses — if the body template changes there, this test must
+    //! change in lockstep, which is exactly the regression guard we want.
     use super::{
-        advertise_custom_actions_in_payload, extract_custom_actions, extract_supported_actions,
-        fold_custom_actions_into_element, is_action_advertised, UiBridgeError,
+        advertise_custom_actions_in_payload, api_error_detailed, as_action_failure,
+        classify_transport_error, extract_custom_actions, extract_supported_actions,
+        fold_custom_actions_into_element, is_action_advertised, recovery_is_genuine, ActionResult,
+        Json, StatusCode, UiBridgeError,
     };
     use crate::mcp::types::ApiResponse;
     use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia};
@@ -5556,87 +5643,131 @@ mod action_not_supported_tests {
         assert_eq!(payload, once, "fold must be idempotent");
     }
 
+    /// A recovery counts only when it chose a command AND the original action
+    /// then succeeded. `recovered:true, commandChosen:null` — the shape the
+    /// LLM fallback produced — is an assertion about nothing.
     #[test]
-    fn action_not_supported_envelope_has_required_fields() {
-        // Build the envelope the handler constructs on the contract-violation
-        // branch and verify the shape the spec requires:
-        //   200 (HTTP) but body { success:false, code:"ACTION_NOT_SUPPORTED",
-        //   data:{ supported_actions:[...] }, recovery:{ commandChosen:null,...} }
-        let action_name = "setValue";
-        let supported = vec![
-            "focus".to_string(),
-            "blur".to_string(),
-            "type".to_string(),
-            "clear".to_string(),
-            "click".to_string(),
-        ];
-        let recovery = RecoveryOutcome {
-            recovered: true,
+    fn only_a_command_backed_recovery_counts_as_recovered() {
+        let mk = |recovered: bool, cmd: Option<&str>| RecoveryOutcome {
+            recovered,
             via: RecoveryVia::LlmFallback,
-            command_chosen: None,
+            command_chosen: cmd.map(str::to_string),
             error_code: None,
             result: None,
         };
-        let recovery_json = serde_json::to_value(&recovery).unwrap();
-        let body = json!({
-            "code": "ACTION_NOT_SUPPORTED",
-            "supported_actions": supported,
-            "requested_action": action_name,
-            "recovery": recovery_json,
-        });
-        let envelope = ApiResponse::<serde_json::Value> {
-            success: false,
-            data: Some(body),
-            error: Some(format!(
-                "Action '{}' is not supported by element 'btn-1'. \
-                 Element advertises: {:?}",
-                action_name, supported
-            )),
-            error_detail: None,
-            hint: None,
-            code: None,
-            suggestions: None,
-        };
-        let envelope_json = serde_json::to_value(&envelope).unwrap();
+        assert!(recovery_is_genuine(&mk(true, Some("scroll_into_view"))));
+        assert!(
+            !recovery_is_genuine(&mk(true, None)),
+            "recovered with no command chosen is not a recovery"
+        );
+        assert!(!recovery_is_genuine(&mk(false, Some("scroll_into_view"))));
+        assert!(!recovery_is_genuine(&mk(false, None)));
+    }
 
-        assert_eq!(
-            envelope_json.get("success").and_then(|v| v.as_bool()),
-            Some(false),
-            "contract: envelope.success must be false (not the misleading true)"
-        );
-        let data = envelope_json
-            .get("data")
-            .expect("contract: data field must be present");
-        assert_eq!(
-            data.get("code").and_then(|v| v.as_str()),
-            Some("ACTION_NOT_SUPPORTED"),
-            "contract: data.code must be ACTION_NOT_SUPPORTED"
-        );
-        let supp = data
-            .get("supported_actions")
-            .and_then(|v| v.as_array())
-            .expect("contract: data.supported_actions must be an array");
-        let names: Vec<&str> = supp.iter().filter_map(|v| v.as_str()).collect();
-        assert!(names.contains(&"click"));
-        assert!(names.contains(&"type"));
+    /// THE iteration-9 defect: a genuine post-dispatch FAILURE was relabelled
+    /// `ACTION_NOT_SUPPORTED`, which both contradicted the runner's own
+    /// advertised action list (`writeToTerminal` IS supported by a terminal
+    /// element — its pty had exited) and destroyed the typed error, so
+    /// `TERMINAL_EXITED` existed at the handler and was unobservable on the
+    /// wire. The failure must reach the caller verbatim, coded `ACTION_FAILED`.
+    #[test]
+    fn post_dispatch_failure_keeps_its_typed_error_and_codes_action_failed() {
+        let msg = "TERMINAL_EXITED: terminal term-3 is not writable — its process \
+                   exited with code 0. Restart the session before writing to it.";
+        let failure: ActionResult = Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error_detailed(msg, classify_transport_error(msg))),
+        ));
+        let recovery = serde_json::to_value(RecoveryOutcome {
+            recovered: false,
+            via: RecoveryVia::None,
+            command_chosen: None,
+            error_code: None,
+            result: None,
+        })
+        .unwrap();
+
+        let (status, Json(body)) = as_action_failure(
+            failure,
+            "writeToTerminal",
+            "terminal-input-term-3",
+            recovery,
+        )
+        .expect_err("a failure stays a failure");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let wire = serde_json::to_value(&body).unwrap();
+        let text = wire.to_string();
         assert!(
-            !names.contains(&"setValue"),
-            "contract: requested action must NOT appear in the advertised list \
-             (else the discriminator wouldn't fire)"
+            text.contains("TERMINAL_EXITED"),
+            "the handler's typed error must survive to the wire: {text}"
         );
-        // Recovery audit trail still surfaced — commandChosen is null
-        // exactly because that's the contract violation we're flagging.
-        let recovery_field = data
-            .get("recovery")
-            .expect("contract: data.recovery must be carried for audit");
         assert!(
-            recovery_field
-                .get("commandChosen")
-                .map(|v| v.is_null())
-                .unwrap_or(false),
-            "contract: data.recovery.commandChosen must be null (this is the \
-             precondition that triggered ACTION_NOT_SUPPORTED)"
+            !text.contains("ACTION_NOT_SUPPORTED"),
+            "a dispatched action that failed is NOT unsupported: {text}"
         );
+        assert_eq!(
+            wire.pointer("/error_detail/code").and_then(|v| v.as_str()),
+            Some("ACTION_FAILED"),
+            "the existing ACTION_FAILED variant is what an action failure means"
+        );
+        assert_eq!(
+            wire.pointer("/error_detail/context/requested_action")
+                .and_then(|v| v.as_str()),
+            Some("writeToTerminal")
+        );
+        assert!(
+            wire.pointer("/error_detail/context/recovery").is_some(),
+            "the recovery audit trail is still surfaced: {text}"
+        );
+    }
+
+    /// A message the classifier DID recognise keeps its more specific code —
+    /// re-coding everything to `ACTION_FAILED` would be a different bug.
+    #[test]
+    fn a_classified_failure_keeps_its_specific_code() {
+        let msg = "No element found matching '#ghost'";
+        let failure: ActionResult = Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error_detailed(msg, classify_transport_error(msg))),
+        ));
+        let (_, Json(body)) =
+            as_action_failure(failure, "click", "ghost", serde_json::Value::Null).unwrap_err();
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            wire.pointer("/error_detail/code").and_then(|v| v.as_str()),
+            Some("ELEMENT_NOT_FOUND")
+        );
+        assert!(wire.pointer("/error_detail/context/recovery").is_some());
+    }
+
+    /// A transport failure (the frontend never answered) is not an action
+    /// outcome, so it is left exactly as-is.
+    #[test]
+    fn transport_failures_are_not_relabelled_as_action_failures() {
+        let msg = "UI Bridge frontend did not become ready";
+        let failure: ActionResult = Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(api_error_detailed(msg, classify_transport_error(msg))),
+        ));
+        let (status, Json(body)) =
+            as_action_failure(failure, "click", "btn-1", serde_json::Value::Null).unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            wire.pointer("/error_detail/code").and_then(|v| v.as_str()),
+            Some("FRONTEND_NOT_READY"),
+            "a transport error keeps its transport code"
+        );
+    }
+
+    /// A successful action is never touched by the failure re-coder.
+    #[test]
+    fn a_success_passes_through_untouched() {
+        let ok: ActionResult = Ok(Json(ApiResponse::success(json!({ "clicked": true }))));
+        let out = as_action_failure(ok, "click", "btn-1", json!({ "recovered": false })).unwrap();
+        let wire = serde_json::to_value(&out.0).unwrap();
+        assert_eq!(wire.get("success").and_then(|v| v.as_bool()), Some(true));
+        assert!(!wire.to_string().contains("ACTION_FAILED"));
     }
 
     /// Iter-2 item 2 — pre-IPC gate envelope. When the element advertises

@@ -1,6 +1,12 @@
 import { useCallback } from "react";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
+import {
+  RECOVERY_TARGET_MISSING,
+  RECOVERY_UNSCOPED,
+  recoveryVerdict,
+  scopeRecoveryExecutor,
+} from "./recoveryScope";
 
 // Module-level intent store for persistence across IPC calls (capped at 1000 entries)
 const LOCAL_INTENT_STORE_MAX = 1000;
@@ -1090,23 +1096,64 @@ export function useAISearchEvents(
         }
 
         case "ai_recovery_attempt": {
+          // Recovery is SCOPED and READ-ONLY-ish, and it reports what actually
+          // happened. See `./recoveryScope.ts` for the defect this shape
+          // closes: the unscoped version searched every discovered element,
+          // wrote into one the caller never addressed, and then reported
+          // `recovered: true` regardless of the outcome.
           const recoveryParams = payload.params ?? payload.body ?? {};
           const instruction = (recoveryParams.instruction as string) ?? "";
-          try {
-            const { NLActionExecutor } = await import("@qontinui/ui-bridge/ai");
-            const discovered = await currentBridge.discover({ includeHidden: true });
-            const executor = new NLActionExecutor();
-            executor.updateElements(discovered.elements);
-            // Delegate DOM actions to the bridge (UseUIBridgeReturn is API-compatible)
-            executor.setActionExecutor(currentBridge as never);
-            const result = await executor.execute({
-              instruction: instruction || "recover from error state",
-            });
+          const targetElementId = (recoveryParams.elementId as string) ?? "";
+          if (!targetElementId) {
             await sendResponse({
               requestId,
               type,
-              success: true,
-              data: { recovered: true, result, timestamp: Date.now() },
+              success: false,
+              error: `${RECOVERY_UNSCOPED}: ai_recovery_attempt requires params.elementId — recovery is limited to the element the failing action addressed.`,
+              data: { recovered: false },
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          try {
+            const { NLActionExecutor } = await import("@qontinui/ui-bridge/ai");
+            const discovered = await currentBridge.discover({ includeHidden: true });
+            const scoped = discovered.elements.filter((el) => el.id === targetElementId);
+            if (scoped.length === 0) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `${RECOVERY_TARGET_MISSING}: element '${targetElementId}' is not in the current tree; nothing to recover.`,
+                data: { recovered: false },
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            const executor = new NLActionExecutor();
+            // ONLY the addressed element is searchable, so the executor cannot
+            // match a different one however the instruction reads.
+            executor.updateElements(scoped);
+            // Delegate DOM actions to the bridge (UseUIBridgeReturn is
+            // API-compatible), through the scope/write guard.
+            executor.setActionExecutor(
+              scopeRecoveryExecutor(currentBridge as object, targetElementId) as never,
+            );
+            const result = await executor.execute({
+              instruction: instruction || "recover from error state",
+            });
+            const verdict = recoveryVerdict(result);
+            await sendResponse({
+              requestId,
+              type,
+              success: verdict.recovered,
+              data: {
+                recovered: verdict.recovered,
+                elementId: targetElementId,
+                result,
+                timestamp: Date.now(),
+              },
+              error: verdict.reason ?? undefined,
               timestamp: Date.now(),
             });
           } catch (err) {
@@ -1115,6 +1162,7 @@ export function useAISearchEvents(
               type,
               success: false,
               error: err instanceof Error ? err.message : String(err),
+              data: { recovered: false, elementId: targetElementId },
               timestamp: Date.now(),
             });
           }
