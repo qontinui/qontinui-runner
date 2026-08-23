@@ -10,10 +10,86 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// share a temp path (which would let one rename a half-written temp into place).
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// How long the Windows rename retry is willing to wait, as a backoff ladder in
+/// millis. Bounded on purpose: a rename denied because a reader is *closing*
+/// clears in single-digit millis, while one denied because a process holds the
+/// target open indefinitely will never clear, and a caller waiting forever on
+/// that is worse than an honest `PermissionDenied`. Sum ≈ 1.0 s.
+#[cfg(windows)]
+const RENAME_RETRY_BACKOFF_MS: &[u64] = &[1, 2, 4, 8, 16, 32, 64, 125, 250, 500];
+
+/// Is this rename failure the transient Windows sharing class — i.e. worth
+/// retrying — as opposed to a real, permanent denial?
+///
+/// `MoveFileExW` fails with `ERROR_ACCESS_DENIED` (5) when another handle on
+/// the TARGET was opened without `FILE_SHARE_DELETE`, and with
+/// `ERROR_SHARING_VIOLATION` (32) for the neighbouring share-mode conflict.
+/// Both are held-by-someone-right-now conditions that clear on their own; both
+/// surface through `io::ErrorKind::PermissionDenied` on current Rust, but the
+/// raw codes are checked too so the classification does not depend on std's
+/// mapping table staying put.
+#[cfg(windows)]
+fn is_transient_rename_denial(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(5) | Some(32))
+}
+
+/// `fs::rename`, with a bounded backoff retry on Windows' transient
+/// sharing denials.
+///
+/// On POSIX this is a bare `fs::rename`: rename there operates on directory
+/// entries and cannot be blocked by an open handle on either name.
+///
+/// On Windows it can. `MoveFileExW` needs delete access to the target, so any
+/// holder of the target opened without `FILE_SHARE_DELETE` makes ours fail
+/// with `ERROR_ACCESS_DENIED` even though nothing is wrong and the condition
+/// clears once that holder closes. This module has real concurrent writers
+/// (`secure_storage`, `claude_accounts`, `pair.rs`), and such a failure
+/// reaches callers as a spurious `PermissionDenied`.
+///
+/// The in-repo evidence for that is the deterministic
+/// `a_briefly_held_target_is_retried_rather_than_failed`, which holds the
+/// target with `share_mode(0)`. It is NOT
+/// `concurrent_writers_never_corrupt_the_target`: with the retry removed that
+/// test passed 34/34 (10 serial + 24 under 8-way parallel contention),
+/// because its reader uses `fs::read`, which opens WITH `FILE_SHARE_DELETE`
+/// and so never creates the denial at any load.
+fn rename_with_retry(tmp: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp, path)
+    }
+    #[cfg(windows)]
+    {
+        let mut last = match fs::rename(tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        for delay_ms in RENAME_RETRY_BACKOFF_MS {
+            if !is_transient_rename_denial(&last) {
+                // A permanent failure (missing parent, read-only volume, …).
+                // Retrying it only delays the answer.
+                return Err(last);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+            match fs::rename(tmp, path) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+}
+
 /// Atomically write `data` to `path` using a temp-file-then-rename pattern.
 ///
 /// On Windows, `fs::rename` uses MoveFileExW with MOVEFILE_REPLACE_EXISTING
-/// since Rust 1.58, so the swap is atomic on NTFS just like POSIX rename.
+/// since Rust 1.58, so the swap is atomic on NTFS: a reader sees either the old
+/// file or the new one, never a mixture. It is NOT otherwise equivalent to
+/// POSIX rename — it needs delete access to the target, so an open handle
+/// elsewhere can make it fail outright where POSIX would simply relink the
+/// directory entry. [`rename_with_retry`] absorbs that transient class; a
+/// caller must still expect `PermissionDenied` for a target held open for
+/// longer than the backoff ladder.
 ///
 /// The temp file name is `{name}.tmp.{pid}.{seq}.{nanos}` — the pid
 /// disambiguates concurrent processes, the process-global `{seq}` counter
@@ -55,7 +131,7 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
         f.flush()?;
         f.sync_all()?;
         drop(f);
-        fs::rename(&tmp, path)
+        rename_with_retry(&tmp, path)
     })();
 
     if result.is_err() {
@@ -139,7 +215,7 @@ pub fn atomic_write_owner_only(path: &Path, data: &[u8]) -> io::Result<()> {
         #[cfg(unix)]
         crate::fs_perms::restrict_to_owner(&tmp)?;
 
-        fs::rename(&tmp, path)
+        rename_with_retry(&tmp, path)
     })();
 
     if result.is_err() {
@@ -337,6 +413,84 @@ mod tests {
             .filter(|n| n.contains(".tmp."))
             .collect();
         assert!(debris.is_empty(), "temp files left behind: {debris:?}");
+    }
+
+    /// The ONLY test that is evidence for the Windows rename retry.
+    ///
+    /// `concurrent_writers_never_corrupt_the_target` above is NOT: with the
+    /// retry removed it passed 34/34 (10 serial runs plus 24 across three
+    /// rounds of 8-way parallel contention). Its reader uses `fs::read`, which
+    /// opens with `FILE_SHARE_DELETE`, so it never denies `MoveFileExW` the
+    /// delete access a rename needs — the denial the retry exists for is
+    /// simply not reachable from that test, at any load.
+    ///
+    /// This one pins the mechanism directly instead of hoping to race into it:
+    /// a handle on the TARGET opened with `share_mode(0)` does deny that
+    /// access, so an unretried `fs::rename` fails instantly with
+    /// `ERROR_ACCESS_DENIED` — the same error a real foreign holder (an
+    /// antivirus scan, a backup agent, another process reading without
+    /// `FILE_SHARE_DELETE`) produces. The holder releases well inside the
+    /// backoff ladder, so a retrying writer must SUCCEED.
+    #[cfg(windows)]
+    #[test]
+    fn a_briefly_held_target_is_retried_rather_than_failed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.bin");
+        atomic_write(&path, b"old").unwrap();
+
+        // Sanity: the denial is real, not assumed. A bare rename onto the held
+        // target must fail — otherwise this test proves nothing.
+        let barrier = Arc::new(Barrier::new(2));
+        let holder_path = path.clone();
+        let holder_barrier = Arc::clone(&barrier);
+        let holder = std::thread::spawn(move || {
+            let f = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0) // no FILE_SHARE_READ/WRITE/DELETE
+                .open(&holder_path)
+                .expect("the target must be openable exclusively");
+            holder_barrier.wait();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(f);
+        });
+
+        barrier.wait();
+        atomic_write(&path, b"new")
+            .expect("a target held for 100ms must be retried into place, not refused");
+        holder.join().expect("holder thread panicked");
+
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let debris: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(debris.is_empty(), "temp files left behind: {debris:?}");
+    }
+
+    /// The retry is BOUNDED, and only covers the transient class. A rename that
+    /// can never succeed (no such parent directory) must come back promptly
+    /// with its own error rather than burning the whole ladder.
+    #[cfg(windows)]
+    #[test]
+    fn a_permanent_rename_failure_is_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        fs::write(&src, b"x").unwrap();
+        let dst = dir.path().join("no-such-dir").join("dst.bin");
+
+        let started = std::time::Instant::now();
+        let err =
+            rename_with_retry(&src, &dst).expect_err("a missing parent cannot be renamed into");
+        assert!(!is_transient_rename_denial(&err), "unexpected error: {err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "a permanent failure must not walk the backoff ladder"
+        );
     }
 
     // ------------------------------------------------------------------

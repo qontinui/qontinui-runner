@@ -1083,6 +1083,39 @@ pub struct SeedLifecycleRecord {
     pub title: Option<String>,
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// Offset from now (millis) for `confirmed_at`. `None` leaves the row
+    /// UNCONFIRMED, which was the only thing this seam could express — and
+    /// `confirmed` is one of the two gates in
+    /// [`crate::session::snapshot_history::is_restorable_identity`], so every
+    /// seeded row reported `restorable: false` and the frontend's
+    /// `decideColdResume` / drain-skip path could never be reached from a
+    /// seeded store. Negative places the confirmation in the past, matching
+    /// the other offsets on this struct.
+    #[serde(default)]
+    pub confirmed_at: Option<i64>,
+    /// Offset from now (millis) for `restore_pending_at` — the durable
+    /// in-flight-restore marker. `Some` puts the row in the `pending` bucket
+    /// of `GET /control/sessions/restore-health`.
+    #[serde(default)]
+    pub restore_pending_at: Option<i64>,
+    /// Verbatim restore tier — `"resumed"` / `"terminal-only"` / `"failed"`
+    /// (see `session_lifecycle_store::RESTORE_TIER_*`). NOT an offset: it is
+    /// stored as-is, and drives both the `failed` bucket and the rendered
+    /// `restoreStatus` verdict.
+    #[serde(default)]
+    pub restore_tier: Option<String>,
+    /// Verbatim id provenance — `"authoritative"` / `"observed"` /
+    /// `"reconciled"`. `None` (the old hardcoded value) reads as
+    /// `"reconciled"`, and the frontend's `classifyRestoreAction` returns
+    /// `"terminal-only"` for anything that is not `authoritative`/`observed`.
+    /// `confirmedAt` alone is therefore NOT enough to reach the drain's
+    /// `decideColdResume` call site (`useTerminalInitialization.ts` ~1201):
+    /// `isClaudeSession` is `restoreAction === "auto-resume"`, which needs
+    /// BOTH a confirmation and a strong origin. Expressing only the timestamps
+    /// would have moved `restorable` in the restore-health report while
+    /// leaving the drain path exactly as unreachable as before.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1161,9 +1194,13 @@ fn record_from_seed(
         closed_at,
         close_reason,
         provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
-        origin: None,
-        restore_pending_at: None,
-        confirmed_at: None,
+        origin: seed.origin.clone(),
+        // Resolved against `now_ms` exactly like `last_seen_at` — so a caller
+        // can place a confirmation or an in-flight restore marker at a precise
+        // age without knowing the wall clock. Absent means absent; these are
+        // no longer hardcoded to `None`.
+        restore_pending_at: seed.restore_pending_at.map(|off| now_ms + off),
+        confirmed_at: seed.confirmed_at.map(|off| now_ms + off),
         handle: None,
         account_label: None,
         account_wrapper: None,
@@ -1173,7 +1210,7 @@ fn record_from_seed(
         task_run_id: None,
         bypass_permissions: None,
         restored_from_boot_at: None,
-        restore_tier: None,
+        restore_tier: seed.restore_tier.clone(),
     })
 }
 
@@ -2467,6 +2504,10 @@ mod tests {
                     zone_index: None,
                     title: None,
                     working_dir: None,
+                    confirmed_at: None,
+                    restore_pending_at: None,
+                    restore_tier: None,
+                    origin: None,
                 },
                 SeedLifecycleRecord {
                     session_id: "open-b".to_string(),
@@ -2478,6 +2519,10 @@ mod tests {
                     zone_index: None,
                     title: None,
                     working_dir: None,
+                    confirmed_at: None,
+                    restore_pending_at: None,
+                    restore_tier: None,
+                    origin: None,
                 },
                 SeedLifecycleRecord {
                     session_id: "open-c".to_string(),
@@ -2489,6 +2534,10 @@ mod tests {
                     zone_index: None,
                     title: None,
                     working_dir: None,
+                    confirmed_at: None,
+                    restore_pending_at: None,
+                    restore_tier: None,
+                    origin: None,
                 },
                 // A ghost open row aged far into the past — still `state==open`,
                 // so list_open returns it (open_records is strict-open; the
@@ -2503,6 +2552,10 @@ mod tests {
                     zone_index: None,
                     title: None,
                     working_dir: None,
+                    confirmed_at: None,
+                    restore_pending_at: None,
+                    restore_tier: None,
+                    origin: None,
                 },
                 // A closed row — must NOT appear in list_open.
                 SeedLifecycleRecord {
@@ -2515,6 +2568,10 @@ mod tests {
                     zone_index: None,
                     title: None,
                     working_dir: None,
+                    confirmed_at: None,
+                    restore_pending_at: None,
+                    restore_tier: None,
+                    origin: None,
                 },
             ],
         };
@@ -2595,6 +2652,10 @@ mod tests {
                 zone_index: None,
                 title: None,
                 working_dir: None,
+                confirmed_at: None,
+                restore_pending_at: None,
+                restore_tier: None,
+                origin: None,
             }],
         };
         let err = seed_lifecycle_store_at(&path, &bad_state, now).expect_err("bad state rejected");
@@ -2737,6 +2798,10 @@ mod tests {
                 zone_index: None,
                 title: None,
                 working_dir: None,
+                confirmed_at: None,
+                restore_pending_at: None,
+                restore_tier: None,
+                origin: None,
             },
             chrono::Utc::now().timestamp_millis(),
         )
@@ -2783,6 +2848,10 @@ mod tests {
                 zone_index: None,
                 title: None,
                 working_dir: None,
+                confirmed_at: None,
+                restore_pending_at: None,
+                restore_tier: None,
+                origin: None,
             }],
         };
         seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
@@ -2817,6 +2886,10 @@ mod tests {
                 zone_index: None,
                 title: None,
                 working_dir: None,
+                confirmed_at: None,
+                restore_pending_at: None,
+                restore_tier: None,
+                origin: None,
             }],
         };
         seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
@@ -2869,6 +2942,10 @@ mod tests {
                 zone_index: None,
                 title: None,
                 working_dir: None,
+                confirmed_at: None,
+                restore_pending_at: None,
+                restore_tier: None,
+                origin: None,
             }],
         };
         seed_lifecycle_store_at(&path, &req, chrono::Utc::now().timestamp_millis()).unwrap();
@@ -2878,5 +2955,192 @@ mod tests {
             "a merge would have kept the pre-seed rows"
         );
         assert!(store.get("only").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual-test-loop iteration 11, item 3 — the seam could not express the
+    // fields the DRAIN path needs.
+    //
+    // `record_from_seed` hardcoded `confirmed_at` / `restore_pending_at` /
+    // `restore_tier` — and `origin` — to `None`. `confirmed` is one of the two
+    // gates in `is_restorable_identity`, so EVERY seeded row reported
+    // `restorable: false` — which meant a seeded store could never produce a
+    // pending restore, `decideColdResume` never ran, and iteration 10's
+    // drain-skip fix had no end-to-end path to be exercised over.
+    //
+    // `origin` is the second half of the same blockage, found while verifying
+    // the first: `restorable` is what `restore-health` REPORTS, but what the
+    // drain actually gates on is `classifyRestoreAction === "auto-resume"`,
+    // which needs `origin` to be `authoritative`/`observed` as well. Fixing
+    // only the timestamps would have moved the report and left the drain path
+    // exactly as unreachable.
+    // -----------------------------------------------------------------------
+
+    /// A seed carrying the four fields must resolve them onto the record —
+    /// the two timestamps against `now_ms` like every other offset on the
+    /// struct, the tier and the origin verbatim.
+    #[test]
+    fn a_seed_can_now_express_confirmation_pending_tier_and_origin() {
+        let now = 1_700_000_000_000i64;
+        let rec = record_from_seed(
+            &SeedLifecycleRecord {
+                session_id: "sess-1".to_string(),
+                state: "open".to_string(),
+                last_seen_offset_ms: -500,
+                closed_at_offset_ms: None,
+                close_reason: None,
+                page_id: None,
+                zone_index: None,
+                title: None,
+                working_dir: None,
+                confirmed_at: Some(-1_000),
+                restore_pending_at: Some(-250),
+                restore_tier: Some("failed".to_string()),
+                origin: Some("authoritative".to_string()),
+            },
+            now,
+        )
+        .expect("valid seed row");
+
+        assert_eq!(rec.confirmed_at, Some(now - 1_000));
+        assert_eq!(rec.restore_pending_at, Some(now - 250));
+        assert_eq!(rec.restore_tier.as_deref(), Some("failed"));
+        assert_eq!(rec.origin.as_deref(), Some("authoritative"));
+    }
+
+    /// Absent stays absent — the three fields are opt-in, so every existing
+    /// caller's rows are unchanged.
+    #[test]
+    fn a_seed_that_omits_them_still_produces_an_unconfirmed_row() {
+        let rec = open_row("sess-2");
+        assert_eq!(rec.confirmed_at, None);
+        assert_eq!(rec.restore_pending_at, None);
+        assert_eq!(rec.restore_tier, None);
+        assert_eq!(rec.origin, None);
+    }
+
+    /// THE CONSEQUENCE, pinned end-to-end through the real projection:
+    /// `GET /control/sessions/restore-health` reports `restorable: true` for a
+    /// seeded row that is confirmed AND transcript-backed. Before the fix the
+    /// `confirmed` half was unreachable, so this could only ever be `false`.
+    #[test]
+    fn a_confirmed_seeded_row_projects_as_restorable() {
+        use crate::install_effects_producer::{project_restore_health, RestoreHealthFilter};
+
+        #[derive(Debug)]
+        struct AlwaysPresent;
+        impl crate::session::snapshot_history::TranscriptProbe for AlwaysPresent {
+            fn transcript_exists(&self, _id: &str, _wd: Option<&str>) -> bool {
+                true
+            }
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let seed = |id: &str, confirmed_at: Option<i64>| {
+            record_from_seed(
+                &SeedLifecycleRecord {
+                    session_id: id.to_string(),
+                    state: "open".to_string(),
+                    last_seen_offset_ms: -1_000,
+                    closed_at_offset_ms: None,
+                    close_reason: None,
+                    page_id: None,
+                    zone_index: None,
+                    title: None,
+                    working_dir: None,
+                    confirmed_at,
+                    restore_pending_at: None,
+                    restore_tier: None,
+                    origin: None,
+                },
+                now,
+            )
+            .expect("valid seed row")
+        };
+
+        let report = project_restore_health(
+            vec![seed("confirmed", Some(-1_000)), seed("unconfirmed", None)],
+            &AlwaysPresent,
+            RestoreHealthFilter::open_only(),
+        );
+        let row = |id: &str| {
+            report
+                .sessions
+                .iter()
+                .find(|s| s.claude_session_id == id)
+                .unwrap_or_else(|| panic!("{id} must be reported"))
+        };
+        assert!(
+            row("confirmed").restorable,
+            "a confirmed, transcript-backed seeded row must be restorable"
+        );
+        assert!(row("confirmed").confirmed);
+        assert!(
+            !row("unconfirmed").restorable,
+            "omitting confirmedAt must still yield the old, unrestorable row"
+        );
+        assert_eq!(report.unrestorable, 1);
+    }
+
+    /// The `pending` and `failed` buckets of the restore-health filter are now
+    /// reachable from a seed too — they key off exactly these two fields.
+    #[test]
+    fn seeded_pending_and_failed_rows_reach_their_buckets() {
+        use crate::install_effects_producer::RestoreHealthFilter;
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let pending = record_from_seed(
+            &SeedLifecycleRecord {
+                session_id: "pending".to_string(),
+                state: "closed".to_string(),
+                last_seen_offset_ms: -1_000,
+                closed_at_offset_ms: Some(-500),
+                close_reason: Some("pty-exit".to_string()),
+                page_id: None,
+                zone_index: None,
+                title: None,
+                working_dir: None,
+                confirmed_at: None,
+                restore_pending_at: Some(-100),
+                restore_tier: Some(
+                    crate::session::session_lifecycle_store::RESTORE_TIER_FAILED.to_string(),
+                ),
+                origin: None,
+            },
+            now,
+        )
+        .expect("valid seed row");
+
+        // `pending` (marker set) and `failed` (tier) both select it; `open`
+        // does not — it is a closed row.
+        let report = crate::install_effects_producer::project_restore_health(
+            vec![pending.clone()],
+            &NoTranscripts,
+            RestoreHealthFilter::open_only(),
+        );
+        assert!(report.sessions.is_empty(), "a closed row is not `open`");
+
+        for spec in ["pending", "failed", "closed"] {
+            let filter = crate::install_effects_producer::parse_restore_health_include(Some(spec))
+                .expect("a valid include spec");
+            let report = crate::install_effects_producer::project_restore_health(
+                vec![pending.clone()],
+                &NoTranscripts,
+                filter,
+            );
+            assert_eq!(report.sessions.len(), 1, "include={spec}");
+            assert_eq!(
+                report.sessions[0].restore_status, "pending (not yet confirmed)",
+                "include={spec}: the rendered verdict reads off the seeded tier + marker"
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoTranscripts;
+    impl crate::session::snapshot_history::TranscriptProbe for NoTranscripts {
+        fn transcript_exists(&self, _id: &str, _wd: Option<&str>) -> bool {
+            false
+        }
     }
 }

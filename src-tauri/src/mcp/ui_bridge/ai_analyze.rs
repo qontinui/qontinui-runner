@@ -16,6 +16,7 @@ use axum::{extract::State, http::StatusCode, response::Json};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 use super::request::ui_bridge_request_sync;
+use super::types::{recovery_hint_for, UiBridgeError, UiBridgeErrorCode};
 use super::{ipc_handler_get, ipc_handler_post};
 
 // Semantic search & diff
@@ -65,6 +66,58 @@ pub(crate) fn recovery_code_from_message(message: &str) -> Option<String> {
     }
 }
 
+/// Map a `RECOVERY_*` token onto the envelope's TYPED error taxonomy.
+///
+/// The token is the finest-grained answer and is preserved verbatim — in
+/// `code` at the top level and in `error_detail.context.code`. This is the
+/// coarse classification a client that only understands [`UiBridgeErrorCode`]
+/// branches on. Without it every refusal read as `INTERNAL_ERROR`: the
+/// classifier's fallthrough ([`super::types::classify_transport_error`]) has
+/// no pattern for these messages, so it asserted a RUNNER DEFECT for what are
+/// ordinary, expected, caller-caused refusals.
+fn recovery_error_code(code: &str) -> UiBridgeErrorCode {
+    match code {
+        // Request-shape refusals — the caller asked recovery to do something
+        // it is not allowed to do (guess a target, leave the addressed
+        // element, write into input state). Nothing is wrong with the runner.
+        "RECOVERY_UNSCOPED" | "RECOVERY_OUT_OF_SCOPE" | "RECOVERY_WRITE_REFUSED" => {
+            UiBridgeErrorCode::InvalidRequest
+        }
+        // The addressed element is not in the tree — the very condition the
+        // element routes already report as `ELEMENT_NOT_FOUND`.
+        "RECOVERY_TARGET_MISSING" => UiBridgeErrorCode::ElementNotFound,
+        // `RECOVERY_FAILED` and any future token: recovery RAN against the
+        // addressed element and did not recover it. That is an action failure.
+        _ => UiBridgeErrorCode::ActionFailed,
+    }
+}
+
+/// Build the typed `error_detail` for a recovery refusal, preserving whatever
+/// context the upstream detail carried and stamping the token into
+/// `context.code` so nothing is lost by the coarse mapping.
+fn recovery_error_detail(
+    code: &str,
+    message: String,
+    prior_context: Option<serde_json::Value>,
+) -> UiBridgeError {
+    let mapped = recovery_error_code(code);
+    let recovery = Some(recovery_hint_for(&mapped));
+    let mut obj = match prior_context {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert(
+        "code".to_string(),
+        serde_json::Value::String(code.to_string()),
+    );
+    UiBridgeError {
+        code: mapped,
+        message,
+        recovery,
+        context: Some(serde_json::Value::Object(obj)),
+    }
+}
+
 /// Stop `/ai/recovery/attempt` from laundering a typed refusal into a success.
 ///
 /// THE DEFECT: the frontend answered `RECOVERY_UNSCOPED` /
@@ -87,6 +140,13 @@ pub(crate) fn recovery_code_from_message(message: &str) -> Option<String> {
 ///
 /// `recovered: true` and transport-level failures (500 / 503 — the frontend
 /// never answered) pass through untouched: those are not recovery verdicts.
+///
+/// Both refusal arms also build a TYPED `error_detail` ([`recovery_error_code`]).
+/// Stamping only the top-level `code` left the token laundered one layer down:
+/// `api_error` leaves `error_detail: None`, and `classify_transport_error` has
+/// no pattern for `RECOVERY_*: …`, so the structured half of the very same body
+/// said `INTERNAL_ERROR` — a runner defect — for an ordinary caller-caused
+/// refusal.
 pub(crate) fn as_recovery_failure(result: BridgeResult) -> BridgeResult {
     let code_of = |payload: &serde_json::Value, fallback: Option<&str>| -> String {
         payload
@@ -123,13 +183,51 @@ pub(crate) fn as_recovery_failure(result: BridgeResult) -> BridgeResult {
                 .unwrap_or_else(|| {
                     format!("{code}: recovery did not recover the addressed element")
                 });
-            let mut body = api_error(message);
+            let mut body = api_error(message.clone());
+            // `api_error` leaves `error_detail: None`, which is exactly how the
+            // typed token used to get laundered one layer down: a later
+            // classifier filled the empty slot with its `InternalError`
+            // fallthrough, so the body said `RECOVERY_UNSCOPED` at the top and
+            // `INTERNAL_ERROR` inside. Build the detail HERE, the way
+            // `elements::as_action_failure` does.
+            body.error_detail = Some(recovery_error_detail(&code, message, None));
             body.code = Some(code);
             Err((StatusCode::BAD_REQUEST, Json(body)))
         }
         Err((status, Json(mut body))) => {
-            if status == StatusCode::BAD_REQUEST && body.code.is_none() {
-                body.code = Some(code_of(&serde_json::Value::Null, body.error.as_deref()));
+            if status == StatusCode::BAD_REQUEST {
+                let code = body
+                    .code
+                    .clone()
+                    .unwrap_or_else(|| code_of(&serde_json::Value::Null, body.error.as_deref()));
+                // The live path: `wrap_ipc_result` already flattened the
+                // frontend's `success:false` payload into a 400 and ran
+                // `classify_transport_error` over the refusal prose, which has
+                // no pattern for `RECOVERY_*: …` and so produced
+                // `InternalError`. Re-code ONLY that unclassified case — the
+                // same rule `as_action_failure` applies — because a detail the
+                // classifier genuinely recognised is a better answer than the
+                // token's coarse mapping.
+                let unclassified = match &body.error_detail {
+                    None => true,
+                    Some(d) => matches!(d.code, UiBridgeErrorCode::InternalError),
+                };
+                if unclassified {
+                    let prior = body.error_detail.take();
+                    let message = prior
+                        .as_ref()
+                        .map(|d| d.message.clone())
+                        .or_else(|| body.error.clone())
+                        .unwrap_or_else(|| {
+                            format!("{code}: recovery did not recover the addressed element")
+                        });
+                    body.error_detail = Some(recovery_error_detail(
+                        &code,
+                        message,
+                        prior.and_then(|d| d.context),
+                    ));
+                }
+                body.code = Some(code);
             }
             Err((status, Json(body)))
         }
@@ -332,6 +430,108 @@ mod recovery_failure_tests {
         let (status, Json(body)) = as_recovery_failure(failure).unwrap_err();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.code, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Iteration 11, item 2 — the typed token was laundered ONE LAYER DOWN.
+    //
+    // `code` at the top level said `RECOVERY_UNSCOPED`; `error_detail.code`
+    // said `INTERNAL_ERROR`, because `api_error` leaves the detail empty and a
+    // downstream classifier filled it with its fallthrough. A client reading
+    // the structured half was told the runner had a defect.
+    // ------------------------------------------------------------------
+
+    /// The detail's code for each mapped token — read off the SERIALIZED
+    /// envelope, which is what a caller actually sees.
+    fn detail_code(body: &ApiResponse<()>) -> String {
+        serde_json::to_value(body).unwrap()["error_detail"]["code"]
+            .as_str()
+            .expect("error_detail.code must be present")
+            .to_string()
+    }
+
+    fn detail_context_code(body: &ApiResponse<()>) -> String {
+        serde_json::to_value(body).unwrap()["error_detail"]["context"]["code"]
+            .as_str()
+            .expect("error_detail.context.code must be present")
+            .to_string()
+    }
+
+    /// All three mapped codes, on the 200-with-`recovered:false` arm.
+    #[test]
+    fn each_recovery_token_gets_its_own_typed_inner_code() {
+        for (token, expected) in [
+            ("RECOVERY_UNSCOPED", "INVALID_REQUEST"),
+            ("RECOVERY_TARGET_MISSING", "ELEMENT_NOT_FOUND"),
+            ("RECOVERY_FAILED", "ACTION_FAILED"),
+        ] {
+            let out = as_recovery_failure(ok(json!({
+                "success": false,
+                "error": format!("{token}: refused"),
+                "code": token,
+                "recovered": false,
+            })));
+            let (status, Json(body)) = out.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{token}");
+            assert_eq!(body.code.as_deref(), Some(token), "{token}");
+            assert_ne!(detail_code(&body), "INTERNAL_ERROR", "{token}");
+            assert_eq!(detail_code(&body), expected, "{token}");
+            // The token itself survives the coarse mapping.
+            assert_eq!(detail_context_code(&body), token, "{token}");
+        }
+    }
+
+    /// THE LIVE PATH: `wrap_ipc_result` has already flattened the frontend's
+    /// `success:false` payload into a 400 whose `error_detail` was classified
+    /// `INTERNAL_ERROR` (no transport pattern matches `RECOVERY_*: …`). That
+    /// unclassified detail must be RE-CODED, not left alone.
+    #[test]
+    fn a_pre_classified_internal_error_detail_is_recoded() {
+        for (token, expected) in [
+            ("RECOVERY_UNSCOPED", "INVALID_REQUEST"),
+            ("RECOVERY_TARGET_MISSING", "ELEMENT_NOT_FOUND"),
+            ("RECOVERY_FAILED", "ACTION_FAILED"),
+        ] {
+            let message = format!("{token}: refused");
+            let pre = crate::mcp::types::api_error_detailed(
+                message.clone(),
+                super::super::types::classify_transport_error(&message),
+            );
+            assert_eq!(
+                detail_code(&pre),
+                "INTERNAL_ERROR",
+                "precondition: the classifier must fall through for {token}"
+            );
+            let failure: BridgeResult = Err((StatusCode::BAD_REQUEST, Json(pre)));
+            let (_, Json(body)) = as_recovery_failure(failure).unwrap_err();
+            assert_eq!(body.code.as_deref(), Some(token), "{token}");
+            assert_eq!(detail_code(&body), expected, "{token}");
+            assert_eq!(detail_context_code(&body), token, "{token}");
+        }
+    }
+
+    /// A detail the transport classifier genuinely RECOGNISED is a better
+    /// answer than the token's coarse mapping, so it is kept.
+    #[test]
+    fn an_already_classified_detail_is_not_reclassified() {
+        let message = "No element found for 'ghost'";
+        let pre = crate::mcp::types::api_error_detailed(
+            message,
+            super::super::types::classify_transport_error(message),
+        );
+        assert_eq!(detail_code(&pre), "ELEMENT_NOT_FOUND");
+        let failure: BridgeResult = Err((StatusCode::BAD_REQUEST, Json(pre)));
+        let (_, Json(body)) = as_recovery_failure(failure).unwrap_err();
+        assert_eq!(detail_code(&body), "ELEMENT_NOT_FOUND");
+    }
+
+    /// The other half of the contract, structurally: a genuine recovery is a
+    /// 200 and carries no `error_detail` at all.
+    #[test]
+    fn a_genuine_recovery_carries_no_error_detail() {
+        let Json(body) = as_recovery_failure(ok(json!({ "recovered": true }))).unwrap();
+        assert!(body.success);
+        assert!(body.error_detail.is_none());
     }
 
     /// A 400 that already carries a code keeps it — this only ever adds.
