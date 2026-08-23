@@ -24,6 +24,8 @@ import {
   reportTreeReset,
   decideReconnectOutcome,
   decideColdResume,
+  decideDrainSkipDisposition,
+  applyDrainSkip,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
@@ -608,5 +610,102 @@ describe("buildResumeCmd (resume-size picker policy)", () => {
     const unbound = buildResumeCmd("sess-1", undefined, "summary");
     expect(unbound).not.toContain("CLAUDE_CONFIG_DIR");
     expect(unbound).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manual-test-loop iteration 10, item 1 — the STRANDED RESTORE MARKER.
+//
+// The drain used to answer a non-`respawn` decision with a bare
+// `updateTab(tabId, {isReconnecting:false}); continue;`. The durable
+// `restore_pending_at` marker stamped before the drain therefore stayed SET on
+// a record still pointing at its DEAD pre-restart terminal id, which the
+// backend poll can never match — and the poll clears a stale marker ONLY on the
+// `KeepAlive` branch, which an unmatched record cannot reach. Result: the row
+// sat at `tier=failed, pendingAt=set` forever, with `resumeFailed` never set so
+// `ResumeFailedBanner` never rendered it either. Silent, permanent, invisible.
+// ---------------------------------------------------------------------------
+describe("decideDrainSkipDisposition (item 1 — never strand the marker)", () => {
+  it("skip-unknown surfaces the actionable retry banner", () => {
+    const d = decideDrainSkipDisposition("skip-unknown");
+    expect(d.tabUpdates).toEqual({ isReconnecting: false, resumeFailed: true });
+  });
+
+  it("skip-alive surfaces the informational note — retrying would FORK the live transcript", () => {
+    const d = decideDrainSkipDisposition("skip-alive");
+    expect(d.tabUpdates).toEqual({ isReconnecting: false, restoreTerminalOnly: true });
+    expect(d.tabUpdates.resumeFailed).toBeUndefined();
+  });
+
+  it("BOTH skips rebind the record and clear the marker — the invariant that was violated", () => {
+    for (const decision of ["skip-alive", "skip-unknown"] as const) {
+      const d = decideDrainSkipDisposition(decision);
+      expect(d.rebindToRestoredTab).toBe(true);
+      expect(d.clearRestorePending).toBe(true);
+      // Whatever else it does, it must never leave the pane spinning.
+      expect(d.tabUpdates.isReconnecting).toBe(false);
+    }
+  });
+});
+
+describe("applyDrainSkip (item 1 — the wiring, not just the decision)", () => {
+  /** The row state a caller can observe after the skip, as the two IPCs describe it. */
+  const runSkip = async (decision: "skip-alive" | "skip-unknown") => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+    const updateTab = vi.fn();
+    await applyDrainSkip({
+      decision,
+      tabId: "tab-new",
+      claudeSessionId: "sess-1",
+      zoneIndex: 3,
+      updateTab,
+      invokeFn: async (cmd, args) => {
+        calls.push([cmd, args]);
+        return { success: true };
+      },
+    });
+    return { calls, updateTab };
+  };
+
+  it("skip-unknown (fetchLiveClaudeSessionIds returned null) rebinds, clears the marker, and shows the banner", async () => {
+    const { calls, updateTab } = await runSkip("skip-unknown");
+    expect(calls.map((c) => c[0])).toEqual([
+      "terminal_session_rebind_terminal",
+      "terminal_session_clear_restore_pending",
+    ]);
+    expect(calls[0][1]).toEqual({
+      claudeSessionId: "sess-1",
+      terminalId: "tab-new",
+      zoneIndex: 3,
+    });
+    expect(calls[1][1]).toEqual({ claudeSessionId: "sess-1" });
+    expect(updateTab).toHaveBeenCalledWith("tab-new", {
+      isReconnecting: false,
+      resumeFailed: true,
+    });
+  });
+
+  it("rebind runs BEFORE the clear — the reverse would relabel a skipped restore 'resumed'", async () => {
+    const { calls } = await runSkip("skip-alive");
+    expect(calls[0][0]).toBe("terminal_session_rebind_terminal");
+    expect(calls[1][0]).toBe("terminal_session_clear_restore_pending");
+  });
+
+  it("a failing rebind does NOT abort the marker clear — the stranding must not survive an IPC hiccup", async () => {
+    const seen: string[] = [];
+    const updateTab = vi.fn();
+    await applyDrainSkip({
+      decision: "skip-unknown",
+      tabId: "tab-new",
+      claudeSessionId: "sess-1",
+      zoneIndex: 0,
+      updateTab,
+      invokeFn: async (cmd) => {
+        seen.push(cmd);
+        if (cmd === "terminal_session_rebind_terminal") throw new Error("ipc down");
+        return { success: true };
+      },
+    });
+    expect(seen).toContain("terminal_session_clear_restore_pending");
   });
 });

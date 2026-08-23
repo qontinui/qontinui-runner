@@ -1007,27 +1007,48 @@ async fn seed_scenario_handler(
 //
 // The StatusStrip seam above seeds the *transcript-list* render path. It has no
 // way to exercise the session-RESTORE path, which reads the durable
-// `SessionLifecycleStore` (`<home>/.qontinui/runner/terminal-sessions[-<port>].json`)
-// at boot and resurrects every restorable row. Restore tests otherwise have to
-// hand-write a port-namespaced JSON file with exact camelCase keys and compute
-// the anchor/last-seen offset math by hand. These routes give them a seam:
+// `SessionLifecycleStore` at boot and resurrects every restorable row. Restore
+// tests otherwise have to hand-write the store's JSON with exact camelCase keys
+// and compute the anchor/last-seen offset math by hand. These routes give them
+// a seam:
 //
-//   - POST /ui-bridge/test/seed-lifecycle-store  — write a port-namespaced
-//     store from a JSON body of `{ records: [ {sessionId, state, lastSeenOffsetMs,
+//   - POST /ui-bridge/test/seed-lifecycle-store  — write this instance's store
+//     from a JSON body of `{ records: [ {sessionId, state, lastSeenOffsetMs,
 //     closeReason?, ...} ] }`. `lastSeenOffsetMs` is relative to "now" (negative
 //     = the past), so a body can place open/ghost/closed rows at precise ages
 //     without the caller knowing the wall clock. 400 on a malformed body.
-//   - POST /ui-bridge/test/clear-lifecycle-store — delete the port-namespaced
-//     store file. Returns whether a file was removed.
-//   - POST /ui-bridge/test/list-lifecycle-open — read the port-namespaced store
-//     back and return the `state == "open"` session ids (the StatusStrip
-//     restore consumer's input), so a test can assert the seed round-tripped
-//     without reaching into the filesystem.
+//   - POST /ui-bridge/test/clear-lifecycle-store — delete this instance's store
+//     file. Returns whether a file was removed.
+//   - POST /ui-bridge/test/list-lifecycle-open — read this instance's store back
+//     and return the `state == "open"` session ids (the StatusStrip restore
+//     consumer's input), so a test can assert the seed round-tripped without
+//     reaching into the filesystem.
 //
-// The store path is namespaced by the runner's actually-bound API port,
-// mirroring `main.rs`'s `lifecycle_store` wiring (port 9876 → base name, every
-// other port → `-<port>` suffix), so a temp runner seeds/reads its OWN file
-// and never the primary's live sessions.
+// ## The path is INSTANCE-namespaced, not port-namespaced
+//
+// This block used to say the file was namespaced by the runner's bound API
+// port (`terminal-sessions[-<port>].json`). It is not, and has not been since
+// `2026-08-10-temp-runner-session-restore-isolation`: all three routes resolve
+// `session_lifecycle_store::store_path()`, which is
+// `instance::scope_path(<runner dir>)/terminal-sessions.json` — the primary at
+// `~/.qontinui/runner/`, every secondary under
+// `~/.qontinui/runner/instance-<name>/`. The distinction is load-bearing for a
+// caller reaching for the file directly: a recycled temp-runner PORT no longer
+// aliases a previous temp's store, but two runners sharing an INSTANCE NAME
+// would share one. Either way a temp runner seeds/reads its OWN file and never
+// the primary's live sessions.
+//
+// ## The seed is applied to the RUNNING store, not just the file
+//
+// Writing the file is not enough inside a live runner: the running
+// `SessionLifecycleStore` holds the authoritative map in memory and rewrites
+// the whole file on its next persist, so a poll tick / close / compaction after
+// the seed silently restored the pre-seed state while this route had already
+// answered `success: true`. The handler therefore drops the sibling WAL (whose
+// deltas describe the state being replaced and would otherwise replay over the
+// seed on the next `open()`) and calls `reload_from_disk()` on the registered
+// store. If a store IS registered and the reload FAILS, the route answers
+// HTTP 409 rather than claiming a seed that will be overwritten.
 
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 use std::path::Path;
@@ -1074,6 +1095,15 @@ pub struct SeedLifecycleResponse {
     pub success: bool,
     pub seeded: usize,
     pub path: String,
+    /// Whether the RUNNING store adopted the seed (`reload_from_disk`). `false`
+    /// means no store was registered in this process — the file is the whole
+    /// state, which is the case for out-of-process callers and unit tests. A
+    /// registered store that failed to reload is a 409, never a `false` here.
+    pub reloaded: bool,
+    /// Records the running store holds after the reload. Absent when
+    /// `reloaded` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_memory_records: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1195,6 +1225,21 @@ fn seed_lifecycle_store_at(
             format!("failed to write lifecycle store: {e}"),
         )
     })?;
+    // Drop the sibling write-ahead log. `SessionLifecycleStore::open` replays it
+    // OVER the snapshot, so a WAL left behind by whatever wrote the store before
+    // this seed would resurrect those records on the next open — the
+    // clear-then-seed contract silently violated, with no error anywhere.
+    let wal = crate::session::session_lifecycle_store::wal_path_for(path);
+    match std::fs::remove_file(&wal) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to clear lifecycle store WAL {}: {e}", wal.display()),
+            ))
+        }
+    }
     Ok(seeded)
 }
 
@@ -1216,7 +1261,7 @@ fn list_lifecycle_open_at(path: &Path) -> Vec<String> {
 }
 
 async fn seed_lifecycle_store_handler(
-    axum::extract::State(_state): axum::extract::State<Arc<ApiState>>,
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     Json(req): Json<SeedLifecycleRequest>,
 ) -> Result<Json<SeedLifecycleResponse>, (StatusCode, Json<InjectSessionError>)> {
     // This control route runs INSIDE the target runner, so its own instance
@@ -1224,27 +1269,60 @@ async fn seed_lifecycle_store_handler(
     // self-scoped path (no port arg needed once the port is no longer the key).
     let path = crate::session::session_lifecycle_store::store_path();
     let now_ms = chrono::Utc::now().timestamp_millis();
-    match seed_lifecycle_store_at(&path, &req, now_ms) {
-        Ok(seeded) => {
-            info!(
-                "test_fixtures: seeded lifecycle store path={} records={}",
-                path.display(),
-                seeded,
-            );
-            Ok(Json(SeedLifecycleResponse {
-                success: true,
-                seeded,
-                path: path.display().to_string(),
-            }))
+    let seeded = match seed_lifecycle_store_at(&path, &req, now_ms) {
+        Ok(seeded) => seeded,
+        Err((code, error)) => {
+            return Err((
+                code,
+                Json(InjectSessionError {
+                    success: false,
+                    error,
+                }),
+            ))
         }
-        Err((code, error)) => Err((
-            code,
-            Json(InjectSessionError {
-                success: false,
-                error,
-            }),
-        )),
-    }
+    };
+    // Hand the seed to the RUNNING store. Without this the file is authoritative
+    // only until the live store's next persist rewrites it from its own
+    // in-memory map — see this module's header for the silent-loss defect.
+    // `try_state` is a `Manager` method — imported locally so this module's
+    // other handlers keep their existing (Manager-free) import surface.
+    use tauri::Manager as _;
+    let (reloaded, in_memory_records) = match state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+    {
+        Some(store) => match store.reload_from_disk() {
+            Ok(count) => (true, Some(count)),
+            Err(e) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(InjectSessionError {
+                        success: false,
+                        error: format!(
+                            "seed written to {} but the running lifecycle store could not adopt it ({e}); it would be overwritten by the store's next persist",
+                            path.display()
+                        ),
+                    }),
+                ))
+            }
+        },
+        // No store registered in this process (out-of-process callers, tests):
+        // the file IS the whole state, so the seed stands as written.
+        None => (false, None),
+    };
+    info!(
+        "test_fixtures: seeded lifecycle store path={} records={} reloaded={}",
+        path.display(),
+        seeded,
+        reloaded,
+    );
+    Ok(Json(SeedLifecycleResponse {
+        success: true,
+        seeded,
+        path: path.display().to_string(),
+        reloaded,
+        in_memory_records,
+    }))
 }
 
 async fn list_lifecycle_open_handler(
@@ -2643,5 +2721,162 @@ mod tests {
         assert!((0..=3).contains(&ttl), "ttl_secs ~= now+3, got {ttl}");
 
         crate::coord_mcp::remove_agent_token(agent_id);
+    }
+
+    /// A minimal live open record, built through the seam's own converter so
+    /// the fixture cannot drift from the record shape the seam writes.
+    fn open_row(id: &str) -> TerminalSessionRecord {
+        record_from_seed(
+            &SeedLifecycleRecord {
+                session_id: id.to_string(),
+                state: "open".to_string(),
+                last_seen_offset_ms: 0,
+                closed_at_offset_ms: None,
+                close_reason: None,
+                page_id: None,
+                zone_index: None,
+                title: None,
+                working_dir: None,
+            },
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .expect("valid seed row")
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual-test-loop iteration 10, item 5 — the seed-lifecycle-store seam
+    // silently lost the seed.
+    //
+    // Two ways it went missing, both answered `success: true`:
+    //   (a) a stale sibling WAL replayed OVER the seeded snapshot on the next
+    //       `SessionLifecycleStore::open`, resurrecting the very records the
+    //       clear-then-seed contract had just discarded;
+    //   (b) a RUNNING store kept the pre-seed map in memory and rewrote the
+    //       whole file from it on its next persist.
+    // -----------------------------------------------------------------------
+
+    /// (a) — the seed must drop the WAL, or the file it wrote is not what the
+    /// next reader sees.
+    #[test]
+    fn seed_lifecycle_store_drops_a_stale_wal_that_would_replay_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // A pre-existing store with one row, persisted through the real write
+        // path so a genuine WAL exists beside the snapshot.
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.record_open(open_row("pre-seed"));
+        }
+        let wal = crate::session::session_lifecycle_store::wal_path_for(&path);
+        assert!(wal.exists(), "precondition: the write path left a WAL");
+
+        let req = SeedLifecycleRequest {
+            records: vec![SeedLifecycleRecord {
+                session_id: "seeded".to_string(),
+                state: "open".to_string(),
+                last_seen_offset_ms: -1_000,
+                closed_at_offset_ms: None,
+                close_reason: None,
+                page_id: None,
+                zone_index: None,
+                title: None,
+                working_dir: None,
+            }],
+        };
+        seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
+
+        assert!(!wal.exists(), "the seed must clear the sibling WAL");
+        assert_eq!(
+            list_lifecycle_open_at(&path),
+            vec!["seeded".to_string()],
+            "the next reader sees the SEED, not the WAL-replayed pre-seed row"
+        );
+    }
+
+    /// (b) — a live store adopts the seeded file, so its next persist writes
+    /// the SEED back instead of clobbering it with the pre-seed map.
+    #[test]
+    fn a_running_store_adopts_the_seed_instead_of_overwriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(open_row("pre-seed"));
+
+        let req = SeedLifecycleRequest {
+            records: vec![SeedLifecycleRecord {
+                session_id: "seeded".to_string(),
+                state: "open".to_string(),
+                last_seen_offset_ms: -1_000,
+                closed_at_offset_ms: None,
+                close_reason: None,
+                page_id: None,
+                zone_index: None,
+                title: None,
+                working_dir: None,
+            }],
+        };
+        seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
+
+        // WITHOUT the reload this is where the seed dies: the live store still
+        // holds `pre-seed` and knows nothing of `seeded`.
+        let adopted = store.reload_from_disk().expect("reload");
+        assert_eq!(adopted, 1);
+        let ids: Vec<String> = store
+            .open_records()
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["seeded".to_string()],
+            "the RUNNING store holds the seed"
+        );
+
+        // The next lifecycle write persists the seeded map — the pre-seed row
+        // does not come back.
+        store.touch("seeded");
+        assert_eq!(
+            list_lifecycle_open_at(&path),
+            vec!["seeded".to_string()],
+            "a persist after the seed writes the SEED back, not the pre-seed state"
+        );
+    }
+
+    /// The reload is a whole-map REPLACE: a merge would resurrect exactly the
+    /// rows the clear-then-seed contract discarded.
+    #[test]
+    fn reload_from_disk_replaces_rather_than_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        for id in ["a", "b"] {
+            store.record_open(open_row(id));
+        }
+
+        let req = SeedLifecycleRequest {
+            records: vec![SeedLifecycleRecord {
+                session_id: "only".to_string(),
+                state: "open".to_string(),
+                last_seen_offset_ms: 0,
+                closed_at_offset_ms: None,
+                close_reason: None,
+                page_id: None,
+                zone_index: None,
+                title: None,
+                working_dir: None,
+            }],
+        };
+        seed_lifecycle_store_at(&path, &req, chrono::Utc::now().timestamp_millis()).unwrap();
+        assert_eq!(store.reload_from_disk().unwrap(), 1);
+        assert!(
+            store.get("a").is_none(),
+            "a merge would have kept the pre-seed rows"
+        );
+        assert!(store.get("only").is_some());
     }
 }

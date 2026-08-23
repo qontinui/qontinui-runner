@@ -19,8 +19,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import type { CommandResponse } from "./types";
-import type { HandshakePatterns } from "./providerAdapter";
+import {
+  CLAUDE_HANDSHAKE_REGEXES,
+  CLAUDE_RESUME_FAILURE_REGEXES,
+  type HandshakePatterns,
+} from "./providerAdapter";
 import { writeWhenReady, type TerminalRefsMap } from "./writeWhenReady";
+import { TERMINAL_EXITED, type TerminalWriteResult } from "./terminalWriteResult";
 
 // ---------------------------------------------------------------------------
 // "Resume from summary?" picker policy (#548 item 3)
@@ -56,10 +61,7 @@ export function getResumeSummaryPolicy(): ResumeSummaryPolicy {
  * "Resume full session as-is", "Don't ask me again"). Matched against
  * ANSI-stripped text.
  */
-const RESUME_PICKER_PATTERNS: RegExp[] = [
-  /Resume from summary/i,
-  /Resume full session as-is/i,
-];
+const RESUME_PICKER_PATTERNS: RegExp[] = [/Resume from summary/i, /Resume full session as-is/i];
 
 /** True when the pane is showing the CLI's resume-size picker. */
 export function detectResumePicker(text: string): boolean {
@@ -85,69 +87,45 @@ export function stripAnsi(text: string): string {
 }
 
 /**
- * Markers that the Claude Code TUI actually rendered in this pane — i.e. the
- * resume command landed and the CLI took over the terminal. Deliberately
- * Claude-UI-shaped (rounded input box, status-line hints) rather than "any
- * output grew": a shell prompt echo or an error message must NOT count.
- *
- * The interactive resume-size picker ("Resume from summary?") is itself
- * Claude UI — a pane wedged on it still counts as HANDSHAKE OK here (the
- * resume landed; answering the picker is a separate concern).
- */
-const CLAUDE_HANDSHAKE_PATTERNS: RegExp[] = [
-  /\? for shortcuts/, // persistent status-line hint under the input box
-  /esc to interrupt/i, // shown while Claude is actively working
-  /bypass permissions/i, // permission-mode indicator in the status line
-  /Welcome (?:back )?to Claude/i, // launch banner
-  /[╭╰]─{3,}/, // rounded input-box / dialog frame
-];
-
-/**
- * Definitive evidence that the REQUESTED session did NOT resume — evaluated
- * BEFORE the handshake patterns on every probe. "The Claude TUI appeared" is
- * not the same claim as "the requested session resumed": a
- * `claude --resume <bogus-id>` can fall through to an error dialog, a fresh
- * session, or the interactive session picker, all of which still render
- * Claude-UI frames and previously read as a VERIFIED restore (boot-restore
- * remediation item 4). Matching any of these parks the tab `resumeFailed`
- * with the durable restore-pending marker kept.
- *
- * Wording sourced from the Claude Code CLI's unknown-session error and the
- * `--resume` session-picker frames; extend from real scrollback if a real
- * failed resume ever verifies (same maintenance rule as the picker patterns
- * above).
- */
-const RESUME_FAILURE_PATTERNS: RegExp[] = [
-  /No conversation found/i, // `--resume <unknown-id>` error
-  /No conversations? (?:found|to resume)/i, // empty-history variants
-  /Select a (?:session|conversation) to resume/i, // interactive session picker frame
-];
-
-/**
  * True when the pane's recent output shows a definitive resume FAILURE
  * (unknown session id / fell through to the session picker). Checked before
  * {@link detectClaudeHandshake} — failure frames are themselves provider UI.
  *
- * Phase 4 (provider-agnostic): when `patterns` is supplied (the per-adapter
- * `HandshakePatterns` from the provider descriptor), its `failure` substrings
- * are matched (case-insensitive) on the ANSI-stripped text. Omitting it falls
- * back to the built-in Claude regex set — the live default for Claude restores.
+ * Matches the UNION of the descriptor's `failure` substrings and its
+ * `failurePatterns` regexes; with no descriptor it falls back to Claude's own
+ * regex set. See {@link HandshakePatterns} for why the union (and not the
+ * former `if (patterns) return substringsOnly`) is the correct shape: the
+ * boot-restore path always supplies a descriptor, so an either/or made every
+ * regex marker dead in production.
  */
 export function detectResumeFailure(text: string, patterns?: HandshakePatterns): boolean {
   const stripped = stripAnsi(text);
-  if (patterns) return matchSubstrings(stripped, patterns.failure);
-  return RESUME_FAILURE_PATTERNS.some((p) => p.test(stripped));
+  if (patterns) {
+    return (
+      matchSubstrings(stripped, patterns.failure) ||
+      matchRegexes(stripped, patterns.failurePatterns)
+    );
+  }
+  return matchRegexes(stripped, CLAUDE_RESUME_FAILURE_REGEXES);
 }
 
 /**
  * True when the pane's recent output shows the provider's resume handshake.
- * With `patterns` supplied, matches its `success` substrings (case-insensitive)
- * on ANSI-stripped text; otherwise falls back to the built-in Claude regex set.
+ * Same union rule as {@link detectResumeFailure}: descriptor substrings ∪
+ * descriptor regexes, falling back to Claude's regex set when no descriptor is
+ * supplied. The Claude descriptor's regexes carry the rounded input-box frame
+ * marker, which no substring can express — a restored pane that has painted
+ * only the frame verifies here.
  */
 export function detectClaudeHandshake(text: string, patterns?: HandshakePatterns): boolean {
   const stripped = stripAnsi(text);
-  if (patterns) return matchSubstrings(stripped, patterns.success);
-  return CLAUDE_HANDSHAKE_PATTERNS.some((p) => p.test(stripped));
+  if (patterns) {
+    return (
+      matchSubstrings(stripped, patterns.success) ||
+      matchRegexes(stripped, patterns.successPatterns)
+    );
+  }
+  return matchRegexes(stripped, CLAUDE_HANDSHAKE_REGEXES);
 }
 
 /** Case-insensitive substring match of any pattern in `text`. */
@@ -155,6 +133,12 @@ function matchSubstrings(text: string, substrings: string[]): boolean {
   if (substrings.length === 0) return false;
   const lower = text.toLowerCase();
   return substrings.some((s) => s.length > 0 && lower.includes(s.toLowerCase()));
+}
+
+/** Regex match of any pattern in `text`. An absent/empty set never matches. */
+function matchRegexes(text: string, patterns?: RegExp[]): boolean {
+  if (!patterns || patterns.length === 0) return false;
+  return patterns.some((p) => p.test(text));
 }
 
 /** How many trailing characters of the (decoded) ring to scan per probe. */
@@ -245,8 +229,27 @@ export interface TypeAndVerifyOptions extends HandshakeWaitOptions {
   attempts?: number;
   /** Delay between typing and the first probe, and before a retry retype. */
   settleMs?: number;
-  /** Injectable writer (tests); defaults to {@link writeWhenReady}. */
-  write?: (refs: TerminalRefsMap, tabId: string, text: string) => void;
+  /**
+   * Injectable writer (tests); defaults to {@link writeWhenReady}.
+   *
+   * Resolving a {@link TerminalWriteResult} is what lets this loop tell a
+   * write that reached the PTY from one refused with `TERMINAL_EXITED` /
+   * `TERMINAL_WRITE_FAILED`. A doubled writer that resolves `void` (or
+   * returns nothing at all) is treated as NO INFORMATION and the loop behaves
+   * exactly as it did before — only an explicit failure envelope changes the
+   * outcome, so a test double never has to fabricate a success envelope.
+   */
+  write?: (
+    refs: TerminalRefsMap,
+    tabId: string,
+    text: string,
+  ) => Promise<TerminalWriteResult> | TerminalWriteResult | void;
+  /**
+   * Called with the typed envelope when a resume write is REFUSED. The loop
+   * already short-circuits on it; this is the hook that lets the caller log or
+   * surface the reason instead of the generic "handshake not observed".
+   */
+  onWriteFailure?: (failure: Extract<TerminalWriteResult, { success: false }>) => void;
   /**
    * Keystrokes to type (at most ONCE per call) when a probe shows the CLI's
    * "Resume from summary?" picker — see {@link buildPickerAnswer}. This is
@@ -266,6 +269,13 @@ export interface TypeAndVerifyOptions extends HandshakeWaitOptions {
  * When `pickerAnswer` is set and a probe shows the resume-size picker, the
  * answer is typed once so an unattended resume can't wedge on it. The picker
  * is itself Claude UI, so the same probe also verifies the handshake.
+ *
+ * REFUSED WRITES short-circuit. The writer now resolves a
+ * {@link TerminalWriteResult}; a `TERMINAL_EXITED` envelope fails immediately
+ * (no process to hand-shake with, and a retype cannot resurrect the pty) and a
+ * `TERMINAL_WRITE_FAILED` one skips straight to the retype. Either way the
+ * ~31 s scrollback poll is not spent re-deriving a diagnosis the write already
+ * returned — see `writeWhenReady`'s header for the defect this closes.
  */
 export async function typeResumeAndVerify(
   terminalRefs: TerminalRefsMap,
@@ -279,6 +289,7 @@ export async function typeResumeAndVerify(
     write = writeWhenReady,
     pickerAnswer,
     onProbe,
+    onWriteFailure,
     ...waitOpts
   } = options;
   let pickerAnswered = false;
@@ -286,16 +297,46 @@ export async function typeResumeAndVerify(
     onProbe?.(tail);
     if (pickerAnswer && !pickerAnswered && detectResumePicker(tail)) {
       pickerAnswered = true;
-      write(terminalRefs, tabId, pickerAnswer);
+      void write(terminalRefs, tabId, pickerAnswer);
     }
+  };
+  /**
+   * Type `text` and report the REFUSAL envelope, if any. `null` means "no
+   * refusal" — either the write landed or the injected writer resolved
+   * nothing (no information; treated as landed, the pre-envelope behaviour).
+   */
+  const typeAndCheck = async (
+    text: string,
+  ): Promise<Extract<TerminalWriteResult, { success: false }> | null> => {
+    const result = await write(terminalRefs, tabId, text);
+    if (result && result.success === false) {
+      onWriteFailure?.(result);
+      console.warn(
+        `[resumeVerification] resume write REFUSED for ${tabId}: ${result.error} ${result.hint}`,
+      );
+      return result;
+    }
+    return null;
   };
   for (let attempt = 1; attempt <= attempts; attempt++) {
     if (attempt > 1) {
       // Clear any half-typed line from the failed attempt, then retype.
-      write(terminalRefs, tabId, CLEAR_LINE);
+      void write(terminalRefs, tabId, CLEAR_LINE);
       await new Promise((r) => setTimeout(r, settleMs));
     }
-    write(terminalRefs, tabId, resumeCmd);
+    const refusal = await typeAndCheck(resumeCmd);
+    if (refusal) {
+      // The write never reached a process, so there is nothing to hand-shake
+      // WITH: polling the scrollback for up to `timeoutMs` (twice) would spend
+      // the whole ~31 s budget confirming what the envelope already said.
+      //
+      // `TERMINAL_EXITED` is terminal — the pty is gone and a retype cannot
+      // change that, so fail immediately. `TERMINAL_WRITE_FAILED` is an IPC
+      // failure against a pane that is NOT marked exited, which is exactly the
+      // transient the retry exists for: skip this attempt's poll and retype.
+      if (refusal.code === TERMINAL_EXITED || attempt === attempts) return "failed";
+      continue;
+    }
     await new Promise((r) => setTimeout(r, settleMs));
     const outcome = await waitForClaudeHandshake(tabId, { ...waitOpts, onProbe: probe });
     if (outcome === "verified") return "verified";

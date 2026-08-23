@@ -2292,6 +2292,70 @@ impl SessionLifecycleStore {
         w.appends >= WAL_COMPACT_APPENDS
     }
 
+    /// Re-read this store's on-disk snapshot (+ WAL replay) and REPLACE the
+    /// in-memory map with it. Returns the record count now held.
+    ///
+    /// THE DEFECT this exists for: the `seed-lifecycle-store` test seam writes
+    /// the snapshot file directly, but a RUNNING runner holds the authoritative
+    /// copy in memory and rewrites the whole file on its next persist. Any
+    /// lifecycle write after the seed — a poll tick's `touch`, a close, a
+    /// compaction — therefore silently overwrote the seeded rows with the
+    /// pre-seed in-memory state, and the seam reported `success: true` while
+    /// the seed had already been lost. Reloading closes the window: the running
+    /// store adopts the seeded file as its own state, so the next persist
+    /// writes the SEED back rather than clobbering it.
+    ///
+    /// Deliberately whole-map REPLACE, not merge: the seam's contract is
+    /// clear-then-seed (the file it wrote is the complete intended store), and
+    /// a merge would resurrect exactly the pre-seed rows the caller cleared.
+    ///
+    /// Takes `map` then `wal` (the store-wide lock order) so no append can
+    /// straddle the swap, and truncates the WAL — its deltas describe the state
+    /// that was just discarded, and replaying them over the reload would undo
+    /// it on the next `open()`.
+    pub fn reload_from_disk(&self) -> std::io::Result<usize> {
+        let mut m = self
+            .map
+            .lock()
+            .map_err(|_| std::io::Error::other("session lifecycle map lock poisoned"))?;
+        let mut w = self
+            .wal
+            .lock()
+            .map_err(|_| std::io::Error::other("session lifecycle WAL lock poisoned"))?;
+        let mut fresh = load_map(&self.path);
+        let replay = replay_wal(&self.wal_path, &mut fresh);
+        if replay.applied > 0 || replay.damaged {
+            // The WAL on disk belongs to the state we are replacing. Fold what
+            // it had into the reload (so a concurrent append is not lost) and
+            // then rewrite both files from the reloaded map below.
+            debug!(
+                applied = replay.applied,
+                damaged = replay.damaged,
+                "session_lifecycle_store: reload folded a non-empty WAL"
+            );
+        }
+        *m = fresh;
+        let count = m.len();
+        if let Err(e) = write_map(&self.path, &m) {
+            warn!(error = %e, "session_lifecycle_store: reload snapshot rewrite failed");
+        }
+        // Same ending as [`Self::compact`], and for the same reason: the WAL
+        // handle is kept OPEN across appends, so truncating the file without
+        // dropping it would leave the next append writing at the old offset —
+        // NUL-padding the log into a torn line.
+        w.file = None;
+        w.dirty = false;
+        match std::fs::File::create(&self.wal_path) {
+            Ok(_) => w.appends = 0,
+            Err(e) => warn!(
+                error = %e,
+                path = %self.wal_path.display(),
+                "session_lifecycle_store: reload WAL truncate failed — replay may re-apply discarded deltas"
+            ),
+        }
+        Ok(count)
+    }
+
     /// Fold the WAL into the JSON snapshot and truncate it.
     ///
     /// Ordering is what makes this crash-safe: the snapshot is written and
@@ -2524,7 +2588,7 @@ fn write_map(path: &Path, map: &HashMap<String, TerminalSessionRecord>) -> std::
 /// Write-ahead-log path for a snapshot path: `terminal-sessions.json` →
 /// `terminal-sessions.wal.jsonl`, always a sibling so both live under the same
 /// instance-scoped directory.
-fn wal_path_for(path: &Path) -> PathBuf {
+pub(crate) fn wal_path_for(path: &Path) -> PathBuf {
     path.with_extension("wal.jsonl")
 }
 

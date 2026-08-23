@@ -229,9 +229,7 @@ export function extractApiErrorMessage(body: string, statusText: string): string
   const nested = obj.error;
   const candidates: unknown[] = [
     typeof nested === "string" ? nested : undefined,
-    nested && typeof nested === "object"
-      ? (nested as Record<string, unknown>).message
-      : undefined,
+    nested && typeof nested === "object" ? (nested as Record<string, unknown>).message : undefined,
     obj.message,
     obj.detail,
   ];
@@ -239,6 +237,50 @@ export function extractApiErrorMessage(body: string, statusText: string): string
   if (!message) return trimmed;
   const hint = typeof obj.hint === "string" && obj.hint.trim() !== "" ? obj.hint : null;
   return hint ? `${message.trim()} (${hint.trim()})` : message.trim();
+}
+
+/**
+ * Describe a THROWN value, whatever shape it arrived in.
+ *
+ * THE DEFECT this closes: every panel loader wrote
+ * `err instanceof Error ? err.message : "<bare constant>"`. The `else` arm is
+ * not a rare edge here — `invoke()` rejects with a plain STRING carrying the
+ * Rust command's own error text, so a Tauri-backed loader took the branch that
+ * DISCARDS the diagnosis on every failure and rendered only the constant. The
+ * overlapping-intents panel therefore said `Failed to load overlap pairs` and
+ * nothing else, no matter why it failed — a read-value on that element told an
+ * operator (or an automation client) exactly as much as an empty panel would.
+ *
+ * Everything non-`Error` is serialized rather than dropped: a string verbatim,
+ * an object's `status` / `code` / `error` / `message` / `detail` fields when it
+ * has any (the runner's `ApiResponse` envelope and `fetch`-style rejections
+ * both land here), and a JSON dump as the last resort. `fallback` is used ONLY
+ * when the value carries no information at all — losing the cause is strictly
+ * worse than showing it ugly, the same rule
+ * {@link extractApiErrorMessage} follows.
+ */
+export function describeThrown(err: unknown, fallback: string): string {
+  if (err instanceof Error) return err.message || fallback;
+  if (typeof err === "string") return err.trim() || fallback;
+  if (typeof err === "number" || typeof err === "boolean") return String(err);
+  if (err && typeof err === "object") {
+    const o = err as Record<string, unknown>;
+    const status =
+      typeof o.status === "number" || typeof o.status === "string" ? `HTTP ${o.status}` : null;
+    const body = [o.error, o.message, o.detail, o.code].find(
+      (c): c is string => typeof c === "string" && c.trim() !== "",
+    );
+    if (status && body) return `${status}: ${body.trim()}`;
+    if (body) return body.trim();
+    if (status) return status;
+    try {
+      const dump = JSON.stringify(err);
+      if (dump && dump !== "{}") return `${fallback} (${dump})`;
+    } catch {
+      // Circular / non-serializable — fall through to the fallback.
+    }
+  }
+  return fallback;
 }
 
 /**
@@ -327,8 +369,12 @@ export async function getCoordinatorState(): Promise<CoordinatorState> {
  *  Mirrors `CoordinatorAction` (kebab-case `type`, camelCase fields). Only
  *  the variants the deferrals panel actually fires are listed; extend as
  *  more dashboard surfaces need manual dispatch. */
-export type DispatchCoordinatorAction =
-  | { type: "assign-task"; taskId: string; sessionId: string; reasoning?: string };
+export type DispatchCoordinatorAction = {
+  type: "assign-task";
+  taskId: string;
+  sessionId: string;
+  reasoning?: string;
+};
 
 // ---------------------------------------------------------------------------
 // Row 9 Phase 4 — fleet health + alerts (FleetHealthPanel).
@@ -456,9 +502,7 @@ export interface OverlappingIntentPair {
 /** Fetch the L2 overlapping-intents snapshot from coord.agent_worktrees.
  *  Read-only — the panel is informational, no actions taken from
  *  client-side. */
-export async function listOverlappingIntents(
-  limit = 200,
-): Promise<OverlappingIntentPair[]> {
+export async function listOverlappingIntents(limit = 200): Promise<OverlappingIntentPair[]> {
   return invoke<OverlappingIntentPair[]>("list_overlapping_intents", { limit });
 }
 

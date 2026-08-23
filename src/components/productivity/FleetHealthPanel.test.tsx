@@ -14,8 +14,8 @@
 
 import { describe, expect, it } from "vitest";
 
-import { deriveFleetView } from "./FleetHealthPanel";
-import type { FleetHealth, FleetMachineSnapshot } from "./coordinatorApi";
+import { deriveAlertBadges, deriveFleetView } from "./FleetHealthPanel";
+import type { FleetAlert, FleetHealth, FleetMachineSnapshot } from "./coordinatorApi";
 import {
   COORD_SOURCE_NO_ACCOUNT,
   COORD_SOURCE_SETTINGS_UNREADABLE,
@@ -105,6 +105,10 @@ describe("deriveFleetView — fleet-auth P2 auth-state mapping", () => {
     expect(v.isAuthBlocked).toBe(true);
     expect(v.machines).toEqual([]);
     expect(v.alerts).toEqual([]);
+    // …and the ROLLUP too: it feeds the header's severity badges, so a stale
+    // pre-rejection count would render beside the "coord rejected us" notice
+    // as if it were current fleet state.
+    expect(v.rollup).toEqual({ critical: 0, warning: 0, info: 0 });
   });
 
   it("state 'unpaired' → auth-blocked; stale machine grid + alerts suppressed", () => {
@@ -191,5 +195,74 @@ describe("deriveFleetView — coord-mode gating (§6.4)", () => {
     const v = deriveFleetView(okPayload());
     expect(v.coordDisabled).toBe(false);
     expect(v.machines).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manual-test-loop iteration 10, item 7 — the header and the body disagreed.
+//
+// Observed live: the header read `0 machines / 61 critical / 1929 warning`
+// while the body read `No machines registered with a pollable /health URL yet`.
+// `machines.length` counts the pollable machines the body lists;
+// `rollup.{critical,warning}` is coord's FLEET-WIDE alert total. Two unrelated
+// populations rendered side by side with nothing saying so.
+// ---------------------------------------------------------------------------
+describe("deriveAlertBadges (item 7 — header and body describe one population)", () => {
+  const alert = (
+    id: number,
+    severity: FleetAlert["severity"],
+    machine_id: string | null,
+  ): FleetAlert => ({
+    id,
+    alert_key: `k-${id}`,
+    severity,
+    kind: "probe",
+    machine_id,
+    summary: "s",
+    detail: {},
+    first_seen_at: "2026-08-22T00:00:00Z",
+    last_seen_at: "2026-08-22T00:00:00Z",
+    occurrences: 1,
+    resolved_at: null,
+    page_due_at: null,
+  });
+
+  it("THE REGRESSION: no machines listed ⇒ no per-machine badges, every alert labelled fleet-wide", () => {
+    const b = deriveAlertBadges([], [], { critical: 61, warning: 1929, info: 0 });
+    expect(b.scoped).toEqual({ critical: 0, warning: 0 });
+    expect(b.fleetWide).toEqual({ critical: 61, warning: 1929 });
+  });
+
+  it("alerts against a LISTED machine are scoped — they share the header's population", () => {
+    const b = deriveAlertBadges(
+      [machine],
+      [alert(1, "critical", "m-1"), alert(2, "warning", "m-1")],
+      { critical: 1, warning: 2, info: 0 },
+    );
+    expect(b.scoped).toEqual({ critical: 1, warning: 1 });
+    // The rollup's second warning is against something this list does not show,
+    // so it surfaces as an explicitly-labelled fleet-wide excess — never hidden,
+    // and never silently attributed to the one machine on screen.
+    expect(b.fleetWide).toEqual({ critical: 0, warning: 1 });
+  });
+
+  it("alerts against an UNLISTED machine, and fleet-scope alerts, never count as scoped", () => {
+    const b = deriveAlertBadges(
+      [machine],
+      [alert(1, "critical", "m-other"), alert(2, "critical", null)],
+      { critical: 2, warning: 0, info: 0 },
+    );
+    expect(b.scoped).toEqual({ critical: 0, warning: 0 });
+    expect(b.fleetWide).toEqual({ critical: 2, warning: 0 });
+  });
+
+  it("never reports a negative excess when the active-alert page over-covers the rollup", () => {
+    const b = deriveAlertBadges([machine], [alert(1, "critical", "m-1")], {
+      critical: 0,
+      warning: 0,
+      info: 0,
+    });
+    expect(b.fleetWide.critical).toBe(0);
+    expect(b.fleetWide.warning).toBe(0);
   });
 });

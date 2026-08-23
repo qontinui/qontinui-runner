@@ -122,10 +122,72 @@ export function deriveFleetView(
     // them as if current. Same for isolated: there is no fleet.
     machines: isAuthBlocked || coordDisabled ? [] : (data?.health?.machines ?? []),
     alerts: isAuthBlocked || coordDisabled ? [] : (data?.alerts ?? []),
-    rollup: coordDisabled
-      ? { critical: 0, warning: 0, info: 0 }
-      : (data?.health?.alerts ?? { critical: 0, warning: 0, info: 0 }),
+    // Auth-blocked gets the SAME suppression the grid and alert list get two
+    // lines up. It did not before, which was invisible while the rollup was
+    // only a number: now that an unexplained rollup surfaces as an explicit
+    // "N critical fleet-wide" badge (see `deriveAlertBadges`), leaving it
+    // through would render a stale pre-rejection frame as current — beside a
+    // notice saying coord rejected our credentials.
+    rollup:
+      isAuthBlocked || coordDisabled
+        ? { critical: 0, warning: 0, info: 0 }
+        : (data?.health?.alerts ?? { critical: 0, warning: 0, info: 0 }),
     coordDisabled,
+  };
+}
+
+/**
+ * Severity counts for the header, split by the POPULATION each one describes.
+ *
+ * THE DEFECT this closes: the header rendered `rollup.critical` /
+ * `rollup.warning` straight from `health.alerts`, which is coord's FLEET-WIDE
+ * alert rollup, immediately beside `machines.length`, which counts only the
+ * machines registered with a pollable `/health` URL — the same set the body
+ * lists. The two populations are unrelated, so the panel could (and did, on
+ * 2026-08-22) read `0 machines / 61 critical / 1929 warning` in the header
+ * while the body said `No machines registered with a pollable /health URL
+ * yet`. Nothing in the UI said the counts were about a different population,
+ * so the only available reading was that the panel contradicted itself.
+ *
+ * The split makes the population explicit instead of implicit:
+ *
+ * - `scoped` counts the active alerts whose `machine_id` is one of the
+ *   machines the body lists. These share the header's `N machines` population,
+ *   so they render as plain `N critical` / `N warning` badges.
+ * - `fleetWide` is what the rollup counts BEYOND those — alerts against
+ *   machines this list does not show, and fleet-scope alerts with no
+ *   `machine_id` at all. Non-zero only when there is a genuine excess, and it
+ *   renders with an explicit "fleet-wide" label.
+ *
+ * Nothing is hidden: with no machines listed, every alert is fleet-wide and the
+ * header says so. `fleetWide` is derived by subtracting the scoped counts from
+ * the rollup (clamped at zero) rather than by counting `alerts` directly,
+ * because `alerts` is coord's active-alert PAGE while `rollup` is the true
+ * total — trusting the page for the total would under-report.
+ *
+ * Pure so it is unit-testable under the runner's node-environment vitest.
+ */
+export function deriveAlertBadges(
+  machines: FleetMachineSnapshot[],
+  alerts: FleetAlert[],
+  rollup: { critical: number; warning: number; info: number },
+): {
+  scoped: { critical: number; warning: number };
+  fleetWide: { critical: number; warning: number };
+} {
+  const listed = new Set(machines.map((m) => m.machine_id));
+  const scoped = { critical: 0, warning: 0 };
+  for (const a of alerts) {
+    if (a.machine_id === null || !listed.has(a.machine_id)) continue;
+    if (a.severity === "critical") scoped.critical += 1;
+    else if (a.severity === "warning") scoped.warning += 1;
+  }
+  return {
+    scoped,
+    fleetWide: {
+      critical: Math.max(0, rollup.critical - scoped.critical),
+      warning: Math.max(0, rollup.warning - scoped.warning),
+    },
   };
 }
 
@@ -139,6 +201,9 @@ export function FleetHealthPanel() {
 
   const { isUnauthorized, isUnpaired, isAuthBlocked, machines, alerts, rollup, coordDisabled } =
     deriveFleetView(data, coord);
+  // Header badges must describe the SAME population the body lists — see
+  // `deriveAlertBadges` for the header/body contradiction this resolves.
+  const badges = deriveAlertBadges(machines, alerts, rollup);
   // Derived from the SAME `source` as the notice body below, so the two can
   // never disagree about why the panel is off.
   const disabledTooltip = coordDisabled
@@ -196,14 +261,38 @@ export function FleetHealthPanel() {
           <span className="text-xs text-muted-foreground">
             {machines.length} machine{machines.length === 1 ? "" : "s"}
           </span>
-          {rollup.critical > 0 && (
-            <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold border border-red-500/40 bg-red-500/10 text-red-400">
-              {rollup.critical} critical
+          {badges.scoped.critical > 0 && (
+            <span
+              data-ui-bridge-id="productivity.fleet-health-scoped-critical"
+              className="rounded px-1.5 py-0.5 text-[10px] font-semibold border border-red-500/40 bg-red-500/10 text-red-400"
+            >
+              {badges.scoped.critical} critical
             </span>
           )}
-          {rollup.warning > 0 && (
-            <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold border border-amber-500/30 bg-amber-500/5 text-amber-400">
-              {rollup.warning} warning
+          {badges.scoped.warning > 0 && (
+            <span
+              data-ui-bridge-id="productivity.fleet-health-scoped-warning"
+              className="rounded px-1.5 py-0.5 text-[10px] font-semibold border border-amber-500/30 bg-amber-500/5 text-amber-400"
+            >
+              {badges.scoped.warning} warning
+            </span>
+          )}
+          {/* Alerts the listed machines do NOT account for. Explicitly
+              labelled, because the population is not the one this header's
+              machine count (or the grid below) describes. */}
+          {(badges.fleetWide.critical > 0 || badges.fleetWide.warning > 0) && (
+            <span
+              data-ui-bridge-id="productivity.fleet-health-fleet-wide"
+              title="Alerts across the whole fleet, including machines not listed below and fleet-scope alerts with no machine"
+              className="rounded px-1.5 py-0.5 text-[10px] font-semibold border border-border bg-muted/30 text-muted-foreground"
+            >
+              {[
+                badges.fleetWide.critical > 0 ? `${badges.fleetWide.critical} critical` : null,
+                badges.fleetWide.warning > 0 ? `${badges.fleetWide.warning} warning` : null,
+              ]
+                .filter(Boolean)
+                .join(", ")}{" "}
+              fleet-wide
             </span>
           )}
         </div>

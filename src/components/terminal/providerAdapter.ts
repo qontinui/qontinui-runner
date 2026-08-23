@@ -22,13 +22,70 @@
  */
 export type RestoreTier = "full" | "terminal-only";
 
-/** Success/failure substring patterns (ANSI-stripped) for `resumeVerification`. */
+/**
+ * Success/failure patterns (ANSI-stripped) for `resumeVerification`.
+ *
+ * TWO matcher kinds, both live, unioned by `resumeVerification`'s detectors:
+ *
+ * - `success` / `failure` — case-insensitive SUBSTRINGS. The portable half of
+ *   the descriptor contract; a provider adapter can be declared without
+ *   regex knowledge.
+ * - `successPatterns` / `failurePatterns` — REGEXES, for markers a substring
+ *   cannot express (the Claude TUI's rounded input-box frame, `/[╭╰]─{3,}/`,
+ *   is the motivating one — it is a shape, not a phrase).
+ *
+ * THE DEFECT this closes: boot-restore ALWAYS passes a descriptor's
+ * `HandshakePatterns`, and the detectors used to treat that as an EITHER/OR —
+ * `if (patterns) return matchSubstrings(...)`. The regex sets in
+ * `resumeVerification.ts` were therefore dead on the only path that runs in
+ * production, so the frame marker never participated in a real verification: a
+ * restored pane that had painted only the box frame read as "handshake not
+ * observed" and burned the full retry budget. The regexes now travel WITH the
+ * provider descriptor, so unioning them cannot leak Claude's frames into a
+ * future non-Claude adapter's verification.
+ */
 export interface HandshakePatterns {
   /** Substrings whose presence confirms the resume landed. */
   success: string[];
   /** Substrings whose presence means the resume FAILED (drives the banner). */
   failure: string[];
+  /** Regex markers unioned with {@link HandshakePatterns.success}. */
+  successPatterns?: RegExp[];
+  /** Regex markers unioned with {@link HandshakePatterns.failure}. */
+  failurePatterns?: RegExp[];
 }
+
+/**
+ * Markers that the Claude Code TUI actually rendered in this pane — i.e. the
+ * resume command landed and the CLI took over the terminal. Deliberately
+ * Claude-UI-shaped (rounded input box, status-line hints) rather than "any
+ * output grew": a shell prompt echo or an error message must NOT count.
+ *
+ * The interactive resume-size picker ("Resume from summary?") is itself
+ * Claude UI — a pane wedged on it still counts as HANDSHAKE OK (the resume
+ * landed; answering the picker is a separate concern).
+ */
+export const CLAUDE_HANDSHAKE_REGEXES: RegExp[] = [
+  /\? for shortcuts/, // persistent status-line hint under the input box
+  /esc to interrupt/i, // shown while Claude is actively working
+  /bypass permissions/i, // permission-mode indicator in the status line
+  /Welcome (?:back )?to Claude/i, // launch banner
+  /[╭╰]─{3,}/, // rounded input-box / dialog frame
+];
+
+/**
+ * Definitive evidence that the REQUESTED session did NOT resume — evaluated
+ * BEFORE the success markers on every probe. "The Claude TUI appeared" is not
+ * the same claim as "the requested session resumed": a
+ * `claude --resume <bogus-id>` can fall through to an error dialog, a fresh
+ * session, or the interactive session picker, all of which still render
+ * Claude-UI frames.
+ */
+export const CLAUDE_RESUME_FAILURE_REGEXES: RegExp[] = [
+  /No conversation found/i, // `--resume <unknown-id>` error
+  /No conversations? (?:found|to resume)/i, // empty-history variants
+  /Select a (?:session|conversation) to resume/i, // interactive session picker frame
+];
 
 /**
  * The capability surface the frontend needs from a provider adapter (plan §4).
@@ -51,13 +108,16 @@ export interface SessionProviderDescriptor {
 
 /**
  * The Claude descriptor (Phase 2). Resume is the deterministic, non-interactive
- * `claude --resume <id>`; the handshake patterns mirror `resumeVerification.ts`
- * (the `CLAUDE_HANDSHAKE_PATTERNS` success set + the `RESUME_FAILURE_PATTERNS`
- * "did NOT resume" set — failure checked first, since a failure dialog is itself
- * Claude UI). `restoreTier` is `"full"` — Claude resumes the FULL conversation
- * by id. The patterns are plain substrings (the descriptor contract is
- * substring-based); the regex-based matchers in `resumeVerification.ts` remain
- * the live boot-restore implementation this descriptor describes.
+ * `claude --resume <id>`. `restoreTier` is `"full"` — Claude resumes the FULL
+ * conversation by id.
+ *
+ * The handshake set carries BOTH halves and both are live: the plain
+ * substrings, plus {@link CLAUDE_HANDSHAKE_REGEXES} /
+ * {@link CLAUDE_RESUME_FAILURE_REGEXES}, which `resumeVerification` unions into
+ * the same probe. Before that union the regexes were dead on the boot-restore
+ * path (which always supplies this descriptor), so the box-frame marker never
+ * ran in production — see {@link HandshakePatterns} for the full defect note.
+ * Failure is still checked FIRST, since a failure dialog is itself Claude UI.
  */
 export const claudeDescriptor: SessionProviderDescriptor = {
   provider: "claude",
@@ -77,6 +137,8 @@ export const claudeDescriptor: SessionProviderDescriptor = {
       "Select a session to resume", // interactive session-picker frame
       "Select a conversation to resume",
     ],
+    successPatterns: CLAUDE_HANDSHAKE_REGEXES,
+    failurePatterns: CLAUDE_RESUME_FAILURE_REGEXES,
   }),
   restoreTier: () => "full",
 };
