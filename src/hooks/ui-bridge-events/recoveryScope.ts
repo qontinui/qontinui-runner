@@ -30,6 +30,10 @@ export const RECOVERY_OUT_OF_SCOPE = "RECOVERY_OUT_OF_SCOPE";
 export const RECOVERY_WRITE_REFUSED = "RECOVERY_WRITE_REFUSED";
 /** Machine-readable refusal: the addressed element is not in the current tree. */
 export const RECOVERY_TARGET_MISSING = "RECOVERY_TARGET_MISSING";
+/** Machine-readable outcome: recovery RAN against the addressed element and
+ *  did not recover it. Not a refusal — an honest negative result — but still a
+ *  failure, so it must never reach the caller as an HTTP 200 success. */
+export const RECOVERY_FAILED = "RECOVERY_FAILED";
 
 /**
  * Actions that MUTATE input state. Kept in lockstep with the runner-side
@@ -167,4 +171,33 @@ export function recoveryVerdict(result: unknown): RecoveryVerdict {
   const code = typeof r.errorCode === "string" ? r.errorCode : null;
   const message = typeof r.error === "string" ? r.error : "recovery did not succeed";
   return { recovered: false, reason: code ? `${code}: ${message}` : message };
+}
+
+/**
+ * Build the `data` payload for a FAILED `ai_recovery_attempt` response.
+ *
+ * ## THE DEFECT this closes (the last laundering edge)
+ *
+ * The handler already answered a typed refusal honestly at the ENVELOPE level
+ * — `{success: false, error: "RECOVERY_UNSCOPED: …", data: {recovered: false}}`.
+ * The runner's response dispatcher, however, forwards only
+ * `response.data` to the HTTP layer (`handle_ui_bridge_response` in
+ * `src-tauri/src/mcp/ui_bridge/request.rs`). When a handler supplies `data`,
+ * the sibling `success` and `error` are dropped on the floor — so
+ * `wrap_ipc_result` saw a bare `{recovered: false}`, found no `success: false`
+ * to flatten, and answered **HTTP 200 `{"success":true,"recovered":false}`**.
+ * A caller that refused to guess a target read as a caller that succeeded.
+ *
+ * Mirroring the refusal INTO `data` is what survives that extraction: the
+ * runner then sees the failure envelope it was always sent, and the
+ * `as_recovery_failure` boundary in `ai_analyze.rs` stamps the machine-readable
+ * `code` onto the HTTP 400. Both halves are required — this one carries the
+ * diagnosis across the seam, that one gives it a code.
+ */
+export function recoveryFailureData(
+  code: string,
+  message: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return { success: false, error: message, code, recovered: false, ...extra };
 }

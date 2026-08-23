@@ -33,6 +33,7 @@ import {
   Rocket,
 } from "lucide-react";
 import {
+  describeThrown,
   dispatchCoordinatorAction,
   getCoordinatorDecisions,
   getCoordinatorLeader,
@@ -1224,8 +1225,11 @@ export function CoordinatorDashboard() {
       setOverlapPairs(rows);
     } catch (err) {
       // Phase 1B may not yet be applied on this runner build — render
-      // the empty state rather than crashing.
-      setOverlapError(err instanceof Error ? err.message : "Failed to load overlap pairs");
+      // the empty state rather than crashing. `listOverlappingIntents` goes
+      // through `invoke()`, which rejects with a plain STRING, so the
+      // `instanceof Error` arm alone discarded the cause on EVERY real failure
+      // and left only the bare constant — see `describeThrown`.
+      setOverlapError(describeThrown(err, "Failed to load overlap pairs"));
       setOverlapPairs([]);
     } finally {
       setOverlapLoading(false);

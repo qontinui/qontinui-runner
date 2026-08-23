@@ -24,6 +24,8 @@ import {
   waitForClaudeHandshake,
   typeResumeAndVerify,
 } from "./resumeVerification";
+import { claudeDescriptor } from "./providerAdapter";
+import { TERMINAL_EXITED, TERMINAL_WRITE_FAILED } from "./terminalWriteResult";
 
 const CLAUDE_UI =
   "╭──────────────────────────────╮\n│ > │\n╰──────────────────────────────╯\n  ? for shortcuts";
@@ -311,5 +313,144 @@ describe("typeResumeAndVerify (retry-once state machine)", () => {
     expect(out).toBe("failed");
     // Exactly two typed attempts — the spec is retry ONCE, not retry forever.
     expect(writes.filter((w) => w === CMD)).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manual-test-loop iteration 10, item 2 — the resume WRITE RESULT was discarded.
+//
+// `writeWhenReady` dropped the `Promise<TerminalWriteResult>`, so a write
+// refused with `TERMINAL_EXITED` looked exactly like one that landed and the
+// loop spent its whole ~31 s budget (2 × 15 s poll) probing the scrollback of a
+// pane whose process was already gone.
+// ---------------------------------------------------------------------------
+describe("typeResumeAndVerify — refused writes (item 2)", () => {
+  const CMD_2 = "claude --resume abc-123\r";
+  const exited = {
+    success: false as const,
+    code: TERMINAL_EXITED,
+    error: "TERMINAL_EXITED: terminal tab-1 is not writable",
+    hint: "Restart the session before writing to it.",
+    terminalId: "tab-1",
+    exitCode: 1,
+  };
+  const ipcFailed = {
+    success: false as const,
+    code: TERMINAL_WRITE_FAILED,
+    error: "TERMINAL_WRITE_FAILED: terminal_write failed for tab-1",
+    hint: "Check the runner log.",
+    terminalId: "tab-1",
+  };
+
+  it("TERMINAL_EXITED fails fast — no scrollback probe, no retype, no 31s burn", async () => {
+    let probes = 0;
+    const writes: string[] = [];
+    const onWriteFailure = vi.fn();
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD_2, {
+      write: ((_r: never, _t: string, text: string) => {
+        writes.push(text);
+        return Promise.resolve(exited);
+      }) as never,
+      onWriteFailure,
+      settleMs: 1,
+      timeoutMs: 50,
+      intervalMs: 1,
+      readTail: async () => {
+        probes += 1;
+        return CLAUDE_UI;
+      },
+    });
+    expect(out).toBe("failed");
+    expect(probes).toBe(0);
+    expect(writes.filter((w) => w === CMD_2)).toHaveLength(1);
+    // The TYPED failure reaches the caller, not a generic "handshake not observed".
+    expect(onWriteFailure).toHaveBeenCalledWith(exited);
+  });
+
+  it("TERMINAL_WRITE_FAILED skips this attempt's poll but still retypes once", async () => {
+    let probes = 0;
+    const writes: string[] = [];
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD_2, {
+      write: ((_r: never, _t: string, text: string) => {
+        writes.push(text);
+        return Promise.resolve(ipcFailed);
+      }) as never,
+      settleMs: 1,
+      timeoutMs: 50,
+      intervalMs: 1,
+      readTail: async () => {
+        probes += 1;
+        return CLAUDE_UI;
+      },
+    });
+    expect(out).toBe("failed");
+    expect(probes).toBe(0);
+    expect(writes.filter((w) => w === CMD_2)).toHaveLength(2);
+  });
+
+  it("an OK envelope behaves exactly as before — the happy path is untouched", async () => {
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD_2, {
+      write: (() => Promise.resolve({ success: true, bytes: 4 })) as never,
+      settleMs: 1,
+      timeoutMs: 50,
+      intervalMs: 1,
+      readTail: async () => CLAUDE_UI,
+    });
+    expect(out).toBe("verified");
+  });
+
+  it("a writer that resolves NOTHING is 'no information', not a failure", async () => {
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD_2, {
+      write: (() => undefined) as never,
+      settleMs: 1,
+      timeoutMs: 50,
+      intervalMs: 1,
+      readTail: async () => CLAUDE_UI,
+    });
+    expect(out).toBe("verified");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manual-test-loop iteration 10, item 3 — the handshake REGEX SET was dead code.
+//
+// Boot-restore ALWAYS passes the provider descriptor's `HandshakePatterns`, and
+// the detectors short-circuited on it (`if (patterns) return substringsOnly`).
+// The box-frame marker `/[╭╰]─{3,}/` — which no substring can express — was
+// therefore never consulted on the only path that runs in production.
+// ---------------------------------------------------------------------------
+describe("descriptor-driven detection unions the regexes (item 3)", () => {
+  const patterns = claudeDescriptor.handshakePatterns();
+  /** A restored pane that has painted ONLY the rounded input box. */
+  const FRAME_ONLY =
+    "╭────────────────────────────╮\n│ >                          │\n╰────────────────────────────╯";
+
+  it("a pane showing only the box frame VERIFIES through the live (descriptor) path", () => {
+    expect(detectClaudeHandshake(FRAME_ONLY, patterns)).toBe(true);
+  });
+
+  it("the frame marker is genuinely regex-only — no success substring matches it", () => {
+    const lower = FRAME_ONLY.toLowerCase();
+    expect(patterns.success.some((sub) => lower.includes(sub.toLowerCase()))).toBe(false);
+  });
+
+  it("the substring half still matches — the union added to it, it did not replace it", () => {
+    expect(detectClaudeHandshake("  ? for shortcuts", patterns)).toBe(true);
+  });
+
+  it("a plain shell still does NOT verify — the union did not weaken the gate", () => {
+    expect(detectClaudeHandshake(PLAIN_SHELL, patterns)).toBe(false);
+  });
+
+  it("failure detection unions its regexes too, and still wins over the frames", () => {
+    expect(detectResumeFailure(BOGUS_RESUME_ERROR, patterns)).toBe(true);
+    expect(detectResumeFailure(SESSION_PICKER, patterns)).toBe(true);
+    expect(detectResumeFailure(FRAME_ONLY, patterns)).toBe(false);
+  });
+
+  it("a descriptor with NO regexes matches substrings only — no Claude leakage", () => {
+    const gemini = { success: ["gemini ready"], failure: ["no such chat"] };
+    expect(detectClaudeHandshake(FRAME_ONLY, gemini)).toBe(false);
+    expect(detectClaudeHandshake("Gemini ready", gemini)).toBe(true);
   });
 });

@@ -19,7 +19,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { extractApiErrorMessage, spawnFromPlan } from "./coordinatorApi";
+import { describeThrown, extractApiErrorMessage, spawnFromPlan } from "./coordinatorApi";
 
 const mockInvoke = invoke as ReturnType<typeof vi.fn>;
 
@@ -76,13 +76,11 @@ describe("spawnFromPlan", () => {
   });
 
   it("propagates the backend error on failure", async () => {
-    mockInvoke.mockRejectedValue(
-      new Error('HTTP 400: {"error":"unknown plan_slug"}'),
-    );
+    mockInvoke.mockRejectedValue(new Error('HTTP 400: {"error":"unknown plan_slug"}'));
 
-    await expect(
-      spawnFromPlan("bogus", "phase", ["repo"], "intent", "prompt"),
-    ).rejects.toThrow(/HTTP 400/);
+    await expect(spawnFromPlan("bogus", "phase", ["repo"], "intent", "prompt")).rejects.toThrow(
+      /HTTP 400/,
+    );
   });
 });
 
@@ -120,5 +118,56 @@ describe("extractApiErrorMessage", () => {
 
   it("keeps an unrecognised JSON object visible rather than dropping it", () => {
     expect(extractApiErrorMessage('{"weird":1}', "x")).toBe('{"weird":1}');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manual-test-loop iteration 10, item 6 — a non-Error throw discarded the cause.
+//
+// The panel loaders all wrote `err instanceof Error ? err.message : "<const>"`.
+// `invoke()` rejects with a plain STRING, so the discarding arm was the one
+// taken on every real failure and the overlapping-intents panel rendered the
+// bare `Failed to load overlap pairs` and nothing else.
+// ---------------------------------------------------------------------------
+describe("describeThrown (item 6)", () => {
+  it("THE REGRESSION: a plain-string rejection (what invoke() throws) keeps its text", () => {
+    expect(
+      describeThrown("coord unreachable: connection refused", "Failed to load overlap pairs"),
+    ).toBe("coord unreachable: connection refused");
+  });
+
+  it("an Error still yields its message", () => {
+    expect(describeThrown(new Error("boom"), "fallback")).toBe("boom");
+  });
+
+  it("a status + body object serializes BOTH halves", () => {
+    expect(describeThrown({ status: 500, error: "list_overlapping_intents failed" }, "fb")).toBe(
+      "HTTP 500: list_overlapping_intents failed",
+    );
+  });
+
+  it("a status-only or body-only object still surfaces what it has", () => {
+    expect(describeThrown({ status: 404 }, "fb")).toBe("HTTP 404");
+    expect(describeThrown({ message: "no such command" }, "fb")).toBe("no such command");
+    expect(describeThrown({ code: "E_NOENT" }, "fb")).toBe("E_NOENT");
+  });
+
+  it("an unrecognised object is DUMPED alongside the fallback rather than dropped", () => {
+    expect(describeThrown({ weird: 1 }, "Failed to load overlap pairs")).toBe(
+      'Failed to load overlap pairs ({"weird":1})',
+    );
+  });
+
+  it("only a genuinely empty value falls back to the bare constant", () => {
+    expect(describeThrown(null, "fb")).toBe("fb");
+    expect(describeThrown(undefined, "fb")).toBe("fb");
+    expect(describeThrown("   ", "fb")).toBe("fb");
+    expect(describeThrown({}, "fb")).toBe("fb");
+  });
+
+  it("survives a circular object instead of throwing inside the error path", () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    expect(describeThrown(circular, "fb")).toBe("fb");
   });
 });

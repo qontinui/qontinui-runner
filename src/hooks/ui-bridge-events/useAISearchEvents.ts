@@ -2,8 +2,11 @@ import { useCallback } from "react";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
 import {
+  RECOVERY_FAILED,
   RECOVERY_TARGET_MISSING,
   RECOVERY_UNSCOPED,
+  RecoveryRefusedError,
+  recoveryFailureData,
   recoveryVerdict,
   scopeRecoveryExecutor,
 } from "./recoveryScope";
@@ -1105,12 +1108,17 @@ export function useAISearchEvents(
           const instruction = (recoveryParams.instruction as string) ?? "";
           const targetElementId = (recoveryParams.elementId as string) ?? "";
           if (!targetElementId) {
+            const unscoped = `${RECOVERY_UNSCOPED}: ai_recovery_attempt requires params.elementId — recovery is limited to the element the failing action addressed.`;
             await sendResponse({
               requestId,
               type,
               success: false,
-              error: `${RECOVERY_UNSCOPED}: ai_recovery_attempt requires params.elementId — recovery is limited to the element the failing action addressed.`,
-              data: { recovered: false },
+              error: unscoped,
+              code: RECOVERY_UNSCOPED,
+              // Mirrored INTO `data` because the runner's response dispatcher
+              // forwards only `data` when it is present — see
+              // `recoveryFailureData` for the HTTP-200 laundering this closes.
+              data: recoveryFailureData(RECOVERY_UNSCOPED, unscoped),
               timestamp: Date.now(),
             });
             return true;
@@ -1120,12 +1128,16 @@ export function useAISearchEvents(
             const discovered = await currentBridge.discover({ includeHidden: true });
             const scoped = discovered.elements.filter((el) => el.id === targetElementId);
             if (scoped.length === 0) {
+              const missing = `${RECOVERY_TARGET_MISSING}: element '${targetElementId}' is not in the current tree; nothing to recover.`;
               await sendResponse({
                 requestId,
                 type,
                 success: false,
-                error: `${RECOVERY_TARGET_MISSING}: element '${targetElementId}' is not in the current tree; nothing to recover.`,
-                data: { recovered: false },
+                error: missing,
+                code: RECOVERY_TARGET_MISSING,
+                data: recoveryFailureData(RECOVERY_TARGET_MISSING, missing, {
+                  elementId: targetElementId,
+                }),
                 timestamp: Date.now(),
               });
               return true;
@@ -1143,26 +1155,38 @@ export function useAISearchEvents(
               instruction: instruction || "recover from error state",
             });
             const verdict = recoveryVerdict(result);
+            const attempted = {
+              elementId: targetElementId,
+              result,
+              timestamp: Date.now(),
+            };
             await sendResponse({
               requestId,
               type,
               success: verdict.recovered,
-              data: {
-                recovered: verdict.recovered,
-                elementId: targetElementId,
-                result,
-                timestamp: Date.now(),
-              },
+              data: verdict.recovered
+                ? { recovered: true, ...attempted }
+                : // Same mirroring as the two refusals above: a recovery that
+                  // RAN and did not recover must not reach the caller as an
+                  // HTTP 200 success either.
+                  recoveryFailureData(
+                    RECOVERY_FAILED,
+                    verdict.reason ?? "recovery did not succeed",
+                    attempted,
+                  ),
               error: verdict.reason ?? undefined,
               timestamp: Date.now(),
             });
           } catch (err) {
+            const thrown = err instanceof Error ? err.message : String(err);
+            const code = err instanceof RecoveryRefusedError ? err.code : RECOVERY_FAILED;
             await sendResponse({
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
-              data: { recovered: false, elementId: targetElementId },
+              error: thrown,
+              code,
+              data: recoveryFailureData(code, thrown, { elementId: targetElementId }),
               timestamp: Date.now(),
             });
           }
