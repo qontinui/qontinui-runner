@@ -994,6 +994,10 @@ async fn spawn_looping_agent_terminal(
         .map(|s| crate::mcp::types::runner_api_port(s.inner()));
     crate::coord_mcp::provision_coord_mcp_for_session(&workdir, bound_port);
     crate::fleet_commands::provision_fleet_commands_for_session(&workdir);
+    // ... and the fleet's agent skills. This is the call site the plan's own
+    // citation list missed; because provisioning is fail-soft, omitting it
+    // would have left every looping-agent session silently skill-less.
+    crate::fleet_skills::provision_agent_skills_for_session(&workdir);
 
     // Interactive `claude` argv with the prompt as the trailing positional
     // arg (the proven continuation recipe — flags before prompt, `--`

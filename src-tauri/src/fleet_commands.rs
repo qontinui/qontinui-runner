@@ -32,7 +32,15 @@
 //!
 //! Because these bodies ship to every fleet device, they must stay free of any
 //! one operator's absolute paths — see
-//! [`tests::staged_fleet_commands_have_no_plan_path_hardcodes`].
+//! [`tests::staged_fleet_text_has_no_operator_path_hardcodes`], and
+//! [`crate::agent_skills::self_path`] for the shape-based gate that substring
+//! list is only a floor for.
+//!
+//! ## The skills sibling
+//!
+//! [`crate::fleet_skills`] is this module for `.claude/skills/`. The two must
+//! be provisioned from the same set of spawn paths; that is asserted, not
+//! assumed.
 
 use std::path::Path;
 
@@ -307,29 +315,69 @@ mod tests {
         }
     }
 
-    /// The bundled commands must never acquire the operator's absolute plan
-    /// paths. Scope to the specific hardcode patterns that were neutralized —
-    /// NOT bare `qontinui-dev-notes`, which legitimately appears as a repo name.
+    /// The bundled text must never acquire the operator's absolute plan paths
+    /// or a reach into the operator's `qontinui-claude-config` checkout. Scope
+    /// to the specific hardcode patterns that were neutralized — NOT bare
+    /// `qontinui-dev-notes`, which legitimately appears as a repo name.
     ///
     /// This guard is independent of where the bodies come from, and it got MORE
     /// load-bearing once these files became the canonical, user-facing
     /// defaults: whatever is here ships to every fleet device.
+    ///
+    /// ## This list is a FLOOR, not the gate
+    ///
+    /// A substring list only catches the spellings someone thought of.
+    /// Measured 2026-08-24 over the four real hardcode sites in
+    /// `coord-pr-label/SKILL.md`: `qontinui-claude-config/.claude` catches
+    /// **one** of them, because the other three wore an elided spelling
+    /// (`.../coord-pr-label/set-label.sh`) that expands to the same config-repo
+    /// path while containing neither token. The actual gate is shape-based and
+    /// lives in [`crate::agent_skills::self_path`], which asks whether a unit
+    /// can reach its own files at all once provisioned. Keep this list — it is
+    /// cheap and it covers the plan-path patterns that shape rule says nothing
+    /// about — but do not mistake it for coverage.
     #[test]
-    fn staged_fleet_commands_have_no_plan_path_hardcodes() {
+    fn staged_fleet_text_has_no_operator_path_hardcodes() {
         const FORBIDDEN: &[&str] = &[
             "qontinui-dev-notes/plans",
             "qontinui-root/plans",
             "D:/qontinui-root",
+            // The config-repo reach. Both separator spellings, because a
+            // Windows-authored body writes the second.
+            "qontinui-claude-config/.claude",
+            "qontinui-claude-config\\.claude",
         ];
+        let mut checked = 0usize;
         for (name, contents) in FLEET_COMMANDS {
+            checked += 1;
             for pat in FORBIDDEN {
                 assert!(
                     !contents.contains(pat),
-                    "bundled agent command {name} contains forbidden plan-path hardcode \
+                    "bundled agent command {name} contains forbidden operator-path hardcode \
                      {pat:?} — an operator-local absolute path must never ship to a fleet \
                      device; rewrite it in src-tauri/src/fleet_commands/{name}.md"
                 );
             }
         }
+        // The same floor over the embedded SKILLS bundle. Vacuous while Phase 6
+        // has not filled it (see `crate::fleet_skills::FLEET_SKILLS`), and
+        // written so it stops being vacuous the moment it is.
+        for skill in crate::fleet_skills::FLEET_SKILLS {
+            for (path, text) in skill.files {
+                checked += 1;
+                for pat in FORBIDDEN {
+                    assert!(
+                        !text.contains(pat),
+                        "bundled agent skill {}/{path} contains forbidden operator-path \
+                         hardcode {pat:?}",
+                        skill.name
+                    );
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "the guard scanned nothing — the embedded bundles have gone missing"
+        );
     }
 }

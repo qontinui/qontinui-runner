@@ -3249,6 +3249,10 @@ async fn run_continuation_terminal(
     // Bundle /vet-plan and /implement-plan into the session cwd so they resolve
     // as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(workdir);
+    // Same for the fleet's agent skills (`.claude/skills/<name>/`). These two
+    // must stay called from the SAME set of spawn paths — asserted by
+    // `fleet_skills::tests::the_two_provisioners_are_called_from_the_same_spawn_paths`.
+    crate::fleet_skills::provision_agent_skills_for_session(workdir);
 
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
@@ -3967,6 +3971,8 @@ async fn run_agent_subprocess(
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
+    // Same for the fleet's agent skills — same call-site set, asserted by test.
+    crate::fleet_skills::provision_agent_skills_for_session(&primary_wt);
 
     let log_path = agent_log_path(payload.agent_id);
 

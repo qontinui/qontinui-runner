@@ -35,6 +35,9 @@ mod agent_pusher;
 // requests on coord WS, materializes worktrees, spawns the `claude`
 // CLI, heartbeats the claim, forwards stdout/stderr to coord logs.
 mod agent_runtime;
+// Resolution of the fleet's agent SKILLS. Named `agent_skills`, never `skills`:
+// `crate::skills` is the automation-template registry, an unrelated concept.
+mod agent_skills;
 mod agent_token;
 mod agent_worktree;
 mod agentic_verification;
@@ -105,6 +108,7 @@ mod fixer;
 // `GET /coord/fleet` can answer "where do I have agent capacity?".
 mod fleet;
 mod fleet_commands;
+mod fleet_skills;
 mod flow_control;
 mod follow_up;
 mod fs_atomic;
