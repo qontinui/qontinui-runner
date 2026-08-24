@@ -23,16 +23,26 @@ pub async fn start_comparison(
     // Only meaningful for `variation_type = "custom"`. Present so the desktop
     // UI can express everything the HTTP route can.
     custom_overrides: Option<Vec<serde_json::Value>>,
+    // Only meaningful for `variation_type = "model"`.
+    models: Option<Vec<String>>,
+    // Only meaningful for `variation_type = "context_tokens"`.
+    context_token_limits: Option<Vec<usize>>,
 ) -> Result<String, String> {
     let use_wt = use_worktree.unwrap_or(true);
-    let custom_overrides = custom_overrides.unwrap_or_default();
 
     // Build entries from the TYPED variation — the same single derivation path
     // the HTTP surface uses. This command used to carry its own string match
     // that handled only "architecture" | "same" and rejected "custom", so the
     // very same variation_type was accepted over HTTP and refused from the
     // desktop UI. It now accepts exactly what the HTTP route accepts.
-    let variation = crate::comparison::parse_variation(&variation_type, custom_overrides)?;
+    let variation = crate::comparison::parse_variation(
+        &variation_type,
+        crate::comparison::VariationArgs {
+            custom_overrides: custom_overrides.unwrap_or_default(),
+            models: models.unwrap_or_default(),
+            context_token_limits: context_token_limits.unwrap_or_default(),
+        },
+    )?;
     let entries: Vec<ComparisonEntryJson> =
         crate::comparison::build_comparison_arms(&variation, 3, use_wt)
             .into_iter()
@@ -45,19 +55,31 @@ pub async fn start_comparison(
             })
             .collect();
 
-    let comparison_id = format!("cmp-{}", uuid::Uuid::new_v4());
-    let now = chrono::Utc::now().to_rfc3339();
-    let entries_json = serde_json::to_string(&entries).map_err(|e| e.to_string())?;
+    // Same observation the HTTP route records, from the same helper — this
+    // command used to reach a parallel copy of the persistence layer that had
+    // no idea the axis columns existed.
+    let observed = crate::comparison::observe_treatment_axis(
+        &variation_type,
+        &entries
+            .iter()
+            .map(|e| e.overrides.clone())
+            .collect::<Vec<_>>(),
+    );
 
-    let cid = comparison_id.clone();
-    let wid = workflow_id.clone();
-    let vtype = variation_type.clone();
-    let ejs = entries_json.clone();
-    let now_c = now.clone();
+    let comparison_id = format!("cmp-{}", uuid::Uuid::new_v4());
+    let entries_json = serde_json::to_string(&entries).map_err(|e| e.to_string())?;
 
     storage
         .pg_db()
-        .insert_comparison(&cid, &wid, &vtype, &ejs)
+        .create_comparison_run(
+            &comparison_id,
+            &workflow_id,
+            &variation_type,
+            &entries_json,
+            chrono::Utc::now(),
+            Some(&observed.computed_axis),
+            observed.drift_class_token(),
+        )
         .await?;
 
     // Launch runs via local HTTP API in background
@@ -110,7 +132,7 @@ pub async fn start_comparison(
         let status_pg = new_status.to_string();
         tokio::spawn(async move {
             let _ = pg_db
-                .update_comparison_entries(&comp_id_pg, &ejs_pg, &status_pg)
+                .update_comparison_run_entries(&comp_id_pg, &ejs_pg, &status_pg)
                 .await;
         });
     });
@@ -124,29 +146,15 @@ pub async fn get_comparison_status(
     storage: State<'_, StorageCompartment>,
     comparison_id: String,
 ) -> Result<serde_json::Value, String> {
-    let cmp_json = storage
+    let row = storage
         .pg_db()
-        .get_comparison(&comparison_id)
+        .get_comparison_run(&comparison_id)
         .await?
         .ok_or_else(|| format!("Comparison not found: {}", comparison_id))?;
 
-    let id = cmp_json["id"].as_str().unwrap_or("").to_string();
-    let workflow_id = cmp_json["workflow_id"].as_str().unwrap_or("").to_string();
-    let variation_type = cmp_json["variation_type"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    let status = cmp_json["status"].as_str().unwrap_or("").to_string();
-    let entries_json_str = cmp_json["entries_json"]
-        .as_str()
-        .unwrap_or("[]")
-        .to_string();
-    let report: Option<String> = cmp_json["report"].as_str().map(|s| s.to_string());
-    let created_at = cmp_json["created_at"].as_str().unwrap_or("").to_string();
-    let completed_at: Option<String> = cmp_json["completed_at"].as_str().map(|s| s.to_string());
-
+    let status = row.status.clone();
     let mut entries: Vec<ComparisonEntryJson> =
-        serde_json::from_str(&entries_json_str).unwrap_or_default();
+        serde_json::from_str(&row.entries_json).unwrap_or_default();
 
     // Enrich with live task_run statuses
     let mut all_done = true;
@@ -194,22 +202,16 @@ pub async fn get_comparison_status(
     // Auto-complete if all done
     let final_status = if all_done && status == "running" {
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
-        let _ = storage.pg_db().complete_comparison(&id, &entries_str).await;
+        let _ = storage
+            .pg_db()
+            .complete_comparison_run(&row.id, &entries_str)
+            .await;
         "completed".to_string()
     } else {
         status
     };
 
-    Ok(serde_json::json!({
-        "id": id,
-        "workflow_id": workflow_id,
-        "variation_type": variation_type,
-        "status": final_status,
-        "entries": entries,
-        "report": report,
-        "created_at": created_at,
-        "completed_at": completed_at,
-    }))
+    Ok(comparison_run_json(&row, &entries, &final_status))
 }
 
 /// List recent comparison runs.
@@ -217,7 +219,42 @@ pub async fn get_comparison_status(
 pub async fn list_comparisons(
     storage: State<'_, StorageCompartment>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    storage.pg_db().list_comparisons().await
+    let rows = storage.pg_db().list_comparison_runs(50).await?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let entries: Vec<ComparisonEntryJson> =
+                serde_json::from_str(&row.entries_json).unwrap_or_default();
+            let status = row.status.clone();
+            comparison_run_json(row, &entries, &status)
+        })
+        .collect())
+}
+
+/// The JSON shape this command surface returns for one comparison run.
+///
+/// Carries the observed treatment axis beside the declared `variation_type`.
+/// `computed_axis: null` means the axis was never computed — a row from a build
+/// that predates it — not "nothing varied", which is `[]`.
+fn comparison_run_json(
+    row: &crate::database::pg::comparison::ComparisonRunRow,
+    entries: &[ComparisonEntryJson],
+    status: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id,
+        "workflow_id": row.workflow_id,
+        "variation_type": row.variation_type,
+        "status": status,
+        "entries": entries,
+        "report": row.report,
+        "created_at": row.created_at,
+        "completed_at": row.completed_at,
+        "computed_axis": row.computed_axis,
+        // Projected through the parser, so a token this build does not know
+        // reads out as `unknown` rather than as an unclassifiable string.
+        "axis_drift_class": row.axis_drift().as_wire_str(),
+    })
 }
 
 fn calculate_duration(created_at: &str, completed_at: Option<&str>) -> u64 {

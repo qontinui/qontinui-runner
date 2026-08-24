@@ -404,23 +404,80 @@ pub fn build_run_overrides(
         .collect()
 }
 
+/// The caller-supplied parameters a `variation_type` may need.
+///
+/// Three of the six variations carry data: `custom` its override blobs, `model`
+/// its model list, `context_tokens` its limits. Bundling them keeps
+/// [`parse_variation`] one function as more variations gain parameters, instead
+/// of growing a positional argument per axis.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VariationArgs {
+    /// Only meaningful for `custom`.
+    pub custom_overrides: Vec<serde_json::Value>,
+    /// Only meaningful for `model`.
+    pub models: Vec<String>,
+    /// Only meaningful for `context_tokens`.
+    pub context_token_limits: Vec<usize>,
+}
+
+/// The fewest arms a comparison can have and still be a comparison.
+///
+/// Rejecting at parse time is what keeps [`AxisDriftClass::Divergent`] — "the
+/// declared side is internally inconsistent" — a *historical-row* verdict rather
+/// than something the live surfaces can still produce.
+pub const MIN_COMPARISON_ARMS: usize = 2;
+
 /// Parse the wire `variation_type` string into the typed variation.
 ///
 /// This is the ONLY place a `variation_type` string becomes a variation. Both
 /// call sites use it, so an unknown token is rejected identically everywhere —
 /// previously the HTTP surface accepted `custom` and the Tauri command rejected
 /// it, for the same input.
+///
+/// All six variations are reachable from the wire. `model` and `context_tokens`
+/// used to be enum-only: [`declared_axes`] knew their tokens and could classify
+/// them, but nothing could ever *declare* them, so those classification arms
+/// were unreachable by construction.
 pub fn parse_variation(
     variation_type: &str,
-    custom_overrides: Vec<serde_json::Value>,
+    args: VariationArgs,
 ) -> Result<ComparisonVariation, String> {
+    let need_arms = |what: &str, n: usize| -> Result<(), String> {
+        if n < MIN_COMPARISON_ARMS {
+            Err(format!(
+                "variation_type '{}' needs at least {} {} to compare; got {}",
+                variation_type.trim().to_ascii_lowercase(),
+                MIN_COMPARISON_ARMS,
+                what,
+                n
+            ))
+        } else {
+            Ok(())
+        }
+    };
+
     match variation_type.trim().to_ascii_lowercase().as_str() {
         "architecture" => Ok(ComparisonVariation::Architecture),
         "same" => Ok(ComparisonVariation::Same),
         "multi_agent" => Ok(ComparisonVariation::MultiAgent),
-        "custom" => Ok(ComparisonVariation::Custom {
-            overrides: custom_overrides,
-        }),
+        "model" => {
+            need_arms("models", args.models.len())?;
+            Ok(ComparisonVariation::Model {
+                models: args.models,
+            })
+        }
+        "context_tokens" => {
+            need_arms("context token limits", args.context_token_limits.len())?;
+            Ok(ComparisonVariation::ContextTokens {
+                limits: args.context_token_limits,
+            })
+        }
+        "custom" => {
+            need_arms("override blobs", args.custom_overrides.len())?;
+            Ok(ComparisonVariation::Custom {
+                overrides: args.custom_overrides,
+            })
+        }
         other => Err(format!("Unknown variation_type: {}", other)),
     }
 }
@@ -444,11 +501,13 @@ pub const ROOT_AXIS_PATH: &str = "<root>";
 /// Override paths that are per-arm distinct *by construction* and are therefore
 /// never a real treatment axis.
 ///
-/// `label` is the only such key today: the HTTP path reads an arm's own `label`
-/// from inside its override object and carries it into the stored blob, and
-/// [`build_run_overrides`] writes `label` into the override JSON on the
-/// `MultiAgent`, `Model` and `ContextTokens` arms. Without ignoring it every
-/// custom-arm comparison would report a spurious extra axis.
+/// `label` is the only such key today. [`build_comparison_arms`] keeps an arm's
+/// label as a *sibling* of its overrides on every generated arm, so the built-in
+/// variations never put it in the blob — but the `Custom` arm carries the
+/// caller's override object through verbatim, and the convention there is that
+/// the arm's name lives inside it as `label` (that is where
+/// `build_comparison_arms` reads it from). Without ignoring it, every custom
+/// comparison would report a spurious extra axis.
 ///
 /// Note that `use_worktree` is deliberately *not* here: the HTTP path injects
 /// the same value into every arm, so it is constant across arms and can never
@@ -823,6 +882,59 @@ pub fn axis_adjusted_confidence(
             AUTO_CANARY_CONFIDENCE_THRESHOLD
         )),
     )
+}
+
+// =============================================================================
+// Phase 2b — the observed half, in the shape `project.comparison_runs` stores
+// =============================================================================
+
+/// The observed half of a comparison run's declared-vs-actual pair, ready to
+/// persist beside the declared `variation_type`.
+///
+/// Produced by [`observe_treatment_axis`] at the moment a run's arms are built,
+/// which is the only moment that matters: nothing downstream rewrites an arm's
+/// `overrides`, so the axes a run moved are fixed from creation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedAxis {
+    /// The differing key paths as a JSON array — the shape
+    /// `project.comparison_runs.computed_axis` (`jsonb`) holds.
+    ///
+    /// An empty array means "nothing differed", which is a real observation.
+    /// The *absence* of an observation is `NULL` in the column and is never
+    /// produced here; see the column's own note in
+    /// `cmpaxis_01_comparison_computed_axis`.
+    pub computed_axis: serde_json::Value,
+    /// The declared-vs-actual classification.
+    pub drift_class: AxisDriftClass,
+}
+
+impl ObservedAxis {
+    /// The classification's wire token, as stored in
+    /// `project.comparison_runs.axis_drift_class`.
+    pub fn drift_class_token(&self) -> &'static str {
+        self.drift_class.as_wire_str()
+    }
+}
+
+/// Compute the observed treatment axis and its classification in one pass.
+///
+/// Both persistence call sites (`mcp::comparison_api` and `commands::comparison`)
+/// go through this rather than calling [`computed_treatment_axes`] and
+/// [`classify_axis_drift`] separately, so the stored pair can never disagree
+/// about which arms it looked at.
+pub fn observe_treatment_axis(
+    variation_type: &str,
+    arm_overrides: &[serde_json::Value],
+) -> ObservedAxis {
+    ObservedAxis {
+        computed_axis: serde_json::Value::Array(
+            computed_treatment_axes(arm_overrides)
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+        drift_class: classify_axis_drift(variation_type, arm_overrides),
+    }
 }
 
 #[cfg(test)]
@@ -1380,33 +1492,44 @@ mod tests {
     // Phase 4 — one grammar, one derivation path
     // ---------------------------------------------------------------------
 
+    fn custom_args(overrides: Vec<serde_json::Value>) -> VariationArgs {
+        VariationArgs {
+            custom_overrides: overrides,
+            ..VariationArgs::default()
+        }
+    }
+
     #[test]
     fn parse_variation_accepts_every_wire_token_both_call_sites_use() {
         assert_eq!(
-            parse_variation("architecture", vec![]).unwrap(),
+            parse_variation("architecture", VariationArgs::default()).unwrap(),
             ComparisonVariation::Architecture
         );
         assert_eq!(
-            parse_variation("same", vec![]).unwrap(),
+            parse_variation("same", VariationArgs::default()).unwrap(),
             ComparisonVariation::Same
         );
         assert_eq!(
-            parse_variation("multi_agent", vec![]).unwrap(),
+            parse_variation("multi_agent", VariationArgs::default()).unwrap(),
             ComparisonVariation::MultiAgent
         );
         assert_eq!(
-            parse_variation("custom", vec![json!({"model": "opus"})]).unwrap(),
+            parse_variation(
+                "custom",
+                custom_args(vec![json!({"model": "opus"}), json!({})])
+            )
+            .unwrap(),
             ComparisonVariation::Custom {
-                overrides: vec![json!({"model": "opus"})]
+                overrides: vec![json!({"model": "opus"}), json!({})]
             }
         );
         // Case/whitespace tolerated identically for both callers.
         assert_eq!(
-            parse_variation("  ARCHITECTURE ", vec![]).unwrap(),
+            parse_variation("  ARCHITECTURE ", VariationArgs::default()).unwrap(),
             ComparisonVariation::Architecture
         );
         // Unknown is rejected with the same message everywhere.
-        let err = parse_variation("teleportation", vec![]).unwrap_err();
+        let err = parse_variation("teleportation", VariationArgs::default()).unwrap_err();
         assert_eq!(err, "Unknown variation_type: teleportation");
     }
 
@@ -1415,7 +1538,158 @@ mod tests {
     /// now resolve through this one function, so parity is structural.
     #[test]
     fn custom_is_no_longer_rejected_by_one_call_site_and_accepted_by_the_other() {
-        assert!(parse_variation("custom", vec![json!({"a": 1})]).is_ok());
+        assert!(parse_variation(
+            "custom",
+            custom_args(vec![json!({"a": 1}), json!({"a": 2})])
+        )
+        .is_ok());
+    }
+
+    /// `model` and `context_tokens` were enum-only: `declared_axes` knew their
+    /// tokens and could classify them, but no wire caller could ever declare
+    /// one, so those classification arms were unreachable by construction.
+    #[test]
+    fn model_and_context_tokens_are_reachable_from_the_wire() {
+        assert_eq!(
+            parse_variation(
+                "model",
+                VariationArgs {
+                    models: vec!["opus".into(), "sonnet".into()],
+                    ..VariationArgs::default()
+                }
+            )
+            .unwrap(),
+            ComparisonVariation::Model {
+                models: vec!["opus".into(), "sonnet".into()]
+            }
+        );
+        assert_eq!(
+            parse_variation(
+                "context_tokens",
+                VariationArgs {
+                    context_token_limits: vec![100_000, 200_000],
+                    ..VariationArgs::default()
+                }
+            )
+            .unwrap(),
+            ComparisonVariation::ContextTokens {
+                limits: vec![100_000, 200_000]
+            }
+        );
+    }
+
+    /// Every token `parse_variation` accepts must be a token `declared_axes`
+    /// can classify. If the two grammars drift apart again, a run becomes
+    /// declarable but unclassifiable — permanently `unknown`, which is the
+    /// exact blind spot this plan closed.
+    #[test]
+    fn every_parsable_token_is_also_classifiable() {
+        for token in [
+            "architecture",
+            "same",
+            "multi_agent",
+            "model",
+            "context_tokens",
+            "custom",
+        ] {
+            let args = VariationArgs {
+                custom_overrides: vec![json!({"a": 1}), json!({"a": 2})],
+                models: vec!["a".into(), "b".into()],
+                context_token_limits: vec![1000, 2000],
+            };
+            assert!(
+                parse_variation(token, args).is_ok(),
+                "parse_variation rejected {token}"
+            );
+            assert_ne!(
+                declared_axes(token),
+                DeclaredAxes::Unrecognized,
+                "declared_axes cannot classify {token}"
+            );
+        }
+    }
+
+    /// A "comparison" of fewer than two arms is not one. Rejecting at parse
+    /// time is what keeps `Divergent` a historical-row verdict rather than
+    /// something the live surfaces can still write.
+    #[test]
+    fn a_parametrised_variation_needs_at_least_two_arms() {
+        let cases = vec![
+            ("custom", custom_args(vec![json!({"a": 1})])),
+            ("custom", custom_args(vec![])),
+            (
+                "model",
+                VariationArgs {
+                    models: vec!["opus".into()],
+                    ..VariationArgs::default()
+                },
+            ),
+            (
+                "context_tokens",
+                VariationArgs {
+                    context_token_limits: vec![100_000],
+                    ..VariationArgs::default()
+                },
+            ),
+        ];
+        for (token, args) in cases {
+            let err = parse_variation(token, args).unwrap_err();
+            assert!(
+                err.contains("at least 2"),
+                "{token} under-armed error was: {err}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 2b — the observed half, in the shape the column stores
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn observe_treatment_axis_pairs_the_array_with_its_own_classification() {
+        let arms = build_run_overrides(&ComparisonVariation::MultiAgent, 2);
+        let observed = observe_treatment_axis("multi_agent", &arms);
+        assert_eq!(observed.computed_axis, json!(["multi_agent_mode"]));
+        assert_eq!(observed.drift_class, AxisDriftClass::None);
+        assert_eq!(observed.drift_class_token(), "none");
+    }
+
+    /// `computed_axis` is always a JSON *array*, so the column never has to
+    /// distinguish "wrote a scalar" from "wrote a list". The absence of an
+    /// observation is SQL NULL, which this function cannot produce.
+    #[test]
+    fn observe_treatment_axis_always_emits_an_array_even_when_nothing_differed() {
+        let observed = observe_treatment_axis("same", &[json!({}), json!({})]);
+        assert_eq!(observed.computed_axis, json!([]));
+        assert!(observed.computed_axis.is_array());
+        assert_eq!(observed.drift_class, AxisDriftClass::None);
+
+        // An empty computed set under a declaration that promised a treatment
+        // is `active_negation`, not `none`.
+        let negated = observe_treatment_axis("architecture", &[json!({}), json!({})]);
+        assert_eq!(negated.computed_axis, json!([]));
+        assert_eq!(negated.drift_class_token(), "active_negation");
+    }
+
+    /// The pair must come from ONE look at the arms — a stored axis that
+    /// disagreed with its own stored class would be worse than neither.
+    #[test]
+    fn observed_pair_agrees_with_the_two_functions_it_composes() {
+        let arms = vec![
+            json!({"workflow_architecture": "traditional", "model": "opus"}),
+            json!({"workflow_architecture": "agentic_verification", "model": "sonnet"}),
+        ];
+        let observed = observe_treatment_axis("architecture", &arms);
+        assert_eq!(
+            observed.computed_axis,
+            json!(computed_treatment_axes(&arms))
+        );
+        assert_eq!(
+            observed.drift_class,
+            classify_axis_drift("architecture", &arms)
+        );
+        // Two axes moved where one was declared.
+        assert_eq!(observed.drift_class_token(), "benign_add");
     }
 
     #[test]

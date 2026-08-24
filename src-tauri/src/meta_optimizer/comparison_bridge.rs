@@ -188,12 +188,6 @@ pub fn comparison_to_recommendation(
     Ok(Some(recommendation.id))
 }
 
-/// Check if a comparison run has the `recommendation_id` and `source` columns.
-/// PG schema always has these columns; this returns true unconditionally now.
-pub fn has_bridge_columns() -> bool {
-    true
-}
-
 /// Create a comparison config to validate a recommendation via A/B testing.
 ///
 /// Returns a ComparisonConfig that can be passed to the comparison system.
@@ -261,12 +255,4 @@ pub fn build_validation_comparison_with_pg(
     recommendation_id: &str,
 ) -> Result<Option<crate::comparison::ComparisonConfig>, String> {
     build_validation_comparison(pg_db, recommendation_id)
-}
-
-/// Check if bridge columns exist. SQLite-only (uses PRAGMA).
-/// PG always has these columns so this always returns true when PG is available.
-#[allow(dead_code)]
-pub fn has_bridge_columns_with_pg(_pg_db: &std::sync::Arc<crate::database::pg::PgDb>) -> bool {
-    // PG schema always has these columns; SQLite may not if migration hasn't run
-    true
 }

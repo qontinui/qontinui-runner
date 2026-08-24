@@ -21,13 +21,22 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 #[derive(Debug, Deserialize)]
 pub struct StartComparisonRequest {
     pub workflow_id: String,
-    /// "architecture" | "same" | "custom"
+    /// `architecture` | `same` | `multi_agent` | `model` | `context_tokens` |
+    /// `custom` — the tokens `comparison::parse_variation` accepts, which are
+    /// exactly the ones `comparison::declared_axes` can classify.
     #[serde(default = "default_variation_type")]
     pub variation_type: String,
     #[serde(default = "default_true")]
     pub use_worktree: bool,
+    /// Only read for `variation_type = "custom"`.
     #[serde(default)]
     pub custom_overrides: Vec<serde_json::Value>,
+    /// Only read for `variation_type = "model"`.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Only read for `variation_type = "context_tokens"`.
+    #[serde(default)]
+    pub context_token_limits: Vec<usize>,
 }
 
 fn default_variation_type() -> String {
@@ -71,12 +80,47 @@ pub struct ComparisonEntryResultJson {
 pub struct ComparisonRunView {
     pub id: String,
     pub workflow_id: String,
+    /// What the run *declared* would vary between its arms.
     pub variation_type: String,
     pub status: String,
     pub entries: Vec<ComparisonEntryJson>,
     pub report: Option<String>,
     pub created_at: String,
     pub completed_at: Option<String>,
+    /// What actually varied: the observed key paths.
+    ///
+    /// `null` means the axis was **never computed** — a row written before the
+    /// runner recorded it. It does not mean "nothing varied"; that is `[]`.
+    pub computed_axis: Option<serde_json::Value>,
+    /// The declared-vs-actual classification (`none`, `in_place`, `pending`,
+    /// `benign_add`, `active_negation`, `divergent`, `unknown`). `unknown` is a
+    /// coverage gap, never agreement.
+    pub axis_drift_class: String,
+}
+
+impl ComparisonRunView {
+    fn from_row(
+        row: crate::database::pg::comparison::ComparisonRunRow,
+        entries: Vec<ComparisonEntryJson>,
+        status: String,
+    ) -> Self {
+        // Project through the parser rather than echoing the stored bytes: a
+        // token this build does not know reads out as `unknown` — a coverage
+        // gap — instead of leaking an unclassifiable string to the client.
+        let axis_drift_class = row.axis_drift().as_wire_str().to_string();
+        ComparisonRunView {
+            id: row.id,
+            workflow_id: row.workflow_id,
+            variation_type: row.variation_type,
+            status,
+            entries,
+            report: row.report,
+            created_at: row.created_at,
+            completed_at: row.completed_at,
+            computed_axis: row.computed_axis,
+            axis_drift_class,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,14 +165,17 @@ pub async fn start_comparison(
     // Build entries from the TYPED variation — the single derivation path in
     // `crate::comparison`. This route used to hand-roll a string match here, and
     // `commands::comparison` hand-rolled a second, narrower one; both are gone.
-    let variation =
-        match crate::comparison::parse_variation(&req.variation_type, req.custom_overrides.clone())
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return Err((StatusCode::BAD_REQUEST, Json(api_error(e))));
-            }
-        };
+    let variation_args = crate::comparison::VariationArgs {
+        custom_overrides: req.custom_overrides.clone(),
+        models: req.models.clone(),
+        context_token_limits: req.context_token_limits.clone(),
+    };
+    let variation = match crate::comparison::parse_variation(&req.variation_type, variation_args) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err((StatusCode::BAD_REQUEST, Json(api_error(e))));
+        }
+    };
     let entries: Vec<ComparisonEntryJson> =
         crate::comparison::build_comparison_arms(&variation, 3, req.use_worktree)
             .into_iter()
@@ -141,8 +188,18 @@ pub async fn start_comparison(
             })
             .collect();
 
+    // The observed half of the declared-vs-actual pair, recorded at the only
+    // moment it is decided: nothing downstream rewrites an arm's `overrides`.
+    let observed = crate::comparison::observe_treatment_axis(
+        &req.variation_type,
+        &entries
+            .iter()
+            .map(|e| e.overrides.clone())
+            .collect::<Vec<_>>(),
+    );
+
     let comparison_id = format!("cmp-{}", uuid::Uuid::new_v4());
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = chrono::Utc::now();
     let entries_count = entries.len();
     let entries_json_str = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
 
@@ -155,7 +212,9 @@ pub async fn start_comparison(
             &req.workflow_id,
             &req.variation_type,
             &entries_json_str,
-            &now,
+            now,
+            Some(&observed.computed_axis),
+            observed.drift_class_token(),
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
@@ -264,14 +323,7 @@ pub async fn get_comparison(
             )
         })?;
 
-    let id = row.id;
-    let workflow_id = row.workflow_id;
-    let variation_type = row.variation_type;
-    let status = row.status;
-    let report = row.report;
-    let created_at = row.created_at;
-    let completed_at = row.completed_at;
-
+    let status = row.status.clone();
     let mut entries: Vec<ComparisonEntryJson> =
         serde_json::from_str(&row.entries_json).unwrap_or_default();
 
@@ -319,28 +371,23 @@ pub async fn get_comparison(
     // Update comparison status if all entries are done
     let final_status = if all_done && status == "running" {
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
-        let _ = pg.complete_comparison_run(&id, &entries_str).await;
+        let _ = pg.complete_comparison_run(&row.id, &entries_str).await;
         "completed".to_string()
     } else if any_running {
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
         let _ = pg
-            .update_comparison_run_entries(&id, &entries_str, &status)
+            .update_comparison_run_entries(&row.id, &entries_str, &status)
             .await;
         status
     } else {
         status
     };
 
-    Ok(Json(ApiResponse::success(ComparisonRunView {
-        id,
-        workflow_id,
-        variation_type,
-        status: final_status,
+    Ok(Json(ApiResponse::success(ComparisonRunView::from_row(
+        row,
         entries,
-        report,
-        created_at,
-        completed_at,
-    })))
+        final_status,
+    ))))
 }
 
 /// GET /comparisons — list recent comparison runs.
@@ -359,16 +406,8 @@ pub async fn list_comparisons(
         .map(|r| {
             let entries: Vec<ComparisonEntryJson> =
                 serde_json::from_str(&r.entries_json).unwrap_or_default();
-            ComparisonRunView {
-                id: r.id,
-                workflow_id: r.workflow_id,
-                variation_type: r.variation_type,
-                status: r.status,
-                entries,
-                report: r.report,
-                created_at: r.created_at,
-                completed_at: r.completed_at,
-            }
+            let status = r.status.clone();
+            ComparisonRunView::from_row(r, entries, status)
         })
         .collect();
 
