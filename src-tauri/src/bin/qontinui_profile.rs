@@ -64,7 +64,7 @@ use qontinui_runner_lib::pair::{
 };
 use qontinui_runner_lib::profile_cli::EnvCmd;
 use qontinui_runner_lib::profiles::{
-    load_strict, profiles_path, AuthConfig, BlobConfig, Profile, ProfilesFile,
+    load_strict, profiles_path, AuthConfig, BlobConfig, Profile, ProfilesFile, PROD_API_BASE_URL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -906,6 +906,26 @@ fn select_pair_mode(
     }
 }
 
+/// Resolve the base URL for pair-code redemption. Three-step order:
+///
+/// 1. `web_base_env` (`$QONTINUI_WEB_BASE`) — an explicit operator override,
+///    always wins when set to a non-empty value.
+/// 2. `coord_base`, best-effort-derived via [`derive_web_base_from_coord`] —
+///    only meaningful when the active machine already has a `profiles.json`
+///    (e.g. an operator who has configured a non-default/self-hosted coord).
+/// 3. [`PROD_API_BASE_URL`] — the fleet's real production default. A fresh
+///    machine with neither of the above pairs against production out of
+///    the box; it no longer needs a throwaway local-dev profile just to
+///    satisfy a resolution this mode doesn't otherwise need. Fleet-join,
+///    2026-08-24.
+fn resolve_pair_code_base(coord_base: Option<&str>, web_base_env: Option<&str>) -> String {
+    web_base_env
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| coord_base.map(derive_web_base_from_coord))
+        .unwrap_or_else(|| PROD_API_BASE_URL.to_string())
+}
+
 fn cmd_device_pair(
     auth_token: Option<&str>,
     pair_code: Option<&str>,
@@ -926,13 +946,22 @@ fn cmd_device_pair(
             return ExitCode::from(2);
         }
     };
-    let base = match coord_http_base() {
-        Ok(b) => b,
-        Err(e) => {
+    // `base` (the coord HTTP base, derived from the active profile's
+    // coord_url) is required unconditionally for Browser/AuthToken modes.
+    // PairCode mode only consults it as a secondary fallback — see
+    // `resolve_pair_code_base` — so a missing/unreadable profiles.json must
+    // NOT hard-error here: that would force every fresh machine to run
+    // `qontinui_profile init` (which writes an unrelated local-dev DB/
+    // Redis/blob stack profile it will never use) just to redeem a pair
+    // code against production. Fleet-join, 2026-08-24.
+    let base_result = coord_http_base();
+    if !matches!(mode, PairMode::PairCode(_)) {
+        if let Err(e) = &base_result {
             eprintln!("error: could not resolve coord_url: {}", e);
             return ExitCode::from(2);
         }
-    };
+    }
+    let base = base_result.unwrap_or_default();
 
     // Resolve tenant_id when needed. For PairCode mode the tenant is
     // carried back in the redeem response (we resolve it from there
@@ -983,13 +1012,12 @@ fn cmd_device_pair(
                     return ExitCode::from(2);
                 }
             };
-            // Pair codes redeem against the web backend. Derive the web
-            // base from the active profile's coord_url just like
-            // pair_via_browser does — operator can override via
-            // QONTINUI_WEB_BASE.
-            let web_base = std::env::var("QONTINUI_WEB_BASE")
-                .ok()
-                .unwrap_or_else(|| derive_web_base_from_coord(&base));
+            // Pair codes redeem against the web backend. Resolution order
+            // lives in `resolve_pair_code_base` — see its doc comment.
+            let web_base = resolve_pair_code_base(
+                (!base.is_empty()).then_some(base.as_str()),
+                std::env::var("QONTINUI_WEB_BASE").ok().as_deref(),
+            );
             pair_with_pair_code(&web_base, code, &device_id)
         }
         PairMode::AuthToken(token) => {
@@ -1816,6 +1844,53 @@ mod tests {
             }
             other => panic!("expected Device::Pair {{pair_code}}, got {:?}", other),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_pair_code_base — fleet-join, 2026-08-24. A fresh machine
+    // with no profiles.json and no override must still be able to redeem
+    // a pair code against production, not hard-error.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolve_pair_code_base_prefers_env_override_over_everything() {
+        assert_eq!(
+            resolve_pair_code_base(
+                Some("https://coord.qontinui.io:9870"),
+                Some("https://custom.example")
+            ),
+            "https://custom.example"
+        );
+    }
+
+    #[test]
+    fn resolve_pair_code_base_ignores_an_empty_env_override() {
+        // An empty string is not a real override — e.g. `QONTINUI_WEB_BASE=`
+        // in an env file. Falls through exactly as if unset.
+        assert_eq!(
+            resolve_pair_code_base(Some("https://coord.qontinui.io:9870"), Some("")),
+            "https://coord.qontinui.io"
+        );
+    }
+
+    #[test]
+    fn resolve_pair_code_base_falls_back_to_derived_coord_when_no_override() {
+        assert_eq!(
+            resolve_pair_code_base(Some("https://coord.qontinui.io:9870"), None),
+            "https://coord.qontinui.io"
+        );
+    }
+
+    #[test]
+    fn resolve_pair_code_base_falls_back_to_prod_default_with_nothing_configured() {
+        // The fresh-machine case this whole fix is for: no profiles.json
+        // (coord_base is None), no QONTINUI_WEB_BASE. Must resolve to the
+        // fleet's real production API host, not error and not silently
+        // point at localhost.
+        assert_eq!(
+            resolve_pair_code_base(None, None),
+            PROD_API_BASE_URL
+        );
     }
 
     #[test]
