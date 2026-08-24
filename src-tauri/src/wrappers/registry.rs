@@ -424,24 +424,49 @@ impl WrapperRegistry {
         }
     }
 
+    /// Flush the whole index to `wrappers-index.json`.
+    ///
+    /// Delegates to [`crate::fs_atomic::atomic_write`], which stages the bytes
+    /// in a temp path unique per call (`{name}.tmp.{pid}.{seq}.{nanos}`),
+    /// fsyncs, renames, retries the transient Windows sharing denial, and
+    /// removes its own temp on failure.
+    ///
+    /// This used to hand-roll the same pattern onto a FIXED temp name,
+    /// `wrappers-index.json.tmp`, which every concurrent save shared. Two saves
+    /// then interleaved as: A writes the temp, B overwrites the same temp, A
+    /// renames it away, B's rename finds nothing — measured as **40 occurrences
+    /// in a 182-line log** of
+    ///
+    /// ```text
+    /// wrappers: atomic rename of index failed (Das System kann die angegebene
+    /// Datei nicht finden. (os error 2)), writing directly
+    /// ```
+    ///
+    /// Note what that error IS: `NotFound` (os error 2), the losing writer's
+    /// temp having been consumed by the winner. The old comment here blamed
+    /// "rename fails if the target exists in some FS configs", which is not
+    /// what the platform was reporting and is not why this failed — a rename
+    /// onto an existing target is exactly what `MoveFileExW` with
+    /// `MOVEFILE_REPLACE_EXISTING` (what `fs::rename` has used since Rust 1.58)
+    /// does successfully. Chasing that phantom is how the fallback got written.
+    ///
+    /// And the fallback was worse than the failure it papered over: a plain
+    /// `fs::write` straight onto the live index, i.e. it responded to a
+    /// concurrency problem by DROPPING atomicity on the real file, where a
+    /// reader can observe a truncated index. So it is deleted rather than
+    /// widened — a unique temp per save removes the collision, and a rename
+    /// that still fails is a real error worth returning.
     async fn save_index(&self) -> Result<(), RegistryError> {
         let path = self.root.join(INDEX_FILE);
-        let tmp = self.root.join(format!("{}.tmp", INDEX_FILE));
-        let snapshot = self.inner.read().await;
-        let bytes = serde_json::to_vec_pretty(&*snapshot)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        std::fs::write(&tmp, &bytes)?;
-        // Best-effort atomic replace.
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            // On Windows rename fails if the target exists in some FS configs;
-            // fall back to a non-atomic write.
-            warn!(
-                "wrappers: atomic rename of index failed ({}), writing directly",
-                e
-            );
-            std::fs::write(&path, &bytes)?;
-            let _ = std::fs::remove_file(&tmp);
-        }
+        // Serialize under the read lock, then DROP it before touching the
+        // filesystem: the bytes are a snapshot, and holding a lock across
+        // blocking IO only widens the window other savers wait in.
+        let bytes = {
+            let snapshot = self.inner.read().await;
+            serde_json::to_vec_pretty(&*snapshot)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        };
+        crate::fs_atomic::atomic_write(&path, &bytes)?;
         Ok(())
     }
 }
@@ -613,5 +638,158 @@ mod tests {
         }
         reg.rescan("ghost").await.unwrap();
         assert!(reg.get("ghost").await.is_none());
+    }
+
+    /// Build a synthetic wrapper whose serialized form is large enough that a
+    /// non-atomic write is observably torn by a concurrent reader.
+    fn synthetic_wrapper(id: &str, filler: usize) -> Wrapper {
+        Wrapper {
+            id: id.to_string(),
+            package_name: "x".repeat(filler),
+            version: "0.0.0".to_string(),
+            manifest: WrapperManifest {
+                id: id.to_string(),
+                display_name: id.to_string(),
+                description: "d".repeat(filler),
+                transport: "api".to_string(),
+                categories: vec![],
+                env_vars: vec![],
+            },
+            actions: vec![],
+            install_path: id.to_string(),
+            installed_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// `save_index` must not stage its bytes through a SHARED, PREDICTABLE temp
+    /// path. This is the property, asserted deterministically rather than raced
+    /// for.
+    ///
+    /// The pre-fix code staged every write in exactly `wrappers-index.json.tmp`.
+    /// Occupying that name proves whether it is still used: with the fixed name,
+    /// `std::fs::write` onto a directory fails and the save errors out; with a
+    /// per-call unique temp (`{name}.tmp.{pid}.{seq}.{nanos}`) the save is
+    /// completely unaffected.
+    ///
+    /// Why a directory rather than a second concurrent saver: two savers
+    /// colliding is a timing window, and a test that only *sometimes* observes
+    /// the defect is not evidence. This one cannot pass with the shared name.
+    #[tokio::test]
+    async fn save_index_does_not_stage_through_the_shared_fixed_temp_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let reg = WrapperRegistry::new(root.clone()).await;
+        {
+            let mut idx = reg.inner.write().await;
+            idx.wrappers
+                .insert("w".to_string(), synthetic_wrapper("w", 16));
+        }
+
+        // Occupy the legacy fixed staging path.
+        let legacy_tmp = root.join(format!("{}.tmp", INDEX_FILE));
+        std::fs::create_dir(&legacy_tmp).unwrap();
+
+        reg.save_index()
+            .await
+            .expect("save_index must not depend on the shared fixed temp name");
+
+        let bytes = std::fs::read(root.join(INDEX_FILE)).unwrap();
+        let parsed: PersistedIndex = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.wrappers.len(), 1);
+        assert!(
+            legacy_tmp.is_dir(),
+            "the legacy fixed temp path must be untouched"
+        );
+    }
+
+    /// Concurrent `save_index` calls must each succeed and must never let a
+    /// reader observe a partial index.
+    ///
+    /// The defect behind it: `save_index` staged every write in the FIXED path
+    /// `wrappers-index.json.tmp`, so concurrent savers shared one temp file.
+    /// The winner renamed it away and the loser's rename hit `NotFound`
+    /// (os error 2) — 40 times in a 182-line production log — after which the
+    /// old fallback wrote the bytes NON-atomically straight onto the live
+    /// index, which is exactly when a reader can see a truncated file.
+    ///
+    /// Honest about what this test is: it exercises the end-to-end OUTCOME —
+    /// every save returns `Ok`, every readable snapshot parses whole, no temp
+    /// debris — but it is a RACE. With the fix neutered it went red on one run
+    /// (reader saw a 0-byte index; a saver got `PermissionDenied`) and green on
+    /// another, so it is not by itself reliable evidence. The deterministic
+    /// evidence is `save_index_does_not_stage_through_the_shared_fixed_temp_name`
+    /// above, which cannot pass while the shared temp name is in use.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_save_index_never_publishes_a_partial_index() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_path = root.join(INDEX_FILE);
+
+        let reg = WrapperRegistry::new(root.clone()).await;
+        // A payload big enough (~64KB) that a torn write is not a needle.
+        {
+            let mut idx = reg.inner.write().await;
+            for i in 0..32 {
+                let id = format!("w{i}");
+                idx.wrappers
+                    .insert(id.clone(), synthetic_wrapper(&id, 1024));
+            }
+        }
+        // Seed, so the reader always has something to read.
+        reg.save_index().await.expect("seed save must succeed");
+
+        let stop = StdArc::new(AtomicBool::new(false));
+        let reader_stop = StdArc::clone(&stop);
+        let reader_path = index_path.clone();
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0usize;
+            while !reader_stop.load(Ordering::SeqCst) {
+                if let Ok(bytes) = std::fs::read(&reader_path) {
+                    serde_json::from_slice::<PersistedIndex>(&bytes).unwrap_or_else(|e| {
+                        panic!(
+                            "reader observed a partial/torn index ({} bytes): {e} — save_index                              published a non-atomic write",
+                            bytes.len()
+                        )
+                    });
+                    reads += 1;
+                }
+            }
+            reads
+        });
+
+        let mut savers = Vec::new();
+        for _ in 0..4 {
+            let reg = Arc::clone(&reg);
+            savers.push(tokio::spawn(async move {
+                for _ in 0..50 {
+                    reg.save_index().await.expect("save_index must succeed");
+                }
+            }));
+        }
+        for s in savers {
+            s.await.expect("saver task panicked");
+        }
+        stop.store(true, Ordering::SeqCst);
+        let reads = reader.join().expect("reader thread panicked");
+        assert!(reads > 0, "the reader never observed the index");
+
+        // The final index is whole…
+        let bytes = std::fs::read(&index_path).unwrap();
+        let parsed: PersistedIndex = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.wrappers.len(), 32);
+
+        // …and nothing staged is left behind — including the legacy fixed temp
+        // name, whose presence would mean the shared-temp path is back.
+        let debris: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != INDEX_FILE)
+            .collect();
+        assert!(debris.is_empty(), "temp files left behind: {debris:?}");
     }
 }
