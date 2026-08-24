@@ -489,10 +489,12 @@ fn run_claude_session_inline(
     }
     let _ = &tool_policy_settings_path;
 
-    // Compose the flag vector through the shared launch seam, then re-apply the
-    // `/c` shell wrapper (this path spawns `cmd /c claude …`). The operator's
-    // global template + per-account command layer in here; with no operator
-    // config the composed tail is byte-identical to the historical argv.
+    // Compose the flag vector through the shared launch seam, then let
+    // `render_program_and_argv` pick the program: `cmd /c claude …` on Windows
+    // (for npm's `claude.cmd` shim), a directly-executed resolved `claude`
+    // everywhere else. The operator's global template + per-account command
+    // layer in here; with no operator config the composed tail is
+    // byte-identical to the historical argv.
     let spec = crate::claude_session::launch_spec::LaunchSpec {
         permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
         session_id: session_id_pin,
