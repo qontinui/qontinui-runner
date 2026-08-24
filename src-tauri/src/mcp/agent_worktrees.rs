@@ -80,6 +80,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/agent-worktrees/reclaimable", get(reclaimable_handler))
         .route("/agent-worktrees/reclaim", post(reclaim_handler))
+        // WIP-custody orphan report (plan
+        // `2026-08-22-wip-custody-rebuild-survivable-attribution`, Phase 3):
+        // the worktrees holding real uncommitted work whose owning session is
+        // NOT live, each with its WIP summary and a ready-to-run resume line.
+        .route("/agent-worktrees/wip-orphans", get(wip_orphans_handler))
 }
 
 /// `GET /agent-worktrees/reclaimable`
@@ -158,6 +163,51 @@ async fn reclaimable_handler(
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("worktree survey failed: {e}"))),
+        )),
+    }
+}
+
+/// `GET /agent-worktrees/wip-orphans[?refresh=1&waitSecs=N]`
+///
+/// The report the operator's complaint asks for: *"there is probably WIP in
+/// many of these sessions and I can't identify easily which session the WIP
+/// refers to."*
+///
+/// ```jsonc
+/// { "success": true, "data": {
+///     "predicate": "is_dirty AND owner_live != true AND (no custody record OR …)",
+///     "scanned": 1250, "wip_total": 170,
+///     "orphans": [
+///       { "worktree_path": "D:/qontinui-root/_wt/foo",
+///         "session_label": "amber-otter (session aaaa1111)",
+///         "attribution_source": "custody_record",
+///         "attribution_confidence": "strong",
+///         "orphan_reason": "custody-stale",
+///         "last_seen": "2026-08-21T09:12:04Z", "last_seen_age_secs": 190_000,
+///         "wip_summary": "Uncommitted work, snapshotted to refs/wip/aaaa1111 (2.1 GB)…",
+///         "resume_command": "cd \"D:/…/foo\" && CLAUDE_CONFIG_DIR=\"C:/claude/.claude-gmail\" claude --resume aaaa1111-…",
+///         "recover_wip_command": "git -C \"D:/…/foo\" stash apply 9f2c…" }
+///     ],
+///     "session_roots_scanned": 5, "coord_ownership_reachable": true } }
+/// ```
+///
+/// **Read-only.** It removes nothing, pins nothing and clears nothing — the
+/// plan's scope fence is explicit that no phase here removes a worktree, a
+/// branch or a target directory.
+///
+/// Same bounded-by-construction posture as
+/// [`reclaimable_handler`]: it reads the cached census snapshot, and a
+/// `census_status: "pending"` report says "not known yet", never "nothing is
+/// orphaned".
+async fn wip_orphans_handler(
+    State(_state): State<Arc<ApiState>>,
+    Query(query): Query<SurveyQuery>,
+) -> Result<Json<ApiResponse<on_demand::WipOrphanReport>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match on_demand::wip_orphans(query).await {
+        Ok(report) => Ok(Json(ApiResponse::success(report))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("wip-orphan report failed: {e}"))),
         )),
     }
 }
