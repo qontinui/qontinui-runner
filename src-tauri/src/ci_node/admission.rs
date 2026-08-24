@@ -844,6 +844,7 @@ mod tests {
             max_concurrent_builds: cap,
             repo_allowlist: allow.iter().map(|s| s.to_string()).collect(),
             min_free_disk_gb: 20,
+            canonical_converge: false,
         }
     }
 

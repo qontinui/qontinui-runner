@@ -394,7 +394,7 @@ pub fn apply_section_with(section: &SectionPlan, clone: Cloner<'_>, confirm: boo
 mod tests {
     use super::*;
     use crate::env_agent::pull::SectionPolicy;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn plan_with(changes: Vec<Change>) -> SectionPlan {
         SectionPlan {
@@ -407,6 +407,7 @@ mod tests {
             // budget, so it has no unmeasurable keys — the empty set is the
             // honest value here, not a placeholder.
             unknown_keys: BTreeSet::new(),
+            agreed: BTreeMap::new(),
         }
     }
 

@@ -2245,6 +2245,22 @@ pub struct CiNodeSettings {
     /// (this box has hit `os error 112` — disk exhaustion is real).
     #[serde(default = "default_ci_node_min_free_disk_gb")]
     pub min_free_disk_gb: u64,
+    /// May a dispatch CONVERGE this box's global toolchains toward canonical?
+    ///
+    /// Default FALSE, and the default is the whole point. A manifest's
+    /// `[canonical]` block declares that a build REQUIRES the box to be at
+    /// canonical; it must never also be the thing that authorises rewriting
+    /// the owner's rustup/volta/pyenv installation, because the manifest is a
+    /// file in someone else's repository. So the requirement comes from the
+    /// repo and the authority comes from here — the same split, and the same
+    /// reason, as `repo_allowlist` deciding which repos' commands may run at
+    /// all.
+    ///
+    /// With this false a drifted box does not silently build anyway: the
+    /// dispatch is REFUSED with the drift named (`ci_node::canonical`). Off
+    /// means "do not touch my toolchains", not "ignore the declaration".
+    #[serde(default)]
+    pub canonical_converge: bool,
 }
 
 fn default_ci_node_max_concurrent_builds() -> u32 {
@@ -2262,6 +2278,7 @@ impl Default for CiNodeSettings {
             max_concurrent_builds: default_ci_node_max_concurrent_builds(),
             repo_allowlist: Vec::new(),
             min_free_disk_gb: default_ci_node_min_free_disk_gb(),
+            canonical_converge: false,
         }
     }
 }
