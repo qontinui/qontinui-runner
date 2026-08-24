@@ -8416,6 +8416,21 @@ mod coord_mcp_body_gate_tests {
     /// `approve`. `approve` must stay unreachable — it CLEARS a gate, i.e.
     /// performs the gated action, and the 10s evaluation sweep already clears
     /// anything whose predicate verifies.
+    ///
+    /// Both spellings coord forbids are checked, because coord forbids both:
+    /// `approve_has_no_agent_tool_at_all` (coord `mcp/agent_tool_access.rs`)
+    /// rejects `coord_approve_gate` AND `coord_gate_approve`. A control that
+    /// pinned one spelling would go quiet the moment the other was the one
+    /// someone reached for.
+    ///
+    /// **This is the WEAKER of the two checks, deliberately, and it is worth
+    /// knowing which.** coord asserts against its MOUNTED CATALOG — its own
+    /// note explains why: *"'absent from the floor' would still be satisfied by
+    /// a tool that exists and is one grant away."* This door cannot see coord's
+    /// catalog; it can only state that this allowlist does not forward the name.
+    /// So coord's test is the real guarantee that `approve` does not exist, and
+    /// this one only guarantees that THIS proxy would not carry it if it did.
+    /// Do not let this test's presence read as coverage of coord's invariant.
     #[test]
     fn gate_action_verbs_are_callable_and_approve_is_not() {
         for tool in [
@@ -8448,9 +8463,19 @@ mod coord_mcp_body_gate_tests {
                 "{tool} must be callable through the proxy"
             );
         }
-        // The negative control. coord defines no such tool, so this pins the
-        // grant above as an enumeration rather than a pattern.
-        assert!(!coord_mcp_tool_is_allowed("coord_approve_gate"));
+        // The negative control, on BOTH spellings coord forbids. This pins the
+        // grant above as an enumeration rather than a `coord_*_gate` pattern
+        // that would sweep `approve` in with the rest.
+        for forbidden in ["coord_approve_gate", "coord_gate_approve"] {
+            assert!(
+                !coord_mcp_tool_is_allowed(forbidden),
+                "{forbidden:?} must not be forwarded. `approve` CLEARS a gate — it performs \
+                 the gated action — and the ~10s evaluation sweep already clears every gate \
+                 whose predicate verifies, so the verb has nothing to do. coord's \
+                 `approve_has_no_agent_tool_at_all` is the authority on its absence; this \
+                 only pins that THIS door would not carry it."
+            );
+        }
     }
 
     /// Non-allowlisted tools are refused with the request's id echoed —
