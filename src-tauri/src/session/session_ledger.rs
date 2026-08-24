@@ -114,10 +114,19 @@ pub struct LedgerEntry {
     #[serde(default)]
     pub working_dir: Option<String>,
     /// `confirmed && transcriptExists` AT CAPTURE TIME — the same join
-    /// `/control/sessions/restore-health` reports. `false` says the
-    /// conversation was never resumable, so its later absence is not a restore
-    /// defect.
-    pub restorable: bool,
+    /// `/control/sessions/restore-health` reports.
+    ///
+    /// **A TRI-STATE, deliberately.** `Some(false)` says the conversation was
+    /// never resumable, so its later absence is not a restore defect —
+    /// a real claim the report renders as *"restore could not have brought its
+    /// conversation back"*. But the underlying `TranscriptProbe` returns a bare
+    /// `bool` that **cannot express "could not determine"** (its own docs say
+    /// so, and the disk impl returns `false` for a missing or blank
+    /// `working_dir`). Collapsing that into `Some(false)` would tell the
+    /// operator not to bother resuming a session that has real WIP. So an
+    /// unprobeable record is `None`, and the report gives it its own reason.
+    #[serde(default)]
+    pub restorable: Option<bool>,
 
     // --- the Phase 1-3 join -------------------------------------------------
     /// The git worktree root containing [`Self::working_dir`], when it is
@@ -181,7 +190,11 @@ impl SessionLedger {
                     s.working_dir.as_deref().unwrap_or(""),
                     s.session_name.as_deref().unwrap_or(""),
                     s.worktree_path.as_deref().unwrap_or(""),
-                    s.restorable
+                    match s.restorable {
+                        Some(true) => "y",
+                        Some(false) => "n",
+                        None => "?",
+                    }
                 )
             })
             .collect();
@@ -252,8 +265,21 @@ pub fn capture(
         .into_iter()
         .map(|rec| {
             let confirmed = rec.confirmed_at.is_some();
-            let transcript_exists =
-                probe.transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
+            // Guarded exactly like `SessionLifecycleStore::probe_transcript_exists`:
+            // a missing or BLANK `working_dir` makes the disk probe answer a
+            // question it was never asked, and its `false` means "I could not
+            // look", not "there is no transcript".
+            let restorable = rec
+                .working_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+                .map(|w| {
+                    is_restorable_identity(
+                        confirmed,
+                        probe.transcript_exists(&rec.claude_session_id, Some(w)),
+                    )
+                });
 
             // The Phase 1-3 join: which worktree, and what does its custody
             // record say about the work in it.
@@ -276,7 +302,7 @@ pub fn capture(
                 account_label: rec.account_label,
                 config_dir: rec.config_dir,
                 working_dir: rec.working_dir,
-                restorable: is_restorable_identity(confirmed, transcript_exists),
+                restorable,
                 worktree_path: worktree.map(|p| p.to_string_lossy().replace('\\', "/")),
                 plan_slug: custody.as_ref().and_then(|c| c.plan_slug.clone()),
                 work_unit_id: custody.as_ref().and_then(|c| c.work_unit_id.clone()),
@@ -324,14 +350,21 @@ fn last_written() -> &'static Mutex<Option<String>> {
 /// diagnostic, and a diagnostic must never be the thing that breaks a boot.
 pub fn persist_if_changed(ledger: &SessionLedger) -> bool {
     let fp = ledger.fingerprint();
-    {
-        let guard = last_written().lock();
-        if let Ok(g) = guard {
-            if g.as_deref() == Some(fp.as_str()) {
-                debug!("session_ledger: unchanged — no write");
-                return false;
-            }
-        }
+    // The guard is held across the WHOLE write, not just the comparison.
+    //
+    // Three writers exist in one process — the boot latch, the 45 s liveness
+    // poll, and `POST /control/sessions/ledger/capture` — and they can overlap.
+    // Dropping the lock after the check made this check-then-act, and two
+    // concurrent `fs::write`s to one temp path then two renames can publish a
+    // TRUNCATED ledger, defeating the atomicity this whole module is built
+    // around. A poisoned lock skips the write rather than racing.
+    let Ok(mut guard) = last_written().lock() else {
+        warn!("session_ledger: write lock poisoned — skipping this write");
+        return false;
+    };
+    if guard.as_deref() == Some(fp.as_str()) {
+        debug!("session_ledger: unchanged — no write");
+        return false;
     }
 
     let path = ledger_path();
@@ -345,7 +378,11 @@ pub fn persist_if_changed(ledger: &SessionLedger) -> bool {
         warn!("session_ledger: serialize failed");
         return false;
     };
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    // pid AND a per-call counter: the pid alone gave every writer in this
+    // process the same temp path.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
     if let Err(e) = std::fs::write(&tmp, &json) {
         warn!(error = %e, path = %tmp.display(), "session_ledger: temp write failed");
         return false;
@@ -355,9 +392,7 @@ pub fn persist_if_changed(ledger: &SessionLedger) -> bool {
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
-    if let Ok(mut g) = last_written().lock() {
-        *g = Some(fp);
-    }
+    *guard = Some(fp);
     info!(
         sessions = ledger.sessions.len(),
         reason = %ledger.reason,
@@ -365,6 +400,38 @@ pub fn persist_if_changed(ledger: &SessionLedger) -> bool {
         "session_ledger: persisted the open-session ledger"
     );
     true
+}
+
+/// [`persist_if_changed`], refusing the one write that can DESTROY evidence.
+///
+/// The boot path reads the prior ledger and then writes this process's own
+/// capture over the same file. If the lifecycle registry happens to be empty at
+/// that instant — a fresh instance, a lost or reset registry, a store that
+/// failed to open — an empty `sessions: []` lands on disk and the only record
+/// of what the LAST boot had open is gone. The next boot then reads that empty
+/// ledger and reports `verdict: "match"`, a fabricated positive on a file this
+/// code wrote itself. Exactly the vacuous-`match` the census's R3 forbids.
+///
+/// So an EMPTY capture never overwrites a NON-EMPTY prior. It is not dropped
+/// silently either — it is logged, because "the registry read empty at boot" is
+/// itself worth seeing.
+pub fn persist_capture(ledger: &SessionLedger) -> bool {
+    if ledger.sessions.is_empty() {
+        if let Some(prior) = prior() {
+            if !prior.sessions.is_empty() {
+                warn!(
+                    prior_sessions = prior.sessions.len(),
+                    prior_captured_at = %prior.captured_at,
+                    reason = %ledger.reason,
+                    "session_ledger: REFUSING to overwrite a non-empty prior ledger with an \
+                     empty capture — the registry read empty, which is not proof the previous \
+                     boot had nothing open"
+                );
+                return false;
+            }
+        }
+    }
+    persist_if_changed(ledger)
 }
 
 /// Read a ledger from `path`. `None` on any failure AND on an unrecognised
@@ -438,11 +505,14 @@ pub struct LedgerOutcome {
     pub wip_state: Option<String>,
     #[serde(default)]
     pub wip_ref: Option<String>,
-    /// Was this session resumable AT CAPTURE TIME?
-    pub restorable: bool,
+    /// Was this session resumable AT CAPTURE TIME? `None` = could not be
+    /// determined, never collapsed into `false`.
+    pub restorable: Option<bool>,
     /// For a missing session: WHY it is missing.
     /// `not-restorable` — it was never identity-restorable, so restore could
     /// not have brought its conversation back;
+    /// `restorability-unknown` — we could not tell (no working dir to probe
+    /// against), so its absence is NOT evidence either way;
     /// `no-attempt` — nothing came back and nothing tried.
     #[serde(default)]
     pub reason: Option<String>,
@@ -485,11 +555,21 @@ pub struct LedgerReport {
 }
 
 fn resume_command_for(entry: &LedgerEntry) -> Option<String> {
-    let dir = entry
-        .worktree_path
-        .as_deref()
-        .or(entry.working_dir.as_deref())?;
-    let config = entry.config_dir.as_deref()?;
+    use crate::agent_worktree::custody::{is_shell_safe_token, shell_quote_path};
+    // Every input here reaches a line the operator COPY-PASTES INTO A SHELL,
+    // and `config_dir` / `working_dir` come off a registry file. A token that
+    // cannot be rendered safely yields NO line — the same omit-never-guess rule
+    // the unknown-account-root case already follows.
+    let dir = shell_quote_path(
+        entry
+            .worktree_path
+            .as_deref()
+            .or(entry.working_dir.as_deref())?,
+    )?;
+    let config = shell_quote_path(entry.config_dir.as_deref()?)?;
+    if !is_shell_safe_token(&entry.claude_session_id) {
+        return None;
+    }
     Some(format!(
         "cd \"{dir}\" && CLAUDE_CONFIG_DIR=\"{config}\" claude --resume {}",
         entry.claude_session_id
@@ -517,7 +597,12 @@ fn outcome_of(entry: &LedgerEntry, reason: Option<&str>) -> LedgerOutcome {
 ///
 /// Split from the route so the verdict and the resume lines are testable
 /// without a store, a disk or a rebuild.
-pub fn diff(prior: Option<&SessionLedger>, back: &[String], current: SessionLedger) -> LedgerReport {
+pub fn diff(
+    prior: Option<&SessionLedger>,
+    back: &[String],
+    current: SessionLedger,
+    restore_stamps_available: bool,
+) -> LedgerReport {
     let generated_at = current.captured_at_ms;
     let Some(prior) = prior else {
         // No prior ledger cannot mean "nothing was lost". Same reading as
@@ -543,8 +628,7 @@ pub fn diff(prior: Option<&SessionLedger>, back: &[String], current: SessionLedg
     };
 
     let back_lower: Vec<String> = back.iter().map(|s| s.to_ascii_lowercase()).collect();
-    let is_back =
-        |id: &str| back_lower.iter().any(|b| b == &id.to_ascii_lowercase());
+    let is_back = |id: &str| back_lower.iter().any(|b| b == &id.to_ascii_lowercase());
 
     let mut returned = Vec::new();
     let mut missing = Vec::new();
@@ -555,16 +639,24 @@ pub fn diff(prior: Option<&SessionLedger>, back: &[String], current: SessionLedg
             // Two honest reasons, and no third: a session that was never
             // identity-restorable is not a restore defect, and everything else
             // is simply "nothing brought it back".
-            let reason = if e.restorable {
-                "no-attempt"
-            } else {
-                "not-restorable"
+            let reason = match e.restorable {
+                Some(true) => "no-attempt",
+                Some(false) => "not-restorable",
+                // Never "not-restorable": that sentence tells the operator the
+                // conversation could not have come back, which we do not know.
+                None => "restorability-unknown",
             };
             missing.push(outcome_of(e, Some(reason)));
         }
     }
 
-    let verdict = if prior.sessions.is_empty() {
+    // An input we could not read must not be laundered into a confident miss
+    // count. `observed_back` skips the sticky-restore-stamp arm when this boot
+    // never latched a census, so a session that came back and was then closed
+    // lands in `missing` — through no fault of the rebuild.
+    let verdict = if !restore_stamps_available && !missing.is_empty() {
+        VERDICT_UNKNOWN
+    } else if prior.sessions.is_empty() {
         // The prior boot genuinely had nothing open. Only stateable because a
         // ledger EXISTS saying so — which is exactly the difference between
         // this and the `no_prior_ledger` arm above.
@@ -585,7 +677,7 @@ pub fn diff(prior: Option<&SessionLedger>, back: &[String], current: SessionLedg
         .iter()
         .filter(|m| m.wip_state.is_some() || m.worktree_path.is_some())
         .count();
-    let note = format!(
+    let mut note = format!(
         "{} of {} sessions open before the last shutdown came back. {} did not; {} of those \
          name a worktree that may hold uncommitted work, and {} could not be given a resume \
          line because the account root they ran under is unknown (a --resume under the wrong \
@@ -596,10 +688,17 @@ pub fn diff(prior: Option<&SessionLedger>, back: &[String], current: SessionLedg
         with_wip,
         unresumable
     );
+    if !restore_stamps_available {
+        note.push_str(
+            " CAVEAT: this boot never latched a restore census, so a session that came back \
+             and was then CLOSED cannot be distinguished from one that never returned. The \
+             miss count is an UPPER BOUND, which is why the verdict reads `unknown`.",
+        );
+    }
 
     LedgerReport {
         status: "ok".to_string(),
-        reason: (verdict == VERDICT_UNKNOWN).then(|| "unknown".to_string()),
+        reason: (verdict == VERDICT_UNKNOWN).then(|| "restore_stamps_unavailable".to_string()),
         generated_at,
         prior_captured_at: Some(prior.captured_at.clone()),
         prior_reason: Some(prior.reason.clone()),
@@ -649,7 +748,7 @@ pub fn observed_back(store: &SessionLifecycleStore, boot_at_ms: Option<i64>) -> 
 mod tests {
     use super::*;
 
-    fn entry(id: &str, restorable: bool, config: Option<&str>) -> LedgerEntry {
+    fn entry(id: &str, restorable: Option<bool>, config: Option<&str>) -> LedgerEntry {
         LedgerEntry {
             claude_session_id: id.to_string(),
             terminal_id: format!("term-{id}"),
@@ -688,14 +787,19 @@ mod tests {
     #[test]
     fn the_report_names_all_n_marks_returns_and_gives_a_resume_line_for_each_miss() {
         let prior = ledger(vec![
-            entry("s1", true, Some("C:/claude/.claude-gmail")),
-            entry("s2", true, Some("C:/claude/.claude-tiohorst")),
-            entry("s3", true, Some("C:/claude/.claude-paktis")),
+            entry("s1", Some(true), Some("C:/claude/.claude-gmail")),
+            entry("s2", Some(true), Some("C:/claude/.claude-tiohorst")),
+            entry("s3", Some(true), Some("C:/claude/.claude-paktis")),
         ]);
         let report = diff(
             Some(&prior),
             &["s1".to_string()],
-            ledger(vec![entry("s1", true, Some("C:/claude/.claude-gmail"))]),
+            ledger(vec![entry(
+                "s1",
+                Some(true),
+                Some("C:/claude/.claude-gmail"),
+            )]),
+            true,
         );
 
         assert_eq!(report.expected.len(), 3, "the ledger names ALL N");
@@ -720,12 +824,14 @@ mod tests {
     /// unknown — and the note says how many were omitted for that reason.
     #[test]
     fn an_unknown_account_root_yields_no_resume_line_and_the_note_says_so() {
-        let prior = ledger(vec![entry("s1", true, None)]);
-        let report = diff(Some(&prior), &[], ledger(Vec::new()));
+        let prior = ledger(vec![entry("s1", Some(true), None)]);
+        let report = diff(Some(&prior), &[], ledger(Vec::new()), true);
         assert_eq!(report.missing.len(), 1);
         assert_eq!(report.missing[0].resume_command, None);
         assert!(
-            report.note.contains("account root they ran under is unknown"),
+            report
+                .note
+                .contains("account root they ran under is unknown"),
             "{}",
             report.note
         );
@@ -736,7 +842,7 @@ mod tests {
     /// in-process `OnceLock` was not enough.
     #[test]
     fn no_prior_ledger_is_unknown_never_a_vacuous_match() {
-        let report = diff(None, &[], ledger(Vec::new()));
+        let report = diff(None, &[], ledger(Vec::new()), true);
         assert_eq!(report.verdict, VERDICT_UNKNOWN);
         assert_eq!(report.status, "unavailable");
         assert_eq!(report.reason.as_deref(), Some("no_prior_ledger"));
@@ -747,7 +853,7 @@ mod tests {
     /// affirmatively had nothing open, and a ledger on disk says so.
     #[test]
     fn an_empty_prior_ledger_is_a_real_match_unlike_an_absent_one() {
-        let report = diff(Some(&ledger(Vec::new())), &[], ledger(Vec::new()));
+        let report = diff(Some(&ledger(Vec::new())), &[], ledger(Vec::new()), true);
         assert_eq!(report.verdict, VERDICT_MATCH);
         assert_eq!(report.status, "ok");
     }
@@ -757,10 +863,10 @@ mod tests {
     #[test]
     fn a_never_restorable_session_is_reported_as_such_not_as_a_failed_restore() {
         let prior = ledger(vec![
-            entry("s1", false, Some("C:/claude/.claude-gmail")),
-            entry("s2", true, Some("C:/claude/.claude-gmail")),
+            entry("s1", Some(false), Some("C:/claude/.claude-gmail")),
+            entry("s2", Some(true), Some("C:/claude/.claude-gmail")),
         ]);
-        let report = diff(Some(&prior), &[], ledger(Vec::new()));
+        let report = diff(Some(&prior), &[], ledger(Vec::new()), true);
         let by = |id: &str| {
             report
                 .missing
@@ -778,43 +884,155 @@ mod tests {
     /// chain must not manufacture a phantom `missing`.
     #[test]
     fn id_matching_is_case_insensitive() {
-        let prior = ledger(vec![entry("AAAA-1111", true, Some("C:/claude/.claude-x"))]);
-        let report = diff(Some(&prior), &["aaaa-1111".to_string()], ledger(Vec::new()));
+        let prior = ledger(vec![entry(
+            "AAAA-1111",
+            Some(true),
+            Some("C:/claude/.claude-x"),
+        )]);
+        let report = diff(
+            Some(&prior),
+            &["aaaa-1111".to_string()],
+            ledger(Vec::new()),
+            true,
+        );
         assert_eq!(report.returned.len(), 1);
         assert!(report.missing.is_empty());
         assert_eq!(report.verdict, VERDICT_MATCH);
+    }
+
+    /// An UNPROBEABLE record must not be told its conversation could not have
+    /// come back. That sentence, on a session with real WIP, is the operator
+    /// deciding not to bother resuming it.
+    #[test]
+    fn an_unprobeable_session_is_restorability_unknown_not_not_restorable() {
+        let prior = ledger(vec![
+            entry("s1", None, Some("C:/claude/.claude-gmail")),
+            entry("s2", Some(false), Some("C:/claude/.claude-gmail")),
+        ]);
+        let report = diff(Some(&prior), &[], ledger(Vec::new()), true);
+        let by = |id: &str| {
+            report
+                .missing
+                .iter()
+                .find(|m| m.claude_session_id == id)
+                .unwrap()
+                .reason
+                .clone()
+        };
+        assert_eq!(by("s1").as_deref(), Some("restorability-unknown"));
+        assert_eq!(by("s2").as_deref(), Some("not-restorable"));
+        // …and it still gets a resume line, because we do not know it is dead.
+        let s1 = report
+            .missing
+            .iter()
+            .find(|m| m.claude_session_id == "s1")
+            .unwrap();
+        assert!(s1.resume_command.is_some());
+    }
+
+    /// A skipped input must not become a confident miss count.
+    #[test]
+    fn absent_restore_stamps_downgrade_the_verdict_to_unknown() {
+        let prior = ledger(vec![entry("s1", Some(true), Some("C:/claude/.claude-x"))]);
+        let report = diff(
+            Some(&prior),
+            &[],
+            ledger(Vec::new()),
+            /* stamps */ false,
+        );
+        assert_eq!(report.verdict, VERDICT_UNKNOWN);
+        assert_eq!(report.reason.as_deref(), Some("restore_stamps_unavailable"));
+        assert!(report.note.contains("UPPER BOUND"), "{}", report.note);
+        // The evidence is still shown, exactly as the census does for `unknown`.
+        assert_eq!(report.missing.len(), 1);
+    }
+
+    /// No miss ⇒ no caveat: an absent input only matters when it could have
+    /// changed the answer.
+    #[test]
+    fn absent_restore_stamps_do_not_downgrade_a_full_match() {
+        let prior = ledger(vec![entry("s1", Some(true), Some("C:/claude/.claude-x"))]);
+        let report = diff(Some(&prior), &["s1".to_string()], ledger(Vec::new()), false);
+        assert_eq!(report.verdict, VERDICT_MATCH);
+        assert_eq!(report.reason, None);
+    }
+
+    /// A shell-hostile id or path yields NO resume line rather than a broken
+    /// (or dangerous) one the operator would paste.
+    #[test]
+    fn a_shell_hostile_id_or_path_yields_no_resume_line() {
+        let mut e = entry("s1\"; rm -rf /", Some(true), Some("C:/claude/.claude-x"));
+        assert_eq!(resume_command_for(&e), None);
+
+        e = entry("s1", Some(true), Some("C:/claude/.claude-x"));
+        e.worktree_path = Some("D:/a`whoami`".to_string());
+        e.working_dir = None;
+        assert_eq!(resume_command_for(&e), None);
+
+        e = entry("s1", Some(true), Some("C:/$EVIL"));
+        assert_eq!(resume_command_for(&e), None);
+    }
+
+    /// An empty capture must never destroy a non-empty prior — that is how a
+    /// later boot manufactures a vacuous `match`.
+    #[test]
+    fn an_empty_capture_is_refused_when_it_would_erase_a_non_empty_prior() {
+        // `prior()` is a process-wide latch we cannot seed from a unit test
+        // without poisoning other tests, so this asserts the DECISION shape
+        // that `persist_capture` encodes: an empty capture beside a non-empty
+        // prior is refused; every other combination proceeds.
+        fn would_refuse(capture_len: usize, prior_len: Option<usize>) -> bool {
+            capture_len == 0 && matches!(prior_len, Some(n) if n > 0)
+        }
+        assert!(would_refuse(0, Some(3)), "empty over non-empty: REFUSE");
+        assert!(!would_refuse(0, Some(0)), "empty over empty: fine");
+        assert!(!would_refuse(0, None), "empty with no prior: fine");
+        assert!(!would_refuse(3, Some(3)), "non-empty always proceeds");
     }
 
     /// The change key moves on the fields that make an entry actionable, and
     /// only on those — so a quiet poll tick costs a comparison, not a write.
     #[test]
     fn the_fingerprint_moves_on_content_and_not_on_capture_time() {
-        let a = ledger(vec![entry("s1", true, Some("C:/claude/.claude-x"))]);
+        let a = ledger(vec![entry("s1", Some(true), Some("C:/claude/.claude-x"))]);
         let mut b = a.clone();
         b.captured_at_ms = 999_999;
         b.captured_at = "2027-01-01T00:00:00Z".to_string();
         b.reason = REASON_POLL.to_string();
-        assert_eq!(a.fingerprint(), b.fingerprint(), "time alone is not a change");
+        assert_eq!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "time alone is not a change"
+        );
 
         let mut c = a.clone();
-        c.sessions.push(entry("s2", true, Some("C:/claude/.claude-x")));
-        assert_ne!(a.fingerprint(), c.fingerprint(), "a new session IS a change");
+        c.sessions
+            .push(entry("s2", Some(true), Some("C:/claude/.claude-x")));
+        assert_ne!(
+            a.fingerprint(),
+            c.fingerprint(),
+            "a new session IS a change"
+        );
 
         let mut d = a.clone();
         d.sessions[0].worktree_path = Some("D:/elsewhere".to_string());
-        assert_ne!(a.fingerprint(), d.fingerprint(), "a moved worktree IS a change");
+        assert_ne!(
+            a.fingerprint(),
+            d.fingerprint(),
+            "a moved worktree IS a change"
+        );
     }
 
     /// Entry order must not manufacture a change.
     #[test]
     fn the_fingerprint_is_order_independent() {
         let a = ledger(vec![
-            entry("s1", true, Some("C:/claude/.claude-x")),
-            entry("s2", true, Some("C:/claude/.claude-x")),
+            entry("s1", Some(true), Some("C:/claude/.claude-x")),
+            entry("s2", Some(true), Some("C:/claude/.claude-x")),
         ]);
         let b = ledger(vec![
-            entry("s2", true, Some("C:/claude/.claude-x")),
-            entry("s1", true, Some("C:/claude/.claude-x")),
+            entry("s2", Some(true), Some("C:/claude/.claude-x")),
+            entry("s1", Some(true), Some("C:/claude/.claude-x")),
         ]);
         assert_eq!(a.fingerprint(), b.fingerprint());
     }
@@ -826,7 +1044,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qontinui-ledger-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("v99.json");
-        let mut l = ledger(vec![entry("s1", true, None)]);
+        let mut l = ledger(vec![entry("s1", Some(true), None)]);
         l.ledger_version = 99;
         std::fs::write(&p, serde_json::to_vec(&l).unwrap()).unwrap();
         assert!(load_from(&p).is_none());

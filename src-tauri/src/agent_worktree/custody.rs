@@ -189,11 +189,7 @@ pub fn parse_gitdir_line(raw: &str, worktree: &Path) -> Option<PathBuf> {
             .as_bytes()
             .get(1)
             .is_some_and(|c| *c == b':' && rest.as_bytes()[0].is_ascii_alphabetic());
-    Some(if looks_absolute {
-        p
-    } else {
-        worktree.join(p)
-    })
+    Some(if looks_absolute { p } else { worktree.join(p) })
 }
 
 /// Read at most `max` bytes of a small file. Returns `None` on any IO error
@@ -241,7 +237,20 @@ pub fn parse_session_trailers(body: &str) -> (Option<String>, Option<String>) {
 }
 
 fn strip_trailer(line: &str, key: &str) -> Option<String> {
-    if line.len() < key.len() || !line[..key.len()].eq_ignore_ascii_case(key) {
+    // BYTE comparison, not `line[..key.len()]`.
+    //
+    // Slicing by byte length panics the moment byte `key.len()` is not a UTF-8
+    // char boundary — and it is not, for any commit line starting with CJK or
+    // an emoji (`"日本語のコミット"`, `"🤖 rebuild"`). This runs inside
+    // `capture_worktree` for EVERY worktree's HEAD message on a 33-minute walk
+    // with no `catch_unwind` above it, so one such commit anywhere on the box
+    // would abort the whole census and leave the survey serving a stale
+    // snapshot forever.
+    //
+    // A matching ASCII prefix guarantees byte `key.len()` IS a boundary, so
+    // the slice on the next line is safe only because of this check.
+    let (k, l) = (key.as_bytes(), line.as_bytes());
+    if l.len() < k.len() || !l[..k.len()].eq_ignore_ascii_case(k) {
         return None;
     }
     let v = line[key.len()..].trim();
@@ -438,11 +447,7 @@ impl SessionDirectory {
 
     /// Test seam.
     #[cfg(test)]
-    pub fn from_parts(
-        names: &[(&str, &str)],
-        transcripts: &[&str],
-        roots_scanned: usize,
-    ) -> Self {
+    pub fn from_parts(names: &[(&str, &str)], transcripts: &[&str], roots_scanned: usize) -> Self {
         Self {
             names: names
                 .iter()
@@ -655,7 +660,12 @@ impl Attribution {
 
 /// Render the label for a session id. **This function is why nothing renders
 /// blank.**
-fn label_for(session_id: &str, identity: &SessionIdentity, fallback_name: Option<&str>) -> String {
+fn label_for(
+    session_id: &str,
+    identity: &SessionIdentity,
+    fallback_name: Option<&str>,
+    resolution_attempted: bool,
+) -> String {
     if let Some(name) = identity.name.as_deref().or(fallback_name) {
         let name = name.trim();
         if !name.is_empty() {
@@ -665,9 +675,16 @@ fn label_for(session_id: &str, identity: &SessionIdentity, fallback_name: Option
     if identity.transcript {
         // Resolvable, just unnamed — the operator can `--resume` it.
         format!("session {session_id}")
-    } else {
+    } else if resolution_attempted {
         // GHOST: id stamped, nothing survives that can resolve it.
         format!("session {session_id} (unresolvable)")
+    } else {
+        // NOT a ghost — we never looked. `roots_scanned == 0` means no account
+        // root was readable, so "unresolvable" here would be a statement about
+        // OUR failure dressed up as a fact about the session. The `unresolvable`
+        // FIELD is already guarded this way at every call site; the LABEL is
+        // what the operator actually reads, so it must be guarded identically.
+        format!("session {session_id}")
     }
 }
 
@@ -698,7 +715,12 @@ pub fn resolve_attribution(
 ) -> Attribution {
     // --- source 1: the custody record ---------------------------------------
     if let Some(rec) = input.custody {
-        if let Some(id) = rec.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(id) = rec
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let age = rec
                 .last_seen_epoch
                 .map(|e| input.now_epoch.saturating_sub(e));
@@ -713,7 +735,12 @@ pub fn resolve_attribution(
                         .filter(|s| !s.is_empty())
                         .map(str::to_string)
                 }),
-                session_label: label_for(id, &identity, rec.session_name.as_deref()),
+                session_label: label_for(
+                    id,
+                    &identity,
+                    rec.session_name.as_deref(),
+                    directory.roots_scanned() > 0,
+                ),
                 source: AttributionSource::CustodyRecord.as_str(),
                 confidence: if stale {
                     Confidence::Evidential.as_str()
@@ -722,9 +749,24 @@ pub fn resolve_attribution(
                 },
                 last_seen: rec.last_seen.clone(),
                 last_seen_age_secs: age,
-                // `last_seen` IS the liveness signal (never `pid`). An absent
-                // epoch is UNKNOWN, not dead.
-                owner_live: age.map(|a| a <= CUSTODY_STALE_AFTER_SECS),
+                // `last_seen` IS the liveness signal (never `pid`) — but only
+                // in ONE direction. A FRESH record proves the session wrote a
+                // turn minutes ago, so `Some(true)` is an observation. SILENCE
+                // proves nothing: a session idle awaiting the operator, blocked
+                // on a long build, or watching CI is alive and quiet, and this
+                // fleet routinely has such sessions.
+                //
+                // So staleness stays `None` (unknowable), exactly as
+                // `coord::owner_live_from_state` refuses to read coord's
+                // `stale` / `pending_resolution` as death — a manufactured
+                // `Some(false)` is what fed `SessionGone`'s destructive
+                // `Remove` authority, the Phase 0 defect. The observation is
+                // NOT lost: `custody_stale` and `last_seen_age_secs` carry it
+                // losslessly, as evidence rather than as a verdict.
+                owner_live: match age {
+                    Some(a) if a <= CUSTODY_STALE_AFTER_SECS => Some(true),
+                    _ => None,
+                },
                 unresolvable: identity.is_ghost() && directory.roots_scanned() > 0,
                 config_dir: identity.config_dir.clone(),
                 work_unit_id: non_empty(rec.work_unit_id.as_deref()),
@@ -743,7 +785,7 @@ pub fn resolve_attribution(
         if let Some(id) = non_empty(c.allocation_session_id.as_deref()) {
             let identity = directory.resolve(&id);
             return Attribution {
-                session_label: label_for(&id, &identity, None),
+                session_label: label_for(&id, &identity, None, directory.roots_scanned() > 0),
                 session_name: identity.name.clone(),
                 source: AttributionSource::CoordAllocation.as_str(),
                 confidence: if c.allocation_owner_live == Some(true) {
@@ -763,7 +805,7 @@ pub fn resolve_attribution(
         if let Some(id) = non_empty(c.branch_author_session_id.as_deref()) {
             let identity = directory.resolve(&id);
             return Attribution {
-                session_label: label_for(&id, &identity, None),
+                session_label: label_for(&id, &identity, None, directory.roots_scanned() > 0),
                 session_name: identity.name.clone(),
                 source: AttributionSource::CoordBranchAuthor.as_str(),
                 // A durable (repo, branch) binding carries no liveness
@@ -783,7 +825,12 @@ pub fn resolve_attribution(
     if let Some(id) = non_empty(input.trailer_session_id) {
         let identity = directory.resolve(&id);
         return Attribution {
-            session_label: label_for(&id, &identity, input.trailer_session_name),
+            session_label: label_for(
+                &id,
+                &identity,
+                input.trailer_session_name,
+                directory.roots_scanned() > 0,
+            ),
             session_name: identity
                 .name
                 .clone()
@@ -802,7 +849,48 @@ pub fn resolve_attribution(
 }
 
 fn non_empty(s: Option<&str>) -> Option<String> {
-    s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// Shell-safe rendering of the ready-to-run lines
+// ---------------------------------------------------------------------------
+
+/// Is this token safe to drop into a shell command UNQUOTED?
+///
+/// Session ids and commit shas come from `$GIT_DIR/qontinui-custody.json` —
+/// written by a **shell script in another repo** — and from a `Session-Id:`
+/// commit trailer, which any commit author controls. Both then land in a line
+/// the operator COPY-PASTES INTO A SHELL. A `"` or a backtick in either would
+/// break out of the quoting.
+///
+/// Every id this fleet issues is a UUID and every sha is hex, so the
+/// conservative set costs nothing real; a token outside it makes the caller
+/// emit NO command rather than a broken or dangerous one — the same
+/// omit-never-guess rule the resume line already follows for an unknown
+/// account root.
+pub fn is_shell_safe_token(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 128
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Render a path for inclusion inside a double-quoted shell word.
+///
+/// Returns `None` when the path contains a character that cannot be made safe
+/// inside double quotes (`"`, `` ` ``, `$`, `\\`, or a control character) —
+/// again: no line beats a broken one.
+pub fn shell_quote_path(p: &str) -> Option<String> {
+    if p.is_empty()
+        || p.bytes()
+            .any(|b| matches!(b, b'"' | b'`' | b'$' | b'\\') || b < 0x20)
+    {
+        return None;
+    }
+    Some(p.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -957,6 +1045,11 @@ pub mod coord {
         /// (1,499 worktrees) that is millions of throwaway `String`s on a path
         /// the operator waits on.
         rows: Vec<(String, Option<String>, CoordWorktreeRow, String)>,
+        /// Normalized ledger path → index into [`Self::rows`]. The exact-match
+        /// arm is the overwhelmingly common one, and a linear scan there is
+        /// `O(worktrees x coord_rows)` — ~2.4M comparisons at fleet scale. The
+        /// suffix arm cannot be hashed, so it keeps the scan.
+        by_path: std::collections::HashMap<String, usize>,
         /// coord answered at all. `false` ⇒ absence is UNKNOWN, not "no owner".
         pub reachable: bool,
     }
@@ -975,8 +1068,14 @@ pub mod coord {
                     ));
                 }
             }
+            let by_path = rows
+                .iter()
+                .enumerate()
+                .map(|(i, (_, _, _, norm))| (norm.clone(), i))
+                .collect();
             Self {
                 rows,
+                by_path,
                 reachable: true,
             }
         }
@@ -998,8 +1097,16 @@ pub mod coord {
             repo: &str,
             branch: Option<&str>,
         ) -> Option<CoordOwner> {
-            let mut out: Option<CoordOwner> = None;
             let census_norm = super::norm(census_path);
+            if let Some(&i) = self.by_path.get(&census_norm) {
+                let (session_id, state, w, _) = &self.rows[i];
+                return Some(CoordOwner {
+                    allocation_session_id: Some(session_id.clone()),
+                    allocation_owner_live: owner_live_from_state(state.as_deref()),
+                    branch_author_session_id: w.author_agent_session_id.clone(),
+                });
+            }
+            let mut out: Option<CoordOwner> = None;
             for (session_id, state, w, ledger_norm) in &self.rows {
                 if norm_path_matches(&census_norm, ledger_norm) {
                     return Some(CoordOwner {
@@ -1117,7 +1224,9 @@ pub mod coord {
         #[test]
         fn an_unknown_worktree_yields_none_not_a_fabricated_owner() {
             let idx = index(r#"{"sessions":[]}"#);
-            assert!(idx.owner_for("D:/x", "qontinui-runner", Some("b")).is_none());
+            assert!(idx
+                .owner_for("D:/x", "qontinui-runner", Some("b"))
+                .is_none());
             assert!(idx.reachable, "an EMPTY answer is still an answer");
         }
     }
@@ -1197,8 +1306,17 @@ mod tests {
     #[test]
     fn only_captured_means_captured_and_probe_failed_is_not_clean() {
         assert!(wip_state_is_captured(Some("captured")));
-        for s in ["unchanged", "deferred", "clean", "probe_failed", "uncaptured"] {
-            assert!(!wip_state_is_captured(Some(s)), "{s} must not read captured");
+        for s in [
+            "unchanged",
+            "deferred",
+            "clean",
+            "probe_failed",
+            "uncaptured",
+        ] {
+            assert!(
+                !wip_state_is_captured(Some(s)),
+                "{s} must not read captured"
+            );
         }
         assert!(wip_state_is_honest_clean(Some("clean")));
         assert!(!wip_state_is_honest_clean(Some("probe_failed")));
@@ -1256,25 +1374,6 @@ mod tests {
         assert!(!a.unresolvable);
     }
 
-    #[test]
-    fn an_empty_directory_never_declares_a_ghost() {
-        // roots_scanned == 0 means resolution was not attempted; declaring a
-        // ghost from that would be the 92%-failure-rate artifact.
-        let coord = CoordOwner {
-            allocation_session_id: Some("zzzz".into()),
-            ..Default::default()
-        };
-        let a = resolve_attribution(
-            &AttributionInput {
-                coord: Some(&coord),
-                ..Default::default()
-            },
-            &SessionDirectory::empty(),
-        );
-        assert!(!a.unresolvable);
-        assert_eq!(a.session_label, "session zzzz (unresolvable)");
-    }
-
     // ---- source order -------------------------------------------------------
 
     fn rec(id: &str, last_seen_epoch: Option<i64>) -> CustodyRecord {
@@ -1317,22 +1416,6 @@ mod tests {
         assert_eq!(a.confidence, "strong");
         assert_eq!(a.owner_live, Some(true));
         assert_eq!(a.wip_state.as_deref(), Some("captured"));
-    }
-
-    #[test]
-    fn a_stale_record_is_evidential_and_not_live_keyed_on_last_seen() {
-        let r = rec("aaaa1111-2222-3333-4444-555555555555", Some(0));
-        let a = resolve_attribution(
-            &AttributionInput {
-                custody: Some(&r),
-                now_epoch: CUSTODY_STALE_AFTER_SECS + 10,
-                ..Default::default()
-            },
-            &dir(),
-        );
-        assert!(a.custody_stale);
-        assert_eq!(a.confidence, "evidential");
-        assert_eq!(a.owner_live, Some(false));
     }
 
     #[test]
@@ -1401,6 +1484,103 @@ mod tests {
         assert_eq!(a.confidence, "weak");
         assert_eq!(a.owner_live, None);
         assert_eq!(a.session_name.as_deref(), Some("amber-otter"));
+    }
+
+    // ---- regressions the review caught --------------------------------------
+
+    /// A commit message that starts with CJK or an emoji must NOT panic. This
+    /// runs per worktree inside the census walk, which has no `catch_unwind`
+    /// above it — one such commit anywhere on the box would abort the whole
+    /// 33-minute walk and leave the survey serving a stale snapshot forever.
+    #[test]
+    fn a_non_ascii_commit_line_does_not_panic_the_census() {
+        for body in [
+            "日本語のコミットメッセージ\n\nSession-Id: abc\n",
+            "🤖🚀🎉 rebuild the runner\nSession-Name: né\n",
+            "Ω",
+            "Session-Id",
+        ] {
+            let _ = parse_session_trailers(body);
+        }
+        let (id, _) = parse_session_trailers("日本語\nSession-Id: abc\n");
+        assert_eq!(id.as_deref(), Some("abc"));
+    }
+
+    /// `roots_scanned == 0` means we never looked. Claiming `(unresolvable)`
+    /// there would dress OUR failure up as a fact about the session — and the
+    /// label is what the operator actually reads.
+    #[test]
+    fn an_unscanned_directory_never_labels_a_session_unresolvable() {
+        let coord = CoordOwner {
+            allocation_session_id: Some("zzzz-1111".into()),
+            ..Default::default()
+        };
+        let a = resolve_attribution(
+            &AttributionInput {
+                coord: Some(&coord),
+                ..Default::default()
+            },
+            &SessionDirectory::empty(),
+        );
+        assert_eq!(a.session_label, "session zzzz-1111");
+        assert!(!a.unresolvable);
+        assert!(!a.session_label.is_empty());
+    }
+
+    /// Silence is not death. A session idle awaiting the operator, blocked on a
+    /// long build, or watching CI is alive and quiet — and a manufactured
+    /// `Some(false)` here is what feeds `SessionGone`'s destructive `Remove`.
+    #[test]
+    fn a_stale_custody_record_is_unknowable_liveness_never_dead() {
+        let r = rec("aaaa1111-2222-3333-4444-555555555555", Some(0));
+        let a = resolve_attribution(
+            &AttributionInput {
+                custody: Some(&r),
+                now_epoch: CUSTODY_STALE_AFTER_SECS + 10,
+                ..Default::default()
+            },
+            &dir(),
+        );
+        assert_eq!(
+            a.owner_live, None,
+            "2h of custody silence is UNKNOWABLE, never a positive death claim"
+        );
+        // The observation is not lost — it is carried as evidence.
+        assert!(a.custody_stale);
+        assert_eq!(a.confidence, "evidential");
+        assert!(a.last_seen_age_secs.unwrap() > CUSTODY_STALE_AFTER_SECS);
+    }
+
+    #[test]
+    fn a_fresh_custody_record_is_still_positively_live() {
+        let r = rec("aaaa1111-2222-3333-4444-555555555555", Some(1_000));
+        let a = resolve_attribution(
+            &AttributionInput {
+                custody: Some(&r),
+                now_epoch: 1_060,
+                ..Default::default()
+            },
+            &dir(),
+        );
+        assert_eq!(a.owner_live, Some(true), "a written turn IS an observation");
+    }
+
+    /// The ready-to-run lines are copy-pasted into a shell, and their inputs
+    /// come from a file another repo's shell script writes.
+    #[test]
+    fn shell_hostile_tokens_and_paths_are_refused_not_escaped_badly() {
+        assert!(is_shell_safe_token("aaaa1111-2222-3333-4444-555555555555"));
+        assert!(is_shell_safe_token("9f2cdeadbeef"));
+        for bad in ["a\"; rm -rf /", "`whoami`", "$(id)", "a b", "", "a\nb"] {
+            assert!(!is_shell_safe_token(bad), "{bad:?} must be refused");
+        }
+        assert_eq!(
+            shell_quote_path("D:/qontinui-root/_wt/a"),
+            Some("D:/qontinui-root/_wt/a".to_string())
+        );
+        for bad in ["D:/a\"b", "D:/`x`", "D:/$HOME", ""] {
+            assert_eq!(shell_quote_path(bad), None, "{bad:?} must be refused");
+        }
     }
 
     // ---- the two join traps -------------------------------------------------

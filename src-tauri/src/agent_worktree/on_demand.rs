@@ -342,6 +342,10 @@ pub struct SurveyItem {
     /// Verbatim hook state. `captured` is the ONLY value meaning the work is
     /// snapshotted; `probe_failed` is deliberately NOT `clean`.
     pub wip_state: Option<String>,
+    /// The session's own one-line statement of what it was doing, from the
+    /// custody record. Rendered because the operator's question is not only
+    /// "whose is this" but "what was it for".
+    pub intent: Option<String>,
     /// The `CLAUDE_CONFIG_DIR` whose `projects/` holds this session's
     /// transcript — the root a `--resume` must run under. `None` for a ghost,
     /// and NEVER guessed: a resume under the wrong root fails with a message
@@ -1158,6 +1162,7 @@ fn build_survey_items(
                 wip_ref: a.attribution.wip_ref,
                 wip_commit: a.attribution.wip_commit,
                 wip_state: a.attribution.wip_state,
+                intent: a.attribution.intent,
                 config_dir: a.attribution.config_dir,
                 head_sha: a.census.head_sha.clone(),
                 head_age_secs: a.census.head_age_secs,
@@ -1229,8 +1234,8 @@ fn summarize_attribution(items: &[SurveyItem], summary: &mut SurveySummary) {
     summary.unattributed = summary.surveyed - summary.attributed;
     // `None`, never `0.0`, on an empty population: an empty census says
     // nothing about coverage (served policy `silent-empty-is-unknown`).
-    summary.attribution_rate = (summary.surveyed > 0)
-        .then(|| summary.attributed as f64 / summary.surveyed as f64);
+    summary.attribution_rate =
+        (summary.surveyed > 0).then(|| summary.attributed as f64 / summary.surveyed as f64);
 
     let wip: Vec<&SurveyItem> = items.iter().filter(|i| i.is_dirty).collect();
     summary.wip_surveyed = wip.len();
@@ -1512,6 +1517,8 @@ pub struct WipOrphan {
     pub wip_state: Option<String>,
     pub work_unit_id: Option<String>,
     pub plan_slug: Option<String>,
+    /// The session's own statement of what it was doing.
+    pub intent: Option<String>,
 
     // --- the ready-to-run lines -------------------------------------------
     /// `cd <worktree> && CLAUDE_CONFIG_DIR=<root> claude --resume <id>`.
@@ -1571,27 +1578,38 @@ pub struct WipOrphanReport {
 /// from `last_seen` (or coord's own verdict) and **never** from the record's
 /// `pid`, which is `$PPID` in bash's namespace and is not a Win32 pid.
 pub const WIP_ORPHAN_PREDICATE: &str =
-    "is_dirty AND owner_live != true AND (no custody record OR custody last_seen older \
-     than 2h)";
+    "is_dirty AND owner_live != true; each row carries the arm that admitted it in \
+     `orphan_reason` (unattributed-wip | custody-stale | owner-closed | \
+     owner-liveness-unknown)";
 
 fn orphan_reason_for(item: &SurveyItem) -> Option<&'static str> {
     if !item.is_dirty {
         return None;
     }
+    // A LIVE owner's dirty tree is not an orphan — that is the difference
+    // between a triage list and a wall of noise.
     if item.owner_live == Some(true) {
         return None;
     }
-    match (item.session_id.is_some(), item.custody_stale) {
-        // A custody record exists and has gone quiet — the strongest kind of
-        // orphan, because we know exactly whose it was.
-        (true, true) => Some("custody-stale"),
-        // Attributed by a source that carries no liveness statement at all
-        // (coord's durable binding, or the weak commit trailer). Evidence of a
-        // past owner, never a live claim (plan Risk 3).
-        (true, false) => Some("owner-liveness-unknown"),
-        // Dirty, and NOTHING named an owner. This is the population the whole
-        // plan exists for.
-        (false, _) => Some("unattributed-wip"),
+    if item.session_id.is_none() {
+        // Dirty, and NOTHING named an owner. The population the plan exists for.
+        return Some("unattributed-wip");
+    }
+    if item.custody_stale {
+        // A custody record exists and has gone quiet. The strongest kind of
+        // orphan, because we know exactly whose it was — but note that silence
+        // is EVIDENCE, not a death certificate (see `custody::owner_live`).
+        return Some("custody-stale");
+    }
+    // Split deliberately: coord saying `closed` is a KNOWN death, and calling
+    // it "unknown" would understate what we actually have. Everything else is
+    // a source that carries no liveness statement at all (coord's durable
+    // branch binding, or the weak commit trailer) — evidence of a past owner,
+    // never a live claim (plan Risk 3).
+    if item.owner_live == Some(false) {
+        Some("owner-closed")
+    } else {
+        Some("owner-liveness-unknown")
     }
 }
 
@@ -1642,21 +1660,44 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
         .iter()
         .filter_map(|item| {
             let orphan_reason = orphan_reason_for(item)?;
-            let resume_command = match (item.session_id.as_deref(), item.config_dir.as_deref()) {
-                (Some(id), Some(dir)) => Some(format!(
-                    "cd \"{}\" && CLAUDE_CONFIG_DIR=\"{}\" claude --resume {}",
-                    item.worktree_path, dir, id
-                )),
+            // Both lines are COPY-PASTED INTO A SHELL, and every input comes
+            // from a file a shell script in another repo writes (or from a
+            // commit trailer any author controls). A token that cannot be
+            // rendered safely yields NO line — the same omit-never-guess rule
+            // the unknown-account-root case already follows.
+            let quoted_path = custody::shell_quote_path(&item.worktree_path);
+            let resume_command = match (
+                item.session_id.as_deref(),
+                item.config_dir.as_deref(),
+                quoted_path.as_deref(),
+            ) {
+                (Some(id), Some(dir), Some(path)) if custody::is_shell_safe_token(id) => {
+                    custody::shell_quote_path(dir).map(|dir| {
+                        format!("cd \"{path}\" && CLAUDE_CONFIG_DIR=\"{dir}\" claude --resume {id}")
+                    })
+                }
                 // A ghost, or an id whose account root we could not establish.
                 // NEVER guessed — see the field docs.
                 _ => None,
             };
-            let recover_wip_command = item.wip_commit.as_deref().map(|c| {
-                format!(
-                    "git -C \"{}\" stash apply {}",
-                    item.worktree_path, c
+            // GATED ON `captured`, not on the commit merely existing. A record
+            // whose CURRENT turn reported `probe_failed` / `unchanged` /
+            // `deferred` can still carry a `wip_commit` from an EARLIER turn;
+            // handing the operator `stash apply <stale-commit>` would splice
+            // old content over the live tree — while the row's own summary
+            // says the work "exists ONLY in this worktree". Contradicting
+            // ourselves in the direction of data loss is the one thing this
+            // surface must never do.
+            let recover_wip_command = custody::wip_state_is_captured(item.wip_state.as_deref())
+                .then(
+                    || match (item.wip_commit.as_deref(), quoted_path.as_deref()) {
+                        (Some(c), Some(path)) if custody::is_shell_safe_token(c) => {
+                            Some(format!("git -C \"{path}\" stash apply {c}"))
+                        }
+                        _ => None,
+                    },
                 )
-            });
+                .flatten();
             Some(WipOrphan {
                 id: item.id.clone(),
                 worktree_path: item.worktree_path.clone(),
@@ -1682,9 +1723,20 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
                 wip_state: item.wip_state.clone(),
                 work_unit_id: item.work_unit_id.clone(),
                 plan_slug: item.plan_slug.clone(),
+                intent: item.intent.clone(),
                 resume_command,
                 recover_wip_command,
-                inspect_command: format!("git -C \"{}\" status --porcelain", item.worktree_path),
+                inspect_command: quoted_path
+                    .as_deref()
+                    .map(|p| format!("git -C \"{p}\" status --porcelain"))
+                    // A path we cannot render safely is stated, not silently
+                    // rendered into a broken command.
+                    .unwrap_or_else(|| {
+                        format!(
+                            "(no safe shell rendering for this path: {})",
+                            item.worktree_path
+                        )
+                    }),
             })
         })
         .collect();
@@ -1954,6 +2006,7 @@ mod tests {
             wip_ref: None,
             wip_commit: None,
             wip_state: None,
+            intent: None,
             config_dir: None,
             head_sha: None,
             head_age_secs: None,
@@ -2033,8 +2086,13 @@ mod tests {
     fn survey_marks_cleared_clean_worktree_reapable() {
         let wt = "D:/qontinui-root/qontinui-runner-wt-a";
         let pull = pull_with(vec![instruction(wt)]);
-        let (items, canonical) =
-            build_survey_items(&[census_row(wt, false, Some(false))], Some(&pull), &SessionDirectory::empty(), None, 0);
+        let (items, canonical) = build_survey_items(
+            &[census_row(wt, false, Some(false))],
+            Some(&pull),
+            &SessionDirectory::empty(),
+            None,
+            0,
+        );
         assert_eq!(canonical, 0);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "reapable");
@@ -2053,7 +2111,13 @@ mod tests {
         // refuses it and SAYS SO.
         let wt = "D:/qontinui-root/qontinui-runner-wt-b";
         let pull = pull_with(vec![instruction(wt)]);
-        let (items, _) = build_survey_items(&[census_row(wt, false, Some(true))], Some(&pull), &SessionDirectory::empty(), None, 0);
+        let (items, _) = build_survey_items(
+            &[census_row(wt, false, Some(true))],
+            Some(&pull),
+            &SessionDirectory::empty(),
+            None,
+            0,
+        );
         assert_eq!(items[0].status, "blocked");
         assert_eq!(items[0].reason, Some("building"));
         assert!(items[0].reason_detail.unwrap().contains("build"));
@@ -2063,7 +2127,13 @@ mod tests {
     fn survey_blocks_a_dirty_worktree_coord_cleared() {
         let wt = "D:/qontinui-root/qontinui-runner-wt-c";
         let pull = pull_with(vec![instruction(wt)]);
-        let (items, _) = build_survey_items(&[census_row(wt, true, Some(false))], Some(&pull), &SessionDirectory::empty(), None, 0);
+        let (items, _) = build_survey_items(
+            &[census_row(wt, true, Some(false))],
+            Some(&pull),
+            &SessionDirectory::empty(),
+            None,
+            0,
+        );
         assert_eq!(items[0].status, "blocked");
         assert_eq!(items[0].reason, Some("dirty"));
     }
@@ -2071,7 +2141,13 @@ mod tests {
     #[test]
     fn survey_blocks_everything_when_coord_is_unreachable() {
         let wt = "D:/qontinui-root/qontinui-runner-wt-d";
-        let (items, _) = build_survey_items(&[census_row(wt, false, Some(false))], None, &SessionDirectory::empty(), None, 0);
+        let (items, _) = build_survey_items(
+            &[census_row(wt, false, Some(false))],
+            None,
+            &SessionDirectory::empty(),
+            None,
+            0,
+        );
         assert_eq!(items[0].status, "blocked");
         assert_eq!(items[0].reason, Some("coord-unreachable"));
     }
@@ -2091,7 +2167,13 @@ mod tests {
             }],
         }))
         .unwrap();
-        let (items, _) = build_survey_items(&[census_row(wt, false, Some(false))], Some(&pull), &SessionDirectory::empty(), None, 0);
+        let (items, _) = build_survey_items(
+            &[census_row(wt, false, Some(false))],
+            Some(&pull),
+            &SessionDirectory::empty(),
+            None,
+            0,
+        );
         assert_eq!(items[0].status, "blocked");
         assert_eq!(items[0].reason, Some("pinned"));
         assert!(items[0].pinned);
@@ -2109,7 +2191,13 @@ mod tests {
             }],
         }))
         .unwrap();
-        let (items, _) = build_survey_items(&[census_row(wt, false, Some(false))], Some(&pull), &SessionDirectory::empty(), None, 0);
+        let (items, _) = build_survey_items(
+            &[census_row(wt, false, Some(false))],
+            Some(&pull),
+            &SessionDirectory::empty(),
+            None,
+            0,
+        );
         assert_eq!(items[0].status, "blocked");
         assert_eq!(items[0].reason, Some("session-live"));
     }
@@ -2125,7 +2213,13 @@ mod tests {
         let mut big = census_row(b, false, Some(false));
         big.attributable_bytes = 1000;
         let dirty = census_row(blocked, true, Some(false));
-        let (items, _) = build_survey_items(&[small, dirty, big], Some(&pull), &SessionDirectory::empty(), None, 0);
+        let (items, _) = build_survey_items(
+            &[small, dirty, big],
+            Some(&pull),
+            &SessionDirectory::empty(),
+            None,
+            0,
+        );
         assert_eq!(items[0].worktree_path, b);
         assert_eq!(items[1].worktree_path, a);
         assert_eq!(items[2].status, "blocked");
@@ -2291,7 +2385,18 @@ mod tests {
     fn cold_start_without_a_snapshot_is_pending_and_says_so() {
         // The endpoint must ALWAYS answer — and an empty list before the first
         // walk must read as "not known yet", never as "nothing to clean up".
-        let s = assemble_survey(None, None, None, None, true, None, chrono::Utc::now(), &SessionDirectory::empty(), None, None);
+        let s = assemble_survey(
+            None,
+            None,
+            None,
+            None,
+            true,
+            None,
+            chrono::Utc::now(),
+            &SessionDirectory::empty(),
+            None,
+            None,
+        );
         assert_eq!(s.census_status, CensusStatus::Pending);
         assert!(s.items.is_empty());
         assert_eq!(s.summary.reapable, 0);
@@ -2336,7 +2441,18 @@ mod tests {
         let now = chrono::Utc::now();
         let sample = volume_sample(chrono::Duration::seconds(30), now);
 
-        let s = assemble_survey(None, None, None, None, true, Some(&sample), now, &SessionDirectory::empty(), None, None);
+        let s = assemble_survey(
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some(&sample),
+            now,
+            &SessionDirectory::empty(),
+            None,
+            None,
+        );
 
         // The reclaim half is honestly unknown…
         assert_eq!(s.census_status, CensusStatus::Pending);
@@ -2360,7 +2476,18 @@ mod tests {
     #[test]
     fn an_unsampled_volume_reading_is_unknown_never_a_fabricated_zero() {
         let now = chrono::Utc::now();
-        let s = assemble_survey(None, None, None, None, false, None, now, &SessionDirectory::empty(), None, None);
+        let s = assemble_survey(
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            now,
+            &SessionDirectory::empty(),
+            None,
+            None,
+        );
 
         assert_eq!(s.summary.volumes_status, CensusStatus::Pending);
         assert!(s.summary.volumes.is_empty());
@@ -2384,7 +2511,18 @@ mod tests {
     fn a_stale_volume_sample_is_flagged_and_still_shown() {
         let now = chrono::Utc::now();
         let sample = volume_sample(chrono::Duration::seconds(1_800), now);
-        let s = assemble_survey(None, None, None, None, false, Some(&sample), now, &SessionDirectory::empty(), None, None);
+        let s = assemble_survey(
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(&sample),
+            now,
+            &SessionDirectory::empty(),
+            None,
+            None,
+        );
 
         assert_eq!(s.summary.volumes_status, CensusStatus::Stale);
         assert_eq!(
@@ -2442,7 +2580,18 @@ mod tests {
             now,
             chrono::Duration::seconds(120),
         );
-        let s = assemble_survey(Some(&fresh), None, None, None, false, None, now, &SessionDirectory::empty(), None, None);
+        let s = assemble_survey(
+            Some(&fresh),
+            None,
+            None,
+            None,
+            false,
+            None,
+            now,
+            &SessionDirectory::empty(),
+            None,
+            None,
+        );
         assert_eq!(s.census_status, CensusStatus::Fresh);
         assert_eq!(s.census_age_secs, Some(120));
         assert!(s.census_note.contains("2m 0s ago"), "{}", s.census_note);
@@ -2453,7 +2602,18 @@ mod tests {
             now,
             chrono::Duration::seconds(1800),
         );
-        let s = assemble_survey(Some(&old), None, None, None, false, None, now, &SessionDirectory::empty(), None, None);
+        let s = assemble_survey(
+            Some(&old),
+            None,
+            None,
+            None,
+            false,
+            None,
+            now,
+            &SessionDirectory::empty(),
+            None,
+            None,
+        );
         assert_eq!(s.census_status, CensusStatus::Stale);
         assert!(s.census_note.contains("stale"), "{}", s.census_note);
         // Stale data is still SHOWN — flagged, not hidden.
@@ -2576,7 +2736,9 @@ mod tests {
         assert_eq!(it.attribution_confidence, "strong");
         assert_eq!(it.session_id.as_deref(), Some(OWNER));
         assert_eq!(it.session_name.as_deref(), Some("amber-otter"));
-        assert!(it.session_label.starts_with("amber-otter (session aaaa1111"));
+        assert!(it
+            .session_label
+            .starts_with("amber-otter (session aaaa1111"));
         assert_eq!(it.owner_live, Some(true));
         assert_eq!(it.wip_state.as_deref(), Some("captured"));
         assert_eq!(it.plan_slug.as_deref(), Some("2026-08-22-wip-custody"));
@@ -2701,7 +2863,12 @@ mod tests {
         assert_eq!(o.worktree_path, "D:/qontinui-root/wt-stale");
         assert_eq!(o.orphan_reason, "custody-stale");
         assert!(o.custody_stale);
-        assert_eq!(o.owner_live, Some(false));
+        // NOT Some(false): 2h of custody silence is UNKNOWABLE liveness, never a
+        // death claim (a session idle awaiting the operator, blocked on a build,
+        // or watching CI is alive and quiet). The observation is carried by
+        // `custody_stale` + `last_seen_age_secs`, as evidence rather than verdict.
+        assert_eq!(o.owner_live, None);
+        assert!(o.last_seen_age_secs.unwrap() > custody::CUSTODY_STALE_AFTER_SECS);
         assert!(report.predicate.contains("is_dirty"));
     }
 

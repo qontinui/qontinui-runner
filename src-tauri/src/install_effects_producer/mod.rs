@@ -722,7 +722,7 @@ async fn get_sessions_ledger(
             clean_shutdown: boot.map(|b| !b.crash_recovery),
             sessions: Vec::new(),
         };
-        let mut report = ledger::diff(prior, &[], empty);
+        let mut report = ledger::diff(prior, &[], empty, false);
         report.status = "unavailable".to_string();
         report.reason = Some("lifecycle_store_unavailable".to_string());
         report.verdict = ledger::VERDICT_UNKNOWN.to_string();
@@ -738,7 +738,15 @@ async fn get_sessions_ledger(
     // admitting it with a `0` floor.
     let boot_at = crate::session::restore_census::latched().map(|c| c.boot_at_ms);
     let back = ledger::observed_back(&store, boot_at);
-    Json(ApiResponse::success(ledger::diff(prior, &back, current)))
+    // `boot_at == None` means the sticky-restore-stamp arm was SKIPPED, so a
+    // session that returned and was then closed cannot be told from one that
+    // never came back. That is reported, not laundered into a miss count.
+    Json(ApiResponse::success(ledger::diff(
+        prior,
+        &back,
+        current,
+        boot_at.is_some(),
+    )))
 }
 
 /// Query for `POST /control/sessions/ledger/capture`.
@@ -807,7 +815,10 @@ async fn post_sessions_ledger_capture(
         .filter(|s| !s.is_empty())
         .unwrap_or(ledger::REASON_PRE_REBUILD);
     let captured = ledger::capture(&store, &index, reason, now, boot);
-    let persisted = ledger::persist_if_changed(&captured);
+    // `persist_capture`, not `persist_if_changed`: an empty capture must never
+    // erase a non-empty prior ledger — that is how a later boot manufactures a
+    // vacuous `match`.
+    let persisted = ledger::persist_capture(&captured);
     let path = ledger::ledger_path().to_string_lossy().replace('\\', "/");
     Ok(Json(ApiResponse::success(serde_json::json!({
         "persisted": persisted,
