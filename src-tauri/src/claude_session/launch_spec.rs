@@ -145,11 +145,37 @@ pub fn render_argv(spec: &LaunchSpec, cfg: &LaunchConfig, claude_bin: &str) -> V
 /// `<resolved> claude --flags`, handing the CLI its own name as the first
 /// positional (i.e. as a prompt). `argv_head_is_claude_bin` pins the contract
 /// this relies on.
+///
+/// **Blocking:** the non-Windows arm walks `PATH` with `stat`s via
+/// [`crate::agent_runtime::resolve_claude_bin`], whose doc requires callers on
+/// an async task to use `spawn_blocking`. That resolution is what skips the
+/// runner's own per-terminal identity/shim dirs, which `shim_materializer` also
+/// prepends to `PATH` off Windows — so a bare `Command::new("claude")` could
+/// resolve to a shim, and the walk is not optional.
+///
+/// This inherits, and does not widen, `ClaudeSession::spawn`'s existing
+/// blocking contract: that function already spawns a process and runs the whole
+/// stream-json init handshake synchronously. Two of its callers —
+/// `mcp/task_runs.rs::create_ai_session` and the `tokio::spawn` in
+/// `mcp/backend_relay.rs` — are on the executor and were already violating it
+/// far more expensively than a `PATH` walk; `mcp/sessions.rs` and the
+/// `runner.rs` inline path both go through `spawn_blocking` and are fine.
+/// Fixing those two is a separate change, not a consequence of this one.
 pub fn render_program_and_argv(spec: &LaunchSpec, cfg: &LaunchConfig) -> (String, Vec<String>) {
     #[cfg(target_os = "windows")]
     {
+        // `claude_bin_path()` (not the literal `"claude"`) so a
+        // `QONTINUI_CLAUDE_BIN` override is honoured on BOTH platforms. It
+        // returns `"claude"` when unset, so the default invocation is unchanged.
+        // The full `resolve_claude_bin()` is deliberately NOT used here: cmd.exe
+        // does its own `.cmd`/PATHEXT resolution, which is the entire reason
+        // this arm exists.
         let mut args = vec!["/c".to_string()];
-        args.extend(render_argv(spec, cfg, "claude"));
+        args.extend(render_argv(
+            spec,
+            cfg,
+            &crate::agent_runtime::claude_bin_path(),
+        ));
         ("cmd.exe".to_string(), args)
     }
     #[cfg(not(target_os = "windows"))]
@@ -706,9 +732,14 @@ mod tests {
         let (program, args) = render_program_and_argv(&spec(), &LaunchConfig::default());
 
         assert_ne!(program, "cmd.exe", "cmd.exe does not exist off Windows");
-        assert!(
-            program.ends_with("claude"),
-            "program should be the resolved claude binary, got {program:?}"
+        // Compare against the resolver itself rather than hardcoding a "claude"
+        // suffix: `QONTINUI_CLAUDE_BIN` can legitimately point anywhere (a dev
+        // box or CI runner may export it), and a literal suffix assertion would
+        // fail there for reasons unrelated to the regression this guards.
+        assert_eq!(
+            program,
+            crate::agent_runtime::resolve_claude_bin(),
+            "program should be exactly the resolved claude binary"
         );
         assert!(
             !args.iter().any(|a| a == "/c"),

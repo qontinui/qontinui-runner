@@ -202,6 +202,21 @@ fn resolve_spawn_cwd(requested: Option<&str>) -> Result<Option<String>, String> 
     Ok(Some(cwd.to_string()))
 }
 
+/// Why the spawn closure bailed, and — the part that matters for the task-run
+/// row — whether a usable session survived the failure.
+///
+/// The three failure points are not equivalent. `spawn failed` and
+/// `register failed` leave nothing the caller can talk to, so the row is dead
+/// and must be reconciled. `initial prompt failed` happens AFTER the child is
+/// spawned and registered in `SessionManager`: that session is live and still
+/// reachable on `POST /sessions/{id}/message`, so stamping its row
+/// `failed`/`completed_at` would be a lie about a running session.
+struct SpawnFailure {
+    message: String,
+    /// True when a registered, reachable session outlived the error.
+    session_live: bool,
+}
+
 async fn spawn_session(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<SpawnSessionRequest>,
@@ -359,17 +374,32 @@ async fn spawn_session(
             None, // agent_log_emitter — mcp session path, no coord agent_logs
         ) {
             Ok(s) => Arc::new(s),
-            Err(e) => return Err(format!("spawn failed: {}", e)),
+            Err(e) => {
+                return Err(SpawnFailure {
+                    message: format!("spawn failed: {}", e),
+                    session_live: false,
+                })
+            }
         };
 
         if let Err(e) = sm.register(&trid, session.clone()) {
-            return Err(format!("register failed: {}", e));
+            // The child is spawned but unregistered, so nothing can reach it by
+            // id — the row is dead even though a process leaked (pre-existing).
+            return Err(SpawnFailure {
+                message: format!("register failed: {}", e),
+                session_live: false,
+            });
         }
 
         crate::commands::ai_session::emit_session_state(&handle, &trid, &trid, session.state());
 
         if let Err(e) = session.send_initial_prompt(&initial_prompt_for_closure) {
-            return Err(format!("initial prompt failed: {}", e));
+            // Spawned AND registered: the session is live and addressable. Do
+            // not reconcile the row — only the first turn failed.
+            return Err(SpawnFailure {
+                message: format!("initial prompt failed: {}", e),
+                session_live: true,
+            });
         }
 
         crate::commands::ai_session::emit_session_state(&handle, &trid, &trid, session.state());
@@ -407,23 +437,28 @@ async fn spawn_session(
         Ok(Err(e)) => {
             warn!(
                 "Failed to spawn role={:?} session {}: {}",
-                req.role, task_run_id, e
+                req.role, task_run_id, e.message
             );
-            // The task-run row was created BEFORE the spawn was attempted, so a
-            // failed spawn used to leave it reading `running` forever with
-            // `sessions_count: 0` and an empty `output_log` — a dead row that
-            // looks live to every consumer, while the HTTP body below says
-            // `state: "error"`. Reconcile the row with the answer we return.
-            if let Err(db_err) = state
-                .app_state
-                .pg_db
-                .fail_task_run(&task_run_id, &e)
-                .await
-            {
-                warn!(
-                    "could not mark task run {} failed after spawn failure: {}",
-                    task_run_id, db_err
-                );
+            // The task-run row is created BEFORE the spawn is attempted, so a
+            // dead spawn used to leave it reading `running` forever with
+            // `sessions_count: 0` and an empty `output_log` — a row that looks
+            // live to every consumer while the HTTP body says `state: "error"`.
+            //
+            // Only reconcile when nothing usable survived: `session_live` marks
+            // the `initial prompt failed` case, where the session is registered
+            // and still addressable on `POST /sessions/{id}/message`.
+            if !e.session_live {
+                if let Err(db_err) = state
+                    .app_state
+                    .pg_db
+                    .fail_task_run(&task_run_id, &e.message)
+                    .await
+                {
+                    warn!(
+                        "could not mark task run {} failed after spawn failure: {}",
+                        task_run_id, db_err
+                    );
+                }
             }
             Ok(Json(SpawnSessionResponse {
                 task_run_id,
@@ -447,7 +482,10 @@ async fn spawn_session(
             if let Err(db_err) = state
                 .app_state
                 .pg_db
-                .fail_task_run(&task_run_id, &format!("spawn_blocking join error: {join_err}"))
+                .fail_task_run(
+                    &task_run_id,
+                    &format!("spawn_blocking join error: {join_err}"),
+                )
                 .await
             {
                 warn!(
