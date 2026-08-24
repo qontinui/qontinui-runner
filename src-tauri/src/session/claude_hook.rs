@@ -42,12 +42,25 @@
 //! carrier" rather than a filename — pinned by
 //! `tests::only_the_stop_script_may_name_a_carrier_file`.
 //!
-//! The identity shim appends `--settings <that settings file>` to the real
-//! `claude` argv (alongside `--session-id`), so a HAND-STARTED `claude` gets the
-//! hook out of the box. **Nothing is ever written to or read from
-//! `~/.claude/settings.json`** — the out-of-box, zero-touch guarantee (plan §2
-//! Principle 2). The hook is confirmation-only: identity is already pinned +
-//! recorded synchronously at spawn (the §3b determinism mechanism).
+//! ## Two delivery paths, because only one has a wrapper in the chain
+//!
+//! For a HAND-STARTED or shell-wrapped `claude`, the identity shim appends
+//! `--settings <that settings file>` to the real argv (alongside
+//! `--session-id`), reading the path from [`CLAUDE_SETTINGS_ENV`] — zero setup.
+//!
+//! An AUTONOMOUS spawn execs `claude` as the PTY child itself, so there is no
+//! shim in the chain and the env var lands on the process that was supposed to
+//! already carry the flag. That path must spell the flag out for itself, via
+//! [`direct_spawn_settings_args`]. It did not until 2026-08-24, which meant
+//! every runner-spawned autonomous session ran with no hooks at all.
+//!
+//! **Nothing is ever written to or read from `~/.claude/settings.json`** — the
+//! out-of-box, zero-touch guarantee (plan §2 Principle 2). The SessionStart hook
+//! is confirmation-only for identity purposes: that is already pinned + recorded
+//! synchronously at spawn (the §3b determinism mechanism). What is NOT
+//! redundant is the second `SessionStart` command in the same block — the policy
+//! injection ([`crate::mcp::policy_context`]) — and the `Stop` / `PreCompact`
+//! hooks, none of which have a spawn-time equivalent.
 //!
 //! ## Materialization
 //!
@@ -279,6 +292,63 @@ pub fn session_restore_dir() -> PathBuf {
 /// Reads the live flag; see [`materialize_with`] for the explicit-variant form.
 pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
     materialize_with(base_dir, StopHookRegistration::from_env())
+}
+
+/// The `--settings <path>` argv pair for a spawn that execs `claude` DIRECTLY,
+/// or an EMPTY vector when the carrier could not be materialized.
+///
+/// ## Why a direct spawn needs its own resolver
+///
+/// The module docs above describe delivery as "the identity shim appends
+/// `--settings`", and for a hand-typed or shell-wrapped `claude` that is exactly
+/// what happens: [`CLAUDE_SETTINGS_ENV`] is injected onto the PTY child and the
+/// shim on `PATH` reads it. **An autonomous spawn never goes through the shim.**
+/// It execs `claude` as the PTY child itself, so the env var lands on the very
+/// process that was supposed to have the flag already — nothing is left in the
+/// chain to turn it into argv. The result was silent and total: every
+/// runner-spawned autonomous session ran with NO `SessionStart`, `PreCompact` or
+/// `Stop` hook at all, which is the same failure shape
+/// [`crate::mcp::policy_context`] exists to remove (measured 2026-08-24 on the
+/// operator box: 118 terminal spawns, zero `/control/session-open` posts and
+/// zero `policy-context` fetches, while the route and the hook script both
+/// worked when invoked by hand).
+///
+/// The direct-exec path already injects `--append-system-prompt` for precisely
+/// this reason — it is the seam where a runner-owned flag has to be spelled out
+/// because no wrapper will spell it for us. This is that same seam for the hook
+/// carrier.
+///
+/// ## Materializes rather than guessing the path
+///
+/// It calls [`materialize`] instead of composing [`settings_path`], for two
+/// reasons. The carrier must EXIST when `claude` parses the flag — pointing
+/// `--settings` at a missing file is a launch-time failure, and this path must
+/// fail OPEN (no flag) rather than break a session start. And the variant name
+/// is a function of the `Stop`-hook flag, which only [`materialize`] resolves;
+/// a second copy of that decision is the drift the [`settings_path`] docs warn
+/// about. `materialize` is idempotent and memoized ([`cached_materialization`]),
+/// so calling it here and again at the spawn seam costs one cache hit.
+pub fn direct_spawn_settings_args() -> Vec<String> {
+    settings_args_from(materialize(&session_restore_dir()))
+}
+
+/// [`direct_spawn_settings_args`] over an already-resolved carrier path — the
+/// pure half, so both arms are assertable without writing to the real
+/// [`session_restore_dir`].
+///
+/// `None` ⇒ EMPTY, never a bare `--settings`: a flag with no value, or one
+/// naming a file that does not exist, is a launch-time failure, and this path
+/// must fail OPEN. A session with no hooks is the pre-change behaviour; a
+/// session that will not start is not.
+fn settings_args_from(path: Option<PathBuf>) -> Vec<String> {
+    match path {
+        Some(path) => vec![
+            "--settings".to_string(),
+            path.to_string_lossy().into_owned(),
+        ],
+        // The failure is already logged at `warn` inside `materialize`.
+        None => Vec::new(),
+    }
 }
 
 /// [`materialize`] with the `Stop`-hook registration variant supplied
@@ -578,6 +648,26 @@ mod tests {
     use super::*;
 
     use crate::mcp::continuation_verdict::Mode;
+
+    /// The direct-exec carrier: a resolved path becomes the two-token pair, in
+    /// that order, with the path VERBATIM (it is a Windows absolute path in
+    /// production, so no quoting or normalization may creep in — the argv is
+    /// exec'd, not shell-parsed).
+    #[test]
+    fn settings_args_pair_a_resolved_carrier_path() {
+        let carrier = r"C:\Users\x\.qontinui\runner\session-restore\claude_hook_settings.json";
+        let args = settings_args_from(Some(PathBuf::from(carrier)));
+        assert_eq!(args, vec!["--settings".to_string(), carrier.to_string()]);
+    }
+
+    /// Fail-open. A materialize failure must yield NOTHING — never a dangling
+    /// `--settings` and never a path that is not on disk. Either would turn a
+    /// best-effort hook into a broken session start, which is the one thing
+    /// this delivery path is forbidden to do.
+    #[test]
+    fn settings_args_are_empty_when_the_carrier_is_unavailable() {
+        assert!(settings_args_from(None).is_empty());
+    }
 
     /// Everything that must hold for BOTH variants: all four scripts on disk,
     /// SessionStart + PreCompact registered and pointing at them, no

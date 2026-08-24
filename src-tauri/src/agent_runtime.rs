@@ -3008,6 +3008,16 @@ pub(crate) fn build_continuation_claude_command(
     add_dir_args: Vec<String>,
     prompt: String,
     system_prompt: Option<String>,
+    // The `--settings <path>` pair delivering the runner's bundled Claude hook
+    // block, from
+    // [`crate::session::claude_hook::direct_spawn_settings_args`]. Empty ⇒ no
+    // hooks for this session (the fail-open arm, and what tests pass).
+    //
+    // Passed in rather than resolved here ON PURPOSE: it makes every call site
+    // state whether its spawn is a direct exec that needs the flag spelled out,
+    // and it keeps this builder pure so the argv-shape regressions below assert
+    // against a fixed vector instead of whatever is on the machine's disk.
+    hook_settings_args: Vec<String>,
     launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
 ) -> Vec<String> {
     use crate::claude_session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
@@ -3020,6 +3030,14 @@ pub(crate) fn build_continuation_claude_command(
     //    interactive panes they never pick up the shell-integration wrapper's
     //    briefing; injecting it here gives fleet/gate-continuation sessions the
     //    same capability + guardrail context an operator's pane gets.
+    //  - the `--settings <hook file>` pair, for the SAME reason and from the
+    //    same blind spot: the identity shim is what appends it for a hand-typed
+    //    `claude`, and a direct exec has no shim in the chain, so an autonomous
+    //    session got NO `SessionStart`/`PreCompact`/`Stop` hook at all —
+    //    including the `SessionStart` policy injection that
+    //    `QONTINUI_POLICY_INJECTION` now defaults to ON. One value, not
+    //    variadic, so unlike `--add-dir` it cannot swallow the trailing prompt;
+    //    it still sits ahead of the `--` with everything else.
     //  - the attached-form `--add-dir=<sibling>` tokens.
     //  - the `--` end-of-options terminator immediately before the trailing
     //    positional prompt.
@@ -3030,11 +3048,12 @@ pub(crate) fn build_continuation_claude_command(
     // of this tail by the seam, and the operator's launch template layers in
     // between — with no operator config the output is byte-identical to the
     // historical hand-built argv.
-    let mut extra_required = Vec::with_capacity(add_dir_args.len() + 4);
+    let mut extra_required = Vec::with_capacity(add_dir_args.len() + hook_settings_args.len() + 4);
     if let Some(sp) = system_prompt {
         extra_required.push("--append-system-prompt".to_string());
         extra_required.push(sp);
     }
+    extra_required.extend(hook_settings_args);
     extra_required.extend(add_dir_args);
     extra_required.push("--".to_string());
     extra_required.push(prompt);
@@ -3185,6 +3204,10 @@ async fn run_continuation_terminal(
         Some(crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
         )),
+        // Direct exec — no identity shim in the chain to append `--settings`,
+        // so the hook carrier has to be spelled out here or this session runs
+        // with no SessionStart/PreCompact/Stop hook at all.
+        crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
     ));
 
@@ -3505,6 +3528,10 @@ async fn run_condition_check_terminal(
         Some(crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
         )),
+        // Direct exec — no identity shim in the chain to append `--settings`,
+        // so the hook carrier has to be spelled out here or this session runs
+        // with no SessionStart/PreCompact/Stop hook at all.
+        crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
     ));
 
@@ -5291,6 +5318,7 @@ mod tests {
             vec!["--add-dir=D:/wt/sibling".to_string()],
             "do the thing".to_string(),
             None,
+            Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
@@ -5316,6 +5344,7 @@ mod tests {
             ],
             "run /implement-plan plans/x.md".to_string(),
             None,
+            Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
@@ -5344,6 +5373,7 @@ mod tests {
             vec![],
             "-prompt with dash".to_string(),
             None,
+            Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
@@ -5365,6 +5395,7 @@ mod tests {
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some("You are inside the Qontinui Runner.".to_string()),
+            Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         // The prompt stays the trailing positional behind `--`.
@@ -5413,6 +5444,7 @@ mod tests {
             vec![],
             "do the thing".to_string(),
             Some(briefing),
+            Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         let flag = cmd
@@ -5426,6 +5458,92 @@ mod tests {
             prompt.starts_with(crate::terminal::RUNNER_CONTEXT_SOURCE_MARKER),
             "injected system prompt must start with the source marker, got: {}",
             prompt.chars().take(80).collect::<String>()
+        );
+    }
+
+    /// THE GAP THIS CLOSES. An autonomous spawn execs `claude` directly, so the
+    /// identity shim — the thing that appends `--settings` for a hand-typed
+    /// `claude` — is not in the chain. Before this pair was threaded through,
+    /// every runner-spawned session ran with NO `SessionStart` hook, which
+    /// silently voided the `SessionStart` policy injection that
+    /// `QONTINUI_POLICY_INJECTION` defaults to ON.
+    ///
+    /// The pair must land AHEAD of the `--` terminator, like every other
+    /// runner-injected flag, and must not disturb the trailing positional.
+    #[test]
+    fn continuation_command_injects_hook_settings_before_terminator() {
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec!["--add-dir=D:/wt/coord".to_string()],
+            "do the thing".to_string(),
+            Some("briefing".to_string()),
+            vec![
+                "--settings".to_string(),
+                "C:/hooks/claude_hook_settings.json".to_string(),
+            ],
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
+        assert_eq!(cmd.get(cmd.len() - 2).map(String::as_str), Some("--"));
+
+        let flag = cmd
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings must be injected on the direct-exec path");
+        let term = cmd.iter().position(|a| a == "--").unwrap();
+        assert!(flag < term, "--settings must precede the terminator");
+        assert_eq!(
+            cmd.get(flag + 1).map(String::as_str),
+            Some("C:/hooks/claude_hook_settings.json"),
+            "the settings path must immediately follow its flag"
+        );
+    }
+
+    /// Fail-open: a runner that could not materialize the hook carrier passes an
+    /// EMPTY vector, and the argv must then be byte-identical to the historical
+    /// one. A bare `--settings` with no value, or one pointing at a file that
+    /// does not exist, would break the session start this path must never break.
+    #[test]
+    fn continuation_command_omits_hook_settings_when_unavailable() {
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec![],
+            "do the thing".to_string(),
+            None,
+            Vec::new(),
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        assert_eq!(
+            cmd.join("|"),
+            "claude|--dangerously-skip-permissions|--session-id|abc-123|--|do the thing"
+        );
+    }
+
+    /// `--settings` takes exactly ONE value, so unlike the variadic `--add-dir`
+    /// it cannot swallow the trailing prompt — but the ORDER still has to hold
+    /// when both are present alongside the briefing. Pins the whole composed
+    /// tail rather than one flag, because the 2026-06-12 incident was an
+    /// ordering bug, not a missing-flag bug.
+    #[test]
+    fn continuation_command_orders_the_full_injected_tail() {
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec!["--add-dir=D:/wt/coord".to_string()],
+            "do the thing".to_string(),
+            Some("briefing".to_string()),
+            vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        assert_eq!(
+            cmd.join("|"),
+            concat!(
+                "claude|--dangerously-skip-permissions|--session-id|abc-123|",
+                "--append-system-prompt|briefing|--settings|C:/hooks/s.json|",
+                "--add-dir=D:/wt/coord|--|do the thing"
+            )
         );
     }
 

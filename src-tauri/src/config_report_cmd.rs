@@ -1393,8 +1393,13 @@ pub(crate) fn claude_settings_carrier_reading(
     };
     LayerReading::known(
         format!(
-            "{} — on disk: {}; variant `{}`. The shim appends `--settings` ONLY when that file \
-             exists (fail-open), so a `false` here means spawned sessions get NO hook. {}",
+            "{} — on disk: {}; variant `{}`. Two appenders read this ONE file: the identity \
+             shim, for a PATH-resolved `claude`, and \
+             `claude_hook::direct_spawn_settings_args`, for an autonomous spawn that execs \
+             `claude` directly with no shim in the chain. BOTH append `--settings` ONLY when \
+             that file exists (fail-open), so a `false` here means spawned sessions get NO \
+             hook: no SessionStart confirmation, no SessionStart policy injection, no \
+             PreCompact, and no Stop. {}",
             path.display(),
             exists,
             reg.as_str(),
@@ -3221,8 +3226,12 @@ mod tests {
         assert!(value.contains("on disk: true"), "got {value}");
         assert!(value.contains("variant `registered`"), "got {value}");
         assert!(
-            value.contains("The shim appends `--settings` ONLY when that file exists (fail-open)"),
+            value.contains("BOTH append `--settings` ONLY when that file exists (fail-open)"),
             "the row must state WHY existence is the load-bearing fact: {value}"
+        );
+        assert!(
+            value.contains("direct_spawn_settings_args"),
+            "the row must name BOTH appenders: an operator debugging a hookless autonomous              session is looking for the one that is not the shim: {value}"
         );
         assert!(
             value.contains("QONTINUI_CLAUDE_HOOK_SETTINGS onto a spawned CHILD"),
