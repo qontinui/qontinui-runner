@@ -143,6 +143,35 @@ pub fn set_bound_port(port: u16) {
     }
 }
 
+/// Test-only RAII restore for [`BOUND_PORT`].
+///
+/// Captures the RAW atomic, which [`bound_port`] cannot give back: that reader
+/// substitutes the bootstrap port when the atomic is `0`, so "save the current
+/// value and put it back" via `bound_port()` writes a fabricated non-zero port
+/// over the genuine not-yet-bound state and destroys it for the rest of the
+/// test binary. Restoring on `Drop` also covers the unwind path — a failing
+/// assertion would otherwise leave a scratch port behind and turn one real
+/// failure into a cascade of unrelated ones.
+///
+/// Restores by storing directly rather than through [`set_bound_port`], which
+/// has a publish side effect this must not re-trigger.
+#[cfg(test)]
+pub(crate) struct BoundPortRestore(u16);
+
+#[cfg(test)]
+impl BoundPortRestore {
+    pub(crate) fn capture() -> Self {
+        Self(BOUND_PORT.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+impl Drop for BoundPortRestore {
+    fn drop(&mut self) {
+        BOUND_PORT.store(self.0, Ordering::Relaxed);
+    }
+}
+
 /// The bound runner API port for the shim loopback. Falls back to the bootstrap
 /// port (`get_mcp_api_port`) only if the bind hasn't recorded one yet — a window
 /// that should never be hit in practice (bind precedes terminal spawn).
@@ -161,6 +190,20 @@ mod tests {
 
     #[test]
     fn bound_port_roundtrips_and_falls_back() {
+        // `BOUND_PORT` is process-global and the fallback arm reads
+        // `QONTINUI_PORT`, so this test was only sound while it was the sole
+        // mutator. It is not any more — the spawn seams read it through
+        // `terminal::spawn_seam_api_port`, and those tests set it too.
+        //
+        // The lock serializes the tests that OPT IN to it, which is the three
+        // that assert on a specific port value; it does not exclude production
+        // readers exercised by tests that don't take it (`config_report_cmd`'s
+        // seam capture, for one). That is fine only because those assert
+        // PRESENCE, never a value. Asserting a value there means taking this
+        // lock there too.
+        let _env_lock = crate::test_env::env_lock();
+        let _restore = BoundPortRestore::capture();
+
         // Fresh process state may already have a value from another test; assert
         // the set/get contract rather than a specific initial value.
         set_bound_port(54321);

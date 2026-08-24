@@ -116,6 +116,58 @@ pub(crate) const CREDENTIAL_VALUE_ENV_VARS: &[&str] = &[
     "QONTINUI_TEST_AUTO_LOGIN_PASSWORD",
 ];
 
+/// The runner API port a spawn seam advertises to the session it launches: the
+/// ACTUALLY-BOUND one, never the port this runner merely *wanted*.
+///
+/// # Why this exists as a shared function
+///
+/// This is a DIFFERENT, smaller set than the eight-seam scrub table above —
+/// only the seams that hand their child a runner ADDRESS. Five do, via one or
+/// both of `QONTINUI_RUNNER_API_PORT` and the [`runner_context`] briefing
+/// (whose `Runner HTTP API:` line and `:{api_port}/…` endpoints render from the
+/// same number): the PTY pane seam, which sets both; the headless
+/// `finalize_headless_child_env`, which sets both; and the three
+/// `build_continuation_claude_command` argv renders (two in `agent_runtime`,
+/// one in `looping_agent_supervisor`), which carry the briefing alone. The
+/// other six scrub-table seams set neither and are not callers here.
+///
+/// For those five the number is the session's ONLY answer to "where do I reach
+/// the runner". Each computed it itself, and every one reached for
+/// [`crate::mcp::types::get_mcp_api_port`] — whose own doc says it is "only
+/// safe to use for **bootstrap**", because it reads `QONTINUI_PORT` (or the
+/// `9876` default) and `mcp_api`'s bind loop falls back across
+/// `[port, port+1, port+2]` when a port is blocked. On a secondary or temp
+/// runner that number is the DESIRED port, and the session is told to talk to a
+/// socket this runner does not own.
+///
+/// That is the same class of defect
+/// `plans/2026-08-19-autonomous-spawn-coord-identity.md` Phase 2 closed for the
+/// coord-mcp proxy config: it made the headless continuation resolve the real
+/// bound port for `.mcp.json`, while the briefing and env var that ship to the
+/// SAME child two frames later kept the bootstrap default. One session, two
+/// disagreeing ports.
+///
+/// # Bound-or-bootstrap, deliberately — this is not the fail-closed resolver
+///
+/// [`crate::coord_mcp::resolve_bound_api_port`] returns `Option<u16>` and
+/// callers must refuse to write on `None`: a `.mcp.json` naming a dead port is
+/// worse than an absent one. A briefing is the opposite case — it is prose that
+/// must always render, and withholding the port would delete the session's only
+/// pointer at the runner. So this reads
+/// [`crate::install_effects_producer::intercept::bound_port`], the process-global
+/// recorded in `mcp_api.rs` at the instant the listener binds, which already
+/// carries exactly this bound-else-bootstrap contract and already serves the two
+/// identity/install seams in `session.rs`. It was built for "the terminal
+/// env-seam (which has no `app_state`)" and the env seam is the one caller it
+/// never acquired.
+///
+/// The bootstrap fallback is only reachable before the bind records a port — a
+/// window no session spawn can be inside, since the API server binds during
+/// startup and every seam here runs on a live runner.
+pub(crate) fn spawn_seam_api_port() -> u16 {
+    crate::install_effects_producer::intercept::bound_port()
+}
+
 /// Strip [`CREDENTIAL_VALUE_ENV_VARS`] from a PTY child's environment.
 ///
 /// `CommandBuilder` seeds its env map at construction (`get_base_env`) from
@@ -601,7 +653,8 @@ pub fn strip_ansi(text: &str) -> String {
 mod tests {
     use super::{
         memory_clause, runner_context, scrub_credential_env_pty, scrub_credential_env_std,
-        scrub_credential_env_tokio, CREDENTIAL_VALUE_ENV_VARS, RUNNER_CONTEXT_SOURCE_MARKER,
+        scrub_credential_env_tokio, spawn_seam_api_port, CREDENTIAL_VALUE_ENV_VARS,
+        RUNNER_CONTEXT_SOURCE_MARKER,
     };
     use crate::mcp::fleet_policy_poller::{
         briefing_for_test, pin_plan_capture_level_for_test, BriefingProvenance,
@@ -1361,5 +1414,56 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
         let briefing = runner_context(41234);
         assert!(briefing.contains("http://127.0.0.1:41234"), "{briefing}");
         assert!(!briefing.contains("http://127.0.0.1:9876"), "{briefing}");
+    }
+
+    // =======================================================================
+    // The spawn seams' shared API-port read (`spawn_seam_api_port`).
+    // =======================================================================
+
+    /// The number every seam ships to its child must be the ACTUALLY-BOUND
+    /// port, even when `QONTINUI_PORT` names a different one — which is exactly
+    /// what happens on a runner that fell back off a blocked port, and on a
+    /// secondary whose launcher set `QONTINUI_PORT` to a port it did not get.
+    /// Before this chokepoint every seam read `get_mcp_api_port()` and this
+    /// assertion would have failed.
+    #[test]
+    fn spawn_seam_api_port_prefers_the_bound_port_over_the_configured_one() {
+        use crate::install_effects_producer::intercept::{set_bound_port, BoundPortRestore};
+        // `BOUND_PORT` and `QONTINUI_PORT` are both process-global; hold the
+        // bin-wide env lock so a sibling test that also takes it cannot observe
+        // or clobber either mid-assertion. Both restores are RAII, so a failing
+        // assertion cannot strand scratch state for the rest of the binary.
+        let _env_lock = crate::test_env::env_lock();
+        let _env = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
+        let _bound = BoundPortRestore::capture();
+
+        std::env::set_var("QONTINUI_PORT", "9876");
+        set_bound_port(41_237);
+        assert_eq!(
+            spawn_seam_api_port(),
+            41_237,
+            "the seam must advertise the port this runner BOUND, not the one it wanted"
+        );
+    }
+
+    /// ...and with no bind recorded it still renders a usable port rather than
+    /// nothing. A briefing is prose the session must always receive: unlike a
+    /// `.mcp.json` write (which fails closed on an unresolvable port, because a
+    /// config naming a dead socket is worse than none), withholding the number
+    /// here would delete the session's only pointer at its runner.
+    #[test]
+    fn spawn_seam_api_port_falls_back_when_no_bind_has_been_recorded() {
+        use crate::install_effects_producer::intercept::{set_bound_port, BoundPortRestore};
+        let _env_lock = crate::test_env::env_lock();
+        let _env = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
+        let _bound = BoundPortRestore::capture();
+
+        std::env::set_var("QONTINUI_PORT", "9903");
+        set_bound_port(0);
+        assert_eq!(
+            spawn_seam_api_port(),
+            9903,
+            "with no recorded bind the bootstrap port is the only answer there is"
+        );
     }
 }

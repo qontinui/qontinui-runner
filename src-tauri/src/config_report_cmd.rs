@@ -807,10 +807,13 @@ fn pty_seam(fp: &EnvFingerprinter, config_dir: Option<&str>) -> SeamEnvReport {
 /// extracted and unit-tested precisely so this is possible; none of them
 /// spawns, and the spawn path itself is untouched.
 fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvReport> {
-    let runner_api_port = crate::mcp::types::get_mcp_api_port();
-
     let mut headless = crate::process_helpers::tokio_no_window("claude");
-    crate::agent_runtime::finalize_headless_child_env(&mut headless, runner_api_port);
+    // No port argument to supply any more: the seam resolves its own, so the
+    // report captures the number production actually ships instead of a second
+    // copy of that decision made here. The local this replaced read
+    // `mcp::types::get_mcp_api_port()` — the DESIRED port — which would have
+    // rendered a passing row for a seam pointing sessions at a dead socket.
+    crate::agent_runtime::finalize_headless_child_env(&mut headless);
 
     let mut claude_session = std::process::Command::new("claude");
     crate::claude_session::session::ClaudeSession::finalize_child_env(

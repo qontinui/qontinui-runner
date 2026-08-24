@@ -657,7 +657,16 @@ async fn spawn_continuation(
     title: Option<&str>,
     coord_session_id: Option<uuid::Uuid>,
 ) -> Result<String, String> {
-    let port = crate::mcp::types::get_mcp_api_port();
+    // The ACTUALLY-BOUND port. `get_mcp_api_port()` is the port this runner
+    // WANTED, and on a secondary — or after `mcp_api`'s bind loop falls back off
+    // a blocked port — this loopback POST then lands on a DIFFERENT runner's
+    // `/sessions/spawn`. That is not a mis-addressed request that fails; it
+    // succeeds, and the continuation for this runner's exhausted session is
+    // spawned by the primary, under the primary's accounts and workdirs, with
+    // nothing here reporting anything wrong. It also routes straight past the
+    // headless-provisioning fix in `agent_runtime::run_continuation_headless`,
+    // since that fix runs in whichever process actually handles the POST.
+    let port = crate::install_effects_producer::intercept::bound_port();
     let url = format!("http://127.0.0.1:{port}/sessions/spawn");
     let inherited = inherited_context(terminal_id);
     let body = spawn_body(terminal_id, title, coord_session_id, &inherited);
