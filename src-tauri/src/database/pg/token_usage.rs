@@ -13,10 +13,17 @@ pub struct PhaseSpendTotals {
     pub phase: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// Integer cents, as stored. `phase_token_usage.cost_cents` is a bigint
-    /// and `ai_pricing::calculate_cost_cents` truncates, so a sub-cent call
-    /// contributes 0 — this total is a **floor** on the real spend, never an
-    /// overstatement.
+    /// Integer cents, as stored. `phase_token_usage.cost_cents` is a bigint and
+    /// the writer ROUNDS to the nearest cent (`ai_pricing` uses `f64::round`,
+    /// not truncation), so a call under half a cent contributes 0 while one just
+    /// over it contributes 1. This total is therefore an approximation in both
+    /// directions, not a floor.
+    ///
+    /// It is also an ESTIMATE wherever the catalog cannot price the model:
+    /// `record_phase_token_usage_with_cache` writes
+    /// `ai_pricing::calculate_cost_cents_or_estimate`, which borrows a
+    /// same-family price and logs that it did. It used to write `0` in that
+    /// case, which made this total silently unusable as prior spend.
     pub cost_cents: u64,
 }
 
