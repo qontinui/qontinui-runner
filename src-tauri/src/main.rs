@@ -3017,7 +3017,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         chrono::Utc::now().timestamp_millis(),
                         session::shutdown_marker::boot_classification(),
                     );
-                    session::session_ledger::persist_if_changed(&boot_ledger);
+                    // `persist_capture` REFUSES to overwrite a non-empty prior
+                    // ledger with an empty capture: if the registry happens to
+                    // read empty here (fresh instance, lost registry, store
+                    // open failure), the only record of what the LAST boot had
+                    // open would be destroyed, and the NEXT boot would report a
+                    // fabricated `verdict: "match"` off a file we wrote.
+                    session::session_ledger::persist_capture(&boot_ledger);
                 }
 
                 // Restore-registry cloud mirror (plan 2026-07-09-runner-
@@ -3126,6 +3132,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // 7 days and re-qualifies for restore at every boot.
                     let mut consecutive_no_match: StdHashMap<String, u32> = StdHashMap::new();
 
+                    // Built ONCE, outside the loop: `discover()` walks every
+                    // Claude config root, and paying that on a 45s tick scales
+                    // with the account roots rather than with anything that
+                    // changed. The index is a directory LIST, so a session
+                    // opened later is picked up by the walk it triggers, not by
+                    // rebuilding this.
+                    let ledger_transcript_index =
+                        session::reconcile::DiskTranscriptIndex::discover();
+
                     loop {
                         tokio::time::sleep(Duration::from_secs(45)).await;
 
@@ -3144,15 +3159,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // construction — a ledger is a diagnostic and must
                         // never break the liveness poll.
                         {
-                            let idx = session::reconcile::DiskTranscriptIndex::discover();
                             let led = session::session_ledger::capture(
                                 &poll_lifecycle_store,
-                                &idx,
+                                &ledger_transcript_index,
                                 session::session_ledger::REASON_POLL,
                                 chrono::Utc::now().timestamp_millis(),
                                 session::shutdown_marker::boot_classification(),
                             );
-                            session::session_ledger::persist_if_changed(&led);
+                            session::session_ledger::persist_capture(&led);
                         }
 
                         let open = poll_lifecycle_store.open_records();
