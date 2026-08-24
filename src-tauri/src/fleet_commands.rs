@@ -50,11 +50,62 @@ const VET_PLAN: &str = include_str!("fleet_commands/vet-plan.md");
 /// it there.
 const IMPLEMENT_PLAN: &str = include_str!("fleet_commands/implement-plan.md");
 
+/// `/policy` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/policy.md` in this repository — edit it there.
+///
+/// One of the five COORD DOORS added to the bundle: the read door for the
+/// fleet policy documents. Bundled rather than left to the account layer
+/// because the override fetch itself needs a reachable backend — an agent that
+/// cannot reach the network is exactly the agent that needs to read policy and
+/// report why it is stuck.
+const POLICY: &str = include_str!("fleet_commands/policy.md");
+
+/// `/gate` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/gate.md` in this repository — edit it there.
+///
+/// The transport-agnostic gate register/attest/withdraw door. Same reasoning
+/// as [`POLICY`]: registering a gate is how a blocked agent makes its blocker
+/// observable, so it must not itself depend on a healthy transport.
+const GATE: &str = include_str!("fleet_commands/gate.md");
+
+/// `/whereami` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/whereami.md` in this repository — edit it
+/// there.
+///
+/// Reports session IDENTITY from `$QONTINUI_RUNNER_CONTEXT` (never a port
+/// probe). Bundled because it answers "what am I running inside" — a question
+/// whose answer must not depend on the thing being diagnosed.
+const WHEREAMI: &str = include_str!("fleet_commands/whereami.md");
+
+/// `/blocked` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/blocked.md` in this repository — edit it
+/// there.
+///
+/// The session-close emit-on-block protocol. This is the LAST thing a stuck
+/// session runs, so it is the one command least able to rely on a fetch having
+/// succeeded earlier.
+const BLOCKED: &str = include_str!("fleet_commands/blocked.md");
+
+/// `/gate-sweep` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/gate-sweep.md` in this repository — edit it
+/// there.
+///
+/// Reports open/closed gates. Bundled alongside [`GATE`] and [`BLOCKED`] so the
+/// register/report pair is never half-present.
+const GATE_SWEEP: &str = include_str!("fleet_commands/gate-sweep.md");
+
 /// The embedded default commands, as `(name, body)`. `name` is the slash
 /// command `claude` will expose and the filename stem written under
 /// `.claude/commands/` (`vet-plan` -> `vet-plan.md` -> `/vet-plan`).
-pub(crate) const FLEET_COMMANDS: &[(&str, &str)] =
-    &[("vet-plan", VET_PLAN), ("implement-plan", IMPLEMENT_PLAN)];
+pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
+    ("vet-plan", VET_PLAN),
+    ("implement-plan", IMPLEMENT_PLAN),
+    ("policy", POLICY),
+    ("gate", GATE),
+    ("whereami", WHEREAMI),
+    ("blocked", BLOCKED),
+    ("gate-sweep", GATE_SWEEP),
+];
 
 /// Provision the resolved agent commands into `<workdir>/.claude/commands/` so
 /// a `claude` session spawned with `workdir` as its cwd can resolve them as
