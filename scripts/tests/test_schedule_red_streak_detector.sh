@@ -123,11 +123,10 @@ rc=0; bash "$detector" --fixture-dir "$work/holed" > "$work/out.txt" 2>&1 || rc=
 assert "missing runs payload => exit 2, not 0"     2 "$rc"
 assert "and it names the missing fixture"          yes "$(saw '317525761.schedule.json')"
 
-# MALFORMED content, not just a missing file. This is the shape that made the
-# original heredoc-wrapped command substitution report a healthy "0 finding(s)"
-# and exit 0: jq's exit status inside `<<EOF $(...) EOF` is discarded, so a
-# payload carrying `total_count` but no `workflow_runs` array skipped the
-# workflow in silence.
+# MALFORMED content, not just a missing file. Each of these lands on a
+# different guard; the one that reaches the streak computation itself -- the
+# site of the heredoc bug, where jq's exit status used to be discarded -- is
+# called out below.
 mangle() {
   # mangle <file> <json> ; leaves the run's output in $work/out.txt, echoes rc
   rm -rf "$work/bad"; cp -r "$fixtures/real-2026-08-24" "$work/bad"
@@ -140,6 +139,19 @@ mangle() {
 assert "runs payload with no workflow_runs => exit 2" 2 "$(mangle 317525761.schedule.json '{"total_count": 9}')"
 assert "and it does not claim zero findings"       no  "$(saw 'finding(s)')"
 assert "and it names the workflow it could not read" yes "$(saw 'workflow 317525761')"
+
+# THIS is the fixture that reaches the streak jq itself. Every other
+# malformed shape above is caught by an EARLIER guard (the total_count parse,
+# the numeric check, the empty-page check), so with only those, reverting the
+# heredoc fix leaves this suite fully green -- a fix site with no test that
+# distinguishes it is not covered. An OBJECT for workflow_runs has length 1,
+# so it clears the empty-page check; `.workflow_runs[]` then iterates values
+# and `1 | select(.event == ...)` makes jq exit non-zero. Measured: fixed
+# detector exits 2 naming the streak computation; the pre-fix heredoc form
+# exits 0 reporting '0 finding(s)'.
+assert "runs payload that breaks the streak jq => 2" 2 "$(mangle 317525761.schedule.json '{"total_count": 9, "workflow_runs": {"a": 1}}')"
+assert "and it does not claim zero findings"       no  "$(saw 'finding(s)')"
+assert "and it names the streak computation"       yes "$(saw 'could not compute the failure streak')"
 
 assert "total_count>0 but an empty page => exit 2" 2 "$(mangle 317525761.schedule.json '{"total_count": 9, "workflow_runs": []}')"
 assert "and it says the page returned none"        yes "$(saw 'returned none')"

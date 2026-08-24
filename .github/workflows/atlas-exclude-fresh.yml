@@ -730,7 +730,16 @@ jobs:
           # of any one call.
           if [ -z "${url:-}" ]; then
             echo "::error::A pull-request operation reported success but returned no URL."
-            pr_op_failed "URL read-back"
+            if [ -n "$existing_num" ]; then
+              # `gh pr edit` already SUCCEEDED on this arm -- the PR exists and
+              # carries the refreshed body; only reading its URL back came up
+              # empty. Sending the operator to "open the PR by hand" here would
+              # be wrong advice, so this arm does not call pr_op_failed.
+              echo "::error::Refresh PR #$existing_num on '$BRANCH' WAS updated; only the URL read-back was empty."
+              echo "::error::Check $GITHUB_SERVER_URL/$REPO/pull/$existing_num directly."
+            else
+              pr_op_failed "URL read-back"
+            fi
             exit 1
           fi
 

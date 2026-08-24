@@ -130,7 +130,13 @@ assert "no '--state closed' lookup" 0 "$(grep -cE 'state[= ]closed' "$code_only"
 # Every gh call except the deliberately-bare open-PR lookup is guarded.
 # -o, not -c: `grep -c` counts LINES, so two calls on one line would read as
 # one and the guarded/unguarded arithmetic below would be wrong.
-gh_calls="$(grep -o 'gh pr ' "$code_only" | wc -l | tr -d ' ')"
+#
+# The braces put `|| true` on `grep` ALONE, not on the whole pipeline, so a
+# `wc` failure still surfaces. Without it, a body containing NO `gh pr ` at
+# all -- exactly the regression this assertion exists to report -- makes
+# grep exit 1, pipefail propagate, and `set -e` kill the script before the
+# assert can print 'expected 7, got 0'. Loud but illegible again.
+gh_calls="$( { grep -o 'gh pr ' "$code_only" || true; } | wc -l | tr -d ' ')"
 guarded="$(grep -cE 'if ! (url=|existing_draft=)?"?\$?\(?gh pr |if ! gh pr ' "$code_only" || true)"
 assert "gh calls in executable code" 7 "$gh_calls"
 assert "guarded gh calls (all but the bare open lookup)" 6 "$guarded"
@@ -201,6 +207,13 @@ printf '  + (fresh only)     coord.session_policy_reads\n' > "$runner_temp/exclu
 drift_sha="$(sha256sum "$runner_temp/exclude.drift.txt" | cut -c1-16)"
 
 STUB_URL="https://github.com/qontinui/qontinui-runner/pull/4242"
+
+# Pin the stub knobs rather than inheriting them. run_step forwards these to
+# the step, so an ambient `GH_STUB_EMPTY_URL=1` in the caller's environment
+# would silently re-point a dozen assertions at a different scenario.
+GH_STUB_EMPTY_URL=""
+GIT_STUB_STAGED=1
+export GH_STUB_EMPTY_URL GIT_STUB_STAGED
 
 # run_step <fail-keys> <list-open> <isDraft> <comments-file-or-empty>
 # Echoes the exit code; leaves stdout+stderr in $work/out.txt, the gh call log
@@ -325,6 +338,10 @@ assert "and it prints the remediation"             yes "$(has "$REMEDIATION")"
 assert "and it wrote NO summary section"           no  "$(grep -q . "$work/summary.md" && echo yes || echo no)"
 assert "edit path returns no URL => exit 1"        1 "$(run_step '' '1234' 'true' '')"
 assert "and the edit path says so too"             yes "$(has 'returned no URL')"
+# `gh pr edit` succeeded on this arm, so the PR exists and was updated.
+# Telling the operator to open one by hand would be wrong advice.
+assert "edit arm cites the PR that WAS updated"    yes "$(has '#1234 on '\''chore/atlas-exclude-refresh'\'' WAS updated')"
+assert "edit arm does NOT say open one by hand"    no  "$(has 'the fix is already committed there')"
 unset GH_STUB_EMPTY_URL
 
 # ---------------------------------------------------------------------------
@@ -332,13 +349,10 @@ unset GH_STUB_EMPTY_URL
 # ---------------------------------------------------------------------------
 echo ""
 echo "Contradiction guard:"
-GIT_STUB_STAGED_SAVED="${GIT_STUB_STAGED:-}"
 GIT_STUB_STAGED=0
-export GIT_STUB_STAGED
 assert "drift reported but nothing staged => 1" 1 "$(run_step '' '' 'true' '')"
 assert "and it says so"                         yes "$(has "already matches the fresh list")"
-GIT_STUB_STAGED="${GIT_STUB_STAGED_SAVED:-1}"
-export GIT_STUB_STAGED
+GIT_STUB_STAGED=1
 
 echo ""
 if [ "$failures" -gt 0 ]; then
