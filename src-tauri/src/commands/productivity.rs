@@ -2438,6 +2438,61 @@ pub async fn list_overlapping_intents(
 mod overlap_tests {
     use super::*;
 
+    /// Serve exactly ONE HTTP response on a fresh loopback listener, then hand
+    /// back its base URL.
+    ///
+    /// The server deliberately reports NOTHING about delivery. It cannot: on
+    /// Windows the RST is emitted at close, so `write_all` and `flush` both
+    /// succeed on a connection the client will never read from. A "we served
+    /// it" flag here was tried and measured useless — it stayed `true` through
+    /// the mutation that destroys the response. Assert delivery on the CLIENT
+    /// side or not at all.
+    ///
+    /// Two details here are load-bearing on Windows, and both were learned the
+    /// hard way (CI run 32570533855, `test (windows-latest)`):
+    ///
+    /// 1. **The request is drained before the response is written.** Closing a
+    ///    socket that still holds unread bytes in its receive queue makes TCP
+    ///    send **RST instead of FIN**. The client's in-flight response is then
+    ///    discarded and `reqwest` surfaces a transport error.
+    /// 2. **The write half is shut down explicitly** so the peer sees a clean
+    ///    FIN rather than inheriting whatever `drop` does.
+    ///
+    /// Why that turned into a red build rather than a flaky one:
+    /// [`overlapping_intents_for_base`] swallows every transport error into an
+    /// empty `Vec`. So an RST is indistinguishable from "coord answered with
+    /// nothing" — it failed `a_healthy_coord_answer_reaches_the_panel`
+    /// outright, and it made `a_non_2xx_from_coord_degrades_rather_than_erroring`
+    /// pass for the WRONG REASON, asserting emptiness it would have observed
+    /// even if the 403 arm had never run. Linux tolerated the same code, so
+    /// this was invisible on `ubuntu-22.04`.
+    async fn serve_one_response(response: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // (1) Drain the request head. A GET carries no body, so
+                // end-of-headers is the whole request.
+                let mut seen: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = sock.write_all(&response).await;
+                let _ = sock.flush().await;
+                // (2) Clean FIN.
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     #[test]
     fn url_carries_the_limit_and_normalizes_a_trailing_slash() {
         assert_eq!(
@@ -2539,23 +2594,44 @@ mod overlap_tests {
         // Coord's gate is fail-closed: an unpaired runner gets 403
         // `auth_required`. The panel must treat that like any other
         // unavailable answer — empty, logged, never a dialog.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        //
+        // This is asserted in TWO steps on purpose. `overlapping_intents_for_base`
+        // collapses every failure into an empty Vec, so `is_empty()` alone is
+        // VACUOUS — a reset connection satisfies it just as well as a 403, and
+        // on Windows that is exactly what used to happen. Only the inner
+        // `fetch_overlapping_intents` distinguishes them: a delivered non-2xx
+        // yields `coord returned HTTP 403`, whereas a dead connection yields a
+        // `GET overlapping-intents: …` transport error. Assert the status
+        // first, THEN the panel contract.
+        let body = br#"{"error":"auth_required"}"#;
+        let response = || {
+            format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes()
+            .into_iter()
+            .chain(body.iter().copied())
+            .collect::<Vec<u8>>()
+        };
+
+        // (1) the 403 genuinely arrives and is read as a status, not a fault.
+        let (base, server) = serve_one_response(response()).await;
+        let err = fetch_overlapping_intents(&base, 200)
             .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let server = tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
-                use tokio::io::AsyncWriteExt;
-                let _ = sock
-                    .write_all(
-                        b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\
-                          Content-Length: 27\r\n\r\n{\"error\":\"auth_required\"}\r\n",
-                    )
-                    .await;
-                let _ = sock.flush().await;
-            }
-        });
-        let pairs = overlapping_intents_for_base(Some(format!("http://{addr}")), 200).await;
+            .expect_err("a 403 must not parse as success");
+        assert!(
+            err.contains("403"),
+            "expected the delivered status in the error, got {err:?} — a \
+             transport error here means the response never arrived, which \
+             would make step (2) vacuous"
+        );
+        server.abort();
+
+        // (2) and the panel degrades to empty rather than surfacing it.
+        let (base, server) = serve_one_response(response()).await;
+        let pairs = overlapping_intents_for_base(Some(base), 200).await;
         assert!(pairs.is_empty());
         server.abort();
     }
@@ -2564,25 +2640,18 @@ mod overlap_tests {
     async fn a_healthy_coord_answer_reaches_the_panel() {
         // The happy path end-to-end over real HTTP: coord's envelope in,
         // the panel's rows out.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let server = tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
-                use tokio::io::AsyncWriteExt;
-                let body = r#"{"pairs":[{"agentA":"a1","agentB":"a2","intentA":"i1","intentB":"i2","overlappingPaths":["src/x.rs"]}]}"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        let pairs = overlapping_intents_for_base(Some(format!("http://{addr}")), 200).await;
+        let body = br#"{"pairs":[{"agentA":"a1","agentB":"a2","intentA":"i1","intentB":"i2","overlappingPaths":["src/x.rs"]}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect::<Vec<u8>>();
+        let (base, server) = serve_one_response(response).await;
+        let pairs = overlapping_intents_for_base(Some(base), 200).await;
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].agent_a, "a1");
         assert_eq!(pairs[0].overlapping_paths, vec!["src/x.rs"]);
