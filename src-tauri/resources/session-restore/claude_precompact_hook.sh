@@ -2,10 +2,12 @@
 # qontinui session-autonomy — Claude `PreCompact` HOOK (context-exhaustion
 # signal). Plan `2026-07-17-session-autonomy-fabric.md`, Phase 7.
 #
-# Delivered to Claude Code ADDITIVELY via the SAME `--settings
-# <claude_hook_settings.json>` carrier as the SessionStart + Stop hooks
-# (the identity shim appends that flag; nothing is ever written to the user's
-# `~/.claude/settings.json`).
+# Delivered to Claude Code ADDITIVELY via the SAME runner-owned `--settings`
+# carrier as the SessionStart hooks (the identity shim appends that flag;
+# nothing is ever written to the user's `~/.claude/settings.json`). Like them
+# this hook is registered UNCONDITIONALLY, so it rides whichever of the two
+# carrier files the continuation flag selects — unlike the `Stop` hook, which
+# only ever ships in the armed one. See `session::claude_hook`.
 #
 # Claude invokes this when a context compaction is IMMINENT, piping a JSON
 # payload on stdin:
