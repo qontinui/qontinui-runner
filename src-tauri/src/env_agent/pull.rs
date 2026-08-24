@@ -711,6 +711,50 @@ pub fn render_plan(plan: &ApplyPlan) -> String {
         out.push_str(&format!(
             "This machine IS the canonical environment ({who}).\nNothing to pull.\n"
         ));
+        // …but "nothing to pull" is not "nothing is wrong", and on THIS box the
+        // distinction matters more than anywhere else: the capture this machine
+        // publishes is the canonical config every other box reconciles toward,
+        // so a key MISSING FROM THAT PUBLISHED CONFIG is a hole in everyone's
+        // oracle, not just in this report. `plan_to_json` already reports the
+        // unmeasured set here (it is computed before any canonical-self check),
+        // so staying silent in the text would be the two renderers disagreeing
+        // about the same plan — the exact defect `change_is_unknown` exists to
+        // prevent, one level up.
+        //
+        // The two halves are split because they are DIFFERENT claims and only one
+        // of them is about the published config. `unmeasured_key_count` is the
+        // whole set, computed from THIS run's fresh capture; the stored canonical
+        // is a different, older snapshot. A key this run could not read while the
+        // stored config still carries a value produced a `Change::Missing` row —
+        // proof the published config is intact and only today's probe was slow,
+        // which the unmeasured arm is documented to be (transient by design; the
+        // wedged-probe alarm needs four consecutive captures). Using the whole
+        // count for the blind-oracle sentence would announce a hole in every
+        // puller's oracle on the strength of one flaky tick.
+        //
+        // `silently_unmeasured_keys` — unmeasured AND no diff row — is the half
+        // that does mean it: canonical carries no value for the key either, which
+        // on this box is a statement about what this box last published. It is
+        // the same predicate the non-canonical arm below prints its `?` lines
+        // from, so the two arms cannot drift apart.
+        let silent = plan.silently_unmeasured_count();
+        if silent > 0 {
+            out.push_str(&format!(
+                "\n! {silent} key(s) could NOT be measured here AND carry no value in the \
+                 canonical config this box publishes, so the environment's own oracle is \
+                 BLIND on them — every machine that pulls will see them as absent from \
+                 canonical rather than as unread. Re-run `env capture` once the box is \
+                 quiet, or fix the shim if it never answers.\n"
+            ));
+        }
+        let stale = plan.unmeasured_key_count() - silent;
+        if stale > 0 {
+            out.push_str(&format!(
+                "\n! {stale} further key(s) could not be measured on THIS run, but canonical \
+                 already carries a value for them — the published config is intact; this \
+                 capture simply could not confirm it. Nothing is owed unless it persists.\n"
+            ));
+        }
         return out;
     }
 
@@ -1251,6 +1295,85 @@ mod tests {
         let text = render_plan(&plan);
         assert!(text.contains("IS the canonical environment"));
         assert!(text.contains("Nothing to pull"));
+    }
+
+    /// …but "nothing to pull" must not swallow "and I could not read this".
+    ///
+    /// The canonical box is the one place this matters MOST: the capture it
+    /// publishes is what every other machine reconciles toward, so a key it
+    /// failed to measure is absent from canonical for the whole environment —
+    /// and the pulling boxes then see it as `Extra`, i.e. as their own surplus,
+    /// with nothing anywhere saying canonical simply never read it.
+    ///
+    /// It is also the one place the two renderers still disagreed:
+    /// `plan_to_json` computes `unmeasured_key_count` before any canonical-self
+    /// check and always reported it, while `render_plan` returned early. Two
+    /// outputs contradicting each other about one plan is exactly the defect
+    /// `change_is_unknown` was introduced to remove, one level up.
+    #[test]
+    fn canonical_self_still_reports_what_it_could_not_measure() {
+        let plan = compute_plan(
+            &canonical_with(json!({"versions": {"node": "22.1.0"}}), json!({})),
+            json!({"versions": {"node": "22.1.0"}}).as_object().unwrap(),
+            &unknown("versions", &["rustc"]),
+            "env-1",
+            "canon-machine",
+        );
+        assert!(plan.is_canonical_self);
+        assert_eq!(plan.unmeasured_key_count(), 1);
+
+        let text = render_plan(&plan);
+        assert!(text.contains("IS the canonical environment"), "{text}");
+        assert!(text.contains("Nothing to pull"), "{text}");
+        assert!(
+            text.contains("could NOT be measured"),
+            "the blind key has to survive the early return: {text}"
+        );
+        assert!(
+            text.contains("BLIND"),
+            "…and say whose oracle it blinds: {text}"
+        );
+
+        // The JSON said so all along; now they agree.
+        assert_eq!(plan_to_json(&plan)["unmeasured_key_count"], 1);
+    }
+
+    /// …and the blind-oracle sentence is reserved for the keys that actually
+    /// earn it.
+    ///
+    /// A key this run could not read while the STORED canonical still carries a
+    /// value is a slow probe on this tick, not a hole in what this box published
+    /// — the diff proves it by producing a `Missing` row. Driving the blind
+    /// sentence off `unmeasured_key_count` (the whole set) would announce a hole
+    /// in every pulling machine's oracle on the strength of one flaky capture,
+    /// which the unmeasured arm is documented to be transient by design.
+    #[test]
+    fn canonical_self_does_not_call_a_slow_probe_a_hole_in_the_published_config() {
+        let plan = compute_plan(
+            // Canonical HAS `rustc`; this run could not read it locally.
+            &canonical_with(json!({"versions": {"rustc": "1.82.0"}}), json!({})),
+            json!({"versions": {}}).as_object().unwrap(),
+            &unknown("versions", &["rustc"]),
+            "env-1",
+            "canon-machine",
+        );
+        assert!(plan.is_canonical_self);
+        assert_eq!(plan.unmeasured_key_count(), 1);
+        assert_eq!(
+            plan.silently_unmeasured_count(),
+            0,
+            "canonical carries the value, so the key produced a diff row"
+        );
+
+        let text = render_plan(&plan);
+        assert!(
+            !text.contains("BLIND"),
+            "the published config is intact — do not claim otherwise: {text}"
+        );
+        assert!(
+            text.contains("the published config is intact"),
+            "…but the operator is still told this run could not confirm it: {text}"
+        );
     }
 
     /// An empty local machine_id must not accidentally match canonical.

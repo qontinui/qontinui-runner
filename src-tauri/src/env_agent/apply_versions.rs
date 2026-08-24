@@ -716,6 +716,10 @@ pub fn apply_section_with(
         changes: Vec::new(),
         skipped: plan.skipped,
         notes: plan.notes,
+        // Left empty here: `dispatch` is the single writer (see the field's
+        // doc). A module setting it too would create a second source of truth
+        // for a claim the report summary rests on.
+        unmeasured_keys: Vec::new(),
     };
 
     if plan.actions.is_empty() {
