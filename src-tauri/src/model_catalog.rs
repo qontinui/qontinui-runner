@@ -133,8 +133,6 @@ pub struct ModelFacts {
     pub api_shape: ApiShape,
     /// Maximum input context in tokens. `None` = not stated.
     pub context_window: Option<u32>,
-    /// Maximum output tokens per response. `None` = not stated.
-    pub max_output: Option<u32>,
     /// Token pricing. `None` = not stated — cost is then UNKNOWN, and callers
     /// must not silently record zero.
     pub cost: Option<Cost>,
@@ -167,7 +165,6 @@ impl ModelFacts {
             id,
             api_shape,
             context_window: None,
-            max_output: None,
             cost: None,
             image_input: CapabilityState::Unknown,
             cache_min_block_chars: None,
@@ -189,6 +186,12 @@ impl ModelFacts {
 /// (UNKNOWN), never a guess — the Claude 5 family is the current example, and
 /// its `None` reproduces exactly what the old `get_pricing` returned for those
 /// ids (nothing), only now the absence is explicit rather than a fall-through.
+///
+/// **Entries are held NEWEST-FIRST within a family.** [`price_proxy_for`] reads
+/// that ordering to pick which priced generation an unpriced model borrows an
+/// estimate from, so inserting an older entry above a newer one changes a
+/// recorded cost. `price_proxy_is_the_newest_priced_generation` pins the choice
+/// per family rather than trusting the ordering to be maintained by eye.
 pub const CATALOG: &[ModelFacts] = &[
     // ---- Claude 5 family -------------------------------------------------
     // Cost and context are NOT stated here. That is a deliberate `Unknown`,
@@ -198,7 +201,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-opus-5",
         api_shape: ApiShape::AnthropicMessages,
         context_window: None,
-        max_output: None,
         cost: None,
         image_input: CapabilityState::Supported,
         cache_min_block_chars: Some(4096),
@@ -209,7 +211,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-sonnet-5",
         api_shape: ApiShape::AnthropicMessages,
         context_window: None,
-        max_output: None,
         cost: None,
         image_input: CapabilityState::Supported,
         cache_min_block_chars: Some(4096),
@@ -220,7 +221,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-fable-5",
         api_shape: ApiShape::AnthropicMessages,
         context_window: None,
-        max_output: None,
         cost: None,
         image_input: CapabilityState::Supported,
         cache_min_block_chars: Some(4096),
@@ -232,7 +232,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-opus-4-5",
         api_shape: ApiShape::AnthropicMessages,
         context_window: Some(200_000),
-        max_output: None,
         cost: Some(Cost::new(15.0, 75.0)),
         image_input: CapabilityState::Supported,
         cache_min_block_chars: Some(4096),
@@ -243,7 +242,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-opus-4",
         api_shape: ApiShape::AnthropicMessages,
         context_window: Some(200_000),
-        max_output: None,
         cost: Some(Cost::new(15.0, 75.0)),
         image_input: CapabilityState::Supported,
         cache_min_block_chars: Some(4096),
@@ -254,7 +252,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-sonnet-4",
         api_shape: ApiShape::AnthropicMessages,
         context_window: Some(200_000),
-        max_output: None,
         cost: Some(Cost::new(3.0, 15.0)),
         image_input: CapabilityState::Supported,
         cache_min_block_chars: Some(4096),
@@ -265,7 +262,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-haiku-4-5",
         api_shape: ApiShape::AnthropicMessages,
         context_window: Some(200_000),
-        max_output: None,
         cost: Some(Cost::new(0.80, 4.0)),
         image_input: CapabilityState::Supported,
         // Haiku 4.x needs a 4096-TOKEN block before caching fires.
@@ -278,7 +274,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-3-5-sonnet",
         api_shape: ApiShape::AnthropicMessages,
         context_window: Some(200_000),
-        max_output: None,
         cost: Some(Cost::new(3.0, 15.0)),
         image_input: CapabilityState::Supported,
         cache_min_block_chars: Some(4096),
@@ -292,7 +287,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-haiku-3-5",
         api_shape: ApiShape::AnthropicMessages,
         context_window: Some(200_000),
-        max_output: None,
         cost: Some(Cost::new(0.25, 1.25)),
         image_input: CapabilityState::Supported,
         cache_min_block_chars: Some(8192),
@@ -303,7 +297,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-3-5-haiku",
         api_shape: ApiShape::AnthropicMessages,
         context_window: Some(200_000),
-        max_output: None,
         cost: Some(Cost::new(0.25, 1.25)),
         image_input: CapabilityState::Supported,
         // Haiku 3.x: 2048-token floor.
@@ -315,7 +308,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-3-opus",
         api_shape: ApiShape::AnthropicMessages,
         context_window: Some(200_000),
-        max_output: None,
         cost: Some(Cost::new(15.0, 75.0)),
         image_input: CapabilityState::Supported,
         cache_min_block_chars: Some(4096),
@@ -326,7 +318,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-3-sonnet",
         api_shape: ApiShape::AnthropicMessages,
         context_window: Some(200_000),
-        max_output: None,
         cost: Some(Cost::new(3.0, 15.0)),
         image_input: CapabilityState::Supported,
         cache_min_block_chars: Some(4096),
@@ -337,7 +328,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "claude-3-haiku",
         api_shape: ApiShape::AnthropicMessages,
         context_window: Some(200_000),
-        max_output: None,
         cost: Some(Cost::new(0.25, 1.25)),
         image_input: CapabilityState::Supported,
         cache_min_block_chars: Some(8192),
@@ -349,7 +339,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "gemini-2-0-flash",
         api_shape: ApiShape::GoogleGenerativeAi,
         context_window: Some(1_000_000),
-        max_output: None,
         cost: Some(Cost::new(0.10, 0.40)),
         image_input: CapabilityState::Supported,
         cache_min_block_chars: None,
@@ -360,7 +349,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "gemini-1-5-pro",
         api_shape: ApiShape::GoogleGenerativeAi,
         context_window: Some(2_000_000),
-        max_output: None,
         cost: Some(Cost::new(1.25, 5.0)),
         image_input: CapabilityState::Supported,
         cache_min_block_chars: None,
@@ -371,7 +359,6 @@ pub const CATALOG: &[ModelFacts] = &[
         id: "gemini-1-5-flash",
         api_shape: ApiShape::GoogleGenerativeAi,
         context_window: Some(1_000_000),
-        max_output: None,
         cost: Some(Cost::new(0.075, 0.30)),
         image_input: CapabilityState::Supported,
         cache_min_block_chars: None,
@@ -569,6 +556,87 @@ pub fn cache_min_block_chars_or_default(model_id: &str) -> usize {
     }
 }
 
+// ============================================================================
+// Price proxies for a deliberately-absent price
+// ============================================================================
+
+/// Catalog ids whose price is absent ON PURPOSE.
+///
+/// The plan's verification item 6.3 asks for a build-time assertion that
+/// "every model id the catalog knows has a price, and vice versa". Stated
+/// literally it is false: the Claude 5 family is unpriced here because no price
+/// is published for it, and inventing one silently corrupts cost accounting.
+///
+/// So the invariant is asserted in the form that actually holds — every catalog
+/// entry is priced EXCEPT the ids enumerated here, and every id enumerated here
+/// really is in the catalog and really is unpriced
+/// (`guardrail_every_catalog_id_is_priced_or_declared_unpriced`,
+/// `guardrail_unpriced_by_design_is_accurate`). The `None` item 6.3 objects to
+/// is then DECLARED rather than silent: the whole set of absences is visible at
+/// a glance, and a newly unpriced model becomes a deliberate edit rather than an
+/// omission nobody notices.
+const UNPRICED_BY_DESIGN: &[&str] = &["claude-opus-5", "claude-sonnet-5", "claude-fable-5"];
+
+/// The family segment of an Anthropic `claude-<family>-<generation>` id.
+///
+/// Returns `None` for the legacy `claude-<generation>-<family>` spelling
+/// (`claude-3-opus`), which is deliberate: those ids are all priced already, so
+/// they never need a proxy, and reading a family out of the tail would make
+/// `claude-3-opus` and `claude-opus-4` look like the same lookup key.
+fn claude_family_of(q: &str) -> Option<&'static str> {
+    let rest = q.strip_prefix("claude-")?;
+    CLAUDE_FAMILIES.iter().copied().find(|family| {
+        rest == *family
+            || rest
+                .strip_prefix(*family)
+                .is_some_and(|t| t.starts_with('-'))
+    })
+}
+
+/// The catalog entry whose price is the best available proxy for a model whose
+/// own price the catalog does not state.
+///
+/// **This does not state a price.** [`cost_for`] still answers `None` for an
+/// unpriced model — the catalog knows nothing and keeps saying so. What this
+/// offers is the closest *estimate basis* justifiable from facts the catalog
+/// already holds: the newest priced, still-served generation of the SAME
+/// family.
+///
+/// It exists because the constant a caller falls back to is otherwise
+/// family-blind. `claude-opus-5` is unpriced, so every Opus 5 call is estimated
+/// at Claude 3.5 Sonnet's `3.0/15.0` — the same roughly-5x understatement this
+/// catalog was built to retire, surviving in the *estimate* after the *lookup*
+/// was fixed. And `claude-opus-5` is now the routing default
+/// (`ai_router::default_complex_model`), so that estimate is what the default
+/// configuration records. Pricing an Opus model at Opus rates is not a guess
+/// about Opus 5; it is the catalog declining to pretend a model changed tier.
+///
+/// Keyed on FAMILY, so it does not rot on a generation bump: an unreleased
+/// `claude-opus-6` inherits the newest priced Opus rather than a Sonnet price,
+/// and an unreleased `claude-haiku-5` inherits Haiku rates rather than being
+/// overstated 4x. A family with no priced generation at all (`fable` today)
+/// yields `None`, and the caller falls back to its own constant — an honest
+/// "the catalog has nothing to offer here".
+///
+/// Resolution is catalog DECLARATION ORDER, which [`CATALOG`] holds newest-first
+/// within a family; `price_proxy_is_the_newest_priced_generation` pins the
+/// resulting choice for every family, so a reorder cannot silently change a
+/// price.
+pub fn price_proxy_for(model_id: &str) -> Option<&'static ModelFacts> {
+    let q = normalize_id(model_id);
+    if q.is_empty() {
+        return None;
+    }
+    // A model that states its own price needs no proxy.
+    if lookup_normalized(&q).and_then(|f| f.cost).is_some() {
+        return None;
+    }
+    let family = claude_family_of(&q)?;
+    CATALOG
+        .iter()
+        .find(|f| !f.retired && f.cost.is_some() && claude_family_of(f.id) == Some(family))
+}
+
 /// The API shape a model is reached through, when known.
 pub fn api_shape(model_id: &str) -> Option<ApiShape> {
     lookup(model_id).map(|f| f.api_shape)
@@ -632,7 +700,8 @@ mod tests {
             if let Some((_, alias_target)) = ALIASES.iter().find(|(a, _)| a == family) {
                 assert_eq!(
                     alias_target, bare_target,
-                    "`{family}` resolves to `{alias_target}` as an exact alias but                      `{bare_target}` as a suffix"
+                    "`{family}` resolves to `{alias_target}` as an exact alias \
+                     but `{bare_target}` as a suffix"
                 );
             }
         }
@@ -927,6 +996,142 @@ mod tests {
             assert_eq!(cost.input_per_million, *input, "input price for `{id}`");
             assert_eq!(cost.output_per_million, *output, "output price for `{id}`");
         }
+    }
+
+    // ---- Price coverage (plan verification item 6.3) -----------------------
+
+    /// "Every model id the catalog knows has a price, and vice versa" — in the
+    /// form that can actually hold, with the exceptions declared rather than
+    /// discovered.
+    ///
+    /// The bare invariant is false and should be: no price is published for the
+    /// Claude 5 family, and a catalog that guessed one would corrupt every cost
+    /// record downstream. What must not happen is a price going missing by
+    /// ACCIDENT, which is indistinguishable from a deliberate absence until
+    /// someone reads the cost telemetry and finds it wrong.
+    #[test]
+    fn guardrail_every_catalog_id_is_priced_or_declared_unpriced() {
+        for f in CATALOG {
+            let declared_unpriced = UNPRICED_BY_DESIGN.contains(&f.id);
+            assert_eq!(
+                f.cost.is_none(),
+                declared_unpriced,
+                "`{}` is {} but {} in UNPRICED_BY_DESIGN - a price is either stated \
+                 or its absence is declared; there is no third option",
+                f.id,
+                if f.cost.is_none() {
+                    "unpriced"
+                } else {
+                    "priced"
+                },
+                if declared_unpriced { "IS" } else { "is NOT" }
+            );
+        }
+    }
+
+    /// The exception list must describe the catalog, not a memory of it. A stale
+    /// entry here would exempt an id that no longer exists while silently
+    /// re-arming the accident it was meant to permit.
+    #[test]
+    fn guardrail_unpriced_by_design_is_accurate() {
+        for id in UNPRICED_BY_DESIGN {
+            let f = CATALOG
+                .iter()
+                .find(|f| f.id == *id)
+                .unwrap_or_else(|| panic!("UNPRICED_BY_DESIGN names `{id}`, not in the catalog"));
+            assert!(
+                f.cost.is_none(),
+                "`{id}` is declared unpriced but now carries a price - drop it \
+                 from UNPRICED_BY_DESIGN"
+            );
+        }
+    }
+
+    // ---- Price proxies -----------------------------------------------------
+
+    /// Every deliberately-unpriced id either resolves to a priced same-family
+    /// proxy or is honestly proxy-less. A proxy that resolved to something
+    /// unpriced or retired would be worse than none: it would look like a
+    /// justified estimate while carrying no price at all.
+    #[test]
+    fn guardrail_every_price_proxy_is_priced_and_served() {
+        let mut resolved = 0;
+        for id in UNPRICED_BY_DESIGN {
+            if let Some(proxy) = price_proxy_for(id) {
+                resolved += 1;
+                assert!(
+                    proxy.cost.is_some(),
+                    "proxy `{}` for `{id}` has no price",
+                    proxy.id
+                );
+                assert!(!proxy.retired, "proxy `{}` for `{id}` is retired", proxy.id);
+                assert_ne!(proxy.id, *id, "`{id}` proxies to itself");
+            }
+        }
+        // Teeth: without this the loop passes vacuously the moment
+        // `price_proxy_for` regresses to always-`None`, which is exactly the
+        // regression it exists to catch.
+        assert!(
+            resolved > 0,
+            "no deliberately-unpriced id resolved to a proxy at all - the loop \
+             above is asserting nothing"
+        );
+    }
+
+    /// Pins the proxy choice per family. `price_proxy_for` reads CATALOG
+    /// declaration order, so this is what stops a reorder from silently
+    /// repricing a model — the failure the ordering comment alone cannot catch.
+    #[test]
+    fn price_proxy_is_the_newest_priced_generation() {
+        // Opus 5 is unpriced; the newest priced Opus is 4.5, at Opus rates.
+        let opus = price_proxy_for("claude-opus-5").expect("opus 5 has a same-family proxy");
+        assert_eq!(opus.id, "claude-opus-4-5");
+        assert_eq!(opus.cost.unwrap().input_per_million, 15.0);
+        assert_eq!(opus.cost.unwrap().output_per_million, 75.0);
+
+        let sonnet = price_proxy_for("claude-sonnet-5").expect("sonnet 5 has a same-family proxy");
+        assert_eq!(sonnet.id, "claude-sonnet-4");
+
+        // `fable` has no priced generation at all. `None` is the honest answer;
+        // borrowing across families would be a guess wearing a fact's clothes.
+        assert!(price_proxy_for("claude-fable-5").is_none());
+    }
+
+    /// The proxy is generation-agnostic, which is the whole reason it is keyed
+    /// on family: an unreleased id inherits its own family's rate rather than a
+    /// flat constant that is 5x low for Opus and 4x high for Haiku.
+    #[test]
+    fn price_proxy_survives_a_generation_bump() {
+        assert_eq!(
+            price_proxy_for("claude-opus-6").map(|f| f.id),
+            Some("claude-opus-4-5")
+        );
+        assert_eq!(
+            price_proxy_for("claude-haiku-5").map(|f| f.id),
+            Some("claude-haiku-4-5")
+        );
+    }
+
+    /// A model that states its own price is never proxied — including a dated
+    /// id that resolves to a priced entry by prefix.
+    #[test]
+    fn price_proxy_is_none_for_a_priced_model() {
+        assert!(price_proxy_for("claude-opus-4").is_none());
+        assert!(price_proxy_for("claude-opus-4-20250514").is_none());
+        assert!(price_proxy_for("claude-3-5-sonnet").is_none());
+    }
+
+    /// Outside the Claude family scheme there is nothing to borrow FROM, and
+    /// borrowing anyway would assert a cross-vendor price relationship the
+    /// catalog does not know.
+    #[test]
+    fn price_proxy_is_none_outside_the_claude_families() {
+        assert!(price_proxy_for("gpt-4o").is_none());
+        assert!(price_proxy_for("llama-3-70b").is_none());
+        assert!(price_proxy_for("").is_none());
+        // Legacy `claude-<generation>-<family>` ids are priced already, so they
+        // never reach the proxy path.
+        assert!(price_proxy_for("claude-3-opus").is_none());
     }
 
     /// The Claude 5 family has NO stated price — and that must stay an honest

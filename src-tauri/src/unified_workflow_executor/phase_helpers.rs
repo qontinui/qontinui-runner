@@ -103,8 +103,12 @@ pub(super) fn record_phase_token_usage_with_target(
 /// Record phase token usage including prompt cache metrics.
 ///
 /// When `cache_creation_tokens` or `cache_read_tokens` are `Some`, the cost
-/// calculation uses `calculate_cost_cents_with_cache` for accurate pricing
-/// (cache writes at 1.25x, reads at 0.1x base input price).
+/// calculation uses `calculate_cost_cents_with_cache_or_estimate` for accurate
+/// pricing (cache writes at 1.25x, reads at 0.1x base input price).
+///
+/// The recorded figure is an ESTIMATE for any model the catalog cannot price —
+/// `ai_pricing::pricing_or_fallback` says so in the log, naming the model whose
+/// price was borrowed.
 pub(super) fn record_phase_token_usage_with_cache(
     pg_db: &std::sync::Arc<PgDb>,
     task_run_id: &str,
@@ -132,18 +136,23 @@ pub(super) fn record_phase_token_usage_with_cache(
     // Cost estimation: use cache-aware pricing when cache tokens are present
     let cost_cents = if let (Some(input_t), Some(output_t)) = (input_tokens, output_tokens) {
         if let Some(model) = model_used {
+            // The `_or_estimate` variants, not the `Option` ones: `cost_cents`
+            // is non-nullable and `Commands::prior_consumption` reads this row
+            // back as a run's already-billed spend against
+            // `max_cost_per_run_usd`. `.unwrap_or(0)` on an unpriced model
+            // therefore did not merely under-report — it handed a resumed run a
+            // budget it had already spent. An announced estimate is the honest
+            // value here; zero never was.
             if cache_creation > 0 || cache_read > 0 {
-                crate::ai_pricing::calculate_cost_cents_with_cache(
+                crate::ai_pricing::calculate_cost_cents_with_cache_or_estimate(
                     input_t,
                     output_t,
                     cache_creation,
                     cache_read,
                     model,
-                )
-                .unwrap_or(0) as u64
+                ) as u64
             } else {
-                crate::ai_pricing::calculate_cost_cents(input_t, output_t, model).unwrap_or(0)
-                    as u64
+                crate::ai_pricing::calculate_cost_cents_or_estimate(input_t, output_t, model) as u64
             }
         } else {
             0u64

@@ -32,7 +32,8 @@ impl ModelPricing {
 // Pricing Lookup
 // ============================================================================
 
-/// Fallback used when a model's price is not in the catalog.
+/// Last-resort fallback: a model the catalog cannot price and whose family it
+/// cannot price either.
 ///
 /// **This is a GUESS, and it is load-bearing.** `calculate_cost_usd` and its
 /// cache-aware siblings return a bare `f64` with no channel to say "unknown",
@@ -41,6 +42,11 @@ impl ModelPricing {
 /// free" rather than "we do not know". Until routing carries provenance
 /// (plan §3.3, `AiResponse.route`), the substitution is at least LOGGED by
 /// `pricing_or_fallback` rather than being invisible.
+///
+/// It is reached only after [`crate::model_catalog::price_proxy_for`] declines.
+/// Being a Sonnet rate, it is family-blind by construction - it understates an
+/// Opus call roughly 5x and overstates a Haiku call roughly 4x - so a same-family
+/// price is always the better basis when the catalog holds one.
 const UNKNOWN_MODEL_FALLBACK_PRICING: ModelPricing = ModelPricing::new(3.0, 15.0);
 
 /// Get pricing for a model by its ID.
@@ -58,24 +64,52 @@ pub fn get_pricing(model_id: &str) -> Option<ModelPricing> {
         .map(|c| ModelPricing::new(c.input_per_million, c.output_per_million))
 }
 
-/// Resolve pricing, falling back to [`UNKNOWN_MODEL_FALLBACK_PRICING`] and
-/// SAYING SO when the catalog has no price.
+/// Resolve pricing, estimating - and SAYING SO - when the catalog has no price.
 ///
-/// Every unpriced-model path goes through here so the guess is recorded
+/// Every unpriced-model path goes through here so the estimate is recorded
 /// exactly once per call rather than being spread across four functions that
 /// each silently substituted the same constant.
+///
+/// Three rungs, best first:
+///
+/// 1. the catalog's stated price;
+/// 2. the newest priced generation of the model's own FAMILY
+///    ([`crate::model_catalog::price_proxy_for`]);
+/// 3. [`UNKNOWN_MODEL_FALLBACK_PRICING`].
+///
+/// Rung 2 exists because rung 3 is a Sonnet rate applied to every model alike.
+/// `claude-opus-5` carries no catalog price and is now the routing default
+/// (`ai_router::default_complex_model`), so without rung 2 every Opus 5 call is
+/// estimated ~5x low - the exact understatement the capability catalog was built
+/// to retire, surviving in the ESTIMATE after the LOOKUP was fixed. Rung 2
+/// asserts no new price: it borrows one the catalog already holds, from the same
+/// family, and names its source in the log.
 fn pricing_or_fallback(model_id: &str) -> ModelPricing {
-    match get_pricing(model_id) {
-        Some(p) => p,
-        None => {
-            tracing::warn!(
-                model = model_id,
-                "no catalog price for this model - costing it at the fallback rate; \
-                 the recorded cost is an ESTIMATE, not a measurement"
-            );
-            UNKNOWN_MODEL_FALLBACK_PRICING
-        }
+    if let Some(p) = get_pricing(model_id) {
+        return p;
     }
+    // A proxy always carries a price - `price_proxy_for` only ever selects a
+    // priced entry - but read it through the `Option` rather than unwrapping, so
+    // a future catalog edit degrades to the flat rate instead of panicking.
+    if let Some((borrowed_from, c)) = crate::model_catalog::price_proxy_for(model_id)
+        .and_then(|proxy| proxy.cost.map(|c| (proxy.id, c)))
+    {
+        tracing::warn!(
+            model = model_id,
+            priced_as = borrowed_from,
+            "no catalog price for this model - estimating it at the newest priced \
+             generation of its own family; the recorded cost is an ESTIMATE, not a \
+             measurement"
+        );
+        return ModelPricing::new(c.input_per_million, c.output_per_million);
+    }
+    tracing::warn!(
+        model = model_id,
+        "no catalog price for this model and no same-family price to borrow - costing \
+         it at the flat fallback rate, which is family-blind; the recorded cost is a \
+         ROUGH ESTIMATE, not a measurement"
+    );
+    UNKNOWN_MODEL_FALLBACK_PRICING
 }
 
 /// Calculate cost in cents (USD) based on token usage and model.
@@ -86,7 +120,13 @@ fn pricing_or_fallback(model_id: &str) -> ModelPricing {
 /// * `model_id` - Model identifier string
 ///
 /// # Returns
-/// Cost in cents (rounded down to nearest cent), or `None` if model is not recognized.
+/// Cost in cents (rounded to the nearest cent), or `None` when the catalog does
+/// not price the model.
+///
+/// `None` means **unknown**, never free. A caller that can carry an absence
+/// should preserve it; a caller that must produce a number must NOT coerce it
+/// to `0` — use [`calculate_cost_cents_or_estimate`], which estimates and logs
+/// instead of fabricating a zero.
 ///
 /// # Example
 /// ```
@@ -160,6 +200,30 @@ pub fn calculate_cost_usd(input_tokens: u64, output_tokens: u64, model_id: &str)
     input_cost + output_cost
 }
 
+/// Cost in cents, ESTIMATING rather than refusing when the model is unpriced.
+///
+/// [`calculate_cost_cents`] answers `None` for a model the catalog cannot
+/// price, which is the honest answer for a caller that can carry an absence.
+/// A caller that must produce a number cannot use it, and the tempting
+/// coercion — `.unwrap_or(0)` — is the one thing it must not do:
+/// `phase_token_usage.cost_cents` is a non-nullable `bigint` that
+/// `Commands::prior_consumption` reads back as a run's already-billed spend
+/// against `max_cost_per_run_usd`. A fabricated zero there does not merely
+/// mis-report a number; it hands a resumed run a budget it never earned, and it
+/// reads downstream as "this call was free" rather than "we do not know".
+///
+/// So this variant goes through the same logged, family-aware fallback as the
+/// USD family ([`pricing_or_fallback`]): an unpriced model contributes its
+/// estimate, and the estimate is announced. Use this wherever a `u64`/`u32` must
+/// be written; use [`calculate_cost_cents`] wherever `None` can be preserved.
+pub fn calculate_cost_cents_or_estimate(
+    input_tokens: u64,
+    output_tokens: u64,
+    model_id: &str,
+) -> u32 {
+    (calculate_cost_usd(input_tokens, output_tokens, model_id) * 100.0).round() as u32
+}
+
 // ============================================================================
 // Cache-Aware Pricing
 // ============================================================================
@@ -221,6 +285,29 @@ pub fn calculate_cost_cents_with_cache(
     Some((cost_usd * 100.0).round() as u32)
 }
 
+/// Cache-aware cost in cents, ESTIMATING rather than refusing when the model is
+/// unpriced.
+///
+/// The cache-aware twin of [`calculate_cost_cents_or_estimate`]; see it for why
+/// a caller writing to `phase_token_usage.cost_cents` must never coerce the
+/// `Option` variant's `None` to `0`.
+pub fn calculate_cost_cents_with_cache_or_estimate(
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    model_id: &str,
+) -> u32 {
+    let cost_usd = calculate_cost_usd_with_cache(
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        model_id,
+    );
+    (cost_usd * 100.0).round() as u32
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -228,6 +315,99 @@ pub fn calculate_cost_cents_with_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The catalog states no price for `claude-opus-5`, so the estimate is
+    /// whatever `pricing_or_fallback` decides — and it must be an OPUS rate.
+    ///
+    /// This is the regression for the half-finished half of the capability
+    /// catalog's own bug #2. Absorbing `get_pricing` into the catalog fixed
+    /// where the price is looked up; it left `claude-opus-5` — simultaneously
+    /// made the routing default — estimated at Claude 3.5 Sonnet's `3.0/15.0`,
+    /// the same ~5x understatement, now merely logged.
+    #[test]
+    fn an_unpriced_model_is_estimated_at_its_own_family_rate() {
+        // 1M input + 1M output at Opus rates = 15 + 75.
+        let opus = calculate_cost_usd(1_000_000, 1_000_000, "claude-opus-5");
+        assert!(
+            (opus - 90.0).abs() < 1e-9,
+            "expected an Opus-rate estimate (90.0), got {opus}; a Sonnet-rate 18.0 \
+             means the family proxy is not being consulted"
+        );
+
+        // Sonnet 5 borrows Sonnet 4: 3 + 15.
+        let sonnet = calculate_cost_usd(1_000_000, 1_000_000, "claude-sonnet-5");
+        assert!((sonnet - 18.0).abs() < 1e-9, "expected 18.0, got {sonnet}");
+
+        // A model whose FAMILY the catalog cannot price falls to the flat
+        // last-resort rate. That is the honest floor, not a bug.
+        let fable = calculate_cost_usd(1_000_000, 1_000_000, "claude-fable-5");
+        assert!((fable - 18.0).abs() < 1e-9, "expected 18.0, got {fable}");
+
+        // Nothing changes for a model that states its own price.
+        let opus4 = calculate_cost_usd(1_000_000, 1_000_000, "claude-opus-4");
+        assert!((opus4 - 90.0).abs() < 1e-9, "expected 90.0, got {opus4}");
+    }
+
+    /// The two cents entry points answer different questions, and the
+    /// difference is the whole point: one preserves the unknown, the other
+    /// estimates it. Neither may fabricate a zero.
+    #[test]
+    fn cents_option_preserves_unknown_while_or_estimate_estimates() {
+        // Priced model: both agree.
+        assert_eq!(
+            calculate_cost_cents(1_000_000, 1_000_000, "claude-opus-4"),
+            Some(9000)
+        );
+        assert_eq!(
+            calculate_cost_cents_or_estimate(1_000_000, 1_000_000, "claude-opus-4"),
+            9000
+        );
+
+        // Unpriced model: the Option variant says "unknown"...
+        assert_eq!(
+            calculate_cost_cents(1_000_000, 1_000_000, "claude-opus-5"),
+            None
+        );
+        // ...and the estimating variant produces an Opus-rate figure rather
+        // than the `0` its callers used to coerce that `None` into.
+        let est = calculate_cost_cents_or_estimate(1_000_000, 1_000_000, "claude-opus-5");
+        assert_eq!(
+            est, 9000,
+            "an unpriced model must be estimated, never zeroed"
+        );
+    }
+
+    /// Same contract for the cache-aware pair.
+    #[test]
+    fn cache_aware_cents_or_estimate_never_returns_a_fabricated_zero() {
+        let unpriced = calculate_cost_cents_with_cache_or_estimate(
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            "claude-opus-5",
+        );
+        assert!(
+            unpriced > 0,
+            "an unpriced model with a million tokens of every kind must not cost 0"
+        );
+        // The Option variant still reports the absence honestly.
+        assert_eq!(
+            calculate_cost_cents_with_cache(
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                "claude-opus-5"
+            ),
+            None
+        );
+        // Zero tokens really is zero, in both.
+        assert_eq!(
+            calculate_cost_cents_with_cache_or_estimate(0, 0, 0, 0, "claude-opus-5"),
+            0
+        );
+    }
 
     #[test]
     fn test_calculate_cost_usd_with_cache() {
