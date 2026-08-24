@@ -80,8 +80,34 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] =
 /// broken cache each degrade one step and warn, never propagate. Idempotent:
 /// existing files are overwritten.
 pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
+    let root = Path::new(workdir);
+    // Same refusal the skills provisioner applies, for the same reason and on
+    // the same resolved target — see `fleet_skills::claude_dir_write_refusal`.
+    //
+    // This path is not hypothetical and it is not new: with `workdir` = the
+    // workspace root, `<root>/.claude` is a SYMLINK into
+    // `qontinui-claude-config/.claude/`, where the 78 command bodies are
+    // TRACKED SOURCE. Measured on the operator box 2026-08-24:
+    // `.claude/commands/vet-plan.md` and `implement-plan.md` were dirty and
+    // byte-identical to this module's own `include_str!` copies, i.e. this
+    // function had already overwritten the canonical source with the embedded
+    // defaults (-352/+105 against HEAD). Writing account-fetched text over a
+    // repo's tracked files is a data-loss bug wherever it happens; it also
+    // dirties the worktree, and reclaim gate G1 never removes a dirty
+    // worktree, which is how ~240/255 coord worktrees were once pinned.
+    //
+    // Before the fetch, not after: a target we will refuse to write is not
+    // worth a network budget on the spawn path.
+    if let Some(why) = crate::fleet_skills::claude_dir_write_refusal(root) {
+        warn!(
+            "fleet_commands: declining to provision agent commands into {} — {why}.              (Continuing spawn; the session resolves whatever commands its cwd already              has.)",
+            root.join(".claude").display()
+        );
+        return;
+    }
+
     let registry = crate::agent_commands::resolve_registry();
-    let commands_dir = Path::new(workdir).join(".claude").join("commands");
+    let commands_dir = root.join(".claude").join("commands");
     match provision_fleet_commands_into(&commands_dir, &registry) {
         Ok(written) => {
             info!(
@@ -124,6 +150,61 @@ fn provision_fleet_commands_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The commands provisioner must refuse a target whose `.claude/` is
+    /// tracked source, exactly as the skills provisioner does.
+    ///
+    /// This is a REGRESSION test for an overwrite that had already happened.
+    /// Measured on the operator box 2026-08-24: with `workdir` = the workspace
+    /// root, `<root>/.claude` is a symlink into `qontinui-claude-config/.claude/`,
+    /// whose `commands/` holds 78 TRACKED files. `vet-plan.md` and
+    /// `implement-plan.md` were dirty there and byte-identical to this module's
+    /// own `include_str!` copies — this function had overwritten the canonical
+    /// source with the embedded defaults, losing 247 net lines into the working
+    /// tree. Fail-soft provisioning must never damage a repo it writes near.
+    #[test]
+    fn a_repo_that_tracks_dot_claude_is_refused_by_the_commands_provisioner() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root = tmp.path();
+        git(root, &["init", "--initial-branch=main"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "test"]);
+
+        std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
+        // Same NAME as a bundled default, so an unguarded provision overwrites
+        // it rather than merely adding a sibling.
+        std::fs::write(
+            root.join(".claude/commands/vet-plan.md"),
+            "# canonical fleet source
+",
+        )
+        .unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "track .claude"]);
+
+        provision_fleet_commands_for_session(&root.to_string_lossy());
+
+        assert_eq!(
+            std::fs::read_to_string(root.join(".claude/commands/vet-plan.md")).unwrap(),
+            "# canonical fleet source
+",
+            "the commands provisioner overwrote TRACKED source"
+        );
+    }
 
     #[test]
     fn provisions_every_embedded_command_into_dir() {
