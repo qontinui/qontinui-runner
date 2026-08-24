@@ -40,6 +40,12 @@ import type {
   ErrorStatus,
   RecurrenceEntry,
 } from "../../types/errorMonitor";
+import {
+  DEFAULT_SELECTED_ERROR_STATUSES,
+  ERROR_SEVERITY_FILTER_OPTIONS,
+  ERROR_STATUS_FILTER_OPTIONS,
+  filterBadgeCount,
+} from "./errorFilterOptions";
 import { FixErrorsButton } from "./FixErrorsButton";
 import { BrowserErrorsPanel } from "./BrowserErrorsPanel";
 import { ErrorContextPanel } from "./ErrorContextPanel";
@@ -451,10 +457,7 @@ export function ErrorMonitorTab({
   const [searchText, setSearchText] = useState("");
   const [selectedSeverities, setSelectedSeverities] = useState<ErrorSeverity[]>([]);
   const [selectedStatuses, setSelectedStatuses] = useState<ErrorStatus[]>([
-    "new",
-    "acknowledged",
-    "in_progress",
-    "promoted",
+    ...DEFAULT_SELECTED_ERROR_STATUSES,
   ]);
   const [showFilters, setShowFilters] = useState(false);
   const [expandedErrorId, setExpandedErrorId] = useState<number | null>(null);
@@ -507,15 +510,12 @@ export function ErrorMonitorTab({
     return result;
   }, [errors, searchText, selectedPatternIds]);
 
-  const severityOptions: ErrorSeverity[] = ["critical", "error", "warning", "info", "debug"];
-  const statusOptions: ErrorStatus[] = [
-    "new",
-    "acknowledged",
-    "in_progress",
-    "resolved",
-    "ignored",
-    "recurring",
-  ];
+  // Both lists — and the badge count below — come from `./errorFilterOptions`,
+  // so the pills, the default selection and the badge cannot disagree. They did:
+  // the default selected `promoted` and this list omitted it, leaving a badge of
+  // 4 over at most 3 lit pills and an active filter with no control.
+  const severityOptions = ERROR_SEVERITY_FILTER_OPTIONS;
+  const statusOptions = ERROR_STATUS_FILTER_OPTIONS;
 
   const toggleSeverity = (severity: ErrorSeverity) => {
     setSelectedSeverities((prev) =>
@@ -649,7 +649,7 @@ export function ErrorMonitorTab({
             Filters
             {hasActiveFilters && (
               <span className="ml-1 w-5 h-5 text-xs bg-primary text-primary-foreground rounded-full flex items-center justify-center">
-                {selectedSeverities.length + selectedStatuses.length}
+                {filterBadgeCount(selectedSeverities, selectedStatuses)}
               </span>
             )}
           </button>
