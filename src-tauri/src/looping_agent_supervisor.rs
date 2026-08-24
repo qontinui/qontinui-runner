@@ -1026,6 +1026,10 @@ async fn spawn_looping_agent_terminal(
         Some(crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
         )),
+        // Direct exec — no identity shim in the chain to append `--settings`,
+        // so the hook carrier has to be spelled out here or this session runs
+        // with no SessionStart/PreCompact/Stop hook at all.
+        crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
     ));
 

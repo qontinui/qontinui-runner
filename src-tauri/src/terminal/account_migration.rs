@@ -445,8 +445,9 @@ pub fn migrate_session(
     // #782 transcript-sniffed model is fed as `spec.model`, so it wins over any
     // template `--model` and the session keeps its actual model across the hop.
     // `resume_id` names the exact session id. With no operator config the argv
-    // is byte-identical to the historical hand-built
-    // `claude --permission-mode bypassPermissions [--model m] --resume <id>`.
+    // is the historical hand-built
+    // `claude --permission-mode bypassPermissions [--model m] --resume <id>`
+    // plus the `--settings <hook file>` pair below.
     let launch_cfg =
         crate::claude_session::launch_spec::LaunchConfig::from_settings(Some(dst_config_dir));
     let command = crate::claude_session::launch_spec::render_argv(
@@ -454,6 +455,16 @@ pub fn migrate_session(
             permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
             resume_id: Some(record.claude_session_id.clone()),
             model: model.clone(),
+            // The hook carrier, spelled out because this respawn execs the
+            // resolved `claude_bin_path()` DIRECTLY — the identity shim, which
+            // is what appends `--settings` for a PATH-resolved `claude`, is not
+            // in this chain. Without it the migrated session runs with no
+            // `SessionStart` hook, and `SessionStart` on a `--resume` is exactly
+            // when the policy injection matters most: the session carries its
+            // old context but not the policies as they now stand
+            // ([`crate::mcp::policy_context`]). Empty on a materialize failure
+            // ⇒ no flag, which is the pre-existing behaviour.
+            extra_required: crate::session::claude_hook::direct_spawn_settings_args(),
             ..Default::default()
         },
         &launch_cfg,
