@@ -1028,6 +1028,67 @@ pub struct WorktreeCensus {
     /// tolerates a missing `origin/main` (just the branch name) and never
     /// errors the census. Human-readable context for the P2 base check.
     pub canonical_base_divergence: Option<String>,
+
+    // --- WIP custody (plan `2026-08-22-wip-custody-rebuild-survivable-
+    // attribution`, Phase 3) — WHO owns the uncommitted work in this tree.
+    //
+    // Until this landed, `capture_worktree` derived every field above from git
+    // and filesystem metadata and read NO ownership file, so a dirty worktree
+    // was permanently anonymous: the operator saw "Uncommitted work in this
+    // tree (G1)" and 31.3 GB with no way to learn whose it was.
+    //
+    // All optional and `skip_serializing_if` — coord's `WorktreeItem` has no
+    // `deny_unknown_fields`, so these ride along harmlessly on today's coord
+    // and no `coord.*` migration is required (plan: "No qontinui-web migration
+    // is required: nothing here adds a coord.* column").
+    /// `session_id` from `$GIT_DIR/qontinui-custody.json` — the per-turn
+    /// record the Phase-1 `Stop` hook writes. Worktree-path-keyed, so it
+    /// covers every creation path, including the 168 dirty worktrees that
+    /// were never allocated through coord.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_session_id: Option<String>,
+    /// `session_name` as the record itself carried it. The survey prefers the
+    /// live `~/.qontinui/session-names/` lookup over this copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_session_name: Option<String>,
+    /// `last_seen` — **the liveness signal**. NEVER `pid`: the record's `pid`
+    /// is `$PPID` in bash's namespace, which on Windows is not a Win32 pid, so
+    /// no Rust consumer can probe it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_last_seen: Option<String>,
+    /// Unix seconds of `custody_last_seen`, for staleness arithmetic that
+    /// does not depend on parsing a foreign timestamp format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_last_seen_epoch: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_work_unit_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_plan_slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_intent: Option<String>,
+    /// `refs/wip/<session-id>` — where the Phase-2 snapshot of this tree's
+    /// dirty tracked content lives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_wip_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_wip_commit: Option<String>,
+    /// Verbatim hook state. `captured` is the ONLY value meaning the work is
+    /// snapshotted; `probe_failed` is deliberately NOT `clean`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_wip_state: Option<String>,
+
+    /// `Session-Id:` trailer on HEAD's commit message. The WEAK attribution
+    /// source: it names whoever last COMMITTED, and 35 of 37 uncommitted-only
+    /// worktrees have edits newer than that commit (median +23.3 h). Carried
+    /// because it is free — the same `git log -1` spawn that already computed
+    /// `head_age_secs` now also returns the body — and because without it the
+    /// surface would report ~0% attribution until the Phase-1 hook has been
+    /// installed fleet-wide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_session_id: Option<String>,
+    /// `Session-Name:` trailer on HEAD, same provenance and same weakness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_session_name: Option<String>,
 }
 
 /// Full census body POSTed to coord.
@@ -2025,9 +2086,27 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         git_capture(worktree, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty());
     let head_sha = git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty());
 
-    let head_age_secs = git_capture(worktree, &["log", "-1", "--format=%ct"])
+    // ONE spawn for two facts. `%ct%n%B` puts the committer epoch on the
+    // first line and the full commit body after it, so reading the
+    // `Session-Id:` trailer costs NOTHING on a walk that already takes 33
+    // minutes -- the alternative (a second `git log`) would have added
+    // ~1,250 process spawns per census.
+    let head_log = git_capture(worktree, &["log", "-1", "--format=%ct%n%B"]);
+    let (head_epoch_raw, head_body) = match head_log.as_deref() {
+        Some(s) => match s.split_once('\n') {
+            Some((ct, body)) => (Some(ct), body),
+            // A single line: an empty commit message. The capture is then
+            // just the epoch -- degrade the trailer half, never the
+            // timestamp.
+            None => (Some(s), ""),
+        },
+        None => (None, ""),
+    };
+    let head_age_secs = head_epoch_raw
+        .map(str::trim)
         .and_then(|s| s.parse::<i64>().ok())
         .map(|committed| chrono::Utc::now().timestamp().saturating_sub(committed));
+    let (head_session_id, head_session_name) = super::custody::parse_session_trailers(head_body);
 
     // is_dirty — reclaim-scoped: `git status --porcelain` MINUS the runner's
     // own untracked scaffolding (`.claude/`, `.coord-mcp-status`, `.mcp.json`).
@@ -2045,6 +2124,13 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     // that dir is a shared pool slot. Filesystem-only + cheap (a couple of
     // `is_file` probes plus at most one small TOML parse) — no git spawn.
     let build_target = resolve_build_target_live(worktree);
+
+    // WIP custody (Phase 3). Two bounded FILE READS on the hit path, ONE on
+    // the miss path, and no subprocess at any point — `$GIT_DIR` comes from
+    // the worktree's `.git` FILE (`gitdir: <path>`), never from a
+    // `git rev-parse` spawn and never reconstructed from the worktree path
+    // (git disambiguates admin-dir collisions, so it is not derivable).
+    let custody = super::custody::read_custody(worktree);
 
     let last_access_mtime = std::fs::metadata(worktree)
         .ok()
@@ -2098,6 +2184,18 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         canonical_current_branch,
         canonical_is_dirty,
         canonical_base_divergence,
+        custody_session_id: custody.as_ref().and_then(|c| c.session_id.clone()),
+        custody_session_name: custody.as_ref().and_then(|c| c.session_name.clone()),
+        custody_last_seen: custody.as_ref().and_then(|c| c.last_seen.clone()),
+        custody_last_seen_epoch: custody.as_ref().and_then(|c| c.last_seen_epoch),
+        custody_work_unit_id: custody.as_ref().and_then(|c| c.work_unit_id.clone()),
+        custody_plan_slug: custody.as_ref().and_then(|c| c.plan_slug.clone()),
+        custody_intent: custody.as_ref().and_then(|c| c.intent.clone()),
+        custody_wip_ref: custody.as_ref().and_then(|c| c.wip_ref.clone()),
+        custody_wip_commit: custody.as_ref().and_then(|c| c.wip_commit.clone()),
+        custody_wip_state: custody.as_ref().and_then(|c| c.wip_state.clone()),
+        head_session_id,
+        head_session_name,
     }
 }
 
@@ -4158,6 +4256,18 @@ mod tests {",
             canonical_current_branch: None,
             canonical_is_dirty: None,
             canonical_base_divergence: None,
+            custody_session_id: None,
+            custody_session_name: None,
+            custody_last_seen: None,
+            custody_last_seen_epoch: None,
+            custody_work_unit_id: None,
+            custody_plan_slug: None,
+            custody_intent: None,
+            custody_wip_ref: None,
+            custody_wip_commit: None,
+            custody_wip_state: None,
+            head_session_id: None,
+            head_session_name: None,
         }
     }
 

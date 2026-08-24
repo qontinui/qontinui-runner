@@ -56,6 +56,10 @@ use uuid::Uuid;
 
 use super::canonical_paths::default_canonical_path;
 use super::census::{self, CensusSnapshot, WorktreeCensus};
+use super::custody::{
+    self, coord::CoordOwnership, Attribution, AttributionInput, CoordOwner, CustodyRecord,
+    SessionDirectory,
+};
 use super::reclaim::{self, ReclaimAction, ReclaimInstruction, ReclaimPull, ReclaimStep};
 
 // ---------------------------------------------------------------------------
@@ -288,6 +292,64 @@ pub struct SurveyItem {
     /// coord's own reason string for the instruction (e.g.
     /// `worktree:lifecycle:pr_merged`) — provenance for a reapable item.
     pub coord_reason: Option<String>,
+
+    // --- WIP custody / attribution (plan `2026-08-22-wip-custody-rebuild-
+    // survivable-attribution`, Phase 3) ---------------------------------------
+    //
+    // Before this, the operator saw `"Uncommitted work in this tree (G1) —
+    // commit or stash it first."` beside `31.3 GB` and had NO WAY to learn
+    // whose it was. This block is that answer, at the exact surface where the
+    // complaint bites.
+    /// **Always populated, NEVER blank.** One of `"<name> (session <short>)"`,
+    /// `"session <id>"`, `"session <id> (unresolvable)"` (a ghost — id
+    /// stamped, but no name-file and no transcript in any of the five
+    /// `C:/claude/.claude-*` account roots), or the literal `"unattributed"`.
+    /// Matches coord's shipped precedent, `GET
+    /// /coord/trees/wip-owners/:device_id` ("ownership join (honest
+    /// `unattributed`)").
+    pub session_label: String,
+    /// The owning session id, when any source produced one.
+    pub session_id: Option<String>,
+    /// The resolved human-readable name, when one could be resolved.
+    pub session_name: Option<String>,
+    /// `custody_record` | `coord_allocation` | `coord_branch_author` |
+    /// `commit_trailer` | `none` — WHICH source spoke. Rendered so a weak
+    /// answer can never be mistaken for a strong one.
+    pub attribution_source: &'static str,
+    /// `strong` | `evidential` | `weak` | `none`.
+    pub attribution_confidence: &'static str,
+    /// Last turn the owning session wrote its custody record.
+    pub last_seen: Option<String>,
+    /// Seconds since [`Self::last_seen`]. `None` = UNKNOWN, never "just seen".
+    pub last_seen_age_secs: Option<i64>,
+    /// Tri-state. `None` = unknowable — never fabricated as `false`. Keyed on
+    /// `last_seen`, NEVER on the record's `pid` (which is `$PPID` in bash's
+    /// namespace and is not a Win32 pid).
+    pub owner_live: Option<bool>,
+    /// The custody record exists but its `last_seen` is older than
+    /// [`custody::CUSTODY_STALE_AFTER_SECS`] — evidence of a PAST owner.
+    pub custody_stale: bool,
+    /// The session id resolved to nothing at all (a ghost).
+    pub session_unresolvable: bool,
+    pub work_unit_id: Option<String>,
+    pub plan_slug: Option<String>,
+    /// `refs/wip/<session-id>` — the Phase-2 snapshot of this tree's dirty
+    /// tracked content.
+    pub wip_ref: Option<String>,
+    pub wip_commit: Option<String>,
+    /// Verbatim hook state. `captured` is the ONLY value meaning the work is
+    /// snapshotted; `probe_failed` is deliberately NOT `clean`.
+    pub wip_state: Option<String>,
+    /// The `CLAUDE_CONFIG_DIR` whose `projects/` holds this session's
+    /// transcript — the root a `--resume` must run under. `None` for a ghost,
+    /// and NEVER guessed: a resume under the wrong root fails with a message
+    /// that reads exactly like "that session never existed".
+    pub config_dir: Option<String>,
+    /// HEAD of the worktree — carried so the orphan report can describe the
+    /// WIP without a second census read.
+    pub head_sha: Option<String>,
+    /// `now - committer-time-of-HEAD`, in seconds.
+    pub head_age_secs: Option<i64>,
 }
 
 /// Aggregate counts for the panel header, plus the machine's free-space
@@ -314,6 +376,53 @@ pub struct SurveySummary {
     pub blocked: usize,
     /// Bytes that pressing "Clean up safe worktrees" would free.
     pub reclaimable_bytes: u64,
+
+    // --- Attribution coverage (Phase 3) -------------------------------------
+    // The plan's acceptance says: report the attribution rate. It ALSO says the
+    // "594 operable worktrees" denominator is not reproducible (independent
+    // counts give 1,246-1,257), so the rate is stated against a NAMED
+    // predicate rather than an inherited figure. Two denominators are reported
+    // because they answer different questions:
+    //
+    //   * `attributed` / `surveyed`  — the whole surveyed population
+    //     (census-admitted, canonical checkouts excluded — the same set
+    //     `items` covers).
+    //   * `wip_attributed` / `wip_surveyed` — worktrees the census reports
+    //     DIRTY. This is the population the plan is actually about: the ones
+    //     holding real uncommitted WIP.
+    /// Surveyed worktrees (== `items.len()`), the denominator of
+    /// [`Self::attribution_rate`]. Canonical checkouts are excluded (counted
+    /// separately as `canonical_excluded`).
+    pub surveyed: usize,
+    /// Surveyed worktrees for which SOME source named an owning session.
+    pub attributed: usize,
+    /// Surveyed worktrees rendering the literal `unattributed`.
+    pub unattributed: usize,
+    /// `attributed / surveyed`. `None` — never `0.0` — when nothing was
+    /// surveyed, because an empty census says nothing about coverage.
+    pub attribution_rate: Option<f64>,
+    /// Dirty (G1) worktrees — the WIP population.
+    pub wip_surveyed: usize,
+    pub wip_attributed: usize,
+    /// Of [`Self::wip_attributed`], how many came from the per-turn custody
+    /// record rather than the weak commit trailer. Reported separately because
+    /// the trailer names the last COMMITTER, not the session that made the
+    /// edits.
+    pub wip_attributed_by_custody: usize,
+    pub wip_attribution_rate: Option<f64>,
+    /// How many of the five `C:/claude/.claude-*` account roots the name/ghost
+    /// resolver actually walked. `0` means resolution was NOT ATTEMPTED — a
+    /// reader must not read the ghost count as real in that case (a
+    /// single-root lookup reports a 92% failure rate that is an artifact of
+    /// where it looked).
+    pub session_roots_scanned: usize,
+    /// Worktrees whose session id resolved to nothing at all (ghosts).
+    pub session_ghosts: usize,
+    /// coord answered the ownership read. `false` ⇒ sources 2 and 3 were
+    /// UNAVAILABLE, so a low rate is a coverage gap, not an absence of owners.
+    pub coord_ownership_reachable: bool,
+    /// Present when `coord_ownership_reachable == false`.
+    pub coord_ownership_error: Option<String>,
 
     // --- Volume headroom (disk-monitoring Phase 1, step 3) ---
     /// Free/total bytes per mounted volume. EMPTY while `volumes_status` is
@@ -622,6 +731,9 @@ struct Assembled {
     facts: CandidateFacts,
     junctioned_paths: Vec<String>,
     coord_reason: Option<String>,
+    /// Phase 3 — WHO owns this worktree, resolved through the documented
+    /// source order. Never blank; see [`custody::resolve_attribution`].
+    attribution: Attribution,
 }
 
 /// Build the survey: coord's decision ⋈ this device's most recent on-disk
@@ -667,10 +779,46 @@ pub async fn survey(query: SurveyQuery) -> Result<Survey, String> {
         // Any snapshot at all; returns instantly when one already exists.
         None
     };
-    let (pull, waited) = tokio::join!(
+    // The coord ownership read (sources 2+3) joins the SAME concurrency
+    // group, so the worst case stays max(15s, 15s, wait <=10s) rather than
+    // their sum.
+    let (pull, waited, ownership) = tokio::join!(
         reclaim::fetch_pull(),
-        census::wait_for_census_after(wait_for, query.wait())
+        census::wait_for_census_after(wait_for, query.wait()),
+        custody::coord::fetch_ownership()
     );
+
+    let (ownership, ownership_error) = match ownership {
+        Ok(Some(o)) => (Some(o), None),
+        Ok(None) => (None, Some("no coord_url configured".to_string())),
+        Err(e) => {
+            // NEVER fatal: attribution degrades to the custody record and the
+            // commit trailer, and the summary says coord was unreachable so a
+            // low rate reads as a coverage gap rather than an absence of
+            // owners.
+            warn!("agent_worktrees: coord ownership read failed: {e}");
+            (None, Some(e))
+        }
+    };
+
+    // The name/ghost index sweeps ALL five `C:/claude/.claude-*` account roots
+    // plus `~/.qontinui/session-names/`. Built ONCE per survey: only 9 of 111
+    // sessions resolve inside `.claude-gmail` alone, so a single-root lookup
+    // reports a 92% failure rate that is an artifact of where it looked -- and
+    // a per-worktree sweep of ~3,400 transcripts across ~1,250 worktrees would
+    // be quadratic. `spawn_blocking` keeps the directory walk off the async
+    // reactor.
+    // `cached()` memoizes for 60 s: the panel POLLS this route, and the scan's
+    // answer changes on the timescale of a session starting.
+    let directory = tokio::task::spawn_blocking(SessionDirectory::cached)
+        .await
+        .unwrap_or_else(|e| {
+            // Degrade to a FRESH (blocking) walk rather than to `empty()`: an
+            // empty index makes every session look like a ghost, which is the
+            // false report this whole module exists to prevent.
+            warn!("agent_worktrees: session directory scan panicked: {e} — rescanning inline");
+            std::sync::Arc::new(SessionDirectory::discover())
+        });
 
     let (device_id, pull, coord_error) = match pull {
         Ok(Some((id, p))) => (Some(id), Some(p), None),
@@ -703,6 +851,9 @@ pub async fn survey(query: SurveyQuery) -> Result<Survey, String> {
         census::census_build_active(),
         volume_sample.as_ref(),
         chrono::Utc::now(),
+        &directory,
+        ownership.as_ref(),
+        ownership_error,
     ))
 }
 
@@ -717,6 +868,10 @@ fn assemble_survey(
     census_refreshing: bool,
     volume_sample: Option<&census::VolumeSample>,
     now: chrono::DateTime<chrono::Utc>,
+    // --- Phase 3 attribution inputs ---
+    directory: &SessionDirectory,
+    ownership: Option<&CoordOwnership>,
+    ownership_error: Option<String>,
 ) -> Survey {
     let coord_reachable = pull.is_some();
     let remove_armed = pull.is_some_and(|p| p.remove_armed);
@@ -738,7 +893,16 @@ fn assemble_survey(
             // path — a cold start that renders "unknown free space" because
             // an unrelated walk has not finished is the failure this plan
             // exists to remove.
-            summary: SurveySummary::default().with_volume_sample(volume_sample, now),
+            summary: SurveySummary {
+                // Cold start: NOTHING was surveyed, so `attribution_rate`
+                // stays `None`. A `0.0` here would read as "we looked and
+                // found no owners", which is the opposite of the truth.
+                session_roots_scanned: directory.roots_scanned(),
+                coord_ownership_reachable: ownership.is_some(),
+                coord_ownership_error: ownership_error.clone(),
+                ..SurveySummary::default()
+            }
+            .with_volume_sample(volume_sample, now),
             census_status: CensusStatus::Pending,
             census_taken_at: None,
             census_age_secs: None,
@@ -763,8 +927,14 @@ fn assemble_survey(
         CensusStatus::Stale
     };
 
-    let (items, canonical_excluded) = build_survey_items(&snapshot.req.worktrees, pull);
-    let summary = SurveySummary {
+    let (items, canonical_excluded) = build_survey_items(
+        &snapshot.req.worktrees,
+        pull,
+        directory,
+        ownership,
+        now.timestamp(),
+    );
+    let mut summary = SurveySummary {
         reapable: items.iter().filter(|i| i.status == "reapable").count(),
         blocked: items.iter().filter(|i| i.status == "blocked").count(),
         reclaimable_bytes: items
@@ -772,9 +942,13 @@ fn assemble_survey(
             .filter(|i| i.status == "reapable")
             .map(|i| i.attributable_bytes)
             .sum(),
+        session_roots_scanned: directory.roots_scanned(),
+        coord_ownership_reachable: ownership.is_some(),
+        coord_ownership_error: ownership_error,
         ..Default::default()
-    }
-    .with_volume_sample(volume_sample, now);
+    };
+    summarize_attribution(&items, &mut summary);
+    let summary = summary.with_volume_sample(volume_sample, now);
 
     Survey {
         device_id: Some(snapshot.req.device_id),
@@ -874,6 +1048,9 @@ fn is_canonical_checkout_decision(structural: bool, canonical: Option<&Path>, pa
 fn build_survey_items(
     worktrees: &[WorktreeCensus],
     pull: Option<&ReclaimPull>,
+    directory: &SessionDirectory,
+    ownership: Option<&CoordOwnership>,
+    now_epoch: i64,
 ) -> (Vec<SurveyItem>, usize) {
     // coord's cleared `remove` instructions, keyed by normalized path.
     let mut cleared: BTreeMap<String, &ReclaimInstruction> = BTreeMap::new();
@@ -937,6 +1114,7 @@ fn build_survey_items(
                 .map(|i| i.junctioned_paths.clone())
                 .unwrap_or_else(|| census_junctioned_sinks(w)),
             coord_reason: instr.map(|i| i.reason.clone()),
+            attribution: attribute_row(w, directory, ownership, now_epoch),
         });
     }
 
@@ -963,6 +1141,24 @@ fn build_survey_items(
                 attributable_bytes: a.census.attributable_bytes,
                 junctioned_paths: a.junctioned_paths,
                 coord_reason: a.coord_reason,
+                session_label: a.attribution.session_label,
+                session_id: a.attribution.session_id,
+                session_name: a.attribution.session_name,
+                attribution_source: a.attribution.source,
+                attribution_confidence: a.attribution.confidence,
+                last_seen: a.attribution.last_seen,
+                last_seen_age_secs: a.attribution.last_seen_age_secs,
+                owner_live: a.attribution.owner_live,
+                custody_stale: a.attribution.custody_stale,
+                session_unresolvable: a.attribution.unresolvable,
+                work_unit_id: a.attribution.work_unit_id,
+                plan_slug: a.attribution.plan_slug,
+                wip_ref: a.attribution.wip_ref,
+                wip_commit: a.attribution.wip_commit,
+                wip_state: a.attribution.wip_state,
+                config_dir: a.attribution.config_dir,
+                head_sha: a.census.head_sha.clone(),
+                head_age_secs: a.census.head_age_secs,
             }
         })
         .collect();
@@ -977,6 +1173,73 @@ fn build_survey_items(
     });
 
     (items, canonical_excluded)
+}
+
+/// Resolve ONE census row's owner through the documented source order.
+///
+/// The census already carried the custody record's fields (read at walk time,
+/// as two bounded file reads with no subprocess), so this rehydrates a
+/// [`CustodyRecord`] from them rather than re-reading disk — the survey must
+/// answer from the cached snapshot, exactly like every other fact it reports.
+fn attribute_row(
+    w: &WorktreeCensus,
+    directory: &SessionDirectory,
+    ownership: Option<&CoordOwnership>,
+    now_epoch: i64,
+) -> Attribution {
+    let custody = w.custody_session_id.as_ref().map(|_| CustodyRecord {
+        session_id: w.custody_session_id.clone(),
+        session_name: w.custody_session_name.clone(),
+        work_unit_id: w.custody_work_unit_id.clone(),
+        plan_slug: w.custody_plan_slug.clone(),
+        intent: w.custody_intent.clone(),
+        wip_ref: w.custody_wip_ref.clone(),
+        wip_commit: w.custody_wip_commit.clone(),
+        wip_state: w.custody_wip_state.clone(),
+        last_seen: w.custody_last_seen.clone(),
+        last_seen_epoch: w.custody_last_seen_epoch,
+        ..CustodyRecord::default()
+    });
+    let coord_owner: Option<CoordOwner> =
+        ownership.and_then(|o| o.owner_for(&w.path, &w.repo, w.branch.as_deref()));
+    custody::resolve_attribution(
+        &AttributionInput {
+            custody: custody.as_ref(),
+            coord: coord_owner.as_ref(),
+            trailer_session_id: w.head_session_id.as_deref(),
+            trailer_session_name: w.head_session_name.as_deref(),
+            now_epoch,
+        },
+        directory,
+    )
+}
+
+/// Roll the per-item attributions up into the summary counters.
+///
+/// Stated against a NAMED predicate, because the plan's own "594 operable
+/// worktrees" denominator is not reproducible (independent counts give
+/// 1,246-1,257). The predicate here is: **surveyed = every worktree the census
+/// walk admitted, minus canonical repo checkouts** — i.e. exactly the set
+/// `items` covers, which is the set the operator is looking at.
+fn summarize_attribution(items: &[SurveyItem], summary: &mut SurveySummary) {
+    summary.surveyed = items.len();
+    summary.attributed = items.iter().filter(|i| i.session_id.is_some()).count();
+    summary.unattributed = summary.surveyed - summary.attributed;
+    // `None`, never `0.0`, on an empty population: an empty census says
+    // nothing about coverage (served policy `silent-empty-is-unknown`).
+    summary.attribution_rate = (summary.surveyed > 0)
+        .then(|| summary.attributed as f64 / summary.surveyed as f64);
+
+    let wip: Vec<&SurveyItem> = items.iter().filter(|i| i.is_dirty).collect();
+    summary.wip_surveyed = wip.len();
+    summary.wip_attributed = wip.iter().filter(|i| i.session_id.is_some()).count();
+    summary.wip_attributed_by_custody = wip
+        .iter()
+        .filter(|i| i.attribution_source == "custody_record")
+        .count();
+    summary.wip_attribution_rate = (summary.wip_surveyed > 0)
+        .then(|| summary.wip_attributed as f64 / summary.wip_surveyed as f64);
+    summary.session_ghosts = items.iter().filter(|i| i.session_unresolvable).count();
 }
 
 /// Junction sinks derivable from a census row alone — used when coord has no
@@ -1198,6 +1461,280 @@ pub fn path_id(p: &Path) -> String {
 // Tests — the guard vocabulary is the load-bearing assertion.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// WIP-orphan report — GET /agent-worktrees/wip-orphans
+// ---------------------------------------------------------------------------
+
+/// One worktree holding real WIP whose owner is not around any more.
+///
+/// This is the report the plan asks for by name: *"worktrees whose custody
+/// record is stale AND whose session is not live, with each one's WIP summary
+/// and a ready-to-run resume line."*
+#[derive(Debug, Clone, Serialize)]
+pub struct WipOrphan {
+    /// Same stable handle as [`SurveyItem::id`].
+    pub id: String,
+    pub worktree_path: String,
+    pub repo: String,
+    pub branch: Option<String>,
+
+    /// **Never blank.** `unattributed` when no source spoke; `session <id>
+    /// (unresolvable)` for a ghost.
+    pub session_label: String,
+    pub session_id: Option<String>,
+    pub session_name: Option<String>,
+    pub attribution_source: &'static str,
+    pub attribution_confidence: &'static str,
+    pub last_seen: Option<String>,
+    pub last_seen_age_secs: Option<i64>,
+    /// `None` = unknowable, never fabricated as `false`.
+    pub owner_live: Option<bool>,
+    pub custody_stale: bool,
+    pub session_unresolvable: bool,
+
+    /// Why this row is in the report — the exact arm of the predicate that
+    /// admitted it. Never a bare "orphan".
+    pub orphan_reason: &'static str,
+
+    // --- the WIP summary --------------------------------------------------
+    /// One operator-facing sentence about the uncommitted work.
+    pub wip_summary: String,
+    pub head_sha: Option<String>,
+    pub head_age_secs: Option<i64>,
+    pub attributable_bytes: u64,
+    /// `refs/wip/<session-id>` from the Phase-2 snapshot, when one exists.
+    pub wip_ref: Option<String>,
+    pub wip_commit: Option<String>,
+    /// Verbatim hook state. `captured` is the ONLY value meaning the work is
+    /// safely snapshotted.
+    pub wip_state: Option<String>,
+    pub work_unit_id: Option<String>,
+    pub plan_slug: Option<String>,
+
+    // --- the ready-to-run lines -------------------------------------------
+    /// `cd <worktree> && CLAUDE_CONFIG_DIR=<root> claude --resume <id>`.
+    ///
+    /// `None` — never a guess — when the session is a ghost or the account
+    /// root is unknown: a `--resume` under the wrong `CLAUDE_CONFIG_DIR`
+    /// fails with a message that reads exactly like "that session never
+    /// existed", which would send the operator hunting the wrong problem.
+    pub resume_command: Option<String>,
+    /// How to get the uncommitted work back out of the Phase-2 snapshot.
+    /// `None` when nothing was ever captured — and that absence is itself the
+    /// finding, not a formatting gap.
+    pub recover_wip_command: Option<String>,
+    /// Always present: how to SEE what is uncommitted, which works even when
+    /// neither command above can be built.
+    pub inspect_command: String,
+}
+
+/// The orphan report.
+#[derive(Debug, Clone, Serialize)]
+pub struct WipOrphanReport {
+    pub generated_at: String,
+    /// `pending` | `fresh` | `stale` — the same census freshness the survey
+    /// reports. A `pending` census means this report is UNKNOWN, not empty.
+    pub census_status: CensusStatus,
+    pub census_taken_at: Option<String>,
+    pub census_age_secs: Option<u64>,
+    /// Worktrees examined (the survey's own population).
+    pub scanned: usize,
+    /// Of those, how many the census reports DIRTY — the WIP population.
+    pub wip_total: usize,
+    pub orphans: Vec<WipOrphan>,
+    /// The predicate, spelled out on the wire so nobody has to infer it from
+    /// the row count.
+    pub predicate: &'static str,
+    /// Always present, and explicitly says "not known yet" rather than
+    /// implying "nothing is orphaned".
+    pub note: String,
+    /// How many account roots the resolver walked. `0` ⇒ names and ghosts were
+    /// NOT resolved.
+    pub session_roots_scanned: usize,
+    pub coord_ownership_reachable: bool,
+    pub coord_ownership_error: Option<String>,
+}
+
+/// **The orphan predicate.** Stated here, on the wire, and in the doc comment,
+/// because a report whose membership rule is implicit is a report nobody can
+/// check:
+///
+/// > the census reports the worktree DIRTY (G1 — real uncommitted WIP)
+/// > **AND** the owner is not known to be live (`owner_live != Some(true)`)
+/// > **AND** either no custody record exists for it, or the record's
+/// > `last_seen` is older than [`custody::CUSTODY_STALE_AFTER_SECS`].
+///
+/// The middle clause is what keeps a live session's dirty tree out of the
+/// report; the last clause is what the plan means by "stale". Liveness comes
+/// from `last_seen` (or coord's own verdict) and **never** from the record's
+/// `pid`, which is `$PPID` in bash's namespace and is not a Win32 pid.
+pub const WIP_ORPHAN_PREDICATE: &str =
+    "is_dirty AND owner_live != true AND (no custody record OR custody last_seen older \
+     than 2h)";
+
+fn orphan_reason_for(item: &SurveyItem) -> Option<&'static str> {
+    if !item.is_dirty {
+        return None;
+    }
+    if item.owner_live == Some(true) {
+        return None;
+    }
+    match (item.session_id.is_some(), item.custody_stale) {
+        // A custody record exists and has gone quiet — the strongest kind of
+        // orphan, because we know exactly whose it was.
+        (true, true) => Some("custody-stale"),
+        // Attributed by a source that carries no liveness statement at all
+        // (coord's durable binding, or the weak commit trailer). Evidence of a
+        // past owner, never a live claim (plan Risk 3).
+        (true, false) => Some("owner-liveness-unknown"),
+        // Dirty, and NOTHING named an owner. This is the population the whole
+        // plan exists for.
+        (false, _) => Some("unattributed-wip"),
+    }
+}
+
+/// Human-readable WIP summary. Deliberately blunt about the un-captured case:
+/// `unchanged`, `deferred` and `probe_failed` all mean the work is **only** in
+/// the worktree.
+fn wip_summary_for(item: &SurveyItem) -> String {
+    let bytes = humanize_bytes(item.attributable_bytes);
+    match item.wip_state.as_deref() {
+        Some("captured") => format!(
+            "Uncommitted work, snapshotted to {} ({}). Recover it with the command below.",
+            item.wip_ref.as_deref().unwrap_or("refs/wip/<session>"),
+            bytes
+        ),
+        Some(other) => format!(
+            "Uncommitted work, NOT snapshotted (custody hook last reported '{other}'). It \
+             exists ONLY in this worktree ({bytes})."
+        ),
+        None => format!(
+            "Uncommitted work with no custody record at all — it exists ONLY in this \
+             worktree ({bytes}), and nothing has captured it."
+        ),
+    }
+}
+
+fn humanize_bytes(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// Build the orphan report from an already-assembled survey. PURE, so the
+/// predicate and the rendered commands are unit-testable without a disk walk
+/// or coord.
+pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) -> WipOrphanReport {
+    let wip_total = survey.items.iter().filter(|i| i.is_dirty).count();
+    let mut orphans: Vec<WipOrphan> = survey
+        .items
+        .iter()
+        .filter_map(|item| {
+            let orphan_reason = orphan_reason_for(item)?;
+            let resume_command = match (item.session_id.as_deref(), item.config_dir.as_deref()) {
+                (Some(id), Some(dir)) => Some(format!(
+                    "cd \"{}\" && CLAUDE_CONFIG_DIR=\"{}\" claude --resume {}",
+                    item.worktree_path, dir, id
+                )),
+                // A ghost, or an id whose account root we could not establish.
+                // NEVER guessed — see the field docs.
+                _ => None,
+            };
+            let recover_wip_command = item.wip_commit.as_deref().map(|c| {
+                format!(
+                    "git -C \"{}\" stash apply {}",
+                    item.worktree_path, c
+                )
+            });
+            Some(WipOrphan {
+                id: item.id.clone(),
+                worktree_path: item.worktree_path.clone(),
+                repo: item.repo.clone(),
+                branch: item.branch.clone(),
+                session_label: item.session_label.clone(),
+                session_id: item.session_id.clone(),
+                session_name: item.session_name.clone(),
+                attribution_source: item.attribution_source,
+                attribution_confidence: item.attribution_confidence,
+                last_seen: item.last_seen.clone(),
+                last_seen_age_secs: item.last_seen_age_secs,
+                owner_live: item.owner_live,
+                custody_stale: item.custody_stale,
+                session_unresolvable: item.session_unresolvable,
+                orphan_reason,
+                wip_summary: wip_summary_for(item),
+                head_sha: item.head_sha.clone(),
+                head_age_secs: item.head_age_secs,
+                attributable_bytes: item.attributable_bytes,
+                wip_ref: item.wip_ref.clone(),
+                wip_commit: item.wip_commit.clone(),
+                wip_state: item.wip_state.clone(),
+                work_unit_id: item.work_unit_id.clone(),
+                plan_slug: item.plan_slug.clone(),
+                resume_command,
+                recover_wip_command,
+                inspect_command: format!("git -C \"{}\" status --porcelain", item.worktree_path),
+            })
+        })
+        .collect();
+
+    // Oldest silence first — that is the order an operator triages in.
+    orphans.sort_by(|a, b| {
+        b.last_seen_age_secs
+            .unwrap_or(i64::MAX)
+            .cmp(&a.last_seen_age_secs.unwrap_or(i64::MAX))
+            .then(b.attributable_bytes.cmp(&a.attributable_bytes))
+            .then(a.id.cmp(&b.id))
+    });
+
+    let note = match survey.census_status {
+        CensusStatus::Pending => "No disk snapshot yet — this is NOT 'nothing is orphaned', \
+             it is 'not known yet'."
+            .to_string(),
+        _ => format!(
+            "{} of {} worktrees holding uncommitted work have no live owner. {}",
+            orphans.len(),
+            wip_total,
+            if survey.summary.session_roots_scanned == 0 {
+                "Session names were NOT resolved (no account root was readable), so every \
+                 name here is missing for that reason, not because the session is a ghost."
+            } else {
+                "Liveness is keyed on the custody record's last_seen, never on its pid."
+            }
+        ),
+    };
+
+    WipOrphanReport {
+        generated_at: now.to_rfc3339(),
+        census_status: survey.census_status,
+        census_taken_at: survey.census_taken_at.clone(),
+        census_age_secs: survey.census_age_secs,
+        scanned: survey.items.len(),
+        wip_total,
+        orphans,
+        predicate: WIP_ORPHAN_PREDICATE,
+        note,
+        session_roots_scanned: survey.summary.session_roots_scanned,
+        coord_ownership_reachable: survey.summary.coord_ownership_reachable,
+        coord_ownership_error: survey.summary.coord_ownership_error.clone(),
+    }
+}
+
+/// `GET /agent-worktrees/wip-orphans` — the report, from a live survey.
+pub async fn wip_orphans(query: SurveyQuery) -> Result<WipOrphanReport, String> {
+    let s = survey(query).await?;
+    Ok(build_wip_orphans(&s, chrono::Utc::now()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,6 +1917,47 @@ mod tests {
         );
     }
 
+    /// The Phase-3 attribution half of a `SurveyItem` in its honest-empty
+    /// shape, so a test that is not about attribution does not have to spell
+    /// fifteen `None`s. Note `session_label` is the LITERAL `"unattributed"`,
+    /// never `""` — that is the invariant, not a convenience.
+    fn unattributed_item_fields() -> SurveyItem {
+        SurveyItem {
+            id: String::new(),
+            worktree_path: String::new(),
+            repo: String::new(),
+            branch: None,
+            status: "blocked",
+            reason: None,
+            reason_detail: None,
+            is_dirty: false,
+            building: false,
+            pinned: false,
+            landed_in_main: None,
+            attributable_bytes: 0,
+            junctioned_paths: Vec::new(),
+            coord_reason: None,
+            session_label: "unattributed".to_string(),
+            session_id: None,
+            session_name: None,
+            attribution_source: "none",
+            attribution_confidence: "none",
+            last_seen: None,
+            last_seen_age_secs: None,
+            owner_live: None,
+            custody_stale: false,
+            session_unresolvable: false,
+            work_unit_id: None,
+            plan_slug: None,
+            wip_ref: None,
+            wip_commit: None,
+            wip_state: None,
+            config_dir: None,
+            head_sha: None,
+            head_age_secs: None,
+        }
+    }
+
     fn census_row(path: &str, dirty: bool, building: Option<bool>) -> WorktreeCensus {
         WorktreeCensus {
             repo: "qontinui-runner".to_string(),
@@ -1403,6 +1981,18 @@ mod tests {
             canonical_current_branch: None,
             canonical_is_dirty: None,
             canonical_base_divergence: None,
+            custody_session_id: None,
+            custody_session_name: None,
+            custody_last_seen: None,
+            custody_last_seen_epoch: None,
+            custody_work_unit_id: None,
+            custody_plan_slug: None,
+            custody_intent: None,
+            custody_wip_ref: None,
+            custody_wip_commit: None,
+            custody_wip_state: None,
+            head_session_id: None,
+            head_session_name: None,
         }
     }
 
@@ -1442,7 +2032,7 @@ mod tests {
         let wt = "D:/qontinui-root/qontinui-runner-wt-a";
         let pull = pull_with(vec![instruction(wt)]);
         let (items, canonical) =
-            build_survey_items(&[census_row(wt, false, Some(false))], Some(&pull));
+            build_survey_items(&[census_row(wt, false, Some(false))], Some(&pull), &SessionDirectory::empty(), None, 0);
         assert_eq!(canonical, 0);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "reapable");
@@ -1461,7 +2051,7 @@ mod tests {
         // refuses it and SAYS SO.
         let wt = "D:/qontinui-root/qontinui-runner-wt-b";
         let pull = pull_with(vec![instruction(wt)]);
-        let (items, _) = build_survey_items(&[census_row(wt, false, Some(true))], Some(&pull));
+        let (items, _) = build_survey_items(&[census_row(wt, false, Some(true))], Some(&pull), &SessionDirectory::empty(), None, 0);
         assert_eq!(items[0].status, "blocked");
         assert_eq!(items[0].reason, Some("building"));
         assert!(items[0].reason_detail.unwrap().contains("build"));
@@ -1471,7 +2061,7 @@ mod tests {
     fn survey_blocks_a_dirty_worktree_coord_cleared() {
         let wt = "D:/qontinui-root/qontinui-runner-wt-c";
         let pull = pull_with(vec![instruction(wt)]);
-        let (items, _) = build_survey_items(&[census_row(wt, true, Some(false))], Some(&pull));
+        let (items, _) = build_survey_items(&[census_row(wt, true, Some(false))], Some(&pull), &SessionDirectory::empty(), None, 0);
         assert_eq!(items[0].status, "blocked");
         assert_eq!(items[0].reason, Some("dirty"));
     }
@@ -1479,7 +2069,7 @@ mod tests {
     #[test]
     fn survey_blocks_everything_when_coord_is_unreachable() {
         let wt = "D:/qontinui-root/qontinui-runner-wt-d";
-        let (items, _) = build_survey_items(&[census_row(wt, false, Some(false))], None);
+        let (items, _) = build_survey_items(&[census_row(wt, false, Some(false))], None, &SessionDirectory::empty(), None, 0);
         assert_eq!(items[0].status, "blocked");
         assert_eq!(items[0].reason, Some("coord-unreachable"));
     }
@@ -1499,7 +2089,7 @@ mod tests {
             }],
         }))
         .unwrap();
-        let (items, _) = build_survey_items(&[census_row(wt, false, Some(false))], Some(&pull));
+        let (items, _) = build_survey_items(&[census_row(wt, false, Some(false))], Some(&pull), &SessionDirectory::empty(), None, 0);
         assert_eq!(items[0].status, "blocked");
         assert_eq!(items[0].reason, Some("pinned"));
         assert!(items[0].pinned);
@@ -1517,7 +2107,7 @@ mod tests {
             }],
         }))
         .unwrap();
-        let (items, _) = build_survey_items(&[census_row(wt, false, Some(false))], Some(&pull));
+        let (items, _) = build_survey_items(&[census_row(wt, false, Some(false))], Some(&pull), &SessionDirectory::empty(), None, 0);
         assert_eq!(items[0].status, "blocked");
         assert_eq!(items[0].reason, Some("session-live"));
     }
@@ -1533,7 +2123,7 @@ mod tests {
         let mut big = census_row(b, false, Some(false));
         big.attributable_bytes = 1000;
         let dirty = census_row(blocked, true, Some(false));
-        let (items, _) = build_survey_items(&[small, dirty, big], Some(&pull));
+        let (items, _) = build_survey_items(&[small, dirty, big], Some(&pull), &SessionDirectory::empty(), None, 0);
         assert_eq!(items[0].worktree_path, b);
         assert_eq!(items[1].worktree_path, a);
         assert_eq!(items[2].status, "blocked");
@@ -1550,6 +2140,9 @@ mod tests {
                 census_row(wt, false, Some(false)),
             ],
             None,
+            &SessionDirectory::empty(),
+            None,
+            0,
         );
         assert_eq!(excluded, 1, "the canonical checkout must be filtered out");
         assert_eq!(items.len(), 1);
@@ -1696,7 +2289,7 @@ mod tests {
     fn cold_start_without_a_snapshot_is_pending_and_says_so() {
         // The endpoint must ALWAYS answer — and an empty list before the first
         // walk must read as "not known yet", never as "nothing to clean up".
-        let s = assemble_survey(None, None, None, None, true, None, chrono::Utc::now());
+        let s = assemble_survey(None, None, None, None, true, None, chrono::Utc::now(), &SessionDirectory::empty(), None, None);
         assert_eq!(s.census_status, CensusStatus::Pending);
         assert!(s.items.is_empty());
         assert_eq!(s.summary.reapable, 0);
@@ -1741,7 +2334,7 @@ mod tests {
         let now = chrono::Utc::now();
         let sample = volume_sample(chrono::Duration::seconds(30), now);
 
-        let s = assemble_survey(None, None, None, None, true, Some(&sample), now);
+        let s = assemble_survey(None, None, None, None, true, Some(&sample), now, &SessionDirectory::empty(), None, None);
 
         // The reclaim half is honestly unknown…
         assert_eq!(s.census_status, CensusStatus::Pending);
@@ -1765,7 +2358,7 @@ mod tests {
     #[test]
     fn an_unsampled_volume_reading_is_unknown_never_a_fabricated_zero() {
         let now = chrono::Utc::now();
-        let s = assemble_survey(None, None, None, None, false, None, now);
+        let s = assemble_survey(None, None, None, None, false, None, now, &SessionDirectory::empty(), None, None);
 
         assert_eq!(s.summary.volumes_status, CensusStatus::Pending);
         assert!(s.summary.volumes.is_empty());
@@ -1789,7 +2382,7 @@ mod tests {
     fn a_stale_volume_sample_is_flagged_and_still_shown() {
         let now = chrono::Utc::now();
         let sample = volume_sample(chrono::Duration::seconds(1_800), now);
-        let s = assemble_survey(None, None, None, None, false, Some(&sample), now);
+        let s = assemble_survey(None, None, None, None, false, Some(&sample), now, &SessionDirectory::empty(), None, None);
 
         assert_eq!(s.summary.volumes_status, CensusStatus::Stale);
         assert_eq!(
@@ -1827,6 +2420,9 @@ mod tests {
             false,
             Some(&fresh_volumes),
             now,
+            &SessionDirectory::empty(),
+            None,
+            None,
         );
         assert_eq!(s.census_status, CensusStatus::Stale);
         assert_eq!(s.census_age_secs, Some(7_200));
@@ -1844,7 +2440,7 @@ mod tests {
             now,
             chrono::Duration::seconds(120),
         );
-        let s = assemble_survey(Some(&fresh), None, None, None, false, None, now);
+        let s = assemble_survey(Some(&fresh), None, None, None, false, None, now, &SessionDirectory::empty(), None, None);
         assert_eq!(s.census_status, CensusStatus::Fresh);
         assert_eq!(s.census_age_secs, Some(120));
         assert!(s.census_note.contains("2m 0s ago"), "{}", s.census_note);
@@ -1855,7 +2451,7 @@ mod tests {
             now,
             chrono::Duration::seconds(1800),
         );
-        let s = assemble_survey(Some(&old), None, None, None, false, None, now);
+        let s = assemble_survey(Some(&old), None, None, None, false, None, now, &SessionDirectory::empty(), None, None);
         assert_eq!(s.census_status, CensusStatus::Stale);
         assert!(s.census_note.contains("stale"), "{}", s.census_note);
         // Stale data is still SHOWN — flagged, not hidden.
@@ -1907,6 +2503,7 @@ mod tests {
             attributable_bytes: 4096,
             junctioned_paths: Vec::new(),
             coord_reason: Some("worktree:lifecycle:pr_merged".to_string()),
+            ..unattributed_item_fields()
         };
         let outcome = execute_targets(vec![item], /* dry_run */ false);
         // …and the live re-check said NO.
@@ -1914,6 +2511,269 @@ mod tests {
         assert_eq!(outcome.skipped.len(), 1);
         assert_eq!(outcome.skipped[0].reason, "absent");
         assert!(!outcome.skipped[0].detail.is_empty(), "never a silent drop");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 — WIP custody attribution (plan
+    // `2026-08-22-wip-custody-rebuild-survivable-attribution`)
+    // -----------------------------------------------------------------------
+
+    const OWNER: &str = "aaaa1111-2222-3333-4444-555555555555";
+    const GHOST: &str = "gggg9999-0000-0000-0000-000000000000";
+
+    fn attributed_row(path: &str, session: &str, last_seen_epoch: i64) -> WorktreeCensus {
+        let mut w = census_row(path, /* dirty */ true, Some(false));
+        w.custody_session_id = Some(session.to_string());
+        w.custody_session_name = Some("from-record".to_string());
+        w.custody_last_seen = Some("2026-08-24T00:00:00Z".to_string());
+        w.custody_last_seen_epoch = Some(last_seen_epoch);
+        w.custody_wip_ref = Some(format!("refs/wip/{session}"));
+        w.custody_wip_commit = Some("9f2cdeadbeef".to_string());
+        w.custody_wip_state = Some("captured".to_string());
+        w.custody_plan_slug = Some("2026-08-22-wip-custody".to_string());
+        w
+    }
+
+    fn directory() -> SessionDirectory {
+        SessionDirectory::from_parts(&[(OWNER, "amber-otter")], &[OWNER], 5)
+    }
+
+    /// THE invariant: nothing renders blank. A worktree nothing can attribute
+    /// says so in words, matching coord's shipped `wip-owners` precedent.
+    #[test]
+    fn an_unattributable_worktree_renders_the_literal_unattributed_never_blank() {
+        let wt = "D:/qontinui-root/qontinui-runner-wt-anon";
+        let (items, _) = build_survey_items(
+            &[census_row(wt, true, Some(false))],
+            None,
+            &directory(),
+            None,
+            1_000,
+        );
+        assert_eq!(items[0].session_label, "unattributed");
+        assert!(!items[0].session_label.is_empty());
+        assert_eq!(items[0].attribution_source, "none");
+        assert_eq!(items[0].attribution_confidence, "none");
+        assert_eq!(items[0].owner_live, None, "unknowable, never fabricated");
+    }
+
+    /// The custody record is the primary source and it names the owner at the
+    /// exact surface the operator already looks at.
+    #[test]
+    fn the_custody_record_names_the_owner_on_the_survey_row() {
+        let wt = "D:/qontinui-root/qontinui-runner-wt-owned";
+        let (items, _) = build_survey_items(
+            &[attributed_row(wt, OWNER, 1_000)],
+            None,
+            &directory(),
+            None,
+            1_060,
+        );
+        let it = &items[0];
+        assert_eq!(it.attribution_source, "custody_record");
+        assert_eq!(it.attribution_confidence, "strong");
+        assert_eq!(it.session_id.as_deref(), Some(OWNER));
+        assert_eq!(it.session_name.as_deref(), Some("amber-otter"));
+        assert!(it.session_label.starts_with("amber-otter (session aaaa1111"));
+        assert_eq!(it.owner_live, Some(true));
+        assert_eq!(it.wip_state.as_deref(), Some("captured"));
+        assert_eq!(it.plan_slug.as_deref(), Some("2026-08-22-wip-custody"));
+        // Never `pid`: the record's pid is $PPID in bash's namespace.
+        assert_eq!(it.last_seen_age_secs, Some(60));
+    }
+
+    /// The weak fallback still raises coverage, but is LABELLED weak so it can
+    /// never be mistaken for the per-turn record.
+    #[test]
+    fn the_head_commit_trailer_attributes_weakly_and_says_so() {
+        let wt = "D:/qontinui-root/qontinui-runner-wt-trailer";
+        let mut w = census_row(wt, true, Some(false));
+        w.head_session_id = Some(OWNER.to_string());
+        let (items, _) = build_survey_items(&[w], None, &directory(), None, 1_000);
+        assert_eq!(items[0].attribution_source, "commit_trailer");
+        assert_eq!(items[0].attribution_confidence, "weak");
+        assert_eq!(
+            items[0].owner_live, None,
+            "a commit trailer says NOTHING about liveness"
+        );
+    }
+
+    /// A ghost is never attributed and never blank.
+    #[test]
+    fn a_ghost_session_renders_unresolvable_on_the_survey_row() {
+        let wt = "D:/qontinui-root/qontinui-runner-wt-ghost";
+        let (items, _) = build_survey_items(
+            &[attributed_row(wt, GHOST, 1_000)],
+            None,
+            &directory(),
+            None,
+            1_060,
+        );
+        assert_eq!(
+            items[0].session_label,
+            format!("session {GHOST} (unresolvable)")
+        );
+        assert!(items[0].session_unresolvable);
+        assert_eq!(items[0].session_name, None);
+        assert_eq!(items[0].config_dir, None, "no root ⇒ no resume line later");
+    }
+
+    /// The rate is reported against a NAMED predicate — the survey's own
+    /// population — because the plan's "594 operable worktrees" denominator is
+    /// not reproducible.
+    #[test]
+    fn the_summary_reports_the_attribution_rate_over_the_surveyed_population() {
+        let a = attributed_row("D:/qontinui-root/wt-a", OWNER, 1_000);
+        let b = census_row("D:/qontinui-root/wt-b", true, Some(false));
+        let c = census_row("D:/qontinui-root/wt-c", false, Some(false));
+        let (items, _) = build_survey_items(&[a, b, c], None, &directory(), None, 1_060);
+        let mut summary = SurveySummary::default();
+        summarize_attribution(&items, &mut summary);
+
+        assert_eq!(summary.surveyed, 3);
+        assert_eq!(summary.attributed, 1);
+        assert_eq!(summary.unattributed, 2);
+        assert_eq!(summary.attribution_rate, Some(1.0 / 3.0));
+        // The WIP denominator is the dirty subset — the population the plan is
+        // actually about.
+        assert_eq!(summary.wip_surveyed, 2);
+        assert_eq!(summary.wip_attributed, 1);
+        assert_eq!(summary.wip_attributed_by_custody, 1);
+        assert_eq!(summary.wip_attribution_rate, Some(0.5));
+    }
+
+    /// An empty population is UNKNOWN coverage, not 0%.
+    #[test]
+    fn an_empty_population_reports_rate_none_never_zero() {
+        let mut summary = SurveySummary::default();
+        summarize_attribution(&[], &mut summary);
+        assert_eq!(summary.attribution_rate, None);
+        assert_eq!(summary.wip_attribution_rate, None);
+    }
+
+    // ---- the orphan report --------------------------------------------------
+
+    fn survey_of(rows: Vec<WorktreeCensus>, dir: &SessionDirectory, now_epoch: i64) -> Survey {
+        let (items, _) = build_survey_items(&rows, None, dir, None, now_epoch);
+        let mut summary = SurveySummary {
+            session_roots_scanned: dir.roots_scanned(),
+            coord_ownership_reachable: false,
+            ..Default::default()
+        };
+        summarize_attribution(&items, &mut summary);
+        Survey {
+            device_id: None,
+            coord_reachable: false,
+            coord_error: None,
+            poller: reclaim::poller_health(),
+            remove_armed: false,
+            rejunction_armed: false,
+            canonical_excluded: 0,
+            items,
+            summary,
+            census_status: CensusStatus::Fresh,
+            census_taken_at: Some("2026-08-24T00:00:00Z".to_string()),
+            census_age_secs: Some(10),
+            census_build_ms: Some(1),
+            census_refreshing: false,
+            census_note: String::new(),
+        }
+    }
+
+    /// The predicate: dirty AND not-live AND (no record OR stale record). A
+    /// LIVE owner's dirty tree must stay out — that is the difference between
+    /// a triage list and a wall of noise.
+    #[test]
+    fn the_orphan_report_excludes_a_live_owner_and_includes_a_stale_one() {
+        let live = attributed_row("D:/qontinui-root/wt-live", OWNER, 10_000);
+        let stale = attributed_row("D:/qontinui-root/wt-stale", OWNER, 0);
+        let clean = census_row("D:/qontinui-root/wt-clean", false, Some(false));
+        let now = 10_060i64;
+        let s = survey_of(vec![live, stale, clean], &directory(), now);
+        let report = build_wip_orphans(&s, chrono::Utc::now());
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.wip_total, 2, "only the two dirty rows hold WIP");
+        assert_eq!(report.orphans.len(), 1);
+        let o = &report.orphans[0];
+        assert_eq!(o.worktree_path, "D:/qontinui-root/wt-stale");
+        assert_eq!(o.orphan_reason, "custody-stale");
+        assert!(o.custody_stale);
+        assert_eq!(o.owner_live, Some(false));
+        assert!(report.predicate.contains("is_dirty"));
+    }
+
+    /// A dirty worktree nobody owns is the population the whole plan exists
+    /// for, and it must be IN the report with a stated reason — not dropped
+    /// for lacking a session id.
+    #[test]
+    fn a_dirty_worktree_with_no_owner_is_reported_as_unattributed_wip() {
+        let wt = "D:/qontinui-root/wt-anon";
+        let s = survey_of(vec![census_row(wt, true, Some(false))], &directory(), 1_000);
+        let report = build_wip_orphans(&s, chrono::Utc::now());
+        assert_eq!(report.orphans.len(), 1);
+        let o = &report.orphans[0];
+        assert_eq!(o.orphan_reason, "unattributed-wip");
+        assert_eq!(o.session_label, "unattributed");
+        assert_eq!(o.resume_command, None, "nothing to resume — never a guess");
+        assert!(
+            o.wip_summary.contains("no custody record"),
+            "the summary must say the work is captured NOWHERE: {}",
+            o.wip_summary
+        );
+        assert!(o.inspect_command.contains("status --porcelain"));
+    }
+
+    /// The ready-to-run lines. The resume line MUST name the account root that
+    /// actually holds the transcript; a ghost gets NO line rather than a
+    /// wrong one.
+    #[test]
+    fn the_resume_line_names_the_resolving_account_root_and_a_ghost_gets_none() {
+        let owned = attributed_row("D:/qontinui-root/wt-owned", OWNER, 0);
+        let ghost = attributed_row("D:/qontinui-root/wt-ghost", GHOST, 0);
+        let s = survey_of(vec![owned, ghost], &directory(), 10_000);
+        let report = build_wip_orphans(&s, chrono::Utc::now());
+        assert_eq!(report.orphans.len(), 2);
+
+        let owned = report
+            .orphans
+            .iter()
+            .find(|o| o.worktree_path.ends_with("wt-owned"))
+            .unwrap();
+        let cmd = owned.resume_command.as_deref().unwrap();
+        assert!(cmd.contains("CLAUDE_CONFIG_DIR="), "{cmd}");
+        assert!(cmd.contains(OWNER), "{cmd}");
+        assert!(cmd.contains("D:/qontinui-root/wt-owned"), "{cmd}");
+        // And the WIP itself is recoverable from the Phase-2 snapshot.
+        assert_eq!(
+            owned.recover_wip_command.as_deref(),
+            Some("git -C \"D:/qontinui-root/wt-owned\" stash apply 9f2cdeadbeef")
+        );
+
+        let ghost = report
+            .orphans
+            .iter()
+            .find(|o| o.worktree_path.ends_with("wt-ghost"))
+            .unwrap();
+        assert_eq!(
+            ghost.resume_command, None,
+            "a resume under the wrong CLAUDE_CONFIG_DIR reads like 'session never existed'"
+        );
+        assert!(ghost.session_unresolvable);
+    }
+
+    /// A pending census is UNKNOWN, never "nothing is orphaned".
+    #[test]
+    fn a_pending_census_says_not_known_yet_rather_than_nothing_is_orphaned() {
+        let mut s = survey_of(Vec::new(), &directory(), 0);
+        s.census_status = CensusStatus::Pending;
+        let report = build_wip_orphans(&s, chrono::Utc::now());
+        assert!(report.orphans.is_empty());
+        assert!(
+            report.note.contains("not known yet"),
+            "the note must not imply an empty answer: {}",
+            report.note
+        );
     }
 
     #[test]

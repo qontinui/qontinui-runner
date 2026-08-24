@@ -59,6 +59,9 @@ use crate::worktree::run_git_command;
 
 pub mod canonical_paths;
 pub mod census;
+/// WIP custody — who owns the uncommitted work in a worktree (plan
+/// `2026-08-22-wip-custody-rebuild-survivable-attribution`, Phase 3).
+pub mod custody;
 pub mod dirty;
 pub mod disk_survey;
 pub mod edit_effect_loop;
