@@ -2182,13 +2182,20 @@ fn put_python_declared_deps(section: &mut Section, workspace_root: Option<&Path>
 
 /// The outcome of a bounded subprocess whose FULL stdout we need.
 ///
-/// [`version_of_within`] cannot serve here: it returns only the first line and
-/// collapses spawn failure, timeout and non-zero exit into one `None`. Half B
-/// needs all of stdout (a JSON document) AND needs those failures kept apart,
-/// because each is a different provenance answer and "could not measure" must
-/// never render as "measured, found nothing".
+/// [`version_of_within`] cannot serve here: it returns all of stdout's first
+/// line only, and Half B needs the whole document. Both need the failure modes
+/// kept apart, because each is a different provenance answer and "could not
+/// measure" must never render as "measured, found nothing".
+///
+/// Named `CaptureOutcome`, not `ProbeOutcome`: this module already has a
+/// [`ProbeOutcome`], the `--version` probe's three-way verdict, and the two are
+/// NOT the same quantity — that one distinguishes "unmeasured" from "absent"
+/// for a single version string, this one reports how a full-stdout capture
+/// ended. Sharing a name would make the pair unrepresentable in one module and,
+/// worse, invite a future reader to treat a `TimedOut` here as the same
+/// established fact the version probe earns with a confirming retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ProbeOutcome {
+enum CaptureOutcome {
     /// The process exited 0. Carries all of stdout.
     Ok(String),
     /// The process could not be started — the command is not on PATH.
@@ -2210,7 +2217,7 @@ enum ProbeOutcome {
 /// (`PIPE_BUFFER_CAPACITY` in std's `child_pipe.rs`; the same order on Linux):
 /// once the child fills it, the child blocks in `write`, never exits,
 /// `try_wait` never returns `Some`, and the budget expires. The probe then
-/// reports [`ProbeOutcome::TimedOut`] — a stall misreported as a slow
+/// reports [`CaptureOutcome::TimedOut`] — a stall misreported as a slow
 /// environment, and worst on the LARGE environments Half B most needs to
 /// measure. `version_of_within` escapes this only because a version string is
 /// bytes, not kilobytes.
@@ -2256,7 +2263,7 @@ fn run_bounded_capture(
     args: &[&str],
     cwd: Option<&Path>,
     budget: Duration,
-) -> ProbeOutcome {
+) -> CaptureOutcome {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::Instant;
@@ -2273,14 +2280,14 @@ fn run_bounded_capture(
         command.current_dir(dir);
     }
     let Ok(mut child) = command.spawn() else {
-        return ProbeOutcome::SpawnFailed;
+        return CaptureOutcome::SpawnFailed;
     };
     let Some(mut stdout) = child.stdout.take() else {
         // Cannot happen with `Stdio::piped()`, but reporting a failed
         // measurement is the only honest answer if it ever does.
         let _ = child.kill();
         let _ = child.wait();
-        return ProbeOutcome::NonZeroExit;
+        return CaptureOutcome::NonZeroExit;
     };
 
     // Drains CONCURRENTLY with the wait loop below — this is what keeps the
@@ -2303,23 +2310,23 @@ fn run_bounded_capture(
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    return ProbeOutcome::NonZeroExit;
+                    return CaptureOutcome::NonZeroExit;
                 }
                 // Bounded even on the success path: a fast-exiting shim whose
                 // grandchild still holds the pipe is the classic shape, and it
                 // reaches HERE, not the timeout arm.
                 return match rx.recv_timeout(remaining(deadline)) {
-                    Ok(out) => ProbeOutcome::Ok(out),
+                    Ok(out) => CaptureOutcome::Ok(out),
                     // Exited cleanly but its output never arrived in budget.
                     // No measurement was obtained, so say so.
-                    Err(_) => ProbeOutcome::TimedOut,
+                    Err(_) => CaptureOutcome::TimedOut,
                 };
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return ProbeOutcome::TimedOut;
+                    return CaptureOutcome::TimedOut;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -2328,7 +2335,7 @@ fn run_bounded_capture(
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return ProbeOutcome::NonZeroExit;
+                return CaptureOutcome::NonZeroExit;
             }
         }
     }
@@ -2563,12 +2570,12 @@ fn python_package_set_digest(packages: &[(String, String)]) -> String {
 
 /// Turn a probe outcome into an inventory. Pure, so every rung — including all
 /// the unmeasurable ones — is testable without spawning anything.
-fn inventory_from_outcome(outcome: ProbeOutcome) -> PythonInventory {
+fn inventory_from_outcome(outcome: CaptureOutcome) -> PythonInventory {
     match outcome {
-        ProbeOutcome::SpawnFailed => PythonInventory::nothing(PythonInventoryProbe::PythonAbsent),
-        ProbeOutcome::NonZeroExit => PythonInventory::nothing(PythonInventoryProbe::ProbeFailed),
-        ProbeOutcome::TimedOut => PythonInventory::nothing(PythonInventoryProbe::ProbeTimeout),
-        ProbeOutcome::Ok(stdout) => parse_inventory_json(&stdout)
+        CaptureOutcome::SpawnFailed => PythonInventory::nothing(PythonInventoryProbe::PythonAbsent),
+        CaptureOutcome::NonZeroExit => PythonInventory::nothing(PythonInventoryProbe::ProbeFailed),
+        CaptureOutcome::TimedOut => PythonInventory::nothing(PythonInventoryProbe::ProbeTimeout),
+        CaptureOutcome::Ok(stdout) => parse_inventory_json(&stdout)
             .unwrap_or_else(|| PythonInventory::nothing(PythonInventoryProbe::UnparseableOutput)),
     }
 }
@@ -4187,7 +4194,7 @@ dependencies = [
     fn installed_inventory_digests_the_whole_environment_at_fixed_cost() {
         let doc = r#"{"venv": false, "py": "3.12", "packages":
             {"requests": "2.32.3", "Pillow": "12.1.0", "fastapi": "0.136.2"}}"#;
-        let inventory = inventory_from_outcome(ProbeOutcome::Ok(doc.to_string()));
+        let inventory = inventory_from_outcome(CaptureOutcome::Ok(doc.to_string()));
         assert_eq!(inventory.probe, PythonInventoryProbe::Measured);
         assert_eq!(inventory.env_kind, PythonEnvKind::NotVenv);
         let (digest, count) = inventory.measured.clone().expect("a parsed doc measures");
@@ -4199,7 +4206,7 @@ dependencies = [
         let reordered = r#"{"venv": false, "py": "3.12", "packages":
             {"fastapi": "0.136.2", "pillow": "12.1.0", "requests": "2.32.3"}}"#;
         assert_eq!(
-            inventory_from_outcome(ProbeOutcome::Ok(reordered.to_string())).measured,
+            inventory_from_outcome(CaptureOutcome::Ok(reordered.to_string())).measured,
             inventory.measured,
             "case + order differences are not environment differences"
         );
@@ -4207,7 +4214,7 @@ dependencies = [
         // ONE package at a different version moves it — the exit condition.
         let bumped = doc.replace("2.32.3", "2.32.4");
         assert_ne!(
-            inventory_from_outcome(ProbeOutcome::Ok(bumped)).measured,
+            inventory_from_outcome(CaptureOutcome::Ok(bumped)).measured,
             inventory.measured,
             "a differing installed package must not read as clean"
         );
@@ -4216,7 +4223,7 @@ dependencies = [
             {"requests": "2.32.3", "Pillow": "12.1.0", "fastapi": "0.136.2",
              "numpy": "2.3.0"}}"#;
         assert_ne!(
-            inventory_from_outcome(ProbeOutcome::Ok(extra.to_string())).measured,
+            inventory_from_outcome(CaptureOutcome::Ok(extra.to_string())).measured,
             inventory.measured,
         );
 
@@ -4243,10 +4250,10 @@ dependencies = [
     /// never `system` — when nothing was measured.
     #[test]
     fn env_kind_gates_digest_comparability_and_is_never_assumed() {
-        let venv = inventory_from_outcome(ProbeOutcome::Ok(
+        let venv = inventory_from_outcome(CaptureOutcome::Ok(
             r#"{"venv": true, "py": "3.12", "packages": {"fastapi": "0.136.2"}}"#.to_string(),
         ));
-        let system = inventory_from_outcome(ProbeOutcome::Ok(
+        let system = inventory_from_outcome(CaptureOutcome::Ok(
             r#"{"venv": false, "py": "3.12", "packages": {"fastapi": "0.136.2"}}"#.to_string(),
         ));
         assert_eq!(venv.env_kind, PythonEnvKind::Venv);
@@ -4264,7 +4271,7 @@ dependencies = [
             r#"{"venv": false, "packages": {"fastapi": "0.136.2"}}"#,
         ] {
             assert_eq!(
-                inventory_from_outcome(ProbeOutcome::Ok(missing.to_string())).probe,
+                inventory_from_outcome(CaptureOutcome::Ok(missing.to_string())).probe,
                 PythonInventoryProbe::UnparseableOutput,
                 "for {missing}",
             );
@@ -4275,7 +4282,7 @@ dependencies = [
         // version is the second half of the gate, and it comes from the same
         // invocation so it cannot disagree with the digest it labels.
         assert_eq!(venv.interpreter.as_deref(), Some("3.12"));
-        let other_minor = inventory_from_outcome(ProbeOutcome::Ok(
+        let other_minor = inventory_from_outcome(CaptureOutcome::Ok(
             r#"{"venv": false, "py": "3.13", "packages": {"fastapi": "0.136.2"}}"#.to_string(),
         ));
         assert_eq!(other_minor.env_kind, system.env_kind);
@@ -4286,16 +4293,16 @@ dependencies = [
         );
 
         // Nothing measured => no interpreter claim at all.
-        assert!(inventory_from_outcome(ProbeOutcome::SpawnFailed)
+        assert!(inventory_from_outcome(CaptureOutcome::SpawnFailed)
             .interpreter
             .is_none());
 
         // Nothing measured => `unknown`, on every unmeasurable rung.
         for outcome in [
-            ProbeOutcome::SpawnFailed,
-            ProbeOutcome::NonZeroExit,
-            ProbeOutcome::TimedOut,
-            ProbeOutcome::Ok("not json".to_string()),
+            CaptureOutcome::SpawnFailed,
+            CaptureOutcome::NonZeroExit,
+            CaptureOutcome::TimedOut,
+            CaptureOutcome::Ok("not json".to_string()),
         ] {
             assert_eq!(
                 inventory_from_outcome(outcome.clone()).env_kind,
@@ -4321,7 +4328,7 @@ dependencies = [
     fn unmeasurable_environment_is_distinguishable_from_a_measured_empty_one() {
         // Measured, empty: the probe names the method, the count STATES zero,
         // and a digest (of the empty set) exists.
-        let measured = inventory_from_outcome(ProbeOutcome::Ok(
+        let measured = inventory_from_outcome(CaptureOutcome::Ok(
             r#"{"venv":false,"py":"3.12","packages":{}}"#.to_string(),
         ));
         assert_eq!(measured.probe, PythonInventoryProbe::Measured);
@@ -4333,19 +4340,22 @@ dependencies = [
         // digest — so it can never be misread as zero packages.
         for (outcome, expected) in [
             (
-                ProbeOutcome::SpawnFailed,
+                CaptureOutcome::SpawnFailed,
                 PythonInventoryProbe::PythonAbsent,
             ),
-            (ProbeOutcome::NonZeroExit, PythonInventoryProbe::ProbeFailed),
-            (ProbeOutcome::TimedOut, PythonInventoryProbe::ProbeTimeout),
+            (
+                CaptureOutcome::NonZeroExit,
+                PythonInventoryProbe::ProbeFailed,
+            ),
+            (CaptureOutcome::TimedOut, PythonInventoryProbe::ProbeTimeout),
             // Exited 0, but the output is not the contract we can read. A
             // changed interpreter script, NOT an empty environment.
             (
-                ProbeOutcome::Ok("Package  Version\n-------  -------".to_string()),
+                CaptureOutcome::Ok("Package  Version\n-------  -------".to_string()),
                 PythonInventoryProbe::UnparseableOutput,
             ),
             (
-                ProbeOutcome::Ok("[\"not\", \"an object\"]".to_string()),
+                CaptureOutcome::Ok("[\"not\", \"an object\"]".to_string()),
                 PythonInventoryProbe::UnparseableOutput,
             ),
         ] {
@@ -4416,7 +4426,7 @@ dependencies = [
         let _ = std::fs::remove_dir_all(&dir);
 
         match outcome {
-            ProbeOutcome::Ok(out) => assert!(
+            CaptureOutcome::Ok(out) => assert!(
                 out.len() >= 200_000,
                 "stdout was truncated: got {} bytes, expected the whole payload",
                 out.len()
@@ -4487,7 +4497,9 @@ dependencies = [
     /// and writing Half B's three keys unconditionally.
     #[test]
     fn collect_versions_always_publishes_both_provenance_keys() {
-        let section = collect_versions();
+        // `collect_versions` now returns a `VersionsCapture`; this test asserts
+        // over the section half only — the unknown set is covered separately.
+        let section = collect_versions().section;
 
         let source = section
             .get(PYTHON_DEP_SOURCE_KEY)
@@ -5021,12 +5033,27 @@ dependencies = [
             return;
         }
 
-        // The precondition that makes this the real shape: the LINK itself
-        // reports 0 bytes, which is exactly what the old check condemned.
+        // The precondition that makes this the real shape: on NTFS the LINK
+        // itself reports 0 bytes, which is exactly what the old check condemned.
+        //
+        // It is a WINDOWS fact, not a universal one: a POSIX symlink's
+        // `symlink_metadata().len()` is the length of the stored target string
+        // (10 here, for `rustup.exe`), so asserting 0 unconditionally fails on
+        // Linux and says nothing about the classifier. What both platforms DO
+        // share is that the link is a link — `file_shape` maps that to
+        // `FollowLink` on either OS — so that is what is asserted off Windows,
+        // and the behavioural assertion below stays common to both.
+        let link_md = std::fs::symlink_metadata(&link).unwrap();
+        #[cfg(windows)]
         assert_eq!(
-            std::fs::symlink_metadata(&link).unwrap().len(),
+            link_md.len(),
             0,
-            "precondition: a symlink is a 0-byte reparse point"
+            "precondition: on NTFS a symlink is a 0-byte reparse point"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            link_md.file_type().is_symlink(),
+            "precondition: the link must be a symlink"
         );
         assert!(
             !is_non_executable_stub(&link),
