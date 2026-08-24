@@ -93,6 +93,10 @@ use uuid::Uuid;
 use qontinui_runner_lib::profiles::connected_coord_base;
 
 use super::canonical_paths::default_canonical_path;
+// The trunk resolver used to live here, private. It now backs four call sites
+// across the binary (this census, the reclaim-safety probe, the fleet tree
+// publisher, the build-drift baseline), so it lives in one module instead.
+use crate::git_trunk::resolve_trunk_ref;
 
 /// Default census cadence — 300s (5 min). The census is a heavy-ish
 /// walk (it stats every real file in `node_modules`/`target`), so it
@@ -1773,70 +1777,6 @@ fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Resolve the repo's trunk remote-tracking ref for `worktree` — e.g.
-/// `origin/main`, `origin/master`.
-///
-/// The census used to hardcode `origin/main`. For a repo whose trunk is
-/// `master` that gate could never pass, so [`compute_landed_in_main`]
-/// returned `None` for every worktree of that repo *for the worktree's whole
-/// life* — not transiently — and coord's G2 read every one of them as
-/// not-landed. Measured 2026-08-19 on this fleet: five governed
-/// (`qontinui-*`) repos have a non-`main` trunk, so the blast radius was
-/// never hypothetical.
-///
-/// Resolution order:
-///
-/// 1. `refs/remotes/origin/HEAD` — the symbolic ref `git clone` writes,
-///    pointing at the remote's default branch. It lives in the `.git`
-///    COMMON dir, so every linked worktree of a repo sees it; `git worktree
-///    add` cannot leave it unset (verified across five real worktrees,
-///    2026-08-19).
-/// 2. `origin/main` — the historical behaviour, kept as the fallback for a
-///    clone whose `origin/HEAD` was never written.
-/// 3. `None` — genuinely unresolvable.
-///
-/// **Every rung is verified with `rev-parse` before it is returned.** That
-/// matters most for rung 1: `origin/HEAD` is written at clone time and is
-/// NOT auto-refreshed when the remote's default branch changes (`git remote
-/// set-head origin -a` is the refresh). A stale-but-present `origin/HEAD`
-/// would otherwise resolve to a *wrong* trunk, which is worse than an honest
-/// `None` — a wrong trunk can answer `Some(true)` and let a worktree be
-/// reclaimed. Present-and-unresolvable therefore falls through to rung 2
-/// rather than being trusted.
-///
-/// There is deliberately NO "configured trunk" rung: nothing in this repo
-/// writes such a key, and an unread config would be a rung that silently
-/// always misses while reading like coverage.
-fn resolve_trunk_ref(worktree: &Path) -> Option<String> {
-    // (1) origin/HEAD — the remote's declared default branch.
-    if let Some(head) = git_capture(
-        worktree,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    ) {
-        let head = head.trim();
-        // Verify it actually resolves: a stale origin/HEAD naming a deleted
-        // branch must NOT be trusted as the trunk.
-        if !head.is_empty()
-            && git_capture(worktree, &["rev-parse", "--verify", "--quiet", head]).is_some()
-        {
-            return Some(head.to_string());
-        }
-    }
-
-    // (2) The historical default, still verified before use.
-    if git_capture(
-        worktree,
-        &["rev-parse", "--verify", "--quiet", "origin/main"],
-    )
-    .is_some()
-    {
-        return Some("origin/main".to_string());
-    }
-
-    // (3) Honest unknown.
-    None
 }
 
 /// Refresh a repo's trunk remote-tracking ref, once per census tick.

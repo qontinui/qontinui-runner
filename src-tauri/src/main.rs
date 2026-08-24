@@ -115,6 +115,10 @@ mod git_status_subset;
 // and routes them into a bounded in-process ring buffer + Tauri event
 // channel for the frontend supervision hook.
 mod git_supervision;
+// The single resolver for "which branch does this repo land on" — shared by
+// the worktree census, the reclaim-safety probe, the fleet tree publisher and
+// the build-drift baseline, none of which may assume `origin/main`.
+mod git_trunk;
 // D4+D6 Blind-Spot Recommender (Phase 2): proactive enumeration of regions
 // no live observer's scope covers, ranked by information value.
 mod blind_spots;

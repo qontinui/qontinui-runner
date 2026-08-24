@@ -1986,8 +1986,13 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // `COORD_TREE_FETCH_INTERVAL_SECS` (see `publish_tree_state`). On a
     // no-manual-coding machine that explicit fetch is what keeps these
     // behind-counts honest.
+    // Detached: there is no upstream branch to compare against, so fall back
+    // to the repo's own trunk — resolved, not assumed to be `origin/main`.
+    // On the five governed `master`-trunk repos the old literal named a ref
+    // that does not exist, so `rev-list` failed and `behind_count` collapsed
+    // to `None` for every detached capture.
     let remote_ref = if head_detached.unwrap_or(false) || branch == "(detached)" {
-        "origin/main".to_string()
+        format!("origin/{}", resolve_default_branch(repo_path))
     } else {
         format!("origin/{branch}")
     };
@@ -2043,27 +2048,9 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // when the operator is sitting on a feature branch). Resolve the
     // default branch from `origin/HEAD` (e.g. `origin/main` -> `main`),
     // falling back to `main`. No network fetch — uses last-fetched refs,
-    // same posture as `behind_count` above.
-    let default_branch = crate::process_helpers::no_window("git")
-        .args([
-            "-C",
-            repo_path.to_str()?,
-            "symbolic-ref",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                // `origin/main` -> `main`
-                s.strip_prefix("origin/").map(|b| b.to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "main".to_string());
+    // same posture as `behind_count` above. This used to be an inlined
+    // duplicate of `resolve_default_branch`; both now share one resolver.
+    let default_branch = resolve_default_branch(repo_path);
     let local_ahead: Option<i32> = crate::process_helpers::no_window("git")
         .args([
             "-C",
@@ -2279,26 +2266,20 @@ fn fetch_remote_refs_blocking(repo_path: &std::path::Path) {
 
 /// Resolve a repo's default branch from `origin/HEAD` (`origin/main` -> `main`),
 /// falling back to `main`. No network — uses the last-fetched symbolic ref.
+///
+/// Delegates to [`crate::git_trunk::resolve_trunk_branch`], which additionally
+/// `rev-parse`-verifies each rung. That closes a real hole this function used
+/// to have: `origin/HEAD` is written at clone time and never auto-refreshed,
+/// so a stale one naming a deleted branch was returned verbatim and every
+/// caller below then compared against a ref that does not exist — silently
+/// producing `Err` (`check_if_behind`) or a refusal (`pull_and_update_app`)
+/// that read like a verdict about the tree.
+///
+/// The `main` guess stays HERE rather than inside the resolver: these callers
+/// need *some* branch name, and a visible `unwrap_or_else` at the call site is
+/// how that guess stays auditable.
 fn resolve_default_branch(repo_path: &std::path::Path) -> String {
-    crate::process_helpers::no_window("git")
-        .args([
-            "-C",
-            repo_path.to_str().unwrap_or("."),
-            "symbolic-ref",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                s.strip_prefix("origin/").map(|b| b.to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "main".to_string())
+    crate::git_trunk::resolve_trunk_branch(repo_path).unwrap_or_else(|| "main".to_string())
 }
 
 /// The outcome the executor reports back to coord's flywheel + logs.

@@ -30,7 +30,7 @@
 //! | Guard | Owner | Fact | `reason` |
 //! |---|---|---|---|
 //! | **G1** dirty | coord (inviolable) **+** runner re-check | uncommitted WIP | `dirty` |
-//! | **G2** not landed | coord | HEAD not on `origin/main`, PR unmerged | `not-landed` |
+//! | **G2** not landed | coord | HEAD not on the repo's trunk, PR unmerged | `not-landed` |
 //! | **G3** session-live | coord | another live claim/session on the path | `session-live` |
 //! | **G4** main-merge | coord | active `MainMerge` claim on the repo | `main-merge` |
 //! | **G5** grace | coord | per-signal grace not elapsed | `grace` |
@@ -96,7 +96,9 @@ pub enum SkipReason {
     /// **G6** — a build is in flight (runner-local: held `.cargo-lock`, or
     /// `target`/`node_modules`/root touched inside the activity window).
     Building,
-    /// **G2** — the work has not landed on `origin/main` (and no merged PR).
+    /// **G2** — the work has not landed on the repo's trunk (and no merged
+    /// PR). The trunk is whatever `census::compute_landed_in_main` resolved
+    /// for that repo, which is not necessarily `main`.
     NotLanded,
     /// **G4** — an active `MainMerge` claim is mid-op on this repo.
     MainMerge,
@@ -151,7 +153,7 @@ impl SkipReason {
             SkipReason::Building => {
                 "A build is in flight here (G6) — cargo lock held or recent activity."
             }
-            SkipReason::NotLanded => "The work has not landed on origin/main yet (G2).",
+            SkipReason::NotLanded => "The work has not landed on the repo's trunk yet (G2).",
             SkipReason::MainMerge => "A main-merge is mid-flight on this repo (G4).",
             SkipReason::Grace => "Still inside the reclaim grace window (G5).",
             SkipReason::NotACandidate => {

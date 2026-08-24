@@ -290,28 +290,54 @@ fn probe_git_branch_state(args: &Value) -> ProbeResultBody {
         Some(b) => git_read(&wt, &["rev-parse", "--verify", &format!("refs/heads/{b}")]).is_some(),
         None => head_sha.is_some(),
     };
-    // ahead/behind vs the upstream base (origin/main), read-only.
-    let (ahead, behind) = git_read(
-        &wt,
-        &["rev-list", "--count", "--left-right", "origin/main...HEAD"],
-    )
-    .and_then(|s| {
-        let mut it = s.split_whitespace();
-        let behind = it.next()?.parse::<i64>().ok()?;
-        let ahead = it.next()?.parse::<i64>().ok()?;
-        Some((Some(ahead), Some(behind)))
-    })
-    .unwrap_or((None, None));
-    // Unpushed = local commits not on origin/main (the PR-6 reclaim SAFETY
+    // The upstream base is the repo's OWN trunk, resolved — never assumed to
+    // be `origin/main`. Hardcoding it here made both counts and the safety
+    // predicate below unanswerable, permanently, for every worktree of a
+    // non-`main`-trunk repo: five governed `qontinui-*` repos on this fleet
+    // (measured 2026-08-19). Same defect, same shape and same `git cherry`
+    // call as the one `census::compute_landed_in_main` carried until
+    // `26346e439`; its plan recorded this site as the closest match.
+    //
+    // `resolve_trunk_ref` runs only [`crate::git_trunk::TRUNK_GIT_SUBCOMMANDS`],
+    // which `trunk_subcommands_are_read_only` pins inside [`READ_ONLY_GIT`] —
+    // so reaching past `git_read` here does not widen what a probe may run.
+    let trunk = crate::git_trunk::resolve_trunk_ref(&wt);
+
+    // ahead/behind vs the trunk, read-only.
+    let (ahead, behind) = trunk
+        .as_deref()
+        .and_then(|t| {
+            git_read(
+                &wt,
+                &[
+                    "rev-list",
+                    "--count",
+                    "--left-right",
+                    &format!("{t}...HEAD"),
+                ],
+            )
+        })
+        .and_then(|s| {
+            let mut it = s.split_whitespace();
+            let behind = it.next()?.parse::<i64>().ok()?;
+            let ahead = it.next()?.parse::<i64>().ok()?;
+            Some((Some(ahead), Some(behind)))
+        })
+        .unwrap_or((None, None));
+    // Unpushed = local commits not on the trunk (the PR-6 reclaim SAFETY
     // predicate). `git cherry` lists `+` for unpushed; count them.
-    let has_unpushed = git_read(&wt, &["cherry", "origin/main"])
+    let has_unpushed = trunk
+        .as_deref()
+        .and_then(|t| git_read(&wt, &["cherry", t]))
         .map(|s| s.lines().any(|l| l.trim_start().starts_with('+')));
     ProbeResultBody {
         branch_exists: Some(branch_exists),
         head_sha,
         ahead,
         behind,
-        // `cherry` failing (no origin/main) → fall back to ahead>0.
+        // `cherry` failing (unresolvable trunk) → fall back to ahead>0, and
+        // when that is unknown too, stay `None`. A safety predicate must
+        // report "cannot tell" rather than the reclaim-permitting `false`.
         has_unpushed: has_unpushed.or_else(|| ahead.map(|a| a > 0)),
         ..Default::default()
     }
@@ -564,5 +590,24 @@ mod tests {
         // A typed-error result mutates nothing and carries no evidence.
         assert!(r.process_alive.is_none());
         assert!(r.present.is_none());
+    }
+
+    /// `probe_git_branch_state` resolves the trunk through
+    /// [`crate::git_trunk`], which runs git OUTSIDE this module's
+    /// [`READ_ONLY_GIT`] gate. The module's contract is that a probe never
+    /// writes, so every subcommand the resolver can run must be one this
+    /// allowlist already permits. Pin that containment here: adding a rung
+    /// over there which runs, say, `fetch` would otherwise silently break
+    /// the guarantee the module header states.
+    #[test]
+    fn trunk_subcommands_are_read_only() {
+        for sub in crate::git_trunk::TRUNK_GIT_SUBCOMMANDS {
+            assert!(
+                READ_ONLY_GIT.contains(sub),
+                "git_trunk runs `git {sub}`, which is not in READ_ONLY_GIT — \
+                 either it is read-only and belongs in the allowlist, or the \
+                 resolver may no longer be called from a probe"
+            );
+        }
     }
 }

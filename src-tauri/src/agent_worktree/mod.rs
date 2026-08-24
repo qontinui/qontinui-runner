@@ -719,21 +719,22 @@ pub fn remote_agent_ref(branch: &str) -> String {
 }
 
 /// Resolve a repo's local default branch from `origin/HEAD`, falling back
-/// to `main`. Mirrors `fleet::resolve_default_branch` (kept local — the
-/// allocation path must not cross-module-import fleet internals). Reads
-/// `git -C <canonical> symbolic-ref --short refs/remotes/origin/HEAD` and
-/// strips the `origin/` prefix.
+/// to `main`.
+///
+/// This was a third hand-rolled copy of the same `origin/HEAD` read, kept
+/// local because importing `fleet::resolve_default_branch` would have pulled
+/// the allocation path into fleet internals. [`crate::git_trunk`] is not
+/// fleet internals — it is a leaf module with no dependency of its own — so
+/// that reason no longer holds and all the copies now share one resolver.
+///
+/// The shared resolver additionally `rev-parse`-verifies the ref, which
+/// matters more here than anywhere else: [`resolve_origin_default_sha`] turns
+/// this branch name into the **parent SHA a new worktree is forked from**, so
+/// a stale `origin/HEAD` naming a deleted branch used to fail the allocation
+/// outright. It now falls through to `origin/main` and only guesses `main`
+/// when nothing at all resolves.
 fn resolve_local_default_branch(canonical: &Path) -> String {
-    run_git_command(
-        canonical,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    )
-    .ok()
-    .and_then(|s| {
-        let s = s.trim();
-        s.strip_prefix("origin/").map(|b| b.to_string())
-    })
-    .unwrap_or_else(|| "main".to_string())
+    crate::git_trunk::resolve_trunk_branch(canonical).unwrap_or_else(|| "main".to_string())
 }
 
 /// Resolve the local `origin/<default>` SHA for `canonical` — the base used
