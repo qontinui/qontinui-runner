@@ -83,6 +83,7 @@
 use postgresql_embedded::{PostgreSQL, Settings};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -90,6 +91,109 @@ use std::time::Duration;
 /// dropped early (which would stop the server); stopped explicitly on exit via
 /// [`stop_on_exit`].
 static MANAGED_PG: OnceLock<Mutex<Option<PgHandle>>> = OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// Which database arm this process actually took
+// ---------------------------------------------------------------------------
+
+/// Which of `main.rs`'s mutually exclusive database arms this process ended up
+/// on. Recorded so `/health` can answer *which* database this process is on,
+/// not merely whether one answers.
+///
+/// This exists because the arm is otherwise unobservable from outside the
+/// process. `/health` reported a bare `database.reachable`, which is `true` for
+/// an external docker-compose Postgres, for an embedded cluster this process
+/// started, and for one it attached to alike — three states with completely
+/// different blast radii. Notably it is what makes the attach path *checkable*:
+/// "a second runner attached to the primary's cluster instead of degrading" is
+/// a claim about which arm was taken, and log-scraping was previously the only
+/// way to establish it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DbArm {
+    /// Nothing has been resolved yet (boot has not reached the PG arm).
+    Unknown,
+    /// A PostgreSQL reachable at the profile-resolved URL — a developer's
+    /// docker-compose cluster, or an explicitly configured one.
+    External,
+    /// A bundled cluster this process ran `initdb`/`pg_ctl start` for. This
+    /// process stops it at exit.
+    EmbeddedOwned,
+    /// A bundled cluster another runner process on this machine already had
+    /// running, joined over TCP. This process must never stop it.
+    EmbeddedAttached,
+    /// No database. DB-backed routes serve 503.
+    Degraded,
+}
+
+impl DbArm {
+    /// Stable wire name for `/health`. Kebab-case so the embedded pair reads as
+    /// one family; parsed by tests and by the P1 verification procedure.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DbArm::Unknown => "unknown",
+            DbArm::External => "external",
+            DbArm::EmbeddedOwned => "embedded-owned",
+            DbArm::EmbeddedAttached => "embedded-attached",
+            DbArm::Degraded => "degraded",
+        }
+    }
+
+    fn from_code(code: u8) -> DbArm {
+        match code {
+            1 => DbArm::External,
+            2 => DbArm::EmbeddedOwned,
+            3 => DbArm::EmbeddedAttached,
+            4 => DbArm::Degraded,
+            _ => DbArm::Unknown,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            DbArm::Unknown => 0,
+            DbArm::External => 1,
+            DbArm::EmbeddedOwned => 2,
+            DbArm::EmbeddedAttached => 3,
+            DbArm::Degraded => 4,
+        }
+    }
+}
+
+/// Atomic rather than a `Mutex`: `/health` reads this on every request and must
+/// never be able to block on a lock held by the boot path.
+static DB_ARM: AtomicU8 = AtomicU8::new(0);
+
+/// The embedded cluster's loopback port, or 0 when this process is not on an
+/// embedded arm. Reported beside [`DbArm`] so two runners on one machine can be
+/// shown to be talking to the *same* cluster, which is the whole claim the
+/// attach path makes.
+static EMBEDDED_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// Record which database arm this process took. Called from `main.rs` for the
+/// external and degraded arms; the two embedded arms are set by
+/// [`store_handle`] from the handle itself, so they cannot drift from the
+/// ownership the rest of this module enforces.
+pub fn set_db_arm(arm: DbArm) {
+    DB_ARM.store(arm.code(), Ordering::Relaxed);
+    if !matches!(arm, DbArm::EmbeddedOwned | DbArm::EmbeddedAttached) {
+        EMBEDDED_PORT.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Which database arm this process took. [`DbArm::Unknown`] before the boot
+/// path reaches the PG block.
+pub fn db_arm() -> DbArm {
+    DbArm::from_code(DB_ARM.load(Ordering::Relaxed))
+}
+
+/// The embedded cluster's loopback port, or `None` when this process is not on
+/// an embedded arm.
+pub fn embedded_port() -> Option<u16> {
+    match EMBEDDED_PORT.load(Ordering::Relaxed) {
+        0 => None,
+        port => Some(port),
+    }
+}
 
 /// How long to wait for a TCP connection to a candidate already-running cluster
 /// before deciding it is not actually reachable and provisioning instead.
@@ -122,6 +226,26 @@ impl PgHandle {
     /// must not stop).
     pub fn is_attached(&self) -> bool {
         matches!(self, PgHandle::Attached { .. })
+    }
+
+    /// The loopback port the cluster behind this handle is listening on.
+    ///
+    /// For [`PgHandle::Owned`] this reads back the `Settings` the handle was
+    /// built from rather than a separately-tracked copy, so it cannot drift
+    /// from the port `start()` actually used.
+    pub fn port(&self) -> u16 {
+        match self {
+            PgHandle::Owned(pg) => pg.settings().port,
+            PgHandle::Attached { port } => *port,
+        }
+    }
+
+    /// The [`DbArm`] this handle represents.
+    pub fn arm(&self) -> DbArm {
+        match self {
+            PgHandle::Owned(_) => DbArm::EmbeddedOwned,
+            PgHandle::Attached { .. } => DbArm::EmbeddedAttached,
+        }
     }
 }
 
@@ -806,6 +930,11 @@ pub fn store_handle(handle: PgHandle) {
              server at exit"
         );
     }
+    // Derive the reported arm from the handle rather than letting the caller
+    // pass one: the Owned/Attached distinction is the ownership invariant this
+    // module enforces, and `/health` must not be able to disagree with it.
+    EMBEDDED_PORT.store(handle.port(), Ordering::Relaxed);
+    DB_ARM.store(handle.arm().code(), Ordering::Relaxed);
     let slot = MANAGED_PG.get_or_init(|| Mutex::new(None));
     if let Ok(mut guard) = slot.lock() {
         *guard = Some(handle);
@@ -1190,6 +1319,19 @@ mod tests {
             "the attached URL must name the same port/password/database as the owner's"
         );
 
+        // The two handles must also AGREE about which cluster they are on --
+        // this is exactly what `/health` reports as `database.embeddedPort`,
+        // and the whole claim of the attach path is that there is ONE cluster.
+        // `Owned::port()` reads back the started `Settings`, so a postmaster
+        // that ended up on a different port than we asked for would show here.
+        assert_eq!(owner.handle.arm(), DbArm::EmbeddedOwned);
+        assert_eq!(joiner.handle.arm(), DbArm::EmbeddedAttached);
+        assert_eq!(
+            joiner.handle.port(),
+            owner.handle.port(),
+            "attach means one cluster: both handles must name the same port"
+        );
+
         // The attached URL really works.
         let (client, conn) = connect_test_client(&joiner.url).await;
         let one: i32 = client
@@ -1288,5 +1430,80 @@ mod tests {
         let _ = std::fs::write(&pid_path, original);
         stop(peer.handle).await;
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -- the /health arm observable -------------------------------------
+
+    #[test]
+    fn db_arm_wire_names_round_trip() {
+        for arm in [
+            DbArm::Unknown,
+            DbArm::External,
+            DbArm::EmbeddedOwned,
+            DbArm::EmbeddedAttached,
+            DbArm::Degraded,
+        ] {
+            assert_eq!(
+                DbArm::from_code(arm.code()),
+                arm,
+                "{} must survive the atomic round-trip",
+                arm.as_str()
+            );
+        }
+        // The wire names are read by the P1 verification procedure and by
+        // anything watching /health; pin them rather than letting a rename
+        // silently break a caller.
+        assert_eq!(DbArm::External.as_str(), "external");
+        assert_eq!(DbArm::EmbeddedOwned.as_str(), "embedded-owned");
+        assert_eq!(DbArm::EmbeddedAttached.as_str(), "embedded-attached");
+        assert_eq!(DbArm::Degraded.as_str(), "degraded");
+        assert_eq!(DbArm::Unknown.as_str(), "unknown");
+    }
+
+    /// An out-of-range byte must read as `Unknown`, not panic or alias a real
+    /// arm: the atomic is the only thing between `/health` and a torn value.
+    #[test]
+    fn unknown_arm_code_reads_as_unknown() {
+        assert_eq!(DbArm::from_code(9), DbArm::Unknown);
+        assert_eq!(DbArm::from_code(u8::MAX), DbArm::Unknown);
+    }
+
+    /// Leaving an embedded arm must clear the port. Otherwise a runner that
+    /// booted embedded and then degraded would keep advertising a port it can
+    /// no longer reach, which is worse than reporting nothing.
+    ///
+    /// Shares the process-global arm state with nothing else in this suite
+    /// (no other test calls `set_db_arm` or `store_handle`), so it is
+    /// order-independent.
+    #[test]
+    fn leaving_an_embedded_arm_clears_the_port() {
+        EMBEDDED_PORT.store(54812, Ordering::Relaxed);
+        set_db_arm(DbArm::EmbeddedAttached);
+        assert_eq!(db_arm(), DbArm::EmbeddedAttached);
+        assert_eq!(
+            embedded_port(),
+            Some(54812),
+            "an embedded arm must keep the port it was recorded with"
+        );
+
+        set_db_arm(DbArm::Degraded);
+        assert_eq!(db_arm(), DbArm::Degraded);
+        assert_eq!(
+            embedded_port(),
+            None,
+            "a degraded runner must not advertise an embedded port it cannot serve"
+        );
+
+        set_db_arm(DbArm::Unknown);
+    }
+
+    /// The port an `Attached` handle reports is the one it joined -- the value
+    /// `/health` publishes so two runners can be shown to share a cluster.
+    #[test]
+    fn attached_handle_reports_its_joined_port() {
+        let handle = PgHandle::Attached { port: 54812 };
+        assert_eq!(handle.port(), 54812);
+        assert_eq!(handle.arm(), DbArm::EmbeddedAttached);
+        assert!(handle.is_attached());
     }
 }
