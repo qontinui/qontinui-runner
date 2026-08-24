@@ -7,11 +7,10 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::comparison::{
-    axis_adjusted_confidence, classify_axis_drift, ComparisonRecommendation, ComparisonRun,
-    ComparisonStatus,
+    axis_adjusted_confidence, axis_facts_from_entries_json, AxisFacts, ComparisonRecommendation,
+    ComparisonRun, ComparisonStatus,
 };
 use crate::database::pg::PgDb;
-use crate::mcp::comparison_api::ComparisonEntryJson;
 
 /// Convert a completed comparison run's winner into a meta-optimizer recommendation.
 ///
@@ -27,14 +26,10 @@ pub fn comparison_to_recommendation(
 
     // Load the comparison run from PG.
     //
-    // `variation_type` and the per-arm override blobs come out alongside the
+    // `variation_type` and the run's axis facts come out alongside the
     // `ComparisonRun` because Phase 3 needs the DECLARED label and the ACTUAL
     // arms together — see the axis check below.
-    let (comparison, variation_type, arm_overrides): (
-        ComparisonRun,
-        String,
-        Vec<serde_json::Value>,
-    ) = {
+    let (comparison, variation_type, axis_facts): (ComparisonRun, String, AxisFacts) = {
         let row = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(pg_db.get_comparison_run_for_bridge(&comp_id))
@@ -52,15 +47,15 @@ pub fn comparison_to_recommendation(
             variation_type,
         ) = row;
 
-        // The per-arm config as it was actually STORED. Note the shape: the
-        // live paths persist `Vec<ComparisonEntryJson>`, whose per-arm config
-        // field is `overrides`. (`ComparisonRun.entries` below is typed
-        // `Vec<ComparisonEntry>`, which cannot deserialize from those bytes and
-        // so is always empty — do not read it for the axis.)
-        let arm_overrides: Vec<serde_json::Value> =
-            serde_json::from_str::<Vec<ComparisonEntryJson>>(&entries_json)
-                .map(|arms| arms.into_iter().map(|a| a.overrides).collect())
-                .unwrap_or_default();
+        // The axis facts, derived from the arms as they were actually STORED by
+        // the SAME function every writer persists them with — so what this
+        // reads can never disagree with the row's own `computed_axis` /
+        // `axis_drift_class` columns.
+        //
+        // (`ComparisonRun.entries` below is typed `Vec<ComparisonEntry>`, which
+        // cannot deserialize from those bytes and so is always empty — do not
+        // read it for the axis.)
+        let axis_facts = axis_facts_from_entries_json(&variation_type, &entries_json);
 
         let entries = serde_json::from_str(&entries_json).unwrap_or_default();
         let recommendation: Option<ComparisonRecommendation> =
@@ -88,7 +83,7 @@ pub fn comparison_to_recommendation(
             source: None,
         };
 
-        (run, variation_type, arm_overrides)
+        (run, variation_type, axis_facts)
     };
 
     // Only process completed comparisons with a recommendation
@@ -109,7 +104,7 @@ pub fn comparison_to_recommendation(
     // that `meta_optimizer::parser::auto_apply_high_confidence` sweeps at
     // (`parser.rs:1114` -> `start_canary(.., 10)` at `:1122`). A human can still
     // apply it deliberately; it just no longer applies itself.
-    let axis_class = classify_axis_drift(&variation_type, &arm_overrides);
+    let axis_class = axis_facts.drift_class;
     let (effective_confidence, axis_note) = axis_adjusted_confidence(rec.confidence, axis_class);
     if let Some(note) = axis_note.as_deref() {
         info!(
@@ -160,7 +155,9 @@ pub fn comparison_to_recommendation(
                 "confidence": effective_confidence,
                 "declared_confidence": rec.confidence,
                 "declared_variation_type": variation_type,
-                "computed_axis": crate::comparison::computed_treatment_axes(&arm_overrides),
+                // Null, not `[]`, when no axis could be computed — the same
+                // absence-is-not-zero distinction the column carries.
+                "computed_axis": axis_facts.computed_axis_json(),
                 "axis_drift_class": axis_class.as_wire_str(),
             })
             .to_string(),

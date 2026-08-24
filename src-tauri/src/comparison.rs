@@ -825,6 +825,132 @@ pub fn axis_adjusted_confidence(
     )
 }
 
+// =============================================================================
+// Phase 2b — the axis facts as a PERSISTED, queryable pair
+// =============================================================================
+//
+// Phases 1-3 compute the observed axis and its classification on the fly, at
+// the one place that consumes them (`meta_optimizer::comparison_bridge`). That
+// leaves the fact unrecorded: nothing can ask "how often do declared and actual
+// disagree?" across runs, which is exactly the observation the plan's Phase
+// 2->3 rate check needs, and exactly what a second untyped blob could not
+// answer.
+//
+// So the pair is written into `project.comparison_runs` beside the DECLARED
+// `variation_type` — `computed_axis jsonb NULL` and
+// `axis_drift_class text NOT NULL DEFAULT 'unknown'` (qontinui-web alembic
+// revision `cmpaxis_01_comparison_computed_axis`). Both writers go through
+// [`axis_facts_from_entries_json`] so the stored pair is always derived from
+// the same bytes the row itself stores, by the same code the bridge reads with.
+
+/// The declared-vs-actual axis facts recorded for one comparison run.
+///
+/// The two fields are not independent, and the `Option` is load-bearing:
+///
+/// * `computed_axis: None` means the axis was **never computed** — the arms
+///   could not be parsed, or there were fewer than two of them, so there was
+///   nothing to diff. It is stored as SQL `NULL`.
+/// * `computed_axis: Some(vec![])` means the axis **was** computed and nothing
+///   differed. It is stored as an empty JSON array.
+///
+/// Collapsing those two into one value is the absence-is-not-zero mistake this
+/// whole plan exists to stop (`verification-and-evidence`
+/// `silent-empty-is-unknown`); `drift_class` says which case a row is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxisFacts {
+    /// The key paths observed to actually differ across the arms, or `None`
+    /// when no axis could be computed at all.
+    pub computed_axis: Option<Vec<String>>,
+    /// How the computed axis relates to the declared `variation_type`.
+    pub drift_class: AxisDriftClass,
+}
+
+impl AxisFacts {
+    /// The facts for a run whose arms could not be read at all.
+    pub fn unknown() -> Self {
+        AxisFacts {
+            computed_axis: None,
+            drift_class: AxisDriftClass::Unknown,
+        }
+    }
+
+    /// `computed_axis` as the value to bind to the `jsonb` column.
+    ///
+    /// `None` is SQL `NULL` — the never-computed case. It is deliberately NOT
+    /// `Some(Value::Null)`, which would store the JSON scalar `null` and make
+    /// "we never computed it" indistinguishable from a row that stored a null
+    /// axis on purpose.
+    pub fn computed_axis_json(&self) -> Option<serde_json::Value> {
+        self.computed_axis.as_ref().map(|axes| {
+            serde_json::Value::Array(
+                axes.iter()
+                    .map(|a| serde_json::Value::String(a.clone()))
+                    .collect(),
+            )
+        })
+    }
+}
+
+/// Extract the per-arm override blobs from a stored `entries_json` payload.
+///
+/// The live paths persist `Vec<ComparisonEntryJson>`, whose per-arm config
+/// field is `overrides`. This reads that shape structurally rather than through
+/// the struct, so it stays honest about what it could not read: `None` means
+/// "these bytes are not an array of arm objects carrying `overrides`", which is
+/// a coverage gap, not an empty comparison.
+///
+/// Note what it deliberately does NOT do: fall back to `unwrap_or_default()`.
+/// An unreadable blob that silently becomes an empty `Vec` is the defect at
+/// `comparison_bridge.rs`'s old inline parse — it reads as "no arms", which a
+/// classifier can only report as agreement-shaped nonsense.
+pub fn arm_overrides_from_entries_json(entries_json: &str) -> Option<Vec<serde_json::Value>> {
+    let entries: Vec<serde_json::Value> = serde_json::from_str(entries_json).ok()?;
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            serde_json::Value::Object(mut map) => map.remove("overrides"),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Derive the [`AxisFacts`] to persist for a run, from its DECLARED
+/// `variation_type` and the arms it actually stored.
+///
+/// This is the single derivation used by every writer and by the meta-optimizer
+/// bridge, so a row's `computed_axis` / `axis_drift_class` pair can never
+/// disagree with what a reader would compute from the same `entries_json`.
+pub fn axis_facts_from_entries_json(variation_type: &str, entries_json: &str) -> AxisFacts {
+    let Some(arm_overrides) = arm_overrides_from_entries_json(entries_json) else {
+        return AxisFacts::unknown();
+    };
+    axis_facts_from_arms(variation_type, &arm_overrides)
+}
+
+/// Same as [`axis_facts_from_entries_json`], for a caller that already holds
+/// the per-arm override blobs.
+///
+/// Fewer than two arms yields `computed_axis: None` rather than an empty list:
+/// with nothing to diff against, no axis was computed, and reporting `[]` there
+/// would claim "nothing differed" about a comparison that never compared. The
+/// class is [`AxisDriftClass::Divergent`] — whatever such a run declared, the
+/// declared side is internally inconsistent.
+pub fn axis_facts_from_arms(
+    variation_type: &str,
+    arm_overrides: &[serde_json::Value],
+) -> AxisFacts {
+    if arm_overrides.len() < 2 {
+        return AxisFacts {
+            computed_axis: None,
+            drift_class: AxisDriftClass::Divergent,
+        };
+    }
+    AxisFacts {
+        computed_axis: Some(computed_treatment_axes(arm_overrides)),
+        drift_class: classify_axis_drift(variation_type, arm_overrides),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1554,5 +1680,177 @@ mod tests {
         let projected = build_run_overrides(&variation, 2);
         let from_arms: Vec<serde_json::Value> = arms.into_iter().map(|a| a.overrides).collect();
         assert_eq!(projected, from_arms);
+    }
+
+    // =========================================================================
+    // Phase 2b — the axis facts as a persisted pair
+    // =========================================================================
+
+    /// The exact `entries_json` shape the live paths store: a JSON array of
+    /// `ComparisonEntryJson`, whose per-arm config field is `overrides`.
+    fn stored_entries_json(arms: &[serde_json::Value]) -> String {
+        let entries: Vec<serde_json::Value> = arms
+            .iter()
+            .enumerate()
+            .map(|(i, overrides)| {
+                serde_json::json!({
+                    "label": format!("arm-{}", i),
+                    "overrides": overrides,
+                    "task_run_id": null,
+                    "status": "pending",
+                    "result": null,
+                })
+            })
+            .collect();
+        serde_json::to_string(&entries).unwrap()
+    }
+
+    #[test]
+    fn arm_overrides_are_read_out_of_the_shape_the_live_paths_actually_store() {
+        let arms = vec![json!({"model": "opus"}), json!({"model": "sonnet"})];
+        let stored = stored_entries_json(&arms);
+        assert_eq!(arm_overrides_from_entries_json(&stored), Some(arms));
+    }
+
+    #[test]
+    fn a_real_built_arm_set_round_trips_through_the_stored_blob() {
+        // Not a hand-rolled fixture: the arms the HTTP/Tauri surfaces actually
+        // build, serialized the way they actually persist them.
+        let variation = ComparisonVariation::Model {
+            models: vec!["opus".to_string(), "sonnet".to_string()],
+        };
+        let overrides: Vec<serde_json::Value> = build_comparison_arms(&variation, 2, true)
+            .into_iter()
+            .map(|a| a.overrides)
+            .collect();
+        let stored = stored_entries_json(&overrides);
+
+        let facts = axis_facts_from_entries_json("model", &stored);
+        assert_eq!(facts.computed_axis, Some(vec!["model".to_string()]));
+        assert_eq!(facts.drift_class, AxisDriftClass::None);
+    }
+
+    #[test]
+    fn an_unreadable_blob_is_unknown_never_an_empty_comparison() {
+        // The three ways the bytes can fail to be an arm array. Each must be
+        // UNKNOWN — the coverage-gap class — and must NOT produce an axis.
+        for blob in ["", "not json", "{}", r#"[{"label":"a"}]"#] {
+            assert_eq!(
+                arm_overrides_from_entries_json(blob),
+                None,
+                "blob {:?} should not parse as arms",
+                blob
+            );
+            let facts = axis_facts_from_entries_json("same", blob);
+            assert_eq!(facts, AxisFacts::unknown(), "blob {:?}", blob);
+            assert_eq!(facts.drift_class, AxisDriftClass::Unknown);
+            assert_eq!(facts.computed_axis, None);
+            assert!(!facts.drift_class.is_clean());
+        }
+    }
+
+    #[test]
+    fn nothing_differed_and_never_computed_are_different_stored_values() {
+        // The whole point of the `Option`. `[]` is a computed answer; `NULL` is
+        // the absence of one. Collapsing them is the absence-is-not-zero bug.
+        let same = stored_entries_json(&[json!({"a": 1}), json!({"a": 1})]);
+        let computed = axis_facts_from_entries_json("same", &same);
+        assert_eq!(computed.computed_axis, Some(Vec::new()));
+        assert_eq!(computed.drift_class, AxisDriftClass::None);
+        assert_eq!(computed.computed_axis_json(), Some(json!([])));
+
+        let never = axis_facts_from_entries_json("same", "garbage");
+        assert_eq!(never.computed_axis, None);
+        assert_eq!(never.computed_axis_json(), None);
+
+        assert_ne!(computed.computed_axis_json(), never.computed_axis_json());
+    }
+
+    #[test]
+    fn fewer_than_two_arms_records_no_axis_and_says_divergent() {
+        for arms in [vec![], vec![json!({"model": "opus"})]] {
+            let stored = stored_entries_json(&arms);
+            let facts = axis_facts_from_entries_json("model", &stored);
+            // NOT `Some([])`: with nothing to diff against, no axis was
+            // computed. Claiming "nothing differed" about a run that never
+            // compared would be the same lie the declared label tells.
+            assert_eq!(facts.computed_axis, None, "arms: {:?}", arms);
+            assert_eq!(facts.drift_class, AxisDriftClass::Divergent);
+            assert!(!facts.drift_class.is_clean());
+        }
+    }
+
+    #[test]
+    fn the_stored_pair_is_what_the_classifier_would_say_for_every_case() {
+        // Every classification the plan names, driven end to end from stored
+        // bytes rather than from an in-memory arm slice — this is the path both
+        // writers and the meta-optimizer bridge take.
+        let cases: Vec<(&str, Vec<serde_json::Value>, AxisDriftClass, Vec<&str>)> = vec![
+            (
+                "same",
+                vec![json!({"a": 1}), json!({"a": 1})],
+                AxisDriftClass::None,
+                vec![],
+            ),
+            (
+                "same",
+                vec![json!({"a": 1}), json!({"a": 2})],
+                AxisDriftClass::InPlace,
+                vec!["a"],
+            ),
+            (
+                "model",
+                vec![json!({"model": "a"}), json!({"model": "b"})],
+                AxisDriftClass::None,
+                vec!["model"],
+            ),
+            (
+                "model",
+                vec![
+                    json!({"model": "a", "temp": 1}),
+                    json!({"model": "b", "temp": 2}),
+                ],
+                AxisDriftClass::BenignAdd,
+                vec!["model", "temp"],
+            ),
+            (
+                "model",
+                vec![json!({"temp": 1}), json!({"temp": 2})],
+                AxisDriftClass::Pending,
+                vec!["temp"],
+            ),
+            (
+                "model",
+                vec![json!({"model": "a"}), json!({"model": "a"})],
+                AxisDriftClass::ActiveNegation,
+                vec![],
+            ),
+            (
+                "no_such_variation",
+                vec![json!({"model": "a"}), json!({"model": "b"})],
+                AxisDriftClass::Unknown,
+                vec!["model"],
+            ),
+        ];
+
+        for (variation, arms, expected_class, expected_axis) in cases {
+            let stored = stored_entries_json(&arms);
+            let facts = axis_facts_from_entries_json(variation, &stored);
+            assert_eq!(
+                facts.drift_class, expected_class,
+                "variation={} arms={:?}",
+                variation, arms
+            );
+            assert_eq!(
+                facts.computed_axis,
+                Some(expected_axis.iter().map(|s| s.to_string()).collect()),
+                "variation={} arms={:?}",
+                variation,
+                arms
+            );
+            // The persisted pair must agree with what a reader recomputes from
+            // the same arms — that identity is why the column can be trusted.
+            assert_eq!(facts, axis_facts_from_arms(variation, &arms));
+        }
     }
 }
