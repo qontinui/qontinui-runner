@@ -8,13 +8,15 @@
 //! in-memory image and nothing measured the gap between "on main" and
 //! "running here".
 //!
-//! On a slow interval (and once at startup) this module resolves
-//! `origin/main`'s current SHA — `git ls-remote origin main` from the repo
-//! dir when available, falling back to the local `git rev-parse origin/main`
-//! — and diffs it against the embedded `gitSha` (prefix match: the embedded
-//! value is a 12-char short SHA). The result lands on `/health` as `mainSha`
-//! + `buildDrift {behind, checkedAt, commitsBehind}` and a periodic WARN when
-//! non-zero.
+//! On a slow interval (and once at startup) this module resolves the repo's
+//! TRUNK tip SHA — `git ls-remote origin <trunk>` from the repo dir when
+//! available, falling back to the local `git rev-parse origin/<trunk>` — and
+//! diffs it against the embedded `gitSha` (prefix match: the embedded value
+//! is a 12-char short SHA). The trunk comes from [`crate::git_trunk`]. The
+//! result lands on `/health` as `mainSha` +
+//! `buildDrift {behind, checkedAt, commitsBehind}` and a periodic WARN when
+//! non-zero — the wire name stays `mainSha`, since coord and every `/health`
+//! consumer reads it by that name; it is not a claim that the trunk is `main`.
 //!
 //! Resilience is the contract: a production install with no git repo (or no
 //! network, or no `git` on PATH) serves nulls — every failure mode collapses
@@ -38,7 +40,8 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 pub struct BuildDriftStatus {
     /// Unix millis when this check ran.
     pub checked_at: i64,
-    /// origin/main's current full SHA, when resolvable.
+    /// The trunk tip's current full SHA, when resolvable. Named `main_sha`
+    /// for the wire, not because the trunk is assumed to be `main`.
     pub main_sha: Option<String>,
     /// `Some(true)` when the running binary's embedded SHA is not a prefix of
     /// `main_sha` (the binary is behind — or on a divergent commit).
@@ -122,12 +125,27 @@ fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-/// Resolve origin/main's current SHA: `ls-remote` (authoritative, needs
-/// network) first, local `rev-parse origin/main` (last fetch) as fallback.
-fn resolve_main_sha(repo: &Path) -> Option<String> {
-    git_output(repo, &["ls-remote", "origin", "main"])
+/// Resolve the trunk's current SHA: `ls-remote` (authoritative, needs
+/// network) first, the local remote-tracking ref (last fetch) as fallback.
+///
+/// The trunk is resolved per repo ([`crate::git_trunk`]), not assumed to be
+/// `main`. This is the mildest of the four sites that hardcoded it — both
+/// rungs sit in an `.or_else` chain, so on a `master`-trunk checkout it
+/// degraded to `None` ("drift unknown") rather than answering wrong — but a
+/// permanent `None` here still reads as "we could not check" forever, and
+/// `/health` `buildDrift` is exactly the signal operators use to decide
+/// whether a fix is actually running on a box.
+fn resolve_trunk_sha(repo: &Path) -> Option<String> {
+    // The `main` guess is spelled here, visibly, rather than inside the
+    // resolver: an unresolvable trunk means no LOCAL `origin/*` ref, which
+    // says nothing about what the REMOTE would answer — and `ls-remote`
+    // below needs no local ref at all. Dropping to `None` here would have
+    // made a never-fetched checkout report "drift unknown" where the old
+    // hardcoded `main` could still have answered.
+    let branch = crate::git_trunk::resolve_trunk_branch(repo).unwrap_or_else(|| "main".to_string());
+    git_output(repo, &["ls-remote", "origin", &branch])
         .and_then(|s| s.split_whitespace().next().map(str::to_string))
-        .or_else(|| git_output(repo, &["rev-parse", "origin/main"]))
+        .or_else(|| git_output(repo, &["rev-parse", &format!("origin/{branch}")]))
         .filter(|s| looks_like_sha(s))
 }
 
@@ -136,7 +154,7 @@ fn looks_like_sha(s: &str) -> bool {
 }
 
 /// Pure comparison core (unit-testable without git): prefix-match the
-/// embedded 12-char SHA against origin/main's full SHA. `None` when either
+/// embedded 12-char SHA against the trunk tip's full SHA. `None` when either
 /// side is unknown (e.g. the embedded value is build.rs's `"unknown"`
 /// fallback).
 fn compute_behind(embedded: &str, main_sha: Option<&str>) -> Option<bool> {
@@ -160,7 +178,7 @@ fn check_once_blocking() -> BuildDriftStatus {
         };
     };
 
-    let main_sha = resolve_main_sha(&repo);
+    let main_sha = resolve_trunk_sha(&repo);
     let behind = compute_behind(embedded, main_sha.as_deref());
     let commits_behind = match behind {
         Some(true) => main_sha.as_deref().and_then(|m| {
@@ -200,15 +218,15 @@ pub async fn run_periodic() {
                 git_sha = env!("QONTINUI_GIT_SHA"),
                 main_sha = main,
                 commits_behind = ?status.commits_behind,
-                "build drift: this binary was NOT built from origin/main's current \
+                "build drift: this binary was NOT built from the trunk's current \
                  commit — shipped fixes may not be running here"
             ),
             (Some(false), _) => debug!(
                 git_sha = env!("QONTINUI_GIT_SHA"),
-                "build drift: binary matches origin/main"
+                "build drift: binary matches the trunk tip"
             ),
             _ => debug!(
-                "build drift: origin/main unresolvable (no repo / no network) — reporting unknown"
+                "build drift: trunk tip unresolvable (no repo / no network) — reporting unknown"
             ),
         }
 
