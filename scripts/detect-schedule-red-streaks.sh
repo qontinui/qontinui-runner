@@ -85,8 +85,14 @@ if [ -z "$FIXTURE_DIR" ]; then
   command -v gh >/dev/null 2>&1 || die "gh is required in live mode (or pass --fixture-dir)"
 fi
 
-case "$MIN_STREAK" in ''|*[!0-9]*) die "--min-streak must be a non-negative integer" ;; esac
-case "$WINDOW" in ''|*[!0-9]*) die "--window must be a non-negative integer" ;; esac
+case "$MIN_STREAK" in ''|*[!0-9]*) die "--min-streak must be a positive integer" ;; esac
+case "$WINDOW" in ''|*[!0-9]*) die "--window must be a positive integer" ;; esac
+# Zero is rejected rather than clamped: `--min-streak 0` would name every
+# scheduled workflow, including ones with no failing run at all, and print a
+# citation line with a blank run id and URL. A detector that flags everything
+# says nothing.
+[ "$MIN_STREAK" -ge 1 ] || die "--min-streak must be at least 1"
+[ "$WINDOW" -ge 1 ] || die "--window must be at least 1"
 [ "$WINDOW" -le 100 ] || die "--window may not exceed the API's 100-per-page cap"
 
 # NO error suppression anywhere below. A read that fails is UNKNOWN, and a
@@ -107,7 +113,9 @@ api() {
 inventory="$(api "actions/workflows?per_page=100" "workflows.json")" \
   || die "could not read the workflow inventory for $REPO"
 
-ids="$(printf '%s' "$inventory" | jq -r '.workflows[] | select(.state == "active") | .id')"
+if ! ids="$(printf '%s' "$inventory" | jq -r '.workflows[] | select(.state == "active") | .id')"; then
+  die "could not parse the workflow inventory for $REPO"
+fi
 if [ -n "$ONLY_IDS" ]; then
   filtered=""
   for want in $ONLY_IDS; do
@@ -125,14 +133,19 @@ skipped_baselined=0
 skipped_no_schedule=0
 
 for id in $ids; do
-  name="$(printf '%s' "$inventory" | jq -r --argjson id "$id" '.workflows[] | select(.id == $id) | .name')"
+  if ! name="$(printf '%s' "$inventory" | jq -r --argjson id "$id" '.workflows[] | select(.id == $id) | .name')"; then
+    die "could not read the name of workflow $id"
+  fi
 
   # Push-baseline probe FIRST: a workflow with push runs on the branch is
   # already adjudicated by coord's baseline machinery, and reporting it here
   # would double-report a signal that already has an owner.
   push_json="$(api "actions/workflows/$id/runs?branch=$BRANCH&event=push&per_page=1" "$id.push.json")" \
     || die "could not probe the push baseline for workflow $id"
-  push_total="$(printf '%s' "$push_json" | jq -r '.total_count')"
+  if ! push_total="$(printf '%s' "$push_json" | jq -r '.total_count')"; then
+    die "could not parse the push-baseline payload for workflow $id ($name)"
+  fi
+  case "$push_total" in ''|*[!0-9]*) die "non-numeric push total_count '$push_total' for workflow $id ($name)" ;; esac
   if [ "$push_total" != "0" ]; then
     skipped_baselined=$((skipped_baselined + 1))
     continue
@@ -143,20 +156,47 @@ for id in $ids; do
 
   # This is the whole scope exclusion: a dispatch-only workflow has no
   # `event=schedule` runs on the branch and therefore cannot be named.
-  sched_total="$(printf '%s' "$sched_json" | jq -r '.total_count')"
+  if ! sched_total="$(printf '%s' "$sched_json" | jq -r '.total_count')"; then
+    die "could not parse the scheduled-runs payload for workflow $id ($name)"
+  fi
+  case "$sched_total" in ''|*[!0-9]*) die "non-numeric schedule total_count '$sched_total' for workflow $id ($name)" ;; esac
   if [ "$sched_total" = "0" ]; then
     skipped_no_schedule=$((skipped_no_schedule + 1))
     continue
   fi
 
+  # `total_count` and the returned page can disagree. A non-zero count with an
+  # empty page is a read we cannot interpret -- treating it as "no streak" would
+  # report a healthy 0 findings off no evidence at all.
+  if ! sched_returned="$(printf '%s' "$sched_json" | jq -r '.workflow_runs | length')"; then
+    die "could not count the scheduled runs returned for workflow $id ($name)"
+  fi
+  [ "$sched_returned" -gt 0 ] \
+    || die "workflow $id ($name) reports total_count=$sched_total scheduled runs but returned none"
+
   examined=$((examined + 1))
 
-  # Walk newest-first. Belt-and-braces re-filter on event and branch: a fixture
-  # or a future API change that leaked a non-schedule run must not be counted.
-  read -r streak newest <<EOF
-$(printf '%s' "$sched_json" | jq -r --arg br "$BRANCH" '
+  # Walk newest-first.
+  #
+  # `sort_by(.created_at) | reverse` rather than trusting the API's order: the
+  # reduce below is order-DEPENDENT (`newest` is the first failure seen and
+  # `done` latches on the first non-failing run), so an ordering change would
+  # silently invert both the streak and the run it cites. Making the property
+  # structural costs one jq pass and removes an assumption no test could catch.
+  #
+  # Belt-and-braces re-filter on event and branch: a fixture or a future API
+  # change that leaked a non-schedule run must not be counted.
+  #
+  # NOT `read ... <<EOF $(jq ...) EOF`. A command substitution inside a heredoc
+  # has its exit status DISCARDED -- `set -e` and `pipefail` never see it -- so a
+  # jq failure (a payload with `total_count` but no `workflow_runs`, say) would
+  # leave `streak` empty, skip the workflow, and let the run end
+  # "0 finding(s)" / exit 0. That is precisely the silence this detector exists
+  # to end, reproduced one level up inside the detector itself.
+  if ! streak_tsv="$(printf '%s' "$sched_json" | jq -r --arg br "$BRANCH" '
     [ .workflow_runs[]
       | select(.event == "schedule" and .head_branch == $br and .status == "completed") ]
+    | sort_by(.created_at) | reverse
     | reduce .[] as $r ({streak: 0, done: false, newest: null};
         if .done then .
         elif ($r.conclusion | IN("failure", "timed_out", "startup_failure"))
@@ -170,8 +210,18 @@ $(printf '%s' "$sched_json" | jq -r --arg br "$BRANCH" '
         (if .newest == null then "-"
          else "\(.newest.id)|\(.newest.head_sha[0:8])|\(.newest.created_at)|\(.newest.html_url)"
          end) ]
-    | @tsv')
+    | @tsv')"; then
+    die "could not compute the failure streak for workflow $id ($name)"
+  fi
+
+  IFS=$'\t' read -r streak newest <<EOF
+$streak_tsv
 EOF
+  # An empty or non-numeric streak means the payload was not what we think it
+  # is. `[ "" -ge 3 ]` returns 2, and inside an `if` condition `set -e` is
+  # exempt -- so without this the workflow would be skipped silently.
+  case "$streak" in ''|*[!0-9]*) die "non-numeric streak '$streak' for workflow $id ($name)" ;; esac
+  [ -n "$newest" ] || die "empty streak citation for workflow $id ($name)"
 
   if [ "$streak" -ge "$MIN_STREAK" ]; then
     findings=$((findings + 1))

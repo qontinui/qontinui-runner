@@ -83,7 +83,14 @@ awk '
 # describing a program CI never runs.
 body_lines="$(wc -l < "$step" | tr -d ' ')"
 first_line="$(grep -m1 -vE '^[[:space:]]*(#|$)' "$step" || true)"
-last_line="$(grep -vE '^[[:space:]]*$' "$step" | tail -n1)"
+# `|| true` on BOTH, and for the same reason: when extraction yields NOTHING
+# -- the exact case this block exists to report -- `grep -v` exits 1, and
+# under `pipefail` the assignment would fail and `set -e` would kill the
+# script BEFORE the ::error:: block below could print. That is 'fails loudly
+# but illegibly', i.e. the bug this whole commit removes, reappearing inside
+# the test that guards against it. Neither `|| true` suppresses a real error:
+# an empty value fails the comparison below and gets reported.
+last_line="$(grep -vE '^[[:space:]]*$' "$step" | tail -n1 || true)"
 extract_broken=0
 [ "$body_lines" -ge 100 ] || extract_broken=1
 [ "$first_line" = "set -euo pipefail" ] || extract_broken=1
@@ -118,10 +125,12 @@ assert "no '2>/dev/null' swallowing gh errors" 0 "$(grep -c '2>/dev/null' "$code
 # The reopen path is gone and must stay gone (it latched onto human-authored
 # #896 and killed the step for nine consecutive nights).
 assert "no 'gh pr reopen' in executable code" 0 "$(grep -c 'gh pr reopen' "$code_only" || true)"
-assert "no '--state closed' lookup" 0 "$(grep -c 'state closed' "$code_only" || true)"
+assert "no '--state closed' lookup" 0 "$(grep -cE 'state[= ]closed' "$code_only" || true)"
 
 # Every gh call except the deliberately-bare open-PR lookup is guarded.
-gh_calls="$(grep -c 'gh pr ' "$code_only" || true)"
+# -o, not -c: `grep -c` counts LINES, so two calls on one line would read as
+# one and the guarded/unguarded arithmetic below would be wrong.
+gh_calls="$(grep -o 'gh pr ' "$code_only" | wc -l | tr -d ' ')"
 guarded="$(grep -cE 'if ! (url=|existing_draft=)?"?\$?\(?gh pr |if ! gh pr ' "$code_only" || true)"
 assert "gh calls in executable code" 7 "$gh_calls"
 assert "guarded gh calls (all but the bare open lookup)" 6 "$guarded"
@@ -157,8 +166,9 @@ case "$key" in
   list)          printf '%s\n' "${GH_STUB_LIST_OPEN:-}" ;;
   view:isDraft)  printf '%s\n' "${GH_STUB_ISDRAFT:-true}" ;;
   view:comments) printf '%s' "${GH_STUB_COMMENTS:-}" ;;
-  view:url)      printf '%s\n' "${GH_STUB_URL:?}" ;;
-  create)        printf '%s\n' "${GH_STUB_URL:?}" ;;
+  # GH_STUB_EMPTY_URL models a gh that exits 0 having printed nothing.
+  view:url)      [ -n "${GH_STUB_EMPTY_URL:-}" ] || printf '%s\n' "${GH_STUB_URL:?}" ;;
+  create)        [ -n "${GH_STUB_EMPTY_URL:-}" ] || printf '%s\n' "${GH_STUB_URL:?}" ;;
   edit)          echo "edited" ;;
   comment)       echo "commented" ;;
   *)
@@ -211,6 +221,7 @@ run_step() {
     GH_STUB_ISDRAFT="$3" \
     GH_STUB_COMMENTS="$4" \
     GH_STUB_URL="$STUB_URL" \
+    GH_STUB_EMPTY_URL="${GH_STUB_EMPTY_URL:-}" \
     GH_TOKEN="stub-token" \
     PAT_AVAILABLE="true" \
     REPO="qontinui/qontinui-runner" \
@@ -300,6 +311,21 @@ assert "ready path did not touch the branch"   no  "$(grep -q 'push' "$work/git.
 # Dedup: the same drift must not be commented twice on the same PR.
 assert "ready path, drift already commented"   0 "$(run_step '' '1234' 'false' "<!-- atlas-drift:$drift_sha -->")"
 assert "dedup suppressed the second comment"   no  "$(log_has 'comment' gh.log)"
+
+# A `gh` that exits 0 while printing nothing must NOT reach the summary block:
+# a green step with an empty summary is exactly the silent-green signature
+# (V6 of the plan names it by that name).
+echo ""
+echo "Exit 0 is not the same as 'a pull request exists':"
+GH_STUB_EMPTY_URL=1
+export GH_STUB_EMPTY_URL
+assert "create returns no URL => exit 1"           1 "$(run_step '' '' 'true' '')"
+assert "and it says the URL came back empty"       yes "$(has 'returned no URL')"
+assert "and it prints the remediation"             yes "$(has "$REMEDIATION")"
+assert "and it wrote NO summary section"           no  "$(grep -q . "$work/summary.md" && echo yes || echo no)"
+assert "edit path returns no URL => exit 1"        1 "$(run_step '' '1234' 'true' '')"
+assert "and the edit path says so too"             yes "$(has 'returned no URL')"
+unset GH_STUB_EMPTY_URL
 
 # ---------------------------------------------------------------------------
 # The contradiction guard must stay non-silent.

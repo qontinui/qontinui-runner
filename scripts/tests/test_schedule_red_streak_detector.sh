@@ -67,7 +67,10 @@ saw() { grep -qF "$1" "$work/out.txt" && echo yes || echo no; }
 echo "Recorded real window (qontinui/qontinui-runner@main, read 2026-08-24):"
 assert "findings present => exit 1"                1 "$(run_detector real-2026-08-24)"
 assert "names the atlas freshness workflow"        yes "$(saw 'atlas/exclude.txt freshness (workflow 317525761)')"
-assert "counts the streak as 9, not 10 or 4"       yes "$(saw '9 consecutive failing scheduled runs on main')"
+# Anchored on the workflow id: a bare '9 consecutive' would also match
+# '19 consecutive', so the assertion whose NAME is "not 10 or 4" has to pin
+# both ends of the number.
+assert "counts the streak as 9, not 10 or 4"       yes "$(saw '317525761) -- 9 consecutive failing scheduled runs on main')"
 assert "cites the newest failing run"              yes "$(saw 'run 32701001502')"
 assert "explains why nothing else sees it"         yes "$(saw '0 push runs on main')"
 
@@ -75,12 +78,12 @@ assert "explains why nothing else sees it"         yes "$(saw '0 push runs on ma
 # runs on main), never by a hardcoded id list.
 assert "does NOT flag Release (192238698)"         no  "$(saw '192238698')"
 assert "does NOT flag schema.pg.sql (268755340)"   no  "$(saw '268755340')"
-assert "reports the two as having no sched runs"   yes "$(saw '2 with no scheduled runs')"
+assert "reports the two as having no sched runs"   yes "$(saw '(skipped 0 push-baselined, 2 with no scheduled runs)')"
 
 # A high threshold must silence the same window -- proof the count is real and
 # the finding is not unconditional.
 assert "min-streak 10 => no finding on the same data" 0 "$(run_detector real-2026-08-24 --min-streak 10)"
-assert "and it says zero findings"                 yes "$(saw '0 finding(s)')"
+assert "and it says zero findings"                 yes "$(saw ': 0 finding(s)')"
 assert "--exit-zero suppresses the exit code only" 0 "$(run_detector real-2026-08-24 --exit-zero)"
 assert "--exit-zero still prints the finding"      yes "$(saw 'atlas/exclude.txt freshness (workflow 317525761)')"
 
@@ -93,7 +96,7 @@ assert "synthetic set => exit 1"                   1 "$(run_detector synthetic)"
 # 5 failures in a row, but the workflow has 12 push runs on main: coord's
 # baseline machinery owns it, so this detector must stay quiet.
 assert "skips the push-baselined workflow"         no  "$(saw '900000001')"
-assert "counts it as push-baselined"               yes "$(saw 'skipped 1 push-baselined')"
+assert "counts it as push-baselined"               yes "$(saw '(skipped 1 push-baselined,')"
 # Newest run is green: streak 0 even though older runs failed.
 assert "does not flag a currently-green nightly"   no  "$(saw '900000002')"
 # All cancelled: neutral, so the streak is 0, not 5.
@@ -119,6 +122,41 @@ rm "$work/holed/317525761.schedule.json"
 rc=0; bash "$detector" --fixture-dir "$work/holed" > "$work/out.txt" 2>&1 || rc=$?
 assert "missing runs payload => exit 2, not 0"     2 "$rc"
 assert "and it names the missing fixture"          yes "$(saw '317525761.schedule.json')"
+
+# MALFORMED content, not just a missing file. This is the shape that made the
+# original heredoc-wrapped command substitution report a healthy "0 finding(s)"
+# and exit 0: jq's exit status inside `<<EOF $(...) EOF` is discarded, so a
+# payload carrying `total_count` but no `workflow_runs` array skipped the
+# workflow in silence.
+mangle() {
+  # mangle <file> <json> ; leaves the run's output in $work/out.txt, echoes rc
+  rm -rf "$work/bad"; cp -r "$fixtures/real-2026-08-24" "$work/bad"
+  printf '%s' "$2" > "$work/bad/$1"
+  local rc=0
+  bash "$detector" --fixture-dir "$work/bad" > "$work/out.txt" 2>&1 || rc=$?
+  echo "$rc"
+}
+
+assert "runs payload with no workflow_runs => exit 2" 2 "$(mangle 317525761.schedule.json '{"total_count": 9}')"
+assert "and it does not claim zero findings"       no  "$(saw 'finding(s)')"
+assert "and it names the workflow it could not read" yes "$(saw 'workflow 317525761')"
+
+assert "total_count>0 but an empty page => exit 2" 2 "$(mangle 317525761.schedule.json '{"total_count": 9, "workflow_runs": []}')"
+assert "and it says the page returned none"        yes "$(saw 'returned none')"
+
+assert "unparseable JSON => exit 2, not 0"         2 "$(mangle 317525761.schedule.json 'not json at all')"
+assert "unparseable push probe => exit 2, not 0"   2 "$(mangle 317525761.push.json 'not json at all')"
+assert "non-numeric total_count => exit 2, not 0"  2 "$(mangle 317525761.push.json '{"total_count": "lots"}')"
+
+# --- Argument validation: a threshold that flags everything says nothing.
+echo ""
+echo "Argument validation:"
+rc=0; bash "$detector" --fixture-dir "$fixtures/real-2026-08-24" --min-streak 0 > "$work/out.txt" 2>&1 || rc=$?
+assert "--min-streak 0 is rejected"                2 "$rc"
+rc=0; bash "$detector" --fixture-dir "$fixtures/real-2026-08-24" --window 0 > "$work/out.txt" 2>&1 || rc=$?
+assert "--window 0 is rejected"                    2 "$rc"
+rc=0; bash "$detector" --fixture-dir "$fixtures/real-2026-08-24" --window 500 > "$work/out.txt" 2>&1 || rc=$?
+assert "--window above the API page cap rejected"  2 "$rc"
 
 echo ""
 if [ "$failures" -gt 0 ]; then

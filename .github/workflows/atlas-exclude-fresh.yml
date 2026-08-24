@@ -80,6 +80,15 @@ on:
     branches: [main]
     paths:
       - "atlas/**"
+      # This file itself. `pilot-consistency` runs
+      # atlas/scripts/tests/test_pr_step_guards.sh, whose subject is the
+      # refresh-PR step BELOW -- so without this line a PR that renames the
+      # step, re-indents it, adds an unguarded `gh pr` call, adds `|| true`, or
+      # restores the reopen path runs NO job from this workflow, and the test
+      # that exists to catch exactly that never executes. This file is also
+      # absent from ci-integrity.yml's GATING list, so nothing else stops it
+      # either. A guard that does not run on its own subject is not a guard.
+      - ".github/workflows/atlas-exclude-fresh.yml"
 
 # Least-privilege, stated explicitly rather than inherited.
 #
@@ -711,6 +720,20 @@ jobs:
             fi
             echo "Opened refresh PR: $url"
           fi
+
+          # Exit code 0 is not the same as "a pull request exists". A `gh` that
+          # succeeds while printing nothing would fall through to the summary
+          # block below and write an EMPTY section -- a green step that
+          # delivered nothing, which is verbatim the silent-green signature this
+          # change exists to remove (and which V6 of the plan names). Checked
+          # once here rather than at each site: it is a property of `url`, not
+          # of any one call.
+          if [ -z "${url:-}" ]; then
+            echo "::error::A pull-request operation reported success but returned no URL."
+            pr_op_failed "URL read-back"
+            exit 1
+          fi
+
           {
             echo "### atlas/exclude.txt refresh"
             echo ""
