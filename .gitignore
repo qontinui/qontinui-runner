@@ -75,6 +75,10 @@ docs/*
 # ...but the generated runner onboarding checklist IS tracked (Phase-5
 # anti-drift gate diffs it against a fresh `coord_doctor --onboarding-doc`).
 !docs/runner-onboarding.md
+# ...and so is the generated config-layer inventory, for the same reason: it is
+# the published output of `config_report --layer-doc`, held byte-exact by
+# `config_report::tests::config_report_checked_in_layer_doc_is_the_generators_output`.
+!docs/runner-config-layers.md
 # Same local-only documentation convention applies to nested docs/ dirs.
 python-bridge/docs/*
 
