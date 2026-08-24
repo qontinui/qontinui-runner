@@ -2794,8 +2794,8 @@ mod launch_intent_tests {
     }
 }
 
-/// Wire-contract tests for the `POST /agents/spawn` body
-/// (plan `2026-07-28-coord-post-plan-slug-surfaces-rename`, Stage 4a).
+/// Isolated-mode gate for the spawn base — plan
+/// `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration` §6.4.
 #[cfg(test)]
 mod spawn_base_tests {
     use super::*;
@@ -2854,6 +2854,8 @@ mod spawn_base_tests {
     }
 }
 
+/// Wire-contract tests for the `POST /agents/spawn` body
+/// (plan `2026-07-28-coord-post-plan-slug-surfaces-rename`, Stage 4a).
 #[cfg(test)]
 mod spawn_request_body_tests {
     use super::*;
