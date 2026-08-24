@@ -3056,6 +3056,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     session::shutdown_marker::boot_classification(),
                 );
 
+                // Phase 4 of `2026-08-22-wip-custody-rebuild-survivable-
+                // attribution` — the DISK half of the same set.
+                //
+                // ORDER IS LOAD-BEARING: latch the PREVIOUS boot's ledger off
+                // disk FIRST, then write this boot's. Reversed, this process
+                // overwrites the only record of what the last one had open —
+                // which is precisely the question a post-rebuild report exists
+                // to answer.
+                //
+                // `restore_census`'s `expected` lives in a process-wide
+                // `OnceLock` with zero disk persistence, so it dies with the
+                // runner. This makes the same information survive the kill a
+                // rebuild performs.
+                let _prior_ledger = session::session_ledger::load_prior_once();
+                {
+                    let boot_ledger = session::session_ledger::capture(
+                        &lifecycle_store,
+                        transcript_index.as_ref(),
+                        session::session_ledger::REASON_BOOT_LATCH,
+                        chrono::Utc::now().timestamp_millis(),
+                        session::shutdown_marker::boot_classification(),
+                    );
+                    session::session_ledger::persist_if_changed(&boot_ledger);
+                }
+
                 // Restore-registry cloud mirror (plan 2026-07-09-runner-
                 // session-history-cloud-sync §3.4, Phase 4; gate split off
                 // into its own toggle by plan
@@ -3171,6 +3196,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // registry is empty — an empty snapshot is an honest
                         // freshness proof.
                         poll_lifecycle_store.snapshot_heartbeat();
+
+                        // Phase 4: persist the open-session ledger ON CHANGE.
+                        // The poll IS the store's periodic tick, so this is
+                        // where "on change" naturally lives; the write is
+                        // content-keyed, so a quiet tick costs one string
+                        // comparison and no disk I/O. Fail-soft by
+                        // construction — a ledger is a diagnostic and must
+                        // never break the liveness poll.
+                        {
+                            let idx = session::reconcile::DiskTranscriptIndex::discover();
+                            let led = session::session_ledger::capture(
+                                &poll_lifecycle_store,
+                                &idx,
+                                session::session_ledger::REASON_POLL,
+                                chrono::Utc::now().timestamp_millis(),
+                                session::shutdown_marker::boot_classification(),
+                            );
+                            session::session_ledger::persist_if_changed(&led);
+                        }
 
                         let open = poll_lifecycle_store.open_records();
                         let live = poll_tm.list();

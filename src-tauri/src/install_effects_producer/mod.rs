@@ -155,6 +155,26 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/control/sessions/restore-census",
             get(get_sessions_restore_census),
         )
+        // Rebuild-safe session LEDGER (plan
+        // `2026-08-22-wip-custody-rebuild-survivable-attribution`, Phase 4).
+        //
+        // `restore-census` answers "did THIS boot's restore work?" from a set
+        // latched in a process-wide `OnceLock` with zero disk persistence — so
+        // it dies with the runner and cannot answer "what did the PREVIOUS
+        // boot fail to restore", which is the only time the question is asked.
+        // These two routes are the disk half:
+        //
+        //   GET  …/ledger          — the prior boot's open sessions vs what
+        //                            came back, with a resume line per miss.
+        //   POST …/ledger/capture  — the DELIBERATE pre-rebuild capture.
+        //
+        // Both extend the live surface rather than re-implementing
+        // `restore-census`, which already exists upstream.
+        .route("/control/sessions/ledger", get(get_sessions_ledger))
+        .route(
+            "/control/sessions/ledger/capture",
+            post(post_sessions_ledger_capture),
+        )
         // Phase 4: private-registry credential CRUD. Mounted alongside the
         // Phase-1 run route so a single `install_effects_producer::routes()`
         // merge in `mcp_api.rs` covers the whole producer surface.
@@ -634,6 +654,166 @@ async fn get_sessions_restore_census(
         }));
     };
     Json(ApiResponse::success(build_census(&store, boot, now)))
+}
+
+/// `GET /control/sessions/ledger` — **the post-rebuild report.**
+///
+/// Answers the question a screenshot of the tab bar was standing in for: *of
+/// the N sessions that were open before the last shutdown, which came back,
+/// which did not, and how do I resume the ones that did not?*
+///
+/// ```jsonc
+/// { "success": true, "data": {
+///     "status": "ok", "verdict": "partial",
+///     "priorCapturedAt": "2026-08-24T09:02:11Z", "priorReason": "pre-rebuild",
+///     "expected": [ /* all N */ ],
+///     "returned": [ /* the ones open again */ ],
+///     "missing": [
+///       { "claudeSessionId": "aaaa…", "sessionName": "amber-otter",
+///         "worktreePath": "D:/qontinui-root/_wt/foo",
+///         "planSlug": "2026-08-22-wip-custody", "wipState": "captured",
+///         "reason": "no-attempt",
+///         "resumeCommand": "cd \"D:/…/foo\" && CLAUDE_CONFIG_DIR=\"C:/claude/.claude-gmail\" claude --resume aaaa…" }
+///     ],
+///     "current": { /* what is open right now */ } } }
+/// ```
+///
+/// ### The honesty contract
+///
+/// * **No ledger on disk ⇒ `status: "unavailable"`, `reason:
+///   "no_prior_ledger"`, `verdict: "unknown"`** — never a vacuous `match`. An
+///   EMPTY prior ledger is different and IS a `match`: the previous boot
+///   affirmatively recorded that it had nothing open.
+/// * **A missing session with an unknown account root gets NO resume line**
+///   rather than a guessed one, and the `note` counts how many were omitted
+///   for that reason.
+/// * Read-only: it stats disk and touches no registry state.
+async fn get_sessions_ledger(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<crate::session::session_ledger::LedgerReport>> {
+    use crate::session::reconcile::DiskTranscriptIndex;
+    use crate::session::session_ledger as ledger;
+    use crate::session::session_lifecycle_store::SessionLifecycleStore;
+    use tauri::Manager;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let boot = crate::session::shutdown_marker::boot_classification();
+    // Latch the PRIOR ledger before anything in this process can overwrite it.
+    // Idempotent, so calling it here as well as at boot is safe — and doing it
+    // here means the route still answers on a build whose boot path did not
+    // run the latch.
+    let prior = ledger::load_prior_once();
+
+    let store = state
+        .app_handle
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone());
+    let Some(store) = store else {
+        warn!(
+            "control/sessions/ledger: lifecycle store not in Tauri state — reporting \
+             unavailable WITH a reason (never a bare empty ledger)"
+        );
+        let empty = ledger::SessionLedger {
+            ledger_version: ledger::LEDGER_VERSION,
+            captured_at_ms: now,
+            captured_at: chrono::Utc::now().to_rfc3339(),
+            reason: "unavailable".to_string(),
+            shutdown_at: boot.and_then(|b| b.prior_marker_at),
+            clean_shutdown: boot.map(|b| !b.crash_recovery),
+            sessions: Vec::new(),
+        };
+        let mut report = ledger::diff(prior, &[], empty);
+        report.status = "unavailable".to_string();
+        report.reason = Some("lifecycle_store_unavailable".to_string());
+        report.verdict = ledger::VERDICT_UNKNOWN.to_string();
+        return Json(ApiResponse::success(report));
+    };
+
+    let index = DiskTranscriptIndex::discover();
+    let current = ledger::capture(&store, &index, "read", now, boot);
+    // "Came back" = open now, UNION anything stamped restored by THIS boot —
+    // a session that returned and was then closed did in fact return.
+    // `None` when the boot census never latched — see `observed_back`: an
+    // absent boot instant SKIPS the sticky-restore-stamp arm rather than
+    // admitting it with a `0` floor.
+    let boot_at = crate::session::restore_census::latched().map(|c| c.boot_at_ms);
+    let back = ledger::observed_back(&store, boot_at);
+    Json(ApiResponse::success(ledger::diff(prior, &back, current)))
+}
+
+/// Query for `POST /control/sessions/ledger/capture`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct LedgerCaptureQuery {
+    /// Label recorded on the capture (default `pre-rebuild`). Free-form so an
+    /// operator can say WHY they captured.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `POST /control/sessions/ledger/capture[?reason=…]` — **the deliberate
+/// pre-rebuild capture.**
+///
+/// Run this before rebuilding the runner. It writes the open-session ledger —
+/// id, name, tab title, cwd, worktree, plan — to
+/// `~/.qontinui/runner[/instance-<name>]/session-ledger.json`, atomically, so
+/// the next process can diff against it over `GET /control/sessions/ledger`.
+///
+/// The boot latch and the 45s liveness poll already persist the ledger on
+/// change, so this is belt-and-braces rather than the only writer — but it is
+/// the one an operator can run at a moment of their choosing, and it stamps
+/// the reason.
+///
+/// Returns the captured ledger plus whether a write actually landed
+/// (`persisted: false` means the content was byte-identical to the last one
+/// written, not that the capture failed).
+async fn post_sessions_ledger_capture(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<LedgerCaptureQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use crate::session::reconcile::DiskTranscriptIndex;
+    use crate::session::session_ledger as ledger;
+    use crate::session::session_lifecycle_store::SessionLifecycleStore;
+    use tauri::Manager;
+
+    let store = state
+        .app_handle
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone());
+    let Some(store) = store else {
+        // Deliberately an ERROR, not a degraded 200: unlike the read routes,
+        // this one is asked to CAPTURE, and silently capturing nothing before
+        // a rebuild is the exact failure the phase exists to remove.
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(api_error(
+                "lifecycle store not available — NOTHING was captured. Do not rebuild \
+                 expecting this ledger to exist."
+                    .to_string(),
+            )),
+        ));
+    };
+
+    // Latch the prior ledger first, so a capture taken before any read cannot
+    // destroy the previous boot's record of what was open.
+    let _ = ledger::load_prior_once();
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let boot = crate::session::shutdown_marker::boot_classification();
+    let index = DiskTranscriptIndex::discover();
+    let reason = query
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(ledger::REASON_PRE_REBUILD);
+    let captured = ledger::capture(&store, &index, reason, now, boot);
+    let persisted = ledger::persist_if_changed(&captured);
+    let path = ledger::ledger_path().to_string_lossy().replace('\\', "/");
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "persisted": persisted,
+        "path": path,
+        "ledger": captured,
+    }))))
 }
 
 /// Body of `POST /control/shim-beacon` — a fire-and-forget diagnostic the
