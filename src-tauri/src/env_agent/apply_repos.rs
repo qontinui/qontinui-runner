@@ -31,7 +31,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::apply::{AppliedChange, SectionApply, SectionStatus, SkipRecord};
+use super::apply::{AppliedChange, BlockedCause, SectionApply, SectionStatus, SkipRecord};
 use super::collectors::{self, REPOS_SCOPE_KEY};
 use super::pull::{Change, SectionPlan};
 
@@ -254,7 +254,7 @@ pub fn apply_section_with(section: &SectionPlan, clone: Cloner<'_>, confirm: boo
                 .unwrap_or_else(|| "workspace-root resolution found nothing".to_string());
             let mut out = SectionApply::inert(
                 REPOS_SECTION,
-                SectionStatus::Blocked(format!("no workspace root resolved — {why}")),
+                SectionStatus::blocked_precondition(format!("no workspace root resolved — {why}")),
             );
             out.notes.push(
                 "Set $QONTINUI_ROOT, or the runner's `paths.workspace_root` setting, to the \
@@ -266,7 +266,8 @@ pub fn apply_section_with(section: &SectionPlan, clone: Cloner<'_>, confirm: boo
     };
 
     if let Some(reason) = incomparable_scope(section) {
-        let mut out = SectionApply::inert(REPOS_SECTION, SectionStatus::Blocked(reason));
+        let mut out =
+            SectionApply::inert(REPOS_SECTION, SectionStatus::blocked_precondition(reason));
         out.target = Some(format!("workspace root {}", root.display()));
         return out;
     }
@@ -294,7 +295,7 @@ pub fn apply_section_with(section: &SectionPlan, clone: Cloner<'_>, confirm: boo
         Some(free) if free < needed => {
             let mut blocked = SectionApply::inert(
                 REPOS_SECTION,
-                SectionStatus::Blocked(format!(
+                SectionStatus::blocked_precondition(format!(
                     "{free} GB free on the volume holding {}; {} clone(s) need roughly \
                      {needed} GB to land and still leave the {MIN_FREE_DISK_GB} GB the \
                      supervisor requires to build them",
@@ -319,7 +320,7 @@ pub fn apply_section_with(section: &SectionPlan, clone: Cloner<'_>, confirm: boo
         None => {
             let mut blocked = SectionApply::inert(
                 REPOS_SECTION,
-                SectionStatus::Blocked(format!(
+                SectionStatus::blocked_precondition(format!(
                     "could not determine free space on the volume holding {} — \
                      refusing rather than risk filling the disk",
                     root.display()
@@ -377,7 +378,14 @@ pub fn apply_section_with(section: &SectionPlan, clone: Cloner<'_>, confirm: boo
     } else {
         // Every clone failed. `Applied` would be a lie and `NothingToDo` would
         // hide it; the skip records carry the per-repo reasons.
-        SectionStatus::Blocked("every planned clone failed — see the skipped list".to_string())
+        // NoMovement, not Precondition: nothing on this box stopped the apply from
+        // running — every planned clone RAN and none of them landed, which is
+        // exactly the cause's "the apply did work; the box did not change", with
+        // the per-repo reasons in `skipped`.
+        SectionStatus::Blocked {
+            cause: BlockedCause::NoMovement,
+            reason: "every planned clone failed — see the skipped list".to_string(),
+        }
     };
     out
 }
@@ -395,6 +403,10 @@ mod tests {
             changes,
             local_section_absent: false,
             derived_keys: BTreeSet::new(),
+            // `repos` is enumerated from the filesystem, not probed with a
+            // budget, so it has no unmeasurable keys — the empty set is the
+            // honest value here, not a placeholder.
+            unknown_keys: BTreeSet::new(),
         }
     }
 
