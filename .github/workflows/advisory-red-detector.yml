@@ -1,0 +1,67 @@
+name: advisory-red detector selftest
+
+# Guards scripts/detect-schedule-red-streaks.sh — the watcher for workflows the
+# coord merge train structurally CANNOT see.
+#
+# WHY A DETECTOR EXISTS AT ALL. Coord's `establishes_main_baseline` predicate
+# admits `push` runs on `main`. A workflow triggered only by `schedule` /
+# `workflow_dispatch` / path-filtered `pull_request` has zero of those, so it can
+# never hold a PR — and correspondingly nothing ever reads it. A scheduled run
+# has no author, no PR and no reviewer; GitHub emails the workflow file's last
+# committer, which for a fleet-authored workflow is nobody in particular. That
+# blind spot let `atlas/exclude.txt freshness` sit red for nine consecutive
+# nights (2026-08-15 .. 2026-08-24) while guarding a `DROP TABLE`-class footgun,
+# and for twelve nights before that. Advisory is not the same as unimportant.
+#
+# WHY THIS WORKFLOW IS ONLY A SELFTEST, and deliberately has no `schedule` arm:
+#
+#   * A nightly that goes red because ANOTHER workflow is red would be a third
+#     unowned nightly — the same blind spot one level up.
+#   * Wiring the live detector into a `push`-on-main job would be worse: a red
+#     main baseline holds the coord merge train, so one advisory nightly rotting
+#     would block every unrelated runner PR. The atlas workflow's own header
+#     argues that exact point about itself, and it is right.
+#
+#   So the detector is a TOOL the merge-train steward runs
+#   (`bash scripts/detect-schedule-red-streaks.sh`), and this workflow pins its
+#   contract so the tool cannot rot the way the thing it watches did. An
+#   untested detector reports "0 findings" whether the fleet is healthy or its
+#   own API read 403'd, and nobody can tell the two apart.
+#
+# The selftest is fixture-driven: no network, no `gh`, no credentials, so this
+# runs on `push` to main as well and therefore has a baseline coord can read.
+# Not a gating workflow (see ci-integrity.yml's GATING list) — it tests a
+# reporting tool, not a merge gate.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/detect-schedule-red-streaks.sh"
+      - "scripts/tests/test_schedule_red_streak_detector.sh"
+      - "scripts/tests/fixtures/schedule-red-streaks/**"
+      - ".github/workflows/advisory-red-detector.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/detect-schedule-red-streaks.sh"
+      - "scripts/tests/test_schedule_red_streak_detector.sh"
+      - "scripts/tests/fixtures/schedule-red-streaks/**"
+      - ".github/workflows/advisory-red-detector.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: schedule-red-streak detector selftest
+    runs-on: ubuntu-latest
+    # A checkout plus a handful of jq passes over ~100KB of recorded JSON.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Test the schedule-red-streak detector (fixtures, no network)
+        shell: bash
+        run: bash scripts/tests/test_schedule_red_streak_detector.sh

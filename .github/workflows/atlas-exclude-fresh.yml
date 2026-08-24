@@ -146,6 +146,18 @@ jobs:
         shell: bash
         run: pwsh atlas/scripts/tests/test_regen_exit_contract.ps1
 
+      # Same idea one layer up: the `verify` job's SELF-HEAL step -- the one
+      # that turns a regenerated exclude.txt into a pull request -- is decided
+      # entirely by `gh` exit codes under `set -euo pipefail`, and `verify` can
+      # never test it (it only ever walks whichever single path the live schema
+      # and the live PAT happen to produce, and its success path went
+      # unexercised for the six no-drift nights before it failed nine nights
+      # running). This extracts that step's body from this very file and runs it
+      # against a stubbed `gh`/`git`: no DB, no network, no PAT.
+      - name: Test the refresh-PR step's guards (stubbed gh, no network)
+        shell: bash
+        run: bash atlas/scripts/tests/test_pr_step_guards.sh
+
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -449,6 +461,39 @@ jobs:
         run: |
           set -euo pipefail
 
+          # ---------------------------------------------------------------
+          # ONE remediation block, shared by every guarded `gh pr *` call in
+          # this step, so the call sites cannot drift apart.
+          #
+          # Under the `set -euo pipefail` above, an UNGUARDED `gh` call kills
+          # this step on the spot -- taking the remediation with it. That is not
+          # hypothetical: the `gh pr reopen` that used to sit below the push
+          # failed on NINE consecutive nightlies (2026-08-15 .. 2026-08-24) with
+          # `Resource not accessible by personal access token
+          # (reopenPullRequest)`, and the ::error:: block naming the exact fix
+          # never printed once. The workflow knew the answer and could not reach
+          # the line that says it.
+          #
+          # NEVER "repair" a failure here with `|| true`. Suppressing it ends the
+          # step GREEN with real drift undelivered, which is strictly WORSE than
+          # a loud red -- and reintroducing silent success while fixing a
+          # silent-failure bug is this fleet's most-repeated regression. This
+          # function EXPLAINS the failure; every caller still `exit 1`s.
+          # `branch_pushed` only selects which by-hand remediation is accurate.
+          branch_pushed=0
+          pr_op_failed() {
+            local op="$1"
+            echo "::error::The pull-request '$op' operation failed on $REPO (head branch '$BRANCH')."
+            echo "::error::Usually permissions/config, not schema drift (see gh's error above). Fix EITHER of:"
+            echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
+            echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO."
+            if [ "$branch_pushed" = "1" ]; then
+              echo "::error::Meanwhile, open the PR by hand from '$BRANCH' -- the fix is already committed there."
+            else
+              echo "::error::Meanwhile, deliver the drift by hand -- this run's 'atlas-exclude-fresh' artifact carries the regenerated exclude.txt."
+            fi
+          }
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -473,7 +518,10 @@ jobs:
             # ever quoted them every draft PR would read as ready and this step
             # would become a permanent SILENT no-op -- the failure class this
             # whole change exists to remove.
-            existing_draft="$(gh pr view "$existing_num" --repo "$REPO" --json isDraft --jq '.isDraft')"
+            if ! existing_draft="$(gh pr view "$existing_num" --repo "$REPO" --json isDraft --jq '.isDraft')"; then
+              pr_op_failed "view --json isDraft on #$existing_num"
+              exit 1
+            fi
             if [ "$existing_draft" != "true" ]; then
               # Ready for review => possibly a live merge-train candidate, so the
               # branch is left strictly alone. But exiting green with real drift
@@ -491,8 +539,11 @@ jobs:
               # under `pipefail` that turns a successful dedup HIT into a
               # non-zero pipeline -- i.e. the dedup would fail open and comment
               # again every night, the exact spam it exists to prevent.
-              gh pr view "$existing_num" --repo "$REPO" --json comments \
-                --jq '.comments[].body' > "$RUNNER_TEMP/pr-comments.txt"
+              if ! gh pr view "$existing_num" --repo "$REPO" --json comments \
+                   --jq '.comments[].body' > "$RUNNER_TEMP/pr-comments.txt"; then
+                pr_op_failed "view --json comments on #$existing_num"
+                exit 1
+              fi
               if grep -qF "atlas-drift:$drift_sha" "$RUNNER_TEMP/pr-comments.txt"; then
                 echo "Drift unchanged since the last comment on #$existing_num; not commenting again."
               else
@@ -503,7 +554,10 @@ jobs:
                   cat "$RUNNER_TEMP/exclude.drift.txt"
                   printf '```\n\n<!-- atlas-drift:%s -->\n' "$drift_sha"
                 } > "$RUNNER_TEMP/pr-comment.md"
-                gh pr comment "$existing_num" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-comment.md"
+                if ! gh pr comment "$existing_num" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-comment.md"; then
+                  pr_op_failed "comment on #$existing_num"
+                  exit 1
+                fi
                 echo "Commented the new drift on #$existing_num."
               fi
               exit 0
@@ -542,6 +596,8 @@ jobs:
           # each run. --force-with-lease would be theatre -- we never fetched
           # the remote branch, so there is no lease to check.
           git push --force origin "HEAD:refs/heads/$BRANCH"
+          # Only selects which by-hand remediation pr_op_failed prints.
+          branch_pushed=1
 
           body="$RUNNER_TEMP/pr-body.md"
           {
@@ -592,26 +648,52 @@ jobs:
           EOF
           } > "$body"
 
-          if [ -z "$existing_num" ]; then
-            # A CLOSED (not merged) PR would otherwise make `gh pr create`
-            # succeed every night -- GitHub allows a new PR for a head whose
-            # previous PR was closed -- turning "one PR" into one per night.
-            # Reopen the maintainer's PR instead. mergedAt is the discriminator:
-            # gh reports state CLOSED for merged PRs too, and a merged one must
-            # never be reopened. `first`, not `last`: gh returns newest-first, so
-            # `last` would reopen the OLDEST closed PR. No `|| true`, same reason
-            # as the open-PR lookup above.
-            existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state closed \
-              --json number,mergedAt --jq 'map(select(.mergedAt == null)) | first | .number // empty')"
-            if [ -n "$existing_num" ]; then
-              echo "Reopening previously closed refresh PR #$existing_num."
-              gh pr reopen "$existing_num" --repo "$REPO"
-            fi
-          fi
+          # THERE IS DELIBERATELY NO REOPEN PATH HERE, and adding one back is a
+          # regression. A closed-unmerged head with no OPEN pull request falls
+          # straight through to the guarded `gh pr create` below.
+          #
+          # What used to be here: a `--state closed` lookup plus `gh pr reopen`,
+          # written to stop "one PR per night". Both halves were wrong.
+          #
+          #   1. The selector matched ANY closed-unmerged PR on the head branch,
+          #      and the only one that has ever existed is #896 -- authored by a
+          #      HUMAN (`jspinak`, `is_bot: false`) and deliberately closed
+          #      unmerged on 2026-07-28, ELEVEN DAYS before this code was
+          #      written. So every nightly from 2026-08-15 to 2026-08-24 tried to
+          #      resurrect a maintainer's closed PR under its old title, carrying
+          #      a completely different one-line diff.
+          #
+          #      Narrowing the selector to bot-authored PRs carrying a body
+          #      marker does NOT fix this, so do not "improve" it that way: a BOT
+          #      PR that a maintainer deliberately closed is still wrongly
+          #      reopened, and a bot PR closed BEFORE such a marker shipped is
+          #      skipped -- which sends the run to `gh pr create` and opens a
+          #      SECOND PR on the same head. `reopen` fundamentally cannot tell
+          #      "closed because superseded" from "closed because rejected";
+          #      author and body markers do not carry that distinction.
+          #
+          #   2. The "one PR per night" it was defending against cannot happen.
+          #      One-PR-per-head is enforced by the OPEN-state lookup at the top
+          #      of this step: night 1 creates the PR, night 2 finds it open and
+          #      takes the `gh pr edit` path below. A genuine one-per-night
+          #      stream would require a human to close the PR every single night
+          #      -- at which point a loud stream of PRs is the correct signal,
+          #      not silent resurrection.
+          #
+          # Creating a fresh PR is attributable, closable, and carries the
+          # current drift in its title and body. The human's close stands.
+          # Deleting this also removed the repo's only `gh pr reopen`, so the
+          # reopen verb's PAT-permission dependency is gone entirely.
 
           if [ -n "$existing_num" ]; then
-            gh pr edit "$existing_num" --repo "$REPO" --title "$TITLE" --body-file "$body"
-            url="$(gh pr view "$existing_num" --repo "$REPO" --json url --jq .url)"
+            if ! gh pr edit "$existing_num" --repo "$REPO" --title "$TITLE" --body-file "$body"; then
+              pr_op_failed "edit #$existing_num"
+              exit 1
+            fi
+            if ! url="$(gh pr view "$existing_num" --repo "$REPO" --json url --jq .url)"; then
+              pr_op_failed "view --json url on #$existing_num"
+              exit 1
+            fi
             echo "Updated refresh PR: $url"
           else
             # A failure here is almost always CONFIGURATION rather than drift:
@@ -624,11 +706,7 @@ jobs:
             # is one click away, but a nightly that found REAL drift and could
             # not deliver it must not end green.
             if ! url="$(gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft --title "$TITLE" --body-file "$body")"; then
-              echo "::error::Branch '$BRANCH' was pushed with the regenerated exclude.txt, but opening its PR failed."
-              echo "::error::Usually permissions/config, not schema drift (see gh's error above). Fix EITHER of:"
-              echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
-              echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO."
-              echo "::error::Meanwhile, open the PR by hand from '$BRANCH' -- the fix is already committed there."
+              pr_op_failed "create"
               exit 1
             fi
             echo "Opened refresh PR: $url"
