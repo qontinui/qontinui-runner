@@ -20,6 +20,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   COORD_SOURCE_NO_ACCOUNT,
   COORD_SOURCE_SETTINGS_UNREADABLE,
+  coordCallsReady,
   deriveCoordAvailability,
   deriveCoordGating,
   fetchCoordModeOnce,
@@ -141,5 +142,31 @@ describe("fetchCoordModeOnce", () => {
     resetCoordModeCache();
     await fetchCoordModeOnce();
     expect(mockInvoke).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("coordCallsReady — the fail-open window (§6.4)", () => {
+  it("polls once the mode has settled connected", () => {
+    expect(coordCallsReady({ isolated: false, loading: false })).toBe(true);
+  });
+
+  it("never polls an isolated runner", () => {
+    expect(coordCallsReady({ isolated: true, loading: false })).toBe(false);
+    expect(coordCallsReady({ isolated: true, loading: true })).toBe(false);
+  });
+
+  // The gap this closes: `isolated` is false until `get_coord_mode` answers,
+  // so every gated panel fired one request — and armed its interval — before
+  // the gate could possibly close. Interactivity still fails OPEN during this
+  // window; only the egress waits.
+  it("holds the request while the mode is unresolved", () => {
+    expect(coordCallsReady({ isolated: false, loading: true })).toBe(false);
+  });
+
+  it("releases on a REJECTED resolve, so an older runner build polls as before", () => {
+    // The provider sets `loading` false in `finally`, and leaves the mode
+    // `unknown` (isolated=false) when the invoke rejects. That pair must
+    // poll — a runner predating `get_coord_mode` has to keep working.
+    expect(coordCallsReady({ isolated: false, loading: false })).toBe(true);
   });
 });

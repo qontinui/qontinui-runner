@@ -13,7 +13,16 @@
 
 import { describe, expect, it } from "vitest";
 
-import { deriveSpawnFormState, type SpawnFormInput } from "./SpawnFromPlanModal";
+import {
+  deriveSpawnFormState,
+  spawnNoticeProps,
+  SPAWN_SURFACE,
+  type SpawnFormInput,
+} from "./SpawnFromPlanModal";
+import {
+  coordDisabledCopy,
+  runCoordDisabledAction,
+} from "@/components/shared/CoordConnectionRequired";
 import {
   COORD_SOURCE_NO_ACCOUNT,
   COORD_SOURCE_SETTINGS_UNREADABLE,
@@ -114,5 +123,46 @@ describe("deriveSpawnFormState — coord-mode gating (§6.4)", () => {
     expect(deriveSpawnFormState(filled({ gating: connected, busy: true })).fieldsEnabled).toBe(
       false,
     );
+  });
+});
+
+describe("spawnNoticeProps — the modal's dismiss wiring (§6.4)", () => {
+  // This helper exists ONLY so the wiring below is assertable under
+  // `environment: "node"`, where the notice's button cannot be clicked.
+  // Without these assertions the seam bought nothing.
+  it("passes the modal's own close handler as the notice's onDismiss", () => {
+    const onClose = () => {};
+    const props = spawnNoticeProps(COORD_SOURCE_NO_ACCOUNT, onClose);
+    // The modal is `fixed inset-0` with `aria-modal="true"`. If the notice's
+    // action navigated without closing it, the tab switch would land BEHIND
+    // an opaque overlay and the operator would see nothing happen.
+    expect(props.onDismiss).toBe(onClose);
+  });
+
+  it("names the Spawn surface and its own bridge id", () => {
+    const props = spawnNoticeProps(COORD_SOURCE_NO_ACCOUNT, () => {});
+    expect(props.surface).toBe(SPAWN_SURFACE);
+    expect(props.uiBridgeId).toBe("productivity.spawn-from-plan-modal-isolated");
+  });
+
+  it("forwards the source verbatim so the notice picks the right message", () => {
+    // Both isolated arms reach this modal; collapsing them here would put the
+    // "connect an account" copy in front of an operator whose settings.json
+    // is the actual fault.
+    expect(spawnNoticeProps(COORD_SOURCE_SETTINGS_UNREADABLE, () => {}).source).toBe(
+      COORD_SOURCE_SETTINGS_UNREADABLE,
+    );
+    expect(spawnNoticeProps(null, () => {}).source).toBeNull();
+  });
+
+  it("wires the dismiss so the notice's action closes the modal first", () => {
+    const calls: string[] = [];
+    const props = spawnNoticeProps(COORD_SOURCE_NO_ACCOUNT, () => calls.push("close"));
+    runCoordDisabledAction({
+      copy: coordDisabledCopy(props.source, props.surface),
+      onDismiss: props.onDismiss,
+      dispatch: (tab) => calls.push(`dispatch:${tab}`),
+    });
+    expect(calls).toEqual(["close", "dispatch:settings-account"]);
   });
 });

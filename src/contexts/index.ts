@@ -70,6 +70,7 @@ export {
   resetCoordModeCache,
   deriveCoordAvailability,
   deriveCoordGating,
+  coordCallsReady,
   COORD_SOURCE_NO_ACCOUNT,
   COORD_SOURCE_SETTINGS_UNREADABLE,
 } from "./CoordModeContext";

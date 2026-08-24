@@ -25,7 +25,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, AlertOctagon, AlertTriangle, Info, RefreshCw, Server } from "lucide-react";
 import { createLogger } from "@/lib/logger";
-import { useCoordMode, type CoordGating } from "@/contexts/CoordModeContext";
+import { coordCallsReady, useCoordMode, type CoordGating } from "@/contexts/CoordModeContext";
 import {
   CoordConnectionRequired,
   coordDisabledCopy,
@@ -236,11 +236,16 @@ export function FleetHealthPanel() {
     // "coord unreachable" banner for a condition that is configuration,
     // not an outage. The mode is config-derived, so this is not a
     // reachability heuristic — it never flips back on a network blip.
-    if (coordDisabled) return;
+    //
+    // `coordCallsReady` also holds the FIRST request until the mode has
+    // settled. Branching on `coordDisabled` alone let every app start fire
+    // one GET (and arm the interval) before `get_coord_mode` answered, so an
+    // isolated runner still dialled the phantom base once per launch.
+    if (!coordCallsReady(coord)) return;
     void load();
     const id = window.setInterval(() => void load(), POLL_MS);
     return () => window.clearInterval(id);
-  }, [load, coordDisabled]);
+  }, [load, coord]);
 
   return (
     <section

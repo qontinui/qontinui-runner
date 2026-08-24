@@ -538,9 +538,20 @@ export function deriveLiveHeatmapGate(input: {
   testSeam: boolean;
   /** The runner's coord mode. Omitted = fail open (see CoordModeContext). */
   gating?: CoordGating;
+  /**
+   * True while `get_coord_mode` has not answered yet. The SECTION still
+   * renders live during that window (the gate fails open on `unknown`), but
+   * the 5 s poll waits: `isolated` is false until the mode settles, so an
+   * isolated runner otherwise started this poll on every app launch and only
+   * stopped it a round trip later. See `coordCallsReady`.
+   */
+  resolving?: boolean;
 }): { coordDisabled: boolean; pollEnabled: boolean } {
   const coordDisabled = input.gating?.isolated ?? false;
-  return { coordDisabled, pollEnabled: !input.testSeam && !coordDisabled };
+  return {
+    coordDisabled,
+    pollEnabled: !input.testSeam && !coordDisabled && !(input.resolving ?? false),
+  };
 }
 
 export function FileActivityPanel({
@@ -555,6 +566,7 @@ export function FileActivityPanel({
   const liveGate = deriveLiveHeatmapGate({
     testSeam: initialDataForTest != null,
     gating: coord,
+    resolving: coord.loading,
   });
   const liveHeatmap = useLiveDirtyHeatmap(liveGate.pollEnabled);
   const [windowSecs, setWindowSecsState] = useState<number>(() =>
