@@ -135,9 +135,9 @@ harness_env="$work/harness-env.txt"
   | grep -oE '^[[:space:]]+[A-Z][A-Z0-9_]*=' || true; } \
   | tr -d ' =' | sort -u > "$harness_env"
 [ -s "$harness_env" ] || {
-  echo "::error::could not derive run_step's env list from $0 -- was the function"
-  echo "::error::renamed, or its env assignments re-indented? This check cannot be"
-  echo "::error::skipped: an empty list would make every var below read as missing."
+  echo "::error::could not derive run_step's env list from ${BASH_SOURCE[0]} -- was"
+  echo "::error::the function renamed, or its env assignments re-indented? This check"
+  echo "::error::cannot be skipped: an empty list makes every var below read as missing."
   exit 1
 }
 body_env="$work/body-env.txt"
@@ -165,6 +165,9 @@ if [ -n "$missing" ]; then
   echo "::error::to run_step's env list below -- the allow-list is DERIVED from run_step,"
   echo "::error::so there is no third place to edit. Under set -u an unsupplied var aborts"
   echo "::error::the step body mid-run, which no assertion below can see."
+  echo "::error::...or the derivation above UNDER-matched run_step's env lines, in which"
+  echo "::error::case the harness does supply these and the blame here is misplaced."
+  echo "::error::Check both before editing the step."
   exit 1
 fi
 
@@ -368,6 +371,8 @@ assert "create path => exit 0"                 0 "$(run_step '' '' 'true' '')"
 assert "create path wrote a PR URL to summary" yes "$(summary_has_url)"
 assert "create path called gh pr create"       yes "$(log_has 'create' gh.log)"
 assert "create path did NOT reopen anything"   no  "$(log_has 'reopen' gh.log)"
+# One announcement, after the URL is resolved -- never an empty one stated as fact.
+assert "announces the resolved URL once"       yes "$(has "Refresh PR: $STUB_URL")"
 
 assert "edit path => exit 0"                   0 "$(run_step '' '1234' 'true' '')"
 assert "edit path wrote a PR URL to summary"   yes "$(summary_has_url)"
