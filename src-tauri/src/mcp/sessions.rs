@@ -409,6 +409,22 @@ async fn spawn_session(
                 "Failed to spawn role={:?} session {}: {}",
                 req.role, task_run_id, e
             );
+            // The task-run row was created BEFORE the spawn was attempted, so a
+            // failed spawn used to leave it reading `running` forever with
+            // `sessions_count: 0` and an empty `output_log` — a dead row that
+            // looks live to every consumer, while the HTTP body below says
+            // `state: "error"`. Reconcile the row with the answer we return.
+            if let Err(db_err) = state
+                .app_state
+                .pg_db
+                .fail_task_run(&task_run_id, &e)
+                .await
+            {
+                warn!(
+                    "could not mark task run {} failed after spawn failure: {}",
+                    task_run_id, db_err
+                );
+            }
             Ok(Json(SpawnSessionResponse {
                 task_run_id,
                 task_name: req.task_name,
@@ -426,6 +442,19 @@ async fn spawn_session(
                 "spawn_blocking join error for session {}: {}",
                 task_run_id, join_err
             );
+            // Same reconcile as the spawn-failure arm above: the row exists and
+            // no session ever attached to it.
+            if let Err(db_err) = state
+                .app_state
+                .pg_db
+                .fail_task_run(&task_run_id, &format!("spawn_blocking join error: {join_err}"))
+                .await
+            {
+                warn!(
+                    "could not mark task run {} failed after join error: {}",
+                    task_run_id, db_err
+                );
+            }
             Ok(Json(SpawnSessionResponse {
                 task_run_id,
                 task_name: req.task_name,

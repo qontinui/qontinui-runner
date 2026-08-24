@@ -312,10 +312,16 @@ fn run_async_inline<F: std::future::Future>(fut: F) -> F::Output {
 /// Returned by value so the constructed environment is unit-testable without
 /// spawning `claude`.
 pub(crate) fn build_inline_child_command(
+    program: &str,
     cli_args: &[String],
     working_dir: &str,
 ) -> std::process::Command {
-    let mut cmd = crate::process_helpers::cmd_no_window();
+    // `program` comes from `launch_spec::render_program_and_argv`, which is the
+    // one place that decides `cmd.exe` (Windows, for npm's `claude.cmd` shim)
+    // versus a directly-executed resolved `claude` (everywhere else). Do not
+    // reintroduce `cmd_no_window()` here — it hardcodes `cmd.exe`, which does
+    // not exist off Windows.
+    let mut cmd = crate::process_helpers::no_window(program);
     cmd.args(cli_args)
         .current_dir(working_dir)
         // Remove CLAUDECODE env var to prevent "nested session" detection.
@@ -501,14 +507,10 @@ fn run_claude_session_inline(
             crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
         crate::claude_session::launch_spec::LaunchConfig::from_settings(config_dir.as_deref())
     };
-    let mut cli_args = vec!["/c".to_string()];
-    cli_args.extend(crate::claude_session::launch_spec::render_argv(
-        &spec,
-        &launch_cfg,
-        "claude",
-    ));
+    let (program, cli_args) =
+        crate::claude_session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
 
-    let mut cmd = build_inline_child_command(&cli_args, working_dir);
+    let mut cmd = build_inline_child_command(&program, &cli_args, working_dir);
 
     // ── Observable-bridge federation: spawn-time pull + watcher ───────
     //
@@ -2761,7 +2763,7 @@ mod spawn_env_tests {
     #[test]
     fn inline_child_command_scrubs_credential_values() {
         let args = vec!["/c".to_string(), "claude".to_string()];
-        let cmd = build_inline_child_command(&args, ".");
+        let cmd = build_inline_child_command("cmd.exe", &args, ".");
 
         crate::terminal::assert_credentials_scrubbed_std(&cmd, "build_inline_child_command");
 

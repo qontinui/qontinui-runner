@@ -840,7 +840,13 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
             fp,
             "claude_session::runner::build_inline_child_command",
             "scrub_credential_env_std",
-            &crate::claude_session::runner::build_inline_child_command(&[], "."),
+            // The program is a placeholder: this seam fingerprints the child's
+            // ENVIRONMENT (credential scrubbing), and `build_inline_child_command`
+            // touches env identically whatever it is about to exec. The real
+            // program is chosen per-platform by
+            // `launch_spec::render_program_and_argv`; do not read this literal as
+            // the report asserting what gets spawned.
+            &crate::claude_session::runner::build_inline_child_command("cmd.exe", &[], "."),
         ),
         std_seam(
             fp,

@@ -184,8 +184,9 @@ impl ClaudeSession {
             session_id, working_dir
         );
 
-        // Spawn CLI with stream-json input AND output
-        let mut cmd = crate::process_helpers::cmd_no_window();
+        // Spawn CLI with stream-json input AND output. The Command itself is
+        // built further down, once `render_program_and_argv` has resolved the
+        // program — on non-Windows there is no `cmd.exe` to create it from.
 
         // Resolve the account config dir up front: it feeds BOTH the shared
         // launch-command builder (the per-account operator template) and the
@@ -304,13 +305,10 @@ impl ClaudeSession {
         let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
             effective_config_dir.as_deref(),
         );
-        let mut cli_args = vec!["/c".to_string()];
-        cli_args.extend(crate::claude_session::launch_spec::render_argv(
-            &spec,
-            &launch_cfg,
-            "claude",
-        ));
+        let (program, cli_args) =
+            crate::claude_session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
 
+        let mut cmd = crate::process_helpers::no_window(&program);
         let cli_arg_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
         cmd.args(&cli_arg_refs)
             .current_dir(working_dir)
