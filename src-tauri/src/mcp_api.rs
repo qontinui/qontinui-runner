@@ -740,6 +740,22 @@ async fn health(
         // `degraded` downgrade above so `/health` mirrors the data layer.
         "database": {
             "reachable": pg_reachable,
+            // WHICH database this process is on -- `reachable` only says
+            // whether it answers, and is identically `true` for a developer's
+            // docker-compose cluster, for a bundled cluster this process
+            // started, and for one it attached to. Three states with
+            // completely different blast radii, previously distinguishable
+            // only by scraping the boot log. One of `external` /
+            // `embedded-owned` / `embedded-attached` / `degraded`; `unknown`
+            // only before boot reaches the PG block. Fixed at boot: it names
+            // the arm taken, not current liveness, so a cluster that dies
+            // later flips `reachable`, not `arm`.
+            "arm": crate::embedded_pg::db_arm().as_str(),
+            // The embedded cluster's loopback port, null off the embedded arms.
+            // Two runners reporting the same port is the observable form of the
+            // attach path's claim: one cluster, joined, not two fighting over a
+            // locked data dir.
+            "embeddedPort": crate::embedded_pg::embedded_port(),
         },
         // PR-credential surface (plan qontinui-pr-credential-provisioning,
         // Phase 0): cached `gh auth status` verdict. `state: "pending"` +

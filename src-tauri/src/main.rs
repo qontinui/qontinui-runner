@@ -380,6 +380,64 @@ fn emit_session_bound(handle: &tauri::AppHandle, actions: &[session::reconcile::
     }
 }
 
+/// Boot the bundled embedded PostgreSQL and return a `PgDb` for it, degrading
+/// to a 503-serving pool if it cannot be started or connected to.
+///
+/// Extracted from the boot path because there are now two ways onto this arm:
+/// the original one (no external PostgreSQL reachable and none explicitly
+/// configured) and `QONTINUI_FORCE_EMBEDDED_PG`, which skips the external
+/// attempt outright. Both must behave identically once here.
+fn boot_embedded_pg(rt: &tokio::runtime::Runtime, pg_url: &str) -> Arc<crate::database::pg::PgDb> {
+    let data_root = dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("com.qontinui.runner")
+        .join("embedded-pg");
+
+    let degrade = |reason: String| {
+        error!("{reason} Booting degraded — DB-backed routes return 503.");
+        let pg = Arc::new(
+            crate::database::pg::PgDb::new_degraded(pg_url)
+                .expect("degraded PG pool construction failed"),
+        );
+        crate::database::pg::PgDb::set_global(pg.clone());
+        crate::database::pg::set_pg_available(false);
+        // Overwrites whatever `store_handle` recorded: on the connect-failure
+        // path below the cluster may well be up, but this process has no
+        // usable database, and `/health` must say so.
+        crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::Degraded);
+        pg
+    };
+
+    match rt.block_on(crate::embedded_pg::bootstrap(data_root, "qontinui_db")) {
+        Ok(managed) => {
+            let url = managed.url.clone();
+            crate::embedded_pg::store_handle(managed.handle);
+            match rt.block_on(crate::database::pg::PgDb::new(&url)) {
+                Ok(pg) => {
+                    info!("Connected to embedded PostgreSQL (standalone mode)");
+                    let pg = Arc::new(pg);
+                    crate::database::pg::PgDb::set_global(pg.clone());
+                    crate::database::pg::set_pg_available(true);
+                    pg
+                }
+                Err(conn_err) => degrade(format!(
+                    "Embedded PostgreSQL started but connection failed: {conn_err}."
+                )),
+            }
+        }
+        Err(boot_err) => degrade(format!(
+            "Failed to start bundled embedded PostgreSQL: {boot_err}."
+        )),
+    }
+}
+
+/// Parse a boolean env lever the way the rest of the boot path does.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+}
+
 fn main() {
     // Pre-GUI CLI mode (Phase 1a — devenv enrollment). `qontinui-runner env
     // <sub> …` runs the enrollment CLI (enroll / capture / show) and exits
@@ -527,7 +585,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // runtime hasn't started yet. PG pool connections are tied to their
     // creating runtime, so this same runtime stays alive for the rest of
     // the bootstrap path.
-    let pg_db: Arc<crate::database::pg::PgDb> = {
+    let pg_db: Arc<crate::database::pg::PgDb> = 'pg: {
         let profile = qontinui_runner_lib::profiles::load();
         info!(
             "Connecting to canonical PG via profile '{}'",
@@ -539,12 +597,47 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             .build()
             .expect("Failed to create tokio runtime for PG initialization");
 
+        // `QONTINUI_FORCE_EMBEDDED_PG`: take the embedded arm WITHOUT first
+        // trying the profile-resolved URL.
+        //
+        // Without this lever the embedded arm is unreachable on any machine
+        // that has a PostgreSQL answering on :5432 -- the arm below is entered
+        // only when the external connect FAILS. That made the bundled cluster
+        // untestable exactly where it is developed, which is how it shipped
+        // able to brick every standalone install on second launch
+        // (`12ef54140`) and, later, unable to run two runners at once at all.
+        // It is also what the attach path's own verification needs: proving a
+        // second runner joins the primary's cluster requires putting both on
+        // embedded on a dev box, where an external PG is running by definition.
+        //
+        // Dev/CI lever only. An end user sets neither this nor
+        // `QONTINUI_DISABLE_EMBEDDED_PG` and reaches embedded the original way.
+        let force_embedded = env_flag("QONTINUI_FORCE_EMBEDDED_PG");
+        if force_embedded && env_flag("QONTINUI_DISABLE_EMBEDDED_PG") {
+            // Directly contradictory. Silently picking a winner would leave the
+            // operator debugging the wrong database -- the exact class of
+            // undiagnosable failure this module exists to stop.
+            panic!(
+                "QONTINUI_FORCE_EMBEDDED_PG and QONTINUI_DISABLE_EMBEDDED_PG are both set -- \
+                 they are contradictory; unset one"
+            );
+        }
+        if force_embedded {
+            warn!(
+                "QONTINUI_FORCE_EMBEDDED_PG is set -- using the bundled embedded PostgreSQL \
+                 and NOT trying the profile-resolved URL ({}).",
+                pg_url
+            );
+            break 'pg boot_embedded_pg(&rt, &pg_url);
+        }
+
         match rt.block_on(crate::database::pg::PgDb::new(&pg_url)) {
             Ok(pg) => {
                 info!("PostgreSQL connected successfully");
                 let pg = Arc::new(pg);
                 crate::database::pg::PgDb::set_global(pg.clone());
                 crate::database::pg::set_pg_available(true);
+                crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::External);
 
                 // Phase 5 startup sweep (productivity-coordinator-completion-reports
                 // §9 "Memory pressure audit"): clear any stale
@@ -615,6 +708,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             let pg = Arc::new(pg);
                             crate::database::pg::PgDb::set_global(pg.clone());
                             crate::database::pg::set_pg_available(false);
+                            crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::Degraded);
                             pg
                         }
                         Err(build_err) => {
@@ -643,9 +737,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // forces the legacy behaviour.
                     let explicitly_configured = profile.source != "legacy-env"
                         || std::env::var("RUNNER_DATABASE_URL").is_ok();
-                    let embedded_disabled = std::env::var("QONTINUI_DISABLE_EMBEDDED_PG")
-                        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
-                        .unwrap_or(false);
+                    let embedded_disabled = env_flag("QONTINUI_DISABLE_EMBEDDED_PG");
 
                     if explicitly_configured || embedded_disabled {
                         error!(
@@ -662,43 +754,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                          PostgreSQL (standalone mode).",
                         e
                     );
-                    let data_root = dirs::data_local_dir()
-                        .unwrap_or_else(std::env::temp_dir)
-                        .join("com.qontinui.runner")
-                        .join("embedded-pg");
-
-                    let degrade = |reason: String| {
-                        error!("{reason} Booting degraded — DB-backed routes return 503.");
-                        let pg = Arc::new(
-                            crate::database::pg::PgDb::new_degraded(&pg_url)
-                                .expect("degraded PG pool construction failed"),
-                        );
-                        crate::database::pg::PgDb::set_global(pg.clone());
-                        crate::database::pg::set_pg_available(false);
-                        pg
-                    };
-
-                    match rt.block_on(crate::embedded_pg::bootstrap(data_root, "qontinui_db")) {
-                        Ok(managed) => {
-                            let url = managed.url.clone();
-                            crate::embedded_pg::store_handle(managed.handle);
-                            match rt.block_on(crate::database::pg::PgDb::new(&url)) {
-                                Ok(pg) => {
-                                    info!("Connected to embedded PostgreSQL (standalone mode)");
-                                    let pg = Arc::new(pg);
-                                    crate::database::pg::PgDb::set_global(pg.clone());
-                                    crate::database::pg::set_pg_available(true);
-                                    pg
-                                }
-                                Err(conn_err) => degrade(format!(
-                                    "Embedded PostgreSQL started but connection failed: {conn_err}."
-                                )),
-                            }
-                        }
-                        Err(boot_err) => degrade(format!(
-                            "Failed to start bundled embedded PostgreSQL: {boot_err}."
-                        )),
-                    }
+                    boot_embedded_pg(&rt, &pg_url)
                 }
             }
         }
