@@ -1887,10 +1887,7 @@ mod tests {
         // (coord_base is None), no QONTINUI_WEB_BASE. Must resolve to the
         // fleet's real production API host, not error and not silently
         // point at localhost.
-        assert_eq!(
-            resolve_pair_code_base(None, None),
-            PROD_API_BASE_URL
-        );
+        assert_eq!(resolve_pair_code_base(None, None), PROD_API_BASE_URL);
     }
 
     #[test]
