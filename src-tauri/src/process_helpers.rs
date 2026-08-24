@@ -140,3 +140,182 @@ impl ChildTreeGuard {
         Self
     }
 }
+
+// ── Bounded-duration child execution ─────────────────────────────────────────
+//
+// `std::process::Command::output()` has NO timeout. A child that never exits
+// parks the calling thread forever, and when that thread came from tokio's
+// blocking pool the parked thread is never returned — enough of those and
+// `spawn_blocking` stops scheduling, which is stage 1 of the 2026-08-23 runner
+// wedge (a hung `git` behind an index.lock / credential prompt / unreachable
+// remote held blocking threads until the pool was exhausted).
+//
+// [`run_with_timeout`] is the replacement: it always returns within the budget,
+// and it KILLS + reaps the child on expiry so a hung subprocess cannot outlive
+// the call.
+
+/// Outcome of [`run_with_timeout`].
+#[derive(Debug)]
+pub enum TimedOutput {
+    /// The child exited on its own inside the budget.
+    Completed(std::process::Output),
+    /// The child overran the budget; it was killed.
+    TimedOut {
+        /// The killed child's OS pid — for the caller's WARN line.
+        pid: u32,
+        /// Whether the kill was followed by a successful `wait()` (i.e. the
+        /// child was reaped and left no zombie). Reported rather than assumed
+        /// so a test can assert it.
+        reaped: bool,
+    },
+}
+
+/// Run `cmd` to completion, but never for longer than `timeout`.
+///
+/// Semantics:
+/// - stdin is `/dev/null` so a child can never block waiting for input (this is
+///   also what stops a credential prompt from hanging forever).
+/// - stdout/stderr are piped and drained by two short-lived reader threads, so
+///   a chatty child cannot deadlock on a full pipe buffer.
+/// - On expiry the child is killed and reaped, and `TimedOut` is returned. The
+///   reader threads are NOT joined on that path: joining could re-introduce the
+///   very hang we are escaping (a killed child's grandchildren can keep the
+///   pipe write-ends open). They exit on their own when the pipes close.
+///
+/// Returns `Err` only when the child could not be spawned or `try_wait` failed.
+pub fn run_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<TimedOutput> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stdout_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stderr_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    // Back off from a tight poll to a coarse one: a fast `git rev-parse` still
+    // returns in ~2ms, while a long-running child costs at most 20 wakeups/s.
+    let mut poll = Duration::from_millis(2);
+    let max_poll = Duration::from_millis(50);
+
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let stdout = stdout_reader.join().unwrap_or_default();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                return Ok(TimedOutput::Completed(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                }));
+            }
+            None => {
+                let now = Instant::now();
+                if now >= deadline {
+                    let _ = child.kill();
+                    let reaped = child.wait().is_ok();
+                    return Ok(TimedOutput::TimedOut { pid, reaped });
+                }
+                std::thread::sleep(poll.min(deadline - now));
+                poll = (poll * 2).min(max_poll);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A command that blocks for far longer than any budget we hand it.
+    fn sleeper() -> std::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = no_window("cmd.exe");
+            // `ping -n 60` ≈ 59s of blocking with no console window.
+            c.args(["/C", "ping -n 60 127.0.0.1"]);
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut c = no_window("sh");
+            c.args(["-c", "sleep 60"]);
+            c
+        }
+    }
+
+    /// Item 1 core assertion: a child that never returns must NOT hold the
+    /// calling thread. Without the timeout this test hangs for ~59s and the
+    /// elapsed assertion fails.
+    #[test]
+    fn a_blocking_child_returns_within_the_budget_and_is_reaped() {
+        let budget = Duration::from_millis(400);
+        let started = Instant::now();
+        let out = run_with_timeout(sleeper(), budget).expect("spawn");
+        let elapsed = started.elapsed();
+
+        match out {
+            TimedOutput::TimedOut { pid, reaped } => {
+                assert!(pid > 0, "a killed child must report its pid");
+                assert!(reaped, "the timed-out child must be waited on, not leaked");
+            }
+            TimedOutput::Completed(o) => {
+                panic!("expected a timeout, got exit {:?}", o.status);
+            }
+        }
+        assert!(
+            elapsed < budget * 8,
+            "run_with_timeout blocked for {elapsed:?}, budget was {budget:?}"
+        );
+    }
+
+    /// The fast path must still deliver the child's real output.
+    #[test]
+    fn a_fast_child_completes_normally_with_its_stdout() {
+        #[cfg(target_os = "windows")]
+        let cmd = {
+            let mut c = no_window("cmd.exe");
+            c.args(["/C", "echo hello-from-child"]);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let cmd = {
+            let mut c = no_window("sh");
+            c.args(["-c", "echo hello-from-child"]);
+            c
+        };
+
+        match run_with_timeout(cmd, Duration::from_secs(20)).expect("spawn") {
+            TimedOutput::Completed(o) => {
+                assert!(o.status.success());
+                let s = String::from_utf8_lossy(&o.stdout);
+                assert!(s.contains("hello-from-child"), "got stdout {s:?}");
+            }
+            TimedOutput::TimedOut { .. } => panic!("a trivial echo must not time out"),
+        }
+    }
+}

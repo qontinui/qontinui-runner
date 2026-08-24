@@ -6,12 +6,13 @@
 use crate::commands::compartments::{ExecutionCompartment, HealthCompartment, StorageCompartment};
 use crate::commands::CommandResponse;
 use crate::terminal::transcript;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
-use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 /// Collect workspace project paths for scanning (root + immediate child directories).
@@ -68,7 +69,7 @@ fn collect_all_sessions(
     all_sessions
 }
 
-// ── Scan cache (single-flight + short TTL) ───────────────────────────────────
+// ── Scan cache (last-known-good + off-runtime refresh) ───────────────────────
 //
 // **Why this exists.** Every terminal tab is its own `WebviewWindow`
 // (`commands::terminal_windows`), so each one loads a full app instance with
@@ -86,21 +87,55 @@ fn collect_all_sessions(
 //
 // Each scan crosses 624 workspace child directories with 6 Claude config dirs
 // — ~3,744 `list_sessions` calls — so the burst was ~22,000 filesystem probes
-// for six byte-identical answers. Worse, the work ran inline on the async
-// command, occupying a runtime worker for its whole duration.
+// for six byte-identical answers.
 //
-// Two independent growth axes made this worth fixing rather than tolerating:
-// tabs open, and workspace child directories (441 of those 624 were leftover
-// worktree/spawn dirs). Both scale the burst linearly.
+// ## Iteration 14's fix, and why it was INERT (rewritten 2026-08-24)
 //
-// The fix is deliberately not a background refresher: holding the lock across
-// the scan makes the *first* caller do the work while the other five await it
-// and then read the fresh entry — one scan per burst, no staleness window
-// beyond the TTL, and no timer to keep alive when nothing is watching.
+// Iteration 14 removed the `tokio::sync::Mutex` held across
+// `spawn_blocking(...).await` — correctly — and bounded both remaining waits
+// with `tokio::time::timeout`. Iteration 15 reproduced the same wedge **3/3**
+// on that build, and neither the 20s leader give-up WARN nor the follower
+// give-up WARN appeared in any of the three logs.
+//
+// The reason is structural: `tokio::time::timeout` is driven by the runtime's
+// time driver, and the time driver only advances when a worker runs the
+// scheduler loop. Once every worker is blocked in synchronous code the wheel
+// stops turning and the timeout is disabled by *exactly* the condition it
+// exists to guard. See `crate::off_runtime` for the full argument.
+//
+// Ironically the module's own test already had the right pattern — it measured
+// the runtime's liveness with a std channel *from outside the runtime* — while
+// the production path stayed on the tokio timer.
+//
+// ## The shape now
+//
+// Two changes, and the second is the one that keeps `/health` answering:
+//
+//   1. **The bound is a `std::sync::mpsc::Receiver::recv_timeout` on a
+//      dedicated OS thread.** The scan dispatcher hands the job to a private
+//      worker thread and waits on it with `recv_timeout(SCAN_WAIT_TIMEOUT)`.
+//      The OS schedules that thread whether or not tokio is healthy, so the
+//      give-up decision — the WARN, the in-flight release, the degraded
+//      broadcast — is made off the runtime and lands even if no tokio worker
+//      ever runs again. A second, independent bound (`off_runtime::deadline`)
+//      guards the async caller's wait for the same reason.
+//
+//   2. **The periodic scan is off the request path.** `transcript_list_sessions`
+//      serves the **last-known-good** entry at any age and, if it is stale,
+//      *kicks* a background refresh through a bounded queue without waiting
+//      for it. Only a caller with nothing at all to serve (cold start, or a
+//      brand-new cache key) waits — and only when the scan thread is free.
+//      A stale answer is strictly better than a parked runtime.
+//
+// The scan worker is a **private OS thread**, not `spawn_blocking`: the
+// blocking pool is shared with `tokio::fs` and every other blocking call in
+// the process, so a pathological filesystem walk must not be able to consume
+// it. This is the same pattern `terminal::commit_report::PushDispatcher` uses
+// for the git fan-out, which iteration 14 got right.
 
-/// How long a completed scan stays servable. Must be shorter than the
-/// frontend's 30s poll (so each poll round still sees fresh data) and longer
-/// than one burst's spread (so a burst collapses to a single scan).
+/// How long a completed scan counts as *fresh*. Below this the entry is served
+/// with no refresh at all. Above it the entry is still served — it is the
+/// last-known-good — but a background refresh is kicked.
 const SCAN_CACHE_TTL: Duration = Duration::from_secs(5);
 
 struct ScanCache {
@@ -112,22 +147,85 @@ struct ScanCache {
     sessions: Vec<transcript::TranscriptSession>,
 }
 
-fn scan_cache() -> &'static Mutex<Option<ScanCache>> {
-    static CACHE: OnceLock<Mutex<Option<ScanCache>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+/// Identity of one scan: the exact inputs it answers for. Single flight is
+/// per-key — a caller with different inputs must never be served, or wait for,
+/// another key's scan.
+type ScanKey = (Vec<String>, Vec<std::path::PathBuf>);
+
+/// Broadcast payload — shared so N followers clone once, not N times.
+type ScanResult = Arc<Vec<transcript::TranscriptSession>>;
+
+/// Everything the cache coordinates, behind ONE synchronous mutex.
+#[derive(Default)]
+struct ScanState {
+    cache: Option<ScanCache>,
+    /// Scans currently running or queued, by key. Present means someone is
+    /// already doing this exact work and will broadcast the result.
+    in_flight: HashMap<ScanKey, broadcast::Sender<ScanResult>>,
 }
 
-/// Count of scans actually executed (cache misses). Lets a test prove the
-/// collapse happened rather than inferring it from timing, and is a cheap
-/// operational signal if it is ever surfaced.
+/// Process-wide scan state.
+///
+/// `std::sync::Mutex`, NOT `tokio::sync::Mutex`: every critical section here is
+/// synchronous, and the `!Send` guard makes "held across an await" a compile
+/// error rather than a latent wedge (see the module note above).
+fn scan_state() -> &'static StdMutex<ScanState> {
+    static STATE: OnceLock<StdMutex<ScanState>> = OnceLock::new();
+    STATE.get_or_init(|| StdMutex::new(ScanState::default()))
+}
+
+/// Upper bound on how long a scan may run before it is abandoned, and on how
+/// long any caller will wait for one. Two orders of magnitude above the
+/// measured 433ms burst, so it only ever fires on a genuine stall.
+///
+/// **Enforced off the tokio runtime** — `recv_timeout` on the dispatcher
+/// thread, and `off_runtime::deadline` for the async caller. Never
+/// `tokio::time::timeout`: that is the inert shape iteration 15 reproduced 3/3.
+const SCAN_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Upper bound on the per-mount digest batch (`transcript_session_digests`).
+/// Higher than the scan bound because it reads up to 100 file tails, and it is
+/// still an *upper* bound, not a latency target.
+const DIGEST_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Refresh requests that may sit queued. One is enough: a second pending
+/// refresh answers the same question as the first, and a deeper queue only
+/// delays the WARN that says the scan is stuck.
+const SCAN_QUEUE_CAPACITY: usize = 1;
+
+/// Count of scans actually dispatched (cache misses + stale refreshes). Lets a
+/// test prove the collapse happened rather than inferring it from timing.
 static SCANS_PERFORMED: AtomicU64 = AtomicU64::new(0);
 
-/// Number of real filesystem scans performed since process start.
+/// Count of scans abandoned by the `recv_timeout` bound. Non-zero means the
+/// filesystem walk stopped completing — the wedge precursor, now visible.
+static SCANS_GAVE_UP: AtomicU64 = AtomicU64::new(0);
+
+/// Count of refresh requests refused because the queue was full or the
+/// dispatcher is gone. The caller was served last-known-good instead.
+static SCANS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// True while the scan worker is executing a scan. Read (never waited on) by
+/// cold callers so they degrade immediately instead of queueing behind an
+/// unrelated key's scan.
+static SCAN_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Number of real filesystem scans dispatched since process start.
 pub fn scans_performed() -> u64 {
     SCANS_PERFORMED.load(Ordering::Relaxed)
 }
 
-/// True when a cache entry may serve a request for these inputs.
+/// Number of scans abandoned by the off-runtime bound since process start.
+pub fn scans_gave_up() -> u64 {
+    SCANS_GAVE_UP.load(Ordering::Relaxed)
+}
+
+/// Number of refresh requests dropped because the queue was full.
+pub fn scans_dropped() -> u64 {
+    SCANS_DROPPED.load(Ordering::Relaxed)
+}
+
+/// True when a cache entry is FRESH enough to serve with no refresh at all.
 /// Pure — unit-tested without a clock or a filesystem.
 fn entry_is_servable(
     age: Duration,
@@ -139,56 +237,384 @@ fn entry_is_servable(
     age < SCAN_CACHE_TTL && entry_paths == want_paths && entry_dirs == want_dirs
 }
 
-/// [`collect_all_sessions`] behind the single-flight cache, with the blocking
-/// filesystem work moved off the async runtime.
+// ── The off-runtime scan dispatcher ──────────────────────────────────────────
+
+type ScanFn = Box<dyn FnOnce() -> Vec<transcript::TranscriptSession> + Send + 'static>;
+
+struct ScanRequest {
+    key: ScanKey,
+    scan: ScanFn,
+}
+
+/// Publish the outcome of one scan: release the in-flight slot, update the
+/// cache on success, and hand every waiter something to return.
 ///
-/// The lock is held across the scan on purpose — that is what makes it
-/// single-flight. Concurrent callers park on the mutex (cheap: no runtime
-/// worker is held, the scan itself is on the blocking pool) and then read the
-/// entry the winner just wrote.
+/// Called from the **dispatcher thread**, never from an async task. That is
+/// the point: the degradation lands even when the runtime cannot run anything.
+fn finish_scan(key: &ScanKey, sessions: Option<Vec<transcript::TranscriptSession>>) {
+    let (waiters, payload) = {
+        let mut st = scan_state().lock().unwrap_or_else(|e| e.into_inner());
+        let waiters = st.in_flight.remove(key);
+        let payload: ScanResult = match sessions {
+            Some(s) => {
+                st.cache = Some(ScanCache {
+                    computed_at: Instant::now(),
+                    project_paths: key.0.clone(),
+                    config_dirs: key.1.clone(),
+                    sessions: s.clone(),
+                });
+                Arc::new(s)
+            }
+            None => {
+                // Degraded. Hand waiters the last-known-good for THIS key if
+                // one exists, else empty. The entry keeps its original
+                // timestamp — a failed refresh must never look like a fresh
+                // answer.
+                let lkg = st
+                    .cache
+                    .as_ref()
+                    .filter(|e| e.project_paths == key.0 && e.config_dirs == key.1)
+                    .map(|e| e.sessions.clone())
+                    .unwrap_or_default();
+                Arc::new(lkg)
+            }
+        };
+        (waiters, payload)
+    };
+    // A send error just means "no subscribers".
+    if let Some(tx) = waiters {
+        let _ = tx.send(payload);
+    }
+}
+
+/// The dispatcher loop. Blocking by design; runs on its own OS thread.
+///
+/// `reqs` — refresh requests from the command path (bounded, never blocks the
+/// caller). `job_tx`/`res_rx` — the private worker thread that actually walks
+/// the filesystem.
+fn scan_dispatch_loop(
+    reqs: std::sync::mpsc::Receiver<ScanRequest>,
+    job_tx: std::sync::mpsc::Sender<ScanFn>,
+    res_rx: std::sync::mpsc::Receiver<Vec<transcript::TranscriptSession>>,
+) {
+    scan_dispatch_loop_with_bound(reqs, job_tx, res_rx, SCAN_WAIT_TIMEOUT)
+}
+
+/// The dispatcher loop with the bound injected, so a test can exercise the
+/// REAL loop without waiting out the production 20s.
+fn scan_dispatch_loop_with_bound(
+    reqs: std::sync::mpsc::Receiver<ScanRequest>,
+    job_tx: std::sync::mpsc::Sender<ScanFn>,
+    res_rx: std::sync::mpsc::Receiver<Vec<transcript::TranscriptSession>>,
+    bound: Duration,
+) {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    // True while the worker still owes a result we already gave up on.
+    let mut abandoned = false;
+
+    while let Ok(req) = reqs.recv() {
+        if abandoned {
+            // Reclaim the worker if the stuck scan finally finished. Its
+            // result answers a stale key, so it is discarded rather than
+            // cached under this request's key.
+            match res_rx.try_recv() {
+                Ok(_late) => abandoned = false,
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    finish_scan(&req.key, None);
+                    break;
+                }
+            }
+        }
+
+        if abandoned {
+            SCANS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            // Release FIRST, log second: `warn!` goes through the tracing
+            // subscriber, which is a shared-fate path in exactly the condition
+            // being reported.
+            finish_scan(&req.key, None);
+            warn!(
+                "transcript_list_sessions: the scan thread is still stuck on an earlier scan — \
+                 skipping this refresh and serving last-known-good"
+            );
+            continue;
+        }
+
+        SCAN_BUSY.store(true, Ordering::SeqCst);
+        if job_tx.send(req.scan).is_err() {
+            SCAN_BUSY.store(false, Ordering::SeqCst);
+            finish_scan(&req.key, None);
+            break;
+        }
+
+        // ── THE BOUND ──
+        // A std `recv_timeout` on a non-runtime thread. It fires whether or
+        // not a tokio worker is available, which `tokio::time::timeout` cannot
+        // promise — that is the entire fix.
+        let outcome = res_rx.recv_timeout(bound);
+        SCAN_BUSY.store(false, Ordering::SeqCst);
+
+        match outcome {
+            Ok(sessions) => finish_scan(&req.key, Some(sessions)),
+            Err(RecvTimeoutError::Timeout) => {
+                abandoned = true;
+                SCANS_GAVE_UP.fetch_add(1, Ordering::Relaxed);
+                finish_scan(&req.key, None);
+                warn!(
+                    "transcript_list_sessions: the filesystem scan has not returned within {}s — \
+                     giving up on this refresh and serving last-known-good. This bound is a std \
+                     recv_timeout on a dedicated OS thread, so it fires even when every tokio \
+                     worker is parked.",
+                    bound.as_secs()
+                );
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                finish_scan(&req.key, None);
+                break;
+            }
+        }
+    }
+}
+
+/// Bounded, single-worker dispatcher for the blocking transcript scan.
+struct ScanDispatcher {
+    tx: std::sync::mpsc::SyncSender<ScanRequest>,
+}
+
+impl ScanDispatcher {
+    fn new(capacity: usize) -> Self {
+        let (tx, reqs) = std::sync::mpsc::sync_channel::<ScanRequest>(capacity);
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<ScanFn>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<Vec<transcript::TranscriptSession>>();
+
+        // The worker: walks the filesystem, nothing else. Private to this
+        // module so a pathological walk cannot consume the shared blocking
+        // pool.
+        if let Err(e) = std::thread::Builder::new()
+            .name("transcript-scan".to_string())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let out = job();
+                    if res_tx.send(out).is_err() {
+                        break;
+                    }
+                }
+            })
+        {
+            warn!("transcript_list_sessions: could not start the scan worker thread ({e})");
+        }
+
+        // The bound-holder. Separate from the worker so it can still act while
+        // the worker is stuck.
+        if let Err(e) = std::thread::Builder::new()
+            .name("transcript-scan-bound".to_string())
+            .spawn(move || scan_dispatch_loop(reqs, job_tx, res_rx))
+        {
+            warn!("transcript_list_sessions: could not start the scan dispatcher thread ({e})");
+        }
+
+        Self { tx }
+    }
+
+    /// Enqueue a refresh. NEVER blocks: a full queue (or a dead dispatcher)
+    /// refuses the job and returns `false`, and the caller serves
+    /// last-known-good.
+    fn try_dispatch(&self, key: ScanKey, scan: ScanFn) -> bool {
+        match self.tx.try_send(ScanRequest { key, scan }) {
+            Ok(()) => true,
+            Err(_) => {
+                SCANS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+}
+
+fn scan_dispatcher() -> &'static ScanDispatcher {
+    static DISPATCHER: OnceLock<ScanDispatcher> = OnceLock::new();
+    DISPATCHER.get_or_init(|| ScanDispatcher::new(SCAN_QUEUE_CAPACITY))
+}
+
+/// What this caller's turn at the cache decided.
+enum ScanTurn {
+    /// An entry answered immediately — fresh, or stale-but-usable while
+    /// someone else refreshes.
+    Serve(Vec<transcript::TranscriptSession>),
+    /// A stale entry answered immediately AND we own the background refresh.
+    /// **This is the steady-state path: it never waits.**
+    ServeAndRefresh(Vec<transcript::TranscriptSession>),
+    /// Nothing to serve and we own the refresh. `wait` is false when the scan
+    /// thread is already busy — then we degrade now rather than queue behind
+    /// an unrelated key.
+    Refresh {
+        rx: broadcast::Receiver<ScanResult>,
+        wait: bool,
+    },
+    /// Nothing to serve and someone else owns this key's scan.
+    Follow(broadcast::Receiver<ScanResult>),
+}
+
+/// Await a scan's broadcast under an **off-runtime** bound.
+///
+/// The dispatcher already guarantees a terminal event within
+/// `SCAN_WAIT_TIMEOUT`; this second bound is independent insurance for the
+/// case where the dispatcher itself is lost. Deliberately NOT
+/// `tokio::time::timeout` — see `crate::off_runtime`.
+async fn await_scan(mut rx: broadcast::Receiver<ScanResult>) -> Vec<transcript::TranscriptSession> {
+    let bound = crate::off_runtime::deadline(SCAN_WAIT_TIMEOUT);
+    tokio::select! {
+        r = rx.recv() => match r {
+            Ok(sessions) => (*sessions).clone(),
+            Err(e) => {
+                // The owner went away without publishing. Its slot is already
+                // cleared, so the next poll elects a new one.
+                warn!("transcript_list_sessions: scan owner vanished ({e}) — reporting empty");
+                Vec::new()
+            }
+        },
+        _ = bound => {
+            warn!(
+                "transcript_list_sessions: waited {}s for a first scan and gave up — reporting \
+                 empty rather than holding the command surface open. This bound is measured on a \
+                 dedicated OS thread, so it fires even when every tokio worker is parked.",
+                SCAN_WAIT_TIMEOUT.as_secs()
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// [`collect_all_sessions`] behind the last-known-good cache, with the
+/// blocking filesystem work moved onto a private OS thread.
 async fn collect_all_sessions_cached(
     project_paths: &[String],
     config_dirs: &[std::path::PathBuf],
 ) -> Vec<transcript::TranscriptSession> {
-    let mut guard = scan_cache().lock().await;
-
-    if let Some(entry) = guard.as_ref() {
-        if entry_is_servable(
-            entry.computed_at.elapsed(),
-            &entry.project_paths,
-            &entry.config_dirs,
-            project_paths,
-            config_dirs,
-        ) {
-            debug!(
-                "transcript_list_sessions: served {} sessions from scan cache",
-                entry.sessions.len()
-            );
-            return entry.sessions.clone();
-        }
-    }
-
     let paths = project_paths.to_vec();
     let dirs = config_dirs.to_vec();
-    SCANS_PERFORMED.fetch_add(1, Ordering::Relaxed);
-    let sessions =
-        match tokio::task::spawn_blocking(move || collect_all_sessions(&paths, &dirs)).await {
-            Ok(s) => s,
-            Err(e) => {
-                // The blocking pool panicked or was shut down. Report empty rather
-                // than caching the failure — the next tick retries.
-                warn!("transcript_list_sessions: scan task failed: {e}");
+    collect_all_sessions_cached_with(project_paths, config_dirs, move || {
+        collect_all_sessions(&paths, &dirs)
+    })
+    .await
+}
+
+/// The cache/single-flight machinery with the scan itself injected.
+///
+/// Split out purely so the concurrency contract is testable without touching a
+/// real Claude config tree: the tests supply a scan that blocks on a channel
+/// and then assert that callers still make progress.
+async fn collect_all_sessions_cached_with<F>(
+    project_paths: &[String],
+    config_dirs: &[std::path::PathBuf],
+    scan: F,
+) -> Vec<transcript::TranscriptSession>
+where
+    F: FnOnce() -> Vec<transcript::TranscriptSession> + Send + 'static,
+{
+    let key: ScanKey = (project_paths.to_vec(), config_dirs.to_vec());
+
+    // Synchronous critical section. No `.await` may appear inside it; the
+    // `!Send` std guard enforces that at compile time.
+    let turn = {
+        let mut st = scan_state().lock().unwrap_or_else(|e| e.into_inner());
+        let entry = st
+            .cache
+            .as_ref()
+            .filter(|e| e.project_paths == *project_paths && e.config_dirs == *config_dirs);
+        let fresh = entry
+            .map(|e| {
+                entry_is_servable(
+                    e.computed_at.elapsed(),
+                    &e.project_paths,
+                    &e.config_dirs,
+                    project_paths,
+                    config_dirs,
+                )
+            })
+            .unwrap_or(false);
+        let last_known_good = entry.map(|e| e.sessions.clone());
+        // Subscribe eagerly rather than holding a borrow of `st.in_flight`
+        // into the arm that inserts into it: a `Receiver` is owned, so the
+        // borrow ends here. (Borrowing across the insert is NLL problem case
+        // #3 and does not compile.)
+        let already_running = st.in_flight.get(&key).map(|tx| tx.subscribe());
+
+        match (fresh, last_known_good) {
+            (true, Some(sessions)) => ScanTurn::Serve(sessions),
+            (_, lkg) => {
+                if let Some(rx) = already_running {
+                    match lkg {
+                        // Someone is already refreshing. Serve the stale entry
+                        // NOW — never wait on a live scan when an answer
+                        // exists.
+                        Some(sessions) => ScanTurn::Serve(sessions),
+                        None => ScanTurn::Follow(rx),
+                    }
+                } else {
+                    // Capacity 1: exactly one send per flight.
+                    let (tx, rx) = broadcast::channel(1);
+                    st.in_flight.insert(key.clone(), tx);
+                    SCANS_PERFORMED.fetch_add(1, Ordering::Relaxed);
+                    match lkg {
+                        Some(sessions) => ScanTurn::ServeAndRefresh(sessions),
+                        None => ScanTurn::Refresh {
+                            rx,
+                            wait: !SCAN_BUSY.load(Ordering::SeqCst),
+                        },
+                    }
+                }
+            }
+        }
+    };
+
+    match turn {
+        ScanTurn::Serve(sessions) => {
+            debug!(
+                "transcript_list_sessions: served {} sessions from the scan cache",
+                sessions.len()
+            );
+            sessions
+        }
+
+        ScanTurn::ServeAndRefresh(sessions) => {
+            // Item 2: the periodic scan leaves the request path here. We hand
+            // the work to the private scan thread and return the
+            // last-known-good immediately — no await, and nothing on this
+            // request that a stuck filesystem can hold.
+            if !scan_dispatcher().try_dispatch(key.clone(), Box::new(scan)) {
+                finish_scan(&key, None);
+                warn!(
+                    "transcript_list_sessions: the refresh queue is full — serving \
+                     last-known-good ({} sessions) without refreshing",
+                    sessions.len()
+                );
+            }
+            sessions
+        }
+
+        ScanTurn::Refresh { rx, wait } => {
+            if !scan_dispatcher().try_dispatch(key.clone(), Box::new(scan)) {
+                finish_scan(&key, None);
+                warn!(
+                    "transcript_list_sessions: the refresh queue is full and nothing is cached \
+                     for these inputs — reporting empty"
+                );
                 return Vec::new();
             }
-        };
+            if !wait {
+                // Cold, but the scan thread is occupied by another key. Do not
+                // queue behind it — an empty answer now beats an open request.
+                debug!(
+                    "transcript_list_sessions: scan thread busy — refresh queued, reporting empty \
+                     for this poll"
+                );
+                return Vec::new();
+            }
+            await_scan(rx).await
+        }
 
-    *guard = Some(ScanCache {
-        computed_at: Instant::now(),
-        project_paths: project_paths.to_vec(),
-        config_dirs: config_dirs.to_vec(),
-        sessions: sessions.clone(),
-    });
-    sessions
+        ScanTurn::Follow(rx) => await_scan(rx).await,
+    }
 }
 
 /// List Claude Code transcript sessions.
@@ -386,16 +812,34 @@ pub async fn transcript_session_digests(
 
     // Digest computation reads the TAIL OF EVERY session file (up to `limit`),
     // so it is blocking I/O and must not run on an async worker.
-    let digests =
-        match tokio::task::spawn_blocking(move || transcript::session_digests_batch(&all_sessions))
-            .await
-        {
+    //
+    // Bounded for the same reason the scan is (Item 1's audit): this runs once
+    // per tab ON MOUNT and touches up to 100 files, so it is a real
+    // blocking-pool consumer on the same request-path family. An exhausted pool
+    // means the `spawn_blocking` future never resolves, and the bound has to be
+    // one the sick runtime cannot disable — `off_runtime::deadline`, never
+    // `tokio::time::timeout`.
+    let digest_task =
+        tokio::task::spawn_blocking(move || transcript::session_digests_batch(&all_sessions));
+    let digest_bound = crate::off_runtime::deadline(DIGEST_WAIT_TIMEOUT);
+    let digests = tokio::select! {
+        joined = digest_task => match joined {
             Ok(d) => d,
             Err(e) => {
                 warn!("transcript_session_digests: digest task failed: {e}");
                 Vec::new()
             }
-        };
+        },
+        _ = digest_bound => {
+            warn!(
+                "transcript_session_digests: digests did not compute within {}s (blocking pool \
+                 exhausted?) — returning none rather than holding the command surface open. This \
+                 bound is measured on a dedicated OS thread.",
+                DIGEST_WAIT_TIMEOUT.as_secs()
+            );
+            Vec::new()
+        }
+    };
 
     info!(
         "transcript_session_digests: computed {} digests",
@@ -733,6 +1177,60 @@ mod tests {
         names.iter().map(std::path::PathBuf::from).collect()
     }
 
+    /// The scan cache, the counters AND the process-wide scan dispatcher are
+    /// global, and the harness runs tests in parallel threads — so any two
+    /// cache tests running at once corrupt each other's counters and evict
+    /// each other's entry. Every test that touches the cache takes this first.
+    static CACHE_TESTS_ARE_SERIAL: StdMutex<()> = StdMutex::new(());
+
+    fn cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        CACHE_TESTS_ARE_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Drop any entry left by a previous test so this one starts from a real
+    /// miss, and wait for the shared scan thread to go idle so `SCAN_BUSY`
+    /// reflects THIS test rather than the previous one's trailing job.
+    fn reset_scan_cache() {
+        // The dispatcher is process-global and its queue holds one job, so
+        // "not busy right now" can be the gap *between* two jobs. Require the
+        // idle observation to hold for a beat before trusting it.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut idle_since: Option<Instant> = None;
+        while Instant::now() < deadline {
+            if SCAN_BUSY.load(Ordering::SeqCst) {
+                idle_since = None;
+            } else {
+                let since = *idle_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_millis(150) {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut st = scan_state().lock().unwrap_or_else(|e| e.into_inner());
+        st.cache = None;
+        st.in_flight.clear();
+    }
+
+    fn fake_session(id: &str) -> transcript::TranscriptSession {
+        transcript::TranscriptSession {
+            session_id: id.to_string(),
+            project_path: String::new(),
+            config_dir: String::new(),
+            message_count: 1,
+            last_modified: String::new(),
+            started_at: None,
+            first_message_preview: None,
+            has_plans: false,
+            display_name: String::new(),
+            injected_live_status: None,
+            injected_tab: None,
+            resume_name: None,
+        }
+    }
+
     #[test]
     fn fresh_entry_with_matching_inputs_is_servable() {
         let p = vec!["a".to_string()];
@@ -781,6 +1279,414 @@ mod tests {
         );
     }
 
+    // ── Item 1: the bound must fire OFF the tokio runtime ────────────────
+    //
+    // Iteration 14's bound was `tokio::time::timeout`, which needs the
+    // runtime's time driver. Iteration 15 reproduced the wedge 3/3 on that
+    // build with neither give-up WARN in any log. These tests pin the
+    // replacement.
+
+    /// **The load-bearing test for Item 1.** A scan that never returns must be
+    /// abandoned by the bound, the in-flight slot released and the give-up
+    /// counter incremented — with **no tokio runtime in the process at all**.
+    ///
+    /// That is the strongest available statement of "this bound does not
+    /// depend on the runtime it protects": there is no runtime to depend on.
+    /// Everything here is measured on the test thread with std channels, so on
+    /// the regressed shape the test FAILS rather than hangs.
+    ///
+    /// Neuter check: put `res_rx.recv()` (or a `tokio::time::timeout`) back in
+    /// place of `res_rx.recv_timeout(..)` in `scan_dispatch_loop` and this
+    /// test fails on the `slot never released` assertion.
+    #[test]
+    fn a_stuck_scan_is_abandoned_by_the_bound_with_no_runtime_at_all() {
+        let _serial = cache_test_guard();
+
+        // A private dispatcher so the test can use a short bound without
+        // touching the 20s production constant or the shared worker.
+        let (req_tx, reqs) = std::sync::mpsc::sync_channel::<ScanRequest>(1);
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<ScanFn>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<Vec<transcript::TranscriptSession>>();
+        std::thread::spawn(move || {
+            while let Ok(job) = job_rx.recv() {
+                let out = job();
+                if res_tx.send(out).is_err() {
+                    break;
+                }
+            }
+        });
+        // Same loop body as production, with the bound shortened. The BOUND
+        // ITSELF is the production code path.
+        std::thread::spawn(move || {
+            scan_dispatch_loop_with_bound(reqs, job_tx, res_rx, Duration::from_millis(400))
+        });
+
+        let key: ScanKey = (Vec::new(), dirs(&["no-runtime-stuck-key"]));
+        let (tx, mut rx) = broadcast::channel::<ScanResult>(1);
+        {
+            let mut st = scan_state().lock().unwrap_or_else(|e| e.into_inner());
+            st.cache = None;
+            st.in_flight.insert(key.clone(), tx);
+        }
+        let gave_up_before = scans_gave_up();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        req_tx
+            .try_send(ScanRequest {
+                key: key.clone(),
+                scan: Box::new(move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv(); // a walk that never returns
+                    Vec::new()
+                }),
+            })
+            .expect("queued");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the scan never started");
+
+        // Give the bound time to fire, then observe — all from the test
+        // thread, with no runtime anywhere.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut released = false;
+        while Instant::now() < deadline {
+            let held = {
+                let st = scan_state().lock().unwrap_or_else(|e| e.into_inner());
+                st.in_flight.contains_key(&key)
+            };
+            if !held {
+                released = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            released,
+            "the in-flight slot was never released — the bound did not fire, which is exactly \
+             the inert shape iteration 15 reproduced 3/3"
+        );
+        assert!(
+            scans_gave_up() > gave_up_before,
+            "the give-up counter did not move — the scan was not recorded as abandoned"
+        );
+        // The waiter must have been handed something, not left parked.
+        assert!(
+            rx.try_recv().is_ok(),
+            "no degraded result was broadcast to the waiters"
+        );
+
+        let _ = release_tx.send(());
+    }
+
+    /// The give-up must reach the LOG, not just the counter.
+    ///
+    /// Iteration 15's single most useful missing piece of evidence was this
+    /// WARN: it never appeared in any of the four reproductions, because the
+    /// `tokio::time::timeout` that would have emitted it could not fire. The
+    /// line is captured here through a real `tracing` subscriber so "the WARN
+    /// appears on a stuck scan" is a tested fact rather than a code reading.
+    ///
+    /// Neuter check: delete the `warn!` in the timeout arm of
+    /// `scan_dispatch_loop_with_bound` and this test fails.
+    #[test]
+    fn a_stuck_scan_logs_the_give_up_warning() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        /// A `MakeWriter` that appends everything into a shared buffer.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let _serial = cache_test_guard();
+        let sink = Captured::default();
+        let buf = sink.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        // Scoped, not global: the harness runs other tests in parallel and a
+        // global subscriber can only be set once per process.
+        tracing::subscriber::with_default(subscriber, || {
+            let (req_tx, reqs) = std::sync::mpsc::sync_channel::<ScanRequest>(1);
+            let (job_tx, job_rx) = std::sync::mpsc::channel::<ScanFn>();
+            let (res_tx, res_rx) = std::sync::mpsc::channel::<Vec<transcript::TranscriptSession>>();
+            std::thread::spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let out = job();
+                    if res_tx.send(out).is_err() {
+                        break;
+                    }
+                }
+            });
+            // The dispatcher thread needs the subscriber too — `with_default`
+            // is per-thread, so hand it an explicit dispatch clone.
+            let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+            std::thread::spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    scan_dispatch_loop_with_bound(reqs, job_tx, res_rx, Duration::from_millis(300))
+                })
+            });
+
+            let key: ScanKey = (Vec::new(), dirs(&["give-up-warn-key"]));
+            let (tx, _rx) = broadcast::channel::<ScanResult>(1);
+            {
+                let mut st = scan_state().lock().unwrap_or_else(|e| e.into_inner());
+                st.cache = None;
+                st.in_flight.insert(key.clone(), tx);
+            }
+
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            req_tx
+                .try_send(ScanRequest {
+                    key,
+                    scan: Box::new(move || {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv();
+                        Vec::new()
+                    }),
+                })
+                .expect("queued");
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the scan never started");
+
+            // Measured on the test thread with a std clock — never a tokio
+            // timer, so a regression fails instead of hanging.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut logged = String::new();
+            while Instant::now() < deadline {
+                logged =
+                    String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                        .to_string();
+                if logged.contains("has not returned within") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let _ = release_tx.send(());
+
+            assert!(
+                logged.contains("has not returned within"),
+                "the give-up WARN never reached the log on a stuck scan — this is the exact \
+                 line that was missing from all four wedge reproductions. Captured output was: \
+                 {logged:?}"
+            );
+            assert!(
+                logged.contains("serving last-known-good"),
+                "the give-up WARN did not say what it did instead; captured: {logged:?}"
+            );
+        });
+        reset_scan_cache();
+    }
+
+    // ── Item 2: the periodic scan must be OFF the request path ───────────
+
+    /// **The load-bearing test for Item 2.** With a last-known-good entry in
+    /// the cache, a caller must be served *immediately* even while the scan
+    /// thread is stuck on a walk that never returns.
+    ///
+    /// Neuter check: make the stale path `await_scan(rx).await` instead of
+    /// returning `sessions`, and this test fails on the 2s bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stuck_scan_does_not_delay_a_caller_that_has_last_known_good() {
+        let _serial = cache_test_guard();
+        reset_scan_cache();
+        let paths: Vec<String> = Vec::new();
+        let key = dirs(&["lkg-key"]);
+
+        // Seed a STALE last-known-good entry.
+        {
+            let mut st = scan_state().lock().unwrap_or_else(|e| e.into_inner());
+            st.cache = Some(ScanCache {
+                computed_at: Instant::now()
+                    .checked_sub(SCAN_CACHE_TTL + Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now),
+                project_paths: paths.clone(),
+                config_dirs: key.clone(),
+                sessions: vec![fake_session("cached-answer")],
+            });
+        }
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+
+        // This caller owns the refresh and must NOT wait for it.
+        let started = Instant::now();
+        let served = collect_all_sessions_cached_with(&paths, &key, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv(); // the walk that wedged the runner
+            vec![fake_session("fresh")]
+        })
+        .await;
+
+        assert_eq!(
+            served.len(),
+            1,
+            "the caller was not served the last-known-good entry"
+        );
+        assert_eq!(served[0].session_id, "cached-answer");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the caller waited {:?} on a live scan — the periodic scan is back on the request \
+             path",
+            started.elapsed()
+        );
+
+        // Confirm the refresh really was dispatched (not silently skipped).
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the background refresh never ran");
+        let _ = release_tx.send(());
+        // Let the dispatcher settle so the next test starts idle.
+        reset_scan_cache();
+    }
+
+    /// A blocked scan must not block *unrelated* callers.
+    ///
+    /// Under the pre-iteration-14 implementation the leader held a
+    /// `tokio::sync::Mutex` across `spawn_blocking(...).await`, so a
+    /// different-key caller parked on that guard for as long as the scan was
+    /// stuck. Measured with a std channel from OUTSIDE the runtime, so a
+    /// regression fails instead of hanging.
+    #[test]
+    fn a_stuck_scan_does_not_block_an_unrelated_caller() {
+        let _serial = cache_test_guard();
+        reset_scan_cache();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let paths: Vec<String> = Vec::new();
+        let stuck_key = dirs(&["stuck-scan-key"]);
+        let other_key = dirs(&["unrelated-scan-key"]);
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+
+        let p = paths.clone();
+        let d = stuck_key.clone();
+        let leader = rt.spawn(async move {
+            collect_all_sessions_cached_with(&p, &d, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv(); // park exactly like a wedged walk
+                Vec::new()
+            })
+            .await
+        });
+
+        // Do not race the leader: wait until its scan is genuinely in flight.
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("leader scan entered");
+
+        // The whole point: a caller for a DIFFERENT key must complete now.
+        // Measured on THIS thread, outside the runtime.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<usize>();
+        let p2 = paths.clone();
+        let d2 = other_key.clone();
+        rt.spawn(async move {
+            let out = collect_all_sessions_cached_with(&p2, &d2, Vec::new).await;
+            let _ = done_tx.send(out.len());
+        });
+        let unrelated = done_rx.recv_timeout(Duration::from_secs(5));
+        assert!(
+            unrelated.is_ok(),
+            "an unrelated caller was blocked by an in-flight scan"
+        );
+
+        let _ = release_tx.send(());
+        let _ = rt.block_on(leader);
+        reset_scan_cache();
+    }
+
+    /// Single flight must survive the restructure: two concurrent cold callers
+    /// on the SAME key run exactly one scan, and the follower gets the leader's
+    /// result rather than an empty list.
+    #[test]
+    fn concurrent_same_key_callers_still_run_exactly_one_scan() {
+        let _serial = cache_test_guard();
+        reset_scan_cache();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let paths: Vec<String> = Vec::new();
+        let key = dirs(&["single-flight-key"]);
+        let before = scans_performed();
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+
+        let p = paths.clone();
+        let d = key.clone();
+        let leader = rt.spawn(async move {
+            collect_all_sessions_cached_with(&p, &d, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+                vec![fake_session("leader-scan")]
+            })
+            .await
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("leader scan entered");
+
+        // This one must NOT start a second scan — it must follow.
+        let p2 = paths.clone();
+        let d2 = key.clone();
+        let follower = rt.spawn(async move {
+            collect_all_sessions_cached_with(&p2, &d2, || {
+                panic!("a follower must never run its own scan")
+            })
+            .await
+        });
+
+        let _ = release_tx.send(());
+        let lead = rt.block_on(leader).expect("leader joined");
+        let follow = rt.block_on(follower).expect("follower joined");
+
+        assert_eq!(
+            scans_performed() - before,
+            1,
+            "two concurrent cold callers on one key must collapse to a single scan"
+        );
+        assert_eq!(lead.len(), 1);
+        assert_eq!(
+            follow.len(),
+            1,
+            "the follower must be handed the leader's result, not an empty list"
+        );
+        assert_eq!(follow[0].session_id, "leader-scan");
+        reset_scan_cache();
+    }
+
     /// The regression this module exists for: six terminal tabs polling in one
     /// burst must produce ONE scan, not six.
     ///
@@ -790,6 +1696,8 @@ mod tests {
     /// measures the caching decision and nothing else.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_callers_collapse_to_one_scan() {
+        let _serial = cache_test_guard();
+        reset_scan_cache();
         let paths: Vec<String> = Vec::new();
         let key_a = dirs(&["scan-cache-test-a"]);
         let before = scans_performed();
@@ -825,6 +1733,29 @@ mod tests {
             scans_performed() - before,
             2,
             "a different cache key must force its own scan"
+        );
+        reset_scan_cache();
+    }
+
+    /// No `tokio::time` may return to the scan path. The whole defect was a
+    /// bound that needed the runtime it was guarding; a grep-level invariant
+    /// is the cheapest way to stop it coming back.
+    #[test]
+    fn the_scan_path_uses_no_tokio_timer() {
+        let src = include_str!("transcript.rs");
+        // Split on the attribute alone: line-ending independent, and this file
+        // contains exactly one `#[cfg(test)]`. Match on the CALL shape
+        // (trailing paren) so the module docs, which have to name the defect
+        // in order to explain it, do not trip their own guard.
+        let production = src.split("#[cfg(test)]").next().expect("module body");
+        assert!(
+            !production.contains("tokio::time::timeout("),
+            "tokio::time::timeout is back on the scan path — it cannot fire when the runtime it \
+             guards is parked (iteration 15 reproduced that 3/3)"
+        );
+        assert!(
+            !production.contains("tokio::time::sleep("),
+            "tokio::time::sleep is back on the scan path — same defect class"
         );
     }
 }

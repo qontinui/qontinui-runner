@@ -585,16 +585,20 @@ async fn tail_session(
             //
             // Detect `git push` Bash tool_use blocks on this line and, for
             // each, resolve repo/branch/SHAs and enqueue a coord outbox
-            // report. Best-effort; the git enumeration runs on a blocking
-            // pool so it never stalls the tail loop. Skipped entirely when no
-            // registrar (outbox) is wired.
+            // report. Best-effort; skipped entirely when no registrar
+            // (outbox) is wired.
+            //
+            // This used to be one `spawn_blocking` per observation — an
+            // UNBOUNDED fan-out onto the shared blocking pool, bounded only
+            // by the transcript's line rate. `dispatch_push_observation`
+            // replaces it with a bounded queue drained by one private worker
+            // thread (see `commit_report`'s "Bounded fan-out" section): the
+            // dispatch is non-blocking, the pool is never touched, and a
+            // pathological git can cost at most that one thread.
             if let Some(reg) = registrar.as_ref() {
                 let pushes = super::commit_report::parse_line_for_pushes(&line);
                 for obs in pushes {
-                    let reg = reg.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        super::commit_report::handle_push_observation(&obs, &reg);
-                    });
+                    super::commit_report::dispatch_push_observation(obs, reg.clone());
                 }
             }
 
