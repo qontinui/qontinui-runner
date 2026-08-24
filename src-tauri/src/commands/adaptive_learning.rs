@@ -64,6 +64,14 @@ pub struct GepaRunResponse {
     pub old_score: Option<f64>,
     pub new_score: Option<f64>,
     pub improvement: Option<f64>,
+    /// The held-out gate's outcome — one of `accepted`, `rejected`,
+    /// `insufficient_data` or `skipped`, as written by
+    /// `workflow_generation::gepa_optimizer::OptimizationOutcome::status_str`
+    /// (see `database::pg::adaptive_learning::PgDb::insert_gepa_run`).
+    ///
+    /// The frontend resolves it through `src/components/adaptive-learning/
+    /// gepaRunStatus.ts`, which renders anything outside those four values
+    /// neutrally rather than as a verdict.
     pub status: String,
     pub created_at: String,
 }
@@ -182,7 +190,14 @@ pub async fn get_gepa_runs(
             old_score: v["old_score"].as_f64(),
             new_score: v["new_score"].as_f64(),
             improvement: v["improvement"].as_f64(),
-            status: v["status"].as_str().unwrap_or("pending").to_string(),
+            // Unreachable today — `get_recent_gepa_runs` builds this JSON with a
+            // non-`Option` `row.get::<_, String>`, which would panic on a NULL
+            // before the value ever reaches here. It is still not `"pending"`:
+            // that is not a value the writer can produce, so defaulting to it
+            // would dress a missing column as a real state if the producer ever
+            // changes. `"unknown"` falls through to the frontend's neutral
+            // rendering instead.
+            status: v["status"].as_str().unwrap_or("unknown").to_string(),
             created_at: v["created_at"].as_str().unwrap_or("").to_string(),
         })
         .collect();
