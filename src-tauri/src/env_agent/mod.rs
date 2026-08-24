@@ -93,22 +93,32 @@ pub struct ConfigEnvelope {
     /// diff silently drops non-string values, so a `{value, status}` value would
     /// make the key disappear from the diff altogether.
     ///
-    /// Always emitted, including as `{}` — deliberately, but note what that does
-    /// and does NOT buy today.
+    /// Always emitted, including as `{}` — and that emptiness is now load-bearing
+    /// rather than aspirational.
     ///
-    /// The backend's envelope model ignores unknown fields (pydantic's default),
-    /// and its `to_stored_config()` (`qontinui-web`
-    /// `backend/app/schemas/devenv.py`) persists only `schema_version`,
-    /// `captured_at` and `sections` — so this field is currently DROPPED on
-    /// receipt. It is therefore inert end-to-end: the only consumer that sees it
-    /// is a reader of the local `~/.qontinui/last_env_capture.json` cache.
+    /// The web-side half has LANDED (qontinui-web PR #992, plan
+    /// `2026-08-14-devenv-capture-probe-budget-makes-actionable-nondeterministic`
+    /// Phase 4, commit `2d11fdda`). `ConfigEnvelope.unknown_keys` in `qontinui-web`
+    /// `backend/app/schemas/devenv.py` is `dict[str, list[str]] | None`, and
+    /// `to_stored_config()` persists it as a sibling of `sections` whenever it is
+    /// not `None` — so what this runner PUTs is stored, and the drift view reads
+    /// an unmeasured key as `DeltaStatusT::unknown` instead of `removed`.
     ///
-    /// The `{}` is emitted anyway so that the distinction is available the moment
-    /// persistence lands (a parallel web-side phase): a reader could then tell
-    /// "this runner measured everything" from "this runner predates the field",
-    /// which a skipped-when-empty field could never express. That is the INTENT
-    /// and its dependency — not a capability this runner can claim on its own,
-    /// since nothing downstream of the PUT stores the field yet.
+    /// That is why `{}` is emitted rather than skipped: the backend deliberately
+    /// keeps `None` (field never arrived — an older runner, nothing can be
+    /// concluded) distinct from `{}` (an explicit "every probe completed"), and a
+    /// skipped-when-empty field would collapse the two and turn "we were never
+    /// told" into a positive claim that everything was measured.
+    ///
+    /// **Still one-way.** `CanonicalConfigResponse` (same file) does NOT serve
+    /// the field back, so [`pull::CanonicalConfig`] has no counterpart and a
+    /// pulling box cannot tell a key CANONICAL failed to measure from one
+    /// canonical genuinely lacks. If the pulling box measured the key it diffs
+    /// as [`pull::Change::Extra`]; if it lacks it too there is no row at all.
+    /// Either way it is never an apply action — which is what keeps this a
+    /// reporting gap rather than a mutation hazard. Closing it needs the serving
+    /// half first; adding a reader for a field nothing serves would just be dead
+    /// code.
     pub unknown_keys: Map<String, Value>,
 }
 
