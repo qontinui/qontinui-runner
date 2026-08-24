@@ -1046,6 +1046,13 @@ fn resolve_secure_storage(now: DateTime<Utc>) -> LayerReading {
 
 /// Render the layer inventory as markdown, generated entirely from
 /// [`LAYER_SPECS`]. Byte-stable. Emit it via `config_report --layer-doc`.
+///
+/// Published at `docs/runner-config-layers.md` — that file IS this
+/// function's output, held byte-exact by
+/// `tests::config_report_checked_in_layer_doc_is_the_generators_output`. A
+/// generator whose artifact is never checked in publishes nothing, which
+/// would leave the three tests below that assert "the generated layer doc
+/// must carry X" asserting about a document no reader ever sees.
 pub fn render_layer_doc() -> String {
     let mut out = String::new();
     out.push_str("# Runner configuration layers\n\n");
@@ -1056,9 +1063,13 @@ pub fn render_layer_doc() -> String {
          instead of trying to unify them.\n\n",
     );
     out.push_str(
-        "<!-- GENERATED — do not edit by hand. Regenerate via \
-         `cargo run --bin config_report -- --layer-doc`. The source of truth is \
-         `LAYER_SPECS` in `src-tauri/src/config_report.rs`. -->\n\n",
+        "<!-- GENERATED — do not edit by hand. Regenerate FROM BASH (Git Bash on \
+         Windows): `cargo run --bin config_report -- --layer-doc > \
+         docs/runner-config-layers.md`. NOT from PowerShell, whose `>` writes UTF-16 \
+         or a BOM that `include_str!` cannot read at all. The source of truth is \
+         `LAYER_SPECS` in `src-tauri/src/config_report.rs`, and \
+         `config_report_checked_in_layer_doc_is_the_generators_output` fails if the \
+         checked-in file drifts from it. -->\n\n",
     );
     for (i, s) in LAYER_SPECS.iter().enumerate() {
         out.push_str(&format!("## {}. {} (`{}`)\n\n", i + 1, s.title, s.name));
@@ -1848,6 +1859,51 @@ absence of a reading, NOT a finding that the generations agree.
         }
         assert!(doc.contains("15. OS keyring / SecureStorage — WITHHELD"));
         assert_eq!(doc, render_layer_doc());
+    }
+
+    /// The checked-in `docs/runner-config-layers.md` IS the generator's output,
+    /// byte for byte.
+    ///
+    /// Without this, `render_layer_doc` is a generator with no artifact: it
+    /// emits a `GENERATED — do not edit by hand` header naming a file that
+    /// nothing publishes, and three tests above ("the artifact a reader outside
+    /// this file actually gets") assert against a doc no reader ever sees. The
+    /// doc is the deliverable; this is the gate that keeps it true.
+    ///
+    /// `include_str!` rather than the CI-workflow shape `coord_doctor`'s
+    /// onboarding doc uses (`.github/workflows/onboarding-doc-fresh.yml`,
+    /// regenerate-and-`git diff --exit-code`), for two reasons. It runs
+    /// unconditionally in `cargo test --lib` instead of behind that workflow's
+    /// `detect` gate, so it cannot be skipped by a path filter; and a PR that
+    /// edits a gating workflow trips `ci-integrity.yml`'s self-edit guard by
+    /// design, which would make the anti-drift gate itself unmergeable through
+    /// the normal train. A stale doc fails an ordinary unit test here, rather
+    /// than a workflow that has to be able to edit itself to be maintained.
+    ///
+    /// Line endings are not a hazard: `.gitattributes` pins `*.md text eol=lf`,
+    /// so the working-tree bytes `include_str!` reads are LF on every platform,
+    /// exactly like the newline the generator emits.
+    ///
+    /// The ENCODING of the redirect is. Because there is no CI job that
+    /// regenerates this doc, a human on Windows is the only thing that ever
+    /// refreshes it — and PowerShell's `>` writes UTF-16LE with a BOM, which
+    /// `include_str!` rejects outright. That surfaces as `stream did not
+    /// contain valid UTF-8` and stops the crate compiling, so it is worth
+    /// naming everywhere the command appears rather than leaving the next
+    /// person to decode it. `coord_doctor`'s onboarding doc never meets this
+    /// because its workflow regenerates it under bash on ubuntu.
+    #[test]
+    fn config_report_checked_in_layer_doc_is_the_generators_output() {
+        const CHECKED_IN: &str = include_str!("../../docs/runner-config-layers.md");
+        assert_eq!(
+            CHECKED_IN,
+            render_layer_doc(),
+            "docs/runner-config-layers.md is stale — regenerate it FROM BASH with \
+             `cargo run --bin config_report -- --layer-doc > \
+             docs/runner-config-layers.md` and commit the result. PowerShell's `>` \
+             would write UTF-16/BOM here, which is a COMPILE error rather than a \
+             failure of this test"
+        );
     }
 
     /// JSON keeps the tri-state tagged, and an Unknown serializes with no

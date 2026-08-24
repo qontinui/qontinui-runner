@@ -34,6 +34,18 @@
 //! config_report --layer-doc  # emit the generated layer inventory (markdown)
 //! ```
 //!
+//! `--layer-doc` is what publishes `docs/runner-config-layers.md`; CI holds the
+//! checked-in copy byte-exact against a fresh run
+//! (`config_report::tests::config_report_checked_in_layer_doc_is_the_generators_output`),
+//! so regenerate and commit it after touching `LAYER_SPECS`. **From bash**
+//! (Git Bash on Windows) — PowerShell's `>` writes UTF-16LE with a BOM, which
+//! `include_str!` cannot read, so the redirect would break the build rather
+//! than refresh the doc:
+//!
+//! ```text
+//! cargo run --bin config_report -- --layer-doc > docs/runner-config-layers.md
+//! ```
+//!
 //! Exit code is 0 whenever a report was produced: an `UNKNOWN` layer is a
 //! finding, not a failure of the tool, and this command makes no claim about
 //! whether the configuration is *correct*.

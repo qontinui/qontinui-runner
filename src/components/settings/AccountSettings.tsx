@@ -27,9 +27,18 @@
  *     token-expiry logout — a stale device JWT is a refresher concern,
  *     never a sign-out.
  *
- * The component is intentionally lean — token/runner_id/heartbeat
- * diagnostics live in the existing `WebIntegrationSettings` panel. This
- * panel is purely about account-bind state.
+ * Alongside the account binding it carries the two runner self-diagnostics
+ * that answer "why is this runner behaving like that?":
+ *
+ *   - Coord Doctor (`coord_doctor_run`) — the 7 ordered provisioning checks,
+ *     stopping at the first red and naming its fix.
+ *   - Configuration report (`config_report_text`) — the fifteen effective
+ *     configuration layers with per-value provenance, plus the env
+ *     generations. This is the in-app half of the `config_report` bin, and
+ *     the only one that can resolve the ten BIN-only layers.
+ *
+ * Token/runner_id/heartbeat diagnostics remain in the separate
+ * `WebIntegrationSettings` panel.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -45,6 +54,9 @@ import {
   Stethoscope,
   CheckCircle2,
   XCircle,
+  ClipboardList,
+  Copy,
+  Check,
 } from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
@@ -118,6 +130,58 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
       setDoctorRunning(false);
     }
   }, [onLog]);
+
+  // --- Effective configuration report (plan 2026-08-20, Phases 1-4) ---------
+  // In-app surface for the `config_report_text` Tauri command: the same
+  // fifteen-layer report the headless `config_report` bin prints, except the
+  // ten BIN-only layers resolve for real here instead of reading `UNKNOWN —
+  // not observable from the headless bin`. That difference is the whole reason
+  // this panel exists: the bin is the only surface that shipped with the
+  // command, and it is the one that can see the least.
+  //
+  // The TEXT form (not the structured `config_report_run`) on purpose — the
+  // report is byte-stable and already laid out for a fixed-width reader, so
+  // re-deriving a React layout from the rows would fork the presentation and
+  // hand a support reader something that no longer matches the bin's output.
+  // What an operator needs from a diagnostic is a copy-pasteable block.
+  const [configReport, setConfigReport] = useState<string | null>(null);
+  const [configReportRunning, setConfigReportRunning] = useState(false);
+  const [configReportCopied, setConfigReportCopied] = useState(false);
+
+  const runConfigReport = useCallback(async () => {
+    setConfigReportRunning(true);
+    setConfigReportCopied(false);
+    // Drop the previous run BEFORE the new one starts. Every reading in this
+    // report carries a capture time, so leaving the old block on screen under
+    // a "Running…" button invites the reader to copy a report whose stamps
+    // describe a different moment than the one they just asked about.
+    setConfigReport(null);
+    try {
+      const text = await invoke<string>("config_report_text");
+      setConfigReport(text);
+      onLog("info", "Configuration report generated — copy it into a bug report or a gate note");
+    } catch (err) {
+      const msg = typeof err === "string" ? err : String(err);
+      setConfigReport(null);
+      onLog("error", `Configuration report failed to run: ${msg}`);
+    } finally {
+      setConfigReportRunning(false);
+    }
+  }, [onLog]);
+
+  const copyConfigReport = useCallback(async () => {
+    if (!configReport) return;
+    try {
+      await navigator.clipboard.writeText(configReport);
+      setConfigReportCopied(true);
+      // Revert the button label on its own; a copy affordance stuck on
+      // "Copied" reads as state rather than as the acknowledgement it is.
+      window.setTimeout(() => setConfigReportCopied(false), 2000);
+    } catch (err) {
+      const msg = typeof err === "string" ? err : String(err);
+      onLog("error", `Could not copy the configuration report: ${msg}`);
+    }
+  }, [configReport, onLog]);
 
   const isTier2 = tier === "qontinui_account";
 
@@ -343,6 +407,68 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
                 </li>
               ))}
             </ul>
+          </div>
+        )}
+      </div>
+
+      <div className="space-y-3 rounded-lg border border-border bg-card/50 p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+              <ClipboardList className="w-4 h-4" />
+              Configuration report
+            </div>
+            <div className="text-xs text-muted-foreground mt-0.5">
+              Print this runner&apos;s effective configuration layer by layer, with where each value
+              came from and when it was read — plus how far the three env generations have drifted
+              apart. UNKNOWN means a layer could not be read, never a default; credential layers are
+              withheld.
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={runConfigReport}
+            disabled={configReportRunning}
+            className="inline-flex items-center gap-2 rounded bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shrink-0"
+          >
+            {configReportRunning ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <ClipboardList className="w-4 h-4" />
+            )}
+            {configReportRunning ? "Running…" : "Run config report"}
+          </button>
+        </div>
+
+        {configReport && (
+          <div className="space-y-2">
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={copyConfigReport}
+                aria-live="polite"
+                className="inline-flex items-center gap-1.5 rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-background/60 transition-colors"
+              >
+                {configReportCopied ? (
+                  <Check className="w-3.5 h-3.5 text-green-400" />
+                ) : (
+                  <Copy className="w-3.5 h-3.5" />
+                )}
+                {configReportCopied ? "Copied" : "Copy report"}
+              </button>
+            </div>
+            {/* Rendered verbatim in a fixed-width block: the report's column
+                alignment is part of its contract, so it must not be reflowed.
+                `tabIndex`/`role` because this scrolls — a keyboard-only user
+                cannot reach ~130 lines inside an unfocusable overflow box. */}
+            <pre
+              tabIndex={0}
+              role="region"
+              aria-label="Effective configuration report"
+              className="max-h-96 overflow-auto rounded border border-border/60 bg-background/40 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground whitespace-pre focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50"
+            >
+              {configReport}
+            </pre>
           </div>
         )}
       </div>
