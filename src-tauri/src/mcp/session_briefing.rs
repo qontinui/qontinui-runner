@@ -459,7 +459,14 @@ pub(crate) fn resolve_requiring(
     RenderedBlock {
         text: substitute(&doc.body, runner_api_base, coord_http_base),
         provenance,
-        fetched_at: Some(doc.fetched_at.clone()),
+        // An EMPTY stamp is an absence, not a time. It is the serde default for
+        // a store entry written by a build that predates the field, and
+        // `fleet_policy_poller`'s `BriefingDial` already reports it as UNKNOWN
+        // for that reason. Reported verbatim here it reached the visibility
+        // route as `"fetched_at": ""`, which the panel rendered as
+        // `last confirmed:` followed by nothing at all — the one thing a
+        // provenance surface must not do.
+        fetched_at: Some(doc.fetched_at.clone()).filter(|s| !s.is_empty()),
     }
 }
 
@@ -490,14 +497,105 @@ pub(crate) fn runner_api_base(api_port: u16) -> String {
 // ===========================================================================
 
 /// JSON for one rendered block.
-fn block_json(text: &str, provenance: &Provenance, fetched_at: Option<&str>) -> Value {
-    json!({
-        "text": text,
-        "provenance": provenance.kind(),
-        "provenance_detail": provenance.describe(),
-        "document_version": provenance.rendered_version(),
-        "fetched_at": fetched_at,
-    })
+///
+/// Returns the MAP rather than a `Value`, so a caller that has to add a field
+/// to it — every caller does — needs no `as_object_mut()` and therefore has no
+/// unwrap-or-skip branch. The `Value` form left the assembly below either
+/// panicking on the request path or silently dropping every key it wanted to
+/// add, and neither is a thing a visibility route should be able to do.
+fn block_json(
+    text: &str,
+    provenance: &Provenance,
+    fetched_at: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut block = serde_json::Map::new();
+    block.insert("text".to_string(), json!(text));
+    block.insert("provenance".to_string(), json!(provenance.kind()));
+    block.insert(
+        "provenance_detail".to_string(),
+        json!(provenance.describe()),
+    );
+    block.insert(
+        "document_version".to_string(),
+        json!(provenance.rendered_version()),
+    );
+    block.insert("fetched_at".to_string(), json!(fetched_at));
+    block
+}
+
+/// The fleet-gated plan-capture clause's state, as `GET /session-briefing`
+/// reports it.
+///
+/// Carried whether or not the clause is INCLUDED. An operator asking "why is my
+/// edited clause not in the prompt?" needs the fleet dial AND the document
+/// state, not one of them: the dial is the authorization, the document is only
+/// the content, and either one alone answers the wrong half of the question.
+struct ClauseReport {
+    /// Is the fleet plan-capture dial at `record`, i.e. is this document's text
+    /// actually appended to the briefing?
+    included: bool,
+    provenance: Provenance,
+    fetched_at: Option<String>,
+}
+
+/// Assemble the `GET /session-briefing` payload. PURE.
+///
+/// The handler owns the I/O — the supervisor probe, the cache reads, the
+/// `runner_context()` render — and this owns the SHAPE, which is the contract
+/// `src/components/settings/SessionBriefingPanel.tsx` reads.
+///
+/// Factored out because nothing pinned that contract. The object used to be
+/// assembled inline behind `if let Some(obj) = payload.as_object_mut()`, which
+/// made every key past the first block conditional on a branch that cannot
+/// fail — and left a renamed or dropped key as a silent panel regression that
+/// neither `cargo test` nor `tsc` could see, since the two ends meet only over
+/// JSON. `the_payload_shape_is_the_contract_the_panel_reads` now pins it.
+fn briefing_payload(
+    api_port: u16,
+    briefing_text: &str,
+    base_provenance: &Provenance,
+    base_fetched_at: Option<&str>,
+    clause: &ClauseReport,
+    rules: &crate::mcp::ai_session::RenderedRules,
+) -> Value {
+    let mut obj = block_json(briefing_text, base_provenance, base_fetched_at);
+
+    obj.insert("api_port".to_string(), json!(api_port));
+    obj.insert(
+        "document".to_string(),
+        json!(format!("{BRIEFING_KIND}/{BRIEFING_RUNNER_SESSION}")),
+    );
+
+    // Kept beside the nested object rather than replaced by it: the flat
+    // boolean is the key Phase 4 of the plan specifies, so a `curl` reader or a
+    // script that predates the nested object keeps working. Both are built from
+    // the same value and can never disagree; the nested one additionally
+    // carries the document state the flat boolean cannot express, and that is
+    // the one the settings panel reads.
+    obj.insert(
+        "plan_capture_clause_included".to_string(),
+        json!(clause.included),
+    );
+    obj.insert(
+        "plan_capture_clause".to_string(),
+        json!({
+            "included": clause.included,
+            "document": format!("{BRIEFING_KIND}/{BRIEFING_PLAN_CAPTURE_CLAUSE}"),
+            "provenance": clause.provenance.kind(),
+            "provenance_detail": clause.provenance.describe(),
+            "document_version": clause.provenance.rendered_version(),
+            "fetched_at": clause.fetched_at,
+        }),
+    );
+
+    let mut rules_json = block_json(&rules.text, &rules.provenance, rules.fetched_at.as_deref());
+    rules_json.insert(
+        "document".to_string(),
+        json!(format!("{BRIEFING_KIND}/{BRIEFING_AI_SESSION_RULES}")),
+    );
+    obj.insert("ai_session_rules".to_string(), Value::Object(rules_json));
+
+    Value::Object(obj)
 }
 
 /// `GET /session-briefing` — exactly what THIS runner will inject.
@@ -521,12 +619,13 @@ pub async fn session_briefing_handler(
     // landed between the two — in which case both answers were true when they
     // were taken.
     let (base_provenance, base_fetched_at) = provenance_of(BRIEFING_RUNNER_SESSION);
-    let clause_included = fleet_policy_poller::effective_plan_capture_level()
-        == fleet_policy_poller::PLAN_CAPTURE_RECORD;
-    // Reported whether or not it is INCLUDED: an operator asking "why is my
-    // edited clause not in the prompt?" needs to see both the fleet dial and
-    // the document state, not one of them.
     let (clause_provenance, clause_fetched_at) = provenance_of(BRIEFING_PLAN_CAPTURE_CLAUSE);
+    let clause = ClauseReport {
+        included: fleet_policy_poller::effective_plan_capture_level()
+            == fleet_policy_poller::PLAN_CAPTURE_RECORD,
+        provenance: clause_provenance,
+        fetched_at: clause_fetched_at,
+    };
 
     // `check_supervisor_available` is a BLOCKING 500ms TCP connect; parking a
     // tokio worker on it for every panel load is not acceptable on a shared
@@ -537,41 +636,14 @@ pub async fn session_briefing_handler(
             .unwrap_or(false);
     let rules = crate::mcp::ai_session::runner_rules_prefix(supervisor_available, api_port);
 
-    let mut payload = block_json(&text, &base_provenance, base_fetched_at.as_deref());
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert(
-            "plan_capture_clause_included".to_string(),
-            json!(clause_included),
-        );
-        obj.insert(
-            "plan_capture_clause".to_string(),
-            json!({
-                "included": clause_included,
-                "document": format!("{BRIEFING_KIND}/{BRIEFING_PLAN_CAPTURE_CLAUSE}"),
-                "provenance": clause_provenance.kind(),
-                "provenance_detail": clause_provenance.describe(),
-                "document_version": clause_provenance.rendered_version(),
-                "fetched_at": clause_fetched_at,
-            }),
-        );
-        obj.insert("api_port".to_string(), json!(api_port));
-        obj.insert(
-            "document".to_string(),
-            json!(format!("{BRIEFING_KIND}/{BRIEFING_RUNNER_SESSION}")),
-        );
-        obj.insert("ai_session_rules".to_string(), {
-            let mut v = block_json(&rules.text, &rules.provenance, rules.fetched_at.as_deref());
-            if let Some(o) = v.as_object_mut() {
-                o.insert(
-                    "document".to_string(),
-                    json!(format!("{BRIEFING_KIND}/{BRIEFING_AI_SESSION_RULES}")),
-                );
-            }
-            v
-        });
-    }
-
-    Json(ApiResponse::success(payload))
+    Json(ApiResponse::success(briefing_payload(
+        api_port,
+        &text,
+        &base_provenance,
+        base_fetched_at.as_deref(),
+        &clause,
+        &rules,
+    )))
 }
 
 /// The door's route table, as data: `(method, path)`.
@@ -765,6 +837,126 @@ mod tests {
         assert!(p.describe().contains("rejected coord v7"));
     }
 
+    // ---- the payload shape -------------------------------------------------
+
+    /// Every key `src/components/settings/SessionBriefingPanel.tsx` reads,
+    /// pinned.
+    ///
+    /// The panel and this route meet only over JSON: a renamed key compiles on
+    /// both sides and fails at runtime, in a read-only settings tab nobody
+    /// loads until they are already debugging something else. So the contract
+    /// is asserted here rather than left to whoever last edited the handler.
+    ///
+    /// The CLAUSE half is asserted with `included: false` deliberately. That is
+    /// the arm where the clause's text is not in the prompt at all, and it is
+    /// exactly the arm where the document state still has to be reported —
+    /// otherwise "my edited clause is not showing up" has no answer.
+    #[test]
+    fn the_payload_shape_is_the_contract_the_panel_reads() {
+        let rules = crate::mcp::ai_session::RenderedRules {
+            text: "[source: x]\n[briefing: builtin-fallback]\nRULES".to_string(),
+            provenance: Provenance::Builtin,
+            fetched_at: None,
+        };
+        let clause = ClauseReport {
+            included: false,
+            provenance: Provenance::Coord {
+                name: BRIEFING_PLAN_CAPTURE_CLAUSE.to_string(),
+                version: 4,
+            },
+            fetched_at: Some("2026-08-24T00:00:00+00:00".to_string()),
+        };
+        let payload = briefing_payload(
+            9877,
+            "[source: y]\n[briefing: coord session_briefing/runner-session v3]\nBRIEFING",
+            &Provenance::Coord {
+                name: BRIEFING_RUNNER_SESSION.to_string(),
+                version: 3,
+            },
+            Some("2026-08-24T00:00:01+00:00"),
+            &clause,
+            &rules,
+        );
+
+        // The base block, at the TOP level — the panel spreads it into its own
+        // `BriefingBlock` rather than nesting it.
+        assert_eq!(
+            payload["text"],
+            "[source: y]\n[briefing: coord session_briefing/runner-session v3]\nBRIEFING"
+        );
+        assert_eq!(payload["provenance"], "coord");
+        assert_eq!(
+            payload["provenance_detail"],
+            "coord session_briefing/runner-session v3"
+        );
+        assert_eq!(payload["document_version"], 3);
+        assert_eq!(payload["fetched_at"], "2026-08-24T00:00:01+00:00");
+        assert_eq!(payload["document"], "session_briefing/runner-session");
+        // The port the panel prints, and the one substituted into the body.
+        assert_eq!(payload["api_port"], 9877);
+
+        // The flat boolean Phase 4 specifies, and the nested object that says
+        // WHICH document the dial is gating.
+        assert_eq!(payload["plan_capture_clause_included"], false);
+        let c = &payload["plan_capture_clause"];
+        assert_eq!(c["included"], false);
+        assert_eq!(c["document"], "session_briefing/plan-capture-clause");
+        assert_eq!(c["provenance"], "coord");
+        assert_eq!(
+            c["provenance_detail"],
+            "coord session_briefing/plan-capture-clause v4"
+        );
+        assert_eq!(c["document_version"], 4);
+        assert_eq!(c["fetched_at"], "2026-08-24T00:00:00+00:00");
+
+        // The second injected prompt, marker line and all.
+        let r = &payload["ai_session_rules"];
+        assert_eq!(
+            r["text"],
+            "[source: x]\n[briefing: builtin-fallback]\nRULES"
+        );
+        assert_eq!(r["provenance"], "builtin");
+        assert_eq!(r["provenance_detail"], "builtin-fallback");
+        assert_eq!(r["document_version"], Value::Null);
+        assert_eq!(r["fetched_at"], Value::Null);
+        assert_eq!(r["document"], "session_briefing/ai-session-rules");
+    }
+
+    /// A REJECTED coord body reports `builtin` with a null rendered version —
+    /// on the clause too, not only on the base block. The panel colours the
+    /// badge from `provenance` and prints `provenance_detail` verbatim, so this
+    /// is what stops it from claiming a version the session never saw.
+    #[test]
+    fn a_rejected_clause_body_reports_builtin_with_no_rendered_version() {
+        let rules = crate::mcp::ai_session::RenderedRules {
+            text: "RULES".to_string(),
+            provenance: Provenance::Builtin,
+            fetched_at: None,
+        };
+        let clause = ClauseReport {
+            included: true,
+            provenance: Provenance::BuiltinRejected { version: 9 },
+            fetched_at: None,
+        };
+        let payload = briefing_payload(
+            9876,
+            "BRIEFING",
+            &Provenance::Builtin,
+            None,
+            &clause,
+            &rules,
+        );
+
+        let c = &payload["plan_capture_clause"];
+        assert_eq!(c["included"], true);
+        assert_eq!(c["provenance"], "builtin");
+        assert_eq!(
+            c["provenance_detail"],
+            "builtin-fallback (rejected coord v9)"
+        );
+        assert_eq!(c["document_version"], Value::Null);
+    }
+
     // ---- routes ------------------------------------------------------------
 
     /// The route table is in lockstep with `routes()`. There is no global
@@ -842,6 +1034,33 @@ mod tests {
         );
         assert_eq!(block.text, "cached body");
         assert_eq!(block.provenance, Provenance::Cached { version: 3 });
+    }
+
+    /// An EMPTY `fetched_at` is UNKNOWN, never an empty timestamp.
+    ///
+    /// The field carries `#[serde(default)]` so a store written before it
+    /// existed restores as `""`. `fleet_policy_poller`'s `BriefingDial` already
+    /// filters that for the config report; `resolve` did not, so the same
+    /// absence reached `GET /session-briefing` as `"fetched_at": ""` and the
+    /// settings panel printed `last confirmed:` with nothing after it.
+    #[test]
+    fn an_empty_stamp_is_reported_as_absent_not_as_a_timestamp() {
+        let pin = fleet_policy_poller::pin_plan_capture_level_for_test("off");
+        let mut doc = fleet_policy_poller::briefing_for_test("body", 3, BriefingProvenance::Cached);
+        doc.fetched_at = String::new();
+        pin.set_briefing(BRIEFING_RUNNER_SESSION, doc);
+
+        let block = resolve(
+            BRIEFING_RUNNER_SESSION,
+            "BUILTIN TEXT",
+            "http://127.0.0.1:9876",
+            "https://coord.example.com",
+        );
+        // The BODY is still the cached one — this is a statement about the
+        // stamp only, not a reason to fall back to the builtin.
+        assert_eq!(block.text, "body");
+        assert_eq!(block.provenance, Provenance::Cached { version: 3 });
+        assert_eq!(block.fetched_at, None);
     }
 
     /// Every guard failure falls back to the builtin and SAYS which version it

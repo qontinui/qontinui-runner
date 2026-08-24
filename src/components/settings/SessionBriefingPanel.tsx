@@ -23,10 +23,21 @@
 import { useCallback, useState } from "react";
 import { ChevronDown, ChevronRight, FileText, RefreshCw } from "lucide-react";
 import { tracedFetch, useApiBase } from "@/lib/runner-api";
+import {
+  describePlanCaptureClause,
+  formatDocumentVersion,
+  formatLastConfirmed,
+  provenanceClasses,
+} from "./sessionBriefingHelpers";
 
-/** One rendered block as `GET /session-briefing` reports it. */
-interface BriefingBlock {
-  text: string;
+/**
+ * Where a block's text came from, as `GET /session-briefing` reports it.
+ *
+ * Split out of [`BriefingBlock`] because the plan-capture clause carries all of
+ * this and no `text` of its own — its body is either already inside the
+ * briefing block above (fleet dial at `record`) or not injected at all.
+ */
+interface BriefingDocumentState {
   /** `coord` | `cached` | `builtin`. */
   provenance: string;
   /** The same fact spelled out, e.g. `builtin-fallback (rejected coord v7)`. */
@@ -37,16 +48,26 @@ interface BriefingBlock {
   document?: string;
 }
 
+/** One rendered block as `GET /session-briefing` reports it. */
+interface BriefingBlock extends BriefingDocumentState {
+  text: string;
+}
+
+interface PlanCaptureClauseState extends BriefingDocumentState {
+  /** Is the fleet dial at `record`, i.e. is the clause actually appended? */
+  included: boolean;
+}
+
 interface SessionBriefingResponse extends BriefingBlock {
+  /**
+   * The flat boolean Phase 4 of the plan specifies. The route builds it and
+   * `plan_capture_clause.included` from the same value, and this panel reads
+   * the nested one — the clause view takes the whole clause. Declared anyway
+   * because it is part of the published route shape that `curl` readers and
+   * scripts use, not an accident.
+   */
   plan_capture_clause_included: boolean;
-  plan_capture_clause: {
-    included: boolean;
-    document?: string;
-    provenance: string;
-    provenance_detail: string;
-    document_version: number | null;
-    fetched_at: string | null;
-  };
+  plan_capture_clause: PlanCaptureClauseState;
   api_port: number;
   ai_session_rules: BriefingBlock;
 }
@@ -57,22 +78,6 @@ interface ApiEnvelope<T> {
   error?: string;
 }
 
-/**
- * Colour a provenance token. `builtin` is deliberately NOT an error colour: it
- * is the correct, expected state on every runner until coord serves the
- * documents, and painting it red would train operators to ignore it.
- */
-function provenanceClasses(provenance: string): string {
-  switch (provenance) {
-    case "coord":
-      return "bg-emerald-500/10 text-emerald-500";
-    case "cached":
-      return "bg-amber-500/10 text-amber-500";
-    default:
-      return "bg-muted text-muted-foreground";
-  }
-}
-
 function ProvenanceBadge({ detail, provenance }: { detail: string; provenance: string }) {
   return (
     <span
@@ -81,6 +86,26 @@ function ProvenanceBadge({ detail, provenance }: { detail: string; provenance: s
     >
       {detail}
     </span>
+  );
+}
+
+/**
+ * Which document a block came from, which generation of it, and when the runner
+ * last confirmed that against coord.
+ *
+ * Its own component because the plan-capture clause needs exactly this row and
+ * has no text to put beside it. Both absent-value rules live in
+ * `sessionBriefingHelpers` rather than inline here — they are honesty rules
+ * about what the runner can and cannot state, and they were the half of this
+ * panel that nothing could test.
+ */
+function BlockMetaRow({ block }: { block: BriefingDocumentState }) {
+  return (
+    <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-muted-foreground">
+      {block.document && <span>document: {block.document}</span>}
+      <span>version: {formatDocumentVersion(block.document_version, block.provenance)}</span>
+      <span>last confirmed: {formatLastConfirmed(block.fetched_at, block.provenance)}</span>
+    </div>
   );
 }
 
@@ -102,19 +127,39 @@ function BlockView({
         </div>
         <ProvenanceBadge detail={block.provenance_detail} provenance={block.provenance} />
       </div>
-      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-muted-foreground">
-        {block.document && <span>document: {block.document}</span>}
-        <span>
-          version:{" "}
-          {block.document_version === null
-            ? "— (compiled-in fallback)"
-            : `v${block.document_version}`}
-        </span>
-        <span>last confirmed: {block.fetched_at ?? "never (compiled-in fallback)"}</span>
-      </div>
+      <BlockMetaRow block={block} />
       <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background/60 p-2 text-[11px] leading-relaxed">
         {block.text}
       </pre>
+    </div>
+  );
+}
+
+/**
+ * The fleet-gated plan-capture clause.
+ *
+ * Rendered the SAME WAY in both arms, on purpose. `GET /session-briefing`
+ * reports this document's provenance, version and stamp whether or not the
+ * clause is in force, because the fleet dial and the coord document are two
+ * independent facts and only one of them is what an operator is usually asking
+ * about. The panel used to print the document state when the clause was
+ * included and drop it entirely when it was omitted — i.e. exactly in the arm
+ * where "why is my edited clause not in the prompt?" gets asked, leaving the
+ * three fields the route serves for that reader unread.
+ */
+function PlanCaptureClauseView({ clause }: { clause: PlanCaptureClauseState }) {
+  return (
+    <div className="rounded-lg bg-muted/20 p-3 space-y-2">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h5 className="text-sm font-medium">Plan-capture clause</h5>
+          <p className="text-[10px] text-muted-foreground">
+            {describePlanCaptureClause(clause.included)}
+          </p>
+        </div>
+        <ProvenanceBadge detail={clause.provenance_detail} provenance={clause.provenance} />
+      </div>
+      <BlockMetaRow block={clause} />
     </div>
   );
 }
@@ -171,10 +216,10 @@ export function SessionBriefingPanel() {
           <div className="text-left">
             <h4 className="font-medium text-sm">Session Briefing (read-only)</h4>
             <p className="text-xs text-muted-foreground">
-              The exact system-prompt text this runner appends to every session it hosts. Edit it
-              in the web console under Coord → Prompt Documents; edits reach sessions spawned after
-              the next runner poll (≤ 45 s), and sessions already running keep the prompt they
-              started with.
+              The exact system-prompt text this runner appends to every session it hosts. Edit it in
+              the web console under Coord → Prompt Documents; edits reach sessions spawned after the
+              next runner poll (≤ 45 s), and sessions already running keep the prompt they started
+              with.
             </p>
           </div>
         </div>
@@ -200,8 +245,8 @@ export function SessionBriefingPanel() {
 
           {error && (
             <p className="text-xs text-destructive">
-              Could not read the briefing from the runner API: {error}. This says nothing about
-              what the briefing contains — only that this panel could not reach the runner.
+              Could not read the briefing from the runner API: {error}. This says nothing about what
+              the briefing contains — only that this panel could not reach the runner.
             </p>
           )}
 
@@ -216,17 +261,7 @@ export function SessionBriefingPanel() {
                 subtitle={`Injected as QONTINUI_RUNNER_CONTEXT and --append-system-prompt · API port ${data.api_port}`}
                 block={data}
               />
-              <p className="text-[10px] text-muted-foreground">
-                Plan-capture clause:{" "}
-                {data.plan_capture_clause_included ? (
-                  <>
-                    included ({data.plan_capture_clause.provenance_detail}) — the fleet dial is at{" "}
-                    <code>record</code>
-                  </>
-                ) : (
-                  <>omitted — the fleet plan-capture dial is off for this tenant</>
-                )}
-              </p>
+              <PlanCaptureClauseView clause={data.plan_capture_clause} />
               <BlockView
                 title="Runner-triggered AI sessions"
                 subtitle="A separate, higher-authority rules block on a spawn seam the briefing above never reaches"
