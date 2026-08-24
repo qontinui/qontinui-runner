@@ -1912,6 +1912,41 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// judgement, not a mechanical consequence, and it is the one entry here worth an
 /// operator's second opinion.
 ///
+/// # The gate-verb family is IN — plan `2026-08-10-agent-gate-management-must-ship-in-the-product`, P4
+///
+/// `coord_reject_gate`, `coord_reopen_gate`, `coord_mute_gate`, `coord_unmute_gate`,
+/// `coord_snooze_gate`, `coord_cancel_continuation`, `coord_force_clear_gate` and
+/// `coord_set_gate_audience` were drift of the worst kind: the one this door's own
+/// warning is built to catch, sitting unread for days.
+///
+/// coord unmasked all eight on the device floor — six in `f9c9eef3` (P4a) and the
+/// `force-clear` / `audience` pair on the 2026-08-20 operator decision — and P4
+/// (`df8c2868`) then shipped the `gate_action` dial to govern them. This list never
+/// moved, so from INSIDE the product every one of them answered `-32601`. That is
+/// precisely the plan's own Null A restated one layer out: an interactive runner
+/// session authenticates as the device principal and reaches coord through this
+/// proxy, so a capability this list omits does not exist for the user, whatever
+/// coord grants. The plan's §9 says so in advance — *"`device_default_allow_set()`
+/// returning a name proves masking, not reachability"* — and this drift is what
+/// running that acceptance for the first time actually found.
+///
+/// **The dial is the control surface, not this list.** Withholding `force-clear` or
+/// `audience` here would not add a safety check; it would make `gate_action` unable
+/// to do its job, because a dial can only govern what the door forwards. The real
+/// checks all live downstream and are unaffected by the grant: clearance authority,
+/// `agent_non_author`, the `gate_action` tiers, and a notification on every
+/// sensitive action. Every one of these verbs is also reversible by `reopen`, which
+/// is the invariant the plan requires of anything it grants.
+///
+/// `approve` stays unreachable — and it is unreachable by construction rather than
+/// by this list, because coord defines no `coord_approve_gate` tool at all. The 10s
+/// evaluation sweep already clears any gate whose predicate verifies, so the action
+/// has nothing to do.
+///
+/// `coord_fixer_arm_readiness` came out of the same drift line and is unrelated to
+/// gates: a read coord grants on its READ-ONLY floor, so it carries no authority a
+/// session lacks. It is IN for the same reason the other reads here are.
+///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
@@ -1922,6 +1957,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_blockers",
     "coord_build_info",
     "coord_can",
+    "coord_cancel_continuation",
     "coord_change_conflict",
     "coord_check_gate_predicate",
     "coord_check_install_safety",
@@ -1945,6 +1981,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_explain_ref_event",
     "coord_explain_worktree",
     "coord_find_references",
+    "coord_fixer_arm_readiness",
+    "coord_force_clear_gate",
     "coord_gate_doctor",
     "coord_gate_inspect",
     "coord_gate_list",
@@ -1962,6 +2000,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_memory_search",
     "coord_merge_order",
     "coord_migration_queue",
+    "coord_mute_gate",
     "coord_orient",
     "coord_post_finding",
     "coord_pr_status",
@@ -1971,6 +2010,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_record_decision",
     "coord_reevaluate_dry",
     "coord_register_gate",
+    "coord_reject_gate",
+    "coord_reopen_gate",
     "coord_report_status",
     "coord_request_handoff",
     "coord_resolve_origin",
@@ -1979,11 +2020,14 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_secret_presence",
     "coord_send_message",
     "coord_session_worktrees",
+    "coord_set_gate_audience",
     "coord_signature",
     "coord_slo_metrics",
+    "coord_snooze_gate",
     "coord_symbol_lookup",
     "coord_twin_catalog",
     "coord_typecheck_file",
+    "coord_unmute_gate",
     "coord_who_is_working_on",
     "coord_withdraw_gate",
     "coord_work_unit_add_citation",
@@ -8338,6 +8382,59 @@ mod coord_mcp_body_gate_tests {
         // decision now, not drift.
         assert!(!coord_mcp_tool_is_allowed("coord_reevaluate"));
         assert!(coord_mcp_withholding_is_deliberate("coord_reevaluate"));
+    }
+
+    /// The gate-verb family, pinned. Plan
+    /// `2026-08-10-agent-gate-management-must-ship-in-the-product`, P4.
+    ///
+    /// coord unmasked these on its device floor across `f9c9eef3` (P4a) and the
+    /// 2026-08-20 `force-clear` / `audience` grants, and P4 shipped the
+    /// `gate_action` dial to govern them — while this list stayed put, so every
+    /// one of them answered `-32601` from inside the product. The runner said so
+    /// itself on every `tools/list` (`drifted_count=9`) for days before anyone
+    /// read it. Pinned here so a later edit cannot silently re-open the gap.
+    ///
+    /// **The negative control is the load-bearing half**, exactly as the plan's
+    /// §9 says: it is what proves the family was granted deliberately rather
+    /// than by a blanket `coord_*_gate` rule that would also hand over
+    /// `approve`. `approve` must stay unreachable — it CLEARS a gate, i.e.
+    /// performs the gated action, and the 10s evaluation sweep already clears
+    /// anything whose predicate verifies.
+    #[test]
+    fn gate_action_verbs_are_callable_and_approve_is_not() {
+        for tool in [
+            "coord_reject_gate",
+            "coord_reopen_gate",
+            "coord_mute_gate",
+            "coord_unmute_gate",
+            "coord_snooze_gate",
+            "coord_cancel_continuation",
+            // Granted 2026-08-20 WITH a notification on every use. Withholding
+            // them here would not add a check — it would make `gate_action`
+            // unable to govern them, since a dial can only govern what the door
+            // forwards.
+            "coord_force_clear_gate",
+            "coord_set_gate_audience",
+            // P4's own addition: mutates nothing, so neither dial-governed nor
+            // notifying.
+            "coord_gate_doctor",
+        ] {
+            assert!(
+                coord_mcp_tool_is_allowed(tool),
+                "{tool} is granted on coord's device floor and must not be withheld here"
+            );
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
+        }
+        // The negative control. coord defines no such tool, so this pins the
+        // grant above as an enumeration rather than a pattern.
+        assert!(!coord_mcp_tool_is_allowed("coord_approve_gate"));
     }
 
     /// Non-allowlisted tools are refused with the request's id echoed —
