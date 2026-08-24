@@ -163,10 +163,27 @@ describe("coordCallsReady — the fail-open window (§6.4)", () => {
     expect(coordCallsReady({ isolated: false, loading: true })).toBe(false);
   });
 
-  it("releases on a REJECTED resolve, so an older runner build polls as before", () => {
-    // The provider sets `loading` false in `finally`, and leaves the mode
-    // `unknown` (isolated=false) when the invoke rejects. That pair must
-    // poll — a runner predating `get_coord_mode` has to keep working.
-    expect(coordCallsReady({ isolated: false, loading: false })).toBe(true);
+  it("a REJECTED resolve still polls, so an older runner build keeps working", async () => {
+    // A runner build predating `get_coord_mode` rejects the invoke. The
+    // provider's `catch` leaves `data` null and its `finally` clears
+    // `loading`; feed the derivation the FIRST of those two, taken from the
+    // real reject path rather than written out by hand.
+    mockInvoke.mockRejectedValueOnce(new Error("Command get_coord_mode not found"));
+    await expect(fetchCoordModeOnce()).rejects.toThrow("Command get_coord_mode not found");
+    const afterReject = deriveCoordGating(null);
+
+    expect(coordCallsReady({ isolated: afterReject.isolated, loading: false })).toBe(true);
   });
 });
+
+/**
+ * NOT PINNED HERE, deliberately and with the gap named: that
+ * `CoordModeProvider`'s `finally` actually clears `loading` on the reject
+ * path. If it stopped doing so, `coordCallsReady` would be false forever and
+ * fleet health, overlapping intents and the live heatmap would go permanently
+ * silent on every runner build predating `get_coord_mode` — and every
+ * assertion in this file would still pass, because none of them render the
+ * provider. Under `environment: "node"` there is no renderer to drive it (see
+ * FleetHealthPanel.test.tsx for the same constraint); closing this needs a
+ * DOM environment for this file, not another pure-function assertion.
+ */
