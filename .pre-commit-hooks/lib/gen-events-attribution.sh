@@ -47,13 +47,67 @@
 # `files:` in .pre-commit-config.yaml on purpose (see above): a schemars type
 # can reference a struct in any module, so the whole crate source is in scope,
 # as are the manifests and lockfile that pin schemars/serde themselves.
+#
+# The list is derived from what actually produces the artifact, not from what
+# has produced a diff so far: `schemas.json` comes from ONE command,
+# `cargo run --bin export_schemas --release` (src-tauri/scripts/generate_types.sh),
+# so the inputs are the whole compiled crate graph plus everything that pins how
+# it compiles. That is why the IN-REPO path dependencies and the toolchain pin
+# are here even though nothing under them derives `JsonSchema` today — the day
+# one does, or the day a feature edit in one of their manifests changes feature
+# unification for `serde`/`chrono`/`uuid`, a narrower list would start clearing
+# guilty pushers with nothing to notice. Out-of-repo inputs (the qontinui-schemas
+# path deps, its TS compile step) are deliberately absent: a push to THIS repo
+# cannot change them, so they can never be this push's fault.
+# Drop the git environment a HOOK inherits, so `git -C <dir>` actually means
+# that directory.
+#
+# This is a correctness precondition, not hygiene. Git exports `GIT_DIR` (and
+# friends) to every hook it runs, and those variables OVERRIDE `-C`: with
+# `GIT_DIR` set, `git -C /some/other/repo log` reports the repo `GIT_DIR` names.
+# Verified directly — two throwaway repos, `GIT_DIR=decoy git -C real log`
+# prints decoy's commit.
+#
+# Two consequences, both observed live on 2026-08-24 the first time this
+# library ran from a real pre-push hook:
+#
+#  - the attribution test's throwaway fixtures committed into the REAL
+#    repository. Its `git -C "$WORK" commit` moved the branch being pushed to a
+#    fixture commit and left the index holding five fixture files. (Recovered
+#    from the reflog; nothing reached origin, because the resulting push
+#    failed.)
+#  - `gen-events-drift.sh`'s `git -C "$SCHEMAS_DIR" status` read THIS repo
+#    rather than qontinui-schemas, so the shared-checkout dirty note described
+#    the wrong repository.
+#
+# It was invisible until now only because nothing ever ran either script from a
+# hook — the test said "run me by hand" and the drift guard's own git calls
+# happen to name the repo whose hook is running. Both callers clear the
+# environment before their first `git`.
+gen_events_clear_inherited_git_env() {
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+        GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_PREFIX \
+        GIT_INTERNAL_SUPER_PREFIX GIT_CONFIG GIT_CONFIG_COUNT \
+        GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_NAMESPACE \
+        GIT_INDEX_VERSION GIT_QUARANTINE_PATH GIT_PUSH_CERT \
+        GIT_REFLOG_ACTION
+}
+
 GEN_EVENTS_ATTRIBUTION_PATHS=(
     "src-tauri/src"
     "src-tauri/build.rs"
     "src-tauri/Cargo.toml"
     "src-tauri/scripts/generate_types.sh"
+    # In-repo path dependencies of the crate `export_schemas` links into
+    # (`qontinui-db = { path = "./clorinde" }`,
+    #  `qontinui-spec-check = { path = "../crates/spec-check" }`).
+    "src-tauri/clorinde"
+    "crates/spec-check"
     "Cargo.toml"
     "Cargo.lock"
+    # The compiler that expands the `schemars` derive. A channel bump is a real
+    # input to the generated JSON and touches none of the paths above.
+    "rust-toolchain.toml"
 )
 
 # Resolve the ref this push is measured against: the branch's own upstream

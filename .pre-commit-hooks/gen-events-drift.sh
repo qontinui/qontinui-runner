@@ -103,8 +103,25 @@ fi
 log()  { echo "[gen-events-drift] $*"; }
 fail() { echo "[gen-events-drift] $*" >&2; }
 
+# Guarded rather than sourced bare: under `set -e` a missing library aborts
+# with a raw bash "No such file or directory", which is the one silent-ish exit
+# this hook promises never to make. A partial or sparse checkout is the realistic
+# way to get here.
+ATTRIBUTION_LIB="$SCRIPT_DIR/lib/gen-events-attribution.sh"
+if [ ! -f "$ATTRIBUTION_LIB" ]; then
+    fail "ERROR: missing $ATTRIBUTION_LIB"
+    fail "The drift guard cannot attribute drift without it, and a guard that"
+    fail "cannot attribute must not excuse. Restore the file (it ships with this"
+    fail "repo) or bypass this push with: SKIP=gen-events-drift git push"
+    exit 1
+fi
 # shellcheck source=lib/gen-events-attribution.sh
-. "$SCRIPT_DIR/lib/gen-events-attribution.sh"
+. "$ATTRIBUTION_LIB"
+
+# Before the first `git`. A hook inherits GIT_DIR, which overrides every
+# `git -C <dir>` below — including the ones aimed at $SCHEMAS_DIR, which would
+# otherwise report on THIS repo. See the function's own comment.
+gen_events_clear_inherited_git_env
 
 # Exit path for "the local environment cannot answer the question". Loud by
 # construction: it always states the reason, the remedy, and what coverage is
@@ -400,27 +417,40 @@ fi
 
 gen_events_attribution "$RUNNER_DIR"
 
-# The regeneration command is the same remedy in every arm; only the urgency
-# differs, so print it from one place and let each arm frame it.
+# The regeneration commands and the shared-checkout caveat: the same remedy in
+# every arm — only the urgency differs — so each arm supplies its own
+# lead-in line and calls this for the body. It really is printed from one
+# place now; it used to be re-typed inline in the pre-existing arm.
+#
+# $1 is the emitter: `log` (stdout) for a non-blocking arm, `fail` (stderr,
+# the default) for a failing one. Passing it keeps an arm's output on ONE
+# stream, so a developer piping stderr sees a failure whole and a developer
+# reading stdout sees a pass whole.
 print_remedy() {
-    fail "Refresh the shared bindings by regenerating and committing them there:"
-    fail "    cd $RUNNER_DIR && bash src-tauri/scripts/generate_types.sh --ts-only"
-    fail "    cd $SCHEMAS_DIR && git add ts/src/generated && git commit"
-    fail "(That command DOES write into qontinui-schemas — run it deliberately, when"
-    fail " you are ready to own the change, and coordinate first if other sessions"
-    fail " share that checkout. This hook itself never writes there.)"
+    local say="${1:-fail}"
+    "$say" "    cd $RUNNER_DIR && bash src-tauri/scripts/generate_types.sh --ts-only"
+    "$say" "    cd $SCHEMAS_DIR && git add ts/src/generated && git commit"
+    "$say" "(That command DOES write into qontinui-schemas — run it deliberately, when"
+    "$say" " you are ready to own the change, and coordinate first if other sessions"
+    "$say" " share that checkout. This hook itself never writes there.)"
 }
 
 # Whether the shared checkout is ALSO dirty in the compared path — a second,
-# independent reason part of the diff may not be the pusher's. Reported in
-# both arms, because it is equally true in both.
+# independent reason part of the diff may not be the pusher's. Now actually
+# reported in every arm, as this comment always claimed: the pre-existing arm
+# exited before reaching it, which is the arm where it matters most — that
+# arm has already concluded the drift is not this push's, and still owes the
+# reader the reason it may not be upstream's either.
+#
+# $1 is the emitter, as for `print_remedy`.
 print_dirty_checkout_note() {
+    local say="${1:-fail}"
     if [ "$SCHEMAS_STATUS_AVAILABLE" = "1" ] \
        && [ -n "$(git -C "$SCHEMAS_DIR" status --porcelain -uall -- ts/src/generated 2>/dev/null)" ]; then
-        echo >&2
-        fail "NOTE: $SCHEMAS_DIR has uncommitted changes under ts/src/generated."
-        fail "Some or all of the difference above may be another session's work in"
-        fail "that shared checkout. Check with its owner before regenerating over it."
+        if [ "$say" = "log" ]; then echo; else echo >&2; fi
+        "$say" "NOTE: $SCHEMAS_DIR has uncommitted changes under ts/src/generated."
+        "$say" "Some or all of the difference above may be another session's work in"
+        "$say" "that shared checkout. Check with its owner before regenerating over it."
     fi
 }
 
@@ -440,13 +470,11 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     log "simply behind this repo's Rust."
     echo
     git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" || true
+    print_dirty_checkout_note log
     echo
     log "Nothing to do for this push. To clear it for everyone:"
-    log "    cd $RUNNER_DIR && bash src-tauri/scripts/generate_types.sh --ts-only"
-    log "    cd $SCHEMAS_DIR && git add ts/src/generated && git commit"
-    log "(that DOES write into the shared qontinui-schemas checkout — coordinate"
-    log " with any session working there first). Set"
-    log "QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 to block on pre-existing drift too."
+    print_remedy log
+    log "Set QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 to block on pre-existing drift too."
     echo
     exit 0
 fi
@@ -464,14 +492,22 @@ elif [ "$ATTRIBUTION_STATE" = "pre-existing" ]; then
     # "this is yours" line, which would be false.
     fail "This drift is PRE-EXISTING — this push changes none of the sources that"
     fail "feed the bindings — but QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 blocks on it."
-else
+elif [ "$ATTRIBUTION_STATE" = "unavailable" ]; then
     fail "Could not tell whether this push caused it: $ATTRIBUTION_UNAVAILABLE_REASON."
     fail "Failing closed. A hook that cannot attribute drift must not excuse it —"
     fail "the alternative is silently clearing a real break."
+else
+    # Not one of the library's three states. Tested explicitly rather than
+    # left as a catch-all `else` on the `unavailable` arm, which would print
+    # an empty reason and read as a diagnosed verdict.
+    fail "Attribution returned an unrecognized state: '$ATTRIBUTION_STATE'."
+    fail "That is a bug in lib/gen-events-attribution.sh, not a verdict about"
+    fail "this push. Failing closed, for the same reason 'unavailable' does."
 fi
 echo >&2
 git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" >&2 || true
 echo >&2
+fail "Refresh the shared bindings by regenerating and committing them there:"
 print_remedy
 print_dirty_checkout_note
 

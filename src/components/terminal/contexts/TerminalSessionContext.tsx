@@ -580,10 +580,13 @@ const PageSessionScope = memo(function PageSessionScope({
     // rendering it could never produce, so without a synthetic ack the stream —
     // and with it this tap's state-tracking feed — wedged at the high
     // watermark. The runner now knows the tier itself: `unwatched` emits
-    // nothing at all (so there is nothing left to ack, and the digest tap below
-    // feeds tracking instead), and `background` is rate-limited server-side
-    // rather than ack-gated. Only a `focused` tab is ack-gated now, and a
-    // focused tab has a rendering pane sending real acks.
+    // nothing at all by DEFAULT (so there is nothing left to ack, and the
+    // digest tap below feeds tracking instead) — or, when the operator has set
+    // `unwatched_flush_interval_ms`, coalesces at that cadence with the digest
+    // stood down, in which case those events land right here like any other
+    // held stream. Neither is ack-gated, and `background` is rate-limited
+    // server-side rather than ack-gated. Only a `focused` tab is ack-gated
+    // now, and a focused tab has a rendering pane sending real acks.
     const unlisten = subscribeTerminalOutputStream((payload) => {
       const tid = payload.terminalId;
       // Drop events for tabs this scope doesn't own (another page/window) or

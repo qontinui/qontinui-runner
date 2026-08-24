@@ -45,8 +45,8 @@ repos:
       # while the pusher's own diff is unrelated. `lib/gen-events-attribution.sh`
       # splits the verdict into pusher-caused (hard failure, unchanged) and
       # pre-existing (reported in full, not blocking; STRICT still blocks), and
-      # fails closed when it cannot tell. Its tests need no Rust toolchain:
-      #   bash .pre-commit-hooks/gen-events-drift-attribution-test.sh
+      # fails closed when it cannot tell. Its tests need no Rust toolchain and
+      # are wired up as `gen-events-attribution-test` below.
       - id: gen-events-drift
         name: Tauri Event Bindings Drift Guard
         entry: bash .pre-commit-hooks/gen-events-drift.sh
@@ -71,6 +71,34 @@ repos:
         # as this repo's schema inputs — the local trigger set was narrower
         # than the contract it implements.
         files: '^src-tauri/(src/(event_system/types|tauri_event_payloads|relay_envelopes|findings/types|schema_export)\.rs|scripts/generate_types\.sh)$'
+        pass_filenames: false
+
+      # The attribution decision `gen-events-drift` splits its verdict on had
+      # no gate at all: until now the only thing that named this test was a
+      # comment saying "run me by hand", which is how a test stops being run.
+      #
+      # Here rather than in ci.yml, deliberately. `ci.yml` is on
+      # `ci-integrity.yml`'s GATING_WORKFLOWS list, so a PR that edits it fails
+      # that check BY DESIGN and coord will not land it — adding the job would
+      # have made the PR carrying it unmergeable. That is a real constraint, not
+      # a preference; revisit only via a standalone workflow file.
+      #
+      # Triggered ONLY by edits to the decision or its test, so a normal commit
+      # pays nothing. That is what lets it live at pre-commit at all: it needs no
+      # Rust toolchain, no qontinui-schemas checkout and no network, only
+      # throwaway git repos under $TMPDIR (which it now cleans up after itself).
+      #
+      # It is deliberately NOT `always_run`. A guard's guard that fires on every
+      # commit gets SKIP=-ed, and then neither runs.
+      - id: gen-events-attribution-test
+        name: gen-events drift attribution — decision tests
+        entry: bash .pre-commit-hooks/gen-events-drift-attribution-test.sh
+        language: system
+        # Same rationale as the drift guard above: pre-commit prints a hook's
+        # output only when it fails, and a passing run should still say which
+        # arms it exercised (it reports skips, which a bare "Passed" would hide).
+        verbose: true
+        files: '^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-drift-attribution-test\.sh)$'
         pass_filenames: false
 
       # Pre-push only: cargo fmt (auto-apply, never blocks) + cargo clippy

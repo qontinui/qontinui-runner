@@ -109,7 +109,8 @@ export interface PaneVisibilityHooks {
    * `"focused"` while visible, `"background"` while mounted-but-hidden, `null`
    * on unmount. The window-wide reconciler merges every pane's declaration and
    * pushes the result through `terminal_set_visibility`; a terminal no pane
-   * declares becomes `unwatched` and the runner stops emitting for it entirely.
+   * declares becomes `unwatched`, for which the runner stops emitting entirely
+   * unless the `unwatched_flush_interval_ms` cap gives that tier a cadence.
    *
    * This SUPERSEDES the render-consumer registration it replaced. That flag
    * existed for exactly one consumer — the page tap, which proxy-acked bytes

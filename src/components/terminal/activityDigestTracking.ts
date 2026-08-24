@@ -12,9 +12,14 @@
  * what makes tracking mount-independent.
  *
  * Phase 5 removes the need for it by making the runner tier-aware: a tab no
- * pane declares is `unwatched` and gets no `terminal-output` at all, so there
- * is nothing left to ack. This module is the replacement feed. It must cover
- * everything the tap's byte stream used to supply for such a tab:
+ * pane declares is `unwatched` and, by default, gets no `terminal-output` at
+ * all, so there is nothing left to ack. (A configured
+ * `unwatched_flush_interval_ms` changes what such a tab RECEIVES — see the
+ * note below — but not the ack story: a held tier is never ack-gated
+ * either.)
+ *
+ * This module is the replacement feed. It must cover everything the tap's
+ * byte stream used to supply for such a tab:
  *
  *  | tracking surface        | old (tap bytes)                | new (digest)                |
  *  |-------------------------|--------------------------------|-----------------------------|
@@ -35,10 +40,16 @@
  * `unwatched_flush_interval_ms` performance cap puts `unwatched` sessions back
  * on `terminal-output` at that cadence, and the runner then stands the digest
  * down for them (`TerminalSession::emit_activity_digest_if_due`) so the page
- * tap is not double-counted. Tracking is fed by the tap in that configuration,
- * exactly as it is for `background`. Nothing here needs to change for it —
- * this module simply never runs — but "unwatched implies digest" is no longer
- * the whole story.
+ * tap is not double-counted. Nothing here needs to change for it — this module
+ * simply never runs — but "unwatched implies digest" is no longer the whole
+ * story.
+ *
+ * And the tap is NOT an equal substitute in that configuration, which is worth
+ * saying because #1084's own reasoning assumed it was: such a tab still has no
+ * mounted xterm, so its output lines come from `outputLineTracking`'s
+ * ANSI-strip fallback, i.e. the very path the table above calls a downgrade.
+ * Everything else (sparkline, state chip, last-output time) the tap does serve
+ * as well as it serves `background`.
  *
  * Pure leaf (no React, no Tauri) so the replacement can be tested against the
  * behavior it replaces — same rationale as `flowControl.ts`,
