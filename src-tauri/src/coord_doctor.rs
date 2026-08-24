@@ -1581,14 +1581,22 @@ mod tests {
     // ---- Phase 5 — CHECK_SPECS single-source-of-truth + onboarding doc ----
 
     #[test]
-    fn check_specs_has_exactly_nine_entries_eight_blocking_one_advisory() {
+    fn check_specs_has_exactly_ten_entries_eight_blocking_two_advisory() {
         assert_eq!(CHECK_SPECS.len(), 10);
         // The split matters more than the total: the doc prose, the module
         // doc, and `render_onboarding_doc` all describe the two classes, and
         // the blocking count is what "green on all of them ⇒ can set gates"
         // actually refers to.
+        //
+        // The BLOCKING count is the load-bearing half and it is deliberately
+        // unchanged at 8. `mcp_json_not_dcr_escalating` was added as the
+        // second ADVISORY check precisely so that "green on all of them ⇒ this
+        // runner can set gates" keeps meaning what it meant: a legacy-only
+        // `.mcp.json` authenticates fine, so it must not withhold gate
+        // registration. A change to the 8 is a change to that sentence; a
+        // change to the 2 is not.
         assert_eq!(CHECK_SPECS.iter().filter(|s| !s.advisory).count(), 8);
-        assert_eq!(CHECK_SPECS.iter().filter(|s| s.advisory).count(), 1);
+        assert_eq!(CHECK_SPECS.iter().filter(|s| s.advisory).count(), 2);
     }
 
     #[test]
