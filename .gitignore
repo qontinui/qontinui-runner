@@ -75,6 +75,8 @@ docs/*
 # ...but the generated runner onboarding checklist IS tracked (Phase-5
 # anti-drift gate diffs it against a fresh `coord_doctor --onboarding-doc`).
 !docs/runner-onboarding.md
+# Same local-only documentation convention applies to nested docs/ dirs.
+python-bridge/docs/*
 
 # Configuration files
 configs/
