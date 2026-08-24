@@ -15,14 +15,22 @@
  *                   non-maximized zone under single view, a compact zone
  *                   card). Nothing renders it, but the page-level output tap
  *                   still feeds its state chip and sparkline from the stream,
- *                   so emission continues — coalesced by the runner to ≥250 ms
- *                   flushes.
+ *                   so emission continues — coalesced by the runner to the
+ *                   configured background flush interval (default ≥250 ms).
  *  - `unwatched`  — NO pane anywhere: virtualized off-screen in flow mode, on a
  *                   non-active terminal page, or in a window that isn't
- *                   showing it. The runner emits no `terminal-output` at all;
- *                   the scrollback ring keeps accumulating and the tab's state
- *                   tracking is fed by the ≤1 Hz `terminal-activity` digest
- *                   instead (see `TerminalSessionContext`'s tap).
+ *                   showing it. By default the runner emits no
+ *                   `terminal-output` at all; the scrollback ring keeps
+ *                   accumulating and the tab's state tracking is fed by the
+ *                   ≤1 Hz `terminal-activity` digest instead (see
+ *                   `TerminalSessionContext`'s tap). An operator who sets the
+ *                   `unwatched_flush_interval_ms` performance cap puts these
+ *                   sessions back on `terminal-output` at that cadence and the
+ *                   runner stands the digest down for them, so the tap feeds
+ *                   tracking instead. Not identically to `background`,
+ *                   though: there is still no mounted xterm to read, so
+ *                   output lines come from `outputLineTracking`'s ANSI-strip
+ *                   fallback rather than from a rendered buffer.
  *
  * ## Why declarations rather than a derived classification
  *

@@ -157,7 +157,9 @@ export function subscribeTerminalOutputStream(
 
 /**
  * The runner's ≤1 Hz activity digest for a terminal it has stopped emitting
- * output for (visibility tier `unwatched`; plan Phase 5 / A4).
+ * output for (visibility tier `unwatched`; plan Phase 5 / A4). A session whose
+ * `unwatched` tier was given a flush cadence emits `terminal-output` instead
+ * and no digest at all, so this stream carries only the dark ones.
  *
  * `bytesDelta` is what the PTY produced since the previous digest for this
  * terminal; `lines` is the trailing non-empty rows of the runner's own rendered

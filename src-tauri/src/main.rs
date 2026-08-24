@@ -962,11 +962,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Visibility sweeper (Phase 5 of
                 // `plans/2026-07-28-runner-many-sessions-performance.md`).
                 // Settles the two deferred jobs the visibility tiers own —
-                // flushing a held `background` window and emitting the ≤1 Hz
-                // `terminal-activity` digest for `unwatched` sessions — when a
-                // session goes QUIET, which is exactly when the reader thread
-                // is parked in a blocking PTY read and can only act on the
-                // next byte. Also prunes visibility reports from closed
+                // flushing a held window (`background`, and `unwatched` too
+                // when that tier is given a cadence) and emitting the ≤1 Hz
+                // `terminal-activity` digest for the `unwatched` sessions that
+                // still owe one — when a session goes QUIET, which is exactly
+                // when the reader thread is parked in a blocking PTY read and
+                // can only act on the next byte. Also prunes visibility reports from closed
                 // pop-out windows. See `terminal::visibility`.
                 terminal::visibility::spawn_sweeper();
 

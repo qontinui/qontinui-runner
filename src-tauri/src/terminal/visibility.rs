@@ -34,8 +34,9 @@
 //!
 //! ## Why a sweeper task and not the reader thread alone
 //!
-//! Both deferred jobs this module owns — flushing a held `background` window
-//! and emitting the ≤1 Hz `unwatched` digest — must fire when a session goes
+//! Both deferred jobs this module owns — flushing a held window (`background`
+//! always, `unwatched` too once the operator gives that tier a cadence) and
+//! emitting the ≤1 Hz `unwatched` digest — must fire when a session goes
 //! QUIET, which is exactly when the reader thread is parked in a blocking
 //! `read()` on the PTY. A reader-thread-only implementation can only act on
 //! the next byte, so the tail of a burst (the part carrying the prompt that
@@ -69,9 +70,12 @@ pub const ACTIVITY_EVENT: &str = "terminal-activity";
 /// settings.json" and "the constant the tier always used" cannot drift apart.
 pub const BACKGROUND_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Byte cap for a held `background` window: flush early rather than ship one
-/// enormous event. Backpressure still applies on top of this — the emission
-/// gate pauses the tier once the unacked gap crosses its high watermark.
+/// Byte cap for a held window, in either tier that can hold: flush early
+/// rather than ship one enormous event. It applies at every flush-interval
+/// setting, which is what bounds a single event when the operator configures a
+/// very long `unwatched` cadence. Backpressure still applies on top of this —
+/// the emission gate pauses the tier once the unacked gap crosses its high
+/// watermark.
 pub const BACKGROUND_HOLD_BYTE_CAP: usize = 256 * 1024;
 
 /// Minimum spacing between [`ACTIVITY_EVENT`] digests for one session — the
@@ -244,10 +248,12 @@ impl VisibilityState {
     }
 }
 
-/// The accumulated webview window of a `background` session.
+/// The accumulated webview window of a session in a HOLDING tier —
+/// `background` always, and `unwatched` once
+/// `PerformanceSettings::unwatched_flush_interval_ms` is positive.
 ///
-/// A background session's chunks are appended here instead of being emitted,
-/// and leave as ONE `terminal-output` event once the window is due. Both the
+/// Such a session's chunks are appended here instead of being emitted, and
+/// leave as ONE `terminal-output` event once the window is due. Both the
 /// reader thread (on the next chunk) and the sweeper (when the session went
 /// quiet mid-window) drain it through the same mutex, which is also what keeps
 /// this session's webview events in stream order.
@@ -311,9 +317,9 @@ impl BackgroundHold {
         self.take_now(now)
     }
 
-    /// Take the held window unconditionally — the tier changed out of
-    /// `background`, so held bytes must ship before anything emitted under the
-    /// new tier or the webview would see them out of order.
+    /// Take the held window unconditionally — the tier changed out of one
+    /// that holds, or the reader is exiting, so held bytes must ship before
+    /// anything emitted after them or the webview would see them out of order.
     pub fn take_now(&mut self, now: Instant) -> Option<(Vec<u8>, u64)> {
         self.last_flush = now;
         if self.pending.is_empty() {

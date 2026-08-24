@@ -918,8 +918,9 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           },
           // Phase 5 — tell the runner what this pane is worth. `null` on
           // unmount drops the declaration; with no pane anywhere declaring it,
-          // the reconciler pushes `unwatched` and the runner stops emitting
-          // `terminal-output` for the terminal altogether.
+          // the reconciler pushes `unwatched`, for which the runner stops
+          // emitting `terminal-output` altogether — unless the operator has
+          // given that tier a cadence via `unwatched_flush_interval_ms`.
           setVisibilityTier: (tier) => {
             if (tier === null) {
               paneTierDeclaration?.release();

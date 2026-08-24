@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import type { SessionState } from "./useZoneLayout";
 import { detectSessionState } from "./sessionStateDetector";
 import { applyActivityDigest } from "./activityDigestTracking";
+import { nextOutputLines, OUTPUT_LINES_WINDOW } from "./outputLineTracking";
 import { getTerminalHotStore } from "./terminalHotStore";
 
 /** Element-wise equality for the sparkline ring buffers. */
@@ -65,8 +66,11 @@ export interface UseSessionStateTrackingReturn {
   handleOutput: (tabId: string, text: string) => void;
   /**
    * Feed tracking from the runner's `terminal-activity` digest instead of from
-   * the output stream — the path for tabs at visibility tier `unwatched`, for
+   * the output stream — the path for tabs at visibility tier `unwatched` for
    * which the runner emits no `terminal-output` at all (plan Phase 5 / A4).
+   * A session configured with `unwatched_flush_interval_ms` is fed through
+   * {@link UseSessionStateTrackingReturn.handleOutput} instead and never
+   * reaches this one.
    */
   handleActivityDigest: (tabId: string, bytesDelta: number, lines: string[]) => void;
 }
@@ -302,42 +306,19 @@ export function useSessionStateTracking(
         return prev;
       });
 
-      // Track last output lines for compact view (keep last 20 non-empty lines).
-      // Read from the xterm buffer which correctly handles cursor movements,
-      // line rewrites, and all escape sequences. Falls back to ANSI-stripping
-      // the raw output if the buffer isn't available yet.
+      // Track last output lines for compact view. `nextOutputLines` owns the
+      // choice between the tab's xterm buffer (authoritative) and the ANSI-strip
+      // fallback (for a tab with no buffer to read), and returns `null` when
+      // this chunk changes nothing. See that module for why the fallback keys on
+      // an EMPTY read rather than on a missing reader, and why that stopped
+      // being harmless once `unwatched_flush_interval_ms` was wired through.
       const bufferReader = getBufferLinesRef.current;
-      if (bufferReader) {
-        const lines = bufferReader(tabId, 20);
-        if (lines.length > 0) {
-          hotStore.setTabOutputLines(tabId, lines);
-        }
-      } else {
-        // Fallback: strip ANSI and accumulate from raw output
-        const stripped = text
-          // eslint-disable-next-line no-control-regex
-          .replace(/\x1b\[[0-9;:?>=! ]*[a-zA-Z@`]/g, "") // CSI sequences
-          // eslint-disable-next-line no-control-regex
-          .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "") // OSC sequences
-          // eslint-disable-next-line no-control-regex
-          .replace(/\x1b[()#%*+\-./][0-9A-Za-z]/g, "") // Character set designations
-          // eslint-disable-next-line no-control-regex
-          .replace(/\x1b[NODMEHc789>=<]/g, "") // Simple escape sequences
-          // eslint-disable-next-line no-control-regex
-          .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "") // Stray control chars
-          .replace(/\r/g, "");
-        const newLines = stripped.split("\n").filter((l) => l.trim().length > 0);
-        if (newLines.length > 0) {
-          const existing = hotStore.getLastOutputLines(tabId);
-          const combined = [...existing, ...newLines];
-          const deduped: string[] = [];
-          for (const line of combined) {
-            if (deduped.length === 0 || line !== deduped[deduped.length - 1]) {
-              deduped.push(line);
-            }
-          }
-          hotStore.setTabOutputLines(tabId, deduped.slice(-20));
-        }
+      const bufferLines = bufferReader ? bufferReader(tabId, OUTPUT_LINES_WINDOW) : [];
+      const nextLines = nextOutputLines(bufferLines, text, () =>
+        hotStore.getLastOutputLines(tabId),
+      );
+      if (nextLines) {
+        hotStore.setTabOutputLines(tabId, nextLines);
       }
 
       processOutput?.(tabId, text);

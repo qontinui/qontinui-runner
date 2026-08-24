@@ -324,6 +324,24 @@ fn hold_interval(
     }
 }
 
+/// Whether the `terminal-activity` digest is this session's job right now.
+///
+/// Two conditions that look similar and are not: `unwatched_interval` is the
+/// session's CONFIG, frozen at spawn, while `tier` is its LIVE service level.
+/// A session can be `unwatched` and still owe no digest (the operator gave the
+/// tier a cadence, so the page tap is fed by real `terminal-output` and a
+/// digest would double-count the sparkline), and a session configured for a
+/// dark `unwatched` tier owes one only while it is actually in that tier.
+///
+/// Extracted rather than left as two early returns in
+/// [`TerminalSession::emit_activity_digest_if_due`] so the decision is
+/// unit-testable: the emitter itself needs a Tauri handle and bails before
+/// either condition is observable, which is exactly how the D3 defect
+/// ("the field exists, nothing reads it") stayed invisible.
+fn digest_is_owed(tier: VisibilityTier, unwatched_interval: Option<Duration>) -> bool {
+    unwatched_interval.is_none() && tier == VisibilityTier::Unwatched
+}
+
 /// Byte cap for a held DEC-2026 (synchronized-output) frame: flush the
 /// accumulated frame once it reaches this size even if `?2026l` hasn't
 /// arrived, so a runaway/never-closed `?2026h` block can't buffer unbounded.
@@ -790,11 +808,18 @@ pub struct TerminalSession {
     /// reader thread on every chunk (one relaxed atomic load); written by
     /// `terminal_set_visibility` on layout changes only.
     visibility: Arc<VisibilityState>,
-    /// The open `background` webview window: chunks accumulated since the last
-    /// flush. Drained by the reader thread on the next chunk, or by the
-    /// visibility sweeper when the session went quiet mid-window. The mutex is
-    /// also the serialization point for this session's webview emission, which
-    /// is what keeps held bytes ahead of anything emitted after a tier change.
+    /// The open webview window of whichever tier is holding: `background`
+    /// always, and `unwatched` too once the operator configures a cadence for
+    /// it. One buffer, not one per tier — the tier can change with bytes still
+    /// in it, which is why the spacing is resolved per flush from the CURRENT
+    /// tier ([`hold_interval`]) rather than fixed when the window opened.
+    ///
+    /// Chunks accumulate here since the last flush, and are drained by the
+    /// reader thread on the next chunk, by the visibility sweeper when the
+    /// session went quiet mid-window, or by the reader's exit flush. The mutex
+    /// is also the serialization point for this session's webview emission,
+    /// which is what keeps held bytes ahead of anything emitted after a tier
+    /// change.
     background_hold: Arc<Mutex<BackgroundHold>>,
     /// Flush spacing for the `background` tier, resolved once at spawn from
     /// `settings.performance` (many-sessions plan Phase 8). Read by the
@@ -1457,6 +1482,36 @@ impl TerminalSession {
                 coalescer.flush_remaining(|payload: &[u8], offset: u64| {
                     emit_impl(payload, offset, false)
                 });
+                // Ship whatever the visibility tier was still HOLDING. That is
+                // a different buffer from the coalescer's: `flush_remaining`
+                // above fires only when a sync block was open, and the common
+                // exit leaves it empty while the tier's window still holds the
+                // tail of the last burst.
+                //
+                // Without this the tail depends on the sweeper still finding
+                // the session — and `TerminalManager::close` REMOVES it from
+                // the map before calling `close()`, so a terminal that exits
+                // and is closed inside one flush interval loses those bytes
+                // outright. Ungated for the same reason the coalescer flush is:
+                // after exit no later chunk can reveal a gap, so the final
+                // frame must land in every tier.
+                //
+                // A no-op when `flush_remaining` did fire: that goes through
+                // `emit_impl(..., gated: false)` -> `Now`, which drains the hold
+                // first (older bytes ship first, as everywhere else).
+                {
+                    let mut hold = reader_background_hold
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some((window, window_offset)) = hold.take_now(Instant::now()) {
+                        emit_terminal_output(
+                            &reader_app,
+                            &reader_id,
+                            &STANDARD.encode(&window),
+                            window_offset,
+                        );
+                    }
+                }
                 debug!(terminal_id = %reader_id, "Reader thread exiting");
             })
             .map_err(|e| format!("Failed to spawn reader thread: {}", e))?;
@@ -2675,10 +2730,7 @@ impl TerminalSession {
     /// double-counting rule as `background`. It stands down for the session's
     /// whole life, matching the cadence resolved at spawn.
     pub fn emit_activity_digest_if_due(&self) {
-        if self.unwatched_flush_interval.is_some() {
-            return;
-        }
-        if self.visibility.tier() != VisibilityTier::Unwatched {
+        if !digest_is_owed(self.visibility.tier(), self.unwatched_flush_interval) {
             return;
         }
         let Some(app) = &self.app_handle else {
@@ -3350,8 +3402,14 @@ mod tests {
     /// Which cadence a held window is measured against follows the CURRENT
     /// tier, because one hold buffer serves both tiers and the tier can change
     /// with bytes still in it. Stock config (`unwatched` = `None`) falls back
-    /// to the background cadence, which is unreachable in practice but must
-    /// never be a zero-length window.
+    /// to the background cadence.
+    ///
+    /// That fallback is REACHED, not merely defensive: the reader samples the
+    /// tier before it takes the hold lock, so a `background` -> `unwatched`
+    /// change landing in that window pushes an already-decided `Hold` into the
+    /// hold of a now-`unwatched` session. Those bytes were produced while the
+    /// webview was entitled to them, so flushing them late is correct — but it
+    /// must flush at a real cadence, never a zero-length window.
     #[test]
     fn hold_interval_follows_the_tier() {
         let bg = Duration::from_millis(250);
@@ -4385,6 +4443,71 @@ mod tests {
         );
 
         crate::settings::set_performance_cache(crate::settings::PerformanceSettings::default());
+    }
+
+    /// The two cadences a spawn will actually give a session follow the
+    /// settings, through the same process-cached snapshot the ring size reads.
+    ///
+    /// This is the layer D3's defect lived one step below: the accessors on
+    /// `PerformanceSettings` were already tested, and the emission path is
+    /// tested against an injected interval — but nothing pinned that `spawn`
+    /// resolves the setting rather than the constant, which is exactly the
+    /// shape of "the field exists, is served, and nothing reads it".
+    #[test]
+    fn resolved_flush_intervals_follow_the_settings() {
+        let _guard = crate::settings::perf_test_lock();
+        crate::settings::set_performance_cache(crate::settings::PerformanceSettings::default());
+        assert_eq!(
+            resolved_flush_intervals(),
+            (crate::terminal::visibility::BACKGROUND_FLUSH_INTERVAL, None),
+            "stock: the historical background spacing, and a dark unwatched tier"
+        );
+
+        crate::settings::set_performance_cache(crate::settings::PerformanceSettings {
+            background_flush_interval_ms: 1000,
+            unwatched_flush_interval_ms: 4000,
+            ..crate::settings::PerformanceSettings::default()
+        });
+        assert_eq!(
+            resolved_flush_intervals(),
+            (
+                Duration::from_millis(1000),
+                Some(Duration::from_millis(4000))
+            )
+        );
+
+        // `0` is the unwatched tier's OFF switch, not a zero-length window —
+        // collapsing the two would make every stock install's silent tier an
+        // uncoalesced firehose.
+        crate::settings::set_performance_cache(crate::settings::PerformanceSettings {
+            background_flush_interval_ms: 0,
+            unwatched_flush_interval_ms: 0,
+            ..crate::settings::PerformanceSettings::default()
+        });
+        assert_eq!(resolved_flush_intervals(), (Duration::ZERO, None));
+
+        crate::settings::set_performance_cache(crate::settings::PerformanceSettings::default());
+    }
+
+    /// The digest's two conditions are orthogonal: the session's frozen CONFIG
+    /// and its live TIER. Pinned as a predicate because the emitter needs a
+    /// Tauri handle and returns before either is observable, so a regression
+    /// in this decision would be invisible to every other test.
+    #[test]
+    fn digest_is_owed_only_by_a_dark_unwatched_session() {
+        // Stock config: owed while unwatched, never in a tier that already
+        // delivers `terminal-output` (the page tap feeds tracking there, and a
+        // digest on top would double-count the sparkline).
+        assert!(digest_is_owed(VisibilityTier::Unwatched, None));
+        assert!(!digest_is_owed(VisibilityTier::Background, None));
+        assert!(!digest_is_owed(VisibilityTier::Focused, None));
+
+        // Configured cadence: the tier emits, so the digest stands down for
+        // the session's whole life — in every tier, including `unwatched`.
+        let configured = Some(Duration::from_millis(4000));
+        assert!(!digest_is_owed(VisibilityTier::Unwatched, configured));
+        assert!(!digest_is_owed(VisibilityTier::Background, configured));
+        assert!(!digest_is_owed(VisibilityTier::Focused, configured));
     }
 
     /// The ring honors the capacity it was given: it keeps the newest

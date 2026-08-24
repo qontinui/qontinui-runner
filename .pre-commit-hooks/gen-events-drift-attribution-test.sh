@@ -26,10 +26,35 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/gen-events-attribution.sh
 . "$SCRIPT_DIR/lib/gen-events-attribution.sh"
 
+# MUST come before the first `git`. Every fixture below is a throwaway repo
+# addressed with `git -C "$WORK"` — and under a hook, GIT_DIR overrides `-C`, so
+# without this the fixtures commit into the REAL repository. That is not
+# hypothetical: it happened the first time this script ran from a pre-push hook.
+gen_events_clear_inherited_git_env
+
 PASS=0
 FAIL=0
+SKIP=0
 WORK=""
 UPSTREAM=""
+
+# Every fixture root, removed on exit. `fixture` is called ~20 times and each
+# call builds an upstream repo plus a clone, so without this a run leaves that
+# many trees behind in $TMPDIR — on a dev box that is a slow leak, and on a
+# CI runner it is disk the next job wanted. Same shape as the scratch cleanup
+# in `gen-events-drift.sh`, which traps EXIT for exactly this reason.
+FIXTURE_ROOTS=()
+cleanup() {
+    local root
+    for root in "${FIXTURE_ROOTS[@]:-}"; do
+        [ -n "$root" ] || continue
+        # `chmod -R` first: git makes objects read-only, which blocks `rm` on
+        # some filesystems (notably a Windows checkout).
+        chmod -R u+w "$root" 2>/dev/null || true
+        rm -rf "$root"
+    done
+}
+trap cleanup EXIT
 
 check() {
     local label="$1" want="$2" got="$3"
@@ -52,12 +77,27 @@ fail_note() {
     FAIL=$((FAIL + 1))
 }
 
+# A case this environment could not set up. Counted and reported in the summary
+# rather than printed and forgotten: an arm that silently stops being exercised
+# reads exactly like an arm that passes.
+skip_note() {
+    printf '  SKIP %s\n' "$1"
+    SKIP=$((SKIP + 1))
+}
+
 # A repo with an `origin` remote whose `main` is the upstream of the local
 # branch — the shape every real push has. A real clone rather than a faked
 # remote-tracking ref, so `merge-base` resolves exactly as it does live.
 fixture() {
     local root
-    root="$(mktemp -d -t gen-events-attr-XXXXXX)"
+    # Hard-fail rather than continue: without this a failed `mktemp` leaves
+    # $WORK pointing at the PREVIOUS fixture, and every later case then
+    # reports a plausible-looking verdict about the wrong repo.
+    if ! root="$(mktemp -d -t gen-events-attr-XXXXXX)" || [ ! -d "$root" ]; then
+        printf '  FATAL could not create a fixture directory\n' >&2
+        exit 1
+    fi
+    FIXTURE_ROOTS+=("$root")
     UPSTREAM="$root/upstream"
     WORK="$root/work"
 
@@ -89,6 +129,31 @@ fixture() {
     git -C "$WORK" config user.email t@example.com
     git -C "$WORK" config user.name t
     git -C "$WORK" config core.hooksPath "$WORK/.git/no-hooks"
+
+    # The fixture is only a fixture if git agrees. `GIT_DIR` and friends
+    # OVERRIDE `git -C`, so a leaked one aims every command below at the
+    # real repository — which is how a run from a pre-push hook once
+    # committed fixtures onto the branch being pushed. `gen_events_clear_inherited_git_env`
+    # is supposed to have prevented that; this is the assertion that it did,
+    # and it fails LOUDLY rather than letting the run proceed against the
+    # wrong repo. A future git that adds another such variable trips here.
+    #
+    # Compared through `cd ... && pwd -P` on BOTH sides rather than by string:
+    # on Git Bash `$WORK` is an MSYS path (/tmp/...) while git answers with a
+    # Windows one (C:/Users/...), and those name the same directory. Putting
+    # both through the same shell builtin is what makes the check portable
+    # rather than a guaranteed false positive on Windows.
+    local want got toplevel
+    want="$(cd "$WORK" && pwd -P)"
+    toplevel="$(git -C "$WORK" rev-parse --show-toplevel 2>/dev/null || true)"
+    got=""
+    [ -n "$toplevel" ] && got="$(cd "$toplevel" 2>/dev/null && pwd -P)"
+    if [ -z "$got" ] || [ "$want" != "$got" ]; then
+        printf '  FATAL fixture escaped: git -C %s resolves to %s\n' \
+            "$want" "${got:-<unresolvable>}" >&2
+        printf '        A git environment variable is overriding -C. Refusing to run.\n' >&2
+        exit 1
+    fi
 }
 
 # Append to a path in the work tree and commit it.
@@ -196,6 +261,18 @@ commit_change "src-tauri/src/lib.rs" "// my rust change"
 decide
 check "my own Rust commit atop a peer's is still MINE" "mine" "$ATTRIBUTION_STATE"
 
+# The codegen inputs are wider than the paths a diff has historically moved:
+# `schemas.json` comes out of a release build of the whole crate graph, so an
+# in-repo path dependency or the toolchain pin can move it without any
+# `src-tauri/src` file changing. Pinned here because the asymmetry only works
+# while the list stays complete — a narrowed list clears a guilty pusher.
+for input in rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml; do
+    fixture
+    commit_change "$input" "# touched"
+    decide
+    check "$input is a codegen input, so it is MINE" "mine" "$ATTRIBUTION_STATE"
+done
+
 echo "  -- fail closed when the question cannot be answered --"
 
 fixture
@@ -211,13 +288,87 @@ else
     fail_note "unavailable must state a reason"
 fi
 
+if [ -n "${ATTRIBUTION_TOUCHED:-}" ]; then
+    fail_note "unavailable must blame nothing, got: $ATTRIBUTION_TOUCHED"
+else
+    pass_note "the UNAVAILABLE arm blames nothing"
+fi
+
+# A repo with no commits at all. Reached in practice by a fresh `git init`
+# before the first commit, and it must not read as 'nothing changed'.
+fixture
+EMPTY="$(dirname "$WORK")/empty"
+git init --quiet --initial-branch=main "$EMPTY"
+gen_events_attribution "$EMPTY"
+check "a repo with no HEAD commit is UNAVAILABLE" "unavailable" "$ATTRIBUTION_STATE"
+
 fixture
 SHALLOW="$(dirname "$WORK")/shallow"
-if git clone --quiet --depth 1 --config core.autocrlf=false "file://$UPSTREAM" "$SHALLOW" 2>/dev/null; then
+if CLONE_ERR="$(git clone --quiet --depth 1 --config core.autocrlf=false "file://$UPSTREAM" "$SHALLOW" 2>&1)"; then
     gen_events_attribution "$SHALLOW"
     check "a shallow clone is UNAVAILABLE, not cleared" "unavailable" "$ATTRIBUTION_STATE"
 else
-    printf '  skip shallow-clone case (clone unsupported in this environment)\n'
+    skip_note "shallow-clone case: clone failed (${CLONE_ERR%%$'\n'*})"
+fi
+
+echo "  -- which ref 'before this push' is measured against --"
+
+# Fallback 2: no upstream, but the remote publishes a default branch. Pointed
+# at a non-`main` name so the resolved ref PROVES which fallback fired —
+# with origin/HEAD -> origin/main the answer is the same string as fallback 3.
+fixture
+git -C "$WORK" update-ref refs/remotes/origin/trunk refs/remotes/origin/main
+git -C "$WORK" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/trunk
+git -C "$WORK" update-ref -d refs/remotes/origin/main
+git -C "$WORK" branch --unset-upstream >/dev/null 2>&1
+commit_change "src/app.ts" "// ui"
+decide
+check "with no upstream, origin/HEAD is the base" "origin/trunk" "$ATTRIBUTION_BASE_REF"
+check "and the verdict still holds" "pre-existing" "$ATTRIBUTION_STATE"
+
+# Fallback 3: no upstream and no published default branch — the literal
+# origin/main is the last resort before failing closed.
+fixture
+git -C "$WORK" branch --unset-upstream >/dev/null 2>&1
+# `symbolic-ref --delete`, never `update-ref -d`: the latter DEREFERENCES, so it
+# deletes refs/remotes/origin/main and leaves nothing for fallback 3 to find —
+# which turns this case into a second copy of the no-remote one.
+git -C "$WORK" symbolic-ref --delete refs/remotes/origin/HEAD >/dev/null 2>&1
+commit_change "src-tauri/src/lib.rs" "// mine"
+decide
+check "with neither, origin/main is the base" "origin/main" "$ATTRIBUTION_BASE_REF"
+check "and the verdict still holds" "mine" "$ATTRIBUTION_STATE"
+
+echo "  -- a hook environment must not redirect the fixtures --"
+
+# The defect this pins, verbatim: git exports GIT_DIR to every hook, GIT_DIR
+# beats `git -C`, and the first real pre-push run of this script therefore
+# committed its fixtures onto the branch being pushed and emptied the index.
+# Recovered from the reflog; nothing reached origin only because the push then
+# failed. `gen_events_clear_inherited_git_env` is the fix, and this is the test
+# that would have caught it: point GIT_DIR at a DECOY repo, then assert the
+# decision still measured the fixture and the decoy is untouched.
+fixture
+DECOY="$(dirname "$WORK")/decoy"
+git init --quiet --initial-branch=main "$DECOY"
+git -C "$DECOY" config user.email t@example.com
+git -C "$DECOY" config user.name t
+git -C "$DECOY" config core.hooksPath "$DECOY/.git/no-hooks"
+git -C "$DECOY" commit --quiet --allow-empty -m "decoy tip"
+DECOY_TIP_BEFORE="$(git -C "$DECOY" rev-parse HEAD)"
+commit_change "src-tauri/src/lib.rs" "// mine"
+(
+    export GIT_DIR="$DECOY/.git"
+    export GIT_WORK_TREE="$DECOY"
+    gen_events_clear_inherited_git_env
+    decide
+    printf '%s\n' "$ATTRIBUTION_STATE" > "$WORK/.state"
+) || true
+check "a leaked GIT_DIR does not redirect the decision" "mine" "$(cat "$WORK/.state" 2>/dev/null)"
+if [ "$(git -C "$DECOY" rev-parse HEAD)" = "$DECOY_TIP_BEFORE" ]; then
+    pass_note "and the decoy repo was not written to"
+else
+    fail_note "the decoy repo was written to — a fixture escaped"
 fi
 
 echo "  -- what the failure message is allowed to claim --"
@@ -238,5 +389,10 @@ decide
 check "the PRE-EXISTING arm blames nothing" "" "$ATTRIBUTION_TOUCHED"
 
 echo
-printf '%d passed, %d failed\n' "$PASS" "$FAIL"
+if [ "$SKIP" -gt 0 ]; then
+    printf '%d passed, %d failed, %d SKIPPED (arms not exercised in this environment)\n' \
+        "$PASS" "$FAIL" "$SKIP"
+else
+    printf '%d passed, %d failed\n' "$PASS" "$FAIL"
+fi
 [ "$FAIL" -eq 0 ]
