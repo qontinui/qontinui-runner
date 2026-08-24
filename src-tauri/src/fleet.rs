@@ -3978,6 +3978,7 @@ mod tests {",
             max_concurrent_builds,
             repo_allowlist: Vec::new(),
             min_free_disk_gb: 50,
+            canonical_converge: false,
         }
     }
 

@@ -246,6 +246,10 @@ pub(crate) async fn run_dispatch(
                 None,
                 &tail,
                 None,
+                // The gate has not run yet — at these two exits the manifest is
+                // not even parsed — so this reports "not evaluated", which is a
+                // different statement from "not required".
+                None,
             )
             .await;
             // prepare_worktree may have left a partial worktree behind.
@@ -279,6 +283,10 @@ pub(crate) async fn run_dispatch(
                 None,
                 &tail,
                 None,
+                // The gate has not run yet — at these two exits the manifest is
+                // not even parsed — so this reports "not evaluated", which is a
+                // different statement from "not required".
+                None,
             )
             .await;
             workspace.cleanup(reported).await;
@@ -304,6 +312,55 @@ pub(crate) async fn run_dispatch(
         host.cargo_build_jobs,
         host.test_threads
     ));
+
+    // ── Canonical-configuration gate ──
+    //
+    // FIRST, and before anything is downloaded. Two reasons, in order of which
+    // one actually bites. A dispatch that will be refused for being off
+    // canonical must not first pay to install a node tree into the tool cache;
+    // and a convergence that IS authorised can rewrite the very toolchain the
+    // later steps compile with, so running it after provisioning would mean
+    // provisioning against a toolchain that is about to change underneath it.
+    let canonical_started = Instant::now();
+    let canonical_outcome = {
+        let mut log = |line: String| sink.push(&line);
+        // Read per dispatch, like every other CI-node consent value — the grant
+        // governs the NEXT dispatch, never one already running.
+        let authorized = crate::settings::get_ci_node_settings().canonical_converge;
+        super::canonical::ensure(manifest.canonical.as_ref(), authorized, &mut log).await
+    };
+    sink.push(&canonical_outcome.summary_line());
+    if canonical_outcome.is_refusal() {
+        steps_summary.push(StepSummary {
+            name: "[setup] canonical".to_string(),
+            conclusion: "failure".to_string(),
+            duration_secs: canonical_started.elapsed().as_secs(),
+        });
+        let tail = sink.finish().await;
+        // No artifact, for the same reason a provisioning failure files none:
+        // this aborts before the first step, so any JUnit under the warm
+        // `.ci-target` cache belongs to a PREVIOUS dispatch.
+        let reported = reporting::post_result(
+            &base,
+            &payload.dispatch_id,
+            "failure",
+            &steps_summary,
+            canonical_outcome.reason(),
+            &tail,
+            None,
+            Some(&canonical_outcome),
+        )
+        .await;
+        workspace.cleanup(reported).await;
+        return;
+    }
+    if manifest.canonical.is_some() {
+        steps_summary.push(StepSummary {
+            name: "[setup] canonical".to_string(),
+            conclusion: "success".to_string(),
+            duration_secs: canonical_started.elapsed().as_secs(),
+        });
+    }
 
     // ── Provisioning (tools, siblings, then services) ──
     let provision_started = Instant::now();
@@ -345,6 +402,7 @@ pub(crate) async fn run_dispatch(
                 None,
                 &tail,
                 None,
+                Some(&canonical_outcome),
             )
             .await;
             workspace.cleanup(reported).await;
@@ -435,6 +493,7 @@ pub(crate) async fn run_dispatch(
         None,
         &tail,
         capture.artifact(),
+        Some(&canonical_outcome),
     )
     .await;
     // The receipt is the only key to cleanup; the artifact is already sent.

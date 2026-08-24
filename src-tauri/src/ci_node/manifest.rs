@@ -199,6 +199,60 @@ pub(crate) struct CiManifest {
     /// before the first step, health-gated, and destroyed with the dispatch.
     #[serde(default)]
     pub services: Vec<CiService>,
+    /// The canonical-configuration requirement, if this repo has one. Absent
+    /// (the default) means the dispatch makes no claim about the box's
+    /// toolchains and none is checked.
+    #[serde(default)]
+    pub canonical: Option<CiCanonical>,
+}
+
+/// "This build requires the box to be at the canonical configuration for these
+/// toolchains."
+///
+/// # What this declares, and what it deliberately does NOT
+///
+/// It declares a **requirement**. It does not, and must not, grant permission
+/// to satisfy that requirement by rewriting the owner's global toolchain — a
+/// manifest is a file in someone else's repository, and converging a machine's
+/// rustup/volta/pyenv installation is a far larger act than dropping a pinned
+/// binary into a dispatch-scoped cache. The authority to converge lives on the
+/// box, in `CiNodeSettings::canonical_converge`, default false.
+///
+/// With no authority and a drifted box the dispatch is **refused**, not run
+/// anyway — see `ci_node::canonical` for why that arm was chosen over the
+/// defensible alternative.
+///
+/// # Why toolchain NAMES and not a bare `required = true`
+///
+/// The `versions` section carries far more than toolchains: repo-derived keys
+/// (`node_dep_*`, `python_dep_*`) that converge by pulling the repo rather than
+/// by anything this runner could apply, an installed-package inventory digest,
+/// a sibling-schemas stamp. Gating on the whole section being clean would make
+/// the declaration unsatisfiable for reasons that have nothing to do with the
+/// toolchain a build compiles with. Naming the toolchains keeps the requirement
+/// exactly as wide as the build's real dependency — and keeps the blast radius
+/// of a convergence exactly as wide as the declaration, since only the named
+/// keys are ever passed to the apply.
+///
+/// # Land order: runner first, manifests after
+///
+/// `deny_unknown_fields` on [`CiManifest`] means a manifest carrying a
+/// `[canonical]` table is a **hard parse error** on any runner built before
+/// this phase — the dispatch fails validation, on a required check, on a
+/// user's machine, for a change that looks purely local. That is the same
+/// coupling `[[tools]]` and `[[siblings]]` each had before theirs, and the fix
+/// is the same one: roll the runner out first and land the manifests that
+/// declare it after. It is deliberately NOT a compatibility shim — version
+/// skew here is a sequencing problem, and a shim would only hide it.
+///
+/// The set is CLOSED, and closed against `env_agent`'s own
+/// [`apply_versions::Tool`] rather than a second list here, so a manifest can
+/// never name a key the convergence machinery has no manager cascade for.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CiCanonical {
+    /// Toolchain keys — any of `node`, `python`, `rustc`.
+    pub toolchains: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -432,6 +486,7 @@ pub(crate) fn parse_and_validate(text: &str) -> Result<CiManifest, String> {
     validate_siblings(&manifest.siblings)?;
     validate_tools(&manifest.tools)?;
     validate_services(&manifest.services)?;
+    validate_canonical(manifest.canonical.as_ref())?;
     for (i, step) in manifest.steps.iter().enumerate() {
         let label = if step.name.trim().is_empty() {
             format!("steps[{i}]")
@@ -517,6 +572,47 @@ fn validate_siblings(siblings: &[CiSibling]) -> Result<(), String> {
             ));
         }
         seen_dirs.push(dir);
+    }
+    Ok(())
+}
+
+/// Validate the `[canonical]` requirement against the CLOSED set of toolchains
+/// `env_agent` can actually converge.
+///
+/// The known-set is read from [`apply_versions::APPLIABLE_TOOLS`] rather than
+/// restated here, for the same reason the tool registry's error quotes
+/// `known_tool_names()`: a second list is a second thing to forget to update,
+/// and the failure mode is a manifest that validates and then cannot be
+/// satisfied by any machine.
+fn validate_canonical(canonical: Option<&CiCanonical>) -> Result<(), String> {
+    let Some(c) = canonical else {
+        return Ok(());
+    };
+    // An empty list is refused rather than treated as "no requirement". A
+    // present-but-empty `[canonical]` reads to its author as a declaration; if
+    // it silently meant nothing, a repo could believe it was gated when it was
+    // not — a vacuous requirement, which is this lane's recurring defect shape.
+    if c.toolchains.is_empty() {
+        return Err(
+            "[canonical]: declares no toolchains. Name the toolchains this build              requires the box to be at canonical for (any of: node, python, rustc),              or remove the [canonical] table — an empty requirement gates nothing"
+                .to_string(),
+        );
+    }
+    let known: Vec<&str> = qontinui_runner_lib::env_agent::apply_versions::APPLIABLE_TOOLS
+        .iter()
+        .map(|t| t.key())
+        .collect();
+    let mut seen: Vec<&str> = Vec::new();
+    for name in &c.toolchains {
+        if qontinui_runner_lib::env_agent::apply_versions::Tool::from_key(name).is_none() {
+            return Err(format!(
+                "[canonical]: '{name}' is not a convergeable toolchain (known: {known:?}).                  Only keys this runner has a version-manager cascade for can be required"
+            ));
+        }
+        if seen.contains(&name.as_str()) {
+            return Err(format!("[canonical]: toolchain '{name}' declared twice"));
+        }
+        seen.push(name);
     }
     Ok(())
 }
@@ -789,6 +885,86 @@ working_dir = "src-tauri"
 env = { QONTINUI_DISABLE_KEYCHAIN = "1" }
 timeout_secs = 7200
 "#;
+
+    /// The `[canonical]` requirement, and the closed set it validates against.
+    #[test]
+    fn canonical_declares_a_closed_set_of_toolchains() {
+        let m = parse_and_validate(&format!(
+            "{VALID}
+[canonical]
+toolchains = [\"rustc\", \"node\"]
+"
+        ))
+        .expect("a canonical block naming real toolchains must parse");
+        let c = m.canonical.expect("[canonical] must survive parsing");
+        assert_eq!(c.toolchains, vec!["rustc".to_string(), "node".to_string()]);
+
+        // Absent is the default and means no claim — NOT an empty claim.
+        let plain = parse_and_validate(VALID).expect("valid");
+        assert!(plain.canonical.is_none());
+    }
+
+    /// The known-set is `env_agent`'s, not a second list. A key the convergence
+    /// machinery has no manager cascade for must not be declarable, or a repo
+    /// could commit a requirement no machine could ever satisfy.
+    #[test]
+    fn an_unconvergeable_toolchain_is_refused() {
+        let err = parse_and_validate(&format!(
+            "{VALID}
+[canonical]
+toolchains = [\"deno\"]
+"
+        ))
+        .expect_err("deno has no version-manager cascade");
+        assert!(err.contains("not a convergeable toolchain"), "{err}");
+        // The message must name what IS available, the way the tool registry's
+        // refusal quotes `known_tool_names()`.
+        assert!(err.contains("rustc"), "{err}");
+    }
+
+    /// An empty list is refused rather than treated as "no requirement": it
+    /// reads to its author as a declaration, and a declaration that gates
+    /// nothing is this lane's recurring defect.
+    #[test]
+    fn an_empty_canonical_block_is_refused_not_ignored() {
+        let err = parse_and_validate(&format!(
+            "{VALID}
+[canonical]
+toolchains = []
+"
+        ))
+        .expect_err("an empty requirement must not pass as 'no requirement'");
+        assert!(err.contains("declares no toolchains"), "{err}");
+    }
+
+    #[test]
+    fn a_toolchain_declared_twice_is_refused() {
+        let err = parse_and_validate(&format!(
+            "{VALID}
+[canonical]
+toolchains = [\"node\", \"node\"]
+"
+        ))
+        .expect_err("duplicates are a manifest mistake, not a doubled requirement");
+        assert!(err.contains("declared twice"), "{err}");
+    }
+
+    /// `deny_unknown_fields` is what makes the land order load-bearing: a
+    /// manifest carrying `[canonical]` is a HARD PARSE ERROR on a runner that
+    /// predates this phase, exactly as `[[tools]]`/`[[siblings]]` were before
+    /// theirs. Runner rolls out first; manifests declaring it land after.
+    #[test]
+    fn an_unknown_key_inside_canonical_is_a_hard_parse_error() {
+        let err = parse_and_validate(&format!(
+            "{VALID}
+[canonical]
+toolchains = [\"node\"]
+required = true
+"
+        ))
+        .expect_err("deny_unknown_fields must reject a key this runner does not know");
+        assert!(err.to_lowercase().contains("required"), "{err}");
+    }
 
     #[test]
     fn valid_manifest_parses() {

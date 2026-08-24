@@ -191,6 +191,14 @@ fn save_ci_node_settings_impl(
             .filter(|r| !r.is_empty())
             .collect(),
         min_free_disk_gb,
+        // This form has no field for `canonical_converge`, so it must not
+        // DECIDE it. Struct-update carries the persisted value through, which
+        // means an unrelated save here (toggling `enabled`, editing the
+        // allowlist) cannot silently revoke a convergence grant the owner made
+        // through the audited web/coord directive — nor, in the other
+        // direction, invent one: the only writer that can set it true is that
+        // directive. The same rule protects any field added here later.
+        ..settings::get_ci_node_settings()
     };
     settings::save_ci_node_settings(ci_node).map_err(AppError::ConfigError)?;
 

@@ -79,6 +79,16 @@ pub(crate) struct CiSettingsDirective {
     pub repo_allowlist: Vec<String>,
     #[serde(default = "default_min_free_disk_gb")]
     pub min_free_disk_gb: u64,
+    /// May a dispatch converge this box's global toolchains toward canonical?
+    ///
+    /// `#[serde(default)]` = FALSE, and that default is the contract with a
+    /// web build that predates this field: a directive that does not mention
+    /// it turns convergence OFF rather than leaving whatever was there. That
+    /// is the same direction every other field here runs — a directive states
+    /// the whole desired config, so an omitted grant is an absent grant, never
+    /// an inherited one.
+    #[serde(default)]
+    pub canonical_converge: bool,
     /// The web `devenv_machines.id` this config was saved against. Logged only
     /// — it is a correlation aid for the owner reading runner logs next to the
     /// dashboard, and grants nothing.
@@ -228,6 +238,11 @@ pub(crate) fn validate(
         max_concurrent_builds: directive.max_concurrent_builds,
         repo_allowlist: allowlist,
         min_free_disk_gb: directive.min_free_disk_gb,
+        // No range to check — it is a boolean grant. What it needs instead is
+        // for the ABSENT case to land on false, which the serde default above
+        // guarantees, and for it to be un-settable from a repo, which it is:
+        // this struct is only ever built from an owner-authored directive.
+        canonical_converge: directive.canonical_converge,
     })
 }
 
@@ -280,8 +295,43 @@ mod tests {
             max_concurrent_builds: 2,
             repo_allowlist: vec!["qontinui/qontinui-runner".to_string()],
             min_free_disk_gb: 20,
+            canonical_converge: false,
             machine_id: None,
         }
+    }
+
+    /// A directive from a web build that predates the field turns convergence
+    /// OFF, and that is the contract rather than an accident: the grant lets a
+    /// repo's manifest drive rustup/volta/pyenv on the owner's machine, so it
+    /// has to be stated to exist. Deserialized from JSON on purpose — the
+    /// serde default is the thing under test, not the struct literal.
+    #[test]
+    fn an_omitted_convergence_grant_is_no_grant() {
+        let raw = serde_json::json!({
+            "enabled": true,
+            "max_concurrent_builds": 1,
+            "repo_allowlist": ["qontinui/qontinui-runner"],
+            "min_free_disk_gb": 20,
+        });
+        let d: CiSettingsDirective =
+            serde_json::from_value(raw).expect("a directive without the field must still parse");
+        assert!(!d.canonical_converge);
+        let settings = validate(&d).expect("otherwise valid");
+        assert!(
+            !settings.canonical_converge,
+            "an absent grant must never persist as a granted one"
+        );
+    }
+
+    /// …and an explicit grant survives validation, or the owner's web toggle
+    /// would be a no-op.
+    #[test]
+    fn an_explicit_convergence_grant_is_carried_through() {
+        let d = CiSettingsDirective {
+            canonical_converge: true,
+            ..directive()
+        };
+        assert!(validate(&d).expect("otherwise valid").canonical_converge);
     }
 
     /// The pinned wire contract coord publishes, including the two correlation

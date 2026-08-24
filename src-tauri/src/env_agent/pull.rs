@@ -19,7 +19,7 @@
 //! never a value. The plan can therefore report "this box is missing secret X"
 //! and can never copy X.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -192,6 +192,15 @@ pub struct SectionPlan {
     /// `{value, status}` value or a `"<unknown>"` sentinel would each relocate
     /// the bug rather than fix it.
     pub unknown_keys: BTreeSet<String>,
+    /// Keys BOTH sides carry with the SAME value, and that value.
+    ///
+    /// The positive half of the diff. `changes` says what differs; this says
+    /// what provably matches, so "this box is at canonical for `rustc`" can be
+    /// ANSWERED rather than inferred from `rustc` not appearing in `changes` —
+    /// an inference that also holds when neither capture contains `rustc` at
+    /// all. Consumers that gate on being at canonical (`ci_node::canonical`)
+    /// must read this, not the absence of a change row.
+    pub agreed: BTreeMap<String, String>,
 }
 
 impl SectionPlan {
@@ -407,7 +416,21 @@ fn string_list(value: Option<&Value>) -> BTreeSet<String> {
 }
 
 /// Diff canonical against local for one section. **Pure — unit-tested.**
-fn diff_section(canonical: Option<&Value>, local: Option<&Value>) -> Vec<Change> {
+/// Diff one section, returning both halves of the answer: the differences, and
+/// the keys that positively AGREE (with the value both sides carry).
+///
+/// The agreement half exists because an empty change list is silence, and
+/// silence here has three different causes: both sides agree, neither side has
+/// the key, or this box could not read it. `unknown_keys` already split the
+/// third out of the other two. Without `agreed`, a consumer asking "is this box
+/// at canonical for `python`?" can only infer yes from an absence — and would
+/// answer yes for a box where python is absent from BOTH captures, which is the
+/// `silent-empty-is-unknown` rule inverted. So agreement is recorded, not
+/// inferred.
+fn diff_section(
+    canonical: Option<&Value>,
+    local: Option<&Value>,
+) -> (Vec<Change>, BTreeMap<String, String>) {
     let can = string_pairs(canonical);
     let loc = string_pairs(local);
     let loc_map: std::collections::BTreeMap<&str, &str> =
@@ -416,6 +439,7 @@ fn diff_section(canonical: Option<&Value>, local: Option<&Value>) -> Vec<Change>
         can.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
     let mut changes = Vec::new();
+    let mut agreed: BTreeMap<String, String> = BTreeMap::new();
     for (k, cv) in &can {
         match loc_map.get(k.as_str()) {
             None => changes.push(Change::Missing {
@@ -427,7 +451,11 @@ fn diff_section(canonical: Option<&Value>, local: Option<&Value>) -> Vec<Change>
                 local: (*lv).to_string(),
                 canonical: cv.clone(),
             }),
-            Some(_) => {}
+            // Both sides carry the key and the values match. Recorded rather
+            // than left as an absence — see this function's docs.
+            Some(_) => {
+                agreed.insert(k.clone(), cv.clone());
+            }
         }
     }
     for (k, lv) in &loc {
@@ -439,7 +467,7 @@ fn diff_section(canonical: Option<&Value>, local: Option<&Value>) -> Vec<Change>
         }
     }
     changes.sort_by(|a, b| a.key().cmp(b.key()));
-    changes
+    (changes, agreed)
 }
 
 /// Compute the apply plan from a canonical payload and this box's own capture.
@@ -520,13 +548,15 @@ pub fn compute_plan(
                 .into_iter()
                 .filter(|k| !local_keys.contains(k))
                 .collect();
+            let (changes, agreed) = diff_section(can, loc);
             SectionPlan {
                 section: name.clone(),
                 policy,
-                changes: diff_section(can, loc),
+                changes,
                 local_section_absent: can.is_some() && loc.is_none(),
                 derived_keys,
                 unknown_keys,
+                agreed,
             }
         })
         .collect();
@@ -980,6 +1010,64 @@ mod tests {
         }
     }
 
+    /// `agreed` is the POSITIVE half of the diff, and it exists because an
+    /// empty change list has three different causes.
+    ///
+    /// Both sides carrying `rustc` with the same value, and NEITHER side
+    /// carrying `python` at all, produce exactly the same evidence in
+    /// `changes`: nothing. A consumer gating on "is this box at canonical for
+    /// python?" from the change list alone therefore passes a box that has no
+    /// python and never did — a positive claim computed from an absence, which
+    /// is the rule this module already enforces for `unknown_keys`.
+    #[test]
+    fn agreement_is_recorded_not_inferred_from_an_empty_diff() {
+        let canonical = canonical_with(
+            json!({"versions": {"rustc": "1.95.0", "node": "v22.11.0"}}),
+            json!({"versions": "applyable"}),
+        );
+        let local = json!({"versions": {"rustc": "1.95.0", "node": "v20.9.0"}});
+        let plan = plan_of(&canonical, local.as_object().unwrap(), "env-1", "this-box");
+        let versions = plan
+            .sections
+            .iter()
+            .find(|s| s.section == "versions")
+            .expect("versions section");
+
+        // rustc matches -> recorded, with the value.
+        assert_eq!(versions.agreed.get("rustc"), Some(&"1.95.0".to_string()));
+        // node drifts -> a change row, and NOT agreed.
+        assert!(!versions.agreed.contains_key("node"));
+        assert_eq!(versions.changes.len(), 1);
+        assert_eq!(versions.changes[0].key(), "node");
+        // python is in neither capture -> no change row AND no agreement. This
+        // is the pair that used to be indistinguishable.
+        assert!(!versions.agreed.contains_key("python"));
+        assert!(!versions.changes.iter().any(|c| c.key() == "python"));
+    }
+
+    /// A key this box could not MEASURE must never land in `agreed`. It is
+    /// absent locally, so it can only diff as `Missing` — but a future capture
+    /// shape that echoed a placeholder value must not be able to turn "we did
+    /// not read it" into "it matches".
+    #[test]
+    fn an_unmeasured_key_is_never_recorded_as_agreeing() {
+        let canonical = canonical_with(
+            json!({"versions": {"node": "v22.11.0"}}),
+            json!({"versions": "applyable"}),
+        );
+        let local = json!({"versions": {}});
+        let plan = compute_plan(
+            &canonical,
+            local.as_object().unwrap(),
+            &unknown("versions", &["node"]),
+            "env-1",
+            "this-box",
+        );
+        let versions = &plan.sections[0];
+        assert!(versions.agreed.is_empty());
+        assert!(versions.is_unknown("node"));
+    }
+
     #[test]
     fn policy_parses_known_wire_values() {
         assert_eq!(SectionPolicy::from_wire("applyable"), Applyable);
@@ -1032,7 +1120,10 @@ mod tests {
     fn diff_detects_missing_differing_and_extra() {
         let can = sect(&[("node", "22.1.0"), ("rustc", "1.82.0")]);
         let loc = sect(&[("node", "20.9.0"), ("python", "3.12.1")]);
-        let changes = diff_section(Some(&can), Some(&loc));
+        let (changes, agreed) = diff_section(Some(&can), Some(&loc));
+        // Nothing matches here, so the positive half must be EMPTY — not a
+        // mirror of the change list.
+        assert!(agreed.is_empty());
         assert_eq!(
             changes,
             vec![
@@ -1056,7 +1147,24 @@ mod tests {
     #[test]
     fn identical_sections_produce_no_changes() {
         let s = sect(&[("node", "22.1.0")]);
-        assert!(diff_section(Some(&s), Some(&s)).is_empty());
+        let (changes, agreed) = diff_section(Some(&s), Some(&s));
+        assert!(changes.is_empty());
+        // …and the agreement is RECORDED. This is the assertion that separates
+        // "both sides say 22.1.0" from "neither side mentions node", which the
+        // empty change list alone cannot.
+        assert_eq!(agreed.get("node"), Some(&"22.1.0".to_string()));
+    }
+
+    /// Two absences are not an agreement. Both captures being empty produces
+    /// an empty change list AND an empty agreement map — so a consumer reading
+    /// `agreed` gets the right answer where one reading `changes` gets a
+    /// dangerously wrong one.
+    #[test]
+    fn two_empty_sections_agree_about_nothing() {
+        let empty = sect(&[]);
+        let (changes, agreed) = diff_section(Some(&empty), Some(&empty));
+        assert!(changes.is_empty());
+        assert!(agreed.is_empty());
     }
 
     /// Only `applyable` sections yield actions, and an `Extra` local key is
@@ -1773,6 +1881,7 @@ mod tests {
             local_section_absent: false,
             derived_keys: BTreeSet::new(),
             unknown_keys: ["node".to_string()].into_iter().collect(),
+            agreed: BTreeMap::new(),
         };
         assert_eq!(
             hand_built.actionable().len(),
@@ -1830,6 +1939,7 @@ mod tests {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            agreed: BTreeMap::new(),
         };
         let plan = ApplyPlan {
             environment_id: "env-1".to_string(),

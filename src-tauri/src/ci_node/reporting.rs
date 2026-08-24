@@ -434,6 +434,11 @@ pub(crate) async fn post_result(
     reason: Option<&str>,
     log_tail: &str,
     test_results: Option<&super::junit::TestArtifact>,
+    // The canonical-configuration verdict. `None` means the gate had not run
+    // yet at this exit (the manifest was not even parsed), which is reported
+    // as `not_evaluated` — a different statement from `not_requested`, and
+    // neither of them an absence for a consumer to interpret.
+    canonical: Option<&super::canonical::Outcome>,
 ) -> ResultReported {
     let url = format!(
         "{}/coord/ci/dispatches/{}/result",
@@ -444,6 +449,16 @@ pub(crate) async fn post_result(
     if let Some(r) = reason {
         summary["reason"] = serde_json::Value::String(r.to_string());
     }
+    // ALWAYS present, on every conclusion. This is what makes a green produced
+    // under a converged toolchain distinguishable from one produced at
+    // canonical, and both from one that never made the claim — coord persists
+    // `summary` with the dispatch result, so this is the surface an operator
+    // reads. Emitting it unconditionally is the point: an optional field would
+    // put the reader back to inferring a toolchain claim from an absence.
+    summary["canonical"] = match canonical {
+        Some(outcome) => outcome.to_json(),
+        None => serde_json::json!({ "status": "not_evaluated" }),
+    };
     let mut body = serde_json::json!({
         "conclusion": conclusion,
         "summary": summary,
@@ -610,6 +625,9 @@ pub(crate) fn post_cancelled_result_detached(
             &[],
             Some(&reason),
             "",
+            None,
+            // Admission rejected this before a manifest existed, so the gate
+            // could not have run: `not_evaluated`.
             None,
         )
         .await;
