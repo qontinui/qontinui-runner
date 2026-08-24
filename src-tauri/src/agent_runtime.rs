@@ -3165,7 +3165,7 @@ async fn run_continuation_terminal(
         add_dir_args,
         payload.initial_prompt.clone(),
         Some(crate::terminal::runner_context(
-            crate::mcp::types::get_mcp_api_port(),
+            crate::terminal::spawn_seam_api_port(),
         )),
         &launch_cfg,
     ));
@@ -3482,7 +3482,7 @@ async fn run_condition_check_terminal(
         Vec::new(),
         payload.initial_prompt.clone(),
         Some(crate::terminal::runner_context(
-            crate::mcp::types::get_mcp_api_port(),
+            crate::terminal::spawn_seam_api_port(),
         )),
         &launch_cfg,
     ));
@@ -3670,23 +3670,6 @@ async fn acquire_continuation_workdir(
     Ok((workdir, None, uuid::Uuid::now_v7()))
 }
 
-/// Resolve this runner's ACTUALLY-BOUND API port from managed Tauri state, via
-/// the process-global `AppHandle` (background tasks get no `AppHandle`
-/// parameter). Same read the terminal continuation path performs inline —
-/// `AppState.api_port`, never the `QONTINUI_PORT`/`MCP_API_PORT` env default,
-/// which is wrong on every secondary/temp runner.
-///
-/// `None` means the port is genuinely unresolvable (no Tauri runtime, or
-/// `AppState` not managed yet). Callers MUST keep failing closed on `None`; do
-/// not substitute a default.
-pub(crate) fn resolve_bound_api_port() -> Option<u16> {
-    use tauri::Manager;
-    crate::tauri_app_handle::current().and_then(|app| {
-        app.try_state::<Arc<crate::commands::AppState>>()
-            .map(|s| crate::mcp::types::runner_api_port(s.inner()))
-    })
-}
-
 /// The `bound_port` argument the headless gate continuation hands to coord-mcp
 /// provisioning.
 ///
@@ -3737,7 +3720,7 @@ async fn run_continuation_headless(
     // provisioning fails closed (refuses the write + drops a degraded
     // breadcrumb) rather than emitting a config pointing at the bootstrap
     // default `:9876`, which is dead on any secondary/temp runner.
-    let bound_port = headless_continuation_bound_port(resolve_bound_api_port);
+    let bound_port = headless_continuation_bound_port(crate::coord_mcp::resolve_bound_api_port);
     crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
     match spawn_claude_child(workdir, initial_prompt).await {
         Ok(mut child) => {
@@ -4417,7 +4400,16 @@ fn pick_autonomous_git_identity(
 /// Extracted from [`spawn_claude_child`] because that function spawns a real
 /// process and cannot run in a unit test — with the scrub inlined there,
 /// deleting it reddened nothing.
-pub(crate) fn finalize_headless_child_env(cmd: &mut tokio::process::Command, runner_api_port: u16) {
+pub(crate) fn finalize_headless_child_env(cmd: &mut tokio::process::Command) {
+    // Resolved HERE, not passed in. The port is the one value this seam ships
+    // that a call site can get wrong invisibly, and `spawn_claude_child` — the
+    // only production caller — did: it passed `mcp::types::get_mcp_api_port()`,
+    // the bootstrap default, while `run_continuation_headless` one frame up
+    // resolved the ACTUALLY-BOUND port for the same child's `.mcp.json`. A
+    // parameter is exactly what made that divergence untestable, and it is the
+    // same reason the rest of this function was extracted in the first place.
+    // The PTY seam has always resolved its own; now neither can drift.
+    let runner_api_port = crate::terminal::spawn_seam_api_port();
     cmd.env(
         "QONTINUI_RUNNER_CONTEXT",
         crate::terminal::runner_context(runner_api_port),
@@ -4490,7 +4482,7 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
     // Runner-context marker + API port, then the credential scrub — the LAST
     // env mutations before the spawn. Extracted so the production call site is
     // unit-testable; see the function's doc comment.
-    finalize_headless_child_env(&mut cmd, crate::mcp::types::get_mcp_api_port());
+    finalize_headless_child_env(&mut cmd);
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.
@@ -4814,7 +4806,7 @@ mod tests {
             cmd.env(name, "hunter2");
         }
 
-        finalize_headless_child_env(&mut cmd, 9876);
+        finalize_headless_child_env(&mut cmd);
 
         crate::terminal::assert_credentials_scrubbed_tokio(&cmd, "finalize_headless_child_env");
 
@@ -4831,15 +4823,90 @@ mod tests {
                 )
             })
             .collect();
+        // Presence, not a specific value: the seam resolves the bound port
+        // itself now, and WHICH port that is belongs to
+        // `headless_finalize_child_env_stamps_the_bound_port_not_the_configured_one`
+        // (which pins it under the env lock). Asserting a literal here would
+        // make this scrub test depend on a process-global another test owns.
         assert!(
-            envs.iter()
-                .any(|(k, v)| k == "QONTINUI_RUNNER_API_PORT" && v.as_deref() == Some("9876")),
+            envs.iter().any(|(k, v)| k == "QONTINUI_RUNNER_API_PORT"
+                && v.as_deref()
+                    .is_some_and(|p| p.parse::<u16>().is_ok_and(|p| p != 0))),
             "the runner API port must still be exported"
         );
         assert!(
             envs.iter()
                 .any(|(k, v)| k == "QONTINUI_RUNNER_CONTEXT" && v.is_some()),
             "the runner-context briefing must still be exported"
+        );
+    }
+
+    /// The headless seam must stamp the ACTUALLY-BOUND port into both values a
+    /// session reads to find its runner — `QONTINUI_RUNNER_API_PORT` and the
+    /// `runner_context` briefing — even when `QONTINUI_PORT` names a different
+    /// one (a runner that fell back off a blocked port; a secondary whose
+    /// launcher set a port it did not get).
+    ///
+    /// This is the assertion the old `runner_api_port: u16` parameter made
+    /// impossible: the wrong value was chosen at `spawn_claude_child`'s call
+    /// site, which spawns a real process and cannot run in a unit test, so the
+    /// seam could be tested green while production shipped `:9876` to a session
+    /// whose runner was on `:9877` — and whose `.mcp.json`, provisioned one
+    /// frame up, correctly named `:9877`.
+    #[test]
+    fn headless_finalize_child_env_stamps_the_bound_port_not_the_configured_one() {
+        use crate::install_effects_producer::intercept::{set_bound_port, BoundPortRestore};
+        let _env_lock = env_lock();
+        // `runner_context` reads the process-global plan-capture level AND the
+        // briefing-document cache, whose only serializer is this pin (its `Drop`
+        // clears the cache). Without it a sibling test that plants a briefing
+        // body — `session_briefing`'s and `fleet_policy_poller`'s do — can render
+        // a body with no `{{runner_api_base}}` placeholder at all and redden the
+        // port assertions below for reasons unrelated to the port. Same guard,
+        // same reason, as `runner_context_briefing_is_appended_to_the_argv` and
+        // `terminal::the_api_port_reaches_the_rendered_briefing`.
+        //
+        // Order is env_lock → pin, deliberately and consistently: nothing in the
+        // crate takes them the other way round, so there is one global ordering
+        // and no deadlock to introduce later.
+        let _pin = crate::mcp::fleet_policy_poller::pin_plan_capture_level_for_test("off");
+        let _env = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
+        let _bound = BoundPortRestore::capture();
+
+        std::env::set_var("QONTINUI_PORT", "9876");
+        set_bound_port(41_238);
+
+        let mut cmd = tokio::process::Command::new("dummy");
+        finalize_headless_child_env(&mut cmd);
+
+        let envs: std::collections::HashMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().to_string(),
+                        v.to_string_lossy().to_string(),
+                    )
+                })
+            })
+            .collect();
+
+        assert_eq!(
+            envs.get("QONTINUI_RUNNER_API_PORT").map(String::as_str),
+            Some("41238"),
+            "the child must be told the port its runner actually bound"
+        );
+        let briefing = envs
+            .get("QONTINUI_RUNNER_CONTEXT")
+            .expect("the seam must still export the runner-context briefing");
+        assert!(
+            briefing.contains("41238"),
+            "the briefing's endpoints must name the bound port: {briefing}"
+        );
+        assert!(
+            !briefing.contains("127.0.0.1:9876"),
+            "the briefing must not point the session at the DESIRED port: {briefing}"
         );
     }
 
@@ -6046,12 +6113,18 @@ mod tests {
         );
     }
 
-    /// The production resolver itself: with no Tauri runtime (this unit-test
-    /// context has no process-global `AppHandle`) it must return `None` rather
-    /// than fabricating the env/bootstrap default port.
+    /// The production resolver the headless path is wired to — `coord_mcp`'s,
+    /// which has owned this read since 2026-06-12 and is what `coord_doctor`,
+    /// `config_report` and `agent_worktree::isolated_edit` already call. (This
+    /// module briefly carried a second, byte-equivalent copy; a duplicated
+    /// security control is two things to keep in step, so the copy is gone.)
+    ///
+    /// With no Tauri runtime — this unit-test context has no process-global
+    /// `AppHandle` — it must return `None` rather than fabricating the
+    /// env/bootstrap default port.
     #[test]
     fn resolve_bound_api_port_is_none_without_a_tauri_runtime() {
-        let port = resolve_bound_api_port();
+        let port = crate::coord_mcp::resolve_bound_api_port();
         assert_eq!(
             port, None,
             "no AppHandle ⇒ no managed AppState ⇒ the port is UNKNOWN, never a default"

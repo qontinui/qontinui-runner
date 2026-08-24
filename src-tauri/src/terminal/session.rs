@@ -1561,7 +1561,13 @@ impl TerminalSession {
         // Mark this terminal as running inside the Qontinui Runner so that tools
         // (e.g. Claude Code via the shell integration wrapper) can detect the context.
         cmd.env("QONTINUI_RUNNER_TERMINAL", "1");
-        let runner_api_port = crate::mcp::types::get_mcp_api_port();
+        // The ACTUALLY-BOUND port, not the bootstrap default — see
+        // `crate::terminal::spawn_seam_api_port`. `apply_identity_seam` and
+        // `apply_install_intercept_env` in this same file already read the bound
+        // port; this seam, which renders the number the session actually READS
+        // (its `QONTINUI_RUNNER_API_PORT` and the briefing's endpoints), was the
+        // one that did not.
+        let runner_api_port = crate::terminal::spawn_seam_api_port();
         cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
 
         // Forward the continuation-verdict mode to the bundled `Stop` hook so it

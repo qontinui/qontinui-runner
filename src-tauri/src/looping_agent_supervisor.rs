@@ -1023,7 +1023,7 @@ async fn spawn_looping_agent_terminal(
         Vec::new(),
         prompt,
         Some(crate::terminal::runner_context(
-            crate::mcp::types::get_mcp_api_port(),
+            crate::terminal::spawn_seam_api_port(),
         )),
         &launch_cfg,
     ));
