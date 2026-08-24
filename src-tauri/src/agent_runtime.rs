@@ -563,7 +563,7 @@ pub(crate) fn claude_bin_path() -> String {
 /// Falls back to [`claude_bin_path`] when nothing resolves, so behavior is
 /// never worse than the bare name. Does blocking filesystem stats — callers
 /// on an async task must run this via `spawn_blocking`.
-fn resolve_claude_bin() -> String {
+pub(crate) fn resolve_claude_bin() -> String {
     let bare = claude_bin_path();
     // An explicit `QONTINUI_CLAUDE_BIN` override (or any absolute path) is
     // launchable as-is — no PATH search, no shim shadowing.
