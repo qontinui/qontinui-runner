@@ -221,16 +221,20 @@ struct NonceBinding {
     ///
     /// Its one job is to give [`device_nonce_snapshot`]'s bound a total,
     /// oldest-first eviction order. Before that bound existed, the persisted
-    /// device set was reaped by **nothing**: `revoke_proxy_nonce` has no
+    /// device set had exactly one production reaper —
+    /// [`release_workdir_on_session_close`], on the last open record for a
+    /// workdir closing — **and it returns early on the `qontinui-root`
+    /// workdir**. Nothing else reached it: `revoke_proxy_nonce` has no
     /// production caller, `evict_proxy_nonces_for_workdir` fires only on
     /// relay-chat close for a per-session relay workdir, terminal close revokes
     /// nothing, and — since Phase 4 carried `terminal_id` into the store — a
-    /// persistent binding is evicted only by a re-mint for its own
-    /// `(workdir, terminal_id)` slot. Terminal ids are per-PTY, so every
-    /// terminal ever spawned added one permanent entry, restored into the live
-    /// map at every boot, with no expiry column and no cap: unbounded growth in
-    /// an encrypted store that is fully re-encrypted and rewritten on every
-    /// mint, and an unbounded set of eternally-valid loopback keys.
+    /// persistent binding is otherwise evicted only by a re-mint for its own
+    /// `(workdir, terminal_id)` slot. Terminal ids are per-PTY, so a slot is
+    /// never reused and every terminal spawned in ROOT added one permanent
+    /// entry, restored into the live map at every boot, with no expiry column
+    /// and no cap: monotone growth in an encrypted store that is fully
+    /// re-encrypted and rewritten on every mint, and an ever-growing set of
+    /// eternally-valid loopback keys.
     ///
     /// A restored binding carries its PERSISTED mint time. It has to: stamping
     /// the restore instant instead made every restored binding tie, so the
@@ -1153,16 +1157,32 @@ pub(crate) fn spawn_log_proxy_nonce_rejected(nonce: Option<&str>, cause: impl In
 /// Phase 4 carried `terminal_id` into the store, which fixed the slot-collapse
 /// cascade but removed the only thing that was reaping the persisted set. It
 /// was an accidental GC and a destructive one — that is the bug Phase 4 fixed —
-/// but **nothing took its place**: `revoke_proxy_nonce` has no production
-/// caller (every reference is a test), `evict_proxy_nonces_for_workdir` fires
-/// only from `mcp/backend_relay.rs` on relay-chat close for a per-session relay
-/// workdir, `terminal/session.rs` provisions on spawn and revokes nothing on
-/// close, and a persistent binding is now evicted only by a re-mint for its own
-/// `(workdir, terminal_id)` slot. Terminal ids are per-PTY, so **every terminal
-/// ever spawned added one permanent entry**, restored into the live map at
-/// every boot, with no expiry column and no cap — unbounded growth in an
-/// encrypted store that is fully re-encrypted and rewritten on every mint, plus
-/// an unbounded set of eternally-valid loopback keys.
+/// but what took its place reaches **less than all of it**:
+/// `revoke_proxy_nonce` has no production caller (every reference is a test),
+/// `evict_proxy_nonces_for_workdir` fires only from `mcp/backend_relay.rs` on
+/// relay-chat close for a per-session relay workdir, `terminal/session.rs`
+/// provisions on spawn and revokes nothing on close, and a persistent binding
+/// is otherwise evicted only by a re-mint for its own `(workdir, terminal_id)`
+/// slot — and terminal ids are per-PTY, so that slot is never reused.
+///
+/// The one production reaper is [`release_workdir_on_session_close`], via
+/// `session_lifecycle_store::record_close`: when the LAST open record for a
+/// workdir closes it drops every nonce bound to that workdir and mirrors the
+/// shrunken set. That is real coverage and this doc used to deny it. What it
+/// does NOT cover is the accumulator that actually matters:
+///
+/// * **the `qontinui-root` workdir, which that reaper returns early on by
+///   design** (its nonce is the shared credential for every root-launched
+///   session, healed at boot rather than per-session). Root is also where the
+///   most terminals are spawned, and each gets its own per-PTY slot — so root
+///   alone still adds one permanent entry per terminal, forever;
+/// * a session that never reaches `record_close` at all — a runner killed
+///   rather than closed, a terminal with no lifecycle record.
+///
+/// Both are restored into the live map at every boot, with no expiry column,
+/// in an encrypted store that is fully re-encrypted and rewritten on every
+/// mint. The growth is narrower than "every terminal ever spawned" but it is
+/// still monotone and still unbounded, which is what the cap below answers.
 ///
 /// The bound is applied HERE, at the snapshot, rather than by revoking on
 /// terminal close, and that choice is the point:
@@ -1239,11 +1259,13 @@ fn device_nonce_snapshot(
 /// function for why the bound lives at the snapshot rather than at revoke time.
 ///
 /// **The bound is against CUMULATIVE terminal spawns, not the concurrent
-/// working set.** Nothing reaps the persisted set: `revoke_proxy_nonce` has no
-/// production caller, terminal close revokes nothing, and a persistent binding
-/// is evicted only by a re-mint for its own `(workdir, terminal_id)` slot —
-/// and terminal ids are per-PTY, so a slot is never reused. Every terminal ever
-/// spawned therefore adds one entry that lives forever. Sizing this against
+/// working set.** One production path does reap the persisted set —
+/// [`release_workdir_on_session_close`], on the last open record for a workdir
+/// closing — but it returns early on the `qontinui-root` workdir by design, and
+/// never runs for a session that dies without a `record_close`. Root is where
+/// the most terminals are spawned and every one takes its own per-PTY
+/// `(workdir, terminal_id)` slot, so root alone still adds one entry that lives
+/// forever. Sizing this against
 /// concurrency (~9 sessions on the heaviest measured box) would be sizing
 /// against the wrong quantity: at that rate 256 CUMULATIVE spawns is weeks, not
 /// never. **An operator on a long-lived install WILL meet this cap.**
@@ -2398,20 +2420,62 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
             return;
         }
     }
-    let (revoked_nonces, snapshot) = {
+    let (revoked_bindings, snapshot) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        let mut revoked_nonces: Vec<String> = Vec::new();
+        // The terminal id rides along so the forensics line below can carry the
+        // Phase 4 join key. Resolved HERE because the binding is gone from the
+        // map the moment `retain` returns — a later `terminal_id_for_nonce`
+        // would find nothing and report every session-close revoke as unknown.
+        let mut revoked_bindings: Vec<(String, Option<String>)> = Vec::new();
         map.retain(|n, b| {
             if b.workdir == workdir {
-                revoked_nonces.push(n.clone());
+                revoked_bindings.push((n.clone(), b.terminal_id.clone()));
                 return false;
             }
             true
         });
-        let snapshot = (!revoked_nonces.is_empty()).then(|| map.clone());
-        (revoked_nonces, snapshot)
+        let snapshot = (!revoked_bindings.is_empty()).then(|| map.clone());
+        (revoked_bindings, snapshot)
     };
-    let revoked = revoked_nonces.len();
+    let revoked = revoked_bindings.len();
+    // Rotation forensics: session close is the LARGEST revoke path in
+    // production, and until now the only one that emitted nothing. Plan
+    // 2026-08-20 Phase 3 gave `revoke_proxy_nonce` and
+    // `revoke_agent_proxy_nonces` a `revoke` line and recorded this one as an
+    // explicit residual ("also revokes nonces and still emits no `revoke`
+    // line") — which mattered more than the two that were covered:
+    // `revoke_proxy_nonce` has no production caller at all and agent nonces are
+    // never persisted, so on a real box EVERY key that died by revocation died
+    // here, silently. A later `reject` on one of those nonces joined to a
+    // `mint`/`write` pair and then to nothing, leaving "the client is 401ing
+    // and the key simply vanished" — indistinguishable from the eviction
+    // cascade Phase 4 fixed, which is precisely the discrimination the
+    // 2026-08-19 reconstruction needed and could not make.
+    //
+    // Emitted AFTER the map lock is released (the emitter does file I/O) and
+    // BEFORE the persist, matching `revoke_agent_proxy_nonces`' discipline.
+    for (nonce, terminal_id) in &revoked_bindings {
+        log_rotation_event_with(
+            "revoke",
+            workdir,
+            nonce,
+            "session close (last open session for this workdir; live registry, \
+             and the shrunken set is mirrored to the encrypted store)",
+            &[(
+                "terminal_id",
+                serde_json::Value::from(
+                    // Same spelling as the `reject` line's field: a
+                    // terminal-less binding is the string "none", never JSON
+                    // null, so the two lines join on one shape.
+                    terminal_id.clone().unwrap_or_else(|| "none".to_string()),
+                ),
+            )],
+        );
+    }
+    let revoked_nonces: Vec<String> = revoked_bindings
+        .into_iter()
+        .map(|(nonce, _)| nonce)
+        .collect();
     if let Some(snapshot) = snapshot {
         persist_proxy_nonces(&snapshot);
     }
@@ -2819,7 +2883,7 @@ pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
 /// warned about and swallowed by [`write_mcp_json`]), so a caller that reports
 /// the rewrite in its own forensics line reports what happened rather than what
 /// it intended.
-fn rewrite_root_config_preserving_nonce(workdir: &str, bound_port: u16, nonce: &str) -> bool {
+fn rewrite_config_preserving_nonce(workdir: &str, bound_port: u16, nonce: &str) -> bool {
     write_mcp_json(workdir, &coord_mcp_proxy_config_json(bound_port, nonce))
 }
 
@@ -4027,21 +4091,77 @@ fn read_proxy_nonce(config_path: &Path) -> Option<String> {
 /// - `Rewrite` — the config holds the proxy shape on a port ≠ the instance's
 ///   current bound port → rewrite it to the correct port (+ a fresh persisted
 ///   nonce) so the next MCP read targets a live proxy.
-/// - `Leave` — no `.mcp.json` proxy port readable, OR the port already matches.
+/// - `UpgradeHeaders` — the port already matches and a nonce is readable, but
+///   the file carries only the legacy `X-Coord-Mcp-Proxy-Key` header → rewrite
+///   it in place **with that same nonce** so it gains the static
+///   `Authorization` key. See [`RootReconcileAction::UpgradeHeaders`] for the
+///   measured mechanism; this is the SESSION-side half of it.
+/// - `Leave` — no `.mcp.json` proxy port readable, OR the port matches and the
+///   file already carries the non-escalating header shape.
+///
+/// # Why the session side needed its own upgrade arm
+///
+/// Plan `2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning` shipped the
+/// header upgrade for the ROOT config only and recorded the session side as an
+/// explicit residual: this resolver keyed on the port alone, so on the very
+/// deploy that ships the Phase 2 emitter (runner rebuild, same port) a healthy
+/// legacy-only session config classified as `Leave` and was left
+/// DCR-escalating for the next client launched against it.
+///
+/// The residual is narrow — `acquire_for_terminal` rewrites the in-workdir file
+/// through the Phase 2 emitter on **every** session spawn, so the population
+/// drains on its own — but it is not benign while it lasts, for the reason the
+/// plan records: `terminal/session.rs` skips `--mcp-config` injection whenever
+/// [`workdir_declares_coord_mcp`] is true, so a legacy-only in-workdir file is
+/// **authoritative** for a hand-launched client and is not shadowed by a
+/// healthier app-data config. The exposed population is a pre-deploy worktree
+/// that survives the upgrade and gets a hand-launched client before it gets a
+/// runner-spawned session.
+///
+/// # What this deliberately does NOT do
+///
+/// There is no session-side `AdoptNonce`. The root resolver re-registers an
+/// unregistered on-disk nonce; doing that per session workdir would re-register
+/// an unbounded number of boot-time nonces into a set that is already capped
+/// ([`MAX_PERSISTED_DEVICE_NONCES`]), so it needs its own bound and its own
+/// analysis. An unregistered session nonce still classifies `Leave` here — the
+/// same behaviour as before this arm existed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReconcileAction {
     Rewrite,
+    UpgradeHeaders,
     Leave,
 }
 
-/// Pure reconcile predicate: given the session's currently-written proxy port
-/// (if any) and the instance's current bound port, decide whether to rewrite.
+/// Pure reconcile predicate for one session config: given the proxy port
+/// currently written to it (`None` = absent / unparseable / not the proxy
+/// shape), the nonce readable from it, whether its `headers` map carries a
+/// static `Authorization` key at all, and the instance's current bound port,
+/// decide what to do. See [`ReconcileAction`] for each arm's rationale.
 pub(crate) fn reconcile_action(
     current_proxy_port: Option<u16>,
+    on_disk_nonce: Option<&str>,
+    has_static_authorization: bool,
     bound_port: u16,
 ) -> ReconcileAction {
-    match current_proxy_port {
-        Some(p) if p != bound_port => ReconcileAction::Rewrite,
+    let Some(port) = current_proxy_port else {
+        // Not our proxy shape — never touched here.
+        return ReconcileAction::Leave;
+    };
+    if port != bound_port {
+        // Port moved: a live client's cached URL is stale too, so it must
+        // reconnect regardless — mint fresh + rewrite. This arm already emits
+        // the current header shape, so it subsumes the upgrade.
+        return ReconcileAction::Rewrite;
+    }
+    // Port matches. The only thing left that this path can fix without touching
+    // the registry is the header SHAPE, and only when there is a nonce to
+    // re-emit verbatim: rewriting a shape around an EMPTY credential would
+    // produce a config that authenticates against nothing.
+    match on_disk_nonce {
+        Some(nonce) if !nonce.is_empty() && !has_static_authorization => {
+            ReconcileAction::UpgradeHeaders
+        }
         _ => ReconcileAction::Leave,
     }
 }
@@ -4393,7 +4513,7 @@ fn reconcile_root_config_gated(
 ///
 /// - `UpgradeHeaders` — port unchanged AND the on-disk nonce is registered, but
 ///   the file carries only the legacy proxy-key header: rewrite it through
-///   [`rewrite_root_config_preserving_nonce`], **preserving the nonce
+///   [`rewrite_config_preserving_nonce`], **preserving the nonce
 ///   verbatim**, so the next client launched against it stops escalating a 401
 ///   into OAuth/DCR. Port and nonce both unchanged; only the headers map moves.
 /// - `AdoptNonce` — port unchanged, a nonce IS on disk but unregistered:
@@ -4426,7 +4546,7 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             // nonce was read from disk, so this Option is always Some here.
             let nonce = on_disk_nonce
                 .expect("UpgradeHeaders implies a readable on-disk nonce (resolver invariant)");
-            rewrite_root_config_preserving_nonce(&root, bound_port, &nonce);
+            rewrite_config_preserving_nonce(&root, bound_port, &nonce);
             info!(
                 "coord_mcp: boot self-heal UPGRADED the header shape of root \
                  {root}/.mcp.json (port :{bound_port} and nonce BOTH unchanged) — the \
@@ -4459,7 +4579,7 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             // no-op for any reader.
             let needs_upgrade = !read_static_authorization_presence(&root_dir.join(".mcp.json"));
             let rewritten =
-                needs_upgrade && rewrite_root_config_preserving_nonce(&root, bound_port, &nonce);
+                needs_upgrade && rewrite_config_preserving_nonce(&root, bound_port, &nonce);
             adopt_on_disk_nonce(&root, &nonce, rewritten);
             info!(
                 "coord_mcp: boot self-heal ADOPTED on-disk root nonce for {root} \
@@ -4491,14 +4611,40 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
     }
 }
 
+/// What one boot-time session-config reconcile pass actually did. Two counts,
+/// not one, because the two effects are different events for an operator: a
+/// `rewritten` config ROTATED its nonce (any live client holding the old one
+/// must reconnect), while an `upgraded` one kept its nonce byte-for-byte and
+/// only gained the static `Authorization` key. Collapsing them into a single
+/// "rewrote N configs" boot line — which is what this returned before the
+/// upgrade arm existed — would report a harmless shape repair in the same
+/// words as a credential rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SessionReconcileCounts {
+    /// Configs rewritten to the current bound port with a FRESH nonce.
+    pub(crate) rewritten: usize,
+    /// Configs rewritten in place preserving their existing nonce, purely to
+    /// add the static `Authorization` header.
+    pub(crate) upgraded: usize,
+}
+
 /// Boot-time session-config reconcile (Phase 3c). For each live session workdir,
-/// if its `.mcp.json` coord-mcp proxy port ≠ the instance's CURRENT bound port,
-/// rewrite it via [`write_coord_mcp_proxy_config`] (correct port + a freshly
-/// persisted nonce), guarded by [`coord_mcp_safe_to_write`] so it never clobbers
-/// an agent-spawn's static-bearer config. Combined with Phase 3b (persisted
-/// nonces), the common same-port restart needs no rewrite at all — this covers
-/// only the instance/port-change case. Returns the number of SESSION configs
-/// rewritten.
+/// dispatch on [`reconcile_action`]:
+///
+/// * port ≠ the instance's CURRENT bound port → rewrite via
+///   [`write_coord_mcp_proxy_config`] (correct port + a freshly persisted
+///   nonce), so the next MCP read targets a live proxy;
+/// * port matches but the file carries only the legacy proxy-key header →
+///   rewrite in place through [`rewrite_config_preserving_nonce`], **preserving
+///   the nonce verbatim**, so the next client launched against it stops
+///   escalating a 401 into OAuth/DCR. This is the session-side half of the root
+///   path's [`RootReconcileAction::UpgradeHeaders`], and closes the residual
+///   plan `2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning` recorded
+///   against this function.
+///
+/// Both mutating arms are guarded by [`coord_mcp_safe_to_write`] so neither
+/// clobbers an agent-spawn's static-bearer config. Combined with Phase 3b
+/// (persisted nonces), the common same-port restart still rotates nothing.
 ///
 /// Root-config self-heal is NOT done here — the boot task calls
 /// [`reconcile_root_config`] UNCONDITIONALLY (plan 2026-07-07 Change 1 secondary
@@ -4509,31 +4655,77 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
 /// Wired into the same startup path as the other auto-start tasks (see
 /// `mcp_api::start_server`), AFTER [`restore_proxy_nonces_from_store`] so a
 /// rewrite reuses the restored map where possible.
-pub(crate) fn reconcile_session_configs<I>(workdirs: I, bound_port: u16) -> usize
+pub(crate) fn reconcile_session_configs<I>(workdirs: I, bound_port: u16) -> SessionReconcileCounts
 where
     I: IntoIterator<Item = String>,
 {
-    let mut rewritten = 0usize;
+    let mut counts = SessionReconcileCounts::default();
     for workdir in workdirs {
-        if reconcile_action(read_proxy_port(&workdir), bound_port) != ReconcileAction::Rewrite {
-            continue;
+        let config_path = Path::new(&workdir).join(".mcp.json");
+        // Port, nonce and header shape, read the way `resolve_root_reconcile`
+        // reads them for the root file — three reads of one path, not one
+        // parse shared between them. That is the existing shape and it is left
+        // alone deliberately, but it is worth being exact about what it does
+        // NOT buy: the reads are not atomic with each other, so a rewrite
+        // landing between them could hand the resolver a mixed observation.
+        // Harmless here in both directions — the only writer that races this
+        // is a session spawn, which writes the CURRENT shape, so the worst
+        // case is an `UpgradeHeaders` that re-emits the same nonce over a file
+        // that just gained the header anyway. Idempotent, and the nonce is
+        // preserved either way.
+        let on_disk_nonce = read_proxy_nonce(&config_path);
+        let action = reconcile_action(
+            read_proxy_port(&workdir),
+            on_disk_nonce.as_deref(),
+            read_static_authorization_presence(&config_path),
+            bound_port,
+        );
+        match action {
+            ReconcileAction::Leave => continue,
+            ReconcileAction::Rewrite => {
+                if !coord_mcp_safe_to_write(&workdir) {
+                    // An agent-spawn static-bearer config (or a user's own
+                    // file) — never clobber. (A proxy-shaped config is
+                    // ours-refreshable, so this only skips configs we must not
+                    // touch.)
+                    continue;
+                }
+                write_coord_mcp_proxy_config(&workdir, bound_port);
+                counts.rewritten += 1;
+                info!("coord_mcp: reconciled {workdir}/.mcp.json to bound port :{bound_port}");
+            }
+            ReconcileAction::UpgradeHeaders => {
+                if !coord_mcp_safe_to_write(&workdir) {
+                    continue;
+                }
+                // SAFETY: the resolver only yields UpgradeHeaders when a
+                // non-empty nonce was read from disk, so this Option is always
+                // Some here — the same invariant the root path relies on.
+                let nonce = on_disk_nonce
+                    .expect("UpgradeHeaders implies a readable on-disk nonce (resolver invariant)");
+                // Counted only when the write ACTUALLY landed: `write_mcp_json`
+                // warns and swallows a permission failure, and a boot line that
+                // counted the attempt would report a repair that did not happen.
+                if rewrite_config_preserving_nonce(&workdir, bound_port, &nonce) {
+                    counts.upgraded += 1;
+                    info!(
+                        "coord_mcp: boot reconcile UPGRADED the header shape of session \
+                         {workdir}/.mcp.json (port :{bound_port} and nonce BOTH unchanged) — \
+                         the file carried only the legacy proxy-key header, which leaves the \
+                         next client launched against it escalating a 401 into OAuth/DCR"
+                    );
+                }
+            }
         }
-        if !coord_mcp_safe_to_write(&workdir) {
-            // An agent-spawn static-bearer config (or a user's own file) — never
-            // clobber. (A proxy-shaped config is ours-refreshable, so this only
-            // skips configs we must not touch.)
-            continue;
-        }
-        write_coord_mcp_proxy_config(&workdir, bound_port);
-        rewritten += 1;
-        info!("coord_mcp: reconciled {workdir}/.mcp.json to bound port :{bound_port}");
     }
-    if rewritten > 0 {
+    if counts.rewritten > 0 || counts.upgraded > 0 {
         info!(
-            "coord_mcp: boot reconcile rewrote {rewritten} session config(s) to the current bound port"
+            "coord_mcp: boot reconcile rewrote {} session config(s) to the current bound port \
+             and upgraded {} to the non-escalating header shape (nonce preserved)",
+            counts.rewritten, counts.upgraded
         );
     }
-    rewritten
+    counts
 }
 
 #[cfg(test)]
@@ -6898,30 +7090,72 @@ mod tests {
         );
     }
 
-    /// Phase 3c — the pure reconcile predicate: rewrite only when a proxy port
-    /// is present AND differs from the current bound port.
+    /// Phase 3c — the pure reconcile predicate: rewrite on a port mismatch,
+    /// and (post-#1079 follow-up) upgrade the header shape in place when the
+    /// port matches but the file is still legacy-only.
     #[test]
     fn reconcile_action_rewrites_only_on_port_mismatch() {
+        // A port mismatch wins over every header consideration: that arm
+        // rewrites through the current emitter, so it already yields the new
+        // shape and must not be split by it.
         assert_eq!(
-            reconcile_action(Some(9877), 9876),
+            reconcile_action(Some(9877), Some("old"), false, 9876),
             ReconcileAction::Rewrite,
             "stale port → rewrite"
         );
         assert_eq!(
-            reconcile_action(Some(9876), 9876),
-            ReconcileAction::Leave,
-            "matching port → leave"
+            reconcile_action(Some(9877), Some("old"), true, 9876),
+            ReconcileAction::Rewrite,
+            "stale port → rewrite even when the header shape is already current"
         );
         assert_eq!(
-            reconcile_action(None, 9876),
+            reconcile_action(Some(9876), Some("keep"), true, 9876),
+            ReconcileAction::Leave,
+            "matching port + current header shape → leave"
+        );
+        assert_eq!(
+            reconcile_action(None, None, false, 9876),
             ReconcileAction::Leave,
             "no readable proxy port (absent / static-bearer agent config) → leave"
         );
     }
 
+    /// The session-side header upgrade — the residual plan
+    /// `2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning` recorded
+    /// against `reconcile_session_configs` ("still keys on port alone, so a
+    /// live session workdir's `.mcp.json` gets no header upgrade at boot").
+    ///
+    /// A legacy-only config on the RIGHT port is the DCR-escalating shape: it
+    /// authenticates perfectly, so every credential-shaped predicate calls it
+    /// healthy, and the next client launched against it still escalates a 401
+    /// into OAuth/DCR. That is why the arm keys on the header SHAPE and not on
+    /// the nonce's health.
+    #[test]
+    fn reconcile_action_upgrades_a_legacy_only_config_on_the_bound_port() {
+        assert_eq!(
+            reconcile_action(Some(9876), Some("keep"), false, 9876),
+            ReconcileAction::UpgradeHeaders,
+            "matching port, nonce present, legacy-only headers → upgrade in place"
+        );
+        // No nonce to re-emit ⇒ nothing to preserve, and rewriting the shape
+        // around an empty credential would produce a config that authenticates
+        // against nothing. Left alone rather than upgraded or rotated.
+        assert_eq!(
+            reconcile_action(Some(9876), None, false, 9876),
+            ReconcileAction::Leave,
+            "matching port but no readable nonce → leave (nothing to preserve)"
+        );
+        assert_eq!(
+            reconcile_action(Some(9876), Some(""), false, 9876),
+            ReconcileAction::Leave,
+            "an empty nonce is not a credential to preserve"
+        );
+    }
+
     /// Phase 3c — end-to-end reconcile over a workdir set: a stale-port proxy
-    /// config is rewritten to the bound port; a matching one and an agent
-    /// (static-bearer) config are left untouched.
+    /// config is rewritten to the bound port; a legacy-only config on the right
+    /// port is upgraded in place with its nonce preserved; an already-current
+    /// config and an agent (static-bearer) config are left untouched.
     #[test]
     fn reconcile_session_configs_rewrites_stale_leaves_agent() {
         let _env_lock = env_lock();
@@ -6944,14 +7178,26 @@ mod tests {
         )
         .unwrap();
 
-        // Already-correct proxy config on :9876 → must be left as-is.
-        let ok = base.join("ok");
-        std::fs::create_dir_all(&ok).unwrap();
+        // Legacy-only proxy config on the RIGHT port → must be UPGRADED in
+        // place: same port, same nonce, headers gain `Authorization`. Before
+        // the #1079 follow-up this classified `Leave` and stayed
+        // DCR-escalating.
+        let legacy = base.join("legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(
-            ok.join(".mcp.json"),
+            legacy.join(".mcp.json"),
             r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"keep"}}}}"#,
         )
         .unwrap();
+
+        // Already-current proxy config on :9876 → must be left BYTE-IDENTICAL.
+        // The upgrade arm must be a one-shot repair, not a rewrite on every
+        // boot: a file rewritten each time would churn the encrypted store and
+        // the rotation log for no change at all.
+        let ok = base.join("ok");
+        std::fs::create_dir_all(&ok).unwrap();
+        let ok_cfg = r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"Authorization":"Bearer keepauth","X-Coord-Mcp-Proxy-Key":"keepauth"}}}}"#;
+        std::fs::write(ok.join(".mcp.json"), ok_cfg).unwrap();
 
         // Agent static-bearer config → must NEVER be clobbered.
         let agent_payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"agent"}"#);
@@ -6965,13 +7211,19 @@ mod tests {
 
         let workdirs = vec![
             stale.to_string_lossy().to_string(),
+            legacy.to_string_lossy().to_string(),
             ok.to_string_lossy().to_string(),
             agent.to_string_lossy().to_string(),
         ];
-        let rewritten = reconcile_session_configs(workdirs, 9876);
+        let counts = reconcile_session_configs(workdirs, 9876);
         assert_eq!(
-            rewritten, 1,
-            "only the stale-port proxy config is rewritten"
+            counts,
+            SessionReconcileCounts {
+                rewritten: 1,
+                upgraded: 1,
+            },
+            "exactly the stale-port config rotates, and exactly the legacy-only \
+             one is upgraded in place"
         );
 
         // Stale rewritten to the bound port (+ a fresh registered nonce).
@@ -6987,8 +7239,34 @@ mod tests {
             "the rewritten config must carry a freshly-registered nonce"
         );
 
-        // Correct config untouched; agent config preserved verbatim.
-        assert_eq!(read_proxy_port(&ok.to_string_lossy()), Some(9876));
+        // The legacy-only config: port AND nonce unchanged, headers upgraded.
+        // Preserving the nonce is what makes this safe — a live MCP client
+        // cached it at launch and never re-reads the file, so rewriting the
+        // bytes around an unchanged credential cannot strand it.
+        assert_eq!(read_proxy_port(&legacy.to_string_lossy()), Some(9876));
+        let up: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(legacy.join(".mcp.json")).unwrap())
+                .unwrap();
+        let up_headers = &up["mcpServers"]["coord-mcp"]["headers"];
+        assert_eq!(
+            up_headers[PROXY_AUTHORIZATION_HEADER_JSON],
+            serde_json::Value::from(format!("{PROXY_BEARER_PREFIX}keep")),
+            "the upgrade must add the static Authorization key carrying the SAME nonce"
+        );
+        assert_eq!(
+            up_headers[COORD_MCP_PROXY_KEY_HEADER_JSON], "keep",
+            "and must not rotate the nonce, nor drop the legacy header the \
+             recovery doors still read by name"
+        );
+
+        // Already-current config untouched BYTE-FOR-BYTE; agent config
+        // preserved verbatim.
+        assert_eq!(
+            std::fs::read_to_string(ok.join(".mcp.json")).unwrap(),
+            ok_cfg,
+            "a config already carrying the non-escalating shape must not be \
+             rewritten on every boot"
+        );
         assert_eq!(
             std::fs::read_to_string(agent.join(".mcp.json")).unwrap(),
             agent_cfg,
@@ -8026,6 +8304,75 @@ mod tests {
             rotation_key_prefix(&agent_nonce).as_str()
         );
         for n in [nonce.as_str(), agent_nonce.as_str()] {
+            assert!(!raw.contains(n), "a revoke line leaked a full nonce");
+        }
+    }
+
+    /// Post-merge follow-up to plan
+    /// `2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning`, which
+    /// recorded this as an explicit residual: "`release_workdir_on_session_close`
+    /// also revokes nonces and still emits no `revoke` line."
+    ///
+    /// It matters more than the two paths Phase 3 did cover. `revoke_proxy_nonce`
+    /// has NO production caller and agent nonces are never persisted, so on a
+    /// real box every key that died by revocation died here — silently. A later
+    /// `reject` carrying one of those prefixes joined to a `mint`/`write` pair
+    /// and then to nothing, which is indistinguishable from the eviction cascade
+    /// Phase 4 fixed. Telling those two apart is precisely what the 2026-08-19
+    /// reconstruction needed and could not do.
+    #[test]
+    fn rotation_revoke_line_is_emitted_on_session_close() {
+        let dir = rotation_log_test_dir();
+
+        let wd = format!("D:/rot-close-wt-{}", uuid::Uuid::now_v7());
+        // Both classes bound to one workdir: the shared `.mcp.json` credential
+        // (terminal-less) and a per-PTY one. Session close drops both, so both
+        // must be accounted for.
+        let shared = register_proxy_nonce(&wd, None);
+        let per_terminal = register_proxy_nonce(&wd, Some("terminal-rot-close"));
+
+        release_workdir_on_session_close(&wd);
+
+        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
+        let revokes: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
+            .filter(|v| v["event"] == "revoke" && v["workdir"] == wd.as_str())
+            .collect();
+        assert_eq!(
+            revokes.len(),
+            2,
+            "one revoke line per nonce the close killed, not one per close"
+        );
+
+        let by_prefix = |n: &str| {
+            revokes
+                .iter()
+                .find(|v| v["key_prefix"] == rotation_key_prefix(n).as_str())
+                .unwrap_or_else(|| panic!("no revoke line joins to the {n} prefix"))
+                .clone()
+        };
+        // The Phase 4 join key rides on the line, spelled the same way a
+        // `reject` spells it: the string "none" for a terminal-less binding,
+        // never JSON null, so the two events join on one shape.
+        assert_eq!(by_prefix(&shared)["terminal_id"], "none");
+        assert_eq!(
+            by_prefix(&per_terminal)["terminal_id"],
+            "terminal-rot-close",
+            "the terminal id must be resolved BEFORE the retain drops the \
+             binding — afterwards there is nothing left to resolve it from"
+        );
+        for v in &revokes {
+            assert!(
+                v["cause"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("session close"),
+                "the cause must name the path, or the line cannot be told from \
+                 an explicit revoke: {v}"
+            );
+        }
+        for n in [shared.as_str(), per_terminal.as_str()] {
             assert!(!raw.contains(n), "a revoke line leaked a full nonce");
         }
     }

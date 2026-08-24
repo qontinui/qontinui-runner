@@ -233,7 +233,7 @@ pub fn run_checks(checks: Vec<Check<'_>>) -> DoctorReport {
 }
 
 // ===========================================================================
-// Single source of truth — the static spec for each of the 9 checks.
+// Single source of truth — the static spec for each of the 10 checks.
 //
 // `name` and `fix` are sourced FROM here by `diagnose()` (so the live report
 // can't drift from this table), and the onboarding doc is GENERATED from here
@@ -264,7 +264,7 @@ pub struct CheckSpec {
     pub advisory: bool,
 }
 
-/// The 9 checks in `diagnose()` order. THE single source of truth for check
+/// The 10 checks in `diagnose()` order. THE single source of truth for check
 /// names + fixes (the live report sources them here) and for the onboarding
 /// doc (which is generated from here). Index 5 (check 6, device-JWT-live) is
 /// also the source the `DEVICE_JWT_LIVE_CHECK_NAME`/`_FIX` constants derive
@@ -348,6 +348,21 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
               dev-start.ps1 / the supervisor); spawns are stripped either way",
         advisory: true,
     },
+    CheckSpec {
+        name: "mcp_json_not_dcr_escalating",
+        title: ".mcp.json carries the non-escalating header shape",
+        verifies: "the coord-mcp proxy .mcp.json carries the nonce in a static \
+                   `Authorization: Bearer` header, not only in the legacy \
+                   `X-Coord-Mcp-Proxy-Key` one — a legacy-only file \
+                   authenticates fine today and still makes the next MCP \
+                   client launched against it escalate a stale-key 401 into \
+                   OAuth discovery, Dynamic Client Registration, this runner's \
+                   own 404, and a durable client-side poison entry",
+        fix: "spawn a terminal in that workdir (every session spawn rewrites \
+              the file through the current emitter), or restart the runner so \
+              the boot self-heal upgrades it in place with the same nonce",
+        advisory: true,
+    },
 ];
 
 /// Look up a [`CheckSpec`] by name at construction time. Panics if the name is
@@ -420,7 +435,7 @@ pub fn render_onboarding_doc() -> String {
 }
 
 // ===========================================================================
-// Real wiring — the 9 checks, reusing existing predicates / on-disk state.
+// Real wiring — the 10 checks, reusing existing predicates / on-disk state.
 // ===========================================================================
 
 /// Runtime-only facts the lib can't observe on its own. Injected so the Tauri
@@ -476,6 +491,7 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
     let s_mcp = spec("mcp_json_valid");
     let s_coord = spec("coord_reachable");
     let s_markers = spec("no_inherited_session_markers");
+    let s_dcr = spec("mcp_json_not_dcr_escalating");
 
     let checks = vec![
         Check::new(s_claude.name, s_claude.fix, move || {
@@ -609,6 +625,14 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
         // advisory it also runs even when an earlier check went red — which is
         // the point, since env hygiene is independent of the credential chain.
         Check::from_spec(s_markers, inherited_session_markers_check),
+        // ADVISORY, and last. A legacy-only config is a real finding but not a
+        // blocker: it authenticates perfectly today, so failing the report on
+        // it would withhold gate registration from a runner whose coord access
+        // works. Being advisory it also runs after a blocking red — which is
+        // the point here, because the header shape is independent of the
+        // credential chain, and the machines most likely to carry a pre-Phase-2
+        // config are exactly the ones with something else wrong too.
+        Check::from_spec(s_dcr, mcp_json_dcr_escalation_check),
     ];
 
     run_checks(checks)
@@ -906,17 +930,37 @@ fn resolve_tenant_for_doctor(bearer: &str) -> Option<(uuid::Uuid, &'static str)>
 // bearer must decode `sub_type == "device"`.
 // ---------------------------------------------------------------------------
 
-/// Extract `(port, nonce)` from a session `.mcp.json`'s coord-mcp loopback
-/// proxy entry, if it is the proxy shape (`url` = `http://127.0.0.1:<port>/
-/// coord-mcp` plus a proxy nonce). `None` for a static-bearer (agent-path)
-/// config or a non-coord config.
+/// What a session `.mcp.json`'s coord-mcp loopback proxy entry holds, when it
+/// holds the proxy shape at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProxyConfigFacts {
+    /// The loopback port the `url` names.
+    port: u16,
+    /// The proxy nonce, under either accepted header name.
+    nonce: String,
+    /// Whether the `headers` map carries a static `Authorization` key AT ALL —
+    /// a question about the map's SHAPE, not about the credential in it.
+    ///
+    /// It is a separate fact from `nonce` precisely because the two can
+    /// disagree in the direction that matters: a legacy-only config resolves a
+    /// perfectly live `nonce` and still has no `Authorization` key, which is
+    /// the shape that leaves the next MCP client escalating a 401 into
+    /// OAuth/DCR. Check 6 (credential health) reads `nonce`; check 10 (DCR
+    /// safety) reads this.
+    has_static_authorization: bool,
+}
+
+/// Extract the proxy facts from a session `.mcp.json`'s coord-mcp entry, if it
+/// is the proxy shape (`url` = `http://127.0.0.1:<port>/coord-mcp` plus a proxy
+/// nonce). `None` for a static-bearer (agent-path) config or a non-coord
+/// config.
 ///
 /// The nonce is resolved by [`crate::coord_mcp_config::proxy_nonce_from_header_object`],
 /// which accepts BOTH the Phase 2 `Authorization: Bearer <nonce>` shape and the
 /// legacy `X-Coord-Mcp-Proxy-Key` header — hardcoding either name here would
 /// make `coord doctor` blind to one half of the configs on disk, and silently
 /// (a `None` reads as "not a proxy config", not as an error).
-fn parse_mcp_json_proxy(path: &Path) -> Option<(u16, String)> {
+fn parse_mcp_json_proxy(path: &Path) -> Option<ProxyConfigFacts> {
     let bytes = std::fs::read(path).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let server = v.get("mcpServers")?.get("coord-mcp")?;
@@ -926,7 +970,29 @@ fn parse_mcp_json_proxy(path: &Path) -> Option<(u16, String)> {
     let port_str = after.strip_suffix("/coord-mcp")?;
     let port: u16 = port_str.parse().ok()?;
     let nonce = crate::coord_mcp_config::proxy_nonce_from_header_object(server.get("headers")?)?;
-    Some((port, nonce))
+    // Asked of the WHOLE document, through the same predicate the boot
+    // self-heal's upgrade arm keys on, so the doctor and the repair can never
+    // disagree about which files are still escalating.
+    let has_static_authorization = crate::coord_mcp_config::config_doc_has_static_authorization(&v);
+    Some(ProxyConfigFacts {
+        port,
+        nonce,
+        has_static_authorization,
+    })
+}
+
+/// Locate the coord-mcp proxy `.mcp.json` the way check 6 does: cwd first, then
+/// one level up (a common layout is cwd = sub-repo, config at the repo root).
+/// Shared by checks 6 and 10 so they can never report on two different files.
+fn find_proxy_mcp_json() -> Option<(PathBuf, ProxyConfigFacts)> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut candidates = vec![cwd.join(".mcp.json")];
+    if let Some(parent) = cwd.parent() {
+        candidates.push(parent.join(".mcp.json"));
+    }
+    candidates
+        .into_iter()
+        .find_map(|p| parse_mcp_json_proxy(&p).map(|facts| (p, facts)))
 }
 
 fn jwt_sub_type(token: &str) -> Option<String> {
@@ -945,27 +1011,13 @@ fn jwt_sub_type(token: &str) -> Option<String> {
 }
 
 fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (bool, String) {
-    // Look for a coord-mcp proxy `.mcp.json` in the cwd, then the repo root.
-    let candidates: Vec<PathBuf> = {
-        let mut v = Vec::new();
-        if let Ok(cwd) = std::env::current_dir() {
-            v.push(cwd.join(".mcp.json"));
-            // one level up (common: cwd is a sub-repo, config at repo root)
-            if let Some(parent) = cwd.parent() {
-                v.push(parent.join(".mcp.json"));
-            }
-        }
-        v
-    };
-    let found = candidates
-        .into_iter()
-        .find_map(|p| parse_mcp_json_proxy(&p).map(|pr| (p, pr)));
-    let Some((path, (cfg_port, nonce))) = found else {
+    let Some((path, facts)) = find_proxy_mcp_json() else {
         return (
             false,
             "no coord-mcp proxy .mcp.json found in cwd or repo root".into(),
         );
     };
+    let (cfg_port, nonce) = (facts.port, facts.nonce);
 
     // Port == bound port (when we know the bound port).
     match bound_port {
@@ -1029,6 +1081,73 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
             false,
             format!("access-token bearer is not a coord DEVICE JWT (sub_type={other:?})"),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Check 10 — the `.mcp.json` header SHAPE (advisory).
+//
+// Post-merge follow-up to plan
+// `2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning`. That plan
+// introduced the distinction this check reports and wired the predicate
+// (`coord_mcp_config::config_doc_has_static_authorization`) to exactly ONE
+// consumer: the boot self-heal's in-place upgrade arm. Nothing an operator can
+// run could see it — check 6 reports port, nonce registration and bearer type,
+// all of which a legacy-only config passes, so `coord doctor` called the
+// DCR-escalating shape fully green. A diagnostic that cannot see the failure
+// class its own plan exists to close is the gap this closes.
+// ---------------------------------------------------------------------------
+
+/// Report whether the discovered coord-mcp proxy `.mcp.json` still carries only
+/// the legacy `X-Coord-Mcp-Proxy-Key` header.
+///
+/// **Green is not "the credential is healthy"** — that is check 6's question,
+/// and the two deliberately disagree on exactly one input: a live, registered
+/// nonce carried ONLY in the legacy header is green there and red here. The
+/// mechanism is measured (client 2.1.236/2.1.237): an MCP client whose static
+/// `headers` map has no `Authorization` key attaches an OAuth provider, so a
+/// later stale-key 401 runs RFC 9728 → RFC 8414 discovery, falls through to
+/// Dynamic Client Registration at `<origin>/register`, gets this runner's own
+/// 404, and writes a durable `mcpOAuth` entry after which it sends the (now
+/// healthy) server **zero** requests forever.
+///
+/// "No proxy config found" is reported as GREEN with an explicit not-applicable
+/// detail, not as a failure. This check asks one question about a file, and a
+/// runner with no proxy `.mcp.json` in reach has no escalating file — saying
+/// so is honest, whereas warning would put a permanent advisory on every
+/// agent-path and bare-cwd runner. The absent-config case is check 6's to
+/// fail, and it does.
+fn mcp_json_dcr_escalation_check() -> (bool, String) {
+    let Some((path, facts)) = find_proxy_mcp_json() else {
+        return (
+            true,
+            "no coord-mcp proxy .mcp.json in cwd or repo root — nothing here can \
+             escalate (check 6 owns whether one SHOULD be present)"
+                .into(),
+        );
+    };
+    if facts.has_static_authorization {
+        (
+            true,
+            format!(
+                "{}: carries a static Authorization header, so a stale-key 401 \
+                 cannot escalate into OAuth/DCR",
+                path.display()
+            ),
+        )
+    } else {
+        (
+            false,
+            format!(
+                "{}: carries ONLY the legacy X-Coord-Mcp-Proxy-Key header. The \
+                 credential is fine — this is about the header SHAPE: the next MCP \
+                 client launched against this file will attach an OAuth provider, so \
+                 a future stale-key 401 escalates into discovery -> Dynamic Client \
+                 Registration -> this runner's 404 -> a durable client-side poison \
+                 entry that silences the server permanently",
+                path.display()
+            ),
+        )
     }
 }
 
@@ -1309,7 +1428,8 @@ mod tests {
                "headers":{"X-Coord-Mcp-Proxy-Key":"abc123"}}}}"#,
         )
         .unwrap();
-        let (port, nonce) = parse_mcp_json_proxy(&path).expect("parses proxy config");
+        let facts = parse_mcp_json_proxy(&path).expect("parses proxy config");
+        let (port, nonce) = (facts.port, facts.nonce);
         assert_eq!(port, 9877);
         assert_eq!(nonce, "abc123");
         let _ = std::fs::remove_file(&path);
@@ -1332,9 +1452,13 @@ mod tests {
                "headers":{"Authorization":"Bearer noncefromauth"}}}}"#,
         )
         .unwrap();
-        let (port, nonce) = parse_mcp_json_proxy(&path).expect("parses the new shape");
-        assert_eq!(port, 9877);
-        assert_eq!(nonce, "noncefromauth");
+        let facts = parse_mcp_json_proxy(&path).expect("parses the new shape");
+        assert_eq!(facts.port, 9877);
+        assert_eq!(facts.nonce, "noncefromauth");
+        assert!(
+            facts.has_static_authorization,
+            "the shape fact travels alongside the nonce — check 10 reads it"
+        );
 
         // Both present, disagreeing → Authorization wins, matching the
         // request-side resolver the runner authenticates with.
@@ -1346,8 +1470,79 @@ mod tests {
                           "X-Coord-Mcp-Proxy-Key":"fromlegacy"}}}}"#,
         )
         .unwrap();
-        assert_eq!(parse_mcp_json_proxy(&path).unwrap().1, "fromauth");
+        assert_eq!(parse_mcp_json_proxy(&path).unwrap().nonce, "fromauth");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The predicate check 10 is built on: a legacy-only config resolves a
+    /// perfectly good nonce AND reports the escalating shape. The two facts
+    /// must be independent, because that combination — healthy credential,
+    /// escalating shape — is the entire population this check exists to find,
+    /// and it is exactly the one check 6 passes.
+    #[test]
+    fn parse_mcp_json_proxy_reports_a_legacy_only_config_as_escalating() {
+        let dir = std::env::temp_dir().join("qontinui_doctor_test_mcp_legacy_shape");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"coord-mcp":{"type":"http",
+               "url":"http://127.0.0.1:9876/coord-mcp",
+               "headers":{"X-Coord-Mcp-Proxy-Key":"livenonce"}}}}"#,
+        )
+        .unwrap();
+        let facts = parse_mcp_json_proxy(&path).expect("a legacy config is still a proxy config");
+        assert_eq!(facts.nonce, "livenonce", "the credential reads fine");
+        assert!(
+            !facts.has_static_authorization,
+            "...and the SHAPE is still the DCR-escalating one — that is the \
+             whole finding"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Check 10's own arms. Driven through `run_checks` so the advisory
+    /// contract is asserted too: a red here must NOT fail the report.
+    #[test]
+    fn dcr_escalation_check_warns_without_blocking() {
+        let escalating = || {
+            (
+                false,
+                "…: carries ONLY the legacy X-Coord-Mcp-Proxy-Key header".to_string(),
+            )
+        };
+        let report = run_checks(vec![Check::from_spec(
+            spec("mcp_json_not_dcr_escalating"),
+            escalating,
+        )]);
+        assert!(
+            report.overall_ok,
+            "a legacy-only config authenticates fine — it must never withhold \
+             gate registration"
+        );
+        assert!(!report.checks[0].ok, "but it must still be RED");
+        assert!(report.checks[0].advisory);
+    }
+
+    /// The live predicate must never PANIC and must never report an absent
+    /// proxy config as a finding: a runner with no `.mcp.json` in reach has no
+    /// escalating file, and warning there would put a permanent advisory on
+    /// every agent-path and bare-cwd runner. Whether one should be present is
+    /// check 6's question, and it fails on it.
+    ///
+    /// Runs against whatever the real cwd holds, so it asserts the invariant
+    /// that holds either way rather than faking a posture.
+    #[test]
+    fn dcr_escalation_check_is_total_and_green_when_no_proxy_config_exists() {
+        let (ok, detail) = mcp_json_dcr_escalation_check();
+        assert!(!detail.is_empty(), "every arm must say what it observed");
+        if find_proxy_mcp_json().is_none() {
+            assert!(ok, "no proxy config in reach ⇒ nothing can escalate");
+            assert!(
+                detail.contains("nothing here can escalate"),
+                "and it must say so rather than implying a healthy file: {detail}"
+            );
+        }
     }
 
     #[test]
@@ -1387,7 +1582,7 @@ mod tests {
 
     #[test]
     fn check_specs_has_exactly_nine_entries_eight_blocking_one_advisory() {
-        assert_eq!(CHECK_SPECS.len(), 9);
+        assert_eq!(CHECK_SPECS.len(), 10);
         // The split matters more than the total: the doc prose, the module
         // doc, and `render_onboarding_doc` all describe the two classes, and
         // the blocking count is what "green on all of them ⇒ can set gates"
@@ -1494,6 +1689,16 @@ mod tests {
         );
     }
 
+    /// The advisory roster is pinned by NAME, not by count: an advisory check
+    /// does not block gate access, so adding one has to be an explicit edit
+    /// here rather than something a new `CheckSpec` can do quietly.
+    ///
+    /// `mcp_json_not_dcr_escalating` is advisory on purpose. A legacy-only
+    /// `.mcp.json` authenticates perfectly — check 6 passes it on every
+    /// dimension it measures — so failing the report on it would withhold gate
+    /// registration from a runner whose coord access demonstrably works. The
+    /// finding is about what the NEXT client will do with a future 401, which
+    /// is a warning, not a blocker.
     #[test]
     fn exactly_the_marker_check_is_advisory_in_the_spec_table() {
         let advisory: Vec<&str> = CHECK_SPECS
@@ -1503,7 +1708,10 @@ mod tests {
             .collect();
         assert_eq!(
             advisory,
-            vec!["no_inherited_session_markers"],
+            vec![
+                "no_inherited_session_markers",
+                "mcp_json_not_dcr_escalating"
+            ],
             "adding an advisory check is a deliberate act — a check that does \
              not block gate access must be justified here"
         );

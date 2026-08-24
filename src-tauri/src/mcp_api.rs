@@ -5592,8 +5592,8 @@ pub fn create_router(
                     .collect(),
                 None => Vec::new(),
             };
-            let session_rewritten = if workdirs.is_empty() {
-                0
+            let session_counts = if workdirs.is_empty() {
+                Default::default()
             } else {
                 crate::coord_mcp::reconcile_session_configs(workdirs, reconcile_bound_port)
             };
@@ -5622,11 +5622,19 @@ pub fn create_router(
                     "unnamed-secondary".to_string()
                 }
             });
+            // The two session counts are reported SEPARATELY: a `rewrote` is a
+            // nonce rotation (a live client holding the old one must reconnect),
+            // an `upgraded` preserved its nonce byte-for-byte and only gained the
+            // static `Authorization` key. One combined number would read every
+            // harmless shape repair as a rotation on the boot line an operator
+            // greps when sessions start 401ing.
             info!(
                 "coord_mcp boot reconcile: restored {restored} persisted nonce(s), \
                  reaped {reaped} stale session-restore config(s), \
-                 rewrote {session_rewritten} session config(s), root self-heal = {root_action:?} \
-                 (instance {reconcile_instance}, bound port :{reconcile_bound_port})"
+                 rewrote {} session config(s), upgraded {} session config header shape(s) \
+                 (nonce preserved), root self-heal = {root_action:?} \
+                 (instance {reconcile_instance}, bound port :{reconcile_bound_port})",
+                session_counts.rewritten, session_counts.upgraded
             );
             if matches!(root_action, crate::coord_mcp::RootReconcileAction::Rewrite)
                 && restored == 0

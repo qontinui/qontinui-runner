@@ -62,6 +62,14 @@ Advisory: a failure here is a **warning**, not a blocker — it does not stop ga
 
 **Fix:** restart the runner from a shell without the markers (via dev-start.ps1 / the supervisor); spawns are stripped either way
 
+### 10. .mcp.json carries the non-escalating header shape (`mcp_json_not_dcr_escalating`) — ADVISORY
+
+Verifies: the coord-mcp proxy .mcp.json carries the nonce in a static `Authorization: Bearer` header, not only in the legacy `X-Coord-Mcp-Proxy-Key` one — a legacy-only file authenticates fine today and still makes the next MCP client launched against it escalate a stale-key 401 into OAuth discovery, Dynamic Client Registration, this runner's own 404, and a durable client-side poison entry
+
+Advisory: a failure here is a **warning**, not a blocker — it does not stop gate registration and does not fail the report. It also runs even when an earlier check went red.
+
+**Fix:** spawn a terminal in that workdir (every session spawn rewrites the file through the current emitter), or restart the runner so the boot self-heal upgrades it in place with the same nonce
+
 ---
 
 `coord doctor` runs these checks live. The **blocking** checks stop at the first failure, naming that one link plus its fix; **advisory** checks always run and only ever warn. Run it from **Settings → Account** in the runner app, or headless via the `coord_doctor` bin (`cargo run --bin coord_doctor`). Green on all of them ⇒ this runner can set gates.
