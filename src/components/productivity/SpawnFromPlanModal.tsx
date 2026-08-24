@@ -281,7 +281,9 @@ export function SpawnFromPlanModal({
               The notice sits ahead of the fields in the reading order
               because the fields it explains are `disabled` and therefore
               unreachable by keyboard and screen reader. */}
-          {coordDisabled ? <CoordConnectionRequired {...spawnNoticeProps(coord.source, onClose)} /> : null}
+          {coordDisabled ? (
+            <CoordConnectionRequired {...spawnNoticeProps(coord.source, onClose)} />
+          ) : null}
 
           <label className="block">
             <span className="block text-xs font-medium text-foreground mb-1">Work unit slug</span>

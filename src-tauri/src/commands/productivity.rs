@@ -2048,6 +2048,33 @@ fn parse_plan_phase(raw: &str) -> Result<Option<u32>, String> {
         .map_err(|_| format!("Phase must be a number (e.g. 4) — got {trimmed:?}."))
 }
 
+/// Turn the Option-family base into the spawn URL prefix, or an operator-facing
+/// refusal naming ISOLATION as the cause.
+///
+/// Split from [`spawn_from_plan`] so both arms are testable without touching
+/// process env — the same split, for the same reason, as
+/// [`overlapping_intents_for_base`].
+///
+/// The two commands diverge on what isolation MEANS, and deliberately so.
+/// Overlapping intents is a passive read, so `None` yields an empty panel.
+/// A spawn is an operator action with an expected effect: silently doing
+/// nothing would be the "clicked and nothing happened" failure the §6.4 UI
+/// gate exists to remove, so this arm refuses out loud and names the fix.
+/// The wording tracks the frontend's `coordDisabledCopy` no-account body, so
+/// an operator who reaches this through the fail-open window reads the same
+/// diagnosis the disabled panel would have shown.
+fn spawn_base_or_isolated(base: Option<String>) -> Result<String, String> {
+    let Some(base) = base else {
+        return Err(concat!(
+            "This runner is in isolated mode — no qontinui account is connected, so ",
+            "there is no coordinator to spawn an agent on. Connect an account under ",
+            "Settings → Account (or point COORD_HTTP_URL at a coordinator) and try again."
+        )
+        .to_string());
+    };
+    Ok(base.trim_end_matches('/').to_string())
+}
+
 /// `spawn_from_plan` — authenticated POST to coord's `POST /agents/spawn`.
 ///
 /// Returns coord's spawn result as a permissive `serde_json::Value` (mirrors
@@ -2089,10 +2116,29 @@ pub async fn spawn_from_plan(
     initial_prompt: String,
     declared_overlap_paths: Vec<String>,
 ) -> Result<serde_json::Value, String> {
-    // Resolve the coord base the SAME way `get_coord_http_base` does
-    // (env `COORD_HTTP_URL` → active profile `coord_url` → dev-localhost).
-    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
-    let base = base.trim_end_matches('/');
+    // `connected_coord_base` — the Option-family policy resolver, for the same
+    // reason `list_overlapping_intents` uses it: this feature must NO-OP when
+    // the runner is standalone, and the String-family sibling
+    // `coord_base_with_source` cannot express "isolated" at all.
+    //
+    // Two concrete wrong answers the String family gave here. With nothing
+    // configured it invents `http://localhost:9870`, so a spawn on a
+    // standalone install POSTed at a phantom coord and surfaced as a bare
+    // connection error. Worse, when `settings.json` cannot be READ the tier is
+    // UNKNOWN and that family guesses the PRODUCTION base — so this command
+    // would have carried the operator's Cognito bearer to
+    // `https://coord.qontinui.io/agents/spawn` and minted a real agent off a
+    // membership the runner never established. `classify_connected` refuses
+    // exactly that egress ("absence of evidence about the tier is not evidence
+    // of membership"); routing through it makes this command obey the same
+    // rule.
+    //
+    // The §6.4 UI gate does not make this unreachable: it fails OPEN on an
+    // unresolved mode by design (a wrongly-disabled panel on a connected
+    // runner is worse than a wrongly-enabled one), and `SpawnFromPlanModal`
+    // documents that the mode can resolve to `isolated` while the modal is
+    // already on screen.
+    let base = spawn_base_or_isolated(qontinui_runner_lib::profiles::connected_coord_base())?;
     let url = format!("{base}/agents/spawn");
 
     // The operator's Cognito user bearer — refresh-first, then read. `None`
@@ -2750,6 +2796,64 @@ mod launch_intent_tests {
 
 /// Wire-contract tests for the `POST /agents/spawn` body
 /// (plan `2026-07-28-coord-post-plan-slug-surfaces-rename`, Stage 4a).
+#[cfg(test)]
+mod spawn_base_tests {
+    use super::*;
+
+    #[test]
+    fn connected_base_becomes_the_spawn_prefix() {
+        let got = spawn_base_or_isolated(Some("https://coord.qontinui.io".to_string())).unwrap();
+        assert_eq!(
+            format!("{got}/agents/spawn"),
+            "https://coord.qontinui.io/agents/spawn"
+        );
+    }
+
+    #[test]
+    fn trailing_slashes_do_not_double_up_in_the_url() {
+        let got = spawn_base_or_isolated(Some("https://coord.qontinui.io///".to_string())).unwrap();
+        assert_eq!(
+            format!("{got}/agents/spawn"),
+            "https://coord.qontinui.io/agents/spawn"
+        );
+    }
+
+    /// The arm this whole split exists for. `connected_coord_base` yields
+    /// `None` on a standalone install AND on an unreadable `settings.json`;
+    /// either way there is nothing to POST to, and the previous String-family
+    /// resolver answered with a phantom localhost (or, on the unknown tier,
+    /// the PRODUCTION base) instead of saying so.
+    #[test]
+    fn isolated_refuses_out_loud_instead_of_dialing_a_guess() {
+        let err = spawn_base_or_isolated(None).unwrap_err();
+        assert!(
+            err.contains("isolated mode"),
+            "should name the cause: {err}"
+        );
+        assert!(
+            err.contains("Settings"),
+            "should name the in-app fix, mirroring the frontend copy: {err}"
+        );
+        // It must not leak either guessed base into an operator-facing string.
+        assert!(
+            !err.contains("localhost"),
+            "must not name the dev guess: {err}"
+        );
+        assert!(
+            !err.contains("coord.qontinui.io"),
+            "must not name prod: {err}"
+        );
+        // Built with `concat!`, not `\`-continued literals: rustfmt collapses a
+        // continued literal onto one line and KEEPS the source indentation as
+        // real spaces, so the operator would read a sentence with 20-space gaps
+        // in it. This assertion is the only thing that notices.
+        assert!(
+            !err.contains("  "),
+            "the message must not carry source indentation: {err:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod spawn_request_body_tests {
     use super::*;

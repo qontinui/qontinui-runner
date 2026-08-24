@@ -59,7 +59,7 @@ import {
   type Recommendation,
 } from "./reviewsApi";
 import { acknowledgeAdvisory } from "./reflectionApi";
-import { useCoordMode, type CoordGating } from "@/contexts/CoordModeContext";
+import { coordCallsReady, useCoordMode, type CoordGating } from "@/contexts/CoordModeContext";
 import {
   CoordConnectionRequired,
   coordDisabledCopy,
@@ -1308,13 +1308,18 @@ export function CoordinatorDashboard() {
     // Isolated runners have no coord replicating `coord.agent_worktrees`,
     // so this poll can only ever return an empty list. Skip it — the
     // panel states the reason instead of implying "no contention".
-    if (coord.isolated) return;
+    //
+    // Waiting on `coordCallsReady` rather than `isolated` alone also holds
+    // the mount read until `get_coord_mode` answers: `isolated` is false
+    // during that window, so an isolated runner used to fire this once per
+    // launch before the gate could close.
+    if (!coordCallsReady(coord)) return;
     void loadOverlap();
     const id = setInterval(() => {
       void loadOverlap();
     }, 30_000);
     return () => clearInterval(id);
-  }, [loadOverlap, coord.isolated]);
+  }, [loadOverlap, coord]);
 
   // Subscribe to `review-completed` so a finished /auto-review surfaces
   // here without forcing the user to refresh. Tauri may not be present in

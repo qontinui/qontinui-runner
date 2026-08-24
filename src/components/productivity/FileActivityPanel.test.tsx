@@ -594,4 +594,34 @@ describe("deriveLiveHeatmapGate — coord-mode gating (§6.4)", () => {
       pollEnabled: false,
     });
   });
+
+  // The fail-open window. `unknown` is what EVERY app start passes through,
+  // so gating the poll on `isolated` alone still let an isolated runner fire
+  // this coord read once per launch — the section renders live (fail open),
+  // but the request waits for the mode.
+  it("while the mode is still resolving → section live, poll held", () => {
+    expect(deriveLiveHeatmapGate({ testSeam: false, gating: unknown, resolving: true })).toEqual({
+      coordDisabled: false,
+      pollEnabled: false,
+    });
+  });
+
+  it("resolving:false is the settled case and polls as before", () => {
+    expect(deriveLiveHeatmapGate({ testSeam: false, gating: connected, resolving: false })).toEqual(
+      { coordDisabled: false, pollEnabled: true },
+    );
+    // A rejected `get_coord_mode` (a runner build predating the command)
+    // settles to unknown with `loading` false — it must NOT hold the poll.
+    expect(deriveLiveHeatmapGate({ testSeam: false, gating: unknown, resolving: false })).toEqual({
+      coordDisabled: false,
+      pollEnabled: true,
+    });
+  });
+
+  it("an isolated runner stays disabled whether or not the mode is resolving", () => {
+    expect(deriveLiveHeatmapGate({ testSeam: false, gating: isolated, resolving: true })).toEqual({
+      coordDisabled: true,
+      pollEnabled: false,
+    });
+  });
 });

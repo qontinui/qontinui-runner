@@ -173,9 +173,7 @@ export function runCoordDisabledAction(args: {
  *  `MainTabId` union. Avoids threading a navigate callback through every
  *  gated panel. */
 function dispatchSetTab(tab: string): void {
-  window.dispatchEvent(
-    new CustomEvent<{ tab: string }>("ui-bridge-set-tab", { detail: { tab } }),
-  );
+  window.dispatchEvent(new CustomEvent<{ tab: string }>("ui-bridge-set-tab", { detail: { tab } }));
 }
 
 export interface CoordConnectionRequiredProps {

@@ -184,6 +184,30 @@ export function deriveCoordGating(data: CoordMode | null): CoordGating {
   };
 }
 
+/**
+ * Whether a coord-backed surface should issue its network call YET.
+ *
+ * The gate itself fails open on `unknown`, and that is right for INTERACTIVITY
+ * — a wrongly-disabled panel on a connected runner removes a working feature.
+ * It is not right for EGRESS. `unknown` covers the mount-to-first-answer
+ * window, which every gated panel passes through on every app start, so an
+ * isolated runner still fired one request per gated surface at a coord that
+ * does not exist — and then started an interval doing it again. That is the
+ * same waste §6.4 gates the steady state to avoid, just bounded to startup.
+ *
+ * So the two questions get two answers: controls stay ENABLED while the mode
+ * resolves (fail open), and the requests WAIT for it (fail closed). The wait
+ * is one already-in-flight `get_coord_mode` invoke, shared process-wide by
+ * {@link fetchCoordModeOnce}, and it ends on rejection too — a runner build
+ * that predates the command settles to `unknown` and polls exactly as before.
+ *
+ * Pure, so each panel's poll decision is testable under the runner's
+ * `environment: "node"` vitest config.
+ */
+export function coordCallsReady(coord: { isolated: boolean; loading: boolean }): boolean {
+  return !coord.isolated && !coord.loading;
+}
+
 // ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
