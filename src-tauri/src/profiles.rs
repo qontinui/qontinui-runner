@@ -356,6 +356,16 @@ pub const PROD_COORD_BASE: &str = "https://coord.qontinui.io";
 /// `prod_coord_ws_url_matches_base` proves the pair stays in sync.
 pub const PROD_COORD_WS_URL: &str = "wss://coord.qontinui.io/ws";
 
+/// The production `qontinui-web` FastAPI backend FQDN — where `/api/v1/*`
+/// actually lives (the `qontinui.io` frontend host has no such routes).
+/// Duplicated from `api_config::PROD_API_BASE_URL` rather than imported:
+/// that module reaches into `crate::settings`/`crate::mcp`, which exist
+/// only in the `main` binary's module tree, not this lib crate's — so it
+/// isn't reachable from lib-crate bin targets like `qontinui_profile`
+/// without a larger refactor out of scope here. Keep these two values in
+/// sync by hand if `api.qontinui.io` ever changes. Fleet-join, 2026-08-24.
+pub const PROD_API_BASE_URL: &str = "https://api.qontinui.io";
+
 /// The `settings.json::tier` value that marks a hosted (production) runner —
 /// the same discriminator the coord doctor's tier check keys on.
 pub const QONTINUI_ACCOUNT_TIER: &str = "qontinui_account";
