@@ -265,6 +265,62 @@ pub struct GateDecision {
     pub p_value: Option<f64>,
     /// 95% CI of the mean paired delta, in percentage points.
     pub confidence_interval: Option<(f64, f64)>,
+    /// The sidecar's self-reported counts checked against its own vectors.
+    /// A disagreement never changes the verdict — see [`ReportedCountCheck`].
+    pub counts: ReportedCountCheck,
+}
+
+/// The sidecar's own count fields checked against what its score vectors
+/// actually contain.
+///
+/// [`GEPAResult::held_out_size`] and [`GEPAResult::excluded_count`] are the
+/// sidecar *telling us* how big the held-out split was and how much of it it
+/// failed to score. The vectors say the same thing independently, so the two
+/// have to agree — and a response whose halves disagree is exactly the class of
+/// silent wire break this client already had to be repaired for once. Checking
+/// is nearly free and turns two otherwise-unread mirror fields into a contract
+/// assertion.
+///
+/// This is a **diagnostic, not a gate**: the decision is computed from the
+/// vectors either way, because they are the thing the comparison is actually
+/// made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportedCountCheck {
+    /// `held_out_size` as reported by the sidecar.
+    pub held_out_size_reported: usize,
+    /// Length of the score vectors — the held-out size as observed.
+    pub held_out_size_actual: usize,
+    /// `excluded_count` as reported by the sidecar.
+    pub excluded_reported: usize,
+    /// Positions actually dropped because at least one arm was `None`.
+    pub excluded_actual: usize,
+}
+
+impl ReportedCountCheck {
+    /// Whether the sidecar's self-report matches its own vectors.
+    pub fn agrees(&self) -> bool {
+        self.held_out_size_reported == self.held_out_size_actual
+            && self.excluded_reported == self.excluded_actual
+    }
+}
+
+/// Compare the sidecar's reported counts against its score vectors.
+///
+/// `actual_len` is the number of score-vector **positions** (`old_scores.len()`),
+/// NOT [`GateDecision::paired`] — those are different quantities here, and
+/// passing the paired count would raise a false alarm on every response with a
+/// single failed example. `excluded_actual` is the number of positions dropped.
+pub fn check_reported_counts(
+    result: &GEPAResult,
+    actual_len: usize,
+    excluded_actual: usize,
+) -> ReportedCountCheck {
+    ReportedCountCheck {
+        held_out_size_reported: result.held_out_size,
+        held_out_size_actual: actual_len,
+        excluded_reported: result.excluded_count,
+        excluded_actual,
+    }
 }
 
 /// Run the held-out validation gate over a sidecar result.
@@ -280,18 +336,27 @@ pub fn evaluate_held_out(result: &GEPAResult) -> GateDecision {
     let thresholds = VerdictThresholds::held_out_gate();
 
     if result.old_scores.len() != result.new_scores.len() {
+        // Nothing is pairable, so every position counts as excluded. The
+        // reported counts go into the warning too: this IS the wire-break class
+        // `ReportedCountCheck` exists for, and it is the least useful moment to
+        // stay quiet about what the sidecar claimed.
+        let unpairable = result.old_scores.len().max(result.new_scores.len());
+        let counts = check_reported_counts(result, unpairable, unpairable);
         warn!(
             old_len = result.old_scores.len(),
             new_len = result.new_scores.len(),
+            held_out_size_reported = counts.held_out_size_reported,
+            excluded_reported = counts.excluded_reported,
             "Held-out score vectors differ in length; nothing can be paired"
         );
         return GateDecision {
             verdict: Verdict::InsufficientData,
             paired: 0,
-            excluded: result.old_scores.len().max(result.new_scores.len()),
+            excluded: unpairable,
             mean_delta_pp: 0.0,
             p_value: None,
             confidence_interval: None,
+            counts,
         };
     }
 
@@ -311,6 +376,17 @@ pub fn evaluate_held_out(result: &GEPAResult) -> GateDecision {
     let paired = deltas_pp.len();
     let excluded = total - paired;
 
+    let counts = check_reported_counts(result, total, excluded);
+    if !counts.agrees() {
+        warn!(
+            held_out_size_reported = counts.held_out_size_reported,
+            held_out_size_actual = counts.held_out_size_actual,
+            excluded_reported = counts.excluded_reported,
+            excluded_actual = counts.excluded_actual,
+            "Sidecar's reported held-out counts disagree with its own score vectors; deciding from the vectors"
+        );
+    }
+
     // Guard the all-excluded case explicitly rather than leaning on
     // `min_runs`: it is the *current* state of the world (the sidecar's metric
     // is wire-broken, so every example fails), and a mean over an empty vector
@@ -323,6 +399,7 @@ pub fn evaluate_held_out(result: &GEPAResult) -> GateDecision {
             mean_delta_pp: 0.0,
             p_value: None,
             confidence_interval: None,
+            counts,
         };
     }
 
@@ -337,6 +414,7 @@ pub fn evaluate_held_out(result: &GEPAResult) -> GateDecision {
         mean_delta_pp,
         p_value: analysis.p_value,
         confidence_interval: analysis.confidence_interval,
+        counts,
     }
 }
 
@@ -553,6 +631,8 @@ impl GepaIntegration {
             excluded = decision.excluded,
             mean_delta_pp = decision.mean_delta_pp,
             p_value = ?decision.p_value,
+            confidence_interval = ?decision.confidence_interval,
+            counts_agree = decision.counts.agrees(),
             instructions_changed = result.instructions_changed,
             "Held-out validation gate evaluated"
         );
@@ -604,8 +684,17 @@ mod tests {
 
     /// Build a result with the given per-example vectors; everything else is
     /// filler so the gate tests read as gate tests.
+    ///
+    /// `held_out_size` / `excluded_count` are derived from the vectors so the
+    /// fixture is self-consistent — a gate test must not accidentally exercise
+    /// [`check_reported_counts`]'s mismatch arm.
     fn result_with(old: Vec<Option<f64>>, new: Vec<Option<f64>>) -> GEPAResult {
         let held_out_size = old.len();
+        let excluded_count = old
+            .iter()
+            .zip(new.iter())
+            .filter(|(o, n)| o.is_none() || n.is_none())
+            .count();
         GEPAResult {
             old_instructions: "old".to_string(),
             new_instructions: "old".to_string(),
@@ -616,7 +705,7 @@ mod tests {
             old_scores: old,
             new_scores: new,
             held_out_size,
-            excluded_count: 0,
+            excluded_count,
             domain_widened: false,
             few_shot_examples: vec![],
         }
@@ -877,6 +966,109 @@ mod tests {
             decision.mean_delta_pp
         );
         assert_eq!(decision.verdict, Verdict::Neutral);
+    }
+
+    // ------------------------------------------------------------------
+    // Sidecar self-report vs. its own vectors
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_reported_counts_agree_with_consistent_response() {
+        // `result_with` derives both counts from the vectors, so this is the
+        // shape a correct sidecar sends.
+        let result = result_with(
+            vec![Some(0.5), None, Some(0.7)],
+            vec![Some(0.6), Some(0.6), None],
+        );
+        let check = check_reported_counts(&result, 3, 2);
+
+        assert!(
+            check.agrees(),
+            "consistent response flagged as a mismatch: {check:?}"
+        );
+        assert_eq!(check.held_out_size_reported, 3);
+        assert_eq!(check.excluded_reported, 2);
+    }
+
+    #[test]
+    fn test_reported_held_out_size_mismatch_is_detected() {
+        let mut result = result_with(vec![Some(0.5), Some(0.6)], vec![Some(0.7), Some(0.8)]);
+        // The sidecar claims a bigger held-out split than it sent scores for —
+        // the silent-truncation shape.
+        result.held_out_size = 10;
+        let check = check_reported_counts(&result, 2, 0);
+
+        assert!(!check.agrees());
+        assert_eq!(check.held_out_size_reported, 10);
+        assert_eq!(check.held_out_size_actual, 2);
+    }
+
+    #[test]
+    fn test_reported_excluded_count_mismatch_is_detected() {
+        let mut result = result_with(vec![Some(0.5), None], vec![Some(0.7), Some(0.8)]);
+        // Sidecar says nothing was dropped; its own vectors say one position was.
+        result.excluded_count = 0;
+        let check = check_reported_counts(&result, 2, 1);
+
+        assert!(!check.agrees());
+        assert_eq!(check.excluded_reported, 0);
+        assert_eq!(check.excluded_actual, 1);
+    }
+
+    /// A disagreement is a diagnostic, not a gate — the verdict still comes
+    /// from the vectors, which are what the comparison is actually made of.
+    #[test]
+    fn test_count_mismatch_does_not_change_the_verdict() {
+        let old = vec![Some(0.50); 12];
+        let new = vec![Some(0.65); 12];
+
+        let honest = evaluate_held_out(&result_with(old.clone(), new.clone()));
+
+        let mut lying = result_with(old, new);
+        lying.held_out_size = 999;
+        lying.excluded_count = 999;
+        let lied_about = evaluate_held_out(&lying);
+
+        // Everything the decision IS survives the lie...
+        assert_eq!(honest.verdict, lied_about.verdict);
+        assert_eq!(honest.paired, lied_about.paired);
+        assert_eq!(honest.excluded, lied_about.excluded);
+        assert_eq!(honest.mean_delta_pp, lied_about.mean_delta_pp);
+        assert_eq!(honest.p_value, lied_about.p_value);
+        assert_eq!(honest.confidence_interval, lied_about.confidence_interval);
+        assert_eq!(lied_about.verdict, Verdict::Positive);
+
+        // ...and only the diagnostic notices it.
+        assert!(honest.counts.agrees());
+        assert!(!lied_about.counts.agrees());
+    }
+
+    /// Pins WHICH length `evaluate_held_out` hands the check.
+    ///
+    /// The two candidates — the vector length and [`GateDecision::paired`] —
+    /// differ exactly when an example failed to score, and passing `paired`
+    /// would raise a false wire-break alarm on every such (healthy) response.
+    /// Without this, that substitution is invisible to the suite.
+    #[test]
+    fn test_check_is_given_the_vector_length_not_the_paired_count() {
+        // 12 positions, one of which is unpaired: paired = 11, total = 12.
+        let mut old: Vec<Option<f64>> = (0..12).map(|i| Some(0.40 + i as f64 * 0.01)).collect();
+        let new: Vec<Option<f64>> = (0..12).map(|i| Some(0.50 + i as f64 * 0.01)).collect();
+        old[3] = None;
+
+        let decision = evaluate_held_out(&result_with(old, new));
+
+        assert_eq!(decision.paired, 11);
+        assert_eq!(decision.counts.held_out_size_actual, 12);
+        assert_ne!(decision.counts.held_out_size_actual, decision.paired);
+        assert_eq!(decision.counts.excluded_actual, 1);
+        // `result_with` derives a self-consistent report, so a correct sidecar
+        // response must NOT trip the diagnostic just because one example failed.
+        assert!(
+            decision.counts.agrees(),
+            "healthy response with one failed example raised a false alarm: {:?}",
+            decision.counts
+        );
     }
 
     // ------------------------------------------------------------------

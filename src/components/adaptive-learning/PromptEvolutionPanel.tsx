@@ -8,6 +8,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { gepaStatusStyle, isAcceptedRun } from "./gepaRunStatus";
 
 interface GepaRun {
   id: string;
@@ -35,6 +36,7 @@ const AUTO_REFRESH_MS = 60_000;
 
 export function PromptEvolutionPanel() {
   const [runs, setRuns] = useState<GepaRun[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<GepaRunDetail | null>(null);
@@ -47,8 +49,14 @@ export function PromptEvolutionPanel() {
     try {
       const result = await invoke<GepaRun[]>("get_gepa_runs", { limit: 50 });
       setRuns(result);
+      setLoadError(null);
     } catch (err) {
+      // An empty table and a failed query are NOT the same observable. Without
+      // this the catch branch renders the empty state, which names a specific
+      // cause ("nothing calls the optimizer") that is wrong when the real
+      // problem is an unreachable database.
       console.error("Failed to load GEPA runs:", err);
+      setLoadError(String(err));
     } finally {
       setLoading(false);
     }
@@ -114,13 +122,17 @@ export function PromptEvolutionPanel() {
 
   const domainStats = allDomains.map((domain) => {
     const domainRuns = runs.filter((r) => r.domain === domain);
+    // Only ACCEPTED runs contribute. Summing the improvement of runs the gate
+    // rejected — or never decided on — would headline a gain that was never
+    // adopted.
     const totalImprovement = domainRuns
-      .filter((r) => r.improvement !== null && r.improvement > 0)
+      .filter((r) => isAcceptedRun(r.status) && r.improvement !== null)
       .reduce((sum, r) => sum + (r.improvement || 0), 0);
-    const successfulRuns = domainRuns.filter(
-      (r) => r.status === "completed" && (r.improvement || 0) > 0,
-    ).length;
-    return { domain, runs: domainRuns, totalImprovement, successfulRuns };
+    // Read the STATUS, not `improvement`. `improvement` is the sidecar's
+    // display-only mean-of-means delta; the accept/reject call is the paired
+    // held-out verdict the status column carries (see `gepaRunStatus`).
+    const acceptedRuns = domainRuns.filter((r) => isAcceptedRun(r.status)).length;
+    return { domain, runs: domainRuns, totalImprovement, acceptedRuns };
   });
 
   return (
@@ -176,10 +188,15 @@ export function PromptEvolutionPanel() {
 
       {loading ? (
         <div style={{ textAlign: "center", padding: "32px", color: "#9ca3af" }}>Loading...</div>
+      ) : loadError !== null ? (
+        <div style={{ textAlign: "center", padding: "32px", color: "#f87171" }}>
+          Couldn&apos;t load optimization runs — this is a query failure, not an empty history.
+          <div style={{ color: "#9ca3af", fontSize: "12px", marginTop: "6px" }}>{loadError}</div>
+        </div>
       ) : runs.length === 0 ? (
         <div style={{ textAlign: "center", padding: "32px", color: "#9ca3af" }}>
-          No GEPA optimization runs yet. Runs are triggered automatically after enough workflow
-          executions.
+          No prompt-optimization runs recorded yet. Nothing calls the optimizer today, so this table
+          stays empty until the path is wired into an execution flow.
         </div>
       ) : (
         <>
@@ -216,9 +233,10 @@ export function PromptEvolutionPanel() {
                   {ds.domain}
                 </div>
                 <div style={{ fontSize: "11px", color: "#9ca3af", marginTop: "4px" }}>
-                  {ds.runs.length} runs, {ds.successfulRuns} improved
+                  {ds.runs.length} runs, {ds.acceptedRuns} accepted
                 </div>
                 <div
+                  title="Summed improvement of the runs the held-out gate accepted."
                   style={{
                     fontSize: "18px",
                     fontWeight: "bold",
@@ -240,7 +258,10 @@ export function PromptEvolutionPanel() {
                 <th style={{ textAlign: "left", padding: "8px", color: "#9ca3af" }}>Domain</th>
                 <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>Old Score</th>
                 <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>New Score</th>
-                <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>
+                <th
+                  style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}
+                  title="The sidecar's mean-of-means delta. Display only — the accept/reject call is the paired held-out verdict in the Status column."
+                >
                   Improvement
                 </th>
                 <th style={{ textAlign: "center", padding: "8px", color: "#9ca3af" }}>Status</th>
@@ -552,25 +573,20 @@ function ScoreBox({ label, score, color }: { label: string; score: number; color
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const colors: Record<string, { bg: string; text: string }> = {
-    completed: { bg: "#1e3a2f", text: "#34d399" },
-    pending: { bg: "#1e3a5f", text: "#60a5fa" },
-    failed: { bg: "#3b1e1e", text: "#f87171" },
-    canary: { bg: "#3b2f1e", text: "#fbbf24" },
-  };
-  const c = colors[status] || colors.pending;
+  const style = gepaStatusStyle(status);
 
   return (
     <span
+      title={style.title}
       style={{
-        background: c.bg,
-        color: c.text,
+        background: style.bg,
+        color: style.text,
         padding: "2px 8px",
         borderRadius: "4px",
         fontSize: "11px",
       }}
     >
-      {status}
+      {style.label}
     </span>
   );
 }
