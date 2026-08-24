@@ -467,6 +467,14 @@ jobs:
           BRANCH: chore/atlas-exclude-refresh
           TITLE: "chore(atlas): refresh exclude.txt against the current qontinui-web schema"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Declared, not inherited from the ambient $GITHUB_SERVER_URL, for
+          # the same reason REPO/BRANCH/RUN_URL are: under this step's
+          # `set -u` an ambient var the harness does not supply is an
+          # unbound-variable abort, and the stubbed-gh test can only run what
+          # it can supply. atlas/scripts/tests/test_pr_step_guards.sh asserts
+          # that every UPPERCASE var this body reads appears in its own env
+          # list, so an inherited one fails there rather than at 07:17 UTC.
+          SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
 
@@ -728,19 +736,34 @@ jobs:
           # change exists to remove (and which V6 of the plan names). Checked
           # once here rather than at each site: it is a property of `url`, not
           # of any one call.
+          # Exit code 0 is not the same as "a pull request exists". A `gh` that
+          # succeeds while printing nothing would otherwise fall through to the
+          # summary block below and write an EMPTY section -- a green step that
+          # delivered nothing, verbatim the silent-green signature this change
+          # exists to remove. The two arms differ, deliberately:
           if [ -z "${url:-}" ]; then
-            echo "::error::A pull-request operation reported success but returned no URL."
             if [ -n "$existing_num" ]; then
-              # `gh pr edit` already SUCCEEDED on this arm -- the PR exists and
-              # carries the refreshed body; only reading its URL back came up
-              # empty. Sending the operator to "open the PR by hand" here would
-              # be wrong advice, so this arm does not call pr_op_failed.
-              echo "::error::Refresh PR #$existing_num on '$BRANCH' WAS updated; only the URL read-back was empty."
-              echo "::error::Check $GITHUB_SERVER_URL/$REPO/pull/$existing_num directly."
+              # EDIT ARM -- do NOT red the night. `gh pr edit` already SUCCEEDED
+              # here: the refreshed exclude.txt IS delivered, to a PR a human is
+              # already watching. Only the read-back was empty, and the URL is
+              # not a guess -- the number came from `gh pr list` and `gh pr edit`
+              # accepted it moments ago, so <server>/<repo>/pull/<n> is the
+              # canonical link. Failing here would add a FALSE-RED class to the
+              # one workflow whose actual disease is unowned reds, which is the
+              # same reasoning that makes 'open the PR by hand' wrong advice on
+              # this arm. This is NOT silent green: the summary below still
+              # carries a real PR URL and the anomaly is stated out loud.
+              url="$SERVER_URL/$REPO/pull/$existing_num"
+              echo "::warning::Reading back the URL of refresh PR #$existing_num returned nothing, but the edit succeeded."
+              echo "::warning::The refreshed exclude.txt IS on that PR. Citing the canonical link: $url"
             else
-              pr_op_failed "URL read-back"
+              # CREATE ARM -- hard failure. Nothing was delivered and there is no
+              # PR number to build a link from, so there is nothing to cite and
+              # real drift is still undelivered.
+              echo "::error::A pull-request operation reported success but returned no URL."
+              pr_op_failed "create (URL read-back)"
+              exit 1
             fi
-            exit 1
           fi
 
           {

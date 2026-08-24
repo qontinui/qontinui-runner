@@ -90,7 +90,7 @@ first_line="$(grep -m1 -vE '^[[:space:]]*(#|$)' "$step" || true)"
 # but illegibly', i.e. the bug this whole commit removes, reappearing inside
 # the test that guards against it. Neither `|| true` suppresses a real error:
 # an empty value fails the comparison below and gets reported.
-last_line="$(grep -vE '^[[:space:]]*$' "$step" | tail -n1 || true)"
+last_line="$( { grep -vE '^[[:space:]]*$' "$step" || true; } | tail -n1)"
 extract_broken=0
 [ "$body_lines" -ge 100 ] || extract_broken=1
 [ "$first_line" = "set -euo pipefail" ] || extract_broken=1
@@ -109,6 +109,29 @@ fi
 
 echo "Extracted refresh-PR step body: $body_lines lines"
 bash -n "$step"
+
+# --- The harness must supply every ambient var the step reads ---------------
+# The step runs under `set -u`, so an UPPERCASE var it reads that run_step
+# does not set aborts mid-body with `unbound variable`. That abort is
+# invisible to the assertions -- the exit code is 1 either way on a failure
+# path -- so the harness would pass locally for one reason and in Actions
+# (where GitHub sets the var) for a different one, exercising the line in
+# NEITHER. Measured, not eyeballed: every `$UPPER` the body reads must be in
+# this list. Add to the list only after adding to run_step's env, never to
+# silence this.
+harness_env="$work/harness-env.txt"
+printf '%s\n' BRANCH GH_TOKEN GITHUB_SHA GITHUB_STEP_SUMMARY PAT_AVAILABLE REPO RUNNER_TEMP RUN_URL SERVER_URL TITLE | sort > "$harness_env"
+body_env="$work/body-env.txt"
+{ grep -oE '\$\{?[A-Z][A-Z0-9_]+' "$step" || true; } | sed 's/[${]//g' | sort -u > "$body_env"
+missing="$(comm -23 "$body_env" "$harness_env")"
+if [ -n "$missing" ]; then
+  echo "::error::the refresh-PR step reads environment the test harness does not set:"
+  echo "$missing" | sed 's/^/::error::  /'
+  echo "::error::Add it to the step's env: block AND to run_step's env list, then to the"
+  echo "::error::allow-list above. Under set -u an unsupplied var aborts the step body"
+  echo "::error::mid-run, which no assertion below can see."
+  exit 1
+fi
 
 # --- Static assertions over the shipped bytes ---------------------------------
 echo ""
@@ -241,6 +264,7 @@ run_step() {
     BRANCH="chore/atlas-exclude-refresh" \
     TITLE="chore(atlas): refresh exclude.txt against the current qontinui-web schema" \
     RUN_URL="https://github.com/qontinui/qontinui-runner/actions/runs/1" \
+    SERVER_URL="https://github.com" \
     RUNNER_TEMP="$runner_temp" \
     GITHUB_SHA="0000000000000000000000000000000000000000" \
     GITHUB_STEP_SUMMARY="$work/summary.md" \
@@ -336,13 +360,18 @@ assert "create returns no URL => exit 1"           1 "$(run_step '' '' 'true' ''
 assert "and it says the URL came back empty"       yes "$(has 'returned no URL')"
 assert "and it prints the remediation"             yes "$(has "$REMEDIATION")"
 assert "and it wrote NO summary section"           no  "$(grep -q . "$work/summary.md" && echo yes || echo no)"
-assert "edit path returns no URL => exit 1"        1 "$(run_step '' '1234' 'true' '')"
-assert "and the edit path says so too"             yes "$(has 'returned no URL')"
-# `gh pr edit` succeeded on this arm, so the PR exists and was updated.
-# Telling the operator to open one by hand would be wrong advice.
-assert "edit arm cites the PR that WAS updated"    yes "$(has '#1234 on '\''chore/atlas-exclude-refresh'\'' WAS updated')"
+# The EDIT arm is deliberately different: `gh pr edit` already succeeded, so
+# the drift IS delivered and the URL is derivable. Reddening there would add
+# a false-red class to the one workflow whose disease is unowned reds. It is
+# not silent green -- the summary still carries a real PR URL -- and these
+# assertions are what keep those two apart.
+assert "edit path returns no URL => exit 0"        0 "$(run_step '' '1234' 'true' '')"
+assert "and it warns about the empty read-back"    yes "$(has '::warning::Reading back the URL')"
+assert "and it derives the canonical PR link"      yes "$(has '/qontinui/qontinui-runner/pull/1234')"
+assert "and the summary carries that link"         yes "$(grep -qF '/qontinui/qontinui-runner/pull/1234' "$work/summary.md" && echo yes || echo no)"
 assert "edit arm does NOT say open one by hand"    no  "$(has 'the fix is already committed there')"
-unset GH_STUB_EMPTY_URL
+assert "edit arm does not emit an ::error::"       no  "$(has '::error::')"
+GH_STUB_EMPTY_URL=""
 
 # ---------------------------------------------------------------------------
 # The contradiction guard must stay non-silent.
