@@ -711,7 +711,10 @@ jobs:
               pr_op_failed "view --json url on #$existing_num"
               exit 1
             fi
-            echo "Updated refresh PR: $url"
+            # The URL is announced AFTER the empty-read-back block below, never
+            # here: an empty read-back would otherwise print
+            # "Updated refresh PR: " as fact and only then be corrected by a
+            # warning citing a different, real link.
           else
             # A failure here is almost always CONFIGURATION rather than drift:
             # the repo currently has "Allow GitHub Actions to create and approve
@@ -726,7 +729,6 @@ jobs:
               pr_op_failed "create"
               exit 1
             fi
-            echo "Opened refresh PR: $url"
           fi
 
           # Exit code 0 is not the same as "a pull request exists". A `gh` that
@@ -765,6 +767,8 @@ jobs:
               exit 1
             fi
           fi
+
+          echo "Refresh PR: $url"
 
           {
             echo "### atlas/exclude.txt refresh"

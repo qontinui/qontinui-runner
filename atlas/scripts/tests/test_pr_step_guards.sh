@@ -120,16 +120,51 @@ bash -n "$step"
 # this list. Add to the list only after adding to run_step's env, never to
 # silence this.
 harness_env="$work/harness-env.txt"
-printf '%s\n' BRANCH GH_TOKEN GITHUB_SHA GITHUB_STEP_SUMMARY PAT_AVAILABLE REPO RUNNER_TEMP RUN_URL SERVER_URL TITLE | sort > "$harness_env"
+# DERIVED from run_step's own env list, never a copy of it. A hand-maintained
+# duplicate can only be wrong in the direction that SILENCES this guard: add a
+# name to the list without adding it to run_step, and the body reads an
+# unsupplied var, comm reports nothing, and the step aborts under `set -u` --
+# exactly what this check exists to prevent. "Remember to update both" is a
+# convention; deriving it is a mechanism. (The extra GH_STUB_*/GIT_STUB_*/PATH
+# names it picks up are harmless: the step body never reads them.)
+# `|| true` inside the braces, on the sed|grep half ONLY. Without it, a renamed
+# or deleted run_step makes grep exit 1, pipefail propagate and `set -e` kill the
+# script before the emptiness check below can say why -- the same loud-but-
+# illegible shape this whole file exists to remove, and it bit here first.
+{ sed -n '/^run_step() {/,/^}/p' "${BASH_SOURCE[0]}" \
+  | grep -oE '^[[:space:]]+[A-Z][A-Z0-9_]*=' || true; } \
+  | tr -d ' =' | sort -u > "$harness_env"
+[ -s "$harness_env" ] || {
+  echo "::error::could not derive run_step's env list from $0 -- was the function"
+  echo "::error::renamed, or its env assignments re-indented? This check cannot be"
+  echo "::error::skipped: an empty list would make every var below read as missing."
+  exit 1
+}
 body_env="$work/body-env.txt"
-{ grep -oE '\$\{?[A-Z][A-Z0-9_]+' "$step" || true; } | sed 's/[${]//g' | sort -u > "$body_env"
+# `[A-Za-z0-9_]*` rather than `[A-Z0-9_]+`: a mixed-case name would otherwise
+# be truncated at the first lowercase letter and reported under a name that
+# does not exist. It still starts at `[A-Z]`, so `${url:-}` and friends are
+# correctly ignored.
+#
+# TWO SHAPES THIS GUARD CANNOT SEE, so do not use them in the step body:
+#   ${!INDIRECT}  -- the `!` blocks the match
+#   $((ARITH))    -- names in arithmetic context carry no `$` at all
+# For those, the `set -u` abort this guard exists to prevent can still
+# happen. No regex can reach them; saying so is the honest fix.
+#
+# Deliberately over-strict: this scans the whole body INCLUDING quoted
+# heredocs, so a literal `$SOMETHING` written into the PR-body markdown would
+# also be demanded of the harness. That fails loud, which is the safe
+# direction.
+{ grep -oE '\$\{?[A-Z][A-Za-z0-9_]*' "$step" || true; } | sed 's/[${]//g' | sort -u > "$body_env"
 missing="$(comm -23 "$body_env" "$harness_env")"
 if [ -n "$missing" ]; then
   echo "::error::the refresh-PR step reads environment the test harness does not set:"
   echo "$missing" | sed 's/^/::error::  /'
-  echo "::error::Add it to the step's env: block AND to run_step's env list, then to the"
-  echo "::error::allow-list above. Under set -u an unsupplied var aborts the step body"
-  echo "::error::mid-run, which no assertion below can see."
+  echo "::error::Declare it in the step's env: block (see SERVER_URL/RUN_URL) AND add it"
+  echo "::error::to run_step's env list below -- the allow-list is DERIVED from run_step,"
+  echo "::error::so there is no third place to edit. Under set -u an unsupplied var aborts"
+  echo "::error::the step body mid-run, which no assertion below can see."
   exit 1
 fi
 
