@@ -172,6 +172,12 @@ pub struct BufferQuery {
 pub struct SubmitPromptRequest {
     /// The text to submit. It will be wrapped in bracketed-paste markers
     /// and followed by a bare CR by `TerminalSession::submit_prompt`.
+    ///
+    /// The body is **neutralized** on the way to the PTY — bracketed-paste
+    /// markers and control bytes other than `\n` / `\r` / `\t` are removed,
+    /// while real escape sequences (colour, diffs) survive intact. See
+    /// `terminal::session::sanitize_submit_body`. The response says whether
+    /// this message was altered.
     pub message: String,
 }
 
@@ -439,6 +445,11 @@ pub async fn get_buffer_handler(
 /// Submit a prompt to an interactive TUI running in the terminal (e.g.
 /// Claude Code). Wraps the message in ANSI bracketed-paste markers and
 /// follows it with a bare CR; see [`crate::terminal::session::TerminalSession::submit_prompt`].
+///
+/// This route is the most exposed of the four inbound prompt producers — its
+/// body is arbitrary caller-supplied text — so the response reports what
+/// actually reached the PTY: `bytes` is the real wire length and `sanitized`
+/// says whether the neutralizer changed the body.
 pub async fn submit_prompt_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -453,8 +464,11 @@ pub async fn submit_prompt_handler(
         )
     })?;
 
-    // Total framing bytes: BRACKETED_PASTE_BEGIN(6) + msg + BRACKETED_PASTE_END(6) + CR(1).
-    let total_bytes = request.message.len() + 13;
+    // Ask the choke point what it will write. `message.len() + framing` is
+    // NOT the answer: the body is neutralized before it is framed, so a
+    // message carrying a paste marker or control bytes reaches the PTY
+    // shorter than it arrived.
+    let payload = crate::terminal::session::submit_payload_info(&request.message);
 
     session.submit_prompt(&request.message).map_err(|e| {
         error!("HTTP: Failed to submit prompt to terminal {}: {}", id, e);
@@ -466,7 +480,8 @@ pub async fn submit_prompt_handler(
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "submitted": true,
-        "bytes": total_bytes,
+        "bytes": payload.bytes,
+        "sanitized": payload.sanitized,
     }))))
 }
 

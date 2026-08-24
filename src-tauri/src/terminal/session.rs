@@ -494,11 +494,19 @@ const POST_PASTE_DELAY: std::time::Duration = std::time::Duration::from_millis(1
 /// `ESC` control byte (which must not reach the PTY). Deliberately a
 /// whitelist of the standard introducers rather than "any printable", so
 /// `ESC b` is treated as a stray control byte and dropped.
+///
+/// `\` — **ST**, the string terminator — is on the list because the
+/// string-introducing sequences below are only well formed once terminated.
+/// Dropping ST's `ESC` turns a complete `OSC … ST` into an unterminated one,
+/// which corrupts exactly the content the negative control promises to
+/// preserve *and* leaves a sequence that consumes whatever follows it.
 fn is_escape_introducer(next: char) -> bool {
     matches!(
         next,
         // CSI, OSC, DCS, SOS, PM, APC
         '[' | ']' | 'P' | 'X' | '^' | '_'
+        // ST — terminates the string sequences above
+        | '\\'
         // charset designators
         | '(' | ')' | '*' | '+'
         // line-size / charset selection
@@ -510,6 +518,54 @@ fn is_escape_introducer(next: char) -> bool {
     )
 }
 
+/// Does `ESC <intro>` open a *string* sequence — one that runs until an
+/// explicit terminator (`ST`, or `BEL` for `OSC`) rather than ending at a
+/// bounded final byte the way `CSI` and the two-character escapes do?
+///
+/// [`sanitize_submit_body`] needs the distinction twice over: the terminator
+/// is otherwise a control byte it would strip, and an unterminated string
+/// sequence consumes every byte after it — including the paste END marker
+/// [`paste_block`] appends.
+fn opens_string_sequence(intro: char) -> bool {
+    matches!(intro, ']' | 'P' | 'X' | '^' | '_')
+}
+
+/// Enforce the no-embedded-paste-marker invariant on the tail of `out`.
+///
+/// **Both** markers are neutralized, not only the END one: an END marker
+/// closes the block early and the remainder is read as terminal INPUT, while
+/// a BEGIN marker re-opens it, so [`paste_block`]'s real END closes the
+/// *inner* block and the terminal is still in paste mode for whatever the
+/// operator types next. Dropping the `ESC` leaves the text readable as a
+/// literal `[201~` / `[200~`.
+///
+/// This is an invariant on the OUTPUT, re-checked after every push, rather
+/// than a search over the input: stripping a control byte can otherwise
+/// reconstitute a marker (`ESC [ 2 NUL 0 1 ~`). Only the characters just
+/// pushed can have completed one, so checking the tail here is exhaustive;
+/// the loop repeats because removing an `ESC` can expose another marker.
+///
+/// Returns how many `ESC`s it removed. The caller needs that: the `ESC` it
+/// drops is a `CSI` introducer, and a `CSI` arriving mid-string is what
+/// [`sanitize_submit_body`] took as *ending* an open string sequence. Once
+/// the `ESC` is gone that sequence is open again.
+fn neutralize_trailing_paste_marker(out: &mut String) -> usize {
+    let mut removed = 0;
+    loop {
+        let marker_len = if out.as_bytes().ends_with(BRACKETED_PASTE_END) {
+            BRACKETED_PASTE_END.len()
+        } else if out.as_bytes().ends_with(BRACKETED_PASTE_BEGIN) {
+            BRACKETED_PASTE_BEGIN.len()
+        } else {
+            return removed;
+        };
+        // Both markers are pure ASCII, so this is a char boundary.
+        let esc_at = out.len() - marker_len;
+        out.remove(esc_at);
+        removed += 1;
+    }
+}
+
 /// Neutralize a message body before it is framed into a bracketed-paste
 /// block by [`paste_block`].
 ///
@@ -519,24 +575,51 @@ fn is_escape_introducer(next: char) -> bool {
 /// would silently corrupt exactly the content agents legitimately send
 /// (coloured build logs, diffs). Two things are removed and nothing else:
 ///
-/// 1. **The bracketed-paste END marker (`\x1b[201~`)**, which would
-///    otherwise terminate the paste block early and leave the remaining
-///    bytes to be interpreted as terminal INPUT rather than pasted text.
-///    The `ESC` is dropped, so the text reads as a literal `[201~`.
+/// 1. **Either bracketed-paste marker (`\x1b[201~`, `\x1b[200~`)** — see
+///    [`neutralize_trailing_paste_marker`] for what each one buys a caller
+///    and why the rule is an invariant on the output.
 /// 2. **C0/C1 control characters other than `\n`, `\r`, `\t`** — plus
 ///    `DEL`, and any `ESC` not introducing a real escape sequence.
 ///
-/// The END-marker rule is enforced as an *invariant on the output*, checked
-/// after every push, rather than as a search over the input: stripping a
-/// control byte can otherwise reconstitute the marker (`\x1b[2\x0001~`).
+/// The one exception to rule 2 is a **string sequence's own terminator**.
+/// `OSC` / `DCS` / `SOS` / `PM` / `APC` run until an explicit `ST`
+/// (`\x1b\\`) or, for `OSC`, a `BEL` — and `BEL` is otherwise a C0 control
+/// this function strips. Dropping it would leave an unterminated sequence
+/// that consumes everything after it, the paste END marker included, so a
+/// terminator is preserved while a string sequence is open, and one that is
+/// never closed gets an `ST` appended.
 fn sanitize_submit_body(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut chars = message.chars().peekable();
+    // Inside an `OSC` / `DCS` / `SOS` / `PM` / `APC` that is not terminated
+    // yet?
+    let mut in_string_sequence = false;
+    // What that flag was immediately before the most recent kept `ESC`, so
+    // the transition can be undone if the neutralizer removes that `ESC`.
+    let mut string_state_before_escape = false;
     while let Some(c) = chars.next() {
         match c {
             '\n' | '\r' | '\t' => out.push(c),
-            '\u{1b}' => match chars.peek() {
-                Some(&next) if is_escape_introducer(next) => out.push(c),
+            // BEL is a C0 control everywhere except here, where it is OSC's
+            // terminator and load-bearing.
+            '\u{7}' if in_string_sequence => {
+                out.push(c);
+                in_string_sequence = false;
+            }
+            '\u{1b}' => match chars.peek().copied() {
+                Some(next) if is_escape_introducer(next) => {
+                    // Consume the introducer alongside the ESC so the
+                    // sequence is classified once, here, rather than
+                    // re-derived from the output later.
+                    chars.next();
+                    out.push(c);
+                    out.push(next);
+                    // An ESC inside a string sequence ends it — whether it
+                    // is the ST that closes it properly or another sequence
+                    // aborting it, which is what a real parser does.
+                    string_state_before_escape = in_string_sequence;
+                    in_string_sequence = opens_string_sequence(next);
+                }
                 // Bare or dangling ESC: a control byte, not a sequence.
                 _ => {}
             },
@@ -544,13 +627,17 @@ fn sanitize_submit_body(message: &str) -> String {
             c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => {}
             c => out.push(c),
         }
-        // Invariant: the sanitized body never contains the paste END
-        // marker. Only the just-pushed char can have completed one, so a
-        // check here is exhaustive; drop the ESC that starts it.
-        while out.as_bytes().ends_with(BRACKETED_PASTE_END) {
-            let esc_at = out.len() - BRACKETED_PASTE_END.len();
-            out.remove(esc_at);
+        if neutralize_trailing_paste_marker(&mut out) > 0 {
+            // That `ESC` is gone, so the `CSI` it introduced no longer ends
+            // an open string sequence: `ESC ] 0 ; ESC [ 2 0 1 ~` must not
+            // leave the OSC open to swallow the paste END marker.
+            in_string_sequence = string_state_before_escape;
         }
+    }
+    // A string sequence left open would swallow the paste END marker and
+    // whatever the terminal prints after it. Close it.
+    if in_string_sequence {
+        out.push_str("\u{1b}\\");
     }
     out
 }
@@ -586,6 +673,38 @@ pub(crate) fn build_submit_payload(message: &str) -> Vec<u8> {
     let mut out = paste_block(message);
     out.extend_from_slice(SUBMIT_ENTER);
     out
+}
+
+/// What [`TerminalSession::submit_prompt`] will actually put on the wire for
+/// a given message — see [`submit_payload_info`].
+pub(crate) struct SubmitPayload {
+    /// Total bytes written to the PTY: the bracketed-paste block plus the
+    /// trailing CR.
+    pub bytes: usize,
+    /// Did [`sanitize_submit_body`] change the body? A caller whose message
+    /// carried a paste marker or a control byte is told so, rather than
+    /// having it altered silently.
+    pub sanitized: bool,
+}
+
+/// Describe the write [`TerminalSession::submit_prompt`] would perform,
+/// without performing it.
+///
+/// Exists because the body is neutralized at the PTY choke point, so
+/// `message.len() + framing` — what the `POST /terminals/{id}/submit-prompt`
+/// route reported before the sanitizer landed — is no longer the number of
+/// bytes that reach the terminal. Both fields come from
+/// [`sanitize_submit_body`] and the framing constants, so the reported count
+/// cannot drift from what [`paste_block`] emits.
+pub(crate) fn submit_payload_info(message: &str) -> SubmitPayload {
+    let body = sanitize_submit_body(message);
+    SubmitPayload {
+        bytes: BRACKETED_PASTE_BEGIN.len()
+            + body.len()
+            + BRACKETED_PASTE_END.len()
+            + SUBMIT_ENTER.len(),
+        sanitized: body != message,
+    }
 }
 
 /// Pure line-assembly core of the typed-input observer
@@ -3790,6 +3909,178 @@ mod tests {
             buf.lock().unwrap().clone(),
             build_submit_payload("x\x1b[201~y")
         );
+    }
+
+    // ---- String-sequence terminators, the paste BEGIN marker, and an
+    // honest wire-length report (post-merge follow-up to the sanitizer).
+
+    /// NEGATIVE CONTROL, second form. The first one pins SGR (a `CSI`
+    /// sequence, self-terminating). A **string** sequence is only well
+    /// formed once terminated, and both of its terminators — `ST` and, for
+    /// `OSC`, `BEL` — are bytes the control-character rule would otherwise
+    /// remove. Dropping either leaves an unterminated sequence that eats
+    /// whatever the terminal sees next.
+    #[test]
+    fn sanitize_submit_body_preserves_string_sequence_terminators() {
+        // OSC 0 (window title) terminated by ST.
+        let osc_st = "\x1b]0;build ok\x1b\\";
+        assert_eq!(sanitize_submit_body(osc_st), osc_st);
+        // The same sequence terminated by BEL, the xterm-legacy form.
+        let osc_bel = "\x1b]0;build ok\x07";
+        assert_eq!(sanitize_submit_body(osc_bel), osc_bel);
+        // OSC 8 hyperlinks — what a modern build log actually carries.
+        let link = "\x1b]8;;https://example.test\x1b\\click\x1b]8;;\x1b\\";
+        assert_eq!(sanitize_submit_body(link), link);
+        // DCS is a string sequence too.
+        let dcs = "\x1bPq#0;2;0;0;0\x1b\\";
+        assert_eq!(sanitize_submit_body(dcs), dcs);
+    }
+
+    /// BEL is load-bearing only *inside* a string sequence; on its own it is
+    /// still a control byte, and the existing strip test stays true.
+    #[test]
+    fn sanitize_submit_body_still_strips_bel_outside_a_string_sequence() {
+        assert_eq!(sanitize_submit_body("a\x07b"), "ab");
+        // Terminated OSC, then a stray BEL: the first survives, the second
+        // does not.
+        assert_eq!(sanitize_submit_body("\x1b]0;t\x07x\x07y"), "\x1b]0;t\x07xy");
+    }
+
+    /// A string sequence the caller never closes would consume the paste END
+    /// marker `paste_block` appends. It is closed with an `ST`.
+    #[test]
+    fn sanitize_submit_body_closes_a_dangling_string_sequence() {
+        assert_eq!(
+            sanitize_submit_body("\x1b]0;no terminator"),
+            "\x1b]0;no terminator\x1b\\"
+        );
+        // Nothing is appended when the sequence is already closed...
+        assert_eq!(sanitize_submit_body("\x1b]0;t\x1b\\"), "\x1b]0;t\x1b\\");
+        // ...nor when a later escape sequence aborts it, as a real parser
+        // treats an ESC arriving mid-string.
+        assert_eq!(sanitize_submit_body("\x1b]0;t\x1b[0m"), "\x1b]0;t\x1b[0m");
+    }
+
+    /// Neutralizing a marker removes the `ESC` that introduced its `CSI` —
+    /// and a `CSI` mid-string is what ends an open string sequence. Without
+    /// undoing that transition, `ESC ] 0 ; ESC [ 2 0 1 ~` leaves the `OSC`
+    /// open and it swallows the paste END marker `paste_block` appends.
+    #[test]
+    fn sanitize_submit_body_reopens_a_string_sequence_when_it_strips_the_csi() {
+        assert_eq!(
+            sanitize_submit_body("\x1b]0;\x1b[201~tail"),
+            "\x1b]0;[201~tail\x1b\\"
+        );
+        // The same undo must not fire when no string sequence was open.
+        assert_eq!(sanitize_submit_body("a\x1b[201~b"), "a[201~b");
+    }
+
+    /// An embedded BEGIN marker re-opens the paste block, so `paste_block`'s
+    /// own END closes the INNER one and the terminal stays in paste mode for
+    /// whatever the operator types next. Neutralized the same way as END.
+    #[test]
+    fn sanitize_submit_body_neutralizes_embedded_paste_begin() {
+        assert_eq!(sanitize_submit_body("a\x1b[200~b"), "a[200~b");
+        // And it cannot be reconstituted by control-byte removal either.
+        assert_eq!(sanitize_submit_body("\x1b[2\u{0}00~"), "[200~");
+    }
+
+    /// The falsifiable core for the BEGIN rule: what `submit_prompt` writes.
+    #[test]
+    fn submit_prompt_neutralizes_embedded_paste_begin_marker() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        session
+            .submit_prompt("before\x1b[200~after")
+            .expect("submit_prompt failed");
+        let written = buf.lock().unwrap().clone();
+
+        assert_eq!(written, b"\x1b[200~before[200~after\x1b[201~\r");
+
+        let begin_marker: &[u8] = b"\x1b[200~";
+        let occurrences: Vec<usize> = written
+            .windows(begin_marker.len())
+            .enumerate()
+            .filter(|(_, w)| *w == begin_marker)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            occurrences,
+            vec![0],
+            "the only paste-begin marker must be the leading one, got {:?}",
+            String::from_utf8_lossy(&written)
+        );
+    }
+
+    /// An unterminated string sequence in the body must not be able to
+    /// swallow the trailing paste END marker.
+    #[test]
+    fn submit_prompt_closes_a_dangling_string_sequence_before_the_end_marker() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        session
+            .submit_prompt("\x1b]0;title")
+            .expect("submit_prompt failed");
+        assert_eq!(
+            buf.lock().unwrap().clone(),
+            b"\x1b[200~\x1b]0;title\x1b\\\x1b[201~\r"
+        );
+    }
+
+    /// `bytes` is what the route reports to its caller. It must equal what
+    /// `submit_prompt` really wrote — not `message.len() + framing`, which
+    /// the sanitizer made wrong.
+    #[test]
+    fn submit_payload_info_reports_the_bytes_actually_written() {
+        for message in [
+            "hello",
+            "",
+            "before\x1b[201~after",
+            "ok\u{0}\u{7}\u{1b}zdone",
+            "\x1b]0;title",
+            "\x1b[31mred\x1b[0m",
+        ] {
+            let info = submit_payload_info(message);
+            let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let session = make_test_session(buf.clone());
+            session
+                .submit_prompt(message)
+                .expect("submit_prompt failed");
+            let written = buf.lock().unwrap().clone();
+            assert_eq!(
+                info.bytes,
+                written.len(),
+                "reported byte count disagrees with the PTY write for {:?}",
+                message
+            );
+            assert_eq!(
+                info.bytes,
+                build_submit_payload(message).len(),
+                "reported byte count disagrees with build_submit_payload for {:?}",
+                message
+            );
+        }
+
+        // The pre-sanitizer formula is genuinely wrong now, so the equality
+        // above is not a tautology: the neutralizer drops the embedded
+        // marker's ESC, one byte the old `message.len() + 13` still counted.
+        assert_eq!(submit_payload_info("before\x1b[201~after").bytes, 29);
+        assert_eq!("before\x1b[201~after".len() + 13, 30);
+    }
+
+    /// A caller whose message was altered is told so.
+    #[test]
+    fn submit_payload_info_flags_only_an_altered_body() {
+        assert!(!submit_payload_info("plain text").sanitized);
+        assert!(!submit_payload_info("\x1b[31mred\x1b[0m").sanitized);
+        assert!(!submit_payload_info("").sanitized);
+        assert!(submit_payload_info("a\x1b[201~b").sanitized);
+        assert!(submit_payload_info("a\x1b[200~b").sanitized);
+        assert!(submit_payload_info("nul\u{0}here").sanitized);
+        // Same length in and out — the dangling OSC gains a two-byte ST
+        // while two NULs are dropped — so only comparing content catches it.
+        assert_eq!(submit_payload_info("\x1b]a\u{0}\u{0}").bytes, 18);
+        assert!(submit_payload_info("\x1b]a\u{0}\u{0}").sanitized);
     }
 
     #[test]
