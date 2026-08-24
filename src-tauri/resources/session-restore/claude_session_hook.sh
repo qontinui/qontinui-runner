@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # qontinui session-restore — Claude SessionStart HOOK (confirmation/liveness).
 #
-# Delivered to Claude Code ADDITIVELY via `--settings <claude_hook_settings.json>`
-# (the identity shim appends that flag). NEVER written into the user's
+# Delivered to Claude Code ADDITIVELY via the runner-owned `--settings` carrier
+# (the identity shim appends that flag), and NEVER written into the user's
 # `~/.claude/settings.json` — the delivery is a separate runner-owned file, so
 # this is zero-touch for every user out of the box (plan §2 Principle 2, §4
 # `capture_hook_delivery`; proven by the Phase 0 probe).
+#
+# This hook is registered UNCONDITIONALLY, so it rides WHICHEVER carrier the
+# continuation flag selects. The two carriers have different filenames and only
+# one of them exists on a given box, so naming one here would name a file that
+# is absent in the default posture — the wrong answer to "why did my
+# SessionStart hook not run?". See `session::claude_hook`.
 #
 # Claude invokes this on a `SessionStart` event, piping a JSON payload on stdin:
 #   { "session_id": "<id>", "source": "startup" | "resume", ... }

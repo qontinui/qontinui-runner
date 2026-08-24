@@ -17,9 +17,11 @@
 #
 # ## Delivery
 #
-# Delivered to Claude Code ADDITIVELY via the SAME `--settings
-# <claude_hook_settings.json>` carrier as the SessionStart confirmation hook
-# and the Stop continuation hook (the identity shim appends that flag).
+# Delivered to Claude Code ADDITIVELY via the SAME runner-owned `--settings`
+# carrier as the SessionStart confirmation hook (the identity shim appends that
+# flag). This hook is registered UNCONDITIONALLY, so it rides whichever of the
+# two carrier files the continuation flag selects; the `Stop` continuation hook
+# is the one exception — it only ever ships in the armed one.
 # NOTHING is ever written to the user's `~/.claude/settings.json`. This script
 # is registered as a SECOND command inside the EXISTING `SessionStart` block —
 # it is a sibling of `claude_session_hook.sh`, never an edit to it: that

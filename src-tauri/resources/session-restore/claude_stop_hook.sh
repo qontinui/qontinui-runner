@@ -2,10 +2,18 @@
 # qontinui session-autonomy — Claude `Stop` HOOK (continuation verdict).
 # Plan `2026-07-17-session-autonomy-fabric.md`, Phase 1.
 #
-# Delivered to Claude Code ADDITIVELY via the SAME `--settings
-# <claude_hook_settings.json>` carrier as the SessionStart confirmation hook
-# (the identity shim appends that flag; nothing is ever written to the user's
-# `~/.claude/settings.json`).
+# Delivered to Claude Code ADDITIVELY via the SAME `--settings` carrier as the
+# SessionStart confirmation hook (the identity shim appends that flag; nothing
+# is ever written to the user's `~/.claude/settings.json`).
+#
+# THIS hook is the one whose REGISTRATION is gated, so — alone among the four
+# bundled scripts — its carrier is fixed: it is only ever registered in
+# `claude_hook_settings.json`, the ARMED variant. The dark variant
+# (`claude_hook_settings-nostop.json`) carries no `Stop` key at all, which is
+# what stops Claude spawning a `bash` for this script once per assistant turn.
+# The short-circuit below therefore no longer covers runner-spawned sessions;
+# it still covers a HAND-STARTED `claude` that picks up an armed carrier left on
+# disk by a previously-armed runner. See `session::claude_hook`.
 #
 # Claude invokes this when the agent is about to END A TURN, piping a JSON
 # payload on stdin:

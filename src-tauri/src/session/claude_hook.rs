@@ -8,19 +8,39 @@
 //! Phase-0 probe PROVED that a `SessionStart` hook supplied ONLY via
 //! `claude --settings <file>` fires on both, additively — Claude MERGES the
 //! `--settings` file's hooks on top of any `~/.claude` config WITHOUT writing
-//! to it. So the entire delivery is two runner-owned files in the runner's OWN
-//! app-data dir (`~/.qontinui/runner/session-restore/`):
+//! to it. So the entire delivery is FIVE runner-owned files in the runner's OWN
+//! app-data dir (`~/.qontinui/runner/session-restore/`) — four bundled scripts
+//! and the one `--settings` carrier that registers them ([`hook_files`] is the
+//! roster):
 //!
-//!   * `claude_session_hook.sh` — the hook script (POSTs `{session_id, source,
-//!     terminal_id, provider, cwd}` to `/control/session-open`).
+//!   * `claude_session_hook.sh` — the confirmation/liveness hook (POSTs
+//!     `{session_id, source, terminal_id, provider, cwd}` to
+//!     `/control/session-open`). `SessionStart`, unconditional.
+//!   * `claude_policy_hook.sh` — policy injection, a SECOND command inside the
+//!     SAME `SessionStart` block (see [`resolve_commands`] for why that forces
+//!     the substitution to key on the placeholder, not the event).
+//!   * `claude_precompact_hook.sh` — the context-exhaustion signal.
+//!     `PreCompact`, unconditional.
+//!   * `claude_stop_hook.sh` — the continuation verdict. `Stop`, and the ONLY
+//!     one whose REGISTRATION is gated.
 //!   * `claude_hook_settings.json` / `claude_hook_settings-nostop.json` —
-//!     `{ "hooks": { "SessionStart": [...], "PreCompact": [...], "Stop": [...] } }`
-//!     pointing each `command` at the corresponding materialized script. The
-//!     `Stop` key is registered ONLY when the continuation flag is armed (see
-//!     [`StopHookRegistration`]); a dark session gets the `-nostop` file, which
-//!     has no `Stop` key at all, so Claude never spawns `bash` for it once per
-//!     assistant turn. The two variants use DISTINCT FILENAMES because the hook
-//!     dir is machine-global — see [`session_restore_dir`].
+//!     `{ "hooks": { "SessionStart": [...], "PreCompact": [...], "Stop": [...] },
+//!     "permissions": { "allow": [...] } }`, each `command` pointing at the
+//!     corresponding materialized script. **`permissions.allow` rides this same
+//!     carrier** (it pre-approves `mcp__coord-mcp`), which is why the file is
+//!     built structurally rather than by text surgery — see [`build_settings`].
+//!     The `Stop` key is registered ONLY when the continuation flag is armed
+//!     (see [`StopHookRegistration`]); a dark session gets the `-nostop` file,
+//!     which has no `Stop` key at all, so Claude never spawns `bash` for it once
+//!     per assistant turn. The two variants use DISTINCT FILENAMES because the
+//!     hook dir is machine-global — see [`session_restore_dir`].
+//!
+//! **Exactly one of the two carrier names exists on a given box per posture**,
+//! so nothing outside this module should name one: in the DEFAULT (dark)
+//! posture `claude_hook_settings.json` is the file that is NOT written. The
+//! bundled scripts' own headers therefore say "the runner-owned `--settings`
+//! carrier" rather than a filename — pinned by
+//! `tests::only_the_stop_script_may_name_a_carrier_file`.
 //!
 //! The identity shim appends `--settings <that settings file>` to the real
 //! `claude` argv (alongside `--session-id`), so a HAND-STARTED `claude` gets the
@@ -31,9 +51,13 @@
 //!
 //! ## Materialization
 //!
-//! [`materialize`] is idempotent — it (re)writes both files every call (cheap,
-//! a few hundred bytes) so a runner upgrade that ships a newer template
-//! refreshes them, and returns the absolute settings-file path. Fail-open: any
+//! [`materialize`] is idempotent, and CACHED: the first call in a process
+//! writes all five files (cheap, a few hundred bytes each) and every later call
+//! for the same (`base_dir`, variant) costs one `stat` per file — see
+//! [`cached_materialization`]. A runner upgrade that ships a newer template
+//! still refreshes them because it is a NEW PROCESS, not because each call
+//! rewrites; an externally deleted file, or a flag flip, also falls through to
+//! a full rewrite. Returns the absolute settings-file path. Fail-open: any
 //! IO error returns `None` (the launch then omits `--settings` — identity still
 //! rides the spawn-time `--session-id` pin; only the confirmation hook is
 //! absent). The settings/script live OUTSIDE any session cwd so they are never
@@ -555,7 +579,7 @@ mod tests {
 
     use crate::mcp::continuation_verdict::Mode;
 
-    /// Everything that must hold for BOTH variants: all three scripts on disk,
+    /// Everything that must hold for BOTH variants: all four scripts on disk,
     /// SessionStart + PreCompact registered and pointing at them, no
     /// unsubstituted placeholders, `permissions.allow` intact, and nothing
     /// outside the tempdir. Returns the parsed settings for variant-specific
@@ -572,7 +596,7 @@ mod tests {
             reg.settings_name()
         );
 
-        // All three scripts exist alongside it — registration is gated,
+        // All four scripts exist alongside it — registration is gated,
         // MATERIALIZATION is not.
         let script_path = tmp.join(HOOK_SCRIPT_NAME);
         let stop_script_path = tmp.join(STOP_HOOK_SCRIPT_NAME);
@@ -1382,5 +1406,56 @@ mod tests {
         assert!(s.contains("runner"), "lives under ~/.qontinui/runner");
         assert!(s.ends_with("session-restore"));
         assert!(!s.contains(".claude"), "NEVER under the user's ~/.claude");
+    }
+
+    /// Only [`STOP_HOOK_SCRIPT`] may name a carrier FILE in its own header.
+    ///
+    /// Splitting the carrier into two variant-named files made "the settings
+    /// file" a posture-dependent fact, and **exactly one of the two names
+    /// exists on a given box**: in the DEFAULT (dark) posture the file called
+    /// `claude_hook_settings.json` is precisely the one that is never written.
+    /// So a script header naming it is not merely imprecise — it sends an
+    /// operator debugging "why did my SessionStart hook not run?" to `stat` a
+    /// path that is absent by design, which reads as "the delivery never
+    /// happened". That is the same question
+    /// `config_report_cmd::claude_settings_carrier_reading` exists to answer,
+    /// and it must not get two different answers.
+    ///
+    /// The `Stop` hook is the ONE exception, and for a structural reason rather
+    /// than a stylistic one: it is the only script whose REGISTRATION is gated,
+    /// so it is only ever registered in the armed carrier. Its carrier is fixed,
+    /// so it is the only one that can name it and still be true — and the
+    /// assertion below pins that it DOES, because that fact is what makes its
+    /// own dark-mode short-circuit vestigial for runner-spawned sessions.
+    ///
+    /// Pure over `include_str!` constants, so it costs no IO and cannot go
+    /// stale against the shipped resources the way a doc comment can.
+    #[test]
+    fn only_the_stop_script_may_name_a_carrier_file() {
+        // Registered unconditionally ⇒ each of these rides WHICHEVER carrier
+        // the flag selects, so neither name can be true for it.
+        for (script_name, text) in [
+            (HOOK_SCRIPT_NAME, HOOK_SCRIPT),
+            (PRECOMPACT_HOOK_SCRIPT_NAME, PRECOMPACT_HOOK_SCRIPT),
+            (POLICY_HOOK_SCRIPT_NAME, POLICY_HOOK_SCRIPT),
+        ] {
+            // Checked separately, NOT by a single `contains` on the shorter
+            // name: `claude_hook_settings-nostop.json` does not contain
+            // `claude_hook_settings.json` (the `-nostop` breaks the `.json`),
+            // so one check would miss the other name entirely.
+            for carrier in [HOOK_SETTINGS_NAME, HOOK_SETTINGS_NAME_NOSTOP] {
+                assert!(
+                    !text.contains(carrier),
+                    "{script_name} rides EITHER carrier, so its header must not name `{carrier}`"
+                );
+            }
+        }
+
+        // The gated one: its carrier IS fixed, so naming it is the accurate
+        // thing to do, and the header must keep saying so.
+        assert!(
+            STOP_HOOK_SCRIPT.contains(HOOK_SETTINGS_NAME),
+            "{STOP_HOOK_SCRIPT_NAME} is armed-only, so its header must name `{HOOK_SETTINGS_NAME}`"
+        );
     }
 }
