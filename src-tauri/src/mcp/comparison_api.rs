@@ -71,12 +71,23 @@ pub struct ComparisonEntryResultJson {
 pub struct ComparisonRunView {
     pub id: String,
     pub workflow_id: String,
+    /// What the author DECLARED would vary between the arms.
     pub variation_type: String,
     pub status: String,
     pub entries: Vec<ComparisonEntryJson>,
     pub report: Option<String>,
     pub created_at: String,
     pub completed_at: Option<String>,
+    /// The key paths that were observed to ACTUALLY differ across the arms.
+    ///
+    /// `null` means the axis was never computed (a row predating the column, or
+    /// arms that could not be read) — it does **not** mean nothing differed;
+    /// that is `[]`. `axis_drift_class` says which case this is.
+    pub computed_axis: Option<serde_json::Value>,
+    /// How `computed_axis` relates to `variation_type` — the drift-class wire
+    /// token (`none` / `benign_add` / `pending` / `in_place` /
+    /// `active_negation` / `divergent` / `unknown`).
+    pub axis_drift_class: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -169,8 +180,18 @@ pub async fn start_comparison(
     let workflow_id = req.workflow_id.clone();
     let comp_id = comparison_id.clone();
 
+    let variation_type = req.variation_type.clone();
+
     tokio::spawn(async move {
-        launch_comparison_entries(pg_db, api_port, &workflow_id, &comp_id, entries).await;
+        launch_comparison_entries(
+            pg_db,
+            api_port,
+            &workflow_id,
+            &comp_id,
+            &variation_type,
+            entries,
+        )
+        .await;
     });
 
     Ok(Json(ApiResponse::success(StartComparisonResponse {
@@ -185,6 +206,7 @@ async fn launch_comparison_entries(
     api_port: u16,
     workflow_id: &str,
     comparison_id: &str,
+    variation_type: &str,
     mut entries: Vec<ComparisonEntryJson>,
 ) {
     let client = reqwest::Client::new();
@@ -242,7 +264,7 @@ async fn launch_comparison_entries(
     let new_status = if all_failed { "failed" } else { "running" };
 
     let _ = pg_db
-        .update_comparison_run_entries(comparison_id, &entries_json, new_status)
+        .update_comparison_run_entries(comparison_id, variation_type, &entries_json, new_status)
         .await;
 }
 
@@ -271,6 +293,8 @@ pub async fn get_comparison(
     let report = row.report;
     let created_at = row.created_at;
     let completed_at = row.completed_at;
+    let computed_axis = row.computed_axis;
+    let axis_drift_class = row.axis_drift_class;
 
     let mut entries: Vec<ComparisonEntryJson> =
         serde_json::from_str(&row.entries_json).unwrap_or_default();
@@ -319,12 +343,14 @@ pub async fn get_comparison(
     // Update comparison status if all entries are done
     let final_status = if all_done && status == "running" {
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
-        let _ = pg.complete_comparison_run(&id, &entries_str).await;
+        let _ = pg
+            .complete_comparison_run(&id, &variation_type, &entries_str)
+            .await;
         "completed".to_string()
     } else if any_running {
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
         let _ = pg
-            .update_comparison_run_entries(&id, &entries_str, &status)
+            .update_comparison_run_entries(&id, &variation_type, &entries_str, &status)
             .await;
         status
     } else {
@@ -340,6 +366,8 @@ pub async fn get_comparison(
         report,
         created_at,
         completed_at,
+        computed_axis,
+        axis_drift_class,
     })))
 }
 
@@ -368,6 +396,8 @@ pub async fn list_comparisons(
                 report: r.report,
                 created_at: r.created_at,
                 completed_at: r.completed_at,
+                computed_axis: r.computed_axis,
+                axis_drift_class: r.axis_drift_class,
             }
         })
         .collect();

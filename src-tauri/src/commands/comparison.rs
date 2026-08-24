@@ -1,7 +1,10 @@
 //! Tauri commands for comparison runs.
 //!
-//! Thin wrappers that delegate to the HTTP API comparison_api module's
-//! database operations, providing frontend access via `invoke()`.
+//! Thin wrappers over `database::pg::comparison` — the single persistence path
+//! for `project.comparison_runs` — providing frontend access via `invoke()`.
+//! This module used to call a *second*, near-identical set of DB functions in
+//! `database::pg::tiered_info`; those are gone, so the desktop surface and the
+//! HTTP surface now record identical rows, axis facts included.
 //!
 //! Migrated to StorageCompartment + HealthCompartment (Workstream C).
 
@@ -57,13 +60,14 @@ pub async fn start_comparison(
 
     storage
         .pg_db()
-        .insert_comparison(&cid, &wid, &vtype, &ejs)
+        .create_comparison_run(&cid, &wid, &vtype, &ejs, &now_c)
         .await?;
 
     // Launch runs via local HTTP API in background
     let pg_db_for_spawn = storage.pg_db().clone();
     let api_port = health.api_port().load(std::sync::atomic::Ordering::Relaxed);
     let comp_id = comparison_id.clone();
+    let vtype_for_spawn = variation_type.clone();
 
     tokio::spawn(async move {
         let client = reqwest::Client::new();
@@ -108,9 +112,10 @@ pub async fn start_comparison(
         let comp_id_pg = comp_id.clone();
         let ejs_pg = ejs.clone();
         let status_pg = new_status.to_string();
+        let vtype_pg = vtype_for_spawn.clone();
         tokio::spawn(async move {
             let _ = pg_db
-                .update_comparison_entries(&comp_id_pg, &ejs_pg, &status_pg)
+                .update_comparison_run_entries(&comp_id_pg, &vtype_pg, &ejs_pg, &status_pg)
                 .await;
         });
     });
@@ -124,29 +129,24 @@ pub async fn get_comparison_status(
     storage: State<'_, StorageCompartment>,
     comparison_id: String,
 ) -> Result<serde_json::Value, String> {
-    let cmp_json = storage
+    let row = storage
         .pg_db()
-        .get_comparison(&comparison_id)
+        .get_comparison_run(&comparison_id)
         .await?
         .ok_or_else(|| format!("Comparison not found: {}", comparison_id))?;
 
-    let id = cmp_json["id"].as_str().unwrap_or("").to_string();
-    let workflow_id = cmp_json["workflow_id"].as_str().unwrap_or("").to_string();
-    let variation_type = cmp_json["variation_type"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    let status = cmp_json["status"].as_str().unwrap_or("").to_string();
-    let entries_json_str = cmp_json["entries_json"]
-        .as_str()
-        .unwrap_or("[]")
-        .to_string();
-    let report: Option<String> = cmp_json["report"].as_str().map(|s| s.to_string());
-    let created_at = cmp_json["created_at"].as_str().unwrap_or("").to_string();
-    let completed_at: Option<String> = cmp_json["completed_at"].as_str().map(|s| s.to_string());
+    let id = row.id;
+    let workflow_id = row.workflow_id;
+    let variation_type = row.variation_type;
+    let status = row.status;
+    let report = row.report;
+    let created_at = row.created_at;
+    let completed_at = row.completed_at;
+    let computed_axis = row.computed_axis;
+    let axis_drift_class = row.axis_drift_class;
 
     let mut entries: Vec<ComparisonEntryJson> =
-        serde_json::from_str(&entries_json_str).unwrap_or_default();
+        serde_json::from_str(&row.entries_json).unwrap_or_default();
 
     // Enrich with live task_run statuses
     let mut all_done = true;
@@ -194,7 +194,10 @@ pub async fn get_comparison_status(
     // Auto-complete if all done
     let final_status = if all_done && status == "running" {
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
-        let _ = storage.pg_db().complete_comparison(&id, &entries_str).await;
+        let _ = storage
+            .pg_db()
+            .complete_comparison_run(&id, &variation_type, &entries_str)
+            .await;
         "completed".to_string()
     } else {
         status
@@ -209,6 +212,10 @@ pub async fn get_comparison_status(
         "report": report,
         "created_at": created_at,
         "completed_at": completed_at,
+        // The DECLARED `variation_type` above and these two are the pair. Null
+        // `computed_axis` means never computed, NOT "nothing differed".
+        "computed_axis": computed_axis,
+        "axis_drift_class": axis_drift_class,
     }))
 }
 
@@ -217,7 +224,26 @@ pub async fn get_comparison_status(
 pub async fn list_comparisons(
     storage: State<'_, StorageCompartment>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    storage.pg_db().list_comparisons().await
+    let rows = storage.pg_db().list_comparison_runs(50i64).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let entries: serde_json::Value =
+                serde_json::from_str(&r.entries_json).unwrap_or_default();
+            serde_json::json!({
+                "id": r.id,
+                "workflow_id": r.workflow_id,
+                "variation_type": r.variation_type,
+                "status": r.status,
+                "entries": entries,
+                "report": r.report,
+                "created_at": r.created_at,
+                "completed_at": r.completed_at,
+                "computed_axis": r.computed_axis,
+                "axis_drift_class": r.axis_drift_class,
+            })
+        })
+        .collect())
 }
 
 fn calculate_duration(created_at: &str, completed_at: Option<&str>) -> u64 {
