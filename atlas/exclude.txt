@@ -568,6 +568,7 @@ coord.session_handle_lineage
 coord.session_handles
 coord.session_messages
 coord.session_output
+coord.session_policy_reads
 coord.session_touched_files
 coord.sessions
 coord.speculative_chains
