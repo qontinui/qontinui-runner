@@ -36,11 +36,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use once_cell::sync::Lazy;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Default-ON env gate (mirrors `coord_register::registration_enabled`). Any of
 /// `0` / `false` / `off` (case-insensitive) disables push-report; anything else
@@ -263,17 +265,82 @@ pub fn parse_repo_full_name(remote_url: &str) -> Option<String> {
     Some(format!("{}/{}", parts[n - 2], parts[n - 1]))
 }
 
+/// Default hard cap on a single `git` invocation. Overridable via
+/// `QONTINUI_COMMIT_LINEAGE_GIT_TIMEOUT_SECS` (clamped to 1..=120).
+const GIT_TIMEOUT_DEFAULT_SECS: u64 = 10;
+
+/// Resolve the per-invocation git timeout.
+fn git_timeout() -> Duration {
+    let secs = std::env::var("QONTINUI_COMMIT_LINEAGE_GIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(GIT_TIMEOUT_DEFAULT_SECS)
+        .clamp(1, 120);
+    Duration::from_secs(secs)
+}
+
 /// Run a git subcommand in `dir`, returning trimmed stdout on success.
+///
+/// **Time-bounded by contract.** `Command::output()` used to be called here
+/// with no timeout at all, so a `git` that never returns — an `index.lock`
+/// held by another process, a credential prompt, an unreachable remote — held
+/// the calling thread forever. Every caller of this function runs on a pool
+/// thread, so "forever" meant one fewer thread in that pool per hung push, and
+/// the 2026-08-23 wedge started exactly there. A timed-out git now returns
+/// `None` (same as any other failure) after the child has been killed and
+/// reaped.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = crate::process_helpers::no_window("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    git_with_timeout(dir, args, git_timeout())
+}
+
+/// [`git`] with an explicit budget.
+fn git_with_timeout(dir: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.current_dir(dir).args(args);
+    run_git_command(cmd, dir, args, timeout)
+}
+
+/// Execute an already-built git `Command` under `timeout`, mapping every
+/// failure mode (non-zero exit, spawn error, timeout) to `None`.
+///
+/// Split out from [`git_with_timeout`] so a test can hand it a command that
+/// genuinely never returns — the hang this function exists to survive.
+fn run_git_command(
+    cmd: std::process::Command,
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    match crate::process_helpers::run_with_timeout(cmd, timeout) {
+        Ok(crate::process_helpers::TimedOutput::Completed(output)) => {
+            if !output.status.success() {
+                return None;
+            }
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        Ok(crate::process_helpers::TimedOutput::TimedOut { pid, reaped }) => {
+            // WARN, not debug: a silent timeout would just relocate the
+            // mystery. The dir + argv are what make it actionable.
+            warn!(
+                dir = %dir.display(),
+                args = ?args,
+                timeout_secs = timeout.as_secs(),
+                child_pid = pid,
+                reaped,
+                "commit_report: git timed out and was killed — treating as a failed lookup"
+            );
+            None
+        }
+        Err(e) => {
+            debug!(
+                "commit_report: git {:?} in {} could not run: {}",
+                args,
+                dir.display(),
+                e
+            );
+            None
+        }
     }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Resolve repo full_name, branch, and the recent-SHA window for a working dir.
@@ -359,6 +426,127 @@ pub fn handle_push_observation(
         return;
     }
     registrar.report_commits(&resolved.repo, &resolved.branch, resolved.shas);
+}
+
+// ── Bounded fan-out ──────────────────────────────────────────────────────────
+//
+// **The problem.** The transcript tail loop used to do
+// `for obs in pushes { spawn_blocking(|| handle_push_observation(..)) }` — one
+// blocking-pool task per transcript line, with no cap of any kind. The bound
+// was the transcript's line rate, i.e. none. Combined with an untimed `git`
+// (fixed above) that is a direct route to blocking-pool exhaustion, which is
+// stage 1 of the 2026-08-23 wedge.
+//
+// **The choice: one dedicated OS thread behind a bounded queue** — NOT a
+// semaphore over `spawn_blocking`, and NOT tokio's blocking pool at all.
+//
+//   * *Why off the blocking pool.* The pool is shared with the transcript
+//     scan, `tokio::fs`, and every other `spawn_blocking` in the process.
+//     Anything that can hang must not be able to consume it. A private thread
+//     caps the blast radius of a pathological git at exactly one thread.
+//   * *Why one worker and not N.* Git enumeration is inherently serial per
+//     repo and the event rate is one burst per `git push` — a human-scale
+//     event. Serial costs nothing real, and with the 10s cap the worst case
+//     for the queue is `depth × 3 × 10s` of lag on a best-effort report.
+//   * *Why a BOUNDED queue with `try_send` (drop) rather than blocking send.*
+//     A blocking send would push the back-pressure right back onto the caller
+//     — the transcript tail loop — which is what we are protecting. Dropping
+//     is safe here: `report_commits` is best-effort and coord dedups, so a
+//     dropped observation costs at most one lineage row that the next push
+//     re-reports. Drops are counted and WARNed, never silent.
+
+/// Queue depth for pending git enumerations. Small on purpose: a backlog this
+/// deep already means git is pathological, and queueing more just delays the
+/// WARN that says so.
+const PUSH_QUEUE_CAPACITY: usize = 32;
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// Bounded, single-worker dispatcher for the blocking git enumeration.
+pub struct PushDispatcher {
+    tx: SyncSender<Job>,
+    accepted: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl PushDispatcher {
+    /// Start a dispatcher with `capacity` queue slots and exactly one worker
+    /// thread. Fail-open: if the thread cannot be spawned the receiver is
+    /// dropped, every dispatch is counted as dropped, and nothing hangs.
+    pub fn new(capacity: usize) -> Self {
+        let (tx, rx) = sync_channel::<Job>(capacity);
+        let spawned = std::thread::Builder::new()
+            .name("commit-report-git".to_string())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            });
+        if let Err(e) = spawned {
+            warn!("commit_report: could not start the git worker thread ({e}) — push reports disabled");
+        }
+        Self {
+            tx,
+            accepted: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Enqueue `job` for the worker. NEVER blocks: a full queue (or a dead
+    /// worker) drops the job and returns `false`.
+    pub fn try_dispatch(&self, job: impl FnOnce() + Send + 'static) -> bool {
+        match self.tx.try_send(Box::new(job)) {
+            Ok(()) => {
+                self.accepted.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(TrySendError::Full(_)) => {
+                let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                warn!(
+                    queue_capacity = PUSH_QUEUE_CAPACITY,
+                    dropped_total = n,
+                    "commit_report: git enumeration queue full — dropping a push observation                      (coord dedups; the next push re-reports it)"
+                );
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Jobs handed to the worker.
+    pub fn accepted(&self) -> u64 {
+        self.accepted.load(Ordering::Relaxed)
+    }
+
+    /// Jobs refused because the queue was full (or the worker is gone).
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// The process-wide dispatcher. Lazily started on the first observed push.
+static PUSH_DISPATCHER: Lazy<PushDispatcher> =
+    Lazy::new(|| PushDispatcher::new(PUSH_QUEUE_CAPACITY));
+
+/// Hand one push observation to the bounded git worker.
+///
+/// This is what the transcript tail loop calls, in place of an unbounded
+/// `spawn_blocking` per line. Returns whether the observation was queued.
+pub fn dispatch_push_observation(
+    obs: PushObservation,
+    registrar: Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+) -> bool {
+    PUSH_DISPATCHER.try_dispatch(move || {
+        handle_push_observation(&obs, &registrar);
+    })
+}
+
+/// Observability for the process-wide dispatcher.
+pub fn dispatch_stats() -> (u64, u64) {
+    (PUSH_DISPATCHER.accepted(), PUSH_DISPATCHER.dropped())
 }
 
 #[cfg(test)]
@@ -498,5 +686,113 @@ mod tests {
         );
         // Different branch is independent.
         assert!(should_report("o/r", "feat/x", "sha2"));
+    }
+    // ── Item 1: bounded + time-bounded git fan-out ───────────────────────
+
+    /// The fan-out cap. Feeding far more observations than the queue can hold
+    /// must NOT block the caller and must NOT create a task per observation:
+    /// everything beyond `capacity` (+ the one job the worker has in hand) is
+    /// refused and counted. With an unbounded fan-out this assertion fails
+    /// because nothing is ever dropped.
+    #[test]
+    fn dispatch_is_bounded_and_never_blocks_the_caller() {
+        const CAPACITY: usize = 4;
+        const OFFERED: u64 = 500;
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let d = PushDispatcher::new(CAPACITY);
+
+        let started = std::time::Instant::now();
+        for _ in 0..OFFERED {
+            let rx = release_rx.clone();
+            // Every accepted job parks until the test releases it, so the
+            // queue really does fill.
+            d.try_dispatch(move || {
+                let _ = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+            });
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "offering {OFFERED} observations blocked the caller for {elapsed:?} —              try_dispatch must never block"
+        );
+        assert_eq!(
+            d.accepted() + d.dropped(),
+            OFFERED,
+            "every offer must be accounted for"
+        );
+        // Worker holds at most one job; the channel holds at most CAPACITY.
+        assert!(
+            d.accepted() <= CAPACITY as u64 + 1,
+            "fan-out cap breached: {} accepted with capacity {CAPACITY}",
+            d.accepted()
+        );
+        assert!(
+            d.dropped() >= OFFERED - (CAPACITY as u64 + 1),
+            "the overflow must be dropped and counted, got {}",
+            d.dropped()
+        );
+
+        // Let the parked jobs go so the worker thread can exit with the sender.
+        for _ in 0..(CAPACITY + 1) {
+            let _ = release_tx.send(());
+        }
+    }
+
+    /// A stand-in for a `git` that never returns (index.lock, credential
+    /// prompt, unreachable remote).
+    fn hung_git() -> std::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = crate::process_helpers::no_window("cmd.exe");
+            c.args(["/C", "ping -n 60 127.0.0.1"]);
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut c = crate::process_helpers::no_window("sh");
+            c.args(["-c", "sleep 60"]);
+            c
+        }
+    }
+
+    /// The stage-1 contract: a git that hangs must surface as a failed lookup
+    /// inside the budget, NOT as a parked thread. Remove the timeout from
+    /// `run_git_command` and this test blocks for ~59s, blowing the elapsed
+    /// assertion.
+    #[test]
+    fn a_hung_git_returns_none_inside_the_budget() {
+        let budget = Duration::from_millis(400);
+        let dir = std::env::temp_dir();
+        let started = std::time::Instant::now();
+        let out = run_git_command(hung_git(), &dir, &["rev-parse", "HEAD"], budget);
+        let elapsed = started.elapsed();
+
+        assert!(out.is_none(), "a timed-out git must not report a result");
+        assert!(
+            elapsed < budget * 8,
+            "run_git_command blocked for {elapsed:?} against a {budget:?} budget"
+        );
+    }
+
+    /// The wrapper must not have broken the happy path.
+    #[test]
+    fn a_real_git_still_answers_through_the_wrapper() {
+        let dir = std::env::temp_dir();
+        let v = git_with_timeout(&dir, &["--version"], Duration::from_secs(30));
+        assert!(
+            v.is_some_and(|v| v.to_lowercase().contains("git version")),
+            "a trivial git must still succeed through the timeout wrapper"
+        );
+    }
+
+    #[test]
+    fn git_timeout_defaults_to_the_documented_budget() {
+        if std::env::var("QONTINUI_COMMIT_LINEAGE_GIT_TIMEOUT_SECS").is_ok() {
+            return; // ambient override — nothing to pin
+        }
+        assert_eq!(git_timeout(), Duration::from_secs(GIT_TIMEOUT_DEFAULT_SECS));
     }
 }

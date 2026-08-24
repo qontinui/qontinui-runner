@@ -151,6 +151,7 @@ mod meta_optimizer;
 mod middleware;
 mod model_catalog;
 mod observer_registry;
+mod off_runtime;
 mod online_learning;
 mod orchestration_loop;
 mod orchestration_loop_configs;
@@ -438,7 +439,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read persisted OTel settings so the tracing pipeline uses saved config
     let otel_config = crate::settings::get_otel_settings();
-    let logging_result = init_logging(LoggingConfig {
+    // Load-bearing binding, not a leftover. It holds THREE `Drop` guards (OTel,
+    // the non-blocking file writer, the non-blocking console writer) and each
+    // one silences its sink the moment it drops. The leading underscore in the
+    // NAME keeps the binding alive for the whole scope; a bare `_` would drop
+    // it immediately and take all three sinks down with it.
+    let _logging_result = init_logging(LoggingConfig {
         otel: otel_config,
         ..LoggingConfig::default()
     })?;

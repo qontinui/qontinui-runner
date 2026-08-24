@@ -186,7 +186,78 @@ pub struct LoggingInitResult {
     /// the process, so it rides in the returned struct alongside `_otel_guard`.
     /// `None` when file logging is disabled.
     pub _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    /// Non-blocking **console** appender guard. Same contract as
+    /// `_file_guard`: dropping it stops the writer thread and silences the
+    /// console. `None` when console logging is disabled.
+    ///
+    /// The console needs the same treatment as the file for a reason that cost
+    /// three iterations to find --- see [`console_writer`].
+    pub _console_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
+
+/// Wrap a console sink so a stalled stdout can never park the caller.
+///
+/// ## Why this exists
+///
+/// `fmt::layer().with_writer(std::io::stdout)` performs a **blocking**
+/// `WriteFile` on whatever thread emitted the event --- and most events are
+/// emitted from tokio worker threads. When stdout's consumer stops draining
+/// (a full pipe, a console host that has stopped servicing writes, a redirect
+/// into a stalled reader), that write blocks *forever*. Every task that logs
+/// then consumes a worker permanently, and the runtime dies once the last
+/// worker is taken --- eight tasks on an eight-core box.
+///
+/// The signature this leaves in the log file is distinctive, because the file
+/// layer runs **before** the console layer in the layer stack: every wedged
+/// task's last log line IS present in the file, and nothing after it. Two
+/// reproductions (2026-08-24) stalled after 124,667 and 124,445 cumulative log
+/// bytes --- 0.18% apart --- while their wall-clock uptimes differed by 16.9%.
+/// A byte-quantized onset is the fingerprint of a fixed-size downstream buffer
+/// filling up, not of a timer or a race.
+///
+/// `non_blocking` moves the write onto a dedicated OS thread behind a bounded
+/// lossy queue. A jammed stdout then costs console lines --- never the runtime,
+/// and never the file log, which stays complete.
+///
+/// `lossy(true)` is stated explicitly rather than inherited from
+/// `NonBlockingBuilder::default()`. It is the default today, but it is the
+/// single property the whole fix rests on: with `lossy(false)` a full queue
+/// makes the writer *wait*, which is the shipped defect wearing a different
+/// hat. A dependency bump must not be able to re-arm this silently.
+///
+/// Generic over the sink and the limit purely so the mechanism tests can hand
+/// it a writer that deliberately blocks and a queue small enough to fill;
+/// production always passes [`std::io::stdout`] and
+/// [`CONSOLE_BUFFERED_LINES_LIMIT`].
+fn console_writer<W>(
+    sink: W,
+    buffered_lines_limit: usize,
+) -> (non_blocking::NonBlocking, non_blocking::WorkerGuard)
+where
+    W: std::io::Write + Send + 'static,
+{
+    non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(buffered_lines_limit)
+        .finish(sink)
+}
+
+/// How many console lines may queue behind a jammed stdout before the wrapper
+/// starts dropping them.
+///
+/// This restates `tracing_appender`'s own default. It is restated rather than
+/// inherited because the two costs it balances pull in OPPOSITE directions,
+/// and a future tuner needs to see both before touching it:
+///
+/// * **Larger** --- more resident memory behind a permanent jam. Each queued
+///   line owns its formatted `Vec<u8>`; at ~250 B/line this ceiling is tens of
+///   megabytes. The bounded array is also allocated eagerly at startup.
+/// * **Smaller** --- the queue reaches capacity *sooner*, which makes
+///   `WorkerGuard::drop`'s shutdown `send_timeout` more likely to expire. When
+///   it does, tracing-appender reports the failure with a `println!` --- onto
+///   the jammed stdout. Shrinking this buys memory with the reachability of a
+///   hang inside someone else's `Drop`.
+const CONSOLE_BUFFERED_LINES_LIMIT: usize = 128_000;
 
 pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> {
     std::fs::create_dir_all(&config.log_dir)?;
@@ -224,6 +295,7 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
     // Hoisted so the WorkerGuard survives past this function and rides home in
     // `LoggingInitResult`; dropping it here would kill the writer thread.
     let mut file_guard = None;
+    let mut console_guard = None;
 
     if config.log_to_file {
         // Daily rotation with a bounded retention window. Without
@@ -251,8 +323,11 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
         let subscriber = registry.with(file_layer).with(jsonl_layer);
 
         if config.log_to_console {
+            let (console_sink, guard) =
+                console_writer(std::io::stdout(), CONSOLE_BUFFERED_LINES_LIMIT);
+            console_guard = Some(guard);
             let console_layer = fmt::layer()
-                .with_writer(std::io::stdout)
+                .with_writer(console_sink)
                 .with_span_events(FmtSpan::CLOSE);
 
             subscriber.with(console_layer).init();
@@ -260,8 +335,10 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
             subscriber.init();
         }
     } else if config.log_to_console {
+        let (console_sink, guard) = console_writer(std::io::stdout(), CONSOLE_BUFFERED_LINES_LIMIT);
+        console_guard = Some(guard);
         let console_layer = fmt::layer()
-            .with_writer(std::io::stdout)
+            .with_writer(console_sink)
             .with_span_events(FmtSpan::CLOSE);
 
         registry.with(console_layer).with(jsonl_layer).init();
@@ -277,6 +354,7 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
     Ok(LoggingInitResult {
         _otel_guard: otel_guard,
         _file_guard: file_guard,
+        _console_guard: console_guard,
     })
 }
 
@@ -669,5 +747,194 @@ mod tests {
 
         assert!(!retract_last_crash_dump("unit test"));
         assert!(other.exists(), "a non-`crash_` file must not be renamed");
+    }
+}
+
+#[cfg(test)]
+mod console_jam_tests {
+    //! The mechanism test for the 2026-08-24 P0 runtime stall.
+    //!
+    //! A blocking console sink used the way `fmt::layer().with_writer(..)`
+    //! uses it will park whichever thread emits the event. Because most events
+    //! are emitted from tokio worker threads, a stalled stdout consumed one
+    //! worker per logging task until the runtime had none left.
+    //!
+    //! Every assertion here is measured **from outside the runtime**, over a
+    //! `std::sync::mpsc` channel. That is deliberate: a check that awaits
+    //! inside the runtime it is testing cannot fail when the runtime is
+    //! parked --- it hangs instead, which is how two earlier attempts lost
+    //! their evidence.
+
+    use super::console_writer;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A sink that accepts `capacity` bytes and then blocks forever --- a
+    /// stdout whose consumer has stopped draining. `release` exists only so
+    /// the test can let the writer thread go at teardown instead of leaking a
+    /// permanently parked thread into the rest of the suite.
+    struct JammedSink {
+        remaining: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+        parked: Arc<AtomicUsize>,
+    }
+
+    impl Write for JammedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = buf.len();
+            if self.remaining.load(Ordering::SeqCst) >= n {
+                self.remaining.fetch_sub(n, Ordering::SeqCst);
+                return Ok(n);
+            }
+            self.parked.fetch_add(1, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Writing through the production console wrapper must never park a tokio
+    /// worker, however hard the sink is jammed.
+    ///
+    /// Neuter check --- this exact edit was run, and it goes RED in 10s:
+    /// swap `.lossy(true)` for `.lossy(false)` in [`console_writer`] and drop
+    /// the limit to 1. Same signature, same types, but a full queue now makes
+    /// the caller wait, which is the shipped defect. The probe below is then
+    /// never scheduled and `recv_timeout` REPORTS the parked runtime instead
+    /// of hanging on it --- the distinction that cost two earlier attempts
+    /// their evidence.
+    #[test]
+    fn a_jammed_console_sink_cannot_park_the_runtime() {
+        const WORKERS: usize = 2;
+
+        let release = Arc::new(AtomicBool::new(false));
+        let parked = Arc::new(AtomicUsize::new(0));
+        let sink = JammedSink {
+            // Enough for a couple of lines, then the jam.
+            remaining: Arc::new(AtomicUsize::new(64)),
+            release: Arc::clone(&release),
+            parked: Arc::clone(&parked),
+        };
+
+        let (writer, guard) = console_writer(sink, super::CONSOLE_BUFFERED_LINES_LIMIT);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(WORKERS)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        // Far more logging tasks than there are workers. Under the defect each
+        // one takes a worker and never gives it back.
+        for i in 0..(WORKERS * 8) {
+            let mut w = writer.clone();
+            rt.spawn(async move {
+                let _ = w.write_all(format!("jammed console line {i}\n").as_bytes());
+            });
+        }
+
+        // The probe. It runs on the same runtime, so it can only answer if a
+        // worker is still free --- and it answers over a std channel, so the
+        // ASSERTION is measured off the runtime entirely.
+        let (tx, rx) = mpsc::channel::<()>();
+        rt.spawn(async move {
+            let _ = tx.send(());
+        });
+
+        let verdict = rx.recv_timeout(Duration::from_secs(5));
+
+        // Teardown BEFORE asserting: a failing assert must not leave parked
+        // writer threads behind for the rest of the suite.
+        release.store(true, Ordering::SeqCst);
+        drop(guard);
+        rt.shutdown_timeout(Duration::from_secs(5));
+
+        assert!(
+            verdict.is_ok(),
+            "the tokio runtime was parked by a jammed console sink: no worker could run a \
+             trivial task within 5s. {} write(s) were blocked in the sink. This is the \
+             2026-08-24 P0 --- console writes must go through a non-blocking appender.",
+            parked.load(Ordering::SeqCst)
+        );
+    }
+
+    /// `init_logging` must never hand a console layer a raw stdout writer.
+    ///
+    /// Without this, the guard is only on the helper: revert the two
+    /// `.with_writer(console_sink)` call sites back to
+    /// `.with_writer(std::io::stdout)`, leave `console_writer` defined and
+    /// unused, and both runtime tests above still pass green. The regression
+    /// this file exists to prevent is a *wiring* choice, and `.init()` is
+    /// global-once per process, so the wiring cannot be exercised twice in a
+    /// test binary. A source check is the honest guard available.
+    #[test]
+    fn init_logging_never_gives_a_console_layer_a_raw_stdout_writer() {
+        // Split so the needle never appears verbatim on a code line --- this
+        // check would otherwise match itself.
+        let needle = concat!("with_writer(std::io::", "stdout");
+        let src = include_str!("logging.rs");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .filter(|(_, l)| l.contains(needle))
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "a console layer is writing straight to stdout again --- that write blocks the              emitting tokio worker when stdout's consumer stops draining, which is the              2026-08-24 P0. Route it through `console_writer`. Offending line(s): {offenders:?}"
+        );
+    }
+
+    /// The wrapper must be lossy rather than back-pressuring: a jammed sink is
+    /// allowed to cost console lines, and nothing else.
+    ///
+    /// The queue limit here is deliberately TINY. With the production limit of
+    /// 128,000 this test would be vacuous --- ten thousand writes would never
+    /// reach capacity, back-pressure would never engage, and the test would
+    /// pass just as happily against a `lossy(false)` wrapper. A limit of 8
+    /// guarantees the queue is full within the first few writes, so every
+    /// write after that exercises the property the test claims to check.
+    #[test]
+    fn a_jammed_console_sink_never_blocks_the_calling_thread() {
+        const TINY_QUEUE: usize = 8;
+
+        let release = Arc::new(AtomicBool::new(false));
+        let sink = JammedSink {
+            remaining: Arc::new(AtomicUsize::new(0)),
+            release: Arc::clone(&release),
+            parked: Arc::new(AtomicUsize::new(0)),
+        };
+        let (writer, guard) = console_writer(sink, TINY_QUEUE);
+
+        let (tx, rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let mut w = writer;
+            for i in 0..10_000 {
+                let _ = w.write_all(format!("line {i}\n").as_bytes());
+            }
+            let _ = tx.send(());
+        });
+
+        let verdict = rx.recv_timeout(Duration::from_secs(10));
+
+        release.store(true, Ordering::SeqCst);
+        drop(guard);
+        let _ = handle.join();
+
+        assert!(
+            verdict.is_ok(),
+            "a jammed console sink blocked its caller: the wrapper must drop lines under \
+             back-pressure, never wait on the sink"
+        );
     }
 }

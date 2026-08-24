@@ -591,6 +591,193 @@ impl TranscriptIndex for DiskTranscriptIndex {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Off-runtime prescan (2026-08-23 wedge, stage 3)
+// ---------------------------------------------------------------------------
+
+/// A one-shot SNAPSHOT of the transcript disk state, built ONCE on the blocking
+/// pool and then answered purely from memory.
+///
+/// ## Why this exists
+///
+/// [`DiskTranscriptIndex`] is lazy: `candidates_for` walks a project directory
+/// the moment the correlation asks for it. `run_reconcile` is a synchronous
+/// function called INLINE from `run_reconcile_pass`, which is `async` — so
+/// every one of those walks ran on a tokio worker, and each walk parked that
+/// worker on the process-global `SESSION_CACHE` mutex for its whole duration
+/// (see `terminal::transcript`). This box has 8 logical CPUs and therefore 8
+/// workers; the 45s reconcile tick plus the 30s transcript polls only had to
+/// line up a handful of times before every worker was parked and axum stopped
+/// answering while the kernel still accepted connections.
+///
+/// The walk is unavoidable. Doing it on a worker is not: parking a *blocking*
+/// thread degrades throughput, parking a *worker* stops the runtime.
+///
+/// ## Answering from a snapshot
+///
+/// The inputs are all knowable before the pass runs — the unbound live PTYs'
+/// working dirs, and the `(session_id, working_dir)` pairs the phantom prune
+/// will probe — so one prescan covers the whole pass.
+///
+/// **Missing evidence is UNKNOWN, never "no".** A `transcript_exists` probe
+/// for a pair the prescan did not cover answers `true`, because the only
+/// consumer is the phantom-record PRUNE: answering `false` on absent evidence
+/// would delete a real session's record. Absent candidates answer "empty",
+/// which binds nothing — the same fail-open the lazy index had.
+#[derive(Debug, Default)]
+pub struct PrescannedTranscriptIndex {
+    candidates: HashMap<String, Vec<TranscriptCandidate>>,
+    /// Pairs the prescan actually probed.
+    probed: HashSet<(String, String)>,
+    /// The probed pairs that DO have a transcript on disk.
+    exists: HashSet<(String, String)>,
+}
+
+impl PrescannedTranscriptIndex {
+    /// Build the snapshot on the blocking pool.
+    ///
+    /// `working_dirs` — the project dirs whose candidates the pass may ask for
+    /// (i.e. the UNBOUND live PTYs; a confirmed terminal must still cost zero
+    /// disk work). `probes` — the `(session_id, working_dir)` pairs the phantom
+    /// prune will ask about.
+    ///
+    /// Returns an empty (fail-open) snapshot when there is nothing to scan or
+    /// when the blocking task could not be joined.
+    pub async fn scan_off_runtime(
+        working_dirs: Vec<String>,
+        probes: Vec<(String, Option<String>)>,
+    ) -> Self {
+        if working_dirs.is_empty() && probes.is_empty() {
+            // Steady state: nothing unbound, nothing open. No disk work at all.
+            return Self::default();
+        }
+        Self::spawn_scan(move || Self::scan_blocking(working_dirs, probes)).await
+    }
+
+    /// Upper bound on one prescan.
+    ///
+    /// Generous: a cold walk of a large workspace legitimately takes seconds.
+    /// It exists to stop an *indefinite* wait, not to police latency.
+    const PRESCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Run `scan` on the BLOCKING pool and await it, **under a bound measured
+    /// off the tokio runtime**.
+    ///
+    /// The one line that matters for stage 3, factored out so a test can hand
+    /// it a scan that never returns and assert that tokio workers keep
+    /// servicing other tasks anyway. Calling `scan()` inline here is exactly
+    /// the regression.
+    ///
+    /// Iteration 14 left this await **unbounded**, on the reasoning that a
+    /// `spawn_blocking` always eventually resolves. It does not when the
+    /// blocking pool is exhausted — the stage-1 condition — and the obvious
+    /// repair (`tokio::time::timeout`) is inert here for the same reason it was
+    /// inert on the transcript scan: the timer wheel stops turning when the
+    /// runtime is the thing that is sick. The bound is therefore
+    /// [`crate::off_runtime::deadline`], measured by the OS scheduler.
+    ///
+    /// Degrading is safe by contract: an empty snapshot binds nothing and
+    /// prunes nothing, because a pair the prescan never probed answers
+    /// `transcript_exists = true` (missing evidence is UNKNOWN, never "no").
+    async fn spawn_scan<F>(scan: F) -> Self
+    where
+        F: FnOnce() -> Self + Send + 'static,
+    {
+        Self::spawn_scan_bounded(scan, Self::PRESCAN_TIMEOUT).await
+    }
+
+    /// [`Self::spawn_scan`] with the bound injected, so a test drives the REAL
+    /// code path without waiting out the production 30s.
+    async fn spawn_scan_bounded<F>(scan: F, timeout: std::time::Duration) -> Self
+    where
+        F: FnOnce() -> Self + Send + 'static,
+    {
+        let bound = crate::off_runtime::deadline(timeout);
+        let task = tokio::task::spawn_blocking(scan);
+        tokio::select! {
+            joined = task => match joined {
+                Ok(idx) => idx,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "session reconcile: transcript prescan task failed — this pass binds and prunes nothing"
+                    );
+                    Self::default()
+                }
+            },
+            _ = bound => {
+                tracing::warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "session reconcile: the transcript prescan did not finish within its bound \
+                     (blocking pool exhausted?) — this pass binds and prunes nothing. The bound \
+                     is measured on a dedicated OS thread, so it fires even when every tokio \
+                     worker is parked."
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// The blocking half. Never call this from async code.
+    fn scan_blocking(working_dirs: Vec<String>, probes: Vec<(String, Option<String>)>) -> Self {
+        let disk = DiskTranscriptIndex::discover();
+        let mut candidates: HashMap<String, Vec<TranscriptCandidate>> = HashMap::new();
+        for wd in working_dirs {
+            if candidates.contains_key(&wd) {
+                continue;
+            }
+            let found = disk.candidates_for(&wd);
+            candidates.insert(wd, found);
+        }
+
+        let mut probed: HashSet<(String, String)> = HashSet::new();
+        let mut exists: HashSet<(String, String)> = HashSet::new();
+        for (session_id, working_dir) in probes {
+            // A record with no working dir is answered `false` by contract —
+            // no probe needed, and recording it would be misleading.
+            let Some(working_dir) = working_dir else {
+                continue;
+            };
+            let key = (session_id.clone(), working_dir.clone());
+            if !probed.insert(key.clone()) {
+                continue;
+            }
+            if TranscriptIndex::transcript_exists(&disk, &session_id, Some(&working_dir)) {
+                exists.insert(key);
+            }
+        }
+
+        Self {
+            candidates,
+            probed,
+            exists,
+        }
+    }
+}
+
+impl TranscriptIndex for PrescannedTranscriptIndex {
+    fn candidates_for(&self, working_dir: &str) -> Vec<TranscriptCandidate> {
+        self.candidates
+            .get(working_dir)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn transcript_exists(&self, session_id: &str, working_dir: Option<&str>) -> bool {
+        let Some(working_dir) = working_dir else {
+            return false;
+        };
+        let key = (session_id.to_string(), working_dir.to_string());
+        if self.probed.contains(&key) {
+            self.exists.contains(&key)
+        } else {
+            // UNKNOWN. The only consumer is the phantom PRUNE, so the safe
+            // answer is "assume it exists" — never delete on absent evidence.
+            true
+        }
+    }
+}
+
 /// The same on-disk existence stat, exposed to the snapshot history's write-time
 /// restorability stamp. One implementation, one answer: the field a recovery
 /// line carries means exactly what the phantom PRUNE above means.
@@ -861,7 +1048,11 @@ pub async fn run_reconcile_pass(
     // terminals that still need binding. Never a table-wide fetch; an empty list
     // means no query at all. Fail-open: an unavailable cmdline just leaves the
     // map empty and every terminal falls through to the rung-3 transcript anchor.
-    let anchor_pids: Vec<u32> = live
+    //
+    // The unbound set is computed once and reused: it drives BOTH the cmdline
+    // query below and the transcript prescan further down, so a fully-bound
+    // fleet still does zero of either.
+    let unbound: Vec<&LivePty> = live
         .iter()
         .filter(|pty| {
             !store
@@ -869,8 +1060,8 @@ pub async fn run_reconcile_pass(
                 .map(|r| r.confirmed_at.is_some())
                 .unwrap_or(false)
         })
-        .filter_map(|pty| pty.ai_pid)
         .collect();
+    let anchor_pids: Vec<u32> = unbound.iter().filter_map(|pty| pty.ai_pid).collect();
     let cmdline_ids: HashMap<u32, String> = if anchor_pids.is_empty() {
         HashMap::new()
     } else {
@@ -884,7 +1075,19 @@ pub async fn run_reconcile_pass(
             .collect()
     };
 
-    let index = DiskTranscriptIndex::discover();
+    // Stage-3 of the 2026-08-23 wedge fix: the transcript directory walk used
+    // to happen INSIDE `run_reconcile` — a synchronous call from this async
+    // function, i.e. on a tokio worker, holding the process-global
+    // `SESSION_CACHE` mutex for the length of the walk. Prescan it on the
+    // blocking pool instead and hand `run_reconcile` a pure in-memory index,
+    // so this pass can no longer park a worker no matter how slow the disk is.
+    let scan_dirs: Vec<String> = unbound.iter().map(|pty| pty.working_dir.clone()).collect();
+    let probes: Vec<(String, Option<String>)> = store
+        .open_records()
+        .into_iter()
+        .map(|r| (r.claude_session_id, r.working_dir))
+        .collect();
+    let index = PrescannedTranscriptIndex::scan_off_runtime(scan_dirs, probes).await;
     let actions = run_reconcile(store, &live, snapshot, &index, &cmdline_ids);
 
     let bound = actions
@@ -1283,6 +1486,143 @@ fn disk_only_restore_candidates_with(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // ── Item 3b: the transcript walk must not run on a tokio worker ──────
+
+    /// One worker thread, one scan that never returns. If the prescan runs on
+    /// the worker (the pre-2026-08-23 shape — `run_reconcile` called inline
+    /// from an async fn), that single worker is parked and NOTHING else on the
+    /// runtime can be serviced, which is precisely how the runner stopped
+    /// answering while its socket still accepted. Off the worker, an unrelated
+    /// task still completes.
+    ///
+    /// Neuter check: replace `spawn_blocking(scan)` in `spawn_scan` with a
+    /// direct `scan()` call and this test fails on the `unrelated task` timeout.
+    #[test]
+    fn the_transcript_prescan_does_not_park_a_tokio_worker() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+
+        rt.block_on(async move {
+            let scan = tokio::spawn(async move {
+                PrescannedTranscriptIndex::spawn_scan(move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv(); // a walk that never returns
+                    PrescannedTranscriptIndex::default()
+                })
+                .await
+            });
+
+            // Wait (off the worker) until the scan is genuinely running.
+            tokio::task::spawn_blocking(move || entered_rx.recv())
+                .await
+                .expect("join")
+                .expect("scan entered");
+
+            // The load-bearing assertion: the runtime is still alive.
+            //
+            // Measured with a std channel, NOT `tokio::time::timeout`: the
+            // time driver runs on the very worker under test, so on the
+            // regressed (parked) runtime the timer would never fire and this
+            // test would HANG instead of failing. A blocking recv on the
+            // block_on thread is outside the runtime and always reports.
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<u8>();
+            tokio::spawn(async move {
+                let _ = done_tx.send(42);
+            });
+            let got = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+            assert_eq!(
+                got.ok(),
+                Some(42),
+                "a tokio worker was parked by the transcript walk — the scan is back on the runtime"
+            );
+
+            let _ = release_tx.send(());
+            let _ = scan.await;
+        });
+    }
+
+    /// Item 3: a prescan that never returns must be ABANDONED, not awaited
+    /// forever. Iteration 14 left this await unbounded.
+    ///
+    /// **Measured from outside the runtime** (a std `recv_timeout` on the
+    /// `block_on` thread): the bound under test is
+    /// `off_runtime::deadline`, and asserting it with `tokio::time::timeout`
+    /// would hang instead of failing whenever the regressed shape is present.
+    ///
+    /// Neuter check: replace the `tokio::select!` in `spawn_scan_bounded` with
+    /// a bare `task.await` (iteration 14's shape) and this test fails on the
+    /// `never gave up` assertion.
+    #[test]
+    fn a_prescan_that_never_returns_is_abandoned_by_the_bound() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (gave_up_tx, gave_up_rx) = std::sync::mpsc::channel::<usize>();
+
+        rt.spawn(async move {
+            let idx = PrescannedTranscriptIndex::spawn_scan_bounded(
+                move || {
+                    let _ = release_rx.recv(); // a walk that never returns
+                    PrescannedTranscriptIndex::default()
+                },
+                std::time::Duration::from_millis(300),
+            )
+            .await;
+            let _ = gave_up_tx.send(idx.probed.len());
+        });
+
+        let got = gave_up_rx.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(
+            got.ok(),
+            Some(0),
+            "the prescan never gave up — the await is unbounded again, so an exhausted blocking \
+             pool holds this pass open forever"
+        );
+
+        // And the degraded snapshot must still fail OPEN: an unprobed pair
+        // reads UNKNOWN, so nothing is pruned on absent evidence.
+        let empty = PrescannedTranscriptIndex::default();
+        assert!(
+            empty.transcript_exists("anything", Some("C:/wd")),
+            "a degraded prescan must not report sessions as missing"
+        );
+
+        let _ = release_tx.send(());
+    }
+
+    /// Absent evidence must read as UNKNOWN, not as "no transcript" — the
+    /// phantom prune deletes records on a `false`, so a pair the prescan never
+    /// probed must answer `true`.
+    #[test]
+    fn an_unprobed_pair_is_unknown_not_missing() {
+        let mut idx = PrescannedTranscriptIndex::default();
+        idx.probed
+            .insert(("known-gone".to_string(), "C:/wd".to_string()));
+
+        assert!(
+            !idx.transcript_exists("known-gone", Some("C:/wd")),
+            "a probed pair with no transcript must answer false"
+        );
+        assert!(
+            idx.transcript_exists("never-probed", Some("C:/wd")),
+            "an unprobed pair must NOT be reported as missing"
+        );
+        assert!(
+            !idx.transcript_exists("anything", None),
+            "a record with no working dir keeps the existing false contract"
+        );
+    }
 
     /// `session_bound_payloads` projects exactly the Bind actions — camelCase
     /// wire shape, origin as its registry string, non-Bind actions dropped.

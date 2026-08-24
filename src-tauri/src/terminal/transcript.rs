@@ -120,6 +120,65 @@ struct CachedSession {
 static SESSION_CACHE: once_cell::sync::Lazy<Mutex<HashMap<PathBuf, CachedSession>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
+// ── Why the accessors below exist ───────────────────────────────────────────
+//
+// `SESSION_CACHE` is a process-global `std::sync::Mutex`. Until 2026-08-23
+// `list_sessions` took it ONCE and held it across the entire directory walk —
+// every `fs::metadata`, every `fs::read_to_string`, for every transcript in
+// the project dir. Any thread that then wanted the cache parked on file IO it
+// had no interest in, and because the walk was also being called INLINE from
+// async code (`session::reconcile`), the parked threads were tokio workers.
+// Eight workers on this box, one 45s reconcile tick plus two 30s transcript
+// polls each parking one, and the runtime stops scheduling anything at all —
+// stage 3 of the wedge.
+//
+// The lock is now taken per-entry, in these three tiny synchronous helpers,
+// and is NEVER held across an `fs::` call. That is enforced by construction:
+// the walk has no guard in scope to hold.
+
+/// Look one path up. `Some(hit)` when the cache has an entry for `path` whose
+/// mtime still matches (the inner `Option` is the cached-as-filtered case);
+/// `None` when the caller must read the file.
+fn cache_lookup(path: &Path, mtime: SystemTime) -> Option<Option<TranscriptSession>> {
+    let cache = SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .get(path)
+        .filter(|c| c.mtime == mtime)
+        .map(|c| c.session.clone())
+}
+
+/// Record one freshly-read entry.
+fn cache_store(path: PathBuf, mtime: SystemTime, session: Option<TranscriptSession>) {
+    let mut cache = SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(path, CachedSession { mtime, session });
+}
+
+/// Evict entries under `project_dir` that this scan did not observe — their
+/// transcript files are gone from disk. Only touches the current project dir
+/// so other projects/config dirs keep their entries.
+fn cache_evict_orphans(project_dir: &Path, seen: &HashSet<PathBuf>) {
+    let mut cache = SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|path, _| !path.starts_with(project_dir) || seen.contains(path));
+}
+
+/// Test seam: called once per transcript file DURING the walk, so a test can
+/// observe — from another thread, at that exact moment — whether the walking
+/// thread is holding `SESSION_CACHE`. Compiles to nothing outside `cfg(test)`.
+#[cfg(test)]
+static WALK_PROBE: Mutex<Option<fn()>> = Mutex::new(None);
+
+#[cfg(test)]
+fn walk_probe() {
+    let f = *WALK_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(f) = f {
+        f();
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn walk_probe() {}
+
 // ── Config Dir Discovery ─────────────────────────────────────────────────────
 
 /// Find Claude Code config directories on this machine.
@@ -420,7 +479,6 @@ pub fn list_sessions(
     let entries = fs::read_dir(&project_dir)
         .map_err(|e| format!("Failed to read project directory {:?}: {}", project_dir, e))?;
 
-    let mut cache = SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
     for entry in entries.flatten() {
@@ -437,20 +495,22 @@ pub fn list_sessions(
         let metadata = fs::metadata(&path);
         let mtime = metadata.as_ref().ok().and_then(|m| m.modified().ok());
 
-        // Check cache: if we've seen this file with the same mtime, reuse the result
+        // Observation point for the lock-scope test (no-op in a real build).
+        walk_probe();
+
+        // Check cache: if we've seen this file with the same mtime, reuse the
+        // result. The lock is held for THIS lookup only — never across the
+        // reads below.
         if let Some(mtime) = mtime {
-            if let Some(cached) = cache.get(&path) {
-                if cached.mtime == mtime {
-                    if let Some(ref session) = cached.session {
-                        // Update project_path/config_dir in case they differ
-                        let mut s = session.clone();
-                        s.project_path = project_path.to_string();
-                        s.config_dir = config_dir.to_string_lossy().to_string();
-                        sessions.push(s);
-                    }
-                    // else: cached as filtered (workflow/empty) — skip
-                    continue;
+            if let Some(cached) = cache_lookup(&path, mtime) {
+                if let Some(mut s) = cached {
+                    // Update project_path/config_dir in case they differ
+                    s.project_path = project_path.to_string();
+                    s.config_dir = config_dir.to_string_lossy().to_string();
+                    sessions.push(s);
                 }
+                // else: cached as filtered (workflow/empty) — skip
+                continue;
             }
         }
 
@@ -473,13 +533,7 @@ pub fn list_sessions(
         // Skip workflow-spawned sessions (they use bypassPermissions)
         if is_workflow_session(&content) {
             if let Some(mt) = mtime {
-                cache.insert(
-                    path.clone(),
-                    CachedSession {
-                        mtime: mt,
-                        session: None,
-                    },
-                );
+                cache_store(path.clone(), mt, None);
             }
             continue;
         }
@@ -498,13 +552,7 @@ pub fn list_sessions(
         // Skip sessions with no real messages
         if message_count == 0 {
             if let Some(mt) = mtime {
-                cache.insert(
-                    path.clone(),
-                    CachedSession {
-                        mtime: mt,
-                        session: None,
-                    },
-                );
+                cache_store(path.clone(), mt, None);
             }
             continue;
         }
@@ -541,13 +589,7 @@ pub fn list_sessions(
         };
 
         if let Some(mt) = mtime {
-            cache.insert(
-                path.clone(),
-                CachedSession {
-                    mtime: mt,
-                    session: Some(session.clone()),
-                },
-            );
+            cache_store(path.clone(), mt, Some(session.clone()));
         }
 
         sessions.push(session);
@@ -557,9 +599,8 @@ pub fn list_sessions(
     // didn't observe in this scan corresponds to a session file that was
     // deleted from disk. Only touch entries under the *current* project_dir
     // so we don't disturb cached entries for other projects/config dirs.
-    cache.retain(|path, _| !path.starts_with(&project_dir) || seen.contains(path));
-
-    drop(cache);
+    // One short critical section, after all the IO is done.
+    cache_evict_orphans(&project_dir, &seen);
 
     // Sort by last_modified descending (newest first)
     sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
@@ -2528,6 +2569,68 @@ mod tests {
     fn clear_cache_under(prefix: &Path) {
         let mut cache = SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.retain(|p, _| !p.starts_with(prefix));
+    }
+
+    // ── Item 3a: the process-global cache lock must not span the walk ────
+    //
+    // Deterministic, not timing-based: the walk itself calls `walk_probe()`
+    // once per transcript, and the probe asks a SEPARATE thread to `try_lock`
+    // `SESSION_CACHE` at that instant. Holding the lock across the walk (the
+    // pre-2026-08-23 shape) makes every one of those attempts fail.
+
+    static PROBE_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static PROBE_ACQUIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn try_lock_from_another_thread() {
+        use std::sync::atomic::Ordering;
+        PROBE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        // A different thread, so this is a real cross-thread acquisition and
+        // not same-thread reentrancy.
+        let got = std::thread::spawn(|| SESSION_CACHE.try_lock().is_ok())
+            .join()
+            .unwrap_or(false);
+        if got {
+            PROBE_ACQUIRED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn the_session_cache_lock_is_not_held_across_the_directory_walk() {
+        use std::sync::atomic::Ordering;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().to_path_buf();
+        let project_dir = temp.path().join("walk_project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let t = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        for i in 0..12 {
+            write_session_with_mtime(&config_dir, &project_path, &format!("walk-{i}"), t);
+        }
+        clear_cache_under(temp.path());
+
+        PROBE_ATTEMPTS.store(0, Ordering::SeqCst);
+        PROBE_ACQUIRED.store(0, Ordering::SeqCst);
+        *WALK_PROBE.lock().unwrap_or_else(|e| e.into_inner()) = Some(try_lock_from_another_thread);
+
+        let sessions = list_sessions(&config_dir, &project_path).expect("walk succeeded");
+
+        *WALK_PROBE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+        assert_eq!(
+            sessions.len(),
+            12,
+            "the walk must still return every session"
+        );
+        let attempts = PROBE_ATTEMPTS.load(Ordering::SeqCst);
+        let acquired = PROBE_ACQUIRED.load(Ordering::SeqCst);
+        assert_eq!(attempts, 12, "the walk must have been probed once per file");
+        assert_eq!(
+            acquired, attempts,
+            "SESSION_CACHE was unavailable to another thread during the walk \
+             ({acquired}/{attempts} acquisitions) — the lock is being held across the file IO"
+        );
     }
 
     #[test]
