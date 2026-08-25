@@ -75,6 +75,31 @@ pub async fn get_error_monitor_errors(
         .filter_map(|v| serde_json::from_value(v).ok())
         .collect();
 
+    // Same injected-error overlay the `query_error_events` command carries, so
+    // the seam is observable from an HTTP acceptance driver and not only
+    // through the Tauri command the page happens to use. Without this the two
+    // doors disagree about what the store contains, which is exactly the kind
+    // of split that made this surface untestable in the first place.
+    //
+    // This route is the UNRESOLVED view (`get_unresolved_errors`), so the
+    // overlay is filtered the same way: a resolved/ignored injected row must
+    // not appear here just because it exists.
+    #[cfg(any(debug_assertions, feature = "test-fixtures"))]
+    let errors = {
+        let query = crate::error_monitor::types::ErrorQuery {
+            task_run_id: task_run_id.clone(),
+            status: Some(vec![
+                crate::error_monitor::types::ErrorStatus::New,
+                crate::error_monitor::types::ErrorStatus::Recurring,
+                crate::error_monitor::types::ErrorStatus::Acknowledged,
+                crate::error_monitor::types::ErrorStatus::InProgress,
+                crate::error_monitor::types::ErrorStatus::Promoted,
+            ]),
+            ..Default::default()
+        };
+        crate::mcp::test_fixtures::merge_with_injected_errors(errors, &query)
+    };
+
     Ok(Json(ApiResponse::success(errors)))
 }
 
@@ -110,6 +135,17 @@ pub async fn get_error_monitor_summary(
                 ))),
             )
         })?;
+
+    // Same injected-error overlay the sibling `GET /error-monitor/errors` route
+    // and the `get_error_summary` command carry.
+    //
+    // Caught by live verification, not by a unit test: with the overlay merged
+    // into the list route but NOT here, a seeded error rendered in the list
+    // while this door still answered `total: 0`. Two doors onto the same store
+    // disagreeing is precisely the split that made this surface untestable, so
+    // every read door gets the overlay or none of them does.
+    #[cfg(any(debug_assertions, feature = "test-fixtures"))]
+    let summary = crate::mcp::test_fixtures::merge_with_injected_summary(summary);
 
     Ok(Json(ApiResponse::success(summary)))
 }

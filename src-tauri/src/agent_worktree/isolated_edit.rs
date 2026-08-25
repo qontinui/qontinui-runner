@@ -690,9 +690,79 @@ pub async fn acquire_for_terminal(
     working_dir: Option<String>,
     agent_session_id: Option<uuid::Uuid>,
 ) -> (Option<String>, Option<IsolatedEditContext>) {
-    let out: (Option<String>, Option<IsolatedEditContext>) = match intent_repo {
-        None => (working_dir, None),
-        Some(repo) => {
+    // ── REUSE BEFORE ALLOCATE (session restore) ────────────────────────────
+    //
+    // Every restart's session restore replays the pane's RECORDED working dir
+    // through this helper. When that dir is itself a prior allocation, the
+    // allocate arm below cannot possibly reuse it: coord mints a FRESH
+    // `agent_id` on every `POST /agents/allocate`, and the local target is
+    // `agent_worktree_root/<agent_id>/<repo>`, so a brand-new directory AND a
+    // brand-new branch were structurally guaranteed. That leaked one worktree
+    // and one branch per restored session per restart, forever — nothing ever
+    // reused or reclaimed the previous one.
+    //
+    // The reuse is deliberately NARROW. It only fires when this call would
+    // otherwise have allocated, and only for the pane's OWN allocation:
+    //
+    //  * `intent_repo.is_some() && worktree_mode_enabled()` — the two gates the
+    //    allocate arm itself is behind. Without this the reuse ran on the
+    //    DEFAULT configuration (mode off, no intent repo), where this helper is
+    //    documented to be a no-op, and rewrote the pane's cwd.
+    //  * the allocation's repo segment must equal the repo being asked for —
+    //    otherwise a session standing in a `qontinui-runner` worktree that asks
+    //    for `qontinui-web` was handed the runner one and the web allocation
+    //    never happened.
+    //  * the recorded dir must BE the allocation root, not merely a descendant
+    //    of it. `allocated_worktree_for_path` maps a descendant up to the root
+    //    (which is what the census wants), but `out.0` becomes the PTY's actual
+    //    working directory, so reusing the root for a pane recorded three
+    //    levels down would silently move the operator's shell.
+    //
+    // What this deliberately does NOT do is adopt a worktree that is merely
+    // path-shaped and present. The probe cannot tell whose allocation it is,
+    // so the narrowing above is what keeps one session from binding itself to
+    // another agent's live worktree and branch — with no claim, no heartbeat
+    // and nothing for the reclaim engine to attribute the directory to, since
+    // no `IsolatedEditContext` travels with a reused worktree (its `Drop`
+    // releases coord claims, and the reused worktree's claims belong to the
+    // allocation that created it).
+    //
+    // `allocated_worktree_for_path` returns `None` the moment the recorded
+    // worktree is genuinely gone (directory deleted, or `git worktree remove`d
+    // so its `.git` file no longer exists), and the allocate arm then produces
+    // a replacement — which is the whole "allocate only when the prior worktree
+    // is gone" contract.
+    let reused: Option<String> = match (intent_repo, working_dir.as_deref()) {
+        (Some(repo), Some(wd)) if worktree_mode_enabled() => {
+            super::canonical_paths::allocated_worktree_for_path(std::path::Path::new(wd))
+                .filter(|found| {
+                    let same_repo = found
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case(repo));
+                    let same_dir = crate::agent_worktree::canonical_paths::paths_equal(
+                        found,
+                        std::path::Path::new(wd),
+                    );
+                    same_repo && same_dir
+                })
+                .map(|p| p.to_string_lossy().to_string())
+        }
+        _ => None,
+    };
+
+    let out: (Option<String>, Option<IsolatedEditContext>) = match (reused, intent_repo) {
+        (Some(reused), _) => {
+            info!(
+                reused_worktree = %reused,
+                purpose = %purpose,
+                "acquire_for_terminal: reusing the live agent worktree this session is \
+                 already recorded in — not allocating a new one"
+            );
+            (Some(reused), None)
+        }
+        (None, None) => (working_dir, None),
+        (None, Some(repo)) => {
             let repos = vec![repo.to_string()];
             match acquire(AcquireRequest {
                 repos: &repos,

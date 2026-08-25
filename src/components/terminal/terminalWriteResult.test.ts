@@ -50,6 +50,55 @@ describe("buildWriteFailure", () => {
       "plain string boom",
     );
   });
+
+  // ── The backend's own refusal (manual-test-loop iter 16) ────────────────
+  //
+  // `TerminalSession::write` in Rust now refuses a write to an exited PTY.
+  // A pane that has not yet processed its `terminal-exit` event calls this
+  // with `exit === null`, so without recognising the backend envelope the
+  // typed TERMINAL_EXITED diagnosis was downgraded to TERMINAL_WRITE_FAILED
+  // — and `resumeVerification` retries TERMINAL_WRITE_FAILED for 31s against
+  // a process that is already gone.
+  it("classifies the BACKEND's TERMINAL_EXITED refusal even before the exit event lands", () => {
+    const backendRefusal = new Error(
+      "TERMINAL_EXITED: terminal term-4 is not writable -- its process exited with code 137.",
+    );
+    const failure = buildWriteFailure("term-4", null, backendRefusal);
+
+    expect(failure.code).toBe(TERMINAL_EXITED);
+    expect(failure.exitCode).toBe(137);
+    expect(failure.hint).toMatch(/restart the session/i);
+  });
+
+  it("reports a null exitCode when the backend refusal says the code is unknown", () => {
+    const failure = buildWriteFailure(
+      "term-5",
+      null,
+      new Error("TERMINAL_EXITED: terminal term-5 is not writable -- its process exited with code unknown."),
+    );
+    expect(failure.code).toBe(TERMINAL_EXITED);
+    expect(failure.exitCode).toBeNull();
+  });
+
+  // The falsifiable other half: recognising the backend envelope must not
+  // swallow every failure into TERMINAL_EXITED. A live pane's IPC failure is
+  // still retryable and must stay TERMINAL_WRITE_FAILED.
+  it("does NOT promote an unrelated IPC failure to TERMINAL_EXITED", () => {
+    const failure = buildWriteFailure("term-6", null, new Error("Terminal not found: term-6"));
+    expect(failure.code).toBe(TERMINAL_WRITE_FAILED);
+  });
+
+  // A locally-observed exit still wins: its exitCode is authoritative over
+  // anything parsed out of the cause string.
+  it("prefers the locally observed exit code over the backend text", () => {
+    const failure = buildWriteFailure(
+      "term-7",
+      { exitCode: 2 },
+      new Error("TERMINAL_EXITED: ... exited with code 137."),
+    );
+    expect(failure.code).toBe(TERMINAL_EXITED);
+    expect(failure.exitCode).toBe(2);
+  });
 });
 
 describe("throwIfWriteFailed", () => {
