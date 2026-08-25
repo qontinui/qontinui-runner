@@ -29,7 +29,7 @@ pub struct UIBridgeActionRequest {
     #[serde(default)]
     pub(crate) expect_change: Option<serde_json::Value>,
     /// Opt-in staleness gate: the snapshot id the caller reasoned from
-    /// (`ubs1_<count36>_<content>_<generation>`, minted by
+    /// (`ubs2_<count36>_<mountEvidence36>_<content>_<generation>`, minted by
     /// `POST /ui-bridge/control/discover`).
     ///
     /// When supplied, the handler takes a pre-action snapshot and REFUSES the
@@ -67,8 +67,38 @@ pub struct UIBridgeActionRequest {
     ///   guarantee.
     #[serde(default)]
     pub(crate) from_snapshot_id: Option<String>,
+    /// D3 effect-calculus per-request opt-in: predict-then-verify for THIS
+    /// action, without flipping the executor-wide flag. Forwarded verbatim to
+    /// the SDK inside the action envelope — the runner never interprets it.
+    ///
+    /// It **must** be declared here rather than left to `extra`: `extra` is a
+    /// flatten catch-all that gets merged into `params`, so an undeclared SDK
+    /// request field is delivered as an action *parameter* and
+    /// `request.verifyEffect` reads `undefined` on the other side.
+    #[serde(default)]
+    pub(crate) verify_effect: Option<bool>,
+    /// Opt into the ranked list of OTHER strategies that would have resolved
+    /// the target, returned on `elementResolution.alternates`.
+    ///
+    /// Purely an SDK-side concern — the runner computes nothing for it and
+    /// only carries it into the action envelope. Opt-in because building the
+    /// list forces the whole resolution chain to run instead of stopping at
+    /// the first hit (`O(elements × candidates)`), and a *request* field
+    /// rather than a config setting so the same call cannot return different
+    /// shapes on different machines.
+    ///
+    /// Same declaration requirement as `verify_effect` above, and for the same
+    /// reason: as an undeclared field it was merged into `params`, which made
+    /// the opt-in unreachable on every runner transport.
+    #[serde(default)]
+    pub(crate) include_resolution_alternates: Option<bool>,
     /// Capture any extra top-level fields (e.g., targetPosition, text, clear)
     /// so they can be merged into params for actions that accept flat format.
+    ///
+    /// **Only genuine flat action parameters belong here.** Anything that is
+    /// part of the SDK's `ControlActionRequest` grammar must be a declared
+    /// field above, or it silently becomes a parameter instead of a request
+    /// field.
     #[serde(flatten)]
     pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }

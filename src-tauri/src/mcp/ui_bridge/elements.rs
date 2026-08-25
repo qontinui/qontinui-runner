@@ -1080,6 +1080,87 @@ pub(crate) fn validate_type_action_params(
     }
 }
 
+/// Build the action envelope handed to the SDK over IPC, consuming the parts of
+/// `request` that belong in it.
+///
+/// Two jobs, deliberately in one place because they are two halves of the same
+/// decision — what counts as an action *parameter* versus a request *field*:
+///
+/// 1. **Flat parameters are merged into `params`.** `extra` is the
+///    `#[serde(flatten)]` catch-all that makes
+///    `{"action":"drag","targetPosition":…}` work alongside
+///    `{"action":"drag","params":{"targetPosition":…}}`. Existing `params`
+///    entries win over flat ones.
+/// 2. **SDK request fields are forwarded as fields.** Every member of the SDK's
+///    `ControlActionRequest` grammar that the runner does not itself consume has
+///    to be a *declared* member of [`UIBridgeActionRequest`] and be named here.
+///    An undeclared one lands in `extra` and is therefore delivered as an action
+///    PARAMETER: the SDK reads `request.<field>`, sees `undefined`, and the
+///    opt-in is unreachable on every runner transport no matter how carefully
+///    the layers above forwarded it. That is precisely what happened to
+///    `includeResolutionAlternates`, and why this function exists as a named,
+///    tested unit rather than an inline `json!` literal.
+///
+/// `fromSnapshotId` is the one field deliberately NOT forwarded. On this route
+/// the staleness gate runs in Rust (fresh pre-action snapshot → HTTP 409
+/// `ELEMENT_STALE` / `staleReason = "snapshot-superseded"`), and that snapshot
+/// is strictly more current than anything the in-process SDK executor could
+/// compare against; forwarding it would arm a second gate able only to produce
+/// a differently-shaped rejection for the same condition. The
+/// `/ui-bridge/sdk/*` wrapper does forward it — there the SDK is the only gate.
+///
+/// Opt-ins the caller did not set are OMITTED rather than sent as `null`, so a
+/// request that opts into nothing produces the same IPC payload this route sent
+/// before the opt-ins existed.
+fn build_action_envelope(
+    action_name: &str,
+    request: &mut UIBridgeActionRequest,
+) -> serde_json::Value {
+    let extra = std::mem::take(&mut request.extra);
+    let merged_params = if extra.is_empty() {
+        request.params.take()
+    } else {
+        let mut base = match request.params.take() {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        for (k, v) in extra {
+            base.entry(k).or_insert(v);
+        }
+        Some(serde_json::Value::Object(base))
+    };
+
+    let mut envelope = serde_json::Map::new();
+    envelope.insert(
+        "action".to_string(),
+        serde_json::Value::String(action_name.to_string()),
+    );
+    envelope.insert(
+        "params".to_string(),
+        merged_params.unwrap_or(serde_json::Value::Null),
+    );
+    envelope.insert(
+        "waitOptions".to_string(),
+        request
+            .wait_options
+            .take()
+            .unwrap_or(serde_json::Value::Null),
+    );
+    if let Some(verify_effect) = request.verify_effect {
+        envelope.insert(
+            "verifyEffect".to_string(),
+            serde_json::Value::Bool(verify_effect),
+        );
+    }
+    if let Some(include_alternates) = request.include_resolution_alternates {
+        envelope.insert(
+            "includeResolutionAlternates".to_string(),
+            serde_json::Value::Bool(include_alternates),
+        );
+    }
+    serde_json::Value::Object(envelope)
+}
+
 pub async fn ui_bridge_execute_action_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -1355,32 +1436,47 @@ pub async fn ui_bridge_execute_action_handler(
     // `2026-08-20-ui-bridge-snapshot-identity-and-selector-candidates`,
     // Phase 2).
     //
-    // UNKNOWN IS NOT STALE. An id this runner cannot parse — a `ubs2` minted
-    // by a newer peer, a truncated string, an id from some other scheme — is
-    // a state in which we cannot JUDGE freshness, which is a different thing
-    // from having judged it stale. Rejecting on it would fail closed on the
-    // wrong axis: it breaks callers without preventing a single wrong click.
-    // So it is logged and the action proceeds exactly as if no id had been
-    // given.
+    // UNKNOWN IS NOT STALE. An id this runner cannot parse — a `ubs1` id from
+    // before the grammar carried mount evidence, a truncated string, an id
+    // from some other scheme — is a state in which we cannot JUDGE freshness,
+    // which is a different thing from having judged it stale. Rejecting on it
+    // would fail closed on the wrong axis: it breaks callers without
+    // preventing a single wrong click. So the action proceeds ungated.
+    //
+    // But NOT SILENTLY. A caller that opted into a freshness guarantee and did
+    // not get one has to be told, in the response, not only in a runner log it
+    // will never read — otherwise the gate degrades into a no-op that looks
+    // exactly like a pass. `gate_report` is merged into the success payload
+    // below as `snapshotGate`.
+    let cited_raw: Option<String> = request
+        .from_snapshot_id
+        .as_deref()
+        .map(str::trim)
+        // An empty string is an omission, not a citation.
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_string);
+    let mut gate_report: Option<serde_json::Value> = None;
     let cited_snapshot: Option<(String, super::helpers::SnapshotSignature)> =
-        match request.from_snapshot_id.as_deref().map(str::trim) {
-            Some(raw) if !raw.is_empty() => {
-                match super::helpers::SnapshotSignature::from_snapshot_id(raw) {
-                    Some(sig) => Some((raw.to_string(), sig)),
-                    None => {
-                        warn!(
-                            "execute_action: fromSnapshotId {:?} on element {} is not a \
-                             recognised snapshot id — cannot judge freshness, so proceeding \
-                             ungated rather than refusing",
-                            raw, id
-                        );
-                        None
-                    }
+        cited_raw.as_deref().and_then(|raw| {
+            match super::helpers::SnapshotSignature::from_snapshot_id(raw) {
+                Some(sig) => Some((raw.to_string(), sig)),
+                None => {
+                    warn!(
+                        "execute_action: fromSnapshotId {:?} on element {} is not a recognised \
+                         ubs2 snapshot id — cannot judge freshness, so proceeding ungated \
+                         rather than refusing",
+                        raw, id
+                    );
+                    gate_report = Some(serde_json::json!({
+                        "citedSnapshotId": raw,
+                        "verdict": "cannotJudge",
+                        "reason": "cannot judge: cited id is not a ubs2 snapshot id",
+                        "gated": false,
+                    }));
+                    None
                 }
             }
-            // An empty string is an omission, not a citation.
-            _ => None,
-        };
+        });
 
     info!(
         "UI Bridge API: Executing action {} on element {}",
@@ -1489,30 +1585,79 @@ pub async fn ui_bridge_execute_action_handler(
         };
 
         // Reuse the shipped predicates rather than re-deriving them:
-        // `superseded_reason` is written in terms of `unchanged_from` /
-        // `remounted_from`, the same two the post-action `expectChange` report
-        // uses, so the pre- and post-action arms can never disagree about what
-        // a remount is.
-        if let Some(change_kind) = current.and_then(|c| c.superseded_reason(cited_sig)) {
-            let current = current.expect("superseded_reason only fires on a taken snapshot");
-            warn!(
-                "execute_action: refusing {} on element {} — cited snapshot {} is superseded by \
-                 {} ({})",
-                action_name,
-                id,
-                cited_id,
-                current.snapshot_id(),
-                change_kind
-            );
-            let detail = UiBridgeError::snapshot_superseded(
-                cited_id,
-                &current.snapshot_id(),
-                change_kind,
-                cited_sig.count,
-                current.count,
-            );
-            let msg = detail.message.clone();
-            return Err((StatusCode::CONFLICT, Json(api_error_detailed(msg, detail))));
+        // `freshness_verdict` is written in terms of `unchanged_from` /
+        // `remounted_from` / `generation_comparable`, the same predicates the
+        // post-action `expectChange` report uses, so the pre- and post-action
+        // arms can never disagree about what a remount is.
+        match current.map(|c| (c, c.freshness_verdict(cited_sig))) {
+            Some((current, super::helpers::FreshnessVerdict::Superseded(change_kind))) => {
+                warn!(
+                    "execute_action: refusing {} on element {} — cited snapshot {} is superseded \
+                     by {} ({})",
+                    action_name,
+                    id,
+                    cited_id,
+                    current.snapshot_id(),
+                    change_kind
+                );
+                let detail = UiBridgeError::snapshot_superseded(
+                    cited_id,
+                    &current.snapshot_id(),
+                    change_kind,
+                    cited_sig.count,
+                    current.count,
+                );
+                let msg = detail.message.clone();
+                return Err((StatusCode::CONFLICT, Json(api_error_detailed(msg, detail))));
+            }
+            // THE arm the `ubs2` grammar exists to make expressible: the two
+            // signatures differ only in generation halves that were never
+            // comparable, because one or both folded no `registeredAt`. A
+            // generation match would have proven nothing and the mismatch
+            // proves nothing either, so the honest answer is neither "fresh"
+            // nor "stale". Fail OPEN — and say so in the response.
+            Some((current, super::helpers::FreshnessVerdict::CannotJudge)) => {
+                warn!(
+                    "execute_action: cannot judge freshness of {} on element {} — cited snapshot \
+                     {} and current {} carry no mount evidence (cited={}, current={}), so \
+                     proceeding ungated rather than refusing",
+                    action_name,
+                    id,
+                    cited_id,
+                    current.snapshot_id(),
+                    cited_sig.mount_evidence,
+                    current.mount_evidence
+                );
+                gate_report = Some(serde_json::json!({
+                    "citedSnapshotId": cited_id,
+                    "currentSnapshotId": current.snapshot_id(),
+                    "verdict": "cannotJudge",
+                    "reason": "cannot judge: no mount evidence",
+                    "citedMountEvidence": cited_sig.mount_evidence,
+                    "currentMountEvidence": current.mount_evidence,
+                    "gated": false,
+                }));
+            }
+            Some((current, super::helpers::FreshnessVerdict::Fresh)) => {
+                gate_report = Some(serde_json::json!({
+                    "citedSnapshotId": cited_id,
+                    "currentSnapshotId": current.snapshot_id(),
+                    "verdict": "fresh",
+                    "citedMountEvidence": cited_sig.mount_evidence,
+                    "currentMountEvidence": current.mount_evidence,
+                    "gated": true,
+                }));
+            }
+            // The pre-action snapshot could not be taken; the warn above
+            // already named why. Same fail-open, same duty to say so.
+            None => {
+                gate_report = Some(serde_json::json!({
+                    "citedSnapshotId": cited_id,
+                    "verdict": "cannotJudge",
+                    "reason": "cannot judge: the pre-action snapshot could not be taken",
+                    "gated": false,
+                }));
+            }
         }
     }
 
@@ -1530,27 +1675,7 @@ pub async fn ui_bridge_execute_action_handler(
         }
     };
 
-    // Merge flat top-level fields into params so actions like drag work with
-    // both {"action":"drag","params":{"targetPosition":{...}}} and
-    // {"action":"drag","targetPosition":{...}} formats.
-    let merged_params = if request.extra.is_empty() {
-        request.params
-    } else {
-        let mut base = match request.params {
-            Some(serde_json::Value::Object(m)) => m,
-            _ => serde_json::Map::new(),
-        };
-        for (k, v) in request.extra {
-            base.entry(k).or_insert(v);
-        }
-        Some(serde_json::Value::Object(base))
-    };
-
-    let action_obj = serde_json::json!({
-        "action": action_name,
-        "params": merged_params,
-        "waitOptions": request.wait_options
-    });
+    let action_obj = build_action_envelope(&action_name, &mut request);
 
     let payload = super::request::target_window_payload(
         serde_json::json!({
@@ -2163,6 +2288,26 @@ pub async fn ui_bridge_execute_action_handler(
         }
     }
 
+    // Surface the freshness gate's own verdict to the CALLER. A gate that
+    // stood down is indistinguishable from a gate that passed unless it says
+    // which happened, and the runner log is not a channel the caller reads.
+    if let Some(report) = gate_report {
+        if let Ok(ref mut json_resp) = result {
+            let merged = match json_resp.data.take() {
+                Some(serde_json::Value::Object(mut m)) => {
+                    m.insert("snapshotGate".to_string(), report);
+                    serde_json::Value::Object(m)
+                }
+                Some(other) => serde_json::json!({
+                    "result": other,
+                    "snapshotGate": report,
+                }),
+                None => serde_json::json!({ "snapshotGate": report }),
+            };
+            json_resp.data = Some(merged);
+        }
+    }
+
     // Persist the action event when task_run_id is provided (non-blocking)
     if let Some(tr_id) = task_run_id {
         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -2747,16 +2892,39 @@ pub async fn ui_bridge_discover_handler(
                     "snapshotIdCitable".to_string(),
                     serde_json::Value::Bool(snapshot_id_citable),
                 );
+                // How much evidence the id's `generation` half was folded
+                // from. Published beside the id because it is the difference
+                // between "no remount" and "cannot see remounts", and a
+                // caller deciding whether to rely on the gate needs it BEFORE
+                // it cites the id, not after the action came back ungated.
+                obj.insert(
+                    "snapshotMountEvidence".to_string(),
+                    serde_json::Value::from(sig.mount_evidence),
+                );
+                let mut notes: Vec<String> = Vec::new();
                 if !snapshot_id_citable {
+                    notes.push(
+                        "This discover narrowed the element set, so its id is not comparable \
+                         with the pre-action snapshot and must NOT be passed as \
+                         fromSnapshotId. POST /ui-bridge/control/discover with exactly \
+                         {\"interactiveOnly\": false} for a citable id."
+                            .to_string(),
+                    );
+                }
+                if sig.mount_evidence == 0 {
+                    notes.push(
+                        "No element in this payload carried `registeredAt`, so this id's \
+                         generation half folded element ids only and CANNOT answer the remount \
+                         question. Citing it as fromSnapshotId will be answered \
+                         \"cannot judge: no mount evidence\" and the action will proceed \
+                         ungated."
+                            .to_string(),
+                    );
+                }
+                if !notes.is_empty() {
                     obj.insert(
                         "snapshotIdNote".to_string(),
-                        serde_json::Value::String(
-                            "This discover narrowed the element set, so its id is not comparable \
-                             with the pre-action snapshot and must NOT be passed as \
-                             fromSnapshotId. POST /ui-bridge/control/discover with exactly \
-                             {\"interactiveOnly\": false} for a citable id."
-                                .to_string(),
-                        ),
+                        serde_json::Value::String(notes.join(" ")),
                     );
                 }
             }
@@ -6827,11 +6995,12 @@ mod read_value_tests {
 /// `helpers.rs`.
 #[cfg(test)]
 mod snapshot_staleness_gate_tests {
+    use super::super::helpers::FreshnessVerdict;
     use super::super::helpers::{
         citable_snapshot_discover_payload, snapshot_signature, SnapshotSignature,
     };
     use super::super::types::{UIBridgeActionRequest, UiBridgeError, UiBridgeErrorCode};
-    use super::{discover_snapshot_id_is_citable, UIBridgeDiscoveryRequest};
+    use super::{build_action_envelope, discover_snapshot_id_is_citable, UIBridgeDiscoveryRequest};
     use serde_json::json;
 
     // ---- request shape -------------------------------------------------
@@ -6926,11 +7095,123 @@ mod snapshot_staleness_gate_tests {
             );
         }
         assert_eq!(gate["force"], json!(false));
-        assert_eq!(citable_snapshot_discover_payload(true)["force"], json!(true));
+        assert_eq!(
+            citable_snapshot_discover_payload(true)["force"],
+            json!(true)
+        );
         // force is the ONLY difference the two forms may have.
         let mut forced = citable_snapshot_discover_payload(true);
         forced["force"] = json!(false);
         assert_eq!(forced, gate);
+    }
+
+    // ---- the action envelope -------------------------------------------
+
+    /// `includeResolutionAlternates` must be delivered as a REQUEST FIELD, not
+    /// as an action parameter.
+    ///
+    /// This is the defect the field was added for. `UIBridgeActionRequest`
+    /// ends in a `#[serde(flatten)] extra` catch-all that exists to fold flat
+    /// action parameters into `params` — so an SDK request field that is not a
+    /// declared struct member lands in `extra`, gets merged into `params`, and
+    /// arrives at the SDK as a parameter. `request.includeResolutionAlternates`
+    /// then reads `undefined` and the opt-in is unreachable on every runner
+    /// transport, no matter how carefully the wrapper above forwarded it.
+    #[test]
+    fn include_resolution_alternates_is_a_request_field_not_a_param() {
+        let mut req: UIBridgeActionRequest = serde_json::from_value(json!({
+            "action": "click",
+            "includeResolutionAlternates": true
+        }))
+        .expect("body parses");
+        assert_eq!(req.include_resolution_alternates, Some(true));
+        assert!(
+            !req.extra.contains_key("includeResolutionAlternates"),
+            "a declared field must not fall into the flatten catch-all"
+        );
+
+        let envelope = build_action_envelope("click", &mut req);
+        assert_eq!(envelope["includeResolutionAlternates"], json!(true));
+        assert!(
+            envelope["params"]
+                .get("includeResolutionAlternates")
+                .is_none(),
+            "the opt-in must NOT be merged into params — that is the bug: {}",
+            envelope
+        );
+    }
+
+    /// Same rule, same reason, for the D3 effect-calculus opt-in.
+    #[test]
+    fn verify_effect_is_a_request_field_not_a_param() {
+        let mut req: UIBridgeActionRequest = serde_json::from_value(json!({
+            "action": "click",
+            "verifyEffect": true
+        }))
+        .expect("body parses");
+        assert_eq!(req.verify_effect, Some(true));
+        assert!(!req.extra.contains_key("verifyEffect"));
+
+        let envelope = build_action_envelope("click", &mut req);
+        assert_eq!(envelope["verifyEffect"], json!(true));
+        assert!(envelope["params"].get("verifyEffect").is_none());
+    }
+
+    /// The flatten catch-all still does its actual job: genuine flat action
+    /// parameters are merged into `params`, and an explicit `params` entry
+    /// wins over the flat spelling of the same key.
+    #[test]
+    fn flat_action_parameters_still_merge_into_params() {
+        let mut req: UIBridgeActionRequest = serde_json::from_value(json!({
+            "action": "drag",
+            "targetPosition": { "x": 10, "y": 20 }
+        }))
+        .expect("body parses");
+        let envelope = build_action_envelope("drag", &mut req);
+        assert_eq!(
+            envelope["params"]["targetPosition"],
+            json!({"x": 10, "y": 20})
+        );
+
+        let mut wins: UIBridgeActionRequest = serde_json::from_value(json!({
+            "action": "type",
+            "params": { "text": "from params" },
+            "text": "from the flat form"
+        }))
+        .expect("body parses");
+        let envelope = build_action_envelope("type", &mut wins);
+        assert_eq!(envelope["params"]["text"], json!("from params"));
+    }
+
+    /// A request that opts into nothing must produce exactly the envelope this
+    /// route sent before the opt-ins existed — omitted, not `null`.
+    #[test]
+    fn unrequested_opt_ins_are_omitted_from_the_envelope() {
+        let mut req: UIBridgeActionRequest =
+            serde_json::from_value(json!({ "action": "click" })).expect("body parses");
+        let envelope = build_action_envelope("click", &mut req);
+        assert_eq!(
+            envelope,
+            json!({ "action": "click", "params": null, "waitOptions": null })
+        );
+    }
+
+    /// `fromSnapshotId` is CONSUMED by this route, not forwarded: the gate ran
+    /// in Rust against a snapshot strictly more current than anything the
+    /// in-process SDK executor could compare against, and forwarding it would
+    /// arm a second gate able only to produce a differently-shaped rejection
+    /// for the same condition.
+    #[test]
+    fn from_snapshot_id_is_consumed_by_the_rust_gate_and_not_forwarded() {
+        let mut req: UIBridgeActionRequest = serde_json::from_value(json!({
+            "action": "click",
+            "fromSnapshotId": "ubs2_2_2_65a59daceda26fb2_c5d41be145c82269"
+        }))
+        .expect("body parses");
+        assert!(req.from_snapshot_id.is_some());
+        let envelope = build_action_envelope("click", &mut req);
+        assert!(envelope.get("fromSnapshotId").is_none());
+        assert!(envelope["params"].get("fromSnapshotId").is_none());
     }
 
     // ---- the refusal ---------------------------------------------------
@@ -6946,15 +7227,19 @@ mod snapshot_staleness_gate_tests {
                 .expect("golden fixture parses");
 
         let cited = snapshot_signature(&json!({ "elements": golden["two_elements"]["elements"] }));
-        let current =
-            snapshot_signature(&json!({ "elements": golden["remount_of_two_elements"]["elements"] }));
+        let current = snapshot_signature(
+            &json!({ "elements": golden["remount_of_two_elements"]["elements"] }),
+        );
 
         // What the caller would have been handed by a citable discover.
         let cited_id = cited.snapshot_id();
         let parsed = SnapshotSignature::from_snapshot_id(&cited_id).expect("id parses");
         assert!(parsed.unchanged_from(&cited), "the wire id is lossless");
 
-        assert_eq!(current.superseded_reason(&parsed), Some("remounted"));
+        assert_eq!(
+            current.freshness_verdict(&parsed),
+            FreshnessVerdict::Superseded("remounted")
+        );
         assert!(
             current.remounted_from(&parsed),
             "the refusal must rest on the shipped remount predicate"
@@ -7000,7 +7285,7 @@ mod snapshot_staleness_gate_tests {
         ]);
         let a = snapshot_signature(&json!({ "elements": elements.clone() }));
         let b = snapshot_signature(&json!({ "elements": elements }));
-        assert_eq!(b.superseded_reason(&a), None);
+        assert_eq!(b.freshness_verdict(&a), FreshnessVerdict::Fresh);
     }
 
     #[test]
@@ -7015,7 +7300,10 @@ mod snapshot_staleness_gate_tests {
             { "id": "btn", "category": "button", "registeredAt": 7,
               "state": { "textContent": "Stop" } }
         ]}));
-        assert_eq!(retitled.superseded_reason(&cited), Some("contentChanged"));
+        assert_eq!(
+            retitled.freshness_verdict(&cited),
+            FreshnessVerdict::Superseded("contentChanged")
+        );
 
         let grown = snapshot_signature(&json!({ "elements": [
             { "id": "btn", "category": "button", "registeredAt": 7,
@@ -7023,7 +7311,10 @@ mod snapshot_staleness_gate_tests {
             { "id": "btn2", "category": "button", "registeredAt": 8,
               "state": { "textContent": "Also" } }
         ]}));
-        assert_eq!(grown.superseded_reason(&cited), Some("elementCountChanged"));
+        assert_eq!(
+            grown.freshness_verdict(&cited),
+            FreshnessVerdict::Superseded("elementCountChanged")
+        );
     }
 
     /// UNKNOWN IS NOT STALE — arm 1. An id this runner cannot parse yields no
@@ -7035,7 +7326,16 @@ mod snapshot_staleness_gate_tests {
     fn an_unparseable_id_yields_no_citation_rather_than_a_refusal() {
         for unknown in [
             "snapshot-3-1724500000000", // the AI layer's old counter id
+            // A well-formed id in the RETIRED `ubs1` grammar. It must not
+            // parse: it carries no mount-evidence segment, so nothing can say
+            // whether its generation half was folded from registration times
+            // or from ids alone, and guessing is the spurious-verdict defect
+            // the `ubs2` grammar exists to close.
+            "ubs1_2_65a59daceda26fb2_c5d41be145c82269",
+            // `ubs2` arity, `ubs1` segment count.
             "ubs2_1_0000000000000001_0000000000000002",
+            // Evidence larger than the element count — no fold can mint this.
+            "ubs2_1_2_0000000000000001_0000000000000002",
             "not-an-id",
             "ubs1_1_deadbeef",
         ] {

@@ -228,15 +228,36 @@ fall-through to the primary tab); the runner forwards it verbatim.
 
 The rule above is about query params, but the **request body** has the identical
 hazard on any `/ui-bridge/sdk/*` wrapper that *reconstructs* the payload instead
-of forwarding it verbatim. `handle_element_action` does both: the WS/HTTP arm
-forwards `body` untouched, while the IPC-fallback arm rebuilds
-`{elementId, action:{...}}` field by field — so a new body field silently
-survives on one transport and silently vanishes on the other, and the same
-request behaves differently depending on which arm answered.
+of forwarding it verbatim — and, one layer down, on the TypeScript handler that
+rebuilds the SDK call from the IPC payload it was handed.
 
-Three opt-ins are threaded there today and all must stay listed here:
+**The fix is structural: forward the request WHOLE at every hop.** A
+per-field roster is a list that has to be maintained, and it was not — the
+enumeration silently dropped every opt-in nobody remembered to re-add. The three
+hops now copy the object instead:
 
-- `verifyEffect` — the D3 effect-calculus per-request opt-in.
+1. `handle_element_action` (`sdk_client.rs`) — the WS/HTTP arm always forwarded
+   `body` untouched; the IPC-fallback arm now clones `body` into the `action`
+   envelope and re-stamps only `action` (so a body with no verb still defaults
+   to `click`). The two arms can no longer disagree about which fields exist.
+2. `execute_action` (`elements.rs`, the runner-direct route) builds its envelope
+   from **declared struct fields** of `UIBridgeActionRequest`. This is the trap
+   worth naming: the struct ends in a `#[serde(flatten)] extra` catch-all whose
+   job is folding *flat action parameters* into `params`, so any SDK request
+   field that is not a declared member lands in `extra` and is delivered as an
+   action **parameter**. The SDK then reads `request.<field>`, sees `undefined`,
+   and the opt-in is unreachable on every runner transport no matter how
+   carefully the wrapper above forwarded it. Anything belonging to the SDK's
+   `ControlActionRequest` grammar must therefore be a declared field.
+3. `useControlEvents.ts` (`case "execute_action"`) types `payload.action` as the
+   SDK's own `ControlActionRequest` and passes it to `executeAction` **whole**.
+   It used to rebuild `{action, params, waitOptions}` from a hand-written
+   three-field type, which is what made hops 1 and 2 dead code as shipped.
+
+The opt-ins riding those hops today, all of which must stay listed here:
+
+- `verifyEffect` — the D3 effect-calculus per-request opt-in. Declared on
+  `UIBridgeActionRequest`; forwarded, never interpreted by the runner.
 - `fromSnapshotId` — the pre-action staleness gate (plan
   `2026-08-20-ui-bridge-snapshot-identity-and-selector-candidates`). The caller
   passes the `snapshotId` it reasoned from; the **runner-direct** route
@@ -248,8 +269,19 @@ Three opt-ins are threaded there today and all must stay listed here:
   `detached`, **not** a new top-level code. `context.changeKind` narrows it to
   `remounted` / `elementCountChanged` / `contentChanged`. Omitting the field
   preserves the previous behaviour exactly.
+
+  This is the one field the runner-direct route **consumes rather than
+  forwards**: it is deliberately absent from that route's action envelope,
+  because the Rust gate has just taken a fresh snapshot and is strictly more
+  current than anything the in-process SDK executor could compare against —
+  forwarding it would arm a second gate able only to produce a
+  differently-shaped rejection for the same condition. The `/ui-bridge/sdk/*`
+  wrapper does forward it, because there the SDK is the only gate there is.
 - `includeResolutionAlternates` — the ranked selector alternates (Phase 3, an
-  SDK-side concern). The runner only forwards it.
+  SDK-side concern). Declared on `UIBridgeActionRequest` and carried verbatim
+  into the action envelope on both routes; the runner computes nothing for it.
+  It is a **declared** field precisely because as an undeclared one it fell into
+  `extra`, was merged into `params`, and the opt-in was unreachable everywhere.
 
 **Unknown is not stale.** An id the runner cannot parse, and a state where the
 pre-action snapshot could not be taken, both proceed UNGATED with a warn. They
@@ -261,20 +293,65 @@ theirs is "re-find the element" and here a re-find would succeed — and click
 the wrong thing.
 
 Ids are minted by `POST /ui-bridge/control/discover`, whose response carries
-`snapshotId`, `snapshotIdCitable` and (when not citable) `snapshotIdNote`. Only
-an unnarrowed `{"interactiveOnly": false}` discover mints a **citable** id,
-because that is the exact element set the gate compares against — both sides
-build their options with `helpers::citable_snapshot_discover_payload`, and they
-must keep doing so. A narrowed discover still returns an id (a valid comparison
-token against another identically-narrowed discover) with
+`snapshotId`, `snapshotIdCitable`, `snapshotMountEvidence` and (when there is
+something to say) `snapshotIdNote`. Only an unnarrowed
+`{"interactiveOnly": false}` discover mints a **citable** id, because that is
+the exact element set the gate compares against — both sides build their
+options with `helpers::citable_snapshot_discover_payload`, and they must keep
+doing so. A narrowed discover still returns an id (a valid comparison token
+against another identically-narrowed discover) with
 `snapshotIdCitable: false`.
 
-The fold behind the id is a cross-repo specification, not an implementation
-detail: FNV-1a-64 over a fixed field list, documented on
+### The id grammar is `ubs2`, and it carries its own evidence
+
+```
+ubs2_{count36}_{mountEvidence36}_{content16hex}_{generation16hex}
+```
+
+Five segments. `mountEvidence` counts how many elements in the payload actually
+carried `registeredAt` — i.e. how much the `generation` half was folded from.
+
+**This exists because "no remount detected" and "cannot see remounts" are
+different answers.** `registeredAt` is optional on the wire; a producer that
+omits it folds no bytes into `generation`, so a generation *match* proves
+nothing, and comparing an ids-only generation against one that folded
+registration times mismatches every time — which reads as a remount that never
+happened. Encoding the count **inside the id** is what makes the distinction
+impossible to lose across a wire: a boolean carried beside the id is exactly
+what the next field-by-field request rebuild would drop, and this session found
+three of those.
+
+Consequences, all deliberate:
+
+- A `ubs1` id **parses to `None`** (`SnapshotSignature::from_snapshot_id`). It
+  carries no evidence segment, so nothing can say whether its generation was
+  ids-only, and guessing reintroduces the spurious verdict. `None` routes it to
+  the "cannot judge" arm.
+- An id whose `mountEvidence` exceeds its `count` does not parse either — no
+  fold can mint it.
+- When the gate's answer would turn on a generation comparison with no evidence
+  behind it, `execute_action` **fails open** (proceeds ungated) and reports
+  `data.snapshotGate = {verdict: "cannotJudge", reason: "cannot judge: no
+  mount evidence", gated: false}`. Fail-open is correct; fail-open *silently*
+  is not — a caller that opted into a freshness guarantee and did not get one
+  must be told in the response, not only in a runner log it never reads. The
+  same block reports `verdict: "fresh"` with `gated: true` when the gate did
+  run, and `cannotJudge` for an unparseable cited id or a pre-action snapshot
+  that could not be taken.
+- A discover whose payload carries no `registeredAt` at all mints an id with
+  `snapshotMountEvidence: 0` and says so in `snapshotIdNote`, so a caller
+  learns the id cannot answer the remount question BEFORE it cites it.
+
+**The FOLD is unchanged — still spec v1.** `ubs2` bumped the id *grammar* only,
+which is why the `content` / `generation` golden vectors did not move; only the
+`snapshotId` strings did. The fold is a cross-repo specification, not an
+implementation detail: FNV-1a-64 over a fixed field list, documented on
 `helpers::SnapshotSignature` and pinned by
-`fixtures/snapshot-signature-golden.json`, which the `ui-bridge` TypeScript SDK
-asserts against the same numbers. Changing it is a `ubs2`, never an edit in
-place.
+`fixtures/snapshot-signature-golden.json` — a **byte-identical copy** of the
+SDK's `packages/ui-bridge/src/core/__fixtures__/snapshot-signature-golden.json`,
+which asserts the same numbers. Take that file from the SDK rather than
+hand-editing it, and change the grammar with a new version tag, never an edit
+in place.
 
 ### Per-window routing (`?windowLabel=`) targets a pop-out runner window
 `tabId` (above) pins a command to a remote browser *tab* via the relay.

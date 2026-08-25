@@ -1244,6 +1244,42 @@ fn append_tab_id_query(path: &str, tab_id: Option<&str>) -> String {
     }
 }
 
+/// Build the IPC-fallback payload for `POST /ui-bridge/sdk/element/:id/action`.
+///
+/// **Forwards the request body WHOLE.** The WS/HTTP arm of
+/// `handle_element_action` sends `body` untouched; this arm used to rebuild the
+/// envelope field by field, which meant the SAME request behaved differently
+/// depending on which transport happened to answer, and every per-request opt-in
+/// the SDK ever added had to be re-threaded here by hand to survive a failover —
+/// `verifyEffect` (D3 effect calculus), `fromSnapshotId` (the pre-action
+/// staleness gate), `includeResolutionAlternates` (the ranked selector
+/// alternates). Copying the object closes that for every field, including the
+/// ones not invented yet: a caller that opted into a freshness guarantee cannot
+/// silently lose it on failover, which is the one outcome an opt-in exists to
+/// rule out.
+///
+/// The only field re-stamped is `action`, so a body with no action verb still
+/// gets the `"click"` default this route has always applied. A non-object body
+/// degrades to an envelope carrying just that verb.
+fn ipc_action_payload(
+    element_id: &str,
+    body: &serde_json::Value,
+    action_name: &str,
+) -> serde_json::Value {
+    let mut envelope = match body {
+        serde_json::Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    envelope.insert(
+        "action".to_string(),
+        serde_json::Value::String(action_name.to_string()),
+    );
+    serde_json::json!({
+        "elementId": element_id,
+        "action": serde_json::Value::Object(envelope)
+    })
+}
+
 /// POST /ui-bridge/sdk/element/:id/action — Execute an action on an element
 async fn handle_element_action(
     State(state): State<Arc<ApiState>>,
@@ -1294,55 +1330,26 @@ async fn handle_element_action(
             (Json(data), success, None)
         }
         Err(_) => {
-            // Fall back to IPC — wrap action in an object to match the format
-            // expected by the TypeScript handler (action.action, action.params, etc.)
-            let params = body
-                .get("params")
-                .cloned()
-                .unwrap_or(serde_json::json!(null));
-            let wait_options = body
-                .get("waitOptions")
-                .cloned()
-                .unwrap_or(serde_json::json!(null));
-            // Forward the D3 effect-calculus per-request opt-in so the IPC path
-            // matches the WS/HTTP path (which forwards the body verbatim). Without
-            // this, `effect_check` would never receive `effectVerification` when
-            // the executor falls back to IPC.
-            let verify_effect = body
-                .get("verifyEffect")
-                .cloned()
-                .unwrap_or(serde_json::json!(null));
-            // Same reason, for the two per-request opt-ins that plan
-            // `2026-08-20-ui-bridge-snapshot-identity-and-selector-candidates`
-            // adds: `fromSnapshotId` (the pre-action staleness gate) and
-            // `includeResolutionAlternates` (the ranked selector alternates,
-            // which are opt-in precisely because they are O(elements ×
-            // candidates) on the hottest payload in the SDK).
+            // Fall back to IPC — wrap the request in an `action` envelope to
+            // match the format the TypeScript handler expects
+            // (`action.action`, `action.params`, …).
             //
-            // The WS/HTTP path forwards the body verbatim, so dropping either
-            // here would mean the SAME request behaves differently depending
-            // on which transport happened to answer — a caller that opted in
-            // to a freshness guarantee would silently lose it on failover,
-            // which is the one outcome an opt-in exists to rule out.
-            let from_snapshot_id = body
-                .get("fromSnapshotId")
-                .cloned()
-                .unwrap_or(serde_json::json!(null));
-            let include_resolution_alternates = body
-                .get("includeResolutionAlternates")
-                .cloned()
-                .unwrap_or(serde_json::json!(null));
-            let payload = serde_json::json!({
-                "elementId": id,
-                "action": {
-                    "action": action_name,
-                    "params": params,
-                    "waitOptions": wait_options,
-                    "verifyEffect": verify_effect,
-                    "fromSnapshotId": from_snapshot_id,
-                    "includeResolutionAlternates": include_resolution_alternates
-                }
-            });
+            // FORWARD THE BODY WHOLE. The WS/HTTP arm above sends `body`
+            // untouched; rebuilding it field by field here is what made a
+            // request behave differently depending on which transport happened
+            // to answer, and every per-request opt-in the SDK has ever added
+            // had to be re-threaded by hand to stay alive on failover —
+            // `verifyEffect` (D3 effect calculus), `fromSnapshotId` (the
+            // pre-action staleness gate) and `includeResolutionAlternates`
+            // (the ranked selector alternates). Copying the object closes that
+            // for every field, including the ones not invented yet: a caller
+            // that opted into a freshness guarantee cannot silently lose it on
+            // failover, which is the one outcome an opt-in exists to rule out.
+            //
+            // `action` is re-stamped from `action_name` so the handler still
+            // gets the same default ("click") this route has always applied to
+            // a body with no action verb.
+            let payload = ipc_action_payload(&id, &body, &action_name);
             match ui_bridge_request_sync(&state, "execute_action", payload).await {
                 Ok(data) => {
                     if data.get("success") == Some(&serde_json::json!(false)) {
@@ -6782,6 +6789,74 @@ async fn handle_sse_event_stream(
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[cfg(test)]
+mod ipc_action_payload_tests {
+    use super::ipc_action_payload;
+    use serde_json::json;
+
+    /// The IPC-fallback arm must forward the body WHOLE, including fields this
+    /// wrapper has never heard of.
+    ///
+    /// The arm used to rebuild `{elementId, action:{...}}` field by field while
+    /// the WS/HTTP arm forwarded `body` untouched, so the SAME request behaved
+    /// differently depending on which transport happened to answer — and every
+    /// per-request opt-in had to be re-threaded here by hand to survive a
+    /// failover. `unknownFutureOptIn` stands in for the field nobody has
+    /// invented yet: it is the one this test actually exists for.
+    #[test]
+    fn every_body_field_survives_the_ipc_fallback() {
+        let body = json!({
+            "action": "click",
+            "params": { "text": "hi" },
+            "waitOptions": { "timeout": 500 },
+            "verifyEffect": true,
+            "fromSnapshotId": "ubs2_2_2_65a59daceda26fb2_c5d41be145c82269",
+            "includeResolutionAlternates": true,
+            "unknownFutureOptIn": { "nested": [1, 2, 3] }
+        });
+        let payload = ipc_action_payload("el_1", &body, "click");
+
+        assert_eq!(payload["elementId"], json!("el_1"));
+        let action = &payload["action"];
+        assert_eq!(action["action"], json!("click"));
+        assert_eq!(action["params"], json!({ "text": "hi" }));
+        assert_eq!(action["waitOptions"], json!({ "timeout": 500 }));
+        assert_eq!(action["verifyEffect"], json!(true));
+        assert_eq!(
+            action["fromSnapshotId"],
+            json!("ubs2_2_2_65a59daceda26fb2_c5d41be145c82269")
+        );
+        assert_eq!(action["includeResolutionAlternates"], json!(true));
+        assert_eq!(
+            action["unknownFutureOptIn"],
+            json!({ "nested": [1, 2, 3] }),
+            "a field this wrapper does not know about must still reach the SDK — that is the \
+             entire point of forwarding the body instead of enumerating it"
+        );
+    }
+
+    /// The one field the fallback re-stamps: a body with no action verb still
+    /// gets the `click` default this route has always applied, and an explicit
+    /// verb is not clobbered by a different one.
+    #[test]
+    fn the_action_verb_is_restamped_from_the_resolved_name() {
+        let defaulted = ipc_action_payload("el_1", &json!({ "params": { "a": 1 } }), "click");
+        assert_eq!(defaulted["action"]["action"], json!("click"));
+        assert_eq!(defaulted["action"]["params"], json!({ "a": 1 }));
+
+        let explicit = ipc_action_payload("el_1", &json!({ "action": "type" }), "type");
+        assert_eq!(explicit["action"]["action"], json!("type"));
+    }
+
+    /// A non-object body cannot be copied; it degrades to the bare verb rather
+    /// than panicking or forwarding a nonsense envelope.
+    #[test]
+    fn a_non_object_body_degrades_to_the_bare_verb() {
+        let payload = ipc_action_payload("el_1", &json!("click"), "click");
+        assert_eq!(payload["action"], json!({ "action": "click" }));
+    }
 }
 
 #[cfg(test)]

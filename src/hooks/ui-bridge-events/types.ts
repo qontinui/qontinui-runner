@@ -1,4 +1,5 @@
 import type {
+  ControlActionRequest,
   RegisteredElement,
   RegisteredComponent,
   ElementIdentifier,
@@ -538,17 +539,28 @@ export interface UIBridgeRequestPayload {
   elementId?: string;
   componentId?: string;
   actionId?: string;
-  action?: {
-    action: string;
-    params?: Record<string, unknown>;
-    waitOptions?: {
-      visible?: boolean;
-      enabled?: boolean;
-      focused?: boolean;
-      timeout?: number;
-      interval?: number;
-    };
-  };
+  /**
+   * The action envelope for `execute_action`, **typed as the SDK's own request
+   * type** so it cannot drift from what the SDK reads.
+   *
+   * This used to be a hand-written structural copy listing exactly
+   * `{ action, params, waitOptions }`. That copy was the reason three
+   * per-request opt-ins the Rust layer forwards — `verifyEffect`,
+   * `fromSnapshotId` and `includeResolutionAlternates` — were invisible to the
+   * handler and got dropped on the floor: the runner's Rust side threaded them
+   * carefully into the IPC payload (`mcp/sdk_client.rs`,
+   * `mcp/ui_bridge/elements.rs`) and the TypeScript handler then rebuilt the
+   * request field by field from a type that had never heard of them.
+   *
+   * Aliasing `ControlActionRequest` is what makes that class of defect
+   * impossible to repeat: a field the SDK adds to its request type is carried
+   * here the moment the dependency is bumped, and the handler forwards this
+   * object **whole** rather than reconstructing it (see `useControlEvents`).
+   *
+   * `string` is the SDK proxy-fallback form (`action: "click"` with no
+   * envelope); the handler normalizes it before use.
+   */
+  action?: ControlActionRequest | string;
   specId?: string;
   url?: string;
   /**

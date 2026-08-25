@@ -1,4 +1,5 @@
 import { useCallback } from "react";
+import type { ControlActionRequest, StableRefResolution } from "@qontinui/ui-bridge";
 import { getApiPort } from "@/lib/runner-api";
 import type { MainTabId } from "@/components/app/tab-types";
 import { migrateTabId } from "@/components/app/tab-types";
@@ -9,6 +10,61 @@ import {
   serializeComponent,
   isElementActionAllowed,
 } from "./utils";
+
+/**
+ * Normalize the IPC `action` field into the SDK request that is FORWARDED
+ * WHOLE to `executeAction`.
+ *
+ * The envelope is returned by identity, never rebuilt. That is the entire
+ * point: this call site used to construct `{action, params, waitOptions}` from
+ * a hand-written three-field payload type, and every per-request opt-in the
+ * Rust layer threaded into the IPC payload — `verifyEffect` (D3 effect
+ * calculus), `fromSnapshotId` (the pre-action staleness gate),
+ * `includeResolutionAlternates` (the ranked selector alternates) — was
+ * silently dropped on the floor here. The SDK read `request.<field>`, saw
+ * `undefined`, and the opt-in was unreachable on every runner transport no
+ * matter how carefully `sdk_client.rs` and `elements.rs` forwarded it.
+ *
+ * A field the SDK adds to `ControlActionRequest` therefore needs no change
+ * here at all — which is the property a per-field roster could never have.
+ *
+ * `string` is the SDK proxy-fallback spelling (a bare verb, no envelope); it
+ * is the ONE input that has to be constructed, because there is no envelope to
+ * forward.
+ */
+export function toActionRequest(
+  action: NonNullable<UIBridgeRequestPayload["action"]>,
+): ControlActionRequest {
+  return typeof action === "string" ? { action } : action;
+}
+
+/**
+ * Project a `resolveStableRef` result onto the `resolve_stable_ref` IPC
+ * response body.
+ *
+ * `resolveStableRef` returns `StableRefResolution { element, resolution }` —
+ * the live `RegisteredElement` plus WHICH of the four strategies produced it.
+ * It used to return the bare `RegisteredElement`, and this projection still
+ * read `resolved.id` / `resolved.mounted`: both `undefined` on the new shape,
+ * so a SUCCESSFUL resolution answered `{elementId: undefined}` and was
+ * indistinguishable from a miss to the stable-ref retry in `elements.rs`,
+ * which reads `elementId` as a string.
+ *
+ * `resolution` is passed through as well, so the retry path has the strategy
+ * and stability class behind the id it is about to act on.
+ */
+export function stableRefResponseData(resolved: StableRefResolution | null): {
+  elementId: string | null;
+  mounted?: boolean;
+  resolution?: StableRefResolution["resolution"];
+} {
+  if (!resolved) return { elementId: null };
+  return {
+    elementId: resolved.element.id,
+    mounted: resolved.element.mounted,
+    resolution: resolved.resolution,
+  };
+}
 
 /**
  * Handles: get_elements, get_element, execute_action, get_components, get_component,
@@ -129,9 +185,10 @@ export function useControlEvents(
             return true;
           }
 
-          // Normalize: action may be a string (from SDK proxy fallback)
-          // or an object { action, params, waitOptions } (from control endpoint)
-          const actionObj = typeof action === "string" ? { action } : action;
+          // Normalize: `action` may be a bare verb (the SDK proxy fallback)
+          // or the full request envelope (the control endpoint). Everything
+          // past this point treats it as the SDK's own `ControlActionRequest`.
+          const actionObj = toActionRequest(action);
 
           // Action-not-allowed pre-check: when the element is registered and
           // we already know its declared action set, surface a hint with the
@@ -164,11 +221,9 @@ export function useControlEvents(
             }
           }
 
-          const result = await currentBridge.executeAction(elementId, {
-            action: actionObj.action,
-            params: actionObj.params,
-            waitOptions: actionObj.waitOptions,
-          });
+          // Forwarded WHOLE — see `toActionRequest` for why this must never
+          // become a field-by-field rebuild again.
+          const result = await currentBridge.executeAction(elementId, actionObj);
 
           // If the action failed because the element wasn't found at all,
           // enrich the response with closest-match element-id suggestions
@@ -504,9 +559,7 @@ export function useControlEvents(
               requestId,
               type,
               success: true,
-              data: resolved
-                ? { elementId: resolved.id, mounted: resolved.mounted }
-                : { elementId: null },
+              data: stableRefResponseData(resolved),
               timestamp: Date.now(),
             });
           } catch (err) {

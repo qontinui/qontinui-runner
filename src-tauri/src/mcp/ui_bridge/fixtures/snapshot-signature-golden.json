@@ -4,7 +4,8 @@
     "count": 0,
     "content": "cbf29ce484222325",
     "generation": "cbf29ce484222325",
-    "snapshotId": "ubs1_0_cbf29ce484222325_cbf29ce484222325"
+    "mountEvidence": 0,
+    "snapshotId": "ubs2_0_0_cbf29ce484222325_cbf29ce484222325"
   },
   "single_minimal": {
     "elements": [
@@ -15,7 +16,8 @@
     "count": 1,
     "content": "583a7aacd700bbfd",
     "generation": "583a7aacd700bbfd",
-    "snapshotId": "ubs1_1_583a7aacd700bbfd_583a7aacd700bbfd"
+    "mountEvidence": 0,
+    "snapshotId": "ubs2_1_0_583a7aacd700bbfd_583a7aacd700bbfd"
   },
   "single_full": {
     "elements": [
@@ -32,7 +34,8 @@
     "count": 1,
     "content": "a90b8969b5033f59",
     "generation": "933eedcc3bc79bd2",
-    "snapshotId": "ubs1_1_a90b8969b5033f59_933eedcc3bc79bd2"
+    "mountEvidence": 1,
+    "snapshotId": "ubs2_1_1_a90b8969b5033f59_933eedcc3bc79bd2"
   },
   "two_elements": {
     "elements": [
@@ -57,7 +60,8 @@
     "count": 2,
     "content": "65a59daceda26fb2",
     "generation": "c5d41be145c82269",
-    "snapshotId": "ubs1_2_65a59daceda26fb2_c5d41be145c82269"
+    "mountEvidence": 2,
+    "snapshotId": "ubs2_2_2_65a59daceda26fb2_c5d41be145c82269"
   },
   "remount_of_two_elements": {
     "elements": [
@@ -82,7 +86,8 @@
     "count": 2,
     "content": "65a59daceda26fb2",
     "generation": "405b6cc498a915bb",
-    "snapshotId": "ubs1_2_65a59daceda26fb2_405b6cc498a915bb"
+    "mountEvidence": 2,
+    "snapshotId": "ubs2_2_2_65a59daceda26fb2_405b6cc498a915bb"
   },
   "missing_registeredAt": {
     "elements": [
@@ -97,7 +102,8 @@
     "count": 1,
     "content": "81e30cd092f43cc3",
     "generation": "805485e4eadded7e",
-    "snapshotId": "ubs1_1_81e30cd092f43cc3_805485e4eadded7e"
+    "mountEvidence": 0,
+    "snapshotId": "ubs2_1_0_81e30cd092f43cc3_805485e4eadded7e"
   },
   "wrong_types_ignored": {
     "elements": [
@@ -114,6 +120,7 @@
     "count": 1,
     "content": "805485e4eadded7e",
     "generation": "805485e4eadded7e",
-    "snapshotId": "ubs1_1_805485e4eadded7e_805485e4eadded7e"
+    "mountEvidence": 0,
+    "snapshotId": "ubs2_1_0_805485e4eadded7e_805485e4eadded7e"
   }
 }

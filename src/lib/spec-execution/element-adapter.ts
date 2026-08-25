@@ -80,18 +80,17 @@ export function externalToDiscovered(ext: ExternalElement): DiscoveredElement {
     state: {
       visible: ext.visible,
       enabled: ext.enabled,
-      // `@qontinui/ui-bridge@0.24.0` (ui-bridge#166) split the disabled axis:
-      // `enabled` stayed as the DERIVED `!(disabled || ariaDisabled)`, and the
-      // two independent signals became required fields. The external wire
-      // carries only the folded bit plus `accessibility.ariaDisabled`, so this
-      // recovers as much as is actually knowable and no more: aria is read
-      // directly, and the native property is credited only for a
-      // not-enabled element that aria does not already explain. An element
-      // disabled BOTH ways therefore under-reports `disabled` here — the fold
-      // destroyed that distinction before it reached the runner, and inventing
-      // it back would be a fabrication.
-      ariaDisabled: ext.accessibility?.ariaDisabled ?? false,
-      disabled: !ext.enabled && !(ext.accessibility?.ariaDisabled ?? false),
+      // `enabled` is a FOLD of three independent signals (native `disabled`,
+      // `aria-disabled`, effective `pointer-events: none`) and cannot be
+      // unfolded, so neither of these is inferred from it. An external app
+      // that publishes only the folded boolean leaves both `false`, which
+      // reads as NOT ASSERTED — inventing a native-disabled claim from a
+      // folded signal is exactly the conflation the SDK split them to end.
+      // (`ExternalElement.disabled`/`ariaDisabled` are the top-level fields
+      // this same change adds below; `accessibility.ariaDisabled` remains a
+      // fallback for a producer that only publishes the nested spelling.)
+      disabled: ext.disabled ?? false,
+      ariaDisabled: ext.ariaDisabled ?? ext.accessibility?.ariaDisabled ?? false,
       focused: ext.focused,
       textContent: asScrubbed(ext.text || ext.accessibleName || ext.accessibility?.accessibleName),
       value: asScrubbed(ext.value),
