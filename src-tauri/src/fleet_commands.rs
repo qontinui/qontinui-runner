@@ -19,7 +19,23 @@
 //!
 //! Adding a command is adding a `.md` file next to them plus one line in
 //! [`FLEET_COMMANDS`]. Nothing in this module or its consumers may assume the
-//! bundle is two commands.
+//! bundle's size, in either direction.
+//!
+//! ### Where the bodies came from, once
+//!
+//! 74 of them were imported from `qontinui-claude-config/.claude/commands/` at
+//! commit `0ecbd67` when `2026-08-20-fleet-served-agent-skills` Phase 6 filled
+//! the bundle. That was a one-time import, not a sync: from here the rule above
+//! applies to all of them equally, and there is no job that re-reads that repo.
+//!
+//! `vet-plan` and `implement-plan` were **not** re-imported. Both trees had
+//! edited them independently — measured 2026-08-25, 60 runner-only and 112
+//! config-only changed lines on `vet-plan`, 43 and 202 on `implement-plan` —
+//! and the runner-only side is a series of reviewed fixes with an in-repo test
+//! behind it ([`tests::every_registration_honesty_block_carries_the_warnings_rule`]
+//! fails on the config-repo copy of `vet-plan`). Overwriting them would have
+//! reverted those. Reconciling the two forks is a content judgement for the
+//! operator, not something an embedding change gets to decide.
 //!
 //! ## Defaults, not the last word
 //!
@@ -48,21 +64,208 @@ use tracing::{info, warn};
 
 use crate::agent_commands::AgentCommandRegistry;
 
-/// `/vet-plan` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/vet-plan.md` in this repository — edit it
-/// there.
-const VET_PLAN: &str = include_str!("fleet_commands/vet-plan.md");
-
-/// `/implement-plan` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/implement-plan.md` in this repository — edit
-/// it there.
-const IMPLEMENT_PLAN: &str = include_str!("fleet_commands/implement-plan.md");
-
 /// The embedded default commands, as `(name, body)`. `name` is the slash
 /// command `claude` will expose and the filename stem written under
 /// `.claude/commands/` (`vet-plan` -> `vet-plan.md` -> `/vet-plan`).
-pub(crate) const FLEET_COMMANDS: &[(&str, &str)] =
-    &[("vet-plan", VET_PLAN), ("implement-plan", IMPLEMENT_PLAN)];
+///
+/// One line per `.md` file in `fleet_commands/`, sorted by name so a diff that
+/// adds a command touches one line. **Never hardcode the length of this slice**
+/// — see the module docs.
+///
+/// ## No underscore-prefixed unit is here, deliberately
+///
+/// The corpus carries copy-source specs (`_gate-registration`, `_loop-control`)
+/// that other units paste from. They are `is_invocable = false` in the store,
+/// and `GET /api/v1/agent-text-units`'s own `invocable_only` documentation
+/// states the rule this bundle has to obey from the other side: *"a client that
+/// PROVISIONS units to disk must pass true: a `_gate-registration.md` written
+/// into `.claude/commands/` becomes an invocable slash command."* An embedded
+/// default is provisioned to disk unconditionally, so shipping one here would
+/// do exactly what the account layer is forbidden to do.
+/// [`tests::no_embedded_command_is_a_copy_source_spec`] holds the line.
+pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
+    ("add-tests", include_str!("fleet_commands/add-tests.md")),
+    ("add-types", include_str!("fleet_commands/add-types.md")),
+    (
+        "analyze-automation",
+        include_str!("fleet_commands/analyze-automation.md"),
+    ),
+    (
+        "analyze-subagent",
+        include_str!("fleet_commands/analyze-subagent.md"),
+    ),
+    (
+        "ask-operator",
+        include_str!("fleet_commands/ask-operator.md"),
+    ),
+    ("audit", include_str!("fleet_commands/audit.md")),
+    ("auto-fix", include_str!("fleet_commands/auto-fix.md")),
+    (
+        "auto-improve",
+        include_str!("fleet_commands/auto-improve.md"),
+    ),
+    ("auto-review", include_str!("fleet_commands/auto-review.md")),
+    ("babysit-prs", include_str!("fleet_commands/babysit-prs.md")),
+    ("blocked", include_str!("fleet_commands/blocked.md")),
+    (
+        "build-mobile-aab",
+        include_str!("fleet_commands/build-mobile-aab.md"),
+    ),
+    (
+        "clean-commit",
+        include_str!("fleet_commands/clean-commit.md"),
+    ),
+    ("clean", include_str!("fleet_commands/clean.md")),
+    (
+        "cleanup-steward",
+        include_str!("fleet_commands/cleanup-steward.md"),
+    ),
+    (
+        "code-analyze",
+        include_str!("fleet_commands/code-analyze.md"),
+    ),
+    ("code-fix", include_str!("fleet_commands/code-fix.md")),
+    ("coordinate", include_str!("fleet_commands/coordinate.md")),
+    ("create-plan", include_str!("fleet_commands/create-plan.md")),
+    (
+        "create-tutorial",
+        include_str!("fleet_commands/create-tutorial.md"),
+    ),
+    ("debug-loop", include_str!("fleet_commands/debug-loop.md")),
+    ("debug", include_str!("fleet_commands/debug.md")),
+    ("find-debt", include_str!("fleet_commands/find-debt.md")),
+    (
+        "find-misplaced",
+        include_str!("fleet_commands/find-misplaced.md"),
+    ),
+    ("fix", include_str!("fleet_commands/fix.md")),
+    ("gate-sweep", include_str!("fleet_commands/gate-sweep.md")),
+    ("gate", include_str!("fleet_commands/gate.md")),
+    (
+        "implement-phase",
+        include_str!("fleet_commands/implement-phase.md"),
+    ),
+    (
+        "implement-plan",
+        include_str!("fleet_commands/implement-plan.md"),
+    ),
+    ("improve-all", include_str!("fleet_commands/improve-all.md")),
+    (
+        "manual-test-coord-loop",
+        include_str!("fleet_commands/manual-test-coord-loop.md"),
+    ),
+    (
+        "manual-test-coord",
+        include_str!("fleet_commands/manual-test-coord.md"),
+    ),
+    (
+        "manual-test-loop",
+        include_str!("fleet_commands/manual-test-loop.md"),
+    ),
+    ("manual-test", include_str!("fleet_commands/manual-test.md")),
+    (
+        "merge-train-steward",
+        include_str!("fleet_commands/merge-train-steward.md"),
+    ),
+    ("mobile-dev", include_str!("fleet_commands/mobile-dev.md")),
+    (
+        "mobile-verify",
+        include_str!("fleet_commands/mobile-verify.md"),
+    ),
+    ("mtc", include_str!("fleet_commands/mtc.md")),
+    ("name", include_str!("fleet_commands/name.md")),
+    ("next-steps", include_str!("fleet_commands/next-steps.md")),
+    (
+        "organize-notes",
+        include_str!("fleet_commands/organize-notes.md"),
+    ),
+    ("plan-graph", include_str!("fleet_commands/plan-graph.md")),
+    ("policy", include_str!("fleet_commands/policy.md")),
+    (
+        "publish-runner",
+        include_str!("fleet_commands/publish-runner.md"),
+    ),
+    ("pull-all", include_str!("fleet_commands/pull-all.md")),
+    ("pull-scoped", include_str!("fleet_commands/pull-scoped.md")),
+    ("pvi", include_str!("fleet_commands/pvi.md")),
+    ("qa", include_str!("fleet_commands/qa.md")),
+    (
+        "recursive-automation",
+        include_str!("fleet_commands/recursive-automation.md"),
+    ),
+    (
+        "refactor-srp",
+        include_str!("fleet_commands/refactor-srp.md"),
+    ),
+    (
+        "reflect-ui-bridge",
+        include_str!("fleet_commands/reflect-ui-bridge.md"),
+    ),
+    (
+        "research-plan",
+        include_str!("fleet_commands/research-plan.md"),
+    ),
+    (
+        "resume-foreign",
+        include_str!("fleet_commands/resume-foreign.md"),
+    ),
+    (
+        "review-before-code",
+        include_str!("fleet_commands/review-before-code.md"),
+    ),
+    (
+        "review-commit",
+        include_str!("fleet_commands/review-commit.md"),
+    ),
+    ("review-logs", include_str!("fleet_commands/review-logs.md")),
+    (
+        "review-plan-next-steps",
+        include_str!("fleet_commands/review-plan-next-steps.md"),
+    ),
+    ("review-plan", include_str!("fleet_commands/review-plan.md")),
+    (
+        "rewind-session",
+        include_str!("fleet_commands/rewind-session.md"),
+    ),
+    (
+        "run-automation",
+        include_str!("fleet_commands/run-automation.md"),
+    ),
+    ("scout", include_str!("fleet_commands/scout.md")),
+    (
+        "security-scan",
+        include_str!("fleet_commands/security-scan.md"),
+    ),
+    (
+        "summarize-session",
+        include_str!("fleet_commands/summarize-session.md"),
+    ),
+    (
+        "symbol-claims-warn",
+        include_str!("fleet_commands/symbol-claims-warn.md"),
+    ),
+    (
+        "test-ui-bridge",
+        include_str!("fleet_commands/test-ui-bridge.md"),
+    ),
+    ("ufix", include_str!("fleet_commands/ufix.md")),
+    ("ui-bridge", include_str!("fleet_commands/ui-bridge.md")),
+    ("unattended", include_str!("fleet_commands/unattended.md")),
+    ("update-spec", include_str!("fleet_commands/update-spec.md")),
+    ("validate", include_str!("fleet_commands/validate.md")),
+    (
+        "verify-plan-status",
+        include_str!("fleet_commands/verify-plan-status.md"),
+    ),
+    ("verify-web", include_str!("fleet_commands/verify-web.md")),
+    ("vet-imp", include_str!("fleet_commands/vet-imp.md")),
+    ("vet-plan", include_str!("fleet_commands/vet-plan.md")),
+    ("whereami", include_str!("fleet_commands/whereami.md")),
+    (
+        "workflow-runs",
+        include_str!("fleet_commands/workflow-runs.md"),
+    ),
+];
 
 /// Provision the resolved agent commands into `<workdir>/.claude/commands/` so
 /// a `claude` session spawned with `workdir` as its cwd can resolve them as
@@ -396,69 +599,182 @@ mod tests {
         }
     }
 
-    /// The bundled text must never acquire the operator's absolute plan paths
-    /// or a reach into the operator's `qontinui-claude-config` checkout. Scope
-    /// to the specific hardcode patterns that were neutralized — NOT bare
-    /// `qontinui-dev-notes`, which legitimately appears as a repo name.
+    /// An operator-ABSOLUTE path into this workspace, in any of the three
+    /// spellings a Windows box produces: drive (`D:/…`, `D:\…`), MSYS (`/d/…`)
+    /// and WSL (`/mnt/d/…`). This is `lint-command-frontmatter.py` check #4's
+    /// `OPERATOR_PATH_RE`, ported literal for literal — see
+    /// [`staged_fleet_text_has_no_operator_path_hardcodes`].
+    static OPERATOR_PATH_RE: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r"(?i)(?:[A-Za-z]:[/\\]|/(?:mnt/)?[a-z]/)qontinui-root")
+                .expect("operator-path regex")
+        });
+
+    /// Check #4's per-line opt-out, matched as the same literal. It marks a line
+    /// that is *genuinely* operator-only — the mobile AAB flow's WSL mount and
+    /// Play-Console paths are the whole of it in this corpus (7 lines in
+    /// `build-mobile-aab.md`).
+    const OPERATOR_LOCAL_MARKER: &str = "operator-local";
+
+    /// The config-repo reach, unconditional and in both separator spellings
+    /// (a Windows-authored body writes the second). This is arm A of
+    /// [`crate::agent_skills::self_path`], kept here so it also covers the
+    /// COMMANDS bundle, which that module does not scan.
+    const CONFIG_REPO_REACH: &[&str] = &[
+        "qontinui-claude-config/.claude",
+        "qontinui-claude-config\\.claude",
+    ];
+
+    /// The bundled text must never carry an operator-absolute path into this
+    /// workspace, or a reach into the operator's `qontinui-claude-config`
+    /// checkout. Whatever is here ships to every fleet device, and a path that
+    /// exists on one machine is a step that silently does nothing on the rest.
     ///
-    /// This guard is independent of where the bodies come from, and it got MORE
-    /// load-bearing once these files became the canonical, user-facing
-    /// defaults: whatever is here ships to every fleet device.
+    /// ## This is check #4, ported — not a substring list of its own
     ///
-    /// ## This list is a FLOOR, not the gate
+    /// The list this test used to carry (`qontinui-dev-notes/plans`,
+    /// `qontinui-root/plans`, `D:/qontinui-root`) was written when the bundle
+    /// was two files, and it does not survive the real corpus in either
+    /// direction. Measured 2026-08-25 over the 74 imported commands and 9
+    /// skills:
     ///
-    /// A substring list only catches the spellings someone thought of.
-    /// Measured 2026-08-24 over the four real hardcode sites in
-    /// `coord-pr-label/SKILL.md`: `qontinui-claude-config/.claude` catches
-    /// **one** of them, because the other three wore an elided spelling
-    /// (`.../coord-pr-label/set-label.sh`) that expands to the same config-repo
-    /// path while containing neither token. The actual gate is shape-based and
-    /// lives in [`crate::agent_skills::self_path`], which asks whether a unit
-    /// can reach its own files at all once provisioned. Keep this list — it is
-    /// cheap and it covers the plan-path patterns that shape rule says nothing
-    /// about — but do not mistake it for coverage.
+    /// * It **over-matches**. `qontinui-dev-notes/plans` appears 9 times as an
+    ///   ordinary repo-relative citation of a plan document
+    ///   (`cleanup-steward.md` ×4, five `SKILL.md`s), which is exactly the
+    ///   spelling `CLAUDE.md` itself uses. Failing those would make the guard
+    ///   refuse working text, and a guard that cries wolf is a guard that gets
+    ///   deleted.
+    /// * It **under-matches**. It knows one of the three absolute spellings.
+    ///   `/mnt/d/qontinui-root` and `D:\qontinui-root` — both live in
+    ///   `build-mobile-aab.md` — match none of its patterns.
+    ///
+    /// `qontinui-claude-config`'s `lint-command-frontmatter.py` check #4
+    /// already states this rule correctly for the tree these bodies came from:
+    /// one shape regex over all three spellings, plus a per-line
+    /// `operator-local` marker for the audited residuals. Porting it — the same
+    /// arrangement, and the same reasoning, as
+    /// [`crate::agent_skills::self_path`]'s port of check #22 — means a body
+    /// that repo's lint accepts is one this bundle accepts, and vice versa.
+    /// **When one changes, change both.**
+    ///
+    /// The shape rule is still only half the gate: it says nothing about
+    /// whether a unit can reach *its own* files once provisioned. That is
+    /// [`crate::agent_skills::self_path`], which runs over every embedded skill
+    /// via [`crate::fleet_skills::tests::embedded_skills_reach_their_own_files`].
     #[test]
     fn staged_fleet_text_has_no_operator_path_hardcodes() {
-        const FORBIDDEN: &[&str] = &[
-            "qontinui-dev-notes/plans",
-            "qontinui-root/plans",
-            "D:/qontinui-root",
-            // The config-repo reach. Both separator spellings, because a
-            // Windows-authored body writes the second.
-            "qontinui-claude-config/.claude",
-            "qontinui-claude-config\\.claude",
-        ];
-        let mut checked = 0usize;
-        for (name, contents) in FLEET_COMMANDS {
-            checked += 1;
-            for pat in FORBIDDEN {
-                assert!(
-                    !contents.contains(pat),
-                    "bundled agent command {name} contains forbidden operator-path hardcode \
-                     {pat:?} — an operator-local absolute path must never ship to a fleet \
-                     device; rewrite it in src-tauri/src/fleet_commands/{name}.md"
-                );
-            }
-        }
-        // The same floor over the embedded SKILLS bundle. Vacuous while Phase 6
-        // has not filled it (see `crate::fleet_skills::FLEET_SKILLS`), and
-        // written so it stops being vacuous the moment it is.
-        for skill in crate::fleet_skills::FLEET_SKILLS {
-            for (path, text) in skill.files {
-                checked += 1;
-                for pat in FORBIDDEN {
-                    assert!(
-                        !text.contains(pat),
-                        "bundled agent skill {}/{path} contains forbidden operator-path \
-                         hardcode {pat:?}",
-                        skill.name
-                    );
+        fn scan(unit: &str, path: &str, text: &str, failures: &mut Vec<String>) {
+            for (n, line) in text.lines().enumerate() {
+                if OPERATOR_PATH_RE.is_match(line) && !line.contains(OPERATOR_LOCAL_MARKER) {
+                    failures.push(format!(
+                        "{unit} {path}:{}: operator-absolute workspace path — rewrite it as \
+                         `<workspace-root>/…` or derive the root at runtime, or append the \
+                         `{OPERATOR_LOCAL_MARKER}` marker if the line is genuinely \
+                         operator-only: {}",
+                        n + 1,
+                        line.trim()
+                    ));
+                }
+                for pat in CONFIG_REPO_REACH {
+                    if line.contains(pat) {
+                        failures.push(format!(
+                            "{unit} {path}:{}: reaches into a `qontinui-claude-config` \
+                             checkout ({pat:?}) — a fleet device has none: {}",
+                            n + 1,
+                            line.trim()
+                        ));
+                    }
                 }
             }
         }
+
+        let mut failures = Vec::new();
+        let mut checked = 0usize;
+        for (name, contents) in FLEET_COMMANDS {
+            checked += 1;
+            scan(
+                "bundled agent command",
+                &format!("src-tauri/src/fleet_commands/{name}.md"),
+                contents,
+                &mut failures,
+            );
+        }
+        for skill in crate::fleet_skills::FLEET_SKILLS {
+            for (path, text) in skill.files {
+                checked += 1;
+                scan(
+                    "bundled agent skill",
+                    &format!("src-tauri/src/fleet_skills/{}/{path}", skill.name),
+                    text,
+                    &mut failures,
+                );
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} operator-path violation(s) in the embedded bundles:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
         assert!(
             checked > 0,
             "the guard scanned nothing — the embedded bundles have gone missing"
         );
+    }
+
+    /// **The guard must be able to fail.** A regex that quietly stops matching
+    /// reads exactly like a clean corpus, and this guard's whole subject is a
+    /// defect that already reads as clean. Samples are check #4's own
+    /// known-bad/known-good pairs plus the two spellings this corpus actually
+    /// contains.
+    #[test]
+    fn the_operator_path_guard_still_fires() {
+        for bad in [
+            r"cp /mnt/d/qontinui-root/qontinui-mobile/google-services.json .",
+            r"adb install -r -d D:\qontinui-root\qontinui-mobile\build-output-signed.apk",
+            r"read D:/qontinui-root/plans/2026-08-20-fleet-served-agent-skills.md",
+            r"bash /d/qontinui-root/qontinui-claude-config/scripts/x.sh",
+        ] {
+            assert!(
+                OPERATOR_PATH_RE.is_match(bad),
+                "known-BAD sample not flagged: {bad}"
+            );
+        }
+        for good in [
+            r"- `<workspace-root>/qontinui-dev-notes/plans/2026-05-21-pr-merge-orchestrator-design.md` —",
+            r"   `$QONTINUI_PLANS_DIR` when it resolves; otherwise they land in `qontinui-dev-notes/plans`,",
+            r"`qontinui-claude-config/knowledge-base/qontinui-specific/coord-merge-train.md`",
+            r"bash <path-to-this-skill-dir>/coord-revive.sh",
+        ] {
+            assert!(
+                !OPERATOR_PATH_RE.is_match(good),
+                "known-GOOD sample flagged: {good}"
+            );
+        }
+        // And the marker is what exempts a line, not the pattern going away.
+        let marked = r"cp /mnt/d/qontinui-root/x .  # operator-local: Play-Console flow";
+        assert!(OPERATOR_PATH_RE.is_match(marked));
+        assert!(marked.contains(OPERATOR_LOCAL_MARKER));
+    }
+
+    /// No embedded command may be an underscore-prefixed copy-source spec.
+    ///
+    /// `_gate-registration` and `_loop-control` are carried by the corpus for
+    /// other units to paste from and are `is_invocable = false` in the store.
+    /// `GET /api/v1/agent-text-units`'s `invocable_only` parameter documents the
+    /// rule from the account side — *"a client that PROVISIONS units to disk
+    /// must pass true"* — and an embedded default is provisioned
+    /// unconditionally, so the bundle has to obey the same rule with no query
+    /// parameter to lean on.
+    #[test]
+    fn no_embedded_command_is_a_copy_source_spec() {
+        for (name, _) in FLEET_COMMANDS {
+            assert!(
+                !name.starts_with('_'),
+                "embedded command {name:?} is a copy-source spec: writing it to \
+                 .claude/commands/{name}.md makes the harness offer it as /{name}, which is \
+                 precisely what `is_invocable = false` exists to prevent"
+            );
+        }
     }
 }

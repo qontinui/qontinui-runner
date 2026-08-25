@@ -38,6 +38,11 @@ mod agent_runtime;
 // Resolution of the fleet's agent SKILLS. Named `agent_skills`, never `skills`:
 // `crate::skills` is the automation-template registry, an unrelated concept.
 mod agent_skills;
+// The two-step corpus fetch both `agent_commands` and `agent_skills` resolve
+// through: read `…/agent-text-units/index` (47 KB), pull bodies only for the
+// units whose `checksum` moved. The full listing is 1.99 MB and the fetch runs
+// inside a 4 s budget on the spawn critical path.
+mod agent_text_units_fetch;
 mod agent_token;
 mod agent_worktree;
 mod agentic_verification;

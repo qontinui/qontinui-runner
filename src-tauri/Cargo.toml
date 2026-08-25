@@ -81,7 +81,16 @@ adb_client = { version = "3", features = ["usb", "mdns"] }
 # as `operation timed out`). `coord_http::coord_client` fixes the coord paths by
 # sharing one pooled client; this feature protects the ~160 call sites that
 # still construct clients per request.
-reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form", "hickory-dns"] }
+# `gzip`: advertise `Accept-Encoding: gzip` and transparently decode the
+# response. qontinui-web runs `GZipMiddleware(minimum_size=1024,
+# compresslevel=6)`, and nothing else in the stack compresses that API (the EB
+# nginx overlay sets timeouts only, the ALB does not compress, CloudFront's
+# `Compress` is scoped to `images/*`), so without this feature the runner asks
+# for and gets every response uncompressed. Measured over the 87-unit agent
+# text-unit corpus 2026-08-25: the full listing is 1,988,661 B plain and
+# ~701,500 B gzipped — 35.3%. That is the difference between needing 486 KB/s
+# and 171 KB/s inside `agent_commands::FETCH_TIMEOUT`, on the spawn path.
+reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form", "hickory-dns", "gzip"] }
 open = "5"
 hostname = "0.4"
 # Row 2 Phase 1 (fleet topology): used by `fleet::detect_resources` to

@@ -84,24 +84,26 @@ use qontinui_types::agent_text_units::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-/// Wall-clock budget for the whole override fetch, matching
-/// `agent_commands::FETCH_TIMEOUT`. Provisioning runs on a spawn path, so the
-/// network layer is hard-bounded — a slow or black-holed backend degrades to
-/// the cache rather than delaying a session launch.
+/// Wall-clock budget for the WHOLE account-layer resolve — index request plus
+/// whatever body requests follow — matching `agent_commands::FETCH_TIMEOUT`.
+/// Provisioning runs on a spawn path, so the network layer is hard-bounded: a
+/// slow or black-holed backend degrades to the cache rather than delaying a
+/// session launch.
 ///
 /// Note what this costs at a spawn: the commands fetch and this one run
 /// sequentially at each call site, so the worst case a session pays for
 /// text-corpus provisioning is **two** of these budgets, not one. That is
 /// accepted rather than parallelized because both are fail-soft and a spawn
 /// that took 8 s longer is strictly better than one that launched without its
-/// tooling. The skills half is also the cheap half: the corpus measured 193 KB
-/// over 9 units on 2026-08-22 against 1.61 MB for the commands, which is the
-/// whole reason this is a `kind`-filtered request rather than a shared one.
+/// tooling.
+///
+/// **It stayed at 4 s when the corpus arrived, deliberately.** Raising it does
+/// not remove the fail-soft cliff, it moves it — and it charges every spawn on
+/// every device. What changed instead is what the 4 s is spent on: see
+/// [`crate::agent_text_units_fetch`], whose index projection takes the warm
+/// path from 1.99 MB to 47 KB. The skills half is also the cheap half — 234 KB
+/// over 9 units against 1.57 MB over 76 commands, measured 2026-08-25.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// Page size for the list endpoint. Nothing here may hardcode the corpus size;
-/// 500 is the endpoint's documented `limit` ceiling.
-const FETCH_LIMIT: u32 = 500;
 
 /// Filename of the on-disk override cache, under the runner's per-instance
 /// config dir — the same convention `agent_commands`, `prompts.rs` and
@@ -458,14 +460,6 @@ fn now_rfc3339() -> String {
 // Fetch
 // ---------------------------------------------------------------------------
 
-/// The list endpoint's envelope. Only `items` is consumed — `pagination` is
-/// irrelevant at corpus scale and unknown fields are ignored.
-#[derive(Debug, Deserialize)]
-struct AgentTextUnitListResponse {
-    #[serde(default)]
-    items: Vec<AgentTextUnit>,
-}
-
 /// What one attempt at the account layer established.
 ///
 /// **Absent** and **unknown** are not the same fact. `NoAccount` is an
@@ -474,94 +468,50 @@ struct AgentTextUnitListResponse {
 /// is the right answer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum FetchOutcome {
-    /// Authenticated fetch succeeded; this is the resolved skill set (possibly
-    /// empty, which is authoritative).
+    /// The account layer resolved; this is the whole skill set (possibly empty,
+    /// which is authoritative). Assembled from the index plus whichever bodies
+    /// the fetch and the cache supplied — see [`crate::agent_text_units_fetch`].
     Fresh(Vec<AgentTextUnit>),
     /// No usable credential, or the backend rejected it (401/403).
     NoAccount,
-    /// Transport error, server error, or an unparseable body — UNKNOWN.
+    /// Transport error, server error, an unparseable body, or a budget overrun
+    /// — UNKNOWN.
     Unavailable(String),
 }
 
-/// Perform the fetch on a dedicated thread with its own current-thread tokio
-/// runtime.
+/// Resolve the account layer: index, bodies for the units whose checksum moved,
+/// cached bodies for the rest.
 ///
-/// Callers reach this from a *sync* provisioning function invoked from *async*
-/// spawn paths. `Handle::block_on` panics when called from inside a runtime
-/// worker, so the work is moved onto its own thread instead — the same
-/// arrangement, and the same reasoning, as `agent_commands`.
-fn fetch_skills_blocking(base_url: &str) -> FetchOutcome {
-    let url = base_url.to_string();
-    let handle = std::thread::Builder::new()
-        .name("agent-skills-fetch".to_string())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    return FetchOutcome::Unavailable(format!("could not build a runtime: {e}"))
-                }
-            };
-            rt.block_on(fetch_skills_async(&url))
-        });
-    match handle {
-        Ok(h) => h
-            .join()
-            .unwrap_or_else(|_| FetchOutcome::Unavailable("the fetch thread panicked".to_string())),
-        Err(e) => FetchOutcome::Unavailable(format!("could not spawn a fetch thread: {e}")),
-    }
-}
+/// `cached` is whatever [`read_cache_at`] produced for this backend. It is both
+/// the source of the checksums that decide what to fetch and the source of the
+/// bodies that are not fetched, so a warm device pays 47 KB instead of 234 KB —
+/// and, more to the point, a warm device resolving COMMANDS pays 47 KB instead
+/// of 1.57 MB.
+fn fetch_skills_blocking(base_url: &str, cached: Option<&[AgentTextUnit]>) -> FetchOutcome {
+    use crate::agent_text_units_fetch::{assemble, fetch_units_blocking, UnitFetchOutcome};
 
-/// The list URL this module fetches, split out so a test can pin the two query
-/// parameters that are load-bearing rather than cosmetic.
-///
-/// * `kind=skill` — `/agent-text-units` serves the whole corpus, and fetching
-///   the commands here would provision them into `.claude/skills/`.
-/// * `invocable_only=true` — see the module docs. Without it the
-///   underscore-prefixed copy-source specs are written to disk and become
-///   invocable units.
-fn list_url(base_url: &str) -> String {
-    format!(
-        "{base_url}/api/v1/agent-text-units?kind={}&invocable_only=true&limit={FETCH_LIMIT}",
-        AgentTextUnitKind::SKILL
-    )
-}
+    let cached = cached.unwrap_or(&[]);
+    let checksums = cached
+        .iter()
+        .filter_map(|u| u.checksum.clone().map(|c| (u.name.clone(), c)))
+        .collect();
 
-/// GET the resolved skill units with the stored bearer.
-async fn fetch_skills_async(base_url: &str) -> FetchOutcome {
-    let auth = crate::auth::AuthManager::new();
-    let token = match auth.get_access_token() {
-        Ok(t) if !t.trim().is_empty() => t,
-        Ok(_) | Err(_) => {
-            debug!(
-                "agent_skills: no stored access token — resolving the embedded defaults \
-                 (sign in to use account skills)"
-            );
-            return FetchOutcome::NoAccount;
+    match fetch_units_blocking(base_url, AgentTextUnitKind::SKILL, checksums, FETCH_TIMEOUT) {
+        UnitFetchOutcome::NoAccount => FetchOutcome::NoAccount,
+        UnitFetchOutcome::Unavailable(why) => FetchOutcome::Unavailable(why),
+        UnitFetchOutcome::Fresh { index, fetched } => {
+            let by_name: std::collections::HashMap<&str, &AgentTextUnit> =
+                cached.iter().map(|u| (u.name.as_str(), u)).collect();
+            match assemble(
+                &index,
+                fetched,
+                |name| by_name.get(name).map(|u| (*u).clone()),
+                Some,
+            ) {
+                Ok(units) => FetchOutcome::Fresh(units),
+                Err(why) => FetchOutcome::Unavailable(why),
+            }
         }
-    };
-
-    let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
-        Ok(c) => c,
-        Err(e) => return FetchOutcome::Unavailable(format!("could not build an HTTP client: {e}")),
-    };
-    let url = list_url(base_url);
-    let resp = match client.get(&url).bearer_auth(&token).send().await {
-        Ok(r) => r,
-        Err(e) => return FetchOutcome::Unavailable(format!("GET {url} failed: {e}")),
-    };
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return FetchOutcome::NoAccount;
-    }
-    if !status.is_success() {
-        return FetchOutcome::Unavailable(format!("GET {url} returned HTTP {status}"));
-    }
-    match resp.json::<AgentTextUnitListResponse>().await {
-        Ok(body) => FetchOutcome::Fresh(body.items),
-        Err(e) => FetchOutcome::Unavailable(format!("GET {url} returned an unreadable body: {e}")),
     }
 }
 
@@ -627,18 +577,29 @@ pub(crate) fn resolve_with(
 /// Never fails and never panics. Every layer degrades to the next one; the
 /// floor is the embedded bundle.
 pub fn resolve_registry() -> AgentSkillRegistry {
-    let base_url = crate::api_config::get_api_base_url();
-    let path = cache_path();
-    let outcome = fetch_skills_blocking(&base_url);
-    let cached = match (&outcome, &path) {
-        // Only pay for the cache read when it can actually be used.
-        (FetchOutcome::Unavailable(_), Some(p)) => read_cache_at(p, &base_url),
-        _ => None,
-    };
+    resolve_registry_at(
+        &crate::api_config::get_api_base_url(),
+        cache_path().as_deref(),
+    )
+}
+
+/// [`resolve_registry`] against a named backend and a named cache file.
+///
+/// The seam exists so the chain can be driven end to end from a test — against
+/// a refused port and an absent cache — rather than only through its pure
+/// middle. A grep proves an embedded body is in the source tree; only running
+/// this proves the resolution reaches it. See
+/// [`tests::every_embedded_skill_resolves_with_the_network_refused`].
+///
+/// Note the cache is now read BEFORE the fetch, not only when the fetch fails:
+/// its checksums are what decide which bodies the fetch has to ask for at all.
+pub(crate) fn resolve_registry_at(base_url: &str, cache: Option<&Path>) -> AgentSkillRegistry {
+    let cached = cache.and_then(|p| read_cache_at(p, base_url));
+    let outcome = fetch_skills_blocking(base_url, cached.as_deref());
     let (registry, action) = resolve_with(outcome, cached);
-    if let Some(p) = &path {
+    if let Some(p) = cache {
         match action {
-            CacheAction::Store(units) => write_cache_at(p, &base_url, &units),
+            CacheAction::Store(units) => write_cache_at(p, base_url, &units),
             CacheAction::Clear => clear_cache_at(p),
             CacheAction::Keep => {}
         }
@@ -1059,22 +1020,74 @@ pub(crate) mod tests {
         );
     }
 
-    // -- fetch URL -----------------------------------------------------------
+    // -- the offline floor ---------------------------------------------------
 
-    /// The two query parameters that are load-bearing rather than cosmetic.
+    /// **The Phase 6 gate.** Every embedded skill resolves out of the binary
+    /// with the network refused and no cache at all — asserted by RUNNING the
+    /// resolver, not by grepping the source tree. A grep proves the string is
+    /// compiled in; it does not prove the resolution chain reaches it, and this
+    /// chain has three rungs and a validator that can reject a unit on any of
+    /// them.
+    ///
+    /// The backend is a port that was bound and released, so the connect is
+    /// REFUSED rather than routed — no live service can answer it, whatever
+    /// this box is running. The cache is a path inside a fresh tempdir that has
+    /// never been written. Whichever way the credential probe goes on the
+    /// machine running this (`NoAccount` with no token, `Unavailable` with one)
+    /// the floor is the same, and asserting the resolved bodies rather than the
+    /// outcome variant is what makes that irrelevant.
     #[test]
-    fn the_list_url_filters_by_kind_and_invocability() {
-        let url = list_url("https://api.example");
-        assert!(
-            url.starts_with("https://api.example/api/v1/agent-text-units?"),
-            "{url}"
+    fn every_embedded_skill_resolves_with_the_network_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("never-written.json");
+        let registry = resolve_registry_at(&refused_backend_url(), Some(&cache));
+
+        assert_eq!(
+            registry.builtin_count(),
+            crate::fleet_skills::FLEET_SKILLS.len()
         );
-        assert!(url.contains("kind=skill"), "{url}");
         assert!(
-            url.contains("invocable_only=true"),
-            "without invocable_only the copy-source specs are written to disk: {url}"
+            !crate::fleet_skills::FLEET_SKILLS.is_empty(),
+            "the embedded skill bundle is empty — this gate would pass vacuously"
         );
-        assert!(url.contains(&format!("limit={FETCH_LIMIT}")), "{url}");
+        for embedded in crate::fleet_skills::FLEET_SKILLS {
+            let resolved = registry.get(embedded.name).unwrap_or_else(|| {
+                panic!(
+                    "embedded skill {:?} did not resolve with the network refused — it is in \
+                     the binary but the resolution chain does not reach it",
+                    embedded.name
+                )
+            });
+            assert_eq!(resolved.source, SkillSource::Builtin);
+            assert_eq!(
+                resolved.files.len(),
+                embedded.files.len(),
+                "{}: the resolved bundle must carry every embedded file",
+                embedded.name
+            );
+            for (path, text) in embedded.files {
+                assert_eq!(
+                    resolved.files.get(*path).map(String::as_str),
+                    Some(*text),
+                    "{}/{path} must resolve byte-identically to what include_str! embedded",
+                    embedded.name
+                );
+            }
+        }
+        assert!(
+            !cache.exists(),
+            "a resolve that never reached a backend must not have written a cache"
+        );
+    }
+
+    /// A `127.0.0.1` port nothing is listening on: bind it, read the number,
+    /// drop the listener. Deliberately not a fixed port — a fixed one is a test
+    /// that fails on whichever box happens to be using it.
+    pub(crate) fn refused_backend_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("read the bound port").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
     }
 
     // -- cache ---------------------------------------------------------------

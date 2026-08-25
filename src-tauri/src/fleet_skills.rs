@@ -11,20 +11,36 @@
 //! per-session provisioner, with [`crate::agent_skills`] resolving
 //! `fresh fetch → disk cache → embedded default` before anything is written.
 //!
-//! ## The embedded bundle is empty until Phase 6
+//! ## The embedded bundle, and what it retires
 //!
-//! [`FLEET_SKILLS`] ships as an empty slice today, and that is the plan's
-//! phasing rather than an oversight: `2026-08-20-fleet-served-agent-skills`
-//! Phase 5 seeds the corpus into the account store and Phase 6 moves those
-//! bodies into this binary as `include_str!` defaults. Until then the floor of
-//! the resolution chain is "no skills", which is byte-identically the state
-//! every device is in today — so this module can only add skills to a session,
-//! never remove them. The layering, provisioning and refusal rules are all live
-//! and tested now; only the default bundle is pending.
+//! [`FLEET_SKILLS`] carries the fleet's real skills, imported from
+//! `qontinui-claude-config/.claude/skills/` at commit `0ecbd67` — the commit
+//! that made every shipped skill reach its own scripts by a skill-dir-relative
+//! path, which is the property [`crate::agent_skills::self_path`] refuses a
+//! bundle for lacking. Nothing in this module or its consumers may assume the
+//! bundle's size, in either direction — the same rule
+//! [`crate::fleet_commands`] states for the commands.
 //!
-//! Nothing in this module or its consumers may assume the bundle's size, in
-//! either direction — the same rule [`crate::fleet_commands`] states for the
-//! commands.
+//! With the bodies compiled in, **delivery no longer needs the operator's
+//! `qontinui-claude-config` checkout**. Until now the only thing that put these
+//! skills in front of a session was a symlink on one machine —
+//! `<workspace-root>/.claude -> qontinui-claude-config/.claude/` — which the
+//! harness reads only when the session's cwd IS the workspace root, and a
+//! gate-continuation session is spawned with a fresh worktree as its cwd. That
+//! symlink is now **redundant**: every spawn path provisions
+//! `<cwd>/.claude/skills/` from this binary, and the network is not on the
+//! critical path. Removing it from a machine is an operator action; nothing in
+//! this crate reads it, and nothing needs it.
+//!
+//! **It does not follow that the checkout is gone.** A fourth unit kind is
+//! still delivered from disk by real path:
+//! `provision_agent_definitions_from_root` copies
+//! `<root>/qontinui-claude-config/.claude/agents/*.md` into each session's
+//! `.claude/agents/`, and it resolves that path itself rather than through the
+//! link — so **agent definitions still require the checkout**, on the operator
+//! box and nowhere else. Bundling them is the same `include_str!` move this
+//! module makes, is named in that function's own doc comment, and is out of
+//! scope for `2026-08-20-fleet-served-agent-skills` Phase 6.
 //!
 //! ## Refusing to write is a first-class outcome
 //!
@@ -52,13 +68,99 @@ use crate::agent_skills::{AgentSkillRegistry, EmbeddedSkill};
 
 /// The embedded default skills, as name + `(relative path, text)` bundle.
 ///
-/// Empty until Phase 6 — see the module docs. Add a skill by adding a
-/// directory of `.md`/`.sh` files under `src-tauri/src/fleet_skills/` and one
-/// [`EmbeddedSkill`] entry here whose files are `include_str!`ed from it, the
-/// way [`crate::fleet_commands::FLEET_COMMANDS`] does. Every entry must satisfy
-/// the same rules a fetched unit does; [`tests::embedded_skills_are_provisionable`]
-/// enforces that.
-pub(crate) const FLEET_SKILLS: &[EmbeddedSkill] = &[];
+/// The canonical sources are the directories under `src-tauri/src/fleet_skills/`
+/// in this repository, exactly as [`crate::fleet_commands`]' `.md` files are for
+/// commands: edit them in place, review the change through a pull request, and
+/// git history is the tamper record.
+///
+/// Add a skill by adding a directory of `.md`/`.sh` files under
+/// `src-tauri/src/fleet_skills/` and one entry here whose files are
+/// `include_str!`ed from it. Every entry must satisfy the same rules a fetched
+/// unit does — [`tests::embedded_skills_are_provisionable`] and
+/// [`tests::embedded_skills_reach_their_own_files`] enforce that, and the
+/// second is the one that refuses a skill which hardcodes a path to its own
+/// scripts. **Never hardcode the length of this slice.**
+pub(crate) const FLEET_SKILLS: &[EmbeddedSkill] = &[
+    EmbeddedSkill {
+        name: "coord-pr-label",
+        files: &[
+            (
+                "SKILL.md",
+                include_str!("fleet_skills/coord-pr-label/SKILL.md"),
+            ),
+            (
+                "set-label-selftest.sh",
+                include_str!("fleet_skills/coord-pr-label/set-label-selftest.sh"),
+            ),
+            (
+                "set-label.sh",
+                include_str!("fleet_skills/coord-pr-label/set-label.sh"),
+            ),
+        ],
+    },
+    EmbeddedSkill {
+        name: "coord-revive",
+        files: &[
+            (
+                "SKILL.md",
+                include_str!("fleet_skills/coord-revive/SKILL.md"),
+            ),
+            (
+                "coord-revive.sh",
+                include_str!("fleet_skills/coord-revive/coord-revive.sh"),
+            ),
+        ],
+    },
+    EmbeddedSkill {
+        name: "page-health",
+        files: &[(
+            "SKILL.md",
+            include_str!("fleet_skills/page-health/SKILL.md"),
+        )],
+    },
+    EmbeddedSkill {
+        name: "pr-status",
+        files: &[
+            ("SKILL.md", include_str!("fleet_skills/pr-status/SKILL.md")),
+            (
+                "pr-status.sh",
+                include_str!("fleet_skills/pr-status/pr-status.sh"),
+            ),
+        ],
+    },
+    EmbeddedSkill {
+        name: "preflight",
+        files: &[("SKILL.md", include_str!("fleet_skills/preflight/SKILL.md"))],
+    },
+    EmbeddedSkill {
+        name: "tag-session",
+        files: &[(
+            "SKILL.md",
+            include_str!("fleet_skills/tag-session/SKILL.md"),
+        )],
+    },
+    EmbeddedSkill {
+        name: "ui-bridge-debug",
+        files: &[(
+            "SKILL.md",
+            include_str!("fleet_skills/ui-bridge-debug/SKILL.md"),
+        )],
+    },
+    EmbeddedSkill {
+        name: "visual-audit",
+        files: &[(
+            "SKILL.md",
+            include_str!("fleet_skills/visual-audit/SKILL.md"),
+        )],
+    },
+    EmbeddedSkill {
+        name: "visual-check",
+        files: &[(
+            "SKILL.md",
+            include_str!("fleet_skills/visual-check/SKILL.md"),
+        )],
+    },
+];
 
 /// The mode provisioned files are given on Unix: owner-writable, world
 /// readable, and **no executable bit anywhere**.
@@ -323,12 +425,18 @@ mod tests {
 
     // -- the embedded bundle -------------------------------------------------
 
-    /// Whatever Phase 6 embeds must satisfy every rule a fetched unit does —
-    /// an embedded default that the resolver would reject is a default nobody
-    /// can ever receive. Vacuous while the bundle is empty, and deliberately
-    /// written so it stops being vacuous the moment it is filled.
+    /// What is embedded must satisfy every rule a FETCHED unit does — an
+    /// embedded default the resolver would reject is a default nobody can ever
+    /// receive. Names, per-file relative paths, the caps, `SKILL.md`
+    /// presence, invocability and the self-path shape, all through the one
+    /// entry point the account layer goes through.
     #[test]
     fn embedded_skills_are_provisionable() {
+        assert!(
+            !FLEET_SKILLS.is_empty(),
+            "the embedded skill bundle is empty — every assertion in this module that \
+             iterates it is then vacuous"
+        );
         for skill in FLEET_SKILLS {
             let files = bundle(skill.files);
             let unit = skill_unit(skill.name, files);
@@ -336,6 +444,41 @@ mod tests {
                 panic!("embedded skill {:?} is not provisionable: {e}", skill.name)
             });
         }
+    }
+
+    /// **The self-path shape gate, over the shipped bundle.**
+    ///
+    /// `validate_override` above already runs it, but it reports the first
+    /// failure as one opaque string. This asserts it directly so a contributor
+    /// who adds a skill that hardcodes a path to its own scripts gets the file,
+    /// the line and the rewrite — and so the arms
+    /// ([`crate::agent_skills::self_path`] A–D) are named as what refuses it.
+    ///
+    /// This is the assertion the bundle being empty made vacuous: the four real
+    /// hardcode sites in `coord-pr-label/SKILL.md` are exactly what it catches,
+    /// and they are why the bundle is imported from `0ecbd67` (which rewrote
+    /// them to `<path-to-this-skill-dir>/…`) rather than from the config repo's
+    /// then-current tip.
+    #[test]
+    fn embedded_skills_reach_their_own_files() {
+        let mut failures = Vec::new();
+        for skill in FLEET_SKILLS {
+            for violation in
+                crate::agent_skills::self_path::skill_self_path_violations(&bundle(skill.files))
+            {
+                failures.push(format!(
+                    "src-tauri/src/fleet_skills/{}/{violation}",
+                    skill.name
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} embedded skill file(s) cannot reach their own files once provisioned into \
+             <workdir>/.claude/skills/<name>/:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     // -- provisioning --------------------------------------------------------

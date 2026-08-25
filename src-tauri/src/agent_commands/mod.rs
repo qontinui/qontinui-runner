@@ -56,19 +56,22 @@ use qontinui_types::agent_commands::AgentCommand;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-/// Wall-clock budget for the whole override fetch. Provisioning runs on a
-/// spawn path, so the network layer is hard-bounded — a slow or black-holed
-/// backend degrades to the cache rather than delaying a session launch.
+/// Wall-clock budget for the WHOLE account-layer resolve — index request plus
+/// whatever body requests follow. Provisioning runs on a spawn path, so the
+/// network layer is hard-bounded: a slow or black-holed backend degrades to the
+/// cache rather than delaying a session launch.
+///
+/// **It stayed at 4 s when the corpus arrived, deliberately** — raising it does
+/// not remove the fail-soft cliff, it moves it, and it charges every spawn on
+/// every device. What changed is what the 4 s buys: see
+/// [`crate::agent_text_units_fetch`], and [`fetch_overrides_blocking`] for the
+/// measurement that forced the change.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// Page size for the list endpoint. The bundle is N commands and nothing here
-/// may hardcode two; 500 is the endpoint's documented `limit` ceiling.
-const FETCH_LIMIT: u32 = 500;
-
-/// Largest override body accepted, in bytes. A command procedure is a few tens
-/// of KB at most (the embedded defaults are ~60 KB combined); this cap exists
-/// so a malformed or hostile row cannot write an unbounded file into a session
-/// cwd.
+/// Largest override body accepted, in bytes. The largest unit in the fleet
+/// corpus is 162 KB (`merge-train-steward`, measured 2026-08-25); this cap
+/// exists so a malformed or hostile row cannot write an unbounded file into a
+/// session cwd, and it is an order of magnitude clear of the real maximum.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Filename of the on-disk override cache, under the runner's per-instance
@@ -396,14 +399,6 @@ fn now_rfc3339() -> String {
 // Fetch
 // ---------------------------------------------------------------------------
 
-/// The list endpoint's envelope. Only `items` is consumed — pagination is
-/// irrelevant at N-commands scale and unknown fields are ignored.
-#[derive(Debug, Deserialize)]
-struct AgentCommandListResponse {
-    #[serde(default)]
-    items: Vec<AgentCommand>,
-}
-
 /// What one attempt at the account layer established.
 ///
 /// The three arms are deliberately distinct: **absent** and **unknown** are not
@@ -423,77 +418,83 @@ pub(crate) enum FetchOutcome {
     Unavailable(String),
 }
 
-/// Perform the fetch on a dedicated thread with its own current-thread tokio
-/// runtime.
+/// Resolve the account layer: index, bodies for the commands whose checksum
+/// moved, cached bodies for the rest.
 ///
-/// Callers reach this from `provision_fleet_commands_for_session`, which is a
-/// *sync* function invoked from *async* spawn paths. `Handle::block_on` panics
-/// when called from inside a runtime worker, so the work is moved onto its own
-/// thread instead.
+/// **This is where the corpus made the old shape untenable.** One
+/// `GET /api/v1/agent-commands?limit=500` returned 1,988,661 bytes over the
+/// real corpus (measured 2026-08-25) — 486 KB/s to stay inside
+/// [`FETCH_TIMEOUT`], on the spawn critical path, fail-soft, so a link that
+/// could not manage it degraded to the defaults and the account's whole corpus
+/// vanished without an error. The index projection makes the warm path 47 KB.
+/// See [`crate::agent_text_units_fetch`] for the numbers and the trade-offs.
 ///
-/// The join is bounded by the reqwest client's own [`FETCH_TIMEOUT`], which
-/// covers connect + read for the single request this makes; everything else on
-/// that thread is local file IO. There is no separate join deadline, so a
-/// hypothetical hang inside reqwest would block the caller — accepted because
-/// the alternative (detaching the thread) leaks it on every spawn.
-fn fetch_overrides_blocking(base_url: &str) -> FetchOutcome {
-    let url = base_url.to_string();
-    let handle = std::thread::Builder::new()
-        .name("agent-commands-fetch".to_string())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    return FetchOutcome::Unavailable(format!("could not build a runtime: {e}"))
-                }
-            };
-            rt.block_on(fetch_overrides_async(&url))
-        });
-    match handle {
-        Ok(h) => h
-            .join()
-            .unwrap_or_else(|_| FetchOutcome::Unavailable("the fetch thread panicked".to_string())),
-        Err(e) => FetchOutcome::Unavailable(format!("could not spawn a fetch thread: {e}")),
+/// `cached` supplies both halves of that: the checksums that decide what to
+/// ask for, and the bodies for everything unchanged.
+fn fetch_overrides_blocking(base_url: &str, cached: Option<&[AgentCommand]>) -> FetchOutcome {
+    use crate::agent_text_units_fetch::{assemble, fetch_units_blocking, UnitFetchOutcome};
+    use qontinui_types::agent_text_units::AgentTextUnitKind;
+
+    let cached = cached.unwrap_or(&[]);
+    let checksums = cached
+        .iter()
+        .filter_map(|c| c.checksum.clone().map(|sum| (c.name.clone(), sum)))
+        .collect();
+
+    match fetch_units_blocking(
+        base_url,
+        AgentTextUnitKind::COMMAND,
+        checksums,
+        FETCH_TIMEOUT,
+    ) {
+        UnitFetchOutcome::NoAccount => FetchOutcome::NoAccount,
+        UnitFetchOutcome::Unavailable(why) => FetchOutcome::Unavailable(why),
+        UnitFetchOutcome::Fresh { index, fetched } => {
+            let by_name: std::collections::HashMap<&str, &AgentCommand> =
+                cached.iter().map(|c| (c.name.as_str(), c)).collect();
+            match assemble(
+                &index,
+                fetched,
+                |name| by_name.get(name).map(|c| (*c).clone()),
+                command_from_unit,
+            ) {
+                Ok(commands) => FetchOutcome::Fresh(commands),
+                Err(why) => FetchOutcome::Unavailable(why),
+            }
+        }
     }
 }
 
-/// GET `{base}/api/v1/agent-commands` with the stored bearer.
-async fn fetch_overrides_async(base_url: &str) -> FetchOutcome {
-    let auth = crate::auth::AuthManager::new();
-    let token = match auth.get_access_token() {
-        Ok(t) if !t.trim().is_empty() => t,
-        Ok(_) | Err(_) => {
-            debug!(
-                "agent_commands: no stored access token — resolving the embedded defaults \
-                 (sign in to use account overrides)"
-            );
-            return FetchOutcome::NoAccount;
-        }
-    };
-
-    let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
-        Ok(c) => c,
-        Err(e) => return FetchOutcome::Unavailable(format!("could not build an HTTP client: {e}")),
-    };
-    let url = format!("{base_url}/api/v1/agent-commands?limit={FETCH_LIMIT}");
-    let resp = match client.get(&url).bearer_auth(&token).send().await {
-        Ok(r) => r,
-        Err(e) => return FetchOutcome::Unavailable(format!("GET {url} failed: {e}")),
-    };
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return FetchOutcome::NoAccount;
-    }
-    if !status.is_success() {
-        return FetchOutcome::Unavailable(format!("GET {url} returned HTTP {status}"));
-    }
-    match resp.json::<AgentCommandListResponse>().await {
-        Ok(body) => FetchOutcome::Fresh(body.items),
-        Err(e) => FetchOutcome::Unavailable(format!("GET {url} returned an unreadable body: {e}")),
-    }
+/// Flatten one `command`-kind text unit into the single-body shape this module
+/// resolves and caches.
+///
+/// A command is the degenerate case of the unified text unit — one file — so
+/// the flattening is total wherever the store's own invariants hold. It is
+/// written to fail rather than guess: a unit whose entrypoint is not in its
+/// `files` map is malformed, and picking "some file" from it would provision a
+/// body nobody authored. `None` propagates as a whole-resolve `Unavailable`
+/// through [`crate::agent_text_units_fetch::assemble`], which leaves the cache
+/// and the embedded defaults in place.
+fn command_from_unit(
+    unit: qontinui_types::agent_text_units::AgentTextUnit,
+) -> Option<AgentCommand> {
+    let body = unit.files.get(&unit.entrypoint).cloned().or_else(|| {
+        // A store that has not populated `entrypoint` still names the file by
+        // the canonical rule, `<name>.md`.
+        unit.files.get(&format!("{}.md", unit.name)).cloned()
+    })?;
+    Some(AgentCommand {
+        id: unit.id,
+        organization_id: unit.organization_id,
+        created_by_user_id: unit.created_by_user_id,
+        name: unit.name,
+        body,
+        checksum: unit.checksum,
+        is_shared: unit.is_shared,
+        current_version: unit.current_version,
+        created_at: unit.created_at,
+        updated_at: unit.updated_at,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -562,18 +563,27 @@ pub(crate) enum CacheAction {
 /// floor is the embedded defaults, which is byte-identically what a device
 /// with no account has always received.
 pub fn resolve_registry() -> AgentCommandRegistry {
-    let base_url = crate::api_config::get_api_base_url();
-    let path = cache_path();
-    let outcome = fetch_overrides_blocking(&base_url);
-    let cached = match (&outcome, &path) {
-        // Only pay for the cache read when it can actually be used.
-        (FetchOutcome::Unavailable(_), Some(p)) => read_cache_at(p, &base_url),
-        _ => None,
-    };
+    resolve_registry_at(
+        &crate::api_config::get_api_base_url(),
+        cache_path().as_deref(),
+    )
+}
+
+/// [`resolve_registry`] against a named backend and a named cache file.
+///
+/// The seam exists so the chain can be driven end to end from a test — against
+/// a refused port and an absent cache — rather than only through its pure
+/// middle. See [`tests::every_embedded_command_resolves_with_the_network_refused`].
+///
+/// Note the cache is now read BEFORE the fetch, not only when the fetch fails:
+/// its checksums are what decide which bodies the fetch has to ask for at all.
+pub(crate) fn resolve_registry_at(base_url: &str, cache: Option<&Path>) -> AgentCommandRegistry {
+    let cached = cache.and_then(|p| read_cache_at(p, base_url));
+    let outcome = fetch_overrides_blocking(base_url, cached.as_deref());
     let (registry, action) = resolve_with(outcome, cached);
-    if let Some(p) = &path {
+    if let Some(p) = cache {
         match action {
-            CacheAction::Store(commands) => write_cache_at(p, &base_url, &commands),
+            CacheAction::Store(commands) => write_cache_at(p, base_url, &commands),
             CacheAction::Clear => clear_cache_at(p),
             CacheAction::Keep => {}
         }
@@ -835,5 +845,91 @@ mod tests {
             registry.builtin_count() >= 1,
             "the bundle must ship at least one command"
         );
+    }
+
+    /// **The Phase 6 gate, commands half.** Every embedded command resolves out
+    /// of the binary with the network refused and no cache at all — asserted by
+    /// RUNNING the resolver, not by grepping the source tree. A grep proves the
+    /// string is compiled in; it does not prove the resolution chain reaches
+    /// it.
+    ///
+    /// The backend is an ephemeral port that was bound and released, so the
+    /// connect is REFUSED rather than routed. The cache is a path in a fresh
+    /// tempdir that has never been written. Both credential outcomes
+    /// (`NoAccount` with no stored token, `Unavailable` with one) land on the
+    /// same floor, which is why this asserts the resolved bodies rather than
+    /// the outcome variant.
+    #[test]
+    fn every_embedded_command_resolves_with_the_network_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("never-written.json");
+        let registry = resolve_registry_at(
+            &crate::agent_skills::tests::refused_backend_url(),
+            Some(&cache),
+        );
+
+        assert!(
+            !crate::fleet_commands::FLEET_COMMANDS.is_empty(),
+            "the embedded command bundle is empty — this gate would pass vacuously"
+        );
+        assert_eq!(
+            registry.builtin_count(),
+            crate::fleet_commands::FLEET_COMMANDS.len()
+        );
+        for (name, body) in crate::fleet_commands::FLEET_COMMANDS {
+            let resolved = registry.get(name).unwrap_or_else(|| {
+                panic!(
+                    "embedded command {name:?} did not resolve with the network refused — it \
+                     is in the binary but the resolution chain does not reach it"
+                )
+            });
+            assert_eq!(resolved.source, CommandSource::Builtin);
+            assert_eq!(
+                &resolved.body, body,
+                "{name} must resolve byte-identically to what include_str! embedded"
+            );
+        }
+        assert!(
+            !cache.exists(),
+            "a resolve that never reached a backend must not have written a cache"
+        );
+    }
+
+    /// Flattening a `command` unit takes the entrypoint file, and refuses
+    /// rather than guessing when there is no such file.
+    #[test]
+    fn a_command_unit_flattens_to_its_entrypoint_body() {
+        use qontinui_types::agent_text_units::AgentTextUnitFiles;
+
+        let mut unit = crate::agent_skills::tests::simple_unit("vet-plan", "# body\n");
+        unit.kind = qontinui_types::agent_text_units::AgentTextUnitKind::command();
+        unit.entrypoint = "vet-plan.md".to_string();
+        unit.files =
+            AgentTextUnitFiles::from([("vet-plan.md".to_string(), "# body\n".to_string())]);
+        unit.checksum = Some("sha-1".to_string());
+        let flat = command_from_unit(unit.clone()).expect("flattens");
+        assert_eq!(flat.name, "vet-plan");
+        assert_eq!(flat.body, "# body\n");
+        assert_eq!(
+            flat.checksum.as_deref(),
+            Some("sha-1"),
+            "the digest must survive the flattening — it is the cache key the next \
+             resolve diffs against"
+        );
+
+        // An unpopulated `entrypoint` still resolves by the canonical rule.
+        let mut by_rule = unit.clone();
+        by_rule.entrypoint = String::new();
+        assert_eq!(
+            command_from_unit(by_rule).expect("flattens").body,
+            "# body\n"
+        );
+
+        // A unit whose entrypoint names no file is malformed, not a coin toss.
+        let mut broken = unit;
+        broken.entrypoint = "somewhere-else.md".to_string();
+        broken.files =
+            AgentTextUnitFiles::from([("other.md".to_string(), "# other\n".to_string())]);
+        assert!(command_from_unit(broken).is_none());
     }
 }
