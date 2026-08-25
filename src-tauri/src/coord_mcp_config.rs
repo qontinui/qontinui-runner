@@ -172,6 +172,85 @@ pub fn config_doc_has_static_authorization(doc: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// JSON key of the **principal-class marker** stamped into the `coord-mcp`
+/// `headers` object by the AGENT-path `.mcp.json` writer
+/// (`coord_mcp::write_coord_mcp_agent_proxy_config`) — and by nothing else.
+///
+/// ## Why a marker exists at all
+///
+/// Three emitters produce a **byte-identical** proxy `.mcp.json` (they all
+/// funnel through `coord_mcp::coord_mcp_proxy_config_json`), and their nonces
+/// are three different security classes:
+///
+/// | emitter | principal | persisted | re-registered after a restart |
+/// |---|---|---|---|
+/// | `write_coord_mcp_proxy_config` | Device/Persistent | yes | usually |
+/// | `write_coord_mcp_agent_proxy_config` | **Agent{id}** | never | **never — by design** |
+/// | `provision_session_proxy_config` | Device/**Ephemeral** | never | **never — by design** |
+///
+/// Rows 2 and 3 are *guaranteed* to be unregistered after a restart, which is
+/// exactly the predicate the boot adopt arm keys on
+/// (`coord_mcp::ReconcileAction::AdoptNonce`). Adoption hard-codes
+/// `principal: Device, lifetime: Persistent` — so without a marker the boot
+/// reconcile would re-register an **agent-scoped** credential as a **device**
+/// one, and the proxy would then inject the live DEVICE JWT for a nonce whose
+/// whole point was to inject one agent's token. The ephemeral case is the same
+/// shape: adoption would convert a TTL-bounded, opt-in-gated, never-persisted
+/// credential into an unbounded persistent one.
+///
+/// The principal class is **not inferable** from the boot reconcile's inputs —
+/// the file is byte-identical and a lifecycle record carries no principal-class
+/// field — so the fix is to remove the unknowability at the SOURCE: the agent
+/// writer self-identifies, and the reconcile refuses to touch what it cannot
+/// vouch for. A legacy agent config written before this marker existed carries
+/// nothing and is therefore still indistinguishable; that residual drains on its
+/// own, because an agent config is rewritten at every agent spawn.
+///
+/// ## Why a header rather than a sibling field on the server object
+///
+/// The `headers` map is already an arbitrary string→string map that every MCP
+/// client forwards verbatim to the server named in `url` — here, the runner's
+/// OWN loopback `/coord-mcp` route, which ignores header names it does not
+/// know. A new key beside `type`/`url`/`headers` would instead have to survive
+/// whatever schema the client validates the server entry against, and a client
+/// that rejects unknown keys would take coord-mcp away from every agent
+/// session. The header is inert by construction; a sibling field is inert only
+/// by assumption.
+///
+/// It carries no secret (the literal string `agent`), so emitting it costs
+/// nothing even in `claude --debug mcp` output, where custom headers are
+/// printed in the clear.
+pub const COORD_MCP_PRINCIPAL_HEADER_JSON: &str = "X-Coord-Mcp-Principal";
+
+/// The only value [`COORD_MCP_PRINCIPAL_HEADER_JSON`] is ever emitted with. The
+/// DEVICE shape omits the header entirely rather than spelling a `device`
+/// value — absence must keep meaning exactly what it meant before the marker
+/// existed, so that not one already-written device config changes class.
+pub const COORD_MCP_PRINCIPAL_AGENT: &str = "agent";
+
+/// True iff the `coord-mcp` entry's `headers` object carries the
+/// [`COORD_MCP_PRINCIPAL_HEADER_JSON`] marker naming the AGENT class.
+///
+/// Case-insensitive on both key and value, matching every other config reader
+/// here (JSON keys are case-sensitive, hand-edited configs are not reliably
+/// canonical). Absent / unparseable / any other value ⇒ `false`, which is the
+/// pre-marker reading: **not marked is not proof of device class**, only proof
+/// that this file cannot vouch for itself. Callers that need a safety property
+/// must treat `true` as "refuse", never `false` as "permit anything".
+pub fn config_doc_is_agent_marked(doc: &serde_json::Value) -> bool {
+    doc.pointer("/mcpServers/coord-mcp/headers")
+        .and_then(|h| h.as_object())
+        .map(|o| {
+            o.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case(COORD_MCP_PRINCIPAL_HEADER_JSON)
+                    && v.as_str()
+                        .map(|s| s.trim().eq_ignore_ascii_case(COORD_MCP_PRINCIPAL_AGENT))
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +477,47 @@ mod tests {
         assert!(config_doc_has_static_authorization(&doc));
         let doc: serde_json::Value = serde_json::from_str(r#"{"mcpServers":{}}"#).unwrap();
         assert!(!config_doc_has_static_authorization(&doc));
+    }
+
+    /// The agent principal marker: recognised case-insensitively on key AND
+    /// value, absent on the device shape, and — the load-bearing part —
+    /// invisible to every OTHER reader in this module, so stamping it cannot
+    /// change how a config's port, nonce or header shape is classified.
+    #[test]
+    fn agent_principal_marker_is_recognised_and_inert_to_every_other_reader() {
+        let n = nonce();
+        let marked: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{{"Authorization":"Bearer {n}","X-Coord-Mcp-Proxy-Key":"{n}","X-Coord-Mcp-Principal":"agent"}}}}}}}}"#
+        ))
+        .unwrap();
+        assert!(config_doc_is_agent_marked(&marked));
+        // Inert: the nonce and the header SHAPE read exactly as they do without it.
+        assert_eq!(proxy_nonce_from_config_doc(&marked), Some(n.clone()));
+        assert!(config_doc_has_static_authorization(&marked));
+
+        // The DEVICE shape carries no marker — absence must keep meaning what it
+        // meant before the marker existed.
+        let device: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"headers":{{"Authorization":"Bearer {n}","X-Coord-Mcp-Proxy-Key":"{n}"}}}}}}}}"#
+        ))
+        .unwrap();
+        assert!(!config_doc_is_agent_marked(&device));
+
+        // Case-insensitive on key and value; whitespace-tolerant on the value.
+        let odd: serde_json::Value = serde_json::from_str(
+            r#"{"mcpServers":{"coord-mcp":{"headers":{"x-coord-mcp-principal":" AGENT "}}}}"#,
+        )
+        .unwrap();
+        assert!(config_doc_is_agent_marked(&odd));
+
+        // Any other value, and every absent shape, is NOT a marker.
+        let other: serde_json::Value = serde_json::from_str(
+            r#"{"mcpServers":{"coord-mcp":{"headers":{"X-Coord-Mcp-Principal":"device"}}}}"#,
+        )
+        .unwrap();
+        assert!(!config_doc_is_agent_marked(&other));
+        let none: serde_json::Value = serde_json::from_str(r#"{"mcpServers":{}}"#).unwrap();
+        assert!(!config_doc_is_agent_marked(&none));
     }
 
     #[test]

@@ -398,9 +398,10 @@ pub(crate) fn session_identity_gate() -> Result<(), SessionIdentityDenial> {
 // `crate::coord_mcp_config` because `coord_doctor` (a LIB module) reads the
 // same shape and cannot reach this bin-only module.
 pub(crate) use crate::coord_mcp_config::{
-    config_doc_has_static_authorization, proxy_nonce_from_config_doc,
-    proxy_nonce_from_header_object, proxy_nonce_from_request, COORD_MCP_PROXY_KEY_HEADER,
-    COORD_MCP_PROXY_KEY_HEADER_JSON, PROXY_AUTHORIZATION_HEADER_JSON, PROXY_BEARER_PREFIX,
+    config_doc_has_static_authorization, config_doc_is_agent_marked, proxy_nonce_from_config_doc,
+    proxy_nonce_from_header_object, proxy_nonce_from_request, COORD_MCP_PRINCIPAL_AGENT,
+    COORD_MCP_PRINCIPAL_HEADER_JSON, COORD_MCP_PROXY_KEY_HEADER, COORD_MCP_PROXY_KEY_HEADER_JSON,
+    PROXY_AUTHORIZATION_HEADER_JSON, PROXY_BEARER_PREFIX,
 };
 
 /// The lead clause of every loopback-proxy "your key is dead" 401.
@@ -3696,13 +3697,58 @@ fn coord_mcp_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Valu
 /// The caller MUST register the agent's [`crate::agent_token::SharedToken`] via
 /// [`register_agent_token`] (and drive proactive refresh) — an agent nonce with
 /// no live slot hard-fails closed (401).
+///
+/// ## The principal-class marker
+///
+/// The emitted document carries [`COORD_MCP_PRINCIPAL_HEADER_JSON`] =
+/// [`COORD_MCP_PRINCIPAL_AGENT`] — the ONE thing that distinguishes it from the
+/// device shape on disk. Without it the file is byte-identical to a device
+/// config, and the boot reconcile's adopt arm would re-register this
+/// **agent-scoped** nonce as a Device/Persistent binding, after which
+/// [`proxy_principal_for_nonce`] answers `Device` and the proxy injects the live
+/// DEVICE JWT for a credential that was scoped to one agent. See
+/// [`COORD_MCP_PRINCIPAL_HEADER_JSON`] for the full three-emitter table and why
+/// the class is not otherwise inferable at boot.
+///
+/// It is a HEADER, not a sibling of `url`/`headers`, because the headers map is
+/// already arbitrary and is forwarded verbatim to our own loopback route, which
+/// ignores names it does not know — inert by construction rather than by
+/// assumption about the client's schema validation.
 pub(crate) fn write_coord_mcp_agent_proxy_config(
     primary_wt: &str,
     bound_port: u16,
     agent_id: Uuid,
 ) {
     let nonce = register_agent_proxy_nonce(primary_wt, agent_id);
-    write_mcp_json(primary_wt, &coord_mcp_proxy_config_json(bound_port, &nonce));
+    write_mcp_json(
+        primary_wt,
+        &coord_mcp_agent_proxy_config_json(bound_port, &nonce),
+    );
+}
+
+/// The AGENT variant of [`coord_mcp_proxy_config_json`]: the very same document
+/// plus the self-identifying principal-class marker.
+///
+/// Built ON TOP of the canonical producer rather than beside it, deliberately —
+/// the loopback-URL / nonce-header contract still has exactly one author, so
+/// the agent shape cannot drift from the device shape in any respect except the
+/// one byte-range it is supposed to differ in. The marker is added to the
+/// `headers` object (see [`write_coord_mcp_agent_proxy_config`]), where it is
+/// invisible to [`read_proxy_nonce`], [`read_proxy_port`],
+/// [`read_static_authorization_presence`] and
+/// [`coord_mcp_existing_config_allows_write`] alike.
+fn coord_mcp_agent_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Value {
+    let mut doc = coord_mcp_proxy_config_json(bound_port, nonce);
+    if let Some(headers) = doc
+        .pointer_mut("/mcpServers/coord-mcp/headers")
+        .and_then(|h| h.as_object_mut())
+    {
+        headers.insert(
+            COORD_MCP_PRINCIPAL_HEADER_JSON.to_string(),
+            serde_json::Value::from(COORD_MCP_PRINCIPAL_AGENT),
+        );
+    }
+    doc
 }
 
 /// Filename of the Phase-1a degraded-only breadcrumb dropped into a session
@@ -4902,10 +4948,15 @@ fn read_proxy_nonce(config_path: &Path) -> Option<String> {
 pub(crate) enum ReconcileAction {
     Rewrite,
     /// Re-register the exact on-disk nonce into the live registry as this
-    /// workdir's Device binding — **no file write of any kind**. Produced when
-    /// the proxy port still matches, a non-empty nonce IS readable, but that
-    /// nonce is not in the live registry (a restart the persisted set did not
-    /// cover, or an eviction).
+    /// workdir's Device binding — **`.mcp.json` is left byte-identical**.
+    /// Produced when the proxy port still matches, a non-empty nonce IS
+    /// readable, but that nonce is not in the live registry (a restart the
+    /// persisted set did not cover, or an eviction).
+    ///
+    /// "No file write" is a statement about `.mcp.json` only: the arm still
+    /// appends one `adopt` line to the rotation forensics log. It does not
+    /// touch the encrypted nonce store — see [`adopt_on_disk_nonce`] for why an
+    /// adopted binding is never persisted.
     AdoptNonce,
     UpgradeHeaders,
     Leave,
@@ -4915,24 +4966,72 @@ pub(crate) enum ReconcileAction {
 /// currently written to it (`None` = absent / unparseable / not the proxy
 /// shape), the nonce readable from it, whether that nonce is currently in the
 /// live registry, whether its `headers` map carries a static `Authorization` key
-/// at all, and the instance's current bound port, decide what to do. See
-/// [`ReconcileAction`] for each arm's rationale.
+/// at all, the instance's current bound port, and whether the file
+/// self-identifies as AGENT-class ([`COORD_MCP_PRINCIPAL_HEADER_JSON`]), decide
+/// what to do. See [`ReconcileAction`] for each arm's rationale.
 ///
-/// **The arm ordering mirrors [`root_reconcile_action`] exactly**, and that is
+/// **The ARM ORDERING mirrors [`root_reconcile_action`] exactly**, and that is
 /// the point of the plan: the two resolvers answer the same question about two
-/// classes of file, and every past divergence between them has been a bug. In
+/// classes of file, and every past divergence in the ordering has been a bug. In
 /// particular `AdoptNonce` is tested BEFORE the header shape — a config whose
 /// credential is dead and whose headers are legacy needs the credential first,
 /// because the header upgrade would rewrite the file around a nonce that still
 /// does not validate, and the upgrade is worthless to a client that cannot
 /// authenticate at all.
+///
+/// # The one arm that deliberately does NOT mirror the root
+///
+/// The **terminal** arm differs, and always has: on a matching port with an
+/// ABSENT or EMPTY nonce, [`root_reconcile_action`] falls through to `Rewrite`
+/// while this resolver returns `Leave`. So a truncated / half-written session
+/// `.mcp.json` sitting on the bound port is never repaired, where the
+/// equivalent root file is minted fresh and rewritten.
+///
+/// That divergence is intended, and the asymmetry in what the two files are
+/// is what makes it so:
+///
+/// * The ROOT config is **shared infrastructure** — one file serving every
+///   session launched anywhere at or under the workspace root, with no other
+///   writer that will come along and fix it. If it is unreadable, nothing
+///   repairs it but this boot pass, and leaving it broken silently breaks
+///   sessions that have no relationship to whatever corrupted it. Rewriting is
+///   also cheap in the only currency that matters here: there is no cached
+///   nonce to strand, because there was no readable nonce to cache.
+/// * A SESSION config is **owned by one workdir and rewritten on every spawn**
+///   (`acquire_for_terminal` → [`provision_coord_mcp_for_session`]), so the
+///   population self-heals without this pass. Meanwhile the workdirs handed to
+///   [`reconcile_session_configs`] come from lifecycle records, and a record can
+///   name a directory whose `.mcp.json` is mid-write by a concurrent spawn, or
+///   is a file we have no business minting a credential into. Writing a fresh
+///   nonce there on the strength of "we could not read the old one" is a
+///   guess; leaving it is not.
+///
+/// In short: the root's `Rewrite` fallback exists because nothing else will fix
+/// it, and the session's `Leave` exists because something else routinely does.
+///
+/// # `is_agent_marked` short-circuits everything
+///
+/// A config that names itself AGENT-class is not this pass's to reconcile in
+/// ANY direction. Adopting it would launder an agent-scoped nonce into a
+/// Device/Persistent binding (the hazard
+/// [`COORD_MCP_PRINCIPAL_HEADER_JSON`] documents in full), and rewriting it
+/// would hand the agent's own MCP client a DEVICE credential in place of the
+/// agent one — an elevation of that session's effective scope either way. Agent
+/// configs are re-provisioned at agent spawn and are never restored across a
+/// restart by design, so `Leave` costs nothing that was ever promised.
 pub(crate) fn reconcile_action(
     current_proxy_port: Option<u16>,
     on_disk_nonce: Option<&str>,
     nonce_is_registered: bool,
     has_static_authorization: bool,
     bound_port: u16,
+    is_agent_marked: bool,
 ) -> ReconcileAction {
+    if is_agent_marked {
+        // Self-identified AGENT class — see the doc section above. Not ours to
+        // adopt, upgrade or rewrite.
+        return ReconcileAction::Leave;
+    }
     let Some(port) = current_proxy_port else {
         // Not our proxy shape — never touched here.
         return ReconcileAction::Leave;
@@ -5026,14 +5125,30 @@ pub(crate) enum RootReconcileAction {
 /// (`None` = no proxy-key header), whether that nonce is currently in the live
 /// registry, whether the file's static `headers` map carries an `Authorization`
 /// key at all (the DCR-escape shape — see
-/// [`RootReconcileAction::UpgradeHeaders`]), and the instance's bound port.
+/// [`RootReconcileAction::UpgradeHeaders`]), the instance's bound port, and
+/// whether the file self-identifies as AGENT-class
+/// ([`COORD_MCP_PRINCIPAL_HEADER_JSON`]).
+///
+/// `is_agent_marked` short-circuits to `Leave` for the same reason it does in
+/// [`reconcile_action`] — see that function's doc section. The root path is a
+/// narrower exposure than the session one (the agent writer is normally aimed
+/// at an agent worktree, not the umbrella root) but not a closed one:
+/// [`provision_coord_mcp_for_session`]'s agent arm writes to whatever workdir it
+/// is given, and an agent session opened AT the workspace root would put an
+/// agent config exactly here.
 pub(crate) fn root_reconcile_action(
     current_proxy_port: Option<u16>,
     on_disk_nonce: Option<&str>,
     nonce_is_registered: bool,
     has_static_authorization: bool,
     bound_port: u16,
+    is_agent_marked: bool,
 ) -> RootReconcileAction {
+    if is_agent_marked {
+        // Self-identified AGENT class — never adopted (scope elevation) and
+        // never rewritten (a device credential handed to an agent's client).
+        return RootReconcileAction::Leave;
+    }
     let Some(port) = current_proxy_port else {
         // Not our proxy shape (absent / unparseable / static-bearer agent
         // config) — never touched here.
@@ -5087,10 +5202,44 @@ fn qontinui_root_dir() -> Option<std::path::PathBuf> {
 /// on-disk string keeps a live MCP client's CACHED nonce validating across the
 /// restart (the client never re-reads the file, so a fresh-minted-and-rewritten
 /// nonce would strand it on a 401). Evicts any prior nonce for the same workdir
-/// (there should be none) and mirrors the updated set to the encrypted store so
-/// the adoption itself survives the NEXT restart. DEVICE binding only — this
-/// path is never reached for an agent config (a static-bearer shape has no proxy
-/// URL, so [`read_proxy_port`] returns `None` and the resolver leaves it).
+/// (there should be none).
+///
+/// # An adopted binding is NEVER persisted
+///
+/// This used to call [`persist_proxy_nonces`], so that "the adoption itself
+/// survives the NEXT restart". That was buying nothing and costing the one
+/// thing that matters here.
+///
+/// Buying nothing: adoption is idempotent and **fully re-derivable from disk on
+/// every boot**. The `.mcp.json` still holds the nonce next time, the port
+/// comparison still matches, and the resolver still yields `AdoptNonce` — the
+/// registry entry is reconstructed at the next boot from the same file it was
+/// reconstructed from at this one. Persisting it merely writes down an answer
+/// the next boot recomputes anyway.
+///
+/// Costing: what the encrypted store confers is **durability on a credential of
+/// UNKNOWN provenance**. Every emitter of the proxy `.mcp.json` writes a
+/// byte-identical document
+/// ([`coord_mcp_proxy_config_json`]) and three of them mint three different
+/// classes — Device/Persistent, Agent-scoped, and Device/Ephemeral — of which
+/// the latter two are *guaranteed* unregistered after a restart and so are
+/// exactly what the adopt predicate selects for. The marked ones are refused
+/// upstream ([`COORD_MCP_PRINCIPAL_HEADER_JSON`]); an UNMARKED legacy one is
+/// still not attestable. Adopting such a nonce for this process's lifetime is a
+/// bounded, self-limiting repair. Writing it into the store is what would make
+/// it eternal — restored on every subsequent boot with no file left to justify
+/// it.
+///
+/// The `minted_at` argument is NOT made pointless by this: the live binding
+/// carries it, so any snapshot a LATER mint triggers orders this binding by the
+/// `.mcp.json`'s real age rather than by the adoption instant — which is the
+/// whole of what Phase 4 exists to establish.
+///
+/// DEVICE binding only — and that is precisely why the caller must have refused
+/// a marked agent config first. (A static-bearer agent shape cannot reach here
+/// at all: it has no proxy URL, so [`read_proxy_port`] returns `None` and the
+/// resolver leaves it. The AGENT-PROXY shape is the one that can, and the
+/// marker is what stops it.)
 ///
 /// `file_rewritten` says whether the caller ALREADY rewrote `.mcp.json` while
 /// adopting — which the `AdoptNonce` arm of [`reconcile_root_config_at`] does
@@ -5109,8 +5258,8 @@ fn qontinui_root_dir() -> Option<std::path::PathBuf> {
 /// `.mcp.json` the nonce was read from, sampled BEFORE any rewrite this arm
 /// performs. Plan
 /// `2026-08-25-boot-adopt-session-nonces-across-all-workdirs` Phase 4: this used
-/// to stamp `SystemTime::now()` and then call [`persist_proxy_nonces`]
-/// unconditionally, while [`device_nonce_snapshot`] cuts the persisted set
+/// to stamp `SystemTime::now()` and then persist unconditionally,
+/// while [`device_nonce_snapshot`] cuts the persisted set
 /// NEWEST-first. Every adopted binding therefore sorted to the head and survived
 /// the [`MAX_PERSISTED_DEVICE_NONCES`] cut ahead of restored bindings carrying
 /// their true persisted age ([`minted_at_from_unix`]) — adoption INVERTED the
@@ -5126,7 +5275,7 @@ fn adopt_on_disk_nonce(
     file_rewritten: bool,
     minted_at: std::time::SystemTime,
 ) {
-    let (snapshot, evicted) = {
+    let evicted = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         // Persistent AND terminal-less only — an adopted nonce came from a
         // runner-written `.mcp.json`, and must NOT evict a bare session's
@@ -5173,7 +5322,7 @@ fn adopt_on_disk_nonce(
                 minted_at,
             },
         );
-        (map.clone(), evicted)
+        evicted
     };
     // Rotation forensics — outside the lock (see `mint_and_register_nonce`).
     for n in &evicted {
@@ -5195,7 +5344,10 @@ fn adopt_on_disk_nonce(
             "re-registered the on-disk `.mcp.json` nonce (no file rewrite)"
         },
     );
-    persist_proxy_nonces(&snapshot);
+    // NO `persist_proxy_nonces` — see this function's doc comment. An adopted
+    // binding is re-derived from the same `.mcp.json` on the next boot; putting
+    // it in the encrypted store would only make a credential of unattestable
+    // provenance outlive the file that justified it.
 }
 
 /// Read the root `.mcp.json` ONCE and resolve both the self-heal action and the
@@ -5221,6 +5373,7 @@ fn resolve_root_reconcile(
         registered,
         read_static_authorization_presence(&path),
         bound_port,
+        read_agent_principal_marker(&path),
     );
     (action, on_disk_nonce)
 }
@@ -5235,6 +5388,24 @@ fn read_static_authorization_presence(config_path: &Path) -> bool {
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .map(|v| config_doc_has_static_authorization(&v))
+        .unwrap_or(false)
+}
+
+/// Whether the `.mcp.json` at `config_path` self-identifies as AGENT-class —
+/// the [`COORD_MCP_PRINCIPAL_HEADER_JSON`] marker
+/// [`write_coord_mcp_agent_proxy_config`] stamps and nothing else emits.
+///
+/// An unreadable / unparseable / absent file is `false`, matching every other
+/// reader here. **`false` is not a device-class attestation** — it is "this file
+/// does not vouch for itself", which is also what every config written before
+/// the marker existed says. It is safe as the input to a REFUSAL (a marked file
+/// is definitely not ours to touch) and would be unsafe as the input to a
+/// permission; nothing here treats it as the latter.
+fn read_agent_principal_marker(config_path: &Path) -> bool {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| config_doc_is_agent_marked(&v))
         .unwrap_or(false)
 }
 
@@ -5543,9 +5714,46 @@ pub(crate) struct SessionReconcileCounts {
 /// nothing, and the real bound — that the adopted set stays far under
 /// [`MAX_PERSISTED_DEVICE_NONCES`] — is a consequence of this contract.
 ///
-/// So if you are about to widen the caller to hand this function a disk census,
-/// re-derive that bound first: 578 adoptions against a cap of 256 is a different
-/// program.
+/// ## What widening the caller would actually admit — read this first
+///
+/// The count is the SECOND-order problem. The first is **principal class**.
+///
+/// Every emitter of the loopback proxy `.mcp.json` funnels through
+/// [`coord_mcp_proxy_config_json`] and produces a byte-identical document, but
+/// the nonces inside them are three different security classes:
+/// [`write_coord_mcp_proxy_config`] mints Device/Persistent,
+/// [`write_coord_mcp_agent_proxy_config`] mints one scoped to a single AGENT,
+/// and [`provision_session_proxy_config`] mints Device/**Ephemeral** (a TTL, and
+/// an opt-in marker that can revoke it). The latter two are never persisted and
+/// are **guaranteed** unregistered after a restart — which is precisely the
+/// predicate the adopt arm keys on — while [`adopt_on_disk_nonce`] registers
+/// whatever it is handed as Device. Adopt an agent config and
+/// [`proxy_principal_for_nonce`] starts answering `Device` for it, so the proxy
+/// injects the live DEVICE JWT for a credential scoped to one agent. Adopt an
+/// ephemeral one and its TTL and kill switch are gone.
+///
+/// What keeps this closed today is a pair of narrow facts, and BOTH are
+/// properties of the caller, not of this function:
+///
+/// * `open_records()` names session workdirs the runner is tracking as live,
+///   which is not where the agent and ephemeral emitters normally write; and
+/// * the agent emitter now stamps a principal-class marker
+///   ([`COORD_MCP_PRINCIPAL_HEADER_JSON`]) that the resolver refuses outright —
+///   but only configs written by a runner carrying that change say anything at
+///   all. **Unmarked is not device-class**; it is silence.
+///
+/// A disk census would hand this function 578 files of entirely unattested
+/// provenance, including every agent worktree and every bare-session mint that
+/// ever touched the box, and the adopt arm would classify each one Device.
+///
+/// The count matters too, and second: 578 adoptions against a cap of 256
+/// ([`MAX_PERSISTED_DEVICE_NONCES`]) is a different program from 11 against 256
+/// — though note that adoption itself no longer persists
+/// ([`adopt_on_disk_nonce`]), so what the cap now governs is the mints these
+/// adoptions share a live map with, not the adoptions themselves.
+///
+/// So: widening the caller is a **security** change first and a capacity change
+/// second. Re-derive the class story before the count.
 ///
 /// Root-config self-heal is NOT done here — the boot task calls
 /// [`reconcile_root_config`] UNCONDITIONALLY (plan 2026-07-07 Change 1 secondary
@@ -5583,23 +5791,73 @@ where
             .as_deref()
             .map(proxy_nonce_is_valid)
             .unwrap_or(false);
+        // The PRINCIPAL-CLASS guard. Three emitters produce a byte-identical
+        // proxy `.mcp.json` and mint three different classes of nonce; only the
+        // marker distinguishes them on disk. See
+        // `COORD_MCP_PRINCIPAL_HEADER_JSON`.
+        let is_agent_marked = read_agent_principal_marker(&config_path);
+        let current_proxy_port = read_proxy_port(&workdir);
+        let has_static_authorization = read_static_authorization_presence(&config_path);
         let action = reconcile_action(
-            read_proxy_port(&workdir),
+            current_proxy_port,
             on_disk_nonce.as_deref(),
             nonce_is_registered,
-            read_static_authorization_presence(&config_path),
+            has_static_authorization,
             bound_port,
+            is_agent_marked,
         );
+        if is_agent_marked {
+            // Name what was refused, not merely that something was skipped —
+            // and only when something actually WAS refused, so a fleet of
+            // healthy agent workdirs does not warn on every boot. Re-running the
+            // pure resolver without the guard is free and says exactly which
+            // repair the marker turned away.
+            let refused = reconcile_action(
+                current_proxy_port,
+                on_disk_nonce.as_deref(),
+                nonce_is_registered,
+                has_static_authorization,
+                bound_port,
+                false,
+            );
+            if !matches!(refused, ReconcileAction::Leave) {
+                warn!(
+                    "coord_mcp: boot reconcile REFUSED to {refused:?} \
+                     {workdir}/.mcp.json — it carries the AGENT principal marker \
+                     ({COORD_MCP_PRINCIPAL_HEADER_JSON}: {COORD_MCP_PRINCIPAL_AGENT}), so \
+                     its nonce is scoped to ONE agent's JWT. Adopting it would re-register \
+                     that credential as Device/Persistent and the proxy would then inject \
+                     the DEVICE JWT for it; rewriting it would hand the agent's own client \
+                     a device credential. Agent configs are re-provisioned at agent spawn \
+                     and are never restored across a restart by design — this file is not \
+                     the boot reconcile's to repair."
+                );
+            }
+        }
         match action {
             ReconcileAction::Leave => continue,
             ReconcileAction::AdoptNonce => {
-                // NO `coord_mcp_safe_to_write` guard, and none is possible:
-                // this arm writes nothing. The guard exists to stop us
-                // clobbering a file that is not ours, and adoption leaves the
-                // file byte-identical — it only re-registers a credential the
-                // file already carries. (An agent static-bearer config cannot
-                // reach here anyway: it has no proxy URL, so `read_proxy_port`
-                // returns `None` and the resolver leaves it.)
+                // NO `coord_mcp_safe_to_write` guard, and none is possible.
+                //
+                // Be exact about what "writes nothing" means, because the loose
+                // version of this sentence is what hid a scope-elevation hazard
+                // for a whole review cycle. This arm writes nothing **to
+                // `.mcp.json`** — the file is left byte-identical, and that is
+                // the only property the guard is about (the guard exists to
+                // stop us clobbering a file that is not ours). It DOES append
+                // one `adopt` line to the rotation forensics log, and it mutates
+                // the in-process nonce registry. It no longer touches the
+                // encrypted store at all: `adopt_on_disk_nonce` deliberately
+                // does not persist, so an adopted binding lives exactly one
+                // process lifetime and is re-derived from this same file at the
+                // next boot.
+                //
+                // (An agent STATIC-BEARER config cannot reach here: it has no
+                // proxy URL, so `read_proxy_port` returns `None` and the
+                // resolver leaves it. An agent PROXY config could — it is
+                // byte-identical to the device shape apart from the
+                // principal-class marker — which is what the marker check
+                // above exists to stop.)
                 //
                 // SAFETY: the resolver only yields AdoptNonce when a non-empty
                 // nonce was read from disk — the same invariant the root path
@@ -5679,9 +5937,20 @@ const CONFIG_CENSUS_MAX_DEPTH: usize = 4;
 
 /// Directory names the census never descends into. Dependency and build trees
 /// hold no session workdir, and `node_modules` alone would multiply the walk by
-/// four orders of magnitude at depth 4 — which is the difference between a
-/// boot-time census that costs milliseconds and one that stats a quarter of a
-/// million directories on the startup path.
+/// four orders of magnitude at depth 4.
+///
+/// **The pruned walk is not "milliseconds"** — an earlier version of this
+/// comment claimed that and it was never true. Measured on the operator box
+/// 2026-08-25 with this exact prune list: **7.45 s warm-cache over 83,826
+/// directories**, plus a `.mcp.json` stat in every one of them on top of the
+/// `read_dir`. Boot is the COLD-cache case by construction, so the real figure
+/// is worse. Pruning is what keeps this seconds rather than minutes; it does
+/// not make it free.
+///
+/// That measurement is why the caller starts this walk and then goes and does
+/// the reconcile, awaiting the census only when it builds the summary line — a
+/// repair that a 401ing client is waiting on must not queue behind an
+/// observability walk. See `mcp_api::start_server`'s boot reconcile task.
 const CONFIG_CENSUS_PRUNED_DIRS: &[&str] = &[
     "node_modules",
     "target",
@@ -5732,7 +6001,15 @@ pub(crate) struct OnDiskConfigCensus {
 /// directory routinely differ in separator and case on Windows. Comparing them
 /// raw would classify every open workdir as orphaned and make the census a
 /// confident lie.
-fn workdir_census_key(path: &str) -> String {
+///
+/// `pub(crate)` because the boot task in `mcp_api::start_server` DEDUPES the
+/// lifecycle-record workdirs through this same key before counting them or
+/// handing them to [`reconcile_session_configs`] — two open terminals sharing
+/// one cwd is legitimate and nothing upstream dedupes, so without it the boot
+/// line's `adopted` count double-counts one file. Sharing the key (rather than
+/// deduping on the raw string) is what keeps that count comparable with
+/// [`OnDiskConfigCensus::open_backed`], which is normalized the same way.
+pub(crate) fn workdir_census_key(path: &str) -> String {
     path.replace('\\', "/")
         .trim_end_matches('/')
         .to_ascii_lowercase()
@@ -8257,22 +8534,22 @@ mod tests {
         // rewrites through the current emitter, so it already yields the new
         // shape and must not be split by it.
         assert_eq!(
-            reconcile_action(Some(9877), Some("old"), true, false, 9876),
+            reconcile_action(Some(9877), Some("old"), true, false, 9876, false),
             ReconcileAction::Rewrite,
             "stale port → rewrite"
         );
         assert_eq!(
-            reconcile_action(Some(9877), Some("old"), true, true, 9876),
+            reconcile_action(Some(9877), Some("old"), true, true, 9876, false),
             ReconcileAction::Rewrite,
             "stale port → rewrite even when the header shape is already current"
         );
         assert_eq!(
-            reconcile_action(Some(9876), Some("keep"), true, true, 9876),
+            reconcile_action(Some(9876), Some("keep"), true, true, 9876, false),
             ReconcileAction::Leave,
             "matching port + registered nonce + current header shape → leave"
         );
         assert_eq!(
-            reconcile_action(None, None, false, false, 9876),
+            reconcile_action(None, None, false, false, 9876, false),
             ReconcileAction::Leave,
             "no readable proxy port (absent / static-bearer agent config) → leave"
         );
@@ -8300,19 +8577,19 @@ mod tests {
     #[test]
     fn reconcile_action_adopts_an_unregistered_nonce_ahead_of_the_header_upgrade() {
         assert_eq!(
-            reconcile_action(Some(9876), Some("stale"), false, false, 9876),
+            reconcile_action(Some(9876), Some("stale"), false, false, 9876, false),
             ReconcileAction::AdoptNonce,
             "unregistered nonce + LEGACY header shape → adopt, NOT upgrade: the \
              credential is what a live client is failing on, and the adopt arm \
              is the only one that leaves the file byte-identical"
         );
         assert_eq!(
-            reconcile_action(Some(9876), Some("stale"), false, true, 9876),
+            reconcile_action(Some(9876), Some("stale"), false, true, 9876, false),
             ReconcileAction::AdoptNonce,
             "unregistered nonce + CURRENT header shape → adopt (nothing else to do)"
         );
         assert_eq!(
-            reconcile_action(Some(9876), Some("live"), true, false, 9876),
+            reconcile_action(Some(9876), Some("live"), true, false, 9876, false),
             ReconcileAction::UpgradeHeaders,
             "a REGISTERED nonce with a legacy shape is still an upgrade — adoption \
              must not swallow the arm it precedes"
@@ -8321,18 +8598,18 @@ mod tests {
         // instance does not own belongs to a different registry, and adopting
         // its nonce here would register a credential into the wrong process.
         assert_eq!(
-            reconcile_action(Some(9877), Some("stale"), false, false, 9876),
+            reconcile_action(Some(9877), Some("stale"), false, false, 9876, false),
             ReconcileAction::Rewrite,
             "port mismatch beats adoption — the client's cached URL is stale too"
         );
         // Nothing to adopt: an absent or empty nonce is not a credential.
         assert_eq!(
-            reconcile_action(Some(9876), None, false, false, 9876),
+            reconcile_action(Some(9876), None, false, false, 9876, false),
             ReconcileAction::Leave,
             "no readable nonce → nothing to adopt and nothing to preserve"
         );
         assert_eq!(
-            reconcile_action(Some(9876), Some(""), false, false, 9876),
+            reconcile_action(Some(9876), Some(""), false, false, 9876, false),
             ReconcileAction::Leave,
             "an empty nonce must never be adopted as a credential"
         );
@@ -8351,7 +8628,7 @@ mod tests {
     #[test]
     fn reconcile_action_upgrades_a_legacy_only_config_on_the_bound_port() {
         assert_eq!(
-            reconcile_action(Some(9876), Some("keep"), true, false, 9876),
+            reconcile_action(Some(9876), Some("keep"), true, false, 9876, false),
             ReconcileAction::UpgradeHeaders,
             "matching port, REGISTERED nonce, legacy-only headers → upgrade in place"
         );
@@ -8359,12 +8636,12 @@ mod tests {
         // around an empty credential would produce a config that authenticates
         // against nothing. Left alone rather than upgraded or rotated.
         assert_eq!(
-            reconcile_action(Some(9876), None, false, false, 9876),
+            reconcile_action(Some(9876), None, false, false, 9876, false),
             ReconcileAction::Leave,
             "matching port but no readable nonce → leave (nothing to preserve)"
         );
         assert_eq!(
-            reconcile_action(Some(9876), Some(""), false, false, 9876),
+            reconcile_action(Some(9876), Some(""), false, false, 9876, false),
             ReconcileAction::Leave,
             "an empty nonce is not a credential to preserve"
         );
@@ -8572,6 +8849,116 @@ mod tests {
         }
     }
 
+    /// **Security regression pin.** An AGENT-class `.mcp.json` sitting on the
+    /// BOUND port with an unregistered nonce matches the adopt predicate
+    /// exactly — it is the shape the arm was built for — and adopting it would
+    /// re-register an agent-scoped credential as Device/Persistent, after which
+    /// [`proxy_principal_for_nonce`] answers `Device` and the proxy injects the
+    /// live DEVICE JWT for it. That is a scope elevation, and before the
+    /// principal-class marker it was unavoidable: the agent and device documents
+    /// were byte-identical and a lifecycle record carries no principal-class
+    /// field to disambiguate them.
+    ///
+    /// Asserted three ways so no single layer can regress silently — the
+    /// EMITTER stamps the marker, the pure RESOLVER refuses on it, and the
+    /// end-to-end reconcile leaves the nonce unregistered.
+    #[test]
+    fn an_agent_marked_config_is_never_adopted() {
+        let tmp =
+            std::env::temp_dir().join(format!("coord-mcp-agentmark-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+        let agent_id = uuid::Uuid::new_v4();
+
+        // (1) The EMITTER self-identifies. Written through the real writer, so
+        // this cannot pass against a hand-rolled document the production path
+        // never produces.
+        write_coord_mcp_agent_proxy_config(&wd, 9876, agent_id);
+        let path = tmp.join(".mcp.json");
+        let nonce = read_proxy_nonce(&path).expect("the agent proxy shape carries a nonce");
+        assert!(
+            read_agent_principal_marker(&path),
+            "write_coord_mcp_agent_proxy_config must stamp the principal-class marker"
+        );
+        assert_eq!(
+            proxy_principal_for_nonce(&nonce),
+            Some(ProxyPrincipal::Agent { agent_id }),
+            "precondition: the freshly written nonce is AGENT-scoped"
+        );
+        // The marker is inert to the readers the reconcile keys on.
+        assert_eq!(read_proxy_port(&wd), Some(9876));
+        assert!(read_static_authorization_presence(&path));
+
+        // (2) The pure RESOLVER refuses. Same inputs that yield AdoptNonce for a
+        // device config on the bound port; only the marker differs.
+        assert_eq!(
+            reconcile_action(Some(9876), Some("agent-nonce"), false, true, 9876, false),
+            ReconcileAction::AdoptNonce,
+            "control: without the marker these exact inputs ARE the adopt case"
+        );
+        assert_eq!(
+            reconcile_action(Some(9876), Some("agent-nonce"), false, true, 9876, true),
+            ReconcileAction::Leave,
+            "an agent-marked config on the bound port with an unregistered nonce must \
+             be LEFT, never adopted — adoption would re-register an agent-scoped \
+             credential as Device/Persistent"
+        );
+        // ... and it is refused in every direction, not only adoption: a rewrite
+        // would hand the agent's own client a DEVICE credential instead.
+        assert_eq!(
+            reconcile_action(Some(9999), Some("agent-nonce"), false, true, 9876, true),
+            ReconcileAction::Leave,
+            "a marked config on a STALE port is left too — a rewrite emits the device shape"
+        );
+        assert_eq!(
+            reconcile_action(Some(9876), Some("agent-nonce"), true, false, 9876, true),
+            ReconcileAction::Leave,
+            "a marked config is not header-upgraded either — the upgrade re-emits \
+             through the DEVICE producer, which would strip the marker itself"
+        );
+        assert_eq!(
+            root_reconcile_action(Some(9876), Some("agent-nonce"), false, true, 9876, true),
+            RootReconcileAction::Leave,
+            "the root resolver refuses on the same grounds — the agent writer takes \
+             whatever workdir it is given, including the umbrella root"
+        );
+
+        // (3) END-TO-END over the real file. The nonce is evicted from the live
+        // registry first, which is exactly what a restart leaves behind: an
+        // agent nonce is never persisted, so it is NEVER registered in the next
+        // process — the precondition the adopt arm keys on.
+        {
+            let mut m = proxy_nonces().lock().unwrap();
+            m.remove(&nonce);
+        }
+        assert!(
+            !proxy_nonce_is_valid(&nonce),
+            "precondition: a restart leaves an agent nonce unregistered"
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let counts = reconcile_session_configs(vec![wd.clone()], 9876);
+
+        assert_eq!(
+            counts,
+            SessionReconcileCounts::default(),
+            "an agent-marked config must produce no reconcile effect at all"
+        );
+        assert!(
+            !proxy_nonce_is_valid(&nonce),
+            "THE regression: the agent nonce must NOT have been re-registered. If it \
+             validates here, `proxy_principal_for_nonce` answers Device for a credential \
+             scoped to one agent, and the proxy injects the device JWT for it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "and the file is left untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// Plan `2026-08-25-boot-adopt-session-nonces-across-all-workdirs` Phase 5 —
     /// the fix pinned at FLEET SCALE, over more session configs than the
     /// persisted set can hold.
@@ -8590,13 +8977,21 @@ mod tests {
     ///    same port) strands that client;
     /// 3. **the persisted cut keeps the newest by `.mcp.json` mtime.** This is
     ///    the assertion the vet note demanded be on AGE rather than on survival
-    ///    counts: `adopt_on_disk_nonce` used to stamp `SystemTime::now()`, so
-    ///    every adopted binding tied at the head of
-    ///    [`device_nonce_snapshot`]'s newest-first cut and outranked restored
-    ///    bindings carrying their true persisted age. A test asserting only
+    ///    counts: `adopt_on_disk_nonce` used to stamp `SystemTime::now()`, so an
+    ///    adopted binding's age recorded the ADOPTION INSTANT and outranked
+    ///    restored bindings carrying their true persisted age in
+    ///    [`device_nonce_snapshot`]'s newest-first cut. A test asserting only
     ///    "all adopted, 256 survive" passes against that `now()` stamp and
     ///    misses the inversion entirely — the count is right and the WRONG 256
     ///    survive.
+    ///
+    ///    Which is why the fixture assigns mtimes **anti-correlated** with
+    ///    adoption order. Under the `now()` stamp `minted_at` necessarily
+    ///    ascends with the loop index; if the fixture's mtimes ascended with it
+    ///    too, both stamps would select the same 256 files and the identity
+    ///    assertion would be satisfied by the bug. Running the mtimes backwards
+    ///    forces the two orderings to disagree, so the surviving SET — not just
+    ///    its size — is what distinguishes them.
     ///
     /// The re-provisioner that confounds the digest gate in production
     /// (112 mint+write pairs inside the 2026-08-24 boot window, rewriting the
@@ -8612,9 +9007,20 @@ mod tests {
         let base = std::env::temp_dir().join(format!("coord-mcp-fleet-{run}"));
         std::fs::create_dir_all(&base).unwrap();
 
-        // Distinct, strictly increasing mtimes: index i is newer than i-1, so
-        // "the newest 256" is exactly indices N-256..N and the expectation is
+        // Distinct mtimes assigned ANTI-CORRELATED with adoption order: index 0
+        // is the NEWEST file and index N-1 the oldest, while
+        // `reconcile_session_configs` adopts them in ascending index order. So
+        // "the newest 256" is exactly indices 0..256 and the expectation is
         // computable rather than observed.
+        //
+        // That inversion is the whole point of this fixture, and an earlier
+        // version got it wrong. With mtimes INCREASING in `i` the two orderings
+        // agree: under the old `SystemTime::now()` stamp `minted_at` also
+        // increases with `i`, so the surviving newest-256 set is identical
+        // either way and the set-identity assertion below passes against the
+        // very bug it names. Anti-correlated, the `now()` ordering keeps
+        // N-256..N and the mtime ordering keeps 0..256 — the two disagree on
+        // 212 of 256 entries, so the assertion can only pass on the mtime stamp.
         let base_secs: i64 = 1_600_000_000; // 2020-09-13
         let mut workdirs: Vec<String> = Vec::with_capacity(N);
         let mut nonces: Vec<String> = Vec::with_capacity(N);
@@ -8632,7 +9038,7 @@ mod tests {
             );
             let path = dir.join(".mcp.json");
             std::fs::write(&path, &cfg).unwrap();
-            let secs = base_secs + i as i64 * 60;
+            let secs = base_secs + (N - 1 - i) as i64 * 60;
             filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(secs, 0)).unwrap();
 
             assert!(
@@ -8698,18 +9104,24 @@ mod tests {
             MAX_PERSISTED_DEVICE_NONCES,
             "the cap must engage — a fleet under it would not exercise the cut"
         );
+        // The newest files are the LOW indices (the fixture runs mtimes
+        // backwards), so the survivors are `0..256` — which is very nearly the
+        // set the `now()` stamp would have DROPPED.
         let expected_survivors: std::collections::HashSet<&String> =
-            nonces[N - MAX_PERSISTED_DEVICE_NONCES..].iter().collect();
+            nonces[..MAX_PERSISTED_DEVICE_NONCES].iter().collect();
         let actual_survivors: std::collections::HashSet<&String> = persisted.keys().collect();
         assert_eq!(
             actual_survivors, expected_survivors,
             "the persisted set must be the NEWEST-by-mtime {MAX_PERSISTED_DEVICE_NONCES}. \
-             Against the old `now()` stamp all N bindings tie at the head and the cut \
-             falls to the nonce-string tiebreak, so the count is right and the wrong \
-             ones survive — which is why this asserts identity, not length"
+             The fixture assigns mtimes ANTI-CORRELATED with adoption order, so under the \
+             old `now()` stamp `minted_at` ascends with the loop index and the cut keeps \
+             the LAST 256 adopted instead — the right COUNT over the wrong entries. That \
+             is why this asserts identity rather than length, and why the \
+             anti-correlation is load-bearing: with mtimes ascending in `i` the two \
+             orderings agree and this assertion passes against the bug"
         );
         // And the ages went to disk as the file's, not the adoption's.
-        for n in &nonces[N - MAX_PERSISTED_DEVICE_NONCES..] {
+        for n in &nonces[..MAX_PERSISTED_DEVICE_NONCES] {
             let i: usize = n.rsplit('-').next().unwrap().parse().unwrap();
             assert_eq!(
                 persisted.get(n).and_then(|b| b.minted_at_unix),
@@ -8989,7 +9401,14 @@ mod tests {
         // healthy. A root config that IS stale for the secondary's port (the
         // `Rewrite` trigger) is still left alone.
         assert_eq!(
-            root_reconcile_action(Some(9876), Some("primary-owned-nonce"), false, true, 9877),
+            root_reconcile_action(
+                Some(9876),
+                Some("primary-owned-nonce"),
+                false,
+                true,
+                9877,
+                false
+            ),
             RootReconcileAction::Rewrite,
             "precondition: ungated, this input would have REWRITTEN the root config"
         );
@@ -9143,34 +9562,34 @@ mod tests {
     fn root_reconcile_action_resolves_adopt_vs_rewrite_vs_leave() {
         // Not our shape (no readable proxy port) → Leave regardless of nonce.
         assert_eq!(
-            root_reconcile_action(None, Some("x"), false, true, 9876),
+            root_reconcile_action(None, Some("x"), false, true, 9876, false),
             RootReconcileAction::Leave
         );
         // Port moved → Rewrite (client's cached URL is stale too — reconnect).
         assert_eq!(
-            root_reconcile_action(Some(9999), Some("x"), true, true, 9876),
+            root_reconcile_action(Some(9999), Some("x"), true, true, 9876, false),
             RootReconcileAction::Rewrite,
             "a moved port must rewrite even with a registered nonce"
         );
         // Same port, nonce readable but UNregistered → Adopt (the core fix).
         assert_eq!(
-            root_reconcile_action(Some(9876), Some("abc"), false, true, 9876),
+            root_reconcile_action(Some(9876), Some("abc"), false, true, 9876, false),
             RootReconcileAction::AdoptNonce
         );
         // Same port, nonce readable AND registered AND already non-escalating
         // → Leave (healthy).
         assert_eq!(
-            root_reconcile_action(Some(9876), Some("abc"), true, true, 9876),
+            root_reconcile_action(Some(9876), Some("abc"), true, true, 9876, false),
             RootReconcileAction::Leave
         );
         // Same port, NO nonce readable → Rewrite (nothing to adopt).
         assert_eq!(
-            root_reconcile_action(Some(9876), None, false, false, 9876),
+            root_reconcile_action(Some(9876), None, false, false, 9876, false),
             RootReconcileAction::Rewrite
         );
         // Same port, EMPTY nonce string → Rewrite (empty is nothing to adopt).
         assert_eq!(
-            root_reconcile_action(Some(9876), Some(""), false, false, 9876),
+            root_reconcile_action(Some(9876), Some(""), false, false, 9876, false),
             RootReconcileAction::Rewrite
         );
     }
@@ -9186,7 +9605,7 @@ mod tests {
         // The regression this pins: same port, REGISTERED nonce, legacy-only
         // header shape.
         assert_eq!(
-            root_reconcile_action(Some(9876), Some("abc"), true, false, 9876),
+            root_reconcile_action(Some(9876), Some("abc"), true, false, 9876, false),
             RootReconcileAction::UpgradeHeaders,
             "a registered nonce in a legacy-only file must be upgraded in place"
         );
@@ -9194,11 +9613,11 @@ mod tests {
         // still rewrites (fresh nonce), and an UNREGISTERED nonce is still
         // adopted — the upgrade never pre-empts either.
         assert_eq!(
-            root_reconcile_action(Some(9999), Some("abc"), true, false, 9876),
+            root_reconcile_action(Some(9999), Some("abc"), true, false, 9876, false),
             RootReconcileAction::Rewrite
         );
         assert_eq!(
-            root_reconcile_action(Some(9876), Some("abc"), false, false, 9876),
+            root_reconcile_action(Some(9876), Some("abc"), false, false, 9876, false),
             RootReconcileAction::AdoptNonce
         );
     }
