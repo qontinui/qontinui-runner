@@ -228,6 +228,17 @@ pub enum ErrorStatus {
     /// Newly detected, not yet reviewed
     #[default]
     New,
+    /// Seen again after it was already recorded.
+    ///
+    /// This variant was MISSING while `'recurring'` was already a first-class
+    /// status everywhere else: the `error_events` table stores it, every
+    /// unresolved-status SQL filter in `database/pg/error_monitor.rs` lists it,
+    /// and `ErrorMonitorTab.tsx` renders a dedicated badge plus the recurrence
+    /// history panel for it. Without the variant `StoredErrorEvent` failed to
+    /// deserialize such a row, and `query_error_events` drops deserialize
+    /// failures with `.filter_map(|v| ... .ok())` — so a recurring error was
+    /// silently invisible rather than reported as an error.
+    Recurring,
     /// Acknowledged by user/system
     Acknowledged,
     /// Being worked on (promoted to finding)
@@ -246,6 +257,7 @@ impl ErrorStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::New => "new",
+            Self::Recurring => "recurring",
             Self::Acknowledged => "acknowledged",
             Self::InProgress => "in_progress",
             Self::Promoted => "promoted",
@@ -258,6 +270,7 @@ impl ErrorStatus {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "new" => Some(Self::New),
+            "recurring" => Some(Self::Recurring),
             "acknowledged" => Some(Self::Acknowledged),
             "in_progress" => Some(Self::InProgress),
             "promoted" => Some(Self::Promoted),
@@ -277,7 +290,12 @@ impl ErrorStatus {
     pub fn is_unresolved(&self) -> bool {
         matches!(
             self,
-            Self::New | Self::Acknowledged | Self::InProgress | Self::Promoted
+            // `Recurring` belongs here for the same reason it appears in every
+            // `status IN ('new', 'recurring', ...)` filter in
+            // `database/pg/error_monitor.rs`: an error that came back is still
+            // unresolved. Omitting it made this predicate disagree with the SQL
+            // it mirrors.
+            Self::New | Self::Recurring | Self::Acknowledged | Self::InProgress | Self::Promoted
         )
     }
 }
@@ -326,21 +344,42 @@ pub struct ErrorEvent {
 }
 
 impl ErrorEvent {
-    /// Compute a signature hash for deduplication
+    /// Compute a signature hash for deduplication.
+    ///
+    /// SHA-256, not `DefaultHasher`. `DefaultHasher`'s output is explicitly
+    /// **not stable across Rust releases**, which was harmless while this value
+    /// only ever lived in the in-process dedup cache — but it is now the
+    /// PERSISTED dedup key in `error_events.signature_hash`, so a toolchain
+    /// bump would silently fork every signature and re-open every stored error
+    /// as `new`. A stable digest is the difference between dedup that survives
+    /// a rebuild and dedup that quietly stops working.
+    ///
+    /// Fields are length-prefixed so `("ab", "c")` and `("a", "bc")` cannot
+    /// collide into the same digest.
     pub fn compute_signature_hash(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use sha2::{Digest, Sha256};
 
-        let mut hasher = DefaultHasher::new();
-        self.log_source_name.hash(&mut hasher);
-        self.severity.as_str().hash(&mut hasher);
-        self.error_type.hash(&mut hasher);
-        self.message.hash(&mut hasher);
+        let mut hasher = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        field(self.log_source_name.as_bytes());
+        field(self.severity.as_str().as_bytes());
+        field(self.error_type.as_deref().unwrap_or("").as_bytes());
+        field(self.message.as_bytes());
         if let Some(ref loc) = self.location {
-            loc.file_path.hash(&mut hasher);
-            loc.line_number.hash(&mut hasher);
+            field(loc.file_path.as_bytes());
+            field(
+                loc.line_number
+                    .map(|n| n.to_string())
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
         }
-        format!("{:x}", hasher.finish())
+        // 32 hex chars: the column is TEXT, and 128 bits is far past any
+        // collision concern for a per-source error signature.
+        format!("{:x}", hasher.finalize())[..32].to_string()
     }
 }
 
@@ -466,6 +505,83 @@ mod tests {
 
         let parsed: ErrorSeverity = serde_json::from_str("\"error\"").unwrap();
         assert_eq!(parsed, ErrorSeverity::Error);
+    }
+
+    // =======================================================================
+    // `recurring` status parity (manual-test-loop iter 16)
+    //
+    // `'recurring'` was already first-class in the schema, in every unresolved
+    // SQL filter, and in `ErrorMonitorTab.tsx` (a dedicated badge plus the
+    // recurrence-history panel) — but `ErrorStatus` had no such variant. A
+    // recurring row therefore failed to deserialize into `StoredErrorEvent`,
+    // and `query_error_events` drops deserialize failures with
+    // `.filter_map(|v| ... .ok())`, so the error was SILENTLY INVISIBLE rather
+    // than reported. The persistence added in this change promotes a repeat to
+    // `recurring`, which would have walked straight into that hole.
+    // =======================================================================
+
+    #[test]
+    fn a_recurring_row_survives_deserialization_into_a_stored_event() {
+        // The exact camelCase shape `PgDb::error_row_to_json` produces.
+        let row = serde_json::json!({
+            "id": 1_i64,
+            "logSourceId": serde_json::Value::Null,
+            "logSourceName": "backend",
+            "taskRunId": serde_json::Value::Null,
+            "workflowName": serde_json::Value::Null,
+            "workflowStepId": serde_json::Value::Null,
+            "logTimestamp": serde_json::Value::Null,
+            "capturedAt": "2026-08-23T00:00:00Z",
+            "severity": "error",
+            "errorType": "TypeError",
+            "errorCode": serde_json::Value::Null,
+            "message": "boom",
+            "stackTrace": serde_json::Value::Null,
+            "contextLines": serde_json::Value::Null,
+            "rawEntry": serde_json::Value::Null,
+            "location": serde_json::Value::Null,
+            "signatureHash": "abc",
+            "occurrenceCount": 4,
+            "firstSeenAt": "2026-08-23T00:00:00Z",
+            "lastSeenAt": "2026-08-23T00:00:00Z",
+            "status": "recurring",
+            "findingId": serde_json::Value::Null,
+            "resolvedByTaskRunId": serde_json::Value::Null,
+            "resolutionNotes": serde_json::Value::Null,
+            "traceId": serde_json::Value::Null,
+            "acknowledgedAt": serde_json::Value::Null,
+            "resolvedAt": serde_json::Value::Null,
+        });
+
+        let parsed: StoredErrorEvent = serde_json::from_value(row).expect(
+            "a `recurring` row must deserialize — query_error_events drops the ones \
+                     that don't, silently",
+        );
+        assert_eq!(parsed.status, ErrorStatus::Recurring);
+        assert_eq!(parsed.occurrence_count, 4);
+    }
+
+    #[test]
+    fn recurring_round_trips_through_every_conversion() {
+        assert_eq!(ErrorStatus::Recurring.as_str(), "recurring");
+        assert_eq!(
+            ErrorStatus::from_str("recurring"),
+            Some(ErrorStatus::Recurring)
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorStatus::Recurring).unwrap(),
+            "\"recurring\""
+        );
+    }
+
+    /// The predicate must agree with the SQL it mirrors: every
+    /// `status IN ('new', 'recurring', 'acknowledged', 'in_progress',
+    /// 'promoted')` filter in `database/pg/error_monitor.rs` counts a
+    /// recurring error as unresolved.
+    #[test]
+    fn recurring_is_unresolved_and_not_terminal() {
+        assert!(ErrorStatus::Recurring.is_unresolved());
+        assert!(!ErrorStatus::Recurring.is_terminal());
     }
 
     #[test]

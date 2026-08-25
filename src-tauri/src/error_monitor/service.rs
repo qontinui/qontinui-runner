@@ -18,7 +18,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::RwLock;
 
 use crate::error_monitor::pipeline::exporters::event_bus::EventBusExporter;
-use crate::error_monitor::pipeline::processors::dedup::DedupProcessor;
+use crate::error_monitor::pipeline::exporters::postgres::PostgresExporter;
 use crate::error_monitor::pipeline::processors::jsonl_preprocess::JsonlPreprocessor;
 use crate::error_monitor::pipeline::processors::parser::ParserProcessor;
 use crate::error_monitor::pipeline::traits::{Exporter, Processor};
@@ -327,7 +327,11 @@ pub struct ErrorMonitorService {
     /// Pipeline processors
     jsonl_preprocessor: JsonlPreprocessor,
     parser_processor: ParserProcessor,
-    dedup_processor: DedupProcessor,
+    /// Pipeline exporter — PERSISTS parsed events into `error_events`.
+    ///
+    /// Runs BEFORE `event_bus_exporter`, so the rows are on disk by the time
+    /// the UI is woken and told to fetch them.
+    postgres_exporter: PostgresExporter,
     /// Pipeline exporter — dispatches parsed events onto the service event bus.
     event_bus_exporter: EventBusExporter,
 }
@@ -344,6 +348,7 @@ impl ErrorMonitorService {
         let current_task_run_id: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
         let current_workflow_name: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
+        let postgres_exporter = PostgresExporter::new(pg_db.clone(), current_task_run_id.clone());
         let event_bus_exporter = EventBusExporter::new(event_tx.clone());
 
         let handle = ErrorMonitorHandle {
@@ -360,7 +365,7 @@ impl ErrorMonitorService {
             event_tx,
             jsonl_preprocessor: JsonlPreprocessor,
             parser_processor: ParserProcessor::new(),
-            dedup_processor: DedupProcessor::new(10_000),
+            postgres_exporter,
             event_bus_exporter,
         };
 
@@ -729,6 +734,23 @@ impl ErrorMonitorService {
     }
 
     /// Scan all sources from the beginning.
+    ///
+    /// # Unreachable today, and it must stay that way until it re-reads safely
+    ///
+    /// `ErrorMonitorHandle::scan_all` — the only producer of `ScanAll` — has no
+    /// call sites anywhere in the crate, so this path never runs. That matters
+    /// now that `process_records` has no signature filter: rewinding every
+    /// position to 0 re-delivers lines already ingested, and the persistence
+    /// exporter would count each one as another OCCURRENCE, inflating
+    /// `occurrence_count` for the whole file on every manual scan.
+    ///
+    /// Re-reading a line is not the error happening again. Before wiring a
+    /// caller, this needs the re-read to be distinguishable from a fresh
+    /// sighting — carry a "replay" marker on the batch and have
+    /// `PostgresExporter` skip the bump for it, or persist last-ingested
+    /// offsets so a rescan resumes rather than rewinds. Do NOT close this by
+    /// putting the signature dedup back in the shared chain; that trades a
+    /// rescan bug for the unreachable-`recurring` bug it just replaced.
     async fn scan_all_sources(&mut self) {
         // Reset all positions
         for state in self.file_states.values_mut() {
@@ -738,7 +760,25 @@ impl ErrorMonitorService {
         self.poll_all_sources().await;
     }
 
-    /// Process log records through the pipeline (preprocessor → parser → dedup → exporters).
+    /// Process log records through the pipeline (preprocessor → parser → exporters).
+    ///
+    /// # There is deliberately NO signature dedup in this chain
+    ///
+    /// A `DedupProcessor` used to sit here, between the parser and the
+    /// exporters, and it made the persistence stage's own feature unreachable:
+    /// `upsert_error_events` deduplicates by bumping `occurrence_count`,
+    /// advancing `last_seen_at` and promoting `new` -> `recurring`, and it can
+    /// only do that if the repeat REACHES it. Filtering repeats out first meant
+    /// that within a single runner lifetime `occurrence_count` never left 1 and
+    /// `recurring` never fired; the promote/bump SQL only ever ran after a
+    /// restart, because that cleared the in-process `seen` set.
+    ///
+    /// The SQL upsert is the dedup authority for persistence — it is the only
+    /// one that survives a restart, since it reads the store rather than a
+    /// process-local set. The wake-up suppression the old stage was really
+    /// providing now lives inside `EventBusExporter`, which is the consumer
+    /// that actually needs it (its payload is empty, so every emission costs
+    /// the UI a re-query). Two consumers, two behaviours.
     async fn process_records(&self, records: Vec<LogRecord>) {
         if records.is_empty() {
             return;
@@ -747,10 +787,16 @@ impl ErrorMonitorService {
         // Run through processor chain
         let records = self.jsonl_preprocessor.process(records).await;
         let records = self.parser_processor.process(records).await;
-        let records = self.dedup_processor.process(records).await;
 
         if records.is_empty() {
             return;
+        }
+
+        // PERSIST FIRST. The event-bus exporter's payload is deliberately empty
+        // — it is a wake-up whose contract is "go read the store" — so waking
+        // the UI before the rows exist is a race it cannot recover from.
+        if let Err(e) = self.postgres_exporter.export(&records).await {
+            tracing::warn!("Error event persistence failed: {}", e);
         }
 
         if let Err(e) = self.event_bus_exporter.export(&records).await {

@@ -487,6 +487,19 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 /// Intentionally NOT `\r\n` (see [`TerminalSession::submit_prompt`]).
 const SUBMIT_ENTER: &[u8] = b"\r";
 
+/// Machine-readable code prefixing the refusal [`TerminalSession::write`]
+/// returns for a PTY whose process has exited.
+///
+/// It is deliberately the SAME token the frontend uses
+/// (`src/components/terminal/terminalWriteResult.ts`), so a refusal that
+/// originates in Rust is classified by `buildWriteFailure` exactly as one the
+/// frontend built for itself. The write surfaces BELOW the frontend -- HTTP
+/// `POST /terminals/{id}/write`, the Tauri `terminal_write` command, the WS
+/// input loop, the transports, the backend relay -- previously had no liveness
+/// gate at all, which left the entire `TERMINAL_EXITED` chain unreachable
+/// through every one of them.
+pub const TERMINAL_EXITED: &str = "TERMINAL_EXITED";
+
 /// Delay between the bracketed-paste block and the trailing submit keystroke.
 ///
 /// **Why this exists:** the original `submit_prompt` wrote
@@ -1561,10 +1574,13 @@ impl TerminalSession {
                     }
                 };
 
-                waiter_alive.store(false, Ordering::Relaxed);
+                // Record the exit code BEFORE clearing `is_alive`. The other
+                // order left a window in which a refused write reported
+                // "exited with code unknown" for a code that was already known.
                 if let Ok(mut ec) = waiter_exit.lock() {
                     *ec = code;
                 }
+                waiter_alive.store(false, Ordering::Relaxed);
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
 
@@ -2422,6 +2438,32 @@ impl TerminalSession {
     /// and future write path. Observation happens AFTER the bytes hit the
     /// PTY and the writer lock is released — it never delays keystrokes.
     pub fn write(&self, data: &[u8]) -> Result<(), String> {
+        // -- LIVENESS GATE ------------------------------------------------
+        //
+        // The funnel is the only honest place for this. Writing to an exited
+        // PTY does not fail at the OS layer: the pty master is still open, so
+        // `write_all` and `flush` both succeed and every surface above
+        // returned a GREEN result for input that reached no process. HTTP
+        // answered `200 {"written":7}` and the Tauri command answered
+        // `success:true` on a terminal whose own `/terminals` row reported
+        // `isAlive:false` at that same moment.
+        //
+        // Gating the two HTTP/IPC call sites alone would leave the WS input
+        // loop, the transports and the backend relay unguarded, so the check
+        // lives here -- where `write` already documents itself as the SINGLE
+        // funnel for terminal input, and where every future write surface
+        // inherits it for free.
+        if !self.is_alive() {
+            return Err(format!(
+                "{}: terminal {} is not writable -- its process exited with code {}.",
+                TERMINAL_EXITED,
+                self.id,
+                match self.exit_code() {
+                    Some(code) => code.to_string(),
+                    None => "unknown".to_string(),
+                }
+            ));
+        }
         {
             let mut writer = self
                 .writer
@@ -2511,6 +2553,24 @@ impl TerminalSession {
     /// after the end marker reliably triggers send. See Phase 6 §6
     /// remediation plan, Issue 1.
     pub fn submit_prompt(&self, message: &str) -> Result<(), String> {
+        // Same LIVENESS GATE as `write`. `submit_prompt` takes the writer lock
+        // directly rather than routing through `write`, so it does NOT inherit
+        // that gate — without this, `POST /terminals/{id}/submit-prompt` and
+        // `coordinator/act.rs::send_message_to_worker` still answered green for
+        // a bracketed paste plus Enter that reached no process, which is the
+        // very defect the gate exists to close, on a sibling path.
+        if !self.is_alive() {
+            return Err(format!(
+                "{}: terminal {} is not writable -- its process exited with code {}.",
+                TERMINAL_EXITED,
+                self.id,
+                match self.exit_code() {
+                    Some(code) => code.to_string(),
+                    None => "unknown".to_string(),
+                }
+            ));
+        }
+
         // Frame + neutralize BEFORE taking the writer lock — the body is
         // untrusted (the `POST /terminals/{id}/submit-prompt` route is
         // caller-supplied) and an embedded `\x1b[201~` would otherwise
@@ -2835,7 +2895,7 @@ impl TerminalSession {
             rows: self.rows.load(Ordering::Relaxed),
             working_dir: self.working_dir.clone(),
             is_alive: self.is_alive.load(Ordering::Relaxed),
-            exit_code: self.exit_code.lock().ok().and_then(|ec| *ec),
+            exit_code: self.exit_code(),
             created_at: self.created_at,
             total_bytes_produced: self.total_bytes_produced.load(Ordering::Relaxed),
             page_id: self.page_id(),
@@ -3016,6 +3076,14 @@ impl TerminalSession {
     /// Check if the shell process is still alive.
     pub fn is_alive(&self) -> bool {
         self.is_alive.load(Ordering::Relaxed)
+    }
+
+    /// The shell process's exit code, once the waiter thread has recorded one.
+    ///
+    /// `None` means either "still running" or "exited but the wait itself
+    /// failed" -- callers that must tell those apart consult [`Self::is_alive`].
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code.lock().ok().and_then(|ec| *ec)
     }
 
     /// Kill the shell process and clean up threads.
@@ -3286,6 +3354,42 @@ mod tests {
             // hook no-ops when this is `None`.
             app_handle: None,
             input_line_buf: Arc::new(Mutex::new(String::new())),
+        }
+    }
+
+    /// A `TerminalSession` fixture that reads as ALIVE for the duration of a
+    /// test, and is restored to dead before it drops.
+    ///
+    /// `make_test_session` deliberately builds a DEAD fixture so `Drop` skips
+    /// `close()` on a session with no real reader/waiter threads. But both
+    /// [`TerminalSession::write`] and [`TerminalSession::submit_prompt`] now
+    /// refuse a dead pty, so every test that exercises a WRITE path needs the
+    /// fixture live. This guard flips the flag and restores it on drop --
+    /// including on an assertion panic, which a manual restore at the end of
+    /// the test body would skip.
+    struct LiveTestSession(TerminalSession);
+
+    impl LiveTestSession {
+        fn new(buf: Arc<Mutex<Vec<u8>>>) -> Self {
+            let session = make_test_session(buf);
+            session.is_alive.store(true, Ordering::Relaxed);
+            Self(session)
+        }
+    }
+
+    impl std::ops::Deref for LiveTestSession {
+        type Target = TerminalSession;
+        fn deref(&self) -> &TerminalSession {
+            &self.0
+        }
+    }
+
+    impl Drop for LiveTestSession {
+        fn drop(&mut self) {
+            // Runs BEFORE the inner session's own `Drop`, which then sees a
+            // dead session and skips `close()` -- exactly as the fixture
+            // intends.
+            self.0.is_alive.store(false, Ordering::Relaxed);
         }
     }
 
@@ -3907,12 +4011,109 @@ mod tests {
         assert_eq!(sanitize_submit_body("\x1b[2\u{0}01~"), "[201~");
     }
 
+    // =======================================================================
+    // PTY LIVENESS GATE -- the dead-write refusal (manual-test-loop iter 16)
+    //
+    // The defect these pin: `write` had NO liveness check, so a write to an
+    // exited PTY succeeded at the OS layer and every surface above it reported
+    // success -- HTTP `200 {"written":7}`, `terminal_write` `success:true` --
+    // on a terminal whose own `/terminals` row said `isAlive:false`. That made
+    // the entire `TERMINAL_EXITED` chain unreachable through those paths.
+    //
+    // `make_test_session` builds a fixture with `is_alive: false`, which is
+    // exactly the dead-PTY condition; the live case flips the flag for the
+    // duration of the write and restores it so `Drop` still skips `close()`.
+    // =======================================================================
+
+    /// `submit_prompt` writes to `self.writer` DIRECTLY rather than routing
+    /// through `write`, so it does not inherit that gate and needs its own.
+    /// Without it `POST /terminals/{id}/submit-prompt` and
+    /// `send_message_to_worker` still answered green for a paste that reached
+    /// no process -- the same defect, one function over.
+    #[test]
+    fn submit_prompt_to_an_exited_pty_is_refused_and_drops_the_bytes() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        assert!(!session.is_alive(), "fixture precondition: pty is dead");
+
+        let err = session
+            .submit_prompt("rm -rf /")
+            .expect_err("submit_prompt to an exited pty must be refused");
+
+        assert!(err.starts_with(TERMINAL_EXITED), "got {err:?}");
+        assert!(
+            buf.lock().unwrap().is_empty(),
+            "a refused submit must not put the paste block on the wire"
+        );
+    }
+
+    /// NEGATIVE case. Two independent assertions, because a gate that returned
+    /// the right error while still writing the bytes would be worse than none.
+    #[test]
+    fn write_to_an_exited_pty_is_refused_and_drops_the_bytes() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let session = make_test_session(buf.clone());
+        assert!(!session.is_alive(), "fixture precondition: pty is dead");
+
+        let err = session
+            .write(b"rm -rf /\r")
+            .expect_err("a write to an exited pty must be refused, not silently accepted");
+
+        assert!(
+            err.starts_with(TERMINAL_EXITED),
+            "the refusal must carry the typed code so `buildWriteFailure` can \
+             classify it; got {err:?}"
+        );
+        assert!(
+            err.contains("test"),
+            "the refusal must name the terminal; got {err:?}"
+        );
+        assert!(
+            buf.lock().unwrap().is_empty(),
+            "a refused write must not reach the pty writer at all"
+        );
+    }
+
+    /// POSITIVE case -- the gate must not break a live pane. Without this the
+    /// negative test above is satisfied by a `write` that refuses everything.
+    #[test]
+    fn write_to_a_live_pty_still_reaches_the_writer() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let session = LiveTestSession::new(buf.clone());
+
+        session
+            .write(b"echo hi\r")
+            .expect("a write to a live pty must still succeed");
+
+        assert_eq!(
+            buf.lock().unwrap().as_slice(),
+            b"echo hi\r",
+            "the live write must land on the pty byte-for-byte"
+        );
+    }
+
+    /// The exit code the waiter recorded must travel in the refusal, so a
+    /// caller can tell a clean exit from a crash without a second round trip.
+    #[test]
+    fn the_refusal_reports_the_recorded_exit_code() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let session = make_test_session(buf);
+        *session.exit_code.lock().unwrap() = Some(137);
+
+        let err = session.write(b"x").expect_err("dead pty must refuse");
+
+        assert!(
+            err.contains("137"),
+            "the refusal must report the recorded exit code; got {err:?}"
+        );
+    }
+
     /// The falsifiable core: assert what `submit_prompt` ACTUALLY writes to
     /// the PTY, not what the test-only `build_submit_payload` returns.
     #[test]
     fn submit_prompt_neutralizes_embedded_paste_end_marker() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("before\x1b[201~after")
             .expect("submit_prompt failed");
@@ -3948,7 +4149,7 @@ mod tests {
     #[test]
     fn submit_prompt_strips_control_bytes_from_the_body() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("ok\u{0}\u{7}\u{1b}zdone")
             .expect("submit_prompt failed");
@@ -3967,7 +4168,7 @@ mod tests {
         );
 
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("x\x1b[201~y")
             .expect("submit_prompt failed");
@@ -4055,7 +4256,7 @@ mod tests {
     #[test]
     fn submit_prompt_neutralizes_embedded_paste_begin_marker() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("before\x1b[200~after")
             .expect("submit_prompt failed");
@@ -4083,7 +4284,7 @@ mod tests {
     #[test]
     fn submit_prompt_closes_a_dangling_string_sequence_before_the_end_marker() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("\x1b]0;title")
             .expect("submit_prompt failed");
@@ -4108,7 +4309,7 @@ mod tests {
         ] {
             let info = submit_payload_info(message);
             let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-            let session = make_test_session(buf.clone());
+            let session = LiveTestSession::new(buf.clone());
             session
                 .submit_prompt(message)
                 .expect("submit_prompt failed");
@@ -4152,7 +4353,7 @@ mod tests {
     #[test]
     fn submit_prompt_writes_bracketed_paste_then_bare_cr() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("hello")
             .expect("submit_prompt failed");
@@ -4167,7 +4368,7 @@ mod tests {
         // LF as the paste-block terminator instead of submitting. The
         // submit byte must be a bare CR; no LF anywhere in the output.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("line1 line2")
             .expect("submit_prompt failed");
@@ -4229,7 +4430,7 @@ mod tests {
         // per-caller observe call (the fixture has no app_handle, so effect
         // dispatch is skipped but line assembly still runs).
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session.write(b"claude --re").expect("write failed");
         assert_eq!(
             session.input_line_buf.lock().unwrap().as_str(),

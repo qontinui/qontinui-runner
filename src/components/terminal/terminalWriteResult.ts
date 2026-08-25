@@ -27,6 +27,20 @@ export type TerminalWriteResult =
 
 
 /**
+ * Pull the exit code out of a backend `TERMINAL_EXITED: ...` refusal.
+ *
+ * The Rust envelope reads `... its process exited with code <n>.`, or
+ * `code unknown.` when the waiter thread never captured one. Returns `null`
+ * for the unknown form, which is the same value the frontend records when a
+ * `terminal-exit` event carries no code -- callers already render it as
+ * "unknown".
+ */
+function parseBackendExitCode(detail: string): number | null {
+  const match = /exited with code (-?\d+)/.exec(detail);
+  return match ? Number(match[1]) : null;
+}
+
+/**
  * Build the failure envelope for a refused or failed PTY write.
  *
  * THE DEFECT this replaces: every `invoke("terminal_write", …)` in this file
@@ -48,7 +62,22 @@ export function buildWriteFailure(
   exit: { exitCode: number | null } | null,
   cause: unknown,
 ): Extract<TerminalWriteResult, { success: false }> {
-  if (exit) {
+  const detail = cause instanceof Error ? cause.message : cause == null ? "" : String(cause);
+  // The Rust write funnel (`TerminalSession::write`) now refuses a write to an
+  // exited PTY with its OWN `TERMINAL_EXITED: ...` envelope. Recognise it, so a
+  // pane whose `terminal-exit` event has not yet landed in this component
+  // (`exit === null`) still classifies the refusal as TERMINAL_EXITED rather
+  // than downgrading the backend's typed diagnosis to TERMINAL_WRITE_FAILED.
+  // That downgrade is not cosmetic: `resumeVerification` treats
+  // TERMINAL_WRITE_FAILED as retryable and burns the full 31s ladder against a
+  // pty that is already gone.
+  // `startsWith`, not `includes`: the Rust envelope always PREFIXES the code
+  // (`mcp/terminals.rs` classifies the same refusal with `e.starts_with(...)`),
+  // so this both matches the guarantee and refuses to promote an unrelated
+  // message that merely mentions the token.
+  const refusedByBackend = !exit && detail.startsWith(TERMINAL_EXITED);
+  if (exit || refusedByBackend) {
+    exit = exit ?? { exitCode: parseBackendExitCode(detail) };
     return {
       success: false,
       code: TERMINAL_EXITED,
@@ -63,7 +92,6 @@ export function buildWriteFailure(
         "(`terminal.restart`). Reading scrollback still works on an exited pane.",
     };
   }
-  const detail = cause instanceof Error ? cause.message : String(cause);
   return {
     success: false,
     code: TERMINAL_WRITE_FAILED,

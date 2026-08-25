@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tauri::Manager;
 use tracing::{debug, error, info, warn};
 
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 use crate::terminal::{strip_ansi, TerminalManager};
 
 // ============================================================================
@@ -338,6 +338,33 @@ pub async fn create_terminal_handler(
     }
 }
 
+/// Build the `ACTION_FAILED` / `TERMINAL_EXITED` body for a write refused
+/// because the PTY behind the terminal is gone.
+///
+/// `bytes_dropped` is reported deliberately: the previous behaviour returned
+/// `{"written": N}` for exactly these bytes, so a caller that trusted the old
+/// shape can see the same number and read that NONE of it landed.
+fn terminal_exited_response(id: &str, message: &str, bytes_dropped: usize) -> ApiResponse<()> {
+    let mut body = api_error_detailed(
+        message.to_string(),
+        crate::mcp::ui_bridge::UiBridgeError {
+            code: crate::mcp::ui_bridge::types::UiBridgeErrorCode::ActionFailed,
+            message: message.to_string(),
+            recovery: Some(crate::mcp::ui_bridge::types::RecoveryHint::Unrecoverable),
+            context: Some(serde_json::json!({
+                "terminal_id": id,
+                "reason": crate::terminal::session::TERMINAL_EXITED,
+                "bytes_dropped": bytes_dropped,
+                "hint": "Restart the session before writing to it (zone hover -> Restart, \
+                         or the `/restart [<zone>]` terminal command). Reading scrollback \
+                         still works on an exited pane.",
+            })),
+        },
+    );
+    body.code = Some("ACTION_FAILED".to_string());
+    body
+}
+
 /// Write data to a terminal's PTY stdin.
 pub async fn write_terminal_handler(
     State(state): State<Arc<ApiState>>,
@@ -361,6 +388,19 @@ pub async fn write_terminal_handler(
     })?;
 
     session.write(&bytes).map_err(|e| {
+        // A dead PTY is not a runner fault -- it is an ACTION failure whose
+        // whole diagnosis is the typed `TERMINAL_EXITED: ...` envelope. 500
+        // would tell the caller to retry against a runner that is perfectly
+        // healthy; 400 + `ACTION_FAILED` tells it the request is unsatisfiable
+        // until the session is restarted, which is what the frontend's
+        // `buildWriteFailure` already reports for the same condition.
+        if e.starts_with(crate::terminal::session::TERMINAL_EXITED) {
+            warn!("HTTP: refused write to exited terminal {}: {}", id, e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(terminal_exited_response(&id, &e, bytes.len())),
+            );
+        }
         error!("HTTP: Failed to write to terminal {}: {}", id, e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
