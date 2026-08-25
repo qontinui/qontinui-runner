@@ -72,6 +72,11 @@ pub mod mcp_spill;
 // server computes drift vs a canonical machine. Auth is a per-machine API key
 // (`X-Machine-Key: mk_<token>`), NOT a user JWT. Lives in the lib crate so both
 // the `qontinui_profile env` CLI and the Tauri runner GUI share one code path.
+// Moved out of the binary crate at P4: the bundled cluster is now the runner's
+// ONLY database, so the lib-side consumers (env_agent's db_schema pool, the
+// `qontinui-specs` CLI) must be able to address it. It has no `crate::`
+// dependencies, so the move is mechanical.
+pub mod embedded_pg;
 pub mod env_agent;
 
 // Device-pairing flow (headless + browser-mediated). Lifted out of

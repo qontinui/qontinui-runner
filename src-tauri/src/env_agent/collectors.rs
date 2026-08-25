@@ -61,65 +61,6 @@ pub(crate) fn sanitize_url(raw: &str) -> Option<String> {
     }
 }
 
-/// Sanitize a PostgreSQL connection string that may be in EITHER supported
-/// form: a `postgres://` URL, or libpq's `key=value` DSN
-/// (`host=... port=... user=... password=... dbname=...`).
-///
-/// # Why this is not just [`sanitize_url`]
-///
-/// It was, and that silently cost the `services` section its single most
-/// important key. `url::Url::parse` rejects a `key=value` DSN outright, so
-/// `sanitize_url` returned `None`, and the caller's `if let Some(_)` simply
-/// skipped `database_url` — no warning, no marker, nothing. The section then
-/// looked *in sync* on a box whose database topology had never been captured at
-/// all. That is exactly how the operator box came to sit on a retired database
-/// while its drift report showed no database difference to reconcile: the
-/// runner's own `legacy_env_fallback` default is a `key=value` DSN, so the form
-/// most likely to be in play was the one form that could not be captured.
-///
-/// `tokio_postgres::Config` parses both forms and is already the parser this
-/// crate uses for exactly this string (`database/pg/mod.rs`,
-/// `env_agent::publish_pg_pool_from_url`), so this reuses it rather than
-/// hand-rolling a DSN scanner.
-///
-/// Secret-free by the same contract as [`sanitize_url`]: only host and port are
-/// read off the parsed config — `user`, `password` and `dbname` are never
-/// touched — and the result is rendered in the canonical `postgres://host:port`
-/// shape so the two input forms converge on ONE comparable value. Without that
-/// normalization two boxes spelling the same server differently would read as
-/// permanent drift.
-pub(crate) fn sanitize_database_url(raw: &str) -> Option<String> {
-    // URL form first: it is the canonical spelling, and keeping it on the
-    // shared choke point means capture and apply cannot disagree about it.
-    if let Some(sanitized) = sanitize_url(raw) {
-        return Some(sanitized);
-    }
-
-    // libpq `key=value` form.
-    let config: tokio_postgres::Config = raw.parse().ok()?;
-    let host = match config.get_hosts().first()? {
-        tokio_postgres::config::Host::Tcp(h) => h.clone(),
-        // `Host::Unix` is a `#[cfg(unix)]` variant, so this arm is unreachable
-        // on Windows — which is exactly why it cannot be the only socket check.
-        #[allow(unreachable_patterns)]
-        _ => return None,
-    };
-    // libpq reads a host beginning with `/` as a socket DIRECTORY rather than a
-    // network host, and on Windows that spelling parses into `Host::Tcp`
-    // carrying a filesystem path — so without this the section would publish
-    // `postgres:///var/run/postgresql:5432` as if it were a comparable server.
-    // A socket path has no cross-box host:port topology and is operator-local,
-    // so report nothing rather than something misleading.
-    if host.starts_with('/') || host.starts_with('\\') {
-        return None;
-    }
-    // `get_ports()` is empty when the DSN omits `port`; libpq's default is 5432
-    // and being explicit keeps two boxes that differ only in explicitness from
-    // reading as drift.
-    let port = config.get_ports().first().copied().unwrap_or(5432);
-    Some(format!("postgres://{host}:{port}"))
-}
-
 /// A git remote, normalized to one canonical secret-free
 /// `https://<host>/<owner>/<name>` rendering. Returns `None` when the input
 /// does not name a host and a two-or-more segment path.
@@ -138,9 +79,9 @@ pub(crate) fn sanitize_database_url(raw: &str) -> Option<String> {
 /// `https://github.com/qontinui/qontinui-runner.git` and
 /// `https://github.com/qontinui/qontinui-runner` are the same repository. Emit
 /// them verbatim and two boxes that merely *cloned differently* read as
-/// permanent drift that no apply can ever clear — the same failure mode
-/// [`sanitize_database_url`] was written to avoid, where two spellings of one
-/// server had to converge on ONE comparable value.
+/// permanent drift that no apply can ever clear — the same failure mode the
+/// retired `database_url` sanitizer was written to avoid, where two spellings
+/// of one server had to converge on ONE comparable value.
 ///
 /// Secret-free by the same contract as its two siblings: userinfo is dropped
 /// structurally, so a token-bearing remote
@@ -274,18 +215,14 @@ pub async fn collect_services() -> Option<Section> {
     let mut section = Section::new();
 
     // Topology from the active profile — URLs sanitized (userinfo stripped).
+    //
+    // P4 removed `database_url` from this section. It is not "dropped": the
+    // runner no longer HAS an external database whose topology could differ
+    // between boxes — every machine runs the bundled cluster on an ephemeral
+    // loopback port, which is machine-local by construction and so is not a
+    // comparable fact. Capturing it would manufacture permanent drift that no
+    // apply could ever clear.
     let profile = crate::profiles::load();
-    match sanitize_database_url(&profile.database_url) {
-        Some(sanitized) => put(&mut section, "database_url", sanitized),
-        // Do NOT drop this silently. A missing key is indistinguishable from
-        // "in sync" downstream, which is precisely how a box on the wrong
-        // database reported no database drift at all.
-        None => warn!(
-            "env capture: database_url is neither a URL nor a libpq key=value DSN with a \
-             TCP host — omitting it from the services section, so this box's database \
-             topology cannot be compared against canonical"
-        ),
-    }
     if let Some(redis) = profile.redis_url.as_deref() {
         if let Some(sanitized) = sanitize_url(redis) {
             put(&mut section, "redis_url", sanitized);
@@ -2849,8 +2786,9 @@ fn origin_of_checkout(dir: &Path) -> Result<Option<String>, String> {
     match sanitize_git_remote(url) {
         Some(canonical) => Ok(Some(canonical)),
         // Deliberately an Err, not a silent None: an unparseable remote is the
-        // exact shape of failure that cost the `services` section its
-        // `database_url` key — see `sanitize_database_url`'s header. The caller
+        // exact shape of failure that once cost the `services` section its
+        // `database_url` key — a quiet `None` that read downstream as "in
+        // sync". (That key is retired as of P4; the lesson is not.) The caller
         // WARNs; it never drops it quietly.
         None => Err(format!(
             "origin url is not a recognisable git remote ({} chars)",
@@ -3388,58 +3326,6 @@ mod tests {
         assert!(sanitize_url("not a url").is_none());
     }
 
-    /// The regression this exists for: the runner's own `legacy_env_fallback`
-    /// default is a libpq `key=value` DSN, and `sanitize_url` returns None for
-    /// it — so `database_url` was silently dropped from every capture made on a
-    /// box using the default, and the section read as in-sync.
-    #[test]
-    fn sanitize_database_url_accepts_the_libpq_keyvalue_default() {
-        let legacy = "host=localhost port=5432 user=qontinui_user \
-                      password=qontinui_dev_password dbname=qontinui_db";
-        assert!(
-            sanitize_url(legacy).is_none(),
-            "precondition: plain URL parsing cannot read this form"
-        );
-        let s = sanitize_database_url(legacy).expect("key=value DSN must be captured");
-        assert_eq!(s, "postgres://localhost:5432");
-        assert!(!s.contains("qontinui_dev_password"), "password leaked: {s}");
-        assert!(!s.contains("qontinui_user"), "username leaked: {s}");
-        assert!(!s.contains("qontinui_db"), "dbname leaked: {s}");
-    }
-
-    /// Both spellings of the same server must converge on ONE value, or two
-    /// boxes that merely write the DSN differently would read as permanent
-    /// drift that no apply could ever clear.
-    #[test]
-    fn sanitize_database_url_normalizes_both_forms_to_the_same_value() {
-        let url_form = sanitize_database_url("postgres://u:p@localhost:5433/qontinui_db").unwrap();
-        let kv_form =
-            sanitize_database_url("host=localhost port=5433 user=u password=p dbname=qontinui_db")
-                .unwrap();
-        assert_eq!(url_form, kv_form);
-        assert_eq!(url_form, "postgres://localhost:5433");
-    }
-
-    /// libpq defaults the port to 5432 when omitted. Rendering it explicitly
-    /// keeps "port omitted" and "port written out" from reading as drift.
-    #[test]
-    fn sanitize_database_url_defaults_the_omitted_port() {
-        let s = sanitize_database_url("host=db.internal user=svc").unwrap();
-        assert_eq!(s, "postgres://db.internal:5432");
-    }
-
-    /// A Unix-socket DSN has no cross-box host:port topology, and the path is
-    /// operator-local — report nothing rather than something misleading.
-    #[test]
-    fn sanitize_database_url_omits_unix_socket_dsns() {
-        assert!(sanitize_database_url("host=/var/run/postgresql user=svc").is_none());
-    }
-
-    #[test]
-    fn sanitize_database_url_still_rejects_garbage() {
-        assert!(sanitize_database_url("not a dsn at all ===").is_none());
-    }
-
     // ---- repos ----------------------------------------------------------
 
     /// The three spellings of ONE repository must converge on ONE value.
@@ -3491,8 +3377,9 @@ mod tests {
     }
 
     /// Unparseable input returns `None` so the CALLER can WARN. Silently
-    /// dropping it is the failure `sanitize_database_url`'s header documents,
-    /// where a quiet `None` cost the `services` section its most important key.
+    /// dropping it is the failure the retired `database_url` sanitizer was
+    /// written for, where a quiet `None` cost the `services` section its most
+    /// important key.
     #[test]
     fn sanitize_git_remote_rejects_what_it_cannot_parse() {
         for bad in [

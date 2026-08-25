@@ -28,7 +28,7 @@
 //! supervisor cron / dashboards.
 
 use clap::{Parser, Subcommand};
-use qontinui_runner_lib::profiles::load_strict;
+use qontinui_runner_lib::embedded_pg::local_dsn;
 use serde_json::{json, Value};
 use std::process::ExitCode;
 use tokio_postgres::Client;
@@ -196,14 +196,19 @@ async fn validate_app_filter(client: &Client, app_id: &str) -> Result<(), String
     ))
 }
 
-/// Open a single PG connection from the active profile's `database_url`.
+/// Open a single PG connection to this machine's bundled cluster.
 ///
 /// Sets `search_path` to `project, public` post-connect so unqualified table
 /// names in the queries resolve to `project.*` first — same convention as the
 /// runner's `database/pg/mod.rs::new` pool post-create hook.
+///
+/// P4: this used to connect to the active profile's `database_url`. The tables
+/// this CLI reads are `project.*` — the runner's OWN schema — which live in the
+/// bundled cluster, so the profile DSN was never the right target; it merely
+/// happened to name the same server on a box configured one particular way.
 async fn open_pg() -> Result<Client, String> {
-    let profile = load_strict().map_err(|e| format!("active profile lacks database_url: {}", e))?;
-    let (client, conn) = tokio_postgres::connect(&profile.database_url, tokio_postgres::NoTls)
+    let dsn = local_dsn("qontinui_db")?;
+    let (client, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
         .await
         .map_err(|e| format!("connect to PG failed: {}", e))?;
     // Spawn the connection driver. If it ends, the next query on `client`

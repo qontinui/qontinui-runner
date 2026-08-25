@@ -14,7 +14,7 @@
 //! {
 //!   "active": "dev",
 //!   "profiles": {
-//!     "dev":     { "database_url": "...", "redis_url": "...", "blob": {...}, "coord_url": "...", "auth": {...} },
+//!     "dev":     { "redis_url": "...", "blob": {...}, "coord_url": "...", "auth": {...} },
 //!     "staging": { ... },
 //!     "prod":    { ... }
 //!   }
@@ -29,15 +29,22 @@
 //!
 //! | Setting       | Legacy env var          |
 //! |---------------|-------------------------|
-//! | database_url  | `RUNNER_DATABASE_URL`   |
 //! | redis_url     | `REDIS_URL`             |
 //! | blob.endpoint | `S3_ENDPOINT`           |
 //! | coord_url     | `COORD_URL`             |
 //!
-//! When even the env-var fallback is unavailable for `database_url`, a
-//! hardcoded localhost default is returned (matches `main.rs:279`'s prior
-//! behavior). Callers needing strict-mode validation can use
-//! [`load_strict`].
+//! ## The database is not in here (P4)
+//!
+//! A profile carries NO `database_url`, and there is no `RUNNER_DATABASE_URL`
+//! fallback and no hardcoded localhost default. The runner has exactly one
+//! database - the bundled cluster in [`crate::embedded_pg`] - so there is no
+//! DSN to select and no arm to pick wrong. A process that needs to address that
+//! cluster resolves it from disk via [`crate::embedded_pg::local_dsn`].
+//!
+//! This is what makes "`coord_url` without a database" a configurable machine:
+//! before P4 `load_inner` required a `database_url` and the fallback it took
+//! when one was absent silently dropped `coord_url` too, so a new fleet machine
+//! could not be onboarded onto the embedded-only shape at all.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -60,9 +67,6 @@ pub struct ProfilesFile {
 /// One environment's connection settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
-    /// Postgres DSN.
-    #[serde(default)]
-    pub database_url: Option<String>,
     /// Redis URL (`redis://host:port/db`).
     #[serde(default)]
     pub redis_url: Option<String>,
@@ -113,7 +117,6 @@ pub struct ResolvedProfile {
     /// Which profile name produced this resolution (`dev`, etc., or
     /// `legacy-env` when no profiles.json existed).
     pub source: String,
-    pub database_url: String,
     pub redis_url: Option<String>,
     pub blob: Option<BlobConfig>,
     pub coord_url: Option<String>,
@@ -141,9 +144,14 @@ pub fn load() -> ResolvedProfile {
     }
 }
 
-/// Strict variant: errors if profiles.json is missing or the active
-/// profile lacks a `database_url`. Used by tooling that must not silently
-/// connect to localhost.
+/// Strict variant: errors if profiles.json is missing, unparseable, or does
+/// not define the active profile. Used by tooling that must not silently
+/// proceed on an unconfigured box.
+///
+/// Before P4 this also errored when the profile lacked a `database_url`, which
+/// was the point of "strict" — it stopped tooling silently connecting to a
+/// localhost default. That default is gone, so there is nothing left to be
+/// strict about on the database axis.
 pub fn load_strict() -> Result<ResolvedProfile> {
     load_inner()
 }
@@ -172,22 +180,10 @@ fn load_inner() -> Result<ResolvedProfile> {
         )
     })?;
 
-    let database_url = profile
-        .database_url
-        .clone()
-        .or_else(|| std::env::var("RUNNER_DATABASE_URL").ok())
-        .ok_or_else(|| {
-            anyhow!(
-                "Profile '{}' has no database_url and RUNNER_DATABASE_URL is unset",
-                active
-            )
-        })?;
-
     debug!("Loaded profile '{}' from {}", active, path.display());
 
     Ok(ResolvedProfile {
         source: active,
-        database_url,
         redis_url: profile
             .redis_url
             .or_else(|| std::env::var("REDIS_URL").ok()),
@@ -200,18 +196,17 @@ fn load_inner() -> Result<ResolvedProfile> {
 }
 
 /// Pure-env-var fallback when profiles.json is missing or unparseable.
-/// Mirrors the legacy main.rs:279 default so machines that haven't been
-/// migrated to the canonical-DB topology continue to work.
+///
+/// P4 removed this function's original reason for existing — a hardcoded
+/// `host=localhost port=5432 ...` DSN that let an unmigrated machine still find
+/// *a* database. There is no DSN to fabricate any more, so an absent
+/// profiles.json now costs only the non-database settings, and the runner still
+/// boots onto its bundled cluster either way.
 fn legacy_env_fallback() -> ResolvedProfile {
-    let database_url = std::env::var("RUNNER_DATABASE_URL").unwrap_or_else(|_| {
-        "host=localhost port=5432 user=qontinui_user password=qontinui_dev_password dbname=qontinui_db".to_string()
-    });
-
     info!("Using legacy env-var configuration (profiles.json not found)");
 
     ResolvedProfile {
         source: "legacy-env".to_string(),
-        database_url,
         redis_url: std::env::var("REDIS_URL").ok(),
         blob: None,
         coord_url: std::env::var("COORD_URL").ok(),
@@ -1994,11 +1989,11 @@ mod tests {
         }"#;
         let parsed: ProfilesFile = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.active.as_deref(), Some("dev"));
-        let dev = parsed.profiles.get("dev").unwrap();
-        assert_eq!(
-            dev.database_url.as_deref(),
-            Some("postgres://u:p@h:5433/db")
-        );
+        // `database_url` is a RETIRED key (P4). The fixture deliberately still
+        // carries one: every machine on this fleet has an existing
+        // profiles.json that does, and the loader must keep parsing them
+        // rather than failing boot on a key it no longer reads.
+        assert!(parsed.profiles.contains_key("dev"));
     }
 
     #[test]
@@ -2029,33 +2024,22 @@ mod tests {
         assert_eq!(dev.auth.as_ref().unwrap().kind, "static-dev-token");
     }
 
-    /// RAII guard that restores `RUNNER_DATABASE_URL` to its pre-test
-    /// value on drop, including the panic path. Without this, a panic
-    /// in the test body between `remove_var` and the manual restore
-    /// would leak the unset state to any sibling test (current or
-    /// future) that reads the var.
-    struct DbUrlRestore {
-        prev: Option<String>,
-    }
-    impl Drop for DbUrlRestore {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("RUNNER_DATABASE_URL", v),
-                None => std::env::remove_var("RUNNER_DATABASE_URL"),
-            }
-        }
-    }
-
+    /// P4: the fallback no longer fabricates a database DSN.
+    ///
+    /// This test used to assert the opposite — that with `RUNNER_DATABASE_URL`
+    /// unset the fallback returned a hardcoded
+    /// `host=localhost ... user=qontinui_user ...` DSN. That default is the
+    /// parity defect the plan removed: it silently pointed an unconfigured
+    /// machine at whatever answered on :5432, which on a dev box is routinely
+    /// an unrelated project's container.
     #[test]
-    fn legacy_fallback_uses_env_or_localhost_default() {
-        let _restore = DbUrlRestore {
-            prev: std::env::var("RUNNER_DATABASE_URL").ok(),
-        };
-        std::env::remove_var("RUNNER_DATABASE_URL");
+    fn legacy_fallback_carries_no_database_dsn() {
         let p = legacy_env_fallback();
         assert_eq!(p.source, "legacy-env");
-        assert!(p.database_url.contains("qontinui_user"));
-        // `_restore` drops here, including the panic path above.
+        // The type itself is the assertion: `ResolvedProfile` has no
+        // `database_url` field to populate, so no localhost default can be
+        // reintroduced without this test failing to compile.
+        let _: Option<String> = p.coord_url;
     }
 
     // ------------------------------------------------------------------
@@ -2825,6 +2809,10 @@ mod tests {
         // typed ProfilesFile round-trip would have dropped.
         assert_eq!(v["unknown_top_level"]["keep"], "me");
         assert_eq!(v["profiles"]["dev"]["unknown_profile_key"], 42);
+        // Still asserted after P4, and now load-bearing for a different
+        // reason: `database_url` is a retired key the typed struct no longer
+        // has, so this proves the raw-JSON edit path preserves keys it cannot
+        // model rather than silently dropping them on rewrite.
         assert_eq!(
             v["profiles"]["dev"]["database_url"],
             "postgres://u:p@h:5433/db"

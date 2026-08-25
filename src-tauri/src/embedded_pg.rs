@@ -100,6 +100,10 @@ static MANAGED_PG: OnceLock<Mutex<Option<PgHandle>>> = OnceLock::new();
 /// on. Recorded so `/health` can answer *which* database this process is on,
 /// not merely whether one answers.
 ///
+/// P4 deleted the external arm: there is exactly one database per runner now,
+/// so the only question left is whether this process OWNS the bundled cluster,
+/// ATTACHED to a peer's, or has none at all.
+///
 /// This exists because the arm is otherwise unobservable from outside the
 /// process. `/health` reported a bare `database.reachable`, which is `true` for
 /// an external docker-compose Postgres, for an embedded cluster this process
@@ -112,9 +116,6 @@ static MANAGED_PG: OnceLock<Mutex<Option<PgHandle>>> = OnceLock::new();
 pub enum DbArm {
     /// Nothing has been resolved yet (boot has not reached the PG arm).
     Unknown,
-    /// A PostgreSQL reachable at the profile-resolved URL — a developer's
-    /// docker-compose cluster, or an explicitly configured one.
-    External,
     /// A bundled cluster this process ran `initdb`/`pg_ctl start` for. This
     /// process stops it at exit.
     EmbeddedOwned,
@@ -131,7 +132,6 @@ impl DbArm {
     pub fn as_str(self) -> &'static str {
         match self {
             DbArm::Unknown => "unknown",
-            DbArm::External => "external",
             DbArm::EmbeddedOwned => "embedded-owned",
             DbArm::EmbeddedAttached => "embedded-attached",
             DbArm::Degraded => "degraded",
@@ -140,7 +140,9 @@ impl DbArm {
 
     fn from_code(code: u8) -> DbArm {
         match code {
-            1 => DbArm::External,
+            // 1 is retired (the external arm, deleted in P4). Deliberately left
+            // unmapped rather than renumbered: reusing a retired discriminant is
+            // how a stale value silently acquires a new meaning.
             2 => DbArm::EmbeddedOwned,
             3 => DbArm::EmbeddedAttached,
             4 => DbArm::Degraded,
@@ -151,7 +153,6 @@ impl DbArm {
     fn code(self) -> u8 {
         match self {
             DbArm::Unknown => 0,
-            DbArm::External => 1,
             DbArm::EmbeddedOwned => 2,
             DbArm::EmbeddedAttached => 3,
             DbArm::Degraded => 4,
@@ -170,7 +171,7 @@ static DB_ARM: AtomicU8 = AtomicU8::new(0);
 static EMBEDDED_PORT: AtomicU16 = AtomicU16::new(0);
 
 /// Record which database arm this process took. Called from `main.rs` for the
-/// external and degraded arms; the two embedded arms are set by
+/// degraded arm; the two embedded arms are set by
 /// [`store_handle`] from the handle itself, so they cannot drift from the
 /// ownership the rest of this module enforces.
 pub fn set_db_arm(arm: DbArm) {
@@ -214,6 +215,10 @@ pub const EMBEDDED_PG_DIR_ENV: &str = "QONTINUI_EMBEDDED_PG_DIR";
 
 /// The machine-shared default root, used whenever [`EMBEDDED_PG_DIR_ENV`] is
 /// unset or blank. Unchanged from the value that was inlined in `main.rs`.
+///
+/// Single source of truth: `main.rs`'s boot path, the standalone `bin/`
+/// binaries and [`local_dsn`] must agree on this path or they will talk to
+/// different clusters. It was duplicated inline in `main.rs` before P4.
 pub fn default_data_root() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
@@ -258,6 +263,75 @@ pub fn set_data_root(root: &std::path::Path) {
 /// from a port number that says nothing about *which* data dir is behind it.
 pub fn embedded_data_root() -> Option<String> {
     DATA_ROOT.get().map(|p| p.display().to_string())
+}
+
+/// Resolve the DSN of the bundled cluster **already running on this machine**,
+/// without booting, starting or provisioning anything.
+///
+/// P4 deleted the external-PG path, so a process that is not the runner — the
+/// `qontinui-profile` / `qontinui-specs` CLIs, a step handler — no longer has a
+/// profile `database_url` to connect to. Its database is the runner's embedded
+/// cluster, and this is the only honest way to address it: the data root is
+/// resolved the same way the boot path resolves it (so a temp runner under
+/// [`EMBEDDED_PG_DIR_ENV`] addresses its OWN cluster, not the machine-shared
+/// one), but the port is ephemeral — so the port comes from PostgreSQL's own
+/// `postmaster.pid` and the superuser password from the `pg-pass` file the
+/// crate wrote at initdb.
+///
+/// Returns `Err` — never a fabricated localhost default — when the cluster is
+/// not running or its credentials are unreadable. A caller that cannot reach a
+/// database must say so; guessing `localhost:5432` is exactly the parity defect
+/// this plan removed, and on this box `:5432` is answered by an unrelated
+/// project's container.
+pub fn local_dsn(db_name: &str) -> Result<String, String> {
+    let data_root = data_root();
+    let mut settings = Settings {
+        installation_dir: data_root.join("pg-install"),
+        data_dir: data_root.join("pg-data"),
+        password_file: data_root.join("pg-pass"),
+        host: "127.0.0.1".to_string(),
+        temporary: false,
+        ..Settings::default()
+    };
+
+    let pid_path = settings.data_dir.join(POSTMASTER_PID);
+    let contents = std::fs::read_to_string(&pid_path).map_err(|e| {
+        format!(
+            "the bundled PostgreSQL does not appear to be running: {} could not be \
+             read ({e}). Start the runner first.",
+            pid_path.display()
+        )
+    })?;
+    // `ready`-only, exactly as the attach path requires: a `starting` cluster
+    // refuses connections, and a caller told a port for one would report a
+    // connection error rather than "not up yet".
+    let port = ready_port_from_postmaster_pid(&contents).ok_or_else(|| {
+        format!(
+            "the bundled PostgreSQL at {} is not ready (its {} does not report a ready TCP port)",
+            settings.data_dir.display(),
+            POSTMASTER_PID
+        )
+    })?;
+    settings.port = port;
+
+    let stored = std::fs::read_to_string(&settings.password_file).map_err(|e| {
+        format!(
+            "the bundled PostgreSQL is running on port {port} but its password file \
+             {} could not be read: {e}",
+            settings.password_file.display()
+        )
+    })?;
+    let stored = stored.trim();
+    if stored.is_empty() {
+        return Err(format!(
+            "the bundled PostgreSQL is running on port {port} but its password file \
+             {} is empty — the superuser password is unrecoverable",
+            settings.password_file.display()
+        ));
+    }
+    settings.password = stored.to_string();
+
+    Ok(settings.url(db_name))
 }
 
 /// How long to wait for a TCP connection to a candidate already-running cluster
@@ -1566,7 +1640,6 @@ mod tests {
     fn db_arm_wire_names_round_trip() {
         for arm in [
             DbArm::Unknown,
-            DbArm::External,
             DbArm::EmbeddedOwned,
             DbArm::EmbeddedAttached,
             DbArm::Degraded,
@@ -1581,7 +1654,6 @@ mod tests {
         // The wire names are read by the P1 verification procedure and by
         // anything watching /health; pin them rather than letting a rename
         // silently break a caller.
-        assert_eq!(DbArm::External.as_str(), "external");
         assert_eq!(DbArm::EmbeddedOwned.as_str(), "embedded-owned");
         assert_eq!(DbArm::EmbeddedAttached.as_str(), "embedded-attached");
         assert_eq!(DbArm::Degraded.as_str(), "degraded");
@@ -1592,6 +1664,10 @@ mod tests {
     /// arm: the atomic is the only thing between `/health` and a torn value.
     #[test]
     fn unknown_arm_code_reads_as_unknown() {
+        // 1 is the RETIRED external-arm discriminant (deleted in P4). It must
+        // read as Unknown rather than aliasing a live arm -- that is the whole
+        // reason the codes were left un-renumbered.
+        assert_eq!(DbArm::from_code(1), DbArm::Unknown);
         assert_eq!(DbArm::from_code(9), DbArm::Unknown);
         assert_eq!(DbArm::from_code(u8::MAX), DbArm::Unknown);
     }

@@ -10,16 +10,16 @@
 //!
 //! [`crate::env_agent::collectors::sanitize_url`] emits `scheme://host[:port]`
 //! and nothing else — it drops **userinfo AND path**. So canonical's
-//! `database_url` carries neither the DB password nor the database name, and
+//! `redis_url` carries neither its userinfo nor its database index, and
 //! `profiles.json` holds the only copy of both. A naive "write canonical's value
-//! into the profile" would therefore blank the password and re-point the box at
-//! the wrong database, and would blank `blob.access_key` / `blob.secret_key` /
-//! `auth.token` — real credentials the captured section never carries.
+//! into the profile" would therefore blank them, and would blank
+//! `blob.access_key` / `blob.secret_key` / `auth.token` — real credentials
+//! the captured section never carries.
 //!
 //! The merge is consequently **strictly additive over a fixed key set**
 //! ([`FIELDS`]):
 //!
-//! - `database_url` / `redis_url` / `coord_url` / `blob.endpoint` — take scheme,
+//! - `redis_url` / `coord_url` / `blob.endpoint` — take scheme,
 //!   host and port from canonical; **preserve local userinfo, path, query and
 //!   fragment** ([`repoint_url`]).
 //! - `blob.kind` / `blob.bucket` — plain strings, replaced wholesale.
@@ -82,7 +82,12 @@ impl Field {
 /// writes. That is the same "unrecognized input falls to the inert branch" idiom
 /// as `SectionPolicy::from_wire`'s unknown → `ReportOnly`.
 pub const FIELDS: &[(&str, Field)] = &[
-    ("database_url", Field::Url("database_url")),
+    // `database_url` was here until P4. The runner has no external database to
+    // point at any more, so applying canonical's value would push a dead key
+    // into every enrolled machine's profiles.json and report drift on a field
+    // nothing reads. Absent from this table => never written, and (per the
+    // exhaustiveness contract above) a canonical section still offering one is
+    // skipped as an unknown key rather than acted on.
     ("redis_url", Field::Url("redis_url")),
     ("coord_url", Field::Url("coord_url")),
     ("blob_kind", Field::BlobPlain("kind")),
@@ -333,9 +338,8 @@ pub fn plan_services(
 /// by a different route.
 ///
 /// Deliberately narrow: only `coord_url`, only on a runner whose tier is KNOWN
-/// hosted, only when canonical's host is loopback. A loopback `database_url` or
-/// `redis_url` is normal and correct dev topology (each box runs its own
-/// Postgres) and is untouched by this. An unknown/unreadable tier does NOT
+/// hosted, only when canonical's host is loopback. A loopback `redis_url` is
+/// normal and correct dev topology and is untouched by this. An unknown/unreadable tier does NOT
 /// trigger the refusal — this guard exists to stop a specific silent breakage,
 /// not to become a second, quieter policy engine.
 fn hosted_coord_url_refusal(key: &str, canonical: &str, tier: &TierRead) -> Option<String> {
@@ -793,6 +797,31 @@ mod tests {
     /// planned write still has the local password and database name.
     #[test]
     fn plan_repoints_dsn_and_keeps_credentials() {
+        // Exemplar moved from `database_url` to `redis_url` at P4: same
+        // `Field::Url` shape, same userinfo-and-path preservation contract, and
+        // `redis_url` is now the only remaining DSN-carrying key.
+        let section = services_section(
+            json!({"redis_url": "redis://new:6380"}),
+            json!({"redis_url": "redis://old:6379"}),
+        );
+        let plan = plan_services(
+            &section,
+            &profile(json!({"redis_url": "redis://user:pw@old:6379/3"})),
+            &TierRead::Absent,
+        );
+        assert_eq!(plan.edits.len(), 1);
+        let edit = &plan.edits[0];
+        assert_eq!(edit.proposed, "redis://user:pw@new:6380/3");
+        assert!(edit.preserved_local_parts);
+        assert_eq!(edit.path, vec!["redis_url".to_string()]);
+    }
+
+    /// P4: `database_url` is a RETIRED key. Canonical may still carry one (an
+    /// un-upgraded backend, or a capture taken before this shipped) and it must
+    /// produce no edit — otherwise the devenv system keeps pushing a dead key
+    /// into every enrolled machine.
+    #[test]
+    fn retired_database_url_is_never_applied() {
         let section = services_section(
             json!({"database_url": "postgres://new:5433"}),
             json!({"database_url": "postgres://old:5432"}),
@@ -802,11 +831,9 @@ mod tests {
             &profile(json!({"database_url": "postgres://user:pw@old:5432/mydb"})),
             &TierRead::Absent,
         );
-        assert_eq!(plan.edits.len(), 1);
-        let edit = &plan.edits[0];
-        assert_eq!(edit.proposed, "postgres://user:pw@new:5433/mydb");
-        assert!(edit.preserved_local_parts);
-        assert_eq!(edit.path, vec!["database_url".to_string()]);
+        assert!(plan.edits.is_empty(), "got {:?}", plan.edits);
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].key, "database_url");
     }
 
     /// `port_*` keys drift on every capture (a box with the backend down differs
@@ -847,7 +874,7 @@ mod tests {
             canonical_machine_name: None,
             schema_version: None,
             captured_at: None,
-            sections: json!({"services": {"database_url": "postgres://new:5433"}})
+            sections: json!({"services": {"redis_url": "redis://new:6380"}})
                 .as_object()
                 .unwrap()
                 .clone(),
@@ -858,7 +885,7 @@ mod tests {
                 .clone(),
             derived_keys: Map::new(),
         };
-        let local = json!({"services": {"database_url": "postgres://old:5432"}});
+        let local = json!({"services": {"redis_url": "redis://old:6379"}});
         let full = compute_plan(
             &canonical_cfg,
             local.as_object().unwrap(),
@@ -869,7 +896,7 @@ mod tests {
         let section = full.sections.into_iter().next().unwrap();
         let plan = plan_services(
             &section,
-            &profile(json!({"database_url": "postgres://u:p@old:5432/db"})),
+            &profile(json!({"redis_url": "redis://u:p@old:6379/0"})),
             &TierRead::Absent,
         );
         assert!(plan.edits.is_empty());
@@ -879,12 +906,12 @@ mod tests {
     #[test]
     fn unparseable_local_value_is_skipped_with_a_reason() {
         let section = services_section(
-            json!({"database_url": "postgres://new:5433"}),
-            json!({"database_url": "postgres://old:5432"}),
+            json!({"redis_url": "redis://new:6380"}),
+            json!({"redis_url": "redis://old:6379"}),
         );
         let plan = plan_services(
             &section,
-            &profile(json!({"database_url": "host=localhost password=secret dbname=q"})),
+            &profile(json!({"redis_url": "host=localhost password=secret dbname=q"})),
             &TierRead::Absent,
         );
         assert!(plan.edits.is_empty());
@@ -1007,24 +1034,21 @@ mod tests {
         assert_eq!(plan.edits[0].proposed, "wss://coord.qontinui.io/ws");
     }
 
-    /// A loopback `database_url` is normal, correct dev topology — every box
-    /// runs its own Postgres — and must NOT be caught by the coord_url guard.
+    /// A loopback `redis_url` is normal, correct dev topology and must NOT be
+    /// caught by the coord_url guard.
     #[test]
     fn guard_does_not_touch_other_loopback_keys() {
         let section = services_section(
-            json!({"database_url": "postgres://localhost:5433"}),
-            json!({"database_url": "postgres://localhost:5432"}),
+            json!({"redis_url": "redis://localhost:6380"}),
+            json!({"redis_url": "redis://localhost:6379"}),
         );
         let plan = plan_services(
             &section,
-            &profile(json!({"database_url": "postgres://u:pw@localhost:5432/qontinui_db"})),
+            &profile(json!({"redis_url": "redis://u:pw@localhost:6379/0"})),
             &TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
         );
         assert_eq!(plan.edits.len(), 1);
-        assert_eq!(
-            plan.edits[0].proposed,
-            "postgres://u:pw@localhost:5433/qontinui_db"
-        );
+        assert_eq!(plan.edits[0].proposed, "redis://u:pw@localhost:6380/0");
     }
 
     #[test]
@@ -1102,12 +1126,19 @@ mod tests {
         let dev = &root["profiles"]["dev"];
 
         // Topology moved…
-        assert_eq!(dev["database_url"], "postgres://user:pw@new:5433/mydb");
         assert_eq!(dev["redis_url"], "redis://new:6380/0");
         assert_eq!(dev["coord_url"], "ws://new:9871/ws");
         assert_eq!(dev["blob"]["kind"], "s3");
         assert_eq!(dev["blob"]["endpoint"], "https://s3.example/");
         assert_eq!(dev["blob"]["bucket"], "new-bucket");
+
+        // …the RETIRED `database_url` was left exactly as it was, even
+        // though canonical offered a new one (P4): an apply must not touch a
+        // key the runner no longer reads.
+        assert_eq!(
+            dev["database_url"], original["profiles"]["dev"]["database_url"],
+            "database_url is retired and must survive an apply byte-identical"
+        );
 
         // …and every credential survived.
         assert_eq!(dev["blob"]["access_key"], "AKIAEXAMPLE");

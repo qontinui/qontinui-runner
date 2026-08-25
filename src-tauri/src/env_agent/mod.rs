@@ -174,6 +174,22 @@ pub fn publish_pg_pool_from_url(database_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Publish a lazy pool pointed at THIS machine's bundled PostgreSQL.
+///
+/// The `db_schema` collector needs a pool to census `alembic_head` and the
+/// schema/table list. Before P4 the CLI got that DSN from the active profile's
+/// `database_url`; there is no such key any more, and the schema it wants to
+/// census is the bundled cluster's.
+///
+/// Returns `Err` when the cluster is not running — the CLI can be invoked with
+/// no runner up. Every caller treats that as "omit the `db_schema` section",
+/// which is the honest outcome: the alternative, guessing `localhost:5432`, is
+/// what let a box census an unrelated project's database and report no drift.
+pub fn publish_pg_pool_from_local_cluster() -> Result<(), String> {
+    let dsn = crate::embedded_pg::local_dsn("qontinui_db")?;
+    publish_pg_pool_from_url(&dsn)
+}
+
 /// Get a clone of the published PG pool, if any. `deadpool_postgres::Pool` is an
 /// `Arc` internally, so cloning is cheap and shares the live pool.
 pub(crate) fn pg_pool() -> Option<deadpool_postgres::Pool> {
