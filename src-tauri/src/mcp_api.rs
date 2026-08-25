@@ -5606,7 +5606,15 @@ pub fn create_router(
             // restored count is half of the Change-2 observability signal: if it
             // is 0 and root self-heal then has to Rewrite, a silent nonce
             // rotation just happened (the exact incident this plan fixes).
-            let restored = crate::coord_mcp::restore_proxy_nonces_from_store();
+            //
+            // `restore.inserted` is what the restore GENUINELY recovered; the
+            // live map size is carried separately as `restore.live_map_len`
+            // (plan `2026-08-25-boot-adopt-session-nonces-across-all-workdirs`
+            // Phase 3). This used to be one number — the live map size, printed
+            // under the word `restored` — which on 2026-08-24 read `restored 1`
+            // for a boot that recovered nothing, made the boot line look healthy
+            // and left the smell test below permanently unable to fire.
+            let restore = crate::coord_mcp::restore_proxy_nonces_from_store();
 
             // Phase 1 of plan
             // `2026-08-25-agent-class-sessions-reach-coord-like-operator-sessions`:
@@ -5666,16 +5674,60 @@ pub fn create_router(
             // Phase 3c — reconcile live session `.mcp.json` ports. Pull the live
             // session workdirs from the managed lifecycle store (open records).
             use tauri::Manager;
-            let workdirs: Vec<String> = match reconcile_app_handle
-                .try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>(
-                ) {
-                Some(store) => store
-                    .inner()
-                    .open_records()
-                    .into_iter()
-                    .filter_map(|r| r.working_dir)
-                    .collect(),
-                None => Vec::new(),
+            let lifecycle_store = reconcile_app_handle
+                .try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+                .map(|s| s.inner().clone());
+            // `open_records()` is `state == "open"` ONLY. That filter IS
+            // `reconcile_session_configs`' input contract — see its
+            // "Input contract" doc section. Plan
+            // `2026-08-25-boot-adopt-session-nonces-across-all-workdirs`
+            // originally proposed re-stating it as an open-record filter inside
+            // that function; vetting struck it because it would restate this
+            // line and bound nothing. Widening what is passed here is therefore
+            // a real semantic change, not a convenience — the adopted set's only
+            // bound against `MAX_PERSISTED_DEVICE_NONCES` is this filter.
+            let workdirs: Vec<String> = lifecycle_store
+                .as_ref()
+                .map(|store| {
+                    store
+                        .open_records()
+                        .into_iter()
+                        .filter_map(|r| r.working_dir)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let open_workdir_count = workdirs.len();
+            // Phase 1 — the whole-disk three-way census, computed BEFORE the
+            // reconcile so `open_backed` describes the same population the
+            // reconcile is about to be handed. Reported alongside, never
+            // instead of, the open-record count: on the incident box the two
+            // were 591 and 11, and a boot line carrying only the larger number
+            // would overstate the reconcile's reach by ~54x.
+            let all_record_workdirs: Vec<String> = lifecycle_store
+                .as_ref()
+                .map(|store| {
+                    store
+                        .all_records()
+                        .into_iter()
+                        .filter_map(|r| r.working_dir)
+                        .collect()
+                })
+                .unwrap_or_default();
+            // On a blocking thread for the same reason the reap above is: it is
+            // a bounded directory walk, but a directory walk nonetheless, and
+            // the boot path is not where a tokio worker should be parked on
+            // filesystem I/O.
+            let census = {
+                let open = workdirs.clone();
+                let all = all_record_workdirs;
+                tokio::task::spawn_blocking(move || {
+                    crate::coord_mcp::census_on_disk_mcp_configs(
+                        open.iter().map(String::as_str),
+                        all.iter().map(String::as_str),
+                    )
+                })
+                .await
+                .unwrap_or(None)
             };
             let session_counts = if workdirs.is_empty() {
                 Default::default()
@@ -5707,22 +5759,48 @@ pub fn create_router(
                     "unnamed-secondary".to_string()
                 }
             });
-            // The two session counts are reported SEPARATELY: a `rewrote` is a
+            // The three session counts are reported SEPARATELY: a `rewrote` is a
             // nonce rotation (a live client holding the old one must reconnect),
             // an `upgraded` preserved its nonce byte-for-byte and only gained the
-            // static `Authorization` key. One combined number would read every
+            // static `Authorization` key, and an `adopted` wrote no file at all —
+            // only the registry moved. One combined number would read every
             // harmless shape repair as a rotation on the boot line an operator
             // greps when sessions start 401ing.
+            //
+            // `adopted` is also Phase 1's blast-radius measurement: it is exactly
+            // how many of the enumerated OPEN session workdirs held a
+            // proxy-shaped `.mcp.json` whose nonce the live registry would have
+            // rejected. Before the adopt arm existed those all classified
+            // `Leave` and this line said `rewrote 0 session config(s)` — the
+            // words "nothing needed doing" over the state "nothing was
+            // repairable".
+            let census_line = match census {
+                Some(c) => format!(
+                    "{} total = {} open-record-backed / {} dead-record-backed / {} orphaned",
+                    c.total, c.open_backed, c.dead_backed, c.orphaned
+                ),
+                // No workspace root resolved: UNKNOWN, not an empty disk. Saying
+                // "0 total" here would be the same class of lie the corrected
+                // `restored` number above exists to stop telling.
+                None => "UNAVAILABLE (no workspace root resolved)".to_string(),
+            };
             info!(
-                "coord_mcp boot reconcile: restored {restored} persisted nonce(s), \
-                 reaped {reaped} stale session-restore config(s), \
+                "coord_mcp boot reconcile: restored {} persisted nonce(s) \
+                 (live nonce map now {}), reaped {reaped} stale session-restore config(s), \
+                 enumerated {open_workdir_count} open session workdir(s) of which \
+                 {} held an UNREGISTERED on-disk nonce and were adopted (no file written); \
                  rewrote {} session config(s), upgraded {} session config header shape(s) \
                  (nonce preserved), root self-heal = {root_action:?} \
-                 (instance {reconcile_instance}, bound port :{reconcile_bound_port})",
-                session_counts.rewritten, session_counts.upgraded
+                 (instance {reconcile_instance}, bound port :{reconcile_bound_port}); \
+                 on-disk .mcp.json census: {census_line}",
+                restore.inserted,
+                restore.live_map_len,
+                session_counts.adopted,
+                session_counts.rewritten,
+                session_counts.upgraded,
             );
             if matches!(root_action, crate::coord_mcp::RootReconcileAction::Rewrite)
-                && restored == 0
+                && restore.inserted == 0
             {
                 warn!(
                     "coord_mcp: root .mcp.json was REWRITTEN with a fresh nonce after restoring 0 \
