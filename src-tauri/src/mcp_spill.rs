@@ -66,10 +66,23 @@ use uuid::Uuid;
 /// than misparsing it.
 pub const SPILL_SCHEMA: u32 = 1;
 
-/// File extension for a spill record. The sweep only ever considers files with
-/// this suffix, so `fs_atomic`'s in-flight temp files (`*.tmp.<pid>.<seq>.…`)
-/// are never mistaken for records.
+/// File extension for a spill record. The record arms of the sweep only ever
+/// consider files with this suffix, so `fs_atomic`'s in-flight temp files
+/// (`*.tmp.<pid>.<seq>.…`) are never mistaken for records — they are swept by
+/// their own arm instead, keyed on [`TEMP_INFIX`].
 pub const SPILL_EXTENSION: &str = "spill";
+
+/// The substring that identifies an `fs_atomic` temp file for one of OUR
+/// records.
+///
+/// [`crate::fs_atomic::atomic_write_owner_only`] names its temp
+/// `{target_file_name}.tmp.{pid}.{seq}.{nanos}`, and our target file name is
+/// always `<id>.spill` — so our temps, and only ours, contain `.spill.tmp.`.
+/// Matching the writer's actual pattern rather than a generic `*.tmp` is what
+/// keeps the sweep from deleting a file some other component happens to leave
+/// under the root. `temp_infix_matches_fs_atomics_naming` pins it against
+/// [`SPILL_EXTENSION`].
+const TEMP_INFIX: &str = ".spill.tmp.";
 
 /// Directory under the runner's app-data dir (`~/.qontinui/runner/`) that holds
 /// every session's spills.
@@ -109,6 +122,15 @@ const SESSION_ID_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 /// practice; the bound exists so a poisoned env var cannot produce a path the
 /// filesystem rejects.
 const MAX_SESSION_KEY_LEN: usize = 64;
+
+/// Hard ceiling on the header line [`SpillStore::read`] will buffer.
+///
+/// A real header is a single JSON object of eight short fields — a few hundred
+/// bytes, and bounded by [`MAX_SESSION_KEY_LEN`] plus the tool name. 8 KiB is
+/// far above any of them and far below the bodies this store holds, which is
+/// the separation that matters: it exists so that a record with no newline in
+/// it cannot be read into memory in its entirety before being rejected.
+const MAX_HEADER_BYTES: u64 = 8 * 1024;
 
 /// Prefix on every diagnostic this module writes. Distinct from the MCP
 /// server's own `[wrappers-mcp]` so retention events are greppable on their own.
@@ -197,10 +219,19 @@ pub struct SpillStore {
     /// **Non-zero means real loss**: a locator this process already handed to a
     /// model now resolves to nothing, which turns a truthful preview into a
     /// dead pointer — strictly worse than the truncation this design rejects.
-    /// Every drop is also warned on stderr, never silent. Deletions of *other*
-    /// sessions' spills are ordinary garbage collection and are logged but not
-    /// counted here: this process never issued those locators, so nobody is
-    /// holding them.
+    /// Every drop is also warned on stderr, never silent, and
+    /// [`SpillStore::read`] consults the counter so a `NotFound` can say WHICH
+    /// of its two possible answers this one is.
+    ///
+    /// **The counter is only honest because the byte bound refuses to evict a
+    /// live neighbour's records** — see [`SpillStore::enforce_byte_bound`].
+    /// Several `wrappers_mcp` servers share one root; that is the ordinary
+    /// case, not an edge. Evicting another server's record would manufacture
+    /// exactly this dead pointer inside a process that cannot count it, cannot
+    /// warn about it, and whose model then simply gets a bare `NotFound` — the
+    /// deletion would be logged as ordinary GC in the wrong process's stderr.
+    /// Reclaiming another session's disk is therefore left to the age bound,
+    /// the one arm entitled to assume that nobody is still holding the locator.
     dropped_own_session: AtomicU64,
 }
 
@@ -289,6 +320,7 @@ impl SpillStore {
         body: &str,
     ) -> io::Result<SpillRecord> {
         self.sweep(body.len() as u64);
+        self.ensure_session_dir()?;
 
         let record = SpillRecord {
             schema: SPILL_SCHEMA,
@@ -312,6 +344,37 @@ impl SpillStore {
         Ok(record)
     }
 
+    /// Make sure this store's session directory exists, recreating it if
+    /// anything removed it since [`SpillStore::open`].
+    ///
+    /// Not paranoia, and not merely defensive. `open` is the ONLY other place
+    /// that creates this directory, and
+    /// [`crate::fs_atomic::atomic_write_owner_only`] does not create its
+    /// parent — so a directory that disappears once makes every later
+    /// oversized result in this process fail to spill and go back to the model
+    /// whole and uncapped, permanently, silently reinstating exactly the
+    /// problem this store exists to solve. A concurrent server's retention
+    /// sweep is one way that happens (see
+    /// [`SpillStore::prune_idle_session_dirs`], which now guards against it
+    /// from the other side); an operator clearing disk is another. Recreating
+    /// here makes the store self-heal against ALL of them rather than against
+    /// one enumerated cause.
+    fn ensure_session_dir(&self) -> io::Result<()> {
+        if self.session_dir.is_dir() {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.session_dir)?;
+        // A recreated directory carries the ambient umask / inherited ACL, so
+        // it gets the same owner-only hardening `open` applies.
+        if let Err(e) = crate::fs_perms::restrict_dir_to_owner(&self.session_dir) {
+            eprintln!(
+                "{LOG_PREFIX} could not restrict {}: {e}",
+                self.session_dir.display()
+            );
+        }
+        Ok(())
+    }
+
     /// Read `len` bytes of the body identified by `id`, starting at `offset`.
     ///
     /// Both endpoints are snapped to UTF-8 character boundaries — the start
@@ -324,14 +387,7 @@ impl SpillStore {
         let path = self.path_for(id);
         let file = fs::File::open(&path).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "no spill '{id}' in session '{}' — it was never written, or retention \
-                         has already swept it",
-                        self.session
-                    ),
-                )
+                io::Error::new(io::ErrorKind::NotFound, self.not_found_message(id))
             } else {
                 e
             }
@@ -339,11 +395,19 @@ impl SpillStore {
 
         let mut reader = BufReader::new(file);
         let mut header = String::new();
-        let header_bytes = reader.read_line(&mut header)?;
+        // Bounded read: a corrupt or truncated record with no newline in it at
+        // all would otherwise make `read_line` pull the ENTIRE file into this
+        // `String` — a body the whole store exists to keep out of memory —
+        // only for the check below to reject it. `Take` stops at a length no
+        // legitimate header can reach, and a header that hits the bound has no
+        // trailing newline, so it falls into the same rejection.
+        let header_bytes = (&mut reader)
+            .take(MAX_HEADER_BYTES)
+            .read_line(&mut header)?;
         if header_bytes == 0 || !header.ends_with('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("spill '{id}' has no header line"),
+                format!("spill '{id}' has no header line in its first {MAX_HEADER_BYTES} bytes"),
             ));
         }
         let record: SpillRecord = serde_json::from_str(header.trim_end_matches('\n'))
@@ -375,6 +439,35 @@ impl SpillStore {
         self.session_dir.join(format!("{id}.{SPILL_EXTENSION}"))
     }
 
+    /// Explain a missing record using what this store actually knows.
+    ///
+    /// "It was never written, or retention swept it" is an ambiguity the store
+    /// can usually resolve for itself, and
+    /// [`SpillStore::dropped_own_session`] is the fact that resolves it: this
+    /// process warns and counts every one of ITS OWN records that retention
+    /// deletes, so a non-zero count says a locator of ours has already been
+    /// invalidated and this is very likely one of them, while a zero count
+    /// says retention in this process is not the explanation and the id came
+    /// from somewhere else. Saying which is the point of keeping the counter
+    /// at all — a number nobody reads is not a safeguard.
+    fn not_found_message(&self, id: &str) -> String {
+        let dropped = self.dropped_own_session();
+        if dropped > 0 {
+            format!(
+                "no spill '{id}' in session '{}' — retention has already dropped {dropped} of \
+                 this session's spills, so this locator was most likely one of them",
+                self.session
+            )
+        } else {
+            format!(
+                "no spill '{id}' in session '{}' — retention in this process has dropped none of \
+                 this session's spills, so it was never written here (a stale id from another \
+                 session, or a record removed out of band)",
+                self.session
+            )
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Retention
     // -----------------------------------------------------------------------
@@ -386,45 +479,118 @@ impl SpillStore {
     /// stop a result from being preserved, so every failure is warned and
     /// stepped over rather than propagated.
     fn sweep(&self, incoming: u64) {
-        let mut files = self.collect();
+        let scan = self.collect();
+        let now = SystemTime::now();
+        let mut files = scan.files;
 
         // Age bound first — it is the cheaper, less destructive of the two, and
-        // whatever it reclaims the byte bound then does not have to.
-        let now = SystemTime::now();
+        // whatever it reclaims the byte bound then does not have to. It is also
+        // the ONLY arm allowed to touch another live session's records, for the
+        // reason `enforce_byte_bound` gives: past `max_age` the conversation
+        // that was handed the locator is long over, so there is nobody left to
+        // hand a dead pointer to.
         files.retain(|f| {
             let age = now.duration_since(f.modified).unwrap_or_default();
             if age > self.max_age {
-                !self.drop_file(f, "age")
+                !self.drop_file(f, f.kind.age_reason())
             } else {
                 true
             }
         });
 
-        // Byte bound: oldest first. Since ids are UUIDv7 and the sort key is
-        // mtime, "oldest" is also "least likely to still be referenced" — and
-        // dead sessions sort before the live one, so another session's garbage
-        // is evicted before our own live locators.
-        files.sort_by_key(|f| f.modified);
+        self.enforce_byte_bound(&files, incoming, now);
+        self.prune_idle_session_dirs(&scan.dirs, now);
+    }
+
+    /// Enforce the total-bytes bound, budgeting `incoming` for the write that
+    /// is about to happen.
+    ///
+    /// **The eviction rule: our own records at any age, plus anyone's records
+    /// already past `max_age` — never a live neighbour's.** Oldest first
+    /// within that set, and the stale foreign ones before our own live ones.
+    ///
+    /// The rule this replaced was "oldest first across every session", on the
+    /// reasoning that mtime order approximates liveness order. It does not.
+    /// Several `wrappers_mcp` servers share this root as a matter of course,
+    /// and oldest-first *systematically prefers* the longest-running live
+    /// session's records: they are the oldest files on disk precisely because
+    /// that session is still going. Evicting one destroys a locator another
+    /// process has already handed to its model, in a process that cannot count
+    /// the loss ([`SpillStore::dropped_own_session`] stays zero there), does
+    /// not warn about it (the warning lands in OUR stderr, labelled as
+    /// ordinary GC), and whose model then gets a bare `NotFound` — the exact
+    /// dead pointer the counter exists to make impossible.
+    ///
+    /// The cost of the new rule is that we can no longer reclaim a live
+    /// neighbour's disk on demand, so a busy neighbour can hold the shared
+    /// total above the cap; we then evict our own oldest, say so on stderr,
+    /// and leave the rest to the age arm. That is the right trade: exceeding a
+    /// disk budget is a recoverable, observable condition, while an uncounted
+    /// dead pointer is a silent lie told to a model.
+    fn enforce_byte_bound(&self, files: &[SpillFile], incoming: u64, now: SystemTime) {
+        if incoming >= self.max_total_bytes {
+            // A body larger than the whole cap is stored anyway — `put`'s doc
+            // says why. Budgeting for it would set a target no amount of
+            // eviction can reach: `total` never falls below `max_total_bytes`,
+            // so the loop runs to exhaustion and deletes every record in every
+            // session for nothing. The cap bounds ACCUMULATION; a single write
+            // that exceeds it on its own is outside what it can express, and
+            // the age arm has already run.
+            eprintln!(
+                "{LOG_PREFIX} incoming body is {incoming} bytes against a {} byte cap — skipping \
+                 byte-bound eviction rather than emptying every session's store for a target it \
+                 could never reach",
+                self.max_total_bytes
+            );
+            return;
+        }
+        // Budget for the incoming write by shrinking the target, not by adding
+        // it to the total: the two are equivalent arithmetic, but a target
+        // that stays constant is one the loop can actually be shown to reach.
+        let budget = self.max_total_bytes - incoming;
         let mut total = files
             .iter()
             .map(|f| f.bytes)
-            .fold(0u64, |a, b| a.saturating_add(b))
-            .saturating_add(incoming);
-        for f in &files {
-            if total <= self.max_total_bytes {
-                break;
+            .fold(0u64, |a, b| a.saturating_add(b));
+        if total <= budget {
+            return;
+        }
+
+        // Temps are counted in `total` — they occupy the same disk — but are
+        // never candidates: an in-flight one belongs to a write happening
+        // right now, and an orphaned one is the age arm's business.
+        let mut candidates: Vec<&SpillFile> = files
+            .iter()
+            .filter(|f| f.evictable_for_bytes(self.max_age, now))
+            .collect();
+        candidates.sort_by_key(|f| (f.own_session, f.modified));
+
+        for f in candidates {
+            if total <= budget {
+                return;
             }
             if self.drop_file(f, "bytes") {
                 total = total.saturating_sub(f.bytes);
             }
         }
-
-        self.prune_empty_session_dirs();
+        if total > budget {
+            eprintln!(
+                "{LOG_PREFIX} {total} bytes remain against a {budget} byte budget after evicting \
+                 every eligible record — the rest belongs to other live sessions or to in-flight \
+                 writes and is theirs to reclaim, not ours to destroy"
+            );
+        }
     }
 
-    /// Every `.spill` file under the root, across all sessions.
-    fn collect(&self) -> Vec<SpillFile> {
-        let mut out = Vec::new();
+    /// Every spill record and every stray `fs_atomic` temp under the root,
+    /// across all sessions, plus each session directory's mtime as it stood
+    /// BEFORE this sweep touched anything.
+    ///
+    /// The pre-sweep mtimes are what [`SpillStore::prune_idle_session_dirs`]
+    /// judges idleness by; reading them here rather than at prune time is what
+    /// stops our own deletions from looking like somebody else's activity.
+    fn collect(&self) -> SweepScan {
+        let mut scan = SweepScan::default();
         let session_dirs = match fs::read_dir(&self.root) {
             Ok(d) => d,
             Err(e) => {
@@ -432,7 +598,7 @@ impl SpillStore {
                     "{LOG_PREFIX} cannot list {} for retention: {e}",
                     self.root.display()
                 );
-                return out;
+                return scan;
             }
         };
         for session_entry in session_dirs.flatten() {
@@ -441,6 +607,14 @@ impl SpillStore {
                 continue;
             }
             let own_session = session_path == self.session_dir;
+            scan.dirs.push(SessionDir {
+                modified: session_entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(UNIX_EPOCH),
+                path: session_path.clone(),
+                own_session,
+            });
             let files = match fs::read_dir(&session_path) {
                 Ok(f) => f,
                 Err(e) => {
@@ -453,26 +627,40 @@ impl SpillStore {
             };
             for file_entry in files.flatten() {
                 let path = file_entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some(SPILL_EXTENSION) {
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let kind = if path.extension().and_then(|e| e.to_str()) == Some(SPILL_EXTENSION) {
+                    SpillKind::Record
+                } else if name.contains(TEMP_INFIX) {
+                    SpillKind::Temp
+                } else {
                     continue;
-                }
+                };
                 let meta = match file_entry.metadata() {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
-                out.push(SpillFile {
+                scan.files.push(SpillFile {
                     path,
                     bytes: meta.len(),
                     modified: meta.modified().unwrap_or(UNIX_EPOCH),
                     own_session,
+                    kind,
                 });
             }
         }
-        out
+        scan
     }
 
-    /// Delete one spill, accounting for it honestly. Returns whether the file
-    /// is actually gone.
+    /// Delete one file, accounting for it honestly. Returns whether it is
+    /// actually gone.
+    ///
+    /// Only a RECORD of our own counts as loss. An own-session temp was never
+    /// published, so no locator was ever issued for it and counting it would
+    /// make the honesty counter — and the `NotFound` message that now cites it
+    /// — lie in the other direction.
     fn drop_file(&self, f: &SpillFile, reason: &str) -> bool {
         if let Err(e) = fs::remove_file(&f.path) {
             eprintln!(
@@ -481,7 +669,7 @@ impl SpillStore {
             );
             return false;
         }
-        if f.own_session {
+        if f.own_session && f.kind == SpillKind::Record {
             let n = self.dropped_own_session.fetch_add(1, Ordering::Relaxed) + 1;
             eprintln!(
                 "{LOG_PREFIX} WARNING dropped OWN-SESSION spill {} ({} bytes, reason={reason}) — \
@@ -500,38 +688,112 @@ impl SpillStore {
         true
     }
 
-    /// Remove other sessions' directories once their last spill is gone.
-    /// Without this the root accrues one empty directory per session forever —
-    /// a slower leak than the bodies, but a leak. Our own directory is left
-    /// alone: this process is still writing into it.
-    fn prune_empty_session_dirs(&self) {
-        let entries = match fs::read_dir(&self.root) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() || path == self.session_dir {
+    /// Remove another session's directory once its last spill is gone AND it
+    /// has been idle for longer than `max_age`. Without this the root accrues
+    /// one empty directory per session forever — a slower leak than the
+    /// bodies, but a leak. Our own directory is always left alone: this
+    /// process is still writing into it.
+    ///
+    /// **The idle test is not a refinement, it is the whole safety property.**
+    /// Every session's directory is created when its server starts and holds
+    /// no `.spill` file until that session's first oversized result — so
+    /// "empty" is the NORMAL state of a perfectly live neighbour, not evidence
+    /// of a dead one. Pruning on emptiness alone deleted a running process's
+    /// directory out from under it, and since
+    /// [`crate::fs_atomic::atomic_write_owner_only`] does not create its
+    /// parent, every subsequent spill in that process failed and its oversized
+    /// bodies went back to the model whole — the sweep silently reinstating
+    /// the exact problem the store exists to fix.
+    ///
+    /// A directory's mtime moves whenever a child is added or removed, so
+    /// "untouched for `max_age`" is the one honest signal that nobody is
+    /// writing there. The mtimes come from [`SpillStore::collect`], i.e. from
+    /// before this sweep deleted anything, so a directory we have just emptied
+    /// ourselves is still judged on the activity that preceded us.
+    /// ([`SpillStore::ensure_session_dir`] is the other half of the fix: a
+    /// prune that is nonetheless wrong is now survivable rather than terminal.)
+    fn prune_idle_session_dirs(&self, dirs: &[SessionDir], now: SystemTime) {
+        for dir in dirs {
+            if dir.own_session {
                 continue;
             }
-            let is_empty = match fs::read_dir(&path) {
+            if now.duration_since(dir.modified).unwrap_or_default() <= self.max_age {
+                continue;
+            }
+            let is_empty = match fs::read_dir(&dir.path) {
                 Ok(mut d) => d.next().is_none(),
                 Err(_) => false,
             };
             if is_empty {
-                let _ = fs::remove_dir(&path);
+                let _ = fs::remove_dir(&dir.path);
             }
         }
     }
 }
 
-/// One spill file as the retention sweep sees it.
+/// What the retention sweep found under the root in one pass.
+#[derive(Debug, Default)]
+struct SweepScan {
+    files: Vec<SpillFile>,
+    dirs: Vec<SessionDir>,
+}
+
+/// One session directory as the sweep first saw it.
+#[derive(Debug)]
+struct SessionDir {
+    path: PathBuf,
+    /// mtime read BEFORE the sweep deleted anything — see
+    /// [`SpillStore::prune_idle_session_dirs`].
+    modified: SystemTime,
+    own_session: bool,
+}
+
+/// What kind of file the sweep is looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpillKind {
+    /// A published `<id>.spill` record. May still be referenced by a locator.
+    Record,
+    /// An `fs_atomic` temp (see [`TEMP_INFIX`]). Either a write happening right
+    /// now, or the full-body-sized remains of one a process kill interrupted —
+    /// `atomic_write_owner_only` cleans up only on a returned `Err`, so a
+    /// killed process leaves its temp behind. Nothing else in this module can
+    /// see such a file, which is how they used to accumulate without bound:
+    /// invisible to both retention arms AND pinning their dead session's
+    /// directory against pruning.
+    Temp,
+}
+
+impl SpillKind {
+    /// Reason string for an age-bound deletion, so the two classes are
+    /// greppable apart in the log.
+    fn age_reason(self) -> &'static str {
+        match self {
+            SpillKind::Record => "age",
+            SpillKind::Temp => "orphan-temp",
+        }
+    }
+}
+
+/// One file under the spill root as the retention sweep sees it.
 #[derive(Debug)]
 struct SpillFile {
     path: PathBuf,
     bytes: u64,
     modified: SystemTime,
     own_session: bool,
+    kind: SpillKind,
+}
+
+impl SpillFile {
+    /// May the byte bound evict this file? See
+    /// [`SpillStore::enforce_byte_bound`] for the rule and why it is narrower
+    /// than the age bound's.
+    fn evictable_for_bytes(&self, max_age: Duration, now: SystemTime) -> bool {
+        if self.kind != SpillKind::Record {
+            return false;
+        }
+        self.own_session || now.duration_since(self.modified).unwrap_or_default() > max_age
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -863,6 +1125,10 @@ mod tests {
         let stale = old.put("t", "text/plain", false, "stale").unwrap();
         let stale_path = old.session_dir().join(format!("{}.spill", stale.id));
         age_file(&stale_path, 3600);
+        // The DIRECTORY has to look dead too, not just its contents: an idle
+        // directory is what the prune keys on now, because an empty one is the
+        // normal state of a live neighbour that has not spilled yet.
+        age_file(old.session_dir(), 3600);
 
         let live = SpillStore::open_with_bounds(
             dir.path().to_path_buf(),
@@ -881,6 +1147,240 @@ mod tests {
         assert!(dir.path().join("sess-new").exists());
         // Another session's garbage is not this session's loss.
         assert_eq!(live.dropped_own_session(), 0);
+    }
+
+    #[test]
+    fn spill_retention_spares_a_live_neighbour_that_has_not_spilled_yet() {
+        // The ordinary case on this box: two `wrappers_mcp` servers, one root.
+        // Session B has opened but has not produced an oversized result yet —
+        // the state EVERY session is in until its first spill — so its
+        // directory is empty. A's sweep must not read that as a dead session.
+        let dir = tempfile::tempdir().unwrap();
+        let b = SpillStore::open_with_bounds(
+            dir.path().to_path_buf(),
+            "sess-b",
+            u64::MAX,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let a = SpillStore::open_with_bounds(
+            dir.path().to_path_buf(),
+            "sess-a",
+            u64::MAX,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        a.put("t", "text/plain", false, "a's first spill").unwrap();
+
+        assert!(
+            b.session_dir().is_dir(),
+            "a live neighbour's directory must survive another session's sweep"
+        );
+        // And B is still able to spill — the property the directory stands for.
+        let rec = b.put("t", "text/plain", false, "b's first spill").unwrap();
+        assert_eq!(b.read(&rec.id, 0, 64).unwrap().text, "b's first spill");
+    }
+
+    #[test]
+    fn spill_put_recreates_a_session_dir_deleted_underneath_it() {
+        // Whatever removed it — another server's sweep, an operator clearing
+        // disk — the store must heal instead of silently spilling nothing for
+        // the rest of the process's life. `atomic_write_owner_only` does not
+        // create its parent, so without this `put` fails `NotFound` forever.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        fs::remove_dir_all(s.session_dir()).unwrap();
+
+        let rec = s
+            .put("t", "text/plain", false, "after the deletion")
+            .unwrap();
+        assert!(s.session_dir().is_dir());
+        assert_eq!(s.read(&rec.id, 0, 64).unwrap().text, "after the deletion");
+    }
+
+    #[test]
+    fn spill_byte_bound_evicts_our_own_before_a_live_neighbours() {
+        // mtime order is not liveness order: the neighbour's record here is the
+        // OLDEST file on disk, which is exactly what a long-running live
+        // session looks like. Evicting it would leave a dead pointer in a
+        // process that never learns of it.
+        let dir = tempfile::tempdir().unwrap();
+        let body = "x".repeat(1024);
+
+        let b = SpillStore::open_with_bounds(
+            dir.path().to_path_buf(),
+            "sess-b",
+            u64::MAX,
+            DEFAULT_MAX_AGE,
+        )
+        .unwrap();
+        let neighbour = b.put("t", "text/plain", false, &body).unwrap();
+        age_file(
+            &b.session_dir().join(format!("{}.spill", neighbour.id)),
+            300,
+        );
+
+        // Room for ~2 bodies of 1 KiB plus their headers, across the WHOLE root.
+        let a = SpillStore::open_with_bounds(
+            dir.path().to_path_buf(),
+            "sess-a",
+            2_600,
+            DEFAULT_MAX_AGE,
+        )
+        .unwrap();
+        let first = a.put("t", "text/plain", false, &body).unwrap();
+        age_file(&a.session_dir().join(format!("{}.spill", first.id)), 200);
+        let second = a.put("t", "text/plain", false, &body).unwrap();
+
+        assert!(
+            b.read(&neighbour.id, 0, 16).is_ok(),
+            "a live neighbour's record is not ours to evict, however old it is"
+        );
+        assert_eq!(
+            a.read(&first.id, 0, 16).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "we make room out of our OWN oldest instead"
+        );
+        assert!(a.read(&second.id, 0, 16).is_ok());
+        assert_eq!(
+            a.dropped_own_session(),
+            1,
+            "and the loss is counted, which is the whole point of restricting the rule"
+        );
+        // A counted loss also changes what a later read says about the id.
+        let msg = a.read(&first.id, 0, 16).unwrap_err().to_string();
+        assert!(
+            msg.contains("dropped 1"),
+            "read must cite the counter: {msg}"
+        );
+    }
+
+    #[test]
+    fn spill_a_body_over_the_whole_cap_does_not_empty_every_session() {
+        // `total = sum + incoming` can never fall below the cap when `incoming`
+        // alone exceeds it, so the byte loop used to run to exhaustion and
+        // delete every record in every session — one oversized body wiping the
+        // multi-session store.
+        let dir = tempfile::tempdir().unwrap();
+        let b = SpillStore::open_with_bounds(
+            dir.path().to_path_buf(),
+            "sess-b",
+            u64::MAX,
+            DEFAULT_MAX_AGE,
+        )
+        .unwrap();
+        let neighbour = b.put("t", "text/plain", false, "neighbour's body").unwrap();
+
+        let a =
+            SpillStore::open_with_bounds(dir.path().to_path_buf(), "sess-a", 100, DEFAULT_MAX_AGE)
+                .unwrap();
+        let ours = a.put("t", "text/plain", false, "our earlier body").unwrap();
+
+        let huge = "y".repeat(4096);
+        let rec = a.put("t", "text/plain", false, &huge).unwrap();
+
+        assert_eq!(a.read(&rec.id, 0, 4096).unwrap().text, huge);
+        assert!(
+            b.read(&neighbour.id, 0, 64).is_ok(),
+            "the neighbour's store must survive our oversized write"
+        );
+        assert!(
+            a.read(&ours.id, 0, 64).is_ok(),
+            "so must our own earlier records"
+        );
+        assert_eq!(a.dropped_own_session(), 0);
+    }
+
+    #[test]
+    fn spill_orphaned_temp_files_are_swept_and_stop_pinning_the_dir() {
+        // A process killed mid-write leaves a full-body-sized temp behind:
+        // `atomic_write_owner_only` cleans up only on a returned `Err`. Neither
+        // retention arm could see it, and it pinned its dead session's
+        // directory against pruning forever.
+        let dir = tempfile::tempdir().unwrap();
+        let dead = dir.path().join("sess-dead");
+        fs::create_dir_all(&dead).unwrap();
+        let orphan = dead.join(format!(
+            "{}.spill.tmp.4242.0.1700000000000000000",
+            "0".repeat(32)
+        ));
+        fs::write(&orphan, "y".repeat(4096)).unwrap();
+        age_file(&orphan, 3600);
+        age_file(&dead, 3600);
+
+        // A temp belonging to a write happening RIGHT NOW must be left alone —
+        // deleting it would corrupt a concurrent server's in-flight spill.
+        let busy = dir.path().join("sess-busy");
+        fs::create_dir_all(&busy).unwrap();
+        let in_flight = busy.join(format!(
+            "{}.spill.tmp.4243.0.1700000000000000001",
+            "1".repeat(32)
+        ));
+        fs::write(&in_flight, "still being written").unwrap();
+
+        let live = SpillStore::open_with_bounds(
+            dir.path().to_path_buf(),
+            "sess-live",
+            u64::MAX,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        // One of OUR OWN, from an earlier run that shared this session key. It
+        // is swept like any other, but it was never published, so it must not
+        // register as a lost locator.
+        let ours = live.session_dir().join(format!(
+            "{}.spill.tmp.4244.0.1700000000000000002",
+            "2".repeat(32)
+        ));
+        fs::write(&ours, "interrupted").unwrap();
+        age_file(&ours, 3600);
+
+        live.put("t", "text/plain", false, "fresh").unwrap();
+
+        assert!(!ours.exists(), "our own aged temp must be swept too");
+        assert_eq!(
+            live.dropped_own_session(),
+            0,
+            "a temp was never published, so sweeping one is not a lost locator"
+        );
+        assert!(!orphan.exists(), "an aged temp must be swept");
+        assert!(
+            !dead.exists(),
+            "and with it gone the dead session's dir prunes"
+        );
+        assert!(in_flight.exists(), "an in-flight temp must be left alone");
+        assert!(busy.exists());
+    }
+
+    #[test]
+    fn spill_temp_infix_matches_fs_atomics_naming() {
+        // `atomic_write_owner_only` names its temp `{file_name}.tmp.{pid}.{seq}.{nanos}`
+        // and our file name is always `<id>.spill`. If either half moves, the
+        // sweep stops seeing temps — silently, since nothing else looks at them.
+        assert_eq!(TEMP_INFIX, format!(".{SPILL_EXTENSION}.tmp."));
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        let target = s.path_for(&"0".repeat(32));
+        let name = target.file_name().unwrap().to_str().unwrap();
+        assert!(format!("{name}.tmp.1234.0.99").contains(TEMP_INFIX));
+    }
+
+    #[test]
+    fn spill_read_of_a_headerless_record_does_not_buffer_the_body() {
+        // A record with no newline at all must be rejected on the bound, not
+        // after pulling the entire body into a `String`.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        let id = "0".repeat(32);
+        fs::write(s.path_for(&id), "z".repeat(MAX_HEADER_BYTES as usize * 4)).unwrap();
+        let err = s.read(&id, 0, 16).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains(&format!("first {MAX_HEADER_BYTES} bytes")),
+            "the message must name the bound the read stopped at: {err}"
+        );
     }
 
     #[test]
@@ -942,8 +1442,10 @@ mod tests {
         assert_eq!(serde_json::from_str::<SpillRecord>(&s).unwrap(), rec);
     }
 
-    /// Backdate a file's mtime by `secs` so retention ordering is deterministic
-    /// rather than dependent on filesystem timestamp granularity.
+    /// Backdate a file's — or a directory's — mtime by `secs` so retention
+    /// ordering is deterministic rather than dependent on filesystem timestamp
+    /// granularity. Directories matter as much as files now: the prune keys on
+    /// a session directory's own idleness.
     fn age_file(path: &Path, secs: u64) {
         let when = SystemTime::now() - Duration::from_secs(secs);
         filetime::set_file_mtime(path, filetime::FileTime::from_system_time(when)).unwrap();
