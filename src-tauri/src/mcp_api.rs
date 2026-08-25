@@ -5696,23 +5696,30 @@ pub fn create_router(
             // line and bound nothing. Widening what is passed here is therefore
             // a real semantic change, not a convenience — the adopted set's only
             // bound against `MAX_PERSISTED_DEVICE_NONCES` is this filter.
-            let workdirs: Vec<String> = lifecycle_store
-                .as_ref()
-                .map(|store| {
-                    store
-                        .open_records()
-                        .into_iter()
-                        .filter_map(|r| r.working_dir)
-                        .collect()
-                })
-                .unwrap_or_default();
+            // DEDUPED by the census's own normalization key. Nothing upstream
+            // dedupes, and two open terminals sharing one cwd is legitimate — so
+            // without this one `.mcp.json` is reconciled twice and counted
+            // twice, and `adopted` (which the boot line offers as a
+            // blast-radius measurement) reports more files than exist. Using
+            // `workdir_census_key` rather than the raw string also folds the
+            // Windows case where two records spell one directory with different
+            // separators or case, and it keeps the count comparable with the
+            // census's `open_backed`, which normalizes the same way.
+            let workdirs: Vec<String> = {
+                let mut seen = std::collections::HashSet::new();
+                lifecycle_store
+                    .as_ref()
+                    .map(|store| {
+                        store
+                            .open_records()
+                            .into_iter()
+                            .filter_map(|r| r.working_dir)
+                            .filter(|wd| seen.insert(crate::coord_mcp::workdir_census_key(wd)))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
             let open_workdir_count = workdirs.len();
-            // Phase 1 — the whole-disk three-way census, computed BEFORE the
-            // reconcile so `open_backed` describes the same population the
-            // reconcile is about to be handed. Reported alongside, never
-            // instead of, the open-record count: on the incident box the two
-            // were 591 and 11, and a boot line carrying only the larger number
-            // would overstate the reconcile's reach by ~54x.
             let all_record_workdirs: Vec<String> = lifecycle_store
                 .as_ref()
                 .map(|store| {
@@ -5723,11 +5730,24 @@ pub fn create_router(
                         .collect()
                 })
                 .unwrap_or_default();
-            // On a blocking thread for the same reason the reap above is: it is
-            // a bounded directory walk, but a directory walk nonetheless, and
-            // the boot path is not where a tokio worker should be parked on
-            // filesystem I/O.
-            let census = {
+            // Phase 1 — the whole-disk three-way census. Reported alongside,
+            // never instead of, the open-record count: on the incident box the
+            // two were 591 and 11, and a boot line carrying only the larger
+            // number would overstate the reconcile's reach by ~54x.
+            //
+            // STARTED here and awaited at the log line — deliberately NOT
+            // awaited here. It is a directory walk on a blocking thread,
+            // measured at 7.45 s warm-cache over 83,826 directories with the
+            // real prune list, and boot is the cold-cache case by construction.
+            // Awaiting it before the reconcile put an OBSERVABILITY walk on the
+            // critical path of the repair, so every 401ing MCP client stayed
+            // broken for its duration. Nothing is lost by the reorder: the
+            // classification is against the `workdirs` Vec captured above, which
+            // is immutable from here on, so `open_backed` describes the same
+            // population whichever side of the reconcile the walk runs on. (The
+            // comment that used to sit here claimed the opposite, and that claim
+            // was the stated reason for the ordering.)
+            let census_task = {
                 let open = workdirs.clone();
                 let all = all_record_workdirs;
                 tokio::task::spawn_blocking(move || {
@@ -5736,8 +5756,6 @@ pub fn create_router(
                         all.iter().map(String::as_str),
                     )
                 })
-                .await
-                .unwrap_or(None)
             };
             let session_counts = if workdirs.is_empty() {
                 Default::default()
@@ -5784,25 +5802,40 @@ pub fn create_router(
             // `Leave` and this line said `rewrote 0 session config(s)` — the
             // words "nothing needed doing" over the state "nothing was
             // repairable".
-            let census_line = match census {
-                Some(c) => format!(
+
+            // The repair is done; NOW collect the observability walk.
+            //
+            // Three arms, not two. `.unwrap_or(None)` folded a `JoinError` — a
+            // PANIC inside the walk — into the same `None` that means "no
+            // workspace root", and the line then asserted the no-root cause for
+            // a condition it had not observed. That is the failure
+            // `coord_mcp::adopt_on_disk_nonce`'s own doc names: a cause string
+            // that contradicts the action is worse than no cause string. Both
+            // arms are UNKNOWN; they are not the SAME unknown, and only one of
+            // them is a bug worth chasing.
+            let census_line = match census_task.await {
+                Ok(Some(c)) => format!(
                     "{} total = {} open-record-backed / {} dead-record-backed / {} orphaned",
                     c.total, c.open_backed, c.dead_backed, c.orphaned
                 ),
                 // No workspace root resolved: UNKNOWN, not an empty disk. Saying
                 // "0 total" here would be the same class of lie the corrected
                 // `restored` number above exists to stop telling.
-                None => "UNAVAILABLE (no workspace root resolved)".to_string(),
+                Ok(None) => "UNAVAILABLE (no workspace root resolved)".to_string(),
+                Err(e) => format!("UNAVAILABLE (the census task itself failed: {e})"),
             };
             info!(
                 "coord_mcp boot reconcile: restored {} persisted nonce(s) \
                  (live nonce map now {}), reaped {reaped} stale session-restore config(s), \
-                 enumerated {open_workdir_count} open session workdir(s) of which \
-                 {} held an UNREGISTERED on-disk nonce and were adopted (no file written); \
+                 enumerated {open_workdir_count} DISTINCT open session workdir(s) of which \
+                 {} held an unregistered on-disk nonce ON THE BOUND PORT and were adopted \
+                 (no .mcp.json written; an unregistered nonce on a STALE port is rewritten \
+                 instead, and counts under `rewrote`); \
                  rewrote {} session config(s), upgraded {} session config header shape(s) \
                  (nonce preserved), root self-heal = {root_action:?} \
                  (instance {reconcile_instance}, bound port :{reconcile_bound_port}); \
-                 on-disk .mcp.json census: {census_line}",
+                 on-disk .mcp.json census (workspace root only, depth <= 4, dependency and \
+                 build trees pruned — a FLOOR, not the whole disk): {census_line}",
                 restore.inserted,
                 restore.live_map_len,
                 session_counts.adopted,
