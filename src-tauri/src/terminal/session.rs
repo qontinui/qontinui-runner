@@ -2405,7 +2405,9 @@ impl TerminalSession {
         unsafe {
             let handle = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
             if !handle.is_null() && !std::ptr::eq(handle, INVALID_HANDLE_VALUE as *mut _) {
-                crate::job_object::assign_process_to_job(handle as _);
+                // SAFETY: `handle` is the OpenProcess result validated on the
+                // line above and closed on the line below.
+                qontinui_runner_win32::assign_process_to_job(handle as _);
                 CloseHandle(handle as _);
             }
         }

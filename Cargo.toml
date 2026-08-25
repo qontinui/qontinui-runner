@@ -1,5 +1,19 @@
 [workspace]
-members = ["src-tauri", "src-tauri/clorinde", "crates/spec-check", "crates/qontinui-app-generator", "crates/comprehension", "crates/qontinui-backend-generator"]
+members = [
+    "src-tauri",
+    "src-tauri/clorinde",
+    "crates/spec-check",
+    "crates/qontinui-app-generator",
+    "crates/comprehension",
+    "crates/qontinui-backend-generator",
+    # Carved OUT of the binary crate's module tree, not created greenfield --
+    # plan 2026-08-21-runner-extract-crates-frontier-first, Phase 1.
+    # `members` is an explicit list, NOT a `crates/*` glob: a new crate that is
+    # not added here is silently outside the workspace and picks up none of the
+    # [profile.*] overrides below.
+    "crates/runner-stats",
+    "crates/runner-win32",
+]
 resolver = "2"
 
 # Workspace-level profile overrides. Cargo only honors [profile.*] in the

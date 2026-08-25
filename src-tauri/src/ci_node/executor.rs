@@ -72,15 +72,16 @@ const CI_JOB_MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024 * 1024;
 /// non-Windows so call sites stay platform-uniform.
 struct CiJob {
     #[cfg(windows)]
-    inner: Option<crate::job_object::ScopedKillOnCloseJob>,
+    inner: Option<qontinui_runner_win32::ScopedKillOnCloseJob>,
 }
 
 impl CiJob {
     fn create() -> Self {
         #[cfg(windows)]
         {
-            let inner =
-                crate::job_object::ScopedKillOnCloseJob::create(Some(CI_JOB_MEMORY_LIMIT_BYTES));
+            let inner = qontinui_runner_win32::ScopedKillOnCloseJob::create(Some(
+                CI_JOB_MEMORY_LIMIT_BYTES,
+            ));
             if inner.is_none() {
                 warn!(
                     "ci_node: per-dispatch memory-limit job unavailable — \
@@ -101,7 +102,8 @@ impl CiJob {
     fn assign(&self, child: &tokio::process::Child) {
         #[cfg(windows)]
         if let (Some(job), Some(raw)) = (self.inner.as_ref(), child.raw_handle()) {
-            job.assign(raw as windows_sys::Win32::Foundation::HANDLE);
+            // SAFETY: `raw` came from the live `child` the caller still owns.
+            unsafe { job.assign(raw as windows_sys::Win32::Foundation::HANDLE) };
         }
     }
 }
@@ -789,7 +791,12 @@ async fn run_step(
     #[cfg(target_os = "windows")]
     {
         if let Some(raw) = child.raw_handle() {
-            crate::job_object::assign_process_to_job(raw as windows_sys::Win32::Foundation::HANDLE);
+            // SAFETY: `raw` came from the live `child` bound just above.
+            unsafe {
+                qontinui_runner_win32::assign_process_to_job(
+                    raw as windows_sys::Win32::Foundation::HANDLE,
+                )
+            };
         }
     }
     // Plus the per-dispatch memory-backstop job (plan §4.6).

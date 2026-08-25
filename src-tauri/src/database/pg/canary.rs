@@ -367,7 +367,7 @@ impl PgDb {
 
         let delta = canary_sr - baseline_sr;
 
-        let analysis = crate::stats::proportion_analysis(
+        let analysis = qontinui_runner_stats::proportion_analysis(
             (canary.success_count as u64, canary_total),
             (baseline.success_count as u64, baseline_total),
             2,
@@ -398,13 +398,13 @@ impl PgDb {
         };
 
         let verdict_enum = if !min_runs_met {
-            crate::stats::Verdict::Neutral
+            qontinui_runner_stats::Verdict::Neutral
         } else {
-            crate::stats::compute_verdict(
+            qontinui_runner_stats::compute_verdict(
                 delta,
                 &analysis,
                 canary_total,
-                &crate::stats::VerdictThresholds::canary(),
+                &qontinui_runner_stats::VerdictThresholds::canary(),
             )
         };
 

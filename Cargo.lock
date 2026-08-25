@@ -6691,6 +6691,8 @@ dependencies = [
  "proc-macro2",
  "qontinui-code-graph",
  "qontinui-db",
+ "qontinui-runner-stats",
+ "qontinui-runner-win32",
  "qontinui-spec-check",
  "qontinui-types",
  "qontinui-vision-core",
@@ -6755,6 +6757,18 @@ dependencies = [
  "xcap",
  "zbus 4.4.0",
  "zip 8.3.0",
+]
+
+[[package]]
+name = "qontinui-runner-stats"
+version = "0.1.0"
+
+[[package]]
+name = "qontinui-runner-win32"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

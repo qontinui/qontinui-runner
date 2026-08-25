@@ -1,0 +1,32 @@
+[package]
+name = "qontinui-runner-win32"
+version = "0.1.0"
+description = "Win32 process-containment primitives (Job Objects) for the qontinui runner"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+tracing = "0.1"
+
+# Target-gated with an EXPLICIT feature list, mirroring src-tauri/Cargo.toml's
+# `[target.'cfg(windows)'.dependencies]` block. A plain `windows-sys` dependency
+# takes default features and will not compile these call sites.
+#
+# `Win32_Security` is here on purpose: it is what makes
+# `windows_sys::Win32::System::JobObjects::CreateJobObjectW` available (its
+# signature names SECURITY_ATTRIBUTES). The binary crate used to work around a
+# then-conditional feature gate with a hand-written
+# `extern "system" { fn CreateJobObjectW(..) }`; declaring the feature here
+# removes the need for that, and with it the load-time symbol-resolution risk.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    # NOT decoration, and NOT droppable: `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`
+    # does not resolve without it. Removing it because nothing in this crate
+    # writes `Win32::System::Threading::` by hand fails with E0432 -- the
+    # dependency is transitive through the struct, not textual. Verified by
+    # removing it and watching the build break.
+    "Win32_System_Threading",
+] }

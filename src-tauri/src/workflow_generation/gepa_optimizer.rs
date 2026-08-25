@@ -28,13 +28,13 @@
 //!    scores **both** arms on the untouched held-out `test` split.
 //! 3. The sidecar returns **per-example** score vectors for the two arms —
 //!    same order, same length — and this module runs the accept/reject
-//!    decision locally through [`crate::stats`].
+//!    decision locally through [`qontinui_runner_stats`].
 //!
 //! # The validation gate
 //!
 //! The decision is a **paired** one-sided test on per-example deltas
-//! ([`crate::stats::paired_analysis`] → [`crate::stats::compute_verdict`] with
-//! [`crate::stats::VerdictThresholds::held_out_gate`]). Pairing is what makes a
+//! ([`qontinui_runner_stats::paired_analysis`] → [`qontinui_runner_stats::compute_verdict`] with
+//! [`qontinui_runner_stats::VerdictThresholds::held_out_gate`]). Pairing is what makes a
 //! small held-out set survivable: both arms are scored on the *same* examples,
 //! so between-example variance drops out.
 //!
@@ -53,7 +53,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::stats::{self, Verdict, VerdictThresholds};
+use qontinui_runner_stats::{self as stats, Verdict, VerdictThresholds};
 
 // ============================================================================
 // Domain Classification
@@ -234,7 +234,7 @@ pub struct DomainOptimizeRequest {
 
 /// Scale factor from a `0.0..=1.0` quality score to **percentage points**.
 ///
-/// [`crate::stats::compute_verdict`]'s `sr_delta_pp` argument and every field of
+/// [`qontinui_runner_stats::compute_verdict`]'s `sr_delta_pp` argument and every field of
 /// [`VerdictThresholds`] are in percentage points — that is what they mean to
 /// the five existing callers (`meta_optimizer/canary.rs`,
 /// `meta_optimizer/eval_runner.rs`, `meta_optimizer/snapshots.rs` ×3,
@@ -243,7 +243,7 @@ pub struct DomainOptimizeRequest {
 /// The sidecar's scores are on a `0.0..=1.0` scale, so a raw mean delta is
 /// **100× smaller** than the same effect expressed in pp. Passing it unscaled
 /// would silently divide every threshold's meaning by 100. Scaling therefore
-/// happens **here, at the call site**, before anything reaches `crate::stats`:
+/// happens **here, at the call site**, before anything reaches `qontinui_runner_stats`:
 /// each per-example delta is multiplied by this constant, so the p-value, the
 /// confidence interval and the `sr_delta_pp` argument are all in one unit.
 const SCORE_TO_PP: f64 = 100.0;
@@ -251,7 +251,7 @@ const SCORE_TO_PP: f64 = 100.0;
 /// The gate's reading of one run's held-out evidence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GateDecision {
-    /// Statistical verdict from [`crate::stats::compute_verdict`].
+    /// Statistical verdict from [`qontinui_runner_stats::compute_verdict`].
     pub verdict: Verdict,
     /// Number of held-out examples where **both** arms produced a score.
     pub paired: usize,
@@ -886,7 +886,7 @@ mod tests {
         );
     }
 
-    /// Deltas are scaled to percentage points before reaching `crate::stats`.
+    /// Deltas are scaled to percentage points before reaching `qontinui_runner_stats`.
     /// A raw 0..1 delta would be 100x smaller and read as ~0.1 pp.
     #[test]
     fn test_deltas_are_scaled_to_percentage_points() {

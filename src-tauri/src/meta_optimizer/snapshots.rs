@@ -161,7 +161,7 @@ pub fn evaluate_recommendation_outcome(
                 let sr_delta = (p.success_rate - b.success_rate) * 100.0; // convert to pp
 
                 // Statistical analysis from snapshot-level aggregate counts
-                let analysis = crate::stats::proportion_analysis(
+                let analysis = qontinui_runner_stats::proportion_analysis(
                     (p.successful_runs as u64, p.total_runs as u64),
                     (b.successful_runs as u64, b.total_runs as u64),
                     2,
@@ -170,11 +170,11 @@ pub fn evaluate_recommendation_outcome(
                 let confidence_interval = analysis.confidence_interval;
                 let effect_size = analysis.effect_size;
 
-                let verdict_enum = crate::stats::compute_verdict(
+                let verdict_enum = qontinui_runner_stats::compute_verdict(
                     sr_delta,
                     &analysis,
                     p.total_runs as u64,
-                    &crate::stats::VerdictThresholds::recommendation(),
+                    &qontinui_runner_stats::VerdictThresholds::recommendation(),
                 );
                 let verdict = verdict_enum.as_recommendation_str();
 
@@ -239,7 +239,7 @@ fn compute_verdict(
             let cost_delta = a.avg_cost_usd - b.avg_cost_usd;
 
             // Statistical analysis when we have enough data
-            let analysis = crate::stats::proportion_analysis(
+            let analysis = qontinui_runner_stats::proportion_analysis(
                 (a.success_count as u64, a.run_count as u64),
                 (b.success_count as u64, b.run_count as u64),
                 2,
@@ -248,11 +248,11 @@ fn compute_verdict(
             let confidence_interval = analysis.confidence_interval;
             let effect_size = analysis.effect_size;
 
-            let verdict_enum = crate::stats::compute_verdict(
+            let verdict_enum = qontinui_runner_stats::compute_verdict(
                 sr_delta,
                 &analysis,
                 a.run_count as u64,
-                &crate::stats::VerdictThresholds::recommendation(),
+                &qontinui_runner_stats::VerdictThresholds::recommendation(),
             );
             let verdict = verdict_enum.as_recommendation_str();
 

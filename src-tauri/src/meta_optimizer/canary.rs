@@ -445,7 +445,7 @@ pub fn evaluate_prompt_canary(canary: &PromptTemplateCanary) -> CanaryEvaluation
     let min_runs: i64 = 10;
     let min_runs_met = c.run_count >= min_runs && b.run_count >= min_runs;
 
-    let analysis = crate::stats::proportion_analysis(
+    let analysis = qontinui_runner_stats::proportion_analysis(
         (c.success_count as u64, candidate_total),
         (b.success_count as u64, baseline_total),
         2,
@@ -464,13 +464,13 @@ pub fn evaluate_prompt_canary(canary: &PromptTemplateCanary) -> CanaryEvaluation
     };
 
     let verdict_enum = if !min_runs_met {
-        crate::stats::Verdict::Neutral
+        qontinui_runner_stats::Verdict::Neutral
     } else {
-        crate::stats::compute_verdict(
+        qontinui_runner_stats::compute_verdict(
             delta,
             &analysis,
             candidate_total,
-            &crate::stats::VerdictThresholds::canary(),
+            &qontinui_runner_stats::VerdictThresholds::canary(),
         )
     };
 
