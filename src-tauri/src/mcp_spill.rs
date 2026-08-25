@@ -52,10 +52,13 @@
 //! channel (same reasoning as the Phase 1 metric line), and in the runner bin
 //! stderr is captured into the dev logs, so a message is never silently lost.
 
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -126,11 +129,70 @@ const MAX_SESSION_KEY_LEN: usize = 64;
 /// Hard ceiling on the header line [`SpillStore::read`] will buffer.
 ///
 /// A real header is a single JSON object of eight short fields — a few hundred
-/// bytes, and bounded by [`MAX_SESSION_KEY_LEN`] plus the tool name. 8 KiB is
-/// far above any of them and far below the bodies this store holds, which is
-/// the separation that matters: it exists so that a record with no newline in
-/// it cannot be read into memory in its entirety before being rejected.
+/// bytes, and bounded by [`MAX_SESSION_KEY_LEN`], [`MAX_TOOL_LEN`] and
+/// [`MAX_CONTENT_TYPE_LEN`]. 8 KiB is far above any of them and far below the
+/// bodies this store holds, which is the separation that matters: it exists so
+/// that a record with no newline in it cannot be read into memory in its
+/// entirety before being rejected.
 const MAX_HEADER_BYTES: u64 = 8 * 1024;
+
+/// Longest [`SpillRecord::tool`] a header will carry.
+///
+/// **`tool` is the one header field that reaches [`SpillStore::put`] from
+/// outside this process.** On `wrappers_mcp`'s unknown-tool arm it is the raw
+/// `name` off the JSON-RPC frame, so a client picks its length. Unbounded, a
+/// 40 KB name broke the format in two directions at once:
+///
+/// - the header line went past [`MAX_HEADER_BYTES`], so [`SpillStore::read`]
+///   refused the record FOREVER — a locator that is a dead pointer from the
+///   moment it is issued, and invisible to
+///   [`SpillStore::dropped_own_session`] because nothing ever deleted it; and
+/// - the preview interpolates the field (`wrappers_mcp::spill_preview`), so
+///   the inline stand-in grew LARGER than the body it replaced — the cap
+///   defeated on the very path that enforces it.
+///
+/// 256 bytes is an order of magnitude above any real tool name
+/// (`wrapper_v0__export_code` is 23) and still leaves the worst-case header far
+/// under the read bound — which the `const _: () = assert!` below checks at
+/// COMPILE time rather than trusting this paragraph. A writer and a reader that
+/// disagree about a bound they share is exactly the drift this module's
+/// one-schema design exists to prevent.
+pub const MAX_TOOL_LEN: usize = 256;
+
+/// Longest [`SpillRecord::content_type`] a header will carry.
+///
+/// Every call site passes a literal today, so this is not reachable the way
+/// [`MAX_TOOL_LEN`] is — but `wrappers_mcp::dispatch_read_spill` re-spills a
+/// body whose `content_type` it read back OFF DISK, which puts the field one
+/// hop from being as caller-controlled as `tool`. Bounding it is what makes the
+/// header bound provable instead of argued.
+const MAX_CONTENT_TYPE_LEN: usize = 128;
+
+/// What one byte of a header field can cost once `serde_json` escapes it: a
+/// control character becomes `\u00XX`, six bytes for one. [`MAX_SESSION_KEY_LEN`]
+/// is exempt — [`sanitize_session_key`] has already reduced that field to
+/// `[A-Za-z0-9._-]`, none of which escapes.
+const JSON_ESCAPE_WORST_CASE: usize = 6;
+
+/// The header's own weight with everything variable removed: the eight keys,
+/// the punctuation, the 32-character id, and the two numbers at their widest
+/// (`u64::MAX`, `i64::MIN`). Measured at ~192 bytes; 256 leaves room for a
+/// field added later without silently eating the margin below.
+const MAX_HEADER_FIXED_BYTES: usize = 256;
+
+/// The writer's bounds must fit what the reader will buffer.
+///
+/// This is the invariant [`MAX_TOOL_LEN`] exists for, stated where the compiler
+/// can enforce it: raising a field bound (or adding a field) past what
+/// [`SpillStore::read`] accepts would otherwise mint records that are
+/// unreadable from the instant they are written, and nothing at runtime would
+/// say so.
+const _: () = assert!(
+    MAX_HEADER_FIXED_BYTES
+        + MAX_SESSION_KEY_LEN
+        + JSON_ESCAPE_WORST_CASE * (MAX_TOOL_LEN + MAX_CONTENT_TYPE_LEN)
+        < MAX_HEADER_BYTES as usize
+);
 
 /// Prefix on every diagnostic this module writes. Distinct from the MCP
 /// server's own `[wrappers-mcp]` so retention events are greppable on their own.
@@ -154,12 +216,14 @@ pub struct SpillRecord {
     /// to the conversation.
     pub session: String,
     /// MCP tool whose result this was. Recorded so a sweep (or an operator) can
-    /// attribute disk use to a tool rather than to "the MCP server".
+    /// attribute disk use to a tool rather than to "the MCP server". Bounded by
+    /// [`MAX_TOOL_LEN`] at the writer, because on the unknown-tool arm this is
+    /// a string the caller chose.
     pub tool: String,
     /// Media type of the body as the writer understood it (`application/json`
     /// for a serialized wrapper result, `text/plain` for subagent output and
     /// error messages). Advisory: it describes the body, it does not constrain
-    /// how a reader slices it.
+    /// how a reader slices it. Bounded by [`MAX_CONTENT_TYPE_LEN`].
     pub content_type: String,
     /// Length of the body in bytes — the TRUE size the preview stands in for.
     pub byte_len: u64,
@@ -199,9 +263,9 @@ impl SpillSlice {
 
 /// A session's spill directory, plus the retention policy that bounds it.
 ///
-/// One store per process: the MCP server's lifetime IS the AI client session's
-/// lifetime, so "the session" and "this process" are the same scope. That is
-/// also why the store carries no lock — `put` is the only mutator and
+/// One store per process. The one piece of mutable state it carries is
+/// [`SpillStore::issued`] — the ids THIS process published — behind a mutex;
+/// nothing else needs one, because `put` is the only mutator and
 /// [`crate::fs_atomic`] already makes concurrent writers to the same path safe.
 #[derive(Debug)]
 pub struct SpillStore {
@@ -214,24 +278,38 @@ pub struct SpillStore {
     session: String,
     max_total_bytes: u64,
     max_age: Duration,
-    /// Spills belonging to THIS store's session that retention deleted.
+    /// Every spill id THIS process has published — the exact set of locators it
+    /// has handed to a model.
+    ///
+    /// **Directory identity is not process identity.** A session directory is
+    /// named for [`ambient_session_key`], and more than one `wrappers_mcp` can
+    /// legitimately land on the same name: a resumed conversation keeps its
+    /// `CLAUDE_CODE_SESSION_ID`, a restarted server reopens the same directory,
+    /// and the `pid-<pid>` fallback repeats whenever a pid comes round again.
+    /// So "in our directory" answers a different question from "we issued it",
+    /// and it is the second one both the honesty counter and the eviction rule
+    /// actually mean. Keyed on ids because that is what a locator IS; a few
+    /// hundred 32-byte strings a day is not a memory concern.
+    issued: Mutex<HashSet<String>>,
+    /// Spills THIS PROCESS issued that retention then deleted.
     ///
     /// **Non-zero means real loss**: a locator this process already handed to a
     /// model now resolves to nothing, which turns a truthful preview into a
     /// dead pointer — strictly worse than the truncation this design rejects.
     /// Every drop is also warned on stderr, never silent, and
     /// [`SpillStore::read`] consults the counter so a `NotFound` can say WHICH
-    /// of its two possible answers this one is.
+    /// of its possible answers this one is.
     ///
     /// **The counter is only honest because the byte bound refuses to evict a
-    /// live neighbour's records** — see [`SpillStore::enforce_byte_bound`].
-    /// Several `wrappers_mcp` servers share one root; that is the ordinary
-    /// case, not an edge. Evicting another server's record would manufacture
-    /// exactly this dead pointer inside a process that cannot count it, cannot
-    /// warn about it, and whose model then simply gets a bare `NotFound` — the
-    /// deletion would be logged as ordinary GC in the wrong process's stderr.
-    /// Reclaiming another session's disk is therefore left to the age bound,
-    /// the one arm entitled to assume that nobody is still holding the locator.
+    /// record this process did not issue** — see
+    /// [`SpillStore::enforce_byte_bound`]. Several `wrappers_mcp` servers share
+    /// one root; that is the ordinary case, not an edge. Evicting another
+    /// server's record would manufacture exactly this dead pointer inside a
+    /// process that cannot count it, cannot warn about it, and whose model then
+    /// simply gets a bare `NotFound` — the deletion would be logged as ordinary
+    /// GC in the wrong process's stderr. Reclaiming anyone else's disk is
+    /// therefore left to the age bound, the one arm entitled to assume that
+    /// nobody is still holding the locator.
     dropped_own_session: AtomicU64,
 }
 
@@ -284,8 +362,18 @@ impl SpillStore {
             session,
             max_total_bytes,
             max_age,
+            issued: Mutex::new(HashSet::new()),
             dropped_own_session: AtomicU64::new(0),
         })
+    }
+
+    /// The set of ids this process has published. A poisoned lock still holds
+    /// usable data — the guarded value is a plain `HashSet` and no writer can
+    /// leave it half-updated — and refusing to read it would blind the honesty
+    /// counter for the rest of the process's life, so the poison is stepped
+    /// over rather than propagated.
+    fn issued(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.issued.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The sanitized session key — also the directory name.
@@ -312,6 +400,11 @@ impl SpillStore {
     /// larger than the total cap is still written: the cap bounds accumulation,
     /// and refusing the write would lose the very result the spill exists to
     /// preserve.
+    ///
+    /// `tool` and `content_type` are bounded HERE, at the writer, rather than
+    /// trusted from the caller — see [`MAX_TOOL_LEN`] for what an unbounded
+    /// `tool` did to both the header and the preview. The body is not bounded:
+    /// storing it whole is the entire point.
     pub fn put(
         &self,
         tool: &str,
@@ -326,8 +419,9 @@ impl SpillStore {
             schema: SPILL_SCHEMA,
             id: Uuid::now_v7().simple().to_string(),
             session: self.session.clone(),
-            tool: tool.to_string(),
-            content_type: content_type.to_string(),
+            tool: bounded_tool_name(tool).into_owned(),
+            content_type: truncate_on_char_boundary(content_type, MAX_CONTENT_TYPE_LEN)
+                .into_owned(),
             byte_len: body.len() as u64,
             created_at_ms: now_ms(),
             is_error,
@@ -341,6 +435,10 @@ impl SpillStore {
         buf.extend_from_slice(body.as_bytes());
 
         crate::fs_atomic::atomic_write_owner_only(&self.path_for(&record.id), &buf)?;
+        // Only a record that actually reached disk is a locator this process
+        // will hand out, so registration happens after the write, not before:
+        // the set has to mean "issued", not "attempted".
+        self.issued().insert(record.id.clone());
         Ok(record)
     }
 
@@ -365,7 +463,18 @@ impl SpillStore {
         }
         fs::create_dir_all(&self.session_dir)?;
         // A recreated directory carries the ambient umask / inherited ACL, so
-        // it gets the same owner-only hardening `open` applies.
+        // it gets the same owner-only hardening `open` applies — BOTH levels,
+        // because `create_dir_all` recreates `<root>` too when the whole tree
+        // was removed, and hardening only the leaf would leave every session's
+        // directory NAME (the join key back to a conversation) world-readable.
+        // The bodies themselves are safe either way — `atomic_write_owner_only`
+        // writes them `0600` — so this closes a naming leak, not a content one.
+        if let Err(e) = crate::fs_perms::restrict_dir_to_owner(&self.root) {
+            eprintln!(
+                "{LOG_PREFIX} could not restrict {}: {e}",
+                self.root.display()
+            );
+        }
         if let Err(e) = crate::fs_perms::restrict_dir_to_owner(&self.session_dir) {
             eprintln!(
                 "{LOG_PREFIX} could not restrict {}: {e}",
@@ -442,29 +551,43 @@ impl SpillStore {
     /// Explain a missing record using what this store actually knows.
     ///
     /// "It was never written, or retention swept it" is an ambiguity the store
-    /// can usually resolve for itself, and
-    /// [`SpillStore::dropped_own_session`] is the fact that resolves it: this
-    /// process warns and counts every one of ITS OWN records that retention
-    /// deletes, so a non-zero count says a locator of ours has already been
-    /// invalidated and this is very likely one of them, while a zero count
-    /// says retention in this process is not the explanation and the id came
-    /// from somewhere else. Saying which is the point of keeping the counter
-    /// at all — a number nobody reads is not a safeguard.
+    /// can resolve for itself, from two facts it owns: whether it ever ISSUED
+    /// this id ([`SpillStore::issued`]) and how many of its own it has since
+    /// lost ([`SpillStore::dropped_own_session`]). Both are needed. The counter
+    /// alone used to be read as covering every record in our directory, so a
+    /// stale id from an earlier server under the same session key was answered
+    /// with "retention dropped it" — the same class of lie the counter exists
+    /// to prevent, pointed the other way. Saying which answer this is, and only
+    /// when the store can actually tell, is the point of keeping either fact —
+    /// a number nobody reads is not a safeguard, and one that is read wrongly
+    /// is worse than none.
     fn not_found_message(&self, id: &str) -> String {
         let dropped = self.dropped_own_session();
-        if dropped > 0 {
-            format!(
-                "no spill '{id}' in session '{}' — retention has already dropped {dropped} of \
-                 this session's spills, so this locator was most likely one of them",
+        let issued = self.issued().contains(id);
+        match (issued, dropped) {
+            (true, 1..) => format!(
+                "no spill '{id}' in session '{}' — this server issued that locator and retention \
+                 has already dropped {dropped} of its own spills, so this was most likely one of \
+                 them",
                 self.session
-            )
-        } else {
-            format!(
-                "no spill '{id}' in session '{}' — retention in this process has dropped none of \
-                 this session's spills, so it was never written here (a stale id from another \
-                 session, or a record removed out of band)",
+            ),
+            (true, 0) => format!(
+                "no spill '{id}' in session '{}' — this server issued that locator and retention \
+                 here has dropped none of its own spills, so the record was removed out of band",
                 self.session
-            )
+            ),
+            (false, 1..) => format!(
+                "no spill '{id}' in session '{}' — this server never issued that locator (the \
+                 session key is shared with any earlier server that used it), and retention here \
+                 has dropped {dropped} of its OWN spills, none of them this one",
+                self.session
+            ),
+            (false, 0) => format!(
+                "no spill '{id}' in session '{}' — this server never issued that locator and \
+                 retention here has dropped none of its own spills, so it was never written by \
+                 this process (a stale id from another session, or a record removed out of band)",
+                self.session
+            ),
         }
     }
 
@@ -505,9 +628,10 @@ impl SpillStore {
     /// Enforce the total-bytes bound, budgeting `incoming` for the write that
     /// is about to happen.
     ///
-    /// **The eviction rule: our own records at any age, plus anyone's records
-    /// already past `max_age` — never a live neighbour's.** Oldest first
-    /// within that set, and the stale foreign ones before our own live ones.
+    /// **The eviction rule: records THIS PROCESS issued, at any age, plus
+    /// anyone's records already past `max_age` — never anybody else's live
+    /// ones.** Oldest first within that set, and the stale foreign ones before
+    /// our own live ones.
     ///
     /// The rule this replaced was "oldest first across every session", on the
     /// reasoning that mtime order approximates liveness order. It does not.
@@ -519,14 +643,37 @@ impl SpillStore {
     /// the loss ([`SpillStore::dropped_own_session`] stays zero there), does
     /// not warn about it (the warning lands in OUR stderr, labelled as
     /// ordinary GC), and whose model then gets a bare `NotFound` — the exact
-    /// dead pointer the counter exists to make impossible.
+    /// dead pointer the counter exists to make impossible. "Issued by us"
+    /// rather than "in our directory" is what makes that hold even when two
+    /// servers share a session key — see [`SpillStore::issued`].
     ///
-    /// The cost of the new rule is that we can no longer reclaim a live
-    /// neighbour's disk on demand, so a busy neighbour can hold the shared
-    /// total above the cap; we then evict our own oldest, say so on stderr,
-    /// and leave the rest to the age arm. That is the right trade: exceeding a
-    /// disk budget is a recoverable, observable condition, while an uncounted
-    /// dead pointer is a silent lie told to a model.
+    /// **The arm refuses a target it cannot reach, rather than spending every
+    /// locator we own trying.** `total` is every byte under the root; the
+    /// candidates are a subset of it — in practice just ours, since the age arm
+    /// has already taken the stale foreign half. So the lowest total eviction
+    /// can produce is
+    /// `total - candidate_bytes`, and when even that exceeds `budget` the loop
+    /// would delete this session's entire store and still be over — turning one
+    /// idle neighbour holding the budget into "one live record at a time" for
+    /// as long as the age arm takes to free them, with every locator we hand
+    /// out dying at the next oversized result. Narrowing the candidate set is
+    /// what made that reachable: exhaustion used to need `incoming >= cap`
+    /// (guarded above), and now needs only a neighbour — or an orphaned
+    /// sub-`max_age` temp, which counts toward `total` and is never a
+    /// candidate — to hold the budget on its own.
+    ///
+    /// The cost of the rule is that we cannot reclaim anyone else's disk on
+    /// demand, so a busy neighbour can hold the shared total above the cap. We
+    /// then evict what is genuinely ours to evict, or nothing at all when that
+    /// would not get us under, say which on stderr, and leave the rest to the
+    /// age arm. Name the worst case plainly: while a neighbour holds the whole
+    /// budget, the byte bound is not enforced AT ALL and the root is bounded by
+    /// `max_age` alone — a day of both sessions' spills. That is still the
+    /// right trade. Exceeding a disk budget is a recoverable, observable
+    /// condition with a stated ceiling and a line on stderr every time it
+    /// happens; an uncounted dead pointer is a silent lie told to a model, and
+    /// the version of this arm that enforced the cap bought the difference by
+    /// telling that lie once per oversized result.
     fn enforce_byte_bound(&self, files: &[SpillFile], incoming: u64, now: SystemTime) {
         if incoming >= self.max_total_bytes {
             // A body larger than the whole cap is stored anyway — `put`'s doc
@@ -563,7 +710,29 @@ impl SpillStore {
             .iter()
             .filter(|f| f.evictable_for_bytes(self.max_age, now))
             .collect();
-        candidates.sort_by_key(|f| (f.own_session, f.modified));
+        let candidate_bytes = candidates
+            .iter()
+            .map(|f| f.bytes)
+            .fold(0u64, |a, b| a.saturating_add(b));
+        // The floor eviction can reach: everything we are not allowed to touch.
+        // Checking it BEFORE deleting anything is the whole guard — the loop
+        // below cannot tell an unreachable target from a nearly-reached one,
+        // and by the time it notices, this session's store is already empty.
+        let unevictable = total.saturating_sub(candidate_bytes);
+        if unevictable > budget {
+            eprintln!(
+                "{LOG_PREFIX} {unevictable} of {total} bytes under {} belong to other live \
+                 sessions or to in-flight writes and exceed the {budget} byte budget on their own \
+                 — skipping byte-bound eviction rather than spending all {} evictable records on \
+                 a target it could never reach. The age bound reclaims the rest once they are \
+                 past {:?}.",
+                self.root.display(),
+                candidates.len(),
+                self.max_age
+            );
+            return;
+        }
+        candidates.sort_by_key(|f| (f.ours, f.modified));
 
         for f in candidates {
             if total <= budget {
@@ -574,10 +743,14 @@ impl SpillStore {
             }
         }
         if total > budget {
+            // Reachable only when a deletion FAILED: the guard above already
+            // refused every case where the candidates could not cover the
+            // overage. Worth saying rather than assuming, because the reason is
+            // now a filesystem error and not a policy decision.
             eprintln!(
                 "{LOG_PREFIX} {total} bytes remain against a {budget} byte budget after evicting \
-                 every eligible record — the rest belongs to other live sessions or to in-flight \
-                 writes and is theirs to reclaim, not ours to destroy"
+                 every eligible record — the candidates covered the overage, so some deletion \
+                 above failed; its error is logged with the file that would not go"
             );
         }
     }
@@ -591,6 +764,9 @@ impl SpillStore {
     /// stops our own deletions from looking like somebody else's activity.
     fn collect(&self) -> SweepScan {
         let mut scan = SweepScan::default();
+        // Held for the whole walk: nothing inside it locks, and `put` — the
+        // only writer — runs on the same thread as the sweep it triggers.
+        let issued = self.issued();
         let session_dirs = match fs::read_dir(&self.root) {
             Ok(d) => d,
             Err(e) => {
@@ -642,11 +818,21 @@ impl SpillStore {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
+                // A record's file stem IS its id (`path_for`), so this asks
+                // exactly the question the eviction rule and the honesty
+                // counter mean: did WE hand this locator out? A temp has no
+                // published id and so is never ours by this test — which is
+                // correct, since nothing was ever issued for it.
+                let ours = kind == SpillKind::Record
+                    && path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|id| issued.contains(id));
                 scan.files.push(SpillFile {
                     path,
                     bytes: meta.len(),
                     modified: meta.modified().unwrap_or(UNIX_EPOCH),
-                    own_session,
+                    ours,
                     kind,
                 });
             }
@@ -657,10 +843,11 @@ impl SpillStore {
     /// Delete one file, accounting for it honestly. Returns whether it is
     /// actually gone.
     ///
-    /// Only a RECORD of our own counts as loss. An own-session temp was never
-    /// published, so no locator was ever issued for it and counting it would
-    /// make the honesty counter — and the `NotFound` message that now cites it
-    /// — lie in the other direction.
+    /// Only a record THIS PROCESS issued counts as loss. A temp of ours was
+    /// never published, and a record in our directory written by an earlier
+    /// server under the same session key was never issued BY US — counting
+    /// either would make the honesty counter, and the `NotFound` message that
+    /// cites it, lie in the other direction.
     fn drop_file(&self, f: &SpillFile, reason: &str) -> bool {
         if let Err(e) = fs::remove_file(&f.path) {
             eprintln!(
@@ -669,12 +856,12 @@ impl SpillStore {
             );
             return false;
         }
-        if f.own_session && f.kind == SpillKind::Record {
+        if f.ours {
             let n = self.dropped_own_session.fetch_add(1, Ordering::Relaxed) + 1;
             eprintln!(
-                "{LOG_PREFIX} WARNING dropped OWN-SESSION spill {} ({} bytes, reason={reason}) — \
-                 any locator already handed to the model for it is now a dead pointer \
-                 (dropped_own_session={n})",
+                "{LOG_PREFIX} WARNING dropped a spill THIS SERVER ISSUED {} ({} bytes, \
+                 reason={reason}) — any locator already handed to the model for it is now a dead \
+                 pointer (dropped_own_session={n})",
                 f.path.display(),
                 f.bytes
             );
@@ -712,6 +899,16 @@ impl SpillStore {
     /// ourselves is still judged on the activity that preceded us.
     /// ([`SpillStore::ensure_session_dir`] is the other half of the fix: a
     /// prune that is nonetheless wrong is now survivable rather than terminal.)
+    ///
+    /// A neighbour that has just passed its own `ensure_session_dir` but has
+    /// not yet created a temp is still racing us between the emptiness check
+    /// and the `remove_dir` below, and no ordering here closes that: the
+    /// filesystem offers no "remove if still empty". It is left as a race
+    /// deliberately, because the whole cost of losing it is bounded and
+    /// self-healing — that neighbour's one in-flight `put` fails, returns its
+    /// body whole (loud, truthful, uncapped for one result), and its next `put`
+    /// recreates the directory. The alternative, a lock file under the root, is
+    /// a new failure mode of its own for a race this narrow.
     fn prune_idle_session_dirs(&self, dirs: &[SessionDir], now: SystemTime) {
         for dir in dirs {
             if dir.own_session {
@@ -780,7 +977,10 @@ struct SpillFile {
     path: PathBuf,
     bytes: u64,
     modified: SystemTime,
-    own_session: bool,
+    /// A published record whose id THIS process issued — not merely a file in
+    /// our session directory. See [`SpillStore::issued`] for why the two are
+    /// different questions.
+    ours: bool,
     kind: SpillKind,
 }
 
@@ -792,7 +992,15 @@ impl SpillFile {
         if self.kind != SpillKind::Record {
             return false;
         }
-        self.own_session || now.duration_since(self.modified).unwrap_or_default() > max_age
+        // The second half is DOCUMENTATION, not behaviour: the age arm runs
+        // first, off the same `now`, and has already deleted everything past
+        // `max_age`, so the only files that reach here matching it are ones
+        // whose `remove_file` just failed and will almost certainly fail again.
+        // It stays because the rule belongs at the point of eviction — a reader
+        // asking "what may the byte bound touch?" should find the whole answer
+        // here — and because it is what keeps this predicate correct on its own
+        // terms if the arms are ever reordered.
+        self.ours || now.duration_since(self.modified).unwrap_or_default() > max_age
     }
 }
 
@@ -809,10 +1017,24 @@ pub fn default_root() -> Option<PathBuf> {
 
 /// The ambient session key, sanitized.
 ///
-/// Falls back to `pid-<pid>` outside Claude Code. Pid reuse across runs can make
-/// two unrelated processes share a directory; that is harmless — ids are unique
-/// within it, and the only consequence is that retention may evict a neighbour's
-/// record instead of its own. It is NOT worth a lock file to prevent.
+/// Falls back to `pid-<pid>` outside Claude Code. **A key is not a process
+/// identity and never was.** Three ordinary things put two `wrappers_mcp`
+/// processes on one directory: a resumed conversation keeps its
+/// `CLAUDE_CODE_SESSION_ID`, a restarted server reopens the same key, and a
+/// reused pid repeats the fallback.
+///
+/// That is survivable, but not for the reason this doc used to give. It claimed
+/// a collision was harmless because "retention may evict a neighbour's record
+/// instead of its own" — which under the current eviction rule is exactly
+/// backwards: reading a stranger's records as our own would make them
+/// *maximally* evictable (the neighbour protection would not apply) and would
+/// count their loss as ours. What actually makes a collision harmless is that
+/// neither the eviction rule nor the honesty counter keys on the directory at
+/// all: both key on [`SpillStore::issued`], the ids this process published. A
+/// colliding stranger's records are therefore treated exactly like any other
+/// neighbour's — not evictable by the byte arm, not counted as our loss,
+/// reclaimed by the age arm alone — and ids stay unique within the directory
+/// regardless. Still NOT worth a lock file to prevent.
 pub fn ambient_session_key() -> String {
     std::env::var(SESSION_ID_ENV)
         .ok()
@@ -841,6 +1063,37 @@ fn sanitize_session_key(raw: &str) -> String {
         out.clear();
     }
     out
+}
+
+/// Bound a tool name to what a header — and therefore a preview — may carry.
+///
+/// **Public because writer and reader must not disagree on a bound they
+/// share.** [`SpillStore::put`] applies it to [`SpillRecord::tool`], and
+/// `wrappers_mcp` applies the same function to the same string on the paths
+/// that render it WITHOUT going through a record: the unknown-tool error
+/// message, and the `tool=` field of the stderr metric lines. Two copies of the
+/// rule would drift; one function cannot.
+pub fn bounded_tool_name(tool: &str) -> Cow<'_, str> {
+    truncate_on_char_boundary(tool, MAX_TOOL_LEN)
+}
+
+/// Cut `value` to at most `max` BYTES on a character boundary, marking the cut.
+///
+/// Marked rather than silently shortened, for the reason the preview is marked
+/// partial: a reader must never have to infer from length alone that it is
+/// holding a fragment. The ellipsis is counted inside `max`, so the result is
+/// never longer than asked for — which is what the header bound rests on.
+fn truncate_on_char_boundary(value: &str, max: usize) -> Cow<'_, str> {
+    /// Three bytes, and reserved out of `max` rather than added to it.
+    const ELLIPSIS: &str = "…";
+    if value.len() <= max {
+        return Cow::Borrowed(value);
+    }
+    let mut cut = max.saturating_sub(ELLIPSIS.len());
+    while cut > 0 && !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Cow::Owned(format!("{}{ELLIPSIS}", &value[..cut]))
 }
 
 /// A spill id is 32 lowercase hex characters — the simple form of the UUIDv7
@@ -1290,6 +1543,166 @@ mod tests {
             "so must our own earlier records"
         );
         assert_eq!(a.dropped_own_session(), 0);
+    }
+
+    #[test]
+    fn spill_byte_bound_refuses_a_target_no_eviction_could_reach() {
+        // The ordinary two-server case, with the neighbour merely IDLE rather
+        // than large: B holds more than A's whole budget in records younger
+        // than `max_age`, so nothing A is allowed to evict can get the root
+        // under the target. Before the guard, every one of A's `put`s ran the
+        // loop to exhaustion — deleting every record A owned, counting them all
+        // as lost, and still being over budget. The store degraded to one live
+        // record at a time and every locator A handed a model died at the next
+        // oversized result, for up to `max_age`.
+        let dir = tempfile::tempdir().unwrap();
+        let body = "x".repeat(1024);
+
+        let b = SpillStore::open_with_bounds(
+            dir.path().to_path_buf(),
+            "sess-b",
+            u64::MAX,
+            DEFAULT_MAX_AGE,
+        )
+        .unwrap();
+        let neighbours: Vec<SpillRecord> = (0..4)
+            .map(|_| b.put("t", "text/plain", false, &body).unwrap())
+            .collect();
+
+        let a = SpillStore::open_with_bounds(
+            dir.path().to_path_buf(),
+            "sess-a",
+            3_000,
+            DEFAULT_MAX_AGE,
+        )
+        .unwrap();
+        let ours: Vec<SpillRecord> = (0..3)
+            .map(|_| a.put("t", "text/plain", false, &body).unwrap())
+            .collect();
+
+        for rec in &ours {
+            assert!(
+                a.read(&rec.id, 0, 16).is_ok(),
+                "a locator we issued must survive a budget no eviction of ours could reach"
+            );
+        }
+        assert_eq!(
+            a.dropped_own_session(),
+            0,
+            "and nothing was spent trying to reach it"
+        );
+        for rec in &neighbours {
+            assert!(
+                b.read(&rec.id, 0, 16).is_ok(),
+                "the neighbour's records were never ours to destroy either"
+            );
+        }
+    }
+
+    #[test]
+    fn spill_a_caller_supplied_tool_name_cannot_mint_an_unreadable_record() {
+        // `wrappers_mcp`'s unknown-tool arm spills an error body whose `tool`
+        // is the raw `name` off the JSON-RPC frame, so a 40 KB name is one
+        // `tools/call` away. Unbounded it pushed the header past
+        // `MAX_HEADER_BYTES`, and `read` then refused the record FOREVER — a
+        // locator that was a dead pointer the moment it was issued, and
+        // invisible to `dropped_own_session` because nothing had deleted it.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        let huge = "z".repeat(40 * 1024);
+        let rec = s.put(&huge, "application/json", true, "the body").unwrap();
+
+        assert!(
+            rec.tool.len() <= MAX_TOOL_LEN,
+            "tool is {} bytes",
+            rec.tool.len()
+        );
+        assert!(
+            rec.tool.starts_with("zzz") && rec.tool.ends_with('…'),
+            "a truncated field must say it was truncated: {}",
+            rec.tool
+        );
+        assert_eq!(s.read(&rec.id, 0, 64).unwrap().text, "the body");
+        assert_eq!(s.read(&rec.id, 0, 64).unwrap().record.tool, rec.tool);
+
+        // The runtime half of the `const _: () = assert!` beside the constants:
+        // every bounded field at its widest, in its most expensive form — a
+        // control character costs six bytes once `serde_json` escapes it — must
+        // still leave the header inside what `read` will buffer.
+        let widest = SpillRecord {
+            schema: SPILL_SCHEMA,
+            id: "0".repeat(32),
+            session: "z".repeat(MAX_SESSION_KEY_LEN),
+            tool: "\u{1}".repeat(MAX_TOOL_LEN),
+            content_type: "\u{1}".repeat(MAX_CONTENT_TYPE_LEN),
+            byte_len: u64::MAX,
+            created_at_ms: i64::MIN,
+            is_error: true,
+        };
+        let header = serde_json::to_string(&widest).unwrap();
+        assert!(
+            (header.len() as u64) < MAX_HEADER_BYTES,
+            "worst-case header is {} bytes against a {MAX_HEADER_BYTES} byte read bound",
+            header.len()
+        );
+    }
+
+    #[test]
+    fn spill_retention_counts_and_evicts_only_what_this_process_issued() {
+        // Two servers, one session key: a resumed conversation keeps its
+        // `CLAUDE_CODE_SESSION_ID`, a restarted server reopens the directory,
+        // and a `pid-<pid>` fallback repeats when a pid comes round again.
+        // Directory identity calls the earlier server's records ours. They are
+        // not — and reading them that way made retention destroy a stranger's
+        // still-live locator AND report the loss as this process's own, the
+        // exact lie the counter exists to prevent.
+        let dir = tempfile::tempdir().unwrap();
+        let max_age = Duration::from_secs(60);
+        let body = "x".repeat(1024);
+
+        let earlier =
+            SpillStore::open_with_bounds(dir.path().to_path_buf(), "sess-a", u64::MAX, max_age)
+                .unwrap();
+        let live = earlier.put("t", "text/plain", false, &body).unwrap();
+        let stale = earlier.put("t", "text/plain", false, &body).unwrap();
+        let live_path = earlier.session_dir().join(format!("{}.spill", live.id));
+        let stale_path = earlier.session_dir().join(format!("{}.spill", stale.id));
+        // Old enough to be the oldest candidate, young enough to be alive.
+        age_file(&live_path, 10);
+        age_file(&stale_path, 3600);
+
+        // Room for ~2 files. This process opens the SAME key.
+        let s = SpillStore::open_with_bounds(dir.path().to_path_buf(), "sess-a", 2_600, max_age)
+            .unwrap();
+        let first = s.put("t", "text/plain", false, &body).unwrap();
+
+        assert!(
+            !stale_path.exists(),
+            "the age arm reclaims it, as it should"
+        );
+        assert_eq!(
+            s.dropped_own_session(),
+            0,
+            "but sweeping a record this process never issued is not this process's loss"
+        );
+
+        let second = s.put("t", "text/plain", false, &body).unwrap();
+        assert!(
+            live_path.exists(),
+            "a live stranger on our session key is a neighbour, not a candidate"
+        );
+        assert_eq!(
+            s.read(&first.id, 0, 16).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "we make room out of what we actually issued"
+        );
+        assert!(s.read(&second.id, 0, 16).is_ok());
+        assert_eq!(s.dropped_own_session(), 1);
+
+        // And the message must not blame our retention for an id we never
+        // handed out — the same lie, pointed the other way.
+        let msg = s.read(&stale.id, 0, 16).unwrap_err().to_string();
+        assert!(msg.contains("never issued"), "{msg}");
     }
 
     #[test]
