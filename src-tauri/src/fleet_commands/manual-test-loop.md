@@ -81,6 +81,7 @@ which is exactly what Element 5 is for.
 **Termination checks (run before implementation, PRIMARY stops first, BACKSTOP last):**
 
 - If status is `NO_DEFICIENCIES` → exit loop, go to "Clean run confirmation" below.
+- If the remaining deficiencies cannot clear until an **observable** condition does (a deploy going green, a migration reaching head, a rebuilt runner becoming the serving build) → that is a BLOCK, not a stall. Run `/blocked` to register the typed coord gate FIRST, then exit and report naming the `gate_id`. Checked before the stall rule because a block presents as one. An unmerged PR is **not** a blocker here — the next iteration tests the branch.
 - If `fingerprint` matches the **previous** iteration's fingerprint → no-progress stall. Surface the stalled plan, exit loop, report.
 - If `ITER > MAX_ROUNDS` (default 12, arg-overridable via `--max-rounds=N`) → **hard-ceiling backstop**. This should almost never fire — if it does, a stall normally would have caught it first. Exit loop and emit the structured escalation handoff (see "Hard-ceiling handoff" under Termination Conditions). Don't keep looping.
 - If this iteration is about to end on a `bailout`- or ungated-`user_deflection`-shaped final paragraph (see "Turn-ending classification") → **you are not done**. Run the next iteration, or register the typed coord gate via `/blocked` first. Never stop here silently.
@@ -188,17 +189,18 @@ Full contract: `qontinui-runner/src-tauri/src/mcp/test_fixtures.rs` module docs.
 
 ## Termination Conditions
 
-The loop ends on (the first four are PRIMARY; the hard ceiling is a BACKSTOP):
+The loop ends on (1–4 and 6 are PRIMARY; the hard ceiling is a BACKSTOP):
 
 1. **Clean run** — two consecutive `NO_DEFICIENCIES` reports. **Primary success condition.**
 2. **No-progress stall** — two consecutive iterations with identical remediation fingerprints. Report the persistent set and stop. (Often means a fix didn't take; the next session will need to diagnose.)
 3. **Repeated hook failure** — same pre-commit hook failure surfaced twice with no obvious env fix. Surface the failure verbatim and exit; do not power through.
 4. **Operator interrupt** — never block on operator input, but if the operator cancels the run, release any coord claims acquired and exit cleanly.
 5. **Hard-ceiling backstop** — `ITER` exceeds `MAX_ROUNDS` (default 12, arg-overridable). Should almost never fire; if it does, the loop is not converging and a stall normally would have caught it. Exit and emit the **Hard-ceiling handoff** below. This is `stop_and_report` — do NOT turn it into an `AskUserQuestion` unless it hits the autonomous-default carve-outs (operator-resource need / observed security anomaly / oversize-plan handoff), per the `implementation-priorities` memory — which supersedes the coord-deploy-or-migration carve-out in `feedback_mtc_loop_autonomous_default`: deploys and migrations proceed autonomously when their documented checks pass.
+6. **Blocked on an observable condition** — the remaining deficiencies cannot clear until a deploy goes green, a migration reaches head, or a rebuilt runner becomes the serving build. Register the typed coord gate via `/blocked` FIRST, then exit and emit the handoff naming the `gate_id`. Evaluated before conditions 2 and 5, because a block presents as either a stall or a non-converging ceiling. **An unmerged PR is not this** — the next iteration tests the branch, so the merge train is never a reason to stop.
 
 ### Turn-ending classification
 
-None of conditions 1–5 reads what an iteration SAID — they watch deficiency counts, fingerprints,
+None of conditions 1–6 reads what an iteration SAID — they watch deficiency counts, fingerprints,
 iteration counts, hook output and the operator. This one watches the loop's **prose**, because the
 failure none of them can see is the iteration that quietly gives up. The stall rule compares iteration N against N+1, and a bail ends the loop
 before N+1 exists, so the last ledger row reads `HAS_DEFICIENCIES` forever and the run looks merely
@@ -232,14 +234,34 @@ is not done: either run the next iteration, or register a typed coord gate via `
 blocker is an observable condition. Do not implement a re-prompt loop off this verdict; acting on it
 automatically is gated behind the runner detector's shadow-corpus review.
 
+**Emit-on-block — a stall or the hard ceiling is sometimes a BLOCK, not an absence of progress.**
+Before you emit the handoff, ask what the loop is actually waiting on. If the remaining deficiencies
+cannot clear until some **observable** condition changes — a deploy going green, a migration
+reaching head, a rebuilt runner becoming the serving build, an upstream fix landing — then this is
+not "no progress", it is *blocked on an observable condition*, and you **MUST** invoke `/blocked` to
+register the typed coord gate **BEFORE** you stop. Then emit the handoff as usual, naming the
+registered `gate_id`. If the blocker has no observable trigger, say so — that case is NOT a gate
+(see `/blocked`).
+
+**The one condition that is never a blocker here is the one you will reach for first: an unmerged
+PR.** The next test-and-plan subagent tests the BRANCH, so waiting on the merge train is the
+built-in legitimate `waiting_on_signal` described above, not a gate — run the next iteration. Gate
+only what actually stops the branch from being testable.
+
+Emit-on-block is **in addition to** the stall/ceiling handoff, not a replacement, and it is a
+**separate trigger from the `bailout` arm above**. That arm cannot cover it: an iteration that stops
+on a real signal classifies as `waiting_on_signal`, which is *legitimate* by construction, so the
+bailout check waves it through. Ungated, it is still an unwatched blocked item.
+
 ### Hard-ceiling handoff
 
 When the loop exits on the hard-ceiling backstop, emit this structured handoff (assembled mechanically from `LEDGER` — do not re-derive it):
 
 ```
-## manual-test-loop escalation — hard-ceiling backstop (non-converging)
+## manual-test-loop escalation — <hard-ceiling backstop (non-converging) | blocked on an observable condition>
 
 - Iterations run: <N> / <MAX_ROUNDS>
+- Registered gate: <gate_id from /blocked, or "none — blocker has no observable trigger">
 - Current failing signal: <the persistent deficiency set / fingerprint still present>
 - Per-iteration ledger:
   iter=1 defs=12 fp=abc123… status=HAS_DEFICIENCIES ending=complete
@@ -290,6 +312,7 @@ Do NOT regenerate per-iteration plans, transcripts, or evaluations — those liv
 - **NEVER let one iteration's transcript leak into the next** — the test-and-plan subagent returns a fingerprint + table, not narration. If a subagent returns a multi-page transcript, summarize it down to the contract above in the main session before continuing.
 - **Always ship after committing, but NEVER to the default branch directly** — per the autonomous-commit-ship feedback there's no "ready to push?" gating, but shipping means branch-first → push the branch → open the PR — and stop there. Coord is the sole merge authority for `qontinui/*` repos; the loop never merges its own PRs ([[feedback_no_direct_pushes_to_main_loops_use_branches]]). See the commit subagent's branch-first contract above.
 - **Never end an iteration on a `bailout`- or ungated-`user_deflection`-shaped final paragraph** — record the `ending` in the ledger, then either run the next iteration or register a typed coord gate via `/blocked`. A loop that stops on a person nobody asked is an ungated blocked item, which policy forbids outright.
+- **Never stop on an observable blocker without registering a gate** — if the deficiencies can't clear until a deploy goes green or a migration reaches head, run `/blocked` BEFORE stopping and name the `gate_id` in the handoff. The `bailout` check will not catch this one: waiting on a real signal is `waiting_on_signal`, which is legitimate — what makes it a defect is stopping there ungated. An unmerged PR is not such a blocker; the next iteration tests the branch.
 - **Always release coord claims on exit** — try/finally semantics, even on abort.
 
 ## Focus

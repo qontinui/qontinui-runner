@@ -1,6 +1,6 @@
 ---
 name: coord-pr-label
-description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, blocked/experimental flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace before sending; tenant resolved automatically from your agent's worktree.
+description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, blocked/experimental flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing gh pr edit is diagnosed rather than relayed); tenant resolved automatically from your agent's worktree.
 user-invocable: true
 ---
 
@@ -38,14 +38,25 @@ fires, so invalid labels never make it to GitHub or coord.
   two green PRs with a declared edge land in dependency order,
   unattended.
   ℹ️ **The coord-landed-parent hole is CLOSED** (2026-08-07). It used to be
-  real: an ff-land closes the parent `merged:false`, so GitHub emits no merge
-  event, the webhook-gated strip never fired, and `downstream-of` is invisible
-  to the edge table besides — the child kept a satisfied label and sat `CLEAN`
-  and unproposed, runner#801 for 7 days. Two triggers close it now: a strip hook
-  on coord's own land path, plus a reconciler sweep for any pre-existing
+  real: an ff-land closes the parent without ever producing the close cause the
+  strip was keyed on. On the **sha-rewriting** shape GitHub emits no merge event
+  at all; on the **sha-preserving** shape it does, but the webhook path stamps
+  `close_cause = 'merged'`, never `commits_landed_via_other_pr` — so the
+  webhook-gated strip never fired on **either** shape, and `downstream-of` is
+  invisible to the edge table besides. The child kept a satisfied label and sat
+  `CLEAN` and unproposed, runner#801 for 7 days. Which shape runner#801 ran on
+  was not determined, and it does not matter — **do not rule out a recurrence on
+  shape grounds** (`knowledge-base/qontinui-specific/coord-merge-train.md`; the
+  two-shape model is `coord-ff-lands.md`). Two triggers close it now: a strip
+  hook on coord's own land path, plus a reconciler sweep for any pre-existing
   backlog. **If you see it recur, do not diagnose it from
-  `repo_branches.close_cause`**, which is sticky and reads
-  `commits_landed_via_other_pr` either way — and say so, because a recurrence
+  `repo_branches.close_cause`** — it is sticky (nothing in coord ever clears it)
+  and it is stamped by non-webhook writers regardless, so a post-hoc read shows
+  *a land cause* — `commits_landed_via_other_pr`, or `merged` where the webhook
+  won the first-writer race on the sha-preserving shape — **whether or not the
+  strip trigger ever fired**; either way the row cannot tell the two apart. Read
+  the reconciler metrics in
+  the order `coord-merge-train.md` gives instead. Say so, because a recurrence
   now is a defect in one of the triggers rather than the known hole. Detail:
   `knowledge-base/qontinui-specific/coord-merge-train.md`.
 - **Pinning a required tag**: `coord:requires-tag=ts-v*`.
@@ -331,7 +342,14 @@ it, run `gh pr edit <pr> --remove-label "<label>"`.
   and only one of them is a missing label.
   1. **The label was never created.** Dynamic-value labels do not exist until
      someone makes them: run `gh label create "<label>" --repo <owner>/<name>`
-     once, then re-run the skill.
+     once, then re-run the skill. **You should not have to look that up here** —
+     having already cleared the ceiling, `set-label.sh` knows a `'<label>' not
+     found` at this point can only be case 1, so it relays gh's own line and
+     then prints the exact `gh label create` command underneath it. It prints
+     the command rather than running it: creating a label changes the repo's
+     label set for every future PR, which is not what you asked this skill to
+     do. The match requires gh to have NAMED the label, so an unresolvable repo
+     or PR — which fails with the same two words — does not collect the advice.
   2. **The label is over 50 characters**, so it *cannot* exist —
      `gh label create` rejects it with
      `HTTP 422 ... name is too long (maximum is 50 characters)`, and creating
@@ -339,9 +357,16 @@ it, run `gh pr edit <pr> --remove-label "<label>"`.
      with an explicit length error before `gh` is reached, so a genuine
      overflow should no longer land you on case 1's advice — if you do see the
      raw gh error for an over-length label, the pre-flight was bypassed (label
-     set by hand, or an older copy of the script).
+     set by hand, or an older copy of the script). The two arms are
+     complementary: the ceiling check catches case 2 *before* the call, and the
+     diagnosis above catches case 1 *after* it, so neither cause reaches you as
+     a bare `'<label>' not found`.
 - **`gh` CLI unauthenticated** — `gh auth status` first; skill bubbles
-  up the auth error from gh.
+  up the auth error from gh. It bubbles up everything else gh says too, on
+  success as well as failure: `set-label.sh` captures gh's stderr in order to
+  answer the one failure above, and re-emits it verbatim on every path, so
+  routine notices (`A new release of gh is available`, deprecation and
+  auth-scope warnings) are not eaten by the diagnosis.
 - **Coord unreachable** — gh-side label add succeeds (GitHub is the
   canonical state), but `coord.pr_labels` will be out of sync until
   the reconciler watcher (Phase 1 D1.5) catches up on its next tick.
@@ -357,7 +382,18 @@ it, run `gh pr edit <pr> --remove-label "<label>"`.
   reached even that (the shadow itself is asserted first, so "no record" is not
   vacuous). The 50/51-character boundary cases are anchored by asserted length,
   so a repo rename fails the test loudly instead of quietly sliding the corpus
-  off the edge it tests.
+  off the edge it tests. One later section deliberately *does* reach a (second)
+  stub gh, to pin the diagnosis above: that the label-not-found shape names
+  `gh label create`; that neither an unrelated failure nor a bare `not found`
+  which never named the label collects that advice; that gh's own stderr
+  survives being answered on every path, success included; and that gh's stdout
+  still lands on stdout. The success case captures the two streams separately,
+  because a merged capture cannot tell the fd ordering apart at all — under the
+  reversed spelling gh's stderr leaks to the real stdout instead of being
+  captured, and the merged text is identical either way. Every case also asserts
+  that the stub was actually invoked, so a regression that exits before `gh` is
+  reached fails loudly instead of satisfying the negative assertions by never
+  running.
 
 ## See Also
 

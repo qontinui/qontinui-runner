@@ -1907,6 +1907,31 @@ A pass is only *passing* if all of these hold:
   (`reference_stale_primary_checkout_causes_phantom_dead_code_findings`).
 - **A shipped fix is not a serving fix.** Verify a coord fix is live by ECS task-def image
   tag, never by a green deploy run — coord's push-deploys debounce and silently no-op.
+  The debounce reports the run **`success`** while rolling nothing, so `Deploy coord:
+  success` is not evidence a change is SERVING: measured 2026-08-24 on coord `b0a6a114`,
+  the run concluded `success` while containing a job literally named **`Deploy SKIPPED
+  (spacing gate — no rollout)`** — also `success` — with `Build, push, and roll coord →
+  skipped`, and **two landed commits were absent from the serving build**. The read that
+  actually answers it:
+
+  ```
+  aws ecs describe-services --cluster qontinui-staging --services coord \
+    --region us-east-1 --query 'services[0].taskDefinition' --output text
+  aws ecs describe-task-definition --task-definition <that> --region us-east-1 \
+    --query 'taskDefinition.containerDefinitions[*].image' --output text
+  ```
+
+  The image tag is the serving sha — compare it to `origin/main`. ⚠️ **The cluster is in
+  `us-east-1`**; querying `eu-central-1` returns `ClusterNotFoundException`, which reads
+  like an outage rather than a wrong region. Do not carry a region over from a neighbouring
+  runbook — the fleet's SSM/Cognito reads (`.claude/commands/babysit-prs.md`,
+  `.claude/commands/merge-train-steward.md`) use `eu-central-1`, and this cluster is the
+  exception. Same read, stated as a rule, in
+  `.claude/commands/merge-train-steward.md` → the honest-bookkeeping step. The
+  serving-image surface is also discussed above under the reaper-inertness preconditions
+  (`ecs-image-stale` / `coord_query_release_state` / `drift_class`) — that discussion is
+  about whether a RESTART may have reset a counter; this bullet is about whether the fix
+  you shipped is running at all.
 - **The failure NOT to repeat, stated precisely:** a targeted fix shipped, was declared
   *"output-verified"* against a **single two-item observation**, and the population it exists
   to drain grew by 568 over the next five days. Never declare a reaper healthy from a point

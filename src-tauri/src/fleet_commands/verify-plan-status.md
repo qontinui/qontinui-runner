@@ -25,7 +25,8 @@ a session launched outside the runner will not have them.
 > *(plan `2026-08-16-plan-corpus-authority-and-run-provenance`, D2/D3 — canonical
 > statement in `CLAUDE.md` -> "Plan corpus authority").* Discovery, search and
 > selection resolve against `agent.work_artifacts` behind qontinui-web; the
-> shipped runner scanner flows filesystem edits INTO it. So:
+> shipped runner scanner flows filesystem edits INTO it (the half that writes
+> *this* layer is opt-in — see the population caveat below). So:
 >
 > * **`$QONTINUI_PLANS_DIR` being unset is NOT an error and NOT a dead end.** It
 >   is a supported configuration — a tenant may author entirely through the web
@@ -33,6 +34,20 @@ a session launched outside the runner will not have them.
 >   instead of asking the operator to invent a path.
 > * **`qontinui-dev-notes` is this fleet's OPTIONAL export target**, never a
 >   requirement. No tenant needs a git repo to author, vet or ship a plan.
+> * **A corpus that ANSWERS is not a corpus that is POPULATED.** The scanner
+>   flows filesystem edits into the operational layer (`coord.work_units`)
+>   whenever a plans dir and a coord base resolve, but the **body sync** that
+>   fills the document layer (`body_push.rs` -> `agent.work_artifacts`) is
+>   **opt-in** — built only under `QONTINUI_PLAN_LIBRARY_SYNC=1`, and gated
+>   again per cycle on the tenant's `plan_capture` dial. **Either missing is a
+>   silent no-op**, so a `200` carrying an empty list is **UNKNOWN, not "no
+>   such plan"**: treat any zero-result corpus read as UNKNOWN unless you have
+>   positively confirmed the body sync is on for this device.
+> * **Do not probe by stem with `q`.** `GET /api/v1/plan-library?q=` matches
+>   **title and body, NOT the slug**, so a by-stem `q` probe returns a false
+>   negative for a plan that IS present. The exact door is
+>   `?kind=plan&work_unit_slug=<stem>`; failing that, page `?kind=plan&limit=200`
+>   and match `slug` yourself.
 > * **When qontinui-web is unreachable**, read the local degraded-mode cache:
 >   `$QONTINUI_PLAN_CACHE_DIR` (default `C:/claude/plan-corpus-cache/`) —
 >   `PLANS-CACHE.md` for the index, `bodies/<kind>__<slug>.md` for bodies.

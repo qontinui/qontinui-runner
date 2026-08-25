@@ -72,6 +72,26 @@ silently give up. Only escalate to an interactive `AskUserQuestion` for: (1) a *
 (2) a fix needing a **coord deploy / web deploy / DB migration**, or (3) a **genuinely-surprising
 finding** that makes continuing autonomously reckless.
 
+**Emit-on-block — a stall or a cap is sometimes a BLOCK, not an absence of progress.** Before you
+emit the handoff, ask what the recursion is actually waiting on. If the remaining failures cannot
+clear until some **observable** condition changes — a deploy or CI run going green, a PR merging, a
+migration reaching head, a rebuilt runner becoming the serving build, an upstream fix landing —
+then this is not "no progress", it is *blocked on an observable condition*, and you **MUST** invoke
+`/blocked` to register the typed coord gate **BEFORE** you stop. Then emit the handoff as usual,
+naming the registered `gate_id`. If the blocker has no observable trigger, say so — that case is
+NOT a gate (see `/blocked`).
+
+**This loop needs the gate more than any other in the roster.** Every other loop stops with a live
+session still holding the context; this one hands each iteration to a freshly-spawned session, so an
+iteration that ends without recursing simply never happens again and there is nobody left to notice
+the blocker cleared. The registered gate is the *only* artifact that outlives the recursion.
+
+It is **in addition to** the cap/stall handoff, not a replacement, and it is a **separate trigger
+from the `bailout` arm above**. That arm cannot cover it: an iteration that stops on a real signal
+classifies as `waiting_on_signal`, which the five-ending table calls *legitimate*, so the bailout
+check waves it through by design. Ungated, it is still an unwatched blocked item — the thing
+`dependency-wait-and-resume` forbids ending a session on.
+
 ## Usage
 
 ```
@@ -165,15 +185,22 @@ Then decide, **in this order** (PRIMARY stops first, BACKSTOP last):
 
 1. **No issues found?** (all states navigated successfully, no errors) → status `SUCCESS`. Report
    success and stop the loop.
-2. **Stall?** — this iteration's fingerprint equals the previous iteration's (carried in the
+2. **Blocked on an observable condition?** — the remaining failures cannot clear until a deploy/CI
+   run goes green, a PR merges, a migration reaches head, or another watchable thing happens →
+   invoke `/blocked` to register the typed coord gate **first**, then stop and emit the Escalation
+   Handoff naming the `gate_id`. Checked here, ahead of stall and cap, because a block usually
+   *presents* as one of them: the same files, the same failed navigations, iteration after
+   iteration. Do NOT spawn another iteration in the hope the condition clears — the gate is what
+   watches for that, and this loop leaves no live session that could.
+3. **Stall?** — this iteration's fingerprint equals the previous iteration's (carried in the
    recursive prompt) → status `STALL`. Stop and emit the Escalation Handoff (below). Do NOT spawn
    another iteration — the same fix on the same files left the same failure.
-3. **Cap reached?** — `ITERATION >= 10` (or `--max-rounds=N`) → status `CAP_REACHED`. Stop and emit
+4. **Cap reached?** — `ITERATION >= 10` (or `--max-rounds=N`) → status `CAP_REACHED`. Stop and emit
    the Escalation Handoff (below).
-4. **About to end on a `bailout` or an ungated `user_deflection`?** → you are not done. Spawn the
+5. **About to end on a `bailout` or an ungated `user_deflection`?** → you are not done. Spawn the
    next iteration, or register the typed coord gate via `/blocked` if the blocker is observable.
    Never stop here silently — this loop has no live session left to catch it.
-5. **Security / coord-deploy-or-migration / surprising finding?** → escalate via `AskUserQuestion`.
+6. **Security / coord-deploy-or-migration / surprising finding?** → escalate via `AskUserQuestion`.
 
 Otherwise (**fixes were made, no stall, under the cap**), trigger a new Claude Code session to
 continue. Use the `mcp__qontinui__trigger_ai_analysis` tool with the prompt below — carry forward
@@ -191,7 +218,7 @@ LEDGER (carry forward, append your row):
 Previous iteration made these fixes:
 - {LIST_OF_FIXES_MADE}
 
-Continue verifying the automation. If all states navigate successfully with no errors, report success and stop. Otherwise apply the Loop Bounds: append a ledger row (including its `ending` column), detect stall (fingerprint == PREV_FINGERPRINT) and the iteration cap, and escalate per the Escalation Handoff if either fires. Do not end this iteration on a `bailout`- or ungated-`user_deflection`-shaped final paragraph: recurse, or register a coord gate via `/blocked` first.
+Continue verifying the automation. If all states navigate successfully with no errors, report success and stop. Otherwise apply the Loop Bounds: append a ledger row (including its `ending` column), detect stall (fingerprint == PREV_FINGERPRINT) and the iteration cap, and escalate per the Escalation Handoff if either fires. If the remaining failures cannot clear until an observable condition does (a deploy or CI run going green, a PR merging, a migration reaching head), that is a BLOCK, not a stall: run `/blocked` to register the typed coord gate BEFORE stopping and name the `gate_id` in the handoff — do not spawn another iteration hoping it clears, because this loop leaves no live session to notice that it did. Do not end this iteration on a `bailout`- or ungated-`user_deflection`-shaped final paragraph: recurse, or register a coord gate via `/blocked` first.
 ```
 
 ### Escalation Handoff
@@ -200,9 +227,10 @@ When you stop on STALL or CAP_REACHED, emit this structured handoff (assembled m
 `LEDGER` — do not re-derive it), then stop:
 
 ```
-## recursive-automation escalation — <iteration-cap reached | no-progress stall>
+## recursive-automation escalation — <iteration-cap reached | no-progress stall | blocked on an observable condition>
 
 - Iterations run: <N> / <MAX>
+- Registered gate: <gate_id from /blocked, or "none — blocker has no observable trigger">
 - States: {states_list}
 - Current failing signal: <the error(s)/failed navigations still present, with the error signature>
 - Per-round ledger:
@@ -256,6 +284,8 @@ Instructions:
    - No errors → report success and stop
    - fingerprint == PREV_FINGERPRINT → STALL → emit Escalation Handoff and stop (do NOT recurse)
    - ITERATION >= MAX_ROUNDS → CAP_REACHED → emit Escalation Handoff and stop
+   - blocked on an observable condition (deploy/CI green, PR merge, migration at head) → register the
+     typed coord gate via /blocked FIRST, then emit the Escalation Handoff naming the gate_id and stop
    - ending is bailout / ungated user_deflection → NOT done: recurse, or register a coord gate via /blocked
    - security / coord-deploy-or-migration / surprising finding → AskUserQuestion
 6. Otherwise (errors found, no stall, under cap): fix them, restart services, then trigger another
@@ -272,6 +302,7 @@ Use trigger_ai_analysis to spawn the next iteration with this same prompt templa
 - **ALWAYS** use trigger_ai_analysis for recursion (NOT write_prompt)
 - **ALWAYS** append a ledger row per iteration (including its `ending`) and carry the LEDGER + fingerprint forward in the recursive prompt
 - **NEVER** end an iteration on a `bailout`- or ungated-`user_deflection`-shaped final paragraph — recurse, or register a typed coord gate via `/blocked` first. This loop has no live session left to notice a silent stop
+- **NEVER** stop on an observable blocker without registering a gate — if the failures can't clear until a deploy goes green, a PR merges or a migration reaches head, run `/blocked` to register the typed coord gate BEFORE stopping, and name the `gate_id` in the handoff. The `bailout` check will not catch this one: waiting on a real signal is `waiting_on_signal`, which is legitimate — what makes it a defect is stopping there ungated, and here the gate is the only artifact that outlives the recursion
 - **NEVER** ask the user to check things manually on routine work — the ONLY exceptions are the escalation carve-outs (security anomaly / coord-deploy-or-migration / genuinely-surprising finding), which use `AskUserQuestion`
 - **STOP** when all navigations succeed with no errors
 - **STALL (PRIMARY stop)**: if an iteration's fingerprint matches the previous iteration's, stop and emit the Escalation Handoff — do NOT spawn another iteration

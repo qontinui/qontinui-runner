@@ -526,10 +526,20 @@ $evalBody = @{
 } | ConvertTo-Json -Compress
 $r = Invoke-RestMethod -Uri 'http://127.0.0.1:9876/ui-bridge/control/page/evaluate' `
      -Method Post -ContentType 'application/json' -Body $evalBody -TimeoutSec 60
-$jwt = ([string]$r.data.result.value).Trim()
+# `data.value`, NOT `data.result.value`. The runner unwraps the frontend's
+# `result` envelope before it reaches HTTP (qontinui-runner
+# `ui_bridge/page.rs` -> `Ok(resp.result.unwrap_or(...))`), so the live answer is
+# {"success":true,"data":{"value":"<jwt>","type":"scalar"}} with no `result` key.
+# The old path read $null off a HEALTHY runner and then threw 'signed out?' —
+# telling the operator to sign in a runner that was already holding a valid
+# token. Fallback kept so this resolves against either envelope.
+$jwt = [string]$r.data.value
+if (-not $jwt -and $r.data.result) { $jwt = [string]$r.data.result.value }
+$jwt = $jwt.Trim()
 # Shape-check before trusting it: a SIGNED-OUT runner answers 200 with an empty
 # or non-token value, and sending that as a bearer turns a missing credential
-# into a 401 the caller then has to decode.
+# into a 401 the caller then has to decode. Reaching this with an EMPTY $jwt now
+# means the runner really did answer without a token, not that the read missed.
 if ($jwt.Split('.').Count -ne 3) { throw 'runner returned a non-JWT (signed out?)' }
 Invoke-RestMethod -Uri 'https://coord.qontinui.io/coord/work-units/upsert' -Method Post `
   -Headers @{Authorization="Bearer $jwt"} -ContentType 'application/json' `

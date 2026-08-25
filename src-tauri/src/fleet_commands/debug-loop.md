@@ -83,6 +83,23 @@ migration**, or (3) a **genuinely-surprising finding** that makes continuing aut
 For routine cap/stall, just emit the handoff and stop — do not ask the user to restart services or
 look at a log.
 
+**Emit-on-block — a stall or a cap is sometimes a BLOCK, not an absence of progress.** Before you
+emit the handoff, ask what the loop is actually waiting on. If the remaining error cannot clear
+until some **observable** condition does — a deploy or CI run going green, a PR merging, a
+migration reaching head, a rebuilt runner becoming the serving build, an upstream fix landing —
+then this is not "no progress", it is *blocked on an observable condition*, and you **MUST** invoke
+`/blocked` to register the typed coord gate **BEFORE** you stop. That turns the blocker into a
+durable, tenant-scoped, fleet-wide watched gate that auto-resumes or notifies on clearance, instead
+of a report that dies with this session. Then emit the handoff as usual, naming the registered
+`gate_id`. If the blocker has no observable trigger, say so — that case is NOT a gate (see
+`/blocked`).
+
+This is **in addition to** the cap/stall handoff, not a replacement, and it is a **separate trigger
+from the `bailout` arm above**. That arm cannot cover it: a round that stops on a real signal
+classifies as `waiting_on_signal`, which the five-ending table calls *legitimate*, so the bailout
+check waves it through by design. Ungated, it is still an unwatched blocked item — the thing
+`dependency-wait-and-resume` forbids ending a session on.
+
 ## Instructions
 
 ### Step 1: Check Logs for Errors
@@ -157,15 +174,20 @@ Then run the termination checks **in this order** (PRIMARY stops first, BACKSTOP
    ```
    [TASK_COMPLETE]
    ```
-2. **Stall?** — this round's fingerprint equals the previous round's → status `STALL`. Stop and
+2. **Blocked on an observable condition?** — the remaining error cannot clear until a deploy/CI run
+   goes green, a PR merges, a migration reaches head, or another watchable thing happens → invoke
+   `/blocked` to register the typed coord gate **first**, then stop and emit the Escalation Handoff
+   naming the `gate_id`. Checked here, ahead of stall and cap, because a block usually *presents* as
+   one of them: the same files, the same error, round after round.
+3. **Stall?** — this round's fingerprint equals the previous round's → status `STALL`. Stop and
    emit the Escalation Handoff (below). Do not loop again — the same fix on the same files left
    the same error, so another identical round won't help.
-3. **Cap reached?** — `round >= MAX_ROUNDS` → status `CAP_REACHED`. Stop and emit the Escalation
+4. **Cap reached?** — `round >= MAX_ROUNDS` → status `CAP_REACHED`. Stop and emit the Escalation
    Handoff (below).
-4. **About to end on a `bailout` or an ungated `user_deflection`?** → you are not done. Fix the next
+5. **About to end on a `bailout` or an ungated `user_deflection`?** → you are not done. Fix the next
    error, or register the typed coord gate via `/blocked` if the blocker is observable. Never stop
    here silently.
-5. **Security / coord-deploy / surprising finding?** → escalate via `AskUserQuestion` per the
+6. **Security / coord-deploy / surprising finding?** → escalate via `AskUserQuestion` per the
    carve-outs in "Loop Bounds".
 
 Otherwise (errors remain, no stall, under the cap): go back to Step 2 and fix the next error.
@@ -176,9 +198,10 @@ When you stop on STALL or CAP_REACHED, emit this structured handoff (assembled m
 `LEDGER` — do not re-derive it):
 
 ```
-## debug-loop escalation — <round-cap reached | no-progress stall>
+## debug-loop escalation — <round-cap reached | no-progress stall | blocked on an observable condition>
 
 - Rounds run: <N> / <MAX_ROUNDS>
+- Registered gate: <gate_id from /blocked, or "none — blocker has no observable trigger">
 - Current failing signal: <the error(s) still present, with the error signature>
 - Per-round ledger:
   round=1 action=<…> delta=<…> fp=<…> status=<…> ending=<…>
@@ -201,6 +224,11 @@ Then stop. Do NOT output `[TASK_COMPLETE]` — the loop did not succeed.
 - **Output `[TASK_COMPLETE]`** only when ALL errors are fixed — never on a STALL or CAP_REACHED stop
 - **The loop is bounded** — record a ledger row per round, stop on stall (PRIMARY) or `MAX_ROUNDS`
   (BACKSTOP), and emit the Escalation Handoff rather than looping silently or giving up silently
+- **NEVER stop on an observable blocker without registering a gate** — if the error can't clear
+  until a deploy goes green, a PR merges or a migration reaches head, run `/blocked` to register the
+  typed coord gate BEFORE stopping, and name the `gate_id` in the handoff. The `bailout` check will
+  not catch this one: waiting on a real signal is `waiting_on_signal`, which is legitimate — what
+  makes it a defect is stopping there ungated
 - **Classify how each round ENDED** (`ending` column) — a `bailout` or an ungated `user_deflection`
   means the loop is not done; finish the item or register a coord gate via `/blocked`
 

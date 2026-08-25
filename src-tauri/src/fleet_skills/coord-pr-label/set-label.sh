@@ -386,8 +386,64 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 echo "step 1/2: gh pr edit $REPO #$PR --add-label \"$LABEL\""
-if ! gh pr edit "$PR" --repo "$REPO" --add-label "$LABEL"; then
-  echo "error: gh pr edit failed" >&2
+
+# gh's stderr is CAPTURED rather than let straight through, so that a
+# `'<label>' not found` can be answered here instead of left for the caller to
+# mis-read. It is re-emitted verbatim first: gh's own wording is the evidence
+# for anything added below it, and swallowing it would trade one bad diagnostic
+# for another.
+#
+# `2>&1 1>&3` is order-sensitive. Inside `$( )` stdout is the capture pipe, so
+# stderr is pointed at that pipe FIRST and stdout is then restored to the real
+# one through the saved fd -- which is why gh's success output (the PR URL)
+# still reaches the terminal. Writing `1>&3 2>&1` captures stdout and leaks
+# stderr, i.e. exactly backwards.
+#
+# The fd is allocated by bash (`{gh_out}`) rather than hardcoded as 3: a literal
+# `exec 3>&1` clobbers whatever the caller had on fd 3, and `exec 3>&-` then
+# CLOSES it rather than restoring it. Nothing invokes this script that way
+# today, but the automatic form costs nothing and cannot.
+GH_RC=0
+exec {gh_out}>&1
+GH_STDERR="$(gh pr edit "$PR" --repo "$REPO" --add-label "$LABEL" 2>&1 1>&"$gh_out")" || GH_RC=$?
+exec {gh_out}>&-
+
+# Re-emitted on BOTH paths, before anything is decided about it. Capturing gh's
+# stderr in order to answer ONE failure must not silently eat what it says the
+# rest of the time: gh writes to stderr on SUCCESS too -- the
+# `A new release of gh is available` notice, deprecation and auth-scope warnings
+# -- and swallowing those would be this change committing the same offence it
+# exists to fix, one path over.
+if [[ -n "$GH_STDERR" ]]; then
+  printf '%s\n' "$GH_STDERR" >&2
+fi
+
+if (( GH_RC != 0 )); then
+  echo "error: gh pr edit failed (exit $GH_RC)" >&2
+
+  # SKILL.md, "Failure modes": `'<label>' not found` has TWO causes, and they
+  # are indistinguishable in gh's output. By this line the label has already
+  # cleared the ceiling check above, so cause 2 (over 50 characters, therefore
+  # uncreatable) is RULED OUT -- what is left is provably cause 1, a
+  # dynamic-value label nobody has created yet. This script is the only thing
+  # in the loop that knows which half the caller is in; #318 closed the length
+  # half without ever saying so at the point of failure.
+  #
+  # Matched on the label being NAMED, not on "not found" alone: gh uses the
+  # same two words for an unresolvable repo or PR, and blanket-appending
+  # create-the-label advice to those would re-signpost the caller wrongly in
+  # the other direction.
+  #
+  # It prints the command rather than running it. Creating a label mutates the
+  # repo's label set for every future PR, which is not what `set-label.sh` was
+  # asked to do, and it is a one-time act a human should see.
+  if [[ "$GH_STDERR" == *"'$LABEL'"* && "$GH_STDERR" == *"not found"* ]]; then
+    echo "       \"$LABEL\" is ${#LABEL} characters, within GitHub's ${GH_LABEL_MAX}-character ceiling," >&2
+    echo "       so this is NOT the length cause -- the label just does not exist in" >&2
+    echo "       $REPO yet. Dynamic-value labels are never created on demand:" >&2
+    echo "         gh label create \"$LABEL\" --repo $REPO" >&2
+    echo "       then re-run this command." >&2
+  fi
   exit 3
 fi
 echo "ok: gh added label \"$LABEL\" to $REPO#$PR"

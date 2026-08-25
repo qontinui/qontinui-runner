@@ -251,8 +251,10 @@ Read coord's own honest view — no new observability:
   **`confidence`** (`fresh|stale|unknown`), **`last_verified_at`**, `merged_at`,
   `merge_commit`, `blockers`, `dep_edges`. Enumerate open PRs with
   `gh pr list --repo <owner/repo> --state open --json number,mergeStateStatus,labels,isDraft`;
-  skip drafts. **Also read `changedFiles`** — a `changedFiles=0` PR is already landed
-  (empty diff) and must not be treated as mergeable work.
+  skip drafts. **Also read `changedFiles`** — a `changedFiles=0` PR is **not mergeable work**;
+  classify it, do not assume it landed. An empty diff is equally consistent with an
+  already-landed PR, an unhydrated or emptied branch, and a self-revert; only the Tier-1
+  "Already-landed empty-diff PR" row's P ∧ N ∧ V ∧ A proof tells them apart.
   ⚠️ On a **watch-only** repo the twin card may be thin or absent, since coord is not landing
   there. That is UNKNOWN, not health: fall back to `gh` (`pr view`, `pr checks`) and judge the
   PR on its own CI. A repo the twin says nothing about is exactly the repo that goes unwatched
@@ -1332,10 +1334,45 @@ Read coord's own honest view — no new observability:
   **The `failure`-side discriminator is STEP-LEVEL.** `cancelled` is the minority shape; the
   common infra kill is `conclusion: failure` with every step green, so classifying on the run
   `conclusion` alone drops a dying runner into the “author a fix PR” arm. Read the JOBS of
-  the red run — `gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs` — **once, by hand, per
-  investigated RED**. Do NOT fold this into `red_main`: that function sweeps every workflow on
-  every repo every tick, and a per-run jobs fetch would multiply its API cost for a read it does
-  not need in order to report `RED(failure)` correctly.
+  the red run — **once, by hand, per investigated RED**. Do NOT fold this into `red_main`: that
+  function sweeps every workflow on every repo every tick, and a per-run jobs fetch would
+  multiply its API cost for a read it does not need in order to report `RED(failure)` correctly.
+
+  ```bash
+  gh api "repos/OWNER/REPO/actions/runs/<run_id>/jobs?per_page=100" --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled") | {name, conclusion, steps: [(.steps // [])[] | {name, conclusion}]}'
+  ```
+
+  ⚠️ **Run that spelling, not a shorter one — all three of its awkward parts are load-bearing,
+  and this file is where the consumers copy it from.** `per_page=100`: the default is **30**, so a
+  wide matrix is silently truncated and the job you are looking for may simply not be in the page
+  — the fleet-wide steward is the reader most likely to hit that. `(.steps // [])[]`: `steps` is
+  OPTIONAL on GitHub's job object, and a bare `.steps[]` **aborts the whole jq program mid-stream**
+  (`Cannot iterate over null`, exit 5) on exactly the **Tier 2** job this classification exists to
+  catch — printing a partial list that reads like a complete one. That one is guarded executably:
+  `scripts/lint-command-frontmatter.py` **check #23** fails CI on the four static spellings of it
+  (`.steps[]`, `.steps | .[]`, `(.steps)[]`, `.["steps"][]`) under `.claude/`, `scripts/` and
+  `.agents/`. It bounds a hand-edit; it does not prove the property — a dynamically built path
+  is invisible to it, `.github/workflows/` is outside its roots, and `per_page` and the projection
+  have no spelling narrow enough to guard at all. Those stay a review concern. And `conclusion` is
+  projected into the output because Tiers 1 and 2 below are keyed on `failure` while `cancelled`
+  is read elsewhere — a filter that selects both and prints neither cannot tell you which of the
+  two you got.
+
+  ⚠️ **Empty output is UNKNOWN, not “genuine failure”.** It means this run has no `failure` or
+  `cancelled` job at all — usually the wrong `run_id`, or a rollup whose red is somewhere else —
+  so go back and re-read the run's own conclusion before concluding anything about the code.
+
+  ⚠️ **A `cancelled` job the filter surfaces has NO row in the table below, and must not fall
+  through it into “otherwise → genuine”.** The three tiers are all keyed on `conclusion ==
+  "failure"`. ⚠️ **Where to read it depends on WHOSE run is red, and this table serves both.**
+  On a **`main` baseline** — the case this section is written for — `cancelled` is the
+  infra-cancelled class, its remedy is the re-run of the red-main remedies table's row 1
+  (`RED(cancelled)`), and it stays `RED(cancelled)` in the verdict vocabulary. On a **PR's own
+  head** that reading does NOT hold: a cancel there reached no verdict at all, must not be counted
+  as a red, and its remedy is normally a rebase — see the **“`cancel` bucket misread as a
+  failure”** row in the wedge-class table below, which measured two runner PRs skipped as “has
+  failures beyond `security`” when the extras were cancels. Read it in whichever of those two
+  places matches the run in your hand, not here.
 
   | Tier | Predicate on the failed job | Reading | Remedy |
   |---|---|---|---|
@@ -1426,9 +1463,9 @@ the intended remediation and do nothing.
 
 | Wedge class | Detector | Remediation (bounded, idempotent) |
 |---|---|---|
-| **Green-but-dirty** PR (behind main / needs rebase) | `mergeable_state=dirty`/`behind` or `freshness_next_action=rebase` + CI green. ⚠️ **A CLEAN `mergeStateStatus` does NOT rule out a coord rebase conflict — for one live PR class it asserts the OPPOSITE of the truth.** GitHub tests a **MERGE** (which trivially takes both sides); coord performs a **REBASE** (which replays commits). For a branch whose content already landed on `main` as a single squashed/verbatim commit, replaying its file-creating commit add/add-conflicts forever while the merge test stays clean. Measured on `qontinui-dev-notes#148` (2026-08-19): `gh pr view` reported `mergeable: MERGEABLE, mergeStateStatus: CLEAN` while coord held a **terminal `conflict`** on the same PR, stuck 30.8h. The decisive test is per-path **blob comparison** between the PR head and `origin/main` (`git rev-parse <head>:<path>` vs `git rev-parse origin/main:<path>`) — **`git cherry` also fails here**, because a squash landing destroys patch-id equivalence while preserving content equivalence: all 8 of #148's commits read `+` while the file was byte-identical at blob `32f17375`. Anywhere below that triages on `mergeStateStatus`, read it as "GitHub's merge test passed", never as "coord can rebase this". | **CI-DURATION-AWARE — do NOT blind-rebase (that's the eager-churn trap).** (1) **Is it even yours to fix?** If the PR is merely *behind* main and coord's dry-rebase resolves it (no `could not apply`), LEAVE IT — coord auto-rebases the candidate at land; a manual rebase only resets CI to do coord's job. Only a TRUE textual conflict (`CONFLICTING` / `could not apply`, confirm via `git merge-tree`) needs hands. (2) **Gate the timing on the repo's candidate-CI p90** (from `coord_query_merge_economics`): **short-CI (p90 < ~30m) → resolve EAGERLY** (rebase in a worktree → re-verify → `--force-with-lease` → let coord land; re-resolution is cheap). **Long-CI (p90 ≥ ~30m; runner ~2h) → resolve JUST-IN-TIME, only when the PR is at/near the FRONT of the land queue** — a rebase resets a full ~2h CI and any sibling land re-dirties it, so resolving deep-in-queue = wasted CI (the churn tonight's audit measured: 82% of candidate CI wasted, 24/24 green). (3) **Overlapping cluster:** when several PRs conflict in the same files, STACK them (`coord:stacked-on=`) or land as a coord batch so they resolve ONCE, not N times. Never `gh pr merge` — coord is the merge authority once clean+green. Rebase mechanics = `/babysit-prs` Step 5 lever 3. |
-| **Already-landed empty-diff PR** (re-proposed forever) | `changedFiles=0` + non-draft + CLEAN, **or** `coord_pr_status` reports `merged_at`/`merge_commit` while `pr_state=open` | **Verify against the PR's CURRENT HEAD, then close.** A coord rebase-land that REWRITES the sha leaves the PR `OPEN` with its original commits NOT ancestors of main (when the rebase was a no-op the tip is preserved instead — both shapes reach this row, and the three guards below hold for either). Prove the land by ALL THREE of (a) `git merge-base --is-ancestor <PR head_sha> origin/main` — **the head itself is on main**, (b) `changedFiles=0`, and (c) `git log origin/main..<PR head_sha>` is EMPTY. Only then `gh pr close`, citing all three. Left open, coord re-cuts a candidate identical to main and re-runs full CI forever (observed on web#833/#836, 2026-07-23). Idempotent; not rate-limited. ⚠️ **NEVER close on the recorded `merge_commit`'s ancestry, and never on `changedFiles=0` alone.** `merged_at`/`merge_commit` come from `coord.repo_branches` keyed on `(repo, pr_number)` — a stamp about *a head that landed*, not about the head you are looking at — and coord's only invalidation fires on `pr_number IS DISTINCT FROM`, which by construction CANNOT fire when the same PR's head moves after a **partial ff-land**. Measured 2026-08-06 on runner#978: `merged_at=2026-08-05T18:49Z` + `merge_commit=be0d07fb` served against `pr_state=open`, where `be0d07fb` is genuinely an ancestor of main **and of the PR's own current head** — so guard (a)-as-written PASSED while 2 commits (+277/-5) sat unlanded. Only `changedFiles=0` stopped this reflex closing live work; that was a single point of failure, and (a)+(c) remove it. An unhydrated PR also reads `changedFiles=0`. (coord's own destructive sweep `phantom_open_candidates` already joins `rb.head_sha = mpr.head_sha` and is NOT affected — this reflex was the sole exposed consumer.) |
-| **Verified-green stuck** PR (train slow) | CLEAN + green + aged past the repo's *data-driven* `suggested_stuck_threshold_secs`, AND a **diagnosed coord defect** blocking autonomy | **Recovery-merge, NOT `--admin`.** `--admin` was observed failing 2026-07-04 ("required status checks expected") — a real observation, but the premise once recorded here to explain it ("bypass lists contain only `Integration:3825026`") is FALSE: measured 2026-07-29, the four `main-merge-gates` rulesets (runner, schemas, qontinui, ui-bridge) also carry `OrganizationAdmin` with `bypass_mode: always`; only coord/web/claude-config are App-only. Bypass lists differ per repo — re-read `bypass_actors` rather than restating a table. Whether `--admin` succeeds is untested by design; the steward's path is the deterministic one: rebase onto `origin/main`, required checks green on the up-to-date head, then plain `gh pr merge <n> --rebase`. Counts against `--max-recovery-merges`. Leave the audit trail first (`/babysit-prs` Step 6). |
+| **Green-but-dirty** PR (behind main / needs rebase) | `mergeable_state=dirty`/`behind` or `freshness_next_action=rebase` + CI green. ⚠️ **A CLEAN `mergeStateStatus` does NOT rule out a coord rebase conflict — for one live PR class it asserts the OPPOSITE of the truth.** GitHub tests a **MERGE** (which trivially takes both sides); coord performs a **REBASE** (which replays commits). For a branch whose content already landed on `main` as a single squashed/verbatim commit, replaying its file-creating commit add/add-conflicts forever while the merge test stays clean. Measured on `qontinui-dev-notes#148` (2026-08-19): `gh pr view` reported `mergeable: MERGEABLE, mergeStateStatus: CLEAN` while coord held a **terminal `conflict`** on the same PR, stuck 30.8h. The decisive test is per-path **blob comparison** between the PR head and `origin/main` (`git rev-parse <head>:<path>` vs `git rev-parse origin/main:<path>`) — **`git cherry` also fails here**, because a squash landing destroys patch-id equivalence while preserving content equivalence: all 8 of #148's commits read `+` while the file was byte-identical at blob `32f17375`. A **second, independent** `git cherry` failure — the *merge-forward* shape, where the landed twins are pulled into the branch and so are excluded from cherry's comparison set — is measured in the **Already-landed empty-diff** row below. Neither is fixable: `git cherry` is not a land proof, in either direction. Anywhere below that triages on `mergeStateStatus`, read it as "GitHub's merge test passed", never as "coord can rebase this". | **CI-DURATION-AWARE — do NOT blind-rebase (that's the eager-churn trap).** (1) **Is it even yours to fix?** If the PR is merely *behind* main and coord's dry-rebase resolves it (no `could not apply`), LEAVE IT — coord auto-rebases the candidate at land; a manual rebase only resets CI to do coord's job. Only a TRUE textual conflict (`CONFLICTING` / `could not apply`, confirm via `git merge-tree`) needs hands. (2) **Gate the timing on the repo's candidate-CI p90** (from `coord_query_merge_economics`): **short-CI (p90 < ~30m) → resolve EAGERLY** (rebase in a worktree → re-verify → `--force-with-lease` → let coord land; re-resolution is cheap). **Long-CI (p90 ≥ ~30m; runner ~2h) → resolve JUST-IN-TIME, only when the PR is at/near the FRONT of the land queue** — a rebase resets a full ~2h CI and any sibling land re-dirties it, so resolving deep-in-queue = wasted CI (the churn tonight's audit measured: 82% of candidate CI wasted, 24/24 green). (3) **Overlapping cluster:** when several PRs conflict in the same files, STACK them (`coord:stacked-on=`) or land as a coord batch so they resolve ONCE, not N times. Never `gh pr merge` — coord is the merge authority once clean+green. Rebase mechanics = `/babysit-prs` Step 5 lever 3. |
+| **Already-landed empty-diff PR** (re-proposed forever) | `changedFiles=0` + non-draft, **or** `coord_pr_status` reports `merged_at`/`merge_commit` while `pr_state=open`. ⚠️ `mergeStateStatus` is a **dispatch hint here, not a gate** — an empty-diff PR reading `BLOCKED` or `UNKNOWN` still enters this row, because what authorises the close is the proof below, not GitHub's merge test. (Whether `CLEAN` genuinely holds on the ff-land shape is **UNSETTLED**: web#1033 read `BLOCKED`, but that read was taken *after* the close and a closed PR's `mergeStateStatus` is not a witness of its open-state value; a fleet sweep on 2026-08-24 found **no** open `changedFiles=0` PR in any of the seven repos, so there was nothing live to settle it against. Treat it as UNKNOWN, which is why it is not a gate.) | **Prove the merge is a NO-OP against the PR's REAL base, then close. Close iff P ∧ N ∧ V ∧ A; any read that errors is UNKNOWN → do not close, route to Tier 2.** ⚠️ **Ancestry is NOT a gate here — it is structurally unsatisfiable on the fleet's most common land shape.** A coord fast-forward land leaves the branch a *descendant* of `main`: it rebases the PR's commits onto a candidate, pushes the candidate tip straight to `main`, and the branch afterwards merges `main` back into itself. So `git merge-base --is-ancestor <head> origin/main` points the wrong way *by construction* and `git log origin/main..<head>` is non-empty *by construction* — not conservative, **unreachable**; no amount of waiting, re-fetching or re-polling will ever make them pass. Measured on `qontinui-web#1033` (2026-08-24): ancestry `exit=1`, `origin/main..head` = 6 commits, `changedFiles=0`, and the merge nonetheless a **proven no-op**. The claim this row used to carry — *"both shapes reach this row, and the three guards below hold for either"* — was **false**, and left open, the row *caused* the very re-cut-forever outcome it exists to prevent. Ancestry now counts as *evidence when it passes*, never as a gate. **P — preconditions, all mandatory.** (P1) Resolve the PR's **real** base — `gh pr view <n> --json baseRefName,headRefOid,isDraft,changedFiles,commits` — and compare against `origin/<baseRefName>`. ⚠️ **The hazard is the LOCAL CLONE, not the PR.** `baseRefName` is a bare branch name that the steward resolves as `origin/<name>` in whatever checkout it happens to be standing in, so a non-default base (or a stale sibling clone) proves a no-op against a same-named branch in the *wrong repo* — that is the D2 failure one level up. Check it where it lives: **`git remote get-url origin` must name the repo you are polling**, exit-status-checked, before any comparison. ⚠️ Do **not** reach for a `baseRepository` JSON field: **it does not exist** — measured 2026-08-25, asking gh for a `baseRepository` field returns `Unknown JSON field: "baseRepository"` and gh exits 1, which would abort this row's FIRST precondition on every PR and silently reproduce the very never-fires defect this rule replaced. The base-side field is `baseRefName` alone; `headRepository` / `headRepositoryOwner` / `isCrossRepository` are the repo-identity fields that do exist, and a PR's base repository is by construction the repo you passed to `-R`, so no PR field could ever disagree. `scripts/steward-empty-diff-fixtures-test.sh`'s **gate2** pins every `--json` field this row names against the real roster. (P2) `git fetch origin <baseRefName>`, **exit status checked** — a stale base is a measured false positive (fixture C5 reads `NOOP-PROVEN` against a stale base for a branch carrying a live deletion). (P3) `git fetch origin refs/pull/<n>/head:refs/tmp/pr<n>`, then `git cat-file -e` on **both** `origin/<baseRefName>^{commit}` and `<head>^{commit}`, both exit-status-checked — a hard prerequisite of N, not a courtesy: `git merge-tree` cannot distinguish an unreadable object from a conflict. (P4) Non-draft. (P6) **The payload must be IN THE TREE** — run the payload guard (inlined under **"The no-op probe"** below, as `scripts/merge-payload-guard.sh` in ccfg; use the **inlined** copy, since a relative path does not resolve from the polled repo's clone) and require exit `0`. N compares *trees*, so a PR whose payload is **not** a tree change is invisible to it and reads no-op while carrying work someone still intends to use. Two such shapes were **measured 2026-08-25, and P ∧ N ∧ V ∧ A all hold on both**: a **history-reconcile / back-merge** PR ("merge `release` into `main`" after the same content landed on `main` under a different sha) reads `commits=2, changedFiles=0, NOOP-PROVEN` — its payload is the **merge edge**, and closing it loses that edge, after which the next merge add/add-conflicts on byte-identical content (`rc=1 UU`), which is the wedge the Green-but-dirty row above documents; and a **marker PR** whose only commit is `git commit --allow-empty` (release marker, CI re-trigger) reads `commits=1, changedFiles=0, NOOP-PROVEN`. The guard refuses exactly two patterns and nothing else — *(a)* the head is a **merge commit whose first parent is already on the base**, and *(b)* **every** commit in `origin/<base>..<head>` is empty — both scoped to heads that are not already ancestors of the base. Measured non-refusals: web#1033 itself (`IN-TREE 6 tree-changing commits`), a single-commit rebase-landed PR (fixture C11), and the disclosed self-revert. A P6 refusal is **abort + escalate to Tier 2**, never a close. (P5) `git --version` ≥ 2.38, **checked in code, not asserted in prose** — an older git is **UNKNOWN → Tier 2**, and must never fall back to tree comparison (measured: that fallback decays within ~1h as `main` advances, and closes live work on any PR whose base is not the default branch). **N — the no-op proof.** `git merge-tree --write-tree origin/<baseRefName> <head>` exits **0** **and** its output equals `git rev-parse 'origin/<baseRefName>^{tree}'`. Both oids validated `^[0-9a-f]{40}` and non-empty **before** the equality test, which is never the first thing evaluated. Three exit codes, deliberately: `0` proven no-op, `1` proven **not** a no-op (conflict included), `2` **UNKNOWN** — and **`2` must never collapse into `1`**; only `0` may reach the close path. Runnable snippet + the exit-code and empty-string traps: **"The no-op probe"** immediately below this table. **V — anti-vacuity.** `gh pr view <n> --json commits` must return **≥ 1**. *Any* head that is an **ancestor** of the base makes N read no-op trivially — merging an ancestor into its descendant changes nothing — and that class holds both the legitimate sha-preserving ff-land **and** every unhydrated, emptied or stale-parked branch. **N cannot tell them apart.** V is what separates them *in the degenerate case*, and its discriminator is the commit count (#1033: `commits=6` with `changedFiles=0`; fixture C3's branch parked exactly at the base tip: `0`). ⚠️ **V is a test for "at least one commit object exists", NOT a hydration test — measured 2026-08-25, and the row used to overstate it.** An unhydrated branch carrying a single `--no-ff` merge-forward and no work at all reads `commits=1, changedFiles=0, NOOP-PROVEN` and sails straight through V (fixture C10); so does an empty-commit marker (C9). **P6 is what stops those**, not V. Keep V — it is still the only thing standing between this reflex and the `commits == 0` population, and it is exactly the conjunct a "simplifying" reviewer will delete — but do not credit it with more than the degenerate shape. **A — cross-source agreement.** GitHub's `changedFiles` must independently read `0`. It is redundant with N when everything is consistent, and that is the point: a different engine on different data. ⚠️ **Scope A's abort to the `changedFiles==0` population only.** GitHub *freezes* a landed PR's diff against its recorded base sha — measured 2026-08-24 on six merged web PRs (#1054/#1051/#1049/#1045/#1041/#1030): every one still reports `changedFiles` of 1..12 and `commits` of 1..3 **while its head IS an ancestor of `origin/main`**, i.e. while N reads no-op. N and `changedFiles` therefore disagree routinely and benignly, with nothing stale; an unscoped "any disagreement escalates" rule would fire on every landed PR on the fleet. **Within** the `changedFiles==0` population, a disagreement is an abort + escalate to Tier 2, never a close. **The close.** Re-read `headRefOid` immediately before `gh pr close` and abort if it moved since P1 — `gh pr close` has no compare-and-swap, and a force-push between the proof and the close is the one way this rule can close work that was live *at the moment of the close*. **NEVER `--delete-branch`**: that is a conjunct of the rule, not manners — it is what keeps a wrong close recoverable (every commit preserved, the PR reopenable) and it is what the asymmetry argument rests on. **The comment must state what was PROVEN, not what was assumed.** Cite base ref + base sha + base tree; head sha + the merged-tree oid from `merge-tree`; `changedFiles`; the commit count; and whatever land evidence was found — or, explicitly, *"none found — closed as a proven no-op, not as a land"*. The rule proves *"merging this PR into `<base>` changes nothing"*; it does **not** by itself prove *"this PR's work landed"*, and the honest generalisation is that **any PR whose payload is not in the tree** reads as a no-op. P6 refuses the two measured members of that class that carry real work when the graph permits (the trunk-side back-merge and the empty-commit marker). **Two survivors remain, and both are deliberately accepted** — do not restate this as "exactly one case", which is the mistake the pre-P6 rule made and which was measured false twice: *(i)* the **self-revert** (`add N.txt` then `git rm N.txt` reads no-op with `commits=2`) genuinely never landed and closes; *(ii)* the **release-side history-reconcile**, which is the same reconcile as the refused one with the merge's parents swapped and is therefore **graph-identical to web#1033 itself**, so no predicate can refuse it without refusing the case this row exists for (fixture C13 pins it). In both, the branch survives, `--delete-branch` is forbidden, and the honest-comment requirement is what tells the author why their PR closed — which is exactly why that requirement is load-bearing and not cosmetic. Never claim "already landed" blindly. **Land evidence is CITED, not REQUIRED** — under N ∧ V there is provably no content to lose, so it is not what authorises the close: collect `merge-base --is-ancestor` if it passes, per-commit `git patch-id --stable` twins reachable from the base, per-path blob comparison, `coord_explain_pr_close` / `close_cause` **keyed on the current head sha**. ⚠️ **Do NOT use `git cherry` here — measured false negative on this exact shape.** All four #1033 commits read `+` ("not upstream") while their `git patch-id --stable` values provably matched commits already on `main`. Cause: `git cherry <upstream> <head>` marks a commit `-` only if an equivalent patch turns up in **`<head>..<upstream>`** — commits on the upstream that are **not** reachable from the head. A merge-forward pulls `main` *into* the branch, so the landed twins become **ancestors of the head** and are excluded from that comparison set *by construction*; they can never be found there. ⚠️ Do not shorten this to "the set is empty": measured twice on #1033 — on 2026-08-24 with `main` still at the merge-base the set was indeed empty (all four `+` vacuously), and re-measured 2026-08-25 with `main` **6 commits ahead** the set was **non-empty** and all four *still* read `+`. Emptiness was an accident of timing; **twin-exclusion** is the durable mechanism, and it does not decay. This is **independent of** the squash-land limitation noted in the Green-but-dirty row above, and it fails in the dangerous direction: it *under-reports* landedness. Left open, coord re-cuts a candidate identical to main and re-runs full CI forever (observed on web#833/#836, 2026-07-23). Idempotent; not rate-limited. **Ledger it:** report `empty-diff candidates seen / closed / declined-with-reason` each cycle — this defect stayed invisible for weeks precisely because a Tier-1 row that *refuses* logs nothing and produces no wedge signal of its own. ⚠️ **NEVER close on the recorded `merge_commit`'s ancestry, and never on `changedFiles=0` alone.** `merged_at`/`merge_commit` come from `coord.repo_branches` keyed on `(repo, pr_number)` — a stamp about *a head that landed*, not about the head you are looking at — and coord's only invalidation fires on `pr_number IS DISTINCT FROM`, which by construction CANNOT fire when the same PR's head moves after a **partial ff-land**. Measured 2026-08-06 on runner#978: `merged_at=2026-08-05T18:49Z` + `merge_commit=be0d07fb` served against `pr_state=open`, where `be0d07fb` is genuinely an ancestor of main **and of the PR's own current head** — so an ancestry-keyed close PASSED while 2 commits (+277/-5) sat unlanded. That case is why the close is keyed on **N** (which reads NOT-NOOP there: merging those 2 commits changes the base) instead of on ancestry, and why **A** keeps `changedFiles=0` as an independent second engine. An unhydrated PR also reads `changedFiles=0` — that one is **V**'s job. (coord's own destructive sweep `phantom_open_candidates` already joins `rb.head_sha = mpr.head_sha` and is NOT affected — this reflex was the sole exposed consumer.) **Fixtures — run them, do not read them:** `bash scripts/steward-empty-diff-fixtures-test.sh` (qontinui-claude-config). Plan: `2026-08-24-steward-empty-diff-reflex-blind-to-ff-lands`. |
+| **Verified-green stuck** PR (train slow) | CLEAN + green + aged past the repo's *data-driven* `suggested_stuck_threshold_secs`, AND a **diagnosed coord defect** blocking autonomy | **Recovery-merge, NOT `--admin`.** `--admin` was observed failing 2026-07-04 ("required status checks expected") — a real observation, but the premise once recorded here to explain it ("bypass lists contain only `Integration:3825026`") is FALSE: measured 2026-07-29, the four `main-merge-gates` rulesets (runner, schemas, qontinui, ui-bridge) also carry `OrganizationAdmin` with `bypass_mode: always`; only coord/web/claude-config are App-only. Bypass lists differ per repo — re-read `bypass_actors` rather than restating a table. Whether `--admin` succeeds is untested by design; the steward's path is the deterministic one: rebase onto `origin/main`, required checks green on the up-to-date head, then plain `gh pr merge <n> --rebase`. **⚠️ Since PR #328 an agent CANNOT run that last command** — shared `.claude/settings.json` carries `deny: Bash(gh pr merge:*)`, which holds in every permission mode (`bypassPermissions` included), cannot be lifted by any local settings file or flag, and cannot be approved by a hook. So this row's recovery now ENDS at the hand-off: leave the audit trail (`/babysit-prs` Step 6 item 1), register a gate / escalate to the operator who holds the merge capability, and go to Tier 2 remediation. `--max-recovery-merges` is inert while the deny stands. Never route around it via `gh api .../pulls/N/merge` — `git-guard.sh` blocks that spelling too. |
 | **Conflicting PR gets NO new CI — coord parks it in `ci-pending` forever** | `/reevaluate` returns `block_reason_code: "ci-pending"` with **`input_freshness.ci_check_row_count: 0`**, and `GET repos/<r>/actions/runs?head_sha=<FULL 40>` returns `total_count: 0` — i.e. CI never fired even once. | **Check `mergeable` FIRST; this is not a separate defect.** A CONFLICTING PR gets **no new `pull_request` workflow runs at all** — GitHub cannot compute `refs/pull/N/merge`, so nothing is scheduled (not queued, not skipped). No runs ⇒ no check rows ⇒ coord waits for CI that can never arrive, and the PR shows **no FAILING checks**, so any sweep that counts only reds reads it as healthy. Measured 2026-08-24 across `qontinui-dev-notes`: 4 of 9 stuck PRs had `total_count: 0`. **Remedy: resolve the conflict — CI follows.** For a **MERGEABLE** PR whose CI simply never fired, `gh pr close <n> && gh pr reopen <n>` fires `reopened` and schedules it (no content change, no new commit, same head sha) — verified on dev-notes#153, green in ~20s, and it then let coord reach its real verdict (`[already-landed] — close this PR`). On a CONFLICTING PR the same close/reopen is a **no-op**: it succeeds and schedules nothing (verified on #203/#84/#78). Do NOT go hunting for disabled Actions or missing workflow files. ⚠️ Use the **FULL 40-char** sha on that query — a short sha returns a silent 200 with `total_count: 0` and fakes this exact symptom. |
 | **`cancel` bucket misread as a failure** (triage error, not a wedge) | a PR's non-passing check is in the **`cancel`** bucket, not `fail` | **`cancelled` is NOT `failed` — it reached NO verdict.** Treating it as a red hides PRs that are actually fixable. Measured 2026-08-22: runner#1062 and #1055 were skipped as "has failures beyond `security`", but those extras were `Clippy diff-scoped (advisory) → cancel` and `test (ubuntu-22.04) → cancel` (the latter cancelled after a **6h** run). Both were genuinely `security`-only, i.e. the stale-base class; after a rebase both went fully green — and #1055's previously-cancelled ubuntu job reached a real verdict in 51m. When triaging, filter on `.bucket == "fail"` and report `cancel` separately. This is the per-PR twin of the main-baseline `cancelled` handling above. |
 | **Stale read** (`freshness_next_action=refresh_github`) | `confidence ∈ {stale,unknown}` | Fire the concrete re-eval lever `POST <base>/pr-merge/prs/<owner>/<repo>/<pr>/reevaluate` (`babysit-prs.md:122` — cures stale snapshots), then wait one poll tick. Phase 2's freshness gate + Phase 1's post-land refresh do the re-read. Idempotent; not rate-limited. |
@@ -1439,6 +1476,266 @@ the intended remediation and do nothing.
 | **`ci_timeout` < real CI livelock** | a GREEN candidate is re-cut ~seconds after its CI completes, forever; nothing lands on a repo whose CI > `COORD_MERGE_CI_TIMEOUT` (1800s default) | FIXED 2026-07-17 (`adb844d6`+`65a462bc`/coord#1070/#1078): `FallThrough`→`check_and_land`. Emergency lever if it recurs: raise `COORD_MERGE_CI_TIMEOUT` above the repo's CI wall-clock (fleet-wide; per-repo timers are the real fix — redesign P1). |
 | **Actions-saturation firehose** (NOT a coord defect) | runner train stalls with green PRs queued; `gh run list` is dominated by ONE branch pushing every ~few min; candidate CI is queued-not-started | **Check the COMMITTER of the looping commits** (`gh api repos/<r>/commits`): `github-actions[bot]` ⇒ a self-triggering auto-commit workflow (e.g. nondeterministic codegen re-detecting its own drift — clorinde `pub mod` HashMap order, fixed runner#769 `55b04022`), NOT a looping agent. Fix = deterministic codegen / per-branch CI concurrency-cancel. Escalate to the branch owner; do NOT "stop an agent" that isn't the cause. |
 | **Post-deploy proposal loss** (NOT a wedge) | coord went quiet on candidate-cutting right after a deploy / reconciler restart | ⚠️ **The "~80 min to rehydrate" figure was FOLKLORE — corrected 2026-07-20 by source trace.** No such constant exists in coord. **Scheduler recovery after a redeploy is ~17s** (leader TTL 15s, `leader.rs:55-57`, + a 2s tick, `merge_scheduler.rs:1843-1847`). What can cost ~88 min is a *single proposal* whose in-flight CI is DISCARDED by the Phase-2 requeue (`merge_scheduler.rs:8692-8704`) — and only for `dry-rebasing`, `landing`, batch members, `speculative-ci`, and base-moved `awaiting-ci` with no live CI. A plain `awaiting-ci` singleton on an unmoved base is ADOPTED and costs nothing (Phase 1, `:8455-8506`). ~88min is runner's candidate-CI suite length (`merge_scheduler.rs:1210`, `:1246`), not a recovery timer. **So: don't wait 80 minutes, and don't cite a system-wide recovery time — quote the per-proposal work at risk.** Correlate "idle since" with a task-def revision bump; WAIT, do not remediate. |
+
+### The no-op probe — conjunct N of the "Already-landed empty-diff PR" row
+
+> ⚠️ **Dollar-digit booby trap — read this before editing anything in this file.** This file is
+> a **slash-command body**. A dollar sign followed by a single digit is a **harness argument
+> placeholder**, not a shell positional: Claude Code substitutes the invocation's argument words
+> into the body before injecting it, indexed from zero, and leaves unfilled positions literal. On
+> 2026-08-13 that silently rewrote the red-main detector's variables to garbage — *"29 queried, 29
+> failed, every line UNKNOWN"* on every repo — while the **tracked file stayed correct**, so no
+> read, diff, review or `git log -S` could see it. This file must contain **zero** dollar-digit
+> sequences: every value goes through a **named** env var (the `RM_*` convention above, `MT_*`
+> here), and **no shell function with positional parameters may be added**. The gate is
+> `grep -cE '[$][0-9]' .claude/commands/merge-train-steward.md` -> `0`, and
+> `scripts/steward-empty-diff-fixtures-test.sh` runs it.
+
+Inputs arrive as **named env vars only**: `MT_BASE` (the PR's real base, `origin/<baseRefName>`,
+freshly fetched) and `MT_HEAD` (the PR's current head sha). **Three exit codes, deliberately:**
+`0` proven no-op, `1` proven **not** a no-op, `2` **UNKNOWN**. Only `0` may reach the close path,
+and **`2` must never be collapsed into `1`** — the Tier-2 escalation path depends on the UNKNOWN
+signal surviving. The snippet below is **byte-identical** to `scripts/merge-noop-probe.sh`;
+`scripts/steward-empty-diff-fixtures-test.sh` fails if the two drift.
+
+- ⚠️ **`git merge-tree` returns `1` for BOTH "conflict" and "I cannot read that object."**
+  Measured in `qontinui-web`: a genuine conflict gives `rc=1`, and
+  `git merge-tree --write-tree origin/main deadbeef…` (an absent object) *also* gives `rc=1`, on
+  stderr `"not something we can merge"`. The exit code alone therefore **cannot** separate
+  NOT-NOOP from UNKNOWN, and a naive `|| { echo NOT-NOOP; exit 1; }` reports "this PR is not a
+  no-op" when the truth is "I could not read the head" — fail-safe for closing, but it destroys
+  the signal escalation runs on. The `git cat-file -e` pair **must** run first; only then does
+  `rc=1` mean conflict. An earlier draft of this very snippet had that bug.
+- ⚠️ **Two unreadable objects compare EQUAL.** Measured: `git rev-parse -q --verify
+  '<absent>^{tree}'` exits 1 printing nothing, so two different absent shas both yield the empty
+  string and an equality test fires on **no evidence at all**. The trap is specific to
+  `-q --verify`: plain `git rev-parse '<absent>^{tree}'` echoes the literal input and exits 128,
+  so two absent shas compare *unequal* — the safe behaviour arrives **by accident**, and
+  "cleaning up" to the `-q --verify` idiom silently removes it. Hence, on this path: every exit
+  status checked, **no `2>/dev/null`, no `|| echo`, no `|| true`, no `|| 0`**; both oids validated
+  as 40-char lowercase hex **and** non-empty; and the equality test never evaluated first.
+- ⚠️ **Old git fails closed, and it must say so out loud.** `--write-tree` needs git >= 2.38 (this
+  fleet's Linux box: 2.47.3; Git-Bash on the Windows members is **unverified**). P5 is **code, not
+  prose** — an earlier draft had the version check in prose only, so a pre-2.38 git exited `129`
+  and the old `|| { echo NOT-NOOP; exit 1; }` arm printed a **proven** verdict for an UNKNOWN.
+  On an old-git machine this row simply never closes: that is the status quo, not a regression,
+  but nobody may read a quiet steward as a working one. Do **not** substitute
+  `head^{tree} == origin/main^{tree}` — measured, that guard decays within ~1h of the land as
+  `main` advances, and it closes live work on any PR whose base is not the default branch.
+- ⚠️ **Git-Bash path mangling.** `git rev-parse '<rev>:<path>'` is MSYS-mangled (see the field
+  lessons further below). This snippet passes `MT_BASE` as a bare ref name with a `^{tree}`
+  suffix, never a `rev:path`, which should be unaffected — **verify on a Windows fleet member**,
+  and do not reach for `MSYS_NO_PATHCONV=1`, which breaks `git -C` paths.
+
+<!-- BEGIN merge-noop-probe (byte-identical to scripts/merge-noop-probe.sh) -->
+```bash
+set -u
+# Missing inputs are UNKNOWN, not a verdict. `set -u` ALONE exits 1, and under
+# the three-exit-code contract below 1 means "proven NOT a no-op" -- measured
+# 2026-08-25: `unset MT_BASE; bash merge-noop-probe.sh` -> rc=1. That is the
+# same UNKNOWN-collapsed-into-a-proven-verdict defect P5 was written to stop,
+# one level up. Check presence explicitly, and exit 2.
+if [ -z "${MT_BASE:-}" ] || [ -z "${MT_HEAD:-}" ]; then
+  echo "UNKNOWN MT_BASE or MT_HEAD unset or empty"; exit 2
+fi
+# Inputs arrive as named env vars ONLY: MT_HEAD (40-hex), MT_BASE (e.g. origin/main).
+# P5 FIRST -- it is CODE, not prose. Without it a pre-2.38 git fails the
+# merge-tree call and the old "|| { echo NOT-NOOP; exit 1; }" arm reported a
+# PROVEN verdict for an UNKNOWN. Measured 2026-08-24 against a shimmed old git:
+# the pre-vet snippet printed "NOT-NOOP merge conflicts", rc=1. See Vet findings.
+MT_GV=$(git --version) || { echo "UNKNOWN git --version failed"; exit 2; }
+MT_GN=${MT_GV#git version }
+# A version string with no dot at all would otherwise parse as "2.2" and report
+# UNKNOWN naming a version that does not exist. Same verdict, honest message.
+case "${MT_GN}" in *.*) ;; *) echo "UNKNOWN git version has no minor: ${MT_GV}"; exit 2;; esac
+MT_MAJ=${MT_GN%%.*}
+MT_REST=${MT_GN#*.}
+MT_MIN=${MT_REST%%.*}
+# Validate the two components SEPARATELY. Concatenating them first cannot see an
+# EMPTY component when the other is numeric -- measured 2026-08-25 against shims
+# printing "git version 2." and "git version .38.1": both slipped past the gate
+# and reached `[: : integer expression expected` on the next line, on a path this
+# row states carries no suppressed shell errors.
+case "${MT_MAJ}" in ""|*[!0-9]*) echo "UNKNOWN git major unparseable: ${MT_GV}"; exit 2;; esac
+case "${MT_MIN}" in ""|*[!0-9]*) echo "UNKNOWN git minor unparseable: ${MT_GV}"; exit 2;; esac
+if [ "${MT_MAJ}" -lt 2 ] || { [ "${MT_MAJ}" -eq 2 ] && [ "${MT_MIN}" -lt 38 ]; }; then
+  echo "UNKNOWN git ${MT_MAJ}.${MT_MIN} lacks merge-tree --write-tree"; exit 2
+fi
+# P3, and it is not optional -- see the exit-code note below.
+git cat-file -e "${MT_BASE}^{commit}" || { echo "UNKNOWN base object absent"; exit 2; }
+git cat-file -e "${MT_HEAD}^{commit}" || { echo "UNKNOWN head object absent"; exit 2; }
+MT_BT=$(git rev-parse "${MT_BASE}^{tree}") \
+  || { echo "UNKNOWN base-tree unreadable"; exit 2; }
+# Discriminate BY EXIT CODE, never by "non-zero". Only rc==1 is a conflict;
+# 128/129 (bad object, unknown option, old git) are UNKNOWN. Measured: conflict
+# rc=1, absent object rc=1, unknown option rc=129.
+MT_MERGED=$(git merge-tree --write-tree "${MT_BASE}" "${MT_HEAD}"); MT_RC=$?
+if [ "${MT_RC}" -eq 1 ]; then echo "NOT-NOOP merge conflicts"; exit 1; fi
+if [ "${MT_RC}" -ne 0 ]; then echo "UNKNOWN merge-tree rc=${MT_RC}"; exit 2; fi
+case "${MT_MERGED}" in *[!0-9a-f]*) echo "UNKNOWN merged-tree not hex"; exit 2;; esac
+case "${MT_BT}"     in *[!0-9a-f]*) echo "UNKNOWN base-tree not hex";   exit 2;; esac
+# Length 40 is SHA-1. In a SHA-256 repository this can never prove a no-op and
+# always reports UNKNOWN -- fail-closed, and correct for this fleet, which is
+# SHA-1 throughout. Widen deliberately if that ever changes; do not drop it.
+[ ${#MT_MERGED} -eq 40 ] && [ ${#MT_BT} -eq 40 ] || { echo "UNKNOWN short sha"; exit 2; }
+if [ "${MT_MERGED}" = "${MT_BT}" ]; then echo "NOOP-PROVEN tree=${MT_BT}"; exit 0; fi
+echo "NOT-NOOP merged=${MT_MERGED} base=${MT_BT}"; exit 1
+```
+<!-- END merge-noop-probe -->
+
+**Conjunct P6 is inlined the same way, and for the same reason.** ⚠️ It was first specified as
+`bash scripts/merge-payload-guard.sh` — a path relative to *this* repo, while P1 requires the
+steward to be standing in the **polled repo's** clone, where it resolves to nothing and the shell
+exits **127**. That fails safe, but it makes a mandatory conjunct abort on every PR, which is the
+never-fires class this whole change exists to close, reached by a third door. **Inlining is what
+makes a conjunct runnable from the mandated CWD**; gate0 in the fixture suite pins both inlined
+copies against their files. Same input convention (`MT_BASE`/`MT_HEAD`), same three exit codes —
+here `0` means the payload IS in the tree (N's verdict is meaningful), `1` means it is **not**
+(refuse, escalate to Tier 2), `2` UNKNOWN.
+
+⚠️ **Two limits, both measured, both graph-isomorphism arguments — so neither is a bug a better
+predicate could fix, and neither may be "closed" by weakening the guard.** *(1)* **Parent order.**
+The same history-reconcile authored on the **release** side (`git checkout rel; git merge trunk`,
+PR'd `rel → trunk`) carries the same two commits with the merge's parents **swapped**, so its first
+parent is not on the base and it **passes** — and that graph is identical to the merge-forward
+shape this row exists to close (web#1033), so nothing over the graph can separate them. It is an
+**accepted close**, pinned as fixture C13 so that deleting P6a is visibly a change in what closes
+rather than a silent one. *(2)* **One over-refusal.** A legitimately sha-preserving ff-landed PR
+that then took a gratuitous `--no-ff` merge-forward is graph-identical to the unhydrated C10 shape
+and is **refused** — fail-safe (it escalates to Tier 2, it never closes wrongly), but say so out
+loud, because a Tier-2 escalation on a PR that plainly landed otherwise reads as a bug to whoever
+picks it up.
+
+<!-- BEGIN merge-payload-guard (byte-identical to scripts/merge-payload-guard.sh) -->
+```bash
+set -u
+# Conjunct P6 of the Tier-1 "Already-landed empty-diff PR" row: is this PR's
+# PAYLOAD in the TREE at all? The no-op proof (N, scripts/merge-noop-probe.sh)
+# compares trees, so a PR whose payload is NOT a tree change is invisible to it
+# and reads NOOP-PROVEN while carrying work a human still intends to use.
+# Two such shapes were MEASURED 2026-08-25 (both close under P AND N AND V AND A alone):
+#   - a history-reconcile / back-merge PR ("merge release into main" after the
+#     same content landed on main under a different sha): commits=2,
+#     changedFiles=0, NOOP-PROVEN -- and the payload is the merge EDGE. Closing
+#     it loses the edge, and the next merge add/add-conflicts on byte-identical
+#     content (rc=1 UU), the wedge the Green-but-dirty row documents.
+#   - a marker PR whose only commit is `git commit --allow-empty` (release
+#     marker / CI re-trigger): commits=1, changedFiles=0, NOOP-PROVEN.
+# Inputs are named env vars ONLY: MT_BASE, MT_HEAD.
+# Exit codes match the probe's contract: 0 payload IS in the tree (N's verdict
+# is meaningful), 1 payload is NOT in the tree (refuse, escalate to Tier 2),
+# 2 UNKNOWN. As everywhere on this path, 2 must never collapse into 1.
+#
+# TWO LIMITS, both measured, both graph-isomorphism arguments -- so neither is a
+# bug to be fixed by a better predicate, and both are stated so nobody "closes"
+# them by weakening the guard:
+#   - PARENT ORDER. A reconcile authored on the RELEASE side (`git checkout rel;
+#     git merge trunk`, PR'd rel -> trunk) has the same two commits with the
+#     parents SWAPPED, so its first parent is not on the base and it PASSES.
+#     That graph is identical to the merge-forward shape this whole row exists
+#     to close (web#1033), so no predicate over the graph can separate them.
+#     It is an ACCEPTED close, pinned by fixture C13.
+#   - ONE OVER-REFUSAL. A legitimately sha-preserving ff-landed PR that then
+#     took a gratuitous `--no-ff` merge-forward is graph-identical to the
+#     unhydrated C10 shape and is REFUSED. Fail-safe -- it escalates to Tier 2,
+#     it never closes wrongly -- but say so, because a Tier-2 escalation on a
+#     landed PR otherwise reads as a bug to whoever picks it up.
+if [ -z "${MT_BASE:-}" ] || [ -z "${MT_HEAD:-}" ]; then
+  echo "UNKNOWN MT_BASE or MT_HEAD unset or empty"; exit 2
+fi
+git cat-file -e "${MT_BASE}^{commit}" || { echo "UNKNOWN base object absent"; exit 2; }
+git cat-file -e "${MT_HEAD}^{commit}" || { echo "UNKNOWN head object absent"; exit 2; }
+# The sha-PRESERVING ff-land: the head is already reachable from the base, so it
+# adds neither a commit nor an edge. Nothing for this guard to find; V's commit
+# count is what governs there.
+# Discriminate BY EXIT CODE, never by "non-zero" -- the same discipline the
+# probe states for `merge-tree`. `git merge-base --is-ancestor` returns 128 on a
+# bad rev (measured), and treating that as a plain "no" turns an UNKNOWN into a
+# verdict. Only 0 and 1 are answers.
+git merge-base --is-ancestor "${MT_HEAD}" "${MT_BASE}"; MT_ARC=$?
+if [ "${MT_ARC}" -eq 0 ]; then
+  echo "IN-TREE head is already an ancestor of the base"; exit 0
+fi
+if [ "${MT_ARC}" -ne 1 ]; then echo "UNKNOWN is-ancestor rc=${MT_ARC} on the head"; exit 2; fi
+# P6a -- history-reconcile: the head is a MERGE commit whose FIRST parent is
+# already on the base. Measured discriminator: the merge-forward shape this row
+# exists for (web#1033) is also a merge commit, but its first parent is the
+# branch's own tip and is NOT on the base, so it passes.
+MT_HP=$(git rev-list --parents -n 1 "${MT_HEAD}") || { echo "UNKNOWN cannot read head parents"; exit 2; }
+MT_NP=0
+for MT_W in ${MT_HP}; do MT_NP=$((MT_NP + 1)); done
+MT_NP=$((MT_NP - 1))
+if [ "${MT_NP}" -gt 1 ]; then
+  git merge-base --is-ancestor "${MT_HEAD}^1" "${MT_BASE}"; MT_PRC=$?
+  if [ "${MT_PRC}" -eq 0 ]; then
+    echo "PAYLOAD-NOT-IN-TREE merge edge: head is a merge whose first parent is already on the base"
+    exit 1
+  fi
+  if [ "${MT_PRC}" -ne 1 ]; then echo "UNKNOWN is-ancestor rc=${MT_PRC} on the first parent"; exit 2; fi
+fi
+# P6b -- marker PR: EVERY commit ahead of the base is empty.
+MT_LIST=$(git rev-list "${MT_BASE}..${MT_HEAD}") || { echo "UNKNOWN cannot list commits"; exit 2; }
+if [ -z "${MT_LIST}" ]; then echo "IN-TREE no commits ahead of the base"; exit 0; fi
+MT_LIVE=0
+for MT_C in ${MT_LIST}; do
+  MT_CP=$(git rev-list --parents -n 1 "${MT_C}") || { echo "UNKNOWN cannot read parents of ${MT_C}"; exit 2; }
+  MT_CN=0
+  for MT_W in ${MT_CP}; do MT_CN=$((MT_CN + 1)); done
+  if [ "${MT_CN}" -lt 2 ]; then MT_LIVE=$((MT_LIVE + 1)); continue; fi
+  git diff-tree --quiet "${MT_C}^" "${MT_C}"; MT_DRC=$?
+  if [ "${MT_DRC}" -eq 1 ]; then MT_LIVE=$((MT_LIVE + 1)); continue; fi
+  if [ "${MT_DRC}" -ne 0 ]; then echo "UNKNOWN diff-tree rc=${MT_DRC} on ${MT_C}"; exit 2; fi
+done
+if [ "${MT_LIVE}" -eq 0 ]; then
+  echo "PAYLOAD-NOT-IN-TREE every commit ahead of the base is empty"; exit 1
+fi
+echo "IN-TREE ${MT_LIVE} tree-changing commit(s) ahead of the base"; exit 0
+```
+<!-- END merge-payload-guard -->
+
+**The fixtures — run them, do not read them.** `bash scripts/steward-empty-diff-fixtures-test.sh`
+(this repo; its tracked `.sh` files are mode `100644`, so invoke through `bash`, never as a
+program — a fresh CI checkout has no exec bit and `Permission denied` rc=126 reads as a
+behavioural failure). It builds three throwaway git repos, touches no network and no fleet state,
+and pins the thirteen git shapes that argue for each conjunct, plus three static gates over this
+file and the UNKNOWN cases. Each row asserts **N's full output string** (a prefix match cannot tell
+`NOT-NOOP merged=<oid>` from `NOT-NOOP merge conflicts`), **P6's exit code**, and the **commits-ahead
+count** — which is the empirical basis of the V argument and must be asserted, not merely printed:
+
+| Case | N | P6 | ahead | What it proves |
+|---|---|---|---|---|
+| C1 the #1033 shape — merge-forward onto already-landed commits | `NOOP-PROVEN` | pass | 2 | the row must **close** this; the retired three-guard rule could not |
+| C2 live work on top of the C1 shape | `NOT-NOOP merged=…` | pass | 3 | N refuses on tree content |
+| C3 branch parked exactly at the base tip | `NOOP-PROVEN` | pass | **0** | **V is the only stopper** — A reads `0`, P1/P2/P6 all pass |
+| C4 live deletion vs the FRESH base | `NOT-NOOP merged=…` | pass | 1 | N refuses |
+| C5 the same branch vs a **STALE** base | `NOOP-PROVEN` | pass | 2 | **P2** (fresh fetch) is the stopper |
+| C6' PR onto `release`, measured against the DEFAULT base | `NOOP-PROVEN` | pass | 2 | **P1** (real base) is the stopper — this one would close live work |
+| C6' the same PR against its REAL base | `NOT-NOOP merged=…` | pass | 1 | N refuses once the base is right |
+| C7 true textual conflict | `NOT-NOOP merge conflicts` | pass | 1 | a conflicted PR is never a no-op |
+| C8 back-merge / history reconcile | `NOOP-PROVEN` | **REFUSE** | 2 | **P ∧ N ∧ V ∧ A all hold** — P6a is the only stopper; the payload is the merge edge |
+| C9 empty-commit marker PR | `NOOP-PROVEN` | **REFUSE** | 1 | V passes on one commit — P6b is the only stopper |
+| C10 unhydrated branch + one `--no-ff` merge-forward | `NOOP-PROVEN` | **REFUSE** | 1 | **V is not a hydration test**; P6a is what stops this |
+| C11 single-commit, rebase-landed | `NOOP-PROVEN` | pass | 1 | **must still close** — pins P6 against over-refusing |
+| C12 self-revert | `NOOP-PROVEN` | pass | 2 | accepted close of never-landed work (survivor 1 of 2) |
+| C13 the same reconcile as C8, authored on the **release** side | `NOOP-PROVEN` | pass | 2 | **accepted close**: swapping the merge's parents makes it graph-identical to C1, so no predicate separates them (survivor 2 of 2) |
+| gate0 drift | — | — | — | the snippet above is byte-identical to `scripts/merge-noop-probe.sh` |
+| gate1 dollar-digit | — | — | — | `0` in this file — **prose included**, which the CI linter's fence-scoped guard #18 does not cover |
+| gate2 gh fields | — | — | — | every `gh pr view --json` field this row names actually exists — this gate exists because `baseRepository` **does not**, and it aborted P1 on every PR |
+| P0 unset `MT_BASE`/`MT_HEAD` | `UNKNOWN` rc=2 | `UNKNOWN` rc=2 | — | bare `set -u` exits **1**, which this contract reads as a *proven* verdict |
+| P4 draft | — | — | — | the row's P1 field list actually requests `isDraft` |
+| P5 six malformed / pre-2.38 git versions | `UNKNOWN` rc=2 | — | — | UNKNOWN never collapses into a proven verdict |
+
+**Nine of the thirteen read `NOOP-PROVEN` — so the no-op proof alone is not the rule, and it is not
+close.** Each negative has a *different primary* stopper, and that is the entire argument for
+keeping the predicate conjunctive. C5 and C6' would each *also* be refused by **A** (GitHub computes
+`changedFiles` against the real, fresh base, so both read `1`), which makes P1 and P2
+belt-and-braces there — still required, because they are what makes N's own proof *sound* rather
+than accidentally-agreeing. The genuinely non-redundant ones are **C3 → V** and **C8/C9/C10 → P6**,
+and those four are exactly the rows a "simplifying" reviewer will delete. ⚠️ Note the fixtures'
+`git rev-list --count BASE..HEAD` only **approximates** V: V's real discriminator is
+`gh pr view --json commits`, which GitHub does *not* recompute to `0` once a head becomes an
+ancestor of its base (measured on six merged web PRs). **Do not let the fixture suite stand in for
+a live check of the `commits` field.**
 
 Tier 1 is **deterministic, auditable, fast** — the SRE reflexes, no LLM cost.
 
@@ -1464,9 +1761,11 @@ Three rows need their default INVERTED here rather than merely disapplied:
   The CI-duration gating in step (2) is likewise moot where there is no candidate CI.
 - **Already-landed empty-diff.** This row **DOES apply**, and on a watch-only repo it is the
   more likely of the two — a stranded PR's content often lands out-of-band via a successor PR
-  while the original sits open (ccfg #231, superseded by #255). Run its three-part proof
-  against the PR's CURRENT head before touching anything else; a PR that needs closing must
-  never be re-run and landed as a no-op.
+  while the original sits open (ccfg #231, superseded by #255). Run its **P ∧ N ∧ V ∧ A no-op
+  proof** against the PR's CURRENT head and its **real base** before touching anything else; a PR
+  that needs closing must never be re-run and landed as a no-op. Out-of-band landing is precisely
+  the shape ancestry cannot see, so do **not** substitute an ancestry check for the proof — on a
+  watch-only repo there is no coord land record to fall back on either, and UNKNOWN is UNKNOWN.
 
 **Bounded-remediation discipline (inlined loop control).** Each Tier-1 remediation is a
 bounded attempt, not an open loop:
@@ -1539,6 +1838,12 @@ The pipeline, for each deficiency:
    `--admin` section of `qontinui-claude-config/knowledge-base/qontinui-specific/coord-merge-train.md`).
    A coord fix-land waits for a DRAINED queue (Guardrails); a recovery-merge counts
    against `--max-recovery-merges`.
+   **⚠️ The recovery arm is agent-unexecutable since PR #328** (shared-settings
+   `deny` on `Bash(gh pr merge:*)`, unliftable in every permission mode and by any
+   hook). When the train is the defect, the steward's land step is: audit comment →
+   gate/escalate to the operator → carry on with the remediation PR, which lands
+   normally through the train once the defect is fixed. The fix PR itself is
+   unaffected — it is an ordinary PR.
 
 **with NO human approval click** — this is the operator's explicit directive, made
 responsible by gating on checks, not permission.
@@ -1567,7 +1872,13 @@ hits (a)–(d).
 
 Surface an escalation **with a recommendation**, not as an open question, and use
 `coord_ask_question` (then status `waiting_human`) for anything only a human can answer.
-`AskUserQuestion` is for the interactive-operator case per the `_loop-control.md` carve-outs.
+`AskUserQuestion` is for the interactive-operator case, and only for these three carve-outs:
+(1) a **security anomaly** — an apparent credential leak, auth bypass, injection, or an unexpected
+privilege/escape; (2) a **coord / deploy / migrate need** — an action requiring a coord deploy, a web
+deploy, a DB migration, or another fleet-mutating step; (3) a **genuinely-surprising finding** — a
+result contradicting a core assumption such that continuing autonomously would be reckless.
+Everything else is `stop_and_report`: emit the handoff and stop. Do not ask the operator to confirm
+routine things, restart services, or look at a log.
 
 Everything else the steward decides + executes. A per-PR `needs_human` / `operator_merge`
 state is **surfaced (logged), not auto-actioned, and is NOT a loop-halt** — it's one PR's
@@ -1606,7 +1917,11 @@ state; keep watching the rest of the fleet.
     implement as SEPARATE, independently revertible PRs.
   - **The real fix is upstream:** a coord restart should not orphan proposals at all. Until
     that lands, the drain gate above is a workaround, not the design.
-- **`--max-recovery-merges` (default 1/hour) STANDS.** A recovery-merge bypasses coord, the
+- **`--max-recovery-merges` (default 1/hour) STANDS — but is INERT since PR #328**, which
+  denied `Bash(gh pr merge:*)` fleet-wide in shared settings; a budget on an action no
+  agent can perform caps nothing. Keep the flag (it re-arms the moment the deny is
+  lifted) and do not read a non-zero remaining budget as permission. A recovery-merge
+  bypasses coord, the
   merge authority, on a diagnosed-defect argument — that is a genuinely dangerous, genuinely
   rare act and deserves a hard ceiling. Do not conflate it with authoring fixes.
 - **Tighten the REVIEW, not the volume.** If autonomous fix quality drops, raise the vet bar /
@@ -1660,10 +1975,26 @@ Per iteration, emit a compact ledger: for each PR/signal touched — `repo#pr | 
 `fix_prs authored: N` per repo — a TALLY, not a ceiling) and any registered
 `gate_id`s. Also list **deficiencies found → what you did about them** (fixed / PR # / plan +
 gate_id / unchased-with-reason) — a found deficiency with no disposition is a silent drop.
-On exit (stop / `--once` / cap), emit
-the structured handoff (`_loop-control.md` Element 3): iterations run, terminations, per-wedge
-ledger, any Tier-3 escalations with the specific decision needed **and your recommendation**,
-and any deferred fix-lands with their reason (deploy-batch defer / rate-limit defer).
+On exit (stop / `--once` / cap), emit the structured handoff — assembled **mechanically from the
+ledger, not re-derived**, so whoever picks this up sees exactly what was attempted and the one
+decision that is blocked:
+
+```
+## merge-train-steward escalation — <reason: stop | --once | iteration cap | blocked on an observable condition>
+
+- Iterations run: <N>
+- Termination reason: <stop | --once | cap | blocked>
+- Registered gates: <gate_id(s), or "none">
+- Per-wedge ledger: <repo#pr | class | next-action | action-taken | outcome, one line each>
+- Tier-3 escalations: <the specific decision needed, WITH your recommendation>
+- Deferred fix-lands: <each, with its reason — deploy-batch defer / rate-limit defer>
+```
+
+**Emit-on-block.** If the steward stops because it is waiting on an **observable** condition — a
+deploy going healthy, a CI run going green, a rate-limit window resetting, a coord leader-lease row
+being cleared — invoke `/blocked` to register the typed coord gate **BEFORE** stopping, and name the
+`gate_id` above. That turns the blocker into a watched gate instead of a report that dies with the
+session. If the blocker has no observable trigger, say so — that case is NOT a gate.
 
 Close the session's final report with a **`POLICY_COMPLIANCE` footer** per the unified policy
 protocol, listing the clauses you applied and any `POLICY_GAP` you recorded.
@@ -1702,11 +2033,22 @@ These are the lessons that cost the most time; the 2026-07-17/18 set below still
   not an ancestor — indistinguishable from closed-unmerged by state alone. But when the
   rebase was a no-op the tip is preserved, the head IS an ancestor, and GitHub reads
   `MERGED` (`qontinui-runner#1076`) — so a **passing** ancestry check is genuine positive
-  evidence; only a failing one is uninformative. Never read a fail as "unlanded".
+  evidence; only a failing one is uninformative. Never read a fail as "unlanded" — and never read
+  one as "not a no-op" either. **A FAIL proves nothing in either direction**, which is the whole
+  reason the question *"does merging this PR change its base?"* has to be asked directly rather
+  than inferred from ancestry: `git merge-tree --write-tree`, not `merge-base --is-ancestor`.
   ⚠️ A pass proves only that *the head is reachable from `main`* — NOT that this PR's
   work landed: an unhydrated or empty branch whose head is an old `main` commit passes
-  vacuously. That is precisely why the Tier-1 close row keeps guards (b) `changedFiles=0`
-  and (c) empty `git log origin/main..<head>`. **Ancestry alone never authorises a close.**
+  vacuously. **Ancestry alone never authorises a close.** Since 2026-08-24 the Tier-1 close row
+  uses ancestry as *evidence when it passes* and as a gate **never**, and the rationale this
+  paragraph used to carry — *"that is precisely why the row keeps guards (b) `changedFiles=0` and
+  (c) empty `git log origin/main..<head>`"* — is **retired as measured-wrong on both halves**:
+  (c) is *structurally unsatisfiable* on the merge-forward ff-land shape (web#1033: ancestry
+  `exit=1`, `origin/main..head` = 6 commits, merge a proven no-op), and (b)+(c) never did stop the
+  vacuous case they were credited with — a branch parked at the *current* base tip satisfies both.
+  What authorises the close now is `git merge-tree --write-tree` against the PR's **real** base
+  (N), fenced by an anti-vacuity commit-count check (V) and by `changedFiles=0` as an independent
+  second engine (A). See the Tier-1 "Already-landed empty-diff PR" row and "The no-op probe".
   **Distinctive CONTENT on `origin/main` settles it either way** (and see the silent-empty
   trap above, which is exactly how that content check fails open). Full two-shape model:
   `knowledge-base/qontinui-specific/coord-ff-lands.md`.
@@ -1866,7 +2208,13 @@ These are the lessons that cost the most time; the 2026-07-17/18 set below still
   rate-limits + deploy-batch coordination on top.
 - **`--admin` is off the table — by policy, not because it is impossible.** Recovery =
   rebase → required checks green on the up-to-date head → plain `gh pr merge --rebase`.
-  Never `--admin`, never `--no-verify`. (The four `main-merge-gates` rulesets DO list
+  Never `--admin`, never `--no-verify`. **And since PR #328 the plain form is off the
+  table too — mechanically:** shared `.claude/settings.json` denies
+  `Bash(gh pr merge)` / `Bash(gh pr merge:*)`, a rule no permission mode, local
+  settings file, CLI flag or `PreToolUse` hook can override. A steward that reaches a
+  recovery-merge hands the PR to the operator (audit comment + gate/escalation) and
+  moves on; it does not attempt the merge, and it does not reach for
+  `gh api .../pulls/N/merge`, which `git-guard.sh` blocks as the same act. (The four `main-merge-gates` rulesets DO list
   `OrganizationAdmin` as a bypass actor — measured 2026-07-29 — so never tell a caller
   "no one but coord can merge this"; say the steward does not merge it. Per-repo bypass
   detail: `qontinui-claude-config/knowledge-base/qontinui-specific/coord-merge-train.md`.)

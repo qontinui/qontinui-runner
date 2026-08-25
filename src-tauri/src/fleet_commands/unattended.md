@@ -58,10 +58,10 @@ Now put **every** unit into exactly one terminal state:
 
 | State | Meaning | Evidence required |
 |---|---|---|
-| **LANDED** | On `main`, verified **by content** on `origin/main` | The landed SHA plus the content check. `gh` PR state is not evidence; `closed, merged=false` is a normal ff-land. Ancestry only on the LANDED sha, never the head |
+| **LANDED** | On `main`, verified **by content** on `origin/main` | The landed SHA plus the content check. `gh` PR state is not evidence in EITHER direction — `closed, merged=false` and `MERGED` with `mergeCommit.oid == headRefOid` are **both** normal coord lands (`coord-ff-lands.md`). Ancestry only on the LANDED sha, never the head |
 | **WATCHED** | Incomplete, but a coord gate watches the trigger and can resume it after every session dies | `gate_id`, **read back** after registration (`coordination` `gate-read-back`) |
 | **RECORDED** | Not resumable work, but a durable record exists so the next session need not re-derive it | The memory record id / plan slug / policy clause |
-| **IMPEDED** | Not done because a condition that is **currently true, environmental and shared** blocks it — and that condition is now posted where the next session will be handed it | The returned `finding_id`. Cite an `alert_key` too *if you actually have one* — `GET /coord/alerts` takes a device JWT but filters the infra-scoped (NULL-`device_id`) class to `is_admin` staff, so for exactly this condition class its silence is never evidence |
+| **IMPEDED** | Not done because a condition that is **currently true, environmental and shared** blocks it — and that condition is now posted where the next session will be handed it | The returned `finding_id`. Cite an `alert_key` too *if you actually have one* — `GET /coord/alerts` takes a device JWT, and coord#1601 added a machine arm over a closed allowlist (`FLEET_INFRA_MACHINE_KINDS`), but that arm is **legacy-posture only** and production runs `COORD_ALERTS_TENANT_STRICT=1`, so for exactly this condition class its silence is **still** never evidence — see the alerts note under 2b-findings |
 | **DROPPED** | Exists only in this transcript | — |
 
 IMPEDED is a *converted* state, not a softer DROPPED: it is earned by the
@@ -133,9 +133,23 @@ step must actively defeat:
 - A coord write returning **"Command failed with no output"** is a dead cached
   transport, and the write is **presumed LOST**. Run `/coord-revive`, re-issue
   over the live door, and **verify by read**.
-- **`pr_merged` false-clears on an open PR**, and never fires at all on a
-  coord-orchestrated repo (ff-land closes with `mergedAt:null`). Prefer
-  `commit_live` anchored to a **post-land main SHA**.
+- ~~**`pr_merged` … never fires at all on a coord-orchestrated repo (ff-land
+  closes with `mergedAt:null`)**~~ — **both halves corrected.** The gate does
+  not read GitHub's `merged` bool at all: `gates::pr_merged_verdict` clears on
+  coord's own land record (`pr_state = 'merged'` **or** `close_cause ∈ {merged,
+  commits_landed_via_other_pr}`), so it clears on a coord land, and a coord land has **two**
+  GitHub shapes anyway — `CLOSED, merged=false` only when the rebase rewrote the
+  sha, `MERGED` with `mergeCommit.oid == headRefOid` when it did not
+  (`knowledge-base/qontinui-specific/coord-ff-lands.md`). What survives is
+  narrower and is **not** a false clear: an explicitly `open`/`draft` `pr_state`
+  carrying a land cause hits the **contradiction guard** and returns `Open`
+  until the PR leaves open/draft. The guard is deliberately narrow — `pr_state =
+  None` plus a land cause is **not** a contradiction and still clears: that is
+  coord's ff-land record beating the webhook, and the content really did land.
+  The real coin-flip is the **pre-land SHA
+  anchor** — a `commit_live`/`ref_exists` gate on the branch head you read
+  before landing clears only on the sha-preserving shape — so anchor
+  `commit_live` to a **post-land main SHA**, never a pre-land one.
 - **`file_exists` 403s fleet-wide.** Do not use it.
 - ~~**`unit_status` is rejected 400/422 over the device HTTP door**~~ —
   **corrected 2026-08-23: it is accepted.** Registering
@@ -144,10 +158,19 @@ step must actively defeat:
   runner-minted **device JWT** returned a `gate_id` with an empty `warnings[]`,
   and the gate evaluated on schedule (`verdict: open` against an `in_progress`
   unit, `continuation_will_dispatch: true`) rather than pinning unevaluated.
-  Keep the rest of the hazard: a **`pr_merged` on an already-closed PR goes
-  terminal `failed`, un-withdrawable** — and on a coord-orchestrated repo an
-  ff-land closes the PR with `mergedAt: null`, so `pr_merged` is the wrong
-  predicate there regardless. **`unit_status` on the plan's own work unit is
+  Keep the rest of the hazard: a **`pr_merged` on a PR closed WITHOUT a land
+  cause** (`author_closed` / `unexplained` / `branch_deleted_by` / NULL) **goes
+  terminal `failed`, un-withdrawable** — a PR closed *with* a land cause clears
+  normally. **The no-land-cause class includes the dying-land arm**, where
+  the land pushed and flipped the proposal but died before the provenance
+  stamps — it reaps `closed` with `close_cause = 'unexplained'`, which is why it
+  lands in this class — so the gate reads `Failed` on work that is provably on
+  `main`. Content
+  on `main` is **not** the discriminator there (a routine `author_closed` whose
+  work shipped via a different PR looks identical); a `merged`
+  `coord.merge_proposals` row for **this** PR is. That is a reason to check a
+  `Failed`, **not** a reason to avoid the predicate on a coord-orchestrated
+  repo — it clears there normally. **`unit_status` on the plan's own work unit is
   usually the right one for "resume when this plan's work has landed"**, because
   `shipped` is DERIVED from merged PR citations.
 - **`Misconfigured` is terminal** — the sweep re-evaluates `open` only. A
@@ -155,6 +178,26 @@ step must actively defeat:
 - A blocker with **no observable trigger is not a gate.** Do not force-fit a
   predicate onto an open-ended TODO; that pollutes the registry with gates that
   never clear. Route it to 2b, 2c or 2d instead.
+- **Send `gate_class`, and read `initial_verdict_reason` back.** These are the
+  two registration mechanics this step is a consumer of, and omitting either is
+  invisible at registration time. `gate_class` decides **who may clear** the
+  gate — omit it and a closeout silently files unclassified gates, which is how
+  the clearance-authority surface stayed dark fleet-wide for a week. An
+  `/unattended` gate is a session-close artifact with no operator watching, so
+  classify it BY DEFAULT rather than leaving it to a later reader.
+  `initial_verdict_reason` is what separates a REGISTERED-BUT-NOT-USABLE gate
+  from a usable one: a returned `gate_id` is **not** sufficient. Treat a
+  non-empty `warnings[]`, or an `initial_verdict_reason` containing **"cannot
+  evaluate"**, as **not registered** for the purposes of Step 2a — the item is still DROPPED
+  and must fall through to 2b/2c/2d. **One exception, and it is not a judgement
+  call:** a `pr_merged` gate on a coord-orchestrated repo *always* comes back
+  carrying coord's informational `ℹ … the clear may lag GitHub's close by one
+  provenance write` steer, which `check_predicate` pushes into **`warnings[]`**
+  and not only into `steer` (`gates.rs`, `pr_merged_orchestrated_warning` →
+  `warnings.push`). That is a steer, **not a rejection**: the gate is registered
+  and usable. Read the warning text before dropping anything — the rule is
+  "warnings mean not-usable", and this one says the opposite in words.
+  Canonical: `_gate-registration`, which lists this command as a consumer.
 
 Read every `gate_id` back. **A gate you did not read back is still DROPPED.**
 
@@ -248,9 +291,21 @@ The same pair belongs in `alerts.detail` when the condition is *also* carried by
 an alert — but **you cannot write it from a session**: every `INSERT INTO
 coord.alerts` is a coord-internal watcher, and there is no `coord_post_alert`
 tool and no alert-write route on the agent door. Reading is barely better for
-this class: `GET /coord/alerts` accepts a device JWT, but infra-scoped
-(NULL-`device_id`) alerts are visible only to `is_admin` staff — the visibility
-gap Phase 2 of the plan above closes. So the finding body is the edge record you
+this class, and **the fix that was supposed to change that has landed without
+changing it.** `GET /coord/alerts` accepts a device JWT; coord#1601 (`61a107be`,
+Phase 2/G2 of the plan above) added a machine arm so a device principal could
+read the infra class, scoped to a closed kind allowlist
+(`FLEET_INFRA_MACHINE_KINDS`) AND the no-device/no-tenant/no-repo shape. But the
+arm is gated `!strict_tenant` in BOTH `build_get_alerts_query` and
+`fleet_health_rollup_sql`, and production runs `COORD_ALERTS_TENANT_STRICT=1`
+— measured 2026-08-25 against the running service `qontinui-staging-coord:857`,
+and there is no separate staging. So the arm never fires in the only environment
+that exists, and infra-scoped alerts remain unreadable from an ordinary tenant's
+session exactly as before. **Read that as UNKNOWN, not as "no alert exists"**
+[policy: `verification-and-evidence` `silent-empty-is-unknown`]. Do not "verify"
+this by finding that you CAN see NULL-`device_id` rows: an operator/system-tenant
+device reaches that class through a pre-existing arm, so a privileged principal
+is not a sample. So the finding body is the edge record you
 actually author; the `alerts.detail` mirror is a note for whoever owns the
 alert, not a step in this procedure. Never report an edge as mirrored when no
 door existed to mirror it through.
@@ -363,12 +418,17 @@ door ever failing**, so the UNKNOWN clause below does not catch it on its own.
 Treat any zero-result corpus read as UNKNOWN unless you have positively
 confirmed the body sync is on for this device.
 
-**Do not probe by stem.** `GET /api/v1/plan-library?q=` matches **title and
+**Do not probe by stem with `q`.** `GET /api/v1/plan-library?q=` matches **title and
 body, NOT the slug** (measured 2026-08-22), while the stem is the canonical plan
 identifier everywhere else - `Depends-On:`, the `Plan: <stem>` PR marker,
 `$QONTINUI_PLANS_DIR` filenames. A by-stem existence probe therefore returns a
 **false negative for a plan that is present** - another definite-looking "no"
-that routes straight to 3c. Resolve by id, or search by title words.
+that routes straight to 3c. **The exact by-stem door is
+`?kind=plan&work_unit_slug=<stem>`** - the adapter writes a plan's own stem into
+`work_unit_slug` (`body_push.rs:558`, `kind == Plan` only) and the list route
+filters that column exactly. Failing that, page `?kind=plan&limit=200` and match
+the `slug` field yourself; the list route has no `slug` filter, and a zero from
+either is still UNKNOWN under the frozen-corpus rule above.
 
 **An UNKNOWN at this step is not a miss — it must NOT fall through to 3c.** If
 neither the corpus nor a *successfully rendered* cache answered, you have not

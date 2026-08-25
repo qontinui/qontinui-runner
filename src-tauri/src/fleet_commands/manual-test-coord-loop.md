@@ -92,8 +92,14 @@ Compute a stable fingerprint over the remediation-plan section: sort issue lines
 
 Append to `LEDGER`:
 ```
-iter=N counts="bugs=… friction=… missing=… product_gaps=… setup_gaps=… security_anomalies=… blocked=…" fp=<fingerprint> status=<NO_DEFICIENCIES|HAS_DEFICIENCIES>
+iter=N counts="bugs=… friction=… missing=… product_gaps=… setup_gaps=… security_anomalies=… blocked=…" fp=<fingerprint> status=<NO_DEFICIENCIES|HAS_DEFICIENCIES> ending=<pending>
 ```
+
+Write `ending=<pending>` here and fill it in at the **end** of the iteration (after step h, or after
+step f decides to exit), per "Turn-ending classification" below. It cannot be judged at this point:
+`/manual-test-coord` has only just returned and the iteration has no final paragraph yet. A row still
+reading `<pending>` when the loop exits is itself a signal — the iteration ended somewhere that never
+reached its own classification step.
 
 #### f. Termination checks (before involving the operator)
 
@@ -110,11 +116,14 @@ bugs=0 friction=0 missing=0 product_gaps=0 setup_gaps=0
 Apply in order:
 
 1. If counts satisfy NO_DEFICIENCIES → increment `CLEAN_STREAK`. If `CLEAN_STREAK >= 2` → exit loop, jump to Final Report (success).
-2. If `ITER >= MAX` → exit loop with reason `iteration cap`. Jump to Final Report.
-3. Else → reset `CLEAN_STREAK = 0`. Auto-filter the remediation table for autonomously-fixable items (same filter as step h: repo is `qontinui-claude-config` or `qontinui-runner`, unambiguous, no API/schema/migration/IPC):
+2. **Blocked on an observable condition?** — the remaining deficiencies cannot clear until something *watchable* happens: a Vercel or ECS deploy going healthy, an alembic migration reaching head, a rebuilt runner becoming the serving build, a coord fix landing. Deferred coord/web items are the common case here, and they are exactly the ones this loop cannot fix. **Invoke `/blocked` to register the typed coord gate BEFORE exiting**, then exit with reason `blocked` and name the `gate_id` in the Final Report. Checked ahead of the cap and the stall because a block presents as both: the same deferred set, iteration after iteration, until `ITER` runs out. If the blocker has no observable trigger, say so — that case is NOT a gate (see `/blocked`).
+3. **Stall?** — this iteration's fingerprint equals the previous iteration's AND no autonomous remediation was applied in either → exit with reason `stalled` (Termination Condition 3). Another identical iteration cannot help, and each one costs 5–10 minutes of ECS + RDS + temp-runner build.
+4. If `ITER >= MAX` → exit loop with reason `iteration cap`. Jump to Final Report.
+5. Else → reset `CLEAN_STREAK = 0`. Auto-filter the remediation table for autonomously-fixable items (same filter as step h: repo is `qontinui-claude-config` or `qontinui-runner`, unambiguous, no API/schema/migration/IPC):
    - If there ARE autonomously-fixable items → proceed directly to step h (remediate). No operator prompt.
    - If there are ZERO autonomously-fixable items (all items are coord/web/deferred) → log deferred items in the iteration ledger, increment `ITER`, restart the loop body at step a (skip remediation, no operator prompt).
-4. Before proceeding, check the operator gate conditions (step g). If ANY gate condition fires, pause for operator input before continuing. Otherwise, proceed autonomously.
+6. **About to end this iteration on a `bailout` or an ungated `user_deflection`?** (see "Turn-ending classification") → you are not done. Run the next iteration, or register the typed coord gate via `/blocked` first. Never stop here silently.
+7. Before proceeding, check the operator gate conditions (step g). If ANY gate condition fires, pause for operator input before continuing. Otherwise, proceed autonomously.
 
 #### g. Operator gate (conditional — fires only on exceptional conditions)
 
@@ -169,7 +178,7 @@ For the items that DO pass: delegate to ONE Agent (subagent_type: `general-purpo
 > Rules:
 > - Fix the root cause, not symptoms.
 > - After each item, run the verification step. Report `PASS | FAIL | DEFERRED` per item.
-> - Run the repo's standard typecheck/lint at the end (Rust: `cargo check` + `cargo clippy --tests -D warnings` via cargo-guard; Markdown skill files: lint by re-reading the file end-to-end for structural sanity).
+> - Run the repo's standard typecheck/lint at the end (Rust: `cargo check` + `cargo clippy --tests -D warnings` — via `cargo-guard.sh` ONLY in `qontinui-runner`, which is a runner-only wrapper that refuses from any other repo; in `qontinui-coord`/`-schemas`/`-supervisor`/`-inspect` use raw `cargo` with `CARGO_TARGET_DIR` pointed at that repo's existing shared target dir; Markdown skill files: lint by re-reading the file end-to-end for structural sanity).
 > - **Do NOT commit.** The wrapper does not commit between iterations — operator handles commits at session end.
 > - Report back: changed files, per-item PASS/FAIL/DEFERRED, anything deferred and why.
 
@@ -188,6 +197,52 @@ The loop ends on:
 3. **No-progress stall** — the fingerprint is identical for 2 consecutive iterations AND no autonomous remediation was applied in either of those iterations. Exit with reason `stalled` (prevents infinite loops on unfixable deficiencies that the loop cannot remediate).
 4. **Hard skill failure** — `/manual-test-coord` returns with the report header missing or malformed (skill crash, supervisor unreachable, staging coord 500). Don't retry; surface the failure and exit. The operator will likely need to re-run after fixing the underlying problem.
 5. **Operator stop** — operator chose "stop" at an exceptional-condition prompt (step g). Rare since the gate only fires on security anomalies, regressions, or iteration-cap with P0s.
+6. **Blocked on an observable condition** — the remaining deficiencies wait on a deploy going healthy, a migration reaching head, or a rebuilt runner becoming the serving build. Register the typed coord gate via `/blocked` FIRST, then exit with reason `blocked`. Evaluated ahead of conditions 2 and 3 (step f), because a block presents as both a stall and an iteration cap.
+
+### Turn-ending classification
+
+This skill inlines the shared loop-control rubric (`_loop-control.md`). Its `--max-iters` cap is
+Element 1, its remediation fingerprint is Element 2, its `LEDGER` is Element 4, and the Final Report
+is Element 3's structured handoff. This section is **Element 5**, and it is the one element none of
+the others substitutes for.
+
+Conditions 1–6 above all watch the loop's **work** — deficiency counts, fingerprints, iteration
+counts, the operator. None of them reads what an iteration *said*. That leaves one failure
+uncovered, and it is the expensive one here: the iteration that quietly gives up. The stall rule
+compares iteration N against N+1, and a bail ends the loop before N+1 exists, so the last `LEDGER`
+row reads `HAS_DEFICIENCIES` forever and nothing anywhere calls that a failure.
+
+Judge the ending from the **last non-empty paragraph** of the iteration's final text, matched at its
+**start**. The anchoring is the whole trick: an iteration that *discusses* stopping mid-paragraph and
+then keeps remediating is `complete`.
+
+| Ending | Shape |
+|---|---|
+| `complete` | Does not start with a stop pattern. The overwhelming majority. |
+| `waiting_on_signal` | Stops on an **observable** signal with a bounded wait — "resume once the staging deploy goes healthy". Legitimate. |
+| `user_deflection` | Stops on a **person** — "retry when you approve", "let me know how to proceed". Not a verdict on its own. |
+| `bailout` | Stops with neither a signal nor a person to wait on — "I'll stop here", "I am unable to proceed". |
+| `unknown` | The iteration's final text could not be read. **Never fold this into `complete`** — count it separately. |
+
+**`user_deflection` is only a bailout when the work is UNGATED.** Policy `planning-and-scope`
+`dependency-wait-and-resume` prescribes stopping on a human decision — *provided* the gate and
+continuation were registered first ("never end a session with a blocked item that has no registered
+gate"). So join the text with gate state: deflection **+ a registered gate** is the prescribed
+`stop with status waiting`; deflection **+ no gate** is a bailout. Collapsing that distinction flags
+every correctly-closed blocked session, which is how a control this cheap gets switched off.
+
+**This skill's operator gate makes the distinction unusually easy to get wrong.** Step g's prompt is
+a *designed, condition-gated* `AskUserQuestion` — a deflection that policy prescribes — so an
+iteration ending at the gate is `user_deflection`, never a bailout. What is a bailout is stopping
+*outside* the gate: the loop deferring a coord/web item and ending, with no gate condition fired and
+no `/blocked` gate registered.
+
+**What to do with it — nothing automatic.** Record it in the `ending` column and name it in the
+Final Report. A `bailout` or ungated `user_deflection` is the `finish-to-zero` clause telling you the
+run is not done: either run the next iteration, or — when the blocker is an observable condition —
+invoke `/blocked` to register the typed coord gate BEFORE stopping, so it becomes a watched gate
+instead of a dead report. Do not implement a re-prompt loop off this verdict; acting on it
+automatically is gated behind the runner detector's shadow-corpus review.
 
 ## Final Report
 
@@ -198,13 +253,14 @@ After exit, in the main session, produce ONE consolidated report:
 
 - Iterations run: N (of MAX)
 - Target: <staging|local|both>
-- Termination reason: <clean run | iteration cap | stalled | operator stop | hard skill failure>
+- Termination reason: <clean run | iteration cap | stalled | blocked | operator stop | hard skill failure>
+- Registered gate: <gate_id from /blocked, or "none — no observable blocker">
 - Total deficiencies across all iters: <sum>
 - Per-iteration ledger:
-  iter=1 counts="bugs=… …" fp=abc123… status=HAS_DEFICIENCIES   → operator chose: remediate (passed=4, deferred=2)
-  iter=2 counts="…"           fp=def456… status=HAS_DEFICIENCIES   → operator chose: skip
-  iter=3 counts="bugs=0 …"    fp=—       status=NO_DEFICIENCIES    → clean
-  iter=4 counts="bugs=0 …"    fp=—       status=NO_DEFICIENCIES    → clean (confirmation)
+  iter=1 counts="bugs=… …" fp=abc123… status=HAS_DEFICIENCIES ending=complete   → operator chose: remediate (passed=4, deferred=2)
+  iter=2 counts="…"           fp=def456… status=HAS_DEFICIENCIES ending=user_deflection (gated — step g fired)  → operator chose: skip
+  iter=3 counts="bugs=0 …"    fp=—       status=NO_DEFICIENCIES  ending=complete   → clean
+  iter=4 counts="bugs=0 …"    fp=—       status=NO_DEFICIENCIES  ending=complete   → clean (confirmation)
 - Open items requiring operator action (coord/web touch):
   • <one-line description of each deferred item, with repo + file/module>
 - Repos touched by autonomous remediation: <list>
@@ -231,6 +287,8 @@ Do NOT regenerate per-iteration plans or transcripts. The final report is a thin
 - **One `Skill` call per iteration.** Don't fan out parallel `/manual-test-coord` invocations — staging coord is rate-limited and two parallel runs would cross-contaminate the rendezvous protocol.
 - **Cap iterations at 4 by default.** Coord iters are expensive (~5–10 min each). Raising the cap requires explicit `--max-iters=N` from the operator.
 - **One `sleep` allowed.** The `--rendezvous-window` pause is the only `sleep` in the wrapper. Everything else is event-driven (skill return, sub-agent return, operator response).
+- **Classify how each iteration ENDED** (`ending` column) — a `bailout` or an ungated `user_deflection` means the loop is not done; run the next iteration or register a coord gate via `/blocked`. An iteration that ends at step g's operator gate is a *gated* deflection and is fine.
+- **NEVER stop on an observable blocker without registering a gate** — deferred coord/web items are the common case, and they are precisely what this loop cannot fix. If they wait on a deploy going healthy or a migration reaching head, run `/blocked` to register the typed coord gate BEFORE exiting and name the `gate_id` in the Final Report. The `bailout` check will not catch this one: waiting on a real signal is `waiting_on_signal`, which is legitimate — what makes it a defect is stopping there ungated.
 
 ## Focus
 

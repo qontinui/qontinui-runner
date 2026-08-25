@@ -76,6 +76,23 @@ Only escalate to an interactive `AskUserQuestion` for: (1) a **security anomaly*
 leak / auth bypass / injection), (2) a fix that needs a **coord deploy / web deploy / DB migration**,
 or (3) a **genuinely-surprising finding** that makes continuing autonomously reckless.
 
+**Emit-on-block — a stall or a cap is sometimes a BLOCK, not an absence of progress.** Before you
+emit the handoff, ask what the loop is actually waiting on. If the bug cannot be fixed until some
+**observable** condition changes — a deploy or CI run going green, a PR merging, a migration
+reaching head, a rebuilt runner becoming the serving build, an upstream fix landing — then this is
+not "no progress", it is *blocked on an observable condition*, and you **MUST** invoke `/blocked` to
+register the typed coord gate **BEFORE** you stop. That turns the blocker into a durable,
+tenant-scoped, fleet-wide watched gate that auto-resumes or notifies on clearance, instead of a
+report that dies with this session. Then emit the handoff as usual, naming the registered
+`gate_id`. If the blocker has no observable trigger, say so — that case is NOT a gate (see
+`/blocked`).
+
+This is **in addition to** the cap/stall handoff, not a replacement, and it is a **separate trigger
+from the `bailout` arm above**. That arm cannot cover it: a round that stops on a real signal
+classifies as `waiting_on_signal`, which the five-ending table calls *legitimate*, so the bailout
+check waves it through by design. Ungated, it is still an unwatched blocked item — the thing
+`dependency-wait-and-resume` forbids ending a session on.
+
 ## UI Bridge Architecture
 
 The UI Bridge is an **SDK-based system** — any React app with the `@qontinui/ui-bridge` SDK installed can be discovered and controlled programmatically. No browser extension required.
@@ -401,15 +418,20 @@ Then run the termination checks **in this order** (PRIMARY stops first, BACKSTOP
 
 1. **Bug resolved?** (UI Bridge verification in Step 8 confirms the expected behavior) → status
    `FIXED`. Proceed to Step 11 (Clean Up and Report).
-2. **Stall?** — this round's fingerprint equals the previous round's → status `STALL`. Stop and emit
+2. **Blocked on an observable condition?** — the bug cannot be fixed until a deploy/CI run goes
+   green, a PR merges, a migration reaches head, or another watchable thing happens → invoke
+   `/blocked` to register the typed coord gate **first**, then stop and emit the Escalation Handoff
+   naming the `gate_id`. Checked here, ahead of stall and cap, because a block usually *presents* as
+   one of them: the same files, the same failing signal, round after round.
+3. **Stall?** — this round's fingerprint equals the previous round's → status `STALL`. Stop and emit
    the Escalation Handoff (below). Another identical round won't help: the same edit to the same
    files left the same failing signal.
-3. **Cap reached?** — `round >= MAX_ROUNDS` → status `CAP_REACHED`. Stop and emit the Escalation
+4. **Cap reached?** — `round >= MAX_ROUNDS` → status `CAP_REACHED`. Stop and emit the Escalation
    Handoff (below).
-4. **About to end on a `bailout` or an ungated `user_deflection`?** → you are not done. Take the next
+5. **About to end on a `bailout` or an ungated `user_deflection`?** → you are not done. Take the next
    round, or register the typed coord gate via `/blocked` if the blocker is observable. Never stop
    here silently.
-5. **Security / coord-deploy-or-migration / surprising finding?** → escalate via `AskUserQuestion`
+6. **Security / coord-deploy-or-migration / surprising finding?** → escalate via `AskUserQuestion`
    per the carve-outs in "Loop Bounds".
 
 Otherwise (bug not yet resolved, no stall, under the cap): go back to Step 2. Use the UI Bridge to
@@ -421,10 +443,11 @@ When you stop on STALL or CAP_REACHED, emit this structured handoff (assembled m
 `LEDGER` — do not re-derive it), then stop:
 
 ```
-## ufix escalation — <round-cap reached | no-progress stall>
+## ufix escalation — <round-cap reached | no-progress stall | blocked on an observable condition>
 
 - Bug: <one-line restatement of the bug report>
 - Rounds run: <N> / <MAX_ROUNDS>
+- Registered gate: <gate_id from /blocked, or "none — blocker has no observable trigger">
 - Current failing signal: <what the UI Bridge / logs still show vs. expected, with error signature>
 - Per-round ledger:
   round=1 action=<…> delta=<…> fp=<…> status=<…> ending=<…>
@@ -481,6 +504,11 @@ If `healthy: false`:
   (BACKSTOP, arg-overridable) and emit the Escalation Handoff rather than looping or giving up silently
 - **Classify how each round ENDED** (`ending` column) — a `bailout` or an ungated `user_deflection`
   means the loop is not done; take the next round or register a coord gate via `/blocked`
+- **NEVER stop on an observable blocker without registering a gate** — if the bug can't be fixed
+  until a deploy goes green, a PR merges or a migration reaches head, run `/blocked` to register the
+  typed coord gate BEFORE stopping, and name the `gate_id` in the handoff. The `bailout` check will
+  not catch this one: waiting on a real signal is `waiting_on_signal`, which is legitimate — what
+  makes it a defect is stopping there ungated
 - **ALWAYS** use the UI Bridge to inspect and verify UI state before and after fixes
 - **ALWAYS** check logs when the UI state alone doesn't explain the issue
 - **ALWAYS** verify the fix by re-checking UI state via the UI Bridge

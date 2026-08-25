@@ -87,7 +87,16 @@ cp /mnt/d/qontinui-root/qontinui-mobile/google-services.json .  # operator-local
 
 If `git pull` fails with `hint: You have divergent branches` after a remote force-push (look for `forced update` in the fetch output), the WSL clone needs to be realigned to the rewritten history. The clone may also have working-tree pollution — every file showing "modified" with mode 100644→100755 plus CRLF line endings — left over from the original Windows-origin checkout.
 
-`git reset --hard origin/master` is blocked by the safety hook; this non-`--hard` recovery slips past:
+`git reset --hard origin/master` is blocked by the safety hook, and so — since
+2026-08-25 — is a bare `git checkout HEAD -- .`, which wipes the working tree
+from HEAD just as thoroughly. The recovery below still runs, but **not because
+it evades the guard**: it executes inside a `wsl … bash -c '…'` payload, which
+`git-guard.sh` does not descend into by design (guard-hooks.md, "What is still
+out of reach"). Read that as a scope fence, not a licence — the reason it is
+*safe* here is that `/home/qontinui/qontinui-mobile` is a disposable WSL **build
+clone** with no agent's uncommitted work in it, which is exactly the thing the
+guard exists to protect elsewhere. Do not lift this recipe into a shared
+worktree:
 
 ```bash
 wsl -d Ubuntu -- bash -c '

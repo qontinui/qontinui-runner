@@ -566,14 +566,30 @@ note_origin() {
 # Windows jq/python emits CRLF, and a CR surviving into an Authorization header
 # makes curl exit 3 with http_code 000, which classify() reports as UNREACHABLE
 # — a false DEAD over a live door, invisible on Linux.
+# `.data.value` is the LIVE shape and is read FIRST; `.data.result.value` is kept
+# only as a fallback. The runner unwraps the frontend's `result` envelope before
+# it reaches HTTP (qontinui-runner `ui_bridge/page.rs` ->
+# `Ok(resp.result.unwrap_or(...))`), so a healthy runner answers
+# {"success":true,"data":{"value":"<jwt>","type":"scalar"}} with NO `result` key.
+# Reading `result` alone returned "" from a runner that was holding a valid
+# token, which classify() then reported as a DEAD door — the false-DEAD this
+# function's own CR-strip comment above exists to prevent, reached by a
+# different route.
 read_minted_jwt() {
   if [ "$JSON_READER" = jq ]; then
-    jq -r '.data.result.value // ""' 2>/dev/null
+    jq -r '[(.data? | objects | .value?), (.data? | objects | .result? | objects | .value?)]
+           | map(select(type == "string" and . != "")) | (.[0] // "")' 2>/dev/null
   else
     "$JSON_READER" -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: print(); sys.exit(0)
-print((((d.get("data",{}) or {}).get("result",{}) or {}).get("value","") or ""))' 2>/dev/null
+data=d.get("data") or {}
+if not isinstance(data,dict): data={}
+res=data.get("result") or {}
+if not isinstance(res,dict): res={}
+for v in (data.get("value"), res.get("value")):
+    if isinstance(v,str) and v: print(v); sys.exit(0)
+print()' 2>/dev/null
   fi
 }
 
@@ -584,9 +600,9 @@ print((((d.get("data",{}) or {}).get("result",{}) or {}).get("value","") or ""))
 # broken one — an empty string reads as a VALUE. (Same class as
 # reference_missing_schema_object_swallow_arm_hides_wrong_column_forever.)
 #
-# It reads ONLY error-carrying fields and NEVER `.data.result.value`, so no
-# token can escape through this path even if the runner ever put one in an
-# error string.
+# It reads ONLY error-carrying fields and NEVER either token path
+# (`.data.value` or `.data.result.value`), so no token can escape through this
+# path even if the runner ever put one in an error string.
 read_eval_error() {
   if [ "$JSON_READER" = jq ]; then
     jq -r '[.error?, (.data? | objects | .error?), (.data? | objects | .result? | objects | .error?), .message?]
@@ -960,7 +976,7 @@ for origin in ${QONTINUI_RUNNER_URL:-} $RUNNER_ORIGINS http://127.0.0.1:9876; do
         case "$MCODE" in
           4??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $MEVAL_URL with no error string in the body - the UI-Bridge evaluate route is absent/renamed, or something else answers on this port. NOT a sign-in problem)" ;;
           5??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $MEVAL_URL with no error string in the body - the route is PRESENT and failed server-side. Says nothing about the route existing or about your sign-in state)" ;;
-          *)   mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE but the body carried neither a .data.result.value nor an error string - the UI-Bridge response shape has changed)" ;;
+          *)   mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE but the body carried neither a .data.value / .data.result.value nor an error string - the UI-Bridge response shape has changed)" ;;
         esac
       fi ;;
   esac
