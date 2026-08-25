@@ -761,6 +761,71 @@ Goal: {{goal}}
         assert!(!p.body.contains("---"));
     }
 
+    /// The authoring-ergonomics regression this fix exists for: a parameter
+    /// with NO `label` and NO `description`. Before the `SkillParameter`
+    /// deserialize defaults, this failed the whole struct and degraded the
+    /// ENTIRE prompt to parameterless with a `parse_error` — one missing key
+    /// cost the author every parameter on the prompt.
+    #[test]
+    fn parameter_without_label_or_description_still_parses() {
+        let raw = "---\ntitle: Minimal\nparameters:\n  - name: project_name\n    type: string\n    required: true\n---\n\nBuild {{project_name}}.\n";
+        let p = parse_prompt_document("minimal-doc", "d", 1, raw);
+        assert_eq!(
+            p.parse_error, None,
+            "a {{name, type, required}} parameter must not fail the document"
+        );
+        assert_eq!(p.parameters.len(), 1);
+        let param = &p.parameters[0];
+        assert_eq!(param.name, "project_name");
+        assert_eq!(param.param_type, "string");
+        assert_eq!(param.label, "Project name", "label derives from name");
+        assert_eq!(param.description, "");
+        assert!(param.required);
+        assert!(p.body.starts_with("Build {{project_name}}."));
+    }
+
+    #[test]
+    fn parameter_with_only_name_and_type_defaults_required_false() {
+        let raw = "---\nparameters:\n  - name: focus_area\n    type: string\n---\n\nBody.\n";
+        let p = parse_prompt_document("bare-param", "d", 1, raw);
+        assert_eq!(p.parse_error, None);
+        assert_eq!(p.parameters.len(), 1);
+        assert_eq!(p.parameters[0].label, "Focus area");
+        assert_eq!(p.parameters[0].description, "");
+        assert!(!p.parameters[0].required);
+    }
+
+    /// Wire contract: defaults apply on the way IN only. A defaulted parameter
+    /// must still serialize all three keys, so the hand-written TS mirror at
+    /// `qontinui-schemas/ts/src/workflow/skill.ts` (which types them as
+    /// non-optional) stays accurate and this change needs no schemas PR.
+    #[test]
+    fn defaulted_parameters_still_serialize_label_description_and_required() {
+        let raw = "---\nparameters:\n  - name: project_name\n    type: string\n---\n\nBody.\n";
+        let p = parse_prompt_document("bare-param", "d", 1, raw);
+        let out = serde_json::to_value(&p.parameters[0]).expect("serialize");
+        assert_eq!(out.get("label").and_then(|v| v.as_str()), Some("Project name"));
+        assert_eq!(out.get("description").and_then(|v| v.as_str()), Some(""));
+        assert_eq!(out.get("required").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    /// A fully-specified parameter is untouched — no regression for the
+    /// existing playbooks and seed documents.
+    #[test]
+    fn fully_specified_parameter_is_unchanged_by_the_defaults() {
+        let p = parse_prompt_document("ui-bridge-new-project", "d", 3, SEED_BODY);
+        assert_eq!(p.parse_error, None);
+        let language = &p.parameters[2];
+        assert_eq!(language.label, "Language", "explicit label wins over name");
+        assert_eq!(
+            language.description,
+            "The UI Bridge requires TypeScript or React."
+        );
+        assert!(language.required);
+        // `goal`'s label is a full sentence — proof nothing re-derives it.
+        assert_eq!(p.parameters[1].label, "What should it do?");
+    }
+
     #[test]
     fn unparseable_frontmatter_degrades_to_parameterless_prompt() {
         // `parameters` is a scalar — cannot deserialize into Vec<SkillParameter>.

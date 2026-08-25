@@ -39,7 +39,38 @@ pub struct SkillAuthor {
     pub url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Derive a human-readable label from a parameter `name`.
+///
+/// `project_name` → `"Project name"`. Splits on `_`, `-` and whitespace, drops
+/// empty segments (so `a__b`, `_leading` and `trailing_` never produce doubled,
+/// leading or trailing spaces), joins with single spaces, and uppercases the
+/// first character. Idempotent on already-humanized input (`"Focus area"` →
+/// `"Focus area"`), and never panics — including on `""` and on names whose
+/// first character is multi-byte.
+pub fn humanize_param_name(name: &str) -> String {
+    let joined = name
+        .split(|c: char| c == '_' || c == '-' || c.is_whitespace())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut chars = joined.chars();
+    match chars.next() {
+        // `to_uppercase` is char-correct (never byte indexing), so a non-ASCII
+        // leading character is widened rather than sliced mid-codepoint.
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// A single skill / prompt-template parameter.
+///
+/// `label`, `description` and `required` stay non-`Option` and carry no
+/// `skip_serializing_if`: defaulting happens on the way IN (see the manual
+/// [`Deserialize`] impl below), never on the way OUT, so every serialized
+/// payload still carries all three keys and the hand-written TS mirror at
+/// `qontinui-schemas/ts/src/workflow/skill.ts` stays accurate.
+#[derive(Debug, Clone, Serialize)]
 pub struct SkillParameter {
     pub name: String,
     #[serde(rename = "type")]
@@ -61,6 +92,68 @@ pub struct SkillParameter {
     pub pattern: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<ParameterDependency>,
+}
+
+/// Wire shape for [`SkillParameter`] deserialization.
+///
+/// `label`, `description` and `required` are optional here so a non-programmer
+/// authoring prompt-template YAML frontmatter can write just `{name, type}`
+/// without failing the whole struct — which previously degraded the ENTIRE
+/// prompt to parameterless with a `parse_error`.
+///
+/// This lives in the type's own `Deserialize` rather than in a per-consumer
+/// fixup pass on purpose: there are four deserialization sites
+/// (`SkillDefinition.parameters`, `CreateSkillRequest`, `UpdateSkillRequest`,
+/// `PromptFrontmatter.parameters`) and any of them could silently forget a
+/// fixup. Here, sibling access (`label` derived from `name`) happens in exactly
+/// one place that no call site can skip.
+#[derive(Deserialize)]
+struct SkillParameterWire {
+    name: String,
+    #[serde(rename = "type")]
+    param_type: String,
+    /// `Option` on the WIRE only. An explicitly-supplied empty label is
+    /// preserved as empty; only an ABSENT key is humanized from `name`.
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    default: Option<Value>,
+    #[serde(default)]
+    options: Option<Vec<SkillParameterOption>>,
+    #[serde(default)]
+    placeholder: Option<String>,
+    #[serde(default)]
+    min: Option<f64>,
+    #[serde(default)]
+    max: Option<f64>,
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default)]
+    depends_on: Option<ParameterDependency>,
+}
+
+impl<'de> Deserialize<'de> for SkillParameter {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let w = SkillParameterWire::deserialize(d)?;
+        Ok(SkillParameter {
+            label: w.label.unwrap_or_else(|| humanize_param_name(&w.name)),
+            name: w.name,
+            param_type: w.param_type,
+            description: w.description,
+            required: w.required,
+            default: w.default,
+            options: w.options,
+            placeholder: w.placeholder,
+            min: w.min,
+            max: w.max,
+            pattern: w.pattern,
+            depends_on: w.depends_on,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -866,6 +959,145 @@ pub fn annotate_skill_origins(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── humanize_param_name ──────────────────────────────────────────────
+
+    #[test]
+    fn humanize_param_name_splits_and_capitalizes() {
+        assert_eq!(humanize_param_name("project_name"), "Project name");
+        assert_eq!(humanize_param_name("url"), "Url");
+        assert_eq!(humanize_param_name("max-retry-count"), "Max retry count");
+    }
+
+    #[test]
+    fn humanize_param_name_is_idempotent_on_humanized_input() {
+        assert_eq!(humanize_param_name("Focus area"), "Focus area");
+        assert_eq!(
+            humanize_param_name(&humanize_param_name("focus_area")),
+            "Focus area"
+        );
+    }
+
+    #[test]
+    fn humanize_param_name_never_emits_doubled_or_edge_spaces() {
+        assert_eq!(humanize_param_name("a__b"), "A b");
+        assert_eq!(humanize_param_name("_leading"), "Leading");
+        assert_eq!(humanize_param_name("trailing_"), "Trailing");
+        assert_eq!(humanize_param_name("a - b"), "A b");
+    }
+
+    #[test]
+    fn humanize_param_name_handles_empty_and_non_ascii_without_panicking() {
+        assert_eq!(humanize_param_name(""), "");
+        assert_eq!(humanize_param_name("___"), "");
+        assert_eq!(humanize_param_name("   "), "");
+        // Multi-byte leading char: must go through `chars()`, never byte slicing.
+        assert_eq!(humanize_param_name("über_name"), "Über name");
+        assert_eq!(humanize_param_name("日本_name"), "日本 name");
+        assert_eq!(humanize_param_name("🚀_launch"), "🚀 launch");
+    }
+
+    // ── SkillParameter authoring defaults ────────────────────────────────
+
+    #[test]
+    fn skill_parameter_defaults_label_description_and_required() {
+        let p: SkillParameter =
+            serde_json::from_value(serde_json::json!({"name": "project_name", "type": "string"}))
+                .expect("a minimal {name, type} parameter must deserialize");
+        assert_eq!(p.label, "Project name");
+        assert_eq!(p.description, "");
+        assert!(!p.required);
+        assert_eq!(p.default, None);
+        assert!(p.options.is_none());
+    }
+
+    #[test]
+    fn skill_parameter_preserves_an_explicit_empty_label() {
+        // ABSENT label → humanized. Explicit `""` → kept empty; an author who
+        // deliberately blanks the label must not have one synthesized back.
+        let p: SkillParameter = serde_json::from_value(
+            serde_json::json!({"name": "project_name", "type": "string", "label": ""}),
+        )
+        .expect("explicit empty label must deserialize");
+        assert_eq!(p.label, "");
+    }
+
+    #[test]
+    fn skill_parameter_fully_specified_round_trips_unchanged() {
+        let raw = serde_json::json!({
+            "name": "language",
+            "type": "select",
+            "label": "Language",
+            "description": "The UI Bridge requires TypeScript or React.",
+            "required": true,
+            "default": "TypeScript",
+            "options": [
+                {"label": "TypeScript", "value": "TypeScript"},
+                {"label": "React", "value": "React"}
+            ],
+            "placeholder": "pick one",
+            "min": 1.0,
+            "max": 2.0,
+            "pattern": "^[A-Z]",
+            "depends_on": {"param": "mode", "value": "advanced"}
+        });
+        let p: SkillParameter = serde_json::from_value(raw.clone()).expect("full parameter");
+        assert_eq!(p.name, "language");
+        assert_eq!(p.param_type, "select");
+        assert_eq!(p.label, "Language");
+        assert_eq!(p.description, "The UI Bridge requires TypeScript or React.");
+        assert!(p.required);
+        assert_eq!(p.default, Some(Value::String("TypeScript".into())));
+        assert_eq!(p.options.as_ref().expect("options").len(), 2);
+        assert_eq!(p.placeholder.as_deref(), Some("pick one"));
+        assert_eq!(p.min, Some(1.0));
+        assert_eq!(p.max, Some(2.0));
+        assert_eq!(p.pattern.as_deref(), Some("^[A-Z]"));
+        assert_eq!(p.depends_on.as_ref().expect("depends_on").param, "mode");
+
+        // Serialization is byte-for-byte the input for a fully-specified param.
+        assert_eq!(serde_json::to_value(&p).expect("serialize"), raw);
+    }
+
+    #[test]
+    fn skill_parameter_serialization_still_emits_all_three_keys() {
+        // Wire contract: defaults apply on the way IN, never on the way OUT.
+        // The hand-written TS mirror types label/description/required as
+        // non-optional, so a defaulted parameter must still carry all three.
+        let p: SkillParameter =
+            serde_json::from_value(serde_json::json!({"name": "project_name", "type": "string"}))
+                .expect("minimal parameter");
+        let out = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "name": "project_name",
+                "type": "string",
+                "label": "Project name",
+                "description": "",
+                "required": false
+            })
+        );
+        for key in ["label", "description", "required"] {
+            assert!(
+                out.get(key).is_some(),
+                "{key} must always be serialized — the TS mirror types it as required"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_parameter_deserializes_from_minimal_yaml_frontmatter() {
+        // The exact authoring shape the fix exists for.
+        let params: Vec<SkillParameter> = serde_yaml::from_str(
+            "- name: project_name\n  type: string\n  required: true\n",
+        )
+        .expect("a {name, type, required} YAML parameter must deserialize");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].label, "Project name");
+        assert_eq!(params[0].description, "");
+        assert!(params[0].required);
+    }
 
     #[test]
     fn test_load_builtin_skills() {
