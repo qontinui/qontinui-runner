@@ -199,8 +199,16 @@ mod tests {
 
     /// A tokened allocation registers the agent; re-allocating the
     /// same agent_id replaces in place (still exactly one entry — the
-    /// prior `AgentDaemons` is dropped, stopping both old daemons; the
-    /// Drop→stop path itself is covered by the handles' own tests).
+    /// prior `AgentDaemons` is dropped, stopping both old daemons).
+    ///
+    /// The Drop→stop path is covered by `dirty_poller::tests::
+    /// cancelling_stops_the_poller_task` and `agent_pusher::tests::
+    /// pusher_handle_drop_actually_stops_the_task`, both of which assert
+    /// the task is FINISHED. This note used to claim the same coverage
+    /// while the only such test asserted nothing at all and could not
+    /// fail — which is how a leak of one detached task per agent teardown
+    /// went unnoticed until 1,353 orphans were ticking on one box.
+    ///
     /// Unreachable coord base ⇒ the spawned tasks just error+retry.
     #[tokio::test]
     async fn tokened_allocation_registers_then_replaces() {
