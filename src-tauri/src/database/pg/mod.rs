@@ -107,7 +107,8 @@ use tracing::{debug, info, warn};
 static GLOBAL_PG_DB: OnceLock<Arc<PgDb>> = OnceLock::new();
 
 /// Whether the canonical PG was reachable at boot. `true` after a successful
-/// `PgDb::new`; `false` when the runner booted degraded (`QONTINUI_ALLOW_NO_DB`)
+/// `PgDb::new`; `false` when the runner booted degraded (as of P4: the bundled
+/// cluster failed to start or connect -- previously also `QONTINUI_ALLOW_NO_DB`)
 /// with PG unreachable. DB-backed HTTP handlers consult `pg_available()` to
 /// return a clean `503 database unavailable` instead of hitting a dead pool.
 ///
