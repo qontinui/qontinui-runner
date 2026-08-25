@@ -2696,6 +2696,25 @@ mod tests {
         w
     }
 
+    /// A GHOST fixture: a custody record that stamps an id and carries **no
+    /// name**.
+    ///
+    /// A session is a ghost iff no name resolves from ANY of the four sources —
+    /// the custody record, `~/.qontinui/session-names/`, the account-root
+    /// name-files, and the transcripts. Phase 1 made the custody record the
+    /// PRIMARY name source, so a fixture that names its own session there is an
+    /// attributed row no matter what the directory does or does not know about
+    /// the id. `attributed_row` names it unconditionally; a ghost must clear it.
+    ///
+    /// This is deliberately separate from `session_unresolvable`, which answers
+    /// a different question — *is there an account root to build a resume line
+    /// from?* — and stays true here either way.
+    fn ghost_row(path: &str, last_seen_epoch: i64) -> WorktreeCensus {
+        let mut w = attributed_row(path, GHOST, last_seen_epoch);
+        w.custody_session_name = None;
+        w
+    }
+
     fn directory() -> SessionDirectory {
         SessionDirectory::from_parts(&[(OWNER, "amber-otter")], &[OWNER], 5)
     }
@@ -2767,7 +2786,7 @@ mod tests {
     fn a_ghost_session_renders_unresolvable_on_the_survey_row() {
         let wt = "D:/qontinui-root/qontinui-runner-wt-ghost";
         let (items, _) = build_survey_items(
-            &[attributed_row(wt, GHOST, 1_000)],
+            &[ghost_row(wt, 1_000)],
             None,
             &directory(),
             None,
@@ -2899,7 +2918,7 @@ mod tests {
     #[test]
     fn the_resume_line_names_the_resolving_account_root_and_a_ghost_gets_none() {
         let owned = attributed_row("D:/qontinui-root/wt-owned", OWNER, 0);
-        let ghost = attributed_row("D:/qontinui-root/wt-ghost", GHOST, 0);
+        let ghost = ghost_row("D:/qontinui-root/wt-ghost", 0);
         let s = survey_of(vec![owned, ghost], &directory(), 10_000);
         let report = build_wip_orphans(&s, chrono::Utc::now());
         assert_eq!(report.orphans.len(), 2);
