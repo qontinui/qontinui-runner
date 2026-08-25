@@ -1089,10 +1089,9 @@ mod tests {
     #[test]
     fn skill_parameter_deserializes_from_minimal_yaml_frontmatter() {
         // The exact authoring shape the fix exists for.
-        let params: Vec<SkillParameter> = serde_yaml::from_str(
-            "- name: project_name\n  type: string\n  required: true\n",
-        )
-        .expect("a {name, type, required} YAML parameter must deserialize");
+        let params: Vec<SkillParameter> =
+            serde_yaml::from_str("- name: project_name\n  type: string\n  required: true\n")
+                .expect("a {name, type, required} YAML parameter must deserialize");
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].label, "Project name");
         assert_eq!(params[0].description, "");
