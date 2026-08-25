@@ -2783,13 +2783,8 @@ mod tests {
     #[test]
     fn a_ghost_session_renders_unresolvable_on_the_survey_row() {
         let wt = "D:/qontinui-root/qontinui-runner-wt-ghost";
-        let (items, _) = build_survey_items(
-            &[ghost_row(wt, 1_000)],
-            None,
-            &directory(),
-            None,
-            1_060,
-        );
+        let (items, _) =
+            build_survey_items(&[ghost_row(wt, 1_000)], None, &directory(), None, 1_060);
         assert_eq!(
             items[0].session_label,
             format!("session {GHOST} (unresolvable)")
