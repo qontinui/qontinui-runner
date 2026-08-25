@@ -105,6 +105,7 @@ mod fixer;
 // `GET /coord/fleet` can answer "where do I have agent capacity?".
 mod fleet;
 mod fleet_commands;
+mod fleet_skills;
 mod flow_control;
 mod follow_up;
 mod fs_atomic;

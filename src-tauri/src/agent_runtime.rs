@@ -3249,6 +3249,9 @@ async fn run_continuation_terminal(
     // Bundle /vet-plan and /implement-plan into the session cwd so they resolve
     // as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(workdir);
+    // Same for the fleet SKILLS (.claude/skills/<name>/SKILL.md) — a device with
+    // no qontinui-claude-config checkout has no skills dir at all.
+    crate::fleet_skills::provision_fleet_skills_for_session(workdir);
 
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
@@ -3950,6 +3953,10 @@ async fn run_agent_subprocess(
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
+    // Same for the fleet SKILLS. Note provision_agent_definitions above still
+    // COPIES .claude/agents from a claude-config checkout, so agents remain
+    // absent on a device without one; skills no longer do.
+    crate::fleet_skills::provision_fleet_skills_for_session(&primary_wt);
 
     let log_path = agent_log_path(payload.agent_id);
 
