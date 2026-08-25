@@ -1349,6 +1349,39 @@ pub async fn ui_bridge_execute_action_handler(
         ));
     }
 
+    // ── Snapshot-staleness gate: shape check ───────────────────────────
+    // `fromSnapshotId` is the caller's opt-in to a PRE-action freshness
+    // guarantee (plan
+    // `2026-08-20-ui-bridge-snapshot-identity-and-selector-candidates`,
+    // Phase 2).
+    //
+    // UNKNOWN IS NOT STALE. An id this runner cannot parse — a `ubs2` minted
+    // by a newer peer, a truncated string, an id from some other scheme — is
+    // a state in which we cannot JUDGE freshness, which is a different thing
+    // from having judged it stale. Rejecting on it would fail closed on the
+    // wrong axis: it breaks callers without preventing a single wrong click.
+    // So it is logged and the action proceeds exactly as if no id had been
+    // given.
+    let cited_snapshot: Option<(String, super::helpers::SnapshotSignature)> =
+        match request.from_snapshot_id.as_deref().map(str::trim) {
+            Some(raw) if !raw.is_empty() => {
+                match super::helpers::SnapshotSignature::from_snapshot_id(raw) {
+                    Some(sig) => Some((raw.to_string(), sig)),
+                    None => {
+                        warn!(
+                            "execute_action: fromSnapshotId {:?} on element {} is not a \
+                             recognised snapshot id — cannot judge freshness, so proceeding \
+                             ungated rather than refusing",
+                            raw, id
+                        );
+                        None
+                    }
+                }
+            }
+            // An empty string is an omission, not a citation.
+            _ => None,
+        };
+
     info!(
         "UI Bridge API: Executing action {} on element {}",
         request.action, id
@@ -1390,35 +1423,112 @@ pub async fn ui_bridge_execute_action_handler(
 
     let start = Instant::now();
 
-    // Optional pre-action snapshot for the click-had-no-effect detector.
+    // Optional pre-action snapshot.
+    //
+    // ONE snapshot, TWO consumers — deliberately not two detectors (the plan
+    // is explicit that Phase 2 promotes the existing signal rather than
+    // standing a second one up beside it):
+    //
+    //   1. the click-had-no-effect / remount detector, which compares it
+    //      against a post-action snapshot, and
+    //   2. the `fromSnapshotId` staleness gate below, which compares it
+    //      against the id the CALLER reasoned from.
+    //
     // We take it BEFORE the action so the timing is fair (vs. counting
     // mutations the action itself produces in flight). The snapshot is a
     // discover call with `interactive_only: false` to catch every element
-    // that could have changed.
-    let pre_snapshot_signature: Option<super::helpers::SnapshotSignature> =
-        if expect_change.is_some() {
+    // that could have changed — and that is also, byte for byte, the options
+    // payload a citable `snapshotId` is minted from in
+    // `ui_bridge_discover_handler`. The two MUST stay identical: an id minted
+    // over a different element set is not comparable with this one, which is
+    // why the discover handler marks any narrowed result
+    // `snapshotIdCitable: false` instead of handing out an id that would
+    // always be refused here.
+    let pre_snapshot_needed = expect_change.is_some() || cited_snapshot.is_some();
+    let pre_snapshot: Result<Option<super::helpers::SnapshotSignature>, String> =
+        if pre_snapshot_needed {
             match ui_bridge_request_sync(
                 &state,
                 "discover",
                 super::request::target_window_payload(
-                    serde_json::json!({ "options": { "interactiveOnly": false } }),
+                    super::helpers::citable_snapshot_discover_payload(false),
                     window_label,
                 ),
             )
             .await
             {
-                Ok(data) => Some(snapshot_signature(&data)),
-                Err(e) => {
-                    warn!(
-                    "execute_action: pre-snapshot failed for expectChange ({}); skipping detector",
-                    e
-                );
-                    None
-                }
+                Ok(data) => Ok(Some(snapshot_signature(&data))),
+                Err(e) => Err(e),
             }
         } else {
-            None
+            Ok(None)
         };
+
+    // ── Snapshot-staleness gate: the refusal ───────────────────────────
+    // This is the whole point of Phase 2. Everything upstream of it is
+    // read-only, so refusing here refuses BEFORE the action commits — unlike
+    // the post-action `expectChange` report, which can only tell a caller
+    // afterwards that the world had already moved.
+    if let Some((cited_id, cited_sig)) = cited_snapshot.as_ref() {
+        // UNKNOWN IS NOT STALE, second arm. If the pre-action snapshot could
+        // not be taken there is no observation to judge against, so the gate
+        // stands down rather than refusing. Same reasoning as an unparseable
+        // id above: "cannot judge" must not be spelled "is stale".
+        let current = match &pre_snapshot {
+            Ok(Some(sig)) => Some(*sig),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(
+                    "execute_action: fromSnapshotId was supplied on element {} but the \
+                     pre-action snapshot failed ({}) — cannot judge freshness, so proceeding \
+                     ungated rather than refusing",
+                    id, e
+                );
+                None
+            }
+        };
+
+        // Reuse the shipped predicates rather than re-deriving them:
+        // `superseded_reason` is written in terms of `unchanged_from` /
+        // `remounted_from`, the same two the post-action `expectChange` report
+        // uses, so the pre- and post-action arms can never disagree about what
+        // a remount is.
+        if let Some(change_kind) = current.and_then(|c| c.superseded_reason(cited_sig)) {
+            let current = current.expect("superseded_reason only fires on a taken snapshot");
+            warn!(
+                "execute_action: refusing {} on element {} — cited snapshot {} is superseded by \
+                 {} ({})",
+                action_name,
+                id,
+                cited_id,
+                current.snapshot_id(),
+                change_kind
+            );
+            let detail = UiBridgeError::snapshot_superseded(
+                cited_id,
+                &current.snapshot_id(),
+                change_kind,
+                cited_sig.count,
+                current.count,
+            );
+            let msg = detail.message.clone();
+            return Err((StatusCode::CONFLICT, Json(api_error_detailed(msg, detail))));
+        }
+    }
+
+    // Past the gate: the detector keeps its original best-effort semantics —
+    // a failed pre-snapshot disables it rather than failing the action.
+    let pre_snapshot_signature: Option<super::helpers::SnapshotSignature> = match pre_snapshot {
+        Ok(sig) if expect_change.is_some() => sig,
+        Ok(_) => None,
+        Err(e) => {
+            warn!(
+                "execute_action: pre-snapshot failed for expectChange ({}); skipping detector",
+                e
+            );
+            None
+        }
+    };
 
     // Merge flat top-level fields into params so actions like drag work with
     // both {"action":"drag","params":{"targetPosition":{...}}} and
@@ -1977,7 +2087,7 @@ pub async fn ui_bridge_execute_action_handler(
             &state,
             "discover",
             super::request::target_window_payload(
-                serde_json::json!({ "options": { "interactiveOnly": false } }),
+                super::helpers::citable_snapshot_discover_payload(false),
                 window_label,
             ),
         )
@@ -2010,10 +2120,20 @@ pub async fn ui_bridge_execute_action_handler(
                     "remounted": remounted,
                     "preElementCount": pre_sig.count,
                     "postElementCount": post.count,
-                    "preSignature": pre_sig.content.to_string(),
-                    "postSignature": post.content.to_string(),
-                    "preGeneration": pre_sig.generation.to_string(),
-                    "postGeneration": post.generation.to_string(),
+                    // Snapshot signature spec v1 hex (see `helpers.rs`). These
+                    // are opaque comparison tokens — never parse them; two ids
+                    // being equal is the whole contract.
+                    "preSignature": format!("{:016x}", pre_sig.content),
+                    "postSignature": format!("{:016x}", post.content),
+                    "preGeneration": format!("{:016x}", pre_sig.generation),
+                    "postGeneration": format!("{:016x}", post.generation),
+                    // The content-addressed ids. `postSnapshotId` is what a
+                    // caller re-issues its NEXT action against when it wants
+                    // the `fromSnapshotId` gate, so it never needs a
+                    // separate re-snapshot round-trip after a successful
+                    // action.
+                    "preSnapshotId": pre_sig.snapshot_id(),
+                    "postSnapshotId": post.snapshot_id(),
                     "settleMs": settle_ms,
                 })
             }
@@ -2495,12 +2615,65 @@ pub async fn ui_bridge_execute_component_action_handler(
     wrap_ipc_result(ipc_result)
 }
 
+/// Does a discover request address the same element set the
+/// `fromSnapshotId` gate compares against?
+///
+/// Only an unnarrowed `{"interactiveOnly": false}` discover does — that is the
+/// exact payload `helpers::citable_snapshot_discover_payload` builds for the
+/// action handler's pre-action snapshot. Any narrowing option returns a subset
+/// (or a different set entirely), and an id minted over it would be refused by
+/// the gate on every single call.
+///
+/// `force` is deliberately NOT a disqualifier: it clears and re-scans the
+/// registry before the read, which changes when the elements were registered
+/// but not which elements come back.
+fn discover_snapshot_id_is_citable(request: &UIBridgeDiscoveryRequest) -> bool {
+    // Resolve the top-level and nested-`options` spellings first — reading
+    // `request.interactive_only` etc. directly here would silently refuse a
+    // citable id for the exact `{"options": {"interactiveOnly": false}}`
+    // body that `resolve()` exists to honour.
+    let opts = request.resolve();
+    opts.interactive_only == Some(false)
+        && opts.root.is_none()
+        && opts.include_hidden.is_none()
+        && opts.limit.is_none()
+        && opts.types.is_none()
+        && opts.selector.is_none()
+}
+
 /// Discover controllable elements in the UI.
 ///
 /// On success the result is cached on `ApiState::ui_bridge_last_discovered`
 /// so agents can retrieve the same element set via
 /// `GET /ui-bridge/control/elements/last-discovered`. This works around the
 /// React registry occasionally pruning elements between calls.
+///
+/// ## Snapshot identity
+///
+/// The response carries three extra fields:
+///
+/// - `snapshotId` — the content-addressed spec-v1 id of the element set just
+///   returned (`ubs1_<count36>_<content>_<generation>`, see
+///   [`super::helpers::SnapshotSignature`]).
+/// - `snapshotIdCitable` — whether that id may be passed as
+///   `fromSnapshotId` on `POST /control/element/{id}/action`. True only
+///   for an UNNARROWED discover (`{"interactiveOnly": false}` and nothing
+///   else), because that is the exact element set the action handler's
+///   pre-action snapshot compares against. An id minted over a narrowed set is
+///   still a valid comparison token against another identically-narrowed
+///   discover — it is simply not comparable with the gate's snapshot, and
+///   would be refused every time.
+/// - `snapshotIdNote` — present only when not citable, saying what to POST
+///   instead. Absence of a citable id is stated, never left to be inferred.
+///
+/// The structured `{count, content, generation}` is deliberately NOT emitted
+/// alongside. The id is content-addressed and
+/// [`super::helpers::SnapshotSignature::from_snapshot_id`] recovers all three
+/// losslessly, so a second copy on the wire would be two representations of
+/// one fact — the drift this spec exists to prevent, in miniature. (The SDK
+/// does surface `BridgeSnapshot.signature` next to `snapshotId`; there the
+/// struct is the in-process value the id is derived FROM, not a second copy
+/// of it.)
 pub async fn ui_bridge_discover_handler(
     State(state): State<Arc<ApiState>>,
     request: Option<Json<UIBridgeDiscoveryRequest>>,
@@ -2525,19 +2698,27 @@ pub async fn ui_bridge_discover_handler(
     // directly here is what silently dropped an `{"options": {...}}` body.
     let opts = request.resolve();
 
-    let payload = serde_json::json!({
-        "options": {
-            "root": opts.root,
-            "interactiveOnly": opts.interactive_only,
-            "includeHidden": opts.include_hidden,
-            "limit": opts.limit,
-            "types": opts.types,
-            "selector": opts.selector
-        },
-        // Top-level (not inside options) — force is a meta-flag about
-        // registry state rather than a discovery filter.
-        "force": opts.force.unwrap_or(false)
-    });
+    let snapshot_id_citable = discover_snapshot_id_is_citable(&request);
+    let force = opts.force.unwrap_or(false);
+    let payload = if snapshot_id_citable {
+        // Built by the SAME constructor the action handler's pre-action
+        // snapshot uses, so the two element sets cannot drift apart.
+        super::helpers::citable_snapshot_discover_payload(force)
+    } else {
+        serde_json::json!({
+            "options": {
+                "root": opts.root,
+                "interactiveOnly": opts.interactive_only,
+                "includeHidden": opts.include_hidden,
+                "limit": opts.limit,
+                "types": opts.types,
+                "selector": opts.selector
+            },
+            // Top-level (not inside options) — force is a meta-flag about
+            // registry state rather than a discovery filter.
+            "force": force
+        })
+    };
 
     match ui_bridge_request_sync(&state, "discover", payload).await {
         Ok(mut data) => {
@@ -2550,6 +2731,35 @@ pub async fn ui_bridge_discover_handler(
             // Applied BEFORE caching so `/control/last-discovered` advertises
             // them too.
             advertise_custom_actions_in_payload(&mut data);
+
+            // Stamp the snapshot identity. Done BEFORE the cache write so
+            // `/control/elements/last-discovered` serves the same id with the
+            // same element set — a cached payload whose id had to be
+            // recomputed by the reader would be a second definition of the
+            // fold, which is exactly what spec v1 exists to prevent.
+            if let Some(obj) = data.as_object_mut() {
+                let sig = snapshot_signature(&serde_json::Value::Object(obj.clone()));
+                obj.insert(
+                    "snapshotId".to_string(),
+                    serde_json::Value::String(sig.snapshot_id()),
+                );
+                obj.insert(
+                    "snapshotIdCitable".to_string(),
+                    serde_json::Value::Bool(snapshot_id_citable),
+                );
+                if !snapshot_id_citable {
+                    obj.insert(
+                        "snapshotIdNote".to_string(),
+                        serde_json::Value::String(
+                            "This discover narrowed the element set, so its id is not comparable \
+                             with the pre-action snapshot and must NOT be passed as \
+                             fromSnapshotId. POST /ui-bridge/control/discover with exactly \
+                             {\"interactiveOnly\": false} for a citable id."
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
 
             // Populate the last-discovered cache. Best-effort — never
             // block the response on a write lock.
@@ -6604,6 +6814,275 @@ mod read_value_tests {
         assert!(
             !validate_read_value_all(&json!({ "selector": "i", "all": false, "index": 2 }))
                 .unwrap()
+        );
+    }
+}
+
+/// Phase 2 of plan
+/// `2026-08-20-ui-bridge-snapshot-identity-and-selector-candidates`: the
+/// pre-action staleness gate. These lock down the parts that are pure — the
+/// request shape, the citability predicate, the shared discover payload and
+/// the refusal envelopes. The predicates themselves (`remounted_from`,
+/// `superseded_reason`) are pinned against the cross-repo golden vectors in
+/// `helpers.rs`.
+#[cfg(test)]
+mod snapshot_staleness_gate_tests {
+    use super::super::helpers::{
+        citable_snapshot_discover_payload, snapshot_signature, SnapshotSignature,
+    };
+    use super::super::types::{UIBridgeActionRequest, UiBridgeError, UiBridgeErrorCode};
+    use super::{discover_snapshot_id_is_citable, UIBridgeDiscoveryRequest};
+    use serde_json::json;
+
+    // ---- request shape -------------------------------------------------
+
+    /// `fromSnapshotId` must land in its own field. `UIBridgeActionRequest`
+    /// captures unknown top-level keys in `extra` and MERGES them into the
+    /// action's params — so a field that failed to bind here would be silently
+    /// forwarded to the frontend as an action parameter instead of gating
+    /// anything.
+    #[test]
+    fn from_snapshot_id_binds_to_its_own_field_and_not_to_extra() {
+        let req: UIBridgeActionRequest = serde_json::from_value(json!({
+            "action": "click",
+            "fromSnapshotId": "ubs1_2_65a59daceda26fb2_c5d41be145c82269",
+            "targetPosition": { "x": 1, "y": 2 }
+        }))
+        .expect("body parses");
+        assert_eq!(
+            req.from_snapshot_id.as_deref(),
+            Some("ubs1_2_65a59daceda26fb2_c5d41be145c82269")
+        );
+        assert!(
+            !req.extra.contains_key("fromSnapshotId"),
+            "must not also leak into the flat params merge: {:?}",
+            req.extra.keys().collect::<Vec<_>>()
+        );
+        // The genuinely-flat field still reaches `extra`.
+        assert!(req.extra.contains_key("targetPosition"));
+    }
+
+    /// Omitting it is the opt-out, and it must be indistinguishable from the
+    /// requests every existing caller already sends.
+    #[test]
+    fn omitting_from_snapshot_id_is_none() {
+        let req: UIBridgeActionRequest =
+            serde_json::from_value(json!({ "action": "click" })).expect("body parses");
+        assert!(req.from_snapshot_id.is_none());
+    }
+
+    // ---- citability ----------------------------------------------------
+
+    fn discovery(value: serde_json::Value) -> UIBridgeDiscoveryRequest {
+        serde_json::from_value(value).expect("discovery request parses")
+    }
+
+    #[test]
+    fn only_an_unnarrowed_interactive_only_false_discover_is_citable() {
+        assert!(discover_snapshot_id_is_citable(&discovery(
+            json!({ "interactiveOnly": false })
+        )));
+        // force re-scans, it does not filter.
+        assert!(discover_snapshot_id_is_citable(&discovery(
+            json!({ "interactiveOnly": false, "force": true })
+        )));
+    }
+
+    #[test]
+    fn narrowed_or_defaulted_discovers_are_not_citable() {
+        for narrowed in [
+            json!({}),
+            json!({ "force": true }),
+            json!({ "interactiveOnly": true }),
+            json!({ "interactiveOnly": false, "selector": "button" }),
+            json!({ "interactiveOnly": false, "limit": 10 }),
+            json!({ "interactiveOnly": false, "types": ["button"] }),
+            json!({ "interactiveOnly": false, "root": "#main" }),
+            json!({ "interactiveOnly": false, "includeHidden": true }),
+            // `includeHidden: false` still narrows relative to "unspecified":
+            // it is a stated filter, and the gate's payload does not state it.
+            json!({ "interactiveOnly": false, "includeHidden": false }),
+        ] {
+            assert!(
+                !discover_snapshot_id_is_citable(&discovery(narrowed.clone())),
+                "{narrowed} must not mint a citable id"
+            );
+        }
+    }
+
+    /// The gate compares a cited id against a snapshot taken with
+    /// `citable_snapshot_discover_payload(false)`. A citable discover must send
+    /// the SAME options, or the two element sets differ and every cited id is
+    /// refused. One constructor, asserted from both sides.
+    #[test]
+    fn citable_discover_and_the_pre_action_snapshot_send_the_same_options() {
+        let gate = citable_snapshot_discover_payload(false);
+        assert_eq!(gate["options"]["interactiveOnly"], json!(false));
+        for narrowing in ["root", "includeHidden", "limit", "types", "selector"] {
+            assert_eq!(
+                gate["options"][narrowing],
+                serde_json::Value::Null,
+                "{narrowing} must be unset in the citable payload"
+            );
+        }
+        assert_eq!(gate["force"], json!(false));
+        assert_eq!(citable_snapshot_discover_payload(true)["force"], json!(true));
+        // force is the ONLY difference the two forms may have.
+        let mut forced = citable_snapshot_discover_payload(true);
+        forced["force"] = json!(false);
+        assert_eq!(forced, gate);
+    }
+
+    // ---- the refusal ---------------------------------------------------
+
+    /// End-to-end over the golden remount pair: the caller cites the snapshot
+    /// it reasoned from, the subtree is torn down and rebuilt identically, and
+    /// the gate must refuse with `remounted` — the case `ELEMENT_STALE` cannot
+    /// see, because every element still resolves.
+    #[test]
+    fn a_same_shape_remount_is_refused_as_remounted() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/snapshot-signature-golden.json"))
+                .expect("golden fixture parses");
+
+        let cited = snapshot_signature(&json!({ "elements": golden["two_elements"]["elements"] }));
+        let current =
+            snapshot_signature(&json!({ "elements": golden["remount_of_two_elements"]["elements"] }));
+
+        // What the caller would have been handed by a citable discover.
+        let cited_id = cited.snapshot_id();
+        let parsed = SnapshotSignature::from_snapshot_id(&cited_id).expect("id parses");
+        assert!(parsed.unchanged_from(&cited), "the wire id is lossless");
+
+        assert_eq!(current.superseded_reason(&parsed), Some("remounted"));
+        assert!(
+            current.remounted_from(&parsed),
+            "the refusal must rest on the shipped remount predicate"
+        );
+
+        let detail = UiBridgeError::snapshot_superseded(
+            &cited_id,
+            &current.snapshot_id(),
+            "remounted",
+            parsed.count,
+            current.count,
+        );
+        // NOT a new top-level code — the fourth `staleReason` in the SDK's
+        // existing `UB-STALE-ELEMENT` family.
+        assert!(matches!(detail.code, UiBridgeErrorCode::ElementStale));
+        let ctx = detail.context.expect("context");
+        assert_eq!(ctx["code"], json!("UB-STALE-ELEMENT"));
+        assert_eq!(ctx["staleReason"], json!("snapshot-superseded"));
+        assert_eq!(ctx["changeKind"], json!("remounted"));
+        assert_eq!(ctx["fromSnapshotId"], json!(cited_id));
+        assert_eq!(ctx["currentSnapshotId"], json!(current.snapshot_id()));
+        assert_eq!(ctx["fromElementCount"], json!(2));
+        assert_eq!(ctx["currentElementCount"], json!(2));
+        // The recovery is per-reason and written here, not shared with the
+        // element-level stale reasons — re-finding would SUCCEED and click the
+        // wrong thing, so the message must say re-snapshot and say not to.
+        assert!(detail.message.contains("Re-snapshot"), "{}", detail.message);
+        assert!(
+            detail.message.contains("Do NOT re-find"),
+            "{}",
+            detail.message
+        );
+    }
+
+    /// An unchanged world must NOT be refused — the gate is a precondition,
+    /// not a rate limiter, and snapshot-then-several-actions is the normal
+    /// pattern the design decision explicitly preserved.
+    #[test]
+    fn an_unchanged_snapshot_is_not_superseded() {
+        let elements = json!([
+            { "id": "btn", "category": "button", "registeredAt": 7,
+              "state": { "textContent": "Go" } }
+        ]);
+        let a = snapshot_signature(&json!({ "elements": elements.clone() }));
+        let b = snapshot_signature(&json!({ "elements": elements }));
+        assert_eq!(b.superseded_reason(&a), None);
+    }
+
+    #[test]
+    fn content_and_count_changes_are_classified_apart_from_remounts() {
+        let base = json!([
+            { "id": "btn", "category": "button", "registeredAt": 7,
+              "state": { "textContent": "Go" } }
+        ]);
+        let cited = snapshot_signature(&json!({ "elements": base }));
+
+        let retitled = snapshot_signature(&json!({ "elements": [
+            { "id": "btn", "category": "button", "registeredAt": 7,
+              "state": { "textContent": "Stop" } }
+        ]}));
+        assert_eq!(retitled.superseded_reason(&cited), Some("contentChanged"));
+
+        let grown = snapshot_signature(&json!({ "elements": [
+            { "id": "btn", "category": "button", "registeredAt": 7,
+              "state": { "textContent": "Go" } },
+            { "id": "btn2", "category": "button", "registeredAt": 8,
+              "state": { "textContent": "Also" } }
+        ]}));
+        assert_eq!(grown.superseded_reason(&cited), Some("elementCountChanged"));
+    }
+
+    /// UNKNOWN IS NOT STALE — arm 1. An id this runner cannot parse yields no
+    /// citation at all, so the gate stands down and the action proceeds. It
+    /// must NOT become a rejection: "cannot judge" and "is stale" are
+    /// different states, and refusing on the first breaks callers (a `ubs2`
+    /// id from a newer peer, say) without preventing a single wrong click.
+    #[test]
+    fn an_unparseable_id_yields_no_citation_rather_than_a_refusal() {
+        for unknown in [
+            "snapshot-3-1724500000000", // the AI layer's old counter id
+            "ubs2_1_0000000000000001_0000000000000002",
+            "not-an-id",
+            "ubs1_1_deadbeef",
+        ] {
+            assert!(
+                SnapshotSignature::from_snapshot_id(unknown).is_none(),
+                "{unknown:?} must not parse"
+            );
+        }
+        // ...and an unparseable id is the same input the handler turns into
+        // `None`, which is exactly what omitting the field produces.
+        let omitted: UIBridgeActionRequest =
+            serde_json::from_value(json!({ "action": "click" })).expect("body parses");
+        assert!(omitted.from_snapshot_id.is_none());
+    }
+
+    /// UNKNOWN IS NOT STALE — arm 2. A blank id is an omission, not a
+    /// citation; it must not be parsed, refused, or forwarded as one.
+    #[test]
+    fn a_blank_from_snapshot_id_is_an_omission() {
+        for blank in ["", "   "] {
+            let req: UIBridgeActionRequest =
+                serde_json::from_value(json!({ "action": "click", "fromSnapshotId": blank }))
+                    .expect("body parses");
+            let trimmed = req.from_snapshot_id.as_deref().map(str::trim).unwrap_or("");
+            assert!(trimmed.is_empty(), "{blank:?} must read as no citation");
+        }
+    }
+
+    /// The refusal reuses the SHIPPED element-stale code. A new top-level code
+    /// would have forced every caller to learn a second taxonomy for the same
+    /// question ("is my reference still good?").
+    #[test]
+    fn the_refusal_stays_in_the_element_stale_family() {
+        let detail = UiBridgeError::snapshot_superseded(
+            "ubs1_2_65a59daceda26fb2_c5d41be145c82269",
+            "ubs1_2_65a59daceda26fb2_405b6cc498a915bb",
+            "remounted",
+            2,
+            2,
+        );
+        assert_eq!(
+            serde_json::to_value(&detail.code).unwrap(),
+            json!("ELEMENT_STALE")
+        );
+        assert_eq!(
+            detail.context.expect("context")["staleReason"],
+            json!("snapshot-superseded")
         );
     }
 }

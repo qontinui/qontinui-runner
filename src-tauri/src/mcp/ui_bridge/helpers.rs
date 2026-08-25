@@ -119,10 +119,98 @@ pub(super) fn filter_element_fields(
     serde_json::Value::Object(out)
 }
 
-/// Cheap fingerprint of a discover snapshot for click-had-no-effect
-/// detection.
+/// FNV-1a 64-bit offset basis. Part of the normative snapshot-signature
+/// spec v1 — see [`SnapshotSignature`].
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a 64-bit prime. Part of the normative snapshot-signature spec v1.
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// The one fold the snapshot signature is allowed to use.
+///
+/// Deliberately NOT `DefaultHasher`. That was the previous implementation and
+/// it made the "one definition, not two" requirement unachievable: `std`'s
+/// `DefaultHasher` is SipHash-1-3 under a fixed-but-**unspecified** key whose
+/// output Rust does not guarantee across releases, so no TypeScript (or any
+/// other) implementation could ever reproduce it. FNV-1a-64 is four lines of
+/// arithmetic in every language and is pinned here by golden vectors.
+#[derive(Debug, Clone, Copy)]
+struct Fnv1a64(u64);
+
+impl Fnv1a64 {
+    fn new() -> Self {
+        Self(FNV1A64_OFFSET_BASIS)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(FNV1A64_PRIME);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+/// Render `n` in lowercase base-36, the `count` component of a snapshot id.
+///
+/// Hand-rolled because Rust has no `to_string_radix`; the spec names
+/// JavaScript's `Number.prototype.toString(36)`, which is lowercase and
+/// unpadded, and this must match it byte for byte.
+fn to_base36(mut n: usize) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(DIGITS[n % 36]);
+        n /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).expect("base36 digits are ASCII")
+}
+
+/// Cheap fingerprint of a discover snapshot: the identity of a snapshot, and
+/// the click-had-no-effect / remount detector's comparison token.
+///
+/// > **The fold is a cross-language SPECIFICATION, not an implementation
+/// > detail.** It is "snapshot signature spec v1", normative in plan
+/// > `2026-08-20-ui-bridge-snapshot-identity-and-selector-candidates`, and the
+/// > `ui-bridge` TypeScript SDK implements the same fold over the same fields
+/// > in the same order. The two sides are pinned to each other by the golden
+/// > vectors in `snapshot-signature-golden.json` (committed beside this file
+/// > as `fixtures/snapshot-signature-golden.json` and asserted by
+/// > `golden_vectors_*` below). Changing any byte of the fold — a field, its
+/// > order, its terminator, the endianness of `registeredAt` — breaks the SDK
+/// > silently and must be a v2 with a new id prefix, never an edit in place.
+///
+/// **Spec v1.** Iterate `elements` in array order. Per element, feed these
+/// byte sequences, in this order, into the two independent FNV-1a-64 states:
+///
+/// | Field | Condition | Bytes | Into |
+/// |---|---|---|---|
+/// | `id` | is a string | `utf8(id)` then `0xFF` | content *and* generation |
+/// | `category` | is a string | `utf8(category)` then `0xFF` | content |
+/// | `state.textContent` | is a string | `utf8(value)` then `0xFF` | content |
+/// | `state.ariaPressed` | is a boolean | one byte, `0x01` / `0x00` | content |
+/// | `registeredAt` | is an integer ≥ 0 | the u64 as 8 bytes **little-endian** | generation |
+///
+/// A field that is absent or of the wrong type contributes **no bytes at
+/// all**. That is load-bearing, not laziness: a serializer that omits
+/// `registeredAt` then folds nothing into `generation` beyond the ids, so it
+/// simply never reports a remount rather than reporting a spurious one.
 ///
 /// TWO independent hashes, deliberately not one:
+///
+/// - `content` folds each element's `id`, `category`, `state.textContent` and
+///   `state.ariaPressed` — what the element *shows*.
+/// - `generation` folds each element's `registeredAt`, the per-registration
+///   `Date.now()` the SDK registry stamps
+///   (`ui-bridge/packages/ui-bridge/src/core/registry.ts`) — WHICH MOUNT the
+///   element belongs to.
 ///
 /// - `content` folds each element's `id`, `category`, `state.textContent` and
 ///   `state.ariaPressed` — what the element *shows*.
@@ -143,11 +231,25 @@ pub(super) fn filter_element_fields(
 /// `registeredAt` is re-stamped by a real unregister→register cycle, so the
 /// generation hash moves while the content hash does not.
 ///
-/// Residual: `registeredAt` has millisecond resolution, so a remount that
-/// completes inside the same millisecond is still invisible. Every observed
-/// one has been ≥1ms.
+/// Two residuals, inherited and NOT fixed by spec v1. Anything built on this
+/// signature — the pre-action staleness gate included — is a strong signal,
+/// not a total guarantee, and must say so rather than implying otherwise.
+///
+/// 1. **Millisecond resolution.** `registeredAt` is millisecond-resolution, so
+///    a remount completing inside the same millisecond is still invisible.
+///    Every observed one has been ≥1ms.
+/// 2. **Unobserved content change.** `count` and `generation` depend only on
+///    `id` and `registeredAt`, so a *mount-only* fold — no DOM access at all —
+///    reproduces both exactly, which is why element-set churn and remounts are
+///    catchable on any path, however cheap. `content` is not reproducible that
+///    way: it needs the elements' rendered state, so a pure content change is
+///    only visible to a caller that actually took a newer snapshot. This route
+///    always takes one (the pre-action discover), so all three change kinds
+///    are live here; a path that stamps no intervening snapshot — the SDK's
+///    in-process executor — can only see the first two. Nothing observed the
+///    change, so nothing can prove it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SnapshotSignature {
+pub(crate) struct SnapshotSignature {
     /// Number of elements in the snapshot.
     pub count: usize,
     /// Hash over what the elements show.
@@ -171,49 +273,147 @@ impl SnapshotSignature {
             && self.content == other.content
             && self.generation != other.generation
     }
+
+    /// Why `self` (the world as it stands) supersedes `cited` (the snapshot a
+    /// caller reasoned from), or `None` when it does not.
+    ///
+    /// The classification is derived entirely from the two predicates above —
+    /// it does not re-derive the remount test, it asks
+    /// [`Self::remounted_from`] — so the pre-action gate and the post-action
+    /// `expectChange` report can never disagree about what a remount is.
+    ///
+    /// - `remounted` — the case nothing else in the stack can catch: the
+    ///   elements still resolve and still show the same thing, so
+    ///   `ELEMENT_STALE` stays silent, but they were re-registered under a new
+    ///   mount and any state inside that subtree is gone.
+    /// - `elementCountChanged` — elements appeared or disappeared.
+    /// - `contentChanged` — same number of elements, showing something else.
+    pub fn superseded_reason(&self, cited: &Self) -> Option<&'static str> {
+        if self.unchanged_from(cited) {
+            None
+        } else if self.remounted_from(cited) {
+            Some("remounted")
+        } else if self.count != cited.count {
+            Some("elementCountChanged")
+        } else {
+            Some("contentChanged")
+        }
+    }
+
+    /// The content-addressed snapshot id: `ubs1_<count36>_<content>_<generation>`.
+    ///
+    /// Content-addressed, not a counter, and that is the point: two ids alone
+    /// answer both questions the structured value answers, with no shared
+    /// object and no server-side snapshot table. *Equal* means nothing
+    /// observable changed ([`Self::unchanged_from`]); *same count and content,
+    /// different generation* means a REMOUNT ([`Self::remounted_from`]). It
+    /// also fixes the defect in the AI layer's `snapshot-<counter>-<Date.now()>`
+    /// id (`ui-bridge/.../ai/semantic-snapshot.ts`), whose counter is
+    /// per-instance and therefore collides across processes.
+    ///
+    /// `ubs1` is the spec version. A future fold change takes `ubs2`; it never
+    /// edits v1 in place, because an id minted by one side and compared by the
+    /// other is exactly the cross-language contract the golden vectors pin.
+    pub fn snapshot_id(&self) -> String {
+        format!(
+            "ubs1_{}_{:016x}_{:016x}",
+            to_base36(self.count),
+            self.content,
+            self.generation
+        )
+    }
+
+    /// Parse an id minted by [`Self::snapshot_id`] back into the signature it
+    /// addresses, so a cited id can be compared with [`Self::unchanged_from`]
+    /// / [`Self::remounted_from`] instead of by string equality — the caller
+    /// gets *why* its snapshot is stale, not just *that* it is.
+    ///
+    /// Returns `None` for anything that is not a well-formed v1 id (wrong
+    /// prefix, wrong arity, non-hex halves, count that does not parse). A
+    /// caller that supplied a malformed id must be told so explicitly rather
+    /// than have it silently treated as "no id supplied".
+    pub fn from_snapshot_id(id: &str) -> Option<Self> {
+        let mut parts = id.split('_');
+        if parts.next()? != "ubs1" {
+            return None;
+        }
+        let count_raw = parts.next()?;
+        let content_raw = parts.next()?;
+        let generation_raw = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        if count_raw.is_empty()
+            || !count_raw
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        {
+            return None;
+        }
+        let count = usize::from_str_radix(count_raw, 36).ok()?;
+        if content_raw.len() != 16 || generation_raw.len() != 16 {
+            return None;
+        }
+        Some(Self {
+            count,
+            content: u64::from_str_radix(content_raw, 16).ok()?,
+            generation: u64::from_str_radix(generation_raw, 16).ok()?,
+        })
+    }
 }
 
-pub(super) fn snapshot_signature(snapshot: &serde_json::Value) -> SnapshotSignature {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+/// Compute the spec-v1 signature of a snapshot payload. See
+/// [`SnapshotSignature`] for the normative fold — this function IS that spec,
+/// and the golden-vector tests below are what keep it and the TypeScript SDK
+/// from drifting.
+pub(crate) fn snapshot_signature(snapshot: &serde_json::Value) -> SnapshotSignature {
+    /// A field's byte sequence is terminated so that `{id:"ab",category:"c"}`
+    /// and `{id:"abc"}` cannot fold to the same bytes. `0xFF` is never a valid
+    /// UTF-8 byte, so no string value can contain it.
+    const FIELD_TERMINATOR: u8 = 0xFF;
 
     let elements = snapshot
         .get("elements")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut content = DefaultHasher::new();
-    let mut generation = DefaultHasher::new();
-    for el in &elements {
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let mut content = Fnv1a64::new();
+    let mut generation = Fnv1a64::new();
+    for el in elements {
         if let Some(s) = el.get("id").and_then(|v| v.as_str()) {
-            s.hash(&mut content);
+            content.write(s.as_bytes());
+            content.write(&[FIELD_TERMINATOR]);
             // The id is folded into BOTH hashes so a generation change is
             // always attributable to a specific element rather than to a
             // reordering of the array.
-            s.hash(&mut generation);
+            generation.write(s.as_bytes());
+            generation.write(&[FIELD_TERMINATOR]);
         }
         if let Some(s) = el.get("category").and_then(|v| v.as_str()) {
-            s.hash(&mut content);
+            content.write(s.as_bytes());
+            content.write(&[FIELD_TERMINATOR]);
         }
         if let Some(s) = el
             .get("state")
             .and_then(|v| v.get("textContent"))
             .and_then(|v| v.as_str())
         {
-            s.hash(&mut content);
+            content.write(s.as_bytes());
+            content.write(&[FIELD_TERMINATOR]);
         }
-        if let Some(s) = el
+        if let Some(b) = el
             .get("state")
             .and_then(|v| v.get("ariaPressed"))
             .and_then(|v| v.as_bool())
         {
-            s.hash(&mut content);
+            content.write(&[u8::from(b)]);
         }
-        // Absent on a serializer that does not emit it — folded as a constant
-        // so such a snapshot simply never reports a remount, rather than
-        // reporting a spurious one.
+        // Absent on a serializer that does not emit it — contributes NO bytes,
+        // so such a snapshot simply never reports a remount rather than
+        // reporting a spurious one. `as_u64` is also the spec's "integer ≥ 0"
+        // predicate: it rejects negatives, fractions, strings and booleans.
         if let Some(n) = el.get("registeredAt").and_then(|v| v.as_u64()) {
-            n.hash(&mut generation);
+            generation.write(&n.to_le_bytes());
         }
     }
     SnapshotSignature {
@@ -221,6 +421,39 @@ pub(super) fn snapshot_signature(snapshot: &serde_json::Value) -> SnapshotSignat
         content: content.finish(),
         generation: generation.finish(),
     }
+}
+
+/// The ONE `discover` IPC payload a **citable** snapshot id is minted over.
+///
+/// Two call sites must agree byte for byte or the whole staleness gate
+/// misfires: `ui_bridge_discover_handler`, which hands the caller a
+/// `snapshotId`, and `execute_action`'s pre-action snapshot, which compares
+/// the caller's cited id against the world as it stands. A signature is only
+/// comparable with another signature over the same element SET, so "the same
+/// discover options" is a correctness requirement, not tidiness — hence one
+/// constructor rather than two literals that look alike today.
+///
+/// `force` is the one legitimate difference between the two: it triggers a
+/// registry clear + rescan before the read, which changes *when* the elements
+/// were registered but not *which* elements are returned, so a forced discover
+/// still mints a citable id.
+///
+/// Any narrowing option (`root`, `selector`, `types`, `limit`,
+/// `includeHidden`, or `interactiveOnly: true`) produces a DIFFERENT element
+/// set, and an id minted over it would be refused by the gate every single
+/// time. Such a discover reports `snapshotIdCitable: false` instead.
+pub(super) fn citable_snapshot_discover_payload(force: bool) -> serde_json::Value {
+    serde_json::json!({
+        "options": {
+            "root": serde_json::Value::Null,
+            "interactiveOnly": false,
+            "includeHidden": serde_json::Value::Null,
+            "limit": serde_json::Value::Null,
+            "types": serde_json::Value::Null,
+            "selector": serde_json::Value::Null
+        },
+        "force": force
+    })
 }
 
 /// Count elements in a discover payload, handling the common shapes
@@ -943,7 +1176,10 @@ where
 
 #[cfg(test)]
 mod helpers_tests {
-    use super::{parse_eval_result, read_window_label, return_expression_js, snapshot_signature};
+    use super::{
+        parse_eval_result, read_window_label, return_expression_js, snapshot_signature,
+        SnapshotSignature,
+    };
     use axum::http::StatusCode;
     use serde_json::json;
     use std::ops::Deref;
@@ -1177,5 +1413,170 @@ mod helpers_tests {
         let post = snapshot_signature(&no_gen);
         assert!(post.unchanged_from(&pre));
         assert!(!post.remounted_from(&pre));
+    }
+
+    // ---- snapshot signature spec v1: the cross-repo golden vectors -----
+    //
+    // THIS is the contract with the `ui-bridge` TypeScript SDK. Both sides
+    // fold the same fixture and must produce identical hex. A prose "keep
+    // these in sync" comment is precisely the drift these vectors exist to
+    // prevent — if one of these fails, do NOT re-baseline it, because the
+    // other repo is asserting the same numbers.
+
+    /// The fixture is embedded rather than read from disk so the assertion
+    /// cannot silently vanish when the test runs from a different cwd — a
+    /// conformance test that can skip itself is worse than none.
+    const GOLDEN_FIXTURE: &str = include_str!("fixtures/snapshot-signature-golden.json");
+
+    fn golden_cases() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(GOLDEN_FIXTURE)
+            .expect("golden fixture is valid JSON")
+            .as_object()
+            .expect("golden fixture is a JSON object of named cases")
+            .clone()
+    }
+
+    /// The full roster. Named explicitly so removing a case from the fixture
+    /// fails here instead of quietly shrinking the loop below to nothing.
+    const GOLDEN_CASE_NAMES: &[&str] = &[
+        "empty",
+        "single_minimal",
+        "single_full",
+        "two_elements",
+        "remount_of_two_elements",
+        "missing_registeredAt",
+        "wrong_types_ignored",
+    ];
+
+    #[test]
+    fn golden_fixture_carries_every_expected_case() {
+        let cases = golden_cases();
+        for name in GOLDEN_CASE_NAMES {
+            assert!(
+                cases.contains_key(*name),
+                "golden fixture is missing case {name:?} — the SDK asserts it too"
+            );
+        }
+        assert_eq!(
+            cases.len(),
+            GOLDEN_CASE_NAMES.len(),
+            "golden fixture gained a case this test does not name: {:?}",
+            cases.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn golden_vectors_match_spec_v1() {
+        for (name, case) in golden_cases() {
+            let sig = snapshot_signature(&json!({ "elements": case["elements"].clone() }));
+            assert_eq!(
+                sig.count,
+                case["count"].as_u64().expect("count") as usize,
+                "{name}: count"
+            );
+            assert_eq!(
+                format!("{:016x}", sig.content),
+                case["content"].as_str().expect("content"),
+                "{name}: content hash"
+            );
+            assert_eq!(
+                format!("{:016x}", sig.generation),
+                case["generation"].as_str().expect("generation"),
+                "{name}: generation hash"
+            );
+            assert_eq!(
+                sig.snapshot_id(),
+                case["snapshotId"].as_str().expect("snapshotId"),
+                "{name}: snapshot id"
+            );
+        }
+    }
+
+    /// THE case the whole plan is about, asserted against the shared fixture
+    /// rather than a hand-built pair: the same two elements showing the same
+    /// thing, re-registered under a new mount. `content` must be IDENTICAL,
+    /// `generation` must DIFFER, and `remounted_from` must say so.
+    #[test]
+    fn golden_remount_case_is_reported_as_a_remount() {
+        let cases = golden_cases();
+        let pre = snapshot_signature(&json!({ "elements": cases["two_elements"]["elements"] }));
+        let post = snapshot_signature(
+            &json!({ "elements": cases["remount_of_two_elements"]["elements"] }),
+        );
+
+        assert_eq!(pre.content, post.content, "content is identical across the remount");
+        assert_ne!(pre.generation, post.generation, "generation moves on a remount");
+        assert!(!post.unchanged_from(&pre), "a remount is a change");
+        assert!(
+            post.remounted_from(&pre),
+            "the golden remount case must satisfy remounted_from — this is the predicate the \
+             pre-action staleness gate is built on"
+        );
+    }
+
+    /// An empty snapshot folds to the bare offset basis in both states. Pinned
+    /// separately because it is the one vector a broken `Fnv1a64::new` would
+    /// still pass by accident if the loop never ran.
+    #[test]
+    fn empty_snapshot_is_the_bare_offset_basis() {
+        let sig = snapshot_signature(&json!({ "elements": [] }));
+        assert_eq!(sig.count, 0);
+        assert_eq!(format!("{:016x}", sig.content), "cbf29ce484222325");
+        assert_eq!(format!("{:016x}", sig.generation), "cbf29ce484222325");
+        // A payload with no `elements` key at all is the same as an empty one.
+        assert!(snapshot_signature(&json!({})).unchanged_from(&sig));
+    }
+
+    // ---- snapshot id round-trip ---------------------------------------
+
+    #[test]
+    fn snapshot_id_round_trips_through_from_snapshot_id() {
+        for (name, case) in golden_cases() {
+            let sig = snapshot_signature(&json!({ "elements": case["elements"].clone() }));
+            let parsed = SnapshotSignature::from_snapshot_id(&sig.snapshot_id())
+                .unwrap_or_else(|| panic!("{name}: id must parse back"));
+            assert!(parsed.unchanged_from(&sig), "{name}: round-trip must be lossless");
+        }
+    }
+
+    /// `count` is base-36, so a three-digit count must not be read as decimal.
+    #[test]
+    fn snapshot_id_count_is_base36() {
+        let sig = SnapshotSignature {
+            count: 1295, // 36^2 - 1 => "zz"
+            content: 1,
+            generation: 2,
+        };
+        assert_eq!(
+            sig.snapshot_id(),
+            "ubs1_zz_0000000000000001_0000000000000002"
+        );
+        assert_eq!(
+            SnapshotSignature::from_snapshot_id(&sig.snapshot_id()).map(|s| s.count),
+            Some(1295)
+        );
+    }
+
+    /// A malformed id must be rejected, never silently read as "no id given" —
+    /// the gate has to be able to tell a typo from an omission.
+    #[test]
+    fn malformed_snapshot_ids_are_rejected() {
+        for bad in [
+            "",
+            "ubs1",
+            "ubs1_1_deadbeef",                             // too few parts
+            "ubs1_1_0000000000000001_0000000000000002_x",  // too many parts
+            "ubs2_1_0000000000000001_0000000000000002",    // wrong version
+            "ubs1__0000000000000001_0000000000000002",     // empty count
+            "ubs1_1_000000000000001_0000000000000002",     // 15 hex chars
+            "ubs1_1_0000000000000001_000000000000000g",    // non-hex
+            "ubs1_-1_0000000000000001_0000000000000002",   // negative count
+            "ubs1_1_0000000000000001_0000000000000002 ",   // trailing space
+        ] {
+            assert!(
+                SnapshotSignature::from_snapshot_id(bad).is_none(),
+                "{bad:?} must not parse as a snapshot id"
+            );
+        }
     }
 }

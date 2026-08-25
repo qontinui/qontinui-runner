@@ -1,0 +1,119 @@
+{
+  "empty": {
+    "elements": [],
+    "count": 0,
+    "content": "cbf29ce484222325",
+    "generation": "cbf29ce484222325",
+    "snapshotId": "ubs1_0_cbf29ce484222325_cbf29ce484222325"
+  },
+  "single_minimal": {
+    "elements": [
+      {
+        "id": "el_1"
+      }
+    ],
+    "count": 1,
+    "content": "583a7aacd700bbfd",
+    "generation": "583a7aacd700bbfd",
+    "snapshotId": "ubs1_1_583a7aacd700bbfd_583a7aacd700bbfd"
+  },
+  "single_full": {
+    "elements": [
+      {
+        "id": "btn_save",
+        "category": "button",
+        "state": {
+          "textContent": "Save",
+          "ariaPressed": false
+        },
+        "registeredAt": 1724500000000
+      }
+    ],
+    "count": 1,
+    "content": "a90b8969b5033f59",
+    "generation": "933eedcc3bc79bd2",
+    "snapshotId": "ubs1_1_a90b8969b5033f59_933eedcc3bc79bd2"
+  },
+  "two_elements": {
+    "elements": [
+      {
+        "id": "btn_save",
+        "category": "button",
+        "state": {
+          "textContent": "Save",
+          "ariaPressed": true
+        },
+        "registeredAt": 1724500000000
+      },
+      {
+        "id": "inp_name",
+        "category": "input",
+        "state": {
+          "textContent": ""
+        },
+        "registeredAt": 1724500000001
+      }
+    ],
+    "count": 2,
+    "content": "65a59daceda26fb2",
+    "generation": "c5d41be145c82269",
+    "snapshotId": "ubs1_2_65a59daceda26fb2_c5d41be145c82269"
+  },
+  "remount_of_two_elements": {
+    "elements": [
+      {
+        "id": "btn_save",
+        "category": "button",
+        "state": {
+          "textContent": "Save",
+          "ariaPressed": true
+        },
+        "registeredAt": 1724500009999
+      },
+      {
+        "id": "inp_name",
+        "category": "input",
+        "state": {
+          "textContent": ""
+        },
+        "registeredAt": 1724500010000
+      }
+    ],
+    "count": 2,
+    "content": "65a59daceda26fb2",
+    "generation": "405b6cc498a915bb",
+    "snapshotId": "ubs1_2_65a59daceda26fb2_405b6cc498a915bb"
+  },
+  "missing_registeredAt": {
+    "elements": [
+      {
+        "id": "btn_save",
+        "category": "button",
+        "state": {
+          "textContent": "Save"
+        }
+      }
+    ],
+    "count": 1,
+    "content": "81e30cd092f43cc3",
+    "generation": "805485e4eadded7e",
+    "snapshotId": "ubs1_1_81e30cd092f43cc3_805485e4eadded7e"
+  },
+  "wrong_types_ignored": {
+    "elements": [
+      {
+        "id": "btn_save",
+        "category": 123,
+        "state": {
+          "textContent": null,
+          "ariaPressed": "yes"
+        },
+        "registeredAt": "nope"
+      }
+    ],
+    "count": 1,
+    "content": "805485e4eadded7e",
+    "generation": "805485e4eadded7e",
+    "snapshotId": "ubs1_1_805485e4eadded7e_805485e4eadded7e"
+  }
+}

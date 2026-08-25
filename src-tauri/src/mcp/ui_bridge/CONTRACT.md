@@ -224,6 +224,58 @@ An unknown/stale `tabId` is rejected by the relay with a structured
 `{success:false, code:"TAB_NOT_FOUND"|"TAB_STALE", ...}` envelope (NOT a silent
 fall-through to the primary tab); the runner forwards it verbatim.
 
+### Body fields drop the same way query params do (`fromSnapshotId`)
+
+The rule above is about query params, but the **request body** has the identical
+hazard on any `/ui-bridge/sdk/*` wrapper that *reconstructs* the payload instead
+of forwarding it verbatim. `handle_element_action` does both: the WS/HTTP arm
+forwards `body` untouched, while the IPC-fallback arm rebuilds
+`{elementId, action:{...}}` field by field — so a new body field silently
+survives on one transport and silently vanishes on the other, and the same
+request behaves differently depending on which arm answered.
+
+Three opt-ins are threaded there today and all must stay listed here:
+
+- `verifyEffect` — the D3 effect-calculus per-request opt-in.
+- `fromSnapshotId` — the pre-action staleness gate (plan
+  `2026-08-20-ui-bridge-snapshot-identity-and-selector-candidates`). The caller
+  passes the `snapshotId` it reasoned from; the **runner-direct** route
+  (`POST /ui-bridge/control/element/{id}/action`, `elements.rs`) takes a
+  pre-action snapshot and refuses with HTTP 409,
+  `error_detail.code = "ELEMENT_STALE"` and
+  `error_detail.context.staleReason = "snapshot-superseded"` — a fourth value
+  in the SDK's `UB-STALE-ELEMENT` family alongside `unmounted` / `rerendered` /
+  `detached`, **not** a new top-level code. `context.changeKind` narrows it to
+  `remounted` / `elementCountChanged` / `contentChanged`. Omitting the field
+  preserves the previous behaviour exactly.
+- `includeResolutionAlternates` — the ranked selector alternates (Phase 3, an
+  SDK-side concern). The runner only forwards it.
+
+**Unknown is not stale.** An id the runner cannot parse, and a state where the
+pre-action snapshot could not be taken, both proceed UNGATED with a warn. They
+are states in which freshness cannot be judged, which is not the same as having
+judged it stale; refusing on them would break callers without preventing a
+single wrong click. The recovery text for `snapshot-superseded` is written at
+the rejection site rather than shared with the other three reasons, because
+theirs is "re-find the element" and here a re-find would succeed — and click
+the wrong thing.
+
+Ids are minted by `POST /ui-bridge/control/discover`, whose response carries
+`snapshotId`, `snapshotIdCitable` and (when not citable) `snapshotIdNote`. Only
+an unnarrowed `{"interactiveOnly": false}` discover mints a **citable** id,
+because that is the exact element set the gate compares against — both sides
+build their options with `helpers::citable_snapshot_discover_payload`, and they
+must keep doing so. A narrowed discover still returns an id (a valid comparison
+token against another identically-narrowed discover) with
+`snapshotIdCitable: false`.
+
+The fold behind the id is a cross-repo specification, not an implementation
+detail: FNV-1a-64 over a fixed field list, documented on
+`helpers::SnapshotSignature` and pinned by
+`fixtures/snapshot-signature-golden.json`, which the `ui-bridge` TypeScript SDK
+asserts against the same numbers. Changing it is a `ubs2`, never an edit in
+place.
+
 ### Per-window routing (`?windowLabel=`) targets a pop-out runner window
 `tabId` (above) pins a command to a remote browser *tab* via the relay.
 `windowLabel` is the **local** analog: it targets one of THIS runner process's

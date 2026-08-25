@@ -1312,13 +1312,35 @@ async fn handle_element_action(
                 .get("verifyEffect")
                 .cloned()
                 .unwrap_or(serde_json::json!(null));
+            // Same reason, for the two per-request opt-ins that plan
+            // `2026-08-20-ui-bridge-snapshot-identity-and-selector-candidates`
+            // adds: `fromSnapshotId` (the pre-action staleness gate) and
+            // `includeResolutionAlternates` (the ranked selector alternates,
+            // which are opt-in precisely because they are O(elements ×
+            // candidates) on the hottest payload in the SDK).
+            //
+            // The WS/HTTP path forwards the body verbatim, so dropping either
+            // here would mean the SAME request behaves differently depending
+            // on which transport happened to answer — a caller that opted in
+            // to a freshness guarantee would silently lose it on failover,
+            // which is the one outcome an opt-in exists to rule out.
+            let from_snapshot_id = body
+                .get("fromSnapshotId")
+                .cloned()
+                .unwrap_or(serde_json::json!(null));
+            let include_resolution_alternates = body
+                .get("includeResolutionAlternates")
+                .cloned()
+                .unwrap_or(serde_json::json!(null));
             let payload = serde_json::json!({
                 "elementId": id,
                 "action": {
                     "action": action_name,
                     "params": params,
                     "waitOptions": wait_options,
-                    "verifyEffect": verify_effect
+                    "verifyEffect": verify_effect,
+                    "fromSnapshotId": from_snapshot_id,
+                    "includeResolutionAlternates": include_resolution_alternates
                 }
             });
             match ui_bridge_request_sync(&state, "execute_action", payload).await {

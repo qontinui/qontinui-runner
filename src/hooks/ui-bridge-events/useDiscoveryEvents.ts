@@ -99,6 +99,50 @@ export function useDiscoveryEvents(
 
           const result = await currentBridge.discover(discoverOptions);
 
+          // Backfill `registeredAt` from the registry.
+          //
+          // WHY THIS EXISTS. The runner folds every discover payload into a
+          // snapshot signature (`mcp/ui_bridge/helpers.rs`, spec v1) whose
+          // `generation` half is a hash over each element's `registeredAt` —
+          // the field that says WHICH MOUNT an element belongs to, and the
+          // only way a same-shape remount (identical ids, identical text, new
+          // mount) is visible at all.
+          //
+          // `discover()` builds its elements from `ActionExecutor.find`, whose
+          // `DiscoveredElement` literals never copy `registeredAt` out of the
+          // registry record — only `createSnapshotAsync()` does. So the
+          // generation hash over a discover payload folded nothing but element
+          // ids, and `remounted` on an action result could never be anything
+          // but `false`: a silent, permanent false negative on the exact
+          // signal the detector was built for. Backfilling it here — the same
+          // registry lookup the stableRef enrichment below already does — is
+          // what makes that signal real, and it is what the pre-action
+          // `fromSnapshotId` staleness gate depends on.
+          //
+          // Deliberately independent of the stableRef block: that one is
+          // wrapped in a dynamic import that may legitimately fail, and this
+          // must not fail with it. Unregistered DOM hits (discover synthesizes
+          // ids for those) have no registry record and simply contribute
+          // nothing to the generation hash — per spec, an absent field folds
+          // no bytes rather than a spurious constant.
+          try {
+            const registry = (
+              currentBridge as { registry?: { getElement?: (id: string) => unknown } }
+            ).registry;
+            if (result?.elements && registry?.getElement) {
+              for (const el of result.elements as unknown as Array<Record<string, unknown>>) {
+                const reg = registry.getElement(el.id as string) as {
+                  registeredAt?: number;
+                } | null;
+                if (typeof reg?.registeredAt === "number") {
+                  el.registeredAt = reg.registeredAt;
+                }
+              }
+            }
+          } catch (err) {
+            logger.warn("discover: registeredAt backfill failed", err);
+          }
+
           // Enrich elements with stableRef if createStableRef is available
           try {
             const { createStableRef } = await import("@qontinui/ui-bridge/core");
