@@ -1455,6 +1455,56 @@ pub fn terminal_report_tree_reset(
     })
 }
 
+/// Report that a terminal pane's UI Bridge input element is NOT registered
+/// (manual-test-loop iter 18, item 1).
+///
+/// WHY a Tauri command and not just a `console.error`: a webview console line
+/// never reaches the runner log — the same reason [`terminal_report_tree_reset`]
+/// exists — and the only path that carries it out of WebView2 at all is the
+/// SDK's optional browser-capture pipeline into the error monitor, itself a
+/// DB-backed surface that can be degraded. Iteration 17 observed a restored pane
+/// with no `terminal-input-<id>` for over two minutes and reported that "the
+/// retry ladder's give-up warning never fires"; it could not have been seen from
+/// `/health`, from the runner log, or from any HTTP probe even if it HAD fired.
+/// A failure of this class must be readable from outside the webview over a path
+/// with no dependencies, or it is indistinguishable from silence.
+///
+/// Two reporters call this, both once per terminal id per page lifetime:
+///
+///  - `reason = "instance-ladder"` — a MOUNTED `TerminalInstance` polled for
+///    its input element and the bridge registry for the full retry budget and
+///    never landed.
+///  - `reason = "no-owner"` — the mount-independent proxy watchdog saw
+///    `terminal-input-<id>` unowned for the whole budget. This is the arm that
+///    covers a pane which never mounted at all (a flow-grid `assigned-virtual`
+///    zone), which is precisely the case the ladder could not report because it
+///    never started.
+///
+/// Pure observability: one `tracing::warn!` line. Always succeeds.
+#[tauri::command]
+pub fn terminal_report_bridge_registration_failure(
+    terminal_id: String,
+    element_id: String,
+    reason: String,
+    elapsed_ms: Option<u64>,
+    detail: Option<String>,
+) -> Result<CommandResponse, String> {
+    let elapsed = elapsed_ms.unwrap_or(0);
+    warn!(
+        terminal_id = %terminal_id,
+        element_id = %element_id,
+        reason = %reason,
+        elapsed_ms = elapsed,
+        detail = detail.as_deref().unwrap_or("(none)"),
+        "UI Bridge terminal input registration FAILED: {element_id} is not registered after {elapsed}ms (reason={reason}); custom actions on terminal {terminal_id} will answer ELEMENT_NOT_FOUND"
+    );
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
 /// List the LIVE Claude Code sessions with the names the operator actually
 /// sees — read from Claude Code's own per-process registry
 /// (`<config_dir>/sessions/<pid>.json`), not from our transcript scraping.
@@ -2184,6 +2234,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_session_clear_restore_pending,
             terminal_session_rebind_terminal,
             terminal_report_tree_reset,
+            terminal_report_bridge_registration_failure,
         ])
         .build()
 }

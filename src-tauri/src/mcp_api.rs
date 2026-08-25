@@ -784,6 +784,11 @@ async fn health(
             // attach path's claim: one cluster, joined, not two fighting over a
             // locked data dir.
             "embeddedPort": crate::embedded_pg::embedded_port(),
+            // WHICH data dir is behind that port. `embeddedPort` alone cannot
+            // distinguish "this temp runner provisioned a private cluster"
+            // from "it attached to the machine-shared one" — the port is
+            // ephemeral either way. Null off the embedded arms.
+            "embeddedDataRoot": crate::embedded_pg::embedded_data_root(),
         },
         // PR-credential surface (plan qontinui-pr-credential-provisioning,
         // Phase 0): cached `gh auth status` verdict. `state: "pending"` +
