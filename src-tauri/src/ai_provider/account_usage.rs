@@ -292,6 +292,18 @@ impl std::fmt::Display for AccountSelectError {
 
 impl std::error::Error for AccountSelectError {}
 
+/// The config dir's last path segment — the `label` the per-device account
+/// feed puts on the wire.
+///
+/// Splits on BOTH separators rather than going through `std::path` for the
+/// same reason [`derive_account_name`] does: on a Linux host a Windows-style
+/// `C:\claude\.claude-hotmail` has no `file_name()` and collapses to one
+/// segment, so a roster written on Windows would stop matching its own
+/// published labels.
+fn roster_basename(config_dir: &str) -> &str {
+    config_dir.rsplit(['/', '\\']).next().unwrap_or(config_dir)
+}
+
 /// A caller-requested account resolved to a validated, spawnable config dir.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAccount {
@@ -333,10 +345,17 @@ pub fn resolve_requested_account(account: &str) -> Result<ResolvedAccount, Accou
 ///
 /// Resolution order:
 /// 1. Match `account` against an exact roster entry, else a roster dir whose
-///    `derive_account_name` equals `account` case-insensitively. No match ⇒
-///    `NotInRoster` (with the available friendly names for the error body).
+///    `derive_account_name` equals `account` case-insensitively, else one whose
+///    config-dir BASENAME does (`.claude-hotmail`). No match ⇒ `NotInRoster`
+///    (with the available friendly names for the error body).
 /// 2. `has_valid_creds(dir)` false ⇒ `NotLoggedIn`.
 /// 3. Populate `cooldown_remaining_secs` from `cooldown(dir)`.
+///
+/// The basename arm exists because that is the `label` the per-device account
+/// feed puts on the wire (`commands::ai_settings`'s `usage_twin_report`), and
+/// therefore the string an operator picking an account off that feed hands
+/// back. Without it, every account name the operator can actually SEE fails to
+/// resolve.
 fn resolve_from(
     account: &str,
     roster: &[String],
@@ -350,6 +369,11 @@ fn resolve_from(
             roster
                 .iter()
                 .find(|d| derive_account_name(d).eq_ignore_ascii_case(account))
+        })
+        .or_else(|| {
+            roster
+                .iter()
+                .find(|d| roster_basename(d).eq_ignore_ascii_case(account))
         })
         .ok_or_else(|| AccountSelectError::NotInRoster {
             requested: account.to_string(),
@@ -919,6 +943,18 @@ mod tests {
             .expect("exact path should resolve");
         assert_eq!(resolved.config_dir, "C:\\claude\\.claude-paktis");
         assert_eq!(resolved.account_name, "paktis");
+    }
+
+    /// The per-device account feed publishes the config-dir BASENAME as
+    /// `label`, so that string has to resolve — otherwise every account name
+    /// an operator can see is unusable as a spawn pin.
+    #[test]
+    fn resolve_in_roster_by_published_label() {
+        let roster = win_roster();
+        let resolved = resolve_from(".claude-gmail", &roster, |_| true, |_| None)
+            .expect("the published wire label should resolve");
+        assert_eq!(resolved.config_dir, "C:\\claude\\.claude-gmail");
+        assert_eq!(resolved.account_name, "gmail");
     }
 
     #[test]

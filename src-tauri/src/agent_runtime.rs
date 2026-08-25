@@ -111,6 +111,24 @@ pub struct LaunchPayload {
     pub plan_phase: Option<u32>,
     #[serde(default)]
     pub correlation_topic: Option<String>,
+    /// Optional per-spawn Claude account pin
+    /// (plan `2026-08-25-general-purpose-session-spawn-machine-account-prompt`
+    /// Phase 3). The value is the account LABEL — the config-dir basename, the
+    /// same identity the per-device account feed publishes — or, equivalently,
+    /// a friendly name or a full roster `config_dir`; all three resolve
+    /// through [`crate::ai_provider::resolve_requested_account`].
+    ///
+    /// `Some` OVERRIDES [`crate::settings::AccountSelectionMode`] for this
+    /// spawn only (a per-child `CLAUDE_CONFIG_DIR`, never the machine-global
+    /// `switch_claude_account` mutation — that would leak one spawn's choice
+    /// into every other session on the box). `None` leaves today's least-usage
+    /// rotation untouched.
+    ///
+    /// An unresolvable pin FAILS the spawn (see [`resolve_spawn_account_with`]);
+    /// it never degrades to rotation, because a pinned account silently ignored
+    /// is indistinguishable from one honoured.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 impl LaunchPayload {
@@ -3722,7 +3740,9 @@ async fn run_continuation_headless(
     // default `:9876`, which is dead on any secondary/temp runner.
     let bound_port = headless_continuation_bound_port(crate::coord_mcp::resolve_bound_api_port);
     crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
-    match spawn_claude_child(workdir, initial_prompt).await {
+    // No per-spawn pin here: a gate continuation carries no account field —
+    // the `pick_best_account` call above is the whole selection.
+    match spawn_claude_child(workdir, initial_prompt, None).await {
         Ok(mut child) => {
             let pid = child.id().map(|p| p as i64);
             // Exempt this headless child from the session-tracking health
@@ -3803,6 +3823,58 @@ fn payload_to_allocate_result(payload: &LaunchPayload) -> crate::agent_worktree:
     }
 }
 
+/// Resolve a spawn's optional [`LaunchPayload::account`] pin into the
+/// `CLAUDE_CONFIG_DIR` override the child will run under.
+///
+/// Pure core, parameterised over the resolver so the FAIL-LOUD contract is
+/// unit-testable without the roster / credential / cooldown singletons
+/// (mirrors `ai_provider::account_usage::resolve_from`).
+///
+/// Three outcomes, and the middle one is the whole point:
+/// - no pin (`None`, or a blank string — which names no account at all, so it
+///   is absence rather than a wrong name) ⇒ `Ok(None)`, today's least-usage
+///   rotation runs unchanged;
+/// - a pin that does not resolve — off-roster name, or a roster account with no
+///   live credentials ⇒ **`Err`**, which the caller turns into a
+///   `report_spawn_failed` lifecycle post. It NEVER falls back to rotation: a
+///   pinned account that is silently ignored is indistinguishable from one that
+///   was honoured, so the operator would have no way to tell which account
+///   actually ran;
+/// - a pin that resolves ⇒ `Ok(Some(resolved))`, pinned for this child only.
+///
+/// A rate-limited-but-valid account still resolves (the caller asked for it
+/// explicitly); the cooldown rides along on
+/// [`crate::ai_provider::ResolvedAccount::cooldown_remaining_secs`] and the
+/// caller warns.
+fn resolve_spawn_account_with(
+    account: Option<&str>,
+    resolve: impl FnOnce(
+        &str,
+    ) -> Result<
+        crate::ai_provider::ResolvedAccount,
+        crate::ai_provider::AccountSelectError,
+    >,
+) -> anyhow::Result<Option<crate::ai_provider::ResolvedAccount>> {
+    let Some(requested) = account.map(str::trim).filter(|a| !a.is_empty()) else {
+        return Ok(None);
+    };
+    resolve(requested).map(Some).map_err(|e| {
+        anyhow::anyhow!(
+            "spawn requested account '{requested}' but it cannot be used: {} \
+             — refusing to fall back to account rotation (an ignored pin is \
+             indistinguishable from an honoured one)",
+            e.message()
+        )
+    })
+}
+
+/// Production wiring of [`resolve_spawn_account_with`] against the live roster.
+fn resolve_spawn_account(
+    account: Option<&str>,
+) -> anyhow::Result<Option<crate::ai_provider::ResolvedAccount>> {
+    resolve_spawn_account_with(account, crate::ai_provider::resolve_requested_account)
+}
+
 /// End-to-end run of one agent subprocess:
 /// 1. `git worktree add` each allocated worktree.
 /// 2. Spawn `claude` CLI in the first worktree with the initial prompt.
@@ -3853,6 +3925,35 @@ async fn run_agent_subprocess(
     // outcome to a specific PR. The path rewrite above does not touch push_ref,
     // so read it once here and reuse for all of this spawn's reports.
     let primary_push_ref = payload.worktrees.first().and_then(|wt| wt.push_ref.clone());
+
+    // Step 0: resolve the optional per-spawn account pin — BEFORE materializing
+    // anything, so an unusable pin costs no worktrees. An unresolvable pin is a
+    // terminal spawn failure reported to coord, never a quiet demotion to
+    // least-usage rotation (see `resolve_spawn_account_with`).
+    let pinned_account = match resolve_spawn_account(payload.account.as_deref()) {
+        Ok(a) => a,
+        Err(e) => {
+            let reason = format!("{e:#}");
+            warn!("agent_runtime: agent_id={agent_id} NOT launched — {reason}");
+            report_spawn_failed(agent_id, &reason, None, 0, primary_push_ref.as_deref()).await;
+            return Err(e);
+        }
+    };
+    if let Some(acct) = &pinned_account {
+        info!(
+            "agent_runtime: agent_id={agent_id} pinned to Claude account '{}' \
+             (config_dir override — account_selection_mode does not apply to this spawn)",
+            acct.account_name
+        );
+        if let Some(secs) = acct.cooldown_remaining_secs {
+            warn!(
+                "agent_runtime: pinned account '{}' is rate-limited for another {secs}s; \
+                 spawning anyway per the explicit pin",
+                acct.account_name
+            );
+        }
+    }
+    let pinned_config_dir = pinned_account.as_ref().map(|a| a.config_dir.clone());
 
     // Step 1: materialize worktrees.
     if let Err(e) = materialize_worktrees(&payload).await {
@@ -3966,7 +4067,14 @@ async fn run_agent_subprocess(
     // mid-run rate-limit the inference path rotates via
     // `rotate_account_on_rate_limit`, and `spawn_claude_child` re-reads the
     // resolved dir on each respawn, so retries pick up the rotation.
-    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    //
+    // SKIPPED when this spawn carries an account pin: the picker mutates the
+    // process-global resolved dir, which is precisely the leak a per-spawn
+    // override exists to avoid — and its result would be ignored anyway, since
+    // the override is passed to every (re)spawn below.
+    if pinned_config_dir.is_none() {
+        let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    }
 
     loop {
         // Stop requested during a restart back-off (or before the first spawn):
@@ -3975,7 +4083,13 @@ async fn run_agent_subprocess(
             final_reason = Some("stopped by operator before (re)spawn".to_string());
             break;
         }
-        match spawn_claude_child(&primary_wt, &payload.initial_prompt).await {
+        match spawn_claude_child(
+            &primary_wt,
+            &payload.initial_prompt,
+            pinned_config_dir.as_deref(),
+        )
+        .await
+        {
             Ok(mut child) => {
                 let pid = child.id().map(|p| p as i64);
                 // Exempt this headless child from the session-tracking health
@@ -4422,7 +4536,11 @@ pub(crate) fn finalize_headless_child_env(cmd: &mut tokio::process::Command) {
 /// Spawn `claude` CLI as a tokio child. `initial_prompt` is piped to
 /// stdin. stdout/stderr are inherited as pipes so the caller can stream
 /// them.
-async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Result<Child> {
+async fn spawn_claude_child(
+    workdir: &str,
+    initial_prompt: &str,
+    account_config_dir_override: Option<&str>,
+) -> anyhow::Result<Child> {
     let bin = claude_bin_path();
     let mut cmd = crate::process_helpers::tokio_no_window(&bin);
     cmd.current_dir(workdir)
@@ -4441,9 +4559,18 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
     // default itself has live credentials; otherwise the spawn is a 401 zombie.
     // Fail loud with an actionable reason (the callers turn this `Err` into a
     // `report_spawn_failed` lifecycle post) rather than starting a dead `claude`.
+    //
+    // `account_config_dir_override` is the caller's per-spawn PIN
+    // (`LaunchPayload::account`, already validated against the roster + its
+    // credentials by `resolve_spawn_account`). When present it wins over
+    // `account_selection_mode` entirely, for this child only — nothing global
+    // is mutated, so a sibling session on the same box is unaffected.
     let ai = crate::settings::get_ai_settings();
     let (resolved_config_dir, _config_dir_source) =
-        crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
+        crate::ai_provider::get_effective_config_dir_with_override(
+            &ai.claude_cli,
+            account_config_dir_override,
+        );
     match resolved_config_dir {
         Some(dir) => {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
@@ -5317,6 +5444,7 @@ mod tests {
             plan_slug: None,
             plan_phase: Some(4),
             correlation_topic: Some("my-coordination-topic".to_string()),
+            account: None,
         };
         let serialized = serde_json::to_value(serde_json::json!({
             "channel": format!("events.agent.spawn_requested.{}", payload.target_device_id),
@@ -5364,6 +5492,109 @@ mod tests {
             map.insert(k.clone(), v.clone());
         }
         body
+    }
+
+    // --- per-spawn account pin (plan 2026-08-25, Phase 3) -------------------
+
+    fn ok_account(name: &str) -> crate::ai_provider::ResolvedAccount {
+        crate::ai_provider::ResolvedAccount {
+            config_dir: format!("C:\\claude\\.claude-{name}"),
+            account_name: name.to_string(),
+            cooldown_remaining_secs: None,
+        }
+    }
+
+    /// THE fail-loud contract: a pinned account that does not resolve must
+    /// ERROR, not quietly hand the spawn back to least-usage rotation. A
+    /// silently-ignored pin is indistinguishable from an honoured one, so the
+    /// operator could never tell which account actually ran.
+    #[test]
+    fn unknown_pinned_account_errors_instead_of_rotating() {
+        let err = resolve_spawn_account_with(Some("nope"), |requested| {
+            Err(crate::ai_provider::AccountSelectError::NotInRoster {
+                requested: requested.to_string(),
+                roster: vec!["hotmail".to_string(), "gmail".to_string()],
+            })
+        })
+        .expect_err("an unresolvable pin must fail the spawn, not fall back");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nope"),
+            "the rejected name must be named: {msg}"
+        );
+        assert!(
+            msg.contains("hotmail") && msg.contains("gmail"),
+            "the operator needs the roster to correct the typo: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to fall back to account rotation"),
+            "the refusal must be explicit, not implied: {msg}"
+        );
+    }
+
+    /// A roster account with no live credentials is the same class of failure:
+    /// spawning under it would 401-zombie the child, and rotating away from it
+    /// would hide that the pin was ignored.
+    #[test]
+    fn logged_out_pinned_account_errors_instead_of_rotating() {
+        let err = resolve_spawn_account_with(Some("gmail"), |_| {
+            Err(crate::ai_provider::AccountSelectError::NotLoggedIn {
+                config_dir: "C:\\claude\\.claude-gmail".to_string(),
+            })
+        })
+        .expect_err("a logged-out pin must fail the spawn");
+        assert!(format!("{err:#}").contains("no valid credentials"));
+    }
+
+    /// The resolver is never even consulted without a pin — `None` leaves
+    /// today's rotation untouched.
+    #[test]
+    fn absent_pin_leaves_rotation_untouched() {
+        let resolved = resolve_spawn_account_with(None, |_| {
+            panic!("the resolver must not run when no account is pinned")
+        })
+        .expect("no pin is not an error");
+        assert!(resolved.is_none());
+    }
+
+    /// A blank string names no account, so it is absence — not a wrong name to
+    /// fail loudly on. (Coord normalizes empty-to-`None` at its boundary; this
+    /// is the runner's belt-and-braces.)
+    #[test]
+    fn blank_pin_is_absence_not_a_bad_name() {
+        for blank in ["", "   "] {
+            let resolved = resolve_spawn_account_with(Some(blank), |_| {
+                panic!("a blank pin must not reach the resolver")
+            })
+            .expect("a blank pin is not an error");
+            assert!(resolved.is_none(), "blank {blank:?} must mean no pin");
+        }
+    }
+
+    #[test]
+    fn resolved_pin_is_returned_for_the_child_env() {
+        let resolved = resolve_spawn_account_with(Some(".claude-hotmail"), |requested| {
+            assert_eq!(requested, ".claude-hotmail");
+            Ok(ok_account("hotmail"))
+        })
+        .expect("a resolvable pin succeeds")
+        .expect("a pin yields an override");
+        assert_eq!(resolved.config_dir, "C:\\claude\\.claude-hotmail");
+    }
+
+    /// The wire key coord sends is `account`, and its absence must stay
+    /// tolerated (`#[serde(default)]`) — every coord shipping today omits it.
+    #[test]
+    fn launch_payload_reads_optional_account_key() {
+        let without: LaunchPayload =
+            serde_json::from_value(launch_body_with(serde_json::json!({}))).unwrap();
+        assert_eq!(without.account, None);
+
+        let with: LaunchPayload = serde_json::from_value(launch_body_with(serde_json::json!({
+            "account": ".claude-hotmail"
+        })))
+        .unwrap();
+        assert_eq!(with.account.as_deref(), Some(".claude-hotmail"));
     }
 
     #[test]
