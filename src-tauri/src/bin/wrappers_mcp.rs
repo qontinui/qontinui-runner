@@ -515,10 +515,24 @@ fn dispatch_read_spill(store: Option<&SpillStore>, arguments: Value) -> Value {
     let slice = match store.read(spill_id, offset, length) {
         Ok(s) => s,
         Err(e) => {
+            // The store's own message already distinguishes "swept" from
+            // "never written" using its drop counter; this adds the standing
+            // total, because a model holding SEVERAL locators needs to know
+            // that the others may be dead too, not just this one.
+            let dropped = store.dropped_own_session();
+            let note = if dropped > 0 {
+                format!(
+                    " — retention has dropped {dropped} of this server's own spills, so any \
+                     other locator it handed you earlier may also no longer resolve; re-run the \
+                     tool rather than assuming the result is gone"
+                )
+            } else {
+                String::new()
+            };
             return tool_error(
                 READ_SPILL_TOOL_NAME,
-                format!("cannot read spill '{spill_id}': {e}"),
-            )
+                format!("cannot read spill '{spill_id}': {e}{note}"),
+            );
         }
     };
 
@@ -671,8 +685,34 @@ const DEFAULT_SPILL_THRESHOLD_BYTES: usize = 32 * 1024;
 /// Operator override for [`DEFAULT_SPILL_THRESHOLD_BYTES`], in bytes. `0`
 /// disables spilling outright — every body goes back whole, exactly as it did
 /// before this phase — which is the escape hatch for a consumer that turns out
-/// to need entire bodies.
+/// to need entire bodies. Any other value is clamped up to
+/// [`MIN_SPILL_THRESHOLD_BYTES`].
 const SPILL_THRESHOLD_ENV: &str = "QONTINUI_MCP_SPILL_THRESHOLD_BYTES";
+
+/// Floor under a non-zero [`SPILL_THRESHOLD_ENV`].
+///
+/// **Why a floor rather than head/tail scaled to the threshold.** The
+/// documented model is "`0` disables, a positive value lowers context use", and
+/// below roughly 7 KB the unclamped machinery inverted it: `head_end`
+/// saturates at `text.len()`, `tail_start` collapses onto it, and the
+/// "preview" becomes the whole body plus ~640 bytes of locator header — so
+/// lowering the threshold *raised* context use. Lower still, under ~510 bytes,
+/// [`dispatch_read_spill`]'s own result exceeded the threshold and re-spilled,
+/// minting a fresh record on every retrieval.
+///
+/// Scaling the excerpt to the threshold would keep the model true down to a
+/// few hundred bytes, but it buys nothing real: at that size a preview cannot
+/// carry both a usable excerpt AND the ~640-byte locator block a model needs
+/// to fetch the rest, so what it would deliver is a correctly-shaped preview
+/// that is almost entirely boilerplate. A floor says that outright instead of
+/// degrading quietly. 8 KiB clears the widest possible preview
+/// ([`PREVIEW_HEAD_BYTES`] + [`PREVIEW_TAIL_BYTES`] + the header ≈ 6.8 KB, and
+/// `a_preview_at_the_floor_is_smaller_than_the_threshold` pins that) and
+/// leaves [`max_read_length`] at 4 KiB, comfortably above
+/// [`MIN_READ_LENGTH`], so a retrieval cannot re-spill either. An operator who
+/// genuinely wants everything spilled sets `1`, gets 8 KiB and a line on
+/// stderr saying so.
+const MIN_SPILL_THRESHOLD_BYTES: usize = 8 * 1024;
 
 /// Bytes of the body shown at the head of a preview.
 const PREVIEW_HEAD_BYTES: usize = 4096;
@@ -681,6 +721,13 @@ const PREVIEW_HEAD_BYTES: usize = 4096;
 /// head-only because for the content this server actually returns — logs,
 /// diffs, source, command output — the tail is where the failure is.
 const PREVIEW_TAIL_BYTES: usize = 2048;
+
+/// How much of an error message [`tool_error`] echoes to stderr.
+///
+/// Generous enough to hold an upstream failure's own message and the start of
+/// whatever body it carried — which is what an operator reads the log for —
+/// and small enough that a 300 KB error body cannot land there in full.
+const TOOL_ERROR_STDERR_BYTES: usize = 2048;
 
 /// A body whose longest whitespace-free run exceeds this is treated as having
 /// no line structure, and gets no excerpt at all.
@@ -715,7 +762,7 @@ fn spill_store() -> Option<&'static SpillStore> {
 
 /// The effective spill threshold. See [`SPILL_THRESHOLD_ENV`].
 fn spill_threshold_bytes() -> usize {
-    match std::env::var(SPILL_THRESHOLD_ENV) {
+    let raw = match std::env::var(SPILL_THRESHOLD_ENV) {
         Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<usize>() {
             Ok(v) => v,
             Err(e) => {
@@ -727,6 +774,27 @@ fn spill_threshold_bytes() -> usize {
             }
         },
         _ => DEFAULT_SPILL_THRESHOLD_BYTES,
+    };
+    let effective = effective_threshold(raw);
+    if effective != raw {
+        eprintln!(
+            "[wrappers-mcp] WARNING {}={} is below the {} byte floor — using the floor. Below it \
+             a preview costs more context than the body it replaces; set 0 to disable spilling \
+             instead.",
+            SPILL_THRESHOLD_ENV, raw, MIN_SPILL_THRESHOLD_BYTES
+        );
+    }
+    effective
+}
+
+/// Apply [`MIN_SPILL_THRESHOLD_BYTES`], preserving `0`'s "spilling is off"
+/// meaning. Split out from [`spill_threshold_bytes`] so the clamp is testable
+/// without mutating a process-global env var.
+fn effective_threshold(raw: usize) -> usize {
+    if raw == 0 {
+        0
+    } else {
+        raw.max(MIN_SPILL_THRESHOLD_BYTES)
     }
 }
 
@@ -749,7 +817,15 @@ fn text_result(tool: &str, content_type: &str, text: String) -> Value {
 /// response carries no `error` string, so a failure can cost as much context
 /// as a success.
 fn tool_error(tool: &str, msg: String) -> Value {
-    eprintln!("[wrappers-mcp] tool error: {}", msg);
+    // The stderr echo is bounded even though the agent-bound copy is spilled
+    // below. Both `dispatch_tool_call` and `dispatch_subagent_call`
+    // interpolate a whole upstream JSON body into this message, so echoing it
+    // in full put a 300 KB error into the client's MCP server log — the same
+    // unbounded cost on the same body, moved to a different channel, which
+    // would undercut the claim that the error path is bounded at all. The
+    // truncated head is enough to identify the failure; the whole body is one
+    // `read_spilled_result` away.
+    eprintln!("[wrappers-mcp] tool error: {}", stderr_echo(&msg));
     text_result_with(
         tool,
         "text/plain",
@@ -758,6 +834,26 @@ fn tool_error(tool: &str, msg: String) -> Value {
         spill_store(),
         spill_threshold_bytes(),
     )
+}
+
+/// The bounded stderr rendering of an error message.
+///
+/// Cut on a character boundary and labelled with what was withheld, so a log
+/// reader can tell a truncated echo from a short error. Done inline rather
+/// than through `str_utils`: that helper lives in the runner bin's module
+/// tree, which this second bin cannot import (the same crate boundary that put
+/// `mcp_spill` in the lib).
+fn stderr_echo(msg: &str) -> std::borrow::Cow<'_, str> {
+    if msg.len() <= TOOL_ERROR_STDERR_BYTES {
+        return std::borrow::Cow::Borrowed(msg);
+    }
+    let cut = floor_char_boundary(msg, TOOL_ERROR_STDERR_BYTES);
+    std::borrow::Cow::Owned(format!(
+        "{} … [{} of {} bytes shown; the whole body went to the agent, spilled if oversized]",
+        &msg[..cut],
+        cut,
+        msg.len()
+    ))
 }
 
 /// Build the wire envelope, applying the spill policy.
@@ -778,6 +874,11 @@ fn tool_error(tool: &str, msg: String) -> Value {
 /// truncation applies just as much when the disk is the thing that failed, and
 /// an oversized truthful result beats a lost one. `isError` survives a spill —
 /// the flag rides on the envelope, not on the text.
+///
+/// `threshold` is an EFFECTIVE threshold — `0`, or at least
+/// [`MIN_SPILL_THRESHOLD_BYTES`]. Both production callers get it from
+/// [`spill_threshold_bytes`], which is where the floor is applied; the
+/// parameter exists so tests can drive the policy without an env var.
 fn text_result_with(
     tool: &str,
     content_type: &str,
@@ -885,6 +986,13 @@ fn spill_preview(record: &SpillRecord, text: &str) -> String {
         return out;
     }
 
+    // Head and tail are fixed rather than derived from the threshold, and
+    // [`MIN_SPILL_THRESHOLD_BYTES`] is what makes that safe: it guarantees
+    // `PREVIEW_HEAD_BYTES + PREVIEW_TAIL_BYTES + this header` stays under the
+    // threshold, so the preview is always strictly cheaper than the body it
+    // stands in for. Without the floor these two lines degenerate — `head_end`
+    // saturates at `text.len()` and `tail_start` collapses onto it, emitting
+    // the entire body plus the header under a "PARTIAL RESULT" banner.
     let head_end = floor_char_boundary(text, PREVIEW_HEAD_BYTES);
     let tail_start =
         ceil_char_boundary(text, text.len().saturating_sub(PREVIEW_TAIL_BYTES)).max(head_end);
@@ -1700,6 +1808,117 @@ mod tests {
         // No store at all is an honest error, not a panic.
         let result = dispatch_read_spill(None, json!({ "spill_id": "0".repeat(32) }));
         assert_eq!(result["isError"], json!(true));
+    }
+
+    #[test]
+    fn read_spill_says_when_retention_is_the_reason_a_locator_died() {
+        // The counter is the store's only way to resolve "never written" from
+        // "swept", and a model reading the error is exactly who needs it: it
+        // decides between re-running the tool and giving up.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SpillStore::open_with_bounds(
+            dir.path().to_path_buf(),
+            "test-session",
+            2_600,
+            std::time::Duration::from_secs(24 * 60 * 60),
+        )
+        .unwrap();
+        let body = "x".repeat(1024);
+        let first = store.put("t", "text/plain", false, &body).unwrap();
+        store.put("t", "text/plain", false, &body).unwrap();
+        store.put("t", "text/plain", false, &body).unwrap();
+        assert!(store.dropped_own_session() > 0, "retention must have run");
+
+        let result = dispatch_read_spill(Some(&store), json!({ "spill_id": first.id }));
+        assert_eq!(result["isError"], json!(true));
+        let text = body_text(&result);
+        assert!(text.contains("retention"), "must name the cause: {text}");
+        assert!(
+            text.contains("may also no longer resolve"),
+            "must warn about the OTHER locators it issued: {text}"
+        );
+
+        // A never-issued id in a store that has lost nothing says the opposite.
+        let clean = test_store(&dir);
+        let text = body_text(&dispatch_read_spill(
+            Some(&clean),
+            json!({ "spill_id": "0".repeat(32) }),
+        ))
+        .to_string();
+        assert!(
+            text.contains("dropped none"),
+            "a store with no losses must not blame retention: {text}"
+        );
+    }
+
+    #[test]
+    fn a_threshold_below_the_floor_is_raised_to_it() {
+        // The documented model is "0 disables, positive lowers"; below the
+        // floor an unclamped threshold inverted it.
+        assert_eq!(effective_threshold(0), 0, "0 must keep meaning 'disabled'");
+        assert_eq!(effective_threshold(1), MIN_SPILL_THRESHOLD_BYTES);
+        assert_eq!(
+            effective_threshold(MIN_SPILL_THRESHOLD_BYTES - 1),
+            MIN_SPILL_THRESHOLD_BYTES
+        );
+        assert_eq!(effective_threshold(64 * 1024), 64 * 1024);
+        // Both operands are constants, so this is a compile-time invariant: a
+        // default below the floor would mean the shipped configuration is one
+        // the floor exists to reject.
+        const { assert!(DEFAULT_SPILL_THRESHOLD_BYTES >= MIN_SPILL_THRESHOLD_BYTES) };
+    }
+
+    #[test]
+    fn a_preview_at_the_floor_is_smaller_than_the_threshold() {
+        // The property the floor exists for: at the smallest threshold an
+        // operator can select, a preview still costs strictly less context
+        // than the body it replaces — and less than the threshold itself, so
+        // it can never be mistaken for an under-threshold body.
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        let body: String = (0..8000)
+            .map(|i| format!("line {i} of the log\n"))
+            .collect();
+        let result = text_result_with(
+            "wrapper_v0__export_code",
+            "text/plain",
+            false,
+            body.clone(),
+            Some(&store),
+            MIN_SPILL_THRESHOLD_BYTES,
+        );
+        let text = body_text(&result);
+        assert!(text.contains("PARTIAL RESULT"));
+        assert!(
+            text.len() < MIN_SPILL_THRESHOLD_BYTES,
+            "preview is {} bytes against a {} byte floor",
+            text.len(),
+            MIN_SPILL_THRESHOLD_BYTES
+        );
+        assert!(text.len() < body.len());
+        // And a retrieval at that threshold still fits inline, so no read of a
+        // spill can mint a spill of its own.
+        assert!(MIN_SPILL_THRESHOLD_BYTES as u64 - READ_LENGTH_HEADROOM >= MIN_READ_LENGTH);
+    }
+
+    #[test]
+    fn the_stderr_echo_of_an_error_is_bounded_and_char_aligned() {
+        // The agent-bound copy is spilled; without this the same 300 KB body
+        // still went to the client's server log in full.
+        let short = "boom";
+        assert_eq!(stderr_echo(short), short);
+
+        // Every character is 3 bytes, so the cut lands mid-character unless it
+        // is snapped — and `&msg[..cut]` would panic if it were not.
+        let long = "日本語テキスト".repeat(20_000);
+        assert!(long.len() > TOOL_ERROR_STDERR_BYTES);
+        let echoed = stderr_echo(&long);
+        assert!(echoed.len() < long.len() / 10);
+        assert!(echoed.starts_with("日本語"));
+        assert!(
+            echoed.contains(&format!("of {} bytes shown", long.len())),
+            "a truncated echo must say what it withheld"
+        );
     }
 
     #[test]
