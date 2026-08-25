@@ -49,7 +49,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use qontinui_runner_lib::mcp_spill::{SpillRecord, SpillStore};
+use qontinui_runner_lib::mcp_spill::{bounded_tool_name, SpillRecord, SpillStore};
 
 const SERVER_NAME: &str = "qontinui-wrappers";
 const SERVER_VERSION: &str = "0.1.0";
@@ -584,16 +584,20 @@ fn dispatch_tool_call(
     reverse_map: &HashMap<String, (String, String)>,
     params: ToolsCallParams,
 ) -> Value {
-    let tool = params.name.clone();
+    // Bounded here, once, rather than at each site that renders it. On the arm
+    // below `params.name` is whatever the client put in the JSON-RPC frame — a
+    // 40 KB `name` is a legal request — and every downstream use of it is a
+    // rendering: the error message, the spill record's `tool` field, the
+    // preview built from that field, and the stderr metric line. The lookup
+    // still keys on the raw name, so bounding the label cannot change which
+    // tool resolves.
+    let tool = bounded_tool_name(&params.name).into_owned();
     let (wrapper_id, action_id) = match reverse_map.get(&params.name) {
         Some(pair) => pair.clone(),
         None => {
             return tool_error(
                 &tool,
-                format!(
-                    "unknown tool '{}' (no matching wrapper action installed)",
-                    params.name
-                ),
+                format!("unknown tool '{tool}' (no matching wrapper action installed)"),
             );
         }
     };
@@ -895,7 +899,7 @@ fn text_result_with(
                 eprintln!(
                     "[wrappers-mcp] WARNING {} produced {} bytes (threshold {}) but no spill \
                      store is open — returning it whole",
-                    tool,
+                    bounded_tool_name(tool),
                     text.len(),
                     threshold
                 );
@@ -908,7 +912,7 @@ fn text_result_with(
                         "{} spill tool={} original_bytes={} preview_bytes={} spill_id={} \
                          is_error={}",
                         METRIC_PREFIX,
-                        tool,
+                        record.tool,
                         record.byte_len,
                         preview.len(),
                         record.id,
@@ -921,7 +925,7 @@ fn text_result_with(
                         "[wrappers-mcp] WARNING spilling {} bytes for {} failed: {} — returning \
                          the body whole",
                         text.len(),
-                        tool,
+                        bounded_tool_name(tool),
                         e
                     );
                     text
@@ -1123,9 +1127,19 @@ fn observe_tool_result(tool: &str, result: &Value) {
     // static tools return plain text (the provider's analysis; a spill slice
     // plus a header), and every error body is a plain message.
     let pretty = !is_error && tool != SUBAGENT_TOOL_NAME && tool != READ_SPILL_TOOL_NAME;
+    // Bounded for the same reason `dispatch_tool_call` bounds its label: on the
+    // unknown-tool path this is the client's own `name`, and a 40 KB one would
+    // land in the client's MCP server log in full on every call — the
+    // unbounded cost the spill store exists to refuse, moved to another
+    // channel. The comparisons above use the raw name, so what the line
+    // REPORTS is bounded without changing what it MEANS.
     eprintln!(
         "{} tool_result tool={} text_bytes={} is_error={} pretty={}",
-        METRIC_PREFIX, tool, text_bytes, is_error, pretty
+        METRIC_PREFIX,
+        bounded_tool_name(tool),
+        text_bytes,
+        is_error,
+        pretty
     );
 }
 
@@ -1721,6 +1735,71 @@ mod tests {
         let slice = store.read(&id, 0, msg.len() as u64).unwrap();
         assert!(slice.record.is_error);
         assert_eq!(slice.text, msg);
+    }
+
+    #[test]
+    fn a_caller_supplied_tool_name_cannot_inflate_the_preview_or_kill_the_locator() {
+        // The reachable path: a `tools/call` naming a tool that does not exist.
+        // `params.name` is whatever the client sent, and at 40 KB it defeated
+        // the cap on the very path that enforces it — `spill_preview`
+        // interpolates `record.tool`, so the "preview" came back LARGER than
+        // the body it replaced, and the record's header exceeded what
+        // `SpillStore::read` will buffer, so the locator inside it was dead on
+        // arrival.
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        let huge = "z".repeat(40 * 1024);
+        let body = format!("unknown tool '{huge}' (no matching wrapper action installed)");
+        assert!(body.len() > 32 * 1024);
+
+        let result = text_result_with(
+            &huge,
+            "text/plain",
+            true,
+            body.clone(),
+            Some(&store),
+            32 * 1024,
+        );
+        let text = body_text(&result);
+        assert!(
+            text.len() < body.len(),
+            "a preview is {} bytes against a {} byte body",
+            text.len(),
+            body.len()
+        );
+        assert!(
+            text.len() < 32 * 1024,
+            "and it must be under the threshold it stands in for: {} bytes",
+            text.len()
+        );
+
+        // The locator it hands out has to resolve. A header over
+        // `MAX_HEADER_BYTES` is refused forever, so this is the difference
+        // between a preview and a lie.
+        let id = spill_id_of(text);
+        let slice = store.read(&id, 0, body.len() as u64).unwrap();
+        assert_eq!(slice.text, body, "the body itself is stored WHOLE");
+        assert!(slice.record.tool.len() <= qontinui_runner_lib::mcp_spill::MAX_TOOL_LEN);
+
+        // Same bound on the message the unknown-tool arm actually builds, so
+        // the oversized name never reaches a body in the first place. No spill
+        // store is set in tests, so this is the message verbatim.
+        let result = dispatch_tool_call(
+            "http://127.0.0.1:1",
+            &HashMap::new(),
+            ToolsCallParams {
+                name: huge.clone(),
+                arguments: json!({}),
+            },
+        );
+        assert_eq!(result["isError"], json!(true));
+        assert!(
+            // The bound plus this message's own fixed wording — nothing that
+            // scales with what the client sent.
+            body_text(&result).len() < qontinui_runner_lib::mcp_spill::MAX_TOOL_LEN + 128,
+            "unknown-tool message is {} bytes",
+            body_text(&result).len()
+        );
     }
 
     #[test]
