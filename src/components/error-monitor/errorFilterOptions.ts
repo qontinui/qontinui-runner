@@ -62,13 +62,43 @@ export const ERROR_STATUS_FILTER_OPTIONS: readonly ErrorStatus[] = orderedKeys(S
 export const ERROR_SEVERITY_FILTER_OPTIONS: readonly ErrorSeverity[] =
   orderedKeys(SEVERITY_PILL_ORDER);
 
-/** The tab's initial status selection. Must be representable as pills. */
-export const DEFAULT_SELECTED_ERROR_STATUSES: readonly ErrorStatus[] = [
+/**
+ * The statuses the summary SQL counts as UNRESOLVED.
+ *
+ * Kept as its own named constant because it is not a UI preference — it is a
+ * transcription of `get_error_summary`'s
+ * `COUNT(*) FILTER (WHERE status IN (...)) AS unresolved_count`
+ * (`src-tauri/src/database/pg/error_monitor.rs`). The two must agree, and
+ * naming it is what makes the test below able to say so.
+ */
+export const UNRESOLVED_ERROR_STATUSES: readonly ErrorStatus[] = [
   "new",
+  "recurring",
   "acknowledged",
   "in_progress",
   "promoted",
 ];
+
+/**
+ * The tab's initial status selection. Must be representable as pills.
+ *
+ * WHY it equals the unresolved set (manual-test-loop iter 19, item A): this
+ * list used to omit `recurring` while `unresolvedCount` — the number the tab's
+ * own header renders as "N unresolved" — includes it. Measured with 6
+ * unresolved rows (4 `recurring`, 2 `new`): the header read **6 unresolved**,
+ * the footer read **2 errors**, and only 2 rendered. Lighting the `recurring`
+ * pill by hand showed all 6.
+ *
+ * That is the worst shape this defect can take. Nothing was broken-looking:
+ * the header was right, the body was internally consistent, and the four
+ * missing rows were `recurring` — i.e. errors that had happened MORE than
+ * once, the ones most worth seeing. A default that hides the repeat offenders
+ * while counting them in the headline is a silent under-report.
+ *
+ * So the default is defined as "the unresolved set", not re-typed as a second
+ * list that happens to look similar.
+ */
+export const DEFAULT_SELECTED_ERROR_STATUSES: readonly ErrorStatus[] = UNRESOLVED_ERROR_STATUSES;
 
 /**
  * The number shown in the "Filters" badge.
@@ -88,4 +118,28 @@ export function filterBadgeCount(
   ).length;
   const statuses = selectedStatuses.filter((s) => ERROR_STATUS_FILTER_OPTIONS.includes(s)).length;
   return severities + statuses;
+}
+
+/**
+ * The corpus size the footer's "(filtered from N)" must disclose.
+ *
+ * WHY this is not just `errors.length` (manual-test-loop iter 19, item B): the
+ * error list the tab holds is what the SERVER already narrowed down — the
+ * status and severity pills are sent as query parameters, not applied in the
+ * browser. Reporting "filtered from" against that post-filter list disclosed
+ * only the client-side trimming (search text, pattern cluster) and reported
+ * every server-side exclusion as zero. Measured: a 6-row corpus with the
+ * `recurring` pill unlit rendered "2 errors (filtered from 2)" — a footer
+ * asserting nothing was hidden while four rows were being withheld.
+ *
+ * `summary.total` is the unfiltered `COUNT(*)` over the same scope, so it is
+ * the one number the filters cannot shrink. `null` means the summary has not
+ * loaded yet; the caller's own count is the honest stand-in for that moment,
+ * because the alternative is rendering `undefined` or a number we cannot back.
+ */
+export function disclosedCorpusTotal(
+  summaryTotal: number | null | undefined,
+  loadedErrorCount: number,
+): number {
+  return summaryTotal ?? loadedErrorCount;
 }

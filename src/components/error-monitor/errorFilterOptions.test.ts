@@ -4,8 +4,25 @@ import {
   DEFAULT_SELECTED_ERROR_STATUSES,
   ERROR_SEVERITY_FILTER_OPTIONS,
   ERROR_STATUS_FILTER_OPTIONS,
+  UNRESOLVED_ERROR_STATUSES,
+  disclosedCorpusTotal,
   filterBadgeCount,
 } from "./errorFilterOptions";
+
+/**
+ * The `status IN (...)` list from `get_error_summary`'s `unresolved_count`
+ * FILTER clause (`src-tauri/src/database/pg/error_monitor.rs`), transcribed by
+ * hand. Deliberately NOT imported from the module under test: the whole point
+ * is to compare the UI's default against the SQL's definition, and importing
+ * the UI's own constant would compare it against itself.
+ */
+const SQL_UNRESOLVED_STATUSES: ErrorStatus[] = [
+  "new",
+  "recurring",
+  "acknowledged",
+  "in_progress",
+  "promoted",
+];
 
 /**
  * Every member of `ErrorStatus`, spelled out. Deliberately NOT derived from the
@@ -66,7 +83,35 @@ describe("error monitor filter options", () => {
     expect(filterBadgeCount([], [...DEFAULT_SELECTED_ERROR_STATUSES])).toBe(
       litStatusPills + litSeverityPills,
     );
-    expect(filterBadgeCount([], [...DEFAULT_SELECTED_ERROR_STATUSES])).toBe(4);
+    // 5 since iter 19 added `recurring` to the default set (was 4).
+    expect(filterBadgeCount([], [...DEFAULT_SELECTED_ERROR_STATUSES])).toBe(5);
+  });
+
+  /**
+   * Item A. The header renders `summary.unresolvedCount`; the body renders the
+   * rows the default status filter admits. If those two sets differ, the tab
+   * contradicts itself — measured at 6 unresolved in the header above 2 rows in
+   * the body, the 4 missing ones all `recurring`.
+   *
+   * Asserted as SET EQUALITY in both directions. A subset check would pass a
+   * default that hides rows (the actual defect); a superset check would pass a
+   * default that admits `resolved`/`ignored` rows the header does not count.
+   */
+  it("the default status filter admits exactly what the summary calls unresolved", () => {
+    expect([...DEFAULT_SELECTED_ERROR_STATUSES].sort()).toEqual(
+      [...SQL_UNRESOLVED_STATUSES].sort(),
+    );
+    expect([...UNRESOLVED_ERROR_STATUSES].sort()).toEqual([...SQL_UNRESOLVED_STATUSES].sort());
+
+    // Stated the way the operator sees it: a recurring error must be visible
+    // without touching a single pill.
+    expect(DEFAULT_SELECTED_ERROR_STATUSES).toContain("recurring");
+
+    // And the statuses the summary does NOT count as unresolved must stay out
+    // of the default, or the footer would out-count the header instead.
+    for (const closed of ["resolved", "ignored"] as ErrorStatus[]) {
+      expect(DEFAULT_SELECTED_ERROR_STATUSES).not.toContain(closed);
+    }
   });
 
   /** And after toggling — the badge must track the pills, not a stale default. */
@@ -88,6 +133,31 @@ describe("error monitor filter options", () => {
       // pills, and must never under-report a selection the user can see lit.
       expect(filterBadgeCount(severities, statuses)).toBe(severities.length + statuses.length);
     }
+  });
+
+  /**
+   * Item B. The footer's "(filtered from N)" is the only thing on the page that
+   * can tell an operator rows exist outside their current filter. Computed from
+   * the already-server-filtered list, it reported every server-side exclusion as
+   * zero: 6 rows in the store, `recurring` unlit, footer "2 errors (filtered
+   * from 2)".
+   */
+  it("discloses the true corpus size, not the post-filter count", () => {
+    // The measured case: 6 stored, 2 survived the server-side status filter.
+    expect(disclosedCorpusTotal(6, 2)).toBe(6);
+    expect(disclosedCorpusTotal(6, 2)).not.toBe(2);
+
+    // Unfiltered — the two agree, and the footer says nothing surprising.
+    expect(disclosedCorpusTotal(6, 6)).toBe(6);
+
+    // Zero is a real total, not a missing one: `?? ` must not swallow it into
+    // the fallback, or an empty store would report the loaded count instead.
+    expect(disclosedCorpusTotal(0, 4)).toBe(0);
+
+    // Summary not loaded yet -> the caller's own count, the only number we can
+    // stand behind at that instant.
+    expect(disclosedCorpusTotal(null, 2)).toBe(2);
+    expect(disclosedCorpusTotal(undefined, 2)).toBe(2);
   });
 
   it("every default-selected status has a pill to deselect it with", () => {

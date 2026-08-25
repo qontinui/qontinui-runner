@@ -42,6 +42,23 @@ interface UseErrorEventsOptions {
   refreshInterval?: number;
 }
 
+/**
+ * Value-identity of one server-side filter list, for a hook dependency list.
+ *
+ * `useErrorEvents`' callers build these arrays inline, so a fresh object every
+ * render makes reference comparison useless in both directions: depend on the
+ * reference and you refetch every render; depend on nothing (what the code did)
+ * and you never refetch at all. A joined string compares by VALUE.
+ *
+ * `ErrorSeverity` and `ErrorStatus` are lowercase identifiers with no commas,
+ * so join/split round-trips exactly. `undefined` and `[]` both mean "no filter"
+ * to the query builder and both serialize to `""`, which is correct — swapping
+ * one for the other must not trigger a refetch.
+ */
+export function filterListKey(values: readonly string[] | undefined): string {
+  return values?.join(",") ?? "";
+}
+
 interface UseErrorEventsReturn {
   /** List of error events */
   errors: StoredErrorEvent[];
@@ -63,22 +80,35 @@ export function useErrorEvents(options: UseErrorEventsOptions = {}): UseErrorEve
   const [errors, setErrors] = useState<StoredErrorEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const optionsRef = useRef(options);
 
-  useEffect(() => {
-    optionsRef.current = options;
-  });
+  // Every filter the query is built from, as values `useCallback` can compare.
+  //
+  // WHY not `optionsRef` (manual-test-loop iter 19, item C): these filters are
+  // applied by the SERVER, so changing one changes the result set — but
+  // `fetchErrors` read them out of a ref and declared no dependencies, so its
+  // identity never changed, no effect re-ran, and toggling a filter pill did
+  // nothing visible until the 30s auto-refresh tick happened to come round.
+  // The UI showed the new pill state over the old rows for up to half a minute.
+  //
+  // The arrays are compared as joined strings rather than by reference because
+  // callers build them inline (`selectedStatuses.length > 0 ? selectedStatuses
+  // : undefined`), and a fresh array every render would refetch every render.
+  // `ErrorSeverity`/`ErrorStatus` are lowercase identifiers, so a comma is an
+  // unambiguous separator.
+  const { taskRunId, logSourceName, limit } = options;
+  const severitiesKey = filterListKey(options.severities);
+  const statusesKey = filterListKey(options.statuses);
 
   const fetchErrors = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
       const query: ErrorQuery = {
-        taskRunId: optionsRef.current.taskRunId,
-        logSourceName: optionsRef.current.logSourceName,
-        severity: optionsRef.current.severities,
-        status: optionsRef.current.statuses,
-        limit: optionsRef.current.limit ?? DEFAULT_QUERY_LIMIT,
+        taskRunId,
+        logSourceName,
+        severity: severitiesKey ? (severitiesKey.split(",") as ErrorSeverity[]) : undefined,
+        status: statusesKey ? (statusesKey.split(",") as ErrorStatus[]) : undefined,
+        limit: limit ?? DEFAULT_QUERY_LIMIT,
       };
       const result = await errorMonitorService.queryErrorEvents(query);
       setErrors(result);
@@ -94,9 +124,11 @@ export function useErrorEvents(options: UseErrorEventsOptions = {}): UseErrorEve
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [taskRunId, logSourceName, severitiesKey, statusesKey, limit]);
 
-  // Initial fetch. Deferred into a microtask so the setState inside
+  // Initial fetch — and, since `fetchErrors` is now rebuilt whenever a filter
+  // changes, the refetch that makes a pill toggle take effect immediately.
+  // Deferred into a microtask so the setState inside
   // fetchErrors doesn't fire synchronously from the effect body
   // (react-hooks/set-state-in-effect).
   useEffect(() => {
