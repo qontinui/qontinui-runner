@@ -5579,6 +5579,14 @@ pub fn create_router(
             .app_state
             .api_port
             .load(std::sync::atomic::Ordering::Relaxed);
+        // The boot instant for the agent-binding liveness readback's PID-reuse
+        // reference — captured HERE, before the task's 3s delay and before the
+        // restore, exactly as `session::tracking_health` captures its own
+        // before its initial delay. `claude_present_in_inclusive_subtree`
+        // tolerates only `PID_REUSE_SKEW_MS` (5s) of skew, so a value read
+        // after the sleep is already outside it and would start reporting live
+        // terminal-bearing bindings as not-present.
+        let liveness_boot_unix_millis = chrono::Utc::now().timestamp_millis();
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             // Name the rotation-forensics log's resolved path once, BEFORE the
@@ -5594,6 +5602,50 @@ pub fn create_router(
             // is 0 and root self-heal then has to Rewrite, a silent nonce
             // rotation just happened (the exact incident this plan fixes).
             let restored = crate::coord_mcp::restore_proxy_nonces_from_store();
+
+            // Phase 1 of plan
+            // `2026-08-25-agent-class-sessions-reach-coord-like-operator-sessions`:
+            // the restore above deliberately brings back DEVICE bindings only
+            // (OQ3). Immediately after it, read back the last AGENT-binding
+            // census and say whether any of those sessions actually outlived
+            // the previous runner — the one measurement that keeps OQ3's
+            // premise honest instead of merely assumed. One rotation line, and
+            // it is skipped entirely (no process-table sweep) when the last
+            // census held zero, which is this fleet's expected steady state.
+            //
+            // The boot instant was captured OUTSIDE this task (above), matching
+            // `session::tracking_health`'s rule: the guard is keyed on the
+            // runner's own boot, never on a per-record timestamp — and never on
+            // an instant read after a delay, which is already past the 5s skew
+            // tolerance.
+            {
+                let boot_unix_millis = liveness_boot_unix_millis;
+                let terminal_pids: std::collections::HashMap<String, u32> =
+                    match reconcile_app_handle
+                        .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()
+                    {
+                        Some(tm) => tm
+                            .inner()
+                            .list()
+                            .into_iter()
+                            .filter_map(|i| i.pid.filter(|&p| p > 0).map(|p| (i.id, p)))
+                            .collect(),
+                        // No managed TerminalManager (headless/test host): the
+                        // per-binding terminal join simply has nothing to join
+                        // on, which downgrades verdicts to `unknown` rather
+                        // than inventing one.
+                        None => std::collections::HashMap::new(),
+                    };
+                crate::coord_mcp::log_agent_binding_liveness_at_boot(
+                    terminal_pids,
+                    boot_unix_millis,
+                )
+                .await;
+                // Then state THIS boot's own agent set, exactly once, so an idle
+                // runner still emits a census. Ordered after the readback, which
+                // wants the predecessor's line.
+                crate::coord_mcp::log_agent_binding_census_at_boot();
+            }
 
             // Credential-hygiene Task 5 — reap stale app-data session-restore
             // coord-mcp configs (dead port, or our port with an
