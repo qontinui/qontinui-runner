@@ -91,16 +91,37 @@ const TEMP_INFIX: &str = ".spill.tmp.";
 /// every session's spills.
 pub const SPILL_DIR_NAME: &str = "mcp-spill";
 
-/// Total on-disk bound across ALL sessions' spills, enforced by
+/// On-disk bound on the spills THIS PROCESS issued, enforced by
 /// [`SpillStore::put`] before every write.
 ///
-/// 64 MiB is the same number `session/local_store.rs` picked for the session
-/// outbox, and for the same reason: it is orders of magnitude above a healthy
-/// steady state (measured spill bodies are 90–300 KB, so this is ~200+ records)
-/// while staying far below the disk-pressure threshold that has bitten this box
-/// before. Spill files are a NEW disk consumer, which is why the bound ships
-/// with the store rather than as a follow-up.
-pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// **Per-process, not root-wide.** Every `wrappers_mcp` bounds the records it
+/// handed out and nothing else; several of them share one root as a matter of
+/// course. That is what makes [`SpillStore::enforce_byte_bound`]'s target
+/// reachable at all — see its doc for the root-wide budget this replaced and
+/// the three ordinary situations that switched it off.
+///
+/// **The arithmetic, so a reader does not have to derive the fleet-wide
+/// ceiling.** It is `cap × (servers that wrote within `max_age`)` — the live
+/// ones plus any that have since exited, until [`DEFAULT_MAX_AGE`] reclaims the
+/// leavers. At 8 MiB:
+///
+/// | servers within `max_age` | root-wide ceiling |
+/// |---|---|
+/// | 5 — this box's ordinary concurrency | 40 MiB |
+/// | 20 | 160 MiB |
+/// | 42 | 336 MiB — the scale of the 355 MB outbox that filled this disk |
+///
+/// and every one of those servers has to produce ~27 oversized results to reach
+/// its own cap in the first place. Measured spill bodies are 90–300 KB, so
+/// 8 MiB holds ~27 of the largest and ~90 of the smallest; against
+/// `wrappers_mcp`'s 32 KiB spill threshold it is 256 of the smallest body that
+/// can spill at all. A single 300 KB spill is 3.6% of it.
+///
+/// 64 MiB — `session/local_store.rs`'s number — was inherited here by mistake.
+/// That is one GLOBAL outbox, so its cap *is* the ceiling; this one gets
+/// multiplied by every concurrent session, and five sessions at 64 MiB is
+/// 320 MiB — the field incident itself, not a margin below it.
+pub const DEFAULT_MAX_OWN_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Age bound. A locator is only useful for as long as the conversation that was
 /// handed it is still running, and an MCP server process lives exactly as long
@@ -109,11 +130,23 @@ pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// indefinitely.
 pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Operator override for [`DEFAULT_MAX_TOTAL_BYTES`], in bytes. Present because
+/// Operator override for [`DEFAULT_MAX_OWN_BYTES`], in bytes. Present because
 /// disk pressure on this box is a known operational hazard and shrinking the
-/// cap must not require a rebuild. A value that does not parse as a `u64` is
-/// ignored with a warning rather than silently treated as zero.
-pub const MAX_TOTAL_BYTES_ENV: &str = "QONTINUI_MCP_SPILL_MAX_BYTES";
+/// cap must not require a rebuild.
+///
+/// **Monotonic: a smaller value always evicts more.** Not a coincidence — it
+/// falls out of the budget being per-process, because the bytes measured
+/// against the cap are exactly the bytes eviction is allowed to delete, so
+/// lowering the cap can only enlarge the overage the sweep works off. The
+/// root-wide budget this replaced inverted the knob: a smaller cap made a
+/// neighbour's live bytes more likely to exceed the budget on their own, at
+/// which point the arm deleted NOTHING — the single lever an operator has for
+/// disk pressure switching enforcement off, and taking with it even the bytes
+/// this process was entitled to reclaim.
+///
+/// A value that does not parse as a `u64` is ignored with a warning rather than
+/// silently treated as zero.
+pub const MAX_OWN_BYTES_ENV: &str = "QONTINUI_MCP_SPILL_MAX_BYTES";
 
 /// Env var naming the ambient Claude Code session — the same id the session
 /// row records (`session/mod.rs::ambient_claude_code_session_id`) and the
@@ -276,7 +309,10 @@ pub struct SpillStore {
     /// `<root>/<session>/`.
     session_dir: PathBuf,
     session: String,
-    max_total_bytes: u64,
+    /// Bytes THIS PROCESS's own issued records may occupy — see
+    /// [`DEFAULT_MAX_OWN_BYTES`]. Nothing else under the root is measured
+    /// against it, and nothing else is ever deleted to satisfy it.
+    max_own_bytes: u64,
     max_age: Duration,
     /// Every spill id THIS process has published — the exact set of locators it
     /// has handed to a model.
@@ -300,8 +336,8 @@ pub struct SpillStore {
     /// [`SpillStore::read`] consults the counter so a `NotFound` can say WHICH
     /// of its possible answers this one is.
     ///
-    /// **The counter is only honest because the byte bound refuses to evict a
-    /// record this process did not issue** — see
+    /// **The counter is honest by construction, because the byte bound both
+    /// measures and evicts exactly the records this process issued** — see
     /// [`SpillStore::enforce_byte_bound`]. Several `wrappers_mcp` servers share
     /// one root; that is the ordinary case, not an edge. Evicting another
     /// server's record would manufacture exactly this dead pointer inside a
@@ -327,17 +363,17 @@ impl SpillStore {
     }
 
     /// Open (creating if needed) `<root>/<session>/` with the default bounds,
-    /// honouring [`MAX_TOTAL_BYTES_ENV`].
+    /// honouring [`MAX_OWN_BYTES_ENV`].
     pub fn open(root: PathBuf, session: &str) -> io::Result<Self> {
-        Self::open_with_bounds(root, session, max_total_bytes_from_env(), DEFAULT_MAX_AGE)
+        Self::open_with_bounds(root, session, max_own_bytes_from_env(), DEFAULT_MAX_AGE)
     }
 
     /// Open with explicit bounds. Tests use this to exercise retention without
-    /// writing 64 MiB.
+    /// writing 8 MiB.
     pub fn open_with_bounds(
         root: PathBuf,
         session: &str,
-        max_total_bytes: u64,
+        max_own_bytes: u64,
         max_age: Duration,
     ) -> io::Result<Self> {
         let session = sanitize_session_key(session);
@@ -360,7 +396,7 @@ impl SpillStore {
             root,
             session_dir,
             session,
-            max_total_bytes,
+            max_own_bytes,
             max_age,
             issued: Mutex::new(HashSet::new()),
             dropped_own_session: AtomicU64::new(0),
@@ -386,6 +422,15 @@ impl SpillStore {
         &self.session_dir
     }
 
+    /// The bytes this process's own spills may occupy. Exposed so the server
+    /// can state it at startup: the fleet-wide ceiling is this number times the
+    /// number of servers running, and [`MAX_OWN_BYTES_ENV`] can move it, so an
+    /// operator who cannot see the effective value cannot compute the ceiling
+    /// either.
+    pub fn max_own_bytes(&self) -> u64 {
+        self.max_own_bytes
+    }
+
     /// Count of this session's spills that retention has deleted. See
     /// [`SpillStore::dropped_own_session`](struct.SpillStore.html#structfield.dropped_own_session)
     /// — non-zero means at least one issued locator is now a dead pointer.
@@ -397,8 +442,8 @@ impl SpillStore {
     ///
     /// Retention runs FIRST, budgeted for the incoming body, so the bound holds
     /// after the write rather than one write late. A body that is on its own
-    /// larger than the total cap is still written: the cap bounds accumulation,
-    /// and refusing the write would lose the very result the spill exists to
+    /// larger than the cap is still written: the cap bounds accumulation, and
+    /// refusing the write would lose the very result the spill exists to
     /// preserve.
     ///
     /// `tool` and `content_type` are bounded HERE, at the writer, rather than
@@ -595,8 +640,18 @@ impl SpillStore {
     // Retention
     // -----------------------------------------------------------------------
 
-    /// Enforce both bounds across every session's directory, budgeting
-    /// `incoming` bytes for the write that is about to happen.
+    /// Enforce both bounds, budgeting `incoming` bytes for the write that is
+    /// about to happen.
+    ///
+    /// The two arms have deliberately different reach. The age bound works
+    /// across every session's directory — it is the ONLY arm that touches
+    /// anything this process did not issue, and it is entitled to, because past
+    /// `max_age` the conversation that was handed the locator is long over and
+    /// there is nobody left to hand a dead pointer to. The byte bound works on
+    /// this process's own records alone (see
+    /// [`SpillStore::enforce_byte_bound`]). Age runs first: it is the cheaper,
+    /// less destructive of the two, and whatever it reclaims of ours the byte
+    /// bound then does not have to.
     ///
     /// Best-effort by design: a sweep that cannot read a directory must not
     /// stop a result from being preserved, so every failure is warned and
@@ -606,12 +661,6 @@ impl SpillStore {
         let now = SystemTime::now();
         let mut files = scan.files;
 
-        // Age bound first — it is the cheaper, less destructive of the two, and
-        // whatever it reclaims the byte bound then does not have to. It is also
-        // the ONLY arm allowed to touch another live session's records, for the
-        // reason `enforce_byte_bound` gives: past `max_age` the conversation
-        // that was handed the locator is long over, so there is nobody left to
-        // hand a dead pointer to.
         files.retain(|f| {
             let age = now.duration_since(f.modified).unwrap_or_default();
             if age > self.max_age {
@@ -621,120 +670,94 @@ impl SpillStore {
             }
         });
 
-        self.enforce_byte_bound(&files, incoming, now);
+        self.enforce_byte_bound(&files, incoming);
         self.prune_idle_session_dirs(&scan.dirs, now);
     }
 
-    /// Enforce the total-bytes bound, budgeting `incoming` for the write that
-    /// is about to happen.
+    /// Enforce the own-bytes bound, budgeting `incoming` for the write that is
+    /// about to happen.
     ///
-    /// **The eviction rule: records THIS PROCESS issued, at any age, plus
-    /// anyone's records already past `max_age` — never anybody else's live
-    /// ones.** Oldest first within that set, and the stale foreign ones before
-    /// our own live ones.
+    /// **The rule: the records THIS PROCESS issued are both what is MEASURED
+    /// and what is EVICTED.** Nothing else under the root is either — not a
+    /// neighbour's records, live or stale, not a temp. Oldest first within that
+    /// set.
     ///
-    /// The rule this replaced was "oldest first across every session", on the
-    /// reasoning that mtime order approximates liveness order. It does not.
-    /// Several `wrappers_mcp` servers share this root as a matter of course,
-    /// and oldest-first *systematically prefers* the longest-running live
-    /// session's records: they are the oldest files on disk precisely because
-    /// that session is still going. Evicting one destroys a locator another
-    /// process has already handed to its model, in a process that cannot count
-    /// the loss ([`SpillStore::dropped_own_session`] stays zero there), does
-    /// not warn about it (the warning lands in OUR stderr, labelled as
-    /// ordinary GC), and whose model then gets a bare `NotFound` — the exact
-    /// dead pointer the counter exists to make impossible. "Issued by us"
-    /// rather than "in our directory" is what makes that hold even when two
-    /// servers share a session key — see [`SpillStore::issued`].
+    /// That one sentence is the whole design, and the fact that the measured
+    /// set and the candidate set are the *same* set is what buys the property
+    /// that matters: **the target is reachable by construction.** Evicting
+    /// everything we own takes our total to zero, which is under any budget. So
+    /// there is nothing for a refusal guard to refuse, and no arithmetic in
+    /// which the arm can decide it is beaten.
     ///
-    /// **The arm refuses a target it cannot reach, rather than spending every
-    /// locator we own trying.** `total` is every byte under the root; the
-    /// candidates are a subset of it — in practice just ours, since the age arm
-    /// has already taken the stale foreign half. So the lowest total eviction
-    /// can produce is
-    /// `total - candidate_bytes`, and when even that exceeds `budget` the loop
-    /// would delete this session's entire store and still be over — turning one
-    /// idle neighbour holding the budget into "one live record at a time" for
-    /// as long as the age arm takes to free them, with every locator we hand
-    /// out dying at the next oversized result. Narrowing the candidate set is
-    /// what made that reachable: exhaustion used to need `incoming >= cap`
-    /// (guarded above), and now needs only a neighbour — or an orphaned
-    /// sub-`max_age` temp, which counts toward `total` and is never a
-    /// candidate — to hold the budget on its own.
+    /// The rule this replaced measured every byte under the root against a cap
+    /// only our own records could pay — a category error, and one whose failure
+    /// mode was fleet-normal rather than exotic. Five concurrent sessions each
+    /// hold about a fifth of the root, so each computes "unevictable ≈ 0.8 ×
+    /// total"; once the root passes the cap EVERY server refuses at once and
+    /// the root is bounded by `max_age` alone. A restart reproduced it
+    /// single-handed, because [`SpillStore::issued`] is in-memory: a resumed
+    /// conversation's own predecessor's records are foreign-and-live to it. And
+    /// [`MAX_OWN_BYTES_ENV`] inverted — lowering the cap made the refusal more
+    /// likely, so the one lever for disk pressure turned enforcement off.
     ///
-    /// The cost of the rule is that we cannot reclaim anyone else's disk on
-    /// demand, so a busy neighbour can hold the shared total above the cap. We
-    /// then evict what is genuinely ours to evict, or nothing at all when that
-    /// would not get us under, say which on stderr, and leave the rest to the
-    /// age arm. Name the worst case plainly: while a neighbour holds the whole
-    /// budget, the byte bound is not enforced AT ALL and the root is bounded by
-    /// `max_age` alone — a day of both sessions' spills. That is still the
-    /// right trade. Exceeding a disk budget is a recoverable, observable
-    /// condition with a stated ceiling and a line on stderr every time it
-    /// happens; an uncounted dead pointer is a silent lie told to a model, and
-    /// the version of this arm that enforced the cap bought the difference by
-    /// telling that lie once per oversized result.
-    fn enforce_byte_bound(&self, files: &[SpillFile], incoming: u64, now: SystemTime) {
-        if incoming >= self.max_total_bytes {
+    /// Before that it was "oldest first across every session", on the reasoning
+    /// that mtime order approximates liveness order. It does not. Several
+    /// `wrappers_mcp` servers share this root as a matter of course, and
+    /// oldest-first *systematically prefers* the longest-running live session's
+    /// records: they are the oldest files on disk precisely because that
+    /// session is still going. Evicting one destroys a locator another process
+    /// has already handed to its model, in a process that cannot count the loss
+    /// ([`SpillStore::dropped_own_session`] stays zero there), does not warn
+    /// about it (the warning lands in OUR stderr, labelled as ordinary GC), and
+    /// whose model then gets a bare `NotFound` — the exact dead pointer the
+    /// counter exists to make impossible. "Issued by us" rather than "in our
+    /// directory" is what makes the protection hold even when two servers share
+    /// a session key — see [`SpillStore::issued`].
+    ///
+    /// **What the per-process budget costs, stated plainly.** No process
+    /// reclaims another's disk here, so a server that has exited keeps its
+    /// bytes until the age arm takes them, and the root is bounded at
+    /// `max_own_bytes × (servers that wrote within max_age)` rather than at one
+    /// flat number. That is a ceiling — predictable, and computed for the
+    /// default in [`DEFAULT_MAX_OWN_BYTES`] — where the root-wide cap was a
+    /// number that read like one and was not enforced. Exceeding a disk budget
+    /// is recoverable and observable; an uncounted dead pointer is a silent lie
+    /// told to a model.
+    fn enforce_byte_bound(&self, files: &[SpillFile], incoming: u64) {
+        if incoming >= self.max_own_bytes {
             // A body larger than the whole cap is stored anyway — `put`'s doc
-            // says why. Budgeting for it would set a target no amount of
-            // eviction can reach: `total` never falls below `max_total_bytes`,
-            // so the loop runs to exhaustion and deletes every record in every
-            // session for nothing. The cap bounds ACCUMULATION; a single write
-            // that exceeds it on its own is outside what it can express, and
-            // the age arm has already run.
+            // says why. Budgeting for it leaves no budget at all (and would
+            // underflow the subtraction below), so the loop would empty this
+            // process's store for a target the write itself puts back out of
+            // reach the moment it lands. The cap bounds ACCUMULATION; a single
+            // write that exceeds it on its own is outside what it can express,
+            // and the age arm has already run.
             eprintln!(
                 "{LOG_PREFIX} incoming body is {incoming} bytes against a {} byte cap — skipping \
-                 byte-bound eviction rather than emptying every session's store for a target it \
-                 could never reach",
-                self.max_total_bytes
+                 byte-bound eviction rather than emptying this server's own store for a target \
+                 the write itself would immediately exceed",
+                self.max_own_bytes
             );
             return;
         }
         // Budget for the incoming write by shrinking the target, not by adding
         // it to the total: the two are equivalent arithmetic, but a target
         // that stays constant is one the loop can actually be shown to reach.
-        let budget = self.max_total_bytes - incoming;
-        let mut total = files
+        let budget = self.max_own_bytes - incoming;
+        // `SpillFile::ours` is the entire predicate, on both sides of the
+        // ledger: these are the bytes counted, and these are the files
+        // deletable. See this function's doc for why they must be one set.
+        let mut ours: Vec<&SpillFile> = files.iter().filter(|f| f.ours).collect();
+        let mut total = ours
             .iter()
             .map(|f| f.bytes)
             .fold(0u64, |a, b| a.saturating_add(b));
         if total <= budget {
             return;
         }
+        ours.sort_by_key(|f| f.modified);
 
-        // Temps are counted in `total` — they occupy the same disk — but are
-        // never candidates: an in-flight one belongs to a write happening
-        // right now, and an orphaned one is the age arm's business.
-        let mut candidates: Vec<&SpillFile> = files
-            .iter()
-            .filter(|f| f.evictable_for_bytes(self.max_age, now))
-            .collect();
-        let candidate_bytes = candidates
-            .iter()
-            .map(|f| f.bytes)
-            .fold(0u64, |a, b| a.saturating_add(b));
-        // The floor eviction can reach: everything we are not allowed to touch.
-        // Checking it BEFORE deleting anything is the whole guard — the loop
-        // below cannot tell an unreachable target from a nearly-reached one,
-        // and by the time it notices, this session's store is already empty.
-        let unevictable = total.saturating_sub(candidate_bytes);
-        if unevictable > budget {
-            eprintln!(
-                "{LOG_PREFIX} {unevictable} of {total} bytes under {} belong to other live \
-                 sessions or to in-flight writes and exceed the {budget} byte budget on their own \
-                 — skipping byte-bound eviction rather than spending all {} evictable records on \
-                 a target it could never reach. The age bound reclaims the rest once they are \
-                 past {:?}.",
-                self.root.display(),
-                candidates.len(),
-                self.max_age
-            );
-            return;
-        }
-        candidates.sort_by_key(|f| (f.ours, f.modified));
-
-        for f in candidates {
+        for f in ours {
             if total <= budget {
                 return;
             }
@@ -743,14 +766,14 @@ impl SpillStore {
             }
         }
         if total > budget {
-            // Reachable only when a deletion FAILED: the guard above already
-            // refused every case where the candidates could not cover the
-            // overage. Worth saying rather than assuming, because the reason is
-            // now a filesystem error and not a policy decision.
+            // Reachable only when a deletion FAILED. Evicting every record we
+            // issued takes the measured total to zero, so a remainder here is a
+            // filesystem error, never a policy decision — worth saying rather
+            // than assuming, since the two want different responses.
             eprintln!(
-                "{LOG_PREFIX} {total} bytes remain against a {budget} byte budget after evicting \
-                 every eligible record — the candidates covered the overage, so some deletion \
-                 above failed; its error is logged with the file that would not go"
+                "{LOG_PREFIX} {total} bytes of our own remain against a {budget} byte budget \
+                 after evicting every record this server issued — some deletion above failed; \
+                 its error is logged with the file that would not go"
             );
         }
     }
@@ -980,28 +1003,15 @@ struct SpillFile {
     /// A published record whose id THIS process issued — not merely a file in
     /// our session directory. See [`SpillStore::issued`] for why the two are
     /// different questions.
+    ///
+    /// **This flag IS the byte bound**, both halves of it: what it marks is
+    /// what counts against `max_own_bytes` and what may be deleted to get back
+    /// under it ([`SpillStore::enforce_byte_bound`]). [`SpillStore::collect`]
+    /// can only set it on a [`SpillKind::Record`] — a temp has no published id
+    /// — so temps and every foreign record fall outside both halves together,
+    /// which is exactly the symmetry that keeps the bound's target reachable.
     ours: bool,
     kind: SpillKind,
-}
-
-impl SpillFile {
-    /// May the byte bound evict this file? See
-    /// [`SpillStore::enforce_byte_bound`] for the rule and why it is narrower
-    /// than the age bound's.
-    fn evictable_for_bytes(&self, max_age: Duration, now: SystemTime) -> bool {
-        if self.kind != SpillKind::Record {
-            return false;
-        }
-        // The second half is DOCUMENTATION, not behaviour: the age arm runs
-        // first, off the same `now`, and has already deleted everything past
-        // `max_age`, so the only files that reach here matching it are ones
-        // whose `remove_file` just failed and will almost certainly fail again.
-        // It stays because the rule belongs at the point of eviction — a reader
-        // asking "what may the byte bound touch?" should find the whole answer
-        // here — and because it is what keeps this predicate correct on its own
-        // terms if the arms are ever reordered.
-        self.ours || now.duration_since(self.modified).unwrap_or_default() > max_age
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,9 +1042,10 @@ pub fn default_root() -> Option<PathBuf> {
 /// neither the eviction rule nor the honesty counter keys on the directory at
 /// all: both key on [`SpillStore::issued`], the ids this process published. A
 /// colliding stranger's records are therefore treated exactly like any other
-/// neighbour's — not evictable by the byte arm, not counted as our loss,
-/// reclaimed by the age arm alone — and ids stay unique within the directory
-/// regardless. Still NOT worth a lock file to prevent.
+/// neighbour's — not counted against our cap, not evictable by the byte arm,
+/// not counted as our loss, reclaimed by the age arm alone — and ids stay
+/// unique within the directory regardless. Still NOT worth a lock file to
+/// prevent.
 pub fn ambient_session_key() -> String {
     std::env::var(SESSION_ID_ENV)
         .ok()
@@ -1171,19 +1182,19 @@ fn is_continuation(b: u8) -> bool {
     (b & 0b1100_0000) == 0b1000_0000
 }
 
-fn max_total_bytes_from_env() -> u64 {
-    match std::env::var(MAX_TOTAL_BYTES_ENV) {
+fn max_own_bytes_from_env() -> u64 {
+    match std::env::var(MAX_OWN_BYTES_ENV) {
         Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u64>() {
             Ok(v) => v,
             Err(e) => {
                 eprintln!(
-                    "{LOG_PREFIX} ignoring {MAX_TOTAL_BYTES_ENV}={raw:?} ({e}) — using default \
-                     {DEFAULT_MAX_TOTAL_BYTES}"
+                    "{LOG_PREFIX} ignoring {MAX_OWN_BYTES_ENV}={raw:?} ({e}) — using default \
+                     {DEFAULT_MAX_OWN_BYTES}"
                 );
-                DEFAULT_MAX_TOTAL_BYTES
+                DEFAULT_MAX_OWN_BYTES
             }
         },
-        _ => DEFAULT_MAX_TOTAL_BYTES,
+        _ => DEFAULT_MAX_OWN_BYTES,
     }
 }
 
@@ -1457,7 +1468,8 @@ mod tests {
         // mtime order is not liveness order: the neighbour's record here is the
         // OLDEST file on disk, which is exactly what a long-running live
         // session looks like. Evicting it would leave a dead pointer in a
-        // process that never learns of it.
+        // process that never learns of it — and it would not even help, since
+        // its bytes are not measured against our cap in the first place.
         let dir = tempfile::tempdir().unwrap();
         let body = "x".repeat(1024);
 
@@ -1474,7 +1486,7 @@ mod tests {
             300,
         );
 
-        // Room for ~2 bodies of 1 KiB plus their headers, across the WHOLE root.
+        // Room for ~2 bodies of 1 KiB plus their headers, of OUR OWN.
         let a = SpillStore::open_with_bounds(
             dir.path().to_path_buf(),
             "sess-a",
@@ -1485,6 +1497,8 @@ mod tests {
         let first = a.put("t", "text/plain", false, &body).unwrap();
         age_file(&a.session_dir().join(format!("{}.spill", first.id)), 200);
         let second = a.put("t", "text/plain", false, &body).unwrap();
+        age_file(&a.session_dir().join(format!("{}.spill", second.id)), 100);
+        let third = a.put("t", "text/plain", false, &body).unwrap();
 
         assert!(
             b.read(&neighbour.id, 0, 16).is_ok(),
@@ -1496,6 +1510,7 @@ mod tests {
             "we make room out of our OWN oldest instead"
         );
         assert!(a.read(&second.id, 0, 16).is_ok());
+        assert!(a.read(&third.id, 0, 16).is_ok());
         assert_eq!(
             a.dropped_own_session(),
             1,
@@ -1546,15 +1561,16 @@ mod tests {
     }
 
     #[test]
-    fn spill_byte_bound_refuses_a_target_no_eviction_could_reach() {
-        // The ordinary two-server case, with the neighbour merely IDLE rather
-        // than large: B holds more than A's whole budget in records younger
-        // than `max_age`, so nothing A is allowed to evict can get the root
-        // under the target. Before the guard, every one of A's `put`s ran the
-        // loop to exhaustion — deleting every record A owned, counting them all
-        // as lost, and still being over budget. The store degraded to one live
-        // record at a time and every locator A handed a model died at the next
-        // oversized result, for up to `max_age`.
+    fn spill_byte_bound_holds_our_own_store_whatever_neighbours_hold() {
+        // The property the per-process budget exists to guarantee, tested
+        // against the case the root-wide budget could not survive: a live
+        // neighbour holding many times A's whole cap in records younger than
+        // `max_age`. Measuring the root against a per-process cap made
+        // `unevictable > budget` true on every one of A's `put`s, so the byte
+        // bound refused to run and A's store grew to whatever `max_age`
+        // allowed — the fleet-normal shape, not an edge: five sessions sharing
+        // this root each see four fifths of it as unevictable, and a restarted
+        // server sees its OWN predecessor's records that way too.
         let dir = tempfile::tempdir().unwrap();
         let body = "x".repeat(1024);
 
@@ -1565,9 +1581,14 @@ mod tests {
             DEFAULT_MAX_AGE,
         )
         .unwrap();
-        let neighbours: Vec<SpillRecord> = (0..4)
+        let neighbours: Vec<SpillRecord> = (0..40)
             .map(|_| b.put("t", "text/plain", false, &body).unwrap())
             .collect();
+        let neighbour_bytes = session_bytes(b.session_dir());
+        assert!(
+            neighbour_bytes > 3_000 * 10,
+            "the neighbour must dwarf A's cap for this to test anything"
+        );
 
         let a = SpillStore::open_with_bounds(
             dir.path().to_path_buf(),
@@ -1576,27 +1597,81 @@ mod tests {
             DEFAULT_MAX_AGE,
         )
         .unwrap();
-        let ours: Vec<SpillRecord> = (0..3)
+        let ours: Vec<SpillRecord> = (0..12)
             .map(|_| a.put("t", "text/plain", false, &body).unwrap())
             .collect();
 
-        for rec in &ours {
-            assert!(
-                a.read(&rec.id, 0, 16).is_ok(),
-                "a locator we issued must survive a budget no eviction of ours could reach"
-            );
-        }
-        assert_eq!(
-            a.dropped_own_session(),
-            0,
-            "and nothing was spent trying to reach it"
+        // Bounded by OUR cap, regardless of what is next door. The budget is
+        // expressed in BODY bytes, so one record's header is the honest slack
+        // to allow on top of it.
+        let own_bytes = session_bytes(a.session_dir());
+        assert!(
+            own_bytes <= 3_000 + MAX_HEADER_BYTES,
+            "our own store is {own_bytes} bytes against a 3000 byte cap"
         );
+        assert!(
+            a.dropped_own_session() > 0,
+            "and it is bounded by ENFORCEMENT, not by having written too little"
+        );
+        // The newest locator — the one a model is most likely still holding —
+        // is what the oldest were spent on.
+        assert!(a.read(&ours[ours.len() - 1].id, 0, 16).is_ok());
+
+        // None of it was paid for out of the neighbour's store.
         for rec in &neighbours {
             assert!(
                 b.read(&rec.id, 0, 16).is_ok(),
-                "the neighbour's records were never ours to destroy either"
+                "a live neighbour's record is never evicted to satisfy our cap"
             );
         }
+        assert_eq!(session_bytes(b.session_dir()), neighbour_bytes);
+    }
+
+    #[test]
+    fn spill_a_smaller_cap_evicts_more_not_less() {
+        // `QONTINUI_MCP_SPILL_MAX_BYTES` is the only lever an operator has for
+        // disk pressure without a rebuild, and the root-wide budget inverted
+        // it: a smaller cap made the neighbour's live bytes more likely to
+        // exceed the budget on their own, at which point the arm evicted
+        // NOTHING — including the bytes this process was entitled to reclaim.
+        // The neighbour below is what produced that; it must make no difference
+        // now.
+        fn run(cap: u64) -> (u64, u64) {
+            let dir = tempfile::tempdir().unwrap();
+            let body = "x".repeat(1024);
+            let b = SpillStore::open_with_bounds(
+                dir.path().to_path_buf(),
+                "sess-b",
+                u64::MAX,
+                DEFAULT_MAX_AGE,
+            )
+            .unwrap();
+            for _ in 0..30 {
+                b.put("t", "text/plain", false, &body).unwrap();
+            }
+            let a = SpillStore::open_with_bounds(
+                dir.path().to_path_buf(),
+                "sess-a",
+                cap,
+                DEFAULT_MAX_AGE,
+            )
+            .unwrap();
+            for _ in 0..10 {
+                a.put("t", "text/plain", false, &body).unwrap();
+            }
+            (a.dropped_own_session(), session_bytes(a.session_dir()))
+        }
+
+        let (dropped_roomy, bytes_roomy) = run(8_000);
+        let (dropped_tight, bytes_tight) = run(2_000);
+        assert!(
+            dropped_tight > dropped_roomy,
+            "lowering the cap must evict MORE, not less: {dropped_tight} vs {dropped_roomy}"
+        );
+        assert!(
+            bytes_tight < bytes_roomy,
+            "and must leave LESS on disk: {bytes_tight} vs {bytes_roomy}"
+        );
     }
 
     #[test]
@@ -1667,14 +1742,16 @@ mod tests {
         let stale = earlier.put("t", "text/plain", false, &body).unwrap();
         let live_path = earlier.session_dir().join(format!("{}.spill", live.id));
         let stale_path = earlier.session_dir().join(format!("{}.spill", stale.id));
-        // Old enough to be the oldest candidate, young enough to be alive.
-        age_file(&live_path, 10);
+        // Old enough to be the oldest file under the root, young enough to be
+        // alive — the shape that makes an mtime-ordered rule pick it first.
+        age_file(&live_path, 30);
         age_file(&stale_path, 3600);
 
-        // Room for ~2 files. This process opens the SAME key.
+        // Room for ~2 files of OUR OWN. This process opens the SAME key.
         let s = SpillStore::open_with_bounds(dir.path().to_path_buf(), "sess-a", 2_600, max_age)
             .unwrap();
         let first = s.put("t", "text/plain", false, &body).unwrap();
+        age_file(&s.session_dir().join(format!("{}.spill", first.id)), 20);
 
         assert!(
             !stale_path.exists(),
@@ -1687,9 +1764,12 @@ mod tests {
         );
 
         let second = s.put("t", "text/plain", false, &body).unwrap();
+        age_file(&s.session_dir().join(format!("{}.spill", second.id)), 15);
+        let third = s.put("t", "text/plain", false, &body).unwrap();
         assert!(
             live_path.exists(),
-            "a live stranger on our session key is a neighbour, not a candidate"
+            "a live stranger on our session key is a neighbour: neither counted against our cap \
+             nor evictable to satisfy it"
         );
         assert_eq!(
             s.read(&first.id, 0, 16).unwrap_err().kind(),
@@ -1697,6 +1777,7 @@ mod tests {
             "we make room out of what we actually issued"
         );
         assert!(s.read(&second.id, 0, 16).is_ok());
+        assert!(s.read(&third.id, 0, 16).is_ok());
         assert_eq!(s.dropped_own_session(), 1);
 
         // And the message must not blame our retention for an id we never
@@ -1862,5 +1943,17 @@ mod tests {
     fn age_file(path: &Path, secs: u64) {
         let when = SystemTime::now() - Duration::from_secs(secs);
         filetime::set_file_mtime(path, filetime::FileTime::from_system_time(when)).unwrap();
+    }
+
+    /// Bytes of every published record in one session directory — the quantity
+    /// the byte bound is now defined over, measured from the outside rather
+    /// than from the store's own accounting.
+    fn session_bytes(dir: &Path) -> u64 {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some(SPILL_EXTENSION))
+            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum()
     }
 }
