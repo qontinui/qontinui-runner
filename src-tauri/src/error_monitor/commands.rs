@@ -92,6 +92,17 @@ pub async fn query_error_events(
         .filter_map(|v| serde_json::from_value(v).ok())
         .collect();
 
+    // Append any errors injected via the debug-only
+    // `/ui-bridge/test/inject-errors` seam, so the Error Monitor page is
+    // observable to a manual test without writing to the SHARED PostgreSQL
+    // store or mutating global log-source settings. Filtered by the same
+    // `ErrorQuery` the real rows were, so an injected row is never more
+    // visible than a stored one. The merge is a no-op (and the module +
+    // accessor do not exist) on production release builds without
+    // `test-fixtures`.
+    #[cfg(any(debug_assertions, feature = "test-fixtures"))]
+    let events = crate::mcp::test_fixtures::merge_with_injected_errors(events, &query);
+
     tracing::info!(
         "[ERROR_MONITOR] query_error_events returning {} events",
         events.len()
@@ -226,8 +237,16 @@ pub async fn get_error_summary(
         .get_error_summary(task_run_id.as_deref())
         .await?;
 
-    serde_json::from_value::<ErrorSummary>(pg_summary)
-        .map_err(|e| format!("Failed to deserialize error summary: {}", e))
+    let summary = serde_json::from_value::<ErrorSummary>(pg_summary)
+        .map_err(|e| format!("Failed to deserialize error summary: {}", e))?;
+
+    // Fold the injected errors into the counters too. A summary that ignored
+    // them would render "0 errors" above a list of three -- the page's own
+    // header contradicting its own body.
+    #[cfg(any(debug_assertions, feature = "test-fixtures"))]
+    let summary = crate::mcp::test_fixtures::merge_with_injected_summary(summary);
+
+    Ok(summary)
 }
 
 /// Search error events by message content.

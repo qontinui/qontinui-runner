@@ -485,6 +485,456 @@ fn emit_injected_changed(action: &str, count: usize) {
     }
 }
 
+// =============================================================================
+// Injected ERROR EVENTS  (/ui-bridge/test/inject-errors, /seed-error-scenario)
+// =============================================================================
+//
+// ## Why this seam exists
+//
+// The Error Monitor surface was UNOBSERVABLE to a manual test. Three separate
+// iterations failed to verify a defect on `/error-monitor` because there was no
+// honest way to put a row in front of it:
+//
+//   * nothing in `src-tauri/src/` inserted into `error_events` at all, so no
+//     runner action could produce one;
+//   * the store is a SHARED PostgreSQL instance, so writing to it directly
+//     would corrupt every other agent's and the operator's view of the same
+//     table — correctly refused;
+//   * the only other lever was mutating the GLOBAL log-source settings, which
+//     is shared machine state — also correctly refused.
+//
+// So the seam injects an in-process overlay instead. It touches no database and
+// no shared settings: the rows live in this process's memory, are merged into
+// the two read commands the page uses, and vanish with `clear-injected` or with
+// the process.
+//
+// ## Contract
+//
+//   POST /ui-bridge/test/inject-errors
+//        { "errors": [ { ...ErrorSpec... }, ... ] }
+//        -> { success, injected, ids }
+//        ADDITIVE. Appends to whatever is already injected.
+//
+//   POST /ui-bridge/test/seed-error-scenario
+//        { "new": 2, "recurring": 1, "acknowledged": 0, "resolved": 0, "critical": 0 }
+//     or { "errors": [ ... ] }                       (mutually exclusive; 400 on both)
+//        -> { success, cleared_count, seeded, ids }
+//        CLEAR-THEN-SEED, exactly like `seed-terminal-scenario`.
+//
+//   POST /ui-bridge/test/clear-injected     (the EXISTING route — not a new one)
+//        also drops every injected error.
+//
+// ## Merge points
+//
+// `error_monitor::commands::query_error_events` and `::get_error_summary`, via
+// the same cfg-gated shadowing rebind `transcript_list_sessions` uses for
+// injected sessions. Injected rows are APPENDED to the real ones and are
+// filtered by the caller's `ErrorQuery` exactly as a real row would be, so a
+// filter that excludes them is honest rather than special-cased.
+//
+// Ids are negative (`-1`, `-2`, …). Real `error_events.id` values come from a
+// positive-only `bigserial`, so an injected row can never be confused for a
+// stored one, and a caller that tries to `update_error_status` an injected id
+// gets a clean PG miss instead of mutating an unrelated real row.
+
+use crate::error_monitor::types::{
+    ErrorLocation, ErrorSeverity, ErrorStatus, ErrorSummary, StoredErrorEvent,
+};
+
+/// Process-wide overlay of injected error events.
+///
+/// Same shape as [`registry`]: function-local `OnceLock<Mutex<..>>`, accessed
+/// poison-tolerantly. A `Vec` rather than a map — errors have no caller-supplied
+/// stable key, and ordering is part of what the page renders.
+fn error_registry() -> &'static Mutex<Vec<StoredErrorEvent>> {
+    static ERRORS: OnceLock<Mutex<Vec<StoredErrorEvent>>> = OnceLock::new();
+    ERRORS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// One injected error. Every field is optional except `message`, so the
+/// smallest useful body is `{"errors":[{"message":"boom"}]}`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InjectErrorRequest {
+    pub message: String,
+    /// `"critical"` | `"error"` | `"warning"` | `"info"`. Defaults to `error`.
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// `"new"` | `"recurring"` | `"acknowledged"` | `"in_progress"` |
+    /// `"resolved"` | `"ignored"` | `"promoted"`. Defaults to `new`.
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub log_source_name: Option<String>,
+    #[serde(default)]
+    pub error_type: Option<String>,
+    #[serde(default)]
+    pub stack_trace: Option<String>,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub line_number: Option<u32>,
+    #[serde(default)]
+    pub task_run_id: Option<String>,
+    /// Occurrences. A `recurring` fake defaults to 3 so the page's
+    /// occurrence-count column has something to render.
+    #[serde(default)]
+    pub occurrence_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InjectErrorsResponse {
+    pub success: bool,
+    pub injected: usize,
+    pub ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ErrorScenarioCounts {
+    #[serde(default)]
+    pub new: u32,
+    #[serde(default)]
+    pub recurring: u32,
+    #[serde(default)]
+    pub acknowledged: u32,
+    #[serde(default)]
+    pub resolved: u32,
+    #[serde(default)]
+    pub critical: u32,
+}
+
+impl ErrorScenarioCounts {
+    fn is_empty(&self) -> bool {
+        self.new == 0
+            && self.recurring == 0
+            && self.acknowledged == 0
+            && self.resolved == 0
+            && self.critical == 0
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SeedErrorScenarioRequest {
+    #[serde(default, flatten)]
+    pub counts: ErrorScenarioCounts,
+    #[serde(default)]
+    pub errors: Option<Vec<InjectErrorRequest>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SeedErrorScenarioResponse {
+    pub success: bool,
+    pub cleared_count: usize,
+    pub seeded: usize,
+    pub ids: Vec<i64>,
+}
+
+/// Build the request list for a counts-based error scenario. Deterministic
+/// messages (`Scenario <bucket> <n>`) so a test can assert exact membership.
+fn error_requests_from_counts(counts: &ErrorScenarioCounts) -> Vec<InjectErrorRequest> {
+    let mut reqs = Vec::new();
+    let mut push = |bucket: &str, n: u32, severity: &str, status: &str, occurrences: u32| {
+        for i in 1..=n {
+            reqs.push(InjectErrorRequest {
+                message: format!("Scenario {bucket} {i}"),
+                severity: Some(severity.to_string()),
+                status: Some(status.to_string()),
+                log_source_name: Some("scenario".to_string()),
+                error_type: Some(format!("Scenario{}Error", bucket.to_uppercase())),
+                stack_trace: None,
+                file_path: Some(format!("src/scenario/{bucket}.rs")),
+                line_number: Some(i),
+                task_run_id: None,
+                occurrence_count: Some(occurrences),
+            });
+        }
+    };
+    push("new", counts.new, "error", "new", 1);
+    push("recurring", counts.recurring, "error", "recurring", 3);
+    push(
+        "acknowledged",
+        counts.acknowledged,
+        "warning",
+        "acknowledged",
+        1,
+    );
+    push("resolved", counts.resolved, "error", "resolved", 1);
+    push("critical", counts.critical, "critical", "new", 1);
+    reqs
+}
+
+/// Project one request into a full `StoredErrorEvent`.
+///
+/// `id` is caller-supplied and NEGATIVE (see the module note above).
+fn project_injected_error(req: &InjectErrorRequest, id: i64, now: &str) -> StoredErrorEvent {
+    let severity = req
+        .severity
+        .as_deref()
+        .and_then(ErrorSeverity::from_str)
+        .unwrap_or(ErrorSeverity::Error);
+    let status = match req.status.as_deref() {
+        Some("recurring") => ErrorStatus::Recurring,
+        Some("acknowledged") => ErrorStatus::Acknowledged,
+        Some("in_progress") => ErrorStatus::InProgress,
+        Some("resolved") => ErrorStatus::Resolved,
+        Some("ignored") => ErrorStatus::Ignored,
+        Some("promoted") => ErrorStatus::Promoted,
+        _ => ErrorStatus::New,
+    };
+    StoredErrorEvent {
+        id,
+        log_source_id: None,
+        log_source_name: req
+            .log_source_name
+            .clone()
+            .unwrap_or_else(|| "injected".to_string()),
+        task_run_id: req.task_run_id.clone(),
+        workflow_name: None,
+        workflow_step_id: None,
+        log_timestamp: Some(now.to_string()),
+        captured_at: now.to_string(),
+        severity,
+        error_type: req.error_type.clone(),
+        error_code: None,
+        message: req.message.clone(),
+        stack_trace: req.stack_trace.clone(),
+        context_lines: None,
+        raw_entry: Some(req.message.clone()),
+        location: req.file_path.as_ref().map(|fp| ErrorLocation {
+            file_path: fp.clone(),
+            line_number: req.line_number,
+            column_number: None,
+            function_name: None,
+        }),
+        signature_hash: format!("injected-{}", id.unsigned_abs()),
+        occurrence_count: req.occurrence_count.unwrap_or(1),
+        first_seen_at: now.to_string(),
+        last_seen_at: now.to_string(),
+        status,
+        finding_id: None,
+        resolved_by_task_run_id: None,
+        resolution_notes: None,
+        trace_id: None,
+        acknowledged_at: None,
+        resolved_at: None,
+    }
+}
+
+/// Core insert path shared by both error routes. Appends and returns the ids.
+fn insert_errors(reqs: &[InjectErrorRequest]) -> Vec<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut guard = error_registry().lock().unwrap_or_else(|p| p.into_inner());
+    let mut ids = Vec::with_capacity(reqs.len());
+    for req in reqs {
+        // Ids continue DOWNWARD from the current length, so ids are unique
+        // among the CURRENTLY injected set. They restart at -1 after a
+        // `clear-injected`, which is intended: the cleared rows no longer
+        // exist, and nothing persists an injected id.
+        let id = -((guard.len() + 1) as i64);
+        guard.push(project_injected_error(req, id, &now));
+        ids.push(id);
+    }
+    ids
+}
+
+/// Drop every injected error. Shared by `/clear-injected` and the seeder.
+fn clear_all_errors() -> usize {
+    let mut guard = error_registry().lock().unwrap_or_else(|p| p.into_inner());
+    let n = guard.len();
+    guard.clear();
+    info!(
+        "test_fixtures: cleared {} injected error event(s); the error_events table untouched",
+        n,
+    );
+    n
+}
+
+/// Read-only snapshot of the injected errors, for the merge points.
+pub fn injected_error_events() -> Vec<StoredErrorEvent> {
+    error_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Append injected errors to a real result set, applying the caller's own
+/// filters so an injected row is never MORE visible than a real one would be.
+///
+/// Appended, never substituted: a fixture that hid real rows would make the
+/// page lie about the machine's actual state.
+pub fn merge_with_injected_errors(
+    mut real: Vec<StoredErrorEvent>,
+    query: &crate::error_monitor::types::ErrorQuery,
+) -> Vec<StoredErrorEvent> {
+    let injected = injected_error_events();
+    real.reserve(injected.len());
+    for e in injected {
+        if let Some(ref tid) = query.task_run_id {
+            if e.task_run_id.as_deref() != Some(tid.as_str()) {
+                continue;
+            }
+        }
+        if let Some(ref src) = query.log_source_name {
+            if &e.log_source_name != src {
+                continue;
+            }
+        }
+        if let Some(ref statuses) = query.status {
+            if !statuses.is_empty() && !statuses.contains(&e.status) {
+                continue;
+            }
+        }
+        if let Some(ref severities) = query.severity {
+            if !severities.is_empty() && !severities.contains(&e.severity) {
+                continue;
+            }
+        }
+        if let Some(ref et) = query.error_type {
+            if e.error_type.as_deref() != Some(et.as_str()) {
+                continue;
+            }
+        }
+        real.push(e);
+    }
+    // Honour `limit` too. The contract above says an injected row is filtered
+    // "exactly as a real row would be"; without this a `limit: 50` call could
+    // return 53 and a driver asserting on page size would see the seam, not the
+    // page.
+    if let Some(limit) = query.limit {
+        real.truncate(limit as usize);
+    }
+    real
+}
+
+/// Fold the injected errors into a real summary so the page's counters agree
+/// with its list. A summary that ignored them would show "0 errors" above a
+/// list of three.
+pub fn merge_with_injected_summary(mut summary: ErrorSummary) -> ErrorSummary {
+    for e in injected_error_events() {
+        summary.total += 1;
+        let unresolved = matches!(
+            e.status,
+            ErrorStatus::New
+                | ErrorStatus::Recurring
+                | ErrorStatus::Acknowledged
+                | ErrorStatus::InProgress
+                | ErrorStatus::Promoted
+        );
+        if unresolved {
+            summary.unresolved_count += 1;
+        }
+        // The severity counters are UNRESOLVED-scoped in the real summary
+        // (`COUNT(*) FILTER (WHERE severity = ... AND status IN (...))`), so the
+        // overlay has to scope them the same way or an injected resolved row
+        // would inflate a counter the page reads as "still broken".
+        if unresolved {
+            match e.severity {
+                ErrorSeverity::Critical => summary.critical_count += 1,
+                ErrorSeverity::Error => summary.error_count += 1,
+                ErrorSeverity::Warning => summary.warning_count += 1,
+                ErrorSeverity::Info => {}
+            }
+        }
+        if matches!(e.status, ErrorStatus::New) {
+            summary.new_count += 1;
+        }
+        *summary
+            .by_source
+            .entry(e.log_source_name.clone())
+            .or_insert(0) += 1;
+        if let Some(ref et) = e.error_type {
+            *summary.by_error_type.entry(et.clone()).or_insert(0) += 1;
+        }
+        *summary
+            .by_status
+            .entry(e.status.as_str().to_string())
+            .or_insert(0) += 1;
+    }
+    summary.has_actionable_errors =
+        summary.has_actionable_errors || summary.critical_count > 0 || summary.error_count > 0;
+    summary
+}
+
+async fn inject_errors_handler(
+    Json(req): Json<InjectErrorsRequestBody>,
+) -> Result<Json<InjectErrorsResponse>, (StatusCode, Json<InjectSessionError>)> {
+    if req.errors.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(InjectSessionError {
+                success: false,
+                error: "inject-errors body must contain at least one error".to_string(),
+            }),
+        ));
+    }
+    for e in &req.errors {
+        if e.message.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(InjectSessionError {
+                    success: false,
+                    error: "each error needs a non-empty message".to_string(),
+                }),
+            ));
+        }
+    }
+    let ids = insert_errors(&req.errors);
+    info!("test_fixtures: injected {} error event(s)", ids.len());
+    emit_injected_changed("inject-errors", ids.len());
+    Ok(Json(InjectErrorsResponse {
+        success: true,
+        injected: ids.len(),
+        ids,
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InjectErrorsRequestBody {
+    pub errors: Vec<InjectErrorRequest>,
+}
+
+async fn seed_error_scenario_handler(
+    Json(req): Json<SeedErrorScenarioRequest>,
+) -> Result<Json<SeedErrorScenarioResponse>, (StatusCode, Json<InjectSessionError>)> {
+    let has_counts = !req.counts.is_empty();
+    let has_errors = req.errors.as_ref().is_some_and(|e| !e.is_empty());
+
+    if has_counts && has_errors {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(InjectSessionError {
+                success: false,
+                error: "supply either per-bucket counts OR an explicit `errors` list, not both"
+                    .to_string(),
+            }),
+        ));
+    }
+
+    let requests = if has_errors {
+        req.errors.unwrap_or_default()
+    } else {
+        error_requests_from_counts(&req.counts)
+    };
+
+    // Clear-then-seed by contract, mirroring `seed-terminal-scenario`.
+    let cleared_count = clear_all_errors();
+    let ids = insert_errors(&requests);
+
+    info!(
+        "test_fixtures: seeded error scenario cleared={} seeded={}",
+        cleared_count,
+        ids.len(),
+    );
+    emit_injected_changed("seed-errors", ids.len());
+
+    Ok(Json(SeedErrorScenarioResponse {
+        success: true,
+        cleared_count,
+        seeded: ids.len(),
+        ids,
+    }))
+}
+
 /// Core insert path shared by `inject_session_handler` and the
 /// scenario-seeder. Validates the request, builds the `TestSession`, runs TTL
 /// eviction, and inserts under `task_run_id`. Returns the stored
@@ -713,12 +1163,18 @@ async fn clear_sessions_handler() -> Json<ClearSessionsResponse> {
 /// them and the synthetic tabs cease to exist with no separate teardown.
 async fn clear_injected_handler() -> Json<ClearSessionsResponse> {
     let cleared_count = clear_all_sessions();
+    // Injected ERROR events are torn down by the SAME one call, per the
+    // existing teardown contract: `/clear-injected` is the superset that drops
+    // every fixture this module owns. Adding a separate clear-errors route
+    // would let a gate tear down its sessions and silently leave error rows
+    // overlaying the next test's `/error-monitor` page.
+    let cleared_errors = clear_all_errors();
     // The `identityEvidence` override is a fixture too, and it is PROCESS-GLOBAL
     // and sticky — a gate that forgot to clear it would otherwise leave every
     // later session-info read lying about its provenance. Teardown clears it
     // with the same one call that drops the injected fakes.
     crate::commands::session_info::set_forced_identity_evidence(None);
-    emit_injected_changed("clear", cleared_count);
+    emit_injected_changed("clear", cleared_count + cleared_errors);
     Json(ClearSessionsResponse {
         success: true,
         cleared_count,
@@ -1542,6 +1998,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/test/seed-terminal-scenario",
             post(seed_scenario_handler),
         )
+        .route("/ui-bridge/test/inject-errors", post(inject_errors_handler))
+        .route(
+            "/ui-bridge/test/seed-error-scenario",
+            post(seed_error_scenario_handler),
+        )
         .route(
             "/ui-bridge/test/force-identity-evidence",
             post(force_identity_evidence_handler),
@@ -1715,6 +2176,8 @@ mod tests {
             "/ui-bridge/test/clear-sessions",
             "/ui-bridge/test/clear-injected",
             "/ui-bridge/test/seed-terminal-scenario",
+            "/ui-bridge/test/inject-errors",
+            "/ui-bridge/test/seed-error-scenario",
             "/ui-bridge/test/force-identity-evidence",
             "/ui-bridge/test/seed-lifecycle-store",
             "/ui-bridge/test/list-lifecycle-open",
@@ -1727,6 +2190,207 @@ mod tests {
                 "route {route} must remain wired in test_fixtures::routes()",
             );
         }
+    }
+
+    // =======================================================================
+    // Injected ERROR EVENTS seam (manual-test-loop iter 16)
+    //
+    // The surface these make observable: three iterations could not verify an
+    // Error Monitor defect because nothing in the runner inserted into
+    // `error_events`, and the two alternatives (writing the SHARED PostgreSQL
+    // directly, mutating global log-source settings) were correctly refused.
+    // =======================================================================
+
+    fn err(message: &str, status: &str, severity: &str) -> InjectErrorRequest {
+        InjectErrorRequest {
+            message: message.to_string(),
+            severity: Some(severity.to_string()),
+            status: Some(status.to_string()),
+            log_source_name: Some("unit".to_string()),
+            error_type: Some("UnitError".to_string()),
+            stack_trace: None,
+            file_path: None,
+            line_number: None,
+            task_run_id: None,
+            occurrence_count: None,
+        }
+    }
+
+    /// The core round trip: a seeded `recurring` error reaches the merge point
+    /// that `query_error_events` uses, and `clear-injected` removes it.
+    #[test]
+    fn a_seeded_recurring_error_merges_and_then_tears_down() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        let ids = insert_errors(&[err("boom", "recurring", "error")]);
+        assert_eq!(ids.len(), 1);
+        assert!(ids[0] < 0, "injected ids must be negative, got {}", ids[0]);
+
+        let merged = merge_with_injected_errors(
+            Vec::new(),
+            &crate::error_monitor::types::ErrorQuery::default(),
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].message, "boom");
+        assert_eq!(merged[0].status, ErrorStatus::Recurring);
+        assert_eq!(merged[0].occurrence_count, 1);
+
+        // TEARDOWN through the EXISTING clear route's shared core.
+        let cleared = clear_all_errors();
+        assert_eq!(cleared, 1);
+        assert!(
+            merge_with_injected_errors(
+                Vec::new(),
+                &crate::error_monitor::types::ErrorQuery::default()
+            )
+            .is_empty(),
+            "clear-injected must remove every injected error"
+        );
+    }
+
+    /// Real rows are APPENDED to, never replaced — a fixture that hid real
+    /// rows would make the page lie about the machine's actual state.
+    #[test]
+    fn injected_errors_append_to_real_ones() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        let real = vec![project_injected_error(
+            &err("real", "new", "error"),
+            42,
+            "t0",
+        )];
+        insert_errors(&[err("fake", "new", "error")]);
+
+        let merged =
+            merge_with_injected_errors(real, &crate::error_monitor::types::ErrorQuery::default());
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, 42, "the real row must come first and survive");
+        assert!(merged[1].id < 0);
+
+        clear_all_errors();
+    }
+
+    /// The filter arm is load-bearing: an injected row must never be MORE
+    /// visible than a stored one. Without this the overlay would leak into
+    /// every filtered view and make a filter look broken.
+    #[test]
+    fn an_injected_error_obeys_the_callers_query_filters() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        insert_errors(&[
+            err("critical one", "new", "critical"),
+            err("warning one", "new", "warning"),
+        ]);
+
+        let only_critical = crate::error_monitor::types::ErrorQuery {
+            severity: Some(vec![ErrorSeverity::Critical]),
+            ..Default::default()
+        };
+        let merged = merge_with_injected_errors(Vec::new(), &only_critical);
+        assert_eq!(
+            merged.len(),
+            1,
+            "the severity filter must exclude the warning"
+        );
+        assert_eq!(merged[0].message, "critical one");
+
+        let wrong_source = crate::error_monitor::types::ErrorQuery {
+            log_source_name: Some("not-unit".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            merge_with_injected_errors(Vec::new(), &wrong_source).is_empty(),
+            "the log-source filter must exclude injected rows too"
+        );
+
+        clear_all_errors();
+    }
+
+    /// The summary must agree with the list — otherwise the page renders
+    /// "0 errors" above a list of three.
+    #[test]
+    fn the_summary_counts_the_injected_errors() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        insert_errors(&[
+            err("a", "new", "critical"),
+            err("b", "recurring", "error"),
+            // A RESOLVED row must NOT inflate the unresolved-scoped counters —
+            // the real summary scopes them with `AND status IN (...)`.
+            err("c", "resolved", "error"),
+        ]);
+
+        let merged = merge_with_injected_summary(ErrorSummary::default());
+        assert_eq!(merged.total, 3);
+        assert_eq!(merged.unresolved_count, 2);
+        assert_eq!(merged.critical_count, 1);
+        assert_eq!(
+            merged.error_count, 1,
+            "the resolved error must not be counted"
+        );
+        assert_eq!(merged.new_count, 1);
+        assert!(merged.has_actionable_errors);
+        assert_eq!(merged.by_status.get("recurring"), Some(&1));
+
+        clear_all_errors();
+    }
+
+    /// `seed-error-scenario` is clear-then-seed, exactly like its terminal
+    /// sibling: a second seed must not stack on the first.
+    #[test]
+    fn the_error_scenario_seeder_clears_before_it_seeds() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        let first = error_requests_from_counts(&ErrorScenarioCounts {
+            new: 2,
+            recurring: 1,
+            ..Default::default()
+        });
+        insert_errors(&first);
+        assert_eq!(injected_error_events().len(), 3);
+
+        // Second scenario: clear, then seed one.
+        let cleared = clear_all_errors();
+        assert_eq!(cleared, 3);
+        insert_errors(&error_requests_from_counts(&ErrorScenarioCounts {
+            critical: 1,
+            ..Default::default()
+        }));
+
+        let now = injected_error_events();
+        assert_eq!(now.len(), 1, "the seeder must not stack scenarios");
+        assert_eq!(now[0].severity, ErrorSeverity::Critical);
+
+        clear_all_errors();
+    }
+
+    /// The counts vocabulary must actually produce the buckets it names.
+    #[test]
+    fn the_counts_vocabulary_produces_the_named_buckets() {
+        let reqs = error_requests_from_counts(&ErrorScenarioCounts {
+            new: 1,
+            recurring: 2,
+            acknowledged: 1,
+            resolved: 1,
+            critical: 1,
+        });
+        assert_eq!(reqs.len(), 6);
+        let recurring: Vec<_> = reqs
+            .iter()
+            .filter(|r| r.status.as_deref() == Some("recurring"))
+            .collect();
+        assert_eq!(recurring.len(), 2);
+        assert_eq!(
+            recurring[0].occurrence_count,
+            Some(3),
+            "a recurring fake needs an occurrence count > 1 or the page's \
+             recurrence column renders nothing"
+        );
     }
 
     /// The `identityEvidence` override seam: only the three real

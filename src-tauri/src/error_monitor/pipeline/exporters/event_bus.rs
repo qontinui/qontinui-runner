@@ -32,6 +32,12 @@ impl Exporter for EventBusExporter {
             // Emit a NewErrors notification to wake up the UI. The payload is
             // empty because this exporter only signals presence — subscribers
             // fetch the actual records via the PG-backed query API.
+            //
+            // That contract is only honest because `PostgresExporter` runs
+            // immediately BEFORE this one and has already written the rows
+            // (see `ErrorMonitorService::process_records`). For as long as it
+            // did not exist, this empty payload pointed subscribers at a table
+            // nothing ever populated. Do not reorder the two exporters.
             let _ = self.tx.send(ErrorMonitorEvent::NewErrors(Vec::new())).await;
             let source = records
                 .first()

@@ -18,6 +18,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::RwLock;
 
 use crate::error_monitor::pipeline::exporters::event_bus::EventBusExporter;
+use crate::error_monitor::pipeline::exporters::postgres::PostgresExporter;
 use crate::error_monitor::pipeline::processors::dedup::DedupProcessor;
 use crate::error_monitor::pipeline::processors::jsonl_preprocess::JsonlPreprocessor;
 use crate::error_monitor::pipeline::processors::parser::ParserProcessor;
@@ -328,6 +329,11 @@ pub struct ErrorMonitorService {
     jsonl_preprocessor: JsonlPreprocessor,
     parser_processor: ParserProcessor,
     dedup_processor: DedupProcessor,
+    /// Pipeline exporter — PERSISTS parsed events into `error_events`.
+    ///
+    /// Runs BEFORE `event_bus_exporter`, so the rows are on disk by the time
+    /// the UI is woken and told to fetch them.
+    postgres_exporter: PostgresExporter,
     /// Pipeline exporter — dispatches parsed events onto the service event bus.
     event_bus_exporter: EventBusExporter,
 }
@@ -344,6 +350,7 @@ impl ErrorMonitorService {
         let current_task_run_id: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
         let current_workflow_name: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
+        let postgres_exporter = PostgresExporter::new(pg_db.clone(), current_task_run_id.clone());
         let event_bus_exporter = EventBusExporter::new(event_tx.clone());
 
         let handle = ErrorMonitorHandle {
@@ -361,6 +368,7 @@ impl ErrorMonitorService {
             jsonl_preprocessor: JsonlPreprocessor,
             parser_processor: ParserProcessor::new(),
             dedup_processor: DedupProcessor::new(10_000),
+            postgres_exporter,
             event_bus_exporter,
         };
 
@@ -751,6 +759,13 @@ impl ErrorMonitorService {
 
         if records.is_empty() {
             return;
+        }
+
+        // PERSIST FIRST. The event-bus exporter's payload is deliberately empty
+        // — it is a wake-up whose contract is "go read the store" — so waking
+        // the UI before the rows exist is a race it cannot recover from.
+        if let Err(e) = self.postgres_exporter.export(&records).await {
+            tracing::warn!("Error event persistence failed: {}", e);
         }
 
         if let Err(e) = self.event_bus_exporter.export(&records).await {

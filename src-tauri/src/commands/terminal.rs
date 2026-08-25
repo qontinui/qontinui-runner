@@ -412,10 +412,14 @@ pub fn terminal_write(
         )))
     })?;
 
-    // Typed-input observation (L3 git-warn + typed claude resume sniff) is
-    // funneled inside `TerminalSession::write` itself, so every write
-    // surface (this command, HTTP, WS, transports) is covered without
-    // per-caller calls.
+    // Typed-input observation (L3 git-warn + typed claude resume sniff) and
+    // the PTY LIVENESS GATE are both funneled inside `TerminalSession::write`
+    // itself, so every write surface (this command, HTTP, WS, transports) is
+    // covered without per-caller calls. A write to an exited PTY comes back
+    // as a `TERMINAL_EXITED: ...` Err instead of the `success: true` it used
+    // to answer; the frontend's `buildWriteFailure` reads that prefix off the
+    // rejected invoke and classifies it as `TERMINAL_EXITED` even when this
+    // pane has not yet seen its own `terminal-exit` event.
     session.write(&bytes)?;
 
     Ok(CommandResponse {

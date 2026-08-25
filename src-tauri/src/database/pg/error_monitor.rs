@@ -10,7 +10,238 @@ use super::PgDb;
 use serde_json::json;
 use std::collections::HashMap;
 
+/// Coerce a parser-scraped timestamp into something Postgres will accept as
+/// `timestamptz`, or `None`.
+///
+/// Accepted, in order: RFC3339 (`2026-08-25T12:00:00Z`, `...+02:00`), then a
+/// naive `YYYY-MM-DD[ T]HH:MM:SS[.fff]`, which is emitted as RFC3339 in UTC.
+/// `YYYY/MM/DD` separators (which `TIMESTAMP_COMMON` also matches) are
+/// normalized to dashes first rather than left to Postgres' DateStyle, which
+/// would read them MDY on some configurations and silently store the wrong day.
+fn normalize_log_timestamp(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.to_rfc3339());
+    }
+    // Only the DATE half may use slashes; a time is always `HH:MM:SS`.
+    let dashed = match raw.split_once(['T', ' ']) {
+        Some((date, time)) => format!("{}T{}", date.replace('/', "-"), time),
+        None => raw.replace('/', "-"),
+    };
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&dashed, fmt) {
+            return Some(naive.and_utc().to_rfc3339());
+        }
+    }
+    None
+}
+
 impl PgDb {
+    /// Persist one collected error, deduplicating on its signature hash.
+    ///
+    /// # Why this exists
+    ///
+    /// Before this, **nothing in the runner ever inserted a row into
+    /// `error_events`**. The whole module was SELECT/UPDATE only: the pipeline
+    /// parsed errors, deduplicated them, then dropped them on the floor, and
+    /// its one exporter sent an EMPTY `NewErrors(Vec::new())` "presence" signal
+    /// whose stated contract was that subscribers would re-fetch the records
+    /// from the PG-backed query API. That contract had no other half. The store
+    /// was therefore empty machine-wide no matter how log sources were
+    /// configured, and `query_error_events` read a table this application never
+    /// populated.
+    ///
+    /// # Dedup semantics
+    ///
+    /// `signature_hash` has a plain (non-unique) btree index, so `ON CONFLICT`
+    /// is not available. A repeat of a known signature therefore bumps
+    /// `occurrence_count`, advances `last_seen_at`, and promotes `new` to
+    /// `recurring` — which is what `occurrence_count` and the `recurring`
+    /// status exist for. A signature whose only rows are already `resolved` or
+    /// `ignored` is NOT revived: that error came back after being closed, so it
+    /// gets a fresh row rather than silently re-opening a resolution.
+    ///
+    /// Returns `(id, is_new)`.
+    ///
+    /// Timestamps are bound as TEXT with explicit `::TIMESTAMPTZ` casts — the
+    /// runner's tokio-postgres has no `with-chrono-0_4` feature (see the module
+    /// header).
+    pub async fn upsert_error_events(
+        &self,
+        events: &[crate::error_monitor::types::ErrorEvent],
+        task_run_id: Option<&str>,
+    ) -> Result<(usize, usize, Option<String>), String> {
+        if events.is_empty() {
+            return Ok((0, 0, None));
+        }
+        // ONE checkout for the whole batch. Taking it per record put a pool
+        // checkout and up to two round trips on every parsed error, inside the
+        // error monitor's poll loop — a burst of log noise cost 2N queries
+        // against the shared database instead of 2 per error at worst.
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let mut inserted = 0usize;
+        let mut bumped = 0usize;
+        let mut first_error: Option<String> = None;
+        for event in events {
+            // One bad record must not abort the batch; the FIRST failure is
+            // retained so the caller can log a real diagnosis, not a count.
+            match Self::upsert_one(&conn, event, task_run_id, None).await {
+                Ok(true) => inserted += 1,
+                Ok(false) => bumped += 1,
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+        Ok((inserted, bumped, first_error))
+    }
+
+    /// One upsert on an already-checked-out connection. Returns `true` when a
+    /// new row was inserted, `false` when an existing one was bumped.
+    async fn upsert_one(
+        conn: &deadpool_postgres::Client,
+        event: &crate::error_monitor::types::ErrorEvent,
+        task_run_id: Option<&str>,
+        workflow_step_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let signature_hash = event.compute_signature_hash();
+        let severity = event.severity.as_str();
+        // `log_timestamp` is whatever the parser scraped off a log line
+        // (`TIMESTAMP_ISO` / `TIMESTAMP_COMMON`), NOT a validated timestamp.
+        // Binding it straight into `$n::TIMESTAMPTZ` lets one unparseable
+        // string abort the INSERT for that record -- and losing a collected
+        // error in silence is the exact defect this whole change closes. So
+        // normalize here: a value Postgres will accept, or NULL (the column is
+        // nullable, and `captured_at` still records when the runner saw it;
+        // the original text survives verbatim in `raw_entry`).
+        //
+        // It is bound through `$4::TEXT::TIMESTAMPTZ`, not `$4::TIMESTAMPTZ`.
+        // With the single cast Postgres infers the PARAMETER itself as
+        // `timestamptz`, and tokio-postgres then refuses to serialize a Rust
+        // `String` into it -- the insert failed with
+        // `error serializing parameter 3` and every collected error was lost.
+        // (Caught by live verification against a running runner, not by any
+        // unit test: the type check happens at Parse time inside Postgres.)
+        // The extra `::TEXT` pins the parameter's inferred type to `text`, which
+        // is what the module header means by "all timestamps are cast to TEXT" --
+        // this crate's tokio-postgres has no `with-chrono-0_4` feature.
+        let log_timestamp = normalize_log_timestamp(event.log_timestamp.as_deref());
+
+        // Bump an existing OPEN row for this signature. `FOR UPDATE` is not used:
+        // a lost race just means two rows for one signature, which reads
+        // correctly, whereas holding row locks across the monitor's ingest loop
+        // would stall it behind the UI's own reads.
+        let bumped = conn
+            .query_opt(
+                r#"
+                UPDATE error_events
+                   SET occurrence_count = COALESCE(occurrence_count, 0) + 1,
+                       last_seen_at     = now(),
+                       status           = CASE WHEN status = 'new' THEN 'recurring' ELSE status END,
+                       -- FIRST writer wins. `COALESCE($3, task_run_id)` (the
+                       -- other way round) re-attributed an error first seen in
+                       -- run A to whatever run happened to be in flight when it
+                       -- recurred, so `resolve_errors_by_task_run(A)` would
+                       -- never resolve it and a read filtered by A lost it.
+                       -- `first_seen_at` semantics say the original run owns it.
+                       task_run_id      = COALESCE(task_run_id, $3)
+                 WHERE id = (
+                     SELECT id FROM error_events
+                      WHERE signature_hash = $1
+                        AND log_source_name = $2
+                        AND status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted')
+                      ORDER BY last_seen_at DESC
+                      LIMIT 1
+                 )
+             RETURNING id
+                "#,
+                &[&signature_hash, &event.log_source_name, &task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG upsert_error_event (bump): {}", e))?;
+
+        if bumped.is_some() {
+            return Ok(false);
+        }
+
+        let (file_path, line_number, column_number, function_name) = match event.location {
+            Some(ref loc) => (
+                Some(loc.file_path.clone()),
+                loc.line_number.map(|n| n as i32),
+                loc.column_number.map(|n| n as i32),
+                loc.function_name.clone(),
+            ),
+            None => (None, None, None, None),
+        };
+
+        // `log_source_id` is resolved by name rather than passed in: the caller
+        // (the pipeline) only ever knows the source's NAME, and a stale id would
+        // point the row at the wrong source after a log-source re-sync. A miss
+        // leaves it NULL, which the column allows -- `log_source_name` is the
+        // NOT NULL half and the one every read projects.
+        let row = conn
+            .query_one(
+                r#"
+                INSERT INTO error_events (
+                    log_source_id, log_source_name, task_run_id, workflow_step_id,
+                    log_timestamp, captured_at, severity, error_type, error_code,
+                    message, stack_trace, context_lines, raw_entry,
+                    file_path, line_number, column_number, function_name,
+                    signature_hash, occurrence_count, first_seen_at, last_seen_at,
+                    status, trace_id
+                ) VALUES (
+                    (SELECT id FROM log_sources WHERE name = $1 LIMIT 1), $1,
+                    -- Resolved through `task_runs`, not bound raw: the column
+                    -- carries `FOREIGN KEY -> project.task_runs.id`, and an id
+                    -- with no matching row hard-fails the INSERT. The exporter
+                    -- only warns, so that would drop the whole batch of
+                    -- collected errors rather than storing them unattributed.
+                    (SELECT id FROM task_runs WHERE id = $2), $3,
+                    $4::TEXT::TIMESTAMPTZ, now(), $5, $6, $7,
+                    $8, $9, $10, $11,
+                    $12, $13, $14, $15,
+                    $16, 1, now(), now(),
+                    'new', $17
+                )
+                RETURNING id
+                "#,
+                &[
+                    &event.log_source_name,
+                    &task_run_id,
+                    &workflow_step_id,
+                    &log_timestamp,
+                    &severity,
+                    &event.error_type,
+                    &event.error_code,
+                    &event.message,
+                    &event.stack_trace,
+                    &event.context_lines,
+                    &event.raw_entry,
+                    &file_path,
+                    &line_number,
+                    &column_number,
+                    &function_name,
+                    &signature_hash,
+                    &event.trace_id,
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG upsert_error_event (insert): {}", e))?;
+
+        let _id: i64 = row.get(0);
+        Ok(true)
+    }
+
     /// Get unresolved errors, optionally filtered by task_run_id.
     ///
     /// Returns errors with status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted'),
@@ -403,10 +634,17 @@ impl PgDb {
         let column_number: Option<i32> = row.get(16);
         let function_name: Option<String> = row.get(17);
         let signature_hash: String = row.get(18);
-        let occurrence_count: i32 = row.get(19);
+        // NULLABLE in the schema (`occurrence_count INTEGER NULL DEFAULT 1`),
+        // and `Row::get::<i32>` PANICS on a NULL rather than returning an Err —
+        // so a NULL here aborts the task instead of being skipped by the
+        // `filter_map(|v| ... .ok())` the callers rely on.
+        let occurrence_count: i32 = row.get::<_, Option<i32>>(19).unwrap_or(1);
         let first_seen_at: String = row.get(20);
         let last_seen_at: String = row.get(21);
-        let status: String = row.get(22);
+        // Nullable too (`status TEXT NULL DEFAULT 'new'`) — same panic.
+        let status: String = row
+            .get::<_, Option<String>>(22)
+            .unwrap_or_else(|| "new".to_string());
         let finding_id_str: Option<String> = row.get(23);
         let finding_id: Option<i64> = finding_id_str.and_then(|s| s.parse().ok());
         let resolved_by_task_run_id: Option<String> = row.get(24);
@@ -641,7 +879,7 @@ impl PgDb {
                 UPDATE error_events SET
                     status = 'acknowledged',
                     acknowledged_at = $1::TIMESTAMPTZ
-                WHERE status = 'new' AND task_run_id = $2
+                WHERE status IN ('new', 'recurring') AND task_run_id = $2
                 "#,
                 &[&now, &tid],
             )
@@ -653,7 +891,7 @@ impl PgDb {
                 UPDATE error_events SET
                     status = 'acknowledged',
                     acknowledged_at = $1::TIMESTAMPTZ
-                WHERE status = 'new'
+                WHERE status IN ('new', 'recurring')
                 "#,
                 &[&now],
             )
@@ -705,5 +943,40 @@ impl PgDb {
             map.insert(key, count as u32);
         }
         Ok(map)
+    }
+}
+
+#[cfg(test)]
+mod normalize_log_timestamp_tests {
+    use super::normalize_log_timestamp;
+
+    #[test]
+    fn rfc3339_passes_through() {
+        assert!(normalize_log_timestamp(Some("2026-08-25T12:00:00Z"))
+            .unwrap()
+            .starts_with("2026-08-25T12:00:00"));
+    }
+
+    #[test]
+    fn a_naive_log_timestamp_becomes_utc_rfc3339() {
+        let got = normalize_log_timestamp(Some("2026-08-25 12:00:00.123")).unwrap();
+        assert!(got.starts_with("2026-08-25T12:00:00.123"), "{got}");
+        assert!(got.ends_with("+00:00"), "{got}");
+    }
+
+    #[test]
+    fn slash_dates_are_normalized_rather_than_left_to_postgres_datestyle() {
+        // `2026/08/25` read MDY would be a different day, stored silently.
+        let got = normalize_log_timestamp(Some("2026/08/25 12:00:00")).unwrap();
+        assert!(got.starts_with("2026-08-25T12:00:00"), "{got}");
+    }
+
+    /// The load-bearing arm: garbage must become NULL, never an INSERT that
+    /// fails and drops the whole collected error.
+    #[test]
+    fn an_unparseable_timestamp_becomes_none() {
+        assert_eq!(normalize_log_timestamp(Some("not a timestamp")), None);
+        assert_eq!(normalize_log_timestamp(Some("   ")), None);
+        assert_eq!(normalize_log_timestamp(None), None);
     }
 }
