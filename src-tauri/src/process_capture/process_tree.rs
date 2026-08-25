@@ -60,7 +60,7 @@ pub struct ProcessSnapshot {
 /// instant comparison in [`claude_present_in_inclusive_subtree`]. Creation
 /// times come from WMI at second granularity, so a beat of rounding slack is
 /// always allowed before treating a tracked PID as reused.
-const PID_REUSE_SKEW_MS: i64 = 5_000;
+pub(crate) const PID_REUSE_SKEW_MS: i64 = 5_000;
 
 /// True iff a live Claude process is present in the **inclusive** subtree
 /// rooted at `root_pid` — i.e. `root_pid`'s own image is `claude*`, OR any

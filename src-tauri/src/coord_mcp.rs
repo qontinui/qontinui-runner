@@ -1292,6 +1292,692 @@ fn minted_at_from_unix(secs: Option<u64>) -> std::time::SystemTime {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Agent-binding census + boot liveness readback
+// Plan `2026-08-25-agent-class-sessions-reach-coord-like-operator-sessions`,
+// Phase 1 — the only phase of that plan that ships.
+// ---------------------------------------------------------------------------
+
+/// One AGENT-class binding that [`device_nonce_snapshot`] discarded, as the
+/// census records it. The nonce itself is deliberately absent: this is an
+/// aggregate forensics line, and a census is not a place to put key material.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentBindingCensusEntry {
+    agent_id: Uuid,
+    workdir: String,
+    /// Always `None` in production TODAY — [`register_agent_proxy_nonce`] binds
+    /// `terminal_id: None` by construction, because a headless agent subprocess
+    /// never goes through the PTY seam. It is carried anyway because it is the
+    /// ONLY key the boot-side liveness join has (see
+    /// [`classify_agent_binding_liveness`]), so a future terminal-bearing agent
+    /// binding becomes attributable the day it exists — and until then the
+    /// census makes the vacuity of that join visible as a column of `null`
+    /// rather than hiding it.
+    terminal_id: Option<String>,
+    minted_at_unix: u64,
+}
+
+/// Project the live nonce map down to the AGENT bindings — exactly the set
+/// [`device_nonce_snapshot`] drops on the floor. Pure and deterministically
+/// ordered, because the emission gate ([`census_should_emit`]) compares
+/// consecutive censuses for equality and a nondeterministic order would emit a
+/// "change" on every mint.
+///
+/// Ephemeral bindings cannot appear here: the mint route only ever binds
+/// [`ProxyPrincipal::Device`]. The filter is on the principal alone so the
+/// census keeps meaning "everything the persist path discarded for being
+/// agent-class", which is the question Phase 1 asks.
+fn agent_binding_census(map: &HashMap<String, NonceBinding>) -> Vec<AgentBindingCensusEntry> {
+    let mut out: Vec<AgentBindingCensusEntry> = map
+        .values()
+        .filter_map(|b| match b.principal {
+            ProxyPrincipal::Agent { agent_id } => Some(AgentBindingCensusEntry {
+                agent_id,
+                workdir: b.workdir.clone(),
+                terminal_id: b.terminal_id.clone(),
+                minted_at_unix: minted_at_to_unix(b.minted_at),
+            }),
+            ProxyPrincipal::Device => None,
+        })
+        .collect();
+    // Total order over every field, so two censuses of the same live set are
+    // byte-identical. `agent_id` alone is not total: one agent can hold several
+    // bindings (a re-provision into a second worktree).
+    out.sort_by(|a, b| {
+        a.agent_id
+            .cmp(&b.agent_id)
+            .then_with(|| a.workdir.cmp(&b.workdir))
+            .then_with(|| a.terminal_id.cmp(&b.terminal_id))
+            .then_with(|| a.minted_at_unix.cmp(&b.minted_at_unix))
+    });
+    out
+}
+
+/// The last census this process emitted, so [`census_should_emit`] can suppress
+/// the unchanged ones. `None` until the first emission — which is why the first
+/// census of a process ALWAYS emits, even when it is empty.
+static LAST_AGENT_CENSUS: OnceLock<Mutex<Option<Vec<AgentBindingCensusEntry>>>> = OnceLock::new();
+
+fn last_agent_census_cell() -> &'static Mutex<Option<Vec<AgentBindingCensusEntry>>> {
+    LAST_AGENT_CENSUS.get_or_init(|| Mutex::new(None))
+}
+
+/// Emit-on-change gate, pure over an explicit `previous` slot so it is testable
+/// without the process-global.
+///
+/// **Why change-triggered and not every call.** The census hangs off
+/// [`persist_proxy_nonces`], which runs on the mint path — every terminal spawn,
+/// every re-provision, debounced only for the *store write*, not for this. A
+/// line per call would add thousands of identical rows to the same JSONL the
+/// device-side forensics live in, and drown the stream it is meant to sharpen.
+/// A line per CHANGE keeps the newest census an accurate statement of the live
+/// agent set at the moment that set last moved, which is exactly what the boot
+/// readback needs.
+///
+/// **The first call always emits, empty or not.** The expected steady state of
+/// this fleet is zero agent bindings, so "no line" would be the normal case —
+/// and then a census that silently stopped running would be indistinguishable
+/// from a healthy zero. That confusion is the failure class the whole plan is
+/// about (`verification-and-evidence` `silent-empty-is-unknown`), so a boot
+/// always states its zero out loud.
+fn census_should_emit(
+    previous: &mut Option<Vec<AgentBindingCensusEntry>>,
+    next: &[AgentBindingCensusEntry],
+) -> bool {
+    let changed = match previous.as_deref() {
+        None => true,
+        Some(prev) => prev != next,
+    };
+    if changed {
+        *previous = Some(next.to_vec());
+    }
+    changed
+}
+
+/// Render the census payload into the `extra` fields of a rotation line. Split
+/// out so the exact emitted JSON shape is assertable without the filesystem.
+fn agent_census_extra(
+    entries: &[AgentBindingCensusEntry],
+) -> Vec<(&'static str, serde_json::Value)> {
+    let bindings: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "agent_id": e.agent_id.to_string(),
+                "workdir": e.workdir,
+                // `null`, never `"unknown"`: an agent binding has no terminal BY
+                // CONSTRUCTION, which is a different fact from a terminal the
+                // runner failed to record. The `reject` line already draws that
+                // distinction and this must not blur it.
+                "terminal_id": e.terminal_id,
+                "minted_at_unix": e.minted_at_unix,
+            })
+        })
+        .collect();
+    vec![
+        ("agent_bindings", serde_json::Value::from(entries.len())),
+        ("bindings", serde_json::Value::Array(bindings)),
+    ]
+}
+
+/// Emit the `agent_binding_census` rotation event for `map`, if the agent set
+/// changed since the last emission (or this is the first of the process).
+///
+/// ## Why this census exists at all
+///
+/// [`device_nonce_snapshot`] filters `principal == ProxyPrincipal::Device`
+/// (OQ3), so every agent binding is discarded on the way to disk. That drop
+/// rests on one premise, stated verbatim beside [`AGENT_TOKENS`]: *"AGENT
+/// bindings are NEVER persisted (OQ3): a restarted runner has no live agent
+/// session, so a restored agent nonce MUST hard-fail closed."*
+///
+/// **Nobody re-tested that premise for a month.** Phase 1 of plan
+/// `2026-08-25-agent-class-sessions-reach-coord-like-operator-sessions` did,
+/// and it HOLDS: measured 2026-08-25, of 114 open lifecycle records exactly one
+/// predated the 2026-08-24T16:25Z rebuild (a stale `powershell.exe` row last
+/// seen 2026-08-19); no open record lived in a workdir that had ever taken an
+/// `agent mint`; and the 2592 recorded agent mints span 2592 DISTINCT workdirs
+/// — 1.00x, no agent workdir is ever revisited, because every spawn gets a
+/// fresh `qontinui-worktrees/<uuid>/<repo>`. Agent sessions are per-task
+/// ephemeral: they do not outlive their own task, let alone a restart. Phases
+/// 2-6 of that plan (a coord re-mint route, persisted agent bindings, bearer
+/// recovery at boot) were closed on that result and deliberately NOT built.
+///
+/// So this is not recovery machinery. It is the standing detector that makes
+/// the premise self-monitoring, because the defect was never a wrong premise —
+/// it was an unwatched one. If agent sessions ever start outliving the runner,
+/// the pair of events this module emits is what says so: a non-empty
+/// `agent_binding_census`, followed at the next boot by an
+/// `agent_binding_liveness` line whose `alive` count is non-zero.
+///
+/// Best-effort and infallible like every other rotation emission, and it must
+/// be called WITHOUT the nonce-registry lock held — [`log_rotation_event_with`]
+/// does file I/O.
+fn note_agent_binding_census(map: &HashMap<String, NonceBinding>) {
+    let entries = agent_binding_census(map);
+    let emit = match last_agent_census_cell().lock() {
+        Ok(mut prev) => census_should_emit(&mut prev, &entries),
+        // A poisoned gate must not silence the census — emitting a duplicate
+        // line is strictly better than losing the class this code exists to
+        // watch.
+        Err(_) => true,
+    };
+    if !emit {
+        return;
+    }
+    log_rotation_event_with(
+        "agent_binding_census",
+        ROTATION_UNKNOWN,
+        ROTATION_UNKNOWN,
+        "live AGENT-class nonce bindings discarded by device_nonce_snapshot (never persisted, OQ3)",
+        &agent_census_extra(&entries),
+    );
+}
+
+// --- boot side: is any of what the last census held still running? ----------
+
+/// How much of the tail of the rotation JSONL the boot readback reads. The
+/// stream is append-only and unbounded (9k lines on the operator's box at the
+/// time of writing, and it only grows), so the readback bounds its own cost
+/// instead of loading whatever has accumulated. 2 MiB is ~8k lines at the
+/// observed line size — far more than the one census line it is looking for,
+/// which is emitted on change and therefore lands near the end.
+const ROTATION_LOG_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The last `agent_binding_census` line, decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LastAgentCensus {
+    /// The line's own `ts`, verbatim, for the emitted forensics.
+    ts: String,
+    /// `ts` as epoch seconds. `None` when it did not parse — which downgrades
+    /// every verdict to UNKNOWN rather than guessing, because that timestamp is
+    /// the PID-reuse guard.
+    ts_unix: Option<i64>,
+    /// The runner that wrote it.
+    runner_id: String,
+    /// The pid that died — the root of the survivor probe.
+    pid: u32,
+    entries: Vec<AgentBindingCensusEntry>,
+    /// The count the LINE ITSELF declared (`agent_bindings`), independent of how
+    /// many rows decoded. `None` only for a line written without the field.
+    ///
+    /// This is the integrity check on the decode. Without it, a row whose
+    /// `agent_id` fails to parse is dropped by `filter_map` and a boot that
+    /// stranded three bindings reports a healthy zero — byte-identical to the
+    /// fleet's normal steady state, which is exactly the confusion this whole
+    /// module exists to prevent.
+    declared_bindings: Option<u64>,
+    /// Whether `bindings` was present AND an array. A missing or non-array key
+    /// deserializes to an empty Vec through `unwrap_or_default`, which is the
+    /// same silent zero by a different route — so the presence of the key is
+    /// recorded rather than inferred from the row count.
+    rows_present: bool,
+}
+
+impl LastAgentCensus {
+    /// How many bindings the census SAYS it held: its own declared count, or
+    /// the decoded row count when the line carried no count to check against.
+    fn declared_len(&self) -> usize {
+        self.declared_bindings
+            .map(|n| n as usize)
+            .unwrap_or(self.entries.len())
+    }
+
+    /// True when the rows can be trusted to represent the census: the
+    /// `bindings` array was present, and every row it declared decoded.
+    ///
+    /// False is UNKNOWN, never zero — see [`classify_agent_binding_liveness`],
+    /// which refuses to classify rather than reporting the rows that happened
+    /// to survive a decode.
+    fn rows_decodable(&self) -> bool {
+        self.rows_present && self.declared_len() == self.entries.len()
+    }
+}
+
+/// Find the most recent `agent_binding_census` line in a slice of the rotation
+/// JSONL. Pure over the text, so the boot verdict is testable against a literal
+/// log fixture.
+///
+/// Scans backwards and stops at the first hit: censuses supersede one another,
+/// and an older one describes a set that has already moved.
+///
+/// `exclude_pid` drops censuses THIS process wrote. The boot task runs a few
+/// seconds in, by which time a restored terminal may already have minted and
+/// emitted a census of its own — and reading that one would make the readback
+/// compare the live runner against itself, root the survivor probe at a pid
+/// that is obviously alive, and report a meaningless `unknown` for everything.
+/// The predecessor's census is the only one that can answer the question.
+fn parse_last_agent_binding_census(tail: &str, exclude_pid: u32) -> Option<LastAgentCensus> {
+    for line in tail.lines().rev() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue; // a torn or foreign line is skipped, never fatal
+        };
+        if v["event"] != "agent_binding_census" {
+            continue;
+        }
+        if v["pid"].as_u64() == Some(u64::from(exclude_pid)) {
+            continue; // our own line, not the predecessor's
+        }
+        let ts = v["ts"].as_str().unwrap_or_default().to_string();
+        let ts_unix = chrono::DateTime::parse_from_rfc3339(&ts)
+            .ok()
+            .map(|t| t.timestamp());
+        // Both halves of the decode are recorded, not just its output: whether
+        // the `bindings` key was an array at all, and how many rows the line
+        // said it held. A dropped row and an absent key would otherwise both
+        // read as a census of zero.
+        let rows = v["bindings"].as_array();
+        let rows_present = rows.is_some();
+        let entries = rows
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| {
+                        Some(AgentBindingCensusEntry {
+                            agent_id: Uuid::parse_str(r["agent_id"].as_str()?).ok()?,
+                            workdir: r["workdir"].as_str().unwrap_or_default().to_string(),
+                            terminal_id: r["terminal_id"].as_str().map(str::to_owned),
+                            minted_at_unix: r["minted_at_unix"].as_u64().unwrap_or(0),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Some(LastAgentCensus {
+            ts,
+            ts_unix,
+            runner_id: v["runner_id"]
+                .as_str()
+                .unwrap_or(ROTATION_UNKNOWN)
+                .to_string(),
+            pid: v["pid"].as_u64().unwrap_or(0) as u32,
+            entries,
+            declared_bindings: v["agent_bindings"].as_u64(),
+            rows_present,
+        });
+    }
+    None
+}
+
+/// What the boot readback concluded about the agent bindings the last census
+/// held. `unknown` is a first-class bucket, not a rounding of `dead`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentLivenessTally {
+    agent_bindings: usize,
+    alive: usize,
+    dead: usize,
+    unknown: usize,
+    /// Live claude-image processes still hanging off the PREVIOUS runner's pid
+    /// that were created no later than the census. **This is the (i)-vs-(ii)
+    /// discriminator**: zero survivors means the previous runner's whole claude
+    /// subtree died with it; a non-zero count means something outlived it.
+    survivors: usize,
+    /// Which oracle produced the verdicts — so a reader never has to infer it.
+    signal: &'static str,
+}
+
+impl AgentLivenessTally {
+    /// Every binding UNKNOWN, because the oracle could not run. Never `dead`:
+    /// an unavailable signal is UNKNOWN, not zero
+    /// (`verification-and-evidence` `silent-empty-is-unknown`).
+    fn all_unknown(n: usize, signal: &'static str) -> Self {
+        Self {
+            agent_bindings: n,
+            alive: 0,
+            dead: 0,
+            unknown: n,
+            survivors: 0,
+            signal,
+        }
+    }
+}
+
+/// Classify each agent binding the last census held against the live process
+/// table. Pure over its inputs — a synthetic [`ProcessSnapshot`] exercises every
+/// arm without a real process, the same testability posture as
+/// [`crate::session::tracking_health::evaluate`], whose primitives this REUSES
+/// rather than reimplementing.
+///
+/// ## The two probes, and what each can actually prove
+///
+/// 1. **Survivor probe (class-level, a true OS signal).**
+///    `claude_pids_in_inclusive_subtree(census.pid, …)` rooted at the PREVIOUS
+///    runner's pid. On Windows an orphan keeps its now-dangling
+///    `ParentProcessId`, so a claude child that outlived the runner is still
+///    reachable from that root. Survivors are filtered to processes created no
+///    later than the census, which doubles as the PID-reuse guard: a recycled
+///    pid's children are all newer than the census and drop out. This answers
+///    *did ANYTHING of the previous runner's claude subtree survive its death* —
+///    precisely the question that separates "agent sessions die with the runner"
+///    from "they survive and go quiet after the first 401".
+/// 2. **Terminal join (per-binding attribution).** `terminal_id` → this boot's
+///    live PTY pid → `claude_present_in_inclusive_subtree`, with the runner's
+///    OWN boot time as the reuse reference (never a per-record timestamp — see
+///    that function's doc comment for the regression that rule came from). This
+///    is the only key that can pin a surviving process to a SPECIFIC binding.
+///
+/// **The terminal join is vacuous today, and the census shows why.**
+/// [`register_agent_proxy_nonce`] binds `terminal_id: None` unconditionally, so
+/// every production census row carries `null` there and no agent binding can be
+/// individually attributed. That is not papered over: a binding that cannot be
+/// attributed WHILE survivors exist lands in `unknown`, not in `dead`. `dead` is
+/// asserted only when the survivor probe found NOTHING — the one case where the
+/// evidence genuinely covers every binding at once.
+fn classify_agent_binding_liveness(
+    census: &LastAgentCensus,
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+    terminal_pids: &HashMap<String, u32>,
+    boot_unix_millis: i64,
+) -> AgentLivenessTally {
+    use crate::process_capture::process_tree::{
+        claude_pids_in_inclusive_subtree, claude_present_in_inclusive_subtree,
+    };
+
+    let n = census.entries.len();
+    // An empty parent map means "could not read the process table", not "no
+    // processes" — the same posture as the tracking-health tick and
+    // `live_pids_from_snapshot`, both of which refuse to answer rather than
+    // answer zero.
+    if snapshot.parent_map.is_empty() {
+        return AgentLivenessTally::all_unknown(n, "process_table_unavailable");
+    }
+    // The rows must account for the count the line declared. A partially
+    // decoded census would otherwise be classified as if the rows that
+    // survived were the whole set, and a fully undecodable one as a zero.
+    if !census.rows_decodable() {
+        return AgentLivenessTally::all_unknown(census.declared_len(), "census_rows_undecodable");
+    }
+    let Some(census_unix) = census.ts_unix else {
+        return AgentLivenessTally::all_unknown(n, "census_timestamp_unparseable");
+    };
+    if census.pid == 0 {
+        return AgentLivenessTally::all_unknown(n, "census_pid_absent");
+    }
+    // The census's own pid must be GONE for its subtree to mean "what outlived
+    // the restart". Presence in the process table splits two ways, and neither
+    // may be classified:
+    if let Some(&created) = snapshot.creation_times.get(&census.pid) {
+        if created > 0 && created > census_unix {
+            // Created after the line it supposedly wrote — a recycled pid whose
+            // subtree belongs to a stranger.
+            return AgentLivenessTally::all_unknown(n, "prev_runner_pid_recycled");
+        }
+        // Live and predating its own census: this IS the writer, still running.
+        // Two runner processes can share one log dir (an overlapping shutdown,
+        // or a second launch of the same instance), and classifying then would
+        // report a live peer's every binding as `dead`.
+        //
+        // No image comparison is needed to reach that conclusion, and refusing
+        // without one is strictly safer: a pid can only be recycled after the
+        // death that freed it, so a live pid whose creation predates its own
+        // census line is the writer by construction. The one residual case —
+        // a reuse landing inside the same one-second WMI granularity as the
+        // census ts — is also refused here, which is the correct answer for it
+        // too.
+        return AgentLivenessTally::all_unknown(n, "prev_runner_still_alive");
+    }
+
+    // A survivor is a claude process that existed BEFORE THIS BOOT. The
+    // reference is the boot instant, NOT the census ts: the census is written
+    // at nonce-mint time (`agent_runtime.rs:3900`) and the claude child is
+    // spawned afterwards (`:3978`, behind an HTTP probe at `:3905` and, on the
+    // respawn arm, minutes or hours of prior run). Creation times are
+    // second-granular, so keying on the census ts excluded every real survivor
+    // — `survivors` was always empty, every binding fell to `dead`, and the
+    // detector could never fire for the live session it was built to catch.
+    // The same `PID_REUSE_SKEW_MS` slack `claude_present_in_inclusive_subtree`
+    // uses covers the seconds-vs-millis rounding.
+    let boot_cutoff_unix = boot_unix_millis
+        .saturating_add(crate::process_capture::process_tree::PID_REUSE_SKEW_MS)
+        / 1000;
+    let survivors: Vec<u32> = claude_pids_in_inclusive_subtree(census.pid, snapshot)
+        .into_iter()
+        // An unresolvable creation time (`0` — a WMI / `/proc` miss) passes on
+        // purpose: counting it as a survivor pushes bindings toward `unknown`
+        // instead of toward `dead`, which is the conservative direction.
+        .filter(|p| snapshot.creation_times.get(p).copied().unwrap_or(0) <= boot_cutoff_unix)
+        .collect();
+
+    let mut tally = AgentLivenessTally {
+        agent_bindings: n,
+        alive: 0,
+        dead: 0,
+        unknown: 0,
+        survivors: survivors.len(),
+        signal: "prev_runner_subtree+terminal_join",
+    };
+    for e in &census.entries {
+        let attributed = e
+            .terminal_id
+            .as_deref()
+            .and_then(|t| terminal_pids.get(t))
+            .map(|&pid| claude_present_in_inclusive_subtree(pid, snapshot, boot_unix_millis))
+            .unwrap_or(false);
+        if attributed {
+            tally.alive += 1;
+        } else if survivors.is_empty() {
+            // Nothing whatsoever outlived the previous runner, so this binding's
+            // session did not either. This is the arm that confirms OQ3.
+            tally.dead += 1;
+        } else {
+            // Something outlived the runner, but nothing ties it to THIS binding
+            // (there is no terminal to join on). Honest verdict: unknown.
+            tally.unknown += 1;
+        }
+    }
+    tally
+}
+
+/// Outcome of the boot tail read. Three cases that a bare `Option<String>`
+/// collapsed into one silent `return`:
+///
+/// - [`RotationTail::EmissionOff`] — no log dir resolves, i.e. the test
+///   default. Nothing to say and nowhere to say it.
+/// - [`RotationTail::Text`] — readable, INCLUDING an absent file, which is a
+///   genuine "nothing to read" (a first boot on a fresh install). It flows into
+///   the no-census branch, which announces `census_found: false`.
+/// - [`RotationTail::Unreadable`] — the file exists but could not be read
+///   (permissions, a locked handle, a bad seek). The runner CAN still write, so
+///   staying silent here produces a log holding a census and no liveness line —
+///   indistinguishable from a pre-instrumentation build, and more alarming than
+///   the case that does speak up.
+enum RotationTail {
+    Text(String),
+    EmissionOff,
+    Unreadable(String),
+}
+
+/// Read the last [`ROTATION_LOG_TAIL_BYTES`] of the rotation JSONL.
+fn read_rotation_log_tail() -> RotationTail {
+    let Some(dir) = rotation_log_dir() else {
+        return RotationTail::EmissionOff;
+    };
+    read_rotation_log_tail_at(&dir.join(ROTATION_LOG_FILE))
+}
+
+/// [`read_rotation_log_tail`] against an explicit path, so the absent-file and
+/// unreadable arms are testable without touching the real dev-logs dir.
+fn read_rotation_log_tail_at(path: &Path) -> RotationTail {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        // No file yet is not a failure: it is an empty log, and the caller's
+        // no-census branch says so out loud.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return RotationTail::Text(String::new())
+        }
+        Err(e) => return RotationTail::Unreadable(format!("open failed: {e}")),
+    };
+    let len = match f.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => return RotationTail::Unreadable(format!("metadata failed: {e}")),
+    };
+    let from = len.saturating_sub(ROTATION_LOG_TAIL_BYTES);
+    if let Err(e) = f.seek(SeekFrom::Start(from)) {
+        return RotationTail::Unreadable(format!("seek failed: {e}"));
+    }
+    let mut buf = Vec::new();
+    if let Err(e) = f.read_to_end(&mut buf) {
+        return RotationTail::Unreadable(format!("read failed: {e}"));
+    }
+    let raw = String::from_utf8_lossy(&buf).into_owned();
+    RotationTail::Text(drop_partial_first_line(&raw, from > 0).to_string())
+}
+
+/// Drop the first line of a mid-file tail read — it is almost certainly a
+/// fragment of a longer line, and a fragment of JSON parses as nothing. A read
+/// that started at byte 0 is whole and is returned untouched.
+fn drop_partial_first_line(raw: &str, truncated: bool) -> &str {
+    if !truncated {
+        return raw;
+    }
+    match raw.find('\n') {
+        Some(i) => &raw[i + 1..],
+        // No newline at all: the entire tail is one fragment.
+        None => "",
+    }
+}
+
+/// Boot half of Phase 1: read back the last agent-binding census and say, for
+/// the bindings it held, whether their sessions are still running.
+///
+/// Emits exactly one `agent_binding_liveness` rotation line. That line always
+/// distinguishes the three states a naive implementation collapses into one:
+///
+/// - **no census at all** — `census_found: false`, counts `null`. UNKNOWN (the
+///   previous runner predates this instrumentation, or the line aged out of the
+///   tail), and it must never read as a healthy zero.
+/// - **a census of zero** — `census_found: true`, `agent_bindings: 0`. The
+///   expected steady state on this fleet, stated explicitly.
+/// - **a census with bindings** — `alive` / `dead` / `unknown` over them, plus
+///   `survivors`, the class-level discriminator.
+///
+/// `runner_id` + `pid` on the line are THIS boot's (every rotation line carries
+/// them); `prev_runner_id` + `prev_pid` name the process that died. That pair is
+/// the restart boundary the whole measurement hangs on.
+pub(crate) async fn log_agent_binding_liveness_at_boot(
+    terminal_pids: HashMap<String, u32>,
+    boot_unix_millis: i64,
+) {
+    let tail = match read_rotation_log_tail() {
+        RotationTail::Text(t) => t,
+        // Nowhere to write either — the only arm that may stay silent.
+        RotationTail::EmissionOff => return,
+        RotationTail::Unreadable(why) => {
+            log_rotation_event_with(
+                "agent_binding_liveness",
+                ROTATION_UNKNOWN,
+                ROTATION_UNKNOWN,
+                &format!(
+                    "rotation log present but unreadable ({why}) — the census could not be read \
+                     back. UNKNOWN: this is NOT 'no census', and a silent skip here would look \
+                     exactly like a pre-instrumentation build."
+                ),
+                &[
+                    ("census_found", serde_json::Value::Null),
+                    ("agent_bindings", serde_json::Value::Null),
+                    ("alive", serde_json::Value::Null),
+                    ("dead", serde_json::Value::Null),
+                    ("unknown", serde_json::Value::Null),
+                    ("signal", serde_json::Value::from("rotation_log_unreadable")),
+                ],
+            );
+            return;
+        }
+    };
+    let Some(census) = parse_last_agent_binding_census(&tail, std::process::id()) else {
+        log_rotation_event_with(
+            "agent_binding_liveness",
+            ROTATION_UNKNOWN,
+            ROTATION_UNKNOWN,
+            "no agent_binding_census line in the rotation log tail — the previous runner \
+             predates this instrumentation, or the line aged out. UNKNOWN, not zero.",
+            &[
+                ("census_found", serde_json::Value::Bool(false)),
+                ("agent_bindings", serde_json::Value::Null),
+                ("alive", serde_json::Value::Null),
+                ("dead", serde_json::Value::Null),
+                ("unknown", serde_json::Value::Null),
+            ],
+        );
+        return;
+    };
+
+    // Only pay for a process-table snapshot when a census exists AND held
+    // something. A zero census needs no oracle — there is nothing to classify,
+    // and the snapshot is a PowerShell / `/proc` sweep.
+    //
+    // `rows_decodable()` gates the shortcut: an undecodable census also decodes
+    // to zero rows, and taking this arm for it would emit the healthy-zero line
+    // for a boot whose bindings could not be read at all.
+    let tally = if census.rows_decodable() && census.entries.is_empty() {
+        AgentLivenessTally {
+            agent_bindings: 0,
+            alive: 0,
+            dead: 0,
+            unknown: 0,
+            survivors: 0,
+            signal: "not_probed (census held zero agent bindings)",
+        }
+    } else if !census.rows_decodable() {
+        // Refused without a snapshot: the rows are untrustworthy, so no probe
+        // over them could mean anything.
+        AgentLivenessTally::all_unknown(census.declared_len(), "census_rows_undecodable")
+    } else {
+        let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
+        classify_agent_binding_liveness(&census, &snapshot, &terminal_pids, boot_unix_millis)
+    };
+
+    log_rotation_event_with(
+        "agent_binding_liveness",
+        ROTATION_UNKNOWN,
+        ROTATION_UNKNOWN,
+        "boot readback of the last agent-binding census against the live process table",
+        &[
+            ("census_found", serde_json::Value::Bool(true)),
+            ("census_ts", serde_json::Value::from(census.ts.clone())),
+            (
+                "prev_runner_id",
+                serde_json::Value::from(census.runner_id.clone()),
+            ),
+            ("prev_pid", serde_json::Value::from(census.pid)),
+            (
+                "agent_bindings",
+                serde_json::Value::from(tally.agent_bindings),
+            ),
+            ("alive", serde_json::Value::from(tally.alive)),
+            ("dead", serde_json::Value::from(tally.dead)),
+            ("unknown", serde_json::Value::from(tally.unknown)),
+            ("survivors", serde_json::Value::from(tally.survivors)),
+            ("signal", serde_json::Value::from(tally.signal)),
+        ],
+    );
+}
+
+/// State the live agent-binding set ONCE at boot, whatever it is.
+///
+/// Without this the census would only ever be emitted off a mint or an agent
+/// teardown ([`persist_proxy_nonces`] / [`revoke_agent_proxy_nonces`]) — so a
+/// runner that boots and sits idle would emit no census at all, and "the census
+/// never ran" would be the steady state on exactly the fleet whose steady state
+/// is ZERO agent bindings. Those two must never look alike
+/// (`verification-and-evidence` `silent-empty-is-unknown`), and the emit-on-
+/// change gate's first-call rule ([`census_should_emit`]) only helps if
+/// something calls it. This is that something: one guaranteed line per boot.
+///
+/// **Call it AFTER [`log_agent_binding_liveness_at_boot`].** The readback wants
+/// the PREDECESSOR's census; writing ours first would only add a line it has to
+/// skip (it filters on pid, so ordering is a clarity guarantee rather than a
+/// correctness one).
+pub(crate) fn log_agent_binding_census_at_boot() {
+    // Clone under the lock, emit outside it — file I/O must never run with the
+    // registry held. Once per boot, so the clone is not on any hot path.
+    let snapshot = {
+        let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        map.clone()
+    };
+    note_agent_binding_census(&snapshot);
+}
+
 /// True unless `COORD_MCP_PERSIST_NONCES` is explicitly set to `0` — persistence
 /// is ON by default (resolved in the plan: the nonce is a loopback-only key, so
 /// persisting it at rest is acceptable and is the only thing that keeps an
@@ -1318,6 +2004,15 @@ fn nonce_persistence_enabled() -> bool {
 /// encrypted store NOR the process-global env (which would race sibling tests
 /// that read the default store, e.g. `auth::device_jwt_tests`).
 fn persist_proxy_nonces(map: &HashMap<String, NonceBinding>) {
+    // Census the bindings the snapshot is about to DISCARD, BEFORE the
+    // persistence gate. The census is forensics, not persistence: turning
+    // `COORD_MCP_PERSIST_NONCES=0` off should not blind the detector that
+    // watches OQ3's premise (see [`note_agent_binding_census`]). Emitted from
+    // here rather than from inside [`device_nonce_snapshot`] so that function
+    // stays pure — this is the production chokepoint every mint already flows
+    // through, and every caller passes an OWNED snapshot, so no registry lock
+    // is held across the file I/O.
+    note_agent_binding_census(map);
     if !nonce_persistence_enabled() {
         return;
     }
@@ -2342,7 +3037,7 @@ pub(crate) fn revoke_proxy_nonce(nonce: &str) {
 pub(crate) fn revoke_agent_proxy_nonces(agent_id: Uuid) {
     // Collect (nonce, workdir) under the lock; emit the forensics lines after
     // releasing it (`log_rotation_event` does file I/O).
-    let revoked: Vec<(String, String)> = {
+    let (revoked, remaining): (Vec<(String, String)>, HashMap<String, NonceBinding>) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         let mut revoked = Vec::new();
         map.retain(|n, b| {
@@ -2352,8 +3047,15 @@ pub(crate) fn revoke_agent_proxy_nonces(agent_id: Uuid) {
             }
             true
         });
-        revoked
+        // Clone the surviving map for the census. Teardown does NOT go through
+        // `persist_proxy_nonces` (agent nonces are never persisted), so without
+        // this the newest census would keep naming bindings that are already
+        // gone — and the boot readback would then classify torn-down sessions.
+        // Same clone-a-snapshot idiom as `mint_and_register_nonce`, on a path
+        // that fires once per agent teardown.
+        (revoked, map.clone())
     };
+    note_agent_binding_census(&remaining);
     for (nonce, workdir) in &revoked {
         log_rotation_event(
             "revoke",
@@ -8643,5 +9345,553 @@ mod phase2_proxy_header_shape_tests {
             .expect_err("an absent nonce must be rejected");
         assert_eq!(status, 401);
         assert_eq!(gate_msg, msg);
+    }
+}
+
+#[cfg(test)]
+mod agent_binding_census_tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Agent-binding census + boot liveness readback (plan
+    // `2026-08-25-agent-class-sessions-reach-coord-like-operator-sessions`
+    // Phase 1). These pin the ONE property the phase exists for: that the two
+    // readings left open by the vet — "agent sessions die with the runner" vs
+    // "they survive and go quiet" — land in DIFFERENT buckets, and that an
+    // absent signal lands in neither.
+    // -----------------------------------------------------------------------
+
+    fn census_test_binding(
+        principal: ProxyPrincipal,
+        workdir: &str,
+        terminal_id: Option<&str>,
+    ) -> NonceBinding {
+        NonceBinding {
+            workdir: workdir.to_string(),
+            principal,
+            lifetime: NonceLifetime::Persistent,
+            session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+            terminal_id: terminal_id.map(str::to_owned),
+            minted_at: std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000),
+        }
+    }
+
+    /// The census selects EXACTLY what `device_nonce_snapshot` discards — the
+    /// agent bindings — and nothing else. This is the selection half of Phase 1:
+    /// a census that also caught device bindings would report a population that
+    /// is not the one OQ3 is about.
+    #[test]
+    fn census_selects_exactly_the_bindings_device_snapshot_discards() {
+        let agent_a = uuid::Uuid::parse_str("00000000-0000-7000-8000-00000000000a").unwrap();
+        let agent_b = uuid::Uuid::parse_str("00000000-0000-7000-8000-00000000000b").unwrap();
+        let mut map = HashMap::new();
+        map.insert(
+            "n-device".to_string(),
+            census_test_binding(ProxyPrincipal::Device, "D:/wt/device", Some("term-1")),
+        );
+        map.insert(
+            "n-agent-b".to_string(),
+            census_test_binding(ProxyPrincipal::Agent { agent_id: agent_b }, "D:/wt/b", None),
+        );
+        map.insert(
+            "n-agent-a".to_string(),
+            census_test_binding(ProxyPrincipal::Agent { agent_id: agent_a }, "D:/wt/a", None),
+        );
+
+        let census = agent_binding_census(&map);
+        assert_eq!(census.len(), 2, "device bindings are not agent bindings");
+        assert_eq!(
+            census.iter().map(|e| e.agent_id).collect::<Vec<_>>(),
+            vec![agent_a, agent_b],
+            "the census is deterministically ordered — the emit-on-change gate \
+             compares consecutive censuses and a shuffled order would emit on \
+             every mint"
+        );
+        assert_eq!(census[0].workdir, "D:/wt/a");
+        assert_eq!(
+            census[0].terminal_id, None,
+            "an agent binding has no terminal BY CONSTRUCTION — the census must \
+             carry that as absence, not fabricate one"
+        );
+        assert_eq!(census[0].minted_at_unix, 1_700_000_000);
+
+        // The complement is the persisted set: the two projections must not
+        // overlap, or the census would be counting something that DOES reach
+        // disk.
+        let persisted = device_nonce_snapshot(&map);
+        assert_eq!(persisted.len(), 1);
+        assert!(persisted.contains_key("n-device"));
+    }
+
+    /// The gate: FIRST census of a process always emits — empty or not — then
+    /// only on change. A silently absent census line is indistinguishable from
+    /// a healthy zero, and this fleet's expected steady state IS zero, so the
+    /// zero has to be stated out loud at every boot
+    /// (`verification-and-evidence` `silent-empty-is-unknown`).
+    #[test]
+    fn first_census_emits_even_when_empty_then_only_on_change() {
+        let mut prev: Option<Vec<AgentBindingCensusEntry>> = None;
+        assert!(
+            census_should_emit(&mut prev, &[]),
+            "a boot must state its zero, not stay silent"
+        );
+        assert!(
+            !census_should_emit(&mut prev, &[]),
+            "an unchanged census does not re-emit — this hangs off the mint path"
+        );
+
+        let entry = AgentBindingCensusEntry {
+            agent_id: uuid::Uuid::now_v7(),
+            workdir: "D:/wt/x".to_string(),
+            terminal_id: None,
+            minted_at_unix: 42,
+        };
+        assert!(census_should_emit(&mut prev, std::slice::from_ref(&entry)));
+        assert!(!census_should_emit(&mut prev, std::slice::from_ref(&entry)));
+        assert!(
+            census_should_emit(&mut prev, &[]),
+            "dropping back to zero is a change, and is the line that says a \
+             population went away rather than the log going quiet"
+        );
+    }
+
+    /// The emitted JSON shape, end to end through the real rotation writer: an
+    /// agent mint must leave a census line naming that agent, its workdir, its
+    /// (absent) terminal and its mint time.
+    #[test]
+    fn agent_mint_emits_a_census_line_with_the_binding_fields() {
+        let dir = rotation_log_test_dir();
+        let agent_id = uuid::Uuid::now_v7();
+        let wd = format!("D:/census-wt-{}", uuid::Uuid::now_v7());
+        let _nonce = register_agent_proxy_nonce(&wd, agent_id);
+
+        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
+        let row = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["event"] == "agent_binding_census")
+            .filter_map(|v| {
+                v["bindings"]
+                    .as_array()?
+                    .iter()
+                    .find(|b| b["agent_id"] == agent_id.to_string().as_str())
+                    .cloned()
+            })
+            .next()
+            .expect("a census line naming the agent just minted for");
+
+        assert_eq!(row["workdir"], wd.as_str());
+        assert_eq!(
+            row["terminal_id"],
+            serde_json::Value::Null,
+            "null, never the string \"unknown\" — an agent binding HAS no \
+             terminal, which is a different fact from one the runner failed to \
+             record"
+        );
+        assert!(row["minted_at_unix"].as_u64().unwrap_or(0) > 0);
+
+        // The line is aggregate: no key material, and the count is present.
+        let line = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["event"] == "agent_binding_census")
+            .find(|v| {
+                v["bindings"].as_array().is_some_and(|b| {
+                    b.iter()
+                        .any(|r| r["agent_id"] == agent_id.to_string().as_str())
+                })
+            })
+            .unwrap();
+        assert_eq!(line["workdir"], ROTATION_UNKNOWN, "aggregate line");
+        assert_eq!(
+            line["key_prefix"],
+            rotation_key_prefix(ROTATION_UNKNOWN).as_str()
+        );
+        assert!(line["agent_bindings"].as_u64().unwrap_or(0) >= 1);
+        assert!(
+            !raw.contains(&_nonce),
+            "a census line never carries a nonce"
+        );
+    }
+
+    /// A mid-file tail read starts inside a line; that fragment is dropped, not
+    /// fed to the parser as if it were a record.
+    #[test]
+    fn tail_read_drops_the_partial_first_line() {
+        assert_eq!(
+            drop_partial_first_line("{\"a\":1}\n{\"b\":2}\n", false),
+            "{\"a\":1}\n{\"b\":2}\n"
+        );
+        assert_eq!(
+            drop_partial_first_line("a\":1}\n{\"b\":2}\n", true),
+            "{\"b\":2}\n"
+        );
+        assert_eq!(drop_partial_first_line("no newline at all", true), "");
+    }
+
+    fn census_fixture_line(ts: &str, pid: u32, bindings: &str) -> String {
+        format!(
+            "{{\"ts\":\"{ts}\",\"event\":\"agent_binding_census\",\"workdir\":\"unknown\",\
+             \"runner_id\":\"primary\",\"pid\":{pid},\"agent_bindings\":1,\"bindings\":[{bindings}]}}"
+        )
+    }
+
+    /// The readback takes the NEWEST census, tolerates torn/foreign lines, and
+    /// decodes the binding rows.
+    #[test]
+    fn readback_takes_the_newest_census_and_survives_torn_lines() {
+        let old = census_fixture_line(
+            "2026-08-20T10:00:00+00:00",
+            111,
+            "{\"agent_id\":\"00000000-0000-7000-8000-00000000000a\",\"workdir\":\"D:/old\",\"terminal_id\":null,\"minted_at_unix\":1}",
+        );
+        let new = census_fixture_line(
+            "2026-08-24T16:00:00+00:00",
+            222,
+            "{\"agent_id\":\"00000000-0000-7000-8000-00000000000b\",\"workdir\":\"D:/new\",\"terminal_id\":\"term-9\",\"minted_at_unix\":2}",
+        );
+        let tail = format!(
+            "{old}\n{{not json at all\n{{\"event\":\"mint\"}}\n{new}\n{{\"event\":\"reject\"}}\n"
+        );
+
+        let c = parse_last_agent_binding_census(&tail, 0).expect("a census in the tail");
+        assert_eq!(c.pid, 222, "the newest census wins");
+        assert_eq!(c.runner_id, "primary");
+        assert_eq!(c.ts_unix, Some(1_787_587_200), "2026-08-24T16:00:00Z");
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.entries[0].workdir, "D:/new");
+        assert_eq!(c.entries[0].terminal_id.as_deref(), Some("term-9"));
+
+        // Our OWN census is skipped: the boot task runs seconds in, so a
+        // restored terminal may already have written one, and reading it would
+        // root the survivor probe at a pid that is trivially alive.
+        let c = parse_last_agent_binding_census(&tail, 222).expect("the older census");
+        assert_eq!(
+            c.pid, 111,
+            "a census this process wrote is not the predecessor's"
+        );
+
+        assert!(
+            parse_last_agent_binding_census("{\"event\":\"mint\"}\n", 0).is_none(),
+            "no census line is None — the caller renders that as UNKNOWN, not zero"
+        );
+    }
+
+    /// Build a synthetic process table: `parent_map` edges plus per-pid image
+    /// names and creation times. Nothing here touches a real process.
+    fn census_snapshot(
+        edges: &[(u32, u32)],
+        claude_pids: &[u32],
+        created: &[(u32, i64)],
+    ) -> crate::process_capture::process_tree::ProcessSnapshot {
+        let mut snap = crate::process_capture::process_tree::ProcessSnapshot::default();
+        for (parent, child) in edges {
+            snap.parent_map.entry(*parent).or_default().push(*child);
+        }
+        for pid in claude_pids {
+            snap.names.insert(*pid, "claude.exe".to_string());
+        }
+        for (pid, t) in created {
+            snap.creation_times.insert(*pid, *t);
+        }
+        snap
+    }
+
+    fn census_with(
+        pid: u32,
+        ts_unix: i64,
+        entries: Vec<AgentBindingCensusEntry>,
+    ) -> LastAgentCensus {
+        LastAgentCensus {
+            ts: "2026-08-24T16:00:00+00:00".to_string(),
+            ts_unix: Some(ts_unix),
+            runner_id: "primary".to_string(),
+            pid,
+            declared_bindings: Some(entries.len() as u64),
+            rows_present: true,
+            entries,
+        }
+    }
+
+    fn census_entry(terminal_id: Option<&str>) -> AgentBindingCensusEntry {
+        AgentBindingCensusEntry {
+            agent_id: uuid::Uuid::now_v7(),
+            workdir: "D:/wt/agent".to_string(),
+            terminal_id: terminal_id.map(str::to_owned),
+            minted_at_unix: 1000,
+        }
+    }
+
+    /// **The (i)-vs-(ii) discriminator.** Reading (i) — the previous runner's
+    /// whole claude subtree died with it — is the ONLY thing that yields `dead`.
+    #[test]
+    fn nothing_survived_the_previous_runner_reads_as_dead() {
+        // pid 100 was the previous runner; its one child (200, non-claude) is
+        // all that is left, so no claude outlived it.
+        let snap = census_snapshot(&[(1, 100), (100, 200)], &[], &[(200, 500)]);
+        let census = census_with(100, 1000, vec![census_entry(None), census_entry(None)]);
+
+        let t = classify_agent_binding_liveness(&census, &snap, &HashMap::new(), 2_000_000);
+        assert_eq!(t.survivors, 0);
+        assert_eq!((t.alive, t.dead, t.unknown), (0, 2, 0));
+        assert_eq!(t.agent_bindings, 2);
+    }
+
+    /// Reading (ii) — a claude process outlived the runner — must NOT read as
+    /// `dead`. It cannot read as `alive` either while agent bindings carry no
+    /// terminal to join on, so it lands in `unknown`. That third bucket is the
+    /// whole point: collapsing it into `dead` would have re-created the
+    /// unwatched premise this instrumentation exists to watch.
+    #[test]
+    fn a_survivor_the_census_cannot_attribute_is_unknown_not_dead() {
+        let snap = census_snapshot(&[(1, 100), (100, 200)], &[200], &[(200, 500)]);
+        let census = census_with(100, 1000, vec![census_entry(None)]);
+
+        let t = classify_agent_binding_liveness(&census, &snap, &HashMap::new(), 2_000_000);
+        assert_eq!(t.survivors, 1, "a claude child outlived the dead runner");
+        assert_eq!((t.alive, t.dead, t.unknown), (0, 0, 1));
+    }
+
+    /// A binding that DOES carry a terminal, whose PTY hosts a live claude this
+    /// boot, is attributable — and is the only shape that yields `alive`.
+    #[test]
+    fn a_terminal_bearing_binding_hosting_a_live_claude_is_alive() {
+        // 300 is this boot's PTY child; 301 is a live claude under it.
+        let snap = census_snapshot(
+            &[(1, 100), (100, 200), (1, 300), (300, 301)],
+            &[200, 301],
+            &[(200, 500), (300, 1_500), (301, 1_600)],
+        );
+        let census = census_with(100, 1000, vec![census_entry(Some("term-live"))]);
+        let terminals = HashMap::from([("term-live".to_string(), 300u32)]);
+
+        let t = classify_agent_binding_liveness(&census, &snap, &terminals, 1_000_000);
+        assert_eq!((t.alive, t.dead, t.unknown), (1, 0, 0));
+        assert_eq!(t.signal, "prev_runner_subtree+terminal_join");
+    }
+
+    /// Every arm where the ORACLE could not run reports UNKNOWN for every
+    /// binding — never `dead`, and never a silent zero. An unreadable process
+    /// table, an unparseable census timestamp, a missing pid, and a RECYCLED
+    /// pid are four different ways to know nothing, and all four must refuse to
+    /// answer (`verification-and-evidence` `silent-empty-is-unknown`).
+    #[test]
+    fn an_unrunnable_oracle_is_unknown_never_dead() {
+        let entries = vec![census_entry(None), census_entry(None), census_entry(None)];
+
+        // 1 — empty process table: "could not see", not "nothing there".
+        let empty = crate::process_capture::process_tree::ProcessSnapshot::default();
+        let t = classify_agent_binding_liveness(
+            &census_with(100, 1000, entries.clone()),
+            &empty,
+            &HashMap::new(),
+            0,
+        );
+        assert_eq!((t.alive, t.dead, t.unknown), (0, 0, 3));
+        assert_eq!(t.signal, "process_table_unavailable");
+
+        let snap = census_snapshot(&[(1, 100)], &[], &[]);
+
+        // 2 — unparseable census timestamp: the PID-reuse guard is gone.
+        let mut bad_ts = census_with(100, 1000, entries.clone());
+        bad_ts.ts_unix = None;
+        let t = classify_agent_binding_liveness(&bad_ts, &snap, &HashMap::new(), 0);
+        assert_eq!(t.unknown, 3);
+        assert_eq!(t.signal, "census_timestamp_unparseable");
+
+        // 3 — no emitting pid on the census line: nothing to root the probe at.
+        let t = classify_agent_binding_liveness(
+            &census_with(0, 1000, entries.clone()),
+            &snap,
+            &HashMap::new(),
+            0,
+        );
+        assert_eq!(t.unknown, 3);
+        assert_eq!(t.signal, "census_pid_absent");
+
+        // 4 — the previous runner's pid now belongs to a process created AFTER
+        // the census: its subtree is a stranger's, and counting it would
+        // manufacture survivors.
+        let recycled = census_snapshot(
+            &[(1, 100), (100, 200)],
+            &[200],
+            &[(100, 5_000), (200, 5_100)],
+        );
+        let t = classify_agent_binding_liveness(
+            &census_with(100, 1000, entries),
+            &recycled,
+            &HashMap::new(),
+            0,
+        );
+        assert_eq!((t.alive, t.dead, t.unknown), (0, 0, 3));
+        assert_eq!(t.signal, "prev_runner_pid_recycled");
+    }
+
+    /// **F1 regression — the bug that made the detector unable to ever fire.**
+    ///
+    /// The census is written at nonce-MINT time (`agent_runtime.rs:3900`); the
+    /// claude child is spawned afterwards (`:3978`), behind an HTTP probe and,
+    /// on the respawn arm, a whole prior run. So a genuine survivor is created
+    /// AFTER the census, not before. Filtering survivors on the census ts
+    /// excluded every one of them: `survivors` was always empty, `terminal_id`
+    /// is always `None`, and so every binding fell to `dead` — the line read
+    /// `{"alive":0,"dead":1,"survivors":0}` for a session running right now.
+    ///
+    /// The reference is THIS BOOT. A process created after the census but
+    /// before the restart is exactly what "outlived the runner" means.
+    #[test]
+    fn a_survivor_created_after_the_census_is_still_a_survivor() {
+        // Census at t=1000. Claude child created at t=1500 (after the census,
+        // as production always does). Restart/boot at t=3000.
+        let snap = census_snapshot(&[(1, 100), (100, 200)], &[200], &[(200, 1_500)]);
+        let census = census_with(100, 1000, vec![census_entry(None)]);
+
+        let t = classify_agent_binding_liveness(&census, &snap, &HashMap::new(), 3_000_000);
+        assert_eq!(
+            t.survivors, 1,
+            "a claude spawned after its own census line is the NORMAL case — \
+             keying the filter on the census ts made every real survivor invisible"
+        );
+        assert_eq!(
+            (t.alive, t.dead, t.unknown),
+            (0, 0, 1),
+            "reading (ii) must never be reported as `dead`"
+        );
+    }
+
+    /// A process created after THIS BOOT did not outlive anything — it is one of
+    /// the new runner's own children and must not be counted as a survivor.
+    #[test]
+    fn a_process_created_after_this_boot_is_not_a_survivor() {
+        // Boot at t=3000; the claude at 4000 postdates it.
+        let snap = census_snapshot(&[(1, 100), (100, 200)], &[200], &[(200, 4_000)]);
+        let census = census_with(100, 1000, vec![census_entry(None)]);
+
+        let t = classify_agent_binding_liveness(&census, &snap, &HashMap::new(), 3_000_000);
+        assert_eq!(t.survivors, 0);
+        assert_eq!((t.alive, t.dead, t.unknown), (0, 1, 0));
+    }
+
+    /// **F3 — the census's runner must actually be gone.** Two runner processes
+    /// can share one instance's log dir (an overlapping shutdown, or a second
+    /// launch of the same instance). The peer's pid is LIVE and predates its own
+    /// census, so the recycle guard does not fire — and classifying would report
+    /// every one of a live peer's bindings as `dead`.
+    #[test]
+    fn a_live_census_writer_is_refused_not_classified() {
+        // pid 100 is in the process table, created at t=500, i.e. before the
+        // census it wrote at t=1000. It never died.
+        let snap = census_snapshot(&[(1, 100), (100, 200)], &[200], &[(100, 500), (200, 1_500)]);
+        let census = census_with(100, 1000, vec![census_entry(None), census_entry(None)]);
+
+        let t = classify_agent_binding_liveness(&census, &snap, &HashMap::new(), 3_000_000);
+        assert_eq!(
+            (t.alive, t.dead, t.unknown),
+            (0, 0, 2),
+            "a live peer's bindings are UNKNOWN — reporting them dead is the \
+             same false negative F1 produced, by a different route"
+        );
+        assert_eq!(t.signal, "prev_runner_still_alive");
+    }
+
+    /// **F2 — a census whose rows did not decode is UNKNOWN, never a zero.**
+    ///
+    /// The line carries its own authoritative `agent_bindings` count. When the
+    /// decoded rows disagree — one malformed `agent_id`, or a `bindings` key
+    /// that is missing or not an array — the readback must refuse. Otherwise a
+    /// schema change reports `agent_bindings: 0` for a boot that stranded
+    /// three, byte-identical to this fleet's healthy steady state.
+    #[test]
+    fn a_partially_decoded_census_is_unknown_not_a_healthy_zero() {
+        let snap = census_snapshot(&[(1, 100)], &[], &[]);
+
+        // Declared 3, only 1 row survived the decode.
+        let mut partial = census_with(100, 1000, vec![census_entry(None)]);
+        partial.declared_bindings = Some(3);
+        assert!(!partial.rows_decodable());
+        let t = classify_agent_binding_liveness(&partial, &snap, &HashMap::new(), 3_000_000);
+        assert_eq!(t.signal, "census_rows_undecodable");
+        assert_eq!(
+            (t.agent_bindings, t.alive, t.dead, t.unknown),
+            (3, 0, 0, 3),
+            "the DECLARED count is reported, not the count that happened to decode"
+        );
+
+        // `bindings` absent or not an array: also zero rows, also not a zero.
+        let mut no_rows = census_with(100, 1000, vec![]);
+        no_rows.rows_present = false;
+        assert!(!no_rows.rows_decodable());
+        let t = classify_agent_binding_liveness(&no_rows, &snap, &HashMap::new(), 3_000_000);
+        assert_eq!(t.signal, "census_rows_undecodable");
+
+        // And the honest zero still reads as a zero.
+        let empty = census_with(100, 1000, vec![]);
+        assert!(empty.rows_decodable());
+    }
+
+    /// The parser carries BOTH halves of the decode — the count the line
+    /// declared and whether `bindings` was an array — so the integrity check
+    /// above has something to check against.
+    #[test]
+    fn the_parser_records_the_declared_count_and_row_presence() {
+        let good = "{\"ts\":\"2026-08-24T16:00:00+00:00\",\"event\":\"agent_binding_census\",\
+                    \"runner_id\":\"primary\",\"pid\":222,\"agent_bindings\":2,\"bindings\":[\
+                    {\"agent_id\":\"00000000-0000-7000-8000-00000000000a\",\"workdir\":\"D:/a\",\
+                    \"terminal_id\":null,\"minted_at_unix\":1},\
+                    {\"agent_id\":\"not-a-uuid\",\"workdir\":\"D:/b\",\
+                    \"terminal_id\":null,\"minted_at_unix\":2}]}";
+        let c = parse_last_agent_binding_census(good, 0).expect("a census");
+        assert_eq!(c.declared_bindings, Some(2));
+        assert!(c.rows_present);
+        assert_eq!(c.entries.len(), 1, "the malformed uuid row does not decode");
+        assert_eq!(c.declared_len(), 2);
+        assert!(
+            !c.rows_decodable(),
+            "one undecodable row poisons the whole census rather than shrinking it"
+        );
+
+        let no_bindings_key = "{\"ts\":\"2026-08-24T16:00:00+00:00\",\
+                               \"event\":\"agent_binding_census\",\"pid\":222}";
+        let c = parse_last_agent_binding_census(no_bindings_key, 0).expect("a census");
+        assert!(
+            !c.rows_present,
+            "an absent `bindings` key is not an empty set"
+        );
+        assert!(!c.rows_decodable());
+    }
+
+    /// **F4 — an ABSENT log is "nothing to read"; an unreadable one is not.**
+    /// The absent case flows into the no-census branch, which announces
+    /// `census_found:false`; the unreadable case gets its own named signal,
+    /// because a runner that can write but says nothing looks exactly like a
+    /// build without this instrumentation.
+    #[test]
+    fn an_absent_log_reads_empty_but_an_unreadable_one_is_named() {
+        let dir = std::env::temp_dir().join(format!("rot-tail-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Absent file → readable-and-empty, NOT a failure.
+        match read_rotation_log_tail_at(&dir.join("nope.jsonl")) {
+            RotationTail::Text(t) => assert!(t.is_empty()),
+            _ => panic!("an absent rotation log is 'nothing to read', not a read failure"),
+        }
+
+        // A real file round-trips.
+        let f = dir.join(ROTATION_LOG_FILE);
+        std::fs::write(&f, "{\"event\":\"mint\"}\n").unwrap();
+        match read_rotation_log_tail_at(&f) {
+            RotationTail::Text(t) => assert!(t.contains("mint")),
+            _ => panic!("a readable log must come back as text"),
+        }
+
+        // A path that is a DIRECTORY cannot be read as a log, and that is a
+        // failure to READ — distinct from there being nothing there.
+        match read_rotation_log_tail_at(&dir) {
+            RotationTail::Unreadable(why) => assert!(!why.is_empty(), "the reason is named"),
+            _ => panic!("an unreadable path must not masquerade as an empty log"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
