@@ -47,6 +47,16 @@ pub mod fs_perms;
 pub mod machine_identity;
 pub mod secure_storage;
 
+// MCP tool-output spill store (plan `2026-08-20-runner-mcp-tool-output-spill`,
+// Phase 2). In the LIB crate for the SAME reason as `runner_breadcrumb`: the
+// WRITER is a second bin (`bin/wrappers_mcp.rs`, the stdio MCP server), a
+// second bin cannot import from the runner bin's module tree, and the READER
+// must agree with the writer on the on-disk record byte for byte. One module ⇒
+// one schema ⇒ writer and reader cannot drift. Builds on `fs_atomic` (whole
+// records appear at once or not at all) and `fs_perms` (bodies are stored
+// unredacted, so the on-disk control is the one that matters).
+pub mod mcp_spill;
+
 // Machine-side dev-environment capture agent (feat/devenv-environments). Runs
 // on a developer's machine, captures that machine's real dev-environment
 // configuration (SECRET-FREE), and POSTs it to the qontinui-web backend so the
