@@ -241,7 +241,12 @@ mod tests {
         // reading, in the documented `<workspace-root>/…` form, and a citation is
         // not an instruction to read a path. See this module's PR for the
         // separate question of whether those citations should be slug-only.
-        const FORBIDDEN: &[&str] = &["D:/qontinui-root", "D:\\qontinui-root", "C:/Users/", "/home/"];
+        const FORBIDDEN: &[&str] = &[
+            "D:/qontinui-root",
+            "D:\\qontinui-root",
+            "C:/Users/",
+            "/home/",
+        ];
         let mut checked = 0usize;
         check_paths(&FLEET_SKILLS, FORBIDDEN, &mut checked);
         assert!(checked > 0, "no skill files scanned — guard went stale");
