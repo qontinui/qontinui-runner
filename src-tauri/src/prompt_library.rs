@@ -804,7 +804,10 @@ Goal: {{goal}}
         let raw = "---\nparameters:\n  - name: project_name\n    type: string\n---\n\nBody.\n";
         let p = parse_prompt_document("bare-param", "d", 1, raw);
         let out = serde_json::to_value(&p.parameters[0]).expect("serialize");
-        assert_eq!(out.get("label").and_then(|v| v.as_str()), Some("Project name"));
+        assert_eq!(
+            out.get("label").and_then(|v| v.as_str()),
+            Some("Project name")
+        );
         assert_eq!(out.get("description").and_then(|v| v.as_str()), Some(""));
         assert_eq!(out.get("required").and_then(|v| v.as_bool()), Some(false));
     }
