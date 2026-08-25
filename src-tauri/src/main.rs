@@ -131,8 +131,6 @@ mod instance;
 mod instance_health;
 mod instance_manager;
 mod iteration_bundle;
-#[cfg(windows)]
-mod job_object;
 mod knowledge_acquisition;
 mod known_issues;
 mod launch_env;
@@ -224,7 +222,6 @@ mod startup_panic;
 mod state_discovery;
 mod state_explorer;
 mod state_machine_configs;
-mod stats;
 mod step_event_builder;
 mod step_executor;
 mod step_injection;
@@ -521,7 +518,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Windows Job Object so spawned AI processes are auto-killed
     // if the runner crashes (safety net for the explicit taskkill in shutdown).
     #[cfg(windows)]
-    job_object::init_job_object();
+    qontinui_runner_win32::init_job_object();
 
     info!("Starting Qontinui Runner v{}", env!("CARGO_PKG_VERSION"));
 

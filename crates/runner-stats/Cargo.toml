@@ -1,0 +1,15 @@
+[package]
+name = "qontinui-runner-stats"
+version = "0.1.0"
+description = "Shared statistical tests for evaluation, canary verdicts, and comparisons"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+# Deliberately dependency-free. The module was written as "pure Rust
+# implementations -- no external stats crate needed", and keeping it that way is
+# what makes this the cheapest possible compilation unit: it is the first crate
+# carved OUT of the runner binary's module tree (every prior `crates/*` member
+# was created greenfield), so it exists to prove the carve-out mechanism with
+# nothing else in the way.
+# Plan: 2026-08-21-runner-extract-crates-frontier-first.md, Phase 1, crate 1.
+[dependencies]

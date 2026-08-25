@@ -611,9 +611,10 @@ async fn push_one(
     // CREATE_SUSPENDED, which `tokio::process` does not expose.
     #[cfg(windows)]
     let _tree_job = {
-        let job = crate::job_object::ScopedKillOnCloseJob::create(None);
+        let job = qontinui_runner_win32::ScopedKillOnCloseJob::create(None);
         match (job.as_ref(), child.raw_handle()) {
-            (Some(j), Some(handle)) => j.assign(handle as _),
+            // SAFETY: `handle` came from the live `child` this scope owns.
+            (Some(j), Some(handle)) => unsafe { j.assign(handle as _) },
             (None, _) => debug!(
                 "agent_pusher: scoped push job unavailable — \
                  falling back to kill_on_drop + the global job"

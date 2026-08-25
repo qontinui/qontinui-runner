@@ -8,17 +8,32 @@ use std::sync::OnceLock;
 use tracing::{error, info, warn};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, JobObjectExtendedLimitInformation, SetInformationJobObject,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 
-// CreateJobObjectW requires the Win32_Security feature (for SECURITY_ATTRIBUTES param type).
-// Declare it directly via extern to avoid the conditional feature gate, since we only
-// pass null for both parameters anyway.
-extern "system" {
-    fn CreateJobObjectW(lpjobattributes: *const std::ffi::c_void, lpname: *const u16) -> HANDLE;
-}
+// `CreateJobObjectW` used to be declared here as a raw
+// `extern "system" { fn CreateJobObjectW(..) -> HANDLE; }`, with the comment
+// "requires the Win32_Security feature (for SECURITY_ATTRIBUTES) -- declare it
+// directly via extern to avoid the conditional feature gate".
+//
+// That workaround is gone, for two reasons:
+//
+//  1. Its premise was already stale in the binary crate: `Win32_Security` WAS
+//     in `src-tauri/Cargo.toml`'s feature list, so the gate it dodged was not
+//     conditional any more.
+//  2. A hand-declared `extern "system"` block resolves its symbol by NAME at
+//     LOAD time, not at compile time. That is exactly the construct behind
+//     `0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND` -- the failure that ended the
+//     predecessor plan (2026-08-06-runner-move-bin-module-tree-into-lib-crate,
+//     Phase 0 finding 4) after a clean 39m59s compile. Carrying it into a
+//     freshly-created crate, whose linkage is exactly what this crate exists to
+//     prove, would have reproduced the one risk this crate was sequenced early
+//     to retire.
+//
+// This crate declares `Win32_Security` in its OWN feature list, so the import
+// above links through `windows-sys` like every other entry point here.
 
 /// RAII wrapper for a Windows Job Object handle.
 struct JobObjectHandle(HANDLE);
@@ -94,7 +109,15 @@ pub fn init_job_object() {
 ///
 /// # Safety
 /// The `process_handle` must be a valid Windows process HANDLE.
-pub fn assign_process_to_job(process_handle: HANDLE) {
+///
+/// Declared `unsafe` when this module became a CRATE's public API. Inside the
+/// binary crate it was `pub` in a PRIVATE module, so it was not publicly
+/// reachable and `clippy::not_unsafe_ptr_arg_deref` never fired -- a safe `fn`
+/// carrying a documented `# Safety` precondition, which is a contract the type
+/// system was not enforcing. Drawing the crate boundary exposed it, which is
+/// exactly the "re-decide visibility in both directions" the extraction plan
+/// predicted. Suppressing the lint would have kept the unenforced contract.
+pub unsafe fn assign_process_to_job(process_handle: HANDLE) {
     if let Some(job) = JOB_OBJECT.get() {
         if job.0.is_null() || job.0 == INVALID_HANDLE_VALUE {
             // Job Object failed to initialize — skip silently
@@ -192,10 +215,11 @@ impl ScopedKillOnCloseJob {
     /// Assign a child process to this job. Failure is a logged warning —
     /// the global job's kill-on-close still applies to the child.
     ///
-    /// # Safety contract
+    /// # Safety
     /// `process_handle` must be a valid Windows process HANDLE (the same
-    /// contract as [`assign_process_to_job`]).
-    pub fn assign(&self, process_handle: HANDLE) {
+    /// contract as [`assign_process_to_job`], and `unsafe` for the same
+    /// reason).
+    pub unsafe fn assign(&self, process_handle: HANDLE) {
         unsafe {
             let result = AssignProcessToJobObject(self.0, process_handle);
             if result == 0 {
@@ -244,7 +268,9 @@ mod tests {
             .spawn()
             .expect("spawn child");
 
-        job.assign(child.as_raw_handle() as _);
+        // SAFETY: `child` is alive and owned by this test, so its raw handle
+        // is a valid process HANDLE for the duration of the call.
+        unsafe { job.assign(child.as_raw_handle() as _) };
         drop(job);
 
         // Kill-on-close is asynchronous; poll rather than assume.

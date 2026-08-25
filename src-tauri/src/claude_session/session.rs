@@ -442,9 +442,12 @@ impl ClaudeSession {
 
         // Assign to Windows Job Object for crash safety (auto-kill on runner exit)
         #[cfg(target_os = "windows")]
-        crate::job_object::assign_process_to_job(
-            child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
-        );
+        // SAFETY: `child` is the live Claude CLI process spawned just above.
+        unsafe {
+            qontinui_runner_win32::assign_process_to_job(
+                child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+            )
+        };
 
         let child_pid = child.id();
         info!("Claude CLI spawned with PID {}", child_pid);
