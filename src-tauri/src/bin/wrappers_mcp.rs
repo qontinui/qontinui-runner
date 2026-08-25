@@ -1324,11 +1324,17 @@ fn main() {
     // fatal: `text_result_with` then returns oversized bodies whole.
     let _ = SPILL_STORE.set(match SpillStore::open_default() {
         Ok(store) => {
+            // The cap is stated because it is PER SERVER: the disk this fleet
+            // can reach is this number times the number of servers running, and
+            // `QONTINUI_MCP_SPILL_MAX_BYTES` can move it, so an operator who
+            // cannot see the effective value cannot compute the ceiling.
             eprintln!(
-                "[wrappers-mcp] spill store: {} (session {}, threshold {} bytes)",
+                "[wrappers-mcp] spill store: {} (session {}, threshold {} bytes, cap {} bytes for \
+                 this server's own spills)",
                 store.session_dir().display(),
                 store.session(),
-                spill_threshold_bytes()
+                spill_threshold_bytes(),
+                store.max_own_bytes()
             );
             Some(store)
         }
