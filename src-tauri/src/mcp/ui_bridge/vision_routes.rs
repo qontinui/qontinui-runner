@@ -2027,6 +2027,23 @@ impl From<&BaselineRegistryEntry> for qontinui_vision_core::BaselineEntry {
     fn from(b: &BaselineRegistryEntry) -> Self {
         qontinui_vision_core::BaselineEntry {
             element_bboxes: b.element_bboxes.clone(),
+            // `None` = an UNATTRIBUTED baseline, which is exactly what this
+            // registry holds: `BaselineRegistryEntry` records no snapshot id,
+            // so there is nothing to carry over. qontinui-schemas documents
+            // `None` as the supported value for "a baseline written from an
+            // unattributed snapshot, and every baseline file written before
+            // this field existed", and `eval_layout_shift` reports those as
+            // unattributed rather than silently blank.
+            //
+            // STOPGAP, deliberately minimal. qontinui-schemas#145 added this
+            // field and landed ahead of its declared adaptation
+            // (qontinui-runner#1150, `coord:upstream-of=qontinui-runner#1150`),
+            // which is blocked on an unrelated frontend lockfile mismatch. That
+            // left every runner CI run red on E0063 here. #1150 does the real
+            // thing -- it threads a `snapshot_id` onto `BaselineRegistryEntry`
+            // and carries it verbatim -- and SUPERSEDES this line when it
+            // rebases. Do not build on `None` being correct long-term.
+            snapshot_id: None,
         }
     }
 }
