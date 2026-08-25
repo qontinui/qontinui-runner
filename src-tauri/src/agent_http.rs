@@ -38,9 +38,18 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Idle connections kept per host. The daemons all talk to one coord
-/// host, so this is the effective pool size — comfortably above the
-/// per-tick concurrency without pinning sockets open needlessly.
-const POOL_MAX_IDLE_PER_HOST: usize = 8;
+/// host, so this is the effective pool size.
+///
+/// It must be sized against the number of daemons that can be in flight
+/// at once, not against one daemon's per-tick concurrency: there is one
+/// poller task per agent and they are fully concurrent, so the real
+/// figure is the agent count. At the previous value of 8, any healthy
+/// fleet of more than a handful of agents could not return most
+/// responses to the pool, and each request paid a fresh TCP+TLS
+/// handshake — exactly the connection churn this module was introduced
+/// (2026-08-07) to eliminate, reintroduced by scale rather than by a
+/// stray `Client::new()`.
+const POOL_MAX_IDLE_PER_HOST: usize = 64;
 
 /// How long an idle pooled connection survives before being dropped.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);

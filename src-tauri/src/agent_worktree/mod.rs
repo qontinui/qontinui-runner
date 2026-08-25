@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::worktree::run_git_command;
@@ -457,11 +457,11 @@ fn default_ttl_seconds_for(kind: &str) -> i64 {
     }
 }
 
-/// Handle to the heartbeat task spawned for a claim. Dropping it
-/// signals the task to exit on its next tick.
+/// Handle to the heartbeat task spawned for a claim. Dropping it stops
+/// the task immediately.
 #[derive(Debug)]
 pub struct ClaimHeartbeatHandle {
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
     join: Option<tokio::task::JoinHandle<()>>,
     /// Snake-case ClaimKind — for the eventual release call.
     pub kind: String,
@@ -473,9 +473,24 @@ pub struct ClaimHeartbeatHandle {
 }
 
 impl Drop for ClaimHeartbeatHandle {
+    /// Cancel, then abort — the third instance of the same defect fixed in
+    /// `dirty_poller` and `agent_pusher`, found by sweeping for the shape.
+    ///
+    /// `Notify::notify_waiters()` stores no permit, so a shutdown arriving
+    /// while this task was inside `heartbeat_once` was discarded; dropping
+    /// the `JoinHandle` then detached the task instead of aborting it.
+    ///
+    /// The consequence here is the sharpest of the three. A leaked
+    /// heartbeat keeps POSTing `/claims/heartbeat` forever, so the CLAIM
+    /// never expires — the coordination layer goes on seeing a live holder
+    /// for work that finished, and a `phase` claim (7200 s TTL) or a
+    /// `worktree` claim blocks peers indefinitely instead of ageing out.
+    /// A claim's TTL is only a backstop if something stops renewing it.
     fn drop(&mut self) {
-        self.cancel.notify_waiters();
-        let _ = self.join.take();
+        self.cancel.cancel();
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
     }
 }
 
@@ -498,7 +513,7 @@ pub fn spawn_heartbeat_task<F>(
 where
     F: Fn(Option<String>) + Send + Sync + 'static,
 {
-    let cancel = Arc::new(Notify::new());
+    let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     let kind_owned = kind.to_string();
     let resource_clone = resource_key.clone();
@@ -506,7 +521,46 @@ where
 
     let interval_secs: u64 = (ttl_seconds / 3).max(15) as u64;
 
-    let join = tokio::spawn(async move {
+    let join = tokio::spawn(heartbeat_loop(
+        base_clone,
+        machine_id,
+        agent_session_id,
+        kind_owned,
+        resource_clone,
+        interval_secs,
+        cancel_clone,
+        on_stolen,
+    ));
+
+    ClaimHeartbeatHandle {
+        cancel,
+        join: Some(join),
+        kind: kind.to_string(),
+        resource_key,
+        machine_id,
+        coord_http_base,
+        agent_session_id,
+    }
+}
+
+/// The heartbeat task's body, lifted out of [`spawn_heartbeat_task`] so a
+/// test can drive it and observe the task actually ending. Mirrors the
+/// `run` free functions in `dirty_poller` and `agent_pusher`, which exist
+/// for the same reason.
+#[allow(clippy::too_many_arguments)]
+async fn heartbeat_loop<F>(
+    base_clone: String,
+    machine_id: uuid::Uuid,
+    agent_session_id: Option<uuid::Uuid>,
+    kind_owned: String,
+    resource_clone: String,
+    interval_secs: u64,
+    cancel_clone: CancellationToken,
+    on_stolen: F,
+) where
+    F: Fn(Option<String>) + Send + Sync + 'static,
+{
+    {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Skip the first tick (fires immediately) — we just acquired
@@ -515,22 +569,34 @@ where
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
-                _ = cancel_clone.notified() => {
+                _ = cancel_clone.cancelled() => {
                     debug!(
                         "claim-heartbeat: stopping kind={kind_owned} key={resource_clone}"
                     );
                     return;
                 }
             }
-            match heartbeat_once(
-                &base_clone,
-                machine_id,
-                agent_session_id,
-                &kind_owned,
-                &resource_clone,
-            )
-            .await
-            {
+            // Cancellation must beat the heartbeat POST itself, not just
+            // the wait: renewing a claim for work that has already been
+            // torn down is precisely the phantom-holder this fixes.
+            let outcome = tokio::select! {
+                biased;
+                _ = cancel_clone.cancelled() => {
+                    debug!(
+                        "claim-heartbeat: cancelled mid-beat kind={kind_owned} \
+                         key={resource_clone}"
+                    );
+                    return;
+                }
+                res = heartbeat_once(
+                    &base_clone,
+                    machine_id,
+                    agent_session_id,
+                    &kind_owned,
+                    &resource_clone,
+                ) => res,
+            };
+            match outcome {
                 Ok(HeartbeatTickOutcome::Ok) => {}
                 Ok(HeartbeatTickOutcome::Stolen { current_holder }) => {
                     warn!(
@@ -547,16 +613,6 @@ where
                 }
             }
         }
-    });
-
-    ClaimHeartbeatHandle {
-        cancel,
-        join: Some(join),
-        kind: kind.to_string(),
-        resource_key,
-        machine_id,
-        coord_http_base,
-        agent_session_id,
     }
 }
 
@@ -1774,6 +1830,46 @@ pub fn coord_ws_to_http(coord_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cancelling must end the heartbeat task, not merely ask it nicely.
+    ///
+    /// This is the third instance of the leak fixed in `dirty_poller` and
+    /// `agent_pusher`, and the one with the sharpest consequence: a
+    /// detached heartbeat keeps renewing a coord CLAIM forever, so the
+    /// claim never expires and peers keep seeing a live holder for work
+    /// that finished. The TTL is only a backstop if something stops
+    /// renewing.
+    #[tokio::test]
+    async fn cancelling_stops_the_claim_heartbeat_task() {
+        let cancel = CancellationToken::new();
+        // Long interval so the task is parked in the wait when we cancel;
+        // the base is unreachable, so no heartbeat can escape either way.
+        let join = tokio::spawn(heartbeat_loop(
+            "http://127.0.0.1:1".to_string(),
+            uuid::Uuid::nil(),
+            None,
+            "phase".to_string(),
+            "plan:test:phase:1".to_string(),
+            3600,
+            cancel.clone(),
+            |_| {},
+        ));
+        tokio::task::yield_now().await;
+        assert!(!join.is_finished(), "task should be running before cancel");
+
+        cancel.cancel();
+        for _ in 0..100 {
+            if join.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            join.is_finished(),
+            "cancelling must stop the claim-heartbeat task; a detached one \
+             renews a claim for work that is already gone"
+        );
+    }
 
     #[test]
     fn flag_on_by_default() {
