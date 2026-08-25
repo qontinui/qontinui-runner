@@ -1005,13 +1005,13 @@ mod tests {
         let state = crate::ui_error::UiErrorState::new();
 
         let status = |has_ui_error: bool| {
-            crate::ui_error::compute_derived_status(
-                has_ui_error,
-                false,
-                None,
-                Some(true),
-                Some(true),
-            )
+            crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
+                has_ui_error: has_ui_error,
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            })
         };
 
         assert_eq!(status(state.get().await.is_some()), "healthy", "control");

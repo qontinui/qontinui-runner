@@ -193,13 +193,20 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // visible off-box. That is why `ui_bridge_last_pong` lives on
             // `AppState`: this loop only ever holds an `Arc<AppState>`.
             let ui_dead = crate::ui_error::ui_dead_now(&app_state.ui_bridge_last_pong);
-            let base_status = crate::ui_error::compute_derived_status(
-                ui_error_snapshot.is_some(),
-                recent_crash_snapshot.is_some(),
-                Some(ui_dead),
-                crate::mcp_api::embedding_reachable_cached(),
-                None,
-            );
+            // Relay health travels on the heartbeat for the same reason
+            // `ui_dead` does: nothing polls `/health` on an end user's
+            // machine, so this is the only path by which a relay that is
+            // gated ON but not connected becomes visible off-box.
+            let relay_connected = crate::mcp::backend_relay::relay_health(&app_state).await;
+            let base_status =
+                crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
+                    has_ui_error: ui_error_snapshot.is_some(),
+                    has_recent_crash: recent_crash_snapshot.is_some(),
+                    ui_dead: Some(ui_dead),
+                    embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
+                    relay_connected,
+                    ..Default::default()
+                });
 
             // Phase 1b backstop → Phase 2 recovery. The `ProcessFailed` event
             // is the precise, immediate detector, but it only fires where a
