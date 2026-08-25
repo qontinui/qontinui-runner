@@ -76,6 +76,7 @@ import { publishRoster, releaseRoster } from "../terminalVisibilityTiers";
 import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
+import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
 import { type ZoneSessionInfo } from "../zoneProfileStorage";
 import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
@@ -850,9 +851,17 @@ const PageSessionScope = memo(function PageSessionScope({
     return () => register(pageId, null);
   }, [register, pageId, value]);
 
-  // Renders nothing: the lifted provider routes the active page's value into
-  // context and renders the (single) page tree.
-  return null;
+  // Renders ONLY the mount-independent UI Bridge proxies for this page's tabs
+  // (a hidden 1x1 host, no visible UI) — the page tree itself is rendered by
+  // the lifted provider, which routes the active page's value into context.
+  //
+  // This scope is the right home for them precisely because it is always
+  // mounted: outside `TerminalPage`'s `initialized` spinner, outside
+  // `ZoneGrid`, and independent of which page is active. `terminal-input-<id>`
+  // used to exist only while a `TerminalInstance` was mounted, so a flow-grid
+  // `assigned-virtual` pane — or any pane during the whole restore window —
+  // had no bridge element at all. See `../TerminalBridgeProxies`.
+  return <TerminalBridgeProxies tabs={tabs} />;
 });
 
 interface TerminalSessionProviderProps {

@@ -195,6 +195,71 @@ pub fn embedded_port() -> Option<u16> {
     }
 }
 
+/// Env lever that relocates the whole embedded-PG data root.
+///
+/// WHY (manual-test-loop iter 18, item 2): the root was hardcoded to
+/// `%LOCALAPPDATA%/com.qontinui.runner/embedded-pg`, so EVERY runner on the box
+/// — the operator's primary and every throwaway test runner — provisioned or
+/// *attached to* the same cluster. `bootstrap` derives `pg-install`, `pg-data`
+/// and `pg-pass` from this one path, and the attach probe reads
+/// `pg-data/postmaster.pid`, so a fixed root means a temp runner cannot avoid
+/// joining the machine-shared database. Iteration 17 was consequently forced to
+/// write two real `error_events` rows (ids 4 and 5) into the operator's cluster
+/// just to exercise an error route.
+///
+/// Point this at a scratch directory and the runner gets a private cluster —
+/// private install, private data dir, private password file, and an attach
+/// probe that can only ever find *its own* postmaster.
+pub const EMBEDDED_PG_DIR_ENV: &str = "QONTINUI_EMBEDDED_PG_DIR";
+
+/// The machine-shared default root, used whenever [`EMBEDDED_PG_DIR_ENV`] is
+/// unset or blank. Unchanged from the value that was inlined in `main.rs`.
+pub fn default_data_root() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("com.qontinui.runner")
+        .join("embedded-pg")
+}
+
+/// Pure resolver behind [`data_root`], split out so the override semantics are
+/// unit-testable without mutating process env (which races every other test in
+/// the binary).
+///
+/// A whitespace-only override is treated as UNSET rather than as a relative
+/// path of one space: `QONTINUI_EMBEDDED_PG_DIR=` in a shell wrapper is how an
+/// operator spells "no override", and silently provisioning a cluster in the
+/// process CWD would be the worst possible reading of it.
+pub fn resolve_data_root(override_value: Option<&str>, default_root: PathBuf) -> PathBuf {
+    match override_value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => default_root,
+    }
+}
+
+/// The embedded-PG data root this process should use.
+pub fn data_root() -> PathBuf {
+    let override_value = std::env::var(EMBEDDED_PG_DIR_ENV).ok();
+    resolve_data_root(override_value.as_deref(), default_data_root())
+}
+
+/// The data root actually handed to [`bootstrap`], for `/health`. `None` until
+/// the boot path reaches the embedded arm — the external and degraded arms
+/// never set it, and must not report a path they are not using.
+static DATA_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Record the resolved root. Idempotent; first writer wins (boot calls it once).
+pub fn set_data_root(root: &std::path::Path) {
+    let _ = DATA_ROOT.set(root.to_path_buf());
+}
+
+/// The embedded cluster's data root as a string, or `None` off the embedded
+/// arms. Reported by `/health` beside `embeddedPort` so "this temp runner has
+/// its own cluster" is checkable from outside the process instead of inferred
+/// from a port number that says nothing about *which* data dir is behind it.
+pub fn embedded_data_root() -> Option<String> {
+    DATA_ROOT.get().map(|p| p.display().to_string())
+}
+
 /// How long to wait for a TCP connection to a candidate already-running cluster
 /// before deciding it is not actually reachable and provisioning instead.
 const ATTACH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1008,6 +1073,69 @@ mod tests {
              5432001   1730234880\n\
              {status}   \n"
         )
+    }
+
+    // ---- Data-root isolation (manual-test-loop iter 18, item 2) ----
+
+    #[test]
+    fn data_root_override_wins_over_the_shared_default() {
+        let shared = PathBuf::from("C:/Users/x/AppData/Local/com.qontinui.runner/embedded-pg");
+        let isolated = resolve_data_root(Some("C:/tmp/iter18-pg"), shared.clone());
+        assert_eq!(
+            isolated,
+            PathBuf::from("C:/tmp/iter18-pg"),
+            "QONTINUI_EMBEDDED_PG_DIR must relocate the whole root; without this a temp \
+             runner provisions or ATTACHES to the machine-shared cluster"
+        );
+        assert_ne!(
+            isolated, shared,
+            "an override that still resolves to the shared root isolates nothing"
+        );
+    }
+
+    #[test]
+    fn unset_data_root_falls_back_to_the_shared_default() {
+        let shared = PathBuf::from("C:/Users/x/AppData/Local/com.qontinui.runner/embedded-pg");
+        assert_eq!(
+            resolve_data_root(None, shared.clone()),
+            shared,
+            "with the var unset the operator's runner must keep its existing cluster"
+        );
+    }
+
+    #[test]
+    fn blank_data_root_override_is_treated_as_unset() {
+        let shared = PathBuf::from("C:/Users/x/AppData/Local/com.qontinui.runner/embedded-pg");
+        for blank in ["", "   ", "\t", "\n"] {
+            assert_eq!(
+                resolve_data_root(Some(blank), shared.clone()),
+                shared,
+                "{blank:?} must read as no override, never as a relative path"
+            );
+        }
+    }
+
+    #[test]
+    fn override_is_trimmed_before_use() {
+        // A wrapper script that interpolates a path can leave trailing
+        // whitespace; `PathBuf::from("C:/tmp/pg ")` is a DIFFERENT directory on
+        // some filesystems and an invalid one on Windows.
+        assert_eq!(
+            resolve_data_root(Some("  C:/tmp/iter18-pg  "), PathBuf::from("/shared")),
+            PathBuf::from("C:/tmp/iter18-pg")
+        );
+    }
+
+    #[test]
+    fn default_data_root_is_the_historical_shared_path() {
+        // Guards the fallback: this is the path every existing runner's cluster
+        // already lives at, so drifting it would orphan real data.
+        let root = default_data_root();
+        assert!(
+            root.ends_with(PathBuf::from("com.qontinui.runner").join("embedded-pg")),
+            "default root drifted: {}",
+            root.display()
+        );
     }
 
     #[test]

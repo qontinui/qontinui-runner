@@ -391,10 +391,25 @@ fn emit_session_bound(handle: &tauri::AppHandle, actions: &[session::reconcile::
 /// configured) and `QONTINUI_FORCE_EMBEDDED_PG`, which skips the external
 /// attempt outright. Both must behave identically once here.
 fn boot_embedded_pg(rt: &tokio::runtime::Runtime, pg_url: &str) -> Arc<crate::database::pg::PgDb> {
-    let data_root = dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("com.qontinui.runner")
-        .join("embedded-pg");
+    // Honours `QONTINUI_EMBEDDED_PG_DIR` (blank ⇒ unset), falling back to the
+    // machine-shared default. A temp/test runner sets it and gets a cluster of
+    // its own — install dir, data dir, password file and attach probe all hang
+    // off this one path — instead of provisioning or ATTACHING to the
+    // operator's. See `embedded_pg::EMBEDDED_PG_DIR_ENV`.
+    let data_root = crate::embedded_pg::data_root();
+    crate::embedded_pg::set_data_root(&data_root);
+    info!(
+        "Embedded PostgreSQL data root: {} ({})",
+        data_root.display(),
+        if std::env::var(crate::embedded_pg::EMBEDDED_PG_DIR_ENV)
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+        {
+            "isolated via QONTINUI_EMBEDDED_PG_DIR"
+        } else {
+            "machine-shared default"
+        }
+    );
 
     let degrade = |reason: String| {
         error!("{reason} Booting degraded — DB-backed routes return 503.");
@@ -2361,6 +2376,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_list,
             commands::terminal::terminal_migrate_session_account,
             commands::terminal::terminal_report_tree_reset,
+            commands::terminal::terminal_report_bridge_registration_failure,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_save_scrollback,
             commands::terminal::terminal_session_clear_restore_pending,

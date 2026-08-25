@@ -1748,6 +1748,22 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               `answer ELEMENT_NOT_FOUND`,
             lastError ?? "(no error thrown; the input element or the registry never appeared)",
           );
+          // …and OBSERVABLE. Iteration 17 reported "the give-up warning never
+          // fires"; a `console.error` inside WebView2 never reaches the runner
+          // log, so it could not have been seen even if it had. Same reasoning
+          // as `terminal_report_tree_reset`. Fire-and-forget.
+          invoke("terminal_report_bridge_registration_failure", {
+            terminalId: termId,
+            elementId: `terminal-input-${termId}`,
+            reason: "instance-ladder",
+            elapsedMs: Math.round(elapsedMs),
+            detail:
+              lastError instanceof Error
+                ? lastError.message
+                : lastError === undefined
+                  ? null
+                  : String(lastError),
+          }).catch(() => {});
         },
       });
     }, [terminalId]);
