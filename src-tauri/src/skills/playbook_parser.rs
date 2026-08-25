@@ -145,7 +145,10 @@ pub fn parse_playbook_content(
         .map(|p| super::SkillParameter {
             name: p.name.clone(),
             param_type: p.param_type,
-            label: p.name.clone(),
+            // Same helper the `SkillParameter` deserializer uses, so the
+            // construct-by-hand playbook path and the deserialize path produce
+            // identical labels for the same name.
+            label: super::humanize_param_name(&p.name),
             description: p.description.unwrap_or_default(),
             required: false,
             default: p.default.map(|v| serde_json::Value::String(v)),
@@ -405,6 +408,23 @@ triggers:
         let content = "# Just markdown\n\nNo frontmatter here.";
         let path = PathBuf::from("bad.md");
         assert!(parse_playbook_content(content, &path).is_err());
+    }
+
+    #[test]
+    fn playbook_parameter_label_matches_the_deserializer_label() {
+        // The playbook path CONSTRUCTS SkillParameter field-by-field, so it is
+        // blind to serde attributes. Both paths must still agree on the label
+        // they derive from the same raw name.
+        let content =
+            "---\nname: Recorded\nparameters:\n  - name: project_name\n    type: string\n---\n\nBody.";
+        let skill = parse_playbook_content(content, &PathBuf::from("recorded.md")).unwrap();
+        assert_eq!(skill.parameters.len(), 1);
+        assert_eq!(skill.parameters[0].label, "Project name");
+
+        let deserialized: super::super::SkillParameter =
+            serde_json::from_value(serde_json::json!({"name": "project_name", "type": "string"}))
+                .unwrap();
+        assert_eq!(skill.parameters[0].label, deserialized.label);
     }
 
     #[test]
