@@ -1453,11 +1453,26 @@ mod usage_twin_report {
         exhausted: bool,
         source: Option<&'a str>,
         error: bool,
+        /// Which account this machine's rotation has ACTUALLY selected right
+        /// now — the same flag [`super::AccountInfo::is_active`] carries, from
+        /// the same `ai_provider::get_account_statuses()` source. Without it
+        /// the operator sees a roster with utilizations but no answer to "so
+        /// which one runs?". At most one account is `true`; all-`false` is a
+        /// legitimate state (no dir resolved yet on this machine).
+        is_active: bool,
     }
 
     #[derive(Serialize)]
     struct WireBody<'a> {
         accounts: Vec<WireAccount<'a>>,
+        /// The machine-global selection strategy, snake_case
+        /// (`"manual"` | `"least_usage"` — see
+        /// [`crate::settings::AccountSelectionMode::as_str`]). Per-REPORT, not
+        /// per-account: the roster file holds one mode for the whole box.
+        ///
+        /// This is what makes the operator string *"this machine will use:
+        /// &lt;mode&gt;"* answerable from the feed alone.
+        account_selection_mode: &'static str,
     }
 
     pub(super) async fn report_to_coord(results: &[super::AccountUsageInfo]) {
@@ -1474,6 +1489,15 @@ mod usage_twin_report {
             return;
         };
         let url = format!("{}/coord/claude-accounts/usage", base.trim_end_matches('/'));
+        // The live per-account status, from the SAME source the Tauri command
+        // `get_claude_accounts` reads — one selection truth, two surfaces.
+        // Keyed by `config_dir` (not `label`): two roster dirs can share a
+        // basename, and the probe results carry the full dir.
+        let active_dirs: std::collections::HashSet<String> = super::account_infos()
+            .into_iter()
+            .filter(|a| a.is_active)
+            .map(|a| a.config_dir)
+            .collect();
         let body = WireBody {
             accounts: results
                 .iter()
@@ -1487,8 +1511,10 @@ mod usage_twin_report {
                     exhausted: super::probe_result_exhausted(r),
                     source: r.source.as_deref(),
                     error: r.error.is_some(),
+                    is_active: active_dirs.contains(&r.config_dir),
                 })
                 .collect(),
+            account_selection_mode: crate::claude_accounts::effective_selection_mode().as_str(),
         };
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -1511,6 +1537,74 @@ mod usage_twin_report {
             Err(e) => {
                 debug!(error = %e, "coord account-usage report failed — skipped");
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The wire KEYS are the shared contract with coord's
+        /// `claude_account_usage.rs`; a rename on either side is a silent
+        /// data loss (serde drops unknown keys on the ingest side). Pin them.
+        #[test]
+        fn wire_body_key_names_are_the_shared_contract() {
+            let limits: Vec<super::super::ModelLimitInfo> = Vec::new();
+            let body = WireBody {
+                accounts: vec![WireAccount {
+                    label: ".claude-hotmail",
+                    weekly_utilization: 0.25,
+                    weekly_resets_at: Some(1_700_000_000),
+                    session_utilization: Some(0.5),
+                    session_resets_at: None,
+                    model_limits: &limits,
+                    exhausted: false,
+                    source: Some("oauth_usage"),
+                    error: false,
+                    is_active: true,
+                }],
+                account_selection_mode: "least_usage",
+            };
+            let v = serde_json::to_value(&body).expect("serializes");
+
+            // Per-report field, snake_case, NOT nested under an account.
+            assert_eq!(
+                v["account_selection_mode"],
+                serde_json::json!("least_usage")
+            );
+            let acct = &v["accounts"][0];
+            assert_eq!(acct["is_active"], serde_json::json!(true));
+            // Identity stays the config-dir basename — never a full local path.
+            assert_eq!(acct["label"], serde_json::json!(".claude-hotmail"));
+            assert!(
+                acct.get("config_dir").is_none(),
+                "the wire must never carry a local path"
+            );
+        }
+
+        /// `is_active` is a per-account flag; a report where nothing has been
+        /// resolved yet is all-`false`, not a missing key.
+        #[test]
+        fn inactive_accounts_serialize_is_active_false() {
+            let limits: Vec<super::super::ModelLimitInfo> = Vec::new();
+            let body = WireBody {
+                accounts: vec![WireAccount {
+                    label: ".claude-work",
+                    weekly_utilization: 0.0,
+                    weekly_resets_at: None,
+                    session_utilization: None,
+                    session_resets_at: None,
+                    model_limits: &limits,
+                    exhausted: false,
+                    source: None,
+                    error: true,
+                    is_active: false,
+                }],
+                account_selection_mode: "manual",
+            };
+            let v = serde_json::to_value(&body).expect("serializes");
+            assert_eq!(v["accounts"][0]["is_active"], serde_json::json!(false));
+            assert_eq!(v["account_selection_mode"], serde_json::json!("manual"));
         }
     }
 }
@@ -1536,9 +1630,14 @@ pub fn get_claude_accounts() -> Result<CommandResponse, String> {
     get_claude_accounts_impl().map_err(String::from)
 }
 
-fn get_claude_accounts_impl() -> Result<CommandResponse, AppError> {
-    let statuses = crate::ai_provider::get_account_statuses();
-    let accounts: Vec<AccountInfo> = statuses
+/// The live roster status as [`AccountInfo`] rows.
+///
+/// Extracted so the Tauri command and the coord usage feed
+/// (`usage_twin_report`) read ONE source: the feed's `is_active` must mean
+/// exactly what the Settings UI's does, and two independent derivations of
+/// "which account is active" is how those two answers drift apart.
+pub(crate) fn account_infos() -> Vec<AccountInfo> {
+    crate::ai_provider::get_account_statuses()
         .into_iter()
         .map(|(dir, label, active, cooled)| AccountInfo {
             config_dir: dir,
@@ -1546,7 +1645,11 @@ fn get_claude_accounts_impl() -> Result<CommandResponse, AppError> {
             is_active: active,
             is_rate_limited: cooled,
         })
-        .collect();
+        .collect()
+}
+
+fn get_claude_accounts_impl() -> Result<CommandResponse, AppError> {
+    let accounts = account_infos();
 
     Ok(CommandResponse {
         success: true,
