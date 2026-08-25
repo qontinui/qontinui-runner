@@ -70,6 +70,19 @@ use uuid::Uuid;
 use crate::mcp::task_supervisor;
 use crate::mcp::types::ApiState;
 
+/// Consecutive registration rejections after which the relay stops kicking
+/// the device-JWT refresher.
+///
+/// The kick exists because a post-handshake `1008` close usually means a
+/// stale token, and the refresher's own 5-minute tick would otherwise leave
+/// the relay asleep through its backoff. But some rejections are not about
+/// the token: when the backend verifies against a different coord than the
+/// one this runner is paired to, every token it can mint fails identically
+/// and the refresher answers `SkippedNotRefreshable` forever. Three attempts
+/// distinguishes "stale" from "structural" — a genuinely stale token is
+/// replaced on the first successful kick.
+const REGISTRATION_KICK_LIMIT: u32 = 3;
+
 /// Maximum size (bytes) of a request or response body the generic
 /// `http_request` relay arm will carry over the WS in a single
 /// `command_response` frame. Requests with a decoded body larger than this
@@ -226,6 +239,20 @@ pub struct WebIntegrationStatus {
 /// relay state the idle gate reads. Pure-ish (only reads): used by both the
 /// HTTP handler and any future caller that wants the gating snapshot.
 pub(crate) async fn web_integration_status(api_state: &Arc<ApiState>) -> WebIntegrationStatus {
+    web_integration_status_for(&api_state.app_state).await
+}
+
+/// [`web_integration_status`] over the `AppState` it actually reads.
+///
+/// The relay's connection state lives on `AppState::current_server_mode`, so
+/// nothing here needs the fuller `ApiState`. Taking the narrower type lets
+/// the operations heartbeat — which only ever holds an `Arc<AppState>` —
+/// report relay health too. That matters more than it looks: nothing polls
+/// `/health` on an end user's machine, so the heartbeats are the only path by
+/// which a dead relay is ever visible off-box.
+pub(crate) async fn web_integration_status_for(
+    app_state: &Arc<crate::commands::AppState>,
+) -> WebIntegrationStatus {
     use crate::secure_storage::StoredTokenRead;
     let loaded = crate::settings::load_settings_full();
     let (has_device_jwt, credential_read_error) =
@@ -235,7 +262,7 @@ pub(crate) async fn web_integration_status(api_state: &Arc<ApiState>) -> WebInte
             StoredTokenRead::Unreadable(e) => (false, Some(e)),
         };
 
-    let (ws_connected, last_error) = match api_state.app_state.current_server_mode().await {
+    let (ws_connected, last_error) = match app_state.current_server_mode().await {
         Some(sm) => (sm.is_ws_connected(), sm.registration_error().await),
         None => (false, None),
     };
@@ -250,6 +277,59 @@ pub(crate) async fn web_integration_status(api_state: &Arc<ApiState>) -> WebInte
         ws_connected,
         last_error,
     }
+}
+
+/// Relay liveness as a health input: `Some(connected)` when the relay is
+/// gated ON, `None` when it is legitimately parked.
+///
+/// Keyed on [`relay_gate`]'s **outcome**, not on a hand-copied subset of its
+/// inputs — an earlier version copied two of the three gates and dropped the
+/// third, which is exactly the drift the "mirrors the gate" claim is supposed
+/// to rule out:
+///
+/// | `relay_gate` outcome | relay behaviour | verdict |
+/// |---|---|---|
+/// | `Idle` | parked; will not connect | `None` |
+/// | `Unknown` | **retrying forever** | `Some(ws_connected)` |
+/// | `Connect` | connecting / connected | `Some(ws_connected)` |
+///
+/// Two arms are easy to get backwards, and both were:
+///
+/// * **Credential store unreadable.** `relay_gate` returns `Unknown` and the
+///   loop RETRIES rather than idling — deliberately, so an unreadable store
+///   does not silently remove the runner from qontinui-web/mobile. So the
+///   relay is gated ON and failing, and `ws_connected` is a direct
+///   MEASUREMENT of that, not an inference from the credential. Returning
+///   `None` here reported a broken runner as `healthy` — the 2026-08-25
+///   failure mode reintroduced. The UNKNOWN is about the credential, not
+///   about the relay.
+/// * **Not paired at all** (`has_device_jwt == false`, cleanly read).
+///   `relay_gate` returns `Idle`; the relay parks and will never connect. An
+///   unpaired runner is unconfigured, not broken, so it must not read as
+///   degraded — which matters because qontinui-web gates dispatch on
+///   `derived_status == "healthy"`, so a false `degraded` silently removes it
+///   from the auto-dispatch pool.
+///
+/// Pure so it is table-testable across tier × enabled × jwt × ws, the same
+/// split [`should_relay_idle_with`] already uses for the gate itself.
+pub(crate) fn relay_health_from(status: &WebIntegrationStatus) -> Option<bool> {
+    // An unreadable credential store is `Unknown`, never `Idle`: the loop
+    // keeps trying, so fall through to the measured connection state.
+    if status.credential_read_error.is_none()
+        && should_relay_idle_with(
+            status.tier,
+            status.web_integration_enabled,
+            status.has_device_jwt,
+        )
+    {
+        return None;
+    }
+    Some(status.ws_connected)
+}
+
+/// [`relay_health_from`] over a freshly taken snapshot.
+pub(crate) async fn relay_health(app_state: &Arc<crate::commands::AppState>) -> Option<bool> {
+    relay_health_from(&web_integration_status_for(app_state).await)
 }
 
 /// `GET /web-integration/status` — local-only diagnostic endpoint exposing
@@ -500,6 +580,17 @@ async fn relay_loop(
     let mut backoff_ms: u64 = 2000;
     let max_backoff_ms: u64 = 60000;
     let mut consecutive_quick_disconnects: u32 = 0;
+    // Registration rejections ONLY — deliberately not `consecutive_quick_
+    // disconnects`, which is a BACKOFF counter: it is bumped by DNS failures,
+    // connect timeouts, request-build errors and any sub-10s disconnect, and
+    // it is zeroed by the extended-backoff arm every 5 attempts. Reusing it
+    // meant a transient network outage could suppress the kick on the very
+    // next attempt (the stale-token case a kick DOES fix), while the
+    // suppression itself never persisted past one 5-attempt cycle.
+    let mut consecutive_registration_rejections: u32 = 0;
+    // Latches the one-time suppression notice, so it is logged once per
+    // episode rather than once per cycle.
+    let mut kick_suppression_warned = false;
 
     // Subscribe to event broadcast BEFORE the reconnection loop so events
     // are buffered during backoff/reconnection delays (rather than dropped).
@@ -806,6 +897,10 @@ async fn relay_loop(
                         mark_disconnected(&api_state).await;
                         backoff_ms = 2000;
                         consecutive_quick_disconnects = 0;
+                        // A kick means something changed (settings, a fresh
+                        // token): let the next rejection kick again.
+                        consecutive_registration_rejections = 0;
+                        kick_suppression_warned = false;
                         continue;
                     }
                 }
@@ -823,11 +918,35 @@ async fn relay_loop(
                 // JWT is minted before the next attempt. No-op when the token
                 // is actually fine (the refresher only re-mints near expiry).
                 if !connected_ack.load(Ordering::Relaxed) {
-                    info!(
-                        "Backend relay: connection ended before the `connected` ack \
-                         — kicking device-JWT refresher (registration likely rejected)"
-                    );
-                    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+                    // This block IS the "rejected at registration" event, so
+                    // it is the only place the counter is bumped.
+                    consecutive_registration_rejections += 1;
+                    if consecutive_registration_rejections <= REGISTRATION_KICK_LIMIT {
+                        info!(
+                            "Backend relay: connection ended before the `connected` ack \
+                             — kicking device-JWT refresher (registration likely rejected)"
+                        );
+                        crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher()
+                            .await;
+                    } else if !kick_suppression_warned {
+                        kick_suppression_warned = true;
+                        warn!(
+                            attempts = consecutive_registration_rejections,
+                            limit = REGISTRATION_KICK_LIMIT,
+                            "Backend relay: registration still rejected after repeated \
+                             fresh-token attempts — a new device-JWT cannot fix this. \
+                             Read `last_error` on GET /web-integration/status: a \
+                             foreign-issuer rejection means the backend verifies against \
+                             a different coord than the one this runner is paired to. \
+                             Suppressing further refresher kicks; reconnects continue \
+                             on backoff."
+                        );
+                    }
+                } else {
+                    // Registration succeeded at least once on this socket, so
+                    // any future rejection starts a NEW episode.
+                    consecutive_registration_rejections = 0;
+                    kick_suppression_warned = false;
                 }
 
                 // Connection ended. Decide whether this was a "stable" run
@@ -1267,20 +1386,36 @@ async fn run_heartbeat_sender<S>(
         // visible off-box. Passing `None` would fix the status precisely where
         // it was already observable and leave it broken everywhere else.
         let ui_dead = crate::ui_error::ui_dead_now(&api_state.app_state.ui_bridge_last_pong);
-        let derived_status = crate::ui_error::compute_derived_status(
-            ui_error_snapshot.is_some(),
-            recent_crash_snapshot.is_some(),
-            Some(ui_dead),
-            crate::mcp_api::embedding_reachable_cached(),
-            None,
-        )
-        .to_string();
+        // Inside an established connection the gate was met and the socket is
+        // up, so the verdict is `Some(true)` by construction. Recomputing it
+        // would cost two file reads and a credential read every 30s to
+        // rediscover a known value.
+        let relay_connected = Some(true);
+        let derived_status =
+            crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
+                has_ui_error: ui_error_snapshot.is_some(),
+                has_recent_crash: recent_crash_snapshot.is_some(),
+                ui_dead: Some(ui_dead),
+                embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
+                relay_connected,
+                ..Default::default()
+            })
+            .to_string();
 
         let payload = serde_json::json!({
             "type": "heartbeat",
-            "derivedStatus": derived_status,
-            "uiError": ui_error_snapshot,
-            "recentCrash": recent_crash_snapshot,
+            // snake_case, because that is what the backend actually reads
+            // (`devices_ws._handle_heartbeat`: `msg.get("derived_status")` /
+            // `"ui_error"` / `"recent_crash"`). These were camelCase, so all
+            // three were silently dropped and `device_crud.heartbeat_device`
+            // fell back to writing the LITERAL "healthy" every 30s —
+            // clobbering the correct verdict the HTTP operations heartbeat had
+            // just written. A dead WebView with a live relay was stamped
+            // healthy on the next tick. Same defect class this commit exists
+            // to fix, on the adjacent path.
+            "derived_status": derived_status,
+            "ui_error": ui_error_snapshot,
+            "recent_crash": recent_crash_snapshot,
         });
         let text = match serde_json::to_string(&payload) {
             Ok(t) => t,
@@ -3430,6 +3565,94 @@ mod tests {
     // future refactor can't silently regress back to `last_error=null`
     // (the ambiguous state that cost real time during the Redis-disabled
     // pairing outage).
+
+    fn status_fixture(
+        tier: crate::settings::RunnerTier,
+        enabled: bool,
+        has_device_jwt: bool,
+        ws_connected: bool,
+        credential_read_error: Option<String>,
+    ) -> WebIntegrationStatus {
+        WebIntegrationStatus {
+            tier,
+            web_integration_enabled: enabled,
+            has_device_jwt,
+            credential_read_error,
+            settings_provenance: "loaded",
+            settings_error: None,
+            ws_connected,
+            last_error: None,
+        }
+    }
+
+    /// `relay_health_from` must agree with `should_relay_idle_with` on EVERY
+    /// combination -- "mirrors the gate" is the whole justification for the
+    /// design, and an earlier version copied two of the three gates and
+    /// dropped `has_device_jwt`, which made an UNPAIRED runner read
+    /// `degraded` forever (and so silently undispatchable, since qontinui-web
+    /// gates dispatch on `derived_status == "healthy"`).
+    #[test]
+    fn relay_health_matches_the_idle_gate_on_every_combination() {
+        use crate::settings::RunnerTier;
+        for tier in [
+            RunnerTier::Local,
+            RunnerTier::LocalProvider,
+            RunnerTier::QontinuiAccount,
+        ] {
+            for enabled in [false, true] {
+                for has_jwt in [false, true] {
+                    for ws in [false, true] {
+                        let st = status_fixture(tier, enabled, has_jwt, ws, None);
+                        let idle = should_relay_idle_with(tier, enabled, has_jwt);
+                        let verdict = relay_health_from(&st);
+                        if idle {
+                            assert_eq!(
+                                verdict, None,
+                                "gate idles, so no relay is expected: tier={tier:?}                                  enabled={enabled} jwt={has_jwt}"
+                            );
+                        } else {
+                            assert_eq!(
+                                verdict,
+                                Some(ws),
+                                "gate connects, so report the measured state:                                  tier={tier:?} enabled={enabled} jwt={has_jwt}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An unreadable credential store is `RelayGate::Unknown`, which RETRIES
+    /// rather than idling -- so the relay is gated ON and failing, and
+    /// `ws_connected` is a direct measurement of that. Reporting `None`
+    /// (-> `healthy`) here was the 2026-08-25 failure mode reintroduced: the
+    /// UNKNOWN is about the credential, not about the relay.
+    #[test]
+    fn unreadable_credentials_report_the_measured_state_not_unknown() {
+        use crate::settings::RunnerTier;
+        let broken = status_fixture(
+            RunnerTier::QontinuiAccount,
+            true,
+            false, // the probe could not read it: UNKNOWN, not "absent"
+            false, // ...and the relay is measurably not connected
+            Some("store undecryptable".to_string()),
+        );
+        assert_eq!(
+            relay_health_from(&broken),
+            Some(false),
+            "a relay that is retrying and failing must not read as healthy"
+        );
+
+        // Same shape, but the store read cleanly and there genuinely is no
+        // JWT: the gate really does idle, so no relay is expected.
+        let unpaired = status_fixture(RunnerTier::QontinuiAccount, true, false, false, None);
+        assert_eq!(
+            relay_health_from(&unpaired),
+            None,
+            "an unpaired runner is unconfigured, not broken"
+        );
+    }
 
     #[test]
     fn close_before_ack_error_includes_code_and_reason() {

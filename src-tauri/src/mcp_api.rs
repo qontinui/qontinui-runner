@@ -623,13 +623,24 @@ async fn health(
     // ping loop for as long as any UI is alive.
     let ui_dead =
         crate::ui_error::ui_stale(last_pong, pong_age_ms, crate::ui_error::UI_DEAD_AFTER_MS);
-    let derived_status = crate::ui_error::compute_derived_status(
-        ui_error_snapshot.is_some(),
-        recent_crash_snapshot.is_some(),
-        Some(ui_dead),
-        embedding_reachable_cached(),
+    // Relay liveness. `/health` is the endpoint every fleet probe already
+    // polls, so this is where a dead relay has to become visible — it was
+    // published only on `/web-integration/status` before, which nothing
+    // polls, and a three-day outage went unnoticed as a result.
+    // ONE snapshot, verdict derived from it. Taking two would cost a second
+    // settings + credential read per request AND let the block below mix two
+    // instants — e.g. `{"connected": null, "enabled": true}` — on the endpoint
+    // whose entire purpose is diagnosis.
+    let relay_status = crate::mcp::backend_relay::web_integration_status(&state).await;
+    let relay_connected = crate::mcp::backend_relay::relay_health_from(&relay_status);
+    let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
+        has_ui_error: ui_error_snapshot.is_some(),
+        has_recent_crash: recent_crash_snapshot.is_some(),
+        ui_dead: Some(ui_dead),
+        embedding_reachable: embedding_reachable_cached(),
         pg_reachable,
-    );
+        relay_connected,
+    });
 
     // `frontendReady` is DERIVED, not latched (2026-08-05).
     //
@@ -735,6 +746,23 @@ async fn health(
         "consoleErrorCount": console_errors,
         "aiProviderCircuitBreakers": ai_provider_states,
         "embeddingService": embedding_health,
+        // Backend WS relay to qontinui-web. `connected` is null when the
+        // relay is idle BY CONFIGURATION (tier below qontinui_account, or
+        // web_integration disabled) — null is "no relay expected", never
+        // "relay down". `lastError` is the reason the last attempt failed,
+        // which is the whole diagnostic surface when a relay is looping.
+        // NOTE: hand-built camelCase here, while the same fields are
+        // snake_case on `/web-integration/status` (that route serializes the
+        // `WebIntegrationStatus` struct). Both are correct for their endpoint
+        // — do not "fix" one to match the other.
+        "webIntegration": {
+            "relayExpected": relay_connected.is_some(),
+            "connected": relay_connected,
+            "wsConnected": relay_status.ws_connected,
+            "enabled": relay_status.web_integration_enabled,
+            "hasDeviceJwt": relay_status.has_device_jwt,
+            "lastError": relay_status.last_error,
+        },
         // iter4 B-5: PG data-layer liveness (bounded `SELECT 1`). `reachable`
         // is null when unprobed/unconfigured, true/false otherwise. Drives the
         // `degraded` downgrade above so `/health` mirrors the data layer.

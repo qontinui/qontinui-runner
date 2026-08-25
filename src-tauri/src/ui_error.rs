@@ -325,6 +325,23 @@ pub fn ui_dead_now(last_pong: &std::sync::atomic::AtomicU64) -> bool {
 /// * `embedding_reachable` — `None` until the first probe has run (treated as
 ///   unknown, not degraded — avoids false positives during boot). `Some(true)`
 ///   = healthy. `Some(false)` = degraded.
+/// * `relay_connected` — whether the backend WS relay currently holds an
+///   open, post-handshake connection to qontinui-web. `None` when the relay
+///   is legitimately idle (tier below `qontinui_account`, or
+///   `web_integration.enabled = false`, or settings unreadable): a runner
+///   deliberately configured local-only must NOT read as degraded, and an
+///   UNKNOWN must not be reported as a fault. `Some(false)` = the relay is
+///   gated ON but not connected → degraded, never `errored`: local
+///   execution is unaffected, so this is a subsystem out while the app still
+///   works — exactly the class `degraded` already means.
+///
+///   The failure this input exists for: a relay rejected at registration
+///   reconnects forever on its backoff without ever changing any published
+///   status, so `/health` reported `healthy` for THREE DAYS while the runner
+///   was unreachable from every cloud client and its workflow events were
+///   being dropped. `ws_connected` existed the whole time — on
+///   `/web-integration/status`, which nothing polls. Plan
+///   `2026-08-25-coord-jwt-kid-collides-across-environments`.
 /// * `pg_reachable` — bounded PG liveness (a `SELECT 1` with the deadpool
 ///   `get()` timeout). `None` when not probed (e.g. the heartbeat sinks that
 ///   don't run a DB round-trip, or a runner with no PG configured) — treated
@@ -339,16 +356,41 @@ pub fn ui_dead_now(last_pong: &std::sync::atomic::AtomicU64) -> bool {
 /// `ui_dead` — the heartbeat sinks especially, since nothing polls `/health`
 /// on an end user's machine and the heartbeats are the only path by which a
 /// dead UI is ever visible off-box.
-pub fn compute_derived_status(
-    has_ui_error: bool,
-    has_recent_crash: bool,
-    ui_dead: Option<bool>,
-    embedding_reachable: Option<bool>,
-    pg_reachable: Option<bool>,
-) -> &'static str {
-    if has_ui_error || has_recent_crash || matches!(ui_dead, Some(true)) {
+/// The sub-signals [`compute_derived_status`] weighs.
+///
+/// A struct rather than a positional argument list because the inputs are
+/// now four consecutive, mutually interchangeable `Option<bool>`s:
+/// transposing two of them compiles silently and yields a wrong health
+/// verdict, on the one function every fleet probe trusts. Named fields make
+/// that a compile error instead.
+///
+/// `Default` is all-`None`/`false` — "this sink cannot tell" — which is also
+/// the correct value for any signal a caller does not probe, so a sink adds
+/// only the fields it actually measures and a new signal does not touch
+/// every existing call site.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HealthInputs {
+    /// The React error boundary reported an error.
+    pub has_ui_error: bool,
+    /// A crash dump was found at startup.
+    pub has_recent_crash: bool,
+    /// UI liveness from `last_pong`. See [`ui_stale`].
+    pub ui_dead: Option<bool>,
+    /// Embedding-service reachability; `None` until the first probe.
+    pub embedding_reachable: Option<bool>,
+    /// Bounded PG liveness; `None` when not probed.
+    pub pg_reachable: Option<bool>,
+    /// Backend WS relay liveness; `None` when no relay is expected.
+    pub relay_connected: Option<bool>,
+}
+
+pub fn compute_derived_status(i: &HealthInputs) -> &'static str {
+    if i.has_ui_error || i.has_recent_crash || matches!(i.ui_dead, Some(true)) {
         "errored"
-    } else if matches!(embedding_reachable, Some(false)) || matches!(pg_reachable, Some(false)) {
+    } else if matches!(i.embedding_reachable, Some(false))
+        || matches!(i.pg_reachable, Some(false))
+        || matches!(i.relay_connected, Some(false))
+    {
         "degraded"
     } else {
         "healthy"
@@ -491,15 +533,37 @@ mod tests {
     #[test]
     fn derived_status_errored_wins_over_everything() {
         assert_eq!(
-            compute_derived_status(true, false, Some(false), Some(true), Some(true)),
+            compute_derived_status(&HealthInputs {
+                has_ui_error: true,
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "errored"
         );
         assert_eq!(
-            compute_derived_status(true, true, Some(false), Some(false), Some(false)),
+            compute_derived_status(&HealthInputs {
+                has_ui_error: true,
+                has_recent_crash: true,
+                ui_dead: Some(false),
+                embedding_reachable: Some(false),
+                pg_reachable: Some(false),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "errored"
         );
         assert_eq!(
-            compute_derived_status(false, true, Some(false), Some(true), Some(true)),
+            compute_derived_status(&HealthInputs {
+                has_recent_crash: true,
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "errored"
         );
     }
@@ -507,7 +571,13 @@ mod tests {
     #[test]
     fn derived_status_degraded_when_embedding_unreachable() {
         assert_eq!(
-            compute_derived_status(false, false, Some(false), Some(false), Some(true)),
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                embedding_reachable: Some(false),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "degraded"
         );
     }
@@ -517,7 +587,13 @@ mod tests {
         // iter4 B-5: PG down while everything else is fine → degraded, so
         // /health can no longer report "healthy" over a dead data layer.
         assert_eq!(
-            compute_derived_status(false, false, Some(false), Some(true), Some(false)),
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(false),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "degraded"
         );
     }
@@ -525,7 +601,13 @@ mod tests {
     #[test]
     fn derived_status_healthy_when_embedding_reachable() {
         assert_eq!(
-            compute_derived_status(false, false, Some(false), Some(true), Some(true)),
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "healthy"
         );
     }
@@ -534,7 +616,10 @@ mod tests {
     fn derived_status_unknown_embedding_is_healthy_not_degraded() {
         // Boot-time: probe hasn't run yet. Avoid false-positive degraded.
         assert_eq!(
-            compute_derived_status(false, false, None, None, None),
+            compute_derived_status(&HealthInputs {
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "healthy"
         );
     }
@@ -544,7 +629,12 @@ mod tests {
         // No PG probe (heartbeat sinks, or no PG configured) must not
         // false-positive to degraded.
         assert_eq!(
-            compute_derived_status(false, false, Some(false), Some(true), None),
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "healthy"
         );
     }
@@ -577,7 +667,13 @@ mod tests {
             );
         }
         assert_eq!(
-            compute_derived_status(false, false, Some(false), Some(true), Some(true)),
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "healthy",
             "a runner that never mounted a webview is healthy, not errored"
         );
@@ -587,7 +683,13 @@ mod tests {
     fn derived_status_healthy_when_ui_alive_and_fresh() {
         assert!(!ui_stale(SOME_PONG, 500, UI_DEAD_AFTER_MS));
         assert_eq!(
-            compute_derived_status(false, false, Some(false), Some(true), Some(true)),
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "healthy"
         );
     }
@@ -596,7 +698,13 @@ mod tests {
     fn derived_status_errored_when_ui_was_alive_then_went_stale() {
         assert!(ui_stale(SOME_PONG, UI_DEAD_AFTER_MS + 1, UI_DEAD_AFTER_MS));
         assert_eq!(
-            compute_derived_status(false, false, Some(true), Some(true), Some(true)),
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(true),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "errored"
         );
     }
@@ -605,11 +713,23 @@ mod tests {
     fn derived_status_dead_ui_outranks_degraded_pg() {
         // A dead window is not "a subsystem is out but the app works".
         assert_eq!(
-            compute_derived_status(false, false, Some(true), Some(true), Some(false)),
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(true),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(false),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "errored"
         );
         assert_eq!(
-            compute_derived_status(false, false, Some(true), Some(false), Some(false)),
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(true),
+                embedding_reachable: Some(false),
+                pg_reachable: Some(false),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "errored"
         );
     }
@@ -619,15 +739,29 @@ mod tests {
         // `None` = this sink cannot tell. Guards the pre-change behavior for
         // any non-probing caller: identical verdicts to `Some(false)`.
         assert_eq!(
-            compute_derived_status(false, false, None, Some(true), Some(true)),
+            compute_derived_status(&HealthInputs {
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "healthy"
         );
         assert_eq!(
-            compute_derived_status(false, false, None, Some(false), None),
+            compute_derived_status(&HealthInputs {
+                embedding_reachable: Some(false),
+                ..Default::default()
+            }),
             "degraded"
         );
         assert_eq!(
-            compute_derived_status(true, false, None, Some(true), Some(true)),
+            compute_derived_status(&HealthInputs {
+                has_ui_error: true,
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "errored"
         );
     }
@@ -647,15 +781,103 @@ mod tests {
         let ui_dead = ui_stale(SOME_PONG, pong_age_ms, UI_DEAD_AFTER_MS);
         assert!(ui_dead, "a 16-minute-old pong is well past the dead rung");
         assert_eq!(
-            compute_derived_status(
-                false,         // ui_error: null
-                false,         // recent_crash: null
-                Some(ui_dead), // the only signal that stayed correct
-                Some(true),    // embedding service fine
-                Some(true),    // PG fine
-            ),
+            compute_derived_status(&HealthInputs {
+                // ui_error and recent_crash were both null -- a crashed
+                // browser process cannot run the React error boundary, and the
+                // startup-only dump scanner cannot see a mid-run WebView2
+                // Crashpad dump. Left at their `false` defaults.
+                ui_dead: Some(ui_dead), // the only signal that stayed correct
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "errored",
             "the dead-webview incident must no longer report healthy"
+        );
+    }
+
+    /// The 2026-08-25 incident, replayed. This case reads `healthy` on
+    /// `origin/main` -- that is the whole defect.
+    ///
+    /// The backend relay was rejected at registration and reconnected on its
+    /// backoff for THREE DAYS. Nothing else was wrong: the UI was alive, the
+    /// embedding service and PG were reachable, no crash, no boundary error.
+    /// So `/health` said `healthy` while the runner was unreachable from
+    /// every cloud client and was silently dropping its workflow events.
+    #[test]
+    fn derived_status_regression_2026_08_25_dead_relay_read_healthy() {
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                // Nothing else was wrong: no boundary error, no crash, UI
+                // alive, embedding and PG reachable.
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(false), // the only signal that was wrong
+                ..Default::default()
+            }),
+            "degraded",
+            "a relay gated ON but not connected must not report healthy"
+        );
+    }
+
+    #[test]
+    fn a_relay_that_is_off_by_configuration_is_not_a_fault() {
+        // `None` = no relay expected (tier below qontinui_account, or
+        // web_integration disabled, or the runner simply not paired yet). A
+        // runner deliberately configured local-only must never read degraded
+        // for a relay it was never meant to have -- which matters because
+        // qontinui-web gates dispatch on `derived_status == "healthy"`, so a
+        // false `degraded` silently removes it from the auto-dispatch pool.
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: None,
+                ..Default::default()
+            }),
+            "healthy"
+        );
+    }
+    #[test]
+    fn a_dead_relay_degrades_but_never_errors() {
+        // `degraded` is the right class, but NOT because it keeps the runner
+        // dispatchable -- it does not. qontinui-web gates dispatch on
+        // `derived_status == "healthy"` (workflow_dispatcher `_pick_auto_runner`
+        // and `RunOnRunnerButton`), so `degraded` already removes it from the
+        // auto-dispatch pool and the picker. That is CORRECT here: dispatch
+        // rides the very relay that is down.
+        //
+        // The distinction `degraded` buys is against `errored`, which is the
+        // recovery-eligible class -- it routes to automated recovery and reads
+        // as "this runner is broken". A runner whose relay is down still
+        // executes local work correctly, so it is a subsystem out while the app
+        // works: exactly what `degraded` already means for the embedding
+        // service and PG.
+        let with_relay_down = compute_derived_status(&HealthInputs {
+            ui_dead: Some(false),
+            embedding_reachable: Some(true),
+            pg_reachable: Some(true),
+            relay_connected: Some(false),
+            ..Default::default()
+        });
+        assert_ne!(with_relay_down, "errored");
+        assert_eq!(with_relay_down, "degraded");
+
+        // ...and it must not MASK a real error either.
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                has_ui_error: true,
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(false),
+                ..Default::default()
+            }),
+            "errored",
+            "a genuine UI error still wins over relay degradation"
         );
     }
 
@@ -675,7 +897,13 @@ mod tests {
         assert!(ui_stale(SOME_PONG, between, UI_STALE_AFTER_MS));
         assert!(!ui_stale(SOME_PONG, between, UI_DEAD_AFTER_MS));
         assert_eq!(
-            compute_derived_status(false, false, Some(false), Some(true), Some(true)),
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "healthy",
             "an age between the two rungs is stale for diagnostics, not dead"
         );

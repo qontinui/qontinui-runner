@@ -280,13 +280,13 @@ pub(super) async fn gather_ui_error_signals(
         last_pong_age_ms,
         crate::ui_error::UI_DEAD_AFTER_MS,
     );
-    let derived_status = crate::ui_error::compute_derived_status(
-        ui_error.is_some(),
-        recent_crash.is_some(),
-        Some(ui_dead),
-        crate::mcp_api::embedding_reachable_cached(),
-        None,
-    );
+    let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
+        has_ui_error: ui_error.is_some(),
+        has_recent_crash: recent_crash.is_some(),
+        ui_dead: Some(ui_dead),
+        embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
+        ..Default::default()
+    });
     let json = match &ui_error {
         Some(err) => serde_json::to_value(err).unwrap_or(serde_json::Value::Null),
         None => serde_json::Value::Null,
@@ -1023,7 +1023,13 @@ mod frontend_state_tests {
         let ui_dead = ui_stale(i.last_pong, i.last_pong_age_ms, UI_DEAD_AFTER_MS);
         assert!(!ui_dead);
         assert_eq!(
-            compute_derived_status(false, false, Some(ui_dead), Some(true), Some(true)),
+            compute_derived_status(&crate::ui_error::HealthInputs {
+                ui_dead: Some(ui_dead),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "healthy",
             "the same age must still be healthy for the status rung"
         );
@@ -1037,7 +1043,13 @@ mod frontend_state_tests {
         let ui_dead = ui_stale(i.last_pong, i.last_pong_age_ms, UI_DEAD_AFTER_MS);
         assert!(ui_dead);
         assert_eq!(
-            compute_derived_status(false, false, Some(ui_dead), Some(true), Some(true)),
+            compute_derived_status(&crate::ui_error::HealthInputs {
+                ui_dead: Some(ui_dead),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
             "errored"
         );
     }
