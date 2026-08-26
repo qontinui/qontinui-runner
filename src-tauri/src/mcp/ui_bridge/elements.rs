@@ -42,9 +42,7 @@ use super::helpers::{
     filter_element_fields, read_window_label, snapshot_signature,
 };
 use super::recovery_executor::attempt_recovery;
-use super::request::{
-    ui_bridge_request_sync, ui_bridge_request_sync_in_window, wrap_ipc_result,
-};
+use super::request::{ui_bridge_request_sync, ui_bridge_request_sync_in_window, wrap_ipc_result};
 use super::screenshots::capture_runner_window_base64;
 use super::types::{
     classify_transport_error, UIBridgeActionRequest, UIBridgeComponentActionRequest,
@@ -5120,7 +5118,10 @@ mod type_into_tests {
         assert!(js.contains("'Index out of range'"));
         // `typed: true` is now the HANDLER's answer, only ever reached after
         // `execute_action` succeeded — the eval can no longer claim it.
-        assert!(!js.contains("typed:"), "eval must not claim a typed verdict");
+        assert!(
+            !js.contains("typed:"),
+            "eval must not claim a typed verdict"
+        );
     }
 
     #[test]

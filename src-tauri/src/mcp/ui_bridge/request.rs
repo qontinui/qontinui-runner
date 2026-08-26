@@ -1674,7 +1674,9 @@ mod wrap_ipc_result_tests {
         let data = extract_response_data(&response);
         assert_eq!(
             data.get("error"),
-            Some(&json!("RECOVERY_UNSCOPED: recovery requires params.elementId"))
+            Some(&json!(
+                "RECOVERY_UNSCOPED: recovery requires params.elementId"
+            ))
         );
         assert_eq!(data.get("code"), Some(&json!("RECOVERY_UNSCOPED")));
         // Data-only fields are untouched.
@@ -1748,7 +1750,10 @@ mod wrap_ipc_result_tests {
         let (status, body) = wrap_ipc_result(Ok(delivered))
             .expect_err("an invalid stub must not answer HTTP 200 success");
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body.deref().error.as_deref(), Some("urlPattern is required"));
+        assert_eq!(
+            body.deref().error.as_deref(),
+            Some("urlPattern is required")
+        );
         assert_eq!(count.load(Ordering::Relaxed), 0);
     }
 
