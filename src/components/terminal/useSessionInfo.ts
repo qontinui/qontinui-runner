@@ -98,7 +98,7 @@ export interface SessionPrLanded {
   repo: string;
   prNumber: number;
   landedAt: string | null;
-  /** `"github-merge"` | `"ff-land"` | `"coord"`. */
+  /** `"github-merge"` | `"ff-land"` | `"coord-label"`. */
   landSignal: string | null;
 }
 
@@ -107,8 +107,8 @@ export interface SessionPrLanded {
 export interface SessionPrUnknown {
   repo: string;
   prNumber: number;
-  /** `"ref_stale"` | `"head_object_missing"` | `"no_base_ref"` |
-   * `"not_a_repo"` | `"unspecified"`. */
+  /** `"rebase_land_or_abandoned"` | `"ref_stale"` | `"head_object_missing"` |
+   * `"no_base_ref"` | `"not_a_repo"` | `"unspecified"`. */
   reason: string;
 }
 
@@ -378,6 +378,28 @@ export function deriveTrigger(state: SessionInfoState): TriggerState {
 export type PrChipTone = "landed" | "unknown" | "not-landed" | "open";
 
 /**
+ * Land signal → the words on the chip.
+ *
+ * The raw signal is a machine token; three of the four read badly in a
+ * dropdown (`coord-label` most of all). An UNRECOGNISED signal falls through
+ * to itself rather than to a generic "landed" — a newer runner backend can
+ * add a signal this frontend has never heard of, and showing the token is
+ * honest where inventing a friendly name for it would not be. Pure.
+ */
+export const LAND_SIGNAL_LABELS: Readonly<Record<string, string>> = {
+  "github-merge": "merged",
+  "ff-land": "landed (ff)",
+  "coord-label": "landed (coord)",
+};
+
+/** Human label for a land signal; `null` ⇒ landed by a signal we did not
+ * record, which is still a land. Pure. */
+export function landSignalLabel(signal: string | null): string {
+  if (signal === null) return "landed";
+  return LAND_SIGNAL_LABELS[signal] ?? signal;
+}
+
+/**
  * The land-signal chip for one opened PR row. The three buckets render as
  * three distinct states; an unevaluable verdict says so WITH its reason
  * rather than being demoted to a confident negative (R1). Pure.
@@ -387,17 +409,17 @@ export function prRowChip(
   landed: SessionPrLanded | undefined,
   unknown: SessionPrUnknown | undefined,
 ): { text: string; tone: PrChipTone } {
-  if (landed) {
-    const label =
-      landed.landSignal === "github-merge"
-        ? "merged"
-        : landed.landSignal === null
-          ? "landed"
-          : landed.landSignal;
-    return { text: label, tone: "landed" };
-  }
+  if (landed) return { text: landSignalLabel(landed.landSignal), tone: "landed" };
   if (unknown) return { text: `unknown — ${unknown.reason}`, tone: "unknown" };
-  if (pr.prState === "closed") return { text: "closed, not landed", tone: "not-landed" };
+  // `prState === "closed"` reaches here ONLY when the backend recorded a
+  // confident `not-landed`, which since 2026-08-26 it does only for a PR
+  // GitHub still reports open — so a closed row with no land verdict is an
+  // unknown that lost its reason, not a proven negative. Say the weaker
+  // thing. (The strong claim used to read "closed, not landed", and it was
+  // printed on every coord rebase-fast-forward land: those rewrite the shas,
+  // so the ancestry probe backing it could never have passed.)
+  if (pr.prState === "closed")
+    return { text: "closed — land unverified", tone: "unknown" };
   return { text: pr.prState ?? "open", tone: "open" };
 }
 

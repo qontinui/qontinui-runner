@@ -32,9 +32,20 @@
 //! majority of this fleet's landings and leave `merged=false` / `state=closed`
 //! (`knowledge-base/qontinui-specific/coord-ff-lands.md`), so both write paths
 //! run the [`land_verdict`] cascade instead: GitHub merge → local content
-//! proof (`ff-land`) → otherwise one of TWO distinct terminal states,
-//! `not-landed` (evaluated) and `land-unknown` (could not be evaluated, always
-//! with a reason). The cascade never fetches — see [`probe_land`].
+//! proof (`ff-land`) → coord's own `coord:landed` chip (`coord-label`) →
+//! otherwise one of TWO distinct terminal states, `not-landed` (evaluated) and
+//! `land-unknown` (could not be evaluated, always with a reason). The cascade
+//! never fetches — see [`probe_land`].
+//!
+//! AND A FAILED ANCESTRY TEST IS NOT A LAND VERDICT. coord's majority land
+//! shape rebases the PR's commits and pushes the REPLAYED shas, so the PR's
+//! own head sha is not on `origin/<base>` after an ordinary land and the
+//! content proof cannot pass. Until 2026-08-26 that failure was recorded as a
+//! confident `not-landed`, which the Terminal dropdown rendered as
+//! `closed, not landed` on PRs that had shipped — the precise thing
+//! `coord-ff-lands.md` says never to do with ancestry. It is now
+//! `land-unknown` / `rebase_land_or_abandoned`, and the `coord:landed` chip
+//! is what turns the common case back into a positive.
 //!
 //! Best-effort throughout: PG unavailable, no GitHub token, a git/gh failure,
 //! or an API error skips the affected unit and logs — a passive dropdown never
@@ -51,7 +62,7 @@ use uuid::Uuid;
 use crate::database::pg::session_pr_ops::SessionPrStatus;
 use crate::database::pg::PgDb;
 use crate::session::session_lifecycle_store::SessionLifecycleStore;
-use crate::trigger_system::github_api::GitHubClient;
+use crate::trigger_system::github_api::{has_coord_landed_label, GitHubClient};
 
 /// Reconcile cadence. Matches the "similar poller" cadence in the crate
 /// (min-10s pollers, 45s lifecycle poll) — 30s is responsive enough for a
@@ -281,7 +292,7 @@ async fn reconcile_session(
                 &pr.base_ref,
             )
             .await;
-            let verdict = land_verdict(pr.merged, proof);
+            let verdict = land_verdict(pr.merged, has_coord_landed_label(&pr.labels), proof);
             let status = session_pr_status(
                 &verdict,
                 &pr.state,
@@ -337,7 +348,7 @@ async fn reconcile_session(
                     &pr.base_ref,
                 )
                 .await;
-                let verdict = land_verdict(pr.merged, proof);
+                let verdict = land_verdict(pr.merged, has_coord_landed_label(&pr.labels), proof);
                 // `get_pr`'s PrStatus exposes no merged_at; preserve any stamp
                 // the branch path already recorded.
                 let status = session_pr_status(
@@ -401,6 +412,23 @@ enum LandUnknown {
     /// the running runner were both 19 commits behind `origin/main` at plan
     /// vet time, so this is the COMMON case on this fleet, not the exotic one.
     RefStale,
+    /// Every input was present, `origin/<base>` was strictly NEWER than the PR
+    /// head, and git still answered "not an ancestor".
+    ///
+    /// This is not evidence of "not landed". coord lands by rebasing the PR's
+    /// commits onto the base and pushing the REPLAYED shas, so the PR's own
+    /// head sha is not on `origin/<base>` after a perfectly ordinary land —
+    /// the ancestry test cannot pass on that shape and never could. The two
+    /// live possibilities are "coord rebase-landed it" and "it was closed
+    /// unlanded", and ancestry does not separate them:
+    ///
+    /// > *Ancestry is a one-way signal … a pass is positive evidence, but a
+    /// > fail is not evidence of "unlanded". Never use it as a negative test.*
+    /// > — `knowledge-base/qontinui-specific/coord-ff-lands.md`
+    ///
+    /// Reporting this as `not-landed` is exactly the defect that put a
+    /// `closed, not landed` chip on landed PRs in the Terminal dropdown.
+    RebaseLandOrAbandoned,
 }
 
 impl LandUnknown {
@@ -410,6 +438,7 @@ impl LandUnknown {
             LandUnknown::NoBaseRef => "no_base_ref",
             LandUnknown::HeadObjectMissing => "head_object_missing",
             LandUnknown::RefStale => "ref_stale",
+            LandUnknown::RebaseLandOrAbandoned => "rebase_land_or_abandoned",
         }
     }
 }
@@ -421,7 +450,10 @@ enum ContentProof {
     /// The PR head is an ancestor of `origin/<base>`: the commits ARE on the
     /// base branch. Land-path independent — this is what catches an ff-land.
     Ancestor,
-    /// Every input was present and git answered "not an ancestor".
+    /// Every input was present, the base tip was strictly newer, and git
+    /// answered "not an ancestor". **Not a negative verdict** — see
+    /// [`LandUnknown::RebaseLandOrAbandoned`], which is what the cascade
+    /// turns this into.
     NotAncestor,
     /// The probe could not be evaluated. Carries the recorded reason.
     Unknown(LandUnknown),
@@ -448,21 +480,31 @@ struct LandVerdict {
 
 /// THE CASCADE — first hit wins, each hit recorded. Pure over its inputs, so
 /// it unit-tests without git, PG or the network; `proof` is the injected
-/// result of signal 2 ([`probe_land`]).
+/// result of signal 2 ([`probe_land`]) and `coord_landed` the injected result
+/// of signal 3.
 ///
 /// 1. GitHub `merged == true` → `github-merge`.
 /// 2. Content proof: the head commit is an ancestor of `origin/<base>` →
-///    `ff-land`. The signal that must ship; 1 and 3 are corroboration.
-/// 3. coord's verdict → `coord`. **NOT WIRED**: the runner has no in-process
-///    coord PR-status client (`coord_pr_status` appears only in `mcp_api.rs`'s
-///    tool-name allowlist, i.e. a proxied MCP tool, not a callable client), and
-///    standing up a new coord client for a corroborating signal would put a
-///    network dependency on a 30s background tick. When such a client exists it
-///    slots in HERE, between 2 and 4, with `signal = "coord"`.
+///    `ff-land`. 1 and 3 corroborate it.
+/// 3. coord's own verdict, read off the [`COORD_LANDED_LABEL`] chip on the PR
+///    payload the caller already fetched → `coord-label`. This is the signal
+///    that CARRIES this fleet, because 1 and 2 both structurally miss coord's
+///    majority land shape: coord rebases and pushes REPLAYED shas, so GitHub
+///    records no merge and the PR's own head sha is never on `origin/<base>`.
+///    (The doc-comment this replaces reserved slot 3 for a direct coord PR
+///    -status client and called it NOT WIRED. The label is the same verdict
+///    from the same authority over a transport the runner already pays for —
+///    no new client, no network dependency on a 30s background tick. A direct
+///    client, if one ever exists, corroborates rather than replaces it.)
 /// 4. Otherwise TWO distinct terminal states, never merged into one:
-///    `not-landed` (every signal evaluated and said no) and `land-unknown`
+///    `not-landed` (every signal was evaluated and said no) and `land-unknown`
 ///    (a signal could not be evaluated), the latter always with its reason.
-fn land_verdict(github_merged: bool, proof: ContentProof) -> LandVerdict {
+///
+/// **A failed ancestry test is NOT a `not-landed`.** It lands in 4's unknown
+/// arm as [`LandUnknown::RebaseLandOrAbandoned`]; only [`ContentProof::
+/// NotAttempted`] — which on this path means GitHub still reports the PR OPEN
+/// — is an evaluated negative.
+fn land_verdict(github_merged: bool, coord_landed: bool, proof: ContentProof) -> LandVerdict {
     if github_merged {
         return LandVerdict {
             landed: true,
@@ -470,7 +512,23 @@ fn land_verdict(github_merged: bool, proof: ContentProof) -> LandVerdict {
             reason: None,
         };
     }
+    if proof == ContentProof::Ancestor {
+        return LandVerdict {
+            landed: true,
+            signal: "ff-land",
+            reason: None,
+        };
+    }
+    if coord_landed {
+        return LandVerdict {
+            landed: true,
+            signal: "coord-label",
+            reason: None,
+        };
+    }
     match proof {
+        // Handled above; repeated so the match stays exhaustive without a
+        // catch-all that would silently absorb a future variant.
         ContentProof::Ancestor => LandVerdict {
             landed: true,
             signal: "ff-land",
@@ -481,7 +539,12 @@ fn land_verdict(github_merged: bool, proof: ContentProof) -> LandVerdict {
             signal: "land-unknown",
             reason: Some(reason.as_str()),
         },
-        ContentProof::NotAncestor | ContentProof::NotAttempted => LandVerdict {
+        ContentProof::NotAncestor => LandVerdict {
+            landed: false,
+            signal: "land-unknown",
+            reason: Some(LandUnknown::RebaseLandOrAbandoned.as_str()),
+        },
+        ContentProof::NotAttempted => LandVerdict {
             landed: false,
             signal: "not-landed",
             reason: None,
@@ -906,7 +969,7 @@ mod tests {
     /// `ff-land`.
     #[test]
     fn ff_landed_pr_is_landed_with_the_ff_land_signal() {
-        let verdict = land_verdict(false, ContentProof::Ancestor);
+        let verdict = land_verdict(false, false, ContentProof::Ancestor);
         assert!(verdict.landed, "an ff-land is a land");
         assert_eq!(verdict.signal, "ff-land");
         assert_eq!(verdict.reason, None);
@@ -923,20 +986,113 @@ mod tests {
         assert_eq!(status.landed_at, closed_at);
     }
 
-    /// The ancestor test EVALUATED and said no (both objects present, the base
-    /// tip is strictly newer than the head): a real negative.
+    /// THE REGRESSION GUARD for the `closed, not landed` chip on landed PRs.
+    ///
+    /// The ancestor test evaluated and said no. That is NOT a negative land
+    /// verdict: coord's majority land shape rebases the PR's commits and
+    /// pushes the replayed shas, so the PR's own head sha is never on
+    /// `origin/<base>` after an ordinary land, and this branch is exactly what
+    /// a landed PR produces. Until 2026-08-26 it recorded `not-landed`, and
+    /// the Terminal dropdown printed `closed, not landed` on shipped work.
+    ///
+    /// It must be `land-unknown` with a reason. That is a WEAKER claim than
+    /// before, deliberately: the honest answer here is "ancestry cannot tell",
+    /// and the `coord:landed` chip (below) is what recovers the positive.
     #[test]
-    fn evaluated_non_ancestor_is_not_landed() {
-        let verdict = land_verdict(false, ContentProof::NotAncestor);
+    fn non_ancestor_is_land_unknown_never_a_confident_negative() {
+        let verdict = land_verdict(false, false, ContentProof::NotAncestor);
+        assert!(!verdict.landed);
+        assert_ne!(
+            verdict.signal, "not-landed",
+            "a failed ancestry test is not evidence of unlanded - coord-ff-lands.md"
+        );
+        assert_eq!(verdict.signal, "land-unknown");
+        assert_eq!(verdict.reason, Some("rebase_land_or_abandoned"));
+        let status = session_pr_status(&verdict, "closed", None, parse_ts("2026-08-15T10:00:00Z"));
+        assert_eq!(status.pr_state.as_deref(), Some("closed"));
+        assert_eq!(status.land_signal.as_deref(), Some("land-unknown"));
+        assert_eq!(
+            status.land_reason.as_deref(),
+            Some("rebase_land_or_abandoned")
+        );
+        // Unknown carries no land stamp - we did not establish a land.
+        assert_eq!(status.landed_at, None);
+    }
+
+    /// The ONLY confident negative left: GitHub still reports the PR open, so
+    /// no probe was attempted and none was needed. An open PR has not landed.
+    #[test]
+    fn open_pr_is_the_only_confident_not_landed() {
+        let verdict = land_verdict(false, false, ContentProof::NotAttempted);
         assert!(!verdict.landed);
         assert_eq!(verdict.signal, "not-landed");
         assert_eq!(verdict.reason, None);
-        let status = session_pr_status(&verdict, "closed", None, parse_ts("2026-08-15T10:00:00Z"));
-        assert_eq!(status.pr_state.as_deref(), Some("closed"));
-        assert_eq!(status.land_signal.as_deref(), Some("not-landed"));
-        // A not-landed row carries no land stamp, even though it has a close
-        // stamp — closed is not landed.
+        let status = session_pr_status(&verdict, "open", None, None);
+        assert_eq!(status.pr_state.as_deref(), Some("open"));
         assert_eq!(status.landed_at, None);
+    }
+
+    /// SIGNAL 3. coord's `coord:landed` chip rescues every shape the local
+    /// content proof structurally cannot reach - which on this fleet is the
+    /// common one. Each of these probe results would otherwise have been an
+    /// unknown (or, before 2026-08-26, a false `not-landed`).
+    #[test]
+    fn coord_landed_label_lands_every_shape_the_content_proof_cannot_reach() {
+        for proof in [
+            // The rebase-land shape: replayed shas, head not on base.
+            ContentProof::NotAncestor,
+            // The usual post-land state - branch deleted, head object pruned.
+            ContentProof::Unknown(LandUnknown::HeadObjectMissing),
+            ContentProof::Unknown(LandUnknown::RefStale),
+            ContentProof::Unknown(LandUnknown::NotARepo),
+            ContentProof::Unknown(LandUnknown::NoBaseRef),
+        ] {
+            let verdict = land_verdict(false, true, proof);
+            assert!(verdict.landed, "coord's own chip is a land: {proof:?}");
+            assert_eq!(verdict.signal, "coord-label");
+            assert_eq!(verdict.reason, None);
+
+            let closed_at = parse_ts("2026-08-20T08:41:31Z");
+            let status = session_pr_status(&verdict, "closed", None, closed_at);
+            assert!(status.landed);
+            assert_eq!(status.pr_state.as_deref(), Some("merged"));
+            assert_eq!(status.land_signal.as_deref(), Some("coord-label"));
+            // No GitHub merge stamp on this shape; the close time is the land.
+            assert_eq!(status.landed_at, closed_at);
+        }
+    }
+
+    /// Signal precedence: the local CONTENT proof outranks the chip, so a PR
+    /// that is provably on the base reports `ff-land` even when coord also
+    /// labelled it. Both say landed - the recorded WHY is the strongest one.
+    #[test]
+    fn content_proof_outranks_the_coord_chip() {
+        let verdict = land_verdict(false, true, ContentProof::Ancestor);
+        assert!(verdict.landed);
+        assert_eq!(verdict.signal, "ff-land");
+    }
+
+    /// The chip is POSITIVE-ONLY. coord applies it best-effort and only after
+    /// its explanatory comment posts, so its absence establishes nothing - an
+    /// unlabelled PR whose probe could not be evaluated stays UNKNOWN, and
+    /// must not be demoted to a confident negative by the absent label.
+    #[test]
+    fn an_absent_coord_label_proves_nothing() {
+        let verdict = land_verdict(
+            false,
+            false,
+            ContentProof::Unknown(LandUnknown::HeadObjectMissing),
+        );
+        assert!(!verdict.landed);
+        assert_eq!(verdict.signal, "land-unknown");
+        assert_eq!(verdict.reason, Some("head_object_missing"));
+    }
+
+    /// GitHub's own merge still outranks the chip - signal 1 is first.
+    #[test]
+    fn github_merge_outranks_the_coord_chip() {
+        let verdict = land_verdict(true, true, ContentProof::NotAttempted);
+        assert_eq!(verdict.signal, "github-merge");
     }
 
     /// The probe COULD NOT BE EVALUATED — a missing base ref, a pruned head
@@ -952,7 +1108,7 @@ mod tests {
             (LandUnknown::RefStale, "ref_stale"),
             (LandUnknown::NotARepo, "not_a_repo"),
         ] {
-            let verdict = land_verdict(false, ContentProof::Unknown(unknown));
+            let verdict = land_verdict(false, false, ContentProof::Unknown(unknown));
             assert!(!verdict.landed, "unknown is not a land: {want_reason}");
             assert_eq!(verdict.signal, "land-unknown", "reason={want_reason}");
             assert_ne!(
@@ -979,14 +1135,14 @@ mod tests {
             ContentProof::NotAncestor,
             ContentProof::Unknown(LandUnknown::HeadObjectMissing),
         ] {
-            let verdict = land_verdict(true, proof);
+            let verdict = land_verdict(true, false, proof);
             assert!(verdict.landed);
             assert_eq!(verdict.signal, "github-merge");
             assert_eq!(verdict.reason, None);
         }
         let merged_at = parse_ts("2026-08-14T09:00:00Z");
         let status = session_pr_status(
-            &land_verdict(true, ContentProof::NotAttempted),
+            &land_verdict(true, false, ContentProof::NotAttempted),
             "closed",
             merged_at,
             parse_ts("2026-08-14T09:00:05Z"),
@@ -996,10 +1152,13 @@ mod tests {
         assert_eq!(status.landed_at, merged_at);
     }
 
-    /// A "not an ancestor" answer is only evidence when the local
-    /// `origin/<base>` tip is strictly NEWER than the PR head. Equal or older
-    /// means the ref cannot contain the head — a stale-ref artefact, not a
-    /// verdict. (Measured at plan-vet time: this repo and the running runner
+    /// Two DIFFERENT unknowns, and the split still earns its two subprocesses.
+    /// A "not an ancestor" answer against a base tip strictly NEWER than the
+    /// head is a rebase-land-or-abandoned unknown; against an equal or older
+    /// tip the ref could not have contained the head at all, which is a
+    /// stale-ref unknown. Neither is a land verdict - the cascade turns both
+    /// into `land-unknown` - but they are different diagnoses, and the
+    /// dropdown reports the reason it was actually given. (Measured at plan-vet time: this repo and the running runner
     /// were both 19 commits behind `origin/main`.)
     #[test]
     fn stale_base_ref_turns_a_negative_into_unknown() {

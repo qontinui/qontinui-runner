@@ -66,10 +66,12 @@ pub struct SessionPrStatus {
     /// GitHub's `merged_at`. `None` for a fast-forward land — the honest land
     /// stamp for those is [`Self::landed_at`].
     pub merged_at: Option<DateTime<Utc>>,
-    /// `"github-merge"` | `"ff-land"` | `"coord"` | `"not-landed"` |
+    /// `"github-merge"` | `"ff-land"` | `"coord-label"` | `"not-landed"` |
     /// `"land-unknown"`.
     pub land_signal: Option<String>,
-    /// REQUIRED when `land_signal == "land-unknown"`: `"ref_stale"` |
+    /// REQUIRED when `land_signal == "land-unknown"`: `"rebase_land_or_abandoned"`
+    /// (the ancestry test failed, which a coord rebase-land and an abandoned
+    /// PR produce alike) | `"ref_stale"` |
     /// `"head_object_missing"` | `"no_base_ref"` | `"not_a_repo"`. A land
     /// verdict that could not be evaluated is never reported as a confident
     /// negative.

@@ -44,6 +44,37 @@ fn prs_by_head_url(owner: &str, repo: &str, branch: &str) -> String {
     )
 }
 
+/// The chip `qontinui-coord` applies to a PR it fast-forward-landed
+/// (`pr_merge::engine::FF_LAND_LABEL`, mirrored to GitHub by
+/// `announce_ff_land`). It is coord's own land verdict, delivered on the PR
+/// payload the runner already fetches — so reading it costs no extra request.
+///
+/// **Positive-only.** coord sets it best-effort and only after its explanatory
+/// comment posts, so its PRESENCE proves a land and its ABSENCE proves nothing
+/// (`knowledge-base/qontinui-specific/coord-ff-lands.md`).
+pub const COORD_LANDED_LABEL: &str = "coord:landed";
+
+/// Label names off a PR payload's `labels` array.
+///
+/// A payload with no `labels` key — or one whose entries carry no `name` —
+/// yields an EMPTY vec, which every caller must read as "no label observed",
+/// never as "this PR has no labels". Pure, unit-tested.
+pub fn parse_labels(pr: &serde_json::Value) -> Vec<String> {
+    pr["labels"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l["name"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Does this label set carry coord's [`COORD_LANDED_LABEL`] chip? Pure.
+pub fn has_coord_landed_label(labels: &[String]) -> bool {
+    labels.iter().any(|l| l == COORD_LANDED_LABEL)
+}
+
 /// A PR resolved from a head branch by [`GitHubClient::list_prs_for_head`].
 /// Carries the head ref + sha so the attribution reconciler can verify the
 /// PR's head-commit `Session-Id` trailer before recording it.
@@ -65,6 +96,12 @@ pub struct HeadPr {
     /// reconciler's content-proof land signal tests the head commit against
     /// `origin/<base_ref>`.
     pub base_ref: String,
+    /// Label names on the PR. Carries coord's [`COORD_LANDED_LABEL`] chip,
+    /// which is the land signal that survives a rebase (see the constant).
+    /// `#[serde(default)]` so a payload persisted by an older build still
+    /// deserializes — as an EMPTY set, i.e. "not observed".
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// A minimal GitHub API client.
@@ -89,6 +126,9 @@ pub struct PrStatus {
     pub closed_at: Option<String>,
     pub title: String,
     pub html_url: String,
+    /// Label names on the PR — see [`HeadPr::labels`].
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +358,7 @@ impl GitHubClient {
             closed_at: body["closed_at"].as_str().map(|s| s.to_string()),
             title: body["title"].as_str().unwrap_or("").to_string(),
             html_url: body["html_url"].as_str().unwrap_or("").to_string(),
+            labels: parse_labels(&body),
         })
     }
 
@@ -364,6 +405,7 @@ impl GitHubClient {
                     head_ref: pr["head"]["ref"].as_str().unwrap_or("").to_string(),
                     head_sha: pr["head"]["sha"].as_str().unwrap_or("").to_string(),
                     base_ref: pr["base"]["ref"].as_str().unwrap_or("").to_string(),
+                    labels: parse_labels(pr),
                 })
             })
             .collect())
@@ -663,5 +705,64 @@ mod tests {
         let url = prs_by_head_url("qontinui", "qontinui-runner", "fix/issue#42");
         assert!(!url.contains('#'), "raw '#' must never survive: {url}");
         assert!(url.contains("head=qontinui:fix%2Fissue%2342"), "{url}");
+    }
+
+    /// The shape GitHub actually sends: `labels` is an array of objects, and
+    /// only `name` is load-bearing here.
+    #[test]
+    fn parse_labels_reads_the_name_of_every_label() {
+        let pr = serde_json::json!({
+            "labels": [
+                {"id": 1, "name": "coord:landed", "color": "0e8a16"},
+                {"id": 2, "name": "coord:tier1", "color": "ededed"}
+            ]
+        });
+        assert_eq!(parse_labels(&pr), vec!["coord:landed", "coord:tier1"]);
+        assert!(has_coord_landed_label(&parse_labels(&pr)));
+    }
+
+    /// ABSENCE IS NOT A NEGATIVE. Three different payloads mean "no label
+    /// observed" and every one must yield an empty set rather than a panic or
+    /// a partial parse - the land cascade reads an empty set as "coord's chip
+    /// was not seen", never as "coord did not land this".
+    #[test]
+    fn absent_or_malformed_labels_yield_an_empty_set() {
+        for pr in [
+            // No `labels` key at all (an older cached payload).
+            serde_json::json!({"number": 1}),
+            // Present but empty.
+            serde_json::json!({"labels": []}),
+            // Present but not an array.
+            serde_json::json!({"labels": "coord:landed"}),
+            // An array whose entries carry no usable `name`.
+            serde_json::json!({"labels": [{"id": 7}, {"name": 12}]}),
+        ] {
+            let labels = parse_labels(&pr);
+            assert!(labels.is_empty(), "{pr}");
+            assert!(
+                !has_coord_landed_label(&labels),
+                "an unobserved chip is not a present chip: {pr}"
+            );
+        }
+    }
+
+    /// The chip is matched EXACTLY. A near-miss must not read as coord's
+    /// verdict - the label namespace is shared with human- and agent-set
+    /// `coord:*` labels (`/coord-pr-label`).
+    #[test]
+    fn only_the_exact_coord_landed_chip_counts() {
+        assert!(has_coord_landed_label(&["coord:landed".to_string()]));
+        for near in [
+            "coord:landed-2",
+            "coord:land",
+            "landed",
+            "Coord:Landed",
+            "coord:landing",
+        ] {
+            assert!(
+                !has_coord_landed_label(&[near.to_string()]),
+                "near-miss must not count: {near}"
+            );
+        }
     }
 }
