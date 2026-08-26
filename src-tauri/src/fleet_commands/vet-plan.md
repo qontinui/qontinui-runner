@@ -375,6 +375,71 @@ that they're vetting a closed plan and confirm they actually want this
 rewrite. (`PARTIAL` and `NOT STARTED` are fine to overwrite — your vet
 pass produces fresher information.)
 
+##### `IN PROGRESS` is CONDITIONALLY overwritable — read delivery first
+
+`IN PROGRESS` is deliberately **not** a fourth unconditional token in the list
+above, and adding it as one would be a regression: it has **three** dispositions,
+and the file stamp cannot tell them apart in either direction.
+
+**Consult coord's derived delivery BEFORE writing any stamp** (this is the
+vet/no-vet fork; the stamp is an authoring-surface artifact that lags by
+construction):
+
+```
+coord_work_unit_list_citations(<plan-stem>) -> .delivery
+```
+
+(HTTP twin: `GET $COORD_HTTP_URL/coord/agent-work-units/<plan-stem>` for the unit,
+and the citations route for `delivery`.) Branch on the response — **five** arms,
+because two of them are failure shapes that do not look like `delivery` at all:
+
+| # | Response | Reading | Do |
+|---|---|---|---|
+| 1 | `shipped: true` ∧ `evidence_complete: true` | The plan is closed **in substance**. | **Do NOT vet.** Report it and route to closeout (`plan-discipline` "Closeout": stamp the terminal status, archive the artifact). |
+| 2 | `shipped: false` ∧ `evidence_complete: false` | **UNKNOWN — never "undelivered".** `evidence_gaps` names each gap. | Fall through to the stamp arms below and **say the read was inconclusive**, per `verification-and-evidence` `unknown-must-not-render-as-a-default`. |
+| 3 | a top-level `merged_degraded_reason` is present | **UNKNOWN, whatever `delivery` says.** The field sits BESIDE `delivery` and is present even when the verdict could not be derived at all; while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. | Same as arm 2. Do not let a `shipped: false` under it reach the proceed arm. |
+| 4 | an **error** — `no work-unit with that slug in your tenant` | The unit does not exist. **This is the COMMONEST case**: a first-time vet of a `DRAFT` plan has no work unit, because §5.4 below upserts it at the *end* of this run. | **Proceed to vet, and SAY the read was not-found.** There is no delivery to miss when coord has never heard of the unit — but report it rather than folding it silently into "not shipped". An absent unit and an uncited-but-present unit are different facts. |
+| 5 | anything else (incl. `shipped: false` ∧ `evidence_complete: true`, zero citations) | A clean, complete observation of *not delivered*. | Proceed to the stamp arms below. |
+
+Arm 2 is not optional politeness: `evidence_gaps` exists precisely because a
+`merged: false` can be a degraded-predicate artifact rather than an observation
+(a coord ff-landed PR reads `merged: false` under a degraded predicate), and
+reading `shipped: false` as "not shipped" is the failure that clause names.
+Equally, **do not invent a "no citations ⇒ UNKNOWN" arm**: coord already treats
+an empty `citations` array as a complete observation
+(`{shipped: false, evidence_complete: true, evidence_gaps: []}`), and
+second-guessing it would send every unvetted plan down the UNKNOWN path. Where a
+*missing citation marker* is the real cause, the remedy is the backfill door
+(`coord_work_unit_add_citation`), not a fourth verdict.
+
+**Then, and only then, apply the stamp arms.** When the existing block reads
+`IN PROGRESS`:
+
+| # | Case | Discriminator | Disposition |
+|---|---|---|---|
+| 1 | Work has **landed** | delivery arm 1 above | **Refuse.** Do not overwrite; route to closeout. |
+| 2 | The stamping session is **dead with zero work products** | its transcript tail shows death; its worktrees are clean and 0 ahead of `origin/main`; no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED`, stamp a takeover naming both session ids and the evidence, proceed. |
+| 3 | The stamping session is a **LIVE PEER** | the stamp carries a session marker ≠ yours **and case 2's emptiness checks FAIL** | **STOP.** Do not vet and do not implement. |
+
+**Case 3 is invisible to the delivery read, by construction** — a peer
+mid-implementation has no merged PRs yet, so the unit returns
+`{shipped: false, evidence_complete: true, evidence_gaps: []}`, a clean
+non-degraded reading that falls straight through arm 5. Only case 2's three
+emptiness checks separate case 2 from case 3, and **the default when they fail
+is STOP, never adopt.** Adoption is the *earned* branch; stopping is the
+fallback.
+
+Sources — read them before "simplifying" this condition away, because each
+records a real cost already paid:
+`feedback_adopt_dead_session_in_progress_plans` (case 2's three checks; a plan
+stamped by a session that died at its usage limit with zero work products should
+be adopted, not re-vetted) and
+`feedback_plan_already_stamped_by_other_session_is_live_peer` (case 3; on
+2026-06-08 a session rationalized a peer's stamp as "an automated self-stamp",
+built four phases plus tests plus PR #479, and found on rebase that peer PR #468
+had merged the same plan one commit after its branch point — a full
+implementation wasted).
+
 This stamp is mandatory. A vetted plan without the stamp is
 indistinguishable from a draft, and `/implement-plan` will treat it as
 still-aspirational.
