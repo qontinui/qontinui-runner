@@ -3,7 +3,7 @@ import { ChevronDown, Pin, Filter, ArrowDownToLine, Zap, MessageSquare } from "l
 import { useUIElement } from "@qontinui/ui-bridge";
 import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
-import { STATE_BORDER_COLORS } from "./constants";
+import { STATE_BORDER_COLORS, ZONE_HEADER_HEIGHT_PX } from "./constants";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { TenantBadge } from "../TenantBadge";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
@@ -111,7 +111,8 @@ export function ZoneLabel({
       data-claude-session-id={tab.claudeSessionId ?? undefined}
       data-zone-index={zoneIndex}
       data-resume-failed={tab.resumeFailed ? "true" : undefined}
-      className="absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 py-0.5 bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing"
+      className="absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing"
+      style={{ height: `${ZONE_HEADER_HEIGHT_PX}px` }}
       draggable
       onDragStart={(e) => {
         e.dataTransfer.setData("text/tab-id", tab.id);
@@ -238,7 +239,7 @@ export function ZoneLabel({
         ))}
 
       {onAssignTab && allTabs.length > 1 && (
-        <div className="relative shrink-0" ref={selectorRef}>
+        <div className="relative shrink-0 flex items-center" ref={selectorRef}>
           <button
             onClick={(e) => {
               e.stopPropagation();

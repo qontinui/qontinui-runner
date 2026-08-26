@@ -12,5 +12,7 @@ export {
   STATE_LABELS,
   STATE_BG_COLORS,
   TREND_ICONS,
+  ZONE_HEADER_HEIGHT_PX,
+  ZONE_FILTER_BAR_HEIGHT_PX,
 } from "./constants";
 export { formatUptime, countMatches, showSoloSessionInfo } from "./utils";
