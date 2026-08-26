@@ -128,36 +128,37 @@ describe("recoveryVerdict", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Manual-test-loop iteration 10, item 4 — the last laundering edge.
+// Manual-test-loop iteration 10, item 4 — the last laundering edge, since
+// closed AT THE SEAM.
 //
 // `/ai/recovery/attempt` answered a typed refusal with HTTP 200
 // `{"success":true,"recovered":false}`. The frontend DID send
 // `{success:false, error:"RECOVERY_UNSCOPED: …", data:{recovered:false}}`, but
-// the runner's response dispatcher forwards only `response.data` when the
-// handler supplies one — so `success` and `error` never reached the HTTP layer.
+// the runner's response dispatcher forwarded only `response.data` when the
+// handler supplied one — so `success` and `error` never reached the HTTP layer.
+// `extract_response_data` (`src-tauri/src/mcp/ui_bridge/request.rs`) now stamps
+// the envelope's verdict onto `data` for every handler, so this payload no
+// longer mirrors `success`/`error` — duplicating them here would only be a
+// second place for the wording to drift.
 // ---------------------------------------------------------------------------
 describe("recoveryFailureData (item 4)", () => {
-  it("mirrors the failure envelope INTO data, which is the half that survives the seam", () => {
-    const msg = `${RECOVERY_UNSCOPED}: ai_recovery_attempt requires params.elementId`;
-    expect(recoveryFailureData(RECOVERY_UNSCOPED, msg)).toEqual({
-      success: false,
-      error: msg,
+  it("carries the verdict fields the envelope cannot, and nothing it already carries", () => {
+    expect(recoveryFailureData(RECOVERY_UNSCOPED)).toEqual({
       code: RECOVERY_UNSCOPED,
       recovered: false,
     });
   });
 
   it("carries the caller's context through without letting it overwrite the verdict", () => {
-    const out = recoveryFailureData(RECOVERY_TARGET_MISSING, "gone", { elementId: "btn-1" });
+    const out = recoveryFailureData(RECOVERY_TARGET_MISSING, { elementId: "btn-1" });
     expect(out.elementId).toBe("btn-1");
-    expect(out.success).toBe(false);
     expect(out.recovered).toBe(false);
     expect(out.code).toBe(RECOVERY_TARGET_MISSING);
   });
 
   it("never reports recovered:true — a failure payload has exactly one verdict", () => {
     for (const code of [RECOVERY_UNSCOPED, RECOVERY_TARGET_MISSING, RECOVERY_FAILED]) {
-      expect(recoveryFailureData(code, "x").recovered).toBe(false);
+      expect(recoveryFailureData(code).recovered).toBe(false);
     }
   });
 });

@@ -176,28 +176,31 @@ export function recoveryVerdict(result: unknown): RecoveryVerdict {
 /**
  * Build the `data` payload for a FAILED `ai_recovery_attempt` response.
  *
- * ## THE DEFECT this closes (the last laundering edge)
+ * ## What this used to have to do, and no longer does
  *
- * The handler already answered a typed refusal honestly at the ENVELOPE level
- * — `{success: false, error: "RECOVERY_UNSCOPED: …", data: {recovered: false}}`.
- * The runner's response dispatcher, however, forwards only
- * `response.data` to the HTTP layer (`handle_ui_bridge_response` in
- * `src-tauri/src/mcp/ui_bridge/request.rs`). When a handler supplies `data`,
- * the sibling `success` and `error` are dropped on the floor — so
- * `wrap_ipc_result` saw a bare `{recovered: false}`, found no `success: false`
- * to flatten, and answered **HTTP 200 `{"success":true,"recovered":false}`**.
- * A caller that refused to guess a target read as a caller that succeeded.
+ * The runner's response dispatcher used to forward ONLY `response.data` when a
+ * handler supplied one, dropping the sibling `success: false` and `error` on
+ * the floor — so `wrap_ipc_result` saw a bare `{recovered: false}`, found no
+ * `success: false` to flatten, and answered **HTTP 200
+ * `{"success":true,"recovered":false}`**. A caller that refused to guess a
+ * target read as a caller that succeeded. Every handler that wanted an honest
+ * answer had to mirror `success`/`error` into `data` itself, which is what this
+ * helper was for.
  *
- * Mirroring the refusal INTO `data` is what survives that extraction: the
- * runner then sees the failure envelope it was always sent, and the
- * `as_recovery_failure` boundary in `ai_analyze.rs` stamps the machine-readable
- * `code` onto the HTTP 400. Both halves are required — this one carries the
- * diagnosis across the seam, that one gives it a code.
+ * That seam is fixed at the seam: `extract_response_data`
+ * (`src-tauri/src/mcp/ui_bridge/request.rs`) now stamps an envelope-level
+ * `success: false` — plus `error`, `code` and `hint` — onto the forwarded
+ * payload for EVERY handler, so the per-call-site mirroring is gone from here.
+ *
+ * What remains is the part that was never envelope duplication: `recovered`,
+ * the verdict `as_recovery_failure` (`ai_analyze.rs`) keys its Ok-arm on, and
+ * `code`, which stays alongside it so a data-only reader still sees the typed
+ * token. Fields already present here win over the stamped ones, so setting
+ * `recovered: true` from a failure path is not possible by accident.
  */
 export function recoveryFailureData(
   code: string,
-  message: string,
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
-  return { success: false, error: message, code, recovered: false, ...extra };
+  return { code, recovered: false, ...extra };
 }

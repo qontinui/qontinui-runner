@@ -938,8 +938,9 @@ pub async fn handle_ui_bridge_response(
         let mut pending_map = pending.lock().await;
         if let Some(sender) = pending_map.remove(&pkey) {
             pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            // Extract the data portion of the response
-            let data = response.get("data").cloned().unwrap_or(response.clone());
+            // Extract the data portion of the response, carrying the
+            // envelope's failure verdict across the seam.
+            let data = extract_response_data(&response);
             if sender.send(data).is_err() {
                 warn!(
                     "UI Bridge: Failed to send response, receiver dropped for request {}",
@@ -959,6 +960,78 @@ pub async fn handle_ui_bridge_response(
     }
 }
 
+/// Envelope fields a failure verdict travels with, in the order the HTTP layer
+/// consumes them: [`wrap_ipc_result`] reads `error` and `hint`, and
+/// `ai_analyze::as_recovery_failure` reads `code`.
+const FAILURE_VERDICT_FIELDS: [&str; 3] = ["error", "code", "hint"];
+
+/// Extract the payload the waiting HTTP handler should see from a frontend
+/// response envelope, **preserving the envelope's failure verdict**.
+///
+/// The frontend replies with `{requestId, type, success, error?, hint?, data?}`
+/// and only `data` is forwarded, because every IPC-backed handler reads its
+/// result fields straight off that object. That extraction used to drop the
+/// sibling `success`/`error` on the floor whenever a handler supplied a `data`
+/// field — and [`wrap_ipc_result`]'s rule is "failure only if
+/// `data.success == Some(false)`", so an **absent** `success` key read as
+/// success. A handler that answered `{success: false, error: "…",
+/// data: {error: "unknown_tab", …}}` reached the caller as
+/// **HTTP 200 `{"success": true, …}`**.
+///
+/// Handlers used to dodge this one call site at a time by mirroring the failure
+/// into `data` themselves (`recoveryFailureData` in `recoveryScope.ts`,
+/// `useAISearchEvents.ts`). Doing it at the seam closes it for every handler,
+/// including the five `usePageEvents` / `useDebugInspectEvents` refusals that
+/// never knew they had to.
+///
+/// The rules:
+///
+/// - No `data` field → the whole envelope is forwarded (it already carries the
+///   verdict), exactly as before.
+/// - Envelope `success` is anything other than `false` → `data` is forwarded
+///   untouched, so the healthy path is byte-identical.
+/// - Envelope `success: false` + object `data` → `success: false` and every
+///   [`FAILURE_VERDICT_FIELDS`] entry the envelope carries are stamped onto it,
+///   **overwriting** any same-named field in `data`. The envelope is the
+///   authority on the verdict, and the collision is not hypothetical: several
+///   handlers put a machine code in `data.error` (`"unknown_tab"`,
+///   `"invalid_stub"`, `"not_found"`) while the envelope's `error` holds the
+///   prose a caller should read. Data-only fields (`recovered`, `knownTabs`,
+///   `elementId`, …) are untouched. An overwritten value is not recoverable, so
+///   a handler with a machine code to carry should put it in `code` (which the
+///   envelope carries natively) or in a field of its own — not in `data.error`.
+/// - Envelope `success: false` + non-object `data` (scalar, array, null) → a
+///   failure envelope is synthesized with the original payload under `data`,
+///   since a scalar has nowhere to carry a verdict.
+pub(crate) fn extract_response_data(response: &serde_json::Value) -> serde_json::Value {
+    let Some(data) = response.get("data") else {
+        // No `data` sibling: the envelope IS the payload and already carries
+        // whatever `success`/`error` the handler set.
+        return response.clone();
+    };
+
+    if response.get("success").and_then(|v| v.as_bool()) != Some(false) {
+        return data.clone();
+    }
+
+    let mut out = match data.as_object() {
+        Some(obj) => obj.clone(),
+        None => {
+            let mut synthesized = serde_json::Map::new();
+            synthesized.insert("data".to_string(), data.clone());
+            synthesized
+        }
+    };
+
+    out.insert("success".to_string(), serde_json::Value::Bool(false));
+    for field in FAILURE_VERDICT_FIELDS {
+        if let Some(value) = response.get(field) {
+            out.insert(field.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
 /// Wrap a UI Bridge IPC result into an API response, flattening any inner
 /// `{success:false, error}` envelope from the frontend into a flat HTTP 400.
 ///
@@ -975,6 +1048,12 @@ pub async fn handle_ui_bridge_response(
 /// This mirrors the F2 fix originally landed in `design.rs` for the audit
 /// handler (`unwrap_inner_audit_error`) and is now the canonical unwrapper
 /// every IPC-backed handler funnels through.
+///
+/// The "no `success` field at all → HTTP 200" arm is only sound because
+/// [`extract_response_data`] stamps an envelope-level `success: false` onto the
+/// payload before it gets here. Without that, a handler's explicit refusal
+/// arrived as a bare data object and this function read the absent key as a
+/// healthy response — see that function for the defect.
 ///
 /// Note: this is a **back-compat shift** for callers that previously saw
 /// `HTTP 200 + {success:false, ...}` on soft failures — they now get HTTP 400.
@@ -1328,8 +1407,8 @@ mod wrap_ipc_result_tests {
     //! success, inner failure (with/without error field), absent success
     //! field, and non-bool success values.
     use super::{
-        handle_ui_bridge_response, pending_key, split_target_window, wrap_ipc_result,
-        MAIN_WINDOW_LABEL,
+        extract_response_data, handle_ui_bridge_response, pending_key, split_target_window,
+        wrap_ipc_result, MAIN_WINDOW_LABEL,
     };
     use axum::http::StatusCode;
     use serde_json::json;
@@ -1506,6 +1585,171 @@ mod wrap_ipc_result_tests {
         let data = json!({"success": 1, "payload": 2});
         let resp = wrap_ipc_result(Ok(data)).expect("numeric success must produce Ok");
         assert!(resp.deref().success);
+    }
+
+    // ── Envelope failure propagation across the data-extraction seam ────────
+    //
+    // The defect: `handle_ui_bridge_response` forwarded ONLY `response.data`
+    // when a handler supplied one, dropping the sibling `success: false` /
+    // `error`. `wrap_ipc_result` then saw a payload with no `success` key,
+    // took the "absent success is healthy" arm, and answered HTTP 200
+    // `{"success": true, ...}` for a call the frontend had explicitly failed.
+    // Each test below drives a REAL refusal shape from the frontend handlers.
+
+    /// `usePageEvents.ts` `tab_activate` — unknown tabId.
+    #[test]
+    fn envelope_failure_with_dataless_success_becomes_a_failure() {
+        let response = json!({
+            "requestId": "req-tab",
+            "type": "tab_activate",
+            "success": false,
+            "error": "unknown tabId: \"promts\"",
+            "data": { "error": "unknown_tab", "knownTabs": ["prompts", "terminal"] },
+        });
+
+        let data = extract_response_data(&response);
+        assert_eq!(
+            data.get("success"),
+            Some(&json!(false)),
+            "the envelope's verdict must survive extraction, got: {data}"
+        );
+
+        let (status, body) = wrap_ipc_result(Ok(data))
+            .expect_err("an explicit frontend refusal must not answer HTTP 200");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let inner = body.deref();
+        assert!(!inner.success);
+        assert_eq!(inner.error.as_deref(), Some("unknown tabId: \"promts\""));
+    }
+
+    /// `useDebugInspectEvents.ts` `element_not_found` — the refusal carries a
+    /// `hint`, which must reach the flattened body rather than being dropped
+    /// with the rest of the envelope.
+    #[test]
+    fn envelope_failure_forwards_error_code_and_hint_into_data() {
+        let response = json!({
+            "requestId": "req-inspect",
+            "type": "debug_inspect_element",
+            "success": false,
+            "error": "Element not found: sumbit-btn",
+            "code": "UB-ELEM-NOT-FOUND",
+            "hint": { "closestMatches": ["submit-btn"] },
+            "data": { "found": false, "elementId": "sumbit-btn" },
+        });
+
+        let data = extract_response_data(&response);
+        assert_eq!(data.get("success"), Some(&json!(false)));
+        assert_eq!(data.get("code"), Some(&json!("UB-ELEM-NOT-FOUND")));
+        assert_eq!(data.get("found"), Some(&json!(false)), "data fields kept");
+
+        let (status, body) = wrap_ipc_result(Ok(data)).expect_err("must flatten to a failure");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.deref().hint,
+            Some(json!({ "closestMatches": ["submit-btn"] })),
+            "the envelope's hint must survive to the HTTP body"
+        );
+    }
+
+    /// The envelope is the authority on the verdict fields; everything else in
+    /// `data` survives. Several handlers put a machine CODE in `data.error`
+    /// while the envelope's `error` holds the prose — picking `data` there
+    /// would answer `"unknown_tab"` where the caller wants the sentence.
+    #[test]
+    fn envelope_verdict_fields_overwrite_same_named_data_fields() {
+        let response = json!({
+            "requestId": "req-recovery",
+            "type": "ai_recovery_attempt",
+            "success": false,
+            "error": "RECOVERY_UNSCOPED: recovery requires params.elementId",
+            "code": "RECOVERY_UNSCOPED",
+            "data": {
+                "error": "unscoped",
+                "code": "STALE",
+                "recovered": false,
+                "elementId": "btn-1",
+            },
+        });
+
+        let data = extract_response_data(&response);
+        assert_eq!(
+            data.get("error"),
+            Some(&json!("RECOVERY_UNSCOPED: recovery requires params.elementId"))
+        );
+        assert_eq!(data.get("code"), Some(&json!("RECOVERY_UNSCOPED")));
+        // Data-only fields are untouched.
+        assert_eq!(data.get("recovered"), Some(&json!(false)));
+        assert_eq!(data.get("elementId"), Some(&json!("btn-1")));
+    }
+
+    #[test]
+    fn envelope_success_leaves_data_untouched() {
+        // The happy path must be byte-identical: no stamped fields, no
+        // envelope leakage into the payload.
+        let response = json!({
+            "requestId": "req-ok",
+            "type": "tab_activate",
+            "success": true,
+            "data": { "activated": true, "tabId": "prompts" },
+        });
+        assert_eq!(
+            extract_response_data(&response),
+            json!({ "activated": true, "tabId": "prompts" })
+        );
+
+        // `success` absent entirely (handlers that omit it) — also untouched.
+        let response = json!({ "requestId": "req-ok2", "data": { "v": 1 } });
+        assert_eq!(extract_response_data(&response), json!({ "v": 1 }));
+    }
+
+    #[test]
+    fn envelope_failure_with_non_object_data_is_wrapped() {
+        // A scalar `data` has nowhere to carry the verdict, so synthesize an
+        // envelope around it rather than laundering the failure.
+        let response = json!({
+            "requestId": "req-scalar",
+            "success": false,
+            "error": "stub not found: s-1",
+            "data": "s-1",
+        });
+        let data = extract_response_data(&response);
+        assert_eq!(
+            data,
+            json!({ "success": false, "error": "stub not found: s-1", "data": "s-1" })
+        );
+        let (status, _) = wrap_ipc_result(Ok(data)).expect_err("must flatten to a failure");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_delivers_the_failure_verdict_to_the_waiting_handler() {
+        // End-to-end through the real dispatcher: the `invalid_stub` refusal
+        // from `usePageEvents.ts` must arrive at the HTTP layer as a failure.
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let id = "req-stub";
+        let (tx, rx) = oneshot::channel::<serde_json::Value>();
+        {
+            let mut p = pending.lock().await;
+            p.insert(pending_key(MAIN_WINDOW_LABEL, id), tx);
+        }
+        count.store(1, Ordering::Relaxed);
+
+        let response = json!({
+            "requestId": id,
+            "type": "network_stub_add",
+            "success": false,
+            "error": "urlPattern is required",
+            "data": { "error": "invalid_stub", "field": "urlPattern" },
+        });
+        handle_ui_bridge_response(pending.clone(), count.clone(), response).await;
+
+        let delivered = rx.await.expect("sender fired");
+        let (status, body) = wrap_ipc_result(Ok(delivered))
+            .expect_err("an invalid stub must not answer HTTP 200 success");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.deref().error.as_deref(), Some("urlPattern is required"));
+        assert_eq!(count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
