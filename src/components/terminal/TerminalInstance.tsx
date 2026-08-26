@@ -20,6 +20,7 @@ import { writeClipboard } from "@/lib/clipboard";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
 import { attachBridgeInputRegistration } from "./bridgeInputRegistration";
+import { toPtySequence } from "./terminalKeySequence";
 import {
   buildWriteFailure,
   throwIfWriteFailed,
@@ -1660,12 +1661,21 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             sendKeys: {
               id: "sendKeys",
               description:
-                "Send key sequences to the terminal. Fails with TERMINAL_EXITED " +
-                "when the pane's process is gone.",
+                "Send key sequences to the terminal. Accepts `keys` as a raw string " +
+                '(written verbatim), an array of key names (["Enter"]), or the SDK\'s ' +
+                'descriptor array ([{ key: "c", modifiers: { ctrl: true } }]). Fails ' +
+                "with TERMINAL_EXITED when the pane's process is gone.",
               handler: async (params?: unknown) => {
-                const { keys } = (params || {}) as { keys?: string };
-                if (!keys) throw new Error("sendKeys: 'keys' is required");
-                return throwIfWriteFailed(await writePtyRef.current(keys));
+                // `toPtySequence` covers all three `keys` grammars. Before
+                // @qontinui/ui-bridge@0.24.0 (ui-bridge#165) the SDK's built-in
+                // `sendKeys` shadowed this handler, so it had never run and only
+                // ever anticipated the raw-string form — the two ARRAY forms the
+                // built-in used to serve would have been coerced by
+                // `TextEncoder.encode` and typed into the pane as the literal
+                // text "Enter" / "[object Object]", reported as success. See the
+                // header of `./terminalKeySequence.ts`.
+                const { keys } = (params || {}) as { keys?: unknown };
+                return throwIfWriteFailed(await writePtyRef.current(toPtySequence(keys)));
               },
             },
             writeToTerminal: {
