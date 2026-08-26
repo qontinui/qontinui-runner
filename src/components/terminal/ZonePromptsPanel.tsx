@@ -36,6 +36,12 @@ export function ZonePromptsPanel({
   onClose,
   /** Distance from the top of the positioned parent, for `"top"`/`"right"` overlays. */
   topOffsetPx = 0,
+  /**
+   * Rendered height of the `"top"` strip. Callers clamp this to what the zone
+   * can spare (see `promptsStripHeight`) and MUST reserve the same number of
+   * pixels of body padding. Ignored for `"right"`.
+   */
+  heightPx = PROMPTS_PANEL_TOP_HEIGHT_PX,
 }: {
   claudeSessionId: string;
   configDir?: string;
@@ -43,8 +49,9 @@ export function ZonePromptsPanel({
   orientation: PromptsPanelOrientation;
   onClose: () => void;
   topOffsetPx?: number;
+  heightPx?: number;
 }) {
-  const { status, prompts, reason, refresh } = useSessionPrompts(claudeSessionId, {
+  const { status, prompts, reason, refreshing, refresh } = useSessionPrompts(claudeSessionId, {
     configDir,
     projectPath,
     enabled: true,
@@ -81,11 +88,20 @@ export function ZonePromptsPanel({
   useEffect(() => {
     const el = scrollRef.current;
     if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
-  }, [orientation]);
+  }, [orientation, heightPx]);
+
+  // A panel can outlive the session it was opened for (a zone reassigned
+  // underneath it). Reset the follow state and the count baseline, or a new
+  // session with a coincidentally equal prompt count would leave the layout
+  // effect early-returning and the view stuck mid-history.
+  useEffect(() => {
+    stickToBottomRef.current = true;
+    lastCountRef.current = 0;
+  }, [claudeSessionId]);
 
   const frame = isTop ? "absolute left-0 right-0 border-b" : "absolute right-0 bottom-0 border-l";
   const frameStyle = isTop
-    ? { top: `${topOffsetPx}px`, height: `${PROMPTS_PANEL_TOP_HEIGHT_PX}px` }
+    ? { top: `${topOffsetPx}px`, height: `${heightPx}px` }
     : { top: `${topOffsetPx}px`, width: `${PROMPTS_PANEL_RIGHT_WIDTH_PX}px` };
 
   return (
@@ -115,10 +131,11 @@ export function ZonePromptsPanel({
         <div className={`flex items-center gap-1 ${isTop ? "ml-auto" : ""}`}>
           <button
             onClick={refresh}
-            className="p-0.5 rounded text-[#6b7191] hover:text-[#1f2233] hover:bg-[#d7dae3] transition-colors"
+            disabled={refreshing}
+            className="p-0.5 rounded text-[#6b7191] hover:text-[#1f2233] hover:bg-[#d7dae3] transition-colors disabled:opacity-50"
             title="Reload prompts from the session transcript"
           >
-            <RefreshCw className="w-2.5 h-2.5" />
+            <RefreshCw className={`w-2.5 h-2.5 ${refreshing ? "animate-spin" : ""}`} />
           </button>
           <button
             onClick={onClose}

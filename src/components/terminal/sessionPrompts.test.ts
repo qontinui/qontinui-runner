@@ -1,25 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
-  extractUserPrompts,
   normalizePromptText,
   promptsUnchanged,
   formatPromptTime,
   type UserPrompt,
 } from "./sessionPrompts";
-import type { TranscriptMessage } from "./useTranscriptSessions";
-
-function msg(over: Partial<TranscriptMessage>): TranscriptMessage {
-  return {
-    uuid: "u1",
-    msg_type: "user",
-    timestamp: "2026-08-26T14:03:11.000Z",
-    text: "",
-    plan_content: null,
-    model: null,
-    has_tool_use: false,
-    ...over,
-  };
-}
 
 describe("normalizePromptText", () => {
   it("keeps a plain prompt verbatim", () => {
@@ -93,43 +78,6 @@ describe("normalizePromptText", () => {
   it("returns null for an empty record", () => {
     expect(normalizePromptText("")).toBeNull();
     expect(normalizePromptText("   \n  ")).toBeNull();
-  });
-});
-
-describe("extractUserPrompts", () => {
-  it("keeps only user records, oldest first", () => {
-    const out = extractUserPrompts([
-      msg({ uuid: "a", text: "first" }),
-      msg({ uuid: "b", msg_type: "assistant", text: "an answer" }),
-      msg({ uuid: "c", text: "second" }),
-    ]);
-    expect(out.map((p) => p.uuid)).toEqual(["a", "c"]);
-    expect(out.map((p) => p.text)).toEqual(["first", "second"]);
-  });
-
-  it("carries the record timestamp through", () => {
-    const out = extractUserPrompts([
-      msg({ uuid: "a", text: "hi", timestamp: "2026-08-26T09:00:00Z" }),
-    ]);
-    expect(out[0].timestamp).toBe("2026-08-26T09:00:00Z");
-  });
-
-  it("skips records that normalize away", () => {
-    const out = extractUserPrompts([
-      msg({ uuid: "a", text: "<system-reminder>ctx</system-reminder>" }),
-      msg({ uuid: "b", text: "real" }),
-    ]);
-    expect(out.map((p) => p.uuid)).toEqual(["b"]);
-  });
-
-  it("tolerates a missing text field", () => {
-    expect(extractUserPrompts([msg({ uuid: "a", text: undefined as unknown as string })])).toEqual(
-      [],
-    );
-  });
-
-  it("returns an empty array for an empty transcript", () => {
-    expect(extractUserPrompts([])).toEqual([]);
   });
 });
 

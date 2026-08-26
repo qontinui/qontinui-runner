@@ -1,5 +1,3 @@
-import type { TranscriptMessage } from "./useTranscriptSessions";
-
 /**
  * One thing the operator actually typed at a Claude Code session, projected
  * out of that session's JSONL transcript.
@@ -16,14 +14,19 @@ export interface UserPrompt {
 // ── Envelope patterns ───────────────────────────────────────────────────────
 //
 // A transcript `user` record is NOT the same thing as "a prompt the human
-// typed". Claude Code writes several machine-authored records under the same
-// `user` role, and the Rust parser (`terminal/transcript.rs::parse_user_record`)
-// only drops `tool_result` blocks — everything else arrives here as text. So
-// the human/machine split is made HERE, on the text, which keeps the whole
-// feature frontend-only and unit-testable.
+// typed", and the split is made in TWO places for a reason.
 //
-// Each pattern below is anchored on a marker Claude Code emits itself; nothing
-// is filtered on a guess about the wording of a human prompt.
+// Records flagged machine-authored by Claude Code's own JSON fields — `isMeta`
+// slash-command expansions, `isCompactSummary` continuations, `isSidechain`
+// subagent turns — are dropped in Rust (`transcript::read_user_prompts`),
+// because those flags exist only on the raw record and carry no text marker to
+// match on. They are also the big ones; filtering them at the source is what
+// keeps this payload small.
+//
+// What is left is envelope noise INSIDE an operator-authored record, which is
+// text-shaped — so it is handled here, where it needs no DOM to test. Each
+// pattern below is anchored on a marker Claude Code emits itself; nothing is
+// filtered on a guess about the wording of a human prompt.
 
 /** Injected context blocks. Never typed by the operator. */
 const SYSTEM_REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
@@ -82,22 +85,6 @@ export function normalizePromptText(raw: string): string | null {
   if (SYNTHETIC_MARKERS.includes(text)) return null;
   if (TOOL_REJECTION.test(text)) return null;
   return text;
-}
-
-/**
- * Project a session transcript down to the operator's own prompts, oldest
- * first — the order the panel renders them in, so the latest sits at the
- * bottom the way terminal output does.
- */
-export function extractUserPrompts(messages: TranscriptMessage[]): UserPrompt[] {
-  const out: UserPrompt[] = [];
-  for (const msg of messages) {
-    if (msg.msg_type !== "user") continue;
-    const text = normalizePromptText(msg.text ?? "");
-    if (text === null) continue;
-    out.push({ uuid: msg.uuid, timestamp: msg.timestamp, text });
-  }
-  return out;
 }
 
 /**

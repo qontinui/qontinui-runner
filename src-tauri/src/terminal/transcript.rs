@@ -94,6 +94,26 @@ pub struct TranscriptMessage {
     pub has_tool_use: bool,           // whether assistant used tools
 }
 
+/// One operator-authored prompt, projected out of a session transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserPromptRecord {
+    pub uuid: String,
+    pub timestamp: String,
+    pub text: String,
+}
+
+/// Result of [`read_user_prompts`].
+///
+/// Carries the transcript's mtime so a polling caller can hand it back and get
+/// `unchanged: true` with an empty body instead of a re-read — the difference
+/// between a stat and parsing a 10 MB JSONL every few seconds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserPromptsResult {
+    pub mtime_ms: u64,
+    pub unchanged: bool,
+    pub prompts: Vec<UserPromptRecord>,
+}
+
 /// Lightweight digest of a session's tail — used for frozen detection and work summary hints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDigest {
@@ -795,6 +815,105 @@ pub fn read_session(
     }
 
     Ok(messages)
+}
+
+/// Read ONLY the operator's own prompts from a session transcript.
+///
+/// Distinct from [`read_session`] on both axes that matter to a caller that
+/// polls:
+///
+/// 1. **It filters machine-authored `user` records.** A `user` record is not
+///    the same thing as something a human typed. Claude Code files slash-command
+///    EXPANSIONS (`isMeta`), post-`/compact` continuation summaries
+///    (`isCompactSummary`) and subagent turns (`isSidechain`) under the same
+///    role, and those carry no text marker to filter on — only these JSON
+///    flags, which [`TranscriptMessage`] does not preserve. Measured across 905
+///    real user records here, they were 102 + 13 records totalling ~3.5 MB of
+///    machine text that a text-only filter cannot distinguish from a prompt.
+///
+/// 2. **It returns prompts, not the whole conversation.** The same corpus's
+///    largest transcript is 10.4 MB / 7,294 records, of which 108 are
+///    operator prompts — so `read_session` ships ~99% assistant output that a
+///    prompts view discards, on every poll.
+///
+/// `since_mtime_ms` short-circuits: when the file's mtime is unchanged the
+/// parse is skipped entirely and `unchanged: true` comes back.
+pub fn read_user_prompts(
+    config_dir: &Path,
+    project_path: &str,
+    session_id: &str,
+    since_mtime_ms: Option<u64>,
+) -> Result<UserPromptsResult, String> {
+    let encoded = encode_project_path(project_path);
+    let file_path = config_dir
+        .join("projects")
+        .join(&encoded)
+        .join(format!("{}.jsonl", session_id));
+
+    let meta = fs::metadata(&file_path)
+        .map_err(|e| format!("Session file not readable {:?}: {}", file_path, e))?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // mtime 0 means we could not read a modification time at all — treat that
+    // as "always changed" rather than letting an unknown masquerade as a match.
+    if mtime_ms != 0 && since_mtime_ms == Some(mtime_ms) {
+        return Ok(UserPromptsResult {
+            mtime_ms,
+            unchanged: true,
+            prompts: Vec::new(),
+        });
+    }
+
+    let content = fs::read_to_string(&file_path)
+        .map_err(|e| format!("Failed to read session file {:?}: {}", file_path, e))?;
+
+    let mut prompts = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue, // Skip malformed lines
+        };
+        if record.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        if is_machine_authored_user_record(&record) {
+            continue;
+        }
+        // Reuse the shared extractor so this view and the transcript panel
+        // agree on what a record's text IS — they differ only in which
+        // records they keep.
+        if let Some(msg) = parse_user_record(&record) {
+            prompts.push(UserPromptRecord {
+                uuid: msg.uuid,
+                timestamp: msg.timestamp,
+                text: msg.text,
+            });
+        }
+    }
+
+    Ok(UserPromptsResult {
+        mtime_ms,
+        unchanged: false,
+        prompts,
+    })
+}
+
+/// True when a `user` record was written by the harness rather than typed by
+/// the operator. Each flag is Claude Code's own, and absent on a real prompt.
+pub(crate) fn is_machine_authored_user_record(record: &serde_json::Value) -> bool {
+    const MACHINE_FLAGS: [&str; 3] = ["isMeta", "isCompactSummary", "isSidechain"];
+    MACHINE_FLAGS
+        .iter()
+        .any(|f| record.get(*f).and_then(|v| v.as_bool()).unwrap_or(false))
 }
 
 /// Parse a `user` type record from the JSONL transcript.
@@ -2742,5 +2861,130 @@ mod tests {
              must NOT be dropped — that's the common hook-spawn case"
         );
         assert_eq!(result.unwrap().session_id, "fresh-session");
+    }
+
+    // ── Machine-authored `user` records ──────────────────────────────────
+    //
+    // These are the records a TEXT-only filter cannot catch: a slash-command
+    // expansion or a post-`/compact` continuation is indistinguishable from a
+    // long pasted prompt except by these flags, and the flags do not survive
+    // into `TranscriptMessage`.
+
+    fn user_record(extra: serde_json::Value) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "type": "user",
+            "uuid": "u1",
+            "timestamp": "2026-08-26T14:03:11.000Z",
+            "message": { "role": "user", "content": "hello" }
+        });
+        if let (Some(obj), Some(add)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, val) in add {
+                obj.insert(k.clone(), val.clone());
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn a_plain_user_record_is_operator_authored() {
+        assert!(!is_machine_authored_user_record(&user_record(
+            serde_json::json!({})
+        )));
+    }
+
+    #[test]
+    fn explicit_false_flags_are_operator_authored() {
+        assert!(!is_machine_authored_user_record(&user_record(
+            serde_json::json!({"isMeta": false, "isCompactSummary": false, "isSidechain": false})
+        )));
+    }
+
+    #[test]
+    fn is_meta_marks_a_slash_command_expansion() {
+        assert!(is_machine_authored_user_record(&user_record(
+            serde_json::json!({"isMeta": true})
+        )));
+    }
+
+    #[test]
+    fn is_compact_summary_marks_a_continuation() {
+        assert!(is_machine_authored_user_record(&user_record(
+            serde_json::json!({"isCompactSummary": true})
+        )));
+    }
+
+    #[test]
+    fn is_sidechain_marks_a_subagent_turn() {
+        assert!(is_machine_authored_user_record(&user_record(
+            serde_json::json!({"isSidechain": true})
+        )));
+    }
+
+    #[test]
+    fn a_non_bool_flag_does_not_count_as_machine_authored() {
+        // Defensive: a string "true" is not the flag, and must not be read as
+        // one — dropping a real prompt is the worse failure of the two.
+        assert!(!is_machine_authored_user_record(&user_record(
+            serde_json::json!({"isMeta": "true"})
+        )));
+    }
+
+    #[test]
+    fn read_user_prompts_keeps_operator_turns_and_drops_machine_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+        let dir = config_dir.join("projects").join(encode_project_path(project_path));
+        fs::create_dir_all(&dir).unwrap();
+        let lines = [
+            r#"{"type":"user","uuid":"a","timestamp":"t1","message":{"role":"user","content":"real prompt"}}"#,
+            r##"{"type":"user","uuid":"b","timestamp":"t2","isMeta":true,"message":{"role":"user","content":"# Skill body ..."}}"##,
+            r#"{"type":"user","uuid":"c","timestamp":"t3","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued..."}}"#,
+            r#"{"type":"assistant","uuid":"d","timestamp":"t4","message":{"role":"assistant","content":[{"type":"text","text":"an answer"}]}}"#,
+            r#"{"type":"user","uuid":"e","timestamp":"t5","message":{"role":"user","content":[{"type":"tool_result","content":"output"}]}}"#,
+            r#"{"type":"user","uuid":"f","timestamp":"t6","message":{"role":"user","content":"second prompt"}}"#,
+        ];
+        fs::write(dir.join("sess.jsonl"), lines.join("
+")).unwrap();
+
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert!(!out.unchanged);
+        let ids: Vec<&str> = out.prompts.iter().map(|p| p.uuid.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a", "f"],
+            "only operator-authored user turns with text survive"
+        );
+        assert_eq!(out.prompts[0].text, "real prompt");
+    }
+
+    #[test]
+    fn read_user_prompts_short_circuits_on_unchanged_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+        let dir = config_dir.join("projects").join(encode_project_path(project_path));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("sess.jsonl"),
+            r#"{"type":"user","uuid":"a","timestamp":"t1","message":{"role":"user","content":"hi"}}"#,
+        )
+        .unwrap();
+
+        let first = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert_eq!(first.prompts.len(), 1);
+
+        let second =
+            read_user_prompts(&config_dir, project_path, "sess", Some(first.mtime_ms)).unwrap();
+        assert!(second.unchanged, "same mtime must skip the parse");
+        assert!(second.prompts.is_empty(), "an unchanged read carries no body");
+    }
+
+    #[test]
+    fn read_user_prompts_errors_when_the_transcript_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        // Absence must be an Err the caller reports as unavailable, never an
+        // empty prompt list — "no prompts" and "no transcript" differ.
+        assert!(read_user_prompts(temp.path(), r"D:\nope", "missing", None).is_err());
     }
 }
