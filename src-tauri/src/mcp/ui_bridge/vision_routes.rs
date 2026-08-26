@@ -2098,7 +2098,15 @@ impl RequestHints for AnalyzeRequest {
 pub struct AnalyzeResponse {
     pub analyzer: qontinui_vision_core::Analyzer,
     pub findings: Vec<qontinui_vision_core::Finding>,
-    pub frame: AnalyzedFrameInfo,
+    /// `None` when no frame could be captured. The snapshot-only analyzers
+    /// (layout, typography, elements) still ran; see `frame_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<AnalyzedFrameInfo>,
+    /// Why frame capture failed, when it did. Always reported rather than
+    /// swallowed — a caller must be able to tell "the pixels agreed" from
+    /// "there were no pixels".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2172,6 +2180,11 @@ impl RequestHints for AssertRequest {
 pub struct AssertResponse {
     pub results: Vec<qontinui_vision_core::AssertionResult>,
     pub all_passed: bool,
+    /// Why frame capture failed, when it did. Every assertion in the DSL is
+    /// evaluated from the snapshot, so this is informational — but it must
+    /// be visible, not inferred from a missing field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2232,35 +2245,58 @@ async fn vision_analyze_handler(
     // `target` selects the frame source: None = runner desktop (today's
     // behavior); a device/app id sources from that target. visual-audit relies
     // on this to analyze a paired device rather than the runner window.
-    let provider = resolve_frame_provider(&state, &req.target)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(&state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let width = frame.width;
-    let height = frame.height;
+    //
+    // Frame capture is BEST-EFFORT and must not gate the analysis.
+    //
+    // Three of the five analyzers — layout, typography, elements — are pure
+    // geometry over the caller's snapshot and never read a pixel, and
+    // `analyzers::run` already degrades the other two to an explicit
+    // "skipped" finding when `frame` is `None`. Capturing first and `?`-ing
+    // on failure therefore threw away every frameless analysis for a
+    // resource none of them needed: with the Tauri window absent
+    // (`frontendState: "window_missing"`, a headless or crashed UI) the
+    // occlusion and overlap checks 500'd with "Runner window not found"
+    // rather than answering from the snapshot in hand.
+    let frame_result = match resolve_frame_provider(&state, &req.target).await {
+        Ok(provider) => provider.frame(&state).await,
+        Err(e) => Err(e),
+    };
+    let (frame, frame_error) = match frame_result {
+        Ok(f) => (Some(f), None),
+        Err(e) => {
+            warn!("vision/analyze: frame capture failed, continuing snapshot-only: {e}");
+            (None, Some(e))
+        }
+    };
 
     let snapshot = req.snapshot.as_ref();
     let prior = None; // future: look up by sha256 in cache
 
     let input = qontinui_vision_core::AnalyzeInput {
-        frame: Some(&frame),
+        frame: frame.as_ref(),
         snapshot,
         prior_frame: prior,
     };
     let findings = qontinui_vision_core::analyzers::run(req.analyzer, &input);
 
     info!(
-        "vision/analyze: analyzer={:?} findings={}",
+        "vision/analyze: analyzer={:?} findings={} frame={}",
         req.analyzer,
-        findings.len()
+        findings.len(),
+        if frame.is_some() {
+            "captured"
+        } else {
+            "absent"
+        }
     );
     Ok(Json(ApiResponse::success(AnalyzeResponse {
         analyzer: req.analyzer,
         findings,
-        frame: AnalyzedFrameInfo { width, height },
+        frame: frame.as_ref().map(|f| AnalyzedFrameInfo {
+            width: f.width,
+            height: f.height,
+        }),
+        frame_error,
     })))
 }
 
@@ -2274,13 +2310,23 @@ async fn vision_assert_handler(
     // `target` selects the frame source: None = runner desktop (today's
     // behavior); a device/app id sources from that target. visual-audit relies
     // on this to assert against a paired device rather than the runner window.
-    let provider = resolve_frame_provider(&state, &req.target)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(&state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    // Best-effort, for the same reason as `vision/analyze` above — and more
+    // strongly here: NO assertion in the DSL reads `ctx.frame`. Every one of
+    // them evaluates from the snapshot, the OCR blocks or the baseline
+    // registry. Capturing a frame was a hard precondition for a value the
+    // evaluator never consulted, which made `no_overlap` and `no_clipping`
+    // unavailable on a headless runner for no reason at all.
+    let frame_result = match resolve_frame_provider(&state, &req.target).await {
+        Ok(provider) => provider.frame(&state).await,
+        Err(e) => Err(e),
+    };
+    let (frame, frame_error) = match frame_result {
+        Ok(f) => (Some(f), None),
+        Err(e) => {
+            warn!("vision/assert: frame capture failed, continuing snapshot-only: {e}");
+            (None, Some(e))
+        }
+    };
 
     // Project the registry into the vision-core BaselineEntry map
     // (matches the assertion DSL's expected shape).
@@ -2319,7 +2365,7 @@ async fn vision_assert_handler(
 
     let ctx = qontinui_vision_core::EvalContext {
         snapshot: req.snapshot.as_ref(),
-        frame: Some(&frame),
+        frame: frame.as_ref(),
         ocr_blocks: ocr_borrowed.as_deref(),
         baselines: Some(&baselines_owned),
     };
@@ -2341,6 +2387,7 @@ async fn vision_assert_handler(
     Ok(Json(ApiResponse::success(AssertResponse {
         results,
         all_passed,
+        frame_error,
     })))
 }
 
