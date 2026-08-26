@@ -1115,10 +1115,10 @@ export function useAISearchEvents(
               success: false,
               error: unscoped,
               code: RECOVERY_UNSCOPED,
-              // Mirrored INTO `data` because the runner's response dispatcher
-              // forwards only `data` when it is present — see
-              // `recoveryFailureData` for the HTTP-200 laundering this closes.
-              data: recoveryFailureData(RECOVERY_UNSCOPED, unscoped),
+              // `success`/`error` are NOT repeated here: `extract_response_data`
+              // in the runner stamps the envelope's verdict onto `data` for
+              // every handler. `data` carries only what the envelope cannot.
+              data: recoveryFailureData(RECOVERY_UNSCOPED),
               timestamp: Date.now(),
             });
             return true;
@@ -1135,7 +1135,7 @@ export function useAISearchEvents(
                 success: false,
                 error: missing,
                 code: RECOVERY_TARGET_MISSING,
-                data: recoveryFailureData(RECOVERY_TARGET_MISSING, missing, {
+                data: recoveryFailureData(RECOVERY_TARGET_MISSING, {
                   elementId: targetElementId,
                 }),
                 timestamp: Date.now(),
@@ -1166,15 +1166,11 @@ export function useAISearchEvents(
               success: verdict.recovered,
               data: verdict.recovered
                 ? { recovered: true, ...attempted }
-                : // Same mirroring as the two refusals above: a recovery that
-                  // RAN and did not recover must not reach the caller as an
-                  // HTTP 200 success either.
-                  recoveryFailureData(
-                    RECOVERY_FAILED,
-                    verdict.reason ?? "recovery did not succeed",
-                    attempted,
-                  ),
-              error: verdict.reason ?? undefined,
+                : // A recovery that RAN and did not recover must not reach the
+                  // caller as an HTTP 200 success either — the envelope's
+                  // `success: false` below is what the runner now propagates.
+                  recoveryFailureData(RECOVERY_FAILED, attempted),
+              error: verdict.recovered ? undefined : (verdict.reason ?? "recovery did not succeed"),
               timestamp: Date.now(),
             });
           } catch (err) {
@@ -1186,7 +1182,7 @@ export function useAISearchEvents(
               success: false,
               error: thrown,
               code,
-              data: recoveryFailureData(code, thrown, { elementId: targetElementId }),
+              data: recoveryFailureData(code, { elementId: targetElementId }),
               timestamp: Date.now(),
             });
           }
