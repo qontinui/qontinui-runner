@@ -77,16 +77,7 @@ pub(crate) fn target_window_payload(
 /// `waitOptions` to `executeAction`, so delivering a new opt-in end-to-end
 /// needs the frontend change too — this just means it is no longer gone
 /// before it gets there (see [`element_action_payload`]).
-const STEP_RESERVED_KEYS: &[&str] = &[
-    "type",
-    "elementId",
-    "element_id",
-    "label",
-    // Routing, not action data: `ui_bridge_request_sync` consumes this at the
-    // payload ROOT (see `split_target_window`). Lifting it into the envelope
-    // would bury it where nothing reads it.
-    TARGET_WINDOW_FIELD,
-];
+const STEP_RESERVED_KEYS: &[&str] = &["type", "elementId", "element_id", "label"];
 
 /// Build the `execute_action` IPC payload for an element action.
 ///
@@ -112,6 +103,10 @@ const STEP_RESERVED_KEYS: &[&str] = &[
 /// So the envelope is forwarded **by identity**, never rebuilt field-by-field.
 /// That makes this hop lossless; it does not by itself make a new field
 /// *effective*, since the frontend handler picks the fields it forwards on.
+///
+/// The one deliberate exception is `windowLabel`, hoisted out of the envelope
+/// to the payload root below — it is declared on the SDK envelope but consumed
+/// at the root, so forwarding it verbatim is precisely what makes it inert.
 /// A bare-string envelope passes through untouched (the frontend normalizes it).
 /// An envelope with no action name defaults to `click`, preserving the batch
 /// handlers' historical default rather than dispatching `undefined`.
@@ -139,10 +134,28 @@ pub(crate) fn element_action_payload(
         // null / bool / number / array cannot carry an action name.
         _ => serde_json::json!({ "action": "click" }),
     };
-    serde_json::json!({
-        "elementId": element_id,
-        "action": action,
-    })
+
+    // `windowLabel` is DECLARED on the SDK's `ControlActionRequest` envelope
+    // ("carried for transports that forward the request bag verbatim"), but it
+    // is consumed at the payload ROOT by `split_target_window` — so an envelope
+    // that merely carries it routes nothing and the step silently runs against
+    // the main window. Forwarding the envelope whole is what makes that
+    // reachable, so hoist it here, at the single chokepoint, rather than
+    // leaving the one declared envelope field that does nothing.
+    let mut action = action;
+    let window_label = action
+        .as_object_mut()
+        .and_then(|obj| obj.remove(TARGET_WINDOW_FIELD))
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|s| !s.is_empty());
+
+    target_window_payload(
+        serde_json::json!({
+            "elementId": element_id,
+            "action": action,
+        }),
+        window_label.as_deref(),
+    )
 }
 
 /// Build the `execute_action` payload for one batch step, in either grammar.
@@ -1791,18 +1804,52 @@ mod element_action_payload_tests {
     }
 
     #[test]
-    fn window_label_addresses_the_payload_root_not_the_action() {
-        // `windowLabel` is consumed at the root by `split_target_window`;
-        // lifting it into the envelope would bury it where nothing reads it.
-        let payload = step_action_payload(&json!({
+    fn window_label_is_hoisted_to_the_payload_root_from_either_grammar() {
+        // `windowLabel` is declared on the SDK action envelope but consumed at
+        // the payload ROOT. Left in the envelope it routes nothing — the step
+        // silently runs against the main window.
+        let flat = step_action_payload(&json!({
             "elementId": "btn-1",
             "action": "click",
             "windowLabel": "term-1"
         }));
-        assert!(
-            payload.pointer("/action/windowLabel").is_none(),
-            "`windowLabel` is routing, not action data"
-        );
+        let nested = step_action_payload(&json!({
+            "elementId": "btn-1",
+            "action": {"action": "click", "windowLabel": "term-1"}
+        }));
+
+        for (name, payload) in [("flat", &flat), ("nested", &nested)] {
+            assert_eq!(
+                payload.get(TARGET_WINDOW_FIELD).and_then(|v| v.as_str()),
+                Some("term-1"),
+                "{name} step must route to the addressed window"
+            );
+            assert!(
+                payload.pointer("/action/windowLabel").is_none(),
+                "{name} step left `windowLabel` in the envelope, where nothing reads it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_main_or_absent_window_label_leaves_the_payload_unrouted() {
+        // `target_window_payload` no-ops for main/empty, so the single-window
+        // default payload stays byte-identical.
+        for step in [
+            json!({"elementId": "btn-1", "action": "click"}),
+            json!({"elementId": "btn-1", "action": "click", "windowLabel": "main"}),
+            json!({"elementId": "btn-1", "action": "click", "windowLabel": ""}),
+        ] {
+            let payload = step_action_payload(&step);
+            assert!(
+                payload.get(TARGET_WINDOW_FIELD).is_none(),
+                "no routing field should be stamped for {step}"
+            );
+            assert_eq!(
+                payload.pointer("/action/action").and_then(|v| v.as_str()),
+                Some("click")
+            );
+        }
     }
 
     #[test]
