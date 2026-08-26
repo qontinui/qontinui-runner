@@ -41,11 +41,19 @@ on:
     # labeled, unlabeled]`), which is why IT re-fired 5s after its label and
     # this side did not. The asymmetry was the bug.
     #
-    # Cost is one CI run per label event on a runner PR, bounded by the human
-    # labelling rate. If a bot ever labels in a loop, narrow with a job-level
-    # `if: startsWith(github.event.label.name, 'coord:')` rather than by
-    # removing the trigger. Plan: 2026-08-25-merge-train-blind-to-main-side-breakage
-    # (Phase 00).
+    # ⚠️ The label rate here is NOT human-bounded, so every job below carries a
+    # `LABEL GUARD` narrowing this to declaration labels only. Measured
+    # 2026-08-26: coord's own `qontinui-merge-orchestrator` applies
+    # `coord:landed` to **7.2 runner PRs per day**, and it applies it while the
+    # PR is still OPEN (17 of 18 sampled lands: 30s-975s BEFORE close). An
+    # unnarrowed `labeled` trigger therefore fires a full CI run per land —
+    # ~7/day at ~58-144 job-min each, i.e. ~400-1000 wasted job-min per day,
+    # forever. For scale: the cross-repo outage this trigger exists to prevent
+    # cost 1,225 job-min ONCE. Unnarrowed, this trigger would out-waste the bug.
+    #
+    # Only `coord:downstream-of=` / `coord:upstream-of=` change what
+    # `checkout-sibling` resolves, so only those two justify a re-run.
+    # Plan: 2026-08-25-merge-train-blind-to-main-side-breakage (Phase 00).
     types: [opened, synchronize, reopened, labeled]
 
   # Lets coord re-run main's CI on demand — the transport the merge train needs
@@ -100,6 +108,16 @@ env:
 
 jobs:
   test:
+    # LABEL GUARD (see the `types:` comment on `pull_request` above). On a
+    # `labeled` event, run ONLY for the two declaration labels that change what
+    # `checkout-sibling` resolves. Without this, coord's ~7.2 `coord:landed`
+    # labels/day — applied while the PR is still OPEN — would each cost a full
+    # CI run. Every other event (push, opened, synchronize, reopened,
+    # workflow_dispatch) is unaffected: `github.event.action` is not 'labeled'.
+    if: >-
+      github.event.action != 'labeled'
+      || startsWith(github.event.label.name, 'coord:downstream-of=')
+      || startsWith(github.event.label.name, 'coord:upstream-of=')
     strategy:
       # Surface platform-specific failures independently. Default fail-fast
       # cancels ubuntu/windows the moment macos clippy trips, masking
@@ -595,6 +613,16 @@ jobs:
   # scope, distinct from the `test` job's) so candidate/PR runs don't add ~2.6
   # GB saves against the 10 GB repo cache cap.
   clippy-windows:
+    # LABEL GUARD (see the `types:` comment on `pull_request` above). On a
+    # `labeled` event, run ONLY for the two declaration labels that change what
+    # `checkout-sibling` resolves. Without this, coord's ~7.2 `coord:landed`
+    # labels/day — applied while the PR is still OPEN — would each cost a full
+    # CI run. Every other event (push, opened, synchronize, reopened,
+    # workflow_dispatch) is unaffected: `github.event.action` is not 'labeled'.
+    if: >-
+      github.event.action != 'labeled'
+      || startsWith(github.event.label.name, 'coord:downstream-of=')
+      || startsWith(github.event.label.name, 'coord:upstream-of=')
     name: Clippy (windows)
     runs-on: windows-latest
     # 88 successful runs, 2026-08-08..08-20: p50 14.7m, p90 16.5m, max 19.4m.
@@ -685,6 +713,16 @@ jobs:
   # not a test-time one). 764 tests across 64 files all pass on main as of this
   # job's introduction, so it is born green and is a real required check.
   frontend-tests:
+    # LABEL GUARD (see the `types:` comment on `pull_request` above). On a
+    # `labeled` event, run ONLY for the two declaration labels that change what
+    # `checkout-sibling` resolves. Without this, coord's ~7.2 `coord:landed`
+    # labels/day — applied while the PR is still OPEN — would each cost a full
+    # CI run. Every other event (push, opened, synchronize, reopened,
+    # workflow_dispatch) is unaffected: `github.event.action` is not 'labeled'.
+    if: >-
+      github.event.action != 'labeled'
+      || startsWith(github.event.label.name, 'coord:downstream-of=')
+      || startsWith(github.event.label.name, 'coord:upstream-of=')
     name: Frontend unit tests (vitest)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -728,6 +766,16 @@ jobs:
   # test_fixtures.rs) asserts the same anchors from inside the debug test leg;
   # this job additionally holds if the whole module is ever removed.
   seam-gate:
+    # LABEL GUARD (see the `types:` comment on `pull_request` above). On a
+    # `labeled` event, run ONLY for the two declaration labels that change what
+    # `checkout-sibling` resolves. Without this, coord's ~7.2 `coord:landed`
+    # labels/day — applied while the PR is still OPEN — would each cost a full
+    # CI run. Every other event (push, opened, synchronize, reopened,
+    # workflow_dispatch) is unaffected: `github.event.action` is not 'labeled'.
+    if: >-
+      github.event.action != 'labeled'
+      || startsWith(github.event.label.name, 'coord:downstream-of=')
+      || startsWith(github.event.label.name, 'coord:upstream-of=')
     runs-on: ubuntu-latest
 
     # 90 successful runs, 2026-08-08..08-20: p50 0.1m, p90 0.2m, max 0.4m —
@@ -782,6 +830,16 @@ jobs:
           echo "Debug test-fixtures seam gate OK — all three cfg anchors intact."
 
   security:
+    # LABEL GUARD (see the `types:` comment on `pull_request` above). On a
+    # `labeled` event, run ONLY for the two declaration labels that change what
+    # `checkout-sibling` resolves. Without this, coord's ~7.2 `coord:landed`
+    # labels/day — applied while the PR is still OPEN — would each cost a full
+    # CI run. Every other event (push, opened, synchronize, reopened,
+    # workflow_dispatch) is unaffected: `github.event.action` is not 'labeled'.
+    if: >-
+      github.event.action != 'labeled'
+      || startsWith(github.event.label.name, 'coord:downstream-of=')
+      || startsWith(github.event.label.name, 'coord:upstream-of=')
     runs-on: ubuntu-latest
 
     # 63 successful runs, 2026-08-08..08-20: p50 3.3m, p90 3.5m, max 4.3m.
