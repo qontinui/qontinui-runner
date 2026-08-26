@@ -1684,6 +1684,564 @@ async fn agent_token_view_handler(
 }
 
 // =============================================================================
+// /ui-bridge/test/append-transcript-record
+// =============================================================================
+//
+// R1 of `2026-08-26-prompts-panel-manual-test-remediation`.
+//
+// The per-zone "my prompts" panel polls `transcript_read_user_prompts` every 5s
+// and re-renders what changed. That LIVE-UPDATE arm was the one check the
+// manual-test run could not make, because there is no cheap way to make Claude
+// append to its own transcript on demand: a real prompt costs an API-billed
+// turn, and a slash command only helps if it files a `user` record. `/status`
+// was the obvious candidate and files NONE — measured, the terminal's byte
+// count moved 5144 → 8247 while the panel's prompt count stayed at 4, so the
+// input landed and the transcript genuinely did not change.
+//
+// This route makes the append deterministic instead: it writes ONE synthetic
+// record into a named session's JSONL, so the poll has something to observe.
+//
+// ## It writes the path the reader OPENS — it does not re-derive it
+//
+// [`crate::terminal::transcript::read_user_prompts`] builds
+// `<config_dir>/projects/<encoded(project_path)>/<session_id>.jsonl`, where the
+// encoding is `encode_project_path` — a PRIVATE fn. The public handle onto the
+// same construction is [`crate::terminal::transcript::session_transcript_path`],
+// which this route calls. Nothing here reimplements the encoding, so a change
+// to it cannot silently split the writer from the reader.
+//
+// ## The record kinds are exactly the distinctions the RUST reader makes
+//
+// `read_user_prompts` keeps a record only if it is `type:"user"`, carries none
+// of the three machine flags (`is_machine_authored_user_record`), and yields
+// text through `parse_user_record`. So a fixture that can only write a clean
+// prompt cannot exercise the filter at all. [`TranscriptRecordKind`] spans it:
+//
+// | kind | shape written | reader's verdict |
+// |------|---------------|------------------|
+// | `prompt` (default) | plain `user` record, string content | SURFACED |
+// | `meta_expansion` | `user` + `"isMeta":true` | dropped |
+// | `compact_summary` | `user` + `"isCompactSummary":true` | dropped |
+// | `sidechain` | `user` + `"isSidechain":true` | dropped |
+// | `tool_result` | `user`, content `[{"type":"tool_result",…}]` | dropped (no text block) |
+// | `assistant` | `type:"assistant"` | dropped (wrong record type) |
+//
+// `<task-notification>` is deliberately ABSENT from that list. That filter is
+// TypeScript-side (`src/components/terminal/sessionPrompts.ts`), applied to the
+// text the Rust reader has already surfaced — so a Rust knob for it would be a
+// knob for a filter this code does not own. To exercise it, write a `prompt`
+// whose `text` IS a task notification; the Rust reader will surface it (that is
+// correct) and the TS envelope normalizer is then the thing under test.
+//
+// ## The mtime is MOVED, not hoped for
+//
+// The reader short-circuits: `since_mtime_ms == mtime_ms` returns
+// `{unchanged: true, prompts: []}` without parsing. An append that lands inside
+// the same millisecond tick as the caller's last read is therefore INVISIBLE to
+// the panel — the fixture would report success and the poll would show nothing,
+// which is precisely the failure this route exists to rule out. So the write is
+// followed by [`ensure_mtime_moved`], which re-stats and, if the mtime did not
+// move, sets it forward explicitly (escalating deltas) and re-stats again to
+// VERIFY. A file whose mtime refuses to move is a 500, never a success.
+//
+// The guarantee is *strictly greater than* the pre-call mtime, not merely
+// *different from* it: a bump lands the mtime a hair ahead of the wall clock,
+// so the next append's natural mtime can be BEHIND it, and "different" would be
+// satisfied by moving BACKWARDS onto a value the poller had already seen.
+//
+// The post-write `mtime_ms` comes back in the response in the SAME unit and
+// epoch as `UserPromptsResult::mtime_ms`, so a caller hands it straight back as
+// `since_mtime_ms` and asserts on the change instead of sleeping on it.
+//
+// ## The response carries the READER's verdict, not the fixture's opinion
+//
+// `visible_to_reader` / `prompts_after` are produced by calling
+// `read_user_prompts` on the file this route just wrote — not by restating the
+// table above in code. A fixture that predicted visibility from its own `kind`
+// mapping would keep passing after the reader's filter changed underneath it,
+// which is the exact drift a test seam must not have.
+//
+// ## Wire convention
+//
+// Request and response are snake_case (no `rename_all`), deliberately: the
+// request body IS `read_user_prompts`'s parameter list (`config_dir`,
+// `project_path`, `session_id`), and `mtime_ms` matches `UserPromptsResult`'s
+// field name byte-for-byte so the round-trip needs no mental translation.
+
+/// Which record shape to append. See the table in this section's header for
+/// what the reader does with each.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptRecordKind {
+    /// A plain operator-typed prompt — the only kind the reader surfaces.
+    #[default]
+    Prompt,
+    /// A slash-command EXPANSION (`isMeta`). Claude Code files the entire skill
+    /// body under the `user` role; the flag is the only marker.
+    MetaExpansion,
+    /// A post-`/compact` continuation summary (`isCompactSummary`).
+    CompactSummary,
+    /// A subagent turn (`isSidechain`).
+    Sidechain,
+    /// A tool result: a `user` record whose content array holds no `text`
+    /// block, so `parse_user_record` yields nothing.
+    ToolResult,
+    /// An assistant turn — filtered on record TYPE rather than on a flag.
+    Assistant,
+}
+
+impl TranscriptRecordKind {
+    /// Placeholder text used when the caller supplies none, chosen so each
+    /// record still LOOKS like the thing it is standing in for.
+    fn default_text(self) -> &'static str {
+        match self {
+            Self::Prompt => "fixture prompt",
+            Self::MetaExpansion => {
+                "<command-name>/fixture</command-name>\n# Fixture skill body\n\nMachine-authored."
+            }
+            Self::CompactSummary => {
+                "This session is being continued from a previous conversation that ran out of context."
+            }
+            Self::Sidechain => "fixture subagent turn",
+            Self::ToolResult => "fixture tool output",
+            Self::Assistant => "fixture assistant reply",
+        }
+    }
+}
+
+/// Body of `POST /ui-bridge/test/append-transcript-record`.
+///
+/// The first three fields are `read_user_prompts`'s own parameters — give it
+/// the same triple the panel is polling and the append lands where the panel
+/// will look.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppendTranscriptRecordRequest {
+    /// Claude config dir root — the `<config_dir>` of
+    /// `<config_dir>/projects/<encoded project>/<session_id>.jsonl`.
+    pub config_dir: String,
+    /// Unencoded project path (e.g. `D:\qontinui-root\qontinui-runner`). The
+    /// encoding is applied by `session_transcript_path`, never here.
+    pub project_path: String,
+    /// Session id — becomes the JSONL's file stem.
+    pub session_id: String,
+    /// Which shape to write. Defaults to `prompt`.
+    #[serde(default)]
+    pub kind: TranscriptRecordKind,
+    /// The record's text. Defaults to a per-kind placeholder, so the triple
+    /// plus a `kind` is a complete body.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Record uuid. Defaults to a fresh v4; the response echoes whichever was
+    /// used so a caller can pin the exact record the reader returns.
+    #[serde(default)]
+    pub uuid: Option<String>,
+    /// ISO 8601 timestamp. Defaults to now.
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    /// Truncate the transcript before appending. `false` (the default) appends.
+    ///
+    /// This is what lets repeated calls SEED a whole transcript from a known
+    /// empty state — `reset` once, then append one record per kind — without a
+    /// second route to clear the file.
+    #[serde(default)]
+    pub reset: bool,
+}
+
+/// Response of `POST /ui-bridge/test/append-transcript-record`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppendTranscriptRecordResponse {
+    pub success: bool,
+    /// Absolute path written — the path `read_user_prompts` opens for this
+    /// triple, so a caller can assert the two agree without re-deriving the
+    /// project-path encoding.
+    pub path: String,
+    /// Post-write mtime, in the same unit and epoch as
+    /// `UserPromptsResult::mtime_ms`. Hand it back as `since_mtime_ms`.
+    pub mtime_ms: u64,
+    /// The file's mtime BEFORE this call, or `None` when it did not exist.
+    /// Present so the caller can check the move itself rather than trusting
+    /// that it happened.
+    pub previous_mtime_ms: Option<u64>,
+    /// Whether the mtime had to be pushed forward explicitly because the write
+    /// landed inside the previous mtime's tick. Diagnostic only — either way a
+    /// 200 guarantees `mtime_ms` is strictly greater than `previous_mtime_ms`.
+    pub mtime_bumped: bool,
+    /// The uuid of the appended record.
+    pub uuid: String,
+    /// The kind written, echoed back.
+    pub kind: TranscriptRecordKind,
+    /// Whether `read_user_prompts` actually surfaces this record — measured by
+    /// re-reading the file through the real reader, not predicted from `kind`.
+    pub visible_to_reader: bool,
+    /// How many prompts the reader surfaces from the file after this append —
+    /// i.e. how many cards the panel should render.
+    pub prompts_after: usize,
+    /// Total non-empty JSONL lines after this append. Confirms an append did
+    /// not clobber the file.
+    pub records_after: usize,
+    /// Whether this call created the transcript file.
+    pub created: bool,
+}
+
+/// Escalating deltas (millis) tried when the post-write mtime has not moved.
+///
+/// The first two cover a sub-millisecond-granularity filesystem writing twice
+/// inside one tick; the rest cover coarse-granularity ones (some network and
+/// FAT-derived filesystems quantize to 1s or 2s), so this does not silently
+/// give up on the exact platforms where the collision is most likely.
+const MTIME_BUMP_DELTAS_MS: [u64; 6] = [1, 2, 10, 100, 1_000, 2_000];
+
+/// The file's mtime in millis since the Unix epoch, matching how
+/// `read_user_prompts` computes the value it compares against.
+fn transcript_mtime_ms(path: &Path) -> Result<u64, String> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("could not stat {}: {e}", path.display()))?;
+    Ok(meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0))
+}
+
+/// Guarantee the transcript's mtime is strictly GREATER than `previous_ms`, so
+/// the reader's `since_mtime_ms == mtime_ms` short-circuit cannot swallow this
+/// append.
+///
+/// Returns `(mtime_ms, bumped)`. A write on a fast filesystem can land inside
+/// the same millisecond as the caller's last read, so "we wrote, therefore it
+/// changed" is not sound — this re-stats, and on a collision pushes the mtime
+/// forward explicitly and re-stats to VERIFY rather than assuming the set took.
+///
+/// The contract is *strictly greater*, not merely *different*: a bump lands the
+/// mtime slightly ahead of the wall clock, so the NEXT append's natural mtime
+/// can be BEHIND it. "Different" would then be satisfied by going backwards
+/// onto a value the caller had already seen — which is exactly a missed poll.
+fn ensure_mtime_moved(path: &Path, previous_ms: Option<u64>) -> Result<(u64, bool), String> {
+    let observed = transcript_mtime_ms(path)?;
+    // A 0 mtime means the platform gave us no modification time at all. The
+    // reader treats that as "always changed" (it refuses to let an unknown
+    // masquerade as a match), so the short-circuit cannot bite and there is
+    // nothing here to bump.
+    if observed == 0 {
+        return Ok((0, false));
+    }
+    let Some(previous) = previous_ms else {
+        return Ok((observed, false));
+    };
+    if observed > previous {
+        return Ok((observed, false));
+    }
+    for delta in MTIME_BUMP_DELTAS_MS {
+        let target = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(previous.saturating_add(delta));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("could not reopen {} to move its mtime: {e}", path.display()))?;
+        file.set_modified(target)
+            .map_err(|e| format!("could not set the mtime on {}: {e}", path.display()))?;
+        drop(file);
+        let after = transcript_mtime_ms(path)?;
+        if after > previous {
+            return Ok((after, true));
+        }
+    }
+    Err(format!(
+        "the mtime of {} would not move past {}ms after {} attempts — the reader's \
+         since_mtime_ms short-circuit would swallow this append, so reporting success \
+         here would be a lie",
+        path.display(),
+        previous,
+        MTIME_BUMP_DELTAS_MS.len(),
+    ))
+}
+
+/// Whether a newline must be written before the record so the file stays JSONL.
+///
+/// Reads the last byte rather than the whole file: a real transcript reaches
+/// 10 MB, and this runs on every append.
+fn transcript_needs_leading_newline(path: &Path) -> Result<bool, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("could not open {}: {e}", path.display())),
+    };
+    let len = file
+        .metadata()
+        .map_err(|e| format!("could not stat {}: {e}", path.display()))?
+        .len();
+    if len == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))
+        .map_err(|e| format!("could not seek in {}: {e}", path.display()))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)
+        .map_err(|e| format!("could not read the last byte of {}: {e}", path.display()))?;
+    Ok(last[0] != b'\n')
+}
+
+/// Build the JSONL record for `kind`. Every shape here is one Claude Code
+/// actually writes — the flags are its own, and the reader filters on exactly
+/// these and nothing else.
+fn build_transcript_record(
+    kind: TranscriptRecordKind,
+    uuid: &str,
+    timestamp: &str,
+    text: &str,
+) -> serde_json::Value {
+    // The flag key is chosen at runtime, so it is inserted rather than written
+    // as a `json!` literal key.
+    let flagged = |flag: &str| {
+        let mut value = serde_json::json!({
+            "type": "user",
+            "uuid": uuid,
+            "timestamp": timestamp,
+            "message": {"role": "user", "content": text},
+        });
+        value
+            .as_object_mut()
+            .expect("json! built an object")
+            .insert(flag.to_string(), serde_json::Value::Bool(true));
+        value
+    };
+    match kind {
+        TranscriptRecordKind::Prompt => serde_json::json!({
+            "type": "user",
+            "uuid": uuid,
+            "timestamp": timestamp,
+            "message": {"role": "user", "content": text},
+        }),
+        TranscriptRecordKind::MetaExpansion => flagged("isMeta"),
+        TranscriptRecordKind::CompactSummary => flagged("isCompactSummary"),
+        TranscriptRecordKind::Sidechain => flagged("isSidechain"),
+        TranscriptRecordKind::ToolResult => serde_json::json!({
+            "type": "user",
+            "uuid": uuid,
+            "timestamp": timestamp,
+            "message": {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": format!("toolu_{uuid}"),
+                "content": text,
+            }]},
+        }),
+        TranscriptRecordKind::Assistant => serde_json::json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "timestamp": timestamp,
+            "message": {
+                "role": "assistant",
+                "model": "claude-fixture",
+                "content": [{"type": "text", "text": text}],
+            },
+        }),
+    }
+}
+
+/// Core of the route, split out the way `seed_lifecycle_store_at` is: the
+/// handler is a thin wrapper, and the unit tests drive THIS plus the real
+/// reader so they pin the consequence rather than the write.
+fn append_transcript_record_core(
+    req: &AppendTranscriptRecordRequest,
+) -> Result<AppendTranscriptRecordResponse, (StatusCode, String)> {
+    let bad = |msg: String| (StatusCode::BAD_REQUEST, msg);
+
+    let config_dir = req.config_dir.trim();
+    let project_path = req.project_path.trim();
+    let session_id = req.session_id.trim();
+    if config_dir.is_empty() {
+        return Err(bad("config_dir must not be empty".to_string()));
+    }
+    if project_path.is_empty() {
+        return Err(bad("project_path must not be empty".to_string()));
+    }
+    if session_id.is_empty() {
+        return Err(bad("session_id must not be empty".to_string()));
+    }
+    // `session_id` is interpolated straight into a FILENAME, so a separator or
+    // a `..` in it writes outside the transcript dir. Cheap to reject, and the
+    // reader could never have opened such a path anyway.
+    if session_id.contains(['/', '\\', ':']) || session_id.contains("..") {
+        return Err(bad(format!(
+            "session_id {session_id:?} must be a bare file stem — it is interpolated \
+             into <session_id>.jsonl, so path separators and `..` are refused"
+        )));
+    }
+
+    let config_root = std::path::PathBuf::from(config_dir);
+    // The ONE construction the reader uses. Do not re-derive it here.
+    let path = crate::terminal::transcript::session_transcript_path(
+        &config_root,
+        project_path,
+        session_id,
+    );
+
+    let existed = path.exists();
+    let previous_mtime_ms = if existed {
+        Some(transcript_mtime_ms(&path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?)
+    } else {
+        None
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not create {}: {e}", parent.display()),
+            )
+        })?;
+    }
+    if req.reset && existed {
+        std::fs::write(&path, b"").map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not truncate {}: {e}", path.display()),
+            )
+        })?;
+    }
+
+    let uuid = req
+        .uuid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let timestamp = req
+        .timestamp
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let text = req
+        .text
+        .as_deref()
+        .unwrap_or_else(|| req.kind.default_text());
+
+    let record = build_transcript_record(req.kind, &uuid, &timestamp, text);
+    // Compact, not pretty: JSONL is one record per LINE, and a pretty-printed
+    // record would parse as several malformed ones (which the reader skips
+    // silently — the append would vanish with no error anywhere).
+    let line = serde_json::to_string(&record).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not serialize the record: {e}"),
+        )
+    })?;
+    let lead = transcript_needs_leading_newline(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not open {} for append: {e}", path.display()),
+            )
+        })?;
+    let payload = if lead {
+        format!("\n{line}\n")
+    } else {
+        format!("{line}\n")
+    };
+    file.write_all(payload.as_bytes()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not append to {}: {e}", path.display()),
+        )
+    })?;
+    file.flush().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not flush {}: {e}", path.display()),
+        )
+    })?;
+    drop(file);
+
+    let (mtime_ms, mtime_bumped) = ensure_mtime_moved(&path, previous_mtime_ms)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Ask the REAL reader what it now sees. This is the route's honesty
+    // guarantee: `visible_to_reader` is the reader's verdict on the bytes just
+    // written, so the fixture cannot drift from the filter it exists to test.
+    let seen = crate::terminal::transcript::read_user_prompts(
+        &config_root,
+        project_path,
+        session_id,
+        None,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "appended to {} but the reader could not read it back: {e}",
+                path.display()
+            ),
+        )
+    })?;
+    let visible_to_reader = seen.prompts.iter().any(|p| p.uuid == uuid);
+
+    let records_after = std::fs::read_to_string(&path)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not re-read {}: {e}", path.display()),
+            )
+        })?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+
+    Ok(AppendTranscriptRecordResponse {
+        success: true,
+        path: path.display().to_string(),
+        mtime_ms,
+        previous_mtime_ms,
+        mtime_bumped,
+        uuid,
+        kind: req.kind,
+        visible_to_reader,
+        prompts_after: seen.prompts.len(),
+        records_after,
+        created: !existed,
+    })
+}
+
+async fn append_transcript_record_handler(
+    Json(req): Json<AppendTranscriptRecordRequest>,
+) -> Result<Json<AppendTranscriptRecordResponse>, (StatusCode, Json<InjectSessionError>)> {
+    match append_transcript_record_core(&req) {
+        Ok(resp) => {
+            info!(
+                "test_fixtures: appended transcript record path={} kind={:?} uuid={} \
+                 mtime_ms={} bumped={} visible={} prompts_after={}",
+                resp.path,
+                resp.kind,
+                resp.uuid,
+                resp.mtime_ms,
+                resp.mtime_bumped,
+                resp.visible_to_reader,
+                resp.prompts_after,
+            );
+            Ok(Json(resp))
+        }
+        Err((code, error)) => Err((
+            code,
+            Json(InjectSessionError {
+                success: false,
+                error,
+            }),
+        )),
+    }
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -1734,6 +2292,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/test/coord-mcp/agent-token/{agent_id}",
             get(agent_token_view_handler),
+        )
+        .route(
+            "/ui-bridge/test/append-transcript-record",
+            post(append_transcript_record_handler),
         )
 }
 
@@ -1890,6 +2452,7 @@ mod tests {
             "/ui-bridge/test/clear-lifecycle-store",
             "/ui-bridge/test/coord-mcp/seed-agent-token",
             "/ui-bridge/test/coord-mcp/agent-token/{agent_id}",
+            "/ui-bridge/test/append-transcript-record",
         ] {
             assert!(
                 src.contains(&format!("\"{route}\"")),
@@ -3501,5 +4064,435 @@ mod tests {
         fn transcript_exists(&self, _id: &str, _wd: Option<&str>) -> bool {
             false
         }
+    }
+
+    // =========================================================================
+    // R1: append-transcript-record — the prompts panel's live-update seam
+    //
+    // These tests drive the REAL reader
+    // (`crate::terminal::transcript::read_user_prompts`) after every write, not
+    // just the filesystem: the thing R1 exists to make verifiable is what the
+    // panel's poll SEES, and a test that only asserted "a file appeared" would
+    // pass for a record the reader silently drops. None of them touch the
+    // `registry()` singleton, so they need no `TEST_LOCK`.
+    // =========================================================================
+
+    use crate::terminal::transcript::{read_user_prompts, session_transcript_path};
+
+    /// A complete body for `project`/`session`, defaulted the way an
+    /// out-of-process caller's minimal JSON would be.
+    fn append_req(
+        config_dir: &Path,
+        project_path: &str,
+        session_id: &str,
+        kind: TranscriptRecordKind,
+    ) -> AppendTranscriptRecordRequest {
+        AppendTranscriptRecordRequest {
+            config_dir: config_dir.display().to_string(),
+            project_path: project_path.to_string(),
+            session_id: session_id.to_string(),
+            kind,
+            text: None,
+            uuid: None,
+            timestamp: None,
+            reset: false,
+        }
+    }
+
+    /// The file must land at EXACTLY the path `read_user_prompts` opens — that
+    /// is the whole point of routing through `session_transcript_path` instead
+    /// of re-deriving the project-path encoding. Asserted against the reader's
+    /// own construction, and then against the reader actually returning it.
+    #[test]
+    fn append_transcript_record_lands_at_the_path_the_reader_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project_with_underscore";
+
+        let req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+        let resp = append_transcript_record_core(&req).expect("append succeeds");
+
+        let expected = session_transcript_path(&config_dir, project_path, "sess");
+        assert_eq!(
+            std::path::PathBuf::from(&resp.path),
+            expected,
+            "the fixture must write the path the reader opens, encoding included"
+        );
+        assert!(expected.exists(), "the transcript file was created");
+        assert!(resp.created, "a first append reports it created the file");
+        assert_eq!(
+            resp.previous_mtime_ms, None,
+            "there was no file to have an mtime"
+        );
+        assert_eq!(resp.records_after, 1);
+    }
+
+    /// Pin the CONSEQUENCE: the reader returns the appended record, with the
+    /// uuid and text the fixture reported.
+    #[test]
+    fn append_transcript_record_is_returned_by_the_real_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+
+        let mut req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+        req.text = Some("run the manual test again".to_string());
+        let resp = append_transcript_record_core(&req).expect("append succeeds");
+        assert!(resp.visible_to_reader, "a plain prompt is surfaced");
+        assert_eq!(resp.prompts_after, 1);
+
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert!(!out.unchanged);
+        assert_eq!(
+            out.prompts.len(),
+            1,
+            "the reader sees exactly the appended record"
+        );
+        assert_eq!(out.prompts[0].uuid, resp.uuid);
+        assert_eq!(out.prompts[0].text, "run the manual test again");
+        assert_eq!(
+            out.mtime_ms, resp.mtime_ms,
+            "the response's mtime_ms is the reader's own value, handed back verbatim"
+        );
+    }
+
+    /// The reason this route exists. A poll holds the mtime from its last read;
+    /// if the append lands inside that same millisecond the reader
+    /// short-circuits and the panel never updates. Assert the append is visible
+    /// to a reader carrying the PRE-append mtime.
+    #[test]
+    fn append_moves_the_mtime_so_the_next_read_is_not_short_circuited() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+
+        let seed = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+        append_transcript_record_core(&seed).expect("seed append succeeds");
+
+        // What a polling caller holds after its last read.
+        let first = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert_eq!(first.prompts.len(), 1);
+        // Same mtime handed back short-circuits — the state the panel is in
+        // between appends.
+        let idle =
+            read_user_prompts(&config_dir, project_path, "sess", Some(first.mtime_ms)).unwrap();
+        assert!(
+            idle.unchanged,
+            "the reader short-circuits on an unchanged mtime"
+        );
+
+        let resp = append_transcript_record_core(&seed).expect("second append succeeds");
+        assert_eq!(resp.previous_mtime_ms, Some(first.mtime_ms));
+        assert_ne!(
+            resp.mtime_ms, first.mtime_ms,
+            "the fixture must guarantee the mtime moved, bumping it if the write \
+             landed inside the previous tick"
+        );
+
+        let after =
+            read_user_prompts(&config_dir, project_path, "sess", Some(first.mtime_ms)).unwrap();
+        assert!(
+            !after.unchanged,
+            "the poll must see a change — this is the live-update path R1 covers"
+        );
+        assert_eq!(after.prompts.len(), 2, "and it must see the new record");
+    }
+
+    /// The collision hazard is back-to-back appends, which on a fast filesystem
+    /// share one mtime tick. Every one of them must still move the mtime.
+    #[test]
+    fn back_to_back_appends_each_move_the_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+        let req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+
+        let mut last: Option<u64> = None;
+        for i in 0..6 {
+            let resp = append_transcript_record_core(&req).expect("append succeeds");
+            assert_eq!(
+                resp.previous_mtime_ms, last,
+                "append #{i} must report the mtime it started from"
+            );
+            if let Some(previous) = last {
+                assert!(
+                    resp.mtime_ms > previous,
+                    "append #{i} left the mtime at {} (was {previous}) — a poll holding \
+                     the old value would miss it, or worse see it go backwards",
+                    resp.mtime_ms
+                );
+            }
+            last = Some(resp.mtime_ms);
+        }
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert_eq!(
+            out.prompts.len(),
+            6,
+            "all six appends are in the transcript"
+        );
+    }
+
+    /// Every selectable kind must reach the verdict the section header claims —
+    /// and the verdict is the READER's, measured, not the fixture's prediction.
+    #[test]
+    fn every_record_kind_reaches_the_readers_expected_verdict() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+
+        let cases = [
+            (TranscriptRecordKind::Prompt, true),
+            (TranscriptRecordKind::MetaExpansion, false),
+            (TranscriptRecordKind::CompactSummary, false),
+            (TranscriptRecordKind::Sidechain, false),
+            (TranscriptRecordKind::ToolResult, false),
+            (TranscriptRecordKind::Assistant, false),
+        ];
+
+        let mut expected_prompts = 0usize;
+        let mut expected_records = 0usize;
+        let mut surviving_uuids = Vec::new();
+        for (kind, should_surface) in cases {
+            let req = append_req(&config_dir, project_path, "sess", kind);
+            let resp = append_transcript_record_core(&req).expect("append succeeds");
+            assert_eq!(
+                resp.visible_to_reader, should_surface,
+                "{kind:?}: the reader's verdict disagrees with the documented table"
+            );
+            expected_records += 1;
+            if should_surface {
+                expected_prompts += 1;
+                surviving_uuids.push(resp.uuid.clone());
+            }
+            assert_eq!(
+                resp.prompts_after, expected_prompts,
+                "{kind:?}: prompt count"
+            );
+            assert_eq!(
+                resp.records_after, expected_records,
+                "{kind:?}: record count"
+            );
+        }
+
+        // Every kind was written; only the prompt survives the filter.
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        let ids: Vec<&str> = out.prompts.iter().map(|p| p.uuid.as_str()).collect();
+        assert_eq!(
+            ids, surviving_uuids,
+            "exactly the operator-authored prompt reaches the panel"
+        );
+    }
+
+    /// `reset` gives a manual test a known empty starting state without needing
+    /// a second route to clear the file; the default appends instead.
+    #[test]
+    fn reset_truncates_before_appending_and_the_default_appends() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+        let req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+
+        append_transcript_record_core(&req).unwrap();
+        let second = append_transcript_record_core(&req).unwrap();
+        assert_eq!(
+            second.records_after, 2,
+            "the default is append, not overwrite"
+        );
+        assert!(!second.created, "the file already existed");
+
+        let mut reset = req.clone();
+        reset.reset = true;
+        let resp = append_transcript_record_core(&reset).unwrap();
+        assert_eq!(resp.records_after, 1, "reset truncates first");
+        assert_eq!(resp.prompts_after, 1);
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert_eq!(out.prompts.len(), 1);
+        assert_eq!(out.prompts[0].uuid, resp.uuid);
+    }
+
+    /// A transcript whose last line has no trailing newline must not have the
+    /// new record welded onto it — that would corrupt BOTH records, and the
+    /// reader skips malformed lines silently, so the append would just vanish.
+    #[test]
+    fn an_append_onto_a_newline_less_transcript_stays_valid_jsonl() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+        let path = session_transcript_path(&config_dir, project_path, "sess");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // No trailing newline, exactly as a truncated/hand-written file looks.
+        std::fs::write(
+            &path,
+            r#"{"type":"user","uuid":"pre","timestamp":"t0","message":{"role":"user","content":"already here"}}"#,
+        )
+        .unwrap();
+
+        let req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+        let resp = append_transcript_record_core(&req).expect("append succeeds");
+        assert_eq!(resp.records_after, 2);
+
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        let ids: Vec<&str> = out.prompts.iter().map(|p| p.uuid.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["pre", resp.uuid.as_str()],
+            "both the pre-existing record and the appended one parse"
+        );
+    }
+
+    /// A caller-supplied uuid/timestamp is used verbatim, so a gate can pin the
+    /// exact card it expects the panel to render.
+    #[test]
+    fn a_caller_supplied_uuid_and_timestamp_are_used_verbatim() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+        let mut req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+        req.uuid = Some("pinned-uuid".to_string());
+        req.timestamp = Some("2026-08-26T12:00:00Z".to_string());
+        req.text = Some("pinned text".to_string());
+
+        let resp = append_transcript_record_core(&req).unwrap();
+        assert_eq!(resp.uuid, "pinned-uuid");
+
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert_eq!(out.prompts[0].uuid, "pinned-uuid");
+        assert_eq!(out.prompts[0].timestamp, "2026-08-26T12:00:00Z");
+        assert_eq!(out.prompts[0].text, "pinned text");
+    }
+
+    /// Validation: the triple is required, and `session_id` is refused if it
+    /// could escape the transcript directory — it is interpolated into a
+    /// filename, and the reader could never open such a path anyway.
+    #[test]
+    fn append_rejects_an_empty_triple_or_an_escaping_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+
+        for field in ["config_dir", "project_path", "session_id"] {
+            let mut req = append_req(
+                &config_dir,
+                project_path,
+                "sess",
+                TranscriptRecordKind::Prompt,
+            );
+            match field {
+                "config_dir" => req.config_dir = "   ".to_string(),
+                "project_path" => req.project_path = String::new(),
+                _ => req.session_id = " ".to_string(),
+            }
+            let err = append_transcript_record_core(&req)
+                .err()
+                .unwrap_or_else(|| panic!("an empty {field} must be rejected"));
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{field}");
+        }
+
+        for bad in [
+            "../escape",
+            r"..\escape",
+            "nested/sess",
+            r"nested\sess",
+            "C:sess",
+        ] {
+            let mut req = append_req(
+                &config_dir,
+                project_path,
+                "sess",
+                TranscriptRecordKind::Prompt,
+            );
+            req.session_id = bad.to_string();
+            let err = append_transcript_record_core(&req)
+                .err()
+                .unwrap_or_else(|| panic!("session_id {bad:?} must be rejected"));
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+    }
+
+    /// The record shapes are the ones Claude Code actually writes, so the
+    /// machine-flag predicate the reader uses must agree with what this fixture
+    /// emits — checked against `is_machine_authored_user_record` directly so a
+    /// renamed flag fails here rather than silently surfacing machine text.
+    #[test]
+    fn the_written_flags_are_the_ones_the_reader_filters_on() {
+        for (kind, flag) in [
+            (TranscriptRecordKind::MetaExpansion, "isMeta"),
+            (TranscriptRecordKind::CompactSummary, "isCompactSummary"),
+            (TranscriptRecordKind::Sidechain, "isSidechain"),
+        ] {
+            let record = build_transcript_record(kind, "u", "t", "body");
+            assert_eq!(
+                record.get(flag).and_then(|v| v.as_bool()),
+                Some(true),
+                "{kind:?} must carry {flag}"
+            );
+            assert!(
+                crate::terminal::transcript::is_machine_authored_user_record(&record),
+                "{kind:?} must read as machine-authored to the reader"
+            );
+        }
+        let prompt = build_transcript_record(TranscriptRecordKind::Prompt, "u", "t", "body");
+        assert!(
+            !crate::terminal::transcript::is_machine_authored_user_record(&prompt),
+            "a plain prompt must never read as machine-authored"
+        );
+    }
+
+    /// The kind selector is part of the wire contract — a renamed variant
+    /// silently breaks every stored body a manual test uses.
+    #[test]
+    fn record_kinds_serialize_with_their_documented_wire_names() {
+        for (kind, wire) in [
+            (TranscriptRecordKind::Prompt, "\"prompt\""),
+            (TranscriptRecordKind::MetaExpansion, "\"meta_expansion\""),
+            (TranscriptRecordKind::CompactSummary, "\"compact_summary\""),
+            (TranscriptRecordKind::Sidechain, "\"sidechain\""),
+            (TranscriptRecordKind::ToolResult, "\"tool_result\""),
+            (TranscriptRecordKind::Assistant, "\"assistant\""),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
+        }
+        // And a body that omits `kind` defaults to a plain prompt.
+        let req: AppendTranscriptRecordRequest = serde_json::from_str(
+            r#"{"config_dir":"C:/cfg","project_path":"D:/p","session_id":"s"}"#,
+        )
+        .expect("the minimal documented body deserializes");
+        assert_eq!(req.kind, TranscriptRecordKind::Prompt);
+        assert!(!req.reset);
     }
 }
