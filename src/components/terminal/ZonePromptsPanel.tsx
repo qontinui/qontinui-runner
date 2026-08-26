@@ -1,6 +1,6 @@
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { MessageSquare, RefreshCw, X } from "lucide-react";
-import { formatPromptTime } from "./sessionPrompts";
+import { formatPromptTime, type UserPrompt } from "./sessionPrompts";
 import { useSessionPrompts } from "./useSessionPrompts";
 
 /**
@@ -59,6 +59,19 @@ export function ZonePromptsPanel({
 
   const isTop = orientation === "top";
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Prompts the operator has expanded past the clamp, by uuid. Most prompts
+  // are a line or two (median 61 chars across this fleet's transcripts), but a
+  // pasted log can run to 150 KB — one of those unclamped would fill the strip
+  // and bury everything around it, which is the opposite of "at a glance".
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const toggleExpanded = useCallback((uuid: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(uuid)) next.delete(uuid);
+      else next.add(uuid);
+      return next;
+    });
+  }, []);
   // Whether the operator is parked at the bottom. Starts true so the first
   // load lands on the latest prompt.
   const stickToBottomRef = useRef(true);
@@ -167,21 +180,76 @@ export function ZonePromptsPanel({
         )}
         {status === "ready" &&
           prompts.map((p) => (
-            <div
+            <PromptCard
               key={p.uuid}
-              className="rounded border border-[#d7dae3] bg-white px-1.5 py-1 shadow-[0_1px_1px_rgba(31,34,51,0.04)]"
-            >
-              {p.timestamp && (
-                <div className="text-[8px] font-mono text-[#8a90ad] leading-tight">
-                  {formatPromptTime(p.timestamp)}
-                </div>
-              )}
-              <div className="text-[10px] leading-snug whitespace-pre-wrap break-words text-[#1f2233]">
-                {p.text}
-              </div>
-            </div>
+              prompt={p}
+              expanded={expanded.has(p.uuid)}
+              onToggle={() => toggleExpanded(p.uuid)}
+            />
           ))}
       </div>
+    </div>
+  );
+}
+
+/** Lines a prompt shows before it needs expanding. */
+const CLAMP_LINES = 6;
+
+function PromptCard({
+  prompt,
+  expanded,
+  onToggle,
+}: {
+  prompt: UserPrompt;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const [clamped, setClamped] = useState(false);
+
+  // Whether the clamp actually bit — only then is the card worth making
+  // clickable, and only then does the hint earn its row.
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    setClamped(el.scrollHeight > el.clientHeight + 1);
+  }, [prompt.text, expanded]);
+
+  const canExpand = clamped || expanded;
+  return (
+    <div
+      className={`rounded border border-[#d7dae3] bg-white px-1.5 py-1 shadow-[0_1px_1px_rgba(31,34,51,0.04)] ${
+        canExpand ? "cursor-pointer hover:border-[#b6bccd]" : ""
+      }`}
+      onClick={canExpand ? onToggle : undefined}
+      title={canExpand ? (expanded ? "Collapse" : "Show the whole prompt") : undefined}
+    >
+      {prompt.timestamp && (
+        <div className="text-[8px] font-mono text-[#8a90ad] leading-tight">
+          {formatPromptTime(prompt.timestamp)}
+        </div>
+      )}
+      <div
+        ref={bodyRef}
+        className="text-[10px] leading-snug whitespace-pre-wrap break-words text-[#1f2233]"
+        style={
+          expanded
+            ? undefined
+            : {
+                display: "-webkit-box",
+                WebkitLineClamp: CLAMP_LINES,
+                WebkitBoxOrient: "vertical",
+                overflow: "hidden",
+              }
+        }
+      >
+        {prompt.text}
+      </div>
+      {canExpand && (
+        <div className="text-[8px] text-[#8a90ad] mt-0.5">
+          {expanded ? "Show less" : "Show more"}
+        </div>
+      )}
     </div>
   );
 }
