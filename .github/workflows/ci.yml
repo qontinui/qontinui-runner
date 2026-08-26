@@ -27,6 +27,63 @@ on:
     # integration branch must be listed here for stacked-PR CI to fire. CI has
     # no `paths:` filter, so adding the branch suffices.
     branches: [main, develop, 'session-restore-**']
+    #
+    # ⚠️ DO NOT ADD `types: [… labeled]` HERE. It looks like the obvious fix for
+    # the 2026-08-25 declaration race (a `coord:downstream-of=` label landing
+    # ~11 s after `checkout-sibling` already resolved the sibling to `main`, with
+    # nothing re-running this PR's CI). It is the wrong home, on two independent
+    # grounds, both measured:
+    #
+    #   1. COST. `labeled` fires on EVERY label add, including on an ALREADY-
+    #      MERGED PR. Verified on qontinui-schemas, whose gate does carry
+    #      `types: [… labeled]`: #143 merged at 23:33:09Z, coord's post-merge
+    #      `coord:landed` landed at 23:33:11Z, and run 32605532207 was created at
+    #      23:33:13Z. Every runner PR gets `coord:landed` on land. Over PRs
+    #      1132–1161 there were 19 label events, 8 of them post-merge
+    #      `coord:landed`. This workflow is the expensive one (a GREEN main
+    #      rebuild measured at 136–155 job-min, mean ~144), and it has no
+    #      `concurrency:` group, so those runs are additive and uncancelled:
+    #      ~1,150 job-min of pure post-merge waste in a 36 h window, to save the
+    #      ~330 job-min the race actually costs.
+    #
+    #   2. CORRECTNESS — and this is the disqualifying one. The natural
+    #      narrowing (a job-level `if:` on `github.event.label.name`) is WORSE
+    #      than the unguarded trigger. A job skipped by a job-level `if:` still
+    #      publishes a check run, with conclusion `skipped` — confirmed live on
+    #      runner#1150's head 0a76247d, where `Clippy nightly (unscoped,
+    #      all-targets)` sits as `skipped` from clippy-tiers.yml's job-level
+    #      `if:`. coord's `classify_check_rows`
+    #      (coord/src/merge_scheduler.rs) reduces
+    #      `Some("success") | Some("neutral") | Some("skipped") => continue`,
+    #      i.e. it counts `skipped` as PASSING. So a guarded `labeled` trigger
+    #      would let ANY non-matching label add (`coord:landed`, a human label)
+    #      overwrite this PR's real `test (…)` / `Clippy (windows)` conclusions
+    #      with `skipped` and FLIP A RED PR GREEN in coord's eyes. That is a
+    #      strictly worse defect than the race it would be fixing.
+    #
+    # The mechanism lives in `ci-rerun-on-declaration.yml` instead: a ~5 s job
+    # that fires on `labeled`/`unlabeled`, matches only the two label prefixes
+    # `checkout-sibling` actually reads, and RE-RUNS this workflow's existing run
+    # for the PR head. A re-run republishes the real check names with real
+    # conclusions — it never manufactures a `skipped`.
+
+  # Activates coord's ALREADY-SHIPPED redispatcher. `ci_runs_watcher.rs:90` pins
+  # `GATING_WORKFLOW_FILE = "ci.yml"` and `:299-303` dispatches it on the default
+  # branch for ANY repo in `active_repos()` — it does NOT consult
+  # `dispatch_targets.toml` (that identifier appears zero times in the file), so
+  # no manifest entry is needed. Against qontinui-runner it has been inert for
+  # one reason only: this file declared no `workflow_dispatch:` trigger, so the
+  # dispatch 404s. coord anticipates exactly that and logs it at `:318-323`
+  # (`DispatchFailure::NotDispatchable` — "missing or has no `workflow_dispatch:`
+  # trigger (push/PR-only)"). Declaring the trigger turns shipped infrastructure
+  # on rather than building any.
+  #
+  # Note what a dispatched run is and is not: it runs on a BRANCH ref with no PR
+  # context, so `checkout-sibling` short-circuits to the sibling's default branch
+  # and makes no API call. That is the right behaviour for re-establishing a
+  # verdict on `main` after an upstream land; it is NOT a way to re-resolve a
+  # PR's declared sibling (see `ci-rerun-on-declaration.yml` for that).
+  workflow_dispatch:
 
 # Least-privilege, stated explicitly rather than inherited.
 #
