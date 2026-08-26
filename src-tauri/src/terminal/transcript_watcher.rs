@@ -40,6 +40,7 @@ use super::transcript::{
     parse_line_for_touched_files, AgentLogObs,
 };
 use crate::claude_session::coord_register::{AgentLogEmitter, AiCoordRegistrar};
+use crate::session::session_transcript_tailer::SessionTranscriptTailer;
 
 /// Ceiling for "recent enough to schedule a tail task on startup". Older
 /// JSONLs are skipped — they belong to closed sessions whose tabs the user
@@ -81,11 +82,19 @@ struct TailHandle {
 /// `workspace_paths` is the list of project paths the runner currently tracks
 /// (typically a single workspace root). Each path is matched against every
 /// discovered config dir's `projects/<encoded>/` folder.
+///
+/// `tailer` is the session-repository transcript tailer (plan
+/// `2026-08-26-claude-code-session-repository-in-qontinui-web` Phase 2). It is
+/// a SECOND consumer of the same byte-cursor read this watcher already
+/// performs — deliberately not a second watcher, so there is one cursor, one
+/// rotation/truncation handler and one workflow-session filter rather than two
+/// that can disagree. `None` disables it entirely.
 pub fn start_transcript_watcher(
     app_handle: tauri::AppHandle,
     pg: Arc<crate::database::pg::PgDb>,
     workspace_paths: Vec<String>,
     registrar: Option<Arc<AiCoordRegistrar>>,
+    tailer: Option<Arc<SessionTranscriptTailer>>,
 ) -> Result<(), String> {
     if WATCHER.get().is_some() {
         return Err("transcript watcher already started".to_string());
@@ -99,7 +108,7 @@ pub fn start_transcript_watcher(
     // Spawn the orchestrator on the tokio runtime. It owns the channel, the
     // watcher, and the per-session task map.
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = run_orchestrator(app_handle, pg, workspace_paths, registrar).await {
+        if let Err(e) = run_orchestrator(app_handle, pg, workspace_paths, registrar, tailer).await {
             warn!("transcript_watcher: orchestrator exited with error: {}", e);
         }
     });
@@ -115,6 +124,7 @@ async fn run_orchestrator(
     pg: Arc<crate::database::pg::PgDb>,
     workspace_paths: Vec<String>,
     registrar: Option<Arc<AiCoordRegistrar>>,
+    tailer: Option<Arc<SessionTranscriptTailer>>,
 ) -> Result<(), String> {
     let config_dirs = find_claude_config_dirs();
     if config_dirs.is_empty() {
@@ -171,6 +181,7 @@ async fn run_orchestrator(
                     pg.clone(),
                     app_handle.clone(),
                     registrar.clone(),
+                    tailer.clone(),
                     /* start_at_eof */ true,
                 )
                 .await;
@@ -299,6 +310,7 @@ async fn run_orchestrator(
                         pg.clone(),
                         app_handle.clone(),
                         registrar.clone(),
+                        tailer.clone(),
                         /* start_at_eof */ false,
                     )
                     .await;
@@ -321,6 +333,7 @@ async fn run_orchestrator(
                             pg.clone(),
                             app_handle.clone(),
                             registrar.clone(),
+                            tailer.clone(),
                             /* start_at_eof */ true,
                         )
                         .await;
@@ -380,6 +393,7 @@ async fn schedule_tail(
     pg: Arc<crate::database::pg::PgDb>,
     app_handle: tauri::AppHandle,
     registrar: Option<Arc<AiCoordRegistrar>>,
+    tailer: Option<Arc<SessionTranscriptTailer>>,
     start_at_eof: bool,
 ) {
     let mut map = tasks.lock().await;
@@ -408,6 +422,7 @@ async fn schedule_tail(
             pg,
             app_handle,
             registrar,
+            tailer,
             wake,
             cancel,
             start_at_eof,
@@ -434,6 +449,7 @@ async fn tail_session(
     pg: Arc<crate::database::pg::PgDb>,
     app_handle: tauri::AppHandle,
     registrar: Option<Arc<AiCoordRegistrar>>,
+    tailer: Option<Arc<SessionTranscriptTailer>>,
     wake: Arc<Notify>,
     cancel: Arc<Notify>,
     start_at_eof: bool,
@@ -530,6 +546,16 @@ async fn tail_session(
         let mut rows_landed = 0usize;
         let mut bytes_read: u64 = 0;
         let mut line = String::new();
+        // Session-repository Phase 2: the appended bytes this wake consumed,
+        // accumulated so the tailer gets ONE batch (one outbox append, one
+        // durable offset reservation) per wake instead of one per line. Only
+        // built when a tailer is wired, so the watcher's original workload is
+        // byte-for-byte unchanged when it is not.
+        let mut appended_for_tailer = if tailer.is_some() {
+            Some(String::new())
+        } else {
+            None
+        };
         loop {
             line.clear();
             let n = match reader.read_line(&mut line).await {
@@ -552,6 +578,9 @@ async fn tail_session(
                 break;
             }
             bytes_read += n as u64;
+            if let Some(buf) = appended_for_tailer.as_mut() {
+                buf.push_str(&line);
+            }
 
             // Buffer the first 5 lines for the workflow re-check.
             if !did_workflow_recheck && workflow_check_buf.lines().count() < 5 {
@@ -649,6 +678,25 @@ async fn tail_session(
                     session_id
                 );
                 return Ok(());
+            }
+        }
+
+        // ── 7. Session-repository transcript tail (Phase 2) ───────────────
+        //
+        // Deliberately AFTER the workflow re-check above: a workflow session
+        // discovered post-creation returns without ever handing bytes to the
+        // tailer, so the runner's own workflow transcripts keep exactly one
+        // emitter (the executor's `TranscriptEmitter::emit` call sites) rather
+        // than gaining a second, differently-chunked one here.
+        //
+        // The session id is the JSONL stem — the pane's
+        // `claude_code_session_id`, which is exactly the key the registrar's
+        // R4 index resolves for the `terminal_claude` plane. Best-effort and
+        // synchronous: the tailer's whole write path is a bounded local append
+        // that swallows its own errors, so it cannot fail or stall this loop.
+        if let (Some(t), Some(buf)) = (tailer.as_ref(), appended_for_tailer.as_mut()) {
+            if !buf.is_empty() {
+                t.on_appended(&session_id, buf);
             }
         }
     }

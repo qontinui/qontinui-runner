@@ -76,6 +76,7 @@ pub mod restore_record_emitter;
 pub mod session_id; // The ONE Rust answer to "is this a usable provider session id?" — mirrors the frontend isValidSessionId (plan 2026-08-23-single-source-derived-facts, item 1 step 1)
 pub mod session_ledger; // Rebuild-safe, DISK-persisted open-session ledger — the post-rebuild "what did not come back" report (plan 2026-08-22-wip-custody, Phase 4)
 pub mod session_lifecycle_store;
+pub mod session_transcript_tailer; // Interactive-pane Claude Code transcript -> coord transcript stream (plan 2026-08-26-claude-code-session-repository-in-qontinui-web, Phase 2)
 pub mod shutdown_marker;
 pub mod snapshot_history;
 // Moved to the lib crate (`qontinui_runner_lib::tenant_pin`) so `coord_doctor`
