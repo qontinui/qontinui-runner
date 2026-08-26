@@ -59,6 +59,7 @@ export function ZonePromptsPanel({
 
   const isTop = orientation === "top";
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   // Prompts the operator has expanded past the clamp, by uuid. Most prompts
   // are a line or two (median 61 chars across this fleet's transcripts), but a
   // pasted log can run to 150 KB — one of those unclamped would fill the strip
@@ -94,6 +95,25 @@ export function ZonePromptsPanel({
     if (!stickToBottomRef.current) return;
     el.scrollTop = el.scrollHeight;
   }, [prompts.length]);
+
+  // Re-pin whenever the CONTENT resizes, not just when the prompt count does.
+  //
+  // The layout effect above runs before each card has measured its own clamp,
+  // and a card that turns out to be clamped then adds a "Show more" row — so
+  // the content grows AFTER the scroll was set and the view lands short of the
+  // bottom by exactly that much (measured: scrollTop 65 against a 79 maximum).
+  // Expanding a card has the same shape, only larger. Observing the content is
+  // what makes "latest at the bottom" true at rest rather than at first paint.
+  useEffect(() => {
+    const el = scrollRef.current;
+    const content = contentRef.current;
+    if (!el || !content) return;
+    const observer = new ResizeObserver(() => {
+      if (stickToBottomRef.current) el.scrollTop = el.scrollHeight;
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, []);
 
   // Re-anchor when the panel changes shape: the same content in a column is a
   // different scrollHeight than in a strip, so a stuck-to-bottom view would
@@ -163,30 +183,32 @@ export function ZonePromptsPanel({
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-2 py-1 space-y-1"
+        className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-2 py-1"
         // Scrolling here must not also scroll the terminal underneath.
         onWheel={(e) => e.stopPropagation()}
       >
-        {status === "loading" && (
-          <div className="text-[10px] text-[#6b7191] py-1">Reading transcript…</div>
-        )}
-        {status === "unavailable" && (
-          <div className="text-[10px] text-[#a1442f] py-1">
-            Prompts unavailable{reason ? ` — ${reason}` : ""}
-          </div>
-        )}
-        {status === "ready" && prompts.length === 0 && (
-          <div className="text-[10px] text-[#6b7191] py-1">No prompts in this session yet.</div>
-        )}
-        {status === "ready" &&
-          prompts.map((p) => (
-            <PromptCard
-              key={p.uuid}
-              prompt={p}
-              expanded={expanded.has(p.uuid)}
-              onToggle={() => toggleExpanded(p.uuid)}
-            />
-          ))}
+        <div ref={contentRef} className="space-y-1">
+          {status === "loading" && (
+            <div className="text-[10px] text-[#6b7191] py-1">Reading transcript…</div>
+          )}
+          {status === "unavailable" && (
+            <div className="text-[10px] text-[#a1442f] py-1">
+              Prompts unavailable{reason ? ` — ${reason}` : ""}
+            </div>
+          )}
+          {status === "ready" && prompts.length === 0 && (
+            <div className="text-[10px] text-[#6b7191] py-1">No prompts in this session yet.</div>
+          )}
+          {status === "ready" &&
+            prompts.map((p) => (
+              <PromptCard
+                key={p.uuid}
+                prompt={p}
+                expanded={expanded.has(p.uuid)}
+                onToggle={() => toggleExpanded(p.uuid)}
+              />
+            ))}
+        </div>
       </div>
     </div>
   );
