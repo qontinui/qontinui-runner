@@ -391,6 +391,18 @@ impl OutboxWriter {
         Ok(writer)
     }
 
+    /// The outbox file this writer appends to. Exposed so sidecar state that
+    /// must share the outbox's *scope* can co-locate itself without
+    /// re-deriving the path: the outbox dir is instance-scoped
+    /// (`instance::scope_path`) and falls back to a tempdir when
+    /// `~/.qontinui` is unwritable, and a sidecar that rebuilt the path
+    /// itself would silently miss both. Today's sidecar is the transcript
+    /// offset log ([`super::transcript_emitter::TranscriptEmitter`]), whose
+    /// lanes are only meaningful for the rows in THIS outbox.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// How many never-acked records this writer has dropped to stay under the
     /// cap. `0` on a healthy (drained) outbox.
     pub fn dropped_unacked(&self) -> u64 {

@@ -2785,7 +2785,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         machine_id,
                         ai_coord_registrar.clone(),
                     ));
-                app.manage(transcript_emitter);
+                app.manage(transcript_emitter.clone());
+
+                // Session repository Phase 2 (plan 2026-08-26-claude-code-
+                // session-repository-in-qontinui-web) — the INTERACTIVE half
+                // of the same lane. The emitter above has only ever been fed
+                // by the runner's own agentic/workflow runs; this tailer feeds
+                // it the operator's Claude Code tabs, keyed on the
+                // `claude_code_session_id` the resume-sniffer already
+                // registered with coord. Handed to the transcript watcher
+                // below (which owns the file cursors) rather than owning a
+                // watcher of its own.
+                //
+                // Managed as Tauri state so a diagnostic surface can read
+                // `coverage()`; the periodic summary it starts here is what
+                // makes "the tailer is running" distinguishable from "the
+                // tailer is running and reaching every pane" — a Phase 2 exit
+                // criterion, not an assumption.
+                let session_transcript_tailer = std::sync::Arc::new(
+                    session::session_transcript_tailer::SessionTranscriptTailer::new(
+                        transcript_emitter,
+                        ai_coord_registrar.clone(),
+                    ),
+                );
+                session_transcript_tailer.start_coverage_reporter();
+                app.manage(session_transcript_tailer);
 
                 // R2 (session-lifecycle-cleanup) — pane → coord-session-id
                 // store, so a restored terminal pane RESUMES its prior coord
@@ -4217,11 +4241,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let tw_registrar = app
                     .try_state::<Arc<claude_session::coord_register::AiCoordRegistrar>>()
                     .map(|s| s.inner().clone());
+                // Session repository Phase 2: the watcher is also the tailer's
+                // read path. `try_state` (not `state`) because the tailer is
+                // only managed on the branch where the session outbox opened —
+                // an ephemeral-fallback boot still gets its touched-files
+                // watcher, just without cloud transcript sync.
+                let tw_tailer = app
+                    .try_state::<Arc<session::session_transcript_tailer::SessionTranscriptTailer>>()
+                    .map(|s| s.inner().clone());
                 if let Err(e) = crate::terminal::transcript_watcher::start_transcript_watcher(
                     tw_app_handle,
                     tw_pg,
                     workspace_paths,
                     tw_registrar,
+                    tw_tailer,
                 ) {
                     tracing::warn!("transcript watcher failed to start: {}", e);
                 }
