@@ -1,0 +1,382 @@
+name: Stacked PR fast lane
+
+# WHY THIS FILE EXISTS — base-filtered workflows do not fire for stacked PRs.
+#
+# Every gating workflow in this repo carries a `pull_request: branches:` filter,
+# and that filter is matched against the PR's *base*. A stacked PR — one whose
+# base is another feature branch rather than `main`/`develop` — therefore
+# matches NO trigger in ci.yml, clippy-tiers.yml, or the freshness gates. The
+# checks are not red and not pending: they are ABSENT. Measured 2026-08-23 (plan
+# 2026-08-23-stacked-pr-ci-parity §2): a stacked qontinui-runner PR ran exactly
+# ONE real check (Gitleaks, whose workflow has no base filter), while a
+# base-on-main PR ran twenty-one. `test`, `clippy-windows`, `frontend-tests`,
+# `seam-gate` and `security` simply did not exist for it.
+#
+# The previous mitigation was to append the offending base branch to each
+# workflow's filter (`session-restore-**` in ci.yml and clippy-tiers.yml, for
+# runner #651/#652 on 2026-06-26). That does not scale and is not repeated here:
+# it was applied to two workflows and the other eight never got it, so the gap
+# reopened the moment someone invented a new branch name. `branches-ignore`
+# inverts the predicate instead — this lane fires for EVERY base that is not
+# main/develop, and needs no maintenance when a new branch name appears.
+#
+# WHAT THIS BUYS, AND WHAT IT DOES NOT.
+#
+#   It buys COVERAGE, not PARITY. A stacked PR's merge ref merges its head into
+#   its PARENT branch, and the parent lacks main's newer commits. So a green run
+#   here proves this branch's own code compiles, lints and passes the frontend
+#   suite against the parent — it does NOT prove the change is compatible with
+#   main. Semantic merge conflicts against main are invisible to any
+#   `pull_request` workflow on a stacked PR, by construction. Catching those is
+#   the candidate-CI lane's job (plan Phase 4), where coord rebases onto the real
+#   land target before testing. Do not treat this lane's green as a land signal.
+#
+#   It is deliberately NOT a full CI pass. See the budget below.
+#
+# NOT A REQUIRED STATUS CONTEXT — and it must never become one. These jobs do
+# not exist on a base-on-main PR (branches-ignore excludes main), so making any
+# of them required would block every ordinary PR forever on a context with no
+# producer — precisely the 2026-06-26 fleet wedge that ci-integrity.yml's header
+# documents, and precisely the absent-is-blocking arm that plan Phase 3 adds to
+# coord. Keep `required_status_checks.contexts` untouched; keep this file out of
+# ci-integrity.yml's GATING list (it gates nothing — it is an advisory lane).
+#
+# BUDGET CEILING — 40 billable minutes, absolute worst case.
+#
+#   That number is not aspirational. It is the SUM of the three
+#   `timeout-minutes` values below (5 + 25 + 10), so the ceiling is enforced by
+#   the runner rather than by intention. A check that cannot fit inside it does
+#   not get a bigger budget: it gets left out of this lane.
+#
+#   TARGET — single-digit billable minutes for the ordinary push. The `scope`
+#   job below reads the PR diff and runs only the arm(s) the diff touches, so a
+#   Rust-only push pays the Rust arm (~8-12 min warm) and a frontend-only push
+#   pays the frontend arm (~3-5 min). `cancel-in-progress` means a loop session
+#   pushing five times in ten minutes pays for one settled run, not five.
+#
+#   EVERY job here runs on ubuntu (x1 billing multiplier). No windows (x2), no
+#   macos (x10).
+#
+#   DELIBERATELY EXCLUDED, and why — ci.yml's `test` matrix (ubuntu-22.04 +
+#   windows-latest), and its `clippy-windows` job. A full runner CI pass is
+#   ~276 wall-clock / ~280 BILLABLE minutes; the windows `test` leg alone is
+#   ~1h24 at the x2 multiplier. On a loop session's push cadence that is the
+#   single most expensive line available in this fleet, which is why the plan's
+#   Non-goals forbid broadening ci.yml or clippy-tiers.yml instead of adding
+#   this file. The cost of the exclusion is stated plainly: cfg(windows) code
+#   paths and the Rust test suite are NOT covered on a stacked PR. They are
+#   covered when the stack's bottom PR retargets main, and at candidate time.
+#
+#   Anything added here must keep the sum of the timeouts at or under 40 and
+#   must justify itself against that ceiling in a comment. Growth without a
+#   stated ceiling is the failure mode this lane exists to avoid.
+#
+# A note on double-coverage: ci.yml and clippy-tiers.yml still list
+# `session-restore-**` as an accepted base, so a PR stacked on one of those
+# integration branches gets ci.yml AND this lane. That duplicate spend
+# (single-digit minutes) is accepted on purpose rather than adding
+# `session-restore-**` to `branches-ignore` — a second maintenance-coupled
+# branch glob is exactly the mitigation that already failed to scale.
+#
+# Plan: 2026-08-23-stacked-pr-ci-parity, Phase 5.
+
+on:
+  pull_request:
+    # The ONLY trigger. No `push:` — this lane adds exactly zero cost to main,
+    # to develop, and to the merge-candidate refs, all of which ci.yml already
+    # covers in full.
+    branches-ignore: [main, develop]
+
+concurrency:
+  # A loop session force-pushes the same head branch repeatedly. Cancel the
+  # superseded run rather than paying for an answer about a commit nobody is
+  # looking at any more.
+  group: stacked-fastlane-${{ github.head_ref }}
+  cancel-in-progress: true
+
+# Least-privilege, stated explicitly rather than inherited from the repo-level
+# `default_workflow_permissions` (an operator-flippable setting invisible in
+# this file), same as ci.yml. `pull-requests: read` is a real requirement:
+# ./.github/actions/checkout-sibling resolves the DECLARED qontinui-schemas
+# adaptation PR from this PR's coord dep-edge labels via the API. Nothing here
+# writes.
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  # Must match ci.yml exactly. This is not cosmetic: Swatinem/rust-cache hashes
+  # every CARGO*/RUST*/CC/CXX/CFLAGS/CMAKE env var into its cache key, so a
+  # different value here would put the Rust job in a different cache scope and
+  # cost it a full cold dependency compile (see its cache step).
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Read the PR diff once and decide which arm(s) to pay for. ~20 seconds.
+  #
+  # Skipped jobs are the point, and they are safe here only because none of
+  # these contexts is required (see the header). Do not copy this pattern into a
+  # workflow whose contexts ARE required — a skipped required context is the
+  # wedge, not a saving.
+  scope:
+    name: Fast lane scope
+    runs-on: ubuntu-latest
+    # A checkout plus a git diff. 5 minutes is a floor, not a multiple: a
+    # sub-minute job does not want a sub-minute cap, since network jitter on the
+    # checkout alone would flake it. Same reasoning as ci.yml's `seam-gate`.
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+      frontend: ${{ steps.diff.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Both `base.sha` and `head.sha` must be reachable for the diff below.
+          fetch-depth: 0
+
+      - name: Classify changed paths
+        id: diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # FAIL OPEN. If the diff cannot be computed (shallow history, a force
+          # push that orphaned base.sha, an empty PR), run BOTH arms. A scoping
+          # optimisation that silently skips checks on an unreadable diff is a
+          # false green; paying for a full lane run is the cheap failure.
+          run_rust=true
+          run_frontend=true
+
+          changed=""
+          if ! changed="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" 2>&1)"; then
+            echo "::warning::git diff ${BASE_SHA}..${HEAD_SHA} failed; running every arm."
+            changed=""
+          fi
+
+          if [ -n "${changed}" ]; then
+            run_rust=false
+            run_frontend=false
+            while IFS= read -r f; do
+              [ -z "${f}" ] && continue
+              case "${f}" in
+                # Rust sources, the workspace manifests, the toolchain pin, and
+                # the trees reached by include_str! from src-tauri (a change
+                # under examples/ or resources/ recompiles the crate).
+                src-tauri/*|crates/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|examples/*|resources/*) run_rust=true ;;
+                # The lane's own definition and the sibling-resolution action it
+                # calls: run everything so the lane tests itself.
+                .github/workflows/stacked-pr-fastlane.yml|.github/actions/*) run_rust=true; run_frontend=true ;;
+              esac
+              case "${f}" in
+                src/*|scripts/*|package.json|pnpm-lock.yaml|tsconfig*.json|vite.config.ts|vitest.config.ts|eslint.config.js|index.html) run_frontend=true ;;
+              esac
+            done <<< "${changed}"
+          fi
+
+          echo "rust=${run_rust}" >> "$GITHUB_OUTPUT"
+          echo "frontend=${run_frontend}" >> "$GITHUB_OUTPUT"
+          echo "rust=${run_rust} frontend=${run_frontend}"
+
+  # Rust arm: formatting + the ubuntu clippy signal, on one compile pass.
+  #
+  # `cargo clippy` rather than `cargo check` on purpose. Clippy type-checks the
+  # crate exactly as check does and then applies the lint tiers on top, so it is
+  # a strict superset for the same single compile — running both would pay for
+  # two dep graphs (different flag sets => different artifacts) to learn one
+  # extra thing. Lint levels come solely from src-tauri/Cargo.toml
+  # [lints.clippy] (T1 correctness/suspicious are `deny` there and fail this
+  # job; T3 style/complexity/perf stay `warn`), which is the same invocation and
+  # the same contract as ci.yml's ubuntu `Clippy check` step.
+  #
+  # This is NOT the diff-scoped reviewdog lane from clippy-tiers.yml. That one
+  # needs `pull-requests: write` and posts review comments; this lane stays
+  # read-only and lets the check's own colour be the signal.
+  rust-fast:
+    name: Fast lane - fmt + clippy (ubuntu)
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
+    # ubuntu-22.04, not ubuntu-latest — matching ci.yml's `test` matrix leg is
+    # what keeps this job in the same rust-cache scope (see the cache step).
+    runs-on: ubuntu-22.04
+    # The single largest line in the 40-minute ceiling. Sized for a cold cache:
+    # ci.yml records the cache-less dependency graph as ~755 check-compiles
+    # (~17 min on the windows leg; ubuntu is materially faster), plus ~5 min of
+    # setup and frontend build. A warm restore lands at ~8-12 min. If this ever
+    # needs more than 25, the honest response is to cut the job, not to raise
+    # the cap.
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # src-tauri/Cargo.toml has a path dep on ../../qontinui-schemas/rust, so
+      # the crate does not resolve without this. Same action, same
+      # declared-adaptation resolution as ci.yml's `test`, `clippy-windows` and
+      # `security` jobs — a breaking types change stays landable as a DECLARED
+      # pair here too.
+      #
+      # ci.yml's `test` and `clippy-windows` additionally clone qontinui-web and
+      # ui-bridge; this job deliberately does not. Those two exist for the TEST
+      # target (the SDK<->runner manifest diff test reads ui-bridge's
+      # types.ts at test RUNTIME) and for a frontend spec-registry import that no
+      # longer exists in this tree. Plain `cargo clippy` compiles no test
+      # targets, and nothing under src/ resolves a path outside this repo
+      # (tsconfig.json's only alias is `@/* -> src/*`), so both clones are dead
+      # weight in this lane. If a future test-target compile lands here, they
+      # come back with it.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain file
+      # overrides any other channel for every cargo invocation, so rustfmt and
+      # clippy must be installed for 1.95.0 specifically — otherwise
+      # `cargo fmt`/`cargo clippy` auto-switch to a component-less 1.95.0 and
+      # fail with "'cargo-fmt' is not installed".
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      # Same package list as ci.yml (the webkit/gtk/atspi pkg-config deps the
+      # crate's build scripts resolve), and bounded for the same reason: an
+      # unbounded apt hang in this step cost qontinui-runner 3h45m of merge-train
+      # throughput on 2026-08-19. 10 min matches the bound ci.yml and
+      # clippy-tiers.yml put on the identical list, so the three do not drift.
+      #
+      # NOT copied from ci.yml's `test` job: the 12 GB swapfile and the
+      # free-disk-space reclaim. Both guard the LINK step (rustc/LLVM commit
+      # spike, and a target dir holding full debug objects). `cargo clippy`
+      # emits metadata and links nothing, so neither pressure exists here and
+      # neither is worth ~2 min of every run. If this job ever dies with ENOSPC
+      # or an OOM signature, re-add them — do not silently raise the timeout.
+      - name: Install dependencies (Ubuntu)
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core
+
+      # RESTORE-ONLY, and deliberately pointed at ci.yml's cache scope.
+      #
+      # rust-cache builds its key prefix from `shared-key` if given, otherwise
+      # from $GITHUB_JOB — so `shared-key: test` reproduces the prefix ci.yml's
+      # `test` job generates, and the OS/arch and rustc/env/lockfile hashes match
+      # because this job pins the same 1.95.0 toolchain on the same ubuntu-22.04
+      # image with the same CARGO_TERM_COLOR. That cache is saved only from main
+      # (ci.yml's `save-if`) and contains dependency artifacts for every flag set
+      # that job compiled, clippy's among them — so this lane rides main's warm
+      # cache instead of paying a cold dep graph on every stacked push.
+      #
+      # Restore is unrestricted, so this costs the `test` job nothing. A miss
+      # (someone renames that job, or bumps the toolchain here and not there) is
+      # SLOWER, never WRONG — the 25-minute timeout is sized to absorb it.
+      #
+      # `save-if: false` is not incidental. This lane must never write a cache
+      # entry: the repo sits near the 10 GB Actions cache cap, and per-ref saves
+      # from one-shot PR branches are exactly what evicted main's caches on
+      # 2026-07-17 (runner PR #792). Restore, never save.
+      - name: Cache Rust dependencies (restore only)
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Workspace root is the repo root: ./Cargo.toml -> ./target
+          workspaces: ". -> target"
+          shared-key: test
+          save-if: false
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # tauri::generate_context!() in src-tauri/src/lib.rs reads tauri.conf.json
+      # at compile time and panics if frontendDist (../dist) is missing. Clippy
+      # compiles lib.rs, so the frontend must be built first — same ordering
+      # constraint ci.yml and clippy-tiers.yml both document.
+      #
+      # Free side effect worth naming: `pnpm run build` is `tsc && vite build`,
+      # so this step also typechecks the frontend. That is why a Rust-only push
+      # still gets a TS signal even when the frontend arm is skipped.
+      - name: Build frontend
+        run: pnpm run build
+
+      # Cheapest possible fail-fast: seconds, and it needs nothing compiled.
+      - name: Format Rust code check
+        run: |
+          cd src-tauri
+          cargo fmt -- --check
+
+      - name: Clippy check
+        run: |
+          cd src-tauri
+          cargo clippy
+
+  # Frontend arm. Mirrors ci.yml's standalone `frontend-tests` job — which is
+  # green on main and deliberately clones no sibling repos, because the vitest
+  # suite imports @qontinui/* exclusively from npm — and adds the lint and
+  # typecheck steps ci.yml otherwise only runs inside its heavy `test` matrix.
+  # Neither addition needs a sibling checkout (tsconfig.json includes `src`
+  # only; its sole path alias is `@/* -> src/*`).
+  frontend-fast:
+    name: Fast lane - frontend (lint, typecheck, vitest)
+    needs: scope
+    if: needs.scope.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    # ci.yml's `frontend-tests` observes p50 1-2 min against a 15-min cap; three
+    # steps instead of one still lands well inside 10, and 10 keeps the lane's
+    # ceiling arithmetic honest.
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Mirror ci.yml's frontend setup EXACTLY: pnpm 10.33.2, node 20, pnpm
+      # cache keyed on the root lockfile, frozen-lockfile install.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint frontend code
+        run: pnpm run lint
+
+      # Cheap fail-fast on consumer-side camelCase / deny_unknown_fields drift
+      # from qontinui-schemas, same rationale as ci.yml's typecheck step.
+      - name: Typecheck frontend code
+        run: pnpm run typecheck
+
+      - name: Run frontend unit tests
+        run: pnpm test
