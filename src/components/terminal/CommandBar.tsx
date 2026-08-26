@@ -38,6 +38,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useUIElement, type StandardAction } from "@qontinui/ui-bridge";
 
 import { instanceStorage } from "@/lib/instance-storage";
 import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
@@ -90,6 +91,52 @@ function optionId(actionId: string): string {
 function suggestionElementId(slash: string): string {
   return `command-bar-suggestion-${slash.replace(/^\//, "")}`;
 }
+
+
+/**
+ * Author-controlled control id for the command bar's text input. Exported so
+ * tests and callers building UI-Bridge action URLs reference one constant
+ * instead of re-typing the string. Same convention as
+ * `SESSION_MANAGER_TOGGLE_ID` and `ZoneHoverActions`' `terminal.close-session-<id>`.
+ */
+export const COMMAND_BAR_INPUT_ID = "terminal.command-bar-input";
+
+/**
+ * Actions this input advertises.
+ *
+ * The registry's `inferActions('input')` yields
+ * `focus, blur, hover, scroll, scrollIntoView, click, hoverClick, type, clear`
+ * — no `sendKeys`. Both GLOBAL whitelists already carry `sendKeys` (SDK
+ * `action-executor.ts`, runner `mcp/ui_bridge/elements.rs`
+ * `SUPPORTED_ACTION_NAMES`), so the rejection a driver actually hit —
+ * `ACTION_NOT_SUPPORTED`, "Action 'sendKeys' is not supported by element …" —
+ * came from the PER-ELEMENT advertised list at the pre-IPC gate
+ * (`is_action_advertised`, permissive only when an element advertises nothing
+ * at all). Driving the bar (type `/resume`, press Enter) is exactly a
+ * `sendKeys` job, so the inferred set is simply wrong here; this restates it
+ * with `sendKeys` added.
+ *
+ * Deliberately a plain ADVERTISEMENT and not a `customActions` entry: the
+ * SDK's built-in `performSendKeys` already does the right thing for a text
+ * input, and a registered custom action WINS over a same-named built-in on
+ * that element (ui-bridge `bc591af`). `TerminalInstance.tsx` already registers
+ * a custom `sendKeys` on the terminal PANE whose `keys` param is a plain string
+ * written straight to the PTY — a second, incompatible meaning for the name.
+ * A third would make `sendKeys` unpredictable per element, so the command bar
+ * keeps the SDK's descriptor-array contract (`keys: [{key, modifiers?}]`).
+ */
+export const COMMAND_BAR_INPUT_ACTIONS: StandardAction[] = [
+  "focus",
+  "blur",
+  "hover",
+  "scroll",
+  "scrollIntoView",
+  "click",
+  "hoverClick",
+  "type",
+  "clear",
+  "sendKeys",
+];
 
 // Tier-3 (claude subprocess) debounce + gating. The subprocess takes
 // ~1.5-3s; we don't want to fire it on every keystroke. 600ms is long
@@ -203,6 +250,15 @@ export function CommandBar() {
   );
 
   const inputRef = useRef<HTMLInputElement>(null);
+  // Register the input as an addressable bridge element so a driver can
+  // `sendKeys` at it — see `COMMAND_BAR_INPUT_ACTIONS` for why the inferred
+  // action set is not enough.
+  const { ref: bridgeInputRef } = useUIElement({
+    id: COMMAND_BAR_INPUT_ID,
+    type: "input",
+    label: "Command bar",
+    actions: COMMAND_BAR_INPUT_ACTIONS,
+  });
   const blurTimerRef = useRef<number | null>(null);
 
   // Tier-3 state — async AI resolution result + in-flight indicator.
@@ -842,7 +898,17 @@ export function CommandBar() {
         <SpawnTenantPicker cwd={activeTabCwd} />
         <span className="text-[10px] text-[#565f89] font-mono select-none">›</span>
         <input
-          ref={inputRef}
+          // Two consumers of one node: the component's own imperative
+          // focus/blur ref, and the bridge registration's ref callback.
+          ref={(node) => {
+            inputRef.current = node;
+            bridgeInputRef(node);
+          }}
+          // The stamp pins the CONTROL id, and the author stamp wins over the
+          // SDK's auto-derived one (`useAutoRegister.ts`'s `!existingStamp`
+          // guard) — which here would be minted from the ROTATING placeholder
+          // and so would not be stable across the 8s cycle.
+          data-ui-bridge-id={COMMAND_BAR_INPUT_ID}
           value={query}
           onChange={handleChange}
           // A bare click must open the dropdown too: a synthetic click
@@ -853,7 +919,8 @@ export function CommandBar() {
           onKeyDown={handleKeyDown}
           // Stable accessible name. The placeholder rotates every 8s, so
           // it can't be the only name — a lookup by name would resolve
-          // the input or not depending on when it ran.
+          // the input or not depending on when it ran. `ai/find` and the
+          // snapshot's `accessibleName` resolve on this too.
           aria-label="Terminal command bar"
           role="combobox"
           aria-expanded={dropdownVisible}

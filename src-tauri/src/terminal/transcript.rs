@@ -305,12 +305,20 @@ pub fn session_transcript_path(config_dir: &Path, project_path: &str, session_id
 // ── Resume-name extraction (previous-sessions listing) ───────────────────────
 //
 // The `--resume` name a user actually sees is NOT the first-message preview
-// [`generate_display_name`] computes. It lives in the transcript JSONL as a
-// `{"type":"custom-title","customTitle":"…"}` record (Claude's `/rename`
-// appends one — the LAST is the current name) or, absent a rename, Claude's
-// auto `{"type":"summary","summary":"…"}` record (near the HEAD). These helpers
-// recover it. Kept separate from `display_name` (still the useful first-message
-// preview).
+// [`generate_display_name`] computes. It lives in the transcript JSONL as one of
+// three record kinds, in this order of authority:
+//
+// 1. `{"type":"custom-title","customTitle":"…"}` — the operator's explicit
+//    `/rename` (Claude appends one per rename; the LAST is the current name).
+// 2. `{"type":"ai-title","aiTitle":"…","sessionId":"…"}` — the title Claude
+//    deliberately generated for the session.
+// 3. `{"type":"summary","summary":"…"}` — the auto summary record (near the
+//    HEAD).
+//
+// A `/rename` is the operator speaking, so it outranks any generated title; an
+// `ai-title` is a deliberate titling pass, so it outranks the incidental auto
+// `summary`. These helpers recover it. Kept separate from `display_name` (still
+// the useful first-message preview).
 
 /// Turn a raw transcript-sourced string into a displayable TITLE: strip ANSI
 /// escapes, trim, and reject what is left if it is empty.
@@ -329,9 +337,9 @@ pub fn session_transcript_path(config_dir: &Path, project_path: &str, session_id
 /// of one thing, free to drift on exactly the sequences that matter.
 ///
 /// Applied at every point a raw string BECOMES a title
-/// ([`last_custom_title`], [`last_summary`], [`generate_display_name`]) rather
-/// than at the public projections, so no future caller can reach an
-/// unsanitized one.
+/// ([`last_custom_title`], [`last_ai_title`], [`last_summary`],
+/// [`generate_display_name`]) rather than at the public projections, so no
+/// future caller can reach an unsanitized one.
 fn sanitize_title(raw: &str) -> Option<String> {
     let cleaned = crate::terminal::strip_ansi(raw);
     let trimmed = cleaned.trim();
@@ -364,6 +372,35 @@ fn last_custom_title<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String>
     found
 }
 
+/// Scan `lines` for the LAST `ai-title` record and return its `aiTitle`. Same
+/// shape as [`last_custom_title`] — same forward scan keeping the last hit, same
+/// cheap substring pre-check, same [`sanitize_title`].
+///
+/// Claude writes `{"type":"ai-title","aiTitle":"…","sessionId":"…"}` when it
+/// titles a session itself. It ranks BELOW `custom-title` (an explicit
+/// `/rename` is the operator overriding the generated name and must keep
+/// winning) and ABOVE `summary` (a deliberate title beats the incidental auto
+/// summary).
+fn last_ai_title<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut found = None;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() || !line.contains("ai-title") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("ai-title") {
+                if let Some(title) = v.get("aiTitle").and_then(|t| t.as_str()) {
+                    if let Some(t) = sanitize_title(title) {
+                        found = Some(t);
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Scan `lines` for the LAST `summary` record and return its `summary`.
 fn last_summary<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
     let mut found = None;
@@ -386,11 +423,14 @@ fn last_summary<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
 }
 
 /// The `--resume` name for an in-memory transcript string: the LAST
-/// `custom-title` (a `/rename`), else the last `summary` (Claude's auto-title),
-/// else `None`. In-memory variant — used by unit tests; the production path
-/// uses [`extract_resume_name_from_path`] to avoid loading a multi-MB file.
+/// `custom-title` (a `/rename`), else the last `ai-title` (a title Claude
+/// generated for the session), else the last `summary` (the auto summary), else
+/// `None`. In-memory variant — used by unit tests; the production path uses
+/// [`extract_resume_name_from_path`] to avoid loading a multi-MB file.
 fn extract_resume_name(content: &str) -> Option<String> {
-    last_custom_title(content.lines()).or_else(|| last_summary(content.lines()))
+    last_custom_title(content.lines())
+        .or_else(|| last_ai_title(content.lines()))
+        .or_else(|| last_summary(content.lines()))
 }
 
 /// Read the last `max` bytes of `path` as a string, dropping the leading
@@ -440,15 +480,23 @@ fn read_head_lines(path: &Path, max_lines: usize) -> Option<String> {
 /// `custom-title` is appended near the END (scan the last ~64 KB) and Claude's
 /// auto `summary` sits near the HEAD (scan the first ~40 lines), so the whole
 /// (multi-MB) transcript is never loaded. Returns the LAST `custom-title`, else
-/// the last `summary` in the head slice, else `None`.
+/// the last `ai-title`, else the last `summary` in the head slice, else `None`.
+///
+/// An `ai-title` can land anywhere: Claude re-titles as the session evolves
+/// (appended, so the freshest one is in the tail) but a session titled once at
+/// the start and never again keeps its only record near the head. Both slices
+/// are already being read, so it is checked in each — tail first, since the last
+/// record written is the current title.
 pub fn extract_resume_name_from_path(path: &Path) -> Option<String> {
-    if let Some(name) =
-        read_tail_bytes(path, 64 * 1024).and_then(|tail| last_custom_title(tail.lines()))
-    {
+    let tail = read_tail_bytes(path, 64 * 1024);
+    if let Some(name) = tail.as_deref().and_then(|t| last_custom_title(t.lines())) {
+        return Some(name);
+    }
+    if let Some(name) = tail.as_deref().and_then(|t| last_ai_title(t.lines())) {
         return Some(name);
     }
     let head = read_head_lines(path, 40)?;
-    last_summary(head.lines())
+    last_ai_title(head.lines()).or_else(|| last_summary(head.lines()))
 }
 
 /// Best human name for the transcript at `path` for the "previous sessions"
@@ -2074,6 +2122,73 @@ mod tests {
         assert_eq!(
             extract_resume_name("{\"type\":\"custom-title\",\"customTitle\":\"\\u001b[0m\"}"),
             None
+        );
+    }
+
+    /// Claude writes `{"type":"ai-title","aiTitle":"…"}` records that main
+    /// never read. They sit between the operator's explicit `/rename` and the
+    /// incidental auto `summary` in the precedence chain.
+    #[test]
+    fn ai_title_ranks_between_custom_title_and_summary() {
+        const AI: &str =
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Add data attributes to reflection toggle button\",\"sessionId\":\"5f92f974\"}";
+        const SUMMARY: &str = "{\"type\":\"summary\",\"summary\":\"auto summary\"}";
+        const RENAMED: &str = "{\"type\":\"custom-title\",\"customTitle\":\"operator name\"}";
+
+        // Only an ai-title → it is the name.
+        assert_eq!(
+            extract_resume_name(AI).as_deref(),
+            Some("Add data attributes to reflection toggle button")
+        );
+
+        // ai-title beats summary, in either file order.
+        let both = format!("{SUMMARY}\n{AI}");
+        assert_eq!(
+            extract_resume_name(&both).as_deref(),
+            Some("Add data attributes to reflection toggle button")
+        );
+        let both_reversed = format!("{AI}\n{SUMMARY}");
+        assert_eq!(
+            extract_resume_name(&both_reversed).as_deref(),
+            Some("Add data attributes to reflection toggle button")
+        );
+
+        // A `/rename` outranks a generated title, in either file order.
+        let all = format!("{RENAMED}\n{AI}\n{SUMMARY}");
+        assert_eq!(extract_resume_name(&all).as_deref(), Some("operator name"));
+        let all_reversed = format!("{SUMMARY}\n{AI}\n{RENAMED}");
+        assert_eq!(
+            extract_resume_name(&all_reversed).as_deref(),
+            Some("operator name")
+        );
+
+        // The LAST ai-title wins, as with custom-title.
+        let retitled = format!(
+            "{AI}\n{}",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"second thoughts\"}"
+        );
+        assert_eq!(
+            extract_resume_name(&retitled).as_deref(),
+            Some("second thoughts")
+        );
+    }
+
+    /// `aiTitle` goes through the same [`sanitize_title`] as every other title
+    /// source — no second ANSI scanner, and an all-escape title falls through
+    /// rather than surfacing as an empty label.
+    #[test]
+    fn ai_titles_are_stripped_of_ansi_escapes() {
+        let content =
+            "{\"type\":\"ai-title\",\"aiTitle\":\"\\u001b[1;36mFix\\u001b[0m the command bar\"}";
+        let name = extract_resume_name(content).expect("ai-title is a title source");
+        assert_eq!(name, "Fix the command bar");
+        assert!(!name.contains('\u{1b}'));
+
+        // Nothing but escapes → no name left, so the summary below it is used.
+        let escapes_only = "{\"type\":\"ai-title\",\"aiTitle\":\"\\u001b[0m\"}\n{\"type\":\"summary\",\"summary\":\"real summary\"}";
+        assert_eq!(
+            extract_resume_name(escapes_only).as_deref(),
+            Some("real summary")
         );
     }
 
