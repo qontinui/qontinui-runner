@@ -1206,7 +1206,7 @@ mod tests {
         assert_eq!(state.targets.len(), state.backoff.lock().await.len());
     }
 
-    /// Drop must ACTUALLY stop the task, not merely avoid panicking.
+    /// Cancelling must ACTUALLY stop the task, not merely avoid panicking.
     ///
     /// The previous version of this test dropped the handle immediately
     /// and asserted nothing. It could not fail: the task was still parked
@@ -1218,8 +1218,18 @@ mod tests {
     /// This version asserts on `JoinHandle::is_finished()` instead of on
     /// the absence of a panic, which is the only thing that distinguishes
     /// a stopped task from a detached one.
+    ///
+    /// **Named for what it covers.** It drives `run` against a token it
+    /// owns; it does NOT construct a `PusherHandle` and so does not
+    /// exercise `Drop`, nor the `abort()` backstop behind it. Calling it
+    /// `..._drop_actually_stops_the_task` would repeat, in the very change
+    /// that removes it, the false-coverage claim this work exists to fix.
+    /// End-to-end `spawn → Drop → no further requests` is covered once, in
+    /// `dirty_poller::tests::no_requests_are_issued_after_the_handle_is_dropped`;
+    /// the pusher's tick is a `git push`, which has no equivalently cheap
+    /// observable, so it is left to that shared coverage plus this test.
     #[tokio::test]
-    async fn pusher_handle_drop_actually_stops_the_task() {
+    async fn cancelling_stops_the_pusher_task() {
         let state = Arc::new(PusherState {
             agent_id: uuid::Uuid::nil(),
             coord_http_base: "http://invalid:1".into(),
