@@ -255,6 +255,14 @@ Two thread-through styles, mirroring the `tabId` split:
   to that window (no main-window direct-eval fallback for pop-outs — that path is
   main-coupled). Omitting `windowLabel` is byte-identical to the single-window
   default. (Phase 4, plan 2026-06-07-multi-window-sdk-automation.)
+  `type-into` is the one two-step member: it evaluates only a RESOLUTION
+  expression, then dispatches the value mutation as `execute_action` `type`
+  through `ui_bridge_request_sync_in_window` with the same label, so the SDK's
+  `applyValueMutation` stays the single implementation of typing. `text` is
+  required and must be a string (no `""` default), a miss is HTTP 400 rather
+  than a 200 carrying `typed: false`, and the success payload is the SDK's
+  declared `{typed, element}` plus `index` — the old `valueLength` field is
+  gone; read a value back with `POST /control/page/read-value`.
 
 An unknown `windowLabel` (no such window — e.g. a pop-out that already closed)
 returns an immediate, structured error naming the missing window and the

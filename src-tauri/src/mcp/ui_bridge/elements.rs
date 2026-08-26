@@ -42,7 +42,9 @@ use super::helpers::{
     filter_element_fields, read_window_label, snapshot_signature,
 };
 use super::recovery_executor::attempt_recovery;
-use super::request::{ui_bridge_request_sync, wrap_ipc_result};
+use super::request::{
+    ui_bridge_request_sync, ui_bridge_request_sync_in_window, wrap_ipc_result,
+};
 use super::screenshots::capture_runner_window_base64;
 use super::types::{
     classify_transport_error, UIBridgeActionRequest, UIBridgeComponentActionRequest,
@@ -3973,19 +3975,159 @@ pub async fn ui_bridge_read_value_handler(
     }
 }
 
+/// Build the element-RESOLUTION expression for `type-into`.
+///
+/// The returned JS answers a JSON object and mutates nothing beyond scrolling
+/// the hit into view:
+///
+///   - hit  → `{found: true, path, tag, id, testId, index}`
+///   - miss → `{found: false, error, matchCount?}`
+///
+/// `path` is a selector that resolves to **exactly** this element (a unique
+/// `#id` where one exists, otherwise a full `:nth-of-type` path from `html`).
+/// That is what the SDK's `findElementByIdentifier` accepts in place of a
+/// registered element id, so it is how a raw `<input>` — which never appears in
+/// the UI Bridge element registry — becomes addressable by `execute_action`.
+/// A synthesized path is used even when the caller's own selector would do,
+/// because `findElementByIdentifier` tries `[data-testid=…]` and `#id` BEFORE
+/// `querySelector`, so a bare selector like `email` could silently address a
+/// different element than the one this step resolved.
+fn type_into_resolve_js(find_expr: &str, index: u64) -> String {
+    format!(
+        r#"(() => {{
+            const matches = Array.from({find_expr}).filter(el => el);
+            if (matches.length === 0) return JSON.stringify({{ found: false, error: 'No elements found' }});
+            const idx = {index};
+            if (idx >= matches.length) return JSON.stringify({{ found: false, error: 'Index out of range', matchCount: matches.length }});
+            const el = matches[idx];
+            const isUnique = (sel) => {{
+                try {{
+                    const hits = document.querySelectorAll(sel);
+                    return hits.length === 1 && hits[0] === el;
+                }} catch (e) {{
+                    return false;
+                }}
+            }};
+            let path = null;
+            if (el.id) {{
+                const byId = '#' + CSS.escape(el.id);
+                if (isUnique(byId)) path = byId;
+            }}
+            if (!path) {{
+                const parts = [];
+                let cur = el;
+                while (cur && cur.nodeType === 1 && cur !== document.documentElement) {{
+                    let seg = cur.nodeName.toLowerCase();
+                    const parent = cur.parentElement;
+                    if (parent) {{
+                        const sibs = Array.from(parent.children).filter(c => c.nodeName === cur.nodeName);
+                        if (sibs.length > 1) seg += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+                    }}
+                    parts.unshift(seg);
+                    cur = parent;
+                }}
+                path = ['html'].concat(parts).join(' > ');
+            }}
+            el.scrollIntoView({{ block: 'center' }});
+            return JSON.stringify({{
+                found: true,
+                path: path,
+                tag: el.tagName,
+                id: el.id || null,
+                testId: el.getAttribute('data-testid'),
+                index: idx
+            }});
+        }})()"#
+    )
+}
+
+/// Build the `execute_action` IPC payload that hands the value mutation to the
+/// SDK's `applyValueMutation` (native prototype setter chosen by element kind,
+/// `_valueTracker` reset, `input`, the direct `__reactProps$.onChange` call,
+/// then `change`).
+///
+/// Field names match what `useControlEvents.ts::execute_action` destructures
+/// (`{ elementId, action }`), not the `{id, action, params}` spelling a couple
+/// of older Rust call sites still use. `clear` maps to the SDK's
+/// `clear-then-append` mode and its absence to `append`, which is exactly the
+/// `clear ? text : el.value + text` semantics this endpoint has always had.
+fn type_into_action_payload(element_id: &str, text: &str, clear: bool) -> serde_json::Value {
+    serde_json::json!({
+        "elementId": element_id,
+        "action": {
+            "action": "type",
+            "params": { "text": text, "clear": clear },
+        },
+    })
+}
+
 /// Type text into an element by CSS selector or label.
 /// POST /ui-bridge/control/page/type-into
 /// Body: { "selector": "textarea", "text": "hello", "clear": true, "index": 0 }
 /// Or:   { "label": "Email", "text": "user@example.com" }
+///
+/// **This handler resolves; the SDK mutates.** It used to carry its own value
+/// mutation as injected JS, which was a third implementation of typing
+/// alongside the SDK's `applyValueMutation` and the `type_into` relay case in
+/// `usePageEvents.ts` — and it was broken for every `<input>` on the page:
+///
+///   1. The native setter was picked with
+///      `descriptor(HTMLTextAreaElement.prototype, 'value')?.set || descriptor(HTMLInputElement.prototype, 'value')?.set`.
+///      The textarea descriptor ALWAYS exists, so the `||` arm was dead code and
+///      every element got the textarea IDL setter — which throws
+///      `TypeError: Illegal invocation` in Blink when called with an `<input>`
+///      receiver.
+///   2. It never reset React's `_valueTracker` and never called
+///      `__reactProps$*.onChange`, so a controlled React input reverted to its
+///      state value on the next render even when the setter did fire.
+///   3. `text` defaulted to `""`, so a body that omitted it typed nothing and
+///      still answered `{typed: true}` — the silent success the SDK closed
+///      deliberately in `performType`.
+///
+/// So the mutation is gone and the endpoint is now two steps: resolve the
+/// selector/label/index to a uniquely-addressable path
+/// ([`type_into_resolve_js`]), then dispatch `execute_action` `type`
+/// ([`type_into_action_payload`]). All addressing modes survive — `index` and
+/// `label` are resolved here because `findElementByIdentifier` only ever
+/// returns the FIRST `querySelector` hit.
+///
+/// Response shape follows the SDK's declared `typeInto` contract
+/// (`{typed, element?}`) plus `index`. The old `valueLength` field is gone:
+/// `execute_action` reports no post-action value (`getElementState` carries no
+/// `value`), and inventing a third round-trip to read one back is worse than
+/// pointing callers at `POST /control/page/read-value`.
 pub async fn ui_bridge_type_into_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let selector = body.get("selector").and_then(|v| v.as_str());
     let label = body.get("label").and_then(|v| v.as_str());
-    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let clear = body.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
     let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // `text` is REQUIRED, exactly as the SDK's `typeInto` contract declares it.
+    // Defaulting a missing field to `""` made "you forgot the text" and "I typed
+    // your text" the same HTTP 200.
+    let text = match body.get("text") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "'text' must be a string (the characters to type); got {other}"
+                ))),
+            ));
+        }
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(
+                    "'text' field is required (the characters to type). To blank a \
+                     field, send 'clear': true with 'text': \"\".",
+                )),
+            ));
+        }
+    };
 
     // Bust the vision cache: typing changes rendered pixels (form values,
     // validation messages, etc).
@@ -4007,68 +4149,74 @@ pub async fn ui_bridge_type_into_handler(
         ));
     };
 
-    // Item C: UTF-8 safe passthrough. The prior single-quote-literal
-    // interpolation broke on non-ASCII codepoints once the body crossed any
-    // pipeline that downgraded UTF-8 (e.g. lossy decode → '?') and also
-    // choked on newlines / U+2028 / U+2029 / control chars that aren't legal
-    // inside a single-quoted JS literal. `serde_json::to_string` produces a
-    // valid double-quoted JSON string — which is also a valid JS string
-    // literal — with every non-ASCII char preserved (either as a raw UTF-8
-    // sequence or a `\uXXXX` escape, both of which JS parses identically).
-    let text_js_literal = serde_json::to_string(text).map_err(|e| {
+    // Optional `windowLabel` scopes BOTH steps to a pop-out window (Phase 4 of
+    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
+    let window_label = read_window_label(&body);
+
+    // ── Step 1: resolve ──────────────────────────────────────────────────
+    let resolve_js = type_into_resolve_js(&find_expr, index);
+    let raw = evaluate_js_expression_in_window(&state, &resolve_js, window_label)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    // An unparseable eval result used to become
+    // `ApiResponse::success({"typed": false, "error": "Parse error"})` — an
+    // HTTP 200 for a call that demonstrably never ran. Report the runner-side
+    // failure it actually is.
+    let resolved: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
         (
-            StatusCode::BAD_REQUEST,
-            Json(api_error(format!("Failed to encode text: {}", e))),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "type-into: could not parse the element-resolution result ({e}); raw: {}",
+                truncate_str_ellipsis(&raw, 200)
+            ))),
         )
     })?;
 
-    let js = format!(
-        r#"(() => {{
-            const __qt_text = {text_literal};
-            const matches = Array.from({find_expr}).filter(el => el);
-            if (matches.length === 0) return JSON.stringify({{ typed: false, error: 'No elements found' }});
-            const idx = {index};
-            if (idx >= matches.length) return JSON.stringify({{ typed: false, error: 'Index out of range' }});
-            const el = matches[idx];
-            el.scrollIntoView({{ block: 'center' }});
-            el.focus();
-            if ({clear}) {{
-                el.value = '';
-                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            }}
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
-                || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-            if (nativeInputValueSetter) {{
-                nativeInputValueSetter.call(el, {clear} ? __qt_text : el.value + __qt_text);
-            }} else {{
-                el.value = {clear} ? __qt_text : el.value + __qt_text;
-            }}
-            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-            return JSON.stringify({{
-                typed: true,
-                tag: el.tagName,
-                valueLength: el.value.length,
-                index: idx
-            }});
-        }})()"#,
-        find_expr = find_expr,
-        index = index,
-        clear = clear,
-        text_literal = text_js_literal
-    );
-
-    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
-    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
-    let window_label = read_window_label(&body);
-    match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => {
-            let parsed: serde_json::Value = serde_json::from_str(&result)
-                .unwrap_or(serde_json::json!({"typed": false, "error": "Parse error"}));
-            Ok(Json(ApiResponse::success(parsed)))
-        }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    if resolved.get("found").and_then(|v| v.as_bool()) != Some(true) {
+        let message = resolved
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("No elements found")
+            .to_string();
+        return Err((StatusCode::BAD_REQUEST, Json(api_error(message))));
     }
+    let element_path = resolved
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(
+                    "type-into: element resolution returned no addressable path",
+                )),
+            )
+        })?;
+
+    // ── Step 2: mutate, via the SDK ──────────────────────────────────────
+    let action_result = ui_bridge_request_sync_in_window(
+        &state,
+        "execute_action",
+        type_into_action_payload(element_path, &text, clear),
+        window_label,
+    )
+    .await;
+    // `wrap_ipc_result` flattens the SDK's own refusals (non-input element,
+    // element vanished between the two steps) into an honest HTTP 400.
+    let Json(action) = wrap_ipc_result(action_result)?;
+    let action_data = action.data.unwrap_or(serde_json::Value::Null);
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "typed": true,
+        "index": index,
+        "element": {
+            "tag": resolved.get("tag"),
+            "id": resolved.get("id"),
+            "testId": resolved.get("testId"),
+            "selector": element_path,
+        },
+        "durationMs": action_data.get("durationMs"),
+        "consoleErrors": action_data.get("consoleErrors"),
+    }))))
 }
 
 // =========================================================================
@@ -4860,58 +5008,150 @@ mod wait_for_element_dual_emit_tests {
     }
 }
 
-/// Item C — verify the `type-into` JS template encodes the text value via a
-/// double-quoted JSON literal so non-ASCII codepoints (Cyrillic, emoji
-/// surrogate pairs, U+2028/U+2029 line separators) round-trip through the
-/// webview without lossy `?` substitution or string-literal-termination
-/// failures.
+/// `type-into` — the two pure builders behind the resolve-then-`execute_action`
+/// split, and the UTF-8 passthrough (Item C) that used to depend on a
+/// hand-written JS string literal.
 #[cfg(test)]
-mod type_into_unicode_tests {
-    /// Mirror the literal in `ui_bridge_type_into_handler` for unit-testable
-    /// inspection. Keep in sync with the real handler's `text_js_literal`
-    /// construction — the assertions below catch drift if the encoding
-    /// changes back to single-quote interpolation.
-    fn encode_text_for_js(text: &str) -> String {
-        serde_json::to_string(text).expect("text must encode to JSON")
+mod type_into_tests {
+    use super::{type_into_action_payload, type_into_resolve_js};
+    use serde_json::json;
+
+    // ── Item C: UTF-8 passthrough ───────────────────────────────────────
+    //
+    // The text no longer crosses a JS string-literal boundary at ALL — it
+    // travels as a field of the `execute_action` IPC payload, so the encoding
+    // is serde's and the guarantee is structural rather than a mirrored
+    // template. These assert the value survives byte-for-byte.
+
+    /// The `text` a caller sent must arrive at the SDK unchanged — no lossy
+    /// `?` substitution, no literal-termination failure.
+    fn typed_text(text: &str) -> String {
+        let payload = type_into_action_payload("#email", text, false);
+        payload["action"]["params"]["text"]
+            .as_str()
+            .expect("text must be a JSON string")
+            .to_string()
     }
 
     #[test]
-    fn cyrillic_round_trips_through_json_string_literal() {
-        let encoded = encode_text_for_js("\u{0442}\u{0435}\u{0441}\u{0442}");
-        // Either form ("тест" raw or "тест") is fine —
-        // JS parses both identically. serde_json defaults to raw UTF-8.
-        assert!(
-            encoded == "\"\u{0442}\u{0435}\u{0441}\u{0442}\""
-                || encoded == "\"\\u0442\\u0435\\u0441\\u0442\"",
-            "unexpected encoding: {encoded}"
+    fn cyrillic_survives_the_ipc_payload() {
+        let text = "\u{0442}\u{0435}\u{0441}\u{0442}";
+        assert_eq!(typed_text(text), text);
+        // Crucially: no '?' substitution anywhere in the serialized payload.
+        let wire = type_into_action_payload("#email", text, false).to_string();
+        assert!(!wire.contains('?'), "lossy downgrade in: {wire}");
+    }
+
+    #[test]
+    fn newlines_and_line_separators_survive() {
+        assert_eq!(typed_text("line1\nline2"), "line1\nline2");
+        // U+2028 / U+2029 are legal in JSON but NOT in a JS string literal —
+        // the exact pair the old template had to escape by hand.
+        assert_eq!(typed_text("a\u{2028}b\u{2029}c"), "a\u{2028}b\u{2029}c");
+    }
+
+    #[test]
+    fn emoji_with_zwj_survives() {
+        // Family emoji = woman + ZWJ + woman + ZWJ + girl.
+        let text = "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(typed_text(text), text);
+    }
+
+    #[test]
+    fn embedded_quotes_and_backslashes_survive() {
+        assert_eq!(typed_text(r#"she said "hi" \ ok"#), r#"she said "hi" \ ok"#);
+    }
+
+    // ── The action payload the frontend actually destructures ───────────
+
+    #[test]
+    fn action_payload_matches_the_execute_action_contract() {
+        // `useControlEvents.ts` destructures `{ elementId, action }` — the
+        // `{id, action, params}` spelling some older Rust call sites use
+        // reaches that handler as `elementId: undefined`.
+        let payload = type_into_action_payload("html > body > input", "hello", true);
+        assert_eq!(
+            payload,
+            json!({
+                "elementId": "html > body > input",
+                "action": {
+                    "action": "type",
+                    "params": { "text": "hello", "clear": true },
+                },
+            })
         );
-        // Crucially: no '?' substitution.
-        assert!(!encoded.contains('?'));
     }
 
     #[test]
-    fn newlines_are_escaped_not_dropped() {
-        let encoded = encode_text_for_js("line1\nline2");
-        assert_eq!(encoded, "\"line1\\nline2\"");
+    fn action_payload_defaults_to_append_when_not_clearing() {
+        let payload = type_into_action_payload("#note", "more", false);
+        assert_eq!(payload["action"]["params"]["clear"], json!(false));
     }
 
+    // ── The resolution expression ───────────────────────────────────────
+
     #[test]
-    fn emoji_with_zwj_round_trips() {
-        // Family emoji = woman + ZWJ + woman + ZWJ + girl
-        let encoded = encode_text_for_js("\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}");
-        assert!(encoded.starts_with('"') && encoded.ends_with('"'));
-        // ZWJ (U+200D) is in the BMP; serde_json may emit it raw or escaped.
-        // Either way the codepoint must be present, not stripped.
+    fn resolve_js_never_mutates_the_element_value() {
+        // The whole point of the split: this step reads and scrolls, it does
+        // not type. Any value assignment here would be the duplicate coming
+        // back.
+        let js = type_into_resolve_js("document.querySelectorAll('input')", 0);
         assert!(
-            encoded.contains('\u{200D}') || encoded.contains("\\u200d"),
-            "ZWJ lost: {encoded}"
+            !js.contains(".value ="),
+            "resolution step must not assign a value: {js}"
+        );
+        assert!(
+            !js.contains("dispatchEvent"),
+            "resolution step must not dispatch events: {js}"
+        );
+        assert!(
+            !js.contains("HTMLTextAreaElement.prototype"),
+            "the dead prototype-selection fallback must be gone: {js}"
         );
     }
 
     #[test]
-    fn embedded_double_quote_escapes_correctly() {
-        let encoded = encode_text_for_js("she said \"hi\"");
-        assert_eq!(encoded, "\"she said \\\"hi\\\"\"");
+    fn resolve_js_reports_a_miss_rather_than_a_typed_success() {
+        let js = type_into_resolve_js("document.querySelectorAll('input')", 3);
+        assert!(js.contains("found: false"));
+        assert!(js.contains("'No elements found'"));
+        assert!(js.contains("'Index out of range'"));
+        // `typed: true` is now the HANDLER's answer, only ever reached after
+        // `execute_action` succeeded — the eval can no longer claim it.
+        assert!(!js.contains("typed:"), "eval must not claim a typed verdict");
+    }
+
+    #[test]
+    fn resolve_js_honours_the_requested_index_and_find_expression() {
+        let js = type_into_resolve_js("document.querySelectorAll('textarea')", 2);
+        assert!(js.contains("document.querySelectorAll('textarea')"));
+        assert!(js.contains("const idx = 2;"));
+    }
+
+    #[test]
+    fn resolve_js_trips_no_page_evaluate_blocklist_pattern() {
+        // The expression runs through `page_evaluate`, which rejects a fixed
+        // pattern set (`utils.ts::PAGE_EVALUATE_STRUCTURAL_PATTERNS` /
+        // `..._NETWORK_PATTERNS`). A resolution step that cannot be evaluated
+        // is a dead endpoint.
+        let js = type_into_resolve_js("document.querySelectorAll('input')", 0);
+        for banned in [
+            "import(",
+            "require(",
+            "__proto__",
+            "constructor[",
+            "eval(",
+            "new Function",
+            "document.cookie",
+            "window.open",
+            "crypto.subtle",
+            "fetch(",
+            "XMLHttpRequest",
+            "sendBeacon",
+            "WebSocket",
+        ] {
+            assert!(!js.contains(banned), "blocklisted `{banned}` in: {js}");
+        }
     }
 }
 
