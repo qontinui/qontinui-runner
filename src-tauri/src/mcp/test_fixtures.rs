@@ -1617,6 +1617,23 @@ pub struct SeedLifecycleRecord {
     /// leaving the drain path exactly as unreachable as before.
     #[serde(default)]
     pub origin: Option<String>,
+    /// Terminal id the row binds to. `None` keeps the historical synthetic
+    /// `term-<sessionId>`, which no live terminal can ever carry — and
+    /// `terminal_list` keys its `sessionIdsByTerminal` map by the LIVE
+    /// `TerminalInfo::id` (`commands::terminal::terminal_list`, via
+    /// [`SessionLifecycleStore::find_confirmed_open_by_terminal`]). So a seed
+    /// that cannot name a real terminal id could never bind a seeded session
+    /// onto an on-screen tab, and every session-scoped surface that gates on
+    /// `tab.claudeSessionId` stayed unreachable from a fixture.
+    #[serde(default)]
+    pub terminal_id: Option<String>,
+    /// Config dir the row carries. `None` (the old hardcoded value) is the
+    /// other half of the same blockage: `sessionIdsByTerminal` emits
+    /// `{ claudeSessionId, configDir }` per bound terminal, and the
+    /// account-scoped frontend surfaces read the `configDir` off that entry —
+    /// so a bound-but-dirless row reaches the tab and still cannot drive them.
+    #[serde(default)]
+    pub config_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1701,7 +1718,9 @@ fn record_from_seed(
     };
     Ok(TerminalSessionRecord {
         claude_session_id: seed.session_id.clone(),
-        config_dir: None,
+        // Absent means absent — the old hardcoded `None`, kept as the default
+        // so every pre-existing caller's rows are byte-for-byte unchanged.
+        config_dir: seed.config_dir.clone(),
         working_dir: seed.working_dir.clone().or(Some("C:/repo".to_string())),
         page_id: seed
             .page_id
@@ -1709,7 +1728,12 @@ fn record_from_seed(
             .unwrap_or_else(|| "default".to_string()),
         zone_index: seed.zone_index.unwrap_or(0),
         title: seed.title.clone().or_else(|| Some(seed.session_id.clone())),
-        terminal_id: format!("term-{}", seed.session_id),
+        // A caller that knows the live terminal id names it and the row binds
+        // to that tab; omitting it keeps the historical synthetic id.
+        terminal_id: seed
+            .terminal_id
+            .clone()
+            .unwrap_or_else(|| format!("term-{}", seed.session_id)),
         opened_at: last_seen_at - 1_000,
         last_seen_at,
         state,
@@ -3904,6 +3928,8 @@ mod tests {
                     restore_pending_at: None,
                     restore_tier: None,
                     origin: None,
+                    terminal_id: None,
+                    config_dir: None,
                 },
                 SeedLifecycleRecord {
                     session_id: "open-b".to_string(),
@@ -3919,6 +3945,8 @@ mod tests {
                     restore_pending_at: None,
                     restore_tier: None,
                     origin: None,
+                    terminal_id: None,
+                    config_dir: None,
                 },
                 SeedLifecycleRecord {
                     session_id: "open-c".to_string(),
@@ -3934,6 +3962,8 @@ mod tests {
                     restore_pending_at: None,
                     restore_tier: None,
                     origin: None,
+                    terminal_id: None,
+                    config_dir: None,
                 },
                 // A ghost open row aged far into the past — still `state==open`,
                 // so list_open returns it (open_records is strict-open; the
@@ -3952,6 +3982,8 @@ mod tests {
                     restore_pending_at: None,
                     restore_tier: None,
                     origin: None,
+                    terminal_id: None,
+                    config_dir: None,
                 },
                 // A closed row — must NOT appear in list_open.
                 SeedLifecycleRecord {
@@ -3968,6 +4000,8 @@ mod tests {
                     restore_pending_at: None,
                     restore_tier: None,
                     origin: None,
+                    terminal_id: None,
+                    config_dir: None,
                 },
             ],
         };
@@ -4052,6 +4086,8 @@ mod tests {
                 restore_pending_at: None,
                 restore_tier: None,
                 origin: None,
+                terminal_id: None,
+                config_dir: None,
             }],
         };
         let err = seed_lifecycle_store_at(&path, &bad_state, now).expect_err("bad state rejected");
@@ -4198,6 +4234,8 @@ mod tests {
                 restore_pending_at: None,
                 restore_tier: None,
                 origin: None,
+                terminal_id: None,
+                config_dir: None,
             },
             chrono::Utc::now().timestamp_millis(),
         )
@@ -4272,6 +4310,8 @@ mod tests {
                 restore_pending_at: None,
                 restore_tier: None,
                 origin: None,
+                terminal_id: None,
+                config_dir: None,
             }],
         };
         seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
@@ -4310,6 +4350,8 @@ mod tests {
                 restore_pending_at: None,
                 restore_tier: None,
                 origin: None,
+                terminal_id: None,
+                config_dir: None,
             }],
         };
         seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
@@ -4366,6 +4408,8 @@ mod tests {
                 restore_pending_at: None,
                 restore_tier: None,
                 origin: None,
+                terminal_id: None,
+                config_dir: None,
             }],
         };
         seed_lifecycle_store_at(&path, &req, chrono::Utc::now().timestamp_millis()).unwrap();
@@ -4583,6 +4627,8 @@ mod tests {
                 restore_pending_at: Some(-250),
                 restore_tier: Some("failed".to_string()),
                 origin: Some("authoritative".to_string()),
+                terminal_id: None,
+                config_dir: None,
             },
             now,
         )
@@ -4638,6 +4684,8 @@ mod tests {
                     restore_pending_at: None,
                     restore_tier: None,
                     origin: None,
+                    terminal_id: None,
+                    config_dir: None,
                 },
                 now,
             )
@@ -4692,6 +4740,8 @@ mod tests {
                     crate::session::session_lifecycle_store::RESTORE_TIER_FAILED.to_string(),
                 ),
                 origin: None,
+                terminal_id: None,
+                config_dir: None,
             },
             now,
         )
@@ -5158,5 +5208,126 @@ mod tests {
         .expect("the minimal documented body deserializes");
         assert_eq!(req.kind, TranscriptRecordKind::Prompt);
         assert!(!req.reset);
+    }
+
+    // -----------------------------------------------------------------------
+    // Prompts-panel manual-test remediation, item 2 — a seeded row could never
+    // BIND to a tab.
+    //
+    // `record_from_seed` hardcoded the two fields `terminal_list` reads back
+    // through `sessionIdsByTerminal`: `terminal_id` to a synthetic
+    // `term-<sessionId>` no live terminal can ever carry, and `config_dir` to
+    // `None`. Between them, no seeded session could be attached to an on-screen
+    // tab, and anything gating on `tab.claudeSessionId` — the per-session,
+    // account-scoped panels, which also need the `configDir` that rides along —
+    // was unreachable from a fixture. Both are now opt-in, defaulting to
+    // exactly the old values.
+    // -----------------------------------------------------------------------
+
+    /// A seed carrying the two fields resolves them onto the record verbatim —
+    /// they are ids/paths, not now-relative offsets.
+    #[test]
+    fn a_seed_can_now_bind_a_live_terminal_id_and_config_dir() {
+        let rec = record_from_seed(
+            &SeedLifecycleRecord {
+                session_id: "sess-bind".to_string(),
+                state: "open".to_string(),
+                last_seen_offset_ms: 0,
+                closed_at_offset_ms: None,
+                close_reason: None,
+                page_id: None,
+                zone_index: None,
+                title: None,
+                working_dir: None,
+                confirmed_at: Some(-1_000),
+                restore_pending_at: None,
+                restore_tier: None,
+                origin: Some("authoritative".to_string()),
+                terminal_id: Some("terminal-live-7".to_string()),
+                config_dir: Some("C:/claude/.claude-work".to_string()),
+            },
+            1_700_000_000_000,
+        )
+        .expect("valid seed row");
+
+        assert_eq!(rec.terminal_id, "terminal-live-7");
+        assert_eq!(rec.config_dir.as_deref(), Some("C:/claude/.claude-work"));
+    }
+
+    /// Absent stays absent: omitting them reproduces today's row byte-for-byte,
+    /// so every pre-existing caller is unaffected.
+    #[test]
+    fn a_seed_that_omits_the_binding_fields_keeps_the_historical_row() {
+        let rec = open_row("sess-3");
+        assert_eq!(
+            rec.terminal_id, "term-sess-3",
+            "the synthetic default is unchanged"
+        );
+        assert_eq!(rec.config_dir, None);
+    }
+
+    /// THE CONSEQUENCE, pinned through the exact lookup `terminal_list` runs:
+    /// a seeded row that names a live terminal id AND is confirmed resolves via
+    /// [`SessionLifecycleStore::find_confirmed_open_by_terminal`] and carries
+    /// the `config_dir` the `sessionIdsByTerminal` entry hands the frontend.
+    /// Before the fix this could only ever be `None` — the synthetic
+    /// `term-<sessionId>` matched no live terminal.
+    #[test]
+    fn a_seeded_row_binds_to_a_live_terminal_id_through_the_terminal_list_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let bindable = |session_id: &str, terminal_id: Option<&str>| SeedLifecycleRecord {
+            session_id: session_id.to_string(),
+            state: "open".to_string(),
+            last_seen_offset_ms: -1_000,
+            closed_at_offset_ms: None,
+            close_reason: None,
+            page_id: None,
+            zone_index: None,
+            title: None,
+            working_dir: None,
+            confirmed_at: Some(-1_000),
+            restore_pending_at: None,
+            restore_tier: None,
+            origin: Some("authoritative".to_string()),
+            terminal_id: terminal_id.map(str::to_string),
+            config_dir: Some("C:/claude/.claude-work".to_string()),
+        };
+
+        let req = SeedLifecycleRequest {
+            records: vec![
+                bindable("sess-bound", Some("terminal-live-7")),
+                bindable("sess-unbound", None),
+            ],
+        };
+        seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let bound = store
+            .find_confirmed_open_by_terminal("terminal-live-7")
+            .expect("the seeded row resolves by the LIVE terminal id");
+        assert_eq!(bound.claude_session_id, "sess-bound");
+        assert_eq!(
+            bound.config_dir.as_deref(),
+            Some("C:/claude/.claude-work"),
+            "the entry `sessionIdsByTerminal` emits carries the seeded configDir"
+        );
+
+        // The omitted-terminal-id row still lands on the synthetic default, so
+        // it binds to nothing live — the pre-fix behaviour, unchanged.
+        assert!(
+            store
+                .find_confirmed_open_by_terminal("sess-unbound")
+                .is_none(),
+            "a seed that names no terminal id binds to no live terminal"
+        );
+        assert!(
+            store
+                .find_confirmed_open_by_terminal("term-sess-unbound")
+                .is_some(),
+            "…it keeps the historical synthetic id instead"
+        );
     }
 }
