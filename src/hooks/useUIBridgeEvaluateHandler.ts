@@ -14,7 +14,7 @@
  *     v
  * This Hook
  *     | compileEvaluateExpression(expression)()  (security-gated)
- *     | awaitWithTimeout(result, resolveEvaluateTimeoutMs(timeout_ms))
+ *     | awaitWithTimeout(result, describeEvaluateBudget(timeout_ms))
  *     v
  * This Hook
  *     | emit("ui-bridge:evaluate-response", { request_id, ok, result, error })
@@ -50,7 +50,8 @@ import {
   checkEvaluateBlocklist,
   compileEvaluateExpression,
   describeEvaluateResult,
-  resolveEvaluateTimeoutMs,
+  describeEvaluateBudget,
+  type EvaluateBudget,
 } from "./ui-bridge-events/utils";
 import { acquireSingletonListener } from "./ui-bridge-events/singleton-listener";
 import { evaluateRequestDedupe } from "./ui-bridge-events/request-dedupe";
@@ -66,7 +67,7 @@ interface EvaluateRequestPayload {
    * (10 s) when the caller omitted it. This is exactly how long the Rust
    * dispatcher will wait for the response, so the handler awaits a
    * top-level Promise for the same budget — see
-   * {@link resolveEvaluateTimeoutMs}. Absent → the 30 s default cap.
+   * {@link describeEvaluateBudget}. Absent → the 30 s default budget.
    *
    * There is deliberately no `await_promise` field. The Rust side used to
    * forward one and nothing here read it: this flow ALWAYS auto-awaits,
@@ -139,14 +140,14 @@ function rejectIfDangerous(expression: string, allowNetworkRequests: boolean): v
  * the bare Promise object (which would serialize to `{}`). Mirrors the
  * sibling `usePageEvents.ts::page_evaluate` branch.
  *
- * `timeoutMs` is the caller's budget for that await, resolved by
- * {@link resolveEvaluateTimeoutMs} from the request's `timeout_ms` — the
+ * `budget` is the caller's budget for that await, resolved by
+ * {@link describeEvaluateBudget} from the request's `timeout_ms` — the
  * same value the Rust dispatcher is waiting on, so neither side gives up
  * before the other.
  */
-async function evaluateExpression(expression: string, timeoutMs: number): Promise<unknown> {
+async function evaluateExpression(expression: string, budget: EvaluateBudget): Promise<unknown> {
   const result = compileEvaluateExpression(expression)();
-  return await awaitWithTimeout(result, timeoutMs);
+  return await awaitWithTimeout(result, budget.awaitMs, budget);
 }
 
 /**
@@ -216,7 +217,7 @@ export async function handleEvaluateRequest(
       rejectIfDangerous(expression, allow_network_requests === true);
       const resolved = await evaluateExpression(
         expression,
-        resolveEvaluateTimeoutMs(payload.timeout_ms),
+        describeEvaluateBudget(payload.timeout_ms),
       );
       // ONE shape, always: `{ value, type }`. The SAME shaper the legacy
       // `usePageEvents.ts::page_evaluate` branch uses, so the two routes

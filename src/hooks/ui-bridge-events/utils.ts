@@ -208,6 +208,13 @@ export const PAGE_EVALUATE_PROMISE_TIMEOUT_MS = 30_000;
 export const PAGE_EVALUATE_MAX_TIMEOUT_MS = 600_000;
 
 /**
+ * Lower end of the clamp the Rust handler applies to `timeoutMs`
+ * (`page.rs`, `.clamp(1000, 600_000)`). Mirrored here only so the timeout
+ * message can quote the accepted range instead of leaving a caller to guess.
+ */
+export const PAGE_EVALUATE_MIN_TIMEOUT_MS = 1_000;
+
+/**
  * Head start the frontend takes over the Rust dispatcher's identical wait.
  *
  * Both ends now time the same request out at the same budget, so without a
@@ -240,15 +247,54 @@ const PAGE_EVALUATE_TIMEOUT_MARGIN_MS = 250;
  * producing an instant or infinite timeout.
  */
 export function resolveEvaluateTimeoutMs(raw: unknown): number {
+  return describeEvaluateBudget(raw).awaitMs;
+}
+
+/**
+ * The budget behind one evaluate request, with the provenance a timeout error
+ * needs in order to be actionable.
+ */
+export interface EvaluateBudget {
+  /** How long to actually await — the requested budget less the margin. */
+  awaitMs: number;
+  /** The budget the request is being held to, BEFORE the margin. */
+  requestedMs: number;
+  /**
+   * True when the caller sent no usable `timeoutMs` and this is the default.
+   * The difference is the whole point of the timeout message: a default the
+   * caller never chose reads as an undocumented cap, and the fix is to say so.
+   */
+  fromDefault: boolean;
+}
+
+/**
+ * Resolve a raw `timeoutMs` into the await budget AND where that budget came
+ * from — the single source of truth {@link resolveEvaluateTimeoutMs} and the
+ * timeout message both read.
+ *
+ * Split out because the message could not previously be honest. It reported
+ * only the DERIVED number (`"9.8s"`), which is the default 10 000 ms less the
+ * 250 ms margin — so a caller who had never heard of `timeoutMs` saw an
+ * arbitrary 9.8 s and reasonably read it as a hard cap on `page_evaluate`.
+ * It is neither hard nor a cap: it is this request's own default budget, and
+ * the field to raise it already exists.
+ */
+export function describeEvaluateBudget(raw: unknown): EvaluateBudget {
   if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
-    return PAGE_EVALUATE_PROMISE_TIMEOUT_MS;
+    return {
+      awaitMs: PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+      requestedMs: PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+      fromDefault: true,
+    };
   }
-  const budget = Math.min(raw, PAGE_EVALUATE_MAX_TIMEOUT_MS);
+  const requestedMs = Math.min(raw, PAGE_EVALUATE_MAX_TIMEOUT_MS);
   // Never let the margin push a small budget to zero (or negative), which
   // would make every await fail instantly.
-  return budget > PAGE_EVALUATE_TIMEOUT_MARGIN_MS
-    ? budget - PAGE_EVALUATE_TIMEOUT_MARGIN_MS
-    : budget;
+  const awaitMs =
+    requestedMs > PAGE_EVALUATE_TIMEOUT_MARGIN_MS
+      ? requestedMs - PAGE_EVALUATE_TIMEOUT_MARGIN_MS
+      : requestedMs;
+  return { awaitMs, requestedMs, fromDefault: false };
 }
 
 /**
@@ -606,18 +652,53 @@ export function isThenable(value: unknown): value is PromiseLike<unknown> {
  * rather than wedging the response forever. Rejections of the awaited
  * Promise propagate normally (same try/catch handles them).
  */
-export async function awaitWithTimeout(value: unknown, timeoutMs: number): Promise<unknown> {
+/**
+ * Build the `page_evaluate` timeout message.
+ *
+ * Reports the REQUESTED budget rather than the derived await, names where that
+ * budget came from, and points at the knob — because the previous message did
+ * none of the three. `"Promise did not resolve within 9.8s"` is the default
+ * 10 000 ms minus a 250 ms reporting margin, and it read to callers as a hard
+ * ceiling on `page_evaluate` that no field could raise. The field exists, the
+ * Rust handler honours it, and the ceiling is 600 s.
+ *
+ * `budget` is optional so a caller with only a bare number still gets the old
+ * (honest, if terser) sentence rather than a fabricated provenance.
+ *
+ * The leading clause stays verbatim `"Promise did not resolve within Xs"`: it
+ * is the documented discriminator between a frontend timeout and the Rust
+ * side's generic `"UI Bridge page_evaluate timed out after Xms"` (see
+ * {@link PAGE_EVALUATE_TIMEOUT_MARGIN_MS}). Only the number it quotes changed
+ * — from the derived await to the requested budget — plus everything after it.
+ */
+export function evaluateTimeoutMessage(timeoutMs: number, budget?: EvaluateBudget): string {
+  const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+  if (!budget) {
+    return `page_evaluate: Promise did not resolve within ${secs(timeoutMs)}`;
+  }
+  const source = budget.fromDefault
+    ? `That is the DEFAULT budget, not a cap — pass \`timeoutMs\` to raise it`
+    : `That budget came from the \`timeoutMs\` you sent`;
+  return (
+    `page_evaluate: Promise did not resolve within ${secs(budget.requestedMs)} ` +
+    `(awaited ${secs(timeoutMs)}; ${PAGE_EVALUATE_TIMEOUT_MARGIN_MS}ms is reserved so this ` +
+    `error can be reported instead of the call being cut off). ` +
+    `${source} (clamped to ${PAGE_EVALUATE_MIN_TIMEOUT_MS}-${PAGE_EVALUATE_MAX_TIMEOUT_MS}ms).`
+  );
+}
+
+export async function awaitWithTimeout(
+  value: unknown,
+  timeoutMs: number,
+  budget?: EvaluateBudget,
+): Promise<unknown> {
   if (!isThenable(value)) {
     return value;
   }
   let timer: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      reject(
-        new Error(
-          `page_evaluate: Promise did not resolve within ${(timeoutMs / 1000).toFixed(1)}s`,
-        ),
-      );
+      reject(new Error(evaluateTimeoutMessage(timeoutMs, budget)));
     }, timeoutMs);
   });
   try {
