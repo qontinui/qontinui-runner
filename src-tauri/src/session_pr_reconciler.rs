@@ -32,7 +32,8 @@
 //! majority of this fleet's landings and leave `merged=false` / `state=closed`
 //! (`knowledge-base/qontinui-specific/coord-ff-lands.md`), so both write paths
 //! run the [`land_verdict`] cascade instead: GitHub merge → local content
-//! proof (`ff-land`) → coord's own `coord:landed` chip (`coord-label`) →
+//! proof (`ff-land`) → coord's own `coord:landed` chip on a CLOSED PR
+//! (`coord-label`) →
 //! otherwise one of TWO distinct terminal states, `not-landed` (evaluated) and
 //! `land-unknown` (could not be evaluated, always with a reason). The cascade
 //! never fetches — see [`probe_land`].
@@ -292,7 +293,12 @@ async fn reconcile_session(
                 &pr.base_ref,
             )
             .await;
-            let verdict = land_verdict(pr.merged, has_coord_landed_label(&pr.labels), proof);
+            let verdict = land_verdict(
+                pr.merged,
+                &pr.state,
+                has_coord_landed_label(&pr.labels),
+                proof,
+            );
             let status = session_pr_status(
                 &verdict,
                 &pr.state,
@@ -348,7 +354,12 @@ async fn reconcile_session(
                     &pr.base_ref,
                 )
                 .await;
-                let verdict = land_verdict(pr.merged, has_coord_landed_label(&pr.labels), proof);
+                let verdict = land_verdict(
+                    pr.merged,
+                    &pr.state,
+                    has_coord_landed_label(&pr.labels),
+                    proof,
+                );
                 // `get_pr`'s PrStatus exposes no merged_at; preserve any stamp
                 // the branch path already recorded.
                 let status = session_pr_status(
@@ -429,6 +440,32 @@ enum LandUnknown {
     /// Reporting this as `not-landed` is exactly the defect that put a
     /// `closed, not landed` chip on landed PRs in the Terminal dropdown.
     RebaseLandOrAbandoned,
+    /// coord's `coord:landed` chip is on the PR, but GitHub reports the PR is
+    /// NOT closed. Two live signals disagree, so we have no verdict.
+    ///
+    /// The chip is NOT unconditionally a land proof. coord's phantom
+    /// empty-diff sweep applies it off `tree_already_on_main` — a
+    /// `git merge-tree` CONTENT-equality check — and that is equally true of a
+    /// superseded PR, a duplicate, and a PR that was a no-op empty diff from
+    /// the start and landed nothing. Worse, the sweep applies it on its
+    /// `CommentedButCloseFailed` arm, whose own log records that the close
+    /// PATCH failed and *the PR is still OPEN*
+    /// (`qontinui-coord/src/pr_merge/mod.rs`, the label write beneath that
+    /// match). coord has no path that ever REMOVES the chip.
+    ///
+    /// For a CLOSED PR the chip is still the best signal available and the
+    /// cascade takes it: even in the superseded case the session's content
+    /// shipped. For an OPEN one it would override GitHub's live statement that
+    /// the PR is not merged, which is the one direction this module must never
+    /// go — a false "landed" is worse than an honest unknown, and the
+    /// projection's UPSERT would then pin it.
+    CoordChipOnOpenPr,
+    /// GitHub's `state` was never observed. Both API parsers default a
+    /// missing or non-string `state` to the literal `"unknown"`, so a partial
+    /// payload or schema drift reaches the cascade as a state that is neither
+    /// `open` nor `closed`. That is not an evaluated negative — it is the
+    /// absence of the observation the negative would rest on.
+    PrStateUnobserved,
 }
 
 impl LandUnknown {
@@ -439,6 +476,8 @@ impl LandUnknown {
             LandUnknown::HeadObjectMissing => "head_object_missing",
             LandUnknown::RefStale => "ref_stale",
             LandUnknown::RebaseLandOrAbandoned => "rebase_land_or_abandoned",
+            LandUnknown::CoordChipOnOpenPr => "coord_chip_on_open_pr",
+            LandUnknown::PrStateUnobserved => "pr_state_unobserved",
         }
     }
 }
@@ -471,8 +510,8 @@ enum ContentProof {
 struct LandVerdict {
     /// True iff some signal PROVED the PR landed.
     landed: bool,
-    /// `"github-merge"` | `"ff-land"` | `"not-landed"` | `"land-unknown"`
-    /// (`"coord"` is reserved for signal 3, see below).
+    /// `"github-merge"` | `"ff-land"` | `"coord-label"` | `"not-landed"` |
+    /// `"land-unknown"`.
     signal: &'static str,
     /// Set iff `signal == "land-unknown"`.
     reason: Option<&'static str>,
@@ -487,24 +526,36 @@ struct LandVerdict {
 /// 2. Content proof: the head commit is an ancestor of `origin/<base>` →
 ///    `ff-land`. 1 and 3 corroborate it.
 /// 3. coord's own verdict, read off the [`COORD_LANDED_LABEL`] chip on the PR
-///    payload the caller already fetched → `coord-label`. This is the signal
-///    that CARRIES this fleet, because 1 and 2 both structurally miss coord's
-///    majority land shape: coord rebases and pushes REPLAYED shas, so GitHub
-///    records no merge and the PR's own head sha is never on `origin/<base>`.
+///    payload the caller already fetched → `coord-label`, **but only on a PR
+///    GitHub reports CLOSED**. This is the signal that CARRIES this fleet,
+///    because 1 and 2 both structurally miss coord's majority land shape:
+///    coord rebases and pushes REPLAYED shas, so GitHub records no merge and
+///    the PR's own head sha is never on `origin/<base>`.
 ///    (The doc-comment this replaces reserved slot 3 for a direct coord PR
 ///    -status client and called it NOT WIRED. The label is the same verdict
 ///    from the same authority over a transport the runner already pays for —
 ///    no new client, no network dependency on a 30s background tick. A direct
 ///    client, if one ever exists, corroborates rather than replaces it.)
+///
+///    The closed-only gate is load-bearing, not defensive: the chip does not
+///    prove a land on its own, and on an OPEN PR it would contradict GitHub's
+///    live state. See [`LandUnknown::CoordChipOnOpenPr`] for the two coord
+///    paths that produce exactly that.
 /// 4. Otherwise TWO distinct terminal states, never merged into one:
 ///    `not-landed` (every signal was evaluated and said no) and `land-unknown`
 ///    (a signal could not be evaluated), the latter always with its reason.
 ///
 /// **A failed ancestry test is NOT a `not-landed`.** It lands in 4's unknown
-/// arm as [`LandUnknown::RebaseLandOrAbandoned`]; only [`ContentProof::
-/// NotAttempted`] — which on this path means GitHub still reports the PR OPEN
-/// — is an evaluated negative.
-fn land_verdict(github_merged: bool, coord_landed: bool, proof: ContentProof) -> LandVerdict {
+/// arm as [`LandUnknown::RebaseLandOrAbandoned`]. The ONLY evaluated negative
+/// is [`ContentProof::NotAttempted`] on a PR GitHub positively reports `open`
+/// — a state that is neither `open` nor `closed` was never observed at all and
+/// is [`LandUnknown::PrStateUnobserved`].
+fn land_verdict(
+    github_merged: bool,
+    github_state: &str,
+    coord_landed: bool,
+    proof: ContentProof,
+) -> LandVerdict {
     if github_merged {
         return LandVerdict {
             landed: true,
@@ -520,10 +571,20 @@ fn land_verdict(github_merged: bool, coord_landed: bool, proof: ContentProof) ->
         };
     }
     if coord_landed {
-        return LandVerdict {
-            landed: true,
-            signal: "coord-label",
-            reason: None,
+        // Closed-only. On any other state coord's chip and GitHub's live view
+        // disagree, and the honest answer is that we cannot tell.
+        return if github_state == "closed" {
+            LandVerdict {
+                landed: true,
+                signal: "coord-label",
+                reason: None,
+            }
+        } else {
+            LandVerdict {
+                landed: false,
+                signal: "land-unknown",
+                reason: Some(LandUnknown::CoordChipOnOpenPr.as_str()),
+            }
         };
     }
     match proof {
@@ -544,10 +605,19 @@ fn land_verdict(github_merged: bool, coord_landed: bool, proof: ContentProof) ->
             signal: "land-unknown",
             reason: Some(LandUnknown::RebaseLandOrAbandoned.as_str()),
         },
-        ContentProof::NotAttempted => LandVerdict {
+        // Reached only when GitHub did not report the PR closed (a `merged`
+        // PR short-circuits at signal 1). `open` is a real observation and a
+        // real negative; anything else is the parsers' `"unknown"` default,
+        // i.e. no observation at all.
+        ContentProof::NotAttempted if github_state == "open" => LandVerdict {
             landed: false,
             signal: "not-landed",
             reason: None,
+        },
+        ContentProof::NotAttempted => LandVerdict {
+            landed: false,
+            signal: "land-unknown",
+            reason: Some(LandUnknown::PrStateUnobserved.as_str()),
         },
     }
 }
@@ -969,7 +1039,7 @@ mod tests {
     /// `ff-land`.
     #[test]
     fn ff_landed_pr_is_landed_with_the_ff_land_signal() {
-        let verdict = land_verdict(false, false, ContentProof::Ancestor);
+        let verdict = land_verdict(false, "closed", false, ContentProof::Ancestor);
         assert!(verdict.landed, "an ff-land is a land");
         assert_eq!(verdict.signal, "ff-land");
         assert_eq!(verdict.reason, None);
@@ -1000,7 +1070,7 @@ mod tests {
     /// and the `coord:landed` chip (below) is what recovers the positive.
     #[test]
     fn non_ancestor_is_land_unknown_never_a_confident_negative() {
-        let verdict = land_verdict(false, false, ContentProof::NotAncestor);
+        let verdict = land_verdict(false, "closed", false, ContentProof::NotAncestor);
         assert!(!verdict.landed);
         assert_ne!(
             verdict.signal, "not-landed",
@@ -1023,7 +1093,7 @@ mod tests {
     /// no probe was attempted and none was needed. An open PR has not landed.
     #[test]
     fn open_pr_is_the_only_confident_not_landed() {
-        let verdict = land_verdict(false, false, ContentProof::NotAttempted);
+        let verdict = land_verdict(false, "open", false, ContentProof::NotAttempted);
         assert!(!verdict.landed);
         assert_eq!(verdict.signal, "not-landed");
         assert_eq!(verdict.reason, None);
@@ -1047,7 +1117,7 @@ mod tests {
             ContentProof::Unknown(LandUnknown::NotARepo),
             ContentProof::Unknown(LandUnknown::NoBaseRef),
         ] {
-            let verdict = land_verdict(false, true, proof);
+            let verdict = land_verdict(false, "closed", true, proof);
             assert!(verdict.landed, "coord's own chip is a land: {proof:?}");
             assert_eq!(verdict.signal, "coord-label");
             assert_eq!(verdict.reason, None);
@@ -1067,7 +1137,7 @@ mod tests {
     /// labelled it. Both say landed - the recorded WHY is the strongest one.
     #[test]
     fn content_proof_outranks_the_coord_chip() {
-        let verdict = land_verdict(false, true, ContentProof::Ancestor);
+        let verdict = land_verdict(false, "closed", true, ContentProof::Ancestor);
         assert!(verdict.landed);
         assert_eq!(verdict.signal, "ff-land");
     }
@@ -1080,6 +1150,7 @@ mod tests {
     fn an_absent_coord_label_proves_nothing() {
         let verdict = land_verdict(
             false,
+            "closed",
             false,
             ContentProof::Unknown(LandUnknown::HeadObjectMissing),
         );
@@ -1088,10 +1159,67 @@ mod tests {
         assert_eq!(verdict.reason, Some("head_object_missing"));
     }
 
+    /// THE SHIP-BLOCKER FROM REVIEW. coord's chip must NOT override GitHub's
+    /// live statement that a PR is still OPEN.
+    ///
+    /// coord's phantom empty-diff sweep applies `coord:landed` off a
+    /// `git merge-tree` CONTENT-equality proof, and it does so on the
+    /// `CommentedButCloseFailed` arm — where its own log records that the
+    /// close PATCH failed and the PR is still open. Taking the chip there
+    /// would write `pr_state='merged'`, `landed_at=NULL` for a live PR, the
+    /// dropdown would show `landed (coord)`, and `allLanded` could go green
+    /// while the work is still in flight. Two live signals disagreeing is an
+    /// UNKNOWN, and it says which two.
+    #[test]
+    fn coord_chip_never_overrides_a_pr_github_still_reports_open() {
+        let verdict = land_verdict(false, "open", true, ContentProof::NotAttempted);
+        assert!(
+            !verdict.landed,
+            "coord's chip must not out-vote GitHub's live open state"
+        );
+        assert_eq!(verdict.signal, "land-unknown");
+        assert_eq!(verdict.reason, Some("coord_chip_on_open_pr"));
+
+        // And it must not reach the projection as a landed row.
+        let status = session_pr_status(&verdict, "open", None, None);
+        assert!(!status.landed);
+        assert_eq!(status.pr_state.as_deref(), Some("open"));
+        assert_eq!(status.landed_at, None);
+    }
+
+    /// The same guard, stated as the property rather than the instance: for
+    /// EVERY non-closed state, the chip yields an unknown, never a land.
+    #[test]
+    fn the_coord_chip_is_taken_only_on_a_closed_pr() {
+        for state in ["open", "unknown", "", "draft"] {
+            let verdict = land_verdict(false, state, true, ContentProof::NotAttempted);
+            assert!(!verdict.landed, "state={state}");
+            assert_eq!(verdict.signal, "land-unknown", "state={state}");
+        }
+        // Closed is the one state that takes it.
+        let closed = land_verdict(false, "closed", true, ContentProof::NotAttempted);
+        assert!(closed.landed);
+        assert_eq!(closed.signal, "coord-label");
+    }
+
+    /// An UNOBSERVED state is not an evaluated negative. Both API parsers
+    /// default a missing or non-string `state` to the literal `"unknown"`, so
+    /// a partial payload reaches the cascade as neither `open` nor `closed`.
+    /// Now that `not-landed` has exactly one producer, that producer must not
+    /// also absorb "we never saw the state".
+    #[test]
+    fn an_unobserved_pr_state_is_unknown_not_a_confident_negative() {
+        let verdict = land_verdict(false, "unknown", false, ContentProof::NotAttempted);
+        assert!(!verdict.landed);
+        assert_ne!(verdict.signal, "not-landed");
+        assert_eq!(verdict.signal, "land-unknown");
+        assert_eq!(verdict.reason, Some("pr_state_unobserved"));
+    }
+
     /// GitHub's own merge still outranks the chip - signal 1 is first.
     #[test]
     fn github_merge_outranks_the_coord_chip() {
-        let verdict = land_verdict(true, true, ContentProof::NotAttempted);
+        let verdict = land_verdict(true, "closed", true, ContentProof::NotAttempted);
         assert_eq!(verdict.signal, "github-merge");
     }
 
@@ -1108,7 +1236,7 @@ mod tests {
             (LandUnknown::RefStale, "ref_stale"),
             (LandUnknown::NotARepo, "not_a_repo"),
         ] {
-            let verdict = land_verdict(false, false, ContentProof::Unknown(unknown));
+            let verdict = land_verdict(false, "closed", false, ContentProof::Unknown(unknown));
             assert!(!verdict.landed, "unknown is not a land: {want_reason}");
             assert_eq!(verdict.signal, "land-unknown", "reason={want_reason}");
             assert_ne!(
@@ -1135,14 +1263,14 @@ mod tests {
             ContentProof::NotAncestor,
             ContentProof::Unknown(LandUnknown::HeadObjectMissing),
         ] {
-            let verdict = land_verdict(true, false, proof);
+            let verdict = land_verdict(true, "closed", false, proof);
             assert!(verdict.landed);
             assert_eq!(verdict.signal, "github-merge");
             assert_eq!(verdict.reason, None);
         }
         let merged_at = parse_ts("2026-08-14T09:00:00Z");
         let status = session_pr_status(
-            &land_verdict(true, false, ContentProof::NotAttempted),
+            &land_verdict(true, "closed", false, ContentProof::NotAttempted),
             "closed",
             merged_at,
             parse_ts("2026-08-14T09:00:05Z"),

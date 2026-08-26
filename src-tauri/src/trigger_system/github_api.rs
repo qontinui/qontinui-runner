@@ -98,8 +98,12 @@ pub struct HeadPr {
     pub base_ref: String,
     /// Label names on the PR. Carries coord's [`COORD_LANDED_LABEL`] chip,
     /// which is the land signal that survives a rebase (see the constant).
-    /// `#[serde(default)]` so a payload persisted by an older build still
-    /// deserializes — as an EMPTY set, i.e. "not observed".
+    ///
+    /// `#[serde(default)]` is belt-and-braces only: this struct is built by
+    /// hand from a `serde_json::Value` in this module and is not currently
+    /// deserialized anywhere. It costs nothing and means a future
+    /// `Deserialize` of an older payload yields an EMPTY set — "not observed"
+    /// — rather than failing.
     #[serde(default)]
     pub labels: Vec<String>,
 }
@@ -126,7 +130,8 @@ pub struct PrStatus {
     pub closed_at: Option<String>,
     pub title: String,
     pub html_url: String,
-    /// Label names on the PR — see [`HeadPr::labels`].
+    /// Label names on the PR — see [`HeadPr::labels`], including the note on
+    /// `#[serde(default)]`.
     #[serde(default)]
     pub labels: Vec<String>,
 }
