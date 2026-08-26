@@ -33,11 +33,18 @@ impl MutationRoot {
         params: Option<Json<serde_json::Value>>,
     ) -> Result<ActionResult> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let payload = serde_json::json!({
-            "elementId": element_id,
-            "action": action,
-            "params": params.map(|p| p.0).unwrap_or(serde_json::json!({})),
-        });
+        // `params` must be nested INSIDE the action envelope. It used to be a
+        // top-level sibling of a bare-string `action`, which the frontend
+        // handler never reads — so every GraphQL element action ran with no
+        // parameters at all (a `type` mutation typed nothing) while still
+        // reporting success. See `request::element_action_payload`.
+        let payload = ui_bridge::request::element_action_payload(
+            &element_id,
+            serde_json::json!({
+                "action": action,
+                "params": params.map(|p| p.0).unwrap_or(serde_json::json!({})),
+            }),
+        );
         bridge_mutation(state, "execute_action", payload).await
     }
 
