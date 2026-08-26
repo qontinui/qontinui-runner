@@ -21,7 +21,8 @@
 //! against it (`*State::with_shared_token`), one combined handle held
 //! in one process-global registry keyed by `agent_id`. Re-allocating
 //! the same agent drops the prior [`AgentDaemons`] → both old daemons
-//! stop cleanly on their next tick.
+//! stop immediately — each handle's `Drop` cancels a latched
+//! token and aborts the task, rather than hoping it is parked.
 //!
 //! The unification also gives `agent_pusher` its first real spawn
 //! site: every worktree-mode allocation now starts the pusher too,
@@ -39,7 +40,7 @@ use crate::agent_worktree::AllocateResult;
 use crate::dirty_poller::{self, DirtyPollerHandle, DirtyPollerState};
 
 /// Both daemons for one agent. Dropping this stops both: each handle's
-/// `Drop` signals its task to exit on the next tick.
+/// `Drop` cancels and aborts its task, so both stop immediately.
 #[derive(Default)]
 struct AgentDaemons {
     pusher: Option<PusherHandle>,
@@ -110,7 +111,7 @@ pub fn spawn_for_agent_with_token(
     let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut g) = reg.lock() {
         // Insert drops any prior AgentDaemons for this agent → both
-        // old daemons observe cancellation and exit next tick.
+        // old daemons are cancelled and aborted on the spot.
         g.insert(agent_id, daemons);
         info!(
             "agent_daemons: agent_id={agent_id} pusher+poller live (agents tracked={})",
@@ -121,7 +122,7 @@ pub fn spawn_for_agent_with_token(
 
 /// Stop both per-agent daemons by removing the agent's entry from the
 /// registry — dropping the [`AgentDaemons`] signals each handle's task
-/// to exit on its next tick. Called from the spawn-wrapper completion
+/// to stop immediately. Called from the spawn-wrapper completion
 /// path when the agent process is gone. Best-effort and defensive: a
 /// no-op if the registry is uninitialized (nothing was ever spawned) or
 /// the lock is poisoned (a teardown failure must never panic the runner).
@@ -201,13 +202,21 @@ mod tests {
     /// same agent_id replaces in place (still exactly one entry — the
     /// prior `AgentDaemons` is dropped, stopping both old daemons).
     ///
-    /// The Drop→stop path is covered by `dirty_poller::tests::
-    /// cancelling_stops_the_poller_task` and `agent_pusher::tests::
-    /// pusher_handle_drop_actually_stops_the_task`, both of which assert
-    /// the task is FINISHED. This note used to claim the same coverage
-    /// while the only such test asserted nothing at all and could not
-    /// fail — which is how a leak of one detached task per agent teardown
-    /// went unnoticed until 1,353 orphans were ticking on one box.
+    /// The Drop→stop path — `spawn`, then `Drop`, then no further
+    /// requests — is covered end-to-end in exactly one place:
+    /// `dirty_poller::tests::no_requests_are_issued_after_the_handle_is_dropped`,
+    /// which counts requests at a real listener and is verified to fail
+    /// against the old `Drop`. `dirty_poller::tests::
+    /// cancelling_stops_the_poller_task`, `agent_pusher::tests::
+    /// cancelling_stops_the_pusher_task` and `agent_worktree::tests::
+    /// cancelling_stops_the_claim_heartbeat_task` cover the narrower claim
+    /// that each loop honours its token, asserting the task is FINISHED.
+    ///
+    /// Stated precisely because this note used to claim the Drop→stop path
+    /// was covered while the only such test asserted nothing at all and
+    /// could not fail — which is how a leak of one detached task per agent
+    /// teardown went unnoticed until 1,353 orphans were ticking on one box.
+    /// A coverage claim that overstates by one word is how that happened.
     ///
     /// Unreachable coord base ⇒ the spawned tasks just error+retry.
     #[tokio::test]
