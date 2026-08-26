@@ -294,7 +294,9 @@ pub struct SessionPrLanded {
     pub pr_number: i64,
     /// RFC3339 land instant, by whichever signal proved it.
     pub landed_at: Option<String>,
-    /// `"github-merge"` | `"ff-land"` | `"coord"` — WHY this counts as landed.
+    /// `"github-merge"` | `"ff-land"` | `"coord-label"` — WHY this counts as
+    /// landed. Mirrored in `src/components/terminal/useSessionInfo.ts`
+    /// (`SessionPrLanded.landSignal`); keep the two spellings in step.
     pub land_signal: Option<String>,
 }
 
@@ -307,7 +309,9 @@ pub struct SessionPrLanded {
 pub struct SessionPrUnknown {
     pub repo: String,
     pub pr_number: i64,
-    /// `"ref_stale"` | `"head_object_missing"` | `"no_base_ref"` |
+    /// `"rebase_land_or_abandoned"` | `"coord_chip_on_open_pr"` |
+    /// `"pr_state_unobserved"` | `"ref_stale"` | `"head_object_missing"` |
+    /// `"no_base_ref"` |
     /// `"not_a_repo"` — or `"unspecified"` when a row somehow carries the
     /// unknown signal without its reason (still never a confident negative).
     pub reason: String,

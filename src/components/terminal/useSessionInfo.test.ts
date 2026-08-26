@@ -33,6 +33,7 @@ import {
   prLabel,
   prPanelRows,
   landSignalLabel,
+  landUnknownReasonLabel,
   prRowChip,
   sessionInfoElementId,
   sessionInfoRows,
@@ -324,7 +325,7 @@ describe("prRowChip", () => {
       prNumber: 1,
       reason: "ref_stale",
     });
-    expect(chip).toEqual({ text: "unknown — ref_stale", tone: "unknown" });
+    expect(chip).toEqual({ text: "unknown — local base ref is stale", tone: "unknown" });
   });
 
   it("never claims a closed PR did not land — it claims the land is unverified", () => {
@@ -347,6 +348,24 @@ describe("prRowChip", () => {
       text: "open",
       tone: "open",
     });
+  });
+  it("humanizes the unknown reason rather than printing a snake_case token", () => {
+    // The primary user-visible outcome of the ff-land fix is an unknown row,
+    // so its REASON is what people read. It must be words, not a token.
+    const chip = prRowChip(opened({ prNumber: 1, prState: "closed" }), undefined, {
+      repo: "qontinui/qontinui-runner",
+      prNumber: 1,
+      reason: "rebase_land_or_abandoned",
+    });
+    expect(chip.text).not.toContain("rebase_land_or_abandoned");
+    expect(chip.text).toBe("unknown — not on the base branch — may have rebase-landed");
+
+    // The coord-vs-GitHub contradiction names both sides.
+    expect(landUnknownReasonLabel("coord_chip_on_open_pr")).toBe(
+      "coord says landed, GitHub says open",
+    );
+    // An unrecognised reason renders as itself rather than being invented.
+    expect(landUnknownReasonLabel("some_future_reason")).toBe("some_future_reason");
   });
 });
 

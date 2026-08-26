@@ -107,7 +107,8 @@ export interface SessionPrLanded {
 export interface SessionPrUnknown {
   repo: string;
   prNumber: number;
-  /** `"rebase_land_or_abandoned"` | `"ref_stale"` | `"head_object_missing"` |
+  /** `"rebase_land_or_abandoned"` | `"coord_chip_on_open_pr"` |
+   * `"pr_state_unobserved"` | `"ref_stale"` | `"head_object_missing"` |
    * `"no_base_ref"` | `"not_a_repo"` | `"unspecified"`. */
   reason: string;
 }
@@ -375,6 +376,13 @@ export function deriveTrigger(state: SessionInfoState): TriggerState {
   };
 }
 
+/**
+ * `"not-landed"` is deliberately retained but is now RARE: since the land
+ * cascade stopped inferring a negative from a failed ancestry test, the only
+ * confident negative is a PR GitHub positively reports open, which renders as
+ * `"open"`. The tone survives for legacy rows written by an older build, whose
+ * `prState === "closed"` with no verdict still reaches the closed branch below.
+ */
 export type PrChipTone = "landed" | "unknown" | "not-landed" | "open";
 
 /**
@@ -400,6 +408,35 @@ export function landSignalLabel(signal: string | null): string {
 }
 
 /**
+ * Unknown-reason token → the words on the chip.
+ *
+ * The backend records WHY a land could not be established as a machine token;
+ * rendering `unknown — rebase_land_or_abandoned` in a dropdown puts snake_case
+ * in front of a person. Each phrase below says what was actually established,
+ * without implying the stronger claim the token replaced.
+ *
+ * Same fall-through rule as `landSignalLabel`: an UNRECOGNISED reason renders
+ * as itself. A newer backend can record a reason this frontend has never heard
+ * of, and showing the token is honest where inventing a phrase for it is not.
+ * Pure.
+ */
+export const LAND_UNKNOWN_REASONS: Readonly<Record<string, string>> = {
+  rebase_land_or_abandoned: "not on the base branch — may have rebase-landed",
+  coord_chip_on_open_pr: "coord says landed, GitHub says open",
+  pr_state_unobserved: "GitHub state not observed",
+  ref_stale: "local base ref is stale",
+  head_object_missing: "head commit not present locally",
+  no_base_ref: "no local base ref",
+  not_a_repo: "no local checkout",
+  unspecified: "reason not recorded",
+};
+
+/** Human label for an unknown-land reason. Pure. */
+export function landUnknownReasonLabel(reason: string): string {
+  return LAND_UNKNOWN_REASONS[reason] ?? reason;
+}
+
+/**
  * The land-signal chip for one opened PR row. The three buckets render as
  * three distinct states; an unevaluable verdict says so WITH its reason
  * rather than being demoted to a confident negative (R1). Pure.
@@ -410,7 +447,11 @@ export function prRowChip(
   unknown: SessionPrUnknown | undefined,
 ): { text: string; tone: PrChipTone } {
   if (landed) return { text: landSignalLabel(landed.landSignal), tone: "landed" };
-  if (unknown) return { text: `unknown — ${unknown.reason}`, tone: "unknown" };
+  if (unknown)
+    return {
+      text: `unknown — ${landUnknownReasonLabel(unknown.reason)}`,
+      tone: "unknown",
+    };
   // `prState === "closed"` reaches here ONLY when the backend recorded a
   // confident `not-landed`, which since 2026-08-26 it does only for a PR
   // GitHub still reports open — so a closed row with no land verdict is an
