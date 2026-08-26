@@ -1091,6 +1091,23 @@ pub fn terminal_collect_session_metadata(
 /// Synchronous + fast: [`SessionLifecycleStore::record_open`] fsyncs the
 /// atomic write before returning, so the frontend can rely on durability the
 /// instant this resolves.
+///
+/// ## The response says WRITTEN vs BOUND, because they are not the same thing
+///
+/// This command writes a PROVISIONAL row (`confirmed_at` unset — see
+/// [`CONFIRM_DOOR`]), and `terminal_list`'s `sessionIdsByTerminal` map is gated
+/// to CONFIRMED rows only
+/// ([`SessionLifecycleStore::find_confirmed_open_by_terminal`], and the long
+/// rationale on it). So a bare `success: true` told a caller nothing about
+/// whether the session it just recorded would ever surface on a tab — "written"
+/// read as "bound", and diagnosing the difference cost a manual test run most
+/// of its wall clock.
+///
+/// The payload therefore reports the row's ACTUAL confirmation state (read back
+/// from the store, because `record_open` never clears an existing confirmation)
+/// and names the door that flips it. It does NOT confirm: the provisional gate
+/// is deliberate, and surfacing unconfirmed ids would permanently mis-bind
+/// phantom shells and non-pinned launches onto tabs.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn terminal_session_record_open(
@@ -1142,11 +1159,46 @@ pub fn terminal_session_record_open(
         restored_from_boot_at: None,
         restore_tier: None,
     };
+    let session_id = record.claude_session_id.clone();
     store.record_open(record);
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: None,
+        data: Some(record_open_confirmation_report(&store, &session_id)),
+    })
+}
+
+/// The door that flips a provisional row to confirmed — the provider's
+/// SessionStart hook POSTs it (`install_effects_producer::post_session_open`,
+/// which calls [`SessionLifecycleStore::confirm_session`]).
+const CONFIRM_DOOR: &str = "POST /control/session-open";
+
+/// Build [`terminal_session_record_open`]'s honesty payload for
+/// `claude_session_id`: whether the row it just wrote is CONFIRMED — i.e.
+/// whether `terminal_list` will surface it in `sessionIdsByTerminal` — and the
+/// door that confirms it.
+///
+/// Read back from the store rather than assumed: this command always passes
+/// `confirmed_at: None`, but `record_open` never clears an existing
+/// confirmation, so re-recording an already-confirmed session must report
+/// `confirmed: true`. A row that vanished between the write and the read (a
+/// poisoned lock, a concurrent close) reads as unconfirmed — the conservative
+/// answer, since unconfirmed is exactly "do not expect this on a tab yet".
+fn record_open_confirmation_report(
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+) -> serde_json::Value {
+    let confirmed = store
+        .get(claude_session_id)
+        .and_then(|r| r.confirmed_at)
+        .is_some();
+    // `confirmBy` is emitted unconditionally so the payload has one stable
+    // shape for a harness to assert; when `confirmed` is true it simply names
+    // the door that already fired.
+    serde_json::json!({
+        "recorded": true,
+        "confirmed": confirmed,
+        "confirmBy": CONFIRM_DOOR,
     })
 }
 
@@ -2767,5 +2819,78 @@ mod tests {
         // Leave the process cache stocked so a later test in this binary
         // does not inherit a hostile posture.
         crate::settings::set_performance_cache(crate::settings::PerformanceSettings::default());
+    }
+
+    // ── `terminal_session_record_open` answers WRITTEN vs BOUND ──────────
+
+    /// The payload must distinguish a written row from a bound one. A freshly
+    /// recorded session is PROVISIONAL, so `terminal_list` will not surface it
+    /// — the caller has to be told that, and told which door flips it, rather
+    /// than reading a bare `success: true` as "the tab now carries this id".
+    #[test]
+    fn record_open_report_is_unconfirmed_until_the_confirm_door_fires() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
+            .expect("store opens");
+
+        let mut record = restore_candidate_record("sess-1");
+        record.confirmed_at = None;
+        store.record_open(record);
+
+        let report = record_open_confirmation_report(&store, "sess-1");
+        assert_eq!(report["recorded"], serde_json::Value::Bool(true));
+        assert_eq!(
+            report["confirmed"],
+            serde_json::Value::Bool(false),
+            "a freshly recorded row is provisional and will NOT reach terminal_list: {report}"
+        );
+        assert_eq!(
+            report["confirmBy"], CONFIRM_DOOR,
+            "the payload must name the door that confirms it"
+        );
+
+        // …and the report must NOT have confirmed it as a side effect: the
+        // provisional gate is what keeps phantom shells and non-pinned launches
+        // off tabs.
+        assert!(
+            store.find_confirmed_open_by_terminal("term-1").is_none(),
+            "reporting the state must never flip it"
+        );
+    }
+
+    /// Read back, not assumed: this command always passes `confirmed_at: None`,
+    /// but `record_open` never clears an existing confirmation — so
+    /// re-recording an already-confirmed session reports `confirmed: true`.
+    #[test]
+    fn record_open_report_reflects_an_already_confirmed_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
+            .expect("store opens");
+
+        let mut record = restore_candidate_record("sess-2");
+        record.confirmed_at = None;
+        store.record_open(record.clone());
+        store.confirm_session("sess-2");
+
+        // A re-record (the frontend re-asserting the tab) passes no
+        // confirmation of its own…
+        store.record_open(record);
+        let report = record_open_confirmation_report(&store, "sess-2");
+        assert_eq!(
+            report["confirmed"],
+            serde_json::Value::Bool(true),
+            "the confirmed row must report bound, not provisional: {report}"
+        );
+    }
+
+    /// An unknown id is UNCONFIRMED, never a claim of boundness — the
+    /// conservative answer when the row cannot be read back.
+    #[test]
+    fn record_open_report_is_unconfirmed_for_an_unknown_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
+            .expect("store opens");
+        let report = record_open_confirmation_report(&store, "never-recorded");
+        assert_eq!(report["confirmed"], serde_json::Value::Bool(false));
     }
 }
