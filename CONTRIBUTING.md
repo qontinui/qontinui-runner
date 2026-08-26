@@ -118,9 +118,45 @@ cd python-bridge
 pip install -r requirements.txt
 cd ..
 
+# Arm the local pre-push gate (OPTIONAL, and recommended)
+bash ../qontinui-claude-config/scripts/install-repo-git-hooks.sh
+bash ../qontinui-claude-config/scripts/install-repo-git-hooks.sh --check
+
 # Run in development mode
 npm run tauri dev
 ```
+
+#### The pre-push gate
+
+`.pre-commit-config.yaml` defines a pre-push gate that runs `cargo fmt`
+(auto-applied, never blocking) and `cargo clippy` (deny-tier lints block) over
+`src-tauri/`, plus the Tauri event-bindings drift guard. It exists to turn an
+8-15 minute CI roundtrip into 60-90 seconds of local cycle time, and it is
+scoped: it only does the expensive work when `src-tauri/` actually changed in
+the range you are pushing.
+
+Arming it is **opt-in**. The installer above wires this repo's git hooks and
+its `--check` reports whether the gate is armed and by which mechanism; run it
+again with `--uninstall` to take it back out. Installing once in your primary
+checkout also arms every linked worktree, since worktrees share `.git/hooks`.
+
+**Not arming it costs you latency, not coverage.** CI gates both halves
+regardless: `cargo fmt -- --check` and `cargo clippy` both run inside the
+required `test (ubuntu-22.04)` context, with a parallel `clippy-windows` job.
+The gate is a faster feedback loop, never the thing standing between a
+regression and `main`.
+
+Escape hatches, when you need them:
+
+| | |
+|---|---|
+| `QONTINUI_PREPUSH_SKIP=1 git push` | Skip the slow clippy build; `cargo fmt` still auto-applies. |
+| `QONTINUI_PREPUSH_SKIP_ALL=1 git push` | Skip both halves. |
+| `SKIP=gen-events-drift git push` | Skip only the bindings drift guard. |
+| `QONTINUI_PREPUSH_STRICT=1 git push` | The opposite: block on a gate that would otherwise decline (e.g. no sibling `qontinui-schemas` checkout, so cargo cannot load the workspace). |
+
+Prefer any of these to `git push --no-verify`, which disables every hook at once
+— including the free formatting fix.
 
 ## Project Structure
 
