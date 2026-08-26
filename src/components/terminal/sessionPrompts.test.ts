@@ -56,6 +56,31 @@ describe("normalizePromptText", () => {
     ).toBe("real prompt");
   });
 
+  it("drops background-task completion notifications", () => {
+    const raw = "<task-notification>\n<task-id>abc</task-id>\n</task-notification>";
+    expect(normalizePromptText(raw)).toBeNull();
+  });
+
+  it("drops the notification banner along with its block", () => {
+    const raw =
+      "[SYSTEM NOTIFICATION - NOT USER INPUT]\nAn automated event.\n\n<task-notification>\n<task-id>abc</task-id>\n</task-notification>";
+    expect(normalizePromptText(raw)).toBeNull();
+  });
+
+  it("keeps a prompt that follows a notification in the same record", () => {
+    const raw =
+      "<task-notification>\n<task-id>abc</task-id>\n</task-notification>\nnow do the thing";
+    expect(normalizePromptText(raw)).toBe("now do the thing");
+  });
+
+  it("keeps a prompt that merely quotes the notification banner", () => {
+    // Anchored + non-global: only a banner at the START of a record is
+    // transport noise. Mid-prompt it is the operator talking about one.
+    expect(
+      normalizePromptText("why does [SYSTEM NOTIFICATION - NOT USER INPUT] keep appearing?"),
+    ).toBe("why does [SYSTEM NOTIFICATION - NOT USER INPUT] keep appearing?");
+  });
+
   it("drops interruption markers", () => {
     expect(normalizePromptText("[Request interrupted by user]")).toBeNull();
     expect(normalizePromptText("[Request interrupted by user for tool use]")).toBeNull();
