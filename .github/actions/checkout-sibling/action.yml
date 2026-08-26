@@ -235,6 +235,21 @@ inputs:
       "no declaration".
     required: false
     default: 'false'
+  pin-file:
+    description: >-
+      Manifest recording WHICH COMMIT of each sibling this repo's CI builds
+      against, consulted only when no declaration resolved. Path is relative to
+      $GITHUB_WORKSPACE unless absolute. A sibling ABSENT from the file (or a
+      missing file) resolves to the default branch exactly as before, so this is
+      opt-in per sibling. Set to the empty string to skip the lookup entirely.
+
+      WHY: siblings are neither npm deps nor vendored, so no lockfile can pin
+      them and a floating clone makes every peer repo's merge button a write to
+      this repo's `main` — measured as a 5h+ merge-train outage on 2026-08-20
+      (see the manifest's header). The pin is the LOWEST-priority answer: a
+      declared adaptation PR still beats it, so cross-repo pairs land normally.
+    required: false
+    default: .github/sibling-pins.conf
 
 outputs:
   ref:
@@ -242,9 +257,12 @@ outputs:
     value: ${{ steps.resolve.outputs.ref }}
   sha:
     description: >-
-      Head SHA of the declared adaptation PR, or empty when resolving to the
-      default branch (in which case the checked-out commit is whatever that
-      branch tipped at — see the `Checked out … at <sha>` log line).
+      The exact commit that was checked out, when one was resolved: the head SHA
+      of the declared adaptation PR, else the SHA recorded for this sibling in
+      `pin-file`. Empty only when neither applied and the resolution fell
+      through to the default branch (in which case the checked-out commit is
+      whatever that branch tipped at — see the `Checked out … at <sha>` log
+      line).
     value: ${{ steps.resolve.outputs.sha }}
   source:
     description: >-
@@ -255,6 +273,11 @@ outputs:
       the sibling after this side and this step did not opt in. More than one
       form is the COMMON case: a single dep-edge declaration is visible from
       both ends, which is what lets it serve both repos' gates.
+
+      When no declaration resolved and `pin-file` supplied the commit instead,
+      `+pinned` is appended (`none+pinned`, `trailing-declined+pinned`) — so
+      "resolved by declaration", "resolved by pin" and "fell through to the
+      default branch" stay three distinguishable answers rather than one.
     value: ${{ steps.resolve.outputs.source }}
 
 runs:
@@ -269,6 +292,7 @@ runs:
         THIS_REPO: ${{ github.repository }}
         SIBLING_REPO: ${{ inputs.repo }}
         ACCEPT_TRAILING: ${{ inputs.accept-trailing-sibling }}
+        PIN_FILE: ${{ inputs.pin-file }}
       run: |
         set -euo pipefail
 
@@ -284,7 +308,128 @@ runs:
         # vacuous green wearing this action's clothes.
         PR_DETAIL_CALLS=0
 
+        # --- The recorded pin (lowest-priority answer). ----------------------
+        # Consulted ONLY when nothing else resolved a commit, which is why it
+        # lives inside emit(): the three no-declaration exits (not a PR event;
+        # no declaration found; trailing declaration declined) all funnel
+        # through here, and the push-to-`main` build — the one that reds the
+        # repo — is the first of them. A declared adaptation always wins,
+        # because SHA is already non-empty by the time it calls emit().
+        apply_pin() {
+          # `if` rather than `[ … ] && return` — under `set -e` a failing
+          # AND-list is itself a failing command, so the short-circuit form
+          # would abort the step on the ordinary "nothing pinned" path.
+          if [ -n "${SHA}" ]; then return 0; fi
+          if [ -z "${PIN_FILE:-}" ]; then return 0; fi
+
+          # A relative pin-file is tried against the workspace root FIRST, then
+          # against the root of the repo that owns this action. Both are needed:
+          # ci.yml, clippy-tiers.yml and onboarding-doc-fresh.yml check the
+          # runner out AT the workspace root, while qontinui-types-drift.yml,
+          # atlas-exclude-fresh.yml and clorinde-bindings-fresh.yml check it out
+          # under `path: qontinui-runner`. Resolving only against
+          # $GITHUB_WORKSPACE would silently find no manifest in the latter
+          # three — harmless while they only ask about an unpinned sibling, but
+          # it would quietly drop the pin the day one of them asks about a
+          # pinned one, which is exactly the invisible-floating-checkout failure
+          # this whole mechanism exists to end.
+          # `[A-Za-z]:*` and NOT `[A-Za-z]:[\\/]*`: in Git Bash — the bash a
+          # `shell: bash` step gets on windows-latest — a literal backslash is
+          # not matchable by `[\\/]`, `[/\\]` or `\\*`, so the stricter pattern
+          # silently failed to recognise `D:\path`, prepended $GITHUB_WORKSPACE
+          # to it, missed the file and fell through to the default branch. A
+          # fail-open in the very branch meant to honour an explicit path.
+          local file=""
+          case "${PIN_FILE}" in
+            /*|[A-Za-z]:*)
+              file="${PIN_FILE}" ;;
+            *)
+              local candidate
+              for candidate in \
+                "${GITHUB_WORKSPACE}/${PIN_FILE}" \
+                "${GITHUB_ACTION_PATH}/../../../${PIN_FILE}"
+              do
+                if [ -f "${candidate}" ]; then file="${candidate}"; break; fi
+              done ;;
+          esac
+
+          if [ -z "${file}" ] || [ ! -f "${file}" ]; then
+            echo "No pin manifest found for '${PIN_FILE}' (looked under \$GITHUB_WORKSPACE and this action's own repo) — resolving ${SIBLING_REPO} by default branch."
+            return 0
+          fi
+
+          # "Is this sibling LISTED?" and "is its value USABLE?" are separate
+          # answers, and conflating them is a fail-open. Printing $2 alone makes
+          # an entry whose SHA is missing — `qontinui/ui-bridge` with nothing
+          # after it, or a SHA commented out mid-edit — indistinguishable from a
+          # sibling that was never listed, so it floats on the default branch
+          # while LOOKING deliberate. That is reachable by the ordinary bump this
+          # file documents ("delete the old SHA, paste the new one"): miss the
+          # paste and the pin silently evaporates. So carry the field count out
+          # of awk alongside the value, and report every match rather than
+          # `exit`ing on the first — a duplicate entry means the manifest is
+          # telling a human reader something other than what CI will do.
+          local matches
+          matches="$(awk -v repo="${SIBLING_REPO}" '
+            { sub(/#.*/, "") }
+            $1 == repo { print NF "|" $2 }
+          ' "${file}")"
+          matches="${matches//$'\r'/}"
+
+          if [ -z "${matches}" ]; then
+            echo "${SIBLING_REPO} is not listed in ${PIN_FILE} — resolving by default branch."
+            return 0
+          fi
+
+          local n_matches
+          n_matches="$(printf '%s\n' "${matches}" | wc -l | tr -d '[:space:]')"
+          if [ "${n_matches}" -ne 1 ]; then
+            echo "::error::${PIN_FILE} lists ${SIBLING_REPO} ${n_matches} times. Exactly one tree can be checked out, so the file is ambiguous about which commit CI builds against."
+            echo "::error::Keep one entry and delete the rest."
+            exit 1
+          fi
+
+          local nf="${matches%%|*}"
+          local pin="${matches#*|}"
+
+          if [ "${nf}" -lt 2 ]; then
+            echo "::error::${PIN_FILE} lists ${SIBLING_REPO} with no commit SHA after it."
+            echo "::error::Refusing to treat a half-finished entry as 'unpinned' and fall back to the default branch — that silently reinstates the floating checkout this file exists to remove."
+            echo "::error::Either record a full commit SHA (gh api repos/${SIBLING_REPO}/commits/main --jq .sha), or delete the line entirely to float on purpose."
+            exit 1
+          fi
+          if [ "${nf}" -gt 2 ]; then
+            echo "::error::${PIN_FILE}'s ${SIBLING_REPO} entry has ${nf} fields; expected exactly 2 (<owner>/<repo> <40-hex-sha>). Trailing text must be a '#' comment."
+            exit 1
+          fi
+
+          # A malformed pin is a RED, never a silent fall-through to the default
+          # branch: the whole point of the file is that the resolved commit is
+          # DELIBERATE, and "your pin was garbage so we floated instead" would
+          # reinstate the exact coupling this removes, invisibly.
+          case "${pin}" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
+            *)
+              echo "::error::${PIN_FILE} pins ${SIBLING_REPO} to '${pin}', which is not a 40-character lowercase hex commit SHA."
+              echo "::error::Refusing to fall back to the default branch — that is the floating clone this pin exists to remove."
+              echo "::error::Record a full commit SHA: gh api repos/${SIBLING_REPO}/commits/main --jq .sha"
+              exit 1 ;;
+          esac
+
+          SHA="${pin}"
+          if [ "${SOURCE}" = "none" ]; then SOURCE="none+pinned"; else SOURCE="${SOURCE}+pinned"; fi
+          # "SUPERSEDING" because every path that reaches here has already
+          # printed its own `Using <repo> ref: main (…)` line. Leaving two bare
+          # "Using" lines in the log would make the first one read as the answer
+          # to whoever is scrolling this job during the next incident.
+          echo "SUPERSEDING that: ${SIBLING_REPO} @ ${SHA} (pinned in ${PIN_FILE}; no declaration applied)."
+          echo "  To build against a different ${SIBLING_REPO} tree for THIS pull request, declare the"
+          echo "  adaptation pair with a coord dep-edge label — a declaration outranks this pin."
+          echo "  To move the pin for everyone, edit ${PIN_FILE} in an ordinary PR."
+        }
+
         emit() {
+          apply_pin
           {
             echo "ref=${REF}"
             echo "sha=${SHA}"
@@ -710,6 +855,11 @@ runs:
         # future refactor that grows a second way to set REF, not a live check.
         # Keep it; it costs nothing and it is the assertion that would catch the
         # refactor going wrong.
+        #
+        # It keys on REF, and that is deliberate. Do NOT restate it as "a
+        # non-empty SHA implies a PR-detail read" — that WAS true and no longer
+        # is: the pin manifest sets SHA with no API call at all, leaving
+        # REF=main. The invariant that survives is the one written here.
         if [ "${REF}" != "main" ] && [ "${PR_DETAIL_CALLS}" -eq 0 ]; then
           echo "::error::Emitted a non-main ref without reading the declared PR's detail — refusing a vacuous resolution."
           exit 1
@@ -758,11 +908,14 @@ runs:
           exit 1
         fi
 
-        # Fetch the SHA when we have one (a validated declared adaptation), the
-        # branch otherwise (the no-declaration path, which resolves to the
-        # default branch and has no PR head SHA to pin to). Both go through
-        # `--depth 1` on an EXPLICIT refspec: nothing is inferred from the
-        # remote's HEAD.
+        # Fetch the SHA when we have one — either a validated declared
+        # adaptation's head, or the commit recorded in the pin manifest — and
+        # the branch otherwise, which now means only "listed in no manifest and
+        # named by no declaration". Both go through `--depth 1` on an EXPLICIT
+        # refspec: nothing is inferred from the remote's HEAD. GitHub serves an
+        # arbitrary reachable commit to `fetch`, not just a branch tip, so a pin
+        # keeps working after it stops being the default branch's tip — which is
+        # the entire point of recording one.
         target="${SHA:-}"
         kind="sha"
         if [ -z "${target}" ]; then target="${REF}"; kind="branch"; fi

@@ -97,38 +97,56 @@ jobs:
       #   - qontinui-schemas: src-tauri/Cargo.toml's `qontinui-types = { path
       #     = "../../qontinui-schemas/rust" }` — Rust publication is deferred
       #     per the cross-repo dep redesign plan.
-      #   - qontinui-web: src/lib/spec-registry.ts is auto-generated and
-      #     statically imports 14 .spec.uibridge.json files from
-      #     qontinui-web/frontend/src/app at typecheck/build time. These are
-      #     cross-repo file imports rather than npm deps, so the redesign
-      #     doesn't migrate them.
+      #   - qontinui-web: believed VESTIGIAL. This comment used to justify the
+      #     checkout with "src/lib/spec-registry.ts statically imports 14
+      #     .spec.uibridge.json files from qontinui-web/frontend/src/app at
+      #     typecheck/build time" — that file no longer exists in this repo, and
+      #     a tree-wide search finds no build-time, test-time or tsconfig
+      #     reference to a sibling qontinui-web checkout (every
+      #     *.spec.uibridge.json loaded here lives under this repo's own specs/
+      #     and src/specs/). It is pinned rather than deleted so that removing
+      #     it is a separate change with its own verification.
       #   - ui-bridge: the SDK↔runner manifest diff test
       #     (`sdk_manifest_routes_are_exposed_by_runner` in
       #     `mcp/ui_bridge/mod.rs`) reads `UI_BRIDGE_ROUTES` from
       #     `ui-bridge/packages/ui-bridge/src/server/types.ts`. Without this
-      #     clone the test hits its "file unreadable, skip" branch and
+      #     checkout the test hits its "file unreadable, skip" branch and
       #     silently passes, so SDK-vs-runner drift would not be flagged.
       # qontinui-schemas, qontinui-web, and ui-bridge are public org-owned
-      # repos; the default github.token authenticates the clone, no PAT needed.
+      # repos; the default github.token authenticates the fetch, no PAT needed.
       #
-      # qontinui-schemas is NOT cloned here — the action below checks it out
-      # itself, SHA-pinned. It goes to the DECLARED adaptation PR's head commit
-      # rather than the default branch, so a breaking types change can go green
-      # as a DECLARED pair instead of deadlocking: label the coord dep edge
-      # between this PR and its qontinui-schemas PR (either direction) and the
-      # action checks that PR out. Branch NAMES no longer resolve anything — a
-      # name is not an identity, and matching on one let an un-PR'd scratch
-      # branch satisfy the mirror gate in production on 2026-07-28. See
-      # .github/actions/checkout-sibling/action.yml for the full rationale.
+      # NONE of the three is `git clone`d here — the action below checks each
+      # one out itself. It resolves, in order: the DECLARED adaptation PR's head
+      # commit (a coord dep-edge label between this PR and the sibling's,
+      # either direction), then the commit recorded in
+      # .github/sibling-pins.conf, then the default branch. So a breaking
+      # cross-repo change still goes green as a DECLARED pair instead of
+      # deadlocking, while an UNdeclared land in a peer repo can no longer
+      # change what this repo's `main` builds against.
+      #
+      # Branch NAMES resolve nothing — a name is not an identity, and matching
+      # on one let an un-PR'd scratch branch satisfy the mirror gate in
+      # production on 2026-07-28. Floating on a peer's default branch is the
+      # same class of defect one step out: it let a ui-bridge land red this
+      # repo's main and hold the merge train for 5h+ on 2026-08-20, with no
+      # runner commit involved. See .github/sibling-pins.conf for that incident
+      # and .github/actions/checkout-sibling/action.yml for the full rationale.
       - name: Check out sibling qontinui-schemas
         uses: ./.github/actions/checkout-sibling
 
-      - name: Checkout sibling repos
-        run: |
-          cd "$GITHUB_WORKSPACE/.."
-          git clone --depth 1 https://github.com/qontinui/qontinui-web.git
-          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
-        shell: bash
+      # qontinui-web and ui-bridge go through the SAME action, at a commit
+      # recorded in .github/sibling-pins.conf. A declared coord dep-edge label
+      # still outranks the pin, so a genuinely coordinated cross-repo change
+      # ships as a declared pair exactly as it does for qontinui-schemas.
+      - name: Check out sibling qontinui-web
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/qontinui-web
+
+      - name: Check out sibling ui-bridge
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/ui-bridge
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -571,12 +589,19 @@ jobs:
       - name: Check out sibling qontinui-schemas
         uses: ./.github/actions/checkout-sibling
 
-      - name: Checkout sibling repos
-        run: |
-          cd "$GITHUB_WORKSPACE/.."
-          git clone --depth 1 https://github.com/qontinui/qontinui-web.git
-          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
-        shell: bash
+      # qontinui-web and ui-bridge go through the SAME action, at a commit
+      # recorded in .github/sibling-pins.conf — see that file for the 2026-08-20
+      # incident this replaced (a ui-bridge land reddened this repo's main and
+      # held the merge train for 5h+ with no runner commit involved).
+      - name: Check out sibling qontinui-web
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/qontinui-web
+
+      - name: Check out sibling ui-bridge
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/ui-bridge
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
