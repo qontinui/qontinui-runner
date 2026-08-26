@@ -1017,12 +1017,15 @@ async fn seed_scenario_handler(
 //     closeReason?, ...} ] }`. `lastSeenOffsetMs` is relative to "now" (negative
 //     = the past), so a body can place open/ghost/closed rows at precise ages
 //     without the caller knowing the wall clock. 400 on a malformed body.
-//   - POST /ui-bridge/test/clear-lifecycle-store — delete this instance's store
-//     file. Returns whether a file was removed.
+//   - POST /ui-bridge/test/clear-lifecycle-store — empty this instance's store:
+//     delete the snapshot AND its sibling WAL, then make the RUNNING store
+//     adopt the emptiness (same `reload_from_disk` handshake as the seed).
+//     Returns whether a file was removed and whether the live store reloaded.
 //   - POST /ui-bridge/test/list-lifecycle-open — read this instance's store back
 //     and return the `state == "open"` session ids (the StatusStrip restore
 //     consumer's input), so a test can assert the seed round-tripped without
-//     reaching into the filesystem.
+//     reaching into the filesystem. Reads the RUNNING store when one is
+//     registered — see "The read-back must read the same store" below.
 //
 // ## The path is INSTANCE-namespaced, not port-namespaced
 //
@@ -1049,6 +1052,48 @@ async fn seed_scenario_handler(
 // seed on the next `open()`) and calls `reload_from_disk()` on the registered
 // store. If a store IS registered and the reload FAILS, the route answers
 // HTTP 409 rather than claiming a seed that will be overwritten.
+//
+// ## `clear` must clear the same store the seed writes to
+//
+// Manual-test-loop iteration 21: `clear-lifecycle-store` did only half of that
+// handshake. It deleted the snapshot file and answered
+// `{"success":true,"removed":true}` — while the RUNNING store still held every
+// row in memory, so `restore-health?include=all` kept serving all of them and
+// the store's next persist rewrote the file it had just deleted. Calling
+// `clear` twice returned `removed: true` twice, which is only possible because
+// something was re-creating the file behind it.
+//
+// `clear` therefore now does exactly what `seed` does, minus the records:
+// remove the snapshot AND the sibling WAL (a surviving WAL replays its deltas
+// over the empty snapshot on the next `open()` and resurrects the cleared
+// rows), then `reload_from_disk()` so the live store adopts the empty map. A
+// registered store whose reload FAILS is a 409, never a `success: true`.
+//
+// ## The read-back must read the same store
+//
+// `list-lifecycle-open` used to `SessionLifecycleStore::open(path)` a SECOND
+// store over the file. Inside a live runner that reads whatever is on disk
+// rather than what the runner is actually using — and after the old `clear`
+// deleted the file it dutifully answered `open_session_ids: []` while the
+// running store still held eight rows. A seam whose own read-back confirms a
+// clear that did not happen is a FALSE-PASS SOURCE: every
+// clear-then-assert-empty test passed unconditionally.
+//
+// The read-back now prefers the registered store and says which source it
+// used (`source: "running-store" | "snapshot-file"`), so a caller can tell an
+// in-process answer from an out-of-process one instead of guessing.
+//
+// ## Why `{"records": []}` is still a 400
+//
+// The natural "clear" spelling would be `seed-lifecycle-store {"records":[]}`,
+// and it is deliberately NOT accepted. An empty `records` array is far more
+// often a body that lost its rows (a mis-serialized fixture, a filtered list
+// that came back empty) than a deliberate request to wipe the store — and a
+// wipe is destructive and silent. There is a dedicated route whose NAME says
+// what it does, and as of this iteration it actually does it, so the 400
+// costs a caller nothing but a redirect to the right route. Two spellings for
+// one destructive operation would only widen the surface this iteration just
+// narrowed.
 
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 use std::path::Path;
@@ -1144,13 +1189,34 @@ pub struct ListLifecycleOpenResponse {
     pub success: bool,
     pub open_session_ids: Vec<String>,
     pub path: String,
+    /// WHERE the ids were read from: `"running-store"` when this process has a
+    /// live `SessionLifecycleStore` registered (the authoritative answer inside
+    /// a runner), `"snapshot-file"` when it does not and the file is the whole
+    /// state. Never guess — a file read inside a live runner answers about a
+    /// store nothing is using.
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClearLifecycleResponse {
     pub success: bool,
+    /// Whether the snapshot file existed and was deleted.
     pub removed: bool,
+    /// Whether the sibling WAL existed and was deleted. A WAL left behind
+    /// replays its deltas over the empty snapshot on the next `open()` and
+    /// resurrects the very rows the clear discarded.
+    pub removed_wal: bool,
     pub path: String,
+    /// Whether the RUNNING store adopted the clear (`reload_from_disk`).
+    /// `false` means no store was registered in this process — the file was
+    /// the whole state, which is the case for out-of-process callers and unit
+    /// tests. A registered store that failed to reload is a 409, never a
+    /// `false` here.
+    pub reloaded: bool,
+    /// Records the running store holds after the clear — `Some(0)` is the
+    /// whole point of this route. Absent when `reloaded` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_memory_records: Option<usize>,
 }
 
 /// Build a full `TerminalSessionRecord` from a seed spec resolved against
@@ -1225,9 +1291,16 @@ fn seed_lifecycle_store_at(
     now_ms: i64,
 ) -> Result<usize, (StatusCode, String)> {
     if req.records.is_empty() {
+        // Deliberately NOT treated as "clear" — see this section's
+        // "Why `{\"records\": []}` is still a 400" note. An empty array is far
+        // more often a body that lost its rows than a deliberate wipe, and the
+        // wipe has its own route which (since iteration 21) actually empties
+        // the running store rather than just deleting a file.
         return Err((
             StatusCode::BAD_REQUEST,
-            "seed body must contain at least one record".to_string(),
+            "seed body must contain at least one record; to empty the store use \
+             POST /ui-bridge/test/clear-lifecycle-store"
+                .to_string(),
         ));
     }
     let mut records = Vec::with_capacity(req.records.len());
@@ -1282,19 +1355,56 @@ fn seed_lifecycle_store_at(
 
 /// Core read-back: the `state == "open"` session ids in the store at `path`
 /// (sorted). A missing/unreadable store reads as empty.
+///
+/// Only correct when NO store is registered in this process. Inside a live
+/// runner this opens a second store over the file and answers about state
+/// nothing is using — use [`list_lifecycle_open_in`] on the running store
+/// instead. See the module section "The read-back must read the same store".
 fn list_lifecycle_open_at(path: &Path) -> Vec<String> {
     match SessionLifecycleStore::open(path) {
-        Ok(store) => {
-            let mut ids: Vec<String> = store
-                .open_records()
-                .into_iter()
-                .map(|r| r.claude_session_id)
-                .collect();
-            ids.sort();
-            ids
-        }
+        Ok(store) => list_lifecycle_open_in(&store),
         Err(_) => Vec::new(),
     }
+}
+
+/// Core read-back against an ALREADY-OPEN store: the `state == "open"` session
+/// ids it holds, sorted. This is the authoritative answer inside a live runner.
+fn list_lifecycle_open_in(store: &SessionLifecycleStore) -> Vec<String> {
+    let mut ids: Vec<String> = store
+        .open_records()
+        .into_iter()
+        .map(|r| r.claude_session_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Core clear logic, path-injectable so it's unit-testable without an
+/// `ApiState`. Removes the snapshot AND its sibling WAL.
+///
+/// Dropping the WAL is not optional: `SessionLifecycleStore::open` replays it
+/// OVER the snapshot, so a WAL surviving a "clear" resurrects every row the
+/// clear was asked to discard on the very next open — the same silent-loss
+/// shape [`seed_lifecycle_store_at`] already guards against, inverted.
+///
+/// Returns `(snapshot_removed, wal_removed)`; a file that was already absent
+/// reports `false` rather than erroring, so a clear is idempotent.
+fn clear_lifecycle_store_at(path: &Path) -> Result<(bool, bool), (StatusCode, String)> {
+    let wal = crate::session::session_lifecycle_store::wal_path_for(path);
+    let mut removed = [false; 2];
+    for (slot, target) in [(0usize, path), (1usize, wal.as_path())] {
+        match std::fs::remove_file(target) {
+            Ok(()) => removed[slot] = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to clear {}: {e}", target.display()),
+                ))
+            }
+        }
+    }
+    Ok((removed[0], removed[1]))
 }
 
 async fn seed_lifecycle_store_handler(
@@ -1363,38 +1473,97 @@ async fn seed_lifecycle_store_handler(
 }
 
 async fn list_lifecycle_open_handler(
-    axum::extract::State(_state): axum::extract::State<Arc<ApiState>>,
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
 ) -> Json<ListLifecycleOpenResponse> {
     // Runs inside the target runner — its own instance identity selects the
     // correct file (canonical self-scoped path).
     let path = crate::session::session_lifecycle_store::store_path();
+    // Prefer the RUNNING store. Reading the file instead is what made this
+    // read-back lie: after a clear deleted the snapshot it answered "empty"
+    // while the live store still served every row to `restore-health`.
+    use tauri::Manager as _;
+    let (open_session_ids, source) = match state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+    {
+        Some(store) => (list_lifecycle_open_in(&store), "running-store"),
+        // No store registered in this process (out-of-process callers, tests):
+        // the file IS the whole state.
+        None => (list_lifecycle_open_at(&path), "snapshot-file"),
+    };
     Json(ListLifecycleOpenResponse {
         success: true,
-        open_session_ids: list_lifecycle_open_at(&path),
+        open_session_ids,
         path: path.display().to_string(),
+        source,
     })
 }
 
 async fn clear_lifecycle_store_handler(
-    axum::extract::State(_state): axum::extract::State<Arc<ApiState>>,
-) -> Json<ClearLifecycleResponse> {
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> Result<Json<ClearLifecycleResponse>, (StatusCode, Json<InjectSessionError>)> {
     // A control route that clears "self". It runs INSIDE the target runner, so
     // its own instance identity selects the correct file; under instance
     // scoping the former `api_port` query param is redundant with self-identity
     // (a port-named file is no longer the key) — clear the current instance's
     // own store, the only coherent meaning here.
     let path = crate::session::session_lifecycle_store::store_path();
-    let removed = std::fs::remove_file(&path).is_ok();
+    let (removed, removed_wal) = match clear_lifecycle_store_at(&path) {
+        Ok(pair) => pair,
+        Err((code, error)) => {
+            return Err((
+                code,
+                Json(InjectSessionError {
+                    success: false,
+                    error,
+                }),
+            ))
+        }
+    };
+    // Hand the clear to the RUNNING store — the half this route used to skip.
+    // Deleting the file alone left every row in memory, so `restore-health`
+    // kept serving them and the store's next persist re-created the file.
+    // Mirrors `seed_lifecycle_store_handler` exactly, minus the records.
+    use tauri::Manager as _;
+    let (reloaded, in_memory_records) = match state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+    {
+        Some(store) => match store.reload_from_disk() {
+            Ok(count) => (true, Some(count)),
+            Err(e) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(InjectSessionError {
+                        success: false,
+                        error: format!(
+                            "{} was deleted but the running lifecycle store could not adopt the clear ({e}); it still holds the rows and would rewrite them on its next persist",
+                            path.display()
+                        ),
+                    }),
+                ))
+            }
+        },
+        // No store registered in this process: the file WAS the whole state,
+        // so deleting it is the whole clear.
+        None => (false, None),
+    };
     info!(
-        "test_fixtures: cleared lifecycle store path={} removed={}",
+        "test_fixtures: cleared lifecycle store path={} removed={} removed_wal={} reloaded={} in_memory={:?}",
         path.display(),
         removed,
+        removed_wal,
+        reloaded,
+        in_memory_records,
     );
-    Json(ClearLifecycleResponse {
+    Ok(Json(ClearLifecycleResponse {
         success: true,
         removed,
+        removed_wal,
         path: path.display().to_string(),
-    })
+        reloaded,
+        in_memory_records,
+    }))
 }
 
 // =============================================================================
@@ -2808,6 +2977,30 @@ mod tests {
         .expect("valid seed row")
     }
 
+    /// A seed body of N plain `open` rows, one per id.
+    fn seed_of(ids: &[&str]) -> SeedLifecycleRequest {
+        SeedLifecycleRequest {
+            records: ids
+                .iter()
+                .map(|id| SeedLifecycleRecord {
+                    session_id: (*id).to_string(),
+                    state: "open".to_string(),
+                    last_seen_offset_ms: -1_000,
+                    closed_at_offset_ms: None,
+                    close_reason: None,
+                    page_id: None,
+                    zone_index: None,
+                    title: None,
+                    working_dir: None,
+                    confirmed_at: None,
+                    restore_pending_at: None,
+                    restore_tier: None,
+                    origin: None,
+                })
+                .collect(),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Manual-test-loop iteration 10, item 5 — the seed-lifecycle-store seam
     // silently lost the seed.
@@ -2955,6 +3148,172 @@ mod tests {
             "a merge would have kept the pre-seed rows"
         );
         assert!(store.get("only").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual-test-loop iteration 21, item 1 — `clear-lifecycle-store` did not
+    // clear, and its own read-back confirmed the clear anyway.
+    //
+    // Measured on a live runner: `clear` answered
+    // `{"success":true,"removed":true}` TWICE while
+    // `restore-health?include=all` kept serving all 8 rows — the handler
+    // deleted the snapshot file and left the RUNNING store's in-memory map
+    // untouched, so the store re-created the file on its next persist. And
+    // `list-lifecycle-open` read the DELETED FILE rather than the live store,
+    // so it answered `open_session_ids: []`. A clear-then-assert-empty test
+    // therefore passed unconditionally: a FALSE-PASS SOURCE.
+    //
+    // There was no test over this handler at all before these.
+    // -----------------------------------------------------------------------
+
+    /// Seed 4 → clear → BOTH the running store (what `restore-health` reads)
+    /// and the read-back report 0, and a later persist does not resurrect the
+    /// rows.
+    #[test]
+    fn clear_lifecycle_store_empties_the_running_store_not_just_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        seed_lifecycle_store_at(&path, &seed_of(&["s1", "s2", "s3", "s4"]), now).unwrap();
+        assert_eq!(
+            store.reload_from_disk().unwrap(),
+            4,
+            "precondition: 4 seeded"
+        );
+        assert_eq!(list_lifecycle_open_in(&store).len(), 4);
+
+        let (removed, _removed_wal) = clear_lifecycle_store_at(&path).expect("clear");
+        assert!(removed, "the snapshot existed and was deleted");
+        // The half the handler used to skip. Without it the store still holds
+        // all four and rewrites them on its next persist.
+        assert_eq!(store.reload_from_disk().unwrap(), 0);
+
+        assert!(
+            list_lifecycle_open_in(&store).is_empty(),
+            "the RUNNING store — the one `restore-health` reads — must be empty"
+        );
+        assert!(
+            store.open_records().is_empty(),
+            "restore-health's own input must be empty"
+        );
+        assert!(
+            list_lifecycle_open_at(&path).is_empty(),
+            "and the on-disk read-back agrees"
+        );
+
+        // A lifecycle write after the clear must not bring anything back.
+        store.touch("s1");
+        assert!(
+            list_lifecycle_open_at(&path).is_empty(),
+            "a persist after the clear must not resurrect the cleared rows"
+        );
+    }
+
+    /// Negative control: seed 4 → clear → seed 2 must read back EXACTLY 2 —
+    /// not 6 (clear did nothing) and not 0 (the read-back is reading a stale
+    /// file). A test that only ever asserts "empty" cannot tell those apart.
+    #[test]
+    fn clear_then_reseed_reads_back_exactly_the_reseeded_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        seed_lifecycle_store_at(&path, &seed_of(&["a1", "a2", "a3", "a4"]), now).unwrap();
+        store.reload_from_disk().unwrap();
+
+        clear_lifecycle_store_at(&path).expect("clear");
+        store.reload_from_disk().unwrap();
+
+        seed_lifecycle_store_at(&path, &seed_of(&["b1", "b2"]), now).unwrap();
+        store.reload_from_disk().unwrap();
+
+        assert_eq!(
+            list_lifecycle_open_in(&store),
+            vec!["b1".to_string(), "b2".to_string()],
+            "exactly the reseeded rows — 6 would mean the clear was a no-op, 0 \
+             would mean the read-back is not reading the live store"
+        );
+        assert_eq!(
+            list_lifecycle_open_at(&path),
+            vec!["b1".to_string(), "b2".to_string()],
+        );
+    }
+
+    /// The clear must drop the sibling WAL. A surviving WAL replays its deltas
+    /// over the (now absent) snapshot on the next `open()` and resurrects
+    /// exactly the rows the clear discarded — the seed's own hazard, inverted.
+    #[test]
+    fn clear_lifecycle_store_drops_the_wal_that_would_replay_the_cleared_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let wal = crate::session::session_lifecycle_store::wal_path_for(&path);
+
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.record_open(open_row("wal-row-1"));
+            store.record_open(open_row("wal-row-2"));
+        }
+        assert!(wal.exists(), "precondition: the write path left a WAL");
+
+        let (_removed, removed_wal) = clear_lifecycle_store_at(&path).expect("clear");
+        assert!(removed_wal, "the clear must delete the WAL");
+        assert!(!wal.exists());
+        assert!(
+            list_lifecycle_open_at(&path).is_empty(),
+            "the next reader sees an empty store, not the WAL-replayed rows"
+        );
+    }
+
+    /// The read-back must read the SAME store the runner is using. This is the
+    /// lie in its raw form: delete only the snapshot (what the old `clear`
+    /// did) and the file read answers "empty" while the live store still holds
+    /// every row.
+    #[test]
+    fn a_file_read_back_lies_about_a_live_store_the_in_store_read_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        seed_lifecycle_store_at(&path, &seed_of(&["live1", "live2"]), now).unwrap();
+        store.reload_from_disk().unwrap();
+
+        // Exactly the old handler: remove the snapshot, tell the live store
+        // nothing.
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(
+            list_lifecycle_open_at(&path).is_empty(),
+            "the FILE read-back reports empty — this is the false PASS"
+        );
+        assert_eq!(
+            list_lifecycle_open_in(&store),
+            vec!["live1".to_string(), "live2".to_string()],
+            "…while the running store still holds both rows"
+        );
+    }
+
+    /// `seed-lifecycle-store {"records": []}` stays a 400, and says where to
+    /// go instead. See the module note "Why `{\"records\": []}` is still a 400".
+    #[test]
+    fn an_empty_seed_body_is_rejected_and_names_the_clear_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let err = seed_lifecycle_store_at(
+            &path,
+            &SeedLifecycleRequest { records: vec![] },
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .expect_err("an empty body is not a clear");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.contains("clear-lifecycle-store"),
+            "the rejection must name the route that DOES empty the store, got: {}",
+            err.1
+        );
     }
 
     // -----------------------------------------------------------------------

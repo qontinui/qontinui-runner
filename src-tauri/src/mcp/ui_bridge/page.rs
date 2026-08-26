@@ -535,6 +535,87 @@ pub async fn ui_bridge_page_close_request_handler(
     }
 }
 
+/// Same-origin absolute URL → the app-relative path the frontend can act on.
+///
+/// Returns `Some(path)` for `http(s)://localhost[:port]/…` and
+/// `http(s)://127.0.0.1[:port]/…`, `None` for anything else (a relative URL, a
+/// foreign host, a non-HTTP scheme).
+///
+/// WHY this exists (manual-test-loop iteration 21): the runner's frontend
+/// refuses absolute URLs outright — `usePageEvents.ts` logs "ignoring absolute
+/// URL navigation in runner" and does nothing — but still answers
+/// `success: true`. So `page/navigate` on `http://localhost:9881/terminal`
+/// returned HTTP 200 `success: true` with the route unchanged, and so did
+/// `http://localhost:9881/zzz-bogus`. Iteration 12 closed exactly this
+/// false-PASS hole for relative URLs; the absolute branch bypassed the gate it
+/// added because the handler only ran `resolve_navigate_page` under
+/// `url.starts_with('/')`.
+///
+/// Normalizing here rather than gating separately is what keeps ONE resolver:
+/// after this runs, every accepted target is a relative path, so the
+/// unrouted-target gate and the payload sent to the frontend are the same code
+/// for both spellings. Query and fragment are carried through verbatim so an
+/// absolute URL resolves exactly as its relative form would — an absolute
+/// spelling must never be more permissive than the relative one.
+pub(crate) fn same_origin_absolute_path(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    // Userinfo (`http://evil@localhost/`) would let a foreign-looking authority
+    // through the host check below — reject rather than guess.
+    if authority.contains('@') {
+        return None;
+    }
+    let host = authority.split(':').next().unwrap_or("");
+    if host != "localhost" && host != "127.0.0.1" {
+        return None;
+    }
+    Some(if path.is_empty() {
+        "/".to_string()
+    } else {
+        path.to_string()
+    })
+}
+
+/// Why a `page/navigate` target was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NavigateRejection {
+    /// Neither a relative path nor a same-origin absolute URL. The runner
+    /// cannot navigate here at all — a foreign host, a non-HTTP scheme.
+    NotNavigable,
+    /// Normalized fine, but resolves to a page key `PAGE_TO_TAB` has no route
+    /// for. Carries the rejected key.
+    UnroutedPage(String),
+}
+
+/// THE decision every `page/navigate` surface makes about a target: normalize
+/// first, then gate. Returns the NORMALIZED, app-relative url alongside the
+/// page key it resolves to.
+///
+/// One function, three callers — the REST control route, the SDK route's
+/// runner-local fallback (`sdk_client.rs`) and the GraphQL mutation
+/// (`graphql/mutation.rs`). All three previously wrote the gate as
+/// `if url.starts_with('/') { resolve_navigate_page(url) }`, which is three
+/// copies of the SAME false PASS: an absolute URL skipped the gate, and the
+/// frontend then discarded it while every surface answered success. Callers
+/// must forward the returned normalized url, not their original input —
+/// `usePageEvents.ts` acts on relative paths only.
+pub(crate) fn resolve_navigate_target(url: &str) -> Result<(String, String), NavigateRejection> {
+    let normalized = if url.starts_with('/') {
+        url.to_string()
+    } else {
+        same_origin_absolute_path(url).ok_or(NavigateRejection::NotNavigable)?
+    };
+    match resolve_navigate_page(&normalized) {
+        Ok(page) => Ok((normalized, page)),
+        Err(rejected) => Err(NavigateRejection::UnroutedPage(rejected)),
+    }
+}
+
 /// Navigate to a URL.
 ///
 /// Accepts an optional `mode` field:
@@ -546,6 +627,11 @@ pub async fn ui_bridge_page_close_request_handler(
 /// audit which behaviour the runner executed. The legacy `hard` flag is
 /// retained for back-compat — old clients that only read `hard` continue to
 /// work.
+///
+/// `url` in that block is the NORMALIZED target: a same-origin absolute URL
+/// (`http://localhost:9881/terminal`) is rewritten to its path (`/terminal`)
+/// before anything else happens, because that is what actually gets navigated
+/// to. See [`same_origin_absolute_path`].
 pub async fn ui_bridge_page_navigate_handler(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(request): UiBridgeJson<PageNavigateRequest>,
@@ -568,38 +654,9 @@ pub async fn ui_bridge_page_navigate_handler(
             Json(api_error(format!("Unsafe URL scheme rejected: {}", url))),
         ));
     }
-    if !url.starts_with('/') {
-        let is_valid_localhost = [
-            "http://localhost/",
-            "http://localhost:",
-            "https://localhost/",
-            "https://localhost:",
-            "http://127.0.0.1/",
-            "http://127.0.0.1:",
-            "https://127.0.0.1/",
-            "https://127.0.0.1:",
-        ]
-        .iter()
-        .any(|prefix| url.starts_with(prefix))
-            || url == "http://localhost"
-            || url == "https://localhost"
-            || url == "http://127.0.0.1"
-            || url == "https://127.0.0.1";
-
-        if !is_valid_localhost {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(api_error(format!(
-                    "Only relative URLs (starting with /) or localhost URLs are allowed, got: {}",
-                    url
-                ))),
-            ));
-        }
-    }
-
-    // ── Unrouted-target gate ────────────────────────────────────────────
+    // ── Normalize, then gate ─────────────────────────────────
     //
-    // Reject a path the app cannot reach, INSTEAD of reporting `success:
+    // Reject a target the app cannot reach, INSTEAD of reporting `success:
     // true` for a navigation that never happens. The runner has no URL
     // router: `usePageEvents.ts` turns the path into a page key and dispatches
     // `ui-bridge-navigate`, whose only listener looks the key up in
@@ -623,11 +680,24 @@ pub async fn ui_bridge_page_navigate_handler(
     // leaves nothing to misreport in the first place, and the caller gets the
     // rejected key back so it can self-correct.
     //
-    // Absolute localhost URLs are deliberately NOT gated here — the frontend
-    // ignores them entirely ("ignoring absolute URL navigation in runner"),
-    // which is a separate pre-existing behaviour, not this route table.
-    if url.starts_with('/') {
-        if let Err(rejected) = resolve_navigate_page(url) {
+    // Iteration 21: absolute same-origin URLs used to skip this gate entirely
+    // — the SAME false PASS, one gate over. `resolve_navigate_target`
+    // normalizes them to their path FIRST, so both spellings share one
+    // resolver and the gate is unconditional. The frontend is then handed the
+    // NORMALIZED url, because it discards absolute ones outright ("ignoring
+    // absolute URL navigation in runner") while still answering success.
+    let (normalized_url, _page) = match resolve_navigate_target(url) {
+        Ok(resolved) => resolved,
+        Err(NavigateRejection::NotNavigable) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "Only relative URLs (starting with /) or localhost URLs are allowed, got: {}",
+                    url
+                ))),
+            ));
+        }
+        Err(NavigateRejection::UnroutedPage(rejected)) => {
             let preview: Vec<&str> = VALID_NAVIGATE_PAGES.iter().take(12).copied().collect();
             warn!(
                 "UI Bridge API: page navigate to {} rejected — `{}` is not in PAGE_TO_TAB",
@@ -658,7 +728,14 @@ pub async fn ui_bridge_page_navigate_handler(
                 Json(api_error_detailed(message, detail)),
             ));
         }
+    };
+    if normalized_url != url {
+        info!(
+            "UI Bridge API: page navigate normalized same-origin absolute URL {} -> {}",
+            url, normalized_url
+        );
     }
+    let url: &str = normalized_url.as_str();
 
     // Validate and normalize the mode flag. Default = "hard" for back-compat.
     let mode = match normalize_navigate_mode(request.mode.as_deref()) {
@@ -1880,7 +1957,144 @@ mod navigate_route_gate_tests {
     //! These tests exercise `resolve_navigate_page`, the pure predicate the
     //! handler's gate is built on, in BOTH directions — a gate that rejected
     //! everything would end navigation entirely.
-    use super::{resolve_navigate_page, VALID_NAVIGATE_PAGES, VALID_TAB_IDS};
+    use super::{
+        resolve_navigate_page, same_origin_absolute_path, VALID_NAVIGATE_PAGES, VALID_TAB_IDS,
+    };
+
+    // -----------------------------------------------------------------------
+    // Manual-test-loop iteration 21, item 2 — the same false PASS, one gate
+    // over.
+    //
+    // Iteration 12 closed the hole for relative URLs. Absolute ones walked
+    // straight past it: measured on a live runner,
+    // `http://localhost:9881/terminal`, `http://127.0.0.1:9881/settings` AND
+    // `http://localhost:9881/zzz-bogus-i20` all returned HTTP 200
+    // `success: true` while the route stayed `/logs` — because the handler
+    // gated only `url.starts_with('/')`, and the frontend discards absolute
+    // URLs outright ("ignoring absolute URL navigation in runner") while still
+    // answering success.
+    //
+    // The fix normalizes same-origin absolutes to their path BEFORE the gate,
+    // so both spellings share ONE resolver rather than growing a second copy.
+    // These tests pin the normalizer; composing it with
+    // `resolve_navigate_page` below reproduces the handler's exact decision.
+    // -----------------------------------------------------------------------
+
+    /// The handler's decision, read off the SHARED resolver every navigate
+    /// surface uses. `Err(None)` = rejected before the gate (not same-origin);
+    /// `Err(Some(key))` = rejected BY the gate.
+    fn navigate_decision(url: &str) -> Result<String, Option<String>> {
+        match super::resolve_navigate_target(url) {
+            Ok((_normalized, page)) => Ok(page),
+            Err(super::NavigateRejection::NotNavigable) => Err(None),
+            Err(super::NavigateRejection::UnroutedPage(key)) => Err(Some(key)),
+        }
+    }
+
+    /// The resolver hands back the NORMALIZED url, not the caller's input —
+    /// forwarding the original is what left the frontend discarding it.
+    #[test]
+    fn the_resolver_returns_the_normalized_url_for_callers_to_forward() {
+        let (normalized, page) =
+            super::resolve_navigate_target("http://localhost:9881/terminal").unwrap();
+        assert_eq!(normalized, "/terminal");
+        assert_eq!(page, "terminal");
+        // A relative target passes through untouched.
+        let (normalized, _) = super::resolve_navigate_target("/settings").unwrap();
+        assert_eq!(normalized, "/settings");
+    }
+
+    #[test]
+    fn a_same_origin_absolute_url_normalizes_to_its_path() {
+        assert_eq!(
+            same_origin_absolute_path("http://localhost:9881/terminal"),
+            Some("/terminal".to_string())
+        );
+        assert_eq!(
+            same_origin_absolute_path("http://127.0.0.1:9881/settings"),
+            Some("/settings".to_string())
+        );
+        assert_eq!(
+            same_origin_absolute_path("https://localhost/settings/world-state-verifier"),
+            Some("/settings/world-state-verifier".to_string())
+        );
+        // No path at all is the root, not an empty key.
+        assert_eq!(
+            same_origin_absolute_path("http://localhost"),
+            Some("/".to_string())
+        );
+        assert_eq!(
+            same_origin_absolute_path("http://localhost:9881"),
+            Some("/".to_string())
+        );
+    }
+
+    /// A foreign host is NOT normalized — it must fall through to the
+    /// handler's outright rejection rather than being rewritten into a
+    /// same-origin path. `https://example.com/terminal` must never navigate
+    /// the runner to `/terminal`.
+    #[test]
+    fn a_foreign_absolute_url_is_not_normalized() {
+        assert_eq!(same_origin_absolute_path("https://example.com/x"), None);
+        assert_eq!(
+            same_origin_absolute_path("https://example.com/terminal"),
+            None
+        );
+        assert_eq!(
+            same_origin_absolute_path("http://localhost.evil.com/x"),
+            None
+        );
+        // Userinfo must not smuggle a foreign authority past the host check.
+        assert_eq!(same_origin_absolute_path("http://evil@localhost/x"), None);
+        // Not an HTTP URL at all.
+        assert_eq!(same_origin_absolute_path("/terminal"), None);
+        assert_eq!(same_origin_absolute_path("ftp://localhost/x"), None);
+    }
+
+    /// The four measured cases, end to end through the handler's decision.
+    #[test]
+    fn absolute_and_relative_navigation_decide_identically() {
+        // 1. absolute same-origin, valid → accepted (route moves)
+        assert_eq!(
+            navigate_decision("http://localhost:9881/terminal"),
+            Ok("terminal".to_string())
+        );
+        assert_eq!(
+            navigate_decision("http://127.0.0.1:9881/settings"),
+            Ok("settings".to_string())
+        );
+        // 2. absolute same-origin, bogus → rejected BY the gate (400
+        //    INVALID_REQUEST), not answered `success: true`.
+        assert_eq!(
+            navigate_decision("http://localhost:9881/zzz-bogus-i20"),
+            Err(Some("zzz-bogus-i20".to_string()))
+        );
+        // 3. relative valid → unchanged
+        assert_eq!(navigate_decision("/terminal"), Ok("terminal".to_string()));
+        // 4. relative bogus → unchanged (iteration 12's fix still holds)
+        assert_eq!(navigate_decision("/zzz"), Err(Some("zzz".to_string())));
+        // …and the foreign absolute is rejected before the gate ever runs.
+        assert_eq!(navigate_decision("https://example.com/x"), Err(None));
+    }
+
+    /// An absolute spelling must never be MORE permissive than its relative
+    /// form — the gate predicts the frontend, which sees only the path.
+    #[test]
+    fn an_absolute_spelling_is_never_more_permissive_than_the_relative_one() {
+        for path in ["/terminal", "/zzz", "/terminal?x=1", "/settings/nope", "/"] {
+            for origin in [
+                "http://localhost:9881",
+                "http://127.0.0.1:9881",
+                "https://localhost",
+            ] {
+                assert_eq!(
+                    navigate_decision(&format!("{origin}{path}")),
+                    navigate_decision(path),
+                    "{origin}{path} must decide exactly as {path} does"
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_real_page_resolves() {
