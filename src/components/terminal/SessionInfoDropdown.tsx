@@ -265,7 +265,10 @@ export function SessionInfoDropdown({
   if (!claudeSessionId) return null;
 
   return (
-    <div className="relative shrink-0" ref={containerRef}>
+    // `flex items-center`, not the bare block default: a block container
+    // gives its inline-block button a full line-box of leading, which inflated
+    // the 20px zone title bar to 28px and pushed it over the terminal.
+    <div className="relative shrink-0 flex items-center" ref={containerRef}>
       <button
         ref={triggerRef}
         /*

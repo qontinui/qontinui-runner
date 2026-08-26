@@ -45,3 +45,20 @@ export const TREND_ICONS: Record<string, { symbol: string; color: string }> = {
   down: { symbol: "\u25BC", color: "#f7768e" },
   stable: { symbol: "\u2015", color: "#565f89" },
 };
+
+/**
+ * Height of a zone's title bar — `ZoneLabel`, and the single-zone
+ * session-info strip that stands in for it.
+ *
+ * Both the bar and the terminal body's top padding read this, so it is a
+ * CONTRACT rather than a description: `ZoneLabel` sets it explicitly, and
+ * anything taller is clipped instead of silently overlapping the first line of
+ * output. It drifted to 28px once — a `relative` dropdown wrapper is a block
+ * container, so its inline-block button picked up the inherited line-height as
+ * leading — and nothing caught it, because the padding was a magic number
+ * agreeing with the bar only by hand.
+ */
+export const ZONE_HEADER_HEIGHT_PX = 20;
+
+/** Height of a zone's output-filter bar, when open. */
+export const ZONE_FILTER_BAR_HEIGHT_PX = 26;

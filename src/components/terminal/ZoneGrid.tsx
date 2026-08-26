@@ -36,6 +36,8 @@ import {
   formatUptime,
   countMatches,
   showSoloSessionInfo,
+  ZONE_HEADER_HEIGHT_PX,
+  ZONE_FILTER_BAR_HEIGHT_PX,
 } from "./zone-grid";
 import {
   useTerminalSession,
@@ -69,12 +71,6 @@ export type ViewMode = "auto" | "full" | "compact";
  * the value is now stated once and shared by both.
  */
 const MAXIMIZED_HEADER_HEIGHT_PX = 26;
-
-/** Height of the per-zone title bar (`ZoneLabel` / the solo session-info strip). */
-const ZONE_HEADER_HEIGHT_PX = 20;
-
-/** Height of the per-zone output-filter bar, when open. */
-const ZONE_FILTER_BAR_HEIGHT_PX = 26;
 
 interface ZoneGridProps {
   /** Callbacks from useZoneActions — kept as props until that hook moves to context */
