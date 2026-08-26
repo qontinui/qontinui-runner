@@ -625,6 +625,97 @@ export function useControlEvents(
             return key;
           };
 
+          // `keyCode` / `which` are the LEGACY numeric key identifiers. They
+          // are deprecated in the spec and still read by a large amount of real
+          // handler code — xterm.js, CodeMirror, every `e.keyCode === 13`
+          // Enter check, and the jQuery-era `which` idiom. Omitting them (as
+          // this loop did) ships every synthetic event with `keyCode: 0`, so
+          // such a listener sees a keystroke it cannot identify: the same
+          // "dispatch reports success while reaching nothing" failure the
+          // `code` fix above closed, one field over.
+          //
+          // Mirrors the same table `keyToCode` mirrors. When ui-bridge's
+          // `core/key-events.ts` builder ships in a published
+          // `@qontinui/ui-bridge` — it names this copy as "the third duplicate
+          // this module exists to retire" — delete both local tables and call
+          // it instead; the runner consumes the SDK as a package, so it cannot
+          // import an unpublished one today.
+          const NAMED_KEY_CODES: Record<string, number> = {
+            Backspace: 8,
+            Tab: 9,
+            Enter: 13,
+            Shift: 16,
+            Control: 17,
+            Alt: 18,
+            Pause: 19,
+            CapsLock: 20,
+            Escape: 27,
+            PageUp: 33,
+            PageDown: 34,
+            End: 35,
+            Home: 36,
+            ArrowLeft: 37,
+            ArrowUp: 38,
+            ArrowRight: 39,
+            ArrowDown: 40,
+            Insert: 45,
+            Delete: 46,
+            Meta: 91,
+            ContextMenu: 93,
+            NumLock: 144,
+            ScrollLock: 145,
+            F1: 112,
+            F2: 113,
+            F3: 114,
+            F4: 115,
+            F5: 116,
+            F6: 117,
+            F7: 118,
+            F8: 119,
+            F9: 120,
+            F10: 121,
+            F11: 122,
+            F12: 123,
+          };
+          // Punctuation keyCodes are the US-layout PHYSICAL key numbers, which
+          // is what a `keyCode` has always meant — `;` and `:` are both 186.
+          const PUNCTUATION_KEY_CODES: Record<string, number> = {
+            ";": 186,
+            ":": 186,
+            "=": 187,
+            "+": 187,
+            ",": 188,
+            "<": 188,
+            "-": 189,
+            _: 189,
+            ".": 190,
+            ">": 190,
+            "/": 191,
+            "?": 191,
+            "`": 192,
+            "~": 192,
+            "[": 219,
+            "{": 219,
+            "\\": 220,
+            "|": 220,
+            "]": 221,
+            "}": 221,
+            "'": 222,
+            '"': 222,
+          };
+          const keyToKeyCode = (key: string): number => {
+            if (key.length === 1) {
+              const upper = key.toUpperCase();
+              if (upper >= "A" && upper <= "Z") return upper.charCodeAt(0);
+              if (key >= "0" && key <= "9") return key.charCodeAt(0);
+              if (key === " ") return 32;
+              const punctuation = PUNCTUATION_KEY_CODES[key];
+              if (punctuation !== undefined) return punctuation;
+              return upper.charCodeAt(0);
+            }
+            return NAMED_KEY_CODES[key] ?? 0;
+          };
+
           const delay = typeof params.delay === "number" ? params.delay : 0;
           let dispatched = 0;
           let defaultPrevented = false;
@@ -637,9 +728,12 @@ export function useControlEvents(
             const key = keyDesc?.key;
             if (!key) continue;
             const mods = keyDesc.modifiers ?? {};
+            const legacyKeyCode = keyToKeyCode(key);
             const eventInit: KeyboardEventInit = {
               key,
               code: keyToCode(key),
+              keyCode: legacyKeyCode,
+              which: legacyKeyCode,
               bubbles: true,
               cancelable: true,
               ctrlKey: !!mods.ctrl,

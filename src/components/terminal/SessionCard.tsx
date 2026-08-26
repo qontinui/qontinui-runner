@@ -1,5 +1,6 @@
 import { memo, useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useUIElement } from "@qontinui/ui-bridge";
 import {
   TerminalSquare,
   Eye,
@@ -187,6 +188,23 @@ export function sessionCardTooltip(
     return `${base}\ntranscript name: ${transcriptName}`;
   }
   return base;
+}
+
+/**
+ * Author-controlled UI-Bridge control id for one session card.
+ *
+ * Same convention as `SESSION_MANAGER_TOGGLE_ID`
+ * (`terminal.session-manager-toggle`) and `ZoneHoverActions`'
+ * `terminal.close-session-<id>`. The stamp is load-bearing rather than
+ * decorative: `useAutoRegister` preserves an existing stamp verbatim, skips
+ * collision-suffixing for stamped ids and early-returns on re-registration,
+ * whereas the auto-derived id is minted from the element's TEXT — and a card's
+ * text is the session title, which changes whenever Claude re-titles the
+ * session or the operator runs `/rename`. An auto id would therefore go stale
+ * mid-session and silently strand any driver holding it.
+ */
+export function sessionCardElementId(sessionId: string): string {
+  return `terminal.session-card-${sessionId}`;
 }
 
 /**
@@ -394,6 +412,29 @@ function SessionCardInner({
     return () => document.removeEventListener("mousedown", handler);
   }, [contextMenu]);
 
+  const cardName = sessionCardName(session);
+  // Registered on the card's main BUTTON, not the wrapper `<div>`: the button
+  // is what actually opens the transcript (a click dispatched at the wrapper
+  // would not reach the child handler), and it spans the whole visible card
+  // row, so its rect is the card's rect.
+  //
+  // The display title travels as a `data-*` attribute rather than as
+  // `data-ui-bridge-content` on the title `<span>`. Both would remove the
+  // `span.text-xs.truncate.flex-1` + `page/evaluate` scrape, but the content
+  // attribute registers a SECOND element per card whose value the driver still
+  // has to read as text — two ids and two reads for one card, and the text of
+  // that span is the only field it can ever carry. `ElementState.dataset`
+  // projects EVERY `data-*` attribute of the element the driver already
+  // addresses, so one `GET /control/element/terminal.session-card-<id>`
+  // returns the title, the live status and the account together, each as its
+  // own typed field — and none of them polluted by the meta row, the badges
+  // or the promote/commit status lines that share the button's `textContent`.
+  const { ref: cardBridgeRef } = useUIElement({
+    id: sessionCardElementId(session.sessionId),
+    type: "button",
+    label: cardName,
+  });
+
   return (
     <div
       onContextMenu={handleContextMenu}
@@ -415,6 +456,19 @@ function SessionCardInner({
       `}
     >
       <button
+        ref={cardBridgeRef}
+        data-ui-bridge-id={sessionCardElementId(session.sessionId)}
+        // Projected verbatim into `ElementState.dataset` (camelCased), so a
+        // driver reads the card's fields off one element instead of scraping
+        // its rendered text.
+        data-session-id={session.sessionId}
+        data-session-title={cardName}
+        data-session-status={session.liveStatus}
+        data-session-account={session.accountLabel}
+        // `accessibleName` and `ai/find` resolve on this. `title` carries the
+        // rich multi-line tooltip, which makes a poor name, so the headline is
+        // stated separately here; the tooltip is unchanged visually.
+        aria-label={cardName}
         onClick={() => onViewTranscript(session)}
         className="w-full text-left px-3 py-2 pr-20"
         title={sessionCardTooltip(session)}
