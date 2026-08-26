@@ -32,6 +32,7 @@ import {
   prKey,
   prLabel,
   prPanelRows,
+  landSignalLabel,
   prRowChip,
   sessionInfoElementId,
   sessionInfoRows,
@@ -282,7 +283,24 @@ describe("prRowChip", () => {
       { repo: "qontinui/qontinui-runner", prNumber: 1, landedAt: null, landSignal: "ff-land" },
       undefined,
     );
-    expect(chip).toEqual({ text: "ff-land", tone: "landed" });
+    expect(chip).toEqual({ text: "landed (ff)", tone: "landed" });
+  });
+
+  it("renders coord's own `coord:landed` chip as a land", () => {
+    const chip = prRowChip(
+      opened({ prNumber: 1, prState: "closed" }),
+      { repo: "qontinui/qontinui-runner", prNumber: 1, landedAt: null, landSignal: "coord-label" },
+      undefined,
+    );
+    expect(chip).toEqual({ text: "landed (coord)", tone: "landed" });
+  });
+
+  it("shows an unrecognised land signal verbatim rather than inventing a name", () => {
+    // A newer backend can record a signal this frontend has never heard of.
+    // It is still a land; the honest chip is the token itself.
+    expect(landSignalLabel("some-future-signal")).toBe("some-future-signal");
+    // A landed row with NO recorded signal is still landed.
+    expect(landSignalLabel(null)).toBe("landed");
   });
 
   it("renders a GitHub merge as `merged`", () => {
@@ -309,11 +327,22 @@ describe("prRowChip", () => {
     expect(chip).toEqual({ text: "unknown — ref_stale", tone: "unknown" });
   });
 
-  it("distinguishes a closed-not-landed PR from an open one", () => {
-    expect(prRowChip(opened({ prNumber: 1, prState: "closed" }), undefined, undefined)).toEqual({
-      text: "closed, not landed",
-      tone: "not-landed",
-    });
+  it("never claims a closed PR did not land — it claims the land is unverified", () => {
+    // THE REGRESSION GUARD for the dropdown half of the ff-land defect. A
+    // closed row with no land verdict used to read "closed, not landed",
+    // which was printed on PRs coord had rebase-fast-forward landed: those
+    // rewrite the shas, so the backend's ancestry probe could never have
+    // proven the land it was implicitly asserting the absence of.
+    const chip = prRowChip(opened({ prNumber: 1, prState: "closed" }), undefined, undefined);
+    expect(chip.text).not.toBe("closed, not landed");
+    expect(chip.tone).not.toBe("not-landed");
+    expect(chip).toEqual({ text: "closed — land unverified", tone: "unknown" });
+  });
+
+  it("still distinguishes a closed PR from an open one", () => {
+    expect(prRowChip(opened({ prNumber: 1, prState: "closed" }), undefined, undefined).text).toBe(
+      "closed — land unverified",
+    );
     expect(prRowChip(opened({ prNumber: 1, prState: null }), undefined, undefined)).toEqual({
       text: "open",
       tone: "open",
