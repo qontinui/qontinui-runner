@@ -2296,8 +2296,18 @@ impl TerminalSession {
         // interactive + continuation terminals (headless agent subprocesses use a
         // separate direct-spawn path), so it can never elevate an agent session;
         // and `provision_coord_mcp_config_file` returns None on an unresolvable
-        // bound port — then we inject nothing (no broken `--mcp-config`, no cwd
-        // breadcrumb pollution), mirroring the `--settings` fail-open.
+        // bound port — then we inject nothing (no broken `--mcp-config`),
+        // mirroring the `--settings` fail-open.
+        //
+        // Phase 4 (plan 2026-08-24-headless-box-has-no-working-coord-credential-
+        // door): that None arm now RECORDS itself. It used to be silent on the
+        // stated ground that a cwd breadcrumb is pollution — but the file's
+        // absence was then ambiguous between "healthy", "not yet probed" and
+        // "provisioning never ran", and the third is exactly the state that let a
+        // box sit un-provisioned with nothing observable. A spawn that provisions
+        // nothing leaves a NOT PROVISIONED breadcrumb naming the reason; a spawn
+        // that DOES provision clears any stale one, so the marker never outlives
+        // the condition it describes.
         //
         // THIS terminal's id is passed through: it keys both the app-data
         // filename and the minted nonce binding, so two terminals sharing one
@@ -2318,18 +2328,44 @@ impl TerminalSession {
                     terminal_id = %terminal_id,
                     "coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection"
                 );
-            } else if let Some(cfg_path) =
-                crate::coord_mcp::provision_coord_mcp_config_file(cwd, Some(terminal_id))
-            {
-                cmd.env(
-                    crate::coord_mcp::MCP_CONFIG_ENV,
-                    cfg_path.to_string_lossy().as_ref(),
-                );
-                info!(
-                    terminal_id = %terminal_id,
-                    path = %cfg_path.display(),
-                    "coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery"
-                );
+            } else {
+                match crate::coord_mcp::provision_coord_mcp_config_file(cwd, Some(terminal_id)) {
+                    Some(cfg_path) => {
+                        cmd.env(
+                            crate::coord_mcp::MCP_CONFIG_ENV,
+                            cfg_path.to_string_lossy().as_ref(),
+                        );
+                        info!(
+                            terminal_id = %terminal_id,
+                            path = %cfg_path.display(),
+                            "coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery"
+                        );
+                        // This cwd HAS coord-mcp now — retire any breadcrumb a
+                        // previous un-provisioned spawn left behind.
+                        crate::coord_mcp::clear_degraded_breadcrumb(cwd);
+                    }
+                    None => {
+                        // Provisioning was ATTEMPTED and produced nothing. The
+                        // one way that happens is the fail-closed port resolve
+                        // in `mint_device_proxy_config` (no live Tauri runtime /
+                        // managed AppState), plus an app-data write failure —
+                        // both of which `provision_coord_mcp_config_file` has
+                        // already warned about with the specific error. Name the
+                        // OUTCOME here so the session's own cwd carries it.
+                        warn!(
+                            terminal_id = %terminal_id,
+                            cwd = %cwd,
+                            "coord-mcp: no --mcp-config provisioned for this terminal — \
+                             the session starts with NO coord-mcp"
+                        );
+                        crate::coord_mcp::write_unprovisioned_breadcrumb(
+                            cwd,
+                            "the runner could not materialize a --mcp-config for this \
+                             terminal (bound API port unresolvable, or the app-data \
+                             write failed) — see the runner log for the specific error",
+                        );
+                    }
+                }
             }
         }
 
