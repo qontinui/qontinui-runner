@@ -2831,7 +2831,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path().join("cfg");
         let project_path = r"D:\some\project";
-        let dir = config_dir.join("projects").join(encode_project_path(project_path));
+        let dir = config_dir
+            .join("projects")
+            .join(encode_project_path(project_path));
         fs::create_dir_all(&dir).unwrap();
         let lines = [
             r#"{"type":"user","uuid":"a","timestamp":"t1","message":{"role":"user","content":"real prompt"}}"#,
@@ -2841,8 +2843,14 @@ mod tests {
             r#"{"type":"user","uuid":"e","timestamp":"t5","message":{"role":"user","content":[{"type":"tool_result","content":"output"}]}}"#,
             r#"{"type":"user","uuid":"f","timestamp":"t6","message":{"role":"user","content":"second prompt"}}"#,
         ];
-        fs::write(dir.join("sess.jsonl"), lines.join("
-")).unwrap();
+        fs::write(
+            dir.join("sess.jsonl"),
+            lines.join(
+                "
+",
+            ),
+        )
+        .unwrap();
 
         let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
         assert!(!out.unchanged);
@@ -2860,7 +2868,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path().join("cfg");
         let project_path = r"D:\some\project";
-        let dir = config_dir.join("projects").join(encode_project_path(project_path));
+        let dir = config_dir
+            .join("projects")
+            .join(encode_project_path(project_path));
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("sess.jsonl"),
@@ -2874,7 +2884,10 @@ mod tests {
         let second =
             read_user_prompts(&config_dir, project_path, "sess", Some(first.mtime_ms)).unwrap();
         assert!(second.unchanged, "same mtime must skip the parse");
-        assert!(second.prompts.is_empty(), "an unchanged read carries no body");
+        assert!(
+            second.prompts.is_empty(),
+            "an unchanged read carries no body"
+        );
     }
 
     #[test]

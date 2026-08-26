@@ -332,8 +332,7 @@ pub async fn transcript_read_user_prompts(
     // real transcript here, 10.4 MB. Keep it off the async worker.
     let result = tokio::task::spawn_blocking(move || {
         for dir in &config_dirs {
-            if let Ok(r) =
-                transcript::read_user_prompts(dir, &project, &session_id, since_mtime_ms)
+            if let Ok(r) = transcript::read_user_prompts(dir, &project, &session_id, since_mtime_ms)
             {
                 return Some(r);
             }
