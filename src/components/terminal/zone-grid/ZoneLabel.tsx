@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { ChevronDown, Pin, Filter, ArrowDownToLine, Zap } from "lucide-react";
+import { ChevronDown, Pin, Filter, ArrowDownToLine, Zap, MessageSquare } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
@@ -55,6 +55,8 @@ export function ZoneLabel({
   outputByteSize,
   onToggleFilter,
   filterActive,
+  onTogglePrompts,
+  promptsVisible,
 }: {
   tab: TerminalTab;
   state: SessionState;
@@ -72,6 +74,9 @@ export function ZoneLabel({
   outputByteSize?: number;
   onToggleFilter?: () => void;
   filterActive?: boolean;
+  /** Omitted when the tab has no Claude session — there are no prompts to show. */
+  onTogglePrompts?: () => void;
+  promptsVisible?: boolean;
 }) {
   const [showSelector, setShowSelector] = useState(false);
   const [editingLabel, setEditingLabel] = useState(false);
@@ -325,6 +330,25 @@ export function ZoneLabel({
           title="Filter output"
         >
           <Filter className="w-2.5 h-2.5" />
+        </button>
+      )}
+
+      {onTogglePrompts && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onTogglePrompts();
+          }}
+          onMouseDown={(e) => e.stopPropagation()}
+          className={`p-0.5 rounded transition-colors shrink-0 ${
+            promptsVisible
+              ? "text-[#9ece6a] bg-[#9ece6a]/15"
+              : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+          }`}
+          title={promptsVisible ? "Hide my prompts" : "Show my prompts"}
+          aria-pressed={promptsVisible ?? false}
+        >
+          <MessageSquare className="w-2.5 h-2.5" />
         </button>
       )}
 
