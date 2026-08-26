@@ -877,17 +877,17 @@ mod tests {
         fn shape_error_suggestions() -> Option<Vec<String>> {
             Some(vec![
                 "Required field: `assertions` (array of Assertion objects).".to_string(),
-                "Assertion `type` values: no_overlap, contains_text, text_fits_container, \
-                 aligned_horizontally, aligned_vertically, color_within, \
-                 typography_consistent, no_layout_shift_since, no_clipping, \
-                 animation_settled, contrast_meets_wcag."
+                "Assertion `type` values: no_overlap, element_above, contains_text, \
+                 text_fits_container, aligned_horizontally, aligned_vertically, \
+                 color_within, typography_consistent, no_layout_shift_since, \
+                 no_clipping, animation_settled, contrast_meets_wcag."
                     .to_string(),
             ])
         }
         fn shape_error_data() -> Option<serde_json::Value> {
             Some(serde_json::json!({
                 "allowedAssertionTypes": [
-                    "no_overlap", "contains_text", "text_fits_container",
+                    "no_overlap", "element_above", "contains_text", "text_fits_container",
                     "aligned_horizontally", "aligned_vertically", "color_within",
                     "typography_consistent", "no_layout_shift_since", "no_clipping",
                     "animation_settled", "contrast_meets_wcag"
@@ -918,6 +918,13 @@ mod tests {
                 .iter()
                 .any(|t| t.as_str() == Some("contrast_meets_wcag")),
             "contrast_meets_wcag must be in allowed types"
+        );
+        // This stub DUPLICATES `AssertRequest`'s hint rather than deriving
+        // from it, so a variant added to the DSL has to be typed in twice.
+        // Pinning the newest one is what makes the duplication survivable.
+        assert!(
+            types.iter().any(|t| t.as_str() == Some("element_above")),
+            "element_above must be in allowed types"
         );
     }
 
