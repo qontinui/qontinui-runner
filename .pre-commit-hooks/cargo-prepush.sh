@@ -297,12 +297,23 @@ echo "[pre-push] cargo clippy (levels from Cargo.toml [lints.clippy]; deny-tier 
 #
 # `set -o pipefail` is already on (line 23), so the pipeline's status is cargo's
 # whenever cargo is the failing stage.
+#
+# `|| clippy_rc=$?` rather than `if ! cargo …; then rc=$?` — the SAME idiom the
+# metadata preflight above uses, and for the same reason. Inside the body of an
+# `if ! cmd`, `$?` is the status of the NEGATION, which is always 0. This block
+# used to read `if ! cargo clippy …; then rc=$?`, so `rc` was always 0: the
+# `-eq 127` arm below could never fire on its own, and the honest-terminal arm
+# reported "cargo clippy exited 0" in a branch reached only on non-zero exit —
+# a misleading number in the one message written specifically to avoid asserting
+# a cause it cannot support.
 CLIPPY_LOG="$(mktemp)"
 cleanup_clippy_log() { rm -f "$CLIPPY_LOG"; }
 trap 'restore_lock; cleanup_clippy_log' EXIT
 
-if ! cargo clippy 2>&1 | tee "$CLIPPY_LOG"; then
-  rc=$?
+clippy_rc=0
+cargo clippy 2>&1 | tee "$CLIPPY_LOG" || clippy_rc=$?
+if [[ "$clippy_rc" -ne 0 ]]; then
+  rc="$clippy_rc"
   echo
   # Classify by what the log actually contains. Order matters: resource and
   # toolchain failures can also emit an `error:` line, so they are tested first.
