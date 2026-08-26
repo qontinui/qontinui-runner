@@ -59,6 +59,26 @@
 # guilty pushers with nothing to notice. Out-of-repo inputs (the qontinui-schemas
 # path deps, its TS compile step) are deliberately absent: a push to THIS repo
 # cannot change them, so they can never be this push's fault.
+
+# The base-ref cascade this library measures "before this push" against lives
+# in a NEUTRAL sibling: `lib/push-range.sh`. It was moved out because the cargo
+# pre-push gate needs the same cascade and has nothing to do with codegen
+# attribution. Sourced rather than duplicated — one implementation, two
+# opposite fallback policies (see that file's header).
+#
+# Guarded rather than sourced bare: under `set -e` a missing library aborts
+# with a raw bash "No such file or directory", and every caller of this file is
+# a hook that promises a typed message instead.
+GEN_EVENTS_ATTRIBUTION_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ ! -f "$GEN_EVENTS_ATTRIBUTION_LIB_DIR/push-range.sh" ]; then
+    echo "[gen-events-drift] ERROR: missing $GEN_EVENTS_ATTRIBUTION_LIB_DIR/push-range.sh" >&2
+    echo "[gen-events-drift] It ships with this repo and carries the base-ref cascade" >&2
+    echo "[gen-events-drift] attribution measures this push against. Restore it." >&2
+    return 1 2>/dev/null || exit 1
+fi
+# shellcheck source=push-range.sh
+. "$GEN_EVENTS_ATTRIBUTION_LIB_DIR/push-range.sh"
+
 # Drop the git environment a HOOK inherits, so `git -C <dir>` actually means
 # that directory.
 #
@@ -110,25 +130,6 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     "rust-toolchain.toml"
 )
 
-# Resolve the ref this push is measured against: the branch's own upstream
-# first (so "my commits" means the ones not yet pushed), then the remote's
-# default branch, then origin/main. Prints the ref name, or nothing.
-gen_events_attribution_base_ref() {
-    local repo="$1" ref
-    for ref in \
-        "$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)" \
-        "$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)" \
-        "origin/main"
-    do
-        [ -n "$ref" ] || continue
-        git -C "$repo" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1 || continue
-        git -C "$repo" merge-base HEAD "$ref" >/dev/null 2>&1 || continue
-        printf '%s\n' "$ref"
-        return 0
-    done
-    return 1
-}
-
 # Decide attribution for the repo at $1. Sets, in the caller's shell:
 #
 #   ATTRIBUTION_STATE   mine | pre-existing | unavailable
@@ -158,7 +159,7 @@ gen_events_attribution() {
     fi
 
     local ref
-    if ! ref="$(gen_events_attribution_base_ref "$repo")"; then
+    if ! ref="$(push_base_ref "$repo")"; then
         ATTRIBUTION_UNAVAILABLE_REASON="no upstream branch, origin/HEAD or origin/main to measure this push against"
         return 0
     fi
