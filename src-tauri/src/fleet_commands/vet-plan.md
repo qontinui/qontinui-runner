@@ -178,18 +178,19 @@ deliberately answers `200` with `citations: []` plus a `citations_error` /
 `delivery_error` key and no `delivery`, so reading its status line instead of
 those keys turns a degraded read into a confident "no citations".
 
-**Evaluate the arms in this order — 6, 4, 3, 2, 1, 5. The order is load-bearing**
-(several responses match more than one row, and the later rows are the
-permissive ones):
+**Evaluate the arms in this order — 4, 3, 2, 1, 5, then 6. The order is
+load-bearing** (several responses match more than one row, and 1/5 are the
+conclusive ones). **Arm 6 is the DEFAULT**: anything not positively matched by
+4, 3, 2, 1 or 5 is arm 6, so no response can fall off the end of the table:
 
 | # | Response | Reading | Do |
 |---|---|---|---|
-| 6 | **Any error other than arm 4's**, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool being masked / absent / on a dead transport (`"Command failed with no output"`) | **UNKNOWN.** Includes coord's `citation surface unavailable for work-unit …` (whose own text says it is NOT "this unit has no citations") and its generic `citation list failed: …`. | Treat as arm 2. On a dead transport run **`/coord-revive`** and re-issue over the live door before concluding anything. |
 | 4 | the error `no work-unit with that slug in your tenant` | The unit does not exist. **The COMMONEST case** — a first-time vet of a `DRAFT` plan has no work unit, because §5.4 upserts it at the *end* of this run. | **Proceed to vet, and SAY the read was not-found.** An absent unit and an uncited-but-present unit are different facts; do not fold one into the other. |
 | 3 | a top-level `merged_degraded_reason` is present | **UNKNOWN, whatever `delivery` says.** The field sits BESIDE `delivery` and is present even when the verdict could not be derived at all; while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. | Treat as arm 2. |
 | 2 | `evidence_complete: false` — **regardless of `shipped`** | **UNKNOWN — never "undelivered".** `evidence_gaps` names each gap. | Fall through to the stamp arms and **say the read was inconclusive**, per `verification-and-evidence` `unknown-must-not-render-as-a-default`. |
 | 1 | `shipped: true` ∧ `evidence_complete: true` | The plan is closed **in substance**. | **Do NOT vet** (see "Act here" below). Route to closeout. |
 | 5 | `delivery` present ∧ no `merged_degraded_reason` ∧ `evidence_complete: true` ∧ `shipped: false` | A clean, complete observation of *not delivered* — including the zero-citation case. | Proceed to vet. |
+| 6 | **DEFAULT — anything not positively matched above.** Any error other than arm 4's, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport (`"Command failed with no output"`) | **UNKNOWN.** Includes coord's `citation surface unavailable for work-unit …` (whose own text says it is NOT "this unit has no citations") and its generic `citation list failed: …`. | Treat as arm 2. On a dead transport run **`/coord-revive`** and re-issue over the live door before concluding anything. |
 
 Arm 5 is stated as a **positive predicate on purpose.** It was written as
 "anything else" and that was a fail-open default: every shape in arm 6 — coord
@@ -220,12 +221,20 @@ rewritten the plan on disk by then, so a refusal written there refuses nothing.
 If, on the values captured above:
 
 - delivery resolves to **arm 1** (the work has landed), or
-- the status block reads `IN PROGRESS` and resolves to **case 3 or the
-  unidentified default** of §5's disposition table (a live peer, or a stamp you
-  cannot positively attribute),
+- the status block reads `IN PROGRESS` with a session marker that is neither
+  yours nor absent, and it resolves to **case 3 or the unidentified default** of
+  §5's disposition table (a live peer, or a stamp you cannot positively
+  attribute). **Run case 2's probes HERE to decide that** — they are the only
+  thing separating "adopt" from "a peer is mid-flight", and every one of them is
+  read-only: does the stamping session's transcript tail show it died; are its
+  worktrees clean and 0 ahead of `origin/main`; do any PRs or branches exist for
+  the plan. If all of them hold this is case 2 (**adopt**) and you proceed — do
+  not STOP. If any fails, STOP.
 
-then **STOP NOW**: report it with the evidence, release the plan reserve, and
-make **no edit**. Nothing has been written yet, which is the whole reason this
+then **STOP NOW**: report it with the evidence and make **no edit**. Release the
+plan reserve only if THIS run acquired it — skip the release when the reserve
+came back `renewed` (under `/vet-imp` the orchestrator holds it), and skip it
+entirely in a copy of this command that has no reserve step of its own. Nothing has been written yet, which is the whole reason this
 step sits ahead of §4 rather than inside §5.
 
 Carry both captured results forward. §5's "`IN PROGRESS` is CONDITIONALLY
@@ -462,30 +471,42 @@ pass produces fresher information.)
 above, and adding it as one would be a regression: it has three dispositions,
 and the file stamp cannot tell them apart in either direction.
 
-**This section consumes the two values Step 0.25 captured** — the verbatim
-status block (token, date, session marker) and the delivery arm. Do **not**
-re-read the stamp here: the single-stamp invariant below tells you to delete
-every status-adjacent blockquote, so by this point the marker is gone. Do not
-re-issue the delivery read either. If Step 0.25 resolved to delivery arm 1, or
-to case 3 / the unidentified default below, this run should already have
-stopped there without editing anything.
+**This section consumes a CAPTURE STEP's two values** — the verbatim status
+block (token, date, session marker) and the delivery arm from the arm table.
+Which step captured them, and whether the stamp is still readable here, depends
+on the command you are reading:
+
+| Command | Capture step | Stamp still readable at this point? |
+|---|---|---|
+| `/vet-plan` | **Step 0.25** | **No.** §4 has already rewritten the plan, and the single-stamp invariant below deletes every status-adjacent blockquote, so the marker is gone. Consume the capture: do not re-read the stamp, and do not re-issue the delivery read. |
+| `/implement-plan` | **Step 0.45 check 1** (read-only, pre-reserve) | **Yes.** Step 0.5 is that command's FIRST write, so the stamp is intact — read it there and run the arm table inline. |
+
+If the capture already resolved to delivery arm 1, or to case 3 / the
+unidentified default below, that run should have stopped at its capture step
+without editing anything.
+
+**The arms below are scoped to a status block that reads `IN PROGRESS`.** A
+`DRAFT`, absent, `PARTIAL` or `NOT STARTED` block is governed by the paragraph
+above this section, not by this table — do not read the "anything else" row as
+refusing a first-time vet.
 
 | # | Case | Discriminator (from Step 0.25's capture) | Disposition |
 |---|---|---|---|
 | 1 | Work has **landed** | delivery **arm 1** | **Refuse.** Do not overwrite; route to closeout. |
 | 2 | The stamping session is **dead with zero work products** | the marker is a session id ≠ yours, AND its transcript tail shows death, AND its worktrees are clean and 0 ahead of `origin/main`, AND no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED` and record the takeover as the `History:` line **inside that one block** (never a second blockquote — see the single-stamp invariant), naming both session ids and the evidence. |
 | 3 | The stamping session is a **LIVE PEER** | the marker is a session id ≠ yours and case 2's checks do NOT all hold | **STOP.** Do not vet and do not implement. |
-| — | **Anything else** — the stamp carries **no** session marker, carries **your own**, or you cannot positively attribute it | there is no evidence of death and no evidence it is yours | **STOP**, exactly as case 3. |
+| 0 | The marker **IS** your own current session id | a resume, or a Step 0.5 re-run | **Refresh**, never take over: update the date and keep the trail. |
+| — | **Anything else** — the stamp carries **no** session marker, or one you cannot positively attribute | no evidence of death, and no evidence it is yours | **STOP**, exactly as case 3. |
+
+Evaluate case 0 first — a run that positively identifies the marker as **its own
+current session id** is refreshing its own stamp, not taking one over.
 
 **The unidentified default is not a formality.** An unmarked `IN PROGRESS` stamp
 (hand-written, operator-written, or predating the marker convention) matches
 neither case 2 nor case 3, and without this row the reader falls back to the
 pre-change behaviour — overwrite — which is the regression this section opens by
 forbidding. It bites hardest in the motivating scenario: under delivery arm 2 or
-3 (UNKNOWN) with an unmarked stamp, no other row fires at all. The one case that
-may proceed on a self-marked stamp is a run that can positively identify the
-marker as **its own current session id** — a resume or a Step 0.5 re-run — which
-refreshes rather than takes over.
+3 (UNKNOWN) with an unmarked stamp, no other row fires at all.
 
 **Case 3 is invisible to the delivery read, by construction** — a peer
 mid-implementation has no merged PRs yet, so the unit returns
