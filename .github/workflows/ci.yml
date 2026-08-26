@@ -27,6 +27,45 @@ on:
     # integration branch must be listed here for stacked-PR CI to fire. CI has
     # no `paths:` filter, so adding the branch suffices.
     branches: [main, develop, 'session-restore-**']
+    # `labeled`: without an explicit `types:` this defaults to
+    # [opened, synchronize, reopened] and NEVER fires on `labeled`. That gap is
+    # what breaks the declared-adaptation handshake, measured on 2026-08-25:
+    # #1150's `checkout-sibling` step resolved the schemas sibling at
+    # 17:17:49.90Z and correctly logged "no declaration — 2 API calls"; the
+    # `coord:downstream-of=qontinui/qontinui-schemas#145` label landed at
+    # 17:18:01Z, ~11 seconds later; and nothing re-ran the PR's CI against the
+    # now-declared ref. The declaration existed and was never read.
+    #
+    # qontinui-schemas' own consumer gate already does this
+    # (`runner-consumer-check.yml`: `types: [opened, synchronize, reopened,
+    # labeled, unlabeled]`), which is why IT re-fired 5s after its label and
+    # this side did not. The asymmetry was the bug.
+    #
+    # Cost is one CI run per label event on a runner PR, bounded by the human
+    # labelling rate. If a bot ever labels in a loop, narrow with a job-level
+    # `if: startsWith(github.event.label.name, 'coord:')` rather than by
+    # removing the trigger. Plan: 2026-08-25-merge-train-blind-to-main-side-breakage
+    # (Phase 00).
+    types: [opened, synchronize, reopened, labeled]
+
+  # Lets coord re-run main's CI on demand — the transport the merge train needs
+  # when a sibling repo's `main` moves under a floating `path` dependency and
+  # runner `main`'s meaning changes without a runner commit.
+  #
+  # coord's `ci_runs_watcher` already dispatches `ci.yml` on the default branch
+  # via `github_app::workflow_dispatch`, and explicitly anticipates the 404 this
+  # absence produced: "`ci.yml` is missing or has no `workflow_dispatch:`
+  # trigger (push/PR-only)". Declaring the trigger is what makes that shipped
+  # sender reachable at all.
+  #
+  # ⚠️ Declaring it is NECESSARY BUT NOT SUFFICIENT for the merge train to react.
+  # `ci_baseline::establishes_main_baseline` is `event == Some("push")`, so a
+  # `workflow_dispatch` run writes `coord.ci_runs` only and NEVER a
+  # `coord.ci_baselines` row — `MainCiStatus` stays `Green` and no main-red
+  # detector fires. That is deliberate (it stops a manual probe reddening the
+  # train). Consuming a dispatched verdict needs the coord-side provenance arm
+  # tracked as Phase 2c of the plan above; this trigger is only the transport.
+  workflow_dispatch:
 
 # Least-privilege, stated explicitly rather than inherited.
 #
