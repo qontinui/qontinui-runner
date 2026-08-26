@@ -517,6 +517,11 @@ async function evaluateOverlay(
         const ccResult = await crossCheckText(live, {
           ocr: ocrProvider,
           tolerance,
+          // Hand over the rest of the page so the classifier can run its
+          // `occluded` rule. Without a registry that rule is skipped and a
+          // covered label falls through to `font-not-loaded` — the same
+          // DOM-text-present / OCR-empty signature, the wrong diagnosis.
+          registry: elements,
         });
         if (ccResult.skipped) {
           // Capture or OCR couldn't run; treat as a deferred check rather
@@ -540,6 +545,10 @@ async function evaluateOverlay(
               ocrText: ccResult.ocrText,
               similarity: ccResult.similarity,
               cause: ccResult.cause,
+              // Present only on an `occluded` verdict — the element on top
+              // and how much of the target it covers. This is the half that
+              // makes the failure fixable rather than merely reported.
+              ...(ccResult.occlusion ? { occlusion: ccResult.occlusion } : {}),
             },
           };
         }
