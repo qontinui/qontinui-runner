@@ -65,7 +65,7 @@ import {
   resolveZoneIndex,
   type SessionOrigin,
 } from "./sessionRecordArgs";
-import { buildAiLaunchCommand } from "./aiLaunchCommand";
+import { buildAiLaunchCommandForTab } from "./aiLaunchCommand";
 import {
   getActiveProjectHint,
   subscribeActiveProject,
@@ -1074,6 +1074,10 @@ function TerminalPageInner({
       const tabId = await createAndAssignTerminal(label, undefined, spawnTenant);
       if (tabId) createdTabIds.push(tabId);
     }
+    // Tabs that actually received a launch command. A build failure disposes
+    // its own tab (see below), so it must not appear here: the caller — and the
+    // deferred context write — would otherwise be handed a tab that is gone.
+    const launchedTabIds: string[] = [];
     if (createdTabIds.length > 0) {
       const spawnAt = Date.now();
       for (const tabId of createdTabIds) {
@@ -1082,11 +1086,22 @@ function TerminalPageInner({
         // Rust launch-spec builder reads the operator's per-account override +
         // global template from settings itself; the frontend only supplies the
         // fresh id it needs synchronously for updateTab/recordSessionOpen.
-        const { command, pinnedSessionId } = await buildAiLaunchCommand({
-          configDir,
-          isWindows,
-          sessionId: crypto.randomUUID(),
-        });
+        //
+        // The PTY already exists at this point, so a throw here (a Tauri fault,
+        // a data-less response) would strand a bare shell with no toast and no
+        // log. `…ForTab` closes that orphan, fires the page's error toast and
+        // answers null — we skip the tab rather than type into a dead one.
+        const launch = await buildAiLaunchCommandForTab(
+          tabId,
+          { configDir, isWindows, sessionId: crypto.randomUUID() },
+          {
+            disposeTab: closeTerminal,
+            notify: (message) => workflowGen.setNotification({ message, type: "error" }),
+          },
+        );
+        if (!launch) continue;
+        const { command, pinnedSessionId } = launch;
+        launchedTabIds.push(tabId);
         writeWhenReady(tabId, `${command}\r`);
         if (pinnedSessionId) {
           updateTab(tabId, { claudeSessionId: pinnedSessionId, claudeConfigDir: configDir });
@@ -1103,16 +1118,16 @@ function TerminalPageInner({
           startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
         }
       }
-      if (context) {
+      if (context && launchedTabIds.length > 0) {
         const safeContext = context.replace(/\n/g, " ");
         setTimeout(() => {
-          for (const tabId of createdTabIds) {
+          for (const tabId of launchedTabIds) {
             writeWhenReady(tabId, `${safeContext}\r`);
           }
         }, 8000);
       }
     }
-    return createdTabIds;
+    return launchedTabIds;
   };
 
   // Phase 1b — register the Terminal-page command set. Sources the spawn
