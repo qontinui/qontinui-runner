@@ -101,17 +101,75 @@ repos:
         files: '^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-drift-attribution-test\.sh)$'
         pass_filenames: false
 
+      # Same reasoning one file over: the base-ref cascade in
+      # `lib/push-range.sh` and the diff-scoping + workspace-preflight
+      # behaviour `cargo-prepush.sh` builds on it now have tests, and a test
+      # that nothing invokes is a test that quietly stops being run.
+      #
+      # Toolchain-free by construction: throwaway git repos under $TMPDIR plus
+      # a recording `cargo` shim on PATH, so "did the gate run?" is answered
+      # without a Rust build. (Two arms DO use a real `cargo metadata` to
+      # assert on cargo's own manifest-load error text; they SKIP with a stated
+      # reason when cargo is absent.)
+      #
+      # Explicitly `stages: [pre-commit]`, unlike the entry above. The pre-push
+      # stage set is what a direct-shim installer has to mirror, so this test
+      # deliberately does not enlarge it — it gates the edit, which is when it
+      # can actually catch something.
+      - id: push-range-test
+        name: push-range cascade + cargo-prepush scoping — tests
+        entry: bash .pre-commit-hooks/push-range-test.sh
+        language: system
+        stages: [pre-commit]
+        # A passing run should still say which arms it exercised (it reports
+        # skips, which a bare "Passed" would hide).
+        verbose: true
+        files: '^\.pre-commit-hooks/(lib/push-range\.sh|push-range-test\.sh|cargo-prepush\.sh)$'
+        pass_filenames: false
+
       # Pre-push only: cargo fmt (auto-apply, never blocks) + cargo clippy
       # (deny-tier blocks), mirroring CI's Rust gate. Runs once per
       # `git push` (not per commit), and only when src-tauri/ changed in
       # the pushed range. Lets you catch the same lint/fmt failures CI
       # would 8-15 min later in 60-90s locally.
       #
+      # "The pushed range" is resolved by the cascade in
+      # `.pre-commit-hooks/lib/push-range.sh` (`@{upstream}` -> `origin/HEAD`
+      # -> `origin/main`), NOT by a bare `@{u}`. Until 2026-08-26 this comment
+      # was simply wrong: the hook keyed the scoping on `@{u}` alone, an
+      # allocated agent worktree's branch has no upstream until its first push
+      # completes, so the scoping never fired there and every worktree push —
+      # TS-only ones included — paid the full Rust gate. When the cascade can
+      # resolve nothing at all, the hook still runs the gate: it fails OPEN,
+      # deliberately.
+      #
       # The halves are decoupled: QONTINUI_PREPUSH_SKIP=1 skips only the
       # expensive clippy build and still auto-applies fmt.
       # QONTINUI_PREPUSH_SKIP_ALL=1 skips both.
       #
-      # Install once with: pre-commit install --hook-type pre-push
+      # QONTINUI_PREPUSH_STRICT=1 turns the hook's typed DECLINE into a hard
+      # failure. It declines (exit 0, with a framed message naming cause,
+      # remedy and residual coverage) when `cargo metadata` cannot load the
+      # workspace at all — the normal case being a checkout with no sibling
+      # `qontinui-schemas`, which src-tauri/Cargo.toml path-deps. That is a
+      # property of the local environment, not of the pushed code, and CI
+      # still gates BOTH halves (`cargo fmt -- --check` and `cargo clippy`
+      # inside the required `test (ubuntu-22.04)` context, plus the parallel
+      # `clippy-windows` job), so declining costs latency and not coverage.
+      #
+      # ARMING IT. The hook does nothing until this repo's git hooks are
+      # installed, and that is opt-in. One command:
+      #
+      #   bash ../qontinui-claude-config/scripts/install-repo-git-hooks.sh
+      #   bash ../qontinui-claude-config/scripts/install-repo-git-hooks.sh --check
+      #
+      # The installer's primary mechanism is still
+      # `pre-commit install --hook-type pre-push` — it just also handles the
+      # machines where `pre-commit` itself is absent, and its `--check` answers
+      # "is the gate armed here, and by which mechanism?" without reading any
+      # file by eye. Installing once in the primary checkout arms every linked
+      # worktree, because worktrees share `.git/hooks` through the git common
+      # dir.
       - id: cargo-prepush
         name: cargo fmt + clippy (pre-push)
         entry: bash .pre-commit-hooks/cargo-prepush.sh
