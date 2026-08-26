@@ -223,6 +223,8 @@ Avoid the half-pattern (lock without RAII, or RAII without poison recovery): the
 
 A PR is ready to merge when every required workflow is green on the PR's HEAD commit. Don't merge through red, and don't assume someone else's red is "fine" because `main` is also red — that's how `main` ended up with a 685-run failure streak going back to 2025-09-24.
 
+That is the condition you can see. There is a second one you can't: coord scores `main` itself before it will **enqueue** your PR, and a red there blocks the PR with `block_reason_code: "main-red"` no matter how green your HEAD is. See "Advisory on a PR is not harmless on `main`" below — a workflow can be advisory at PR time and still hold the whole merge train shut from `main`.
+
 ### What "main is green" means here
 
 Workflows in `.github/workflows/` split into three tiers. The authoritative list of what actually blocks a merge is the `main-merge-gates` ruleset (see "Branch protection" below) — it pins **check-context names**, so this section and the ruleset must be kept in sync whenever a job is renamed, added, or split out.
@@ -245,7 +247,28 @@ Workflows in `.github/workflows/` split into three tiers. The authoritative list
 
 - `ci-integrity.yml` → `Guard gating workflows from self-edits`. Goes **red by design** on any PR that edits one of the gating workflow files, so coord will not auto-land it and an operator reviews the diff. Do not "fix" this red and do not remove a file from its gating list.
 - `clippy-tiers.yml` → `Clippy nightly (unscoped, all-targets)` + `Clippy diff-scoped (advisory)`. Ubuntu-only, advisory by design; not a substitute for either blocking clippy context above.
-- `qontinui-types-drift.yml`, `reproducibility-gate.yml`, `atlas-exclude-fresh.yml`, `page-spec-paths.yml`, `frontend-coverage-producer.yml`.
+- `reproducibility-gate.yml`, `atlas-exclude-fresh.yml`, `page-spec-paths.yml`, `frontend-coverage-producer.yml`.
+- `qontinui-types-drift.yml` — advisory **on your PR**, but read the next section before treating its `main` red as someone else's problem. Its `push` half is not advisory to anything.
+
+### Advisory on a PR is not harmless on `main`
+
+"Not a merge gate" above means *not a required context on your PR*. It does not mean the workflow cannot block merges, because coord — the actual merge authority — reads a different signal: the state of `main`. Two properties make that signal easy to misread, and the combination cost this repo ten days of partially-blocked merge train in August 2026 (PR #1107).
+
+**Only a `push` run re-baselines coord.** coord scores `main` from the last run of each workflow, and `crates/coord/src/ci_baseline.rs` accepts the `push` event and nothing else:
+
+```rust
+assert!(establishes_main_baseline(Some("push")));
+assert!(!establishes_main_baseline(Some("workflow_dispatch")));
+assert!(!establishes_main_baseline(Some("schedule")));
+```
+
+So `gh workflow run <workflow> --ref main` — the obvious way to refresh a stale red — clears the red in the GitHub UI and changes nothing coord can see. For a paths-filtered workflow, the only thing that re-baselines it is a commit landing on `main` that touches one of its `paths:`. If it went red for a reason *outside* its own filter (the standing case: a sibling repo drifted), nothing in this repo re-runs it and the red freezes indefinitely.
+
+**"PRs are landing" is not evidence the gate is clear.** `main-red` is consulted at **enqueue**, not at land. Already-queued PRs sail through a frozen red while every new one is refused, so the train looks alive from the outside the entire time.
+
+The remedy, and the invariant that makes it available: every paths-filtered workflow lists **its own file** in its `paths:`, so editing the workflow is itself a valid thaw — landing that edit fires a fresh `push` run. That also means a PR editing a paths-filtered gate actually runs the gate, instead of landing unexercised. `src-tauri/tests/workflow_paths_self_inclusion.rs` enforces both halves; if you add a `paths:` filter, add the workflow's own path to it.
+
+Use a dispatch to learn whether a drift is really fixed. Use a push to tell coord.
 
 **Not PR-time at all** (validated at release time):
 
