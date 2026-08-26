@@ -280,8 +280,21 @@ Rules:
 - If the existing block is `Status: VETTED <date>`, replace it with the IN PROGRESS line above and reference the vet date in the body (`Started from VETTED 2026-05-02.`).
 - If the existing block is `Status: DRAFT` or absent, add the IN PROGRESS block but warn the user in your first text turn that the plan was not vetted — give them a chance to abort and run `/vet-plan` first.
 - If the existing block is `Status: PARTIAL` or `Status: NOT STARTED` (set by `/verify-plan-status`), replace it with the IN PROGRESS block and capture the prior state in the body's `History:` line. Don't run `/vet-plan` first unless the user asks — `/verify-plan-status` doesn't supplant a vet pass, but a recent NOT STARTED is also not a reason to re-vet.
-- If the existing block is already `IN PROGRESS`, refresh the date and append your session marker — multiple agents may pick up the same plan; keep the trail.
+- If the existing block is already `IN PROGRESS`, do NOT simply refresh the date and append your session marker. Apply the three-way disposition in `/vet-plan`'s "`IN PROGRESS` is CONDITIONALLY overwritable" section (keep the two in sync): consult `coord_work_unit_list_citations(<plan-stem>).delivery` FIRST — a `shipped: true` ∧ `evidence_complete: true` means the work has landed, so **STOP and route to closeout** rather than re-running phase agents against `main`. Otherwise, an `IN PROGRESS` stamp carrying a session marker ≠ yours is a **live peer** unless you can positively verify the stamping session is dead with zero work products (transcript tail shows death; worktrees clean and 0 ahead of `origin/main`; no PRs and no branches for the plan). Verified-dead → adopt and append your marker, keeping the trail. Not verified → **STOP**; refreshing the date over a live peer is how PR #479 was built against work PR #468 had already merged.
 - If the existing block is `SHIPPED` / `SUPERSEDED` / `OBSOLETE`, STOP — implementing a shipped plan is almost certainly a mistake. Confirm with the user before proceeding.
+
+> **Why the delivery read and not just the token list.** The stamp is an
+> authoring-surface artifact that lags by construction: a session that correctly
+> stops with a gate watching (coord is the sole merge authority, so it cannot land
+> its own last PR) leaves the plan at `IN PROGRESS` *by design*, and that stamp
+> stays stale until someone flips it. Meanwhile coord derives
+> `work_unit.status = shipped` from merged PR citations and refuses a hand-written
+> `shipped` (`422 status_is_derived`), so the derived delivery is the one signal
+> that cannot lag. Measured 2026-08-26 on
+> `2026-08-20-merge-status-review-required-conflates-two-causes`: five independent
+> signals said *shipped* while the plan file said `IN PROGRESS 2026-08-25`.
+> Read `verification-and-evidence` `unknown-must-not-render-as-a-default` before
+> collapsing any UNKNOWN arm into "not shipped".
 
 **Transition the work-unit registry directly when you stamp IN PROGRESS.** The
 IN PROGRESS stamp drives `unit_status` gates, which watch the work unit's `status`
