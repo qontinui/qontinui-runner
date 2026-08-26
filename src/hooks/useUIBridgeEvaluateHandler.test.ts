@@ -226,10 +226,15 @@ describe("handleEvaluateRequest", () => {
       await pending;
       const [, payload] = deps.emit.mock.calls[0];
       expect(payload).toMatchObject({ request_id: "hang", ok: false });
-      // The message names the caller's budget (less the 250 ms head start the
-      // frontend takes so its message beats the Rust dispatcher's), not the
-      // fixed 30 s default cap.
-      expect((payload as { error: string }).error).toMatch(/within 4\.8s/);
+      // The message now leads with the REQUESTED budget (5.0s) and names the
+      // derived await separately, because quoting only the derived number is
+      // what made the old "9.8s" read as an undocumented cap. Both appear, so
+      // this still proves the caller's budget — not the 30 s default — was
+      // honoured.
+      const err = (payload as { error: string }).error;
+      expect(err).toMatch(/within 5\.0s/);
+      expect(err).toMatch(/awaited 4\.8s/);
+      expect(err).toContain("came from the `timeoutMs` you sent");
     } finally {
       vi.useRealTimers();
     }

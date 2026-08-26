@@ -25,6 +25,9 @@ import {
   resolveEvaluateTimeoutMs,
   PAGE_EVALUATE_MAX_TIMEOUT_MS,
   PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+  describeEvaluateBudget,
+  evaluateTimeoutMessage,
+  PAGE_EVALUATE_MIN_TIMEOUT_MS,
 } from "./utils";
 
 describe("isThenable", () => {
@@ -449,5 +452,56 @@ describe("resolveEvaluateTimeoutMs — caller-supplied page/evaluate budget", ()
     ["a string", "60000"],
   ])("falls back to the default cap for %s", (_label, raw) => {
     expect(resolveEvaluateTimeoutMs(raw)).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
+  });
+});
+
+
+describe("describeEvaluateBudget + evaluateTimeoutMessage (U1: the 9.8s that read as a cap)", () => {
+  it("reports the DEFAULT as a default, not as a cap", () => {
+    const budget = describeEvaluateBudget(undefined);
+    expect(budget.fromDefault).toBe(true);
+    expect(budget.requestedMs).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
+
+    const msg = evaluateTimeoutMessage(budget.awaitMs, budget);
+    // the requested budget, not the derived await, leads the sentence
+    expect(msg).toContain("did not resolve within 30.0s");
+    expect(msg).toContain("DEFAULT budget, not a cap");
+    expect(msg).toContain("timeoutMs");
+    expect(msg).toContain(`${PAGE_EVALUATE_MIN_TIMEOUT_MS}-${PAGE_EVALUATE_MAX_TIMEOUT_MS}ms`);
+  });
+
+  it("attributes a caller-supplied budget to the caller", () => {
+    const budget = describeEvaluateBudget(60_000);
+    expect(budget.fromDefault).toBe(false);
+    expect(budget.requestedMs).toBe(60_000);
+
+    const msg = evaluateTimeoutMessage(budget.awaitMs, budget);
+    expect(msg).toContain("did not resolve within 60.0s");
+    expect(msg).toContain("came from the `timeoutMs` you sent");
+    expect(msg).not.toContain("DEFAULT budget");
+  });
+
+  it("names the reporting margin rather than silently shortening the budget", () => {
+    // THE ORIGINAL DEFECT: the message quoted 10000-250 = "9.8s" with no
+    // explanation, so a caller read an arbitrary number as a hard ceiling.
+    const budget = describeEvaluateBudget(10_000);
+    const msg = evaluateTimeoutMessage(budget.awaitMs, budget);
+    expect(msg).toContain("did not resolve within 10.0s");
+    expect(msg).toContain("awaited 9.8s");
+    expect(msg).toContain("250ms is reserved");
+  });
+
+  it("stays byte-compatible with resolveEvaluateTimeoutMs", () => {
+    for (const raw of [undefined, null, 0, -1, NaN, "60000", 1, 1_000, 10_000, 600_000, 5_000_000]) {
+      expect(describeEvaluateBudget(raw).awaitMs).toBe(resolveEvaluateTimeoutMs(raw));
+    }
+  });
+
+  it("keeps the frontend-vs-Rust discriminator verbatim", () => {
+    // This leading clause is how a caller tells a frontend timeout from the
+    // Rust side's generic "UI Bridge page_evaluate timed out after Xms".
+    expect(evaluateTimeoutMessage(5_000)).toBe(
+      "page_evaluate: Promise did not resolve within 5.0s",
+    );
   });
 });
