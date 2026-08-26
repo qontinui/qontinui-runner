@@ -1,0 +1,206 @@
+name: ci-rerun-on-declaration
+
+# Re-run this PR's `ci.yml` when a cross-repo sibling DECLARATION is added to or
+# removed from it, so the declaration is actually acted on.
+#
+# ---------------------------------------------------------------------------
+# THE RACE THIS CLOSES (measured, 2026-08-25)
+# ---------------------------------------------------------------------------
+#
+# runner#1150 was opened at 17:17:32Z. Its CI resolved the qontinui-schemas
+# sibling at 17:17:49.90Z and logged:
+#
+#     Using qontinui/qontinui-schemas ref: main (no declaration — 2 API calls,
+#     no PR-detail read)
+#
+# The declaration `coord:downstream-of=qontinui/qontinui-schemas#145` was applied
+# at 17:18:01Z — 11 s too late. `ci.yml`'s `pull_request:` trigger carried no
+# `types:`, so it defaults to `[opened, synchronize, reopened]` and never fires
+# on `labeled`. NOTHING re-ran #1150's CI. The schemas consumer gate then went
+# green on the premise that a declared adaptation existed and compiled, the
+# breaking change landed at 18:00:58Z, and runner `main` was un-compilable for
+# hours: 8 merge candidates from 8 distinct PRs each rediscovered the identical
+# `error[E0063]: missing field \`snapshot_id\``, burning 466 candidate job-minutes
+# (7.8 runner-hours) to learn one fact eight times.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS A SEPARATE WORKFLOW AND NOT `types: [labeled]` ON `ci.yml`
+# ---------------------------------------------------------------------------
+#
+# Both grounds are documented at length at the `pull_request:` block in
+# `ci.yml`; in short:
+#
+#   - `labeled` fires on every label add including on an already-MERGED PR
+#     (verified on schemas#143: merged 23:33:09Z, `coord:landed` 23:33:11Z, run
+#     32605532207 created 23:33:13Z). `ci.yml` costs ~144 job-min green and has
+#     no concurrency group, so that is ~1,150 job-min/36 h of post-merge waste.
+#
+#   - Narrowing it with a job-level `if:` is WORSE, not better: an `if:`-skipped
+#     job still publishes a check run with conclusion `skipped`, and coord's
+#     `classify_check_rows` treats `skipped` as passing. A label add would
+#     overwrite a red PR's real conclusions with `skipped` and flip it green.
+#
+# A re-run has neither problem. It republishes the SAME check names with REAL
+# conclusions, and it only ever happens for a label this repo's sibling resolver
+# actually reads.
+#
+# ---------------------------------------------------------------------------
+# WHY A RE-RUN PICKS UP THE NEW LABEL
+# ---------------------------------------------------------------------------
+#
+# A re-run replays the ORIGINAL event payload, whose `labels` array is stale. It
+# works anyway because `checkout-sibling` does not read the payload: it reads the
+# labels LIVE, via `api "repos/${THIS_REPO}/issues/${PR_NUMBER}/labels"`
+# (.github/actions/checkout-sibling/action.yml). Nothing else in `ci.yml` reads
+# `github.event.pull_request.labels`. So attempt 2 resolves the sibling against
+# the label set as it stands NOW, which is the whole point.
+#
+# ---------------------------------------------------------------------------
+# SCOPE OF THE LABEL MATCH
+# ---------------------------------------------------------------------------
+#
+# `checkout-sibling` reads exactly two prefixes off THIS PR (its forms 2 and 3):
+# `coord:downstream-of=` and `coord:upstream-of=`. Its other two forms are
+# reverse searches over the SIBLING repo's PRs — a label event here cannot
+# observe those, and re-running on them is coord's job (a reverse dispatch), not
+# this workflow's. Everything else in the `coord:*` namespace — `coord:landed`,
+# `coord:stacked-on=`, `coord:merge-strategy=` — changes no sibling ref and must
+# not cost a CI run. Over runner PRs 1132–1161 that match rule admits 9 of 19
+# label events and rejects all 8 post-merge `coord:landed`.
+#
+# `unlabeled` is deliberate and symmetric: removing a declaration silently
+# reverts sibling resolution to the default branch, so a verdict obtained under
+# the declaration must not be allowed to stand. qontinui-schemas'
+# runner-consumer-check.yml takes the same position for the same reason.
+
+on:
+  pull_request:
+    # Mirror `ci.yml`'s base-branch filter exactly. A PR whose CI this workflow
+    # cannot re-run is a PR it must not fire for.
+    branches: [main, develop, 'session-restore-**']
+    types: [labeled, unlabeled]
+
+permissions:
+  contents: read
+  # `actions: write` is the minimum that can cancel and re-run a workflow run;
+  # it is the only reason this workflow exists. The repo's
+  # `default_workflow_permissions` is "read", which sets a DEFAULT — an explicit
+  # workflow-level `permissions:` block still elevates above it (clorinde-
+  # bindings-fresh.yml and release.yml already rely on that here).
+  actions: write
+  pull-requests: read
+
+jobs:
+  rerun:
+    name: Re-run CI on a sibling declaration
+    runs-on: ubuntu-latest
+    # A cancel can take a short while to settle before a re-run is accepted;
+    # everything else here is a handful of API calls. Nothing in this job
+    # compiles.
+    timeout-minutes: 15
+
+    steps:
+      # The guard is a STEP-level `if:`, not a job-level one, and that is
+      # load-bearing. A job-level `if:` would publish this job's check run as
+      # `skipped`; a step-level one leaves the job `success` in ~5 s. That
+      # distinction does not matter for this workflow's own (new, non-required)
+      # check name, but keeping the safe shape here means nobody copies the
+      # dangerous shape out of this file into `ci.yml`.
+      - name: Re-run ci.yml so checkout-sibling re-resolves the declared sibling
+        if: >-
+          startsWith(github.event.label.name, 'coord:downstream-of=') ||
+          startsWith(github.event.label.name, 'coord:upstream-of=')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          ACTION: ${{ github.event.action }}
+          SELF_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          note() { echo "$*"; echo "$*" >> "${GITHUB_STEP_SUMMARY}"; }
+
+          note "### ci-rerun-on-declaration"
+          note ""
+          note "- PR: \`${REPO}#${PR_NUMBER}\` @ \`${HEAD_SHA}\`"
+          note "- Event: \`${ACTION}\` \`${LABEL_NAME}\`"
+
+          # This workflow run was created BY the label event, so its creation
+          # time is the best available proxy for when the label landed — the
+          # `pull_request` payload carries no label timestamp.
+          label_time="$(gh api "repos/${REPO}/actions/runs/${SELF_RUN_ID}" -q .created_at)"
+          note "- Label observed at: \`${label_time}\`"
+
+          # Newest ci.yml run for this exact head, from the pull_request event.
+          run_json="$(
+            gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${HEAD_SHA}&event=pull_request&per_page=100" \
+              -q '[.workflow_runs[]] | sort_by(.created_at) | last // empty'
+          )"
+
+          if [ -z "${run_json}" ]; then
+            # No run to re-run. Not a failure: CI for this head may not have been
+            # created yet, in which case it will start AFTER the label and read
+            # it correctly on its first attempt — the race cannot occur.
+            note ""
+            note "No \`ci.yml\` run exists yet for this head. Nothing to re-run — a run"
+            note "created after the label reads it on its first attempt."
+            exit 0
+          fi
+
+          run_id="$(printf '%s' "${run_json}" | jq -r .id)"
+          run_status="$(printf '%s' "${run_json}" | jq -r .status)"
+          run_started="$(printf '%s' "${run_json}" | jq -r '.run_started_at // .created_at')"
+          note "- Target run: [\`${run_id}\`](https://github.com/${REPO}/actions/runs/${run_id}) (\`${run_status}\`, started \`${run_started}\`)"
+
+          # If that run started at or after the label landed, it already read the
+          # new label set live and a re-run would buy nothing. Conservative by
+          # construction: when the two are close we re-run rather than skip,
+          # because `checkout-sibling` resolves ~15 s into the run and a run that
+          # started slightly BEFORE the label may still have read it.
+          if [ "$(printf '%s\n%s\n' "${label_time}" "${run_started}" | sort | head -1)" = "${label_time}" ] \
+             && [ "${run_started}" != "${label_time}" ]; then
+            note ""
+            note "Run started after the label landed — it already resolved the sibling"
+            note "against the current label set. No re-run."
+            exit 0
+          fi
+
+          # An in-progress run cannot be re-run (the API rejects it), and this one
+          # is precisely the run that raced the label: it resolved the sibling
+          # before the declaration existed, so its verdict is already wrong. Cancel
+          # it, then re-run. This is the ONLY cancellation this change introduces —
+          # deliberately not a `concurrency: cancel-in-progress` group on `ci.yml`,
+          # which would also kill legitimate in-flight runs on `synchronize` and
+          # manufacture exactly the "unverified tip (cancelled/absent gating CI)"
+          # condition coord's ci_runs_watcher had to be built to repair.
+          if [ "${run_status}" != "completed" ]; then
+            note ""
+            note "Run is \`${run_status}\` and raced the label — cancelling before re-run."
+            gh api -X POST "repos/${REPO}/actions/runs/${run_id}/cancel" >/dev/null || true
+            for _ in $(seq 1 60); do
+              run_status="$(gh api "repos/${REPO}/actions/runs/${run_id}" -q .status)"
+              [ "${run_status}" = "completed" ] && break
+              sleep 10
+            done
+            if [ "${run_status}" != "completed" ]; then
+              note ""
+              note "⚠️ Run did not reach \`completed\` within 10 min; leaving it alone."
+              note "Re-run \`ci.yml\` by hand on this PR to act on \`${LABEL_NAME}\`."
+              exit 0
+            fi
+          fi
+
+          note ""
+          if gh api -X POST "repos/${REPO}/actions/runs/${run_id}/rerun" >/dev/null; then
+            note "✅ Re-ran \`ci.yml\` run \`${run_id}\`. \`checkout-sibling\` reads labels live,"
+            note "so the new attempt resolves the sibling against \`${LABEL_NAME}\`."
+          else
+            # Never fail the PR on this. This workflow is not a required check and
+            # must not become one: a declaration that fails to re-trigger CI is a
+            # missed re-resolution, not a reason to block the PR.
+            note "⚠️ Could not re-run \`ci.yml\` run \`${run_id}\`."
+            note "Re-run it by hand so \`${LABEL_NAME}\` is acted on."
+          fi
