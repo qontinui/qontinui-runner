@@ -50,8 +50,10 @@ import { ZonePromptsPanel, PROMPTS_PANEL_RIGHT_WIDTH_PX } from "./ZonePromptsPan
 import {
   promptsPanelAvailable,
   promptsPanelOrientation,
+  promptsStripHeight,
   zoneBodyPadding,
 } from "./promptsPanelLayout";
+import { useElementHeight } from "./useElementHeight";
 import { classifyTabs, type TabClassification } from "./classifyTabs";
 import { useZoneVirtualization } from "./useZoneVirtualization";
 import {
@@ -64,6 +66,15 @@ import { writeToTerminalById } from "./writeToTerminalById";
 import { useTabHotSlice } from "./useTerminalHotStore";
 
 export type ViewMode = "auto" | "full" | "compact";
+
+/** Per-page storage key for the set of tabs showing their prompts panel. */
+export function promptTabsStorageKey(pageId: string): string {
+  return pageKey(pageId, "zone-prompt-tabs");
+}
+
+function loadPromptTabs(pageId: string): Set<string> {
+  return new Set(instanceStorage.getJSON<string[]>(promptTabsStorageKey(pageId), []));
+}
 
 /**
  * Height of the maximized-view header strip. It used to be implicit (`py-1`
@@ -275,11 +286,25 @@ function ZoneGridInner({
   // layout changes underneath it (unlike `pinnedZones`, which is a property of
   // the zone and gets migrated on layout change). Persisted per page so a
   // reopened window comes back with the same panels showing.
-  const [promptTabs, setPromptTabs] = useState<Set<string>>(
-    () => new Set(instanceStorage.getJSON<string[]>(pageKey(pageId, "zone-prompt-tabs"), [])),
-  );
+  const [promptTabs, setPromptTabs] = useState<Set<string>>(() => loadPromptTabs(pageId));
+  // Which page the state in `promptTabs` actually belongs to.
+  //
+  // ZoneGrid does NOT remount on a page switch (App.tsx dropped the
+  // `key={activePageId}` remount), so `pageId` changes underneath live state:
+  // the lazy initializer above runs once and never re-reads. Without this
+  // guard the persist effect would write page A's Set into page B's key and
+  // destroy B's saved panels — silently, since switching back to A looks fine.
+  const promptTabsPageRef = useRef(pageId);
   useEffect(() => {
-    instanceStorage.setJSON(pageKey(pageId, "zone-prompt-tabs"), [...promptTabs]);
+    if (promptTabsPageRef.current !== pageId) {
+      promptTabsPageRef.current = pageId;
+      // Adopting the new page's persisted state IS the effect; the write
+      // below is skipped this pass, so the old page's Set is never persisted
+      // under the new page's key.
+      setPromptTabs(loadPromptTabs(pageId));
+      return;
+    }
+    instanceStorage.setJSON(promptTabsStorageKey(pageId), [...promptTabs]);
   }, [promptTabs, pageId]);
   const togglePromptsForTab = useCallback((tabId: string) => {
     setPromptTabs((prev) => {
@@ -590,16 +615,18 @@ function ZoneGridInner({
           </div>
         )}
 
-        {tab?.claudeSessionId && maximizedPromptsOpen && (
-          <ZonePromptsPanel
-            claudeSessionId={tab.claudeSessionId}
-            configDir={tab.claudeConfigDir}
-            projectPath={tab.workingDir}
-            orientation="right"
-            topOffsetPx={MAXIMIZED_HEADER_HEIGHT_PX}
-            onClose={() => togglePromptsForTab(tab.id)}
-          />
-        )}
+        {tab?.claudeSessionId &&
+          maximizedPromptsOpen &&
+          tabClassification.get(tab.id) !== "hidden" && (
+            <ZonePromptsPanel
+              claudeSessionId={tab.claudeSessionId}
+              configDir={tab.claudeConfigDir}
+              projectPath={tab.workingDir}
+              orientation="right"
+              topOffsetPx={MAXIMIZED_HEADER_HEIGHT_PX}
+              onClose={() => togglePromptsForTab(tab.id)}
+            />
+          )}
 
         {/* eslint-disable-next-line react-hooks/refs -- terminalRefs is a stable Map-cache (see above). */}
         {layout.zones.map((_, zoneIdx) => {
@@ -625,8 +652,16 @@ function ZoneGridInner({
               key={zoneTab.id}
               className={isVisible ? "h-full w-full" : "hidden"}
               style={
-                isVisible && maximizedPromptsOpen
-                  ? { paddingRight: `${PROMPTS_PANEL_RIGHT_WIDTH_PX}px` }
+                isVisible
+                  ? {
+                      // The header is an absolute overlay here too, so without
+                      // this it covers the terminal's first line — it always
+                      // did; naming its height is what made that visible.
+                      paddingTop: `${MAXIMIZED_HEADER_HEIGHT_PX}px`,
+                      paddingRight: maximizedPromptsOpen
+                        ? `${PROMPTS_PANEL_RIGHT_WIDTH_PX}px`
+                        : undefined,
+                    }
                   : undefined
               }
               onMouseDown={(e) => handleZoneMouseDown(zoneIdx, e)}
@@ -1098,8 +1133,12 @@ function ZoneCellInner({
 
   // Reusable zone-cell DOM registry (Phase 3 observer target + Phase 4 scroll
   // routing). Register only in flow mode — preset layouts never scroll.
+  // Same node the flow-mode registry tracks, kept as a plain ref so the
+  // prompts panel can measure the zone it has to fit inside.
+  const zoneElRef = useRef<HTMLDivElement | null>(null);
   const cellRef = useCallback(
     (el: HTMLDivElement | null) => {
+      zoneElRef.current = el;
       if (!isFlowMode || !tabId) return;
       if (el) registerCell(tabId, el);
       else unregisterCell(tabId);
@@ -1135,14 +1174,23 @@ function ZoneCellInner({
     showCompactCard,
   });
   const showPromptsPanel = promptsAvailable && promptsOpen;
-  const promptsOrientation = promptsPanelOrientation(isSingleView);
+  // Measured only while a panel is open — a closed panel allocates no observer.
+  const zoneHeightPx = useElementHeight(zoneElRef, showPromptsPanel);
   const zoneHeaderPx = showLabels || soloSessionInfo ? ZONE_HEADER_HEIGHT_PX : 0;
   const filterBarPx = showFilterInput === zoneIdx ? ZONE_FILTER_BAR_HEIGHT_PX : 0;
+  const promptsChromeTopPx = zoneHeaderPx + filterBarPx;
+  const promptsOrientation = promptsPanelOrientation({
+    isSingleView,
+    zoneHeightPx,
+    chromeTopPx: promptsChromeTopPx,
+  });
+  const promptsStripPx = promptsStripHeight(zoneHeightPx, promptsChromeTopPx);
   const bodyPad = zoneBodyPadding({
     zoneHeaderPx,
     filterBarPx,
     promptsOpen: showPromptsPanel,
     isSingleView,
+    zoneHeightPx,
   });
   const isFlashing = tab && flashingTabs?.has(tab.id);
   const isStale = tab && staleTabs?.has(tab.id);
@@ -1441,7 +1489,8 @@ function ZoneCellInner({
               configDir={tab.claudeConfigDir}
               projectPath={tab.workingDir}
               orientation={promptsOrientation}
-              topOffsetPx={zoneHeaderPx + filterBarPx}
+              topOffsetPx={promptsChromeTopPx}
+              heightPx={promptsStripPx}
               onClose={handleTogglePrompts}
             />
           )}

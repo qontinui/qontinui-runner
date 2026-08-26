@@ -2445,6 +2445,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::transcript::transcript_get_latest,
             commands::transcript::transcript_list_sessions,
             commands::transcript::transcript_read_session,
+            commands::transcript::transcript_read_user_prompts,
             commands::transcript::transcript_session_digests,
             commands::ui_bridge::ui_bridge_discover,
             commands::ui_bridge::ui_bridge_discover_states_from_fingerprints,
