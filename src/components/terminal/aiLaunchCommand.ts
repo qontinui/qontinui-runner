@@ -43,3 +43,46 @@ export async function buildAiLaunchCommand(params: {
   }
   return { command: data.command, pinnedSessionId: data.pinnedSessionId ?? null };
 }
+
+/**
+ * What the failure path needs from the page. Kept as plain callbacks (no
+ * React, no Tauri) so the orphan-cleanup contract is unit-testable under the
+ * runner's `environment: "node"` vitest config — same precedent as
+ * `buildCreatePlainTerminalAction`.
+ */
+export interface AiLaunchTabHandlers {
+  /** Dispose the already-created tab — `TerminalPage`'s `closeTerminal`. */
+  disposeTab: (tabId: string) => void;
+  /** Surface the failure — the page's existing error toast. */
+  notify: (message: string) => void;
+}
+
+/**
+ * `buildAiLaunchCommand` for a tab that ALREADY EXISTS, with the orphan cleaned
+ * up on failure.
+ *
+ * The AI-session launch path creates a plain PTY first and only afterwards
+ * types the `claude` command into it, so every throw between those two steps
+ * (this builder rejects on a Tauri error and on a `data`-less response) used to
+ * leave a bare shell open with no toast and no log — the genuinely silent
+ * failure. On a throw this closes that tab, reports the reason through the
+ * page's own notification channel, and answers `null` so the caller skips the
+ * tab rather than typing into one that no longer exists.
+ */
+export async function buildAiLaunchCommandForTab(
+  tabId: string,
+  params: { configDir: string; isWindows: boolean; sessionId: string },
+  handlers: AiLaunchTabHandlers,
+): Promise<AiLaunchCommand | null> {
+  try {
+    return await buildAiLaunchCommand(params);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    // Logged as well as toasted: the toast is dismissible and the operator may
+    // not be looking, but a launch that produced no session must leave a trace.
+    console.error(`[LaunchAI] launch-spec build failed for ${tabId}: ${detail}`);
+    handlers.disposeTab(tabId);
+    handlers.notify(`Could not launch a Claude session in ${params.configDir}: ${detail}`);
+    return null;
+  }
+}
