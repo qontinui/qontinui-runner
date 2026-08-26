@@ -377,6 +377,91 @@ fn pr_cred_probe_finished() {
     PR_CRED_PROBE_IN_FLIGHT.store(false, Ordering::Release);
 }
 
+/// Build the `/health` `credentialDoors` section: per transport, can this runner
+/// answer a coord-credential request RIGHT NOW, and if not, WHY not.
+///
+/// # Why this exists (plan 2026-08-24, Phase 4)
+///
+/// Six shipped credential doors mint through
+/// `POST /ui-bridge/control/page/evaluate`, which is a FRONTEND proxy — it
+/// bounces the request through the WebView to reach the Rust process that
+/// actually holds the credential. On a headless runner
+/// (`frontendState: "window_missing"`) there is no WebView, so every one of them
+/// paid a 10-second timeout and then reported "signed out / no credential" —
+/// confidently wrong, because the credential was live the whole time. `/health`
+/// already carried `frontendReady`, the exact fact that settles it, and no door
+/// read it. This publishes the verdict so a door asks one cheap question instead
+/// of probing and timing out.
+///
+/// # Cheap by construction — keep it that way
+///
+/// No network I/O, no credential read, no `AuthManager` touch, no secret or
+/// nonce in the output. Each field is derived from a value the caller already
+/// computed (`frontend_ready`) or from a single filesystem stat. `/health` is
+/// polled by every fleet probe; anything expensive here becomes expensive
+/// everywhere.
+///
+/// # What each verdict means
+///
+/// * `evalMint` — `POST /ui-bridge/control/page/evaluate`, the transport all six
+///   shipped doors use today. Answerable iff the frontend is Responsive.
+/// * `provisionSessionMint` — `POST /coord-mcp/provision-session`, the
+///   in-process, WebView-free mint. `canAnswer` reports the OPT-IN half only
+///   (the marker file), because that is the half a caller can inspect and fix.
+///   It is deliberately NOT a full gate evaluation: the same-user handshake is
+///   per-request and `/health` is unauthenticated, so reporting it here would
+///   either leak whether a key exists or answer a question about a caller that
+///   is not the one asking. A caller that reads `canAnswer: true` and still gets
+///   a 403 has the typed code telling it which handshake step failed.
+/// * `coordMcpForwarder` — the `/coord-mcp*` family (JSON-RPC proxy, the
+///   enumerated reads, the write forwarder). Every route is nonce-gated, so it
+///   answers whenever this process is serving; what it CANNOT do is hand a
+///   caller its first nonce — that is `provisionSessionMint`'s job.
+fn credential_doors_health(frontend_ready: bool) -> serde_json::Value {
+    let marker = crate::coord_mcp::session_identity_marker_path();
+    let marker_present = marker.as_ref().map(|p| p.exists()).unwrap_or(false);
+    serde_json::json!({
+        "evalMint": {
+            "canAnswer": frontend_ready,
+            "transport": "POST /ui-bridge/control/page/evaluate",
+            "reason": if frontend_ready {
+                "the frontend is Responsive, so the UI Bridge eval round-trip can complete"
+            } else {
+                "no responsive frontend — every /ui-bridge/* route is a WebView proxy, so \
+                 this mint will time out. A TIMEOUT HERE IS NOT AN ABSENT CREDENTIAL: use \
+                 provisionSessionMint instead"
+            },
+        },
+        "provisionSessionMint": {
+            "canAnswer": marker_present,
+            "transport": "POST /coord-mcp/provision-session",
+            "reason": if marker_present {
+                "this machine is opted in; present this runner start's owner-only \
+                 loopback key in X-Qontinui-Loopback-Key to mint"
+            } else {
+                "this machine has not opted in — create the opt-in marker to enable \
+                 (deleting it later revokes already-minted session nonces)"
+            },
+            // The path is a stable, non-secret location the operator must act on;
+            // the handshake KEY's contents are never published here.
+            "optInMarker": marker.map(|p| p.display().to_string()),
+            "handshakeHeader": crate::coord_mcp::RUNNER_LOOPBACK_KEY_HEADER,
+            "requiresWebview": false,
+        },
+        "coordMcpForwarder": {
+            // Nonce-gated, in-process, no WebView: it answers whenever this
+            // process is serving /health at all.
+            "canAnswer": true,
+            "transport": "POST /coord-mcp, GET /coord-mcp/claims/*, GET /coord-mcp/agent-*, \
+                          GET /coord-mcp/pr-merge/*, POST /coord-mcp/{gates,work-units}/*",
+            "reason": "in-process and nonce-gated; it forwards with a freshly-read device \
+                       JWT and never emits one. It cannot issue your FIRST nonce — that is \
+                       provisionSessionMint",
+            "requiresWebview": false,
+        },
+    })
+}
+
 /// Build the `/health` `prCredential` section from the cached probe, kicking a
 /// fresh DETACHED probe when the cache is stale and no probe is already in
 /// flight ([`pr_cred_try_begin_probe`]). NEVER blocks: before the first probe
@@ -1080,6 +1165,14 @@ async fn health(
         // `exists: false` with a non-null path means the stream has emitted
         // nothing yet, NOT that forensics are off (a null path means off).
         "coordMcpRotationLog": crate::coord_mcp::rotation_log_health_json(),
+        // Which coord-credential doors can answer RIGHT NOW (plan
+        // 2026-08-24-headless-box-has-no-working-coord-credential-door, Phase 4).
+        // `/health` already carried `frontendState`/`frontendReady` — the facts
+        // a door needs — and no door read them, so each paid a 10s
+        // `page/evaluate` timeout and then drew the WRONG conclusion ("signed
+        // out" for what is really a dead transport). This states the fact
+        // instead of leaving it to be inferred from a timeout.
+        "credentialDoors": credential_doors_health(frontend_ready),
         // Semantic recall (plan 2026-07-30, Phase 3): how each proxied
         // `coord_memory_search` ended — did it get a query vector or not.
         // Non-search traffic is neither touched nor counted, so `enriched`
@@ -3789,7 +3882,19 @@ impl ClaimsReadTarget {
 /// (still percent-encoded — `axum::extract::RawQuery` hands us the raw form,
 /// so coord decodes exactly what the session's client encoded).
 fn claims_upstream_url(base: &str, target: ClaimsReadTarget, raw_query: Option<&str>) -> String {
-    let mut url = format!("{}{}", base.trim_end_matches('/'), target.coord_path());
+    read_upstream_url(base, &target.coord_path(), raw_query)
+}
+
+/// The shared upstream-URL builder for BOTH enumerated read families
+/// ([`ClaimsReadTarget`], [`CoordReadTarget`]): an already-allowlisted,
+/// already-validated coord path appended to the resolved base, plus the inbound
+/// query string forwarded VERBATIM (still percent-encoded).
+///
+/// `coord_path` MUST come from an enum arm — never from request data. This
+/// function does no validation and is not a place to add any: the closed enums
+/// are the boundary.
+fn read_upstream_url(base: &str, coord_path: &str, raw_query: Option<&str>) -> String {
+    let mut url = format!("{}{}", base.trim_end_matches('/'), coord_path);
     if let Some(q) = raw_query {
         if !q.is_empty() {
             url.push('?');
@@ -3797,6 +3902,41 @@ fn claims_upstream_url(base: &str, target: ClaimsReadTarget, raw_query: Option<&
         }
     }
     url
+}
+
+/// The runner-originated error-code family one nonce-gated GET forwarder stamps
+/// on its OWN failures. Distinct per family so a runner verdict can never be
+/// mistaken for a coord one, and so a 2am reader can tell WHICH door refused.
+#[derive(Clone, Copy)]
+struct ReadProxyCodes {
+    /// Nonce missing / stale / non-device, or the live bearer is not a device JWT.
+    unauthorized: &'static str,
+    /// coord could not be dialed at all.
+    upstream_unreachable: &'static str,
+    /// coord answered but its body could not be read.
+    upstream_read_failed: &'static str,
+    /// The runner could not build a response out of coord's answer.
+    response_build_failed: &'static str,
+}
+
+impl ReadProxyCodes {
+    /// `/coord-mcp/claims/*` + the work-unit deps read.
+    const CLAIMS: Self = ReadProxyCodes {
+        unauthorized: "COORD_CLAIMS_PROXY_UNAUTHORIZED",
+        upstream_unreachable: "COORD_CLAIMS_PROXY_UPSTREAM_UNREACHABLE",
+        upstream_read_failed: "COORD_CLAIMS_PROXY_UPSTREAM_READ_FAILED",
+        response_build_failed: "COORD_CLAIMS_PROXY_RESPONSE_BUILD_FAILED",
+    };
+
+    /// `/coord-mcp/agent-*` + `/coord-mcp/pr-merge/*` — the coord `agent-` read
+    /// doors (plan 2026-08-24-headless-box-has-no-working-coord-credential-door,
+    /// Phase 3).
+    const COORD_READ: Self = ReadProxyCodes {
+        unauthorized: "COORD_READ_PROXY_UNAUTHORIZED",
+        upstream_unreachable: "COORD_READ_PROXY_UPSTREAM_UNREACHABLE",
+        upstream_read_failed: "COORD_READ_PROXY_UPSTREAM_READ_FAILED",
+        response_build_failed: "COORD_READ_PROXY_RESPONSE_BUILD_FAILED",
+    };
 }
 
 /// `GET /coord-mcp/claims/list` + `GET /coord-mcp/claims/by-resource` — the
@@ -3826,6 +3966,42 @@ async fn coord_claims_read_proxy_handler(
     headers: axum::http::HeaderMap,
     raw_query: Option<String>,
 ) -> axum::response::Response {
+    // Validate the dynamic segment (if any) up front, but do NOT emit its 400
+    // yet — the shared body emits it only AFTER the nonce gate, so an
+    // unauthenticated caller can never use the validator as an oracle.
+    let validated_path = target.validate().map(|()| target.coord_path());
+    nonce_gated_coord_get(
+        validated_path,
+        ReadProxyCodes::CLAIMS,
+        "coord-mcp claims proxy",
+        headers,
+        raw_query,
+    )
+    .await
+}
+
+/// THE nonce-gated device-JWT coord GET forwarder, shared by both enumerated
+/// read families ([`ClaimsReadTarget`] and [`CoordReadTarget`]).
+///
+/// `validated_path` is the caller's already-allowlisted coord path, or the
+/// runner-originated `(status, code, message)` its segment validator produced.
+/// Passing the validator's VERDICT rather than the target itself is what keeps
+/// this function target-agnostic while preserving the ordering that matters:
+/// the 401 is decided before the 400, so an unauthenticated caller learns
+/// nothing about which segments the runner considers well-formed.
+///
+/// Gate (`coord_mcp::proxy_request_gate`, 401 before any network I/O):
+/// registered proxy nonce (from `Authorization: Bearer <nonce>` or the legacy
+/// `X-Coord-Mcp-Proxy-Key`) AND the live bearer decodes
+/// `sub_type == "device"` — absent/wrong nonce or a missing/non-device token
+/// means the request is NEVER forwarded to coord.
+async fn nonce_gated_coord_get(
+    validated_path: Result<String, (u16, &'static str, String)>,
+    codes: ReadProxyCodes,
+    door: &'static str,
+    headers: axum::http::HeaderMap,
+    raw_query: Option<String>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     // Phase 2 (plan 2026-08-20): resolved through THE shared request-side
@@ -3847,7 +4023,7 @@ async fn coord_claims_read_proxy_handler(
         Some(crate::coord_mcp::ProxyPrincipal::Device) => {}
         _ => {
             warn!(
-                "coord-mcp claims proxy: {}",
+                "{door}: {}",
                 crate::coord_mcp::NON_DEVICE_PROXY_KEY_CAUSE
             );
             return (
@@ -3857,7 +4033,7 @@ async fn coord_claims_read_proxy_handler(
                     "error": crate::coord_mcp::stale_proxy_key_error(
                         crate::coord_mcp::NON_DEVICE_PROXY_KEY_CAUSE,
                     ),
-                    "code": "COORD_CLAIMS_PROXY_UNAUTHORIZED",
+                    "code": codes.unauthorized,
                 })),
             )
                 .into_response();
@@ -3877,7 +4053,7 @@ async fn coord_claims_read_proxy_handler(
         match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
             Ok(pair) => pair,
             Err((status, msg)) => {
-                warn!("coord-mcp claims proxy: {msg}");
+                warn!("{door}: {msg}");
                 return (
                     axum::http::StatusCode::from_u16(status)
                         .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE),
@@ -3897,38 +4073,43 @@ async fn coord_claims_read_proxy_handler(
         bearer.as_deref(),
         &crate::coord_mcp::ProxyPrincipal::Device,
     ) {
-        warn!("coord-mcp claims proxy: {msg}");
+        warn!("{door}: {msg}");
         return (
             axum::http::StatusCode::from_u16(status)
                 .unwrap_or(axum::http::StatusCode::UNAUTHORIZED),
             Json(serde_json::json!({
                 "success": false,
                 "error": msg,
-                "code": "COORD_CLAIMS_PROXY_UNAUTHORIZED",
+                "code": codes.unauthorized,
             })),
         )
             .into_response();
     }
     let bearer = bearer.unwrap_or_default(); // gate guarantees Some(non-empty)
 
-    // Validate the dynamic segment (if any) BEFORE building any coord URL — a
-    // bad shape is a runner-originated 400, never forwarded.
-    if let Err((status, code, msg)) = target.validate() {
-        warn!("coord-mcp claims proxy: {msg}");
-        return (
-            axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_REQUEST),
-            Json(serde_json::json!({
-                "success": false,
-                "error": msg,
-                "code": code,
-            })),
-        )
-            .into_response();
-    }
+    // The dynamic segment's verdict, emitted only NOW — a bad shape is a
+    // runner-originated 400 and is never forwarded, but it is decided after the
+    // 401 so the validator is not an oracle for an unauthenticated caller.
+    let coord_path = match validated_path {
+        Ok(p) => p,
+        Err((status, code, msg)) => {
+            warn!("{door}: {msg}");
+            return (
+                axum::http::StatusCode::from_u16(status)
+                    .unwrap_or(axum::http::StatusCode::BAD_REQUEST),
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": msg,
+                    "code": code,
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
-    let url = claims_upstream_url(&coord_base, target, raw_query.as_deref());
-    forward_claims_get(&url, &bearer, coord_base_source).await
+    let url = read_upstream_url(&coord_base, &coord_path, raw_query.as_deref());
+    forward_coord_get(&url, &bearer, coord_base_source, codes, door).await
 }
 
 /// Forward a claims read to coord and return coord's status + headers + body
@@ -3942,6 +4123,27 @@ async fn forward_claims_get(
     url: &str,
     bearer: &str,
     coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+) -> axum::response::Response {
+    forward_coord_get(
+        url,
+        bearer,
+        coord_base_source,
+        ReadProxyCodes::CLAIMS,
+        "coord-mcp claims proxy",
+    )
+    .await
+}
+
+/// THE coord GET forwarding leg, shared by every enumerated read family:
+/// dial `url` with `bearer` and return coord's status + headers + body
+/// VERBATIM. Runner-originated failures carry `codes`' own family so they can
+/// never be mistaken for a coord verdict, and `door` names the door in the log.
+async fn forward_coord_get(
+    url: &str,
+    bearer: &str,
+    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+    codes: ReadProxyCodes,
+    door: &'static str,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -3962,15 +4164,15 @@ async fn forward_claims_get(
         Ok(resp) => resp,
         Err(e) => {
             warn!(
-                "coord-mcp claims proxy: forward to {url} failed \
+                "{door}: forward to {url} failed \
                  (coord_base_source={coord_base_source}): {e}"
             );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("coord claims endpoint unreachable: {e}"),
-                    "code": "COORD_CLAIMS_PROXY_UPSTREAM_UNREACHABLE",
+                    "error": format!("coord read endpoint unreachable: {e}"),
+                    "code": codes.upstream_unreachable,
                     "upstream_url": url,
                     "coord_base_source": coord_base_source.as_str(),
                 })),
@@ -3995,15 +4197,15 @@ async fn forward_claims_get(
         Ok(b) => b,
         Err(e) => {
             warn!(
-                "coord-mcp claims proxy: reading coord response body from {url} failed \
+                "{door}: reading coord response body from {url} failed \
                  (coord_base_source={coord_base_source}): {e}"
             );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("coord claims response read failed: {e}"),
-                    "code": "COORD_CLAIMS_PROXY_UPSTREAM_READ_FAILED",
+                    "error": format!("coord read response read failed: {e}"),
+                    "code": codes.upstream_read_failed,
                     "upstream_url": url,
                     "coord_base_source": coord_base_source.as_str(),
                 })),
@@ -4015,15 +4217,15 @@ async fn forward_claims_get(
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
             warn!(
-                "coord-mcp claims proxy: response build failed \
+                "{door}: response build failed \
                  (upstream_url={url}, coord_base_source={coord_base_source}): {e}"
             );
             (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("coord claims response build failed: {e}"),
-                    "code": "COORD_CLAIMS_PROXY_RESPONSE_BUILD_FAILED",
+                    "error": format!("coord read response build failed: {e}"),
+                    "code": codes.response_build_failed,
                     "upstream_url": url,
                     "coord_base_source": coord_base_source.as_str(),
                 })),
@@ -4046,6 +4248,322 @@ async fn coord_claims_by_resource_handler(
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> axum::response::Response {
     coord_claims_read_proxy_handler(ClaimsReadTarget::ByResource, headers, raw_query).await
+}
+
+// ---------------------------------------------------------------------------
+// The coord `agent-` READ doors (plan
+// 2026-08-24-headless-box-has-no-working-coord-credential-door, Phase 3)
+// ---------------------------------------------------------------------------
+
+/// The ONLY coord READ routes the `/coord-mcp/agent-*` + `/coord-mcp/pr-merge/*`
+/// forwarder may reach — the device-authed read allowlist the fleet's
+/// `coord-read.ps1` door drives (`coord-read.ps1:76` names the `/coord/agent-*`
+/// prefixes; the verb dispatch adds the three `/pr-merge/*` fleet reads).
+///
+/// # Why these routes and no others
+///
+/// Phase 0 of the plan classified every credential door's upstream. Two doors
+/// (`render-policy-mirrors.ps1`, `coord-read.ps1`) needed coord REST **reads**
+/// that no forwarder fronted — class (c) — so they had no way to reach coord
+/// without a raw bearer in the caller's hands. These variants are that closure.
+/// The two class-(d) doors (`render-memory-cache.ps1`, `render-plan-cache.ps1`)
+/// target **qontinui-web**, a different service with a different authorization
+/// model, and are deliberately NOT here: fronting them is a separate plan.
+///
+/// # Enumerated BY DESIGN — do not add a pass-through
+///
+/// Same boundary as [`ClaimsReadTarget`] and [`CoordWriteTarget`]: the
+/// per-session proxy nonce authenticates a *session*, not an operator, so its
+/// authority must stay scoped to these enumerated read-only endpoints. A generic
+/// `/coord-mcp/proxy/{path}` GET would let a leaked nonce reach ANY coord route
+/// with the runner's device identity — that is exactly Gap 1 of plan
+/// `2026-07-17-coord-device-credential-exposure-and-authz-gaps` (the
+/// unhardened-passthrough finding), and arbitrary paths must be structurally
+/// impossible rather than merely unrouted. Every dynamic segment is validated to
+/// a safe charset BEFORE any URL is built.
+///
+/// # ⚠ Two different coord prefixes, and the difference is load-bearing
+///
+/// * `/coord/agent-*` — the device-authed exceptions inside the otherwise
+///   operator-only `/coord` family. A device JWT authenticates.
+/// * `/pr-merge/*` — **FLEET** routes, gated `FleetPrincipal`; device JWTs are
+///   accepted. Their `/coord/pr-merge/*` twins are OPERATOR routes behind
+///   `require_sso` and answer a device JWT with `401 invalid operator token` —
+///   a status that reads like a credential problem when it is a wrong-prefix
+///   one. Do NOT "normalize" these onto the `/coord` prefix.
+///
+/// Deliberately EXCLUDED, for the same reason [`ClaimsReadTarget`] excludes the
+/// bare work-unit read: coord's operator-tier reads (`GET /coord/work-units`,
+/// `/coord/gates`, `/coord/pr-merge/*`) resolve their tenant SOLELY from an
+/// `OperatorContext`, so a device JWT gets `403 tenant_not_resolved`. The
+/// `agent-` doors above exist precisely to close that gap; forwarding the
+/// operator twins could only ever 403.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CoordReadTarget {
+    /// `GET {coord}/coord/agent-prompt-documents` — the policy-document list.
+    PromptDocuments,
+    /// `GET {coord}/coord/agent-prompt-documents/{kind}/{name}` — one document
+    /// body (e.g. `policy/engineering-priorities`).
+    PromptDocument { kind: String, name: String },
+    /// `GET {coord}/coord/agent-work-units` — the work-unit list.
+    WorkUnits,
+    /// `GET {coord}/coord/agent-work-units/{slug}` — one unit plus the PR
+    /// citations a `shipped` status was derived from.
+    WorkUnit { slug: String },
+    /// `GET {coord}/coord/agent-work-units/{slug}/history` — one unit's full
+    /// status history.
+    WorkUnitHistory { slug: String },
+    /// `GET {coord}/coord/agent-gates` — the gate list (filters travel in the
+    /// query string, forwarded verbatim).
+    Gates,
+    /// `GET {coord}/pr-merge/verdict/{owner}/{repo}/{number}` — per-PR merge
+    /// verdict. NOTE the missing `/coord` prefix: fleet route, not operator.
+    PrMergeVerdict {
+        owner: String,
+        repo: String,
+        number: String,
+    },
+    /// `GET {coord}/pr-merge/events/{owner}/{repo}/{number}` — Tier-1 PR event
+    /// history. Fleet route.
+    PrMergeEvents {
+        owner: String,
+        repo: String,
+        number: String,
+    },
+    /// `GET {coord}/pr-merge/economics` — merge economics; the optional `repo`
+    /// filter travels in the query string. Fleet route.
+    PrMergeEconomics,
+}
+
+/// A coord prompt-document path segment (`kind` or `name`): lowercase
+/// alphanumeric, hyphens and underscores, starting with an alphanumeric
+/// (`^[a-z0-9][a-z0-9_-]*$`). Underscores are in-charset because coord's kinds
+/// include `session_briefing`; hyphens because policy names look like
+/// `engineering-priorities`.
+///
+/// Rejects `/`, `.`, `%`, whitespace and uppercase, so a segment can never carry
+/// a path separator or escape sequence into the fixed coord route template.
+fn prompt_doc_segment_is_valid(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// A PR number path segment: 1..=9 ASCII digits, no sign, no whitespace, no
+/// leading `+`. Parsed rather than pattern-matched so the bound is the type's,
+/// not a hand-written one.
+fn pr_number_is_valid(number: &str) -> bool {
+    !number.is_empty() && number.len() <= 9 && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+impl CoordReadTarget {
+    /// The allowlisted upstream path. Callers MUST have called [`Self::validate`]
+    /// first (the handler does); this builder assumes every segment is safe, and
+    /// the constant templates mean plain interpolation cannot alter the path
+    /// structure.
+    fn coord_path(&self) -> String {
+        match self {
+            CoordReadTarget::PromptDocuments => "/coord/agent-prompt-documents".to_string(),
+            CoordReadTarget::PromptDocument { kind, name } => {
+                format!("/coord/agent-prompt-documents/{kind}/{name}")
+            }
+            CoordReadTarget::WorkUnits => "/coord/agent-work-units".to_string(),
+            CoordReadTarget::WorkUnit { slug } => format!("/coord/agent-work-units/{slug}"),
+            CoordReadTarget::WorkUnitHistory { slug } => {
+                format!("/coord/agent-work-units/{slug}/history")
+            }
+            CoordReadTarget::Gates => "/coord/agent-gates".to_string(),
+            // No `/coord` prefix — fleet routes. See the enum doc.
+            CoordReadTarget::PrMergeVerdict {
+                owner,
+                repo,
+                number,
+            } => format!("/pr-merge/verdict/{owner}/{repo}/{number}"),
+            CoordReadTarget::PrMergeEvents {
+                owner,
+                repo,
+                number,
+            } => format!("/pr-merge/events/{owner}/{repo}/{number}"),
+            CoordReadTarget::PrMergeEconomics => "/pr-merge/economics".to_string(),
+        }
+    }
+
+    /// Validate every dynamic segment. Returns `Err((status, code, msg))` on a
+    /// bad shape so the caller can emit a runner-originated 400 — the segment is
+    /// rejected BEFORE any coord URL is built, mirroring
+    /// [`CoordWriteTarget::validate`] and [`ClaimsReadTarget::validate`].
+    fn validate(&self) -> Result<(), (u16, &'static str, String)> {
+        let bad = |msg: String| (400u16, "COORD_READ_PROXY_BAD_TARGET", msg);
+        match self {
+            CoordReadTarget::PromptDocuments
+            | CoordReadTarget::WorkUnits
+            | CoordReadTarget::Gates
+            | CoordReadTarget::PrMergeEconomics => Ok(()),
+            CoordReadTarget::PromptDocument { kind, name } => {
+                if !prompt_doc_segment_is_valid(kind) {
+                    return Err(bad(format!("invalid prompt-document kind: {kind:?}")));
+                }
+                if !prompt_doc_segment_is_valid(name) {
+                    return Err(bad(format!("invalid prompt-document name: {name:?}")));
+                }
+                Ok(())
+            }
+            CoordReadTarget::WorkUnit { slug } | CoordReadTarget::WorkUnitHistory { slug } => {
+                if slug_is_valid(slug) {
+                    Ok(())
+                } else {
+                    Err(bad(format!("invalid work-unit slug: {slug:?}")))
+                }
+            }
+            CoordReadTarget::PrMergeVerdict {
+                owner,
+                repo,
+                number,
+            }
+            | CoordReadTarget::PrMergeEvents {
+                owner,
+                repo,
+                number,
+            } => {
+                if !github_segment_is_valid(owner) {
+                    return Err(bad(format!("invalid repo owner: {owner:?}")));
+                }
+                if !github_segment_is_valid(repo) {
+                    return Err(bad(format!("invalid repo name: {repo:?}")));
+                }
+                if !pr_number_is_valid(number) {
+                    return Err(bad(format!("invalid PR number: {number:?}")));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Shared entry point for every `CoordReadTarget` route handler: validate the
+/// segments, then hand the verdict to the one nonce-gated GET forwarder.
+async fn coord_read_proxy_handler(
+    target: CoordReadTarget,
+    headers: axum::http::HeaderMap,
+    raw_query: Option<String>,
+) -> axum::response::Response {
+    let validated_path = target.validate().map(|()| target.coord_path());
+    nonce_gated_coord_get(
+        validated_path,
+        ReadProxyCodes::COORD_READ,
+        "coord-mcp coord-read proxy",
+        headers,
+        raw_query,
+    )
+    .await
+}
+
+/// `GET /coord-mcp/agent-prompt-documents` — the policy-document list.
+async fn coord_read_prompt_documents_handler(
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_read_proxy_handler(CoordReadTarget::PromptDocuments, headers, raw_query).await
+}
+
+/// `GET /coord-mcp/agent-prompt-documents/{kind}/{name}` — one document body.
+async fn coord_read_prompt_document_handler(
+    axum::extract::Path((kind, name)): axum::extract::Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_read_proxy_handler(
+        CoordReadTarget::PromptDocument { kind, name },
+        headers,
+        raw_query,
+    )
+    .await
+}
+
+/// `GET /coord-mcp/agent-work-units` — the work-unit list.
+async fn coord_read_work_units_handler(
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_read_proxy_handler(CoordReadTarget::WorkUnits, headers, raw_query).await
+}
+
+/// `GET /coord-mcp/agent-work-units/{slug}` — one unit plus its citations.
+async fn coord_read_work_unit_handler(
+    axum::extract::Path(slug): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_read_proxy_handler(CoordReadTarget::WorkUnit { slug }, headers, raw_query).await
+}
+
+/// `GET /coord-mcp/agent-work-units/{slug}/history` — one unit's status history.
+async fn coord_read_work_unit_history_handler(
+    axum::extract::Path(slug): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_read_proxy_handler(
+        CoordReadTarget::WorkUnitHistory { slug },
+        headers,
+        raw_query,
+    )
+    .await
+}
+
+/// `GET /coord-mcp/agent-gates` — the gate list (filters forwarded verbatim).
+async fn coord_read_gates_handler(
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_read_proxy_handler(CoordReadTarget::Gates, headers, raw_query).await
+}
+
+/// `GET /coord-mcp/pr-merge/verdict/{owner}/{repo}/{number}` — fleet route.
+async fn coord_read_pr_merge_verdict_handler(
+    axum::extract::Path((owner, repo, number)): axum::extract::Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_read_proxy_handler(
+        CoordReadTarget::PrMergeVerdict {
+            owner,
+            repo,
+            number,
+        },
+        headers,
+        raw_query,
+    )
+    .await
+}
+
+/// `GET /coord-mcp/pr-merge/events/{owner}/{repo}/{number}` — fleet route.
+async fn coord_read_pr_merge_events_handler(
+    axum::extract::Path((owner, repo, number)): axum::extract::Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_read_proxy_handler(
+        CoordReadTarget::PrMergeEvents {
+            owner,
+            repo,
+            number,
+        },
+        headers,
+        raw_query,
+    )
+    .await
+}
+
+/// `GET /coord-mcp/pr-merge/economics` — fleet route; `?repo=` forwarded verbatim.
+async fn coord_read_pr_merge_economics_handler(
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_read_proxy_handler(CoordReadTarget::PrMergeEconomics, headers, raw_query).await
 }
 
 /// The ONLY coord WRITE routes the nonce-gated device-JWT forwarder may reach:
@@ -4133,6 +4651,22 @@ fn slug_is_valid(slug: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// One segment of a GitHub `owner/name` slug: starts with an ASCII
+/// alphanumeric, continues in `[A-Za-z0-9._-]`, and is never `.` or `..` — so a
+/// segment can never smuggle a path separator or escape sequence into a fixed
+/// coord route template. Shared by [`parse_owner_repo`] (the PR-creation
+/// forwarder, which takes `owner/name` as one string) and
+/// [`CoordReadTarget`]'s `/pr-merge/*` reads (which take them as two path
+/// params) so the two cannot drift into two different charsets.
+fn github_segment_is_valid(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    s != "." && s != ".." && chars.all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
 }
 
 /// A coord gate id: a canonical UUID (8-4-4-4-12 hex, length 36). Parsed via the
@@ -4576,8 +5110,9 @@ struct ProvisionSessionBody {
 /// authorization is therefore [`crate::coord_mcp::session_identity_gate`], which
 /// stands **IN PLACE OF** the nonce check:
 ///
-/// 1. the master flag `QONTINUI_SESSION_COORD_IDENTITY_ENABLED` — default OFF,
-///    so the feature ships dark and an un-flagged runner exposes nothing; AND
+/// 1. the SAME-USER handshake — the caller must present this runner start's
+///    owner-only loopback key (`~/.qontinui/runner-loopback-key`) in the
+///    `X-Qontinui-Loopback-Key` header; AND
 /// 2. a per-machine operator opt-in marker
 ///    (`~/.qontinui/allow-session-coord-identity`).
 ///
@@ -4585,9 +5120,23 @@ struct ProvisionSessionBody {
 /// looked like a bug: it is deliberate, and those two gates are the entire
 /// authorization story. Removing or weakening either grants any local process —
 /// including a compromised dependency's post-install script — the ability to
-/// mint device identity and act as the operator against coord. "It came from
-/// 127.0.0.1" is NOT an authorization signal on a single-user box, where every
-/// process runs as the same OS user.
+/// mint device identity and act as the operator against coord.
+///
+/// **"It came from 127.0.0.1" is NOT an authorization signal.** Loopback is a
+/// plain TCP socket with no peer-credential check, so ANY local user can reach
+/// it — which is why gate 1 exists and why marker *presence* alone would not do:
+/// the marker is a property of the machine, not of the caller. The handshake
+/// file is written owner-only, so requiring its contents reproduces the store's
+/// own `0600` boundary on the socket. And on a single-user box, gate 2 is what
+/// makes an opted-in machine an operator DECISION rather than an accident of
+/// topology.
+///
+/// Neither gate is an env flag, deliberately. The retired
+/// `QONTINUI_SESSION_COORD_IDENTITY_ENABLED` was read once at spawn, so it could
+/// be neither enabled nor REVOKED without restarting the runner — which served
+/// policy `production-and-cost` `runner-lifecycle` forbids. The marker is
+/// re-read per request instead (plan
+/// 2026-08-24-headless-box-has-no-working-coord-credential-door, Phase 1).
 ///
 /// Three properties contain the blast radius of what is issued (see
 /// `coord_mcp::NonceLifetime`): the nonce is DEVICE-principal (never agent — no
@@ -4628,13 +5177,17 @@ struct ProvisionSessionBody {
 /// |---|---|---|
 /// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String}` |
 /// | 400 | `COORD_MCP_PROVISION_INVALID_CWD` | `cwd` empty or not an existing dir |
-/// | 403 | `COORD_MCP_PROVISION_DISABLED` | master flag off (the default) |
+/// | 403 | `COORD_MCP_PROVISION_NO_HANDSHAKE` | no (or empty) `X-Qontinui-Loopback-Key` header |
+/// | 403 | `COORD_MCP_PROVISION_HANDSHAKE_MISMATCH` | handshake presented, not this runner start's key |
 /// | 403 | `COORD_MCP_PROVISION_NOT_OPTED_IN` | no opt-in marker on this machine |
 /// | 503 | `COORD_MCP_PROVISION_PORT_UNRESOLVABLE` | bound port unresolvable — fail-closed |
 ///
 /// Callers are expected to fail OPEN on every one of these: a launcher that
 /// cannot get identity must still launch the session, un-shimmed.
-async fn coord_provision_session_handler(body: axum::body::Bytes) -> axum::response::Response {
+async fn coord_provision_session_handler(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     let err = |status: axum::http::StatusCode, code: &str, msg: String| {
@@ -4649,10 +5202,17 @@ async fn coord_provision_session_handler(body: axum::body::Bytes) -> axum::respo
             .into_response()
     };
 
-    // Gate FIRST — before parsing, before any registry or credential touch. In
-    // the default (dark) posture this is one env read and the route is
-    // indistinguishable from one that mints nothing.
-    if let Err(denial) = crate::coord_mcp::session_identity_gate() {
+    // Gate FIRST — before parsing, before any registry or credential touch. An
+    // unauthenticated caller therefore never reaches the body parser, the nonce
+    // registry or the credential store; it costs one header read and one marker
+    // stat, and the route is indistinguishable from one that mints nothing.
+    //
+    // The header is read here rather than inside the gate so the gate stays a
+    // pure `Option<&str>` function (unit-testable with no process-global state).
+    let presented_key = headers
+        .get(crate::coord_mcp::RUNNER_LOOPBACK_KEY_HEADER)
+        .and_then(|v| v.to_str().ok());
+    if let Err(denial) = crate::coord_mcp::session_identity_gate(presented_key) {
         warn!(
             "coord-mcp provision-session: denied ({}) — {}",
             denial.code(),
@@ -4745,14 +5305,7 @@ struct VcsPullRequestBody {
 /// [`gate_id_is_valid`] on the coord-mcp write forwarder).
 fn parse_owner_repo(repo: &str) -> Option<(&str, &str)> {
     let (owner, name) = repo.split_once('/')?;
-    let segment_ok = |s: &str| {
-        let mut chars = s.chars();
-        match chars.next() {
-            Some(c) if c.is_ascii_alphanumeric() => {}
-            _ => return false,
-        }
-        s != "." && s != ".." && chars.all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-    };
+    let segment_ok = github_segment_is_valid;
     if segment_ok(owner) && segment_ok(name) && !name.contains('/') {
         Some((owner, name))
     } else {
@@ -6783,8 +7336,9 @@ pub fn create_router(
         // obtains a device-scoped coord-mcp config at launch.
         //
         // ⚠ THE ONE ROUTE IN THIS FAMILY THAT IS NOT NONCE-GATED, and it cannot
-        // be: it is what ISSUES the nonce. It carries the master flag
-        // (`QONTINUI_SESSION_COORD_IDENTITY_ENABLED`, default OFF) + a
+        // be: it is what ISSUES the nonce. It carries the SAME-USER loopback
+        // handshake (`X-Qontinui-Loopback-Key`, matched against the owner-only
+        // `~/.qontinui/runner-loopback-key` written at this runner start) + a
         // per-machine operator opt-in marker IN PLACE OF the nonce check. Read
         // `coord_provision_session_handler`'s doc before touching this.
         .route(
@@ -6802,6 +7356,53 @@ pub fn create_router(
         .route(
             "/coord-mcp/claims/by-resource",
             get(coord_claims_by_resource_handler),
+        )
+        // Nonce-gated coord `agent-` READ forwarder (plan
+        // 2026-08-24-headless-box-has-no-working-coord-credential-door Phase 3).
+        // Same gate + live device-JWT injection as /coord-mcp, allowlisted to
+        // EXACTLY the read-only coord routes enumerated in `CoordReadTarget` —
+        // never a generic path passthrough. These close the class-(c) gap Phase 0
+        // found: `render-policy-mirrors.ps1` and `coord-read.ps1` needed coord
+        // REST reads that no forwarder fronted, so they could only work with a
+        // raw bearer in the caller's hands.
+        //
+        // The path shape mirrors the coord route with the `/coord` prefix
+        // stripped — the same convention `/coord-mcp/claims/list` ->
+        // `/coord/claims/list` already uses. The `/coord-mcp/pr-merge/*` trio
+        // maps to coord's UNPREFIXED fleet routes (`/pr-merge/*`), NOT their
+        // `/coord/pr-merge/*` operator twins; see `CoordReadTarget`'s doc.
+        .route(
+            "/coord-mcp/agent-prompt-documents",
+            get(coord_read_prompt_documents_handler),
+        )
+        .route(
+            "/coord-mcp/agent-prompt-documents/{kind}/{name}",
+            get(coord_read_prompt_document_handler),
+        )
+        .route(
+            "/coord-mcp/agent-work-units",
+            get(coord_read_work_units_handler),
+        )
+        .route(
+            "/coord-mcp/agent-work-units/{slug}",
+            get(coord_read_work_unit_handler),
+        )
+        .route(
+            "/coord-mcp/agent-work-units/{slug}/history",
+            get(coord_read_work_unit_history_handler),
+        )
+        .route("/coord-mcp/agent-gates", get(coord_read_gates_handler))
+        .route(
+            "/coord-mcp/pr-merge/verdict/{owner}/{repo}/{number}",
+            get(coord_read_pr_merge_verdict_handler),
+        )
+        .route(
+            "/coord-mcp/pr-merge/events/{owner}/{repo}/{number}",
+            get(coord_read_pr_merge_events_handler),
+        )
+        .route(
+            "/coord-mcp/pr-merge/economics",
+            get(coord_read_pr_merge_economics_handler),
         )
         // Nonce-gated device-JWT WRITE forwarder for device sessions
         // (plan 2026-06-15-coord-mcp-live-token-write-forwarder Phase 1).
@@ -7271,6 +7872,15 @@ pub async fn start_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let emitter = app_handle.clone();
     let api_ready_flag = app_state.clone();
+
+    // Rotate this runner start's SAME-USER loopback handshake key BEFORE the
+    // socket is served, so any caller that can reach `/health` can already read
+    // the owner-only key file and drive `POST /coord-mcp/provision-session`.
+    // Synchronous and cheap (32 CSPRNG bytes + one owner-only write); it never
+    // fails the boot — a write failure leaves the mint route denying every
+    // request, which is the fail-closed posture, not an outage.
+    crate::coord_mcp::init_loopback_handshake_key();
+
     info!("MCP API server: building router via create_router...");
     let router = create_router(app_state, rag_state, app_handle, instance_manager);
     info!("MCP API server: create_router returned, entering bind loop");
@@ -9641,6 +10251,592 @@ mod coord_claims_proxy_tests {
         // chosen must ride in the error body.
         assert_eq!(v["upstream_url"], url);
         assert_eq!(v["coord_base_source"], "dev_localhost_fallback");
+    }
+}
+
+/// The coord `agent-` READ forwarder (plan
+/// 2026-08-24-headless-box-has-no-working-coord-credential-door, Phase 3).
+///
+/// Same shape as `coord_claims_proxy_tests`: the gate's 401 paths are asserted
+/// through the REAL route handlers on a router built from the same table the
+/// production router registers (so a handler bound to the wrong template is
+/// caught), the segment validators and the URL builder are pure functions tested
+/// directly, and the forwarding leg is exercised through the shared
+/// `forward_coord_get` seam against a local mock coord with a synthetic bearer.
+#[cfg(test)]
+mod coord_read_proxy_tests {
+    use super::{
+        coord_read_gates_handler, coord_read_pr_merge_economics_handler,
+        coord_read_pr_merge_events_handler, coord_read_pr_merge_verdict_handler,
+        coord_read_prompt_document_handler, coord_read_prompt_documents_handler,
+        coord_read_work_unit_handler, coord_read_work_unit_history_handler,
+        coord_read_work_units_handler, forward_coord_get, github_segment_is_valid,
+        pr_number_is_valid, prompt_doc_segment_is_valid, read_upstream_url, CoordReadTarget,
+        ReadProxyCodes,
+    };
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
+
+    /// For each `/coord-mcp` coord-read route the real router registers: the
+    /// axum 0.8 template, a concrete request path that reaches it, and the
+    /// handler it must bind to — ONE row, so the three cannot drift apart.
+    ///
+    /// Same shape (and the same reason) as `coord_write_proxy_tests`'
+    /// `write_route_table`: binding a handler to the wrong template would
+    /// otherwise be undetectable, because every test here asserts a 401 and the
+    /// nonce gate returns that before the handler's target is ever used.
+    fn read_route_table() -> Vec<(&'static str, &'static str, axum::routing::MethodRouter)> {
+        vec![
+            (
+                "/coord-mcp/agent-prompt-documents",
+                "/coord-mcp/agent-prompt-documents",
+                get(coord_read_prompt_documents_handler),
+            ),
+            (
+                "/coord-mcp/agent-prompt-documents/{kind}/{name}",
+                "/coord-mcp/agent-prompt-documents/policy/engineering-priorities",
+                get(coord_read_prompt_document_handler),
+            ),
+            (
+                "/coord-mcp/agent-work-units",
+                "/coord-mcp/agent-work-units",
+                get(coord_read_work_units_handler),
+            ),
+            (
+                "/coord-mcp/agent-work-units/{slug}",
+                "/coord-mcp/agent-work-units/2026-07-03-some-unit",
+                get(coord_read_work_unit_handler),
+            ),
+            (
+                "/coord-mcp/agent-work-units/{slug}/history",
+                "/coord-mcp/agent-work-units/2026-07-03-some-unit/history",
+                get(coord_read_work_unit_history_handler),
+            ),
+            (
+                "/coord-mcp/agent-gates",
+                "/coord-mcp/agent-gates",
+                get(coord_read_gates_handler),
+            ),
+            (
+                "/coord-mcp/pr-merge/verdict/{owner}/{repo}/{number}",
+                "/coord-mcp/pr-merge/verdict/qontinui/qontinui-runner/1144",
+                get(coord_read_pr_merge_verdict_handler),
+            ),
+            (
+                "/coord-mcp/pr-merge/events/{owner}/{repo}/{number}",
+                "/coord-mcp/pr-merge/events/qontinui/qontinui-runner/1144",
+                get(coord_read_pr_merge_events_handler),
+            ),
+            (
+                "/coord-mcp/pr-merge/economics",
+                "/coord-mcp/pr-merge/economics",
+                get(coord_read_pr_merge_economics_handler),
+            ),
+        ]
+    }
+
+    fn read_router() -> Router {
+        read_route_table()
+            .into_iter()
+            .fold(Router::new(), |r, (template, _, handler)| {
+                r.route(template, handler)
+            })
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The upstream path comes from the CLOSED enum, and the two coord prefixes
+    /// are not interchangeable: `agent-*` reads carry `/coord`, `pr-merge/*`
+    /// fleet reads do NOT. Getting that wrong turns an ordinary expired device
+    /// JWT into a `401 invalid operator token` that reads like a credential
+    /// fault, so it is pinned here.
+    #[test]
+    fn coord_read_paths_are_allowlisted_and_keep_the_two_prefixes_apart() {
+        let cases: &[(CoordReadTarget, &str)] = &[
+            (
+                CoordReadTarget::PromptDocuments,
+                "/coord/agent-prompt-documents",
+            ),
+            (
+                CoordReadTarget::PromptDocument {
+                    kind: "policy".to_string(),
+                    name: "engineering-priorities".to_string(),
+                },
+                "/coord/agent-prompt-documents/policy/engineering-priorities",
+            ),
+            (CoordReadTarget::WorkUnits, "/coord/agent-work-units"),
+            (
+                CoordReadTarget::WorkUnit {
+                    slug: "2026-07-03-some-unit".to_string(),
+                },
+                "/coord/agent-work-units/2026-07-03-some-unit",
+            ),
+            (
+                CoordReadTarget::WorkUnitHistory {
+                    slug: "2026-07-03-some-unit".to_string(),
+                },
+                "/coord/agent-work-units/2026-07-03-some-unit/history",
+            ),
+            (CoordReadTarget::Gates, "/coord/agent-gates"),
+            (
+                CoordReadTarget::PrMergeVerdict {
+                    owner: "qontinui".to_string(),
+                    repo: "qontinui-runner".to_string(),
+                    number: "1144".to_string(),
+                },
+                "/pr-merge/verdict/qontinui/qontinui-runner/1144",
+            ),
+            (
+                CoordReadTarget::PrMergeEvents {
+                    owner: "qontinui".to_string(),
+                    repo: "qontinui-runner".to_string(),
+                    number: "1144".to_string(),
+                },
+                "/pr-merge/events/qontinui/qontinui-runner/1144",
+            ),
+            (CoordReadTarget::PrMergeEconomics, "/pr-merge/economics"),
+        ];
+        for (target, expected) in cases {
+            assert_eq!(&target.coord_path(), expected);
+        }
+        // The fleet reads must NOT gain a /coord prefix.
+        assert!(!CoordReadTarget::PrMergeEconomics
+            .coord_path()
+            .starts_with("/coord/"));
+    }
+
+    /// The shared URL builder: allowlisted path + the inbound query verbatim,
+    /// no double slash on a trailing-slash base, no dangling `?`.
+    #[test]
+    fn read_upstream_url_appends_query_verbatim() {
+        assert_eq!(
+            read_upstream_url(
+                "https://coord.example.test",
+                "/coord/agent-gates",
+                Some("work_unit_id=123e4567-e89b-12d3-a456-426614174000"),
+            ),
+            "https://coord.example.test/coord/agent-gates?work_unit_id=123e4567-e89b-12d3-a456-426614174000"
+        );
+        assert_eq!(
+            read_upstream_url("https://coord.example.test/", "/pr-merge/economics", None),
+            "https://coord.example.test/pr-merge/economics"
+        );
+        assert_eq!(
+            read_upstream_url("http://127.0.0.1:9870", "/coord/agent-work-units", Some("")),
+            "http://127.0.0.1:9870/coord/agent-work-units"
+        );
+    }
+
+    /// Every dynamic segment is charset-validated BEFORE any URL is built, with
+    /// the runner-originated 400 code — a path can never be smuggled into a
+    /// fixed coord route template. This is the property that makes the
+    /// enumerated design safe, so it is asserted per segment kind.
+    #[test]
+    fn coord_read_validate_rejects_every_smuggled_segment() {
+        // Segment-less targets are always Ok.
+        for t in [
+            CoordReadTarget::PromptDocuments,
+            CoordReadTarget::WorkUnits,
+            CoordReadTarget::Gates,
+            CoordReadTarget::PrMergeEconomics,
+        ] {
+            assert!(t.validate().is_ok());
+        }
+
+        let bad_segments = ["../etc", "a/b", "a%2fb", "a b", "", "-lead", ".", ".."];
+
+        for bad in bad_segments {
+            for t in [
+                CoordReadTarget::PromptDocument {
+                    kind: bad.to_string(),
+                    name: "engineering-priorities".to_string(),
+                },
+                CoordReadTarget::PromptDocument {
+                    kind: "policy".to_string(),
+                    name: bad.to_string(),
+                },
+                CoordReadTarget::WorkUnit {
+                    slug: bad.to_string(),
+                },
+                CoordReadTarget::WorkUnitHistory {
+                    slug: bad.to_string(),
+                },
+                CoordReadTarget::PrMergeVerdict {
+                    owner: bad.to_string(),
+                    repo: "qontinui-runner".to_string(),
+                    number: "1".to_string(),
+                },
+                CoordReadTarget::PrMergeEvents {
+                    owner: "qontinui".to_string(),
+                    repo: bad.to_string(),
+                    number: "1".to_string(),
+                },
+            ] {
+                let err = t.validate().unwrap_err();
+                assert_eq!(err.0, 400, "{t:?} must be rejected");
+                assert_eq!(err.1, "COORD_READ_PROXY_BAD_TARGET");
+            }
+        }
+
+        // A non-numeric / oversized PR number is rejected too.
+        for bad in ["", "12a", "-1", "+1", " 1", "1234567890"] {
+            let err = CoordReadTarget::PrMergeVerdict {
+                owner: "qontinui".to_string(),
+                repo: "qontinui-runner".to_string(),
+                number: bad.to_string(),
+            }
+            .validate()
+            .unwrap_err();
+            assert_eq!(err.1, "COORD_READ_PROXY_BAD_TARGET", "{bad:?}");
+        }
+
+        // …and the well-formed shapes pass, including coord's underscore kind.
+        assert!(CoordReadTarget::PromptDocument {
+            kind: "session_briefing".to_string(),
+            name: "default".to_string(),
+        }
+        .validate()
+        .is_ok());
+    }
+
+    /// The two shared segment validators, directly.
+    #[test]
+    fn segment_validators_accept_real_shapes_and_reject_smuggling() {
+        for ok in ["policy", "session_briefing", "engineering-priorities", "a1"] {
+            assert!(prompt_doc_segment_is_valid(ok), "{ok:?}");
+        }
+        for bad in ["Policy", "a/b", "..", ".", "", "-a", "a b", "a%2f"] {
+            assert!(!prompt_doc_segment_is_valid(bad), "{bad:?}");
+        }
+        for ok in ["qontinui", "qontinui-runner", "a.b_c-d", "A1"] {
+            assert!(github_segment_is_valid(ok), "{ok:?}");
+        }
+        for bad in ["..", ".", "", "a/b", "-a", "a b", "a%2f"] {
+            assert!(!github_segment_is_valid(bad), "{bad:?}");
+        }
+        assert!(pr_number_is_valid("1"));
+        assert!(pr_number_is_valid("123456789"));
+        assert!(!pr_number_is_valid("1234567890"));
+        assert!(!pr_number_is_valid(""));
+        assert!(!pr_number_is_valid("1a"));
+    }
+
+    /// Absent nonce → 401 from the runner with the coord-read family's own
+    /// error code, on EVERY registered route. The gate runs before any upstream
+    /// I/O, so nothing is ever forwarded to coord.
+    #[tokio::test]
+    async fn coord_read_routes_missing_nonce_is_401_never_forwarded() {
+        for (_, path, _) in read_route_table() {
+            let resp = read_router()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{path} without a nonce must 401");
+            let v = body_json(resp).await;
+            assert_eq!(v["success"], false);
+            assert_eq!(v["code"], "COORD_READ_PROXY_UNAUTHORIZED");
+        }
+    }
+
+    /// A wrong (unregistered) nonce → 401, same code, on EVERY route — with a
+    /// query string present to prove the gate fires regardless.
+    #[tokio::test]
+    async fn coord_read_routes_wrong_nonce_is_401() {
+        for (_, path, _) in read_route_table() {
+            let resp = read_router()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{path}?limit=5"))
+                        .header("X-Coord-Mcp-Proxy-Key", "not-a-registered-nonce")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{path} with a wrong nonce must 401");
+            let v = body_json(resp).await;
+            assert_eq!(v["code"], "COORD_READ_PROXY_UNAUTHORIZED");
+        }
+    }
+
+    /// A path-smuggling attempt is refused by the GATE first (401), never by the
+    /// validator — an unauthenticated caller must not be able to use the
+    /// validator as an oracle for which segments the runner accepts.
+    #[tokio::test]
+    async fn a_smuggled_segment_still_401s_before_it_is_validated() {
+        let resp = read_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/coord-mcp/agent-work-units/NOT%20A%20SLUG")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "COORD_READ_PROXY_UNAUTHORIZED");
+    }
+
+    /// The forwarding leg against a local mock coord: the bearer is injected per
+    /// request, the query string arrives verbatim, and coord's status + body
+    /// come back unreshaped — including a non-200 coord verdict.
+    #[tokio::test]
+    async fn forward_coord_get_injects_bearer_and_passes_through_verbatim() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/coord/agent-prompt-documents",
+                get(
+                    |headers: axum::http::HeaderMap,
+                     axum::extract::RawQuery(q): axum::extract::RawQuery| async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        axum::Json(serde_json::json!({"echo_query": q, "echo_auth": auth}))
+                    },
+                ),
+            )
+            .route(
+                "/pr-merge/economics",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"detail":"fleet_principal_required"}"#,
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+
+        let url = read_upstream_url(&base, "/coord/agent-prompt-documents", Some("kind=policy"));
+        let resp = forward_coord_get(
+            &url,
+            "synthetic-device-jwt",
+            qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
+            ReadProxyCodes::COORD_READ,
+            "test",
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["echo_query"], "kind=policy");
+        assert_eq!(v["echo_auth"], "Bearer synthetic-device-jwt");
+
+        // A non-200 coord verdict is passed through VERBATIM — never reshaped
+        // into a runner error, or the caller cannot tell coord's answer from
+        // the runner's.
+        let url = read_upstream_url(&base, "/pr-merge/economics", None);
+        let resp = forward_coord_get(
+            &url,
+            "synthetic-device-jwt",
+            qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
+            ReadProxyCodes::COORD_READ,
+            "test",
+        )
+        .await;
+        assert_eq!(resp.status(), 403);
+        let v = body_json(resp).await;
+        assert_eq!(v["detail"], "fleet_principal_required");
+
+        // An unreachable coord is a RUNNER-originated 502 in this family's own
+        // code space, carrying the exact upstream dialed.
+        let dead = read_upstream_url("http://127.0.0.1:1", "/coord/agent-gates", None);
+        let resp = forward_coord_get(
+            &dead,
+            "synthetic-device-jwt",
+            qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
+            ReadProxyCodes::COORD_READ,
+            "test",
+        )
+        .await;
+        assert_eq!(resp.status(), 502);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "COORD_READ_PROXY_UPSTREAM_UNREACHABLE");
+        assert_eq!(v["upstream_url"], dead);
+    }
+}
+
+/// The mint route's same-user handshake gate (plan
+/// 2026-08-24-headless-box-has-no-working-coord-credential-door, Phase 1) and
+/// the `/health` `credentialDoors` summary (Phase 4).
+///
+/// The gate's own truth table is unit-tested as a pure resolver in
+/// `coord_mcp::tests`; what is asserted HERE is the wiring that only exists at
+/// the route: the header name actually read, the typed 403 codes actually
+/// emitted, and — the load-bearing one — that the gate runs BEFORE the body
+/// parser, so an unauthenticated caller can never reach the registry or the
+/// credential store.
+#[cfg(test)]
+mod coord_provision_session_gate_tests {
+    use super::{coord_provision_session_handler, credential_doors_health};
+    use axum::{body::Body, http::Request, routing::post, Router};
+    use tower::ServiceExt;
+
+    fn provision_router() -> Router {
+        Router::new().route(
+            "/coord-mcp/provision-session",
+            post(coord_provision_session_handler),
+        )
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// No handshake header ⇒ 403 `_NO_HANDSHAKE`, and it is decided BEFORE the
+    /// body is parsed: the body below is not even valid JSON, and the answer is
+    /// still the 403, not a 400 `_INVALID_BODY`.
+    #[tokio::test]
+    async fn no_handshake_is_403_before_the_body_is_parsed() {
+        let resp = provision_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/coord-mcp/provision-session")
+                    .body(Body::from("not json {"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let v = body_json(resp).await;
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], "COORD_MCP_PROVISION_NO_HANDSHAKE");
+        // The denial names the header and the file, never the secret.
+        let err = v["error"].as_str().unwrap_or_default();
+        assert!(err.contains("X-Qontinui-Loopback-Key"), "{err}");
+        assert!(err.contains("runner-loopback-key"), "{err}");
+    }
+
+    /// An EMPTY handshake header is "not presented", not "wrong" — the two have
+    /// different fixes, which is why they are different codes.
+    #[tokio::test]
+    async fn an_empty_handshake_header_is_no_handshake_not_a_mismatch() {
+        let resp = provision_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/coord-mcp/provision-session")
+                    .header("X-Qontinui-Loopback-Key", "   ")
+                    .body(Body::from(r#"{"cwd":"/tmp"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        assert_eq!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_NO_HANDSHAKE"
+        );
+    }
+
+    /// A WRONG handshake ⇒ 403 `_HANDSHAKE_MISMATCH`, again before the body is
+    /// parsed. In a unit test no runner start has initialized a key, so every
+    /// presented value is wrong — which is itself the fail-closed posture worth
+    /// pinning: no key ⇒ nothing matches, never "anything goes".
+    #[tokio::test]
+    async fn a_wrong_handshake_is_403_mismatch_and_fails_closed_with_no_key() {
+        let resp = provision_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/coord-mcp/provision-session")
+                    .header("X-Qontinui-Loopback-Key", "definitely-not-the-key")
+                    .body(Body::from("not json {"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "COORD_MCP_PROVISION_HANDSHAKE_MISMATCH");
+        let err = v["error"].as_str().unwrap_or_default();
+        assert!(
+            !err.contains("definitely-not-the-key"),
+            "a denial must never echo what the caller presented"
+        );
+    }
+
+    /// The retired master env flag can no longer open the route: setting it
+    /// changes nothing, and the old `COORD_MCP_PROVISION_DISABLED` code is
+    /// unreachable because the variant that produced it is deleted.
+    #[tokio::test]
+    async fn the_retired_master_flag_cannot_reopen_the_route() {
+        let resp = provision_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/coord-mcp/provision-session")
+                    .body(Body::from(r#"{"cwd":"/tmp"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        assert_ne!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_DISABLED",
+            "the flag-off denial is deleted, not merely unused"
+        );
+    }
+
+    /// Phase 4: `/health.credentialDoors` states, per transport, whether it can
+    /// answer — cheaply, and without ever emitting a secret.
+    #[test]
+    fn credential_doors_names_each_transport_and_never_leaks_a_secret() {
+        for frontend_ready in [true, false] {
+            let v = credential_doors_health(frontend_ready);
+
+            // The eval mint is gated on the frontend, which is the whole point:
+            // a headless runner must report it as unable to answer instead of
+            // leaving every door to infer that from a 10s timeout.
+            assert_eq!(v["evalMint"]["canAnswer"], frontend_ready);
+            assert!(v["evalMint"]["transport"]
+                .as_str()
+                .unwrap()
+                .contains("/ui-bridge/control/page/evaluate"));
+
+            // The in-process mint and the forwarder never need a WebView, so
+            // their verdict must not move with the frontend.
+            assert_eq!(v["provisionSessionMint"]["requiresWebview"], false);
+            assert_eq!(v["coordMcpForwarder"]["requiresWebview"], false);
+            assert_eq!(v["coordMcpForwarder"]["canAnswer"], true);
+            assert_eq!(
+                v["provisionSessionMint"]["handshakeHeader"],
+                "X-Qontinui-Loopback-Key"
+            );
+
+            // Every door names a reason, so a reader never has to guess.
+            for door in ["evalMint", "provisionSessionMint", "coordMcpForwarder"] {
+                assert!(
+                    !v[door]["reason"].as_str().unwrap_or_default().is_empty(),
+                    "{door} must state a reason"
+                );
+            }
+
+            // Nothing in the summary may carry a credential: no key, no nonce,
+            // no bearer. The opt-in MARKER path is a location the operator must
+            // act on and is deliberately published; the handshake KEY's path is
+            // not, and its contents never are.
+            let rendered = v.to_string();
+            assert!(!rendered.contains("runner-loopback-key"), "{rendered}");
+            assert!(!rendered.to_lowercase().contains("bearer "), "{rendered}");
+        }
     }
 }
 

@@ -28,10 +28,14 @@
 //!    operator act, and it is reversible in the same place it was enabled —
 //!    which is exactly why a Settings toggle was chosen over a hand-dropped
 //!    dotfile an operator cannot revoke what they cannot find.
-//! 2. **Mint gate (runner-side).** Will a runner actually mint?
-//!    `QONTINUI_SESSION_COORD_IDENTITY_ENABLED` (default OFF — the feature ships
-//!    dark) AND `~/.qontinui/allow-session-coord-identity`. See
-//!    `coord_mcp::session_identity_gate`.
+//! 2. **Mint gate (runner-side).** Will a runner actually mint? The SAME-USER
+//!    loopback handshake (`X-Qontinui-Loopback-Key`, matched against the
+//!    owner-only `~/.qontinui/runner-loopback-key` this runner start wrote) AND
+//!    `~/.qontinui/allow-session-coord-identity`. See
+//!    `coord_mcp::session_identity_gate`. The former spawn-time master env flag
+//!    was DELETED by plan
+//!    `2026-08-24-headless-box-has-no-working-coord-credential-door` — it could
+//!    be neither enabled nor revoked without restarting the runner.
 //!
 //! With this ON and the mint gate OFF, a bare `claude` POSTs once, is refused
 //! with a typed 403, and launches the real CLI unchanged — the default posture

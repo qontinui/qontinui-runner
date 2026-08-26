@@ -109,7 +109,8 @@ impl ProxyPrincipal {
 /// - [`NonceLifetime::Ephemeral`] — minted ONLY by the
 ///   `/coord-mcp/provision-session` route, i.e. on behalf of a session the runner
 ///   did not spawn and cannot vouch for. Bounded expiry, NEVER persisted, and
-///   revoked the moment the machine is opted back out ([`session_identity_gate`]).
+///   revoked the moment the machine is opted back out
+///   ([`session_identity_marker_present`]).
 ///
 /// **A short TTL fights the persistence design — so it is scoped, not global.**
 /// Shortening every nonce would 401 every live agent across a routine runner
@@ -269,16 +270,28 @@ struct NonceBinding {
 }
 
 // ---------------------------------------------------------------------------
-// Session-provisioned coord identity: the TWO gates (plan 2026-07-17 §1/§3)
+// Session-provisioned coord identity: the TWO gates
+// (plan 2026-07-17 §1/§3, re-cut by plan
+//  2026-08-24-headless-box-has-no-working-coord-credential-door Phase 1)
 // ---------------------------------------------------------------------------
-
-/// Master enable flag for session-provisioned coord identity — the
-/// `POST /coord-mcp/provision-session` mint route. **Default OFF: the feature
-/// ships dark**, exactly like [`crate::install_effects_producer::intercept::shim_materializer::ENABLE_FLAG`]
-/// (`QONTINUI_INSTALL_INTERCEPT_ENABLED`), whose constant shape this copies.
-/// Flag off ⇒ the route denies every request ⇒ zero behavior change for every
-/// existing session, spawned or bare.
-pub(crate) const SESSION_IDENTITY_ENABLE_FLAG: &str = "QONTINUI_SESSION_COORD_IDENTITY_ENABLED";
+//
+// The two gates are now the SAME-USER HANDSHAKE and the OPT-IN MARKER. The
+// original §1 shape carried a spawn-time master env flag
+// (`QONTINUI_SESSION_COORD_IDENTITY_ENABLED`) instead of the handshake; it was
+// DELETED, not deprecated, and no override was left behind. Two reasons, both
+// load-bearing:
+//
+//  1. It was read from the process environment, so it was fixed for a runner's
+//     entire lifetime — an operator could neither enable NOR revoke it without
+//     restarting the runner, which served policy `production-and-cost`
+//     `runner-lifecycle` forbids. It could therefore never be the operator's
+//     off switch; the marker already is one, live and per request.
+//  2. It gated the wrong thing. A flag says "the feature is on"; it says
+//     nothing about WHO is calling. Flag-on left the route gated on marker
+//     *presence* alone, and presence is not identity — see below.
+//
+// What replaced it is a control the flag never provided: proof that the caller
+// is the SAME OS USER the runner runs as.
 
 /// File name of the per-machine operator opt-in marker, under `~/.qontinui/`.
 /// Its mere existence is the signal; contents are never read.
@@ -289,6 +302,16 @@ pub(crate) const SESSION_IDENTITY_ENABLE_FLAG: &str = "QONTINUI_SESSION_COORD_ID
 /// the two processes.
 pub(crate) use qontinui_runner_lib::profile_cli::SESSION_IDENTITY_MARKER_FILE;
 
+/// The loopback handshake contract, re-exported from the LIB crate for exactly
+/// the same reason as the marker above: the runner BIN WRITES the key and the
+/// standalone `qontinui-shim` `.exe` READS it, and the two must agree on the
+/// path and the header name byte-for-byte. See
+/// [`qontinui_runner_lib::profile_cli::RUNNER_LOOPBACK_KEY_FILE`] for why the
+/// handshake exists at all.
+pub(crate) use qontinui_runner_lib::profile_cli::{
+    runner_loopback_key_path, RUNNER_LOOPBACK_KEY_FILE, RUNNER_LOOPBACK_KEY_HEADER,
+};
+
 /// Absolute path of the opt-in marker (`~/.qontinui/allow-session-coord-identity`).
 /// `None` when the home dir is unresolvable — which [`session_identity_gate`]
 /// treats as NOT opted in (fail-closed: an unresolvable home must never read as
@@ -298,15 +321,117 @@ pub(crate) fn session_identity_marker_path() -> Option<std::path::PathBuf> {
     qontinui_runner_lib::profile_cli::session_identity_marker_path()
 }
 
+/// THIS runner start's loopback handshake secret, held in memory.
+///
+/// The file at [`runner_loopback_key_path`] is the DELIVERY channel; this cell
+/// is the truth the gate compares against. Seeded exactly once per process by
+/// [`init_loopback_handshake_key`] at server start, so:
+///
+/// * a caller that cannot read the owner-only file cannot learn the secret, and
+/// * a failed file write leaves the route denying every request (fail-closed)
+///   rather than accepting an empty or attacker-chosen value.
+///
+/// Empty/unset ⇒ the route is closed. That is the honest posture for a bin or a
+/// unit test that never initialized one.
+static LOOPBACK_HANDSHAKE_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Generate this start's handshake secret and publish it owner-only at
+/// [`runner_loopback_key_path`]. Idempotent per process (the `OnceLock` is the
+/// guard), and best-effort on the write: a write failure is warned about and
+/// leaves the route CLOSED, never open.
+///
+/// Called synchronously from [`crate::mcp_api::start_server`] before the socket
+/// is served, so a caller that can reach `/health` can already read the key.
+///
+/// # Entropy and rotation
+///
+/// 32 bytes from the OS CSPRNG, hex-encoded (64 chars) — well past the ">=32
+/// bytes of entropy" the contract requires, and the same shape the doors
+/// already handle for nonces. Rotated per runner start (see
+/// [`RUNNER_LOOPBACK_KEY_FILE`]), which is what bounds a leak's blast radius.
+///
+/// The secret itself is NEVER logged — the log line names the path and a short
+/// prefix only, matching the rotation log's discipline.
+pub(crate) fn init_loopback_handshake_key() {
+    let secret = LOOPBACK_HANDSHAKE_KEY.get_or_init(|| {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        // `rand::rng()` is the thread CSPRNG (ChaCha12, seeded from the OS
+        // entropy source and reseeded periodically) — a cryptographically
+        // secure generator, not the `SmallRng`/`StdRng` distinction. It is the
+        // infallible one: `OsRng` in rand 0.9 is `TryRngCore`, and there is no
+        // sane weaker fallback for a secret, so taking the infallible CSPRNG is
+        // both simpler and strictly correct here.
+        rand::rng().fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    });
+    let Some(path) = runner_loopback_key_path() else {
+        warn!(
+            "coord_mcp: home dir unresolvable — no loopback handshake key written; \
+             POST /coord-mcp/provision-session will deny every request"
+        );
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!(
+                "coord_mcp: could not create {} for the loopback handshake key: {e} — \
+                 POST /coord-mcp/provision-session will deny every request",
+                parent.display()
+            );
+            return;
+        }
+    }
+    match crate::fs_perms::write_owner_only(&path, secret.as_bytes()) {
+        Ok(()) => info!(
+            "coord_mcp: loopback handshake key rotated for this runner start \
+             (path={}, key_prefix={}…)",
+            path.display(),
+            &secret[..8.min(secret.len())]
+        ),
+        Err(e) => warn!(
+            "coord_mcp: failed to write the loopback handshake key to {}: {e} — \
+             POST /coord-mcp/provision-session will deny every request (fail-closed)",
+            path.display()
+        ),
+    }
+}
+
+/// This process's handshake secret, or `None` when none was ever initialized.
+fn loopback_handshake_key() -> Option<&'static str> {
+    LOOPBACK_HANDSHAKE_KEY
+        .get()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Constant-time byte equality. Deliberately NOT `==`: a short-circuiting
+/// comparison on a secret leaks its prefix through timing, and this route is
+/// reachable by any local process, so the oracle is genuinely available.
+/// Backed by `subtle`, already a dependency.
+fn secret_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    // `ct_eq` requires equal lengths; the length itself is not a secret (the
+    // key is a fixed-width hex string), so comparing it first is safe and is
+    // what every constant-time string compare does.
+    a.len() == b.len() && bool::from(a.ct_eq(b))
+}
+
 /// Why the mint route refused. Typed rather than a bare bool so the route can
 /// return an explicit, actionable reason — the runner's "no silent empty
-/// responses" rule. A denied caller must be able to tell "the feature is dark"
-/// from "this machine has not opted in", because the fixes are different.
+/// responses" rule. A denied caller must be able to tell "you did not prove you
+/// are the same user" from "you proved it with the WRONG secret" from "this
+/// machine has not opted in", because all three have different fixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionIdentityDenial {
-    /// The master flag is unset/falsy — the feature is dark on this runner.
-    FlagOff,
-    /// The flag is on but the operator has not dropped the opt-in marker.
+    /// No `X-Qontinui-Loopback-Key` header (or an empty one) — the caller never
+    /// attempted the same-user handshake. Fix: read the key file.
+    NoHandshake,
+    /// A handshake was presented and it is not this runner start's secret.
+    /// Fix: re-read the key file (it rotates per runner start) — or the caller
+    /// is a different local user, and the denial is working as designed.
+    HandshakeMismatch,
+    /// Same-user proven, but the operator has not dropped the opt-in marker.
     NotOptedIn,
 }
 
@@ -314,18 +439,31 @@ impl SessionIdentityDenial {
     /// Machine-readable code for the route's JSON error body.
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            SessionIdentityDenial::FlagOff => "COORD_MCP_PROVISION_DISABLED",
+            SessionIdentityDenial::NoHandshake => "COORD_MCP_PROVISION_NO_HANDSHAKE",
+            SessionIdentityDenial::HandshakeMismatch => "COORD_MCP_PROVISION_HANDSHAKE_MISMATCH",
             SessionIdentityDenial::NotOptedIn => "COORD_MCP_PROVISION_NOT_OPTED_IN",
         }
     }
 
     /// Human/agent-actionable explanation — names the exact lever to flip.
     pub(crate) fn message(&self) -> String {
+        let key_path = || {
+            runner_loopback_key_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| format!("~/.qontinui/{RUNNER_LOOPBACK_KEY_FILE}"))
+        };
         match self {
-            SessionIdentityDenial::FlagOff => format!(
-                "session-provisioned coord identity is disabled on this runner — \
-                 set {SESSION_IDENTITY_ENABLE_FLAG}=1 in the runner's environment \
-                 and restart it to enable"
+            SessionIdentityDenial::NoHandshake => format!(
+                "no same-user handshake presented — send the contents of {} in the \
+                 {RUNNER_LOOPBACK_KEY_HEADER} header (the file is owner-only, so only \
+                 the user this runner runs as can read it)",
+                key_path()
+            ),
+            SessionIdentityDenial::HandshakeMismatch => format!(
+                "the {RUNNER_LOOPBACK_KEY_HEADER} handshake does not match this runner \
+                 start's key — re-read {} (it is rotated on every runner start, so a \
+                 cached value goes stale when the runner restarts)",
+                key_path()
             ),
             SessionIdentityDenial::NotOptedIn => {
                 let path = session_identity_marker_path()
@@ -342,14 +480,29 @@ impl SessionIdentityDenial {
 }
 
 /// Pure resolver for [`session_identity_gate`] — both gates, no I/O, so the
-/// default-OFF posture is unit-testable without touching process-global env or
-/// the operator's real home dir.
+/// fail-closed posture is unit-testable without touching process-global state,
+/// the real home dir, or a live `OnceLock`.
+///
+/// Order is deliberate: the **handshake first**, the marker second. The
+/// handshake is the identity proof, and a caller who has not proven they are
+/// the owning user should not learn from the response whether this machine
+/// happens to be opted in.
 fn resolve_session_identity_gate(
-    flag_on: bool,
+    presented_key: Option<&str>,
+    expected_key: Option<&str>,
     marker_exists: bool,
 ) -> Result<(), SessionIdentityDenial> {
-    if !flag_on {
-        return Err(SessionIdentityDenial::FlagOff);
+    let presented = presented_key.map(str::trim).filter(|s| !s.is_empty());
+    let Some(presented) = presented else {
+        return Err(SessionIdentityDenial::NoHandshake);
+    };
+    // No key initialized on this runner (home unresolvable, or the write
+    // failed) ⇒ nothing can match. Fail CLOSED rather than accepting anything.
+    let Some(expected) = expected_key.filter(|s| !s.is_empty()) else {
+        return Err(SessionIdentityDenial::HandshakeMismatch);
+    };
+    if !secret_eq(presented.as_bytes(), expected.as_bytes()) {
+        return Err(SessionIdentityDenial::HandshakeMismatch);
     }
     if !marker_exists {
         return Err(SessionIdentityDenial::NotOptedIn);
@@ -357,9 +510,9 @@ fn resolve_session_identity_gate(
     Ok(())
 }
 
-/// The authorization gate for session-provisioned coord identity: the master
-/// flag AND the per-machine opt-in marker. BOTH are required — neither alone
-/// grants identity.
+/// The authorization gate for session-provisioned coord identity: the SAME-USER
+/// handshake AND the per-machine opt-in marker. BOTH are required — neither
+/// alone grants identity.
 ///
 /// # Why two gates instead of a nonce check
 ///
@@ -371,37 +524,110 @@ fn resolve_session_identity_gate(
 ///
 /// # Why "same machine" is not itself an authorization signal
 ///
-/// On a single-user dev box every process runs as the same OS user, so reaching
-/// `127.0.0.1` proves nothing — a compromised dependency's post-install script
-/// could mint device identity and act as the operator against coord. The marker
-/// converts "any local process" into "any local process on a machine the
-/// operator deliberately, revocably opted in", which is a decision the operator
-/// made rather than one the network topology made for them.
+/// `127.0.0.1:9876` is a TCP socket, and any local user can connect to loopback
+/// — there is no peer-credential check on a TCP socket. So reaching the port
+/// proves nothing, and marker *presence* does not fix that: it is a property of
+/// the machine, not of the caller. Without the handshake, a DIFFERENT local user
+/// could mint a device-scoped nonce they provably cannot obtain today, because
+/// the store (`auth_tokens.enc`) is owner-only and closed to them. The handshake
+/// file is written owner-only, so requiring its contents reproduces the FILE's
+/// boundary on the SOCKET — that is the whole mechanism.
+///
+/// The marker then answers the second, different question: has the operator
+/// deliberately, revocably opted this machine in? A same-user compromise (a
+/// dependency's post-install script runs as the operator and can read the key
+/// file) is bounded by the marker, not by the handshake.
 ///
 /// # Live, not just mint-time
 ///
-/// This is re-checked on every request that presents an
-/// [`NonceLifetime::Ephemeral`] nonce ([`live_binding`]), so deleting the marker
-/// REVOKES already-minted session nonces instead of merely blocking new ones. It
-/// is the operator's actual off switch. Cheap by construction: only ephemeral
-/// bindings pay the check, so a runner-spawned terminal never does.
-pub(crate) fn session_identity_gate() -> Result<(), SessionIdentityDenial> {
-    // Flag first, short-circuiting: in the default (dark) posture this costs one
-    // env read and never touches the filesystem.
-    let flag_on = matches!(
-        std::env::var(SESSION_IDENTITY_ENABLE_FLAG)
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    );
-    if !flag_on {
-        return Err(SessionIdentityDenial::FlagOff);
+/// The MARKER half is re-checked on every request that presents an
+/// [`NonceLifetime::Ephemeral`] nonce ([`live_binding`] →
+/// [`session_identity_marker_present`]), so deleting the marker REVOKES
+/// already-minted session nonces instead of merely blocking new ones. It is the
+/// operator's actual off switch. Cheap by construction: only ephemeral bindings
+/// pay the check, so a runner-spawned terminal never does.
+pub(crate) fn session_identity_gate(
+    presented_key: Option<&str>,
+) -> Result<(), SessionIdentityDenial> {
+    // One marker stat per mint attempt. The mint route runs at most once per
+    // session launch, so the stat is free — and the resolver's ordering
+    // (handshake first) still guarantees an UNAUTHENTICATED caller never learns
+    // from the denial whether this machine is opted in.
+    resolve_session_identity_gate(
+        presented_key,
+        loopback_handshake_key(),
+        session_identity_marker_present(),
+    )
+}
+
+/// Does the per-machine opt-in marker exist RIGHT NOW?
+///
+/// This is the live-revocation half of [`session_identity_gate`], split out
+/// because [`live_binding`] has no request headers to hand: it re-checks the
+/// operator's off switch on every request that presents an ephemeral nonce, and
+/// the handshake was already proven at mint time by the route. Deleting the
+/// marker therefore invalidates ALREADY-MINTED session nonces, not merely future
+/// mints.
+///
+/// Fail-closed on an unresolvable home dir — absence of a readable home must
+/// never read as consent.
+fn session_identity_marker_present() -> bool {
+    // Test-only: let a test drive the operator's switch without touching the
+    // developer's real home dir (see [`MarkerOverride`]). Compiled out of the
+    // shipped binary entirely.
+    #[cfg(test)]
+    match MARKER_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => return false,
+        1 => return true,
+        _ => {}
     }
-    let marker_exists = session_identity_marker_path()
+    session_identity_marker_path()
         .map(|p| p.exists())
-        .unwrap_or(false);
-    resolve_session_identity_gate(flag_on, marker_exists)
+        .unwrap_or(false)
+}
+
+/// Test-only override of the opt-in-marker stat: `-1` = no override (stat the
+/// real marker), `0` = absent, `1` = present.
+///
+/// Without it, every test of the live-revocation property would silently depend
+/// on whether the developer running it happens to have opted THIS machine in —
+/// a test that passes for the wrong reason on one box and fails on another.
+#[cfg(test)]
+static MARKER_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Serializes the tests that install a [`MARKER_OVERRIDE`], which is
+/// process-global.
+#[cfg(test)]
+static MARKER_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII handle for [`MARKER_OVERRIDE`]: holds the serialization lock for the
+/// test's whole body and restores "no override" on drop, so a panicking test
+/// cannot leak the override into the rest of the suite.
+#[cfg(test)]
+struct MarkerOverride(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl MarkerOverride {
+    fn set(present: bool) -> Self {
+        let guard = MARKER_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        MARKER_OVERRIDE.store(i8::from(present), std::sync::atomic::Ordering::SeqCst);
+        MarkerOverride(guard)
+    }
+
+    /// Flip the operator's switch mid-test — this is what makes "deleting the
+    /// marker revokes an ALREADY-MINTED nonce" assertable.
+    fn flip(&self, present: bool) {
+        MARKER_OVERRIDE.store(i8::from(present), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl Drop for MarkerOverride {
+    fn drop(&mut self) {
+        MARKER_OVERRIDE.store(-1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 // Re-export of the `.mcp.json` proxy-header contract, which lives in
@@ -453,13 +679,13 @@ pub(crate) const AGENT_GONE_PROXY_CAUSE: &str =
 /// deliberately cut for exactly that reason:
 ///
 /// * `POST /coord-mcp/provision-session` — it reads as the obvious recovery and
-///   is not one. The route is gated by [`session_identity_gate`], whose first
-///   arm is the default-OFF [`SESSION_IDENTITY_ENABLE_FLAG`], so in the shipped
-///   posture the advised recovery is a **denial**; and even with the flag on
-///   plus the opt-in marker it mints an EPHEMERAL, `terminal_id: None`,
-///   never-persisted nonce — a strictly weaker credential class than the
-///   persistent per-terminal one that just died, gone again at the next
-///   restart, and revocable mid-session by deleting the marker.
+///   is not one. The route is gated by [`session_identity_gate`]: the caller
+///   must present this runner start's owner-only loopback handshake key AND the
+///   machine must carry the opt-in marker, so on an un-opted machine the advised
+///   recovery is a **denial**; and even when both hold it mints an EPHEMERAL,
+///   `terminal_id: None`, never-persisted nonce — a strictly weaker credential
+///   class than the persistent per-terminal one that just died, gone again at
+///   the next restart, and revocable mid-session by deleting the marker.
 /// * Restarting the runner — forbidden outright (served policy
 ///   `production-and-cost` `runner-lifecycle`), and it orphans every OTHER
 ///   session's key, which is the incident this plan was written from.
@@ -2553,7 +2779,7 @@ fn register_proxy_nonce(workdir: &str, terminal_id: Option<&str>) -> String {
 ///   reaches disk), and
 /// - instant GLOBAL revoke is deleting the opt-in marker
 ///   ([`session_identity_marker_path`]), re-checked per request via
-///   [`session_identity_gate`] — the operator's real kill switch that
+///   [`session_identity_marker_present`] — the operator's real kill switch that
 ///   invalidates ALL ephemeral sessions at once.
 ///
 /// Precise per-nonce revoke is INTENTIONALLY deferred to the credential-exposure
@@ -2927,7 +3153,7 @@ fn live_binding(nonce: &str) -> Option<NonceBinding> {
                     .remove(nonce);
                 return None;
             }
-            session_identity_gate().is_ok().then_some(binding)
+            session_identity_marker_present().then_some(binding)
         }
     }
 }
@@ -4042,9 +4268,19 @@ fn coord_mcp_agent_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json
     doc
 }
 
-/// Filename of the Phase-1a degraded-only breadcrumb dropped into a session
-/// workdir when coord-mcp provisioning is degraded (no JWT, unresolvable port,
-/// or a failed reachability probe). Referenced by the `/gate` skill + CLAUDE.md.
+/// Filename of the breadcrumb dropped into a session workdir when coord-mcp is
+/// degraded (no JWT, unresolvable port, a failed reachability probe) **or was
+/// never provisioned at all**. Referenced by the `/gate` skill + CLAUDE.md.
+///
+/// # The never-provisioned arm (plan
+/// # 2026-08-24-headless-box-has-no-working-coord-credential-door, Phase 4)
+///
+/// It used to be written on DEGRADED reasons only, which made its ABSENCE
+/// ambiguous: healthy, not-yet-probed, or *provisioning never ran*. That third
+/// state is the one that hurt — a box sat un-provisioned with nothing
+/// observable, and every reader took the absent file for health. A spawn that
+/// provisions nothing now leaves [`write_unprovisioned_breadcrumb`] naming the
+/// reason, so the absent-file case narrows to "healthy or not yet probed".
 pub(crate) const COORD_MCP_STATUS_FILE: &str = ".coord-mcp-status";
 
 /// Env var the runner injects at spawn carrying the absolute path of a
@@ -4063,18 +4299,44 @@ pub(crate) const MCP_CONFIG_ENV: &str = "QONTINUI_MCP_CONFIG";
 /// (the file is removed by [`clear_degraded_breadcrumb`] on a successful probe),
 /// so its mere presence is the signal. Best-effort: a write failure only logs.
 pub(crate) fn write_degraded_breadcrumb(workdir: &str, reason: &str) {
-    let line =
-        format!("coord-mcp UNREACHABLE ({reason}) — gate registration degraded; use /gate\n");
+    write_status_breadcrumb(
+        workdir,
+        &format!("coord-mcp UNREACHABLE ({reason}) — gate registration degraded; use /gate"),
+    );
+}
+
+/// Write the NEVER-PROVISIONED breadcrumb (Phase 4): this spawn gave the session
+/// no coord-mcp at all, and the reason is stated rather than left to be inferred
+/// from an absent file.
+///
+/// A DIFFERENT verdict word from [`write_degraded_breadcrumb`] on purpose.
+/// "UNREACHABLE" is the verdict of an actual probe; this arm never probed
+/// anything, because there was no config to probe. Collapsing the two would tell
+/// a 2am reader that coord is down when in fact nothing ever asked it.
+pub(crate) fn write_unprovisioned_breadcrumb(workdir: &str, reason: &str) {
+    write_status_breadcrumb(
+        workdir,
+        &format!(
+            "coord-mcp NOT PROVISIONED ({reason}) — this session was spawned with no \
+             coord-mcp config; use /gate or /coord-revive"
+        ),
+    );
+}
+
+/// The single writer of [`COORD_MCP_STATUS_FILE`]. Best-effort: a write failure
+/// only logs — losing the breadcrumb must never fail a spawn.
+fn write_status_breadcrumb(workdir: &str, line: &str) {
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
-    if let Err(e) = std::fs::write(&path, line) {
-        warn!("coord_mcp: failed to write degraded breadcrumb in {workdir}: {e}");
+    if let Err(e) = std::fs::write(&path, format!("{line}\n")) {
+        warn!("coord_mcp: failed to write status breadcrumb in {workdir}: {e}");
     }
 }
 
-/// Remove a stale degraded breadcrumb once coord-mcp is confirmed reachable, so
-/// a session that recovered (e.g. a reconcile fixed the port) does not keep
-/// showing a stale UNREACHABLE marker. Best-effort + idempotent (absent = ok).
-fn clear_degraded_breadcrumb(workdir: &str) {
+/// Remove a stale breadcrumb once coord-mcp is confirmed reachable OR freshly
+/// provisioned, so a session that recovered (e.g. a reconcile fixed the port, or
+/// the next spawn in this cwd DID get a config) does not keep showing a stale
+/// UNREACHABLE / NOT PROVISIONED marker. Best-effort + idempotent (absent = ok).
+pub(crate) fn clear_degraded_breadcrumb(workdir: &str) {
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
     let _ = std::fs::remove_file(path);
 }
@@ -6571,51 +6833,154 @@ mod tests {
 
     /// The route's authorization gate — the substitute for the nonce check every
     /// sibling `/coord-mcp/*` route has. BOTH gates are required, and the
-    /// DEFAULT (flag unset) is denied: the feature ships dark, so an un-flagged
-    /// runner exposes nothing. Pure resolver ⇒ no env/home-dir mutation.
+    /// DEFAULT (no handshake presented) is denied. Pure resolver ⇒ no
+    /// process-env, `OnceLock` or home-dir mutation.
     #[test]
-    fn session_identity_gate_requires_flag_and_marker_and_defaults_denied() {
-        // Default posture: flag off ⇒ FlagOff, regardless of the marker. This is
-        // the "flag OFF ⇒ zero behavior change" acceptance criterion.
+    fn session_identity_gate_requires_handshake_and_marker_and_defaults_denied() {
+        const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // No handshake ⇒ NoHandshake, regardless of the marker. The caller must
+        // not learn the machine's opt-in state before proving same-user.
         assert_eq!(
-            resolve_session_identity_gate(false, false),
-            Err(SessionIdentityDenial::FlagOff)
+            resolve_session_identity_gate(None, Some(KEY), false),
+            Err(SessionIdentityDenial::NoHandshake)
         );
         assert_eq!(
-            resolve_session_identity_gate(false, true),
-            Err(SessionIdentityDenial::FlagOff),
-            "an opted-in machine must STILL be denied while the master flag is dark"
+            resolve_session_identity_gate(None, Some(KEY), true),
+            Err(SessionIdentityDenial::NoHandshake),
+            "an opted-in machine must STILL be denied without the same-user handshake"
         );
-        // Flag on but not opted in ⇒ a DISTINCT reason (different fix).
+        // An empty / whitespace-only header is "not presented", not "wrong".
         assert_eq!(
-            resolve_session_identity_gate(true, false),
+            resolve_session_identity_gate(Some(""), Some(KEY), true),
+            Err(SessionIdentityDenial::NoHandshake)
+        );
+        assert_eq!(
+            resolve_session_identity_gate(Some("   "), Some(KEY), true),
+            Err(SessionIdentityDenial::NoHandshake)
+        );
+
+        // Presented but wrong ⇒ a DISTINCT reason (different fix).
+        assert_eq!(
+            resolve_session_identity_gate(Some("not-the-key"), Some(KEY), true),
+            Err(SessionIdentityDenial::HandshakeMismatch)
+        );
+        // A PREFIX of the real key must not pass — the compare is whole-value.
+        assert_eq!(
+            resolve_session_identity_gate(Some(&KEY[..32]), Some(KEY), true),
+            Err(SessionIdentityDenial::HandshakeMismatch)
+        );
+        // No key initialized on this runner ⇒ nothing can match: fail CLOSED,
+        // never "anything goes".
+        assert_eq!(
+            resolve_session_identity_gate(Some(KEY), None, true),
+            Err(SessionIdentityDenial::HandshakeMismatch)
+        );
+        assert_eq!(
+            resolve_session_identity_gate(Some(KEY), Some(""), true),
+            Err(SessionIdentityDenial::HandshakeMismatch)
+        );
+
+        // Handshake proven but not opted in ⇒ the third, distinct reason.
+        assert_eq!(
+            resolve_session_identity_gate(Some(KEY), Some(KEY), false),
             Err(SessionIdentityDenial::NotOptedIn)
         );
-        // Both ⇒ allowed.
-        assert_eq!(resolve_session_identity_gate(true, true), Ok(()));
-
-        // The two denials never collapse into one code — a caller must be able
-        // to tell "the feature is dark" from "this machine has not opted in".
-        assert_ne!(
-            SessionIdentityDenial::FlagOff.code(),
-            SessionIdentityDenial::NotOptedIn.code()
+        // Both ⇒ allowed (surrounding whitespace on the header is tolerated).
+        assert_eq!(
+            resolve_session_identity_gate(Some(KEY), Some(KEY), true),
+            Ok(())
         );
-        // ...and the not-opted-in message names the marker path to create.
+        assert_eq!(
+            resolve_session_identity_gate(Some(&format!(" {KEY}\n")), Some(KEY), true),
+            Ok(())
+        );
+
+        // The three denials never collapse into one code — a caller must be able
+        // to tell "you did not prove same-user" from "you proved it wrong" from
+        // "this machine has not opted in".
+        let codes = [
+            SessionIdentityDenial::NoHandshake.code(),
+            SessionIdentityDenial::HandshakeMismatch.code(),
+            SessionIdentityDenial::NotOptedIn.code(),
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            for b in codes.iter().skip(i + 1) {
+                assert_ne!(a, b, "denial codes must stay distinct");
+            }
+        }
+        assert_eq!(
+            SessionIdentityDenial::NoHandshake.code(),
+            "COORD_MCP_PROVISION_NO_HANDSHAKE"
+        );
+        assert_eq!(
+            SessionIdentityDenial::HandshakeMismatch.code(),
+            "COORD_MCP_PROVISION_HANDSHAKE_MISMATCH"
+        );
+
+        // The messages name the exact lever: the key file for the two handshake
+        // denials, the marker file for the opt-in one.
+        assert!(SessionIdentityDenial::NoHandshake
+            .message()
+            .contains(RUNNER_LOOPBACK_KEY_FILE));
+        assert!(SessionIdentityDenial::NoHandshake
+            .message()
+            .contains(RUNNER_LOOPBACK_KEY_HEADER));
+        assert!(SessionIdentityDenial::HandshakeMismatch
+            .message()
+            .contains(RUNNER_LOOPBACK_KEY_FILE));
         assert!(SessionIdentityDenial::NotOptedIn
             .message()
             .contains(SESSION_IDENTITY_MARKER_FILE));
+
+        // No denial message may ever carry the secret itself.
+        for d in [
+            SessionIdentityDenial::NoHandshake,
+            SessionIdentityDenial::HandshakeMismatch,
+            SessionIdentityDenial::NotOptedIn,
+        ] {
+            assert!(
+                !d.message().contains(KEY),
+                "a denial must never echo the handshake secret"
+            );
+        }
     }
 
-    /// The live process gate: with the master flag unset (the default in a test
-    /// process, and in production), `session_identity_gate` denies with
-    /// `FlagOff` WITHOUT touching the filesystem for the marker.
+    /// The DELETED master env flag must not creep back as an override. The
+    /// `FlagOff` variant is gone (a compile-time absence — this file would not
+    /// build if a match arm still named it), and no code in this module reads
+    /// the old env var name any more.
     #[test]
-    fn session_identity_gate_is_dark_by_default_in_this_process() {
+    fn the_master_env_flag_arm_is_deleted_not_deprecated() {
+        // Setting the retired flag must not change any verdict: the resolver
+        // has no env input at all, and the live gate is closed in this process
+        // because no handshake key was ever initialized.
         assert_eq!(
-            session_identity_gate(),
-            Err(SessionIdentityDenial::FlagOff),
-            "the master flag is unset by default ⇒ the mint route is dark"
+            session_identity_gate(Some("anything")),
+            Err(SessionIdentityDenial::HandshakeMismatch),
+            "with no key initialized the live gate must fail CLOSED"
         );
+        assert_eq!(
+            session_identity_gate(None),
+            Err(SessionIdentityDenial::NoHandshake)
+        );
+        // The retired name appears nowhere in this module's source.
+        let src = include_str!("coord_mcp.rs");
+        assert!(
+            !src.contains("QONTINUI_SESSION_COORD_IDENTITY_ENABLED"),
+            "the retired master flag must be DELETED, not left as an override"
+        );
+    }
+
+    /// Constant-time compare: correct verdicts (that is what a unit test can
+    /// assert — timing is a property of `subtle`, which is what it is for).
+    #[test]
+    fn secret_eq_matches_only_the_whole_value() {
+        assert!(secret_eq(b"abc123", b"abc123"));
+        assert!(!secret_eq(b"abc123", b"abc124"));
+        assert!(!secret_eq(b"abc123", b"abc12"));
+        assert!(!secret_eq(b"abc12", b"abc123"));
+        assert!(secret_eq(b"", b""));
     }
 
     /// §1/E — the mint route's nonces are EPHEMERAL: revoked the moment the
@@ -6645,11 +7010,27 @@ mod tests {
         );
         assert_eq!(workdir_for_nonce(&pty_nonce).as_deref(), Some(wd.as_str()));
 
-        // The master flag is off in this test process ⇒ the gate denies ⇒ the
-        // ephemeral nonce is revoked live, while the persistent one is not.
+        // THE LIVE-REVOCATION PROPERTY, asserted rather than assumed (plan
+        // 2026-08-24 Phase 1). Opted IN, the freshly-minted ephemeral nonce
+        // resolves…
+        let marker = MarkerOverride::set(true);
+        assert!(
+            proxy_nonce_is_valid(&bare_nonce),
+            "an ephemeral nonce must validate while the machine is opted in"
+        );
+        assert_eq!(
+            proxy_principal_for_nonce(&bare_nonce),
+            Some(ProxyPrincipal::Device),
+            "the mint route issues a DEVICE nonce — never an agent one"
+        );
+
+        // …and DELETING the marker revokes it immediately — not merely blocking
+        // future mints. That is the operator's real off switch, and it is what
+        // makes the marker (rather than a spawn-time env flag) the second gate.
+        marker.flip(false);
         assert!(
             !proxy_nonce_is_valid(&bare_nonce),
-            "an ephemeral nonce must stop validating while the machine is opted out"
+            "an ephemeral nonce must stop validating the moment the machine is opted out"
         );
         assert_eq!(
             proxy_principal_for_nonce(&bare_nonce),
@@ -11370,12 +11751,12 @@ mod phase2_proxy_header_shape_tests {
     /// concrete recovery.
     ///
     /// **This test used to assert `provision-session`** and so PINNED an
-    /// instruction that does not work: that route is gated by the default-OFF
-    /// `SESSION_IDENTITY_ENABLE_FLAG` (flag off ⇒ every request denied) and,
-    /// even enabled, hands back an ephemeral terminal-less nonce — a weaker
-    /// class than the one that just died. The assertions below now pin the
-    /// three Phase-5-VERIFIED steps instead, plus a negative that keeps the
-    /// falsified route from creeping back in.
+    /// instruction that does not work: that route is gated by the same-user
+    /// loopback handshake AND the opt-in marker (an un-opted machine ⇒ every
+    /// request denied) and, even opted in, hands back an ephemeral terminal-less
+    /// nonce — a weaker class than the one that just died. The assertions below
+    /// now pin the three Phase-5-VERIFIED steps instead, plus a negative that
+    /// keeps the falsified route from creeping back in.
     #[test]
     fn the_dead_key_error_string_is_actionable_and_names_no_deprecated_header_alone() {
         let msg = stale_proxy_key_error(STALE_PROXY_KEY_CAUSE);

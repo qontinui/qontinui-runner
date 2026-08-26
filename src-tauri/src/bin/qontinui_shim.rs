@@ -299,6 +299,22 @@ fn session_identity_marker_exists() -> bool {
         .unwrap_or(false)
 }
 
+/// Read the runner's per-start loopback handshake key
+/// (`~/.qontinui/runner-loopback-key`), trimmed. `None` when the home dir is
+/// unresolvable, no runner has written one, or it is unreadable — which is
+/// exactly the case where reading it is NOT proof of same-user, so the shim
+/// must not ask. Resolved through the ONE shared LIB helper the runner-side
+/// writer uses, so the path can never desync (same rule as the marker above).
+///
+/// The value is a secret: it is passed straight into the request header and is
+/// never logged, printed, or written anywhere by this process.
+fn read_loopback_handshake_key() -> Option<String> {
+    let path = qontinui_runner_lib::profile_cli::runner_loopback_key_path()?;
+    let key = std::fs::read_to_string(path).ok()?;
+    let key = key.trim().to_string();
+    (!key.is_empty()).then_some(key)
+}
+
 /// Ask a live runner to mint coord device identity for THIS process's cwd, and
 /// materialize the returned `.mcp.json` document to a temp file (plan
 /// `2026-07-17-universal-coord-device-identity-for-any-session` §5).
@@ -352,14 +368,22 @@ fn self_provision_mcp_config(tool: IdentityTool) -> Option<tempfile::TempPath> {
     // operator's opt-in marker, so with the marker absent this provision would
     // 403 regardless. Stat it FIRST — ONE filesystem stat — to skip the
     // breadcrumb read AND the loopback POST on every bare `claude` launch on the
-    // overwhelmingly common machine that never opted in. The shim cannot read the
-    // runner-side master flag, but the marker is the operator's own switch and is
-    // enough to keep the default posture to a single stat. This is only a cheap
-    // early-out; the route re-checks BOTH gates authoritatively (this never
-    // grants identity, it only avoids asking when the answer is certainly no).
+    // overwhelmingly common machine that never opted in. The marker is the
+    // operator's own switch and is enough to keep the default posture to a
+    // single stat. This is only a cheap early-out; the route re-checks BOTH
+    // gates authoritatively — including the same-user handshake read below,
+    // which the marker stat says nothing about (this never grants identity, it
+    // only avoids asking when the answer is certainly no).
     if !session_identity_marker_exists() {
         return None;
     }
+    // Same-user handshake (plan
+    // 2026-08-24-headless-box-has-no-working-coord-credential-door, Phase 1).
+    // The runner writes this key owner-only at every start; being able to READ
+    // it is the proof that we are the same OS user the runner runs as, which
+    // loopback itself does not establish. Absent/unreadable ⇒ fail-open: we
+    // simply do not ask (the route would 403 `_NO_HANDSHAKE` anyway).
+    let handshake_key = read_loopback_handshake_key()?;
     let runner = qontinui_runner_lib::runner_breadcrumb::resolve_live_runner()?;
     let cwd = env::current_dir().ok()?;
     let body = format!("{{\"cwd\":\"{}\"}}", json_escape(&cwd.to_string_lossy()));
@@ -368,6 +392,10 @@ fn self_provision_mcp_config(tool: IdentityTool) -> Option<tempfile::TempPath> {
         runner.port,
         PROVISION_SESSION_PATH,
         &body,
+        &[(
+            qontinui_runner_lib::profile_cli::RUNNER_LOOPBACK_KEY_HEADER,
+            handshake_key,
+        )],
         CONNECT_TIMEOUT,
         PROVISION_RW_TIMEOUT,
     )
@@ -489,6 +517,7 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
                 !mcp_config.is_empty(),
                 pinned.is_some(),
             ),
+            &[],
             BEACON_TIMEOUT,
             BEACON_TIMEOUT,
         );
@@ -995,13 +1024,19 @@ const PROVISION_RW_TIMEOUT: Duration = Duration::from_secs(3);
 const BEACON_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn http_post(port: u16, path: &str, body: &str) -> Result<String, String> {
-    http_post_with_timeouts(port, path, body, CONNECT_TIMEOUT, RW_TIMEOUT)
+    http_post_with_timeouts(port, path, body, &[], CONNECT_TIMEOUT, RW_TIMEOUT)
 }
 
+/// `extra_headers` are emitted verbatim after the fixed ones. Values are
+/// rejected (the whole request fails) if they contain CR or LF — a header
+/// injection would let a caller forge a second request on this socket. The one
+/// value passed today is the loopback handshake key, which is hex, so this can
+/// only ever fire on a corrupted key file.
 fn http_post_with_timeouts(
     port: u16,
     path: &str,
     body: &str,
+    extra_headers: &[(&str, String)],
     connect_timeout: Duration,
     rw_timeout: Duration,
 ) -> Result<String, String> {
@@ -1020,8 +1055,15 @@ fn http_post_with_timeouts(
         .set_write_timeout(Some(rw_timeout))
         .map_err(|e| e.to_string())?;
 
+    let mut extra = String::new();
+    for (name, value) in extra_headers {
+        if value.contains('\r') || value.contains('\n') {
+            return Err("header value contains CR/LF".to_string());
+        }
+        extra.push_str(&format!("{name}: {value}\r\n"));
+    }
     let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
         body.len()
     );
     stream
