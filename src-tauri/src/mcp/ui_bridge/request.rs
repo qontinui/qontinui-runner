@@ -66,6 +66,140 @@ pub(crate) fn target_window_payload(
     base
 }
 
+/// Step keys that address the *step* rather than the action it carries.
+///
+/// Used by [`step_action_payload`] to decide what to lift into the action
+/// envelope. Everything NOT listed here rides along, so a field added to the
+/// SDK action grammar reaches the frontend without a change to this file.
+///
+/// To be precise about what that buys: it stops the RUNNER hop dropping the
+/// field. `useControlEvents.ts` still forwards only `action`/`params`/
+/// `waitOptions` to `executeAction`, so delivering a new opt-in end-to-end
+/// needs the frontend change too — this just means it is no longer gone
+/// before it gets there (see [`element_action_payload`]).
+const STEP_RESERVED_KEYS: &[&str] = &[
+    "type",
+    "elementId",
+    "element_id",
+    "label",
+    // Routing, not action data: `ui_bridge_request_sync` consumes this at the
+    // payload ROOT (see `split_target_window`). Lifting it into the envelope
+    // would bury it where nothing reads it.
+    TARGET_WINDOW_FIELD,
+];
+
+/// Build the `execute_action` IPC payload for an element action.
+///
+/// **This is the one place the element-action wire convention is spelled.**
+/// The frontend handler (`src/hooks/ui-bridge-events/useControlEvents.ts`,
+/// `case "execute_action"`) destructures `{ elementId, action }` and rejects
+/// the request outright when either is missing. It then normalizes `action` as
+/// *either* a bare string *or* the whole envelope
+/// `{ action, params, waitOptions, ... }` — and reads `params` / `waitOptions`
+/// **only off that envelope**. A sibling `params` at the top level of the
+/// payload is never read by anything.
+///
+/// Hand-rolling this payload is therefore a trap with two distinct failure
+/// modes, and both were live defects fixed alongside this helper
+/// (`plans/2026-08-25-ui-bridge-request-path-loses-fields-structurally.md`):
+///
+/// 1. Emitting `id` instead of `elementId` fails **every** request with
+///    `"elementId and action are required"` — a hard, total failure.
+/// 2. Flattening the envelope to a bare action string silently drops `params`,
+///    `waitOptions` and every opt-in field. The request still looks well-formed
+///    to the receiver, so it succeeds *wrongly*: a `type` action types nothing.
+///
+/// So the envelope is forwarded **by identity**, never rebuilt field-by-field.
+/// That makes this hop lossless; it does not by itself make a new field
+/// *effective*, since the frontend handler picks the fields it forwards on.
+/// A bare-string envelope passes through untouched (the frontend normalizes it).
+/// An envelope with no action name defaults to `click`, preserving the batch
+/// handlers' historical default rather than dispatching `undefined`.
+pub(crate) fn element_action_payload(
+    element_id: &str,
+    action: serde_json::Value,
+) -> serde_json::Value {
+    let action = match action {
+        // The SDK proxy-fallback shape. The frontend turns `"click"` into
+        // `{ action: "click" }` itself, so pass it through rather than
+        // second-guessing it here.
+        serde_json::Value::String(_) => action,
+        serde_json::Value::Object(mut obj) => {
+            // Default on "no usable action NAME", not on "key absent". A
+            // present-but-non-string `action` (a `null` from a serializer
+            // emitting an absent optional, say) must land on the same default
+            // the hand-rolled `as_str().unwrap_or("click")` gave it — an
+            // occupied-entry check would forward `{"action": null}`, which the
+            // frontend rejects as "Action 'null' is not allowed".
+            if obj.get("action").and_then(|v| v.as_str()).is_none() {
+                obj.insert("action".to_string(), serde_json::json!("click"));
+            }
+            serde_json::Value::Object(obj)
+        }
+        // null / bool / number / array cannot carry an action name.
+        _ => serde_json::json!({ "action": "click" }),
+    };
+    serde_json::json!({
+        "elementId": element_id,
+        "action": action,
+    })
+}
+
+/// Build the `execute_action` payload for one batch step, in either grammar.
+///
+/// The batch endpoints disagree about how a step carries its action — which is
+/// the drift this whole helper family exists to absorb — so both are accepted:
+///
+/// * **nested** (`{"elementId": "x", "action": {"action": "type", "params": {...}}}`),
+///   used by `/control/batch-actions`' SDK caller. The envelope is forwarded by
+///   identity.
+/// * **flat** (`{"type": "action", "element_id": "x", "action": "type", "params": {...}}`),
+///   used by `/control/batch-execute` and documented for `/control/batch`. Every
+///   non-reserved key is lifted into the envelope, so `params`, `waitOptions`,
+///   `expectChange` and any later opt-in ride along instead of being dropped by
+///   a hand-maintained field list.
+///
+/// A nested envelope wins over a flat sibling of the same name; flat keys only
+/// fill gaps. Accepting both matters because the runner's own capabilities
+/// manifest documents `/control/batch-actions` steps as FLAT while the SDK type
+/// is nested — so a caller following either is served, instead of one of them
+/// silently losing its params.
+///
+/// The element id is read from `elementId` **or** `element_id`: the two
+/// capability batch endpoints disagreed on the casing (one read each), so both
+/// spellings are accepted rather than breaking whichever callers exist. Each
+/// arm is checked for a *string*, so a `null` under the preferred spelling
+/// falls through to the other rather than resolving to `""`.
+pub(crate) fn step_action_payload(step: &serde_json::Value) -> serde_json::Value {
+    let element_id = step
+        .get("elementId")
+        .and_then(|v| v.as_str())
+        .or_else(|| step.get("element_id").and_then(|v| v.as_str()))
+        .unwrap_or_default();
+
+    // Base: a nested `action` envelope if the step carries one.
+    let mut envelope = match step.get("action") {
+        Some(serde_json::Value::Object(nested)) => nested.clone(),
+        _ => serde_json::Map::new(),
+    };
+
+    if let Some(obj) = step.as_object() {
+        for (key, value) in obj {
+            if STEP_RESERVED_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            // An explicitly nested envelope wins over a flat sibling of the
+            // same name; flat keys only fill gaps.
+            if key == "action" && value.is_object() {
+                continue;
+            }
+            envelope.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    element_action_payload(element_id, serde_json::Value::Object(envelope))
+}
+
 /// Split an optional `windowLabel` routing field out of a request payload.
 ///
 /// Returns `(target_window, payload_without_label)`. Absent / empty / non-string
@@ -1371,5 +1505,321 @@ mod wrap_ipc_result_tests {
         // Either 500 (default) or 503 (frontend not ready) — not 400.
         assert_ne!(status, StatusCode::BAD_REQUEST);
         assert!(status.is_server_error());
+    }
+}
+
+/// Regression tests for the element-action wire convention.
+///
+/// These exist because the convention was violated at four independent sites
+/// and the violations were invisible to the compiler: every one of them built
+/// an untyped `serde_json::json!` payload, so no amount of widening a DTO
+/// would have caught them. The assertions below are deliberately written
+/// against the *frontend handler's* reading of the payload
+/// (`useControlEvents.ts` `case "execute_action"`), which is the actual
+/// contract:
+///   * it destructures `{ elementId, action }` — `id` is not a synonym;
+///   * it reads `params` / `waitOptions` off the `action` envelope only.
+#[cfg(test)]
+mod element_action_payload_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn payload_uses_element_id_key_never_id() {
+        let payload = element_action_payload("btn-1", json!({"action": "click"}));
+
+        assert_eq!(
+            payload.get("elementId").and_then(|v| v.as_str()),
+            Some("btn-1"),
+            "frontend destructures `elementId`; anything else fails the request \
+             with 'elementId and action are required'"
+        );
+        assert!(
+            payload.get("id").is_none(),
+            "`id` was the exact key that broke every batch step — it must not reappear"
+        );
+    }
+
+    #[test]
+    fn params_live_inside_the_action_envelope_not_as_a_sibling() {
+        let payload = element_action_payload(
+            "input-1",
+            json!({"action": "type", "params": {"text": "hi"}}),
+        );
+
+        assert!(
+            payload.get("params").is_none(),
+            "a top-level `params` sibling is never read by the frontend"
+        );
+        assert_eq!(
+            payload
+                .pointer("/action/params/text")
+                .and_then(|v| v.as_str()),
+            Some("hi"),
+            "params must arrive nested in the action envelope"
+        );
+    }
+
+    #[test]
+    fn bare_string_action_passes_through_untouched() {
+        // The SDK proxy-fallback shape. The frontend normalizes it itself.
+        let payload = element_action_payload("btn-1", json!("click"));
+        assert_eq!(
+            payload.get("action").and_then(|v| v.as_str()),
+            Some("click")
+        );
+    }
+
+    #[test]
+    fn missing_action_name_keeps_the_historical_click_default() {
+        for envelope in [json!({}), json!(null), json!(7)] {
+            let payload = element_action_payload("btn-1", envelope);
+            assert_eq!(
+                payload.pointer("/action/action").and_then(|v| v.as_str()),
+                Some("click"),
+                "an envelope with no action name must not dispatch `undefined`"
+            );
+        }
+    }
+
+    /// The headline regression: a batch step must round-trip EVERY field.
+    ///
+    /// This is the structural assertion the class needs — it carries an
+    /// `unknownFutureOptIn` key that no code in this repo knows about. If a
+    /// later change reintroduces field-by-field rebuilding, that key vanishes
+    /// and this test fails, which is exactly the signal that was missing when
+    /// four sites drifted.
+    #[test]
+    fn batch_step_round_trips_every_field() {
+        let step = json!({
+            "label": "fill the search box",
+            "elementId": "search-input",
+            "action": {
+                "action": "type",
+                "params": {"text": "qontinui"},
+                "waitOptions": {"visible": true, "timeout": 2000},
+                "expectChange": true,
+                "fromSnapshotId": "ubs2_a_b_c_d",
+                "verifyEffect": {"mode": "strict"},
+                "unknownFutureOptIn": {"nested": ["value"]}
+            }
+        });
+
+        let payload = step_action_payload(&step);
+
+        assert_eq!(
+            payload.get("elementId").and_then(|v| v.as_str()),
+            Some("search-input")
+        );
+        // The envelope must arrive by identity — not a rebuilt subset of it.
+        assert_eq!(
+            payload.get("action"),
+            step.get("action"),
+            "the action envelope must be forwarded whole, field-for-field"
+        );
+        // Spelled out, so a failure names the field that got dropped.
+        for field in [
+            "params",
+            "waitOptions",
+            "expectChange",
+            "fromSnapshotId",
+            "verifyEffect",
+            "unknownFutureOptIn",
+        ] {
+            assert!(
+                payload.pointer(&format!("/action/{field}")).is_some(),
+                "batch step dropped `{field}` on the way to the frontend"
+            );
+        }
+        // `label` addresses the step, not the action — it should not leak in.
+        assert!(payload.pointer("/action/label").is_none());
+    }
+
+    #[test]
+    fn flat_step_lifts_every_non_reserved_field_into_the_envelope() {
+        let step = json!({
+            "type": "action",
+            "elementId": "btn-1",
+            "label": "submit it",
+            "action": "click",
+            "params": {"button": "left"},
+            "waitOptions": {"enabled": true},
+            "expectChange": true,
+            "unknownFutureOptIn": 42
+        });
+
+        let payload = step_action_payload(&step);
+
+        assert_eq!(
+            payload.get("elementId").and_then(|v| v.as_str()),
+            Some("btn-1")
+        );
+        assert!(payload.get("id").is_none());
+        assert_eq!(
+            payload.pointer("/action/action").and_then(|v| v.as_str()),
+            Some("click")
+        );
+        for field in [
+            "params",
+            "waitOptions",
+            "expectChange",
+            "unknownFutureOptIn",
+        ] {
+            assert!(
+                payload.pointer(&format!("/action/{field}")).is_some(),
+                "flat step dropped `{field}` — the exact loss that made \
+                 `waitOptions` unreachable on batch-execute"
+            );
+        }
+        // Step-addressing keys must not be mistaken for action fields.
+        for reserved in ["type", "label", "elementId", "element_id"] {
+            assert!(
+                payload.pointer(&format!("/action/{reserved}")).is_none(),
+                "`{reserved}` addresses the step, not the action"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_step_accepts_both_element_id_spellings() {
+        // The two capability batch endpoints had drifted: one read `element_id`,
+        // the other `elementId`. Both must resolve.
+        let snake = step_action_payload(&json!({"element_id": "btn-1", "action": "click"}));
+        let camel = step_action_payload(&json!({"elementId": "btn-1", "action": "click"}));
+
+        assert_eq!(
+            snake.get("elementId").and_then(|v| v.as_str()),
+            Some("btn-1")
+        );
+        assert_eq!(
+            camel.get("elementId").and_then(|v| v.as_str()),
+            Some("btn-1")
+        );
+        assert_eq!(snake, camel);
+    }
+
+    #[test]
+    fn flat_step_accepts_an_already_nested_action_envelope() {
+        // The two batch grammars have drifted before, so the flat lifter also
+        // takes the nested shape rather than forwarding an object as the
+        // action *name* (which is never valid).
+        let payload = step_action_payload(&json!({
+            "elementId": "btn-1",
+            "action": {"action": "type", "params": {"text": "hi"}, "waitOptions": {"visible": true}}
+        }));
+
+        assert_eq!(
+            payload.pointer("/action/action").and_then(|v| v.as_str()),
+            Some("type")
+        );
+        assert_eq!(
+            payload
+                .pointer("/action/params/text")
+                .and_then(|v| v.as_str()),
+            Some("hi")
+        );
+        assert!(payload.pointer("/action/waitOptions").is_some());
+    }
+
+    #[test]
+    fn nested_envelope_wins_over_a_flat_sibling_of_the_same_name() {
+        let payload = step_action_payload(&json!({
+            "elementId": "btn-1",
+            "action": {"action": "type", "params": {"text": "nested"}},
+            "params": {"text": "flat"}
+        }));
+
+        assert_eq!(
+            payload
+                .pointer("/action/params/text")
+                .and_then(|v| v.as_str()),
+            Some("nested"),
+            "an explicit envelope must not be overwritten by a flat sibling"
+        );
+    }
+
+    #[test]
+    fn a_present_but_non_string_action_key_still_falls_back_to_click() {
+        // Regression: keying the default off "entry absent" instead of "no
+        // usable name" forwarded `{"action": null}`, which the frontend
+        // rejects with "Action 'null' is not allowed" — a hard failure on a
+        // path (`/control/batch`) that previously clicked. The hand-rolled
+        // `as_str().unwrap_or("click")` this replaced defaulted on ALL of these.
+        for bad in [json!(null), json!(false), json!(7), json!([])] {
+            let payload = step_action_payload(&json!({"elementId": "btn-1", "action": bad}));
+            assert_eq!(
+                payload.pointer("/action/action").and_then(|v| v.as_str()),
+                Some("click"),
+                "a non-string action name must not reach the frontend verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_params_survive_a_bare_string_action_on_a_batch_step() {
+        // The runner's own capabilities manifest documents batch-actions steps
+        // as FLAT (`{elementId, action, params}`) while the SDK type is nested.
+        // A caller following the manifest must not silently lose its params.
+        let payload = step_action_payload(&json!({
+            "elementId": "input-1",
+            "action": "type",
+            "params": {"text": "hi"}
+        }));
+
+        assert_eq!(
+            payload.pointer("/action/action").and_then(|v| v.as_str()),
+            Some("type")
+        );
+        assert_eq!(
+            payload
+                .pointer("/action/params/text")
+                .and_then(|v| v.as_str()),
+            Some("hi"),
+            "flat params on a bare-string action step must reach the envelope"
+        );
+    }
+
+    #[test]
+    fn a_null_preferred_element_id_falls_through_to_the_other_spelling() {
+        let payload = step_action_payload(
+            &json!({"elementId": null, "element_id": "btn-1", "action": "click"}),
+        );
+        assert_eq!(
+            payload.get("elementId").and_then(|v| v.as_str()),
+            Some("btn-1")
+        );
+    }
+
+    #[test]
+    fn window_label_addresses_the_payload_root_not_the_action() {
+        // `windowLabel` is consumed at the root by `split_target_window`;
+        // lifting it into the envelope would bury it where nothing reads it.
+        let payload = step_action_payload(&json!({
+            "elementId": "btn-1",
+            "action": "click",
+            "windowLabel": "term-1"
+        }));
+        assert!(
+            payload.pointer("/action/windowLabel").is_none(),
+            "`windowLabel` is routing, not action data"
+        );
+    }
+
+    #[test]
+    fn window_label_still_composes_onto_an_action_payload() {
+        // `target_window_payload` stamps the routing field onto the payload
+        // root; the action envelope must be left alone by it.
+        let payload = target_window_payload(
+            element_action_payload("btn-1", json!({"action": "click"})),
+            Some("term-1"),
+        );
+        assert_eq!(
+            payload.get(TARGET_WINDOW_FIELD).and_then(|v| v.as_str()),
+            Some("term-1")
+        );
+        assert_eq!(
+            payload.pointer("/action/action").and_then(|v| v.as_str()),
+            Some("click")
+        );
     }
 }

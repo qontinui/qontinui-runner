@@ -559,13 +559,15 @@ pub async fn ui_bridge_batch_actions_handler(
         }
 
         let element_id = step.get("elementId").and_then(|v| v.as_str()).unwrap_or("");
-        let action = step.get("action").cloned().unwrap_or(serde_json::json!({}));
 
-        let payload = serde_json::json!({
-            "id": element_id,
-            "action": action.get("action").and_then(|v| v.as_str()).unwrap_or("click"),
-            "params": action.get("params"),
-        });
+        // Forward the step's action envelope WHOLE (either grammar). This used to emit
+        // `{"id": ..., "action": "<name>", "params": ...}`, which failed
+        // twice over: the frontend reads `elementId` (so every step died on
+        // "elementId and action are required"), and it reads `params` off the
+        // action envelope, never as a top-level sibling — so the parameters
+        // were unreachable even once the id was fixed. See
+        // `request::element_action_payload` for the full contract.
+        let payload = super::request::step_action_payload(step);
 
         let result = ui_bridge_request_sync(&state, "execute_action", payload).await;
 

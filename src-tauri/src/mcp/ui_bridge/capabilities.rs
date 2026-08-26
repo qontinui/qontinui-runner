@@ -430,21 +430,15 @@ pub async fn ui_bridge_control_batch_execute_handler(
             }
 
             "action" => {
-                let element_id = step
-                    .get("element_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let action = step
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("click");
-                let params = step.get("params").cloned();
-
-                let payload = serde_json::json!({
-                    "id": element_id,
-                    "action": action,
-                    "params": params,
-                });
+                // Lift the flat step into a proper action envelope. This used
+                // to emit `{"id": ..., "action": "<name>", "params": ...}`:
+                // the frontend reads `elementId`, so every "action" step in a
+                // batch-execute failed with "elementId and action are
+                // required", and `params` was a sibling the handler never
+                // reads. It also read only `element_id` while its sibling
+                // endpoint below read only `elementId`; the helper accepts
+                // both. See `request::element_action_payload`.
+                let payload = super::request::step_action_payload(step);
 
                 match ui_bridge_request_sync(&state, "execute_action", payload).await {
                     Ok(data) => {
@@ -1224,19 +1218,24 @@ pub async fn ui_bridge_control_batch_handler(
 
     for (i, step) in steps.iter().enumerate() {
         let element_id = step.get("elementId").and_then(|v| v.as_str()).unwrap_or("");
-        let action = step
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("click");
-        let params = step.get("params").cloned();
 
-        let payload = serde_json::json!({
-            "elementId": element_id,
-            "action": {
-                "action": action,
-                "params": params,
-            },
-        });
+        // Lift the step into the action envelope. The id and nesting were
+        // already right here, but rebuilding the envelope from a hardcoded
+        // {action, params} pair dropped `waitOptions`, `expectChange` and every
+        // other opt-in the caller sent. Forwarding the non-reserved keys whole
+        // means this hop stops being the one that loses them.
+        let payload = super::request::step_action_payload(step);
+
+        // Echo the name that was ACTUALLY dispatched, read back off the payload
+        // rather than re-derived from the step. Re-deriving would report
+        // "click" for a step carrying a nested envelope (`as_str()` on an
+        // object yields None), so the result would name a different action than
+        // the one that ran.
+        let action_name = payload
+            .pointer("/action/action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("click")
+            .to_string();
 
         let step_start = std::time::Instant::now();
         let res = ui_bridge_request_sync(&state, "execute_action", payload).await;
@@ -1258,7 +1257,7 @@ pub async fn ui_bridge_control_batch_handler(
             "success": ok,
             "durationMs": duration_ms,
             "elementId": element_id,
-            "action": action,
+            "action": action_name,
             "response": response_value,
         }));
 
