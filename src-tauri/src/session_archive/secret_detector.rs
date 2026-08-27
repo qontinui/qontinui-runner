@@ -432,7 +432,8 @@ mod tests {
 
     #[test]
     fn a_clean_transcript_scans_to_zero_findings_and_an_empty_kind_list() {
-        let text = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"run the tests\"}}";
+        let text =
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"run the tests\"}}";
         let f = scan(text);
         assert_eq!(f.count, 0);
         assert!(f.kinds.is_empty());

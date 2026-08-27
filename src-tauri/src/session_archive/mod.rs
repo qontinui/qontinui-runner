@@ -288,7 +288,9 @@ pub async fn backfill(
             }
         }
         let transcripts = discovery::transcripts_in(home);
-        report.per_home.push((home.label.clone(), transcripts.len()));
+        report
+            .per_home
+            .push((home.label.clone(), transcripts.len()));
         report.subagent_transcripts_skipped += discovery::count_subagent_transcripts(home);
 
         for path in transcripts {
@@ -511,7 +513,12 @@ mod tests {
 
         let sink = RecordingSink::default();
         let mut state = ScanState::default();
-        let report = backfill(&opts_for(vec![home(&dir, "gmail")]), Some(&sink), &mut state).await;
+        let report = backfill(
+            &opts_for(vec![home(&dir, "gmail")]),
+            Some(&sink),
+            &mut state,
+        )
+        .await;
 
         assert_eq!(report.scanned, 1);
         assert_eq!(report.created, 1);
@@ -525,7 +532,10 @@ mod tests {
             p.content_sha256.as_deref(),
             Some(push::digest_bytes(SAMPLE.as_bytes()).as_str())
         );
-        assert_eq!(p.body_source.as_deref(), Some(push::BODY_SOURCE_DISK_VERBATIM));
+        assert_eq!(
+            p.body_source.as_deref(),
+            Some(push::BODY_SOURCE_DISK_VERBATIM)
+        );
         assert_eq!(p.repo.as_deref(), Some("qontinui-runner"));
         assert_eq!(p.git_branch.as_deref(), Some("main"));
         assert_eq!(p.ai_title.as_deref(), Some("A test session"));
@@ -586,7 +596,12 @@ mod tests {
 
         let sink = RecordingSink::default();
         let mut state = ScanState::default();
-        let report = backfill(&opts_for(vec![home(&dir, "gmail")]), Some(&sink), &mut state).await;
+        let report = backfill(
+            &opts_for(vec![home(&dir, "gmail")]),
+            Some(&sink),
+            &mut state,
+        )
+        .await;
         assert_eq!(report.skipped_empty, 1);
         assert!(sink.seen.lock().unwrap().is_empty());
     }
@@ -664,7 +679,12 @@ mod tests {
         };
         // Ancient last activity, but the runner says the pane is open.
         assert_eq!(
-            derive_state(Some(&open), Some(0), 1_756_200_000_000, DEFAULT_IDLE_CUTOFF_MS),
+            derive_state(
+                Some(&open),
+                Some(0),
+                1_756_200_000_000,
+                DEFAULT_IDLE_CUTOFF_MS
+            ),
             "open"
         );
 
@@ -692,13 +712,21 @@ mod tests {
             "open"
         );
         assert_eq!(
-            derive_state(None, Some(now - DEFAULT_IDLE_CUTOFF_MS - 1), now, DEFAULT_IDLE_CUTOFF_MS),
+            derive_state(
+                None,
+                Some(now - DEFAULT_IDLE_CUTOFF_MS - 1),
+                now,
+                DEFAULT_IDLE_CUTOFF_MS
+            ),
             "closed"
         );
         // No evidence at all is `closed`, never `open` — a transcript with no
         // timestamps is history, and defaulting to open would report the
         // entire pre-timestamp corpus as live.
-        assert_eq!(derive_state(None, None, now, DEFAULT_IDLE_CUTOFF_MS), "closed");
+        assert_eq!(
+            derive_state(None, None, now, DEFAULT_IDLE_CUTOFF_MS),
+            "closed"
+        );
     }
 
     #[test]
@@ -755,7 +783,12 @@ mod tests {
         assert_ne!(p.tenant_source, "declared");
         assert_eq!(p.session_name.as_deref(), Some("08-26 backfill"));
         assert_eq!(p.permission_mode.as_deref(), Some("bypassPermissions"));
-        assert_eq!(report.tenant_sources.get(tenancy::TenantSource::DerivedSoleBinding), 1);
+        assert_eq!(
+            report
+                .tenant_sources
+                .get(tenancy::TenantSource::DerivedSoleBinding),
+            1
+        );
     }
 
     #[tokio::test]
@@ -766,7 +799,12 @@ mod tests {
 
         let sink = RecordingSink::default();
         let mut state = ScanState::default();
-        let _ = backfill(&opts_for(vec![home(&dir, "gmail")]), Some(&sink), &mut state).await;
+        let _ = backfill(
+            &opts_for(vec![home(&dir, "gmail")]),
+            Some(&sink),
+            &mut state,
+        )
+        .await;
 
         let seen = sink.seen.lock().unwrap();
         let json = serde_json::to_string(&seen[0]).unwrap();
