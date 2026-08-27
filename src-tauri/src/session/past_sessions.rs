@@ -156,26 +156,15 @@ pub struct PastSessionsOpts {
 /// as the label with the generic `claude` wrapper, and a config dir with no
 /// `.claude-<x>` suffix (or none at all) is `unknown`/`claude`.
 pub(crate) fn account_from_config_dir(config_dir: Option<&str>) -> PastSessionAccount {
-    let acct = |label: &str, wrapper: &str| PastSessionAccount {
-        label: label.to_string(),
-        wrapper: wrapper.to_string(),
-    };
-    let suffix = config_dir.and_then(|cd| {
-        Path::new(cd)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|name| name.strip_prefix(".claude-"))
-            .map(|s| s.to_string())
-    });
-    match suffix.as_deref() {
-        Some("gmail") => acct("gmail", "clg"),
-        Some("hotmail") => acct("hotmail", "clh"),
-        Some("paktis") => acct("paktis", "clp"),
-        Some("qontinui") => acct("qontinui", "clq"),
-        Some("tiohorst") => acct("tiohorst", "clt"),
-        Some(other) => acct(other, "claude"),
-        None => acct("unknown", "claude"),
-    }
+    // The mapping itself lives in the LIB crate
+    // (`session_archive::discovery::account_label_for`) because the session
+    // archive's identity key is `(claude_session_id, account_label)` and
+    // `qontinui-pr session-archive-backfill` — a separate crate root — has to
+    // produce byte-identical labels or every backfilled row forks away from the
+    // one this registry names. One mapping, two callers.
+    let (label, wrapper) =
+        qontinui_runner_lib::session_archive::discovery::account_label_for(config_dir);
+    PastSessionAccount { label, wrapper }
 }
 
 /// Locate the on-disk transcript for a session, if any. Prefers the recorded

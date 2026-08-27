@@ -8355,6 +8355,14 @@ pub fn create_router(
         // the reads are ungated and advertise the flag.
         .merge(crate::mcp::plan_library::routes())
         .merge(crate::mcp::session_briefing::routes())
+        // Claude Code session repository read door (plan
+        // 2026-08-26-claude-code-session-repository-in-qontinui-web). READ ONLY:
+        // `GET /session-repository` and `GET /session-repository/unfinished`
+        // forward to qontinui-web with the runner's device JWT, so an agent
+        // session reaches that corpus the way it reaches the plan library — an
+        // HTTP route rather than an MCP tool, per plan_library's design
+        // decision D5.
+        .merge(crate::mcp::session_repository::routes())
         .merge(crate::mcp::coordinator::routes())
         .merge(crate::mcp::subagent_api::routes())
         .merge(crate::mcp::completion_reports::routes())
