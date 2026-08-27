@@ -381,6 +381,49 @@ pub(crate) fn spawn_gate_reading() -> (&'static str, Option<u64>) {
     (Lane::Host.as_str(), available_commit_bytes())
 }
 
+/// Run one bounded `wsl.exe` probe, reaping the child **and its tree** on
+/// expiry.
+///
+/// `tokio::time::timeout` only drops the output-future, and tokio does *not*
+/// kill on drop by default — so a bare `timeout(Command::output())` orphans a
+/// live `wsl.exe` on every expiry, and that orphan holds its VM session open
+/// for the runner's whole lifetime. `kill_on_drop` alone is not enough either:
+/// `wsl.exe` spawns a second `wsl.exe` to carry the session, and the grandchild
+/// outlives a killed parent. Same defect, and the same two-part fix, as the
+/// `git push` bound in [`crate::agent_pusher`] — see its `kill_on_drop`
+/// comment for the incident that established the pattern.
+///
+/// Measured 2026-08-27 on the operator box: a WSL VM that could not `fork()`
+/// made every probe time out, and the sampler accumulated **512** stuck
+/// `wsl.exe` (98k handles, 23% of all system handles) over ~3h — jamming the
+/// very distro it was trying to read, and outliving the fault that started it.
+#[cfg(windows)]
+async fn wsl_probe(args: &[&str]) -> Option<std::process::Output> {
+    let mut cmd = crate::process_helpers::tokio_no_window("wsl.exe");
+    cmd.args(args)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().ok()?;
+
+    // Held until this function returns; dropping it closes the job and reaps
+    // the whole tree. Best-effort — on failure we still have `kill_on_drop`
+    // plus the global job, i.e. strictly better than before.
+    let _tree_job = {
+        let job = crate::job_object::ScopedKillOnCloseJob::create(None);
+        if let (Some(j), Some(handle)) = (job.as_ref(), child.raw_handle()) {
+            j.assign(handle as _);
+        }
+        job
+    };
+
+    tokio::time::timeout(WSL_PROBE_TIMEOUT, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()
+}
+
 /// Which WSL distro to probe: `QONTINUI_WSL_DISTRO` if set, else the first
 /// entry `wsl.exe --list --quiet` reports. `None` = no WSL on this box, which
 /// is the honest "this machine has one lane" answer, not an error.
@@ -403,15 +446,7 @@ async fn resolve_wsl_distro() -> Option<String> {
             return Some(d);
         }
     }
-    let out = tokio::time::timeout(
-        WSL_PROBE_TIMEOUT,
-        tokio::process::Command::new("wsl.exe")
-            .args(["--list", "--quiet"])
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let out = wsl_probe(&["--list", "--quiet"]).await?;
     if !out.status.success() {
         return None;
     }
@@ -448,15 +483,7 @@ fn first_distro(listing: &str) -> Option<String> {
 #[cfg(windows)]
 async fn collect_wsl_lane() -> Option<ResourceSample> {
     let distro = wsl_distro().await?;
-    let out = tokio::time::timeout(
-        WSL_PROBE_TIMEOUT,
-        tokio::process::Command::new("wsl.exe")
-            .args(["-d", &distro, "--", "cat", "/proc/meminfo"])
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let out = wsl_probe(&["-d", &distro, "--", "cat", "/proc/meminfo"]).await?;
     if !out.status.success() {
         return None;
     }
