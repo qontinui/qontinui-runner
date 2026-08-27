@@ -185,7 +185,7 @@ conclusive ones). **Arm 6 is the DEFAULT**: anything not positively matched by
 
 | # | Response | Reading | Do |
 |---|---|---|---|
-| 4 | the error `no work-unit with that slug in your tenant` | The unit does not exist. **The COMMONEST case** — a first-time vet of a `DRAFT` plan has no work unit, because §5.4 upserts it at the *end* of this run. | **Proceed to vet, and SAY the read was not-found.** An absent unit and an uncited-but-present unit are different facts; do not fold one into the other. |
+| 4 | the error `no work-unit with that slug` (the MCP tool appends ` in your tenant`; the HTTP twin's 404 body deliberately does not, so it cannot leak whether the slug belongs to another tenant — match on the short form) | The unit does not exist. **The COMMONEST case** — a first-time vet of a `DRAFT` plan has no work unit, because §5.4 upserts it at the *end* of this run. | **Proceed to vet, and SAY the read was not-found.** An absent unit and an uncited-but-present unit are different facts; do not fold one into the other. |
 | 3 | a top-level `merged_degraded_reason` is present | **UNKNOWN, whatever `delivery` says.** The field sits BESIDE `delivery` and is present even when the verdict could not be derived at all; while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. | Treat as arm 2. |
 | 2 | `evidence_complete: false` — **regardless of `shipped`** | **UNKNOWN — never "undelivered".** `evidence_gaps` names each gap. | Fall through to the stamp arms and **say the read was inconclusive**, per `verification-and-evidence` `unknown-must-not-render-as-a-default`. |
 | 1 | `shipped: true` ∧ `evidence_complete: true` | The plan is closed **in substance**. | **Do NOT vet** (see "Act here" below). Route to closeout. |
@@ -221,15 +221,31 @@ rewritten the plan on disk by then, so a refusal written there refuses nothing.
 If, on the values captured above:
 
 - delivery resolves to **arm 1** (the work has landed), or
-- the status block reads `IN PROGRESS` with a session marker that is neither
-  yours nor absent, and it resolves to **case 3 or the unidentified default** of
-  §5's disposition table (a live peer, or a stamp you cannot positively
-  attribute). **Run case 2's probes HERE to decide that** — they are the only
-  thing separating "adopt" from "a peer is mid-flight", and every one of them is
-  read-only: does the stamping session's transcript tail show it died; are its
-  worktrees clean and 0 ahead of `origin/main`; do any PRs or branches exist for
-  the plan. If all of them hold this is case 2 (**adopt**) and you proceed — do
-  not STOP. If any fails, STOP.
+- the status block reads `IN PROGRESS` and its session marker is **not
+  positively identifiable as your own current session id** — absent, foreign, or
+  unattributable — and it resolves to **case 3 or the unidentified default** of
+  §5's disposition table (a live peer, an unmarked stamp, or one you cannot
+  positively attribute). **Run case 2's probes HERE to decide that** — they are
+  the only thing separating "adopt" from "a peer is mid-flight", and every one of
+  them is read-only: does the stamping session's transcript tail show it died;
+  are its worktrees clean and 0 ahead of `origin/main`; do any PRs or branches
+  exist for the plan. If all of them hold this is case 2 (**adopt**) and you
+  proceed — do not STOP. If any fails, STOP.
+
+  **An ABSENT marker cannot reach case 2 at all**, because case 2's probes are
+  keyed on "the marker is a session id ≠ yours" and there is no session to probe.
+  So an unmarked `IN PROGRESS` stamp is an unconditional STOP here, exactly as
+  §5's default row says — and it must be caught HERE, since §5's refusal runs
+  after §4 has already rewritten the plan.
+
+- the captured status block reads `SHIPPED`, `SUPERSEDED` or `OBSOLETE`. The
+  do-not-overwrite paragraph in §5 states this rule, but by its own argument a
+  refusal written there refuses nothing — §4 has already rewritten the plan, so
+  §5 would be asking the operator to confirm a rewrite that is on disk. Catch it
+  here instead. Note delivery arm 1 does NOT cover this case: a plan whose file
+  says `SHIPPED` while its work unit carries no citations (PRs landed without the
+  `Plan:` marker — the same failure `coord_work_unit_add_citation` exists to
+  repair) reads **arm 5** and would otherwise proceed to vet,
 
 then **STOP NOW**: report it with the evidence and make **no edit**. Release the
 plan reserve only if THIS run acquired it — skip the release when the reserve
