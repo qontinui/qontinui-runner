@@ -4261,6 +4261,8 @@ mod tests {
                     restore_pending_at: None,
                     restore_tier: None,
                     origin: None,
+                    terminal_id: None,
+                    config_dir: None,
                 })
                 .collect(),
         }
