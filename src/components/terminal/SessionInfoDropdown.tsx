@@ -12,6 +12,7 @@ import {
   sessionInfoRows,
   summarizePrs,
   prPanelRows,
+  prsEmptyStateText,
   TONE_COLORS,
   UNKNOWN_TEXT,
   type InfoRowSpec,
@@ -170,9 +171,19 @@ function SessionInfoPanelBody({
 
       <div className="border-t border-[#2a2d3d]">
         <div className="px-2 py-0.5 text-[9px] text-[#565f89]">{prs.text}</div>
+        {/* Three DIFFERENT sentences for three different claims — never
+            looked / looked and the working dir holds no repos / genuinely no
+            PRs in the repos searched. The single old sentence rendered a
+            silently-skipped session identically to an empty one, which is the
+            confident-default-for-unknown failure this panel exists to avoid. */}
         {body.prs.status === "ok" && prRows.length === 0 && (
-          <div className="px-2 pb-1 text-[9px] text-[#565f89] italic">
-            no PRs attributed to this session
+          <div
+            id={sessionInfoElementId("prs-empty-state", zoneIndex)}
+            data-session-info-field="prs-empty-state"
+            data-session-info-value={prsEmptyStateText(body.prs, body.placement.workingDir)}
+            className="px-2 pb-1 text-[9px] text-[#565f89] italic"
+          >
+            {prsEmptyStateText(body.prs, body.placement.workingDir)}
           </div>
         )}
         {prRows.length > 0 && (
@@ -295,6 +306,12 @@ export function SessionInfoDropdown({
         data-ui-bridge-id={sessionInfoElementId("trigger", zoneIndex)}
         onClick={(e) => {
           e.stopPropagation();
+          // Opening the panel re-reads immediately AND, server-side, nudges
+          // the PR reconciler to look at this session now instead of up to
+          // 30s from now (`session_info_get` → `nudge_session`, debounced and
+          // fire-and-forget). The nudge is asynchronous by design, so THIS
+          // read still shows the pre-nudge counts; the next poll carries the
+          // fresh ones. That is the whole ~90s → ~60s win — not synchrony.
           if (!open) state.refresh();
           setOpen(!open);
         }}

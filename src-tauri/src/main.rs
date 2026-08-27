@@ -2233,14 +2233,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Plan 2026-05-23-coord-native-sessions-phase-7-10 §Phase 7 —
             // "Continue elsewhere" cross-machine handoff trigger.
             commands::session::session_handoff,
-            // Terminal zone-header PR dropdown — per-session PR merged/unmerged
-            // status proxied from coord's GET /pr-merge/session/:id/prs.
-            commands::session_prs::session_prs_get,
             // Terminal zone-header SESSION-INFO dropdown (plan
             // 2026-08-16-runner-session-info-dropdown-and-restore-verification
             // D1) — the ONE read that returns identity ⨝ live-registry overlay
             // ⨝ PR ledger in a single shot, so the panel can never render a
             // partially-loaded (and therefore ambiguous) state.
+            //
+            // The PR ledger is RUNNER-LOCAL Postgres (`project.session_prs`,
+            // written by `session_pr_reconciler` from the `Session-Id:` git
+            // trailer) — NOT a coord proxy. The predecessor command registered
+            // here, `session_prs_get`, carried a comment claiming it was
+            // "proxied from coord's GET /pr-merge/session/:id/prs"; it never
+            // was, and coord's session→PR map is empty for interactive
+            // operator sessions, which is the whole reason this projection
+            // exists. That command had no frontend caller left (its hook
+            // `useSessionPrs.ts` was deleted when this dropdown subsumed it)
+            // and has been deleted rather than deprecated.
             commands::session_info::session_info_get,
             // Plan 2026-05-22-coord-native-session-coordination §D12 / Phase 4 —
             // active tenant resolver for the frontend TenantContext.

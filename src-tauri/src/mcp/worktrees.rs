@@ -3,13 +3,13 @@
 //! Provides tools for listing, reviewing, merging, comparing, and discarding
 //! worktrees created by isolated workflow runs.
 
-use axum::extract::{Json, State};
+use axum::extract::{Json, Query, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::types::{api_error, ApiResponse, ApiState};
 use crate::worktree;
@@ -60,31 +60,220 @@ pub struct BranchInfo {
     pub task_run_id: Option<String>,
 }
 
+/// Query string for `GET /worktrees`.
+///
+/// `repo` is optional so the endpoint stays callable with no parameters at
+/// all (its historical shape). When supplied it must be an absolute path to a
+/// git repository, and the response describes exactly that repository.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListWorktreesQuery {
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+// =============================================================================
+// Repo-root resolution
+// =============================================================================
+
+/// Child directory names never scanned for git repositories.
+///
+/// These are build output, dependency trees, tool state, or worktree scratch
+/// space — never source clones. `qontinui-worktrees` and `.spawn-origin_main`
+/// hold *linked* worktrees whose `git worktree list` output is already
+/// reported by the clone that owns them, so scanning them would duplicate
+/// every entry under a scratch checkout instead of under its real repo.
+/// `target` / `target-pool` / `dist` / `node_modules` can be enormous, and
+/// stat-ing them buys nothing.
+const SKIPPED_SCAN_DIRS: &[&str] = &[
+    ".spawn-origin_main",
+    "qontinui-worktrees",
+    ".claude",
+    "node_modules",
+    "target",
+    "target-pool",
+    "dist",
+];
+
+/// Upper bound on how many repo roots one scan will report. A workspace root
+/// with more immediate children than this is almost certainly not the
+/// umbrella directory we think it is; cap rather than shell out to git
+/// hundreds of times.
+const MAX_SCANNED_REPOS: usize = 32;
+
+/// True when `path` is a git repository root. A normal clone has a `.git`
+/// directory; a linked worktree or submodule has a `.git` *file* pointing at
+/// the real gitdir. Both are valid `git worktree list` cwds, so test for the
+/// entry's existence rather than its kind.
+fn is_git_repo(path: &Path) -> bool {
+    path.join(".git").exists()
+}
+
+/// Resolve the set of git repo roots to list worktrees for, starting at
+/// `root`.
+///
+/// - If `root` is itself a git repository, that is the whole answer.
+/// - Otherwise `root` is treated as an umbrella workspace directory (which
+///   `current_project_path()` returns, and which is *not* a git repo) and its
+///   **depth-1** children are scanned for repositories. No recursion.
+///
+/// Returns an empty vec when neither holds — the caller must treat that as an
+/// unknown ("no repos found here"), never as "this repo has no worktrees".
+///
+/// Pure and synchronous: it only reads the directory tree, shells out to
+/// nothing, and so is unit-testable with `tempfile` and no git installed.
+fn resolve_repo_roots(root: &Path) -> Vec<PathBuf> {
+    if is_git_repo(root) {
+        return vec![root.to_path_buf()];
+    }
+
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(
+                "WORKTREE: cannot scan {} for git repos: {}",
+                root.display(),
+                e
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Dot-directories are tool/VCS state, not source clones.
+        if name.starts_with('.') || SKIPPED_SCAN_DIRS.contains(&name) {
+            continue;
+        }
+        if is_git_repo(&path) {
+            found.push(path);
+        }
+    }
+
+    // Sort before truncating so the cap is deterministic — `read_dir` order
+    // is filesystem-defined and varies across platforms.
+    found.sort();
+    if found.len() > MAX_SCANNED_REPOS {
+        warn!(
+            "WORKTREE: {} contains {} git repos; capping scan at {}",
+            root.display(),
+            found.len(),
+            MAX_SCANNED_REPOS
+        );
+        found.truncate(MAX_SCANNED_REPOS);
+    }
+    found
+}
+
 // =============================================================================
 // Handlers
 // =============================================================================
 
-/// GET /worktrees — List all managed worktrees.
+/// GET /worktrees[?repo=<abs path>] — List all managed worktrees.
+///
+/// With `repo`, lists worktrees for exactly that repository and fails if that
+/// repository fails. Without it, resolves a *set* of repo roots from the
+/// workspace root (see [`resolve_repo_roots`]) and unions their worktrees —
+/// the workspace root is an umbrella directory holding sibling clones, not a
+/// git repo itself, so assuming a single repo there always failed.
 pub async fn list_worktrees_handler(
     State(_state): State<Arc<ApiState>>,
+    Query(query): Query<ListWorktreesQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let repo = crate::mcp::shared::current_project_path().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(api_error("No project path available")),
-        )
-    })?;
-
-    match worktree::list_worktrees(Path::new(&repo)) {
-        Ok(paths) => {
-            let managed: Vec<&String> = paths.iter().filter(|p| p.contains(".worktrees")).collect();
-            Ok(Json(ApiResponse::success(json!({
-                "worktrees": managed,
-                "total": managed.len(),
-            }))))
+    // An explicitly named repo is authoritative: one repo, and its failure is
+    // the response's failure.
+    let explicit = query.repo.is_some();
+    let repos: Vec<PathBuf> = match query.repo.as_deref() {
+        Some(repo) => vec![PathBuf::from(repo)],
+        None => {
+            let root = crate::mcp::shared::current_project_path().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error("No project path available")),
+                )
+            })?;
+            let root = PathBuf::from(root);
+            let found = resolve_repo_roots(&root);
+            if found.is_empty() {
+                // Never answer "no worktrees" for an unknown: name the
+                // directory and say what we failed to find under it.
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(api_error(format!(
+                        "No git repositories found: {} is not a git repository, and none of its \
+                         immediate subdirectories are either. Pass ?repo=<absolute path> to list \
+                         worktrees for a specific repository.",
+                        root.display()
+                    ))),
+                ));
+            }
+            found
         }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    };
+
+    let mut managed: Vec<String> = Vec::new();
+    let mut repos_scanned: Vec<String> = Vec::new();
+    let mut repos_failed: Vec<serde_json::Value> = Vec::new();
+
+    for repo in &repos {
+        match worktree::list_worktrees(repo) {
+            Ok(paths) => {
+                repos_scanned.push(repo.to_string_lossy().to_string());
+                for path in paths {
+                    // Preserve the historical "managed worktree" filter.
+                    if path.contains(".worktrees") && !managed.contains(&path) {
+                        managed.push(path);
+                    }
+                }
+            }
+            Err(e) => {
+                if explicit {
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
+                }
+                warn!(
+                    "WORKTREE: skipping {} while listing worktrees: {}",
+                    repo.display(),
+                    e
+                );
+                repos_failed.push(json!({
+                    "repo": repo.to_string_lossy(),
+                    "error": e,
+                }));
+            }
+        }
     }
+
+    // Every candidate failed — again, an unknown, not an empty answer.
+    if repos_scanned.is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "Failed to list worktrees: all {} candidate repositories errored ({}).",
+                repos.len(),
+                repos_failed
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))),
+        ));
+    }
+
+    let mut body = json!({
+        "worktrees": managed,
+        "total": managed.len(),
+        "reposScanned": repos_scanned,
+    });
+    if !repos_failed.is_empty() {
+        body["reposFailed"] = json!(repos_failed);
+    }
+    Ok(Json(ApiResponse::success(body)))
 }
 
 /// POST /worktrees/diff — Get diff summary for a worktree branch.
@@ -443,4 +632,136 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/worktrees/merge-force", post(merge_worktree_force_handler))
         .route("/worktrees/remove", post(remove_worktree_handler))
         .route("/worktrees/compare", post(compare_worktrees_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create `<root>/<name>` with a `.git` directory — a clone root as far
+    /// as [`is_git_repo`] is concerned, without needing git installed.
+    fn make_repo(root: &Path, name: &str) -> PathBuf {
+        let p = root.join(name);
+        std::fs::create_dir_all(p.join(".git")).unwrap();
+        p
+    }
+
+    /// Create `<root>/<name>` as a plain directory (no `.git`).
+    fn make_plain(root: &Path, name: &str) -> PathBuf {
+        let p = root.join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn root_that_is_itself_a_repo_resolves_to_just_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        // A child repo must NOT be added when the root is already a repo.
+        make_repo(root, "vendored");
+
+        assert_eq!(resolve_repo_roots(root), vec![root.to_path_buf()]);
+    }
+
+    #[test]
+    fn non_repo_parent_yields_its_child_repos() {
+        // THE REGRESSION: the workspace root (D:/qontinui-root) is not a git
+        // repo, so the handler used to shell `git worktree list` there and
+        // fail with "not a git repository" on every single call.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let a = make_repo(root, "qontinui");
+        let b = make_repo(root, "qontinui-runner");
+        let c = make_repo(root, "qontinui-web");
+        // Non-repo siblings are ignored, not errors.
+        make_plain(root, "knowledge-base");
+        std::fs::write(root.join("README.md"), "not a dir").unwrap();
+
+        let mut expected = vec![a, b, c];
+        expected.sort();
+        assert_eq!(resolve_repo_roots(root), expected);
+    }
+
+    #[test]
+    fn skip_list_and_dot_directories_are_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let keep = make_repo(root, "qontinui-runner");
+
+        // Every skip-list entry, made to look exactly like a repo.
+        for name in SKIPPED_SCAN_DIRS {
+            make_repo(root, name);
+        }
+        // Arbitrary dot-directories are excluded by the leading-dot rule even
+        // though they are not named in the skip list.
+        make_repo(root, ".git-mirrors");
+        make_repo(root, ".cache");
+
+        assert_eq!(resolve_repo_roots(root), vec![keep]);
+    }
+
+    #[test]
+    fn scan_is_capped_at_the_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let over = MAX_SCANNED_REPOS + 7;
+        for i in 0..over {
+            // Zero-padded so lexicographic order is stable and the truncation
+            // is deterministic.
+            make_repo(root, &format!("repo-{:03}", i));
+        }
+
+        let found = resolve_repo_roots(root);
+        assert_eq!(found.len(), MAX_SCANNED_REPOS);
+        // Truncation happens after sorting, so it keeps the first N by name.
+        assert_eq!(found[0], root.join("repo-000"));
+        assert_eq!(
+            found[MAX_SCANNED_REPOS - 1],
+            root.join(format!("repo-{:03}", MAX_SCANNED_REPOS - 1))
+        );
+    }
+
+    #[test]
+    fn directory_with_no_repos_yields_empty_vec() {
+        // The handler contract: an empty vec here is an UNKNOWN (HTTP 404
+        // naming the directory), never a confident `{"worktrees": [],
+        // "total": 0}`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        make_plain(root, "docs");
+        make_plain(root, "notes");
+
+        assert!(resolve_repo_roots(root).is_empty());
+    }
+
+    #[test]
+    fn nonexistent_directory_yields_empty_vec_rather_than_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_repo_roots(&dir.path().join("does-not-exist")).is_empty());
+    }
+
+    #[test]
+    fn child_repos_are_not_recursed_into() {
+        // Depth 1 only: a repo nested two levels down is invisible.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let outer = make_plain(root, "group");
+        make_repo(&outer, "nested-repo");
+        let direct = make_repo(root, "direct-repo");
+
+        assert_eq!(resolve_repo_roots(root), vec![direct]);
+    }
+
+    #[test]
+    fn dot_git_file_counts_as_a_repo() {
+        // Linked worktrees and submodules have a `.git` FILE, not a dir.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wt = root.join("linked-worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /somewhere/.git/worktrees/x").unwrap();
+
+        assert_eq!(resolve_repo_roots(root), vec![wt]);
+    }
 }

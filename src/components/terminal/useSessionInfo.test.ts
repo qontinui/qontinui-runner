@@ -32,6 +32,7 @@ import {
   prKey,
   prLabel,
   prPanelRows,
+  prsEmptyStateText,
   landSignalLabel,
   landUnknownReasonLabel,
   prRowChip,
@@ -70,6 +71,10 @@ function prs(overrides: Partial<SessionPrs> = {}): SessionPrs {
     openCount: 0,
     landedCount: 0,
     unknownCount: 0,
+    // Default to SCANNED: the fixtures below are about the ledger's contents,
+    // and the not-scanned case has its own dedicated tests.
+    scanned: true,
+    scannedRepos: ["D:/qontinui-root/qontinui-runner"],
   };
   const merged = { ...base, ...overrides };
   return {
@@ -528,7 +533,7 @@ describe("sessionInfoElementId", () => {
 });
 
 describe("sessionInfoRows", () => {
-  it("emits all fourteen fields, in the D5 order, all four ids among them (D2)", () => {
+  it("emits all fifteen fields, in the D5 order, all four ids among them (D2)", () => {
     expect(sessionInfoRows(body()).map((r) => r.field)).toEqual([
       "account",
       "name",
@@ -544,6 +549,7 @@ describe("sessionInfoRows", () => {
       "restore-tier",
       "prs-opened",
       "prs-landed",
+      "prs-scanned",
     ]);
   });
 
@@ -585,11 +591,35 @@ describe("sessionInfoRows", () => {
     const rows = sessionInfoRows(
       body({ prs: prs({ status: "unavailable", reason: "pg_unavailable" }) }),
     );
-    for (const field of ["prs-opened", "prs-landed"] as const) {
+    for (const field of ["prs-opened", "prs-landed", "prs-scanned"] as const) {
       const row = rows.find((r) => r.field === field);
       expect(row?.value, field).toBeNull();
       expect(row?.display, field).toBe("unavailable — pg_unavailable");
     }
+  });
+
+  // The defect: the operator's terminal sat at `PRs opened: 0` forever because
+  // its cwd was the workspace parent (not itself a repo), so the reconciler
+  // dropped it from every tick. `0` and "never looked" must not render alike.
+  it("says `not scanned yet` — never a zero — when no repo set was ever resolved", () => {
+    const rows = sessionInfoRows(body({ prs: prs({ scanned: false, scannedRepos: [] }) }));
+    const row = rows.find((r) => r.field === "prs-scanned");
+    expect(row?.value).toBeNull();
+    expect(row?.display).toBe("not scanned yet");
+  });
+
+  it("distinguishes `scanned, no repos found` from `scanned N repos`", () => {
+    const none = sessionInfoRows(body({ prs: prs({ scanned: true, scannedRepos: [] }) })).find(
+      (r) => r.field === "prs-scanned",
+    );
+    expect(none?.value).toBe("0");
+    expect(none?.display).toBe("0 — no git repos under the working dir");
+
+    const some = sessionInfoRows(
+      body({ prs: prs({ scanned: true, scannedRepos: ["D:/a", "D:/b"] }) }),
+    ).find((r) => r.field === "prs-scanned");
+    expect(some?.value).toBe("2");
+    expect(some?.display).toBe("2");
   });
 
   it("marks exactly the id-ish rows copyable", () => {
@@ -621,7 +651,74 @@ describe("formatEpochMs", () => {
 // New: normalization never produces a bare empty
 // ---------------------------------------------------------------------------
 
+describe("prsEmptyStateText", () => {
+  // Three different claims → three different sentences. Collapsing them is the
+  // confident-default-for-unknown failure this panel exists to avoid.
+  it("says the reconciler never looked when no repo set was resolved", () => {
+    expect(prsEmptyStateText(prs({ scanned: false, scannedRepos: [] }), "D:/qontinui-root")).toBe(
+      "not scanned yet — the PR reconciler has not resolved this session",
+    );
+  });
+
+  it("names the working dir when it was searched and holds no git repos", () => {
+    expect(prsEmptyStateText(prs({ scanned: true, scannedRepos: [] }), "D:/qontinui-root")).toBe(
+      "no git repos found under D:/qontinui-root — nothing was searched",
+    );
+    // An unknown cwd stays `unknown`, never a blank or a fabricated path.
+    expect(prsEmptyStateText(prs({ scanned: true, scannedRepos: [] }), null)).toBe(
+      "no git repos found under unknown — nothing was searched",
+    );
+  });
+
+  it("only claims `no PRs attributed` once repos were actually searched", () => {
+    expect(prsEmptyStateText(prs({ scanned: true, scannedRepos: ["D:/a"] }), "D:/a")).toBe(
+      "no PRs attributed to this session (searched 1 repo)",
+    );
+    expect(prsEmptyStateText(prs({ scanned: true, scannedRepos: ["D:/a", "D:/b"] }), "D:/")).toBe(
+      "no PRs attributed to this session (searched 2 repos)",
+    );
+  });
+});
+
 describe("normalizeSessionInfo", () => {
+  // An older runner sends neither field. That is "cannot say", which must land
+  // in the not-scanned bucket rather than be back-filled into a claim.
+  it("treats a payload with no scan provenance as NOT scanned", () => {
+    const state = normalizeSessionInfo({
+      available: true,
+      identity: body().identity,
+      name: body().name,
+      account: body().account,
+      placement: body().placement,
+      lifecycle: body().lifecycle,
+      prs: { status: "ok", opened: [], landed: [], unknown: [] },
+    });
+    expect(state.body?.prs.scanned).toBe(false);
+    expect(state.body?.prs.scannedRepos).toEqual([]);
+  });
+
+  it("carries the scan provenance through when the runner sends it", () => {
+    const state = normalizeSessionInfo({
+      available: true,
+      identity: body().identity,
+      name: body().name,
+      account: body().account,
+      placement: body().placement,
+      lifecycle: body().lifecycle,
+      prs: {
+        status: "ok",
+        opened: [],
+        landed: [],
+        unknown: [],
+        scanned: true,
+        scannedRepos: ["D:/qontinui-root/qontinui-runner", 7],
+      },
+    });
+    expect(state.body?.prs.scanned).toBe(true);
+    // Non-string entries are dropped rather than rendered as `undefined`.
+    expect(state.body?.prs.scannedRepos).toEqual(["D:/qontinui-root/qontinui-runner"]);
+  });
+
   it("turns a degraded envelope into an unavailable state carrying its reason", () => {
     expect(normalizeSessionInfo({ available: false, reason: "session_not_found" })).toEqual({
       status: "unavailable",

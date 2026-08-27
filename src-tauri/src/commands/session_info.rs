@@ -336,6 +336,18 @@ pub struct SessionPrs {
     pub open_count: usize,
     pub landed_count: usize,
     pub unknown_count: usize,
+    /// Has the reconciler EVER resolved a repo set for this session?
+    ///
+    /// `false` ⇒ nothing was ever looked at, so an empty ledger asserts
+    /// NOTHING. This is the same G5 distinction `status: "unavailable"` draws
+    /// for the store, applied one level down to the scan: before this field the
+    /// dropdown rendered "no PRs attributed to this session" identically for a
+    /// session that genuinely opened none and for one the reconciler silently
+    /// dropped every tick because its cwd was the (non-repo) workspace parent.
+    pub scanned: bool,
+    /// The repo roots the reconciler last searched for this session. Empty WITH
+    /// `scanned: true` ⇒ the cwd resolved to no git repositories at all.
+    pub scanned_repos: Vec<String>,
 }
 
 /// The projected body — every field group of D1. Flattened into
@@ -440,6 +452,14 @@ fn non_empty(v: Option<&String>) -> Option<String> {
 ///   that proved it.
 /// - `unknown` — rows the cascade could not evaluate, with their reason.
 pub fn project_prs(rows: &[SessionPrRow]) -> SessionPrs {
+    project_prs_scanned(rows, None)
+}
+
+/// [`project_prs`] plus the scan provenance: `scanned_repos` is `None` when the
+/// reconciler has never resolved a repo set for this session, `Some(&[])` when
+/// it resolved one and found no repositories, `Some(&[..])` for the repos it
+/// searched. Pure.
+pub fn project_prs_scanned(rows: &[SessionPrRow], scanned_repos: Option<&[String]>) -> SessionPrs {
     let opened: Vec<SessionPrOpened> = rows
         .iter()
         .map(|r| SessionPrOpened {
@@ -481,6 +501,8 @@ pub fn project_prs(rows: &[SessionPrRow]) -> SessionPrs {
         opened,
         landed,
         unknown,
+        scanned: scanned_repos.is_some(),
+        scanned_repos: scanned_repos.unwrap_or(&[]).to_vec(),
     }
 }
 
@@ -500,6 +522,10 @@ pub fn prs_unavailable(reason: &str) -> SessionPrs {
         open_count: 0,
         landed_count: 0,
         unknown_count: 0,
+        // The STORE could not answer, so the scan provenance is meaningless
+        // here — `status: "unavailable"` already says "this asserts nothing".
+        scanned: false,
+        scanned_repos: Vec::new(),
     }
 }
 
@@ -602,9 +628,11 @@ pub fn project_session_info(
 
 /// Read the runner-local PR ledger for one session, fail-soft.
 ///
-/// Reaches PG the way `session_prs_get` does — [`crate::database::pg::pg_available`]
-/// then `PgDb::try_global()`, a process GLOBAL rather than Tauri state — which
-/// is why the HTTP twin needs no `ApiState` plumbing for the join.
+/// Reaches PG through [`crate::database::pg::pg_available`] then
+/// `PgDb::try_global()`, a process GLOBAL rather than Tauri state — which is
+/// why the HTTP twin needs no `ApiState` plumbing for the join. The scan
+/// provenance ([`crate::session_pr_reconciler::last_scanned_repos`]) is read
+/// the same way, for the same reason.
 ///
 /// Every degraded condition returns [`prs_unavailable`] with a reason:
 /// `invalid_session_id` (the id is not a uuid, so it can never key the
@@ -619,8 +647,12 @@ pub async fn load_prs(claude_session_id: &str) -> SessionPrs {
     let Some(pg_db) = crate::database::pg::PgDb::try_global() else {
         return prs_unavailable("db_unavailable");
     };
+    // Which repos the reconciler last searched for this session. READ ONLY —
+    // never re-run the resolver here: this is a passive read path polled per
+    // zone, and resolving would put a filesystem scan on it.
+    let scanned = crate::session_pr_reconciler::last_scanned_repos(session_uuid);
     match pg_db.list_session_prs(session_uuid).await {
-        Ok(rows) => project_prs(&rows),
+        Ok(rows) => project_prs_scanned(&rows, scanned.as_deref()),
         Err(e) => {
             tracing::debug!("session_info: list_session_prs failed (fail-soft): {e}");
             prs_unavailable("db_error")
@@ -675,6 +707,14 @@ pub async fn session_info_get(
     let Some(rec) = store.get(&id) else {
         return Ok(SessionInfoEnvelope::unavailable("session_not_found"));
     };
+    // Fire-and-forget: ask the reconciler to look at THIS session now rather
+    // than up to 30s from now. This read does not wait on it and never can —
+    // the reconciler ticks on its own task, debounced per session. Without it
+    // a freshly opened PR took up to ~90s to surface (30s reconcile + 60s
+    // poll); with it the NEXT poll after opening the dropdown carries it.
+    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        crate::session_pr_reconciler::nudge_session(uuid);
+    }
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
     let probe = crate::session::reconcile::DiskTranscriptIndex::discover();
     Ok(build_session_info(&rec, &config_dirs, &probe).await)
@@ -879,6 +919,49 @@ mod tests {
         assert_ne!(degraded, empty);
     }
 
+    /// The SAME distinction one level down, on the SCAN rather than the store.
+    /// An empty ledger the reconciler never looked at, an empty ledger whose
+    /// working dir holds no repos, and an empty ledger from repos that WERE
+    /// searched are three different claims, and the dropdown renders three
+    /// different sentences for them. Before this, all three printed
+    /// `no PRs attributed to this session`.
+    #[test]
+    fn never_scanned_is_distinct_from_scanned_with_no_prs() {
+        let never = project_prs(&[]);
+        let scanned_no_repos = project_prs_scanned(&[], Some(&[]));
+        let repos = vec!["D:/qontinui-root/qontinui-runner".to_string()];
+        let scanned = project_prs_scanned(&[], Some(&repos));
+
+        // All three are a healthy, EMPTY ledger — the counts cannot separate
+        // them, which is exactly why the scan provenance has to be on the wire.
+        for prs in [&never, &scanned_no_repos, &scanned] {
+            assert_eq!(prs.status, STATUS_OK);
+            assert_eq!(prs.open_count, 0);
+        }
+
+        assert!(!never.scanned);
+        assert!(never.scanned_repos.is_empty());
+
+        assert!(scanned_no_repos.scanned);
+        assert!(scanned_no_repos.scanned_repos.is_empty());
+
+        assert!(scanned.scanned);
+        assert_eq!(scanned.scanned_repos.len(), 1);
+
+        assert_ne!(never, scanned_no_repos);
+        assert_ne!(scanned_no_repos, scanned);
+    }
+
+    /// A degraded STORE says nothing about the scan either — it must not claim
+    /// `scanned: true` off the back of a read it never made.
+    #[test]
+    fn an_unavailable_ledger_claims_no_scan_provenance() {
+        let degraded = prs_unavailable("db_unavailable");
+        assert_eq!(degraded.status, STATUS_UNAVAILABLE);
+        assert!(!degraded.scanned);
+        assert!(degraded.scanned_repos.is_empty());
+    }
+
     #[test]
     fn opened_and_landed_overlap_rather_than_partition() {
         // 3 attributed rows, 2 of them landed — the `3 opened · 2 landed`
@@ -984,6 +1067,10 @@ mod tests {
             v["prs"]["landed"][0]["landSignal"],
             serde_json::json!("ff-land")
         );
+        // The scan provenance is camelCase on the wire and mirrored in
+        // `src/components/terminal/useSessionInfo.ts` (`SessionPrs`).
+        assert_eq!(v["prs"]["scanned"], serde_json::json!(false));
+        assert_eq!(v["prs"]["scannedRepos"], serde_json::json!([]));
         // A degraded ledger spells its reason on the wire.
         let degraded = project_session_info(&rec, None, true, prs_unavailable("db_error"));
         let dv = serde_json::to_value(&degraded).unwrap();

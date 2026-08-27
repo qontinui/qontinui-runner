@@ -1,21 +1,27 @@
 //! Runner-local per-session PR attribution + status reconciler.
 //!
 //! Feeds `project.session_prs`, which the Terminal zone-header dropdown reads
-//! (`commands::session_prs::session_prs_get`). Ground truth for attribution:
+//! (`commands::session_info::session_info_get`). Ground truth for attribution:
 //! every commit a session makes carries a `Session-Id: <claude_session_id>`
 //! git trailer (installed machine-wide via a `prepare-commit-msg` hook). So
 //! "which PRs did session S open" = PRs whose head-branch HEAD commit carries
 //! `Session-Id: S`.
 //!
-//! Each tick (~30s, plus a best-effort pass at startup):
+//! Each tick (~30s, plus a best-effort pass at startup and an on-demand nudge
+//! when the dropdown opens — see [`nudge_session`]):
 //!
 //! 1. Enumerate open terminal-session records ([`SessionLifecycleStore::open_records`]) —
 //!    each carries the `claude_session_id` and the session's `working_dir`.
-//! 2. Resolve each session's repo (git toplevel of its cwd) → `owner/name`
-//!    from the `origin` remote.
-//! 3. In that repo, read every local branch's HEAD-commit `Session-Id`
-//!    trailer(s) in ONE `git for-each-ref` and keep the branches whose trailer
-//!    names this session.
+//! 2. Resolve the session's repo SET ([`resolve_repo_set`]) — the git toplevel
+//!    of its cwd when that resolves, PLUS every depth-1 child directory of the
+//!    cwd that is itself a repo — then each repo → `owner/name` from `origin`.
+//!    A session whose cwd is the WORKSPACE PARENT (`D:\qontinui-root`, which
+//!    holds the clones but is not itself a repo) used to resolve to nothing and
+//!    was silently dropped from every tick; a session that commits to several
+//!    sibling repos used to be attributed only PRs from one of them.
+//! 3. In each repo, read every local AND `origin/*` branch's HEAD-commit
+//!    `Session-Id` trailer(s) in ONE `git for-each-ref` and keep the branches
+//!    whose trailer names this session.
 //! 4. Resolve each matching branch → its PR(s) via the GitHub API
 //!    (`GitHubClient::list_prs_for_head`, `state=all`).
 //! 5. VERIFY the PR's head-commit `Session-Id` trailer == this session (a
@@ -53,10 +59,13 @@
 //! justifies noisy failures.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -70,9 +79,12 @@ use crate::trigger_system::github_api::{has_coord_landed_label, GitHubClient};
 /// passive status indicator without hammering the GitHub API.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// One local branch with its HEAD sha and the `Session-Id` trailer value(s) on
-/// that HEAD commit.
+/// One branch with its HEAD sha and the `Session-Id` trailer value(s) on that
+/// HEAD commit. Sourced from local heads AND `refs/remotes/origin/*`, so a
+/// branch that was pushed and then deleted locally is still attributable.
 struct BranchTrailer {
+    /// Short branch name, with any `origin/` prefix already stripped — the
+    /// spelling `list_prs_for_head` needs.
     branch: String,
     sha: String,
     session_ids: Vec<String>,
@@ -85,42 +97,70 @@ struct RepoInfo {
     branches: Vec<BranchTrailer>,
 }
 
-/// How long a resolved `working_dir → git toplevel` mapping is trusted.
+/// How long a resolved `working_dir → repo set` mapping is trusted.
 ///
 /// A session's cwd effectively never changes repo, so this only needs to be
-/// short enough that a moved/deleted checkout self-heals within a few minutes.
+/// short enough that a moved/deleted checkout (or a freshly cloned sibling)
+/// self-heals within a few minutes. It is also what keeps the depth-1
+/// directory scan off the 30s tick: the per-tick cost stays one cheap
+/// `for-each-ref` per repo, never a filesystem walk.
 const TOPLEVEL_TTL: Duration = Duration::from_secs(600);
 
-/// Bound on the cross-tick toplevel cache. Sessions come and go, so the map
+/// Bound on the cross-tick repo-set cache. Sessions come and go, so the map
 /// needs a ceiling; well above any realistic live-session count.
 const TOPLEVEL_CACHE_MAX: usize = 512;
 
-/// `working_dir → git toplevel`, cached ACROSS ticks (plan
-/// `2026-07-28-runner-many-sessions-performance` §7a/B8).
+/// Ceiling on how many repos one session's cwd may resolve to. A session
+/// pointed at a huge tree must not be able to melt the tick (each repo costs a
+/// `for-each-ref` plus, potentially, GitHub calls). Well above the ~15 sibling
+/// clones a real workspace parent holds.
+const REPO_SET_MAX: usize = 32;
+
+/// Depth-1 child directory names that are NEVER a session's source repo.
 ///
-/// The per-tick `repo_cache` below cannot help here: it is keyed BY the
-/// toplevel, so it can only dedupe work that happens *after* the toplevel is
-/// known — the `git rev-parse --show-toplevel` subprocess that produces the key
-/// still ran once per open record per tick, i.e. N process spawns every 30s.
+/// These are build/worktree scratch, not source clones: `.spawn-origin_main`
+/// and `qontinui-worktrees` hold throwaway checkouts (whose branches would be
+/// attributed to whichever session last touched them), `target` /
+/// `target-pool` / `dist` / `node_modules` are build output, and `.claude` is
+/// agent state. Anything else beginning with `.` is skipped too — dotfile
+/// directories are tooling, not checkouts.
+const REPO_SCAN_SKIP_DIRS: &[&str] = &[
+    ".spawn-origin_main",
+    "qontinui-worktrees",
+    ".claude",
+    "node_modules",
+    "target",
+    "target-pool",
+    "dist",
+];
+
+/// `working_dir → the set of git repo roots to reconcile for it`, cached
+/// ACROSS ticks (plan `2026-07-28-runner-many-sessions-performance` §7a/B8).
 ///
-/// Invalidation: TTL'd, bounded, and a failed resolution drops the entry so a
-/// moved or deleted checkout re-resolves on the next tick rather than serving
-/// a stale root forever.
+/// The per-tick `repo_cache` below cannot help here: it is keyed BY the repo
+/// root, so it can only dedupe work that happens *after* the roots are known —
+/// the `git rev-parse --show-toplevel` subprocess (and now the depth-1
+/// directory scan) that produces those keys still ran once per open record per
+/// tick, i.e. N process spawns every 30s.
+///
+/// Invalidation: TTL'd and bounded. An EMPTY set is cached like any other —
+/// "this cwd resolves to no repos" is an answer, and rescanning the filesystem
+/// every 30s to re-learn it is exactly the cost the cache exists to avoid.
 #[derive(Default)]
-struct TopLevelCache {
-    entries: HashMap<String, (String, Instant)>,
+struct RepoSetCache {
+    entries: HashMap<String, (Vec<String>, Instant)>,
 }
 
-impl TopLevelCache {
-    fn get(&self, working_dir: &str) -> Option<&str> {
-        let (toplevel, at) = self.entries.get(working_dir)?;
+impl RepoSetCache {
+    fn get(&self, working_dir: &str) -> Option<&[String]> {
+        let (repos, at) = self.entries.get(working_dir)?;
         if at.elapsed() > TOPLEVEL_TTL {
             return None;
         }
-        Some(toplevel.as_str())
+        Some(repos.as_slice())
     }
 
-    fn insert(&mut self, working_dir: String, toplevel: String) {
+    fn insert(&mut self, working_dir: String, repos: Vec<String>) {
         if self.entries.len() >= TOPLEVEL_CACHE_MAX {
             // Drop everything expired; if that frees nothing, drop the whole
             // map rather than growing without bound. Re-resolution is one
@@ -131,7 +171,7 @@ impl TopLevelCache {
                 self.entries.clear();
             }
         }
-        self.entries.insert(working_dir, (toplevel, Instant::now()));
+        self.entries.insert(working_dir, (repos, Instant::now()));
     }
 
     fn invalidate(&mut self, working_dir: &str) {
@@ -139,30 +179,323 @@ impl TopLevelCache {
     }
 }
 
+/// Depth-1 child directories of `working_dir` that LOOK like git repositories
+/// (a `.git` entry exists — a directory for a normal clone, a file for a linked
+/// worktree). Pure filesystem, no subprocess, so it unit-tests without git.
+///
+/// Depth 1 only, deliberately: recursing would turn a workspace parent into an
+/// unbounded walk, and this fleet's layout puts every clone exactly one level
+/// under the workspace root. Sorted by name so the resolved set — and therefore
+/// the reconcile order and the `scannedRepos` the dropdown renders — is stable
+/// across ticks.
+///
+/// NOT truncated: capping here made truncation UNOBSERVABLE to the caller,
+/// which could then only infer it from `len() >= REPO_SET_MAX` and so warned
+/// "PRs in the remainder will not be attributed" for a workspace holding
+/// EXACTLY [`REPO_SET_MAX`] repos, with nothing dropped. The cap belongs to
+/// [`resolve_repo_set_capped`], which applies it as a real total (the cwd's own
+/// toplevel included) and knows how many candidates it actually dropped.
+fn candidate_child_repos(working_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(working_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || REPO_SCAN_SKIP_DIRS.contains(&name.as_str()) {
+                return None;
+            }
+            let path = e.path();
+            if !path.is_dir() || !path.join(".git").exists() {
+                return None;
+            }
+            Some((name, path))
+        })
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    names.into_iter().map(|(_, p)| p).collect()
+}
+
+/// A repo dir whose `.git` is a FILE is a LINKED WORKTREE (the file points at
+/// its canonical clone's `.git/worktrees/<name>`), not a clone of its own.
+///
+/// Both shapes are scanned — a worktree's branches are the session's branches
+/// too — but they share ONE ref store, so two such dirs resolve to the same
+/// `owner/name`. When that happens the canonical clone wins (see
+/// [`resolve_repo_set_capped`]): it is the dir a content proof should run in,
+/// and it is the name a human reading `scannedRepos` expects.
+fn is_linked_worktree(repo_dir: &Path) -> bool {
+    repo_dir.join(".git").is_file()
+}
+
+/// The set of git repo roots to reconcile for one session cwd.
+///
+/// = `git rev-parse --show-toplevel` of the cwd (when it resolves) ∪ the
+/// depth-1 child repos of the cwd. BOTH, always — the cwd being a repo does not
+/// mean its siblings are irrelevant: a session rooted in one clone that also
+/// commits to a neighbour is the normal shape here, and before this the
+/// neighbour's PRs were simply never attributed.
+///
+/// Returns an EMPTY vec when nothing resolves. That is a real answer ("this cwd
+/// contains no repos"), distinct from "never looked" — the caller records which
+/// one happened, so the dropdown can say so instead of printing a confident
+/// "no PRs".
+async fn resolve_repo_set(working_dir: &str) -> Vec<String> {
+    let (repos, dropped) = resolve_repo_set_capped(working_dir, REPO_SET_MAX).await;
+    if dropped > 0 {
+        // ONLY when something was genuinely dropped, and it says how many: the
+        // predecessor inferred truncation from `len() >= REPO_SET_MAX` and so
+        // warned about a "remainder" that did not exist. Not per-tick noise
+        // either: resolution is TTL-cached for TOPLEVEL_TTL, so a given cwd can
+        // warn at most once per cache lifetime.
+        warn!(
+            "session-pr-reconciler: {working_dir} resolves to more than {REPO_SET_MAX} git repos — \
+             capping the scan at {REPO_SET_MAX}; {dropped} candidate repo(s) were NOT scanned and \
+             their PRs will not be attributed"
+        );
+    }
+    repos
+}
+
+/// [`resolve_repo_set`] with the ceiling injected, returning `(repos, dropped)`
+/// so the cap is OBSERVABLE rather than inferred — and unit-testable at a small
+/// `max` instead of needing 33 real repos on disk.
+///
+/// `max` is a real TOTAL: the cwd's own toplevel occupies a slot like any child
+/// (the old code pushed it before the cap loop, making the effective ceiling
+/// `REPO_SET_MAX + 1`). `dropped` counts candidate directories the cap stopped
+/// us from even looking at — 0 means every candidate was resolved.
+///
+/// Dedupe: two local dirs can be the SAME GitHub repo (a linked worktree and
+/// its clone share one ref store), which would run `resolve_repo` +
+/// `branch_trailers` twice over identical refs every tick and render a
+/// duplicate-looking `scannedRepos` entry. Collapsed here, by `owner/name` —
+/// the same key `repo_dirs` uses in `run_tick` — preferring the canonical
+/// clone. The extra `git remote get-url` this costs is per RESOLUTION, not per
+/// tick: the result is `RepoSetCache`d for `TOPLEVEL_TTL`.
+async fn resolve_repo_set_capped(working_dir: &str, max: usize) -> (Vec<String>, usize) {
+    // The cwd itself first (it may be a repo, or inside one), then its depth-1
+    // children — one list so the cap applies to the whole set.
+    let mut candidates: Vec<PathBuf> = vec![PathBuf::from(working_dir)];
+    candidates.extend(candidate_child_repos(Path::new(working_dir)));
+
+    let mut repos: Vec<String> = Vec::new();
+    // `owner/name` → index into `repos`.
+    let mut by_full: HashMap<String, usize> = HashMap::new();
+    let mut dropped = 0usize;
+
+    for (i, dir) in candidates.iter().enumerate() {
+        if repos.len() >= max {
+            dropped = candidates.len() - i;
+            break;
+        }
+        let Some(top) = git_toplevel(&dir.to_string_lossy()).await else {
+            continue;
+        };
+        if repos.iter().any(|r| r == &top) {
+            continue;
+        }
+        let Some(full) = repo_full_name(&top).await else {
+            // No parseable `origin` ⇒ nothing to dedupe on. Keep it: the tick
+            // will skip it anyway, and dropping it here would hide it from
+            // `scannedRepos`.
+            repos.push(top);
+            continue;
+        };
+        match by_full.get(&full).copied() {
+            Some(idx) => {
+                // Same GitHub repo through a second local dir. Keep ONE, and
+                // prefer the canonical clone over a linked worktree.
+                if is_linked_worktree(Path::new(&repos[idx]))
+                    && !is_linked_worktree(Path::new(&top))
+                {
+                    repos[idx] = top;
+                }
+            }
+            None => {
+                by_full.insert(full, repos.len());
+                repos.push(top);
+            }
+        }
+    }
+
+    (repos, dropped)
+}
+
+/// `owner/name` for a repo toplevel, from its `origin` remote.
+async fn repo_full_name(toplevel: &str) -> Option<String> {
+    let remote = git_remote_url(toplevel).await?;
+    let (owner, repo) = parse_owner_repo(&remote)?;
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Per-session record of the repo set the reconciler LAST resolved.
+///
+/// A process global rather than Tauri state, matching this subsystem's existing
+/// idiom (`PgDb::try_global()` — see `commands::session_info::load_prs`), so the
+/// Tauri command and its HTTP twin read it identically with no `ApiState`
+/// plumbing.
+///
+/// An ABSENT entry means "the reconciler has never resolved this session" — the
+/// state that used to be indistinguishable from "scanned and found no PRs", and
+/// which the dropdown now spells out.
+static SCANNED_REPOS: OnceLock<Mutex<HashMap<Uuid, Vec<String>>>> = OnceLock::new();
+
+fn scanned_repos_map() -> &'static Mutex<HashMap<Uuid, Vec<String>>> {
+    SCANNED_REPOS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record which repos were scanned for `session_id` this tick.
+fn record_scanned_repos(session_id: Uuid, repos: &[String]) {
+    let Ok(mut map) = scanned_repos_map().lock() else {
+        return;
+    };
+    if map.len() >= TOPLEVEL_CACHE_MAX && !map.contains_key(&session_id) {
+        // Bounded like the repo-set cache: sessions churn, and losing a record
+        // degrades to "not scanned yet", never to a wrong answer.
+        map.clear();
+    }
+    map.insert(session_id, repos.to_vec());
+}
+
+/// The repos the reconciler last scanned for `session_id`.
+///
+/// `None` ⇒ never scanned (no tick has resolved this session). `Some([])` ⇒
+/// scanned, and the cwd resolved to no git repos at all. `Some([..])` ⇒ these
+/// repos were searched. The three are different claims and the dropdown renders
+/// them differently.
+pub fn last_scanned_repos(session_id: Uuid) -> Option<Vec<String>> {
+    scanned_repos_map().lock().ok()?.get(&session_id).cloned()
+}
+
+/// Capacity of the on-demand nudge channel. Tiny on purpose: a nudge is an
+/// optimisation, so a full channel drops rather than queues — nudges must never
+/// stack up into a backlog of ticks.
+const NUDGE_CHANNEL_CAP: usize = 8;
+
+/// Minimum gap between two on-demand reconciles OF THE SAME SESSION. Five
+/// seconds: short enough that opening the dropdown, seeing a stale count and
+/// reopening it feels responsive, long enough that a panel re-render loop or a
+/// UI-Bridge script hammering the trigger cannot turn into a GitHub API storm.
+const NUDGE_DEBOUNCE: Duration = Duration::from_secs(5);
+
+/// Sender for [`nudge_session`], published by [`start`].
+static NUDGE_TX: OnceLock<mpsc::Sender<Uuid>> = OnceLock::new();
+
+/// Ask the reconciler to reconcile ONE session promptly, out of band with the
+/// 30s tick. Fire-and-forget by contract: the caller (`session_info_get`)
+/// returns the currently-stored ledger immediately and never blocks on this.
+///
+/// Silently drops when the reconciler is not running or the channel is full.
+/// This is an optimisation on top of the interval tick, never a correctness
+/// path — the next tick reconciles the session regardless. Because it is async,
+/// the FIRST dropdown open after a PR is created may still show the old count;
+/// the next poll shows the new one.
+pub fn nudge_session(session_id: Uuid) {
+    if let Some(tx) = NUDGE_TX.get() {
+        let _ = tx.try_send(session_id);
+    }
+}
+
 /// Start the reconciler as a detached background task for the process
 /// lifetime (matching the lifecycle liveness-poll idiom in `main.rs`). Runs a
-/// best-effort pass immediately, then every [`POLL_INTERVAL`].
+/// best-effort pass immediately, then every [`POLL_INTERVAL`] — or sooner for
+/// ONE session when [`nudge_session`] fires (the dropdown was opened).
+///
+/// Exactly ONE per process: a second call warns and returns without starting
+/// anything (see below).
 pub fn start(lifecycle_store: std::sync::Arc<SessionLifecycleStore>) {
+    let (tx, mut rx) = mpsc::channel::<Uuid>(NUDGE_CHANNEL_CAP);
+    // Only the FIRST reconciler owns the nudge door — and a second reconciler
+    // must not run at all. Two of them ticking the same sessions against the
+    // same table is not something to half-support, and the half-supported
+    // version was worse than useless: `set` would drop this `tx`, leaving the
+    // task we are about to spawn with an `rx` whose sender is already gone, so
+    // `recv()` resolves to `None` instantly and forever — a 100%-CPU spin for
+    // the process lifetime, silent. Refuse loudly instead of spawning.
+    if NUDGE_TX.set(tx).is_err() {
+        warn!(
+            "session-pr-reconciler: a second reconciler was started; only the first owns the \
+             nudge door — NOT starting this one (one reconciler per process)"
+        );
+        return;
+    }
+
     tauri::async_runtime::spawn(async move {
         info!(
-            "session-PR reconciler started (interval: {}s)",
-            POLL_INTERVAL.as_secs()
+            "session-pr-reconciler: started (interval: {}s, on-demand nudge debounce: {}s)",
+            POLL_INTERVAL.as_secs(),
+            NUDGE_DEBOUNCE.as_secs()
         );
-        let mut toplevels = TopLevelCache::default();
+        let mut repo_sets = RepoSetCache::default();
+        // Sessions already warned about having no resolvable repos — the warn
+        // fires ONCE per session, not every 30s (item 2: the skip must be
+        // visible without being noise).
+        let mut warned_no_repos: HashSet<Uuid> = HashSet::new();
+        // Last on-demand reconcile per session, for the NUDGE_DEBOUNCE gate.
+        let mut last_nudge: HashMap<Uuid, Instant> = HashMap::new();
+
+        // `interval` (not `sleep`) so a nudge cannot postpone the periodic
+        // tick, and `Delay` so a slow tick does not produce a burst of
+        // catch-up ticks afterwards.
+        let mut ticker = tokio::time::interval(POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // Independent of the guard above: a dropped sender makes `rx.recv()`
+        // resolve to `None` IMMEDIATELY and forever, so an arm that merely
+        // `continue`d would busy-loop with no yielding await. Disabling the
+        // branch instead retires the channel for good — the periodic tick keeps
+        // running, and nothing spins.
+        let mut nudges_open = true;
+
         loop {
-            if let Err(e) = run_tick(&lifecycle_store, &mut toplevels).await {
-                debug!("session-PR reconciler tick error (continuing): {e}");
+            let only: Option<Uuid> = tokio::select! {
+                _ = ticker.tick() => None,
+                maybe = rx.recv(), if nudges_open => match maybe {
+                    Some(session_id) => {
+                        let now = Instant::now();
+                        let fresh = last_nudge
+                            .get(&session_id)
+                            .is_none_or(|at| now.duration_since(*at) >= NUDGE_DEBOUNCE);
+                        if !fresh {
+                            continue;
+                        }
+                        if last_nudge.len() >= TOPLEVEL_CACHE_MAX {
+                            last_nudge.retain(|_, at| now.duration_since(*at) < NUDGE_DEBOUNCE);
+                        }
+                        last_nudge.insert(session_id, now);
+                        Some(session_id)
+                    }
+                    // Sender dropped: nothing can nudge again. Stop selecting
+                    // on the channel (a re-`continue` here would hot-spin) and
+                    // keep ticking on the interval alone.
+                    None => {
+                        nudges_open = false;
+                        continue;
+                    }
+                },
+            };
+
+            if let Err(e) =
+                run_tick(&lifecycle_store, &mut repo_sets, &mut warned_no_repos, only).await
+            {
+                debug!("session-pr-reconciler: tick error (continuing): {e}");
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
 }
 
 /// One reconcile pass. Returns `Err` only for a whole-tick precondition miss
 /// (no DB / no token); per-session/per-repo failures are logged and skipped.
+///
+/// `only` restricts the pass to a single session (the on-demand nudge path);
+/// `None` reconciles every open session.
 async fn run_tick(
     store: &SessionLifecycleStore,
-    toplevels: &mut TopLevelCache,
+    repo_sets: &mut RepoSetCache,
+    warned_no_repos: &mut HashSet<Uuid>,
+    only: Option<Uuid>,
 ) -> Result<(), String> {
     if !crate::database::pg::pg_available() {
         return Err("PG unavailable".to_string());
@@ -182,8 +515,17 @@ async fn run_tick(
             let id = Uuid::parse_str(r.claude_session_id.trim()).ok()?;
             Some((id, wd))
         })
+        .filter(|(id, _)| only.is_none_or(|want| *id == want))
         .collect();
     if records.is_empty() {
+        // Still log. "The reconciler ran and saw zero sessions" is exactly what
+        // you want to see when debugging this subsystem, and returning silently
+        // made it indistinguishable from the reconciler not running at all.
+        info!(
+            "session-pr-reconciler: tick done — sessions_seen=0 sessions_with_repos=0 \
+             repos_scanned=0 prs_upserted=0 scope={}",
+            tick_scope(only)
+        );
         return Ok(());
     }
 
@@ -196,53 +538,124 @@ async fn run_tick(
     // checkout: one `remote get-url` + one `for-each-ref` per repo per tick.
     let mut repo_cache: HashMap<String, Option<RepoInfo>> = HashMap::new();
 
+    // Per-tick counters (item 2). Emitted at `info!` so "the reconciler ran and
+    // saw N sessions, M of which had a repo" is answerable from the log alone —
+    // the whole class of defect here was a skip nobody could observe.
+    let sessions_seen = records.len();
+    let mut sessions_with_repos = 0usize;
+    let mut repos_scanned = 0usize;
+    let mut prs_upserted = 0usize;
+
     for (session_id, working_dir) in records {
-        let toplevel = match toplevels.get(&working_dir) {
-            Some(cached) => cached.to_string(),
-            None => match git_toplevel(&working_dir).await {
-                Some(resolved) => {
-                    toplevels.insert(working_dir.clone(), resolved.clone());
-                    resolved
-                }
-                None => {
-                    toplevels.invalidate(&working_dir);
-                    debug!("session-PR reconciler: {working_dir} is not a git repo — skipping");
-                    continue;
-                }
-            },
+        let repos: Vec<String> = match repo_sets.get(&working_dir) {
+            Some(cached) => cached.to_vec(),
+            None => {
+                let resolved = resolve_repo_set(&working_dir).await;
+                // An EMPTY result is cached like any other. Do NOT
+                // cache-and-forget the miss the way the old toplevel-only path
+                // did: caching the empty answer is what keeps the depth-1
+                // directory scan off the 30s tick, and the TTL is what lets a
+                // newly cloned sibling still appear within a few minutes.
+                repo_sets.insert(working_dir.clone(), resolved.clone());
+                resolved
+            }
         };
 
-        if !repo_cache.contains_key(&toplevel) {
-            let info = resolve_repo(&toplevel).await;
-            repo_cache.insert(toplevel.clone(), info);
-        }
-        let Some(info) = repo_cache.get(&toplevel).and_then(|o| o.as_ref()) else {
+        // Record the resolution BEFORE reconciling: `session_info_get` reads
+        // this to tell "scanned, no PRs" apart from "never looked at".
+        record_scanned_repos(session_id, &repos);
+
+        if repos.is_empty() {
+            // ONCE per session, not once per tick. The predecessor logged this
+            // at `debug!`, which appears in no log this fleet keeps — so a
+            // session whose cwd is the workspace parent was dropped from every
+            // tick for weeks with no observable trace.
+            if warned_no_repos.insert(session_id) {
+                warn!(
+                    "session-pr-reconciler: session {session_id} has NO resolvable git repo — \
+                     working_dir {working_dir} is not a git repository and has no depth-1 child \
+                     repositories; this session's PRs cannot be attributed"
+                );
+            }
             continue;
-        };
+        }
+        // The session resolved this time: re-arm the warn so a checkout that
+        // later disappears is reported again.
+        warned_no_repos.remove(&session_id);
+        sessions_with_repos += 1;
 
-        if let Err(e) = reconcile_session(&pg_db, &client, session_id, &toplevel, info).await {
-            debug!(
-                "session-PR reconciler: session {session_id} in {toplevel} failed (skipping): {e}"
-            );
+        // Union of every repo's Phase-2 results, plus `owner/name → local dir`
+        // for the whole set, so the once-per-session Phase-3 pass below can run
+        // its content proof against the PR's OWN checkout.
+        let mut refreshed: HashSet<(String, i64)> = HashSet::new();
+        let mut repo_dirs: HashMap<String, String> = HashMap::new();
+
+        for toplevel in &repos {
+            if !repo_cache.contains_key(toplevel) {
+                let info = resolve_repo(toplevel).await;
+                repo_cache.insert(toplevel.clone(), info);
+            }
+            let Some(info) = repo_cache.get(toplevel).and_then(|o| o.as_ref()) else {
+                continue;
+            };
+            repos_scanned += 1;
+            repo_dirs.insert(format!("{}/{}", info.owner, info.repo), toplevel.clone());
+
+            match attribute_session_in_repo(&pg_db, &client, session_id, toplevel, info).await {
+                Ok(keys) => {
+                    prs_upserted += keys.len();
+                    refreshed.extend(keys);
+                }
+                Err(e) => debug!(
+                    "session-pr-reconciler: session {session_id} in {toplevel} failed (skipping): {e}"
+                ),
+            }
+        }
+
+        if let Err(e) =
+            refresh_stored_statuses(&pg_db, &client, session_id, &refreshed, &repo_dirs).await
+        {
+            debug!("session-pr-reconciler: status refresh for {session_id} failed: {e}");
         }
     }
+
+    info!(
+        "session-pr-reconciler: tick done — sessions_seen={sessions_seen} \
+         sessions_with_repos={sessions_with_repos} repos_scanned={repos_scanned} \
+         prs_upserted={prs_upserted} scope={}",
+        tick_scope(only)
+    );
 
     Ok(())
 }
 
-/// Attribute + status-refresh one session's PRs within its repo.
-async fn reconcile_session(
+/// `scope=` field of the per-tick counters line — shared by the zero-session
+/// early return and the normal end-of-tick line so both read identically.
+fn tick_scope(only: Option<Uuid>) -> String {
+    match only {
+        Some(id) => format!("on-demand:{id}"),
+        None => "all".to_string(),
+    }
+}
+
+/// Phase 2 — attribute this session's branches in ONE repo to PRs and upsert
+/// them. Returns the `(repo_full, pr_number)` keys it refreshed, so the
+/// once-per-session Phase-3 pass ([`refresh_stored_statuses`]) can skip a
+/// redundant `get_pr` for them.
+///
+/// Phase 3 is deliberately NOT here: a session now reconciles against a SET of
+/// repos, and running the stored-row status refresh per repo would re-`get_pr`
+/// every stored row once per repo in the set.
+async fn attribute_session_in_repo(
     pg_db: &PgDb,
     client: &GitHubClient,
     session_id: Uuid,
     repo_dir: &str,
     info: &RepoInfo,
-) -> Result<(), String> {
+) -> Result<HashSet<(String, i64)>, String> {
     let session_str = session_id.to_string();
     let repo_full = format!("{}/{}", info.owner, info.repo);
 
-    // (repo_full, pr_number) refreshed via the branch path this tick, so the
-    // Phase-3 status pass can skip a redundant get_pr for them.
     let mut refreshed: HashSet<(String, i64)> = HashSet::new();
 
     // ---- Phase 2: attribution (branch → PR), for THIS session's branches ---
@@ -258,7 +671,7 @@ async fn reconcile_session(
             Ok(prs) => prs,
             Err(e) => {
                 debug!(
-                    "session-PR reconciler: list_prs_for_head({repo_full}, {}) failed: {e}",
+                    "session-pr-reconciler: list_prs_for_head({repo_full}, {}) failed: {e}",
                     bt.branch
                 );
                 continue;
@@ -316,17 +729,34 @@ async fn reconcile_session(
                 )
                 .await
             {
-                warn!("session-PR reconciler: upsert_session_pr failed: {e}");
+                warn!("session-pr-reconciler: upsert_session_pr failed: {e}");
                 continue;
             }
             refreshed.insert((repo_full.clone(), pr_number));
         }
     }
 
-    // ---- Phase 3: status refresh for stored rows with no live branch -------
-    // A session's merged PR often has its local branch deleted, so the branch
-    // path above no longer refreshes it. Pull each such stored row's current
-    // state directly. Scoped to this session's OWN PRs.
+    Ok(refreshed)
+}
+
+/// Phase 3 — status refresh for this session's stored rows that the branch
+/// path did not reach this tick. A session's merged PR usually has its local
+/// branch deleted, so Phase 2 no longer refreshes it; pull each such row's
+/// current state directly. Scoped to this session's OWN PRs — never a fleet
+/// scan — and run ONCE per session, over the union of every repo's Phase-2
+/// results.
+///
+/// `repo_dirs` maps `owner/name` → a local checkout of that repo (every repo in
+/// the session's resolved set). The land content-proof needs a local checkout OF
+/// THE PR'S OWN REPO; a row whose repo is not in the set stays UNKNOWN
+/// (`not_a_repo`), never a confident negative.
+async fn refresh_stored_statuses(
+    pg_db: &PgDb,
+    client: &GitHubClient,
+    session_id: Uuid,
+    refreshed: &HashSet<(String, i64)>,
+    repo_dirs: &HashMap<String, String>,
+) -> Result<(), String> {
     let stored = pg_db.list_session_prs(session_id).await.unwrap_or_default();
     for row in stored {
         if refreshed.contains(&(row.repo.clone(), row.pr_number)) {
@@ -345,7 +775,7 @@ async fn reconcile_session(
                 // A session that moved between repos can hold rows for a repo
                 // this tick did not resolve — that is UNKNOWN (`not_a_repo`),
                 // never a confident negative.
-                let dir_for_row = (row.repo == repo_full).then_some(repo_dir);
+                let dir_for_row = repo_dirs.get(&row.repo).map(String::as_str);
                 let proof = probe_land(
                     dir_for_row,
                     pr.merged,
@@ -372,12 +802,12 @@ async fn reconcile_session(
                     .update_session_pr_status(session_id, &row.repo, row.pr_number, &status)
                     .await
                 {
-                    warn!("session-PR reconciler: update_session_pr_status failed: {e}");
+                    warn!("session-pr-reconciler: update_session_pr_status failed: {e}");
                 }
             }
             Err(e) => {
                 debug!(
-                    "session-PR reconciler: get_pr({}/#{}) failed (leaving prior status): {e}",
+                    "session-pr-reconciler: get_pr({}/#{}) failed (leaving prior status): {e}",
                     row.repo, row.pr_number
                 );
             }
@@ -743,14 +1173,14 @@ async fn git_rev_present(dir: &str, rev: &str) -> Option<bool> {
             Some(1) => Some(false),
             _ => {
                 debug!(
-                    "session-PR reconciler: rev-parse {rev} in {dir} errored: {}",
+                    "session-pr-reconciler: rev-parse {rev} in {dir} errored: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
                 None
             }
         },
         Err(e) => {
-            debug!("session-PR reconciler: rev-parse {rev} in {dir} spawn failed: {e}");
+            debug!("session-pr-reconciler: rev-parse {rev} in {dir} spawn failed: {e}");
             None
         }
     }
@@ -778,14 +1208,14 @@ async fn git_is_ancestor(dir: &str, ancestor: &str, descendant: &str) -> Option<
             Some(1) => Some(false),
             _ => {
                 debug!(
-                    "session-PR reconciler: is-ancestor {ancestor} {descendant} in {dir} errored: {}",
+                    "session-pr-reconciler: is-ancestor {ancestor} {descendant} in {dir} errored: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
                 None
             }
         },
         Err(e) => {
-            debug!("session-PR reconciler: is-ancestor spawn in {dir} failed: {e}");
+            debug!("session-pr-reconciler: is-ancestor spawn in {dir} failed: {e}");
             None
         }
     }
@@ -885,18 +1315,29 @@ fn parse_owner_repo(remote: &str) -> Option<(String, String)> {
     Some((owner.to_string(), name.to_string()))
 }
 
-/// Read every local branch's HEAD sha + `Session-Id` trailer value(s) in one
-/// `git for-each-ref`. Line format: `<sha> <branch> <trailer values…>`
-/// (git ref names contain no whitespace, so the first two whitespace fields
-/// are unambiguous; the remainder is the space-joined trailer value set).
+/// Read every branch's HEAD sha + `Session-Id` trailer value(s) in one
+/// `git for-each-ref`, over BOTH `refs/heads/` and `refs/remotes/origin/`.
+///
+/// The remote half matters because the common shape after opening a PR is
+/// push-then-delete-the-local-branch (and coord's land flow deletes it for
+/// you): scanning only local heads dropped exactly those PRs. This is ONE
+/// `for-each-ref` invocation with two patterns, not extra GitHub fan-out — the
+/// `Session-Id` trailer filter still runs entirely locally, before any API call.
+///
+/// Line format: `<sha> <full refname> <trailer values…>` (git ref names contain
+/// no whitespace, so the first two whitespace fields are unambiguous; the
+/// remainder is the space-joined trailer value set). The FULL refname is used
+/// rather than `refname:short` so local and remote are distinguishable without
+/// guessing at an `origin/` prefix.
 async fn branch_trailers(dir: &str) -> Vec<BranchTrailer> {
     let out = match Command::new("git")
         .args([
             "-C",
             dir,
             "for-each-ref",
-            "--format=%(objectname) %(refname:short) %(trailers:key=Session-Id,valueonly,separator=%x20)",
+            "--format=%(objectname) %(refname) %(trailers:key=Session-Id,valueonly,separator=%x20)",
             "refs/heads/",
+            "refs/remotes/origin/",
         ])
         .output()
         .await
@@ -904,35 +1345,69 @@ async fn branch_trailers(dir: &str) -> Vec<BranchTrailer> {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             debug!(
-                "session-PR reconciler: for-each-ref in {dir} failed: {}",
+                "session-pr-reconciler: for-each-ref in {dir} failed: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             );
             return Vec::new();
         }
         Err(e) => {
-            debug!("session-PR reconciler: for-each-ref spawn in {dir} failed: {e}");
+            debug!("session-pr-reconciler: for-each-ref spawn in {dir} failed: {e}");
             return Vec::new();
         }
     };
 
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(parse_branch_trailer_line)
-        .collect()
+    normalize_branch_trailers(String::from_utf8_lossy(&out.stdout).lines())
 }
 
-/// Parse one `for-each-ref` line into a [`BranchTrailer`]. `None` for a line
-/// missing the sha/branch fields.
-fn parse_branch_trailer_line(line: &str) -> Option<BranchTrailer> {
+/// Parse + dedupe `for-each-ref` output into the branch set to attribute. Pure
+/// — unit-tested.
+///
+/// A branch present as BOTH a local head and `origin/<name>` must produce ONE
+/// entry, not two (two entries would double every `list_prs_for_head` call for
+/// it). Local wins: it is the ref the session actually committed on, so its
+/// HEAD sha is the one the PR-head verification compares against.
+/// `refs/remotes/origin/HEAD` is dropped — it is a symbolic alias for the
+/// default branch, not a branch of its own.
+fn normalize_branch_trailers<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<BranchTrailer> {
+    let mut out: Vec<BranchTrailer> = Vec::new();
+    let mut remote: Vec<BranchTrailer> = Vec::new();
+    for line in lines {
+        let Some((sha, refname, session_ids)) = split_for_each_ref_line(line) else {
+            continue;
+        };
+        if let Some(branch) = refname.strip_prefix("refs/heads/") {
+            out.push(BranchTrailer {
+                branch: branch.to_string(),
+                sha,
+                session_ids,
+            });
+        } else if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
+            if branch == "HEAD" || branch.is_empty() {
+                continue;
+            }
+            remote.push(BranchTrailer {
+                branch: branch.to_string(),
+                sha,
+                session_ids,
+            });
+        }
+    }
+    for bt in remote {
+        if !out.iter().any(|l| l.branch == bt.branch) {
+            out.push(bt);
+        }
+    }
+    out
+}
+
+/// Split one `for-each-ref` line into `(sha, full refname, trailer values)`.
+/// `None` for a line missing the sha/refname fields.
+fn split_for_each_ref_line(line: &str) -> Option<(String, &str, Vec<String>)> {
     let mut it = line.split_whitespace();
     let sha = it.next()?.to_string();
-    let branch = it.next()?.to_string();
+    let refname = it.next()?;
     let session_ids: Vec<String> = it.map(|s| s.to_string()).collect();
-    Some(BranchTrailer {
-        branch,
-        sha,
-        session_ids,
-    })
+    Some((sha, refname, session_ids))
 }
 
 /// Read the `Session-Id` trailer value(s) on a specific commit, or `None` if
@@ -1348,27 +1823,63 @@ mod tests {
         );
     }
 
+    /// Parse exactly one `for-each-ref` line through the real normalizer.
+    fn one(line: &str) -> BranchTrailer {
+        normalize_branch_trailers([line].into_iter())
+            .pop()
+            .unwrap_or_else(|| panic!("line produced no branch: {line:?}"))
+    }
+
     #[test]
-    fn parse_branch_trailer_line_splits_sha_branch_and_sessions() {
+    fn for_each_ref_lines_split_into_sha_branch_and_sessions() {
         // No trailer.
-        let bt = parse_branch_trailer_line("abc123 main").unwrap();
+        let bt = one("abc123 refs/heads/main");
         assert_eq!(bt.sha, "abc123");
         assert_eq!(bt.branch, "main");
         assert!(bt.session_ids.is_empty());
 
         // One Session-Id trailer.
-        let bt = parse_branch_trailer_line("deadbeef feat/x 11111111-1111-1111-1111-111111111111")
-            .unwrap();
+        let bt = one("deadbeef refs/heads/feat/x 11111111-1111-1111-1111-111111111111");
         assert_eq!(bt.branch, "feat/x");
         assert_eq!(bt.session_ids, vec!["11111111-1111-1111-1111-111111111111"]);
 
         // Two (branch touched under two Session-Id trailers on one commit).
-        let bt = parse_branch_trailer_line("sha b/1 aaa bbb").unwrap();
+        let bt = one("sha refs/heads/b/1 aaa bbb");
         assert_eq!(bt.session_ids, vec!["aaa", "bbb"]);
 
-        // Malformed (sha only) → no branch field.
-        assert!(parse_branch_trailer_line("loneword").is_none());
-        assert!(parse_branch_trailer_line("").is_none());
+        // Malformed (sha only) → no refname field.
+        assert!(normalize_branch_trailers(["loneword"].into_iter()).is_empty());
+        assert!(normalize_branch_trailers([""].into_iter()).is_empty());
+        // A ref under neither pattern is not a branch.
+        assert!(normalize_branch_trailers(["sha refs/tags/v1"].into_iter()).is_empty());
+    }
+
+    /// Exactly one entry for a branch that exists locally AND on `origin`, and
+    /// the LOCAL sha is the one kept — it is the ref the session committed on,
+    /// so it is what the PR-head verification must compare against.
+    #[test]
+    fn branch_trailers_dedupe_local_and_remote_keeping_local() {
+        let got = normalize_branch_trailers(
+            [
+                "localsha refs/heads/feat/dup session-a",
+                "localsha2 refs/heads/only-local session-a",
+                "remotesha refs/remotes/origin/feat/dup session-a",
+                "remotesha2 refs/remotes/origin/only-remote session-b",
+                // Symbolic alias for the default branch — never a branch.
+                "headsha refs/remotes/origin/HEAD",
+            ]
+            .into_iter(),
+        );
+        let names: Vec<&str> = got.iter().map(|b| b.branch.as_str()).collect();
+        assert_eq!(names, vec!["feat/dup", "only-local", "only-remote"]);
+        assert_eq!(
+            got[0].sha, "localsha",
+            "local ref must win the dedupe, not the remote copy"
+        );
+        // The remote-only branch is the whole point of scanning refs/remotes:
+        // a pushed-then-deleted local branch is still attributable.
+        assert_eq!(got[2].sha, "remotesha2");
+        assert_eq!(got[2].session_ids, vec!["session-b"]);
     }
 
     #[test]
@@ -1379,18 +1890,23 @@ mod tests {
     }
 
     /// The whole point of the cross-tick cache: N sessions sharing a checkout
-    /// resolve the toplevel ONCE, not once per session per 30s tick.
+    /// resolve the repo set ONCE, not once per session per 30s tick.
     #[test]
-    fn toplevel_cache_serves_repeats_and_forgets_failures() {
-        let mut cache = TopLevelCache::default();
+    fn repo_set_cache_serves_repeats_and_forgets_failures() {
+        let mut cache = RepoSetCache::default();
         assert!(cache.get("D:/repo/sub").is_none(), "cold cache resolves");
 
-        cache.insert("D:/repo/sub".to_string(), "D:/repo".to_string());
-        assert_eq!(cache.get("D:/repo/sub"), Some("D:/repo"));
+        cache.insert("D:/repo/sub".to_string(), vec!["D:/repo".to_string()]);
+        assert_eq!(cache.get("D:/repo/sub"), Some(&["D:/repo".to_string()][..]));
         // A second session in the same cwd costs no subprocess.
-        assert_eq!(cache.get("D:/repo/sub"), Some("D:/repo"));
+        assert_eq!(cache.get("D:/repo/sub"), Some(&["D:/repo".to_string()][..]));
         // A different cwd is still a miss.
         assert!(cache.get("D:/other").is_none());
+
+        // An EMPTY set is a cached ANSWER, not a miss — that is what keeps the
+        // depth-1 directory scan off the 30s tick for a cwd with no repos.
+        cache.insert("D:/empty".to_string(), Vec::new());
+        assert_eq!(cache.get("D:/empty"), Some(&[][..]));
 
         // A cwd that stops resolving (checkout moved/deleted) is forgotten so
         // it re-resolves rather than serving a stale root forever.
@@ -1400,15 +1916,326 @@ mod tests {
 
     /// Bounded: the cache must not grow with churning session cwds.
     #[test]
-    fn toplevel_cache_is_bounded() {
-        let mut cache = TopLevelCache::default();
+    fn repo_set_cache_is_bounded() {
+        let mut cache = RepoSetCache::default();
         for i in 0..(TOPLEVEL_CACHE_MAX * 2) {
-            cache.insert(format!("D:/wd/{i}"), "D:/repo".to_string());
+            cache.insert(format!("D:/wd/{i}"), vec!["D:/repo".to_string()]);
         }
         assert!(
             cache.entries.len() <= TOPLEVEL_CACHE_MAX,
             "cache grew past its bound: {}",
             cache.entries.len()
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Repo-SET resolution. The defect these cover: the operator's terminal sits
+    // at the workspace parent (`D:\qontinui-root`), which HOLDS the clones but
+    // is not itself a repo, so the old `git_toplevel(cwd)`-or-skip gate dropped
+    // that session from every tick and its PR counts sat at 0 forever.
+    // ---------------------------------------------------------------------
+
+    /// Make `<parent>/<name>` look like a git repo to the pure scanner (a
+    /// `.git` entry is exactly what it tests for) without paying `git init`.
+    fn fake_repo(parent: &std::path::Path, name: &str) -> PathBuf {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        dir
+    }
+
+    fn scanned_names(parent: &std::path::Path) -> Vec<String> {
+        candidate_child_repos(parent)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect()
+    }
+
+    /// (b) A non-repo parent holding N child clones yields all N.
+    #[test]
+    fn child_scan_finds_every_depth_one_repo_under_a_non_repo_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["qontinui-runner", "qontinui-web", "multistate"] {
+            fake_repo(tmp.path(), name);
+        }
+        // A plain directory that is NOT a repo is not a candidate.
+        std::fs::create_dir_all(tmp.path().join("knowledge-base")).unwrap();
+        // Depth 1 only — a repo nested two levels down is NOT picked up.
+        fake_repo(&tmp.path().join("knowledge-base"), "nested-repo");
+
+        assert_eq!(
+            scanned_names(tmp.path()),
+            vec!["multistate", "qontinui-runner", "qontinui-web"],
+            "sorted by name so the resolved set is stable across ticks"
+        );
+    }
+
+    /// (c) Build/worktree scratch is never a session's source repo.
+    #[test]
+    fn child_scan_excludes_the_skip_list_and_dot_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_repo(tmp.path(), "real-repo");
+        for name in REPO_SCAN_SKIP_DIRS {
+            fake_repo(tmp.path(), name);
+        }
+        // Any other dotted directory is tooling, not a checkout.
+        fake_repo(tmp.path(), ".dev-logs");
+
+        assert_eq!(scanned_names(tmp.path()), vec!["real-repo"]);
+    }
+
+    /// (d) The scanner REPORTS every candidate; capping is the resolver's job.
+    /// Truncating here made truncation unobservable, which is how "exactly at
+    /// the cap" came to warn about a remainder that did not exist.
+    #[test]
+    fn child_scan_reports_every_candidate_and_leaves_capping_to_the_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..(REPO_SET_MAX * 2) {
+            fake_repo(tmp.path(), &format!("repo-{i:03}"));
+        }
+        assert_eq!(candidate_child_repos(tmp.path()).len(), REPO_SET_MAX * 2);
+    }
+
+    /// A linked worktree is scanned like a clone, but is identifiable as one:
+    /// its `.git` is a FILE pointing into the canonical clone. That is the
+    /// tie-break the dedupe uses.
+    #[test]
+    fn child_scan_sees_linked_worktrees_and_tells_them_from_clones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = fake_repo(tmp.path(), "qontinui-runner");
+        let worktree = tmp.path().join("qontinui-runner-wt-appcmd");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../qontinui-runner/.git/worktrees/appcmd\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            scanned_names(tmp.path()),
+            vec!["qontinui-runner", "qontinui-runner-wt-appcmd"],
+            "both shapes are candidates — a worktree's branches are the session's too"
+        );
+        assert!(!is_linked_worktree(&clone), "a `.git` DIR is a clone");
+        assert!(
+            is_linked_worktree(&worktree),
+            "a `.git` FILE is a linked worktree"
+        );
+        // A directory with no `.git` at all is not a worktree either.
+        assert!(!is_linked_worktree(tmp.path()));
+    }
+
+    /// (e) Neither a repo nor holding repos ⇒ EMPTY, which the tick records as
+    /// "scanned, found nothing" rather than silently skipping the session.
+    #[test]
+    fn child_scan_of_a_bare_directory_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("notes")).unwrap();
+        assert!(candidate_child_repos(tmp.path()).is_empty());
+        // A path that does not exist at all is empty, never a panic.
+        assert!(candidate_child_repos(&tmp.path().join("nope")).is_empty());
+    }
+
+    /// `git init` a real repo — the resolver runs `git rev-parse` per candidate,
+    /// so these cases need actual repositories, not just a `.git` directory.
+    fn git_init(dir: &std::path::Path) -> bool {
+        std::fs::create_dir_all(dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn canon(p: &str) -> String {
+        std::fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| p.replace('\\', "/"))
+            .trim_start_matches("//?/")
+            .to_string()
+    }
+
+    /// (a) cwd IS a repo → unchanged behaviour: the toplevel is in the set.
+    /// (b) cwd is a non-repo parent of N repos → all N are in the set.
+    /// Both halves in one test so the two shapes share the `git init` cost.
+    #[tokio::test]
+    async fn resolve_repo_set_covers_the_cwd_repo_and_its_child_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !git_init(&tmp.path().join("alpha")) {
+            eprintln!("git unavailable — skipping resolve_repo_set coverage");
+            return;
+        }
+        git_init(&tmp.path().join("beta"));
+        // Scratch that must never be attributed to a session.
+        git_init(&tmp.path().join("qontinui-worktrees"));
+
+        // (a) cwd is itself a repo.
+        let alpha = tmp.path().join("alpha").to_string_lossy().to_string();
+        let got = resolve_repo_set(&alpha).await;
+        assert_eq!(got.len(), 1, "got {got:?}");
+        assert_eq!(canon(&got[0]), canon(&alpha));
+
+        // (b) cwd is the non-repo workspace parent — the P0 shape.
+        let parent = tmp.path().to_string_lossy().to_string();
+        let got: Vec<String> = resolve_repo_set(&parent)
+            .await
+            .iter()
+            .map(|p| canon(p))
+            .collect();
+        assert_eq!(got.len(), 2, "expected alpha+beta only, got {got:?}");
+        assert!(got.iter().any(|p| p.ends_with("/alpha")), "{got:?}");
+        assert!(got.iter().any(|p| p.ends_with("/beta")), "{got:?}");
+        assert!(
+            !got.iter().any(|p| p.contains("qontinui-worktrees")),
+            "worktree scratch must not be scanned: {got:?}"
+        );
+    }
+
+    /// (e) A cwd that is neither a repo nor a parent of repos resolves to the
+    /// EMPTY set — the state the tick warns about exactly once.
+    #[tokio::test]
+    async fn resolve_repo_set_of_a_repo_less_directory_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("notes")).unwrap();
+        let got = resolve_repo_set(&tmp.path().to_string_lossy()).await;
+        assert!(got.is_empty(), "got {got:?}");
+    }
+
+    /// Run a git subcommand in `dir`; `false` if git is unavailable or it fails.
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// (d) The cap is a real TOTAL and it only reports drops that happened.
+    /// "Exactly at the cap" keeps every repo and drops nothing; one more than
+    /// the cap keeps `max` and reports the remainder — the distinction the
+    /// inferred `len() >= REPO_SET_MAX` test could not make.
+    #[tokio::test]
+    async fn resolve_repo_set_caps_as_a_total_and_reports_only_real_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !git_init(&tmp.path().join("alpha")) {
+            eprintln!("git unavailable — skipping resolve_repo_set cap coverage");
+            return;
+        }
+        git_init(&tmp.path().join("beta"));
+        git_init(&tmp.path().join("gamma"));
+        let parent = tmp.path().to_string_lossy().to_string();
+
+        // Exactly at the cap: all three kept, NOTHING dropped ⇒ no warning.
+        let (repos, dropped) = resolve_repo_set_capped(&parent, 3).await;
+        assert_eq!(repos.len(), 3, "got {repos:?}");
+        assert_eq!(dropped, 0, "nothing was dropped, so nothing may be claimed");
+
+        // Over the cap: capped, and the drop is counted.
+        let (repos, dropped) = resolve_repo_set_capped(&parent, 2).await;
+        assert_eq!(repos.len(), 2, "got {repos:?}");
+        assert_eq!(dropped, 1);
+
+        // The cwd's OWN toplevel occupies a slot — the ceiling used to be
+        // REPO_SET_MAX + 1 because it was pushed before the cap loop.
+        let alpha = tmp.path().join("alpha");
+        git_init(&alpha.join("inner"));
+        let (repos, dropped) = resolve_repo_set_capped(&alpha.to_string_lossy(), 1).await;
+        assert_eq!(repos.len(), 1, "got {repos:?}");
+        assert_eq!(canon(&repos[0]), canon(&alpha.to_string_lossy()));
+        assert_eq!(dropped, 1, "the toplevel counts toward the total");
+    }
+
+    /// A linked worktree and its clone are ONE GitHub repo: they share a ref
+    /// store, so keeping both meant `resolve_repo` + `branch_trailers` twice per
+    /// tick over identical refs and a duplicate-looking `scannedRepos` row. The
+    /// worktree here sorts FIRST, so the canonical clone can only win by being
+    /// actively preferred.
+    #[tokio::test]
+    async fn resolve_repo_set_collapses_a_worktree_into_its_canonical_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("zeta");
+        let seeded = git_init(&clone)
+            && git_in(
+                &clone,
+                &[
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "--allow-empty",
+                    "-q",
+                    "-m",
+                    "seed",
+                ],
+            )
+            && git_in(
+                &clone,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/acme/zeta.git",
+                ],
+            )
+            && git_in(
+                &clone,
+                &["worktree", "add", "-q", "-b", "wt", "../alpha-wt"],
+            );
+        if !seeded {
+            eprintln!("git worktree unavailable — skipping dedupe coverage");
+            return;
+        }
+        assert!(
+            is_linked_worktree(&tmp.path().join("alpha-wt")),
+            "fixture must actually be a linked worktree"
+        );
+
+        let got = resolve_repo_set(&tmp.path().to_string_lossy()).await;
+        assert_eq!(got.len(), 1, "one owner/name ⇒ one entry: {got:?}");
+        assert!(
+            canon(&got[0]).ends_with("/zeta"),
+            "the canonical clone wins over the worktree: {got:?}"
+        );
+    }
+
+    /// The warn-once ledger the tick keeps: a session with no repos is reported
+    /// the FIRST time and then stays quiet, and re-arms if it later resolves.
+    #[test]
+    fn no_repo_warning_fires_once_per_session_and_rearms() {
+        let mut warned: HashSet<Uuid> = HashSet::new();
+        let id = Uuid::nil();
+        assert!(warned.insert(id), "first skip warns");
+        assert!(!warned.insert(id), "subsequent skips are silent");
+        // The checkout came back: re-arm so a later disappearance is reported.
+        warned.remove(&id);
+        assert!(warned.insert(id), "re-armed after a successful resolution");
+    }
+
+    /// The per-session scan ledger the dropdown reads: absent ⇒ never scanned,
+    /// `Some([])` ⇒ scanned and found no repos, `Some([..])` ⇒ these were
+    /// searched. Three different claims, and only the first two used to be
+    /// indistinguishable in the UI.
+    #[test]
+    fn scanned_repos_ledger_distinguishes_never_scanned_from_scanned_empty() {
+        let never = Uuid::from_u128(0xA1);
+        let empty = Uuid::from_u128(0xA2);
+        let full = Uuid::from_u128(0xA3);
+
+        assert_eq!(last_scanned_repos(never), None);
+
+        record_scanned_repos(empty, &[]);
+        assert_eq!(last_scanned_repos(empty), Some(Vec::new()));
+
+        record_scanned_repos(full, &["D:/x".to_string()]);
+        assert_eq!(last_scanned_repos(full), Some(vec!["D:/x".to_string()]));
+    }
+
+    /// The nudge door is fire-and-forget: calling it before the reconciler
+    /// exists must be a silent no-op, never a panic or a block.
+    #[test]
+    fn nudge_without_a_running_reconciler_is_a_silent_no_op() {
+        nudge_session(Uuid::from_u128(0xB1));
     }
 }
