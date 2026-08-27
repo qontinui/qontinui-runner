@@ -71,6 +71,11 @@ function InfoRow({ row, zoneIndex }: { row: InfoRowSpec; zoneIndex: number }) {
   return (
     <div
       ref={ref}
+      // The rows are addressed by id too, and are registered under the same
+      // zone-keyed scheme as the trigger — so they need the same `data-testid`
+      // insurance against losing the registry entry and falling back to a
+      // positional `div-<slug>-<n>`.
+      data-testid={sessionInfoElementId(row.field, zoneIndex)}
       data-session-info-field={row.field}
       data-session-info-value={row.value ?? undefined}
       data-session-info-unknown={known ? undefined : "true"}
@@ -304,6 +309,30 @@ export function SessionInfoDropdown({
          */
         data-no-register="true"
         data-ui-bridge-id={sessionInfoElementId("trigger", zoneIndex)}
+        /*
+         * …and `data-testid` carries the SAME id, because `data-ui-bridge-id`
+         * alone does not survive losing the registry entry.
+         *
+         * The registry is keyed by id and `useUIElement`'s unmount cleanup
+         * unregisters by id UNCONDITIONALLY — it cannot tell that a still-live
+         * twin now owns the entry. Since these ids are keyed on the ZONE SLOT
+         * rather than on the session, any layout change that moves a session
+         * between zones can therefore delete the entry belonging to the
+         * session that inherited the slot. That trigger is then live in the DOM
+         * with no registry entry at all, and `data-no-register` guarantees
+         * nothing re-registers it.
+         *
+         * Core discovery is what names such a node, and its priority is
+         * `data-testid` → the HTML `id` → a slug of the accessible name plus a
+         * FIRST-FREE-INTEGER collision counter (ui-bridge `getElementId`). It
+         * never reads `data-ui-bridge-id`. So an unregistered trigger used to
+         * surface as `button-<slugified label>-<n>` with `n` assigned in
+         * DOM-walk order — an id that shuffles between snapshots and forced
+         * callers to match on accessible name instead. With `data-testid` set,
+         * the discovered id is byte-identical to the registered one, so the
+         * trigger is addressable by the same stable id either way.
+         */
+        data-testid={sessionInfoElementId("trigger", zoneIndex)}
         onClick={(e) => {
           e.stopPropagation();
           // Opening the panel re-reads immediately AND, server-side, nudges
@@ -332,6 +361,10 @@ export function SessionInfoDropdown({
         <div
           ref={panelRef}
           data-ui-bridge-id={sessionInfoElementId("panel", zoneIndex)}
+          // Same reasoning as the trigger: `data-testid` is the attribute core
+          // discovery actually reads, so the panel keeps its stable id even if
+          // its registry entry is lost to a zone-slot id collision.
+          data-testid={sessionInfoElementId("panel", zoneIndex)}
           className="absolute left-0 top-full mt-0.5 w-72 rounded-lg shadow-xl z-50 overflow-hidden"
           style={{ backgroundColor: PANEL_BG, border: `1px solid ${PANEL_BORDER}` }}
         >
