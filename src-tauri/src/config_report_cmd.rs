@@ -2073,6 +2073,10 @@ mod tests {
                 ApiBaseUrlArm::BuildDefaultRelease,
                 "build_default.backend_url",
             ),
+            (
+                ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected,
+                "build_default.backend_url",
+            ),
         ] {
             assert_eq!(arm.value_origin_name(), expected);
             assert!(
