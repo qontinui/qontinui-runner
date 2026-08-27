@@ -130,6 +130,20 @@ export interface SessionPrs {
   openCount: number;
   landedCount: number;
   unknownCount: number;
+  /**
+   * Has the reconciler EVER resolved a repo set for this session?
+   *
+   * `false` ⇒ nothing was ever searched, so an empty ledger asserts NOTHING.
+   * Before this field the panel printed `no PRs attributed to this session`
+   * identically for a session that genuinely opened none and for one the
+   * reconciler silently dropped every tick (its cwd was the workspace parent,
+   * which holds the clones but is not itself a git repo) — a confident default
+   * standing in for an unknown.
+   */
+  scanned: boolean;
+  /** The repo roots last searched. Empty WITH `scanned: true` ⇒ the working
+   * dir resolved to no git repositories at all. */
+  scannedRepos: string[];
 }
 
 export interface SessionInfoBody {
@@ -174,12 +188,14 @@ export type SessionInfoField =
   | "opened-at"
   | "restore-tier"
   | "prs-opened"
-  | "prs-landed";
+  | "prs-landed"
+  | "prs-scanned";
 
 /** `terminal-session-info-<field>-<zoneIndex>`; `field` is also `"trigger"` /
- * `"panel"` for the two container elements. Pure — unit-tested. */
+ * `"panel"` for the two container elements and `"prs-empty-state"` for the
+ * line that says WHY the PR list is empty. Pure — unit-tested. */
 export function sessionInfoElementId(
-  field: SessionInfoField | "trigger" | "panel",
+  field: SessionInfoField | "trigger" | "panel" | "prs-empty-state",
   zoneIndex: number,
 ): string {
   return `terminal-session-info-${field}-${zoneIndex}`;
@@ -537,7 +553,7 @@ export function formatEpochMs(ms: number | null): string | null {
 }
 
 /**
- * The panel's labelled rows, one per D1 field group, ALWAYS all fourteen —
+ * The panel's labelled rows, one per D1 field group, ALWAYS all fifteen —
  * a field with no value renders `unknown`, it does not vanish (R2). Pure —
  * unit-tested, so the UI Bridge id/field contract is checkable without a DOM.
  */
@@ -633,7 +649,45 @@ export function sessionInfoRows(body: SessionInfoBody): InfoRowSpec[] {
       prsOk ? String(prs.landedCount) : null,
       prsOk ? String(prs.landedCount) : prsReason,
     ),
+    // The row that makes `PRs opened: 0` interpretable. `null` (⇒ `unknown` +
+    // `data-session-info-unknown`) is the honest value when nothing was ever
+    // searched: a count of zero repos and "we never looked" are different
+    // claims and must not render as the same string.
+    row(
+      "prs-scanned",
+      "Repos scanned",
+      prsOk && prs.scanned ? String(prs.scannedRepos.length) : null,
+      prsOk ? prsScannedDisplay(prs) : prsReason,
+    ),
   ];
+}
+
+/** What the `Repos scanned` row shows. Pure — unit-tested. */
+export function prsScannedDisplay(prs: SessionPrs): string {
+  if (!prs.scanned) return NOT_SCANNED_TEXT;
+  if (prs.scannedRepos.length === 0) return "0 — no git repos under the working dir";
+  return String(prs.scannedRepos.length);
+}
+
+/** Shown wherever the reconciler has never resolved a repo set for a session. */
+export const NOT_SCANNED_TEXT = "not scanned yet";
+
+/**
+ * The panel's empty-PR-list line. Three DIFFERENT sentences for three
+ * different claims — "we never looked", "we looked and your working dir holds
+ * no repos", and the genuine "you opened no PRs in the repos we searched".
+ * Collapsing them into one line is the confident-default-for-unknown failure
+ * this panel exists to avoid. Pure — unit-tested.
+ */
+export function prsEmptyStateText(prs: SessionPrs, workingDir: string | null): string {
+  if (!prs.scanned) {
+    return `${NOT_SCANNED_TEXT} — the PR reconciler has not resolved this session`;
+  }
+  if (prs.scannedRepos.length === 0) {
+    return `no git repos found under ${workingDir ?? UNKNOWN_TEXT} — nothing was searched`;
+  }
+  const n = prs.scannedRepos.length;
+  return `no PRs attributed to this session (searched ${n} repo${n === 1 ? "" : "s"})`;
 }
 
 function str(v: unknown): string | null {
@@ -654,6 +708,8 @@ function normalizePrs(raw: unknown): SessionPrs {
     openCount: 0,
     landedCount: 0,
     unknownCount: 0,
+    scanned: false,
+    scannedRepos: [],
   });
   if (!raw || typeof raw !== "object") return unavailable("malformed_prs");
   const v = raw as Partial<SessionPrs>;
@@ -661,6 +717,12 @@ function normalizePrs(raw: unknown): SessionPrs {
   const opened = Array.isArray(v.opened) ? v.opened : [];
   const landed = Array.isArray(v.landed) ? v.landed : [];
   const unknown = Array.isArray(v.unknown) ? v.unknown : [];
+  // An older runner sends neither field. That is NOT "scanned with no repos" —
+  // it is "this runner cannot say", which lands in the same not-scanned bucket
+  // rather than being back-filled into a confident claim.
+  const scannedRepos = Array.isArray(v.scannedRepos)
+    ? v.scannedRepos.filter((r): r is string => typeof r === "string")
+    : [];
   return {
     status: "ok",
     reason: null,
@@ -670,6 +732,8 @@ function normalizePrs(raw: unknown): SessionPrs {
     openCount: num(v.openCount, opened.length),
     landedCount: num(v.landedCount, landed.length),
     unknownCount: num(v.unknownCount, unknown.length),
+    scanned: v.scanned === true,
+    scannedRepos,
   };
 }
 
