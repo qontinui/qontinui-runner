@@ -60,6 +60,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::{Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -78,6 +79,93 @@ use crate::trigger_system::github_api::{has_coord_landed_label, GitHubClient};
 /// (min-10s pollers, 45s lifecycle poll) — 30s is responsive enough for a
 /// passive status indicator without hammering the GitHub API.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Wall-clock budget for one LOCAL git query — `rev-parse`, `remote get-url`,
+/// `for-each-ref`, `log -1`, `merge-base --is-ancestor`.
+///
+/// Every one of these reads local refs/objects with no network and no lock this
+/// process holds, so on a healthy checkout they return in single-digit
+/// milliseconds. 15s is three orders of magnitude of headroom (a cold page
+/// cache over a very large object store, a filesystem waking a spun-down disk,
+/// an antivirus scanning the pack files) while still bounding the damage: git
+/// can no longer wedge a tick forever, only cost it 15s per stuck command.
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Wall-clock budget for `gh auth token`.
+///
+/// It reads the local keyring / `hosts.yml` and should answer in well under a
+/// second. It nonetheless CAN block indefinitely — an observed `gh.exe` on this
+/// fleet sat blocked for 4.5 hours, and because [`resolve_github_token`] awaited
+/// it with no timeout, [`run_tick`] never returned for that entire session. Not
+/// an error, not a slow tick: a permanent block, indistinguishable from "the
+/// reconciler is not running". 10s is generous for a prompt-free credential
+/// read and bounds the whole tick's worst case.
+const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run `cmd` to completion under `budget`, KILLING the child if it overruns.
+///
+/// Single door for every subprocess in this module. Before this existed each
+/// call site awaited `.output()` directly, which has no timeout at all: one
+/// hung child blocked its caller, which blocked [`run_tick`], forever. A
+/// timeout bolted onto one call site would only have moved the hang to the
+/// next, so all of them go through here.
+///
+/// `None` means "this command could not answer" — spawn failure OR timeout —
+/// and callers must treat it exactly as they already treat a spawn failure:
+/// never as a negative result. A timeout is logged at `warn!` with the command
+/// and the budget it blew, because the whole cost of the original defect was
+/// that four and a half hours of total failure looked like silence.
+///
+/// The child is killed via `kill_on_drop`: when `timeout` resolves to `Err` its
+/// inner future — which owns the `Child` — is dropped, and tokio's drop guard
+/// kills the process and hands it to the orphan reaper. That matters
+/// concretely: the leaked `gh auth token` processes still resident on this box
+/// are what NOT killing looks like.
+async fn output_with_timeout(cmd: &mut Command, budget: Duration, what: &str) -> Option<Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("session-pr-reconciler: {what} spawn failed: {e}");
+            return None;
+        }
+    };
+    // Captured before `wait_with_output` consumes the child, so the warn can
+    // name the process an operator would go looking for in Task Manager.
+    let pid = child.id();
+
+    match tokio::time::timeout(budget, child.wait_with_output()).await {
+        Ok(Ok(out)) => Some(out),
+        Ok(Err(e)) => {
+            debug!("session-pr-reconciler: {what} failed: {e}");
+            None
+        }
+        Err(_) => {
+            warn!(
+                "session-pr-reconciler: {what} did not finish within {}s (pid {}) — killed it and \
+                 treating it as NO ANSWER; a subprocess that hangs here blocks the whole \
+                 reconcile tick, so this must never be silent",
+                budget.as_secs(),
+                pid.map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+            );
+            None
+        }
+    }
+}
+
+/// `git -C <dir> <args…>` under [`GIT_COMMAND_TIMEOUT`]. Every git invocation
+/// in this module goes through here; `None` is "git could not answer".
+async fn run_git(dir: &str, args: &[&str]) -> Option<Output> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    let what = format!("git {} (in {dir})", args.join(" "));
+    output_with_timeout(&mut cmd, GIT_COMMAND_TIMEOUT, &what).await
+}
 
 /// One branch with its HEAD sha and the `Session-Id` trailer value(s) on that
 /// HEAD commit. Sourced from local heads AND `refs/remotes/origin/*`, so a
@@ -112,9 +200,19 @@ const TOPLEVEL_CACHE_MAX: usize = 512;
 
 /// Ceiling on how many repos one session's cwd may resolve to. A session
 /// pointed at a huge tree must not be able to melt the tick (each repo costs a
-/// `for-each-ref` plus, potentially, GitHub calls). Well above the ~15 sibling
-/// clones a real workspace parent holds.
-const REPO_SET_MAX: usize = 32;
+/// `for-each-ref` plus, potentially, GitHub calls).
+///
+/// 128, not 32. The previous value was BELOW this workspace's real repo count:
+/// `D:\qontinui-root` holds 38 depth-1 clones today, so five were dropped from
+/// every single tick — and because candidates arrive name-sorted, the drop was
+/// alphabetically biased, permanently excluding the tail (`ui-bridge*`,
+/// `wrappers-registry`, `qontinui-workflow-*`) from PR attribution. A cap that
+/// a normal workspace crosses is not a safety valve, it is a silent data loss.
+/// 128 is >3x the current count and well beyond any workspace a human curates
+/// by hand, while still bounding the pathological "session cwd is C:\" case;
+/// and when it IS crossed, [`prioritise_by_recency`] makes the survivors the
+/// repos someone is actually working in rather than the alphabetical head.
+const REPO_SET_MAX: usize = 128;
 
 /// Depth-1 child directory names that are NEVER a session's source repo.
 ///
@@ -280,6 +378,15 @@ async fn resolve_repo_set_capped(working_dir: &str, max: usize) -> (Vec<String>,
     let mut candidates: Vec<PathBuf> = vec![PathBuf::from(working_dir)];
     candidates.extend(candidate_child_repos(Path::new(working_dir)));
 
+    // Only when the cap can actually bind does the ORDER decide who gets
+    // dropped, and alphabetical order is an arbitrary thing to decide that on.
+    // Below the cap this is skipped entirely, so the name-sorted order — and
+    // with it the stable `scannedRepos` the dropdown renders — is untouched in
+    // every normal case.
+    if candidates.len() > max {
+        prioritise_by_recency(&mut candidates);
+    }
+
     let mut repos: Vec<String> = Vec::new();
     // `owner/name` → index into `repos`.
     let mut by_full: HashMap<String, usize> = HashMap::new();
@@ -321,6 +428,44 @@ async fn resolve_repo_set_capped(working_dir: &str, max: usize) -> (Vec<String>,
     }
 
     (repos, dropped)
+}
+
+/// Reorder `candidates[1..]` most-recently-touched FIRST, so that when the cap
+/// binds the repos it drops are the ones nobody has worked in.
+///
+/// `candidates[0]` is the session's own cwd and is pinned: it is the one repo
+/// that is certainly relevant, so it must never be a cap casualty.
+///
+/// Recency = the newer of the directory's own mtime and its `.git` mtime.
+/// Neither is a perfect "last commit" signal (dir mtime moves on top-level
+/// file churn, `.git` on ref/index writes) but together they separate an active
+/// checkout from one untouched for months, which is all the cap needs. Cost is
+/// two `stat`s per candidate, paid ONLY on the pathological path — a workspace
+/// with more than [`REPO_SET_MAX`] repos.
+///
+/// Ties, and candidates whose mtime cannot be read, fall back to name order, so
+/// a quiescent workspace still resolves deterministically tick after tick. The
+/// trade-off accepted here: when the cap binds, `scannedRepos` order tracks
+/// filesystem activity rather than the alphabet. Dropping the right repos
+/// matters more than a stable order in a set that is already being truncated.
+fn prioritise_by_recency(candidates: &mut [PathBuf]) {
+    fn touched_at(p: &Path) -> Option<std::time::SystemTime> {
+        let own = std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let git = std::fs::metadata(p.join(".git"))
+            .and_then(|m| m.modified())
+            .ok();
+        own.max(git)
+    }
+    if candidates.len() < 2 {
+        return;
+    }
+    // `None` sorts BEFORE `Some`, so reversing the mtime comparison also puts
+    // unreadable candidates last — where they belong.
+    candidates[1..].sort_by(|a, b| {
+        touched_at(b)
+            .cmp(&touched_at(a))
+            .then_with(|| a.file_name().cmp(&b.file_name()))
+    });
 }
 
 /// `owner/name` for a repo toplevel, from its `origin` remote.
@@ -398,6 +543,84 @@ pub fn nudge_session(session_id: Uuid) {
     }
 }
 
+/// What the tick-failure ledger decided to say about one `run_tick` error.
+#[derive(Debug, PartialEq, Eq)]
+enum TickFailureReport {
+    /// First tick to fail, or the reason CHANGED — always worth a warn.
+    New,
+    /// The same reason is still failing, and the backoff says report it now.
+    Persisting { consecutive: u32, elapsed: Duration },
+    /// Same reason, inside the current backoff window — stay quiet.
+    Quiet,
+}
+
+/// Deduped ledger for WHOLE-TICK failures.
+///
+/// `run_tick` returns `Err` only for a precondition miss (PG unavailable, no
+/// GitHub token) — a complete outage of the feature, not a per-session skip.
+/// The predecessor logged that at `debug!`, which lands in no log this fleet
+/// keeps, so 4.5 hours during which the reconciler did nothing at all was
+/// indistinguishable from silence.
+///
+/// It cannot simply become an unconditional `warn!` either: at a 30s tick a
+/// persistent condition (an operator with PG stopped for the afternoon) would
+/// emit 120 identical lines an hour and train everyone to ignore it. So: warn
+/// on the FIRST failure and on any change of reason, then on an exponentially
+/// widening schedule (ticks 1, 2, 4, 8, 16, …), each repeat saying how long the
+/// condition has persisted. A four-hour outage costs ~9 lines, and none of them
+/// can be mistaken for a transient.
+#[derive(Default)]
+struct TickFailureLedger {
+    current: Option<TickFailureRun>,
+}
+
+struct TickFailureRun {
+    reason: String,
+    since: Instant,
+    consecutive: u32,
+    /// The `consecutive` value at which the next warn fires. Doubles each time.
+    warn_at: u32,
+}
+
+impl TickFailureLedger {
+    /// Record a failed tick and decide whether it should be reported.
+    fn record(&mut self, reason: &str) -> TickFailureReport {
+        match self.current.as_mut() {
+            Some(run) if run.reason == reason => {
+                run.consecutive += 1;
+                if run.consecutive >= run.warn_at {
+                    run.warn_at = run.warn_at.saturating_mul(2);
+                    TickFailureReport::Persisting {
+                        consecutive: run.consecutive,
+                        elapsed: run.since.elapsed(),
+                    }
+                } else {
+                    TickFailureReport::Quiet
+                }
+            }
+            // No run, or the reason changed — a different failure is news.
+            _ => {
+                self.current = Some(TickFailureRun {
+                    reason: reason.to_string(),
+                    since: Instant::now(),
+                    consecutive: 1,
+                    warn_at: 2,
+                });
+                TickFailureReport::New
+            }
+        }
+    }
+
+    /// Record a successful tick. Returns `Some((consecutive, elapsed))` when
+    /// that success ENDED a run of failures — recovery is worth one line, so
+    /// the log says when the outage stopped and not only that it started.
+    fn clear(&mut self) -> Option<(u32, Duration)> {
+        self.current
+            .take()
+            .map(|run| (run.consecutive, run.since.elapsed()))
+    }
+}
+
 /// Start the reconciler as a detached background task for the process
 /// lifetime (matching the lifecycle liveness-poll idiom in `main.rs`). Runs a
 /// best-effort pass immediately, then every [`POLL_INTERVAL`] — or sooner for
@@ -435,6 +658,8 @@ pub fn start(lifecycle_store: std::sync::Arc<SessionLifecycleStore>) {
         let mut warned_no_repos: HashSet<Uuid> = HashSet::new();
         // Last on-demand reconcile per session, for the NUDGE_DEBOUNCE gate.
         let mut last_nudge: HashMap<Uuid, Instant> = HashMap::new();
+        // Whole-tick failures, deduped — see `TickFailureLedger`.
+        let mut tick_failures = TickFailureLedger::default();
 
         // `interval` (not `sleep`) so a nudge cannot postpone the periodic
         // tick, and `Delay` so a slow tick does not produce a burst of
@@ -477,10 +702,38 @@ pub fn start(lifecycle_store: std::sync::Arc<SessionLifecycleStore>) {
                 },
             };
 
-            if let Err(e) =
-                run_tick(&lifecycle_store, &mut repo_sets, &mut warned_no_repos, only).await
-            {
-                debug!("session-pr-reconciler: tick error (continuing): {e}");
+            // A whole-tick error means the feature produced NOTHING this pass.
+            // Reported at `warn!` — deduped by `TickFailureLedger` so a
+            // persistent condition does not emit every 30s.
+            match run_tick(&lifecycle_store, &mut repo_sets, &mut warned_no_repos, only).await {
+                Err(e) => match tick_failures.record(&e) {
+                    TickFailureReport::New => warn!(
+                        "session-pr-reconciler: tick FAILED — {e}; no session PRs are being \
+                         attributed while this persists (further identical failures are \
+                         reported on a widening interval)"
+                    ),
+                    TickFailureReport::Persisting {
+                        consecutive,
+                        elapsed,
+                    } => warn!(
+                        "session-pr-reconciler: tick STILL failing — {e}; {consecutive} \
+                         consecutive failed ticks over {}s, no session PRs attributed in that \
+                         time",
+                        elapsed.as_secs()
+                    ),
+                    TickFailureReport::Quiet => {
+                        debug!("session-pr-reconciler: tick error (continuing): {e}")
+                    }
+                },
+                Ok(()) => {
+                    if let Some((consecutive, elapsed)) = tick_failures.clear() {
+                        info!(
+                            "session-pr-reconciler: RECOVERED — a tick succeeded after \
+                             {consecutive} consecutive failures over {}s",
+                            elapsed.as_secs()
+                        );
+                    }
+                }
             }
         }
     });
@@ -1163,24 +1416,17 @@ fn classify_negative(head_ts: Option<i64>, base_ts: Option<i64>) -> ContentProof
 /// not a git repository / fatal) or a spawn failure. "git could not answer" is
 /// never reported as "absent".
 async fn git_rev_present(dir: &str, rev: &str) -> Option<bool> {
-    match Command::new("git")
-        .args(["-C", dir, "rev-parse", "--verify", "--quiet", rev])
-        .output()
-        .await
-    {
-        Ok(out) => match out.status.code() {
-            Some(0) => Some(true),
-            Some(1) => Some(false),
-            _ => {
-                debug!(
-                    "session-pr-reconciler: rev-parse {rev} in {dir} errored: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                None
-            }
-        },
-        Err(e) => {
-            debug!("session-pr-reconciler: rev-parse {rev} in {dir} spawn failed: {e}");
+    // `None` from `run_git` (spawn failure OR timeout) is "git could not
+    // answer", which is exactly the `None` this function already means.
+    let out = run_git(dir, &["rev-parse", "--verify", "--quiet", rev]).await?;
+    match out.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => {
+            debug!(
+                "session-pr-reconciler: rev-parse {rev} in {dir} errored: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
             None
         }
     }
@@ -1191,31 +1437,15 @@ async fn git_rev_present(dir: &str, rev: &str) -> Option<bool> {
 /// (128 = missing object / not a repo) or a spawn failure. A non-answer is
 /// never reported as `false`.
 async fn git_is_ancestor(dir: &str, ancestor: &str, descendant: &str) -> Option<bool> {
-    match Command::new("git")
-        .args([
-            "-C",
-            dir,
-            "merge-base",
-            "--is-ancestor",
-            ancestor,
-            descendant,
-        ])
-        .output()
-        .await
-    {
-        Ok(out) => match out.status.code() {
-            Some(0) => Some(true),
-            Some(1) => Some(false),
-            _ => {
-                debug!(
-                    "session-pr-reconciler: is-ancestor {ancestor} {descendant} in {dir} errored: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                None
-            }
-        },
-        Err(e) => {
-            debug!("session-pr-reconciler: is-ancestor spawn in {dir} failed: {e}");
+    let out = run_git(dir, &["merge-base", "--is-ancestor", ancestor, descendant]).await?;
+    match out.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => {
+            debug!(
+                "session-pr-reconciler: is-ancestor {ancestor} {descendant} in {dir} errored: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
             None
         }
     }
@@ -1223,11 +1453,7 @@ async fn git_is_ancestor(dir: &str, ancestor: &str, descendant: &str) -> Option<
 
 /// Committer timestamp (epoch seconds) of a commit, or `None` if git fails.
 async fn git_commit_ts(dir: &str, rev: &str) -> Option<i64> {
-    let out = Command::new("git")
-        .args(["-C", dir, "log", "-1", "--format=%ct", rev])
-        .output()
-        .await
-        .ok()?;
+    let out = run_git(dir, &["log", "-1", "--format=%ct", rev]).await?;
     if !out.status.success() {
         return None;
     }
@@ -1259,11 +1485,7 @@ async fn resolve_repo(toplevel: &str) -> Option<RepoInfo> {
 /// `git -C <dir> rev-parse --show-toplevel` — the repo root, or `None` if the
 /// dir isn't inside a git work tree.
 async fn git_toplevel(dir: &str) -> Option<String> {
-    let out = Command::new("git")
-        .args(["-C", dir, "rev-parse", "--show-toplevel"])
-        .output()
-        .await
-        .ok()?;
+    let out = run_git(dir, &["rev-parse", "--show-toplevel"]).await?;
     if !out.status.success() {
         return None;
     }
@@ -1277,11 +1499,7 @@ async fn git_toplevel(dir: &str) -> Option<String> {
 
 /// `git -C <dir> remote get-url origin`.
 async fn git_remote_url(dir: &str) -> Option<String> {
-    let out = Command::new("git")
-        .args(["-C", dir, "remote", "get-url", "origin"])
-        .output()
-        .await
-        .ok()?;
+    let out = run_git(dir, &["remote", "get-url", "origin"]).await?;
     if !out.status.success() {
         return None;
     }
@@ -1330,30 +1548,27 @@ fn parse_owner_repo(remote: &str) -> Option<(String, String)> {
 /// rather than `refname:short` so local and remote are distinguishable without
 /// guessing at an `origin/` prefix.
 async fn branch_trailers(dir: &str) -> Vec<BranchTrailer> {
-    let out = match Command::new("git")
-        .args([
-            "-C",
-            dir,
+    let out = match run_git(
+        dir,
+        &[
             "for-each-ref",
             "--format=%(objectname) %(refname) %(trailers:key=Session-Id,valueonly,separator=%x20)",
             "refs/heads/",
             "refs/remotes/origin/",
-        ])
-        .output()
-        .await
+        ],
+    )
+    .await
     {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
+        Some(o) if o.status.success() => o,
+        Some(o) => {
             debug!(
                 "session-pr-reconciler: for-each-ref in {dir} failed: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             );
             return Vec::new();
         }
-        Err(e) => {
-            debug!("session-pr-reconciler: for-each-ref spawn in {dir} failed: {e}");
-            return Vec::new();
-        }
+        // Spawn failure or timeout — already logged by `run_git`.
+        None => return Vec::new(),
     };
 
     normalize_branch_trailers(String::from_utf8_lossy(&out.stdout).lines())
@@ -1413,18 +1628,16 @@ fn split_for_each_ref_line(line: &str) -> Option<(String, &str, Vec<String>)> {
 /// Read the `Session-Id` trailer value(s) on a specific commit, or `None` if
 /// the object isn't present locally (or git fails).
 async fn read_session_trailers(dir: &str, sha: &str) -> Option<Vec<String>> {
-    let out = Command::new("git")
-        .args([
-            "-C",
-            dir,
+    let out = run_git(
+        dir,
+        &[
             "log",
             "-1",
             "--format=%(trailers:key=Session-Id,valueonly,separator=%x20)",
             sha,
-        ])
-        .output()
-        .await
-        .ok()?;
+        ],
+    )
+    .await?;
     if !out.status.success() {
         return None;
     }
@@ -1445,11 +1658,15 @@ pub(crate) async fn resolve_github_token() -> Option<String> {
             }
         }
     }
-    let out = Command::new("gh")
-        .args(["auth", "token"])
-        .output()
-        .await
-        .ok()?;
+    // Under a HARD timeout. `gh auth token` has been observed blocked for
+    // hours on this fleet; awaited bare it does not fail the tick, it suspends
+    // it forever — the reconciler stops producing any output at all, which is
+    // exactly how a total outage came to be mistaken for "the fix does not
+    // work". A timeout here yields the same `None` ("no token") the error path
+    // already returns, so the tick fails FAST and visibly instead of hanging.
+    let mut cmd = Command::new("gh");
+    cmd.args(["auth", "token"]);
+    let out = output_with_timeout(&mut cmd, GH_TOKEN_TIMEOUT, "gh auth token").await?;
     if !out.status.success() {
         return None;
     }
@@ -1989,10 +2206,79 @@ mod tests {
     #[test]
     fn child_scan_reports_every_candidate_and_leaves_capping_to_the_caller() {
         let tmp = tempfile::tempdir().unwrap();
-        for i in 0..(REPO_SET_MAX * 2) {
+        let over_cap = REPO_SET_MAX + 1;
+        for i in 0..over_cap {
             fake_repo(tmp.path(), &format!("repo-{i:03}"));
         }
-        assert_eq!(candidate_child_repos(tmp.path()).len(), REPO_SET_MAX * 2);
+        assert_eq!(candidate_child_repos(tmp.path()).len(), over_cap);
+    }
+
+    /// The cap must sit ABOVE a real workspace, not inside it.
+    ///
+    /// It was 32 while `D:\qontinui-root` held 38 depth-1 clones, so five repos
+    /// were dropped from EVERY tick — and since candidates arrive name-sorted,
+    /// the loss was alphabetically biased: the tail (`ui-bridge*`,
+    /// `wrappers-registry`, `qontinui-workflow-*`) could never have a PR
+    /// attributed, while attribution for `qontinui-runner` worked only because
+    /// it happens to sort 23rd. A cap a normal workspace crosses is silent data
+    /// loss, not a safety valve.
+    #[test]
+    fn repo_set_cap_clears_a_real_workspace_with_room_to_grow() {
+        /// Depth-1 git repos counted in `D:\qontinui-root` when this was found.
+        const OBSERVED_WORKSPACE_REPOS: usize = 38;
+        assert!(
+            REPO_SET_MAX > OBSERVED_WORKSPACE_REPOS,
+            "REPO_SET_MAX ({REPO_SET_MAX}) is at or below the {OBSERVED_WORKSPACE_REPOS} repos \
+             this workspace already held — repos would be dropped from every tick"
+        );
+        assert!(
+            REPO_SET_MAX >= OBSERVED_WORKSPACE_REPOS * 3,
+            "REPO_SET_MAX ({REPO_SET_MAX}) leaves no room for the workspace to grow past \
+             {OBSERVED_WORKSPACE_REPOS} repos"
+        );
+    }
+
+    /// When the cap binds, the survivors are chosen by RECENCY, not by name —
+    /// so an actively worked repo is never the one silently dropped. The cwd
+    /// (index 0) is pinned regardless of how stale it looks.
+    #[test]
+    fn recency_prioritisation_pins_the_cwd_and_promotes_the_freshest_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = fake_repo(tmp.path(), "aaa-cwd");
+        // `zzz` sorts LAST by name, so it can only survive a cap by recency.
+        let stale = fake_repo(tmp.path(), "bbb-stale");
+        let fresh = fake_repo(tmp.path(), "zzz-fresh");
+
+        // Make `fresh` unambiguously newer than `stale`. Filesystem mtime
+        // granularity can be coarse, so write rather than trust creation order.
+        std::fs::write(stale.join(".git").join("HEAD"), "ref: refs/heads/x\n").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(fresh.join(".git").join("HEAD"), "ref: refs/heads/x\n").unwrap();
+
+        let mut candidates = vec![cwd.clone(), stale.clone(), fresh.clone()];
+        prioritise_by_recency(&mut candidates);
+
+        assert_eq!(candidates[0], cwd, "the session's own cwd is never moved");
+        assert_eq!(
+            candidates[1], fresh,
+            "the most recently touched repo outranks the alphabetically earlier stale one"
+        );
+        assert_eq!(candidates[2], stale);
+    }
+
+    /// Ordering stays deterministic when nothing distinguishes the candidates:
+    /// equal (or unreadable) mtimes fall back to name order.
+    #[test]
+    fn recency_prioritisation_falls_back_to_name_order_for_ties() {
+        let missing_a = PathBuf::from("Z:/does-not-exist/alpha");
+        let missing_b = PathBuf::from("Z:/does-not-exist/beta");
+        let cwd = PathBuf::from("Z:/does-not-exist");
+        let mut candidates = vec![cwd.clone(), missing_b.clone(), missing_a.clone()];
+        prioritise_by_recency(&mut candidates);
+        assert_eq!(candidates, vec![cwd, missing_a, missing_b]);
+        // Degenerate inputs must not panic.
+        prioritise_by_recency(&mut []);
+        prioritise_by_recency(&mut [PathBuf::from("Z:/x")]);
     }
 
     /// A linked worktree is scanned like a clone, but is identifiable as one:
@@ -2237,5 +2523,168 @@ mod tests {
     #[test]
     fn nudge_without_a_running_reconciler_is_a_silent_no_op() {
         nudge_session(Uuid::from_u128(0xB1));
+    }
+
+    /// A command that sleeps roughly `secs` seconds, using only what the
+    /// platform is guaranteed to ship: `sleep` on unix, `ping -n` on Windows
+    /// (which has no `sleep`, and where `ping -n N` waits about `N-1` seconds).
+    ///
+    /// Spawned DIRECTLY, never through a shell: `cmd /C ping` would make the
+    /// killed child the shell and orphan the `ping` behind it — the exact leak
+    /// this test exists to catch.
+    fn sleeping_command(secs: u32) -> Command {
+        if cfg!(windows) {
+            let mut c = Command::new("ping");
+            c.arg("-n").arg((secs + 1).to_string()).arg("127.0.0.1");
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg(secs.to_string());
+            c
+        }
+    }
+
+    /// The whole point of `output_with_timeout`: a command that overruns its
+    /// budget returns "no answer" PROMPTLY and its child is killed.
+    ///
+    /// This is the defect that mattered most — `gh auth token` awaited with no
+    /// timeout blocked `run_tick` for 4.5 hours, and the leaked `gh.exe`
+    /// processes it left behind are what forgetting the kill looks like.
+    ///
+    /// The leak assertion has real teeth on Windows, where a live process holds
+    /// its cwd open and the directory cannot be removed until it dies; on unix
+    /// removing a running process's cwd is legal, so there it is merely a
+    /// no-op. That is why the test also asserts the elapsed budget, which is
+    /// meaningful everywhere.
+    #[tokio::test]
+    async fn output_with_timeout_kills_a_command_that_overruns_its_budget() {
+        // Positive control FIRST: on a box where the sleeper cannot run at all,
+        // `None` below would prove nothing, so skip instead of passing falsely.
+        let probe = output_with_timeout(
+            &mut sleeping_command(0),
+            Duration::from_secs(30),
+            "sleeper probe",
+        )
+        .await;
+        let Some(probe) = probe else {
+            eprintln!("no runnable sleeper on this platform — skipping timeout coverage");
+            return;
+        };
+        assert!(
+            probe.status.success(),
+            "the probe must complete normally and return its output"
+        );
+
+        let held = tempfile::tempdir().unwrap();
+        let held_path = held.keep();
+
+        let mut cmd = sleeping_command(30);
+        cmd.current_dir(&held_path);
+        let started = Instant::now();
+        let got = output_with_timeout(&mut cmd, Duration::from_millis(300), "test sleeper").await;
+        let waited = started.elapsed();
+
+        assert!(
+            got.is_none(),
+            "an overrun must report NO ANSWER, never a result"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "returned only after {waited:?} — the budget was not enforced"
+        );
+
+        // The kill is asynchronous (tokio signals the child, then reaps it), so
+        // give it a bounded grace period rather than racing it.
+        let mut removed = false;
+        for _ in 0..40 {
+            if std::fs::remove_dir_all(&held_path).is_ok() {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            removed,
+            "the timed-out child still holds {} — it was leaked, not killed",
+            held_path.display()
+        );
+    }
+
+    /// A whole-tick failure must be LOUD once and then quiet, not silent
+    /// forever (the old `debug!`) and not every 30s (which trains everyone to
+    /// ignore it). Warns at consecutive ticks 1, 2, 4, 8, …
+    #[test]
+    fn tick_failure_ledger_warns_once_then_backs_off() {
+        let mut ledger = TickFailureLedger::default();
+
+        assert_eq!(
+            ledger.record("PG unavailable"),
+            TickFailureReport::New,
+            "the first failure is always reported"
+        );
+        // Tick 2 is a scheduled repeat; tick 3 falls inside the widened window.
+        assert!(matches!(
+            ledger.record("PG unavailable"),
+            TickFailureReport::Persisting { consecutive: 2, .. }
+        ));
+        assert_eq!(ledger.record("PG unavailable"), TickFailureReport::Quiet);
+        assert!(matches!(
+            ledger.record("PG unavailable"),
+            TickFailureReport::Persisting { consecutive: 4, .. }
+        ));
+        for _ in 5..8 {
+            assert_eq!(ledger.record("PG unavailable"), TickFailureReport::Quiet);
+        }
+        assert!(matches!(
+            ledger.record("PG unavailable"),
+            TickFailureReport::Persisting { consecutive: 8, .. }
+        ));
+    }
+
+    /// A DIFFERENT failure is news even mid-backoff — losing the token is not
+    /// the same outage as losing PG, and must not be swallowed by the previous
+    /// condition's widened window.
+    #[test]
+    fn tick_failure_ledger_reports_a_changed_reason_immediately() {
+        let mut ledger = TickFailureLedger::default();
+        assert_eq!(ledger.record("PG unavailable"), TickFailureReport::New);
+        assert!(matches!(
+            ledger.record("PG unavailable"),
+            TickFailureReport::Persisting { .. }
+        ));
+        assert_eq!(ledger.record("PG unavailable"), TickFailureReport::Quiet);
+        assert_eq!(
+            ledger.record("no GitHub token"),
+            TickFailureReport::New,
+            "a changed reason restarts the run and reports at once"
+        );
+        // …and the new reason gets its own fresh backoff, not the old one's.
+        assert!(matches!(
+            ledger.record("no GitHub token"),
+            TickFailureReport::Persisting { consecutive: 2, .. }
+        ));
+    }
+
+    /// Recovery is worth exactly one line, and it clears the run so the NEXT
+    /// outage is reported as new rather than as a continuation of the old one.
+    #[test]
+    fn tick_failure_ledger_reports_recovery_and_rearms() {
+        let mut ledger = TickFailureLedger::default();
+        assert!(
+            ledger.clear().is_none(),
+            "a success with no preceding failure says nothing"
+        );
+
+        ledger.record("PG unavailable");
+        ledger.record("PG unavailable");
+        let (consecutive, _) = ledger.clear().expect("ending a run is reported");
+        assert_eq!(consecutive, 2);
+
+        assert!(ledger.clear().is_none(), "the run was consumed");
+        assert_eq!(
+            ledger.record("PG unavailable"),
+            TickFailureReport::New,
+            "re-armed: the same reason recurring later is a NEW outage"
+        );
     }
 }
