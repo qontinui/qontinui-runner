@@ -1909,6 +1909,14 @@ mod tests {
         )
         .unwrap();
         let body = "x".repeat(1024);
+        // These three writes land inside one clock tick on a fast host, so
+        // their mtimes tie. This test leans on the store evicting the
+        // FIRST-ISSUED anyway — a guarantee `SpillStore::evictable_oldest_first`
+        // makes explicitly by tie-breaking on issue order. Before it did, the
+        // sort fell through to `read_dir` order and this assertion failed at
+        // random, reddening `main` (run 33021749396 attempt 2, 2026-08-27).
+        // Do NOT "fix" a recurrence by stamping the mtimes apart here: that
+        // would hide a real eviction-ordering regression rather than catch it.
         let first = store.put("t", "text/plain", false, &body).unwrap();
         store.put("t", "text/plain", false, &body).unwrap();
         store.put("t", "text/plain", false, &body).unwrap();
