@@ -15,7 +15,9 @@ use crate::settings::{
     OpenAiCompatibleSettings, PiCliSettings,
 };
 use anyhow::Result;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tracing::info;
@@ -1121,12 +1123,54 @@ pub(crate) fn is_oauth_token_expired(creds_path: &std::path::Path) -> bool {
     now_ms >= expires_at_ms
 }
 
+/// How long a probe result — success OR failure — is reused before the
+/// account is asked again.
+///
+/// Sized to swallow the burst: the four independent callers
+/// (`check_accounts_usage`, `/analytics/account-usage`, the 10-minute
+/// snapshot timer, `account_migration`'s confirmation) no longer each cost a
+/// request, and a 429'd account is not immediately re-probed into another
+/// 429. A minute is well inside the resolution of the weekly/5-hour windows
+/// these numbers describe, so nothing downstream reads a materially staler
+/// figure than before.
+const USAGE_PROBE_TTL: Duration = Duration::from_secs(60);
+
+/// Shared single-flight + TTL cache in front of the live probe. Keyed by
+/// `config_dir`, which is exactly the per-account identity the probe and the
+/// selection snapshot already use.
+static USAGE_PROBE_CACHE: Lazy<
+    crate::commands::usage_probe_cache::CoalescingCache<AccountUsageInfo>,
+> = Lazy::new(|| crate::commands::usage_probe_cache::CoalescingCache::new(USAGE_PROBE_TTL));
+
 /// Probe a single account for its weekly rate limit utilization.
 ///
-/// Makes a minimal API call (1 token, cheapest model) and reads the
-/// `anthropic-ratelimit-unified-7d-utilization` response header, which
-/// always contains the exact weekly usage fraction regardless of threshold.
+/// Reads through a shared single-flight + TTL cache
+/// ([`USAGE_PROBE_CACHE`]): concurrent callers for the same account await ONE
+/// upstream request, and a result is reused for [`USAGE_PROBE_TTL`].
+///
+/// This is not an optimization. The probe has four independent callers that
+/// each fanned out one request per configured account with no coalescing and
+/// no TTL — measured at 25 usage checks per 5-minute tick and **18,981 HTTP
+/// 429s per day** in the dev logs. Because the probe consumes the same
+/// per-account quota the CLI does, that stampede both competed with real work
+/// and then reported the 429s it earned as account exhaustion.
+///
+/// See [`crate::commands::usage_probe_cache`] for the mechanism.
 pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
+    let key = config_dir.clone();
+    USAGE_PROBE_CACHE
+        .get_or_fetch(&key, move || probe_account_usage_uncached(config_dir))
+        .await
+}
+
+/// The live probe. Makes a minimal API call (1 token, cheapest model) and
+/// reads the `anthropic-ratelimit-unified-7d-utilization` response header,
+/// which always contains the exact weekly usage fraction regardless of
+/// threshold.
+///
+/// Call [`probe_account_usage`] instead — going straight to this bypasses the
+/// coalescing that keeps the runner off Anthropic's rate limiter.
+async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
     let label = std::path::Path::new(&config_dir)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
