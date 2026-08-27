@@ -229,10 +229,31 @@ pub struct WebIntegrationStatus {
     pub settings_error: Option<String>,
     /// Whether the relay currently holds an open, post-handshake WS
     /// connection. False whenever the relay is idling or reconnecting.
+    ///
+    /// **This is the LOCAL socket only** — "my socket is up". It is not the
+    /// same question as whether the server will route to us; see
+    /// [`relay_routable`](Self::relay_routable), which sits beside it
+    /// precisely because the two can disagree.
     pub ws_connected: bool,
     /// The most recent relay connection error (e.g. handshake 401, DNS
     /// failure), or `None` if the last attempt succeeded / none yet.
     pub last_error: Option<String>,
+    /// SERVER-SIDE routability, read back from
+    /// `GET {backend}/api/v1/devices/{id}` on a background timer — "will the
+    /// server actually route relay traffic to me".
+    ///
+    /// Surfaced BESIDE `ws_connected`, never instead of it. During the
+    /// production outage this field exists for, `ws_connected` was `true`
+    /// with `last_error: null` while `coord.devices.ws_session_id` had been
+    /// NULLed server-side and every mobile relay call 503'd — the socket was
+    /// up and heartbeating, and the runner was unreachable. `ws_connected`
+    /// alone cannot see that; this can.
+    ///
+    /// `relay_routable == null` is UNKNOWN (failed read-back, none yet, or a
+    /// past success gone stale) — **never** "not routable". See
+    /// [`crate::mcp::relay_routable`].
+    #[serde(flatten)]
+    pub relay_routable: crate::mcp::relay_routable::RelayRoutableSnapshot,
 }
 
 /// Build the diagnostic [`WebIntegrationStatus`] from the same settings +
@@ -276,6 +297,11 @@ pub(crate) async fn web_integration_status_for(
         settings_error: loaded.error.clone(),
         ws_connected,
         last_error,
+        // CACHED read only — `/web-integration/status` is polled by
+        // dashboards, so the read-back never fans out per request; the
+        // background poller in `relay_routable::poll_loop` owns the upstream
+        // call.
+        relay_routable: crate::mcp::relay_routable::snapshot(),
     }
 }
 
@@ -337,7 +363,13 @@ pub(crate) async fn relay_health(app_state: &Arc<crate::commands::AppState>) -> 
 /// consistent with the rest of the runner's localhost-bound API surface
 /// (see the CORS rationale in `mcp_api::start_server`). Returns the JSON
 /// `{ tier, web_integration_enabled, has_device_jwt, ws_connected,
-/// last_error }`.
+/// last_error, relay_routable, relay_routable_checked_at_ms,
+/// relay_routable_error }`.
+///
+/// `ws_connected` and `relay_routable` answer DIFFERENT questions and are
+/// both reported: the first is this process's socket, the second is the
+/// server's willingness to route to it. They disagreed for hours during the
+/// outage that motivated the second field.
 async fn web_integration_status_handler(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
 ) -> axum::response::Json<WebIntegrationStatus> {
@@ -551,6 +583,25 @@ pub async fn start_relay(api_state: Arc<ApiState>) -> Arc<BackendRelayState> {
     // signal) is still the only clean exit. The factory below clones a fresh
     // `kick_rx`/`shutdown_rx` per respawn, so `kick_cloud_relay` keeps working
     // across respawns.
+    // ROUTABILITY READ-BACK. `relay_loop` can only ever report the LOCAL
+    // socket; `ws_connected: true` with a server-side `ws_session_id` of NULL
+    // is a real, observed production state in which every relay call 503s.
+    // This second supervised task polls the server's own view of this device
+    // so `/web-integration/status` reports both halves. It is deliberately
+    // independent of the relay loop: a wedged or reconnecting relay is
+    // exactly when the server's answer matters most.
+    {
+        let mut routable_shutdown = shutdown_rx.clone();
+        task_supervisor::spawn_supervised(
+            "Relay routability read-back",
+            shutdown_rx.clone(),
+            move || {
+                routable_shutdown.borrow_and_update();
+                crate::mcp::relay_routable::poll_loop(routable_shutdown.clone())
+            },
+        );
+    }
+
     let mut kick_rx_loop = kick_rx;
     let shutdown_rx_loop = shutdown_rx.clone();
     let task_handle = task_supervisor::spawn_supervised("Backend relay", shutdown_rx, move || {
@@ -3582,6 +3633,10 @@ mod tests {
             settings_error: None,
             ws_connected,
             last_error: None,
+            // `relay_health_from` reads the LOCAL gate inputs only; the
+            // server-side read-back is reported alongside them and is not an
+            // input to the health verdict, so the fixture leaves it UNKNOWN.
+            relay_routable: Default::default(),
         }
     }
 
@@ -3679,6 +3734,77 @@ mod tests {
         assert!(
             !msg.is_empty() && msg.contains("no close frame"),
             "must remain actionable even with no close frame: {msg}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Routability is reported BESIDE the socket state, not instead of it.
+    // ------------------------------------------------------------------
+
+    /// The wire shape must carry BOTH halves at the top level: the local
+    /// socket (`ws_connected`) and the server's willingness to route
+    /// (`relay_routable`). The outage this guards against had the first
+    /// green and the second false at the same moment, so a status document
+    /// that emits only one of them is the blind spot, not the fix.
+    #[test]
+    fn status_json_carries_ws_connected_and_relay_routable_side_by_side() {
+        let status = WebIntegrationStatus {
+            tier: crate::settings::RunnerTier::QontinuiAccount,
+            web_integration_enabled: true,
+            has_device_jwt: true,
+            credential_read_error: None,
+            settings_provenance: "loaded",
+            settings_error: None,
+            ws_connected: true,
+            last_error: None,
+            relay_routable: crate::mcp::relay_routable::RelayRoutableSnapshot {
+                relay_routable: Some(false),
+                relay_routable_checked_at_ms: Some(1_700_000_000_000),
+                relay_routable_error: None,
+            },
+        };
+        let v = serde_json::to_value(&status).expect("serializes");
+        assert_eq!(v.get("ws_connected").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(
+            v.get("relay_routable").and_then(|x| x.as_bool()),
+            Some(false),
+            "the incident's exact state: socket up, server not routing"
+        );
+        assert_eq!(
+            v.get("relay_routable_checked_at_ms")
+                .and_then(|x| x.as_u64()),
+            Some(1_700_000_000_000),
+        );
+    }
+
+    /// UNKNOWN must serialize as an explicit `null` with a reason — never as
+    /// `false`, and never by omitting the field (an absent key reads as "this
+    /// build has no routability check", which is a different claim).
+    #[test]
+    fn unknown_routability_serializes_as_null_with_a_reason() {
+        let status = WebIntegrationStatus {
+            tier: crate::settings::RunnerTier::QontinuiAccount,
+            web_integration_enabled: true,
+            has_device_jwt: true,
+            credential_read_error: None,
+            settings_provenance: "loaded",
+            settings_error: None,
+            ws_connected: true,
+            last_error: None,
+            relay_routable: crate::mcp::relay_routable::RelayRoutableSnapshot {
+                relay_routable: None,
+                relay_routable_checked_at_ms: None,
+                relay_routable_error: Some("read-back returned HTTP 401".to_string()),
+            },
+        };
+        let v = serde_json::to_value(&status).expect("serializes");
+        assert!(
+            v.get("relay_routable").is_some_and(|x| x.is_null()),
+            "a failed read-back must be null (UNKNOWN), present but valueless: {v}"
+        );
+        assert_eq!(
+            v.get("relay_routable_error").and_then(|x| x.as_str()),
+            Some("read-back returned HTTP 401"),
         );
     }
 
