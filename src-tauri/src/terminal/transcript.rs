@@ -496,7 +496,14 @@ pub fn extract_resume_name_from_path(path: &Path) -> Option<String> {
         return Some(name);
     }
     let head = read_head_lines(path, 40)?;
-    last_ai_title(head.lines()).or_else(|| last_summary(head.lines()))
+    // `custom-title` is checked here too, and FIRST. The tail scan above misses a
+    // transcript larger than 64 KB whose only `/rename` landed near the head, and
+    // without this arm an `ai-title` in that same head would outrank it - inverting
+    // the precedence this function documents. (On `origin/main` the head slice read
+    // only `summary`, so a head-only `custom-title` was missed outright.)
+    last_custom_title(head.lines())
+        .or_else(|| last_ai_title(head.lines()))
+        .or_else(|| last_summary(head.lines()))
 }
 
 /// Best human name for the transcript at `path` for the "previous sessions"
@@ -2128,6 +2135,46 @@ mod tests {
     /// Claude writes `{"type":"ai-title","aiTitle":"…"}` records that main
     /// never read. They sit between the operator's explicit `/rename` and the
     /// incidental auto `summary` in the precedence chain.
+    #[test]
+    fn a_head_custom_title_outranks_a_head_ai_title_in_a_large_transcript() {
+        // The bounded production path reads a 64 KB TAIL and a 40-line HEAD. A
+        // transcript larger than the tail window whose only `/rename` landed near
+        // the head is invisible to the tail scan, so the head slice has to honour
+        // the same precedence — otherwise an `ai-title` beside it wins and the
+        // operator's explicit name loses to a generated one.
+        let dir = std::env::temp_dir().join(format!(
+            "qontinui-transcript-precedence-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("session.jsonl");
+
+        let mut content = String::new();
+        content.push_str("{\"type\":\"custom-title\",\"customTitle\":\"operator name\"}
+");
+        content.push_str(
+            "{\"type\":\"ai-title\",\"aiTitle\":\"generated name\",\"sessionId\":\"s\"}
+",
+        );
+        // Push both records out of the 64 KB tail window.
+        let filler = "{\"type\":\"assistant\",\"pad\":\"".to_string()
+            + &"x".repeat(512)
+            + "\"}
+";
+        while content.len() < 96 * 1024 {
+            content.push_str(&filler);
+        }
+        std::fs::write(&path, &content).expect("write transcript");
+
+        assert_eq!(
+            extract_resume_name_from_path(&path).as_deref(),
+            Some("operator name"),
+            "a head custom-title must outrank a head ai-title once both are outside the tail window"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ai_title_ranks_between_custom_title_and_summary() {
         const AI: &str =
