@@ -70,6 +70,7 @@ fn main() -> ExitCode {
         Some("create") => pr_create(&args[1..]),
         Some("plan-library-backfill") => plan_library_backfill(&args[1..]),
         Some("plan-workunit-backfill") => plan_workunit_backfill(&args[1..]),
+        Some("session-archive-backfill") => session_archive_backfill(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -88,6 +89,7 @@ USAGE:
   qontinui-pr create --title <title> [options]
   qontinui-pr plan-library-backfill [options]
   qontinui-pr plan-workunit-backfill [options]
+  qontinui-pr session-archive-backfill [options]
 
 OPTIONS (create):
   --repo <owner/name>   Target repo (default: inferred from `git remote get-url origin`)
@@ -117,6 +119,28 @@ OPTIONS (plan-workunit-backfill):
                         ($COORD_HTTP_URL) and the active runner profile.
   --limit <n>           Push at most N work units (ordering is the scan order)
 
+OPTIONS (session-archive-backfill):
+  --dry-run             Scan, detect and attribute — but send nothing
+  --backend <url>       qontinui-web base URL. OVERRIDES the environment
+                        ($QONTINUI_WEB_BACKEND_URL, then $QONTINUI_API_URL)
+  --home <path>         Extra Claude Code account home (repeatable). The
+                        machine's own homes are DISCOVERED, never hard-coded;
+                        this only adds one the sweep cannot see
+  --account <label>     Only this account label (e.g. gmail, tiohorst, unknown)
+  --limit <n>           Archive at most N transcripts (scan order)
+  --force               Ignore the local digest cache and re-send everything
+  --state-file <path>   Re-scan cache (default:
+                        ~/.qontinui/runner/session-archive-backfill-state.json)
+  --idle-hours <n>      A transcript the runner's registry does not know is
+                        called `open` if it was written within this many hours,
+                        else `closed` (default 24)
+  --tenant-repo-map <path>
+                        JSON {\"<repo>\": [\"<tenant-uuid>\", ...]} exported from
+                        coord's repo ownership. WITHOUT it the repo-derived
+                        tenant arm is UNAVAILABLE (not empty) — coord serves
+                        `coord.tenant_repos` only behind an operator Cognito
+                        bearer, which a device JWT cannot present
+
 Values that themselves begin with `--` must use the `--flag=value` form.
 
 `create` opens the PR through the runner's coord-brokered loopback proxy — no
@@ -134,7 +158,14 @@ a machine whose reconcile loop never armed can be caught up WITHOUT a runner
 restart. Idempotent: each unit's push is seeded from coord's current status, so
 an unchanged corpus emits no status write, and a changed one still goes through
 the agent-owner deferral. `--dry-run` contacts nothing, so it shows the FILE
-side only — it cannot tell you which units would transition.";
+side only — it cannot tell you which units would transition.
+
+`session-archive-backfill` walks every discovered Claude Code account home and
+upserts a head row plus the BYTE-VERBATIM transcript into qontinui-web's session
+repository with the runner's own device JWT. Bodies are never modified: a
+detector records `secret_finding_count`/`secret_finding_kinds` as an audit
+signal instead. Idempotent on (claude_session_id, account_label) +
+content_sha256. Every run prints the `tenant_source` histogram.";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PrCreateArgs {
@@ -875,6 +906,264 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
         }
     }
     if summary.failed > 0 {
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+// ===========================================================================
+// `qontinui-pr session-archive-backfill`
+//
+// Plan `2026-08-26-claude-code-session-repository-in-qontinui-web` Phase 1: the
+// one-shot scanner that lands the 8,308 Claude Code transcripts already on disk
+// (measured 2026-08-26 across 7 account homes, ~3.5 GB) into qontinui-web's
+// session repository, without waiting on the live tailer.
+//
+// The scanning, detection, attribution and push logic all live in
+// `qontinui_runner_lib::session_archive`; this function is the flag surface and
+// the resolution of the machine-local inputs that module takes as arguments.
+// ===========================================================================
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SessionArchiveArgs {
+    dry_run: bool,
+    force: bool,
+    backend: Option<String>,
+    homes: Vec<String>,
+    account: Option<String>,
+    limit: Option<usize>,
+    state_file: Option<String>,
+    idle_hours: Option<i64>,
+    tenant_repo_map: Option<String>,
+}
+
+fn parse_session_archive_args(args: &[String]) -> Result<SessionArchiveArgs, String> {
+    let mut out = SessionArchiveArgs::default();
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if arg.starts_with("--") => (f, Some(v)),
+            _ => (arg, None),
+        };
+        let mut consumed = 1usize;
+        // Same value-taking discipline as the two siblings above: a next
+        // element that looks like a flag is an error, so `--home --dry-run`
+        // cannot silently scan a directory named "--dry-run".
+        let mut value = |consumed: &mut usize| -> Result<String, String> {
+            if let Some(v) = inline {
+                return Ok(v.to_string());
+            }
+            match args.get(i + 1) {
+                Some(v) if v.starts_with("--") => Err(format!(
+                    "{flag} requires a value but got the flag-like {v:?} — \
+                     use {flag}=<value> if the value really starts with --"
+                )),
+                Some(v) => {
+                    *consumed = 2;
+                    Ok(v.clone())
+                }
+                None => Err(format!("{flag} requires a value")),
+            }
+        };
+        match flag {
+            "--dry-run" => out.dry_run = true,
+            "--force" => out.force = true,
+            "--backend" => out.backend = Some(value(&mut consumed)?),
+            // Repeatable: an operator with an account home outside the swept
+            // locations names each one.
+            "--home" => out.homes.push(value(&mut consumed)?),
+            "--account" => out.account = Some(value(&mut consumed)?),
+            "--state-file" => out.state_file = Some(value(&mut consumed)?),
+            "--tenant-repo-map" => out.tenant_repo_map = Some(value(&mut consumed)?),
+            "--limit" => {
+                let raw = value(&mut consumed)?;
+                out.limit = Some(
+                    raw.parse::<usize>()
+                        .map_err(|_| format!("--limit expects a number, got {raw:?}"))?,
+                );
+            }
+            "--idle-hours" => {
+                let raw = value(&mut consumed)?;
+                let hours = raw
+                    .parse::<i64>()
+                    .map_err(|_| format!("--idle-hours expects a number, got {raw:?}"))?;
+                if hours <= 0 {
+                    return Err("--idle-hours must be positive".to_string());
+                }
+                out.idle_hours = Some(hours);
+            }
+            other => return Err(format!("unknown option {other:?}")),
+        }
+        i += consumed;
+    }
+    Ok(out)
+}
+
+fn session_archive_backfill(args: &[String]) -> ExitCode {
+    use qontinui_runner_lib::session_archive as sa;
+
+    let parsed = match parse_session_archive_args(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("qontinui-pr: {e}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // The push path reports per-file failures through `tracing::warn!`, and a
+    // bin with no subscriber SWALLOWS them. Same reasoning as the sibling
+    // backfill: an operator seeing `errors=17` with no reason is the silent
+    // failure this tree argues against. `RUST_LOG` still wins if set.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .try_init();
+
+    // Account homes: the machine's own are DISCOVERED (env pin → the
+    // machine-global roster → the `C:/claude/.claude-*` sweep → the default
+    // home), and `--home` only ADDS. A hard-coded roster here would archive a
+    // subset of the corpus while reporting success.
+    let mut configured = sa::discovery::roster_config_dirs();
+    configured.extend(parsed.homes.iter().cloned());
+    let homes = sa::discovery::discover_account_homes_from_env(&configured);
+    if homes.is_empty() {
+        eprintln!(
+            "qontinui-pr: no Claude Code account home found. A home is a directory with a \
+             `projects/` subdirectory; pass --home <path>, or set $CLAUDE_CONFIG_DIR."
+        );
+        return ExitCode::from(2);
+    }
+    if let Some(filter) = parsed.account.as_deref() {
+        if !homes.iter().any(|h| h.label == filter) {
+            eprintln!(
+                "qontinui-pr: --account {filter:?} matches none of the discovered homes ({}). \
+                 Note the plain `%USERPROFILE%/.claude` home is labelled `unknown`.",
+                homes
+                    .iter()
+                    .map(|h| h.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return ExitCode::from(2);
+        }
+    }
+
+    let tenant_repo_map = match parsed.tenant_repo_map.as_deref() {
+        Some(path) => match sa::tenancy::RepoTenantMap::from_json_file(Path::new(path)) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                // An operator who passed the flag ASKED for repo-derived
+                // attribution. Degrading 8,000 rows to `unknown` because the
+                // file had a typo is exactly the quiet failure this plan is
+                // full of warnings about.
+                eprintln!("qontinui-pr: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+
+    let runner_dir = sa::metadata::default_runner_dir();
+    let opts = sa::BackfillOptions {
+        homes,
+        // The runner's own lifecycle registry — primary plus every discovered
+        // `instance-*` secondary — is what supplies the tenant, the account
+        // binding, the session name and the observed open/closed state for the
+        // sessions it knows.
+        registry: sa::metadata::load_all_registries(&runner_dir),
+        device_bindings: qontinui_runner_lib::pair::read_paired_binding_tenant_ids(),
+        repo_map: tenant_repo_map,
+        device_id: qontinui_runner_lib::machine_identity::read_device_id().ok(),
+        machine_hostname: sa::machine_hostname(),
+        machine_pin_tenant: sa::machine_pin_tenant(),
+        idle_cutoff_ms: parsed
+            .idle_hours
+            .map(|h| h * 60 * 60 * 1000)
+            .unwrap_or(sa::DEFAULT_IDLE_CUTOFF_MS),
+        now_ms: chrono::Utc::now().timestamp_millis(),
+        limit: parsed.limit,
+        account_filter: parsed.account.clone(),
+        force: parsed.force,
+    };
+
+    let state_path = parsed
+        .state_file
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(sa::default_state_path);
+    let mut state = sa::push::ScanState::load(&state_path);
+
+    // Resolve the backend BEFORE scanning, so a misconfigured run fails in a
+    // second rather than after reading 3.5 GB. Flag-first, for the reason the
+    // sibling backfill documents: a runner terminal exports the env vars, so
+    // threading `--backend` into the lowest-precedence slot would silently
+    // ignore it exactly where an operator reaches for it.
+    let sink = if parsed.dry_run {
+        None
+    } else {
+        let base = match qontinui_runner_lib::plan_workunit_adapter::body_push::backend_base_from_flag_or_env(
+            parsed.backend.clone(),
+        ) {
+            Some(b) => b,
+            None => {
+                eprintln!(
+                    "qontinui-pr: no qontinui-web backend configured — pass --backend <url> or \
+                     set $QONTINUI_WEB_BACKEND_URL. Refusing to guess a host for a transcript \
+                     archive push."
+                );
+                return ExitCode::from(2);
+            }
+        };
+        println!("archiving to {base} …");
+        Some(sa::push::HttpSessionSink::new(&base))
+    };
+
+    // The sink is async (it shares `reqwest`'s async client with the runner's
+    // own adapters); this bin has no ambient runtime, so give it a
+    // single-threaded one rather than duplicating the client as blocking.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("qontinui-pr: build tokio runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let report = runtime.block_on(sa::backfill(
+        &opts,
+        sink.as_ref().map(|s| s as &dyn sa::push::SessionSink),
+        &mut state,
+    ));
+
+    println!("{}", report.render());
+
+    if parsed.dry_run {
+        println!(
+            "dry run: nothing was sent. Every number above — including the tenant_source \
+             histogram and the detector findings — is what a real run would report."
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    // Best-effort: the cache is an optimisation, and by this point the corpus
+    // is already archived. Say so rather than failing a successful run.
+    if let Err(e) = state.save(&state_path) {
+        eprintln!(
+            "qontinui-pr: warning: could not write the re-scan cache {}: {e:#} — the archive \
+             is unaffected; the next run will simply re-upload unchanged transcripts.",
+            state_path.display()
+        );
+    }
+
+    if report.errors > 0 {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS

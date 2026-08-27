@@ -217,54 +217,20 @@ fn walk_probe() {}
 /// [`crate::session::reconcile::disk_only_restore_candidates`], whose cost and
 /// blast radius are exactly "every account on this machine".
 pub fn find_claude_config_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    // 1. Check CLAUDE_CONFIG_DIR env var first
-    if let Ok(env_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        let p = PathBuf::from(&env_dir);
-        if p.join("projects").exists() {
-            dirs.push(p);
-        }
-    }
-
-    // 2. User-configured dirs from settings
-    let configured = crate::settings::get_claude_config_dirs();
-    for dir_str in configured {
-        let p = PathBuf::from(&dir_str);
-        if p.join("projects").exists() && !dirs.iter().any(|d| d == &p) {
-            dirs.push(p);
-        }
-    }
-
-    // 3. Scan C:\claude\.claude-*\ (multi-account setups on Windows)
-    let claude_root = std::path::Path::new("C:\\claude");
-    if claude_root.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(claude_root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with(".claude-")
-                            && path.join("projects").exists()
-                            && !dirs.iter().any(|d| d == &path)
-                        {
-                            dirs.push(path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. Fallback: user home directory for standard .claude location
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let home_claude = PathBuf::from(&home).join(".claude");
-        if home_claude.join("projects").exists() && !dirs.iter().any(|d| d == &home_claude) {
-            dirs.push(home_claude);
-        }
-    }
-
-    dirs
+    // The rule itself lives in the LIB crate
+    // (`session_archive::discovery::discover_account_homes`) because
+    // `qontinui-pr session-archive-backfill` needs the identical sweep and is a
+    // separate crate root that cannot reach this module. Only the settings
+    // roster stays here — reading it needs `crate::settings`, which is
+    // bin-side — so it is passed in as the `configured` argument. One rule, two
+    // callers; a second copy would be the "kept in sync by shape, not by
+    // import" failure mode this tree argues against everywhere else.
+    qontinui_runner_lib::session_archive::discovery::discover_account_homes_from_env(
+        &crate::settings::get_claude_config_dirs(),
+    )
+    .into_iter()
+    .map(|home| home.config_dir)
+    .collect()
 }
 
 /// Encode a project path to the directory name format used by Claude Code.

@@ -174,6 +174,16 @@ pub mod wedge_diagnostics;
 // path awaits or touches PG.
 pub mod worker_supervisor;
 
+// Claude Code session archive (plan
+// `2026-08-26-claude-code-session-repository-in-qontinui-web`, Phase 1). The
+// account-home scanner, the long-lived-credential DETECTOR (never a redactor —
+// see the module doc), the tenant-attribution rules of §3.6 and the
+// `POST /api/v1/session-repository` sink. It lives in the LIB crate because
+// `qontinui-pr` (`bin/qontinui_cli.rs`) is a separate crate root that can only
+// reach `qontinui_runner_lib`, and the runner's own copies of the discovery and
+// account-labelling rules now delegate here rather than being duplicated.
+pub mod session_archive;
+
 // ============================================================================
 // Test-only: shared process-wide env lock
 // ============================================================================
