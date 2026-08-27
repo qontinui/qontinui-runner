@@ -188,10 +188,10 @@ impl RepoTenantMap {
         for (repo, tenants) in raw {
             let mut parsed = Vec::with_capacity(tenants.len());
             for t in &tenants {
-                parsed.push(
-                    Uuid::parse_str(t.trim())
-                        .map_err(|e| format!("tenant-repo map: repo {repo:?} tenant {t:?}: {e}"))?,
-                );
+                parsed
+                    .push(Uuid::parse_str(t.trim()).map_err(|e| {
+                        format!("tenant-repo map: repo {repo:?} tenant {t:?}: {e}")
+                    })?);
             }
             // Both spellings coord's own predicate accepts.
             by_repo.insert(normalize_repo(&repo), parsed.clone());
@@ -393,7 +393,12 @@ mod tests {
         // The whole point of §3.6's correction: `terminal_claude` panes carry
         // a tenant coord DERIVED, and the runner's own field collapses spawn
         // input with the machine pin. Neither can prove a declaration.
-        let got = resolve_tenant(Some(u(1)), &RepoTenantCandidates::Unavailable, &[u(1), u(2)], None);
+        let got = resolve_tenant(
+            Some(u(1)),
+            &RepoTenantCandidates::Unavailable,
+            &[u(1), u(2)],
+            None,
+        );
         assert_eq!(got.tenant_id, Some(u(1)));
         assert_eq!(got.source, TenantSource::DerivedSoleBinding);
         assert_ne!(got.source, TenantSource::Declared);
@@ -401,7 +406,12 @@ mod tests {
 
     #[test]
     fn one_candidate_is_derived_repo() {
-        let got = resolve_tenant(None, &RepoTenantCandidates::Evaluated(vec![u(7)]), &[], None);
+        let got = resolve_tenant(
+            None,
+            &RepoTenantCandidates::Evaluated(vec![u(7)]),
+            &[],
+            None,
+        );
         assert_eq!(
             got,
             TenantAttribution {
@@ -427,7 +437,12 @@ mod tests {
 
     #[test]
     fn no_candidates_falls_to_a_sole_binding() {
-        let got = resolve_tenant(None, &RepoTenantCandidates::Evaluated(vec![]), &[u(4)], None);
+        let got = resolve_tenant(
+            None,
+            &RepoTenantCandidates::Evaluated(vec![]),
+            &[u(4)],
+            None,
+        );
         assert_eq!(
             got,
             TenantAttribution {
@@ -441,7 +456,12 @@ mod tests {
     fn no_candidates_and_several_bindings_is_unknown_not_ambiguous() {
         // §3.6 rule 3's `|T|=0` arm: sole binding if the device has exactly
         // one, else unknown. `ambiguous` belongs to the `|T|>1` arm only.
-        let got = resolve_tenant(None, &RepoTenantCandidates::Evaluated(vec![]), &[u(4), u(5)], None);
+        let got = resolve_tenant(
+            None,
+            &RepoTenantCandidates::Evaluated(vec![]),
+            &[u(4), u(5)],
+            None,
+        );
         assert_eq!(got.source, TenantSource::Unknown);
         assert_eq!(got.tenant_id, None);
     }
@@ -451,7 +471,12 @@ mod tests {
         // Both fall through to sole binding, but an UNAVAILABLE rule must
         // never be able to produce `ambiguous` — that would report "we could
         // not ask coord" as "coord said it was contested".
-        let got = resolve_tenant(None, &RepoTenantCandidates::Unavailable, &[u(4), u(5)], None);
+        let got = resolve_tenant(
+            None,
+            &RepoTenantCandidates::Unavailable,
+            &[u(4), u(5)],
+            None,
+        );
         assert_eq!(got.source, TenantSource::Unknown);
     }
 
@@ -460,12 +485,7 @@ mod tests {
         // Measured on the operator box 2026-08-27: no `paired_user.json` at
         // all, but `machine.json::active_tenant_id` present. An empty binding
         // list is UNKNOWN, not zero, so the pin is the remaining evidence.
-        let got = resolve_tenant(
-            None,
-            &RepoTenantCandidates::Unavailable,
-            &[],
-            Some(u(11)),
-        );
+        let got = resolve_tenant(None, &RepoTenantCandidates::Unavailable, &[], Some(u(11)));
         assert_eq!(
             got,
             TenantAttribution {
@@ -532,7 +552,10 @@ mod tests {
             RepoTenantCandidates::Evaluated(vec![])
         );
         // No repo at all is UNAVAILABLE — the rule had no input.
-        assert_eq!(map.candidates(None, &[u(1)]), RepoTenantCandidates::Unavailable);
+        assert_eq!(
+            map.candidates(None, &[u(1)]),
+            RepoTenantCandidates::Unavailable
+        );
     }
 
     #[test]
@@ -552,7 +575,11 @@ mod tests {
         h.record(TenantSource::DerivedRepo);
         let rendered = h.render();
         for s in TenantSource::ALL {
-            assert!(rendered.contains(s.as_str()), "missing bucket {}", s.as_str());
+            assert!(
+                rendered.contains(s.as_str()),
+                "missing bucket {}",
+                s.as_str()
+            );
         }
         assert_eq!(h.total(), 3);
         assert_eq!(h.get(TenantSource::Unknown), 2);

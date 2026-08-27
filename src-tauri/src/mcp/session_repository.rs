@@ -214,11 +214,7 @@ fn allowed(params: HashMap<String, String>, allow: &[&str]) -> HashMap<String, S
 /// `GET /session-repository` — filtered, full-text read over the archived
 /// session corpus. **Ungated.**
 pub async fn list_handler(Query(params): Query<HashMap<String, String>>) -> ApiResult {
-    upstream_get(
-        "/api/v1/session-repository",
-        &allowed(params, &LIST_PARAMS),
-    )
-    .await
+    upstream_get("/api/v1/session-repository", &allowed(params, &LIST_PARAMS)).await
 }
 
 /// `GET /session-repository/unfinished` — the capability the operator asked for
@@ -299,7 +295,10 @@ mod tests {
 
         let kept = allowed(params, &LIST_PARAMS);
         assert_eq!(kept.len(), 2);
-        assert_eq!(kept.get("tenant_source").map(String::as_str), Some("ambiguous"));
+        assert_eq!(
+            kept.get("tenant_source").map(String::as_str),
+            Some("ambiguous")
+        );
         assert!(!kept.contains_key("organization_id"));
         assert!(!kept.contains_key("tenant_sauce"));
     }
@@ -330,6 +329,8 @@ mod tests {
             !source.contains(post_import),
             "a write route appeared on a read-only door"
         );
-        assert!(route_entries().iter().all(|(method, _, _)| *method == "GET"));
+        assert!(route_entries()
+            .iter()
+            .all(|(method, _, _)| *method == "GET"));
     }
 }

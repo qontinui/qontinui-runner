@@ -170,8 +170,7 @@ pub fn attach_body(payload: &mut SessionArtifactUpsert, raw: &[u8]) {
     match std::str::from_utf8(raw) {
         Ok(text) => payload.body = Some(text.to_string()),
         Err(_) => {
-            payload.body_base64 =
-                Some(base64::engine::general_purpose::STANDARD.encode(raw));
+            payload.body_base64 = Some(base64::engine::general_purpose::STANDARD.encode(raw));
         }
     }
 }
@@ -514,8 +513,10 @@ impl BackfillReport {
             );
         }
 
-        out.push_str("\nsecret detector (an AUDIT SIGNAL — nothing was masked, no body was \
-                      modified, no row was hidden):\n");
+        out.push_str(
+            "\nsecret detector (an AUDIT SIGNAL — nothing was masked, no body was \
+                      modified, no row was hidden):\n",
+        );
         out.push_str(&format!(
             "  files with findings   {} / {}\n  total findings        {}\n",
             self.files_with_findings, self.scanned, self.total_findings

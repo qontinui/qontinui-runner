@@ -214,7 +214,10 @@ pub fn parse_transcript(raw: &[u8]) -> TranscriptMetadata {
                     .map(str::to_string);
             }
             if meta.working_dir.is_none() {
-                meta.working_dir = record.get("cwd").and_then(Value::as_str).map(str::to_string);
+                meta.working_dir = record
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
             }
             if meta.git_branch.is_none() {
                 meta.git_branch = record
@@ -445,10 +448,16 @@ mod tests {
         let m = parse_transcript(&raw);
         assert_eq!(m.turn_count, 4);
         assert_eq!(m.session_id_in_body.as_deref(), Some("abc"));
-        assert_eq!(m.working_dir.as_deref(), Some("D:/qontinui-root/qontinui-runner"));
+        assert_eq!(
+            m.working_dir.as_deref(),
+            Some("D:/qontinui-root/qontinui-runner")
+        );
         assert_eq!(m.git_branch.as_deref(), Some("main"));
         assert_eq!(m.cli_version.as_deref(), Some("2.0.1"));
-        assert_eq!(m.ai_title.as_deref(), Some("Fix the flaky merge train test"));
+        assert_eq!(
+            m.ai_title.as_deref(),
+            Some("Fix the flaky merge train test")
+        );
         assert_eq!(m.first_prompt.as_deref(), Some("start here"));
         assert_eq!(m.last_prompt.as_deref(), Some("and now finish"));
         assert_eq!(m.started_at.as_deref(), Some("2026-08-26T10:00:00Z"));

@@ -177,10 +177,9 @@ pub fn discover_account_homes_from_env(configured: &[String]) -> Vec<AccountHome
 /// loader: a missing or corrupt roster must degrade to the directory scan
 /// rather than abort a backfill.
 pub fn roster_config_dirs() -> Vec<String> {
-    let Some(path) = dirs::config_dir().map(|d| {
-        d.join("com.qontinui.runner")
-            .join("claude-accounts.json")
-    }) else {
+    let Some(path) =
+        dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("claude-accounts.json"))
+    else {
         return Vec::new();
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -281,9 +280,7 @@ pub fn count_subagent_transcripts(home: &AccountHome) -> usize {
             if let Ok(files) = std::fs::read_dir(&dir) {
                 count += files
                     .flatten()
-                    .filter(|f| {
-                        f.path().extension().and_then(|e| e.to_str()) == Some("jsonl")
-                    })
+                    .filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some("jsonl"))
                     .count();
             }
         }
