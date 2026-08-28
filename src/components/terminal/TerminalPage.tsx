@@ -16,6 +16,7 @@ import { PromptModal } from "./PromptModal";
 import { usePromptLibrary } from "./usePromptLibrary";
 import { usePromptLibraryCommands } from "./commands/usePromptLibraryCommands";
 import { writeToTerminalById } from "./writeToTerminalById";
+import { buildSessionCloseRecord } from "./useTerminalManager";
 import { buildTerminalSessionRoster } from "./terminalSessionRoster";
 import { compareByUsageHeadroom } from "../settings/types";
 import { ZoneMinimap } from "./ZoneMinimap";
@@ -916,14 +917,20 @@ function TerminalPageInner({
     (terminalId: string, exitCode: number | null) => {
       // Record the durable session CLOSE when a pty backing a Claude session
       // exits. Read the latest tab from the ref so this stays identity-stable.
-      const claudeSessionId = tabsRef.current.find((t) => t.id === terminalId)?.claudeSessionId;
-      if (claudeSessionId) {
-        invoke("terminal_session_record_close", {
-          claudeSessionId,
-          reason: "pty-exit",
-        }).catch((err) => {
+      //
+      // Both halves of the key go over the wire. The tab's `claudeSessionId`
+      // may be stale or foreign (a provisional spawn-seam id, a restored id
+      // whose pty was respawned, a `reconciled` bind that "may be foreign"), in
+      // which case a csid-only close would close a DIFFERENT terminal's record
+      // and leave this one open forever. `terminalId` is this handler's own
+      // parameter — the one id that is certainly about the pty that just died.
+      const closeRecord = buildSessionCloseRecord(tabsRef.current, terminalId, "pty-exit");
+      if (closeRecord) {
+        invoke("terminal_session_record_close", closeRecord).catch((err) => {
+          // Log BOTH ids: the iteration-10 restore bug was cracked by noticing
+          // which id a row was actually about.
           logger.warn(
-            `terminal_session_record_close (pty-exit) failed for ${claudeSessionId}: ${err}`,
+            `terminal_session_record_close (pty-exit) failed for claudeSessionId=${closeRecord.claudeSessionId} terminalId=${closeRecord.terminalId}: ${err}`,
           );
         });
       }

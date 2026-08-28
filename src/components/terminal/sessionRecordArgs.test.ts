@@ -123,11 +123,12 @@ describe("buildSessionOpenArgs — onSessionIdBound zone resolution", () => {
   });
 });
 
-describe("buildSessionCloseRecord — explicit-close recording", () => {
+describe("buildSessionCloseRecord — close recording carries BOTH halves of the key", () => {
   it("returns explicit-close args for a tab carrying a claudeSessionId", () => {
     const tabs = [tab("shell"), tab("ai", { claudeSessionId: "sid-close" })];
     expect(buildSessionCloseRecord(tabs, "ai")).toEqual({
       claudeSessionId: "sid-close",
+      terminalId: "ai",
       reason: "explicit",
     });
   });
@@ -141,7 +142,37 @@ describe("buildSessionCloseRecord — explicit-close recording", () => {
     expect(buildSessionCloseRecord([tab("a")], "missing")).toBeNull();
   });
 
-  it("fires terminal_session_record_close with reason 'explicit' (mock invoke)", async () => {
+  /**
+   * THE PAIR-PINNING ASSERTION. A tab can legitimately carry a
+   * `claudeSessionId` that keys ANOTHER terminal's durable record — a
+   * provisional spawn-seam id, a restored id whose pty was respawned under a
+   * fresh `--session-id`, or a `reconciled` freshest-mtime bind that "may be
+   * foreign". The payload must still name THIS tab's own terminal, so the
+   * backend can detect the mis-binding and close the record this terminal
+   * actually owns instead of the foreign one.
+   */
+  it("yields its OWN terminalId even when its claudeSessionId belongs to another tab", () => {
+    const tabs = [
+      tab("tab-other", { claudeSessionId: "sid-shared" }),
+      tab("tab-stale", { claudeSessionId: "sid-shared" }),
+    ];
+    expect(buildSessionCloseRecord(tabs, "tab-stale")).toEqual({
+      claudeSessionId: "sid-shared",
+      terminalId: "tab-stale",
+      reason: "explicit",
+    });
+  });
+
+  it("carries the pty-exit reason and the exiting terminal's own id", () => {
+    const tabs = [tab("shell"), tab("ai", { claudeSessionId: "sid-foreign" })];
+    expect(buildSessionCloseRecord(tabs, "ai", "pty-exit")).toEqual({
+      claudeSessionId: "sid-foreign",
+      terminalId: "ai",
+      reason: "pty-exit",
+    });
+  });
+
+  it("fires terminal_session_record_close with both ids and reason 'explicit' (mock invoke)", async () => {
     mockInvoke.mockReset();
     mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: null });
     const { invoke } = await import("@tauri-apps/api/core");
@@ -150,6 +181,7 @@ describe("buildSessionCloseRecord — explicit-close recording", () => {
     await invoke("terminal_session_record_close", record!);
     expect(mockInvoke).toHaveBeenCalledWith("terminal_session_record_close", {
       claudeSessionId: "sid-close",
+      terminalId: "ai",
       reason: "explicit",
     });
   });

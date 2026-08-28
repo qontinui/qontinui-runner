@@ -11,7 +11,9 @@ use crate::claude_session::SessionManager;
 use crate::commands::CommandResponse;
 use crate::error::AppError;
 use crate::session::pane_store::{PaneKey, PaneSessionStore};
-use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
+use crate::session::session_lifecycle_store::{
+    CloseOutcome, SessionLifecycleStore, TerminalSessionRecord,
+};
 use crate::session::{Intent, SessionKind, SessionRegistry};
 use crate::terminal::visibility::VisibilityTier;
 use crate::terminal::{strip_ansi, TerminalManager};
@@ -1233,20 +1235,43 @@ pub fn terminal_session_clear_restore_pending(
     })
 }
 
-/// Mark a Claude terminal session closed in the lifecycle registry. No-op
-/// (still succeeds) if the session is absent or already closed.
+/// Mark a Claude terminal session closed in the lifecycle registry.
+///
+/// `terminal_id` is OPTIONAL and carries the other half of the key
+/// `terminal_session_record_open` binds. Supply it whenever the caller has a
+/// live terminal in hand: a tab's `claudeSessionId` can legitimately be stale or
+/// foreign, and without the terminal id the store has no way to tell a correct
+/// close from one that lands on a different session's record. Omit it only for
+/// the closers whose terminal is gone by definition (`poll-dead`,
+/// `never-started`, `no-terminal`, `migrated`).
+///
+/// The typed [`CloseOutcome`] is returned in `data` — never rendered into
+/// `message` — and an unresolvable close reports `success: false`. A repeat
+/// close of this terminal's own record (`alreadyClosed`) is a no-op, not a
+/// failure.
 #[tauri::command]
 pub fn terminal_session_record_close(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
     claude_session_id: String,
+    terminal_id: Option<String>,
     reason: String,
 ) -> Result<CommandResponse, String> {
-    store.record_close(&claude_session_id, &reason);
-    Ok(CommandResponse {
-        success: true,
+    let outcome = store.record_close_checked(&claude_session_id, terminal_id.as_deref(), &reason);
+    Ok(close_outcome_response(&outcome))
+}
+
+/// Wire envelope for a [`CloseOutcome`]. Pure, so the two rules it encodes are
+/// unit-testable without a Tauri app handle:
+///
+/// 1. the outcome is a TYPED value in `data`, never prose flattened into
+///    `message` — `message` is for humans, `data` is for callers;
+/// 2. a close that resolved to nothing is **not** a success.
+pub(crate) fn close_outcome_response(outcome: &CloseOutcome) -> CommandResponse {
+    CommandResponse {
+        success: !matches!(outcome, CloseOutcome::NotFound { .. }),
         message: None,
-        data: None,
-    })
+        data: serde_json::to_value(outcome).ok(),
+    }
 }
 
 /// List every RESTORABLE Claude terminal session from the lifecycle registry.
@@ -2248,6 +2273,67 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// The close envelope carries the outcome as a TYPED value in `data`, never
+    /// as prose in `message` — `message` is for humans, `data` is for callers.
+    /// A typed fact flattened into a success-envelope string is exactly the
+    /// pattern the typed-error-boundary work exists to burn down.
+    #[test]
+    fn close_outcome_response_puts_the_typed_outcome_in_data_not_message() {
+        let r = close_outcome_response(&CloseOutcome::Redirected {
+            requested: "stale".to_string(),
+            closed: "live".to_string(),
+            terminal_id: "term-live".to_string(),
+        });
+        assert!(r.message.is_none(), "message must stay free of typed facts");
+        let data = r.data.expect("the outcome is serialized into data");
+        assert_eq!(data["outcome"], "redirected");
+        assert_eq!(data["requested"], "stale");
+        assert_eq!(data["closed"], "live");
+        assert_eq!(data["terminalId"], "term-live");
+    }
+
+    /// A close that resolved to NOTHING is not a success. Under the old
+    /// contract an unresolvable close, a foreign close and a correct close were
+    /// all reported identically as `success: true`, which is why a wrong id was
+    /// undetectable at every layer.
+    #[test]
+    fn close_outcome_response_refuses_to_call_not_found_a_success() {
+        let not_found = close_outcome_response(&CloseOutcome::NotFound {
+            requested: "ghost".to_string(),
+            terminal_id: Some("term-gone".to_string()),
+        });
+        assert!(!not_found.success, "NotFound must NOT report success");
+        assert_eq!(not_found.data.unwrap()["outcome"], "notFound");
+
+        // Everything that really resolved still succeeds — including the benign
+        // repeat close, which must not be made to look like a failure or the
+        // signal gets ignored.
+        for resolved in [
+            CloseOutcome::Closed {
+                claude_session_id: "s".to_string(),
+            },
+            CloseOutcome::Redirected {
+                requested: "a".to_string(),
+                closed: "b".to_string(),
+                terminal_id: "t".to_string(),
+            },
+            CloseOutcome::RedirectedAmbiguous {
+                requested: "a".to_string(),
+                closed: "b".to_string(),
+                terminal_id: "t".to_string(),
+                candidates: vec!["b".to_string(), "c".to_string()],
+            },
+            CloseOutcome::AlreadyClosed {
+                claude_session_id: "s".to_string(),
+            },
+        ] {
+            assert!(
+                close_outcome_response(&resolved).success,
+                "{resolved:?} resolved to a real record — it is a success"
+            );
+        }
+    }
 
     fn restore_candidate_record(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {

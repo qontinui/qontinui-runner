@@ -7,7 +7,7 @@
  *
  * The frontend records OPEN/CLOSE through three Tauri commands:
  *   - `terminal_session_record_open`  (args = {@link SessionOpenArgs})
- *   - `terminal_session_record_close` (args = { claudeSessionId, reason })
+ *   - `terminal_session_record_close` (args = { claudeSessionId, terminalId, reason })
  *   - `terminal_session_list_open`    (restore — see useTerminalInitialization)
  */
 

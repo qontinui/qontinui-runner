@@ -1145,6 +1145,13 @@ impl SessionLifecycleStore {
     /// Mark an open session closed. No-op (no error) if the session is
     /// absent or already closed.
     ///
+    /// Thin wrapper over [`Self::record_close_checked`] with no terminal
+    /// expectation — byte-identical behaviour to the pre-`CloseOutcome` close.
+    /// Kept for the internal closers that legitimately have no live terminal in
+    /// hand (`poll-dead`, `never-started`, `no-terminal`, `migrated`): those
+    /// records' terminals are gone by definition, which is the entire meaning of
+    /// their close reasons.
+    ///
     /// Credential hygiene (Task 5): when this close ends the LAST open session
     /// for its workdir, the workdir's coord-mcp proxy nonce is revoked and its
     /// app-data session-restore config is reaped
@@ -1153,23 +1160,126 @@ impl SessionLifecycleStore {
     /// closes (the session continues under a new record with the same workdir)
     /// and when a sibling open session still shares the workdir.
     pub fn record_close(&self, claude_session_id: &str, reason: &str) {
+        let _ = self.record_close_checked(claude_session_id, None, reason);
+    }
+
+    /// Close the record the caller's TERMINAL actually owns, not merely the one
+    /// its (possibly stale) `claude_session_id` names.
+    ///
+    /// ## Why this exists
+    ///
+    /// The durable binding is established as a `(terminal_id,
+    /// claude_session_id)` PAIR by [`Self::record_open`], and was historically
+    /// dissolved by `claude_session_id` ALONE. A frontend tab can legitimately
+    /// carry a `claudeSessionId` that no longer keys the record for *its own*
+    /// terminal — a provisional spawn-seam id, a restored id whose PTY was
+    /// respawned under a fresh `--session-id`, or a freshest-mtime `reconciled`
+    /// bind that "may be foreign". Every one of those is a well-typed, genuinely
+    /// minted id, so nothing rejects it: the close landed on a foreign record
+    /// (or on nothing), the live terminal's record stayed `open` forever, and
+    /// all three cases reported success identically.
+    ///
+    /// ## Semantics
+    ///
+    /// * `expect_terminal_id == None` — today's behaviour exactly: close the
+    ///   record at `claude_session_id` if it is open.
+    /// * `Some(t)` and the record at `claude_session_id` is open ON `t` —
+    ///   close it. [`CloseOutcome::Closed`]. This is the healthy path.
+    /// * `Some(t)` and that record belongs to a DIFFERENT terminal (or does not
+    ///   exist) — **do not close it.** Resolve the open rows owning `t` and
+    ///   close that record instead, reporting [`CloseOutcome::Redirected`] so
+    ///   the mis-binding becomes observable rather than silent.
+    /// * `Some(t)` with MORE THAN ONE open row on `t` — the per-terminal
+    ///   single-open-row invariant is violated (it is enforced at open and at
+    ///   boot, never in between). Rank with [`open_authority_key`], breaking
+    ///   ties on `claude_session_id` so the choice is DETERMINISTIC, close the
+    ///   winner, and report [`CloseOutcome::RedirectedAmbiguous`] naming every
+    ///   candidate. A nondeterministic close would be a worse failure than the
+    ///   silent no-op it replaces, because it is not reproducible — which is
+    ///   why this must not be a single-match `find_open_by_terminal` call.
+    /// * Nothing resolves — [`CloseOutcome::NotFound`], `warn!` with both ids,
+    ///   and **no row is mutated and no observer fires**.
+    ///
+    /// [`CloseOutcome::AlreadyClosed`] separates a benign repeat close (the
+    /// record for this very terminal is already `closed` — an explicit close
+    /// followed by the pty-exit close, or a `never-started` retirement of a
+    /// provider-less shell) from a genuine resolution failure, so the caller can
+    /// report the latter without crying wolf on the former.
+    pub fn record_close_checked(
+        &self,
+        claude_session_id: &str,
+        expect_terminal_id: Option<&str>,
+        reason: &str,
+    ) -> CloseOutcome {
         let now = Utc::now().timestamp_millis();
-        let (closed, closed_workdir, workdir_still_in_use) = {
+        let (outcome, closed_id, closed, closed_workdir, workdir_still_in_use) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(error = %e, "session_lifecycle_store: lock poisoned on record_close");
-                    return;
+                    return CloseOutcome::NotFound {
+                        requested: claude_session_id.to_string(),
+                        terminal_id: expect_terminal_id.map(str::to_string),
+                    };
                 }
             };
-            let closed = match m.get_mut(claude_session_id) {
+
+            // An empty / whitespace terminal id is "no expectation": empty ids
+            // are uncorrelatable and already excluded from every terminal-keyed
+            // resolver in this file.
+            let expect = expect_terminal_id.map(str::trim).filter(|t| !t.is_empty());
+
+            let (target, outcome) = resolve_close_target(&m, claude_session_id, expect);
+
+            let Some(target) = target else {
+                // Nothing to mutate. Report before dropping the lock.
+                match &outcome {
+                    CloseOutcome::NotFound { .. } => warn!(
+                        claude_session_id = %claude_session_id,
+                        terminal_id = %expect.unwrap_or("<none>"),
+                        reason = %reason,
+                        "session-close: close resolved to no open record — neither the requested session id nor the caller's terminal owns one"
+                    ),
+                    CloseOutcome::AlreadyClosed { .. } => debug!(
+                        claude_session_id = %claude_session_id,
+                        reason = %reason,
+                        "session-close: record already closed — no-op"
+                    ),
+                    _ => {}
+                }
+                return outcome;
+            };
+
+            match &outcome {
+                CloseOutcome::Redirected { closed, .. } => warn!(
+                    requested = %claude_session_id,
+                    closed = %closed,
+                    terminal_id = %expect.unwrap_or("<none>"),
+                    reason = %reason,
+                    "session-close: MIS-BOUND close redirected — the tab's claudeSessionId keys a different terminal's record; closing the record this terminal actually owns"
+                ),
+                CloseOutcome::RedirectedAmbiguous {
+                    closed, candidates, ..
+                } => warn!(
+                    requested = %claude_session_id,
+                    closed = %closed,
+                    candidates = %candidates.join(","),
+                    terminal_id = %expect.unwrap_or("<none>"),
+                    reason = %reason,
+                    "session-close: MIS-BOUND close redirected onto a terminal carrying MULTIPLE open rows — the per-terminal single-open-row invariant is violated; closed the highest-authority row"
+                ),
+                _ => {}
+            }
+
+            let closed = match m.get_mut(target.as_str()) {
                 Some(rec) if rec.state == "open" => {
                     rec.state = "closed".to_string();
                     rec.closed_at = Some(now);
                     rec.close_reason = Some(reason.to_string());
                     rec.clone()
                 }
-                _ => return, // absent or already closed — nothing to flush
+                // Unreachable: `resolve_close_target` only names OPEN rows.
+                _ => return outcome,
             };
             let workdir = closed.working_dir.clone();
             // Answered under the lock rather than off a full-map clone — the
@@ -1184,15 +1294,19 @@ impl SessionLifecycleStore {
                     rec: Box::new(closed.clone()),
                 }],
             );
-            (closed, workdir, still_in_use)
+            (outcome, target, closed, workdir, still_in_use)
         };
         self.snapshot_change(std::iter::once(closed));
         // Fabric Phase 3 (review W2): notify AFTER the durable local write,
         // outside the map lock, and only on a REAL open→closed transition
         // (the early return above skips repeat/absent closes). Best-effort:
         // the production observer enqueues a coord `Closed` outbox row.
+        //
+        // Fired with the id ACTUALLY closed, never the id requested: under a
+        // redirect, notifying for the requested id would evict coord's row for
+        // the live session while the dead one leaked.
         if let Some(obs) = self.close_observer.get() {
-            (obs.0)(claude_session_id);
+            (obs.0)(closed_id.as_str());
         }
 
         // Credential hygiene: drop the coord-mcp device nonce bound to this
@@ -1200,13 +1314,14 @@ impl SessionLifecycleStore {
         // notify above so a real close is always reported to coord, even when
         // the migration early-return below keeps the nonce alive.
         if reason == crate::terminal::account_migration::CLOSE_REASON_MIGRATED {
-            return; // the session lives on under a new record — keep its nonce
+            return outcome; // the session lives on under a new record — keep its nonce
         }
         if let Some(wd) = closed_workdir {
             if !workdir_still_in_use {
                 crate::coord_mcp::release_workdir_on_session_close(&wd);
             }
         }
+        outcome
     }
 
     /// Bump `last_seen_at` on a present session. No-op (no write) if absent.
@@ -2429,6 +2544,158 @@ impl SessionLifecycleStore {
         drop(guard);
         if full {
             self.compact();
+        }
+    }
+}
+
+/// Typed outcome of [`SessionLifecycleStore::record_close_checked`].
+///
+/// Serialized into `CommandResponse.data` (never into `message`): the outcome
+/// is a fact a caller acts on, not prose a human reads, and an unresolvable
+/// close must not be reported as a success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "camelCase")]
+pub enum CloseOutcome {
+    /// The record named by the caller owned the caller's terminal (or the
+    /// caller named no terminal) and was closed. The healthy path.
+    #[serde(rename_all = "camelCase")]
+    Closed { claude_session_id: String },
+    /// The named record belongs to a DIFFERENT terminal. It was left open and
+    /// the single open record owning the caller's terminal was closed instead.
+    /// A `Redirected` in normal operation is itself a bug report.
+    #[serde(rename_all = "camelCase")]
+    Redirected {
+        requested: String,
+        closed: String,
+        terminal_id: String,
+    },
+    /// As [`CloseOutcome::Redirected`], but the caller's terminal carried more
+    /// than one open row. The winner is `open_authority_key`-ranked with a
+    /// `claude_session_id` tiebreak so the choice is deterministic; every
+    /// candidate is named so the invariant violation is observable.
+    #[serde(rename_all = "camelCase")]
+    RedirectedAmbiguous {
+        requested: String,
+        closed: String,
+        terminal_id: String,
+        candidates: Vec<String>,
+    },
+    /// The record for this very terminal is already `closed` — a benign repeat
+    /// (explicit close then pty-exit close) or a `never-started` retirement of a
+    /// provider-less shell. Nothing mutated; not a failure.
+    #[serde(rename_all = "camelCase")]
+    AlreadyClosed { claude_session_id: String },
+    /// Neither the requested `claude_session_id` nor the caller's terminal
+    /// resolves to an open record. Nothing mutated, no observer fired.
+    #[serde(rename_all = "camelCase")]
+    NotFound {
+        requested: String,
+        terminal_id: Option<String>,
+    },
+}
+
+/// Resolve WHICH record a close is actually about, under the map lock.
+///
+/// Returns `(target claude_session_id to close, typed outcome)`. A `None`
+/// target means nothing is mutated. Pure over the map — every mutation, log and
+/// side effect belongs to the caller.
+fn resolve_close_target(
+    m: &HashMap<String, TerminalSessionRecord>,
+    claude_session_id: &str,
+    expect_terminal_id: Option<&str>,
+) -> (Option<String>, CloseOutcome) {
+    let existing = m.get(claude_session_id);
+    match (expect_terminal_id, existing) {
+        // No terminal named — the pre-existing csid-only contract, unchanged.
+        (None, Some(rec)) if rec.state == "open" => (
+            Some(claude_session_id.to_string()),
+            CloseOutcome::Closed {
+                claude_session_id: claude_session_id.to_string(),
+            },
+        ),
+        (None, Some(_)) => (
+            None,
+            CloseOutcome::AlreadyClosed {
+                claude_session_id: claude_session_id.to_string(),
+            },
+        ),
+        (None, None) => (
+            None,
+            CloseOutcome::NotFound {
+                requested: claude_session_id.to_string(),
+                terminal_id: None,
+            },
+        ),
+        // The named record owns the caller's terminal — pair intact.
+        (Some(t), Some(rec)) if rec.terminal_id == t && rec.state == "open" => (
+            Some(claude_session_id.to_string()),
+            CloseOutcome::Closed {
+                claude_session_id: claude_session_id.to_string(),
+            },
+        ),
+        (Some(t), Some(rec)) if rec.terminal_id == t => (
+            None,
+            CloseOutcome::AlreadyClosed {
+                claude_session_id: claude_session_id.to_string(),
+            },
+        ),
+        // Mismatch, or the requested id is unknown: the caller's TERMINAL is
+        // the half of the key that is trustworthy here, so resolve from it.
+        (Some(t), _) => {
+            let mut candidates: Vec<&TerminalSessionRecord> = m
+                .values()
+                .filter(|r| r.state == "open" && r.terminal_id == t)
+                .collect();
+            // Deterministic order even when `open_authority_key` ties: the
+            // HashMap's own iteration order must never decide which live
+            // session dies.
+            candidates.sort_by(|a, b| {
+                open_authority_key(a)
+                    .cmp(&open_authority_key(b))
+                    .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
+            });
+            match candidates.len() {
+                0 => (
+                    None,
+                    CloseOutcome::NotFound {
+                        requested: claude_session_id.to_string(),
+                        terminal_id: Some(t.to_string()),
+                    },
+                ),
+                1 => {
+                    let closed = candidates[0].claude_session_id.clone();
+                    (
+                        Some(closed.clone()),
+                        CloseOutcome::Redirected {
+                            requested: claude_session_id.to_string(),
+                            closed,
+                            terminal_id: t.to_string(),
+                        },
+                    )
+                }
+                _ => {
+                    // Greatest authority key wins — same comparator the boot
+                    // repair uses, so both agree on which colliding row is live.
+                    let closed = candidates
+                        .last()
+                        .expect("len > 1")
+                        .claude_session_id
+                        .clone();
+                    let names: Vec<String> = candidates
+                        .iter()
+                        .map(|r| r.claude_session_id.clone())
+                        .collect();
+                    (
+                        Some(closed.clone()),
+                        CloseOutcome::RedirectedAmbiguous {
+                            requested: claude_session_id.to_string(),
+                            closed,
+                            terminal_id: t.to_string(),
+                            candidates: names,
+                        },
+                    )
+                }
+            }
         }
     }
 }
@@ -4431,6 +4698,295 @@ mod tests {
         // Reload and confirm the closed record persisted with its reason.
         let store = SessionLifecycleStore::open(&path).unwrap();
         assert!(store.open_records().is_empty());
+    }
+
+    /// The HEALTHY path: the pair the tab carries matches the pair
+    /// `record_open` bound, so the close lands on its own record and reports
+    /// `Closed`. A `Redirected` here would itself be the bug report.
+    #[test]
+    fn record_close_checked_closes_its_own_record_when_the_pair_matches() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(auth_on("mine", "term-mine"));
+        store.record_open(auth_on("neighbour", "term-neighbour"));
+
+        let outcome = store.record_close_checked("mine", Some("term-mine"), "explicit");
+
+        assert_eq!(
+            outcome,
+            CloseOutcome::Closed {
+                claude_session_id: "mine".to_string()
+            }
+        );
+        assert_eq!(store.get("mine").unwrap().state, "closed");
+        assert_eq!(
+            store.get("mine").unwrap().close_reason.as_deref(),
+            Some("explicit")
+        );
+        assert_eq!(
+            store.get("neighbour").unwrap().state,
+            "open",
+            "a matched-pair close must not touch any other terminal's record"
+        );
+    }
+
+    /// THE DEFECT. A tab carrying a STALE `claudeSessionId` — one that keys a
+    /// different terminal's record — must close the record its OWN terminal
+    /// owns, and must leave the stale target open. Under the old csid-only
+    /// contract this closed the foreign record and the live pty's record never
+    /// closed at all.
+    #[test]
+    fn record_close_checked_redirects_a_stale_csid_to_the_callers_own_terminal() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        // The record the stale id actually keys — a DIFFERENT terminal.
+        store.record_open(auth_on("stale-foreign", "term-other"));
+        // The record the caller's terminal really owns.
+        store.record_open(auth_on("live-real", "term-live"));
+
+        let outcome = store.record_close_checked("stale-foreign", Some("term-live"), "explicit");
+
+        assert_eq!(
+            outcome,
+            CloseOutcome::Redirected {
+                requested: "stale-foreign".to_string(),
+                closed: "live-real".to_string(),
+                terminal_id: "term-live".to_string(),
+            }
+        );
+        assert_eq!(
+            store.get("live-real").unwrap().state,
+            "closed",
+            "the caller's OWN terminal's record is the one that closes"
+        );
+        assert_eq!(
+            store.get("live-real").unwrap().close_reason.as_deref(),
+            Some("explicit")
+        );
+        assert_eq!(
+            store.get("stale-foreign").unwrap().state,
+            "open",
+            "the foreign record the stale id named must NOT be closed"
+        );
+    }
+
+    /// The redirect must be correct — and DETERMINISTIC — when the caller's
+    /// terminal carries more than one open row (the per-terminal single-open-row
+    /// invariant is enforced at open and at boot, never in between). It ranks
+    /// with `open_authority_key`, so a CONFIRMED row wins over a newer
+    /// unconfirmed one, and every candidate is named.
+    ///
+    /// A `find_open_by_terminal`-style single `.find()` over the `HashMap` would
+    /// close a nondeterministic row here — a worse failure than the silent
+    /// no-op it replaces, because it is not reproducible.
+    #[test]
+    fn record_close_checked_multi_match_closes_the_authoritative_row_deterministically() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        // Two open rows on ONE terminal. Built without `record_open`'s
+        // supersede arm (an `observed` UNCONFIRMED bind deliberately does not
+        // supersede — see `record_open_observed_unconfirmed_does_not_supersede`),
+        // which is how this population arises in production.
+        let mut confirmed = auth_on("real-confirmed", "term-dup");
+        confirmed.confirmed_at = Some(1_000);
+        confirmed.last_seen_at = 1_000;
+        store.record_open(confirmed);
+
+        let mut newer_unconfirmed = rec("phantom-newer");
+        newer_unconfirmed.terminal_id = "term-dup".to_string();
+        newer_unconfirmed.origin = Some(ORIGIN_OBSERVED.to_string());
+        store.record_open(newer_unconfirmed);
+
+        assert_eq!(
+            store
+                .open_records()
+                .iter()
+                .filter(|r| r.terminal_id == "term-dup")
+                .count(),
+            2,
+            "fixture precondition: the terminal really carries two open rows"
+        );
+
+        // Run it repeatedly on identical fixtures: the SAME row must win each
+        // time, regardless of HashMap iteration order.
+        for _ in 0..8 {
+            let dir = tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let mut confirmed = auth_on("real-confirmed", "term-dup");
+            confirmed.confirmed_at = Some(1_000);
+            confirmed.last_seen_at = 1_000;
+            store.record_open(confirmed);
+            let mut newer = rec("phantom-newer");
+            newer.terminal_id = "term-dup".to_string();
+            newer.origin = Some(ORIGIN_OBSERVED.to_string());
+            store.record_open(newer);
+
+            let outcome =
+                store.record_close_checked("no-such-session", Some("term-dup"), "explicit");
+
+            match outcome {
+                CloseOutcome::RedirectedAmbiguous {
+                    ref requested,
+                    ref closed,
+                    ref terminal_id,
+                    ref candidates,
+                } => {
+                    assert_eq!(requested, "no-such-session");
+                    assert_eq!(
+                        closed, "real-confirmed",
+                        "the CONFIRMED row outranks a newer unconfirmed one"
+                    );
+                    assert_eq!(terminal_id, "term-dup");
+                    assert_eq!(
+                        candidates,
+                        &vec!["phantom-newer".to_string(), "real-confirmed".to_string()],
+                        "every colliding row is named, in a deterministic order"
+                    );
+                }
+                other => panic!("expected RedirectedAmbiguous, got {other:?}"),
+            }
+            assert_eq!(store.get("real-confirmed").unwrap().state, "closed");
+            assert_eq!(
+                store.get("phantom-newer").unwrap().state,
+                "open",
+                "only the ranked winner closes"
+            );
+        }
+    }
+
+    /// A close that resolves to nothing mutates nothing, fires no observer, and
+    /// is reported as `NotFound` — never as a success.
+    #[test]
+    fn record_close_checked_not_found_mutates_nothing_and_fires_no_observer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let fired = std::sync::Arc::new(AtomicUsize::new(0));
+        {
+            let fired = fired.clone();
+            store.attach_close_observer(move |_| {
+                fired.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        store.record_open(auth_on("bystander", "term-bystander"));
+
+        let outcome = store.record_close_checked("unknown-sess", Some("term-gone"), "explicit");
+
+        assert_eq!(
+            outcome,
+            CloseOutcome::NotFound {
+                requested: "unknown-sess".to_string(),
+                terminal_id: Some("term-gone".to_string()),
+            }
+        );
+        assert_eq!(
+            store.get("bystander").unwrap().state,
+            "open",
+            "an unresolvable close must not fall back onto some other row"
+        );
+        assert_eq!(fired.load(Ordering::SeqCst), 0, "no observer on NotFound");
+    }
+
+    /// `expect_terminal_id == None` is byte-identical to the historical
+    /// csid-only close on the same fixture — the internal closers
+    /// (`poll-dead`, `never-started`, `no-terminal`, `migrated`) keep their
+    /// semantics exactly.
+    #[test]
+    fn record_close_checked_without_a_terminal_matches_legacy_record_close() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(auth_on("sess", "term-x"));
+
+        // Closes despite naming no terminal, and despite the row living on a
+        // terminal the caller never mentions.
+        assert_eq!(
+            store.record_close_checked("sess", None, "poll-dead"),
+            CloseOutcome::Closed {
+                claude_session_id: "sess".to_string()
+            }
+        );
+        assert_eq!(store.get("sess").unwrap().state, "closed");
+        assert_eq!(
+            store.get("sess").unwrap().close_reason.as_deref(),
+            Some("poll-dead")
+        );
+        // Repeat / absent closes stay no-ops.
+        assert_eq!(
+            store.record_close_checked("sess", None, "again"),
+            CloseOutcome::AlreadyClosed {
+                claude_session_id: "sess".to_string()
+            }
+        );
+        assert_eq!(
+            store.get("sess").unwrap().close_reason.as_deref(),
+            Some("poll-dead"),
+            "a repeat close does not re-stamp the reason"
+        );
+        assert_eq!(
+            store.record_close_checked("ghost", None, "x"),
+            CloseOutcome::NotFound {
+                requested: "ghost".to_string(),
+                terminal_id: None,
+            }
+        );
+    }
+
+    /// The provider-less-shell carve-out: a plain shell's provisional row is
+    /// retired `never-started` WHILE ITS TERMINAL IS ALIVE, by design. The
+    /// user then closes that tab. That must read as a benign repeat close of
+    /// this terminal's own record — not as a resolution failure, and above all
+    /// not as a redirect onto some other terminal's live session.
+    #[test]
+    fn record_close_checked_repeat_close_of_own_retired_row_is_already_closed() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(auth_on("bare-shell", "term-shell"));
+        store.record_open(auth_on("someone-else", "term-else"));
+        store.record_close("bare-shell", "never-started");
+
+        let outcome = store.record_close_checked("bare-shell", Some("term-shell"), "explicit");
+
+        assert_eq!(
+            outcome,
+            CloseOutcome::AlreadyClosed {
+                claude_session_id: "bare-shell".to_string()
+            }
+        );
+        assert_eq!(
+            store.get("bare-shell").unwrap().close_reason.as_deref(),
+            Some("never-started"),
+            "the by-design retirement reason is not overwritten"
+        );
+        assert_eq!(
+            store.get("someone-else").unwrap().state,
+            "open",
+            "a zero-open-row terminal must not redirect onto a neighbour"
+        );
+    }
+
+    /// Under a redirect the close observer must fire for the record ACTUALLY
+    /// closed, never the one requested — otherwise coord's row for the live
+    /// session is evicted while the dead one leaks.
+    #[test]
+    fn record_close_checked_redirect_fires_observer_with_the_redirected_to_id() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        {
+            let seen = seen.clone();
+            store.attach_close_observer(move |csid| seen.lock().unwrap().push(csid.to_string()));
+        }
+        store.record_open(auth_on("stale-foreign", "term-other"));
+        store.record_open(auth_on("live-real", "term-live"));
+
+        store.record_close_checked("stale-foreign", Some("term-live"), "pty-exit");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["live-real".to_string()],
+            "the observer sees the id that closed, not the id that was asked for"
+        );
     }
 
     #[test]
