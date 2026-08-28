@@ -174,6 +174,7 @@ pub mod compartments; // Workstream C: scoped wrappers around Arc<AppState> for 
 pub mod config;
 pub mod container_settings;
 pub mod context;
+pub mod cost_budget_settings; // get/save settings.cost_budget (per-run AI cost cap)
 pub mod cost_dashboard; // Cost dashboard with cache efficiency and phase breakdowns
 pub mod dag_workflows; // DAG workflow import, export, and validation
 pub mod database; // Database maintenance and optimization

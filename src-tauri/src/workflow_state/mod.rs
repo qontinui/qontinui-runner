@@ -40,7 +40,9 @@ mod progress;
 mod progress_parser;
 mod transitions;
 
-pub use checkpoint::{select_replayable, CheckpointManager, StepCheckpoint, StepCheckpointStatus};
+pub use checkpoint::{
+    in_stage, select_replayable, CheckpointManager, StepCheckpoint, StepCheckpointStatus,
+};
 pub use progress::StepProgressMarker;
 pub use progress_parser::{ParsedProgress, ProgressParser};
 pub mod progress_markers {

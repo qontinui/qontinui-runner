@@ -4442,6 +4442,35 @@ pub fn save_accessibility_settings(
     crate::config_facade::save_setting(accessibility_settings)
 }
 
+// ============================================================================
+// Cost Budget Settings
+// ============================================================================
+
+/// The per-run AI cost cap, **sanitized** — i.e. the budget a run will really
+/// enforce, not the raw bytes on disk.
+///
+/// Routed through [`crate::config_facade::get_setting`] rather than a direct
+/// `load_settings()` field read so this getter and every other settings
+/// section share one load path; the `SettingsField` impl for `TokenBudget`
+/// existed with no caller until this function.
+pub fn get_cost_budget_settings() -> crate::cost_management::budget::TokenBudget {
+    crate::config_facade::get_setting::<crate::cost_management::budget::TokenBudget>().sanitized()
+}
+
+/// Persist a new per-run AI cost cap.
+///
+/// Stores exactly what it is handed. The **caller** decides whether to
+/// sanitize first — [`crate::commands::cost_budget_settings`] does, so that a
+/// load-then-save round trip through the UI is a fixed point rather than a
+/// silent `phase_budgets` deletion; see that module for the reasoning.
+/// [`crate::cost_management::budget::TokenBudget::from_settings`] sanitizes
+/// again at use, which is what keeps a hand-edited `settings.json` safe.
+pub fn save_cost_budget_settings(
+    budget: crate::cost_management::budget::TokenBudget,
+) -> Result<(), String> {
+    crate::config_facade::save_setting(budget)
+}
+
 /// Get the current Self-Healing settings
 pub fn get_self_healing_settings() -> SelfHealingSettings {
     crate::config_facade::get_setting::<SelfHealingSettings>()

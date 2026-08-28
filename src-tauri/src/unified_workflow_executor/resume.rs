@@ -151,6 +151,31 @@ pub enum ResumePoint {
     CompletionPhase {
         /// Step index to resume from.
         from_step: usize,
+        /// Stage whose completion steps were running, or `None` for
+        /// **workflow-level** completion.
+        ///
+        /// Completion happens at two levels and the distinction is the whole
+        /// point of this field. `run_multi_stage` runs each stage's
+        /// `completion_*_steps` INSIDE the stage loop, journalling checkpoints
+        /// stamped with that stage; it then persists `completion_running`
+        /// ONCE, after the loop, for the workflow as a whole.
+        ///
+        /// So a `Some(k)` here means "stage `k`'s completion steps were in
+        /// flight", and resuming into stage `k` is right. `None` means the
+        /// stage loop had already finished — every stage is done, and the
+        /// checkpoint-derived stage would name the LAST stage that ran, not a
+        /// stage to re-enter. Carrying it there would resume into a stage that
+        /// had already emitted `stage_complete` and re-run its whole
+        /// verification/agentic loop, so the state-derived arm passes `None`
+        /// deliberately.
+        ///
+        /// `None` therefore still resolves to `start_from_stage = 0` — the
+        /// pre-existing behaviour, which re-enters every stage. Expressing
+        /// "past the last stage" needs the out-of-range handling that
+        /// `StageStart { from_stage: stages.len() }` (already produced by the
+        /// `stage_complete` arm) also lacks today; that is recorded as a
+        /// follow-up rather than guessed at here.
+        stage_index: Option<u32>,
     },
 
     /// Resume from a specific stage in a multi-stage workflow.
@@ -220,8 +245,15 @@ impl ResumePoint {
                     )
                 }
             }
-            ResumePoint::CompletionPhase { from_step } => {
-                format!("from completion phase, step {}", from_step)
+            ResumePoint::CompletionPhase {
+                from_step,
+                stage_index,
+            } => {
+                if let Some(si) = stage_index {
+                    format!("from completion phase, step {}, stage {}", from_step, si)
+                } else {
+                    format!("from completion phase, step {}", from_step)
+                }
             }
             ResumePoint::StageStart { from_stage } => {
                 format!("from stage {} start", from_stage)
@@ -481,7 +513,10 @@ impl ResumeManager {
                 iteration,
                 stage_index,
             },
-            "completion" => ResumePoint::CompletionPhase { from_step },
+            "completion" => ResumePoint::CompletionPhase {
+                from_step,
+                stage_index,
+            },
             other => {
                 warn!(
                     phase = %other,
@@ -614,6 +649,15 @@ impl ResumeManager {
                 let completed_count = completed_steps("completion", Some(0));
                 Ok(ResumePoint::CompletionPhase {
                     from_step: completed_count,
+                    // `None`, NOT `stage_index`. This state is persisted once
+                    // for the whole workflow, after the stage loop has
+                    // finished (`loop_controller`, right after the last
+                    // `stage_complete`), so the checkpoint-derived stage names
+                    // a stage that is already DONE. Carrying it would make
+                    // `start_from_stage` re-enter that stage and re-run its
+                    // verification/agentic loop from iteration 1. See the
+                    // variant's own docs.
+                    stage_index: None,
                 })
             }
 
@@ -954,8 +998,20 @@ mod tests {
             "from agentic phase, iteration 2"
         );
         assert_eq!(
-            ResumePoint::CompletionPhase { from_step: 0 }.description(),
+            ResumePoint::CompletionPhase {
+                from_step: 0,
+                stage_index: None
+            }
+            .description(),
             "from completion phase, step 0"
+        );
+        assert_eq!(
+            ResumePoint::CompletionPhase {
+                from_step: 2,
+                stage_index: Some(3)
+            }
+            .description(),
+            "from completion phase, step 2, stage 3"
         );
         assert_eq!(
             ResumePoint::StageStart { from_stage: 2 }.description(),
@@ -1131,7 +1187,13 @@ mod tests {
         .unwrap();
 
         match point {
-            ResumePoint::CompletionPhase { from_step } => assert_eq!(from_step, 1),
+            ResumePoint::CompletionPhase {
+                from_step,
+                stage_index,
+            } => {
+                assert_eq!(from_step, 1);
+                assert_eq!(stage_index, None);
+            }
             other => panic!("expected CompletionPhase, got {:?}", other),
         }
     }
@@ -1645,7 +1707,10 @@ mod tests {
                 iteration: 3,
                 stage_index: None,
             },
-            ResumePoint::CompletionPhase { from_step: 0 },
+            ResumePoint::CompletionPhase {
+                from_step: 0,
+                stage_index: None,
+            },
             ResumePoint::StageStart { from_stage: 2 },
         ] {
             assert_eq!(
