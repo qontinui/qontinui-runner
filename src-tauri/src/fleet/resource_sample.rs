@@ -411,9 +411,10 @@ async fn wsl_probe(args: &[&str]) -> Option<std::process::Output> {
     // the whole tree. Best-effort — on failure we still have `kill_on_drop`
     // plus the global job, i.e. strictly better than before.
     let _tree_job = {
-        let job = crate::job_object::ScopedKillOnCloseJob::create(None);
+        let job = qontinui_runner_win32::ScopedKillOnCloseJob::create(None);
         if let (Some(j), Some(handle)) = (job.as_ref(), child.raw_handle()) {
-            j.assign(handle as _);
+            // SAFETY: `handle` came from the live `child` this scope owns.
+            unsafe { j.assign(handle as _) };
         }
         job
     };
