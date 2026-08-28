@@ -99,21 +99,37 @@ interface WorkerRegisteredPayload {
   taskRunId: string;
 }
 
+/** Durable-close reasons a FRONTEND caller may record (both have a live tab). */
+export type FrontendCloseReason = "explicit" | "pty-exit";
+
 /**
  * Pure helper: resolve the durable session-CLOSE record args for a tab that is
- * being EXPLICITLY closed by the user. Returns `null` when the tab has no
- * `claudeSessionId` (a plain shell — nothing to record). Exported so the close-
- * recording contract can be unit-tested without booting React (vitest runs in
- * a `node` environment with no React Testing Library — see existing
- * `useTerminalManager.test.ts`).
+ * being closed — explicitly by the user, or because its pty exited. Returns
+ * `null` when the tab has no `claudeSessionId` (a plain shell — nothing to
+ * record). Exported so the close-recording contract can be unit-tested without
+ * booting React (vitest runs in a `node` environment with no React Testing
+ * Library — see existing `useTerminalManager.test.ts`).
+ *
+ * Carries BOTH halves of the key `terminal_session_record_open` binds. The
+ * `claudeSessionId` alone is not a safe close target: it is a real, correctly
+ * minted id, but it is not guaranteed to key the record for *this* terminal —
+ * a provisional spawn-seam id, a restored id whose pty was respawned under a
+ * fresh `--session-id`, or a `reconciled` freshest-mtime bind that "may be
+ * foreign" all typecheck here. The backend cross-checks the pair and closes the
+ * record the terminal actually owns.
+ *
+ * `terminalId` is sourced from `closing.id`, not from the `id` parameter: they
+ * are equal by the `find` predicate, and reading it off the found tab makes
+ * that provenance explicit rather than incidental.
  */
 export function buildSessionCloseRecord(
   tabs: TerminalTab[],
   id: string,
-): { claudeSessionId: string; reason: "explicit" } | null {
+  reason: FrontendCloseReason = "explicit",
+): { claudeSessionId: string; terminalId: string; reason: FrontendCloseReason } | null {
   const closing = tabs.find((t) => t.id === id);
   if (!closing?.claudeSessionId) return null;
-  return { claudeSessionId: closing.claudeSessionId, reason: "explicit" };
+  return { claudeSessionId: closing.claudeSessionId, terminalId: closing.id, reason };
 }
 
 /**
