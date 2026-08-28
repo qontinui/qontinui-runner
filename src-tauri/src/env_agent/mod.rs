@@ -71,6 +71,27 @@ use self::collectors::Section;
 use self::config::EnvAgentConfig;
 
 /// Current envelope schema version. Must match the backend's expectation.
+///
+/// **P4 deliberately does NOT bump this**, and the reason is stronger than
+/// "removing a key is backward-compatible". qontinui-web's drift service
+/// (`app/services/devenv_drift.py`) treats ANY difference between the two
+/// envelopes' `schema_version` as `schema_version_mismatch`, which forces the
+/// whole report to `critical` and clears `in_sync` regardless of the per-key
+/// deltas. A fleet upgrades one box at a time, so a bump would mark every
+/// machine that has not upgraded yet — and every machine that has, against a
+/// canonical that has not — critically drifted on every section, for the whole
+/// rollout window. That is a fleet-wide false alarm in exchange for a signal
+/// nothing consumes: the backend stores and echoes this number but validates no
+/// required field set against it (`sections` is a free-form
+/// `dict[str, dict[str, str]]`, `app/schemas/devenv.py`).
+///
+/// What retiring `database_url` does cost is one transient per-key delta: a
+/// canonical capture taken before P4 still carries `services.database_url`, so
+/// a post-P4 box reads `removed` there until the canonical box re-captures.
+/// That is the rollout step §8 of the plan already prescribes, and it clears
+/// itself — unlike a version mismatch, which nothing but a fleet-wide upgrade
+/// can clear. The key is NOT named in `unknown_keys` to soften it: `unknown`
+/// means "this box could not measure it", and a retired key was not unmeasured.
 const SCHEMA_VERSION: u32 = 1;
 
 /// Wire shape of the capture envelope (`PUT .../config` body).
