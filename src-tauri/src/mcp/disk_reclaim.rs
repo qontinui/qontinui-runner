@@ -84,7 +84,9 @@ pub fn routes() -> Router<Arc<ApiState>> {
 ///     "census_build_ms": 88231,
 ///     "census_refreshing": false,
 ///     "census_note": "Disk state as of 3m 34s ago, from an 88231 ms walk of …",
-///     "scan": { "dirs_visited": 41022, "truncated": false, "read_errors": [],
+///     "scan": { "dirs_visited": 41022, "truncated": false,
+///               // A capped SAMPLE; `read_errors_total` is the real count.
+///               "read_errors": [], "read_errors_total": 0,
 ///               "roots_with_unknown_bytes": 0, "roots_with_partial_bytes": 0 } } }
 /// ```
 ///

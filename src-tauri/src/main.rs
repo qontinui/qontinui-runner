@@ -1119,6 +1119,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // DRY-RUN by default (logs "would reap"); armed via
                 // COORD_ORPHAN_TARGET_REAP_ENABLED. Default 900s cadence
                 // (QONTINUI_ORPHAN_TARGET_INTERVAL_SECS). No coord round-trip.
+                // Instance-gated like spawn_disk_surveyor below: since Phase 2
+                // this cycle runs the SAME machine-wide depth-bounded walk the
+                // reclaim preview publishes, four times as often — ungated,
+                // every secondary and every supervisor-spawned temp runner ran
+                // its own full-machine sizing walk every 15 minutes, and once
+                // the arming flag is flipped they would race each other over
+                // the same paths.
                 agent_worktree::orphan_target_reaper::spawn_orphan_reaper();
                 // Ξ_Disk monitoring (plan 2026-08-07-product-disk-monitoring-
                 // and-cleanup, Phase 1) — the free-space sample, DECOUPLED
