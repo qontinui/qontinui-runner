@@ -725,23 +725,8 @@ impl LoopController {
 
         let total_stages = config.stages.len();
 
-        // Determine which stage to start from based on resume point
-        let start_from_stage = match resume_point {
-            ResumePoint::StageStart { from_stage } => *from_stage as usize,
-            ResumePoint::VerificationPhase {
-                stage_index: Some(si),
-                ..
-            } => *si as usize,
-            ResumePoint::AgenticPhase {
-                stage_index: Some(si),
-                ..
-            } => *si as usize,
-            ResumePoint::SetupPhase {
-                stage_index: Some(si),
-                ..
-            } => *si as usize,
-            _ => 0,
-        };
+        // Determine which stage to start from based on resume point.
+        let start_from_stage = start_stage_for(resume_point);
 
         if start_from_stage > 0 {
             info!(
@@ -1291,19 +1276,12 @@ impl LoopController {
                     stage_num, stage.max_iterations
                 );
 
-                let (stage_starting_iter, stage_agentic_first) = if stage_idx == start_from_stage {
-                    match resume_point {
-                        ResumePoint::VerificationPhase { iteration, .. } => {
-                            (iteration.saturating_sub(1), false)
-                        }
-                        ResumePoint::AgenticPhase { iteration, .. } => {
-                            (iteration.saturating_sub(1), true)
-                        }
-                        _ => (0, config.run_agentic_first && stage_idx == 0),
-                    }
-                } else {
-                    (0, false)
-                };
+                let (stage_starting_iter, stage_agentic_first) = stage_loop_entry_for(
+                    resume_point,
+                    stage_idx,
+                    start_from_stage,
+                    config.run_agentic_first,
+                );
                 let mut stage_loop_config = LoopConfig {
                     max_iterations: stage.max_iterations,
                     base_prompt: config.base_prompt.clone(),
@@ -3352,3 +3330,240 @@ pub(crate) fn build_phase_result_from_steps(
 
 // Health monitoring utilities extracted to health_monitor module
 pub(super) use super::health_monitor::build_resume_agentic_context;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Resume-point → stage/iteration derivation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Which stage of a multi-stage workflow a resumed run re-enters at.
+///
+/// Every stage BELOW the returned index is skipped entirely, so a variant that
+/// silently yields `0` does not merely lose precision — it re-runs each earlier
+/// stage from the top. The setup/agentic/completion steps of those stages do
+/// replay from the journal, but verification is deliberately outside the replay
+/// set (a verification result is a measurement of a world the resumed process
+/// never observed), so they genuinely re-execute.
+///
+/// The match is **exhaustive on purpose**. Before plan
+/// `2026-08-20-workflow-resume-reexecutes-and-rebills` Phase 1 restored
+/// state-based resume, only `FromStart` and `VerificationPhase` were
+/// constructible at runtime; the rest became reachable without gaining a
+/// consumer here, and a `_ => 0` catch-all is exactly what let that pass
+/// unnoticed. A new `ResumePoint` variant must now be a compile error rather
+/// than a silent stage 0.
+///
+/// **`ApprovalPhase` is coverage, not a fix for an observed failure.** Both
+/// writers of `approval_pending` sit behind `LoopConfig::blocking_approval`,
+/// and `run_multi_stage` hardcodes that to `false` on the per-stage config it
+/// builds — as does every other production construction site — so no live run
+/// persists that state today and the variant is reachable only from tests.
+/// Listing it is what makes the derivation total; the day `blocking_approval`
+/// becomes settable, the arm is already right.
+///
+/// `CompletionPhase` carries a stage only on the checkpoints-derived path,
+/// where it names the stage whose completion steps were in flight. The
+/// state-derived path passes `None` on purpose — see the variant's own docs in
+/// `resume.rs`.
+fn start_stage_for(resume_point: &ResumePoint) -> usize {
+    match resume_point {
+        ResumePoint::StageStart { from_stage } => *from_stage as usize,
+        ResumePoint::VerificationPhase {
+            stage_index: Some(si),
+            ..
+        }
+        | ResumePoint::AgenticPhase {
+            stage_index: Some(si),
+            ..
+        }
+        | ResumePoint::SetupPhase {
+            stage_index: Some(si),
+            ..
+        }
+        | ResumePoint::ApprovalPhase {
+            stage_index: Some(si),
+            ..
+        }
+        | ResumePoint::CompletionPhase {
+            stage_index: Some(si),
+            ..
+        } => *si as usize,
+        ResumePoint::FromStart
+        | ResumePoint::VerificationPhase { .. }
+        | ResumePoint::AgenticPhase { .. }
+        | ResumePoint::SetupPhase { .. }
+        | ResumePoint::ApprovalPhase { .. }
+        | ResumePoint::CompletionPhase { .. } => 0,
+    }
+}
+
+/// Where one stage's verification/agentic loop re-enters: `(starting_iteration,
+/// run_agentic_first)`.
+///
+/// `starting_iteration` is 0-based, hence the `saturating_sub(1)` on the
+/// 1-based iteration a resume point carries. Only the stage the run is actually
+/// resuming INTO inherits the resume point; later stages start clean.
+///
+/// `ApprovalPhase` re-enters its own iteration rather than iteration 1, which
+/// is where the catch-all sent it.
+///
+/// It re-enters **verification-first**, and that is a trade rather than a
+/// derivation, because the persisted state cannot tell the two gates apart.
+/// `loop_handlers` raises one from the fix-escalation path (after that
+/// iteration's verification failed) and one from `handle_approval_gate` (after
+/// the agentic phase); both persist the same `approval_pending` carrying
+/// `ctx.iteration`, and `states.rs` maps both to phase `"agentic"`.
+/// Verification-first is the safe side of that ambiguity: verification is
+/// outside the replay set precisely because re-observing costs no AI tokens,
+/// while the agentic steps of a re-entered iteration replay from their journal
+/// rather than re-billing. Neither gate is reachable in production today
+/// anyway — see [`start_stage_for`].
+fn stage_loop_entry_for(
+    resume_point: &ResumePoint,
+    stage_idx: usize,
+    start_from_stage: usize,
+    run_agentic_first: bool,
+) -> (u32, bool) {
+    if stage_idx != start_from_stage {
+        return (0, false);
+    }
+    match resume_point {
+        ResumePoint::VerificationPhase { iteration, .. } => (iteration.saturating_sub(1), false),
+        ResumePoint::AgenticPhase { iteration, .. } => (iteration.saturating_sub(1), true),
+        ResumePoint::ApprovalPhase { iteration, .. } => (iteration.saturating_sub(1), false),
+        ResumePoint::FromStart
+        | ResumePoint::SetupPhase { .. }
+        | ResumePoint::CompletionPhase { .. }
+        | ResumePoint::StageStart { .. } => (0, run_agentic_first && stage_idx == 0),
+    }
+}
+
+#[cfg(test)]
+mod resume_derivation_tests {
+    use super::*;
+
+    #[test]
+    fn every_stage_carrying_variant_resolves_its_stage() {
+        assert_eq!(
+            start_stage_for(&ResumePoint::SetupPhase {
+                from_step: 0,
+                stage_index: Some(2),
+            }),
+            2
+        );
+        assert_eq!(
+            start_stage_for(&ResumePoint::VerificationPhase {
+                iteration: 5,
+                from_step: 1,
+                stage_index: Some(3),
+            }),
+            3
+        );
+        assert_eq!(
+            start_stage_for(&ResumePoint::AgenticPhase {
+                iteration: 5,
+                stage_index: Some(4),
+            }),
+            4
+        );
+        assert_eq!(
+            start_stage_for(&ResumePoint::StageStart { from_stage: 6 }),
+            6
+        );
+    }
+
+    /// The two variants plan `2026-08-20-workflow-resume-reexecutes-and-rebills`
+    /// made constructible without wiring a consumer. Before this, both fell to
+    /// the `_ => 0` catch-all and re-ran every earlier stage.
+    #[test]
+    fn approval_and_completion_no_longer_discard_their_stage() {
+        assert_eq!(
+            start_stage_for(&ResumePoint::ApprovalPhase {
+                iteration: 7,
+                stage_index: Some(2),
+                approval_id: "appr-1".to_string(),
+            }),
+            2
+        );
+        assert_eq!(
+            start_stage_for(&ResumePoint::CompletionPhase {
+                from_step: 3,
+                stage_index: Some(5),
+            }),
+            5
+        );
+    }
+
+    #[test]
+    fn a_single_stage_workflow_and_a_fresh_start_both_resolve_to_stage_zero() {
+        assert_eq!(start_stage_for(&ResumePoint::FromStart), 0);
+        assert_eq!(
+            start_stage_for(&ResumePoint::VerificationPhase {
+                iteration: 4,
+                from_step: 0,
+                stage_index: None,
+            }),
+            0
+        );
+        assert_eq!(
+            start_stage_for(&ResumePoint::ApprovalPhase {
+                iteration: 4,
+                stage_index: None,
+                approval_id: String::new(),
+            }),
+            0
+        );
+        assert_eq!(
+            start_stage_for(&ResumePoint::CompletionPhase {
+                from_step: 0,
+                stage_index: None,
+            }),
+            0
+        );
+    }
+
+    /// A crashed approval gate must re-enter ITS iteration, not iteration 1 —
+    /// and verification-first, because the gate was raised about a verification
+    /// result that iteration had already produced.
+    #[test]
+    fn an_approval_gate_re_enters_its_own_iteration_verification_first() {
+        let point = ResumePoint::ApprovalPhase {
+            iteration: 7,
+            stage_index: Some(2),
+            approval_id: "appr-1".to_string(),
+        };
+        assert_eq!(stage_loop_entry_for(&point, 2, 2, false), (6, false));
+    }
+
+    #[test]
+    fn only_the_resumed_stage_inherits_the_resume_point() {
+        let point = ResumePoint::AgenticPhase {
+            iteration: 7,
+            stage_index: Some(2),
+        };
+        assert_eq!(stage_loop_entry_for(&point, 2, 2, false), (6, true));
+        // A later stage starts clean, agentic-first off.
+        assert_eq!(stage_loop_entry_for(&point, 3, 2, true), (0, false));
+    }
+
+    /// `run_agentic_first` is a stage-0-only fresh-run setting, and a resume
+    /// point that names an iteration overrides it.
+    #[test]
+    fn run_agentic_first_applies_only_to_a_fresh_stage_zero() {
+        assert_eq!(
+            stage_loop_entry_for(&ResumePoint::FromStart, 0, 0, true),
+            (0, true)
+        );
+        assert_eq!(
+            stage_loop_entry_for(
+                &ResumePoint::CompletionPhase {
+                    from_step: 0,
+                    stage_index: Some(1),
+                },
+                1,
+                1,
+                true
+            ),
+            (0, false)
+        );
+    }
+}

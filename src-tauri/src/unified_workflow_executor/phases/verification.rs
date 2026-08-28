@@ -14,7 +14,7 @@ use crate::step_executor::{
 use crate::step_metadata::{StepDetails, StepMetadata};
 use crate::step_registry::{StepEventKind, StepEventLogger};
 use crate::step_types::StepType;
-use crate::workflow_state::{CheckpointManager, StepCheckpoint};
+use crate::workflow_state::{in_stage, CheckpointManager, StepCheckpoint};
 use crate::AppState;
 
 use super::super::phase_configs::{VerificationConfig, VerificationResult};
@@ -177,12 +177,22 @@ impl VerificationExecutor {
         );
         match checkpoint_mgr.get_completed_steps(execution_id, "verification", Some(iteration)) {
             Ok(prior) => {
-                let already_journalled =
-                    prior.iter().filter(|cp| cp.status.is_replayable()).count();
+                // Stage-scoped for the same reason the replay and narration
+                // readers are: `(execution_id, phase, iteration)` is NOT
+                // unique — `stage_index` is part of the table's uniqueness
+                // key, and every stage of a multi-stage workflow writes the
+                // same `(iteration, step_index)` pairs. A stage-blind count
+                // here reported stage 0's rows as this stage's, so a stage
+                // that had journalled nothing still announced steps it was
+                // about to "RE-OBSERVE".
+                let already_journalled = prior
+                    .iter()
+                    .filter(|cp| in_stage(cp, stage_index) && cp.status.is_replayable())
+                    .count();
                 if already_journalled > 0 {
                     info!(
-                        "VERIFICATION-PHASE: {} step(s) of iteration {} are journalled as complete and will be RE-OBSERVED (a verification result is a measurement, not a reusable output)",
-                        already_journalled, iteration
+                        "VERIFICATION-PHASE: {} step(s) of iteration {} (stage {:?}) are journalled as complete and will be RE-OBSERVED (a verification result is a measurement, not a reusable output)",
+                        already_journalled, iteration, stage_index
                     );
                 }
             }

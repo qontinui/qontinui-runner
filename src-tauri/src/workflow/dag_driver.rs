@@ -604,6 +604,14 @@ pub fn dag_result_to_workflow_result(
 /// any other node its replay — an execution-wide prune used to delete the
 /// whole upstream DAG's completions.
 ///
+/// The `until_bash` verdicts are **exempt** from that prune
+/// ([`loop_condition_prefix`]). Re-running a discarded body node redoes work
+/// and lands in a comparable state; re-evaluating a discarded condition is a
+/// control-flow decision taken against a world the original run never saw, so
+/// the loop can end at a different iteration. Those two are not the same
+/// trade, and the verdict rows are small enough that keeping them costs
+/// nothing measurable against the body rows the prune is for.
+///
 /// Setting `commit_interval` to 0 (the default) disables pruning entirely and
 /// keeps full replay fidelity.
 ///
@@ -732,31 +740,67 @@ async fn execute_loop_node(
 
         // Check until_bash: exit code 0 means the termination condition is met.
         if let Some(ref bash_cmd) = node_def.until_bash {
-            // On Windows, bare "bash" resolves via PATH and often lands on
-            // WSL's C:\Windows\System32\bash.exe, which errors with
-            // `execvpe(/bin/bash) failed` when no WSL distro is installed.
-            // Route through ShellCommandHandler so we get Git Bash with
-            // MSYS /usr/bin on PATH; on non-Windows the "bash" binary is
-            // available on the standard shell PATH so bare invocation is
-            // fine.
-            #[cfg(target_os = "windows")]
-            let exit_code = {
-                let (_bash_path, mut c) = crate::step_executor::handlers::shell_command::ShellCommandHandler::spawn_git_bash_with_msys_path();
-                c.args(["-c", bash_cmd])
-                    .status()
-                    .await
-                    .map(|s| s.code().unwrap_or(1))
-                    .unwrap_or(1)
-            };
-            #[cfg(not(target_os = "windows"))]
-            let exit_code = crate::process_helpers::tokio_no_window("bash")
-                .arg("-c")
-                .arg(bash_cmd)
-                .status()
+            let condition_key = loop_condition_journal_key(node_id, iteration);
+
+            // -- Crash-recovery replay of the LOOP CONDITION --------------
+            // This sits after the body-replay `continue`s, so before it was
+            // journaled a resumed loop re-ran `until_bash` once per already
+            // completed iteration. That is not a cosmetic duplicate: it is an
+            // arbitrary shell command with side effects, and it is evaluated
+            // against the CURRENT world rather than the one the original run
+            // saw. A condition that was false at iteration 3 then can be true
+            // at iteration 3 now, breaking the loop where the original never
+            // stopped -- a resumed run that reaches a different end state is
+            // not a replay of anything.
+            let replayed_verdict = match pg_db
+                .event_log_node_completed(execution_id, &condition_key)
                 .await
-                .map(|s| s.code().unwrap_or(1))
-                .unwrap_or(1);
-            if exit_code == 0 {
+            {
+                Ok(Some(recorded)) => recorded.get("met").and_then(|v| v.as_bool()),
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(
+                        node_id,
+                        iteration,
+                        error = %e,
+                        "Loop condition replay lookup failed — until_bash will be re-evaluated"
+                    );
+                    None
+                }
+            };
+
+            let condition_met = match replayed_verdict {
+                Some(met) => {
+                    info!(
+                        node_id,
+                        iteration,
+                        met,
+                        journal_key = %condition_key,
+                        "Replaying journalled until_bash verdict from event log (crash recovery)"
+                    );
+                    met
+                }
+                None => {
+                    let exit_code = run_until_bash(bash_cmd).await;
+                    let met = exit_code == 0;
+                    journal_append(
+                        pg_db,
+                        execution_id,
+                        &condition_key,
+                        EventType::Completed,
+                        Some(&json!({
+                            "met": met,
+                            "exit_code": exit_code,
+                            "loop_node_id": node_id,
+                            "iteration": iteration,
+                        })),
+                    )
+                    .await;
+                    met
+                }
+            };
+
+            if condition_met {
                 info!(
                     node_id,
                     iteration, "Loop until_bash condition met — breaking"
@@ -772,7 +816,12 @@ async fn execute_loop_node(
             match pg_db.event_log_latest_cursor(execution_id).await {
                 Ok(cursor) => {
                     if let Err(e) = pg_db
-                        .event_log_prune_before(execution_id, node_id, cursor)
+                        .event_log_prune_before(
+                            execution_id,
+                            node_id,
+                            cursor,
+                            Some(&loop_condition_prefix(node_id)),
+                        )
                         .await
                     {
                         warn!(
@@ -827,6 +876,72 @@ const JOURNAL_APPEND_ATTEMPTS: u32 = 3;
 /// the subtree that `event_log_prune_before` scopes a checkpoint prune to.
 fn loop_body_journal_key(loop_node_id: &str, iteration: u32, body_node_id: &str) -> String {
     format!("{}/iter{}/{}", loop_node_id, iteration, body_node_id)
+}
+
+/// The key subtree holding one loop's `until_bash` verdicts.
+///
+/// Passed to `event_log_prune_before` as its exemption, so the commit-interval
+/// prune bounds body rows without discarding the loop's control flow.
+fn loop_condition_prefix(loop_node_id: &str) -> String {
+    format!("{}/until/", loop_node_id)
+}
+
+/// Journal key for one iteration's `until_bash` verdict.
+///
+/// Deliberately `"<loop_id>/until/iter<N>"` and NOT
+/// `"<loop_id>/iter<N>/until"`. Node ids are workflow-authored, so the second
+/// shape is exactly the body key of a body node someone named `until`, and the
+/// two would share a row. Putting the literal segment where
+/// [`loop_body_journal_key`] always writes `iter<N>` removes that collision for
+/// every id **that contains no `/`**, since `"until"` is never `"iter<N>"`,
+/// while keeping the key inside the `"<loop_id>/"` subtree the prune scopes to.
+///
+/// It is NOT collision-proof for ids that do contain a `/` — loop `"L"` with a
+/// body node `"until/iter3"` and a second loop named `"L/iter0"` both produce
+/// `"L/iter0/until/iter3"`. Nothing validates node-id characters
+/// (`dag_parser` checks existence and discriminators only), so this is an
+/// assumption, not a guarantee. It is also not a NEW assumption: the prune's
+/// own `"<node_id>/"` scope already reads a `/` in an id as nesting. Both
+/// directions of that collision degrade to a re-execute rather than a wrong
+/// answer — the verdict lookup finds no `"met"` and re-evaluates, the body
+/// lookup finds no `"output"` and re-runs — but a workflow-definition-time
+/// rejection of `/` in node ids would close it properly.
+fn loop_condition_journal_key(loop_node_id: &str, iteration: u32) -> String {
+    format!("{}iter{}", loop_condition_prefix(loop_node_id), iteration)
+}
+
+/// Evaluate a loop's `until_bash` command and return its exit code.
+///
+/// Extracted so the journal-replay branch above reads as one decision. A
+/// command that cannot be spawned at all yields `1` -- "condition not met" --
+/// which continues the loop rather than breaking it on an infrastructure
+/// failure, matching the pre-existing behaviour.
+async fn run_until_bash(bash_cmd: &str) -> i32 {
+    // On Windows, bare "bash" resolves via PATH and often lands on
+    // WSL's C:\Windows\System32\bash.exe, which errors with
+    // `execvpe(/bin/bash) failed` when no WSL distro is installed.
+    // Route through ShellCommandHandler so we get Git Bash with
+    // MSYS /usr/bin on PATH; on non-Windows the "bash" binary is
+    // available on the standard shell PATH so bare invocation is
+    // fine.
+    #[cfg(target_os = "windows")]
+    let exit_code = {
+        let (_bash_path, mut c) = crate::step_executor::handlers::shell_command::ShellCommandHandler::spawn_git_bash_with_msys_path();
+        c.args(["-c", bash_cmd])
+            .status()
+            .await
+            .map(|s| s.code().unwrap_or(1))
+            .unwrap_or(1)
+    };
+    #[cfg(not(target_os = "windows"))]
+    let exit_code = crate::process_helpers::tokio_no_window("bash")
+        .arg("-c")
+        .arg(bash_cmd)
+        .status()
+        .await
+        .map(|s| s.code().unwrap_or(1))
+        .unwrap_or(1);
+    exit_code
 }
 
 /// Append an event to the workflow journal, retrying briefly and **never**
@@ -936,6 +1051,71 @@ mod tests {
             loop_body_journal_key("deploy", 0, "compile"),
             "two loops sharing a body node must not share a journal key"
         );
+    }
+
+    #[test]
+    fn loop_condition_journal_key_distinguishes_iterations_and_loops() {
+        assert_eq!(loop_condition_journal_key("build", 3), "build/until/iter3");
+        assert_ne!(
+            loop_condition_journal_key("build", 3),
+            loop_condition_journal_key("build", 4),
+        );
+        assert_ne!(
+            loop_condition_journal_key("build", 3),
+            loop_condition_journal_key("deploy", 3),
+        );
+    }
+
+    /// The condition key must be prune-scoped like every other loop key,
+    /// otherwise a long loop's `until_bash` verdicts grow without bound.
+    #[test]
+    fn loop_condition_journal_key_is_nested_under_the_loop_node_prefix() {
+        assert!(loop_condition_journal_key("build", 12).starts_with("build/"));
+        assert!(!"build-other".starts_with("build/"));
+    }
+
+    /// A body node may be named anything a workflow author types, `until`
+    /// included. If the condition key were `"<loop>/iter<N>/until"` the two
+    /// would share a journal row, and the loop would replay a body node's
+    /// output as its own break verdict.
+    #[test]
+    fn loop_condition_key_cannot_collide_with_any_body_key() {
+        let condition = loop_condition_journal_key("build", 3);
+        for iteration in 0..64u32 {
+            for body in ["until", "iter3", "compile", "3", ""] {
+                assert_ne!(
+                    condition,
+                    loop_body_journal_key("build", iteration, body),
+                    "body node {:?} at iteration {} collided with the condition key",
+                    body,
+                    iteration
+                );
+            }
+        }
+    }
+
+    /// The verdict keys must sit under the exemption prefix the prune is
+    /// given, and no body key may — otherwise either the verdicts get pruned
+    /// (and the loop can end at a different iteration on resume) or the body
+    /// rows stop being pruned (and the prune stops bounding anything).
+    #[test]
+    fn the_prune_exemption_covers_the_verdicts_and_only_the_verdicts() {
+        let keep = loop_condition_prefix("build");
+        for iteration in 0..64u32 {
+            assert!(
+                loop_condition_journal_key("build", iteration).starts_with(&keep),
+                "verdict for iteration {} is outside the exemption",
+                iteration
+            );
+            for body in ["compile", "test", "until", "iter3", ""] {
+                assert!(
+                    !loop_body_journal_key("build", iteration, body).starts_with(&keep),
+                    "body node {:?} at iteration {} is exempt from the prune",
+                    body,
+                    iteration
+                );
+            }
+        }
     }
 
     /// The checkpoint prune is scoped to `"<loop_id>"` plus its `"<loop_id>/"`
