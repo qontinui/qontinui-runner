@@ -81,6 +81,7 @@ import { type ZoneSessionInfo } from "../zoneProfileStorage";
 import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
 import { decideColdResume } from "../useTerminalInitialization";
+import { noteRecordedZone, recordedZoneLedgerFor } from "../sessionRecordArgs";
 
 import { useSessionStateTracking } from "../useSessionStateTracking";
 import { useOutputSnapshots } from "../useOutputSnapshots";
@@ -390,6 +391,12 @@ const PageSessionScope = memo(function PageSessionScope({
         // Durable-registry OPEN at type time (#548 Phase 1): `--resume` names
         // the exact id in the typed command — no transcript guess.
         const resumedTab = tabs.find((t) => t.id === tabId);
+        // Note the zone we are about to WRITE so the re-resolution backstop in
+        // `TerminalPage` only fires if the tab ends up somewhere else (e.g. the
+        // profile's zone was out of range for the live layout and the tab got
+        // compacted elsewhere) — and stays silent when the profile placement
+        // holds.
+        noteRecordedZone(recordedZoneLedgerFor(pageId), s.claudeSessionId, s.zoneIndex);
         invoke("terminal_session_record_open", {
           claudeSessionId: s.claudeSessionId,
           configDir: s.claudeConfigDir,

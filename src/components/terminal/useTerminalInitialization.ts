@@ -15,7 +15,7 @@ import type { TerminalTab } from "./useTerminalManager";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse, TerminalSessionRecord } from "./types";
 import type { SaveSessionLayoutParams } from "./useSessionPersistence";
-import type { SessionOpenArgs } from "./sessionRecordArgs";
+import { noteRecordedZone, recordedZoneLedgerFor, type SessionOpenArgs } from "./sessionRecordArgs";
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { loadKnownPageIds } from "./useTerminalPages";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
@@ -227,6 +227,21 @@ export async function runVerifiedResume(params: {
       invoke("terminal_session_record_open", { ...recordOpen }).catch((err) => {
         console.warn(`[TerminalPage] re-record open failed for ${claudeSessionId}:`, err);
       });
+      // This payload was frozen at restore time, so its `zoneIndex` is the one
+      // the RECORD carried before the restore — including a stale `-1` for a
+      // session that has since been auto-filled into a real zone. Rather than
+      // resolve the zone here (the drain has no live view of the assignments),
+      // tell the page's recorded-zone ledger what we just wrote: clearing
+      // `isReconnecting` below mutates `tabs`, which re-runs the re-resolution
+      // backstop in `TerminalPage`, which sees the disagreement and corrects
+      // the record. Ordering-safe in both directions — whichever of the two
+      // writes lands last, the ledger disagrees with reality until a correction
+      // is emitted.
+      noteRecordedZone(
+        recordedZoneLedgerFor(recordOpen.pageId),
+        claudeSessionId,
+        recordOpen.zoneIndex,
+      );
     }
     // Release the liveness-poll restore guard so normal classification
     // resumes for this session.
@@ -998,6 +1013,19 @@ export function useTerminalInitialization({
           //    refreshed `lastSeenAt` on ghost rows, making them immortal).
           const tabId = await createTerminal(rec.title, rec.workingDir);
           if (!tabId) continue;
+          // A record with no recorded zone (`UNZONED_INDEX`) is NOT force-placed
+          // here, and is deliberately not clamped to zone 0: zone 0 belongs to
+          // whichever tab actually holds it, and `assignTabToZone` RESERVES the
+          // zone it is given, so inventing one would let an unplaced record
+          // steal the zone a later record legitimately claims (the exact
+          // creation-order bug the reservation machinery exists to prevent).
+          // The tab still lands in a zone — `reconcileAssignments` auto-fills
+          // every unassigned tab into the first non-reserved empty zone — and
+          // the recorded `-1` is then corrected by the re-resolution backstop
+          // in `TerminalPage` (auto-resume rows, via the ledger note in
+          // `runVerifiedResume`). What is NOT done is re-asserting the record
+          // from here: that refreshes `last_seen_at` and is what made ghost
+          // rows immortal.
           if (rec.zoneIndex >= 0) {
             zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
             applyZoneCosmetics(rec.zoneIndex);
