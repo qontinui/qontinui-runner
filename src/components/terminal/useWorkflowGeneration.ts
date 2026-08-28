@@ -15,6 +15,21 @@ interface GenerateWorkflowResponse {
   workflow?: UnifiedWorkflow;
 }
 
+/**
+ * What {@link UseWorkflowGenerationResult.handleGenerateFromLatestSession}
+ * actually achieved.
+ *
+ * It used to return `Promise<void>`, which meant its two failure arms (no
+ * Claude Code session for this project; the detection call threw) were
+ * visible only as a toast — every programmatic caller, `/generate`
+ * included, reported unconditional success. The outcome is typed so a
+ * caller can surface the real verdict; the toast stays for the button
+ * path.
+ */
+export type GenerateFromLatestOutcome =
+  | { ok: true; sessionId: string }
+  | { ok: false; code: "no-session" | "detect-failed"; message: string };
+
 interface UseWorkflowGenerationParams {
   activeId: string | null;
   tabs: Array<{
@@ -43,7 +58,9 @@ interface UseWorkflowGenerationResult {
   isPlanLoading: boolean;
   rightPanelMode: "transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null;
   setRightPanelMode: React.Dispatch<
-    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
+    React.SetStateAction<
+      "transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null
+    >
   >;
   showSidebar: boolean;
   setShowSidebar: React.Dispatch<React.SetStateAction<boolean>>;
@@ -53,7 +70,7 @@ interface UseWorkflowGenerationResult {
   loadingMessages: boolean;
   // Callbacks
   runGeneration: (description: string, inlineContext: string) => Promise<void>;
-  handleGenerateFromLatestSession: () => Promise<void>;
+  handleGenerateFromLatestSession: () => Promise<GenerateFromLatestOutcome>;
   handleGenerateFromTranscript: (desc: string, ctx: string) => Promise<void>;
   handleGenerateAndRunFromTranscript: (desc: string, ctx: string) => Promise<void>;
   handleExecute: () => Promise<void>;
@@ -205,36 +222,35 @@ export function useWorkflowGeneration({
 
   // ── Generate from active or latest session ──────────────────────────────────
 
-  const handleGenerateFromLatestSession = useCallback(async () => {
-    const activeTab = tabs.find((t) => t.id === activeId);
+  const handleGenerateFromLatestSession =
+    useCallback(async (): Promise<GenerateFromLatestOutcome> => {
+      const activeTab = tabs.find((t) => t.id === activeId);
 
-    if (activeTab?.claudeSessionId) {
-      setShowSidebar(true);
-      await handleSelectTranscriptSession(activeTab.claudeSessionId);
-      return;
-    }
-
-    try {
-      const result = await invoke<CommandResponse>("transcript_get_latest", {
-        projectPath: activeTab?.workingDir ?? null,
-      });
-      if (result.success && result.data) {
-        const session = result.data as { session_id: string };
+      if (activeTab?.claudeSessionId) {
         setShowSidebar(true);
-        await handleSelectTranscriptSession(session.session_id);
-      } else {
-        setNotification({
-          message: "No Claude Code sessions found for this project",
-          type: "error",
-        });
+        await handleSelectTranscriptSession(activeTab.claudeSessionId);
+        return { ok: true, sessionId: activeTab.claudeSessionId };
       }
-    } catch (err) {
-      setNotification({
-        message: `Failed to detect session: ${err instanceof Error ? err.message : err}`,
-        type: "error",
-      });
-    }
-  }, [activeId, tabs, handleSelectTranscriptSession]);
+
+      try {
+        const result = await invoke<CommandResponse>("transcript_get_latest", {
+          projectPath: activeTab?.workingDir ?? null,
+        });
+        if (result.success && result.data) {
+          const session = result.data as { session_id: string };
+          setShowSidebar(true);
+          await handleSelectTranscriptSession(session.session_id);
+          return { ok: true, sessionId: session.session_id };
+        }
+        const message = "No Claude Code sessions found for this project";
+        setNotification({ message, type: "error" });
+        return { ok: false, code: "no-session", message };
+      } catch (err) {
+        const message = `Failed to detect session: ${err instanceof Error ? err.message : err}`;
+        setNotification({ message, type: "error" });
+        return { ok: false, code: "detect-failed", message };
+      }
+    }, [activeId, tabs, handleSelectTranscriptSession]);
 
   // ── Generation entry points ────────────────────────────────────────────────
 

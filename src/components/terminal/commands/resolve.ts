@@ -16,7 +16,8 @@
  *
  * Recents (per-runner-instance, persisted to {@link instanceStorage}
  * under `terminal-command-bar-recents`) are pulled to the top of the
- * empty-input view and tie-break above same-score fuzzy hits.
+ * empty-input view and tie-break above same-score fuzzy hits. They never
+ * outrank a better score — see the sort comment below.
  *
  * Phase 2 caveat: we cap at 8 entries to keep the suggestion dropdown
  * scannable. Phase 7's `Ctrl+Shift+K` palette is the "browse everything"
@@ -97,15 +98,12 @@ export function resolve(input: string, recents: readonly string[]): ResolveMatch
     const slashMatch = fuzzyScore(slashBody, query);
     const labelMatch = fuzzyScore(action.label, query);
     const best =
-      slashMatch && (!labelMatch || slashMatch.score >= labelMatch.score)
-        ? slashMatch
-        : labelMatch;
+      slashMatch && (!labelMatch || slashMatch.score >= labelMatch.score) ? slashMatch : labelMatch;
     if (!best) continue;
     // Indices are positions in the slash (with leading "/") for the
     // highlight renderer; shift by +1 when they came from the
     // slash-without-leading-`/` body.
-    const indices =
-      best === slashMatch ? slashMatch.indices.map((i) => i + 1) : [];
+    const indices = best === slashMatch ? slashMatch.indices.map((i) => i + 1) : [];
     scored.push({
       action,
       exact: false,
@@ -115,9 +113,14 @@ export function resolve(input: string, recents: readonly string[]): ResolveMatch
     });
   }
 
+  // Score first, recency only as a TIE-BREAK. Recency as an absolute
+  // sort key outranked the match quality itself: with `/spawn` in
+  // recents, typing `/sw` put `/spawn` (a word-boundary hit) above
+  // `/swap` (a prefix hit), so Tab completed the wrong command.
   scored.sort((a, b) => {
+    if (a._score !== b._score) return b._score - a._score;
     if (a.recent !== b.recent) return a.recent ? -1 : 1;
-    return b._score - a._score;
+    return 0;
   });
 
   return scored.slice(0, MAX_SUGGESTIONS).map(({ _score: _, ...rest }) => rest);

@@ -56,6 +56,7 @@ import {
   sharedSessionIds,
   type LiveClaudeSession,
 } from "../liveClaudeSessions";
+import { FLOW_GRID_ID, LAYOUT_PRESETS } from "../useZoneLayout";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
@@ -141,6 +142,19 @@ export interface TerminalCommandsContext {
 }
 
 /**
+ * Every layout id `zoneLayout.setLayoutId` will actually accept — the
+ * static preset table plus the synthesized past-9 flow grid, which is the
+ * exact gate that function applies (`useZoneLayout.ts::setLayoutId`).
+ * Derived rather than transcribed so `/layout` can never drift from the
+ * presets: a hand-written list is what let `/layout bogus` report success
+ * while `setLayoutId` silently dropped it on the floor.
+ */
+export const LAYOUT_IDS: readonly string[] = [
+  ...LAYOUT_PRESETS.map((preset) => preset.id),
+  FLOW_GRID_ID,
+];
+
+/**
  * `paramSchema` objects below follow the UI Bridge contract — loose
  * `Record<string, unknown>` with hint strings, no runtime validation.
  * The Phase 8 Tier-3 subprocess normalizes these into Anthropic-
@@ -172,7 +186,7 @@ const SCHEMA = {
     zone: "number (1-based zone index)",
     tabId: "string (explicit tab id; takes precedence over zone)",
   },
-  layout: { preset: 'string — one of "single", "split", "quad", "six-pack", "full-grid"' },
+  layout: { preset: `string — one of ${LAYOUT_IDS.join(", ")}` },
   restart: { zone: "number (1-based; defaults to the currently focused zone)" },
   swap: { a: "number (1-based zone index)", b: "number (1-based zone index)" },
 } as const;
@@ -188,18 +202,79 @@ function fail(code: string, message?: string): CommandResult<never> {
 }
 
 /**
- * Resolve a 1-based zone index from an args bag. Accepts either a literal
- * number or the words `next` / `prev` / `needs-input`. Returns `null` when
- * the args don't carry a usable target.
+ * Three-state read of a zone argument.
+ *
+ * The middle state is the whole point of the type. A field that was
+ * SUPPLIED but doesn't parse (`/focus bogus`) must never be
+ * indistinguishable from a field that was never supplied at all
+ * (`/focus`) — collapsing the two to `null` is what made every
+ * zone-taking command silently retarget the focused zone on a typo.
  */
-function readZoneArg(args: Record<string, unknown>, field: string = "zone"): number | null {
+export type ZoneArgRead =
+  | { kind: "absent" }
+  | { kind: "invalid"; raw: string }
+  | { kind: "zone"; zone: number };
+
+/**
+ * Read a 1-based zone number out of an args bag. Accepts a literal
+ * number or its string form; anything else that was actually supplied is
+ * `invalid` rather than `absent`.
+ */
+export function readZoneArg(args: Record<string, unknown>, field: string = "zone"): ZoneArgRead {
   const v = args[field];
-  if (typeof v === "number" && Number.isFinite(v)) return Math.floor(v);
-  if (typeof v === "string") {
-    const n = Number(v);
-    if (Number.isFinite(n)) return Math.floor(n);
+  if (v === undefined || v === null) return { kind: "absent" };
+  if (typeof v === "number") {
+    return Number.isFinite(v)
+      ? { kind: "zone", zone: Math.floor(v) }
+      : { kind: "invalid", raw: String(v) };
   }
-  return null;
+  if (typeof v === "string") {
+    const trimmed = v.trim();
+    if (trimmed === "") return { kind: "absent" };
+    const n = Number(trimmed);
+    return Number.isFinite(n)
+      ? { kind: "zone", zone: Math.floor(n) }
+      : { kind: "invalid", raw: trimmed };
+  }
+  return { kind: "invalid", raw: String(v) };
+}
+
+/**
+ * Outcome of resolving a zone argument to a 0-based grid index.
+ *
+ * `supplied` rides on the resolved states so a handler can tell "the
+ * operator asked for THIS zone" from "no zone was named, so the focused
+ * one applies" — `/close` needs exactly that distinction to know whether
+ * falling back to the active session is legitimate or a silent misfire.
+ */
+export type ZoneResolution =
+  | { kind: "ok"; index: number; supplied: boolean }
+  | { kind: "invalid-zone"; raw: string }
+  | { kind: "out-of-range"; supplied: boolean };
+
+/**
+ * Convert a 1-based zone arg to a 0-based index against a grid of
+ * `zoneCount` zones, defaulting to `focusedZone` when no arg was given.
+ * Pure — exported so the arg-validation contract is unit-testable
+ * without mounting the hook (same split as `resolveTenantArg`).
+ */
+export function resolveZoneTarget(
+  args: Record<string, unknown>,
+  focusedZone: number,
+  zoneCount: number,
+  field: string = "zone",
+): ZoneResolution {
+  const read = readZoneArg(args, field);
+  if (read.kind === "invalid") return { kind: "invalid-zone", raw: read.raw };
+  const supplied = read.kind === "zone";
+  const index = read.kind === "zone" ? read.zone - 1 : focusedZone;
+  if (index < 0 || index >= zoneCount) return { kind: "out-of-range", supplied };
+  return { kind: "ok", index, supplied };
+}
+
+/** Shared error body for a supplied-but-unparseable zone argument. */
+function invalidZone(raw: string): CommandResult<never> {
+  return fail("invalid-zone", `"${raw}" is not a zone number`);
 }
 
 /**
@@ -306,16 +381,12 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   const { labelsAndTags, metrics: metricsRef, eventHistory } = useZoneMetadata();
 
   /**
-   * Helper that converts 1-based zone arg to 0-based, defaulting to
-   * `zoneLayout.focusedZone` when no arg given. Returns null when the
-   * resolved index is out of range (handler returns `out-of-range`).
+   * Helper that converts a 1-based zone arg to a 0-based index against
+   * the live grid, defaulting to `zoneLayout.focusedZone` when no arg was
+   * given. See {@link resolveZoneTarget} for the three-state contract.
    */
-  const resolveZoneIdx = (args: Record<string, unknown>): number | null => {
-    const arg = readZoneArg(args);
-    const idx = arg !== null ? arg - 1 : zoneLayout.focusedZone;
-    if (idx < 0 || idx >= zoneLayout.layout.zones.length) return null;
-    return idx;
-  };
+  const resolveZone = (args: Record<string, unknown>): ZoneResolution =>
+    resolveZoneTarget(args, zoneLayout.focusedZone, zoneLayout.layout.zones.length);
 
   // ── 1. /focus ────────────────────────────────────────────────────────
   useCommandAction({
@@ -355,9 +426,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         const found = zoneLayout.focusNextNeedsInput(sessionStates);
         return found ? ok() : fail("none-needs-input");
       }
-      const idx = resolveZoneIdx({ zone: target ?? args.zone });
-      if (idx === null) return fail("out-of-range");
-      zoneLayout.setFocusedZone(idx);
+      const zone = resolveZone({ zone: target ?? args.zone });
+      if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
+      if (zone.kind === "out-of-range") return fail("out-of-range");
+      zoneLayout.setFocusedZone(zone.index);
       return ok();
     },
   });
@@ -478,9 +550,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     paramSchema: SCHEMA.maximize,
     patterns: [/^maximize(?:\s+(?<zone>\d+))?$/i, /^fullscreen(?:\s+(?<zone>\d+))?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
-      const idx = resolveZoneIdx(args);
-      if (idx === null) return fail("out-of-range");
-      zoneLayout.toggleMaximize(idx);
+      const zone = resolveZone(args);
+      if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
+      if (zone.kind === "out-of-range") return fail("out-of-range");
+      zoneLayout.toggleMaximize(zone.index);
       return ok();
     },
   });
@@ -502,15 +575,32 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     patterns: [/^close(?:\s+(?<zone>\d+))?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
       const explicitTabId = typeof args.tabId === "string" ? args.tabId : null;
-      let tabId: string | null = explicitTabId;
-      if (!tabId) {
-        const idx = resolveZoneIdx(args);
-        if (idx !== null) {
-          tabId = zoneLayout.assignments[idx] ?? null;
-        }
+      if (explicitTabId) {
+        closeTerminal(explicitTabId);
+        return ok();
       }
-      if (!tabId) tabId = activeId;
-      if (!tabId) return fail("no-target", "no session to close");
+      const zone = resolveZone(args);
+      if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
+      // Falling back to the active session is only legitimate when NO
+      // zone was named. A named zone outside the grid (`/close 99`) is an
+      // error; an out-of-range DEFAULT (focused zone left past a shrunken
+      // grid) named nothing, so the active session is still the target.
+      if (zone.kind === "out-of-range") {
+        if (zone.supplied) return fail("out-of-range");
+        if (!activeId) return fail("no-target", "no session to close");
+        closeTerminal(activeId);
+        return ok();
+      }
+      // A named-but-EMPTY zone must say so rather than closing whatever
+      // happens to be active — closing the wrong session is the one
+      // mistake this command can't undo.
+      const tabId = zoneLayout.assignments[zone.index] ?? (zone.supplied ? null : activeId);
+      if (!tabId) {
+        return fail(
+          "no-target",
+          zone.supplied ? `zone ${zone.index + 1} has no session` : "no session to close",
+        );
+      }
       closeTerminal(tabId);
       return ok();
     },
@@ -521,9 +611,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     id: "terminal.layout",
     slash: "/layout",
     label: "Change layout preset",
-    description:
-      'Set the zone-grid layout preset. Accepts "single", "split", "quad", "six-pack", ' +
-      'or "full-grid".',
+    description: `Set the zone-grid layout preset. Accepts ${LAYOUT_IDS.join(", ")}.`,
     paramSchema: SCHEMA.layout,
     // Named-group form so the preset is bound to `args.preset` for both
     // pattern and slash-form invocations.
@@ -535,7 +623,12 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const preset = typeof args.preset === "string" ? args.preset.toLowerCase() : "";
       // Normalize "six-pack" / "sixpack" → "six-pack"; same for full-grid.
       const normalized = preset.replace(/sixpack/, "six-pack").replace(/fullgrid/, "full-grid");
-      if (!normalized) return fail("invalid-preset");
+      // `setLayoutId` drops an unknown id silently, so an unvalidated
+      // preset here reads as success while nothing moved. Same shape as
+      // /select-by-state: name the accepted set in the error.
+      if (!LAYOUT_IDS.includes(normalized)) {
+        return fail("invalid-preset", `preset must be one of: ${LAYOUT_IDS.join(", ")}`);
+      }
       zoneLayout.setLayoutId(normalized);
       return ok();
     },
@@ -558,14 +651,15 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     paramSchema: SCHEMA.restart,
     patterns: [/^restart(?:\s+(?<zone>\d+))?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
-      const idx = resolveZoneIdx(args);
-      if (idx === null) return fail("out-of-range");
-      const tabId = zoneLayout.assignments[idx];
+      const zone = resolveZone(args);
+      if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
+      if (zone.kind === "out-of-range") return fail("out-of-range");
+      const tabId = zoneLayout.assignments[zone.index];
       const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
       if (state !== "completed" && state !== "error") {
         return fail("not-restartable", `session state is ${state}`);
       }
-      transitionEffects.handleRestartInZone(idx);
+      transitionEffects.handleRestartInZone(zone.index);
       return ok();
     },
   });
@@ -584,9 +678,13 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
       const a = readZoneArg(args, "a");
       const b = readZoneArg(args, "b");
-      if (a === null || b === null) return fail("invalid-args", "a and b required");
-      const aIdx = a - 1;
-      const bIdx = b - 1;
+      if (a.kind === "invalid") return invalidZone(a.raw);
+      if (b.kind === "invalid") return invalidZone(b.raw);
+      if (a.kind === "absent" || b.kind === "absent") {
+        return fail("invalid-args", "a and b required");
+      }
+      const aIdx = a.zone - 1;
+      const bIdx = b.zone - 1;
       const maxIdx = zoneLayout.layout.zones.length;
       if (aIdx < 0 || aIdx >= maxIdx || bIdx < 0 || bIdx >= maxIdx) {
         return fail("out-of-range");
@@ -644,19 +742,56 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   });
 
   // 13. /sound — toggle audible needs-input/error notifications
+  //
+  // `/mute` and `/unmute` are NOT aliases of this toggle. They used to be,
+  // which made each of them invert the setting on every repeat — `/mute`
+  // twice left the sound ON. They are separate set-state actions below;
+  // this one stays the honest toggle.
   useCommandAction({
     id: "terminal.toggle-sound",
     slash: "/sound",
-    aliases: ["/toggle-sound", "/mute", "/unmute"],
+    aliases: ["/toggle-sound"],
     label: "Toggle sound notifications",
     description:
       "Audible chimes when a session enters needs-input or error. Same as " +
       "Ctrl+Shift+S and the speaker icon in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
-    patterns: [/^(?:un)?mute$/i, /^toggle\s+sound$/i, /^sound$/i],
-    handler: async (): Promise<CommandResult> => {
+    patterns: [/^toggle\s+sound$/i, /^sound$/i],
+    handler: async (): Promise<CommandResult<{ soundEnabled: boolean }>> => {
       transitionEffects.toggleSound();
-      return ok();
+      return ok({ soundEnabled: !transitionEffects.soundEnabled });
+    },
+  });
+
+  // 13b. /mute — set sound notifications OFF (idempotent)
+  useCommandAction({
+    id: "terminal.mute",
+    slash: "/mute",
+    label: "Mute sound notifications",
+    description:
+      "Turn audible needs-input/error chimes OFF. Idempotent — running it " +
+      "again leaves the sound muted.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^mute$/i],
+    handler: async (): Promise<CommandResult<{ soundEnabled: boolean }>> => {
+      if (transitionEffects.soundEnabled) transitionEffects.toggleSound();
+      return ok({ soundEnabled: false });
+    },
+  });
+
+  // 13c. /unmute — set sound notifications ON (idempotent)
+  useCommandAction({
+    id: "terminal.unmute",
+    slash: "/unmute",
+    label: "Unmute sound notifications",
+    description:
+      "Turn audible needs-input/error chimes ON. Idempotent — running it " +
+      "again leaves the sound on.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^unmute$/i],
+    handler: async (): Promise<CommandResult<{ soundEnabled: boolean }>> => {
+      if (!transitionEffects.soundEnabled) transitionEffects.toggleSound();
+      return ok({ soundEnabled: true });
     },
   });
 
@@ -993,9 +1128,13 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "terminal. Same as the Generate button in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^generate(?:\s+workflow)?$/i],
-    handler: async (): Promise<CommandResult> => {
-      await workflowGen.handleGenerateFromLatestSession();
-      return ok();
+    handler: async (): Promise<CommandResult<{ sessionId: string }>> => {
+      // Surface the real verdict. The underlying call has two failure
+      // arms (no Claude Code session for this project, detection threw)
+      // that used to be swallowed behind an unconditional ok().
+      const outcome = await workflowGen.handleGenerateFromLatestSession();
+      if (!outcome.ok) return fail(outcome.code, outcome.message);
+      return ok({ sessionId: outcome.sessionId });
     },
   });
 
