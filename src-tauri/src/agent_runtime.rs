@@ -4308,15 +4308,38 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
         .join("qontinui-claude-config")
         .join(".claude")
         .join("agents");
+    let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
+
+    // FLOOR FIRST: write the defs bundled into this binary, so a device with no
+    // qontinui-claude-config checkout gets a working subagent set instead of
+    // none. This is the fleet-portability follow-up this function's docstring
+    // has named since it was written; see `crate::fleet_agents`.
+    //
+    // Deliberately NOT fatal: if the embedded write fails we warn and continue
+    // to the checkout overlay, because a checkout present on this device is a
+    // complete answer on its own.
+    let embedded = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(
+                "agent_runtime: embedded agent-def write into {} failed; using checkout only: {e}",
+                dst_dir.display()
+            );
+            0
+        }
+    };
+
+    // CHECKOUT WINS: the operator's live copies are overlaid on top below, so
+    // editing qontinui-claude-config/.claude/agents behaves exactly as before.
     if !src_dir.is_dir() {
         warn!(
-            "agent_runtime: claude-config agents dir not found at {}; skipping \
-             .claude/agents provisioning (auto-spawned subagents will not resolve)",
-            src_dir.display()
+            "agent_runtime: no claude-config agents dir at {}; keeping the \
+             {embedded} embedded subagent def(s) already provisioned into {}",
+            src_dir.display(),
+            dst_dir.display()
         );
         return Ok(());
     }
-    let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
     std::fs::create_dir_all(&dst_dir).map_err(|e| {
         anyhow::anyhow!(
             "create {} for agent-def provisioning: {e}",
@@ -4355,7 +4378,7 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
         copied += 1;
     }
     info!(
-        "agent_runtime: provisioned {copied} subagent def(s) into {}",
+        "agent_runtime: overlaid {copied} checkout subagent def(s) onto {embedded} embedded default(s) in {}",
         dst_dir.display()
     );
     Ok(())
@@ -6105,18 +6128,38 @@ mod tests {
     }
 
     #[test]
-    fn provision_agent_defs_missing_source_is_soft() {
-        // qontinui-root exists but has no qontinui-claude-config/.claude/agents:
-        // must log+continue (Ok), creating nothing — no regression vs today.
+    fn provision_agent_defs_missing_source_falls_back_to_the_embedded_floor() {
+        // qontinui-root exists but has no qontinui-claude-config/.claude/agents —
+        // i.e. every non-operator fleet device.
+        //
+        // CONTRACT CHANGED DELIBERATELY. This test previously asserted
+        // `!wt/.claude.exists()` — "creating nothing". That WAS the behaviour, and
+        // it was the defect: a spawned agent then had no subagents at all, so
+        // `claude` could not resolve the named subagent, the review never ran, and
+        // coord aged the PR out as `specialist_timeout` with no error at the point
+        // of cause. `crate::fleet_agents` now supplies an embedded floor, so the
+        // correct assertion is the opposite one: the defs ARE there.
         let root = tempfile::tempdir().unwrap();
         let wt = tempfile::tempdir().unwrap();
         let wt_cwd = wt.path().to_string_lossy().into_owned();
 
         let res = provision_agent_definitions_from_root(root.path(), &wt_cwd);
-        assert!(res.is_ok(), "missing source dir must fail soft (Ok)");
+        assert!(res.is_ok(), "missing source dir must still fail soft (Ok)");
+
+        let dst = wt.path().join(".claude").join("agents");
+        let written = std::fs::read_dir(&dst)
+            .expect("the embedded floor must create the agents dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+            .count();
+        assert_eq!(
+            written,
+            crate::fleet_agents::embedded_agent_count(),
+            "with no checkout, every embedded default must be provisioned"
+        );
         assert!(
-            !wt.path().join(".claude").exists(),
-            "no .claude tree should be created when source is missing"
+            dst.join("code-reviewer.md").is_file(),
+            "code-reviewer must resolve on a checkout-less device — the fleet's              pre-PR-review policy names that subagent specifically"
         );
     }
 
