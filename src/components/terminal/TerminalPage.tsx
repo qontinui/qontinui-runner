@@ -55,7 +55,14 @@ import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { useCommitState } from "./useCommitState";
 import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
 import { useSessionBoundEvents } from "./useSessionBoundEvents";
-import { buildSessionOpenArgs, type SessionOrigin } from "./sessionRecordArgs";
+import {
+  buildSessionOpenArgs,
+  noteRecordedZone,
+  planZoneReemits,
+  recordedZoneLedgerFor,
+  resolveZoneIndex,
+  type SessionOrigin,
+} from "./sessionRecordArgs";
 import { buildAiLaunchCommand } from "./aiLaunchCommand";
 import {
   getActiveProjectHint,
@@ -587,6 +594,15 @@ function TerminalPageInner({
   }, [tabs]);
 
   /**
+   * What zone each session's DURABLE record currently carries, per
+   * `claudeSessionId`. Written by every `record_open` writer on this page (so
+   * the ledger tracks WRITES, not sightings) and read by the zone backstop
+   * effect below. Page-keyed and module-scoped because the other writers live
+   * outside this component — see `recordedZoneLedgerFor`.
+   */
+  const recordedZones = recordedZoneLedgerFor(pageId);
+
+  /**
    * Durable session-registry OPEN recorder. Fired the instant a tab binds a
    * `claudeSessionId` (via the capture hook). Resolves the tab's current zone
    * by reverse-lookup over the live assignments, then records the OPEN
@@ -612,11 +628,20 @@ function TerminalPageInner({
         pageId,
         origin,
       });
+      // Seed the backstop ledger with the zone we actually WROTE. A tab
+      // usually binds its session id BEFORE `reconcileAssignments` has
+      // auto-filled it into a zone, so this is very often `-1`; recording that
+      // here is what lets the backstop below notice the record disagrees with
+      // the tab's real placement and re-resolve it. (Seeding from the first
+      // OBSERVED zone instead — the previous behavior — made a `-1` record
+      // permanent, because by the time the debounced effect ran the tab was
+      // already sitting in its final zone and nothing looked like a "change".)
+      noteRecordedZone(recordedZones, claudeSessionId, args.zoneIndex);
       invoke("terminal_session_record_open", { ...args }).catch((err) => {
         logger.warn(`terminal_session_record_open failed for ${claudeSessionId}: ${err}`);
       });
     },
-    [pageId],
+    [pageId, recordedZones],
   );
 
   // Post-spawn polling hook that captures Claude CLI's session id from
@@ -637,56 +662,56 @@ function TerminalPageInner({
   // The registry record was already written backend-side — this is UI-only.
   useSessionBoundEvents({ tabs, updateTab });
 
-  // Zone-move backstop: when a Claude session is dragged between zones the
-  // recorded `zoneIndex` must follow. Watch `zoneLayout.assignments` and, after
-  // a short debounce, re-emit `terminal_session_record_open` for any tab whose
-  // resolved zone changed since the last emit. We track the last-emitted zone
-  // per claudeSessionId in a ref so a re-render that doesn't move anything emits
-  // nothing. The initial bind already records via `recordSessionOpen`, so we
-  // seed the ref on first observation to avoid a redundant double-record.
-  const lastEmittedZoneRef = useRef<Map<string, number>>(new Map());
+  // Zone re-resolution backstop. Two jobs, one mechanism:
+  //
+  //  1. Zone MOVE — a Claude session dragged between zones: the recorded
+  //     `zoneIndex` must follow it (in both directions, including back to
+  //     `UNZONED_INDEX` when the drag leaves the tab unassigned).
+  //  2. Zone BIND-TIME STALENESS — the OPEN record is written the moment a tab
+  //     binds its `claudeSessionId`, which is normally before
+  //     `reconcileAssignments` has auto-filled that tab into a zone, so the
+  //     record is written `-1` and then never revisited. `recordSessionOpen`
+  //     seeds the ledger with the zone it WROTE, so the first observation here
+  //     sees `-1 → 3` and corrects it.
+  //
+  // `-1` is deliberately still a reachable recorded value: past the 9-zone
+  // ceiling a live tab is genuinely unassigned, and nothing here clamps it to
+  // zone 0. Debounced 300ms and keyed on `assignments`/`tabs`, so it runs only
+  // after the assignment it is re-resolving has actually settled — it cannot
+  // race an in-flight restore drain into recording a half-applied layout.
   useEffect(() => {
     const timer = setTimeout(() => {
       const assignments = zoneLayout.assignments;
-      const seen = new Set<string>();
-      for (const tab of tabs) {
-        if (!tab.claudeSessionId) continue;
-        seen.add(tab.claudeSessionId);
-        const zoneIndex = Number(
-          Object.entries(assignments).find(([, id]) => id === tab.id)?.[0] ?? -1,
-        );
-        const prevZone = lastEmittedZoneRef.current.get(tab.claudeSessionId);
-        if (prevZone === undefined) {
-          // First observation — seed without emitting; the id-bind path
-          // already recorded the OPEN with the correct zone.
-          lastEmittedZoneRef.current.set(tab.claudeSessionId, zoneIndex);
-          continue;
-        }
-        if (prevZone === zoneIndex) continue;
-        lastEmittedZoneRef.current.set(tab.claudeSessionId, zoneIndex);
+      const emits = planZoneReemits(
+        recordedZones,
+        tabs
+          .filter((tab): tab is typeof tab & { claudeSessionId: string } => !!tab.claudeSessionId)
+          .map((tab) => ({
+            claudeSessionId: tab.claudeSessionId,
+            tabId: tab.id,
+            zoneIndex: resolveZoneIndex(assignments, tab.id),
+          })),
+      );
+      for (const emit of emits) {
+        const tab = tabs.find((t) => t.id === emit.tabId);
         invoke("terminal_session_record_open", {
           ...buildSessionOpenArgs({
             assignments,
             tabs,
-            tabId: tab.id,
-            claudeSessionId: tab.claudeSessionId,
-            configDir: tab.claudeConfigDir,
+            tabId: emit.tabId,
+            claudeSessionId: emit.claudeSessionId,
+            configDir: tab?.claudeConfigDir,
             pageId,
           }),
         }).catch((err) => {
           logger.warn(
-            `terminal_session_record_open (zone-move) failed for ${tab.claudeSessionId}: ${err}`,
+            `terminal_session_record_open (zone re-resolve) failed for ${emit.claudeSessionId}: ${err}`,
           );
         });
       }
-      // Drop tracking for sessions that no longer exist so a reused
-      // claudeSessionId re-seeds cleanly.
-      for (const sid of [...lastEmittedZoneRef.current.keys()]) {
-        if (!seen.has(sid)) lastEmittedZoneRef.current.delete(sid);
-      }
     }, 300);
     return () => clearTimeout(timer);
-  }, [zoneLayout.assignments, tabs, pageId]);
+  }, [zoneLayout.assignments, tabs, pageId, recordedZones]);
   const {
     labelsAndTags,
     eventHistory,
@@ -778,11 +803,7 @@ function TerminalPageInner({
   const terminalSessionRoster = useMemo(
     () =>
       JSON.stringify(
-        buildTerminalSessionRoster(
-          tabs,
-          zoneLayout.assignments,
-          stateTracking.sessionStates,
-        ),
+        buildTerminalSessionRoster(tabs, zoneLayout.assignments, stateTracking.sessionStates),
       ),
     [tabs, zoneLayout.assignments, stateTracking.sessionStates],
   );
