@@ -19,8 +19,11 @@
  *     input (`/sp` → `/spawn-ai `), leaving the cursor at the arg
  *     position.
  *   - **Enter** parses args from the input and executes the selected
- *     action. Result feedback goes into a 3s status line just above
- *     the bar; recents are updated on success.
+ *     action. Result feedback goes into a status line just above the bar
+ *     which HOLDS until the next execute; recents are updated on success.
+ *   - **ArrowUp on an empty input** walks the executed-input history
+ *     (ArrowDown walks back out of it); with content in the input the
+ *     arrows navigate the suggestion list as before.
  *   - **Escape** clears + blurs.
  *   - **Rotating placeholder** cycles example slash commands every 8s
  *     when the input is empty (passive learning surface per redesign
@@ -56,8 +59,29 @@ import {
 
 const RECENTS_STORAGE_KEY = "terminal-command-bar-recents";
 const MAX_RECENTS = 6;
-const STATUS_AUTO_CLEAR_MS = 3000;
 const PLACEHOLDER_ROTATE_MS = 8000;
+
+/** Raw inputs the operator actually executed, newest first — the
+ *  ArrowUp-on-empty recall ring. Distinct from RECENTS, which stores
+ *  action *ids* for ranking, not the text that was typed. */
+const HISTORY_STORAGE_KEY = "terminal-command-bar-history";
+const MAX_HISTORY = 50;
+
+/** DOM id of the suggestion listbox, referenced by the input's
+ *  `aria-controls` / `aria-activedescendant`. */
+const LISTBOX_ID = "command-bar-listbox";
+
+/** Stable per-option DOM id so `aria-activedescendant` can name the row
+ *  the keyboard selection is on. */
+function optionId(actionId: string): string {
+  return `command-bar-option-${actionId}`;
+}
+
+/** `data-page-element` for a suggestion row. Keyed by the slash body
+ *  (leading `/` dropped) so the id is a clean selector token. */
+function suggestionElementId(slash: string): string {
+  return `command-bar-suggestion-${slash.replace(/^\//, "")}`;
+}
 
 // Tier-3 (claude subprocess) debounce + gating. The subprocess takes
 // ~1.5-3s; we don't want to fire it on every keystroke. 600ms is long
@@ -107,6 +131,12 @@ export function CommandBar() {
   const [recents, setRecents] = useState<string[]>(() =>
     instanceStorage.getJSON<string[]>(RECENTS_STORAGE_KEY, []),
   );
+  // Executed raw inputs, newest first, plus the cursor into them.
+  // `historyIdx === -1` means "not browsing history".
+  const [history, setHistory] = useState<string[]>(() =>
+    instanceStorage.getJSON<string[]>(HISTORY_STORAGE_KEY, []),
+  );
+  const [historyIdx, setHistoryIdx] = useState(-1);
 
   // Working dir of the focused tab — the repo the spawn-tenant inference
   // reads. Undefined on an empty page (no tabs yet), which the picker treats
@@ -119,7 +149,6 @@ export function CommandBar() {
 
   const inputRef = useRef<HTMLInputElement>(null);
   const blurTimerRef = useRef<number | null>(null);
-  const statusTimerRef = useRef<number | null>(null);
 
   // Tier-3 state — async AI resolution result + in-flight indicator.
   // Lives outside the synchronous `matches` useMemo because the
@@ -149,23 +178,11 @@ export function CommandBar() {
     };
   }, []);
 
-  // ── Auto-clear the status line.
-  useEffect(() => {
-    if (!status) return;
-    if (statusTimerRef.current !== null) {
-      window.clearTimeout(statusTimerRef.current);
-    }
-    statusTimerRef.current = window.setTimeout(() => {
-      setStatus(null);
-      statusTimerRef.current = null;
-    }, STATUS_AUTO_CLEAR_MS);
-    return () => {
-      if (statusTimerRef.current !== null) {
-        window.clearTimeout(statusTimerRef.current);
-        statusTimerRef.current = null;
-      }
-    };
-  }, [status]);
+  // The status line has NO auto-expiry: it holds the last verdict until
+  // the next execute replaces it. A 3s timer (which the focus gate cut to
+  // under 2s of visible time) meant a slow command's verdict — the
+  // /orchestrate case — landed and vanished while the operator was still
+  // watching the grid.
 
   // Match list — Tier 3 (AI), then Tier 2 (regex patterns), then Tier 1
   // (exact slash / fuzzy). Higher tiers WIN because shape-aware routing
@@ -291,6 +308,18 @@ export function CommandBar() {
     [setRecents],
   );
 
+  /** Record the raw input the operator ran, for ArrowUp recall. Failed
+   *  runs are recorded too — a typo is exactly what you want back. */
+  const persistHistory = useCallback((rawInput: string) => {
+    const entry = rawInput.trim();
+    if (!entry) return;
+    setHistory((prev) => {
+      const next = [entry, ...prev.filter((x) => x !== entry)].slice(0, MAX_HISTORY);
+      instanceStorage.setJSON(HISTORY_STORAGE_KEY, next);
+      return next;
+    });
+  }, []);
+
   const execute = useCallback(
     async (
       action: CommandAction,
@@ -298,6 +327,11 @@ export function CommandBar() {
       presetArgs?: Record<string, unknown>,
       tier?: "ai",
     ) => {
+      // The previous verdict is retired the moment a new command runs —
+      // that, not a timer, is what bounds the status line's lifetime.
+      setStatus(null);
+      persistHistory(rawInput);
+      setHistoryIdx(-1);
       // Tier-2 / Tier-3 hits arrive with args already extracted (regex
       // named groups for Tier-2, model output for Tier-3); use them
       // verbatim rather than re-parsing positionally (positional parse
@@ -333,18 +367,35 @@ export function CommandBar() {
         });
       }
     },
-    [persistRecent],
+    [persistRecent, persistHistory],
   );
+
+  // History recall is armed while the input is EMPTY (nothing to navigate
+  // past) and stays armed once browsing has started — otherwise the recalled
+  // text itself would disarm it on the second ArrowUp.
+  const historyMode = historyIdx >= 0 || query.trim().length === 0;
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
       if (e.key === "ArrowDown") {
         e.preventDefault();
+        if (historyMode && historyIdx >= 0) {
+          const next = historyIdx - 1;
+          setHistoryIdx(next);
+          setQuery(next < 0 ? "" : (history[next] ?? ""));
+          return;
+        }
         setSelectedIdx((i) => Math.min(i + 1, Math.max(0, matches.length - 1)));
         return;
       }
       if (e.key === "ArrowUp") {
         e.preventDefault();
+        if (historyMode && history.length > 0) {
+          const next = Math.min(historyIdx + 1, history.length - 1);
+          setHistoryIdx(next);
+          setQuery(history[next] ?? "");
+          return;
+        }
         setSelectedIdx((i) => Math.max(0, i - 1));
         return;
       }
@@ -376,12 +427,20 @@ export function CommandBar() {
         e.preventDefault();
         setQuery("");
         setSelectedIdx(0);
+        setHistoryIdx(-1);
         inputRef.current?.blur();
         return;
       }
     },
-    [matches.length, query, selectedMatch, execute],
+    [matches.length, query, selectedMatch, execute, history, historyIdx, historyMode],
   );
+
+  // Typing anything by hand leaves history-browsing mode — the recalled
+  // entry has become a fresh edit, not a cursor position.
+  const handleChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setQuery(e.target.value);
+    setHistoryIdx(-1);
+  }, []);
 
   const handleSuggestionClick = useCallback(
     (action: CommandAction, idx: number, presetArgs?: Record<string, unknown>, tier?: "ai") => {
@@ -421,6 +480,24 @@ export function CommandBar() {
     setFocused(true);
   }, []);
 
+  // ── Focus tracked from the INPUT's own events, not React's synthetic
+  //    delegation. React listens for `focusin`/`focusout` at the root, so
+  //    a non-bubbling `FocusEvent('focus')` dispatched straight at the
+  //    element — which is what an external driver like the UI Bridge
+  //    produces — never reached `onFocus`, leaving the empty-input recents
+  //    dropdown undrivable. A native listener on the element sees both the
+  //    real and the dispatched event.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.addEventListener("focus", handleFocus);
+    el.addEventListener("blur", handleBlur);
+    return () => {
+      el.removeEventListener("focus", handleFocus);
+      el.removeEventListener("blur", handleBlur);
+    };
+  }, [handleFocus, handleBlur]);
+
   // Surface matches when the input is focused OR when there's query
   // content. Gating solely on `focused` meant an external driver (UI
   // Bridge `type`/`setValue`, which sets the value + fires `input` but
@@ -438,12 +515,21 @@ export function CommandBar() {
           bar's own height or push the terminal grid while the operator
           types. The wrapper is click-through; only the panels inside it
           capture pointer events. */}
-      {((status && !focused) || dropdownVisible) && (
+      {(status || dropdownVisible) && (
         <div className="absolute bottom-full inset-x-0 z-40 flex justify-center px-3 pb-1 pointer-events-none">
           <div className="w-[520px] max-w-full">
-            {/* Status line — visible briefly after execute. */}
-            {status && !focused && (
-              <div className="mb-1 px-2 py-1 text-[10px] rounded bg-[#1a1b26]/90 border border-[#2a2d3d]/60 backdrop-blur-sm pointer-events-auto">
+            {/* Status line — the last command's verdict, held until the next
+                execute. It is NOT gated on blur any more: an error leaves
+                the input focused, so the `!focused` gate hid exactly the
+                verdicts worth reading. */}
+            {status && (
+              <div
+                data-page-element="command-bar-status"
+                data-status-kind={status.kind}
+                role="status"
+                aria-live="polite"
+                className="mb-1 px-2 py-1 text-[10px] rounded bg-[#1a1b26]/90 border border-[#2a2d3d]/60 backdrop-blur-sm pointer-events-auto"
+              >
                 <span
                   className={
                     status.kind === "ok" ? "text-[#9ece6a] font-mono" : "text-[#f7768e] font-mono"
@@ -463,7 +549,10 @@ export function CommandBar() {
               row also surfaces the confidence so operators can sanity-
               check the AI's choice before pressing Enter. */}
                 {selectedMatch?.exact && (
-                  <div className="px-3 py-1.5 border-b border-[#2a2d3d]/50 flex items-baseline gap-2 text-[11px]">
+                  <div
+                    data-page-element="command-bar-preview"
+                    className="px-3 py-1.5 border-b border-[#2a2d3d]/50 flex items-baseline gap-2 text-[11px]"
+                  >
                     <span className="text-[#9ece6a]">⏎</span>
                     <span className="text-[#c0caf5] font-mono truncate">
                       {query.trim().length > 0 ? query.trim() : selectedMatch.action.slash}
@@ -498,50 +587,64 @@ export function CommandBar() {
                   </div>
                 )}
 
-                {/* Match list */}
+                {/* Match list. `role="listbox"` + one `role="option"` per row
+              is what makes the keyboard selection READABLE from outside —
+              the highlight used to live only in a Tailwind class, so no
+              external driver could tell which row Enter would run. The
+              option's `value` carries the slash so `read-value` on the
+              selected row returns the command itself. */}
                 {matches.length === 0 ? (
                   <div className="px-3 py-2 text-[11px] text-[#565f89]">
                     No match — press <span className="font-mono text-[#a9b1d6]">Ctrl+Shift+K</span>{" "}
                     to browse.
                   </div>
                 ) : (
-                  matches.map((m, idx) => (
-                    <button
-                      key={m.action.id}
-                      type="button"
-                      onMouseDown={(e) => e.preventDefault() /* keep input focus */}
-                      onClick={() => handleSuggestionClick(m.action, idx, m.presetArgs, m.tier)}
-                      onMouseEnter={() => setSelectedIdx(idx)}
-                      className={`w-full flex items-center gap-2 px-3 py-1 text-[11px] text-left transition-colors ${
-                        idx === selectedIdx
-                          ? "bg-[#7aa2f7]/10 text-[#c0caf5]"
-                          : "text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
-                      }`}
-                    >
-                      <span className="font-mono text-[#7aa2f7] shrink-0 w-24 truncate">
-                        {m.action.slash}
-                      </span>
-                      <span className="text-[#565f89] truncate flex-1">{m.action.label}</span>
-                      {m.tier === "ai" && (
-                        <span
-                          className="ml-auto text-[8px] font-mono uppercase tracking-wider shrink-0 text-[#bb9af7]"
-                          title={
-                            m.confidence !== undefined
-                              ? `Tier-3 AI match — confidence ${Math.round(m.confidence * 100)}%`
-                              : "Tier-3 AI match"
-                          }
-                        >
-                          AI
-                          {m.confidence !== undefined ? ` ${Math.round(m.confidence * 100)}%` : ""}
+                  <div id={LISTBOX_ID} role="listbox" aria-label="Command suggestions">
+                    {matches.map((m, idx) => (
+                      <button
+                        key={m.action.id}
+                        id={optionId(m.action.id)}
+                        data-page-element={suggestionElementId(m.action.slash)}
+                        role="option"
+                        aria-selected={idx === selectedIdx}
+                        value={m.action.slash}
+                        type="button"
+                        onMouseDown={(e) => e.preventDefault() /* keep input focus */}
+                        onClick={() => handleSuggestionClick(m.action, idx, m.presetArgs, m.tier)}
+                        onMouseEnter={() => setSelectedIdx(idx)}
+                        className={`w-full flex items-center gap-2 px-3 py-1 text-[11px] text-left transition-colors ${
+                          idx === selectedIdx
+                            ? "bg-[#7aa2f7]/10 text-[#c0caf5]"
+                            : "text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+                        }`}
+                      >
+                        <span className="font-mono text-[#7aa2f7] shrink-0 w-24 truncate">
+                          {m.action.slash}
                         </span>
-                      )}
-                      {m.recent && m.tier !== "ai" && (
-                        <span className="ml-auto text-[8px] text-[#bb9af7] uppercase tracking-wider shrink-0">
-                          recent
-                        </span>
-                      )}
-                    </button>
-                  ))
+                        <span className="text-[#565f89] truncate flex-1">{m.action.label}</span>
+                        {m.tier === "ai" && (
+                          <span
+                            className="ml-auto text-[8px] font-mono uppercase tracking-wider shrink-0 text-[#bb9af7]"
+                            title={
+                              m.confidence !== undefined
+                                ? `Tier-3 AI match — confidence ${Math.round(m.confidence * 100)}%`
+                                : "Tier-3 AI match"
+                            }
+                          >
+                            AI
+                            {m.confidence !== undefined
+                              ? ` ${Math.round(m.confidence * 100)}%`
+                              : ""}
+                          </span>
+                        )}
+                        {m.recent && m.tier !== "ai" && (
+                          <span className="ml-auto text-[8px] text-[#bb9af7] uppercase tracking-wider shrink-0">
+                            recent
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
                 )}
               </div>
             )}
@@ -570,10 +673,24 @@ export function CommandBar() {
         <input
           ref={inputRef}
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onFocus={handleFocus}
-          onBlur={handleBlur}
+          onChange={handleChange}
+          // A bare click must open the dropdown too: a synthetic click
+          // from an external driver doesn't focus the element, so without
+          // this the recents palette stayed shut. Focus/blur themselves
+          // are bound natively in the effect above.
+          onClick={handleFocus}
           onKeyDown={handleKeyDown}
+          // Stable accessible name. The placeholder rotates every 8s, so
+          // it can't be the only name — a lookup by name would resolve
+          // the input or not depending on when it ran.
+          aria-label="Terminal command bar"
+          role="combobox"
+          aria-expanded={dropdownVisible}
+          aria-autocomplete="list"
+          aria-controls={dropdownVisible && matches.length > 0 ? LISTBOX_ID : undefined}
+          aria-activedescendant={
+            dropdownVisible && selectedMatch ? optionId(selectedMatch.action.id) : undefined
+          }
           placeholder={placeholder}
           spellCheck={false}
           autoCorrect="off"
