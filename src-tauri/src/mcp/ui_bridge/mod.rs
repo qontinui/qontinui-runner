@@ -49,6 +49,7 @@ pub mod tauri_audit;
 pub mod terminals;
 pub mod toasts;
 pub mod types;
+pub mod visibility;
 pub mod vision_ai;
 pub mod vision_frame_source;
 pub mod vision_routes;
@@ -373,6 +374,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(tauri_audit::route_entries());
         all.extend_from_slice(terminals::route_entries());
         all.extend_from_slice(toasts::route_entries());
+        all.extend_from_slice(visibility::route_entries());
         all.extend_from_slice(vision_routes::route_entries());
         all
     })
@@ -456,6 +458,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(tauri_audit::routes())
         .merge(terminals::routes())
         .merge(toasts::routes())
+        .merge(visibility::routes())
         .merge(vision_routes::routes())
         // Tier 2.1 — safelisted Tauri command proxy
         .merge(crate::mcp::tauri_proxy::routes())
