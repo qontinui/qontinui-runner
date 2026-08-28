@@ -230,7 +230,23 @@ pub struct ScanStats {
     /// Directories whose read failed (a `read_dir` open, or the `.git` probe
     /// that decides ownership). A failed read is never folded into "nothing
     /// there".
+    ///
+    /// **A bounded SAMPLE.** The walk descends to the reaper's depth bound over
+    /// up to 200,000 directories and records one entry per unreadable `.git`, so
+    /// an antivirus- or permission-locked subtree can fail by the thousand —
+    /// each entry a path plus a sentence, serialized into every response. Read
+    /// [`Self::read_errors_total`] for how many there were; this list is capped
+    /// at [`reaper::MAX_RECORDED_READ_ERRORS`] for diagnosis.
     pub read_errors: Vec<ScanError>,
+    /// How many reads failed, uncapped. `> read_errors.len()` ⇒ the list above
+    /// is a sample. This is the number every honesty branch reads: capping the
+    /// LIST must never shrink the reported COUNT, or the cap would become the
+    /// same class of silent under-report the whole module exists to remove.
+    ///
+    /// The two fields must move together, and nothing in the type system says
+    /// so — read them through [`Self::read_errors_seen`] rather than directly,
+    /// so a total that was never incremented cannot certify completeness.
+    pub read_errors_total: usize,
     /// Directory ENTRIES that errored after their directory opened. Counted
     /// separately from `read_errors`, which records only open failures — a dir
     /// that opens and then errors mid-iteration under-reports otherwise.
@@ -274,9 +290,25 @@ impl ScanStats {
     /// through a second door.
     fn incomplete(&self) -> bool {
         self.truncated
-            || !self.read_errors.is_empty()
+            // The TOTAL, never `!read_errors.is_empty()`: the list is a capped
+            // sample, and a predicate that decides whether an empty population
+            // is a measured zero must read the count that cannot be capped.
+            || self.read_errors_seen() > 0
             || self.entry_errors > 0
             || self.reparse_dirs_skipped > 0
+    }
+
+    /// How many reads failed, as the honesty branches must count them.
+    ///
+    /// `read_errors_total` and `read_errors` are two public fields that have to
+    /// move together, and the type system does not enforce it. Taking the
+    /// larger fails **closed**: a total someone forgot to increment can never
+    /// shrink the count below the errors actually on the wire, so the failure
+    /// mode of the split is an over-report of incompleteness rather than a
+    /// fabricated measured zero — which is the one answer this module exists to
+    /// make impossible.
+    pub(super) fn read_errors_seen(&self) -> usize {
+        self.read_errors_total.max(self.read_errors.len())
     }
 }
 
@@ -487,6 +519,7 @@ pub(super) fn build_snapshot(root: &Path, opts: &ClassifyOptions) -> DiskSurveyS
                 error: e.clone(),
             })
             .collect(),
+        read_errors_total: enumeration.read_errors_total,
         entry_errors: enumeration.entry_errors,
         depth_limited_dirs: enumeration.depth_limited_dirs,
         reparse_dirs_skipped: enumeration.reparse_dirs_skipped,
@@ -659,24 +692,48 @@ pub(super) fn assemble(
     // genuinely-empty case relies on.
     let known = |total: Option<u64>| if population_unknown { None } else { total };
 
-    let by_class: Vec<ClassSummary> = TargetClass::all()
-        .into_iter()
-        .map(|class| {
-            let token = class.as_str();
-            let in_class = || snapshot.items.iter().filter(move |i| i.class == token);
-            let reclaimable = || in_class().filter(|i| i.status == "reclaimable");
-            ClassSummary {
-                class: token,
-                roots: in_class().count(),
-                bytes: known(sum_bytes(in_class())),
-                reclaimable_roots: reclaimable().count(),
-                reclaimable_bytes: known(sum_bytes(reclaimable())),
-                roots_with_unknown_bytes: in_class().filter(|i| i.bytes.is_none()).count(),
-                verb: class.has_verb().then_some(VERB_ORPHAN_REAPER),
-                note: class_note(class),
-            }
-        })
-        .collect();
+    // An unknown population has no per-class rollup either — and this is not a
+    // cosmetic trim. Under `population_unknown` every row is necessarily
+    // `roots: 0, bytes: null, reclaimable_roots: 0`, which is *bit-for-bit the
+    // shape a fully-read, genuinely-empty machine produces*. `roots` is a
+    // `usize`, so unlike the byte totals it cannot be nulled; the rows carry no
+    // information and read as measurement.
+    //
+    // Downstream that difference is load-bearing rather than theoretical: the
+    // web's `measuredZeroBuckets.forBucket()` licenses a MEASURED `0 B` tile
+    // when every row of a bucket reports `roots === 0`, so a failed
+    // `read_dir(workspace_root)` rendered "nothing to reclaim" over a walk that
+    // saw nothing — the exact defect the null byte totals and `roots_unknown`
+    // were added to close, surviving at the cross-repo seam because a consumer
+    // reading only the rollup never sees `roots_unknown`.
+    //
+    // The cold-start branch above already applies this rule in its own words:
+    // "Every class listed with zero roots would imply we had LOOKED." A walk
+    // that failed is the same epistemic state, so it gets the same answer. The
+    // rollup is then EMPTY rather than zeroed, which no consumer can mistake
+    // for a measurement, and `roots_unknown` still carries the statement.
+    let by_class: Vec<ClassSummary> = if population_unknown {
+        Vec::new()
+    } else {
+        TargetClass::all()
+            .into_iter()
+            .map(|class| {
+                let token = class.as_str();
+                let in_class = || snapshot.items.iter().filter(move |i| i.class == token);
+                let reclaimable = || in_class().filter(|i| i.status == "reclaimable");
+                ClassSummary {
+                    class: token,
+                    roots: in_class().count(),
+                    bytes: known(sum_bytes(in_class())),
+                    reclaimable_roots: reclaimable().count(),
+                    reclaimable_bytes: known(sum_bytes(reclaimable())),
+                    roots_with_unknown_bytes: in_class().filter(|i| i.bytes.is_none()).count(),
+                    verb: class.has_verb().then_some(VERB_ORPHAN_REAPER),
+                    note: class_note(class),
+                }
+            })
+            .collect()
+    };
 
     let report_only_bytes = by_class
         .iter()
@@ -724,15 +781,23 @@ pub(super) fn assemble(
         if snapshot.scan.truncated {
             parts.push("it hit its visit ceiling".to_string());
         }
-        if !snapshot.scan.read_errors.is_empty() {
+        // Counted from the uncapped total, never from the sample list — the cap
+        // exists to bound the RESPONSE, and a sentence that read the list would
+        // report a locked subtree as exactly `MAX_RECORDED_READ_ERRORS`
+        // failures, which is the silent under-report this note exists to
+        // prevent. When the list is short of the total, say so, so an operator
+        // does not read `scan.read_errors` as the whole set.
+        let total = snapshot.scan.read_errors_seen();
+        if total > 0 {
+            let listed = snapshot.scan.read_errors.len();
             parts.push(format!(
-                "{} director{} could not be read (see `scan.read_errors`)",
-                snapshot.scan.read_errors.len(),
-                if snapshot.scan.read_errors.len() == 1 {
-                    "y"
+                "{total} director{} could not be read ({})",
+                if total == 1 { "y" } else { "ies" },
+                if listed < total {
+                    format!("`scan.read_errors` lists the first {listed}")
                 } else {
-                    "ies"
-                }
+                    "see `scan.read_errors`".to_string()
+                },
             ));
         }
         if snapshot.scan.entry_errors > 0 {
@@ -847,6 +912,20 @@ pub(super) fn assemble(
                 ""
             },
         )
+    };
+
+    // Staleness belongs in the PROSE, not only in `census_status`. Every branch
+    // above narrates the walk in the past tense with an age — and at 3600 s
+    // cadence `stale_after` is two hours, so a snapshot from a surveyor that
+    // died at boot reads exactly like one taken on schedule to anyone who reads
+    // the sentence rather than the enum. The sibling this route was modelled on
+    // (`on_demand::survey`) appends the same clause to its own note.
+    let note = match status {
+        SurveyStatus::Stale => format!(
+            "{note} This snapshot is STALE — older than twice the survey cadence, so the walk is \
+             overdue and the disk may have moved since. Pass `?refresh=1` to start a fresh one."
+        ),
+        _ => note,
     };
 
     DiskSurvey {
@@ -1542,10 +1621,16 @@ mod tests {
         assert_eq!(s.summary.total_bytes, None);
         assert_eq!(s.summary.reclaimable_bytes, None);
         assert_eq!(s.summary.report_only_bytes, None);
-        for c in &s.summary.by_class {
-            assert_eq!(c.bytes, None, "{} must not report a zero", c.class);
-            assert_eq!(c.reclaimable_bytes, None, "{}", c.class);
-        }
+        // The rollup is EMPTY, not zeroed. A row's `roots` is a `usize` and
+        // cannot be nulled, so four `roots: 0` rows are indistinguishable from a
+        // fully-read empty machine to any consumer that reads the rollup without
+        // `roots_unknown` — which is how the web's `measuredZeroBuckets`
+        // certified a measured `0 B` over this exact failed read.
+        assert!(
+            s.summary.by_class.is_empty(),
+            "a failed walk must publish no per-class rollup: {:?}",
+            s.summary.by_class
+        );
         // `bytes_incomplete` was already the one surviving signal — keep it, and
         // make the prose agree with it instead of contradicting it.
         assert!(s.summary.bytes_incomplete);
@@ -1608,9 +1693,12 @@ mod tests {
         assert_eq!(s.summary.total_bytes, None, "the population is UNKNOWN");
         assert_eq!(s.summary.reclaimable_bytes, None);
         assert_eq!(s.summary.report_only_bytes, None);
-        for c in &s.summary.by_class {
-            assert_eq!(c.bytes, None, "{} must not report a zero", c.class);
-        }
+        assert!(
+            s.summary.by_class.is_empty(),
+            "an unentered subtree leaves the population unknown, so no per-class row may be \
+             published either: {:?}",
+            s.summary.by_class
+        );
         assert!(s.summary.bytes_incomplete);
         assert!(
             !s.census_note.contains("measured zero"),
@@ -1723,6 +1811,10 @@ mod tests {
             path: "/somewhere/unreadable".to_string(),
             error: "permission denied".to_string(),
         });
+        // The list and the count move together — see `read_errors_seen`, which
+        // is what stops a fixture (or a future caller) that moves only one of
+        // them from certifying completeness.
+        snapshot.scan.read_errors_total += 1;
         let s = assemble(Some(&snapshot), None, None, false, chrono::Utc::now());
         assert!(
             s.summary.total_bytes.unwrap_or(0) > 0,
@@ -1764,6 +1856,137 @@ mod tests {
 
     /// Every class is listed even at zero roots, so "we looked and found none"
     /// is distinguishable from "this class was never considered".
+    /// An unknown population publishes NO per-class rollup — the honesty
+    /// contract carried across the cross-repo seam.
+    ///
+    /// Nulling the byte totals and raising `roots_unknown` was enough for a
+    /// consumer that reads them. It is not enough for one that reads the
+    /// rollup: `ClassSummary::roots` is a `usize`, so a failed walk emitted four
+    /// rows of `roots: 0` that are *bit-for-bit* what a fully-read, genuinely
+    /// empty machine emits. `qontinui-web`'s `measuredZeroBuckets.forBucket()`
+    /// licenses a MEASURED `0 B` tile when every row of a bucket reports
+    /// `roots === 0`, so a failed `read_dir(workspace_root)` rendered "nothing
+    /// to reclaim" — the original defect, reached through a consumer instead of
+    /// through a note.
+    #[test]
+    fn an_unknown_population_publishes_no_per_class_rollup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("detached-volume");
+        let failed = build_snapshot(&missing, &clean_opts());
+        let failed = assemble(Some(&failed), None, None, false, chrono::Utc::now());
+        assert!(failed.summary.roots_unknown);
+        assert!(
+            failed.summary.by_class.is_empty(),
+            "four `roots: 0` rows are the shape of a MEASUREMENT; a failed walk must not \
+             produce it: {:?}",
+            failed.summary.by_class
+        );
+
+        // Non-vacuous, and the property the fix must NOT break: a successful
+        // walk over an empty tree still names every class at zero, because
+        // there the zero IS a measurement.
+        let ok = build_snapshot(tmp.path(), &clean_opts());
+        let ok = assemble(Some(&ok), None, None, false, chrono::Utc::now());
+        assert!(!ok.summary.roots_unknown);
+        assert_eq!(
+            ok.summary.by_class.len(),
+            4,
+            "a measured zero keeps its rollup — otherwise this fix would erase the very \
+             distinction it exists to draw"
+        );
+        assert!(ok.summary.by_class.iter().all(|c| c.roots == 0));
+        assert!(ok.summary.by_class.iter().all(|c| c.bytes == Some(0)));
+    }
+
+    /// A stale snapshot says so in the PROSE, not only in `census_status`.
+    ///
+    /// Every populated note narrates the walk in the past tense with an age, and
+    /// at the default cadence `stale_after` is two hours — so a snapshot from a
+    /// surveyor that died at boot read exactly like one taken on schedule to
+    /// anyone reading the sentence rather than the enum. The sibling survey this
+    /// route was modelled on (`on_demand::survey`) appends the same clause.
+    #[test]
+    fn a_stale_snapshot_says_so_in_the_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        mk_target_root(&tmp.path().join("target-wt-old"));
+        let snapshot = build_snapshot(tmp.path(), &clean_opts());
+
+        // Well past `stale_after` for any interval this env can be set to.
+        let much_later = snapshot.taken_at + chrono::Duration::days(30);
+        let stale = assemble(Some(&snapshot), None, None, false, much_later);
+        assert_eq!(stale.census_status, SurveyStatus::Stale);
+        assert!(
+            stale.census_note.contains("STALE"),
+            "a stale snapshot must be flagged in the note a human reads: {}",
+            stale.census_note
+        );
+        // Flagged, never hidden — the items are still served.
+        assert_eq!(stale.summary.roots, 1);
+
+        // Non-vacuous: the same snapshot read fresh carries no such clause.
+        let fresh = assemble(Some(&snapshot), None, None, false, snapshot.taken_at);
+        assert_eq!(fresh.census_status, SurveyStatus::Fresh);
+        assert!(
+            !fresh.census_note.contains("STALE"),
+            "a fresh snapshot must not cry wolf: {}",
+            fresh.census_note
+        );
+    }
+
+    /// The note counts EVERY failed read, not just the recorded sample.
+    ///
+    /// `scan.read_errors` is capped (it is serialized into every response, and
+    /// the walk can fail per directory across a locked subtree), so a sentence
+    /// that read the list's length would report any such subtree as exactly
+    /// `MAX_RECORDED_READ_ERRORS` failures — a silent under-report on the one
+    /// surface built to make under-reports impossible.
+    #[test]
+    fn the_note_counts_every_failed_read_not_just_the_recorded_sample() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("detached-volume");
+        let mut snapshot = build_snapshot(&missing, &clean_opts());
+        assert_eq!(snapshot.scan.read_errors.len(), 1);
+        assert_eq!(snapshot.scan.read_errors_total, 1);
+        // Stand in for a walk whose failures ran past the recording cap.
+        snapshot.scan.read_errors_total = 4_137;
+
+        let s = assemble(Some(&snapshot), None, None, false, chrono::Utc::now());
+        assert!(
+            s.census_note.contains("4137"),
+            "the note must carry the UNCAPPED count: {}",
+            s.census_note
+        );
+        assert!(
+            s.census_note.contains("lists the first 1"),
+            "and must say the list is a sample, so `scan.read_errors` is not read as the whole \
+             set: {}",
+            s.census_note
+        );
+        // The population predicate reads the total too, so a walk whose only
+        // failures were dropped by the cap could never certify a measured zero.
+        assert!(s.summary.roots_unknown);
+
+        // Non-vacuous: an uncapped list says "see", not "lists the first".
+        let uncapped = build_snapshot(&missing, &clean_opts());
+        let uncapped = assemble(Some(&uncapped), None, None, false, chrono::Utc::now());
+        assert!(uncapped.census_note.contains("see `scan.read_errors`"));
+        assert!(!uncapped.census_note.contains("lists the first"));
+
+        // The count and the list are two public fields that must move together,
+        // and nothing in the type system enforces it. `read_errors_seen` takes
+        // the larger, so the failure mode of forgetting the counter is an
+        // over-report of incompleteness — never a fabricated measured zero.
+        let mut desynced = build_snapshot(&missing, &clean_opts());
+        desynced.scan.read_errors_total = 0; // list still holds one error
+        assert!(
+            desynced.scan.incomplete(),
+            "a total left at zero must not certify a walk complete while errors sit on the wire"
+        );
+        let desynced = assemble(Some(&desynced), None, None, false, chrono::Utc::now());
+        assert!(desynced.summary.roots_unknown);
+        assert!(!desynced.census_note.contains("measured zero"));
+    }
+
     #[test]
     fn every_class_appears_in_the_rollup_even_at_zero_roots() {
         let tmp = tempfile::tempdir().unwrap();

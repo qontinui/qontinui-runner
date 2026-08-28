@@ -256,6 +256,18 @@ const MAX_WALK_DEPTH: u32 = 4;
 /// "this list is incomplete" — an under-count is never reported silently.
 const MAX_DIRS_VISITED: usize = 200_000;
 
+/// Ceiling on the failed reads the enumeration RECORDS. The count
+/// ([`Enumeration::read_errors_total`]) is never capped — only the per-path
+/// detail list is, because it is held in memory for the whole walk and
+/// serialized verbatim into every `GET /disk/reclaimable` response. Bounded by
+/// [`MAX_DIRS_VISITED`] alone, one locked subtree could put six figures of
+/// paths on the wire.
+///
+/// The number is a diagnosis budget, not a measurement: past a few dozen
+/// samples the next unreadable path tells an operator nothing the count does
+/// not already say.
+pub(crate) const MAX_RECORDED_READ_ERRORS: usize = 100;
+
 /// Directories the walk never descends into. `.git` holds no build artifacts;
 /// the rest are large populations with no cargo target roots inside them, so
 /// descending only costs time.
@@ -402,7 +414,21 @@ pub struct Enumeration {
     /// not be opened, or a `.git` entry whose stat failed (the probe that
     /// decides ownership). A failed read is reported, never folded into
     /// "nothing there".
+    ///
+    /// **A bounded SAMPLE, not the whole set** — see
+    /// [`MAX_RECORDED_READ_ERRORS`]. [`Self::read_errors_total`] carries how
+    /// many there actually were, so a cap can never shrink the reported count.
     pub read_errors: Vec<(PathBuf, String)>,
+    /// How many reads failed, counted without a bound. `> read_errors.len()`
+    /// means the list above is a sample.
+    ///
+    /// The walk descends to [`MAX_WALK_DEPTH`] over up to [`MAX_DIRS_VISITED`]
+    /// directories and pushes one entry per unreadable `.git`, so an
+    /// antivirus-locked or permission-locked subtree can produce errors by the
+    /// thousand — each one a path plus a sentence, held in memory here and
+    /// serialized whole into every `GET /disk/reclaimable` response. The count
+    /// is what the honesty contract needs; the list is a sample for diagnosis.
+    pub read_errors_total: usize,
     /// Directory ENTRIES that errored mid-iteration, after their `read_dir`
     /// opened successfully. Distinct from [`Self::read_errors`], which records
     /// only open failures: a directory can open and then fail per entry, and
@@ -418,6 +444,20 @@ pub struct Enumeration {
     /// one would double-count the tree behind it — so they are counted here
     /// rather than vanishing.
     pub reparse_dirs_skipped: usize,
+}
+
+impl Enumeration {
+    /// Record one failed read. The COUNT always moves; the per-path detail is
+    /// kept only while under [`MAX_RECORDED_READ_ERRORS`], so a locked subtree
+    /// cannot put six figures of paths in memory and on the wire. Callers must
+    /// go through here rather than pushing directly — a direct push would move
+    /// the list without the count and silently un-cap it.
+    fn record_read_error(&mut self, path: PathBuf, error: String) {
+        self.read_errors_total += 1;
+        if self.read_errors.len() < MAX_RECORDED_READ_ERRORS {
+            self.read_errors.push((path, error));
+        }
+    }
 }
 
 /// What a directory's `.git` entry says — the ONLY discriminator between a
@@ -535,7 +575,7 @@ fn walk(dir: &Path, depth: u32, ctx: &WalkCtx, e: &mut Enumeration) {
         Err(err) => {
             // A read that FAILED is not a directory that is EMPTY. Record it so
             // the survey can say the list is missing a branch.
-            e.read_errors.push((dir.to_path_buf(), err.to_string()));
+            e.record_read_error(dir.to_path_buf(), err.to_string());
             return;
         }
     };
@@ -630,12 +670,12 @@ fn walk(dir: &Path, depth: u32, ctx: &WalkCtx, e: &mut Enumeration) {
                 // an opaque context so everything inside fails closed, and
                 // record the failed read so the survey can say so.
                 GitProbe::Unreadable => {
-                    e.read_errors.push((
+                    e.record_read_error(
                         path.join(".git"),
                         "the `.git` entry could not be read, so this directory's ownership \
                          (canonical checkout / linked worktree / not a repo) is UNKNOWN"
                             .to_string(),
-                    ));
+                    );
                     WalkCtx::OpaqueRepo {
                         root: path.clone(),
                         class: ctx.class(),
@@ -1474,7 +1514,10 @@ pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
     let mut summary = ReapSummary {
         scanned: enumeration.candidates.len(),
         truncated: enumeration.truncated,
-        read_errors: enumeration.read_errors.len(),
+        // The TOTAL, not `read_errors.len()` — the detail list is capped at
+        // `MAX_RECORDED_READ_ERRORS` and reading its length here would make the
+        // cycle log under-report a locked subtree as exactly 100 failures.
+        read_errors: enumeration.read_errors_total,
         entry_errors: enumeration.entry_errors,
         depth_limited_dirs: enumeration.depth_limited_dirs,
         reparse_dirs_skipped: enumeration.reparse_dirs_skipped,
@@ -1614,7 +1657,40 @@ pub struct ReapSummary {
 /// `QONTINUI_ORPHAN_TARGET_INTERVAL_SECS` (default 900 s, floored 60 s).
 /// `MissedTickBehavior::Skip`; failures never panic. The blocking disk work
 /// runs on `spawn_blocking` so it never stalls the async runtime.
+///
+/// ## Instance-gated, exactly like [`super::disk_survey::spawn_disk_surveyor`]
+///
+/// [`run_cycle`] walks the WHOLE MACHINE: [`enumerate_all`] descends to
+/// [`MAX_WALK_DEPTH`] across up to [`MAX_DIRS_VISITED`] directories, spawns one
+/// `git status` per repo root it meets, and sizes every candidate it finds. That
+/// is the same walk the reclaim preview publishes hourly — and the preview's
+/// copy is instance-gated precisely because it is machine-wide, so every
+/// secondary and every supervisor-spawned temp runner would otherwise start its
+/// own full-machine sizing walk over identical data, on the very disk-pressured
+/// box this feature exists for.
+///
+/// The gate stopped at the preview when it was added. This loop runs the same
+/// walk **four times as often** (900 s against the survey's 3600 s), so leaving
+/// it ungated left the louder of the two identical walks running on every
+/// instance. It is also the DESTRUCTIVE engine: once the arming flag is flipped
+/// (plan `2026-08-07-product-disk-monitoring-and-cleanup`, Phase 4), N ungated
+/// instances would race each other over the same paths, each one's
+/// `remove_junction_safe` racing the others' `classify_candidate` readings.
+///
+/// The predicate is the bare [`crate::instance::owns_shared_root_state`] the
+/// survey uses, not `fleet::machine_state_publish_allowed`: that wrapper guards
+/// what a machine PUBLISHES to coord, and this loop publishes nothing and holds
+/// no machine identity. What is being arbitrated here is disk work, so the
+/// disk-work predicate is the right one.
 pub fn spawn_orphan_reaper() {
+    if !crate::instance::owns_shared_root_state() {
+        info!(
+            "orphan_target_reaper: not the shared-root-owning instance — skipping the periodic \
+             reaper (the walk is machine-wide and the owning instance covers this disk). \
+             `GET /disk/reclaimable` still answers here and still refreshes on demand."
+        );
+        return;
+    }
     let secs: u64 = std::env::var(INTERVAL_SECS_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
@@ -2378,6 +2454,76 @@ mod tests {",
         assert_eq!(e.read_errors.len(), 1, "the failed read is RECORDED");
         assert_eq!(e.read_errors[0].0, missing);
         assert!(!e.read_errors[0].1.is_empty(), "with the OS reason");
+    }
+
+    /// The recorded read-error list is capped; the COUNT never is.
+    ///
+    /// The list is held for the whole walk and serialized verbatim into every
+    /// `GET /disk/reclaimable` response, and the walk records one entry per
+    /// unreadable `.git` across up to [`MAX_DIRS_VISITED`] directories — so one
+    /// antivirus- or permission-locked subtree could put six figures of paths on
+    /// the wire. Capping the list is safe only while the count stays exact:
+    /// [`Enumeration::read_errors_total`] is what every honesty branch reads, so
+    /// a cap can never become a silent under-report.
+    #[test]
+    fn recorded_read_errors_are_capped_but_the_count_is_not() {
+        let mut e = Enumeration::default();
+        let n = MAX_RECORDED_READ_ERRORS * 3 + 7;
+        for i in 0..n {
+            e.record_read_error(PathBuf::from(format!("/ws/dir-{i}")), "denied".to_string());
+        }
+        assert_eq!(e.read_errors_total, n, "the count is exact");
+        assert_eq!(
+            e.read_errors.len(),
+            MAX_RECORDED_READ_ERRORS,
+            "the detail list is bounded"
+        );
+        // The sample is the FIRST failures, not the last: the earliest ones sit
+        // nearest the walk's root and say the most about what was missed.
+        assert_eq!(e.read_errors[0].0, PathBuf::from("/ws/dir-0"));
+
+        // Non-vacuous: under the cap the list is complete, so an ordinary walk
+        // loses nothing.
+        let mut small = Enumeration::default();
+        small.record_read_error(PathBuf::from("/ws/one"), "denied".to_string());
+        assert_eq!(small.read_errors_total, 1);
+        assert_eq!(small.read_errors.len(), 1);
+    }
+
+    /// The periodic reaper is instance-gated, exactly like the reclaim preview.
+    ///
+    /// Source-level for the same reason
+    /// `disk_survey::the_periodic_surveyor_is_instance_gated` is: the predicate
+    /// reads process-global state that parallel test threads mutate.
+    ///
+    /// Phase 2 replaced this cycle's shallow container scan with the SAME
+    /// machine-wide walk the preview publishes — and gated only the preview,
+    /// leaving the copy that runs four times as often (900 s against 3600 s)
+    /// starting on every secondary and every supervisor-spawned temp runner.
+    /// This is also the destructive engine, so once the arming flag is flipped
+    /// the ungated version would have N instances racing over the same paths.
+    #[test]
+    fn the_periodic_reaper_is_instance_gated() {
+        const SRC: &str = include_str!("orphan_target_reaper.rs");
+        let prod = SRC
+            .split_once(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+        let spawn = prod
+            .split_once("pub fn spawn_orphan_reaper() {")
+            .map(|(_, after)| after)
+            .expect("spawn_orphan_reaper must exist; move this pin if it is renamed");
+        let body = spawn.split_once("\n}\n").map(|(b, _)| b).unwrap_or(spawn);
+        assert!(
+            body.contains("owns_shared_root_state()"),
+            "the 900s full-machine walk is spawned with no instance guard, so every secondary \
+             and every supervisor-spawned temp runner runs its own copy of it — and would race \
+             them all over the same paths once the arming flag is flipped."
+        );
     }
 
     /// [`MAX_WALK_DEPTH`] and the reparse skip are both silent omissions unless
