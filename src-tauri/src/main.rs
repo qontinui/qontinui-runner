@@ -2651,6 +2651,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .setup(|app| {
             info!("Tauri application setup starting");
 
+            // Capture the primary's boot instant ONCE, synchronously, before
+            // anything can serve a request. It is the reference the PID-reuse
+            // guard keys on (`claude_present_in_inclusive_subtree`), and it is
+            // now shared by BOTH `tracking_health` consumers: the 600 s
+            // periodic task and the on-demand `GET /restart-readiness` pass
+            // (plan 2026-08-29-no-single-answer-…, D5). Two passes keyed on
+            // different instants could disagree; a readiness verdict that
+            // disagrees with /health is worse than the buried number it
+            // replaces. Never `now()` at call time — see the OnceLock's docs.
+            session::tracking_health::set_primary_boot_unix_millis(
+                chrono::Utc::now().timestamp_millis(),
+            );
+
             // Announce the agent-registry break-glass ONCE, loudly, if it is
             // set. A per-spawn warn in a busy log is not discoverable; an
             // operator who exported this months ago otherwise has no signal

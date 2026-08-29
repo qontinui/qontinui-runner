@@ -75,6 +75,17 @@ pub fn is_draining() -> bool {
     DRAINING.load(Ordering::SeqCst)
 }
 
+/// True once a drain has FINISHED. Distinct from [`is_draining`]: a further
+/// `POST /drain` is a fast no-op returning `{already_drained: true}`.
+///
+/// Read-only accessor for the `GET /restart-readiness` verdict (plan
+/// `2026-08-29-no-single-answer-…` Phase 1), which reports drain state without
+/// performing one — a drain is TERMINAL (`DRAINING` is never reset), so the
+/// readiness surface must never trigger it on an operator's behalf.
+pub fn already_drained() -> bool {
+    DRAINED.load(Ordering::SeqCst)
+}
+
 /// Deterministic stable AI-session id for a `task_run_id`.
 ///
 /// `Uuid::new_v5(&AI_SESSION_NS, "ai-session:<task_run_id>")`. This is the
