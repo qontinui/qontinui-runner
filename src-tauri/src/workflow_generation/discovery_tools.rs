@@ -1666,10 +1666,13 @@ fn execute_database_stats(config: &DiscoveryConfig) -> Result<String, String> {
     match client.get(&running_url).send() {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(body) = resp.json::<serde_json::Value>() {
+                // `{ scope, task_runs }` — the scope envelope the handler
+                // returns (`mcp::task_runs::list_running_task_runs`); `data` is
+                // the generic `ApiResponse` wrapper used by sibling routes.
                 let runs = body
-                    .get("data")
+                    .get("task_runs")
                     .and_then(|d| d.as_array())
-                    .or_else(|| body.as_array());
+                    .or_else(|| body.get("data").and_then(|d| d.as_array()));
                 if let Some(run_list) = runs {
                     s.push_str(&format!("- **Active task runs:** {}\n", run_list.len()));
                 }

@@ -10,6 +10,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ActivityType } from "../../types/dashboard/activity-types";
 import type { TaskActivityInfo } from "../../types/dashboard/widget-registry";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { extractRunningTaskRuns } from "@/lib/running-task-runs";
 import { createLogger } from "@/lib/logger";
 
 const logger = createLogger("TaskDetection");
@@ -357,9 +358,10 @@ export function useTaskDetection(options?: UseTaskDetectionOptions): UseTaskDete
         return;
       }
 
-      const tasks: RunningTaskData[] = await response.json();
+      // `{ scope, task_runs }` envelope — never a bare array.
+      const tasks = extractRunningTaskRuns<RunningTaskData>(await response.json());
 
-      if (!Array.isArray(tasks) || tasks.length === 0) {
+      if (tasks.length === 0) {
         // Empty response - increment counter and only declare idle after threshold
         emptyPollCountRef.current++;
         if (emptyPollCountRef.current >= EMPTY_POLL_THRESHOLD) {

@@ -677,12 +677,37 @@ pub struct HistoryQuery {
     pub limit: Option<usize>,
 }
 
+/// The self-describing `scope` this endpoint carries on every response.
+///
+/// Plan `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner`
+/// Phase 2/D4: an operator asking *"are there sessions on this box?"* reaches
+/// this endpoint by name, gets a truthful-but-narrow answer (closed sessions
+/// only), and reads the empty/near-empty result as *"the runner is idle"* while
+/// dozens of live agent sessions run. The fix is to make the endpoint say what
+/// it covers — scoping it, not widening it.
+pub const SESSIONS_HISTORY_SCOPE: &str =
+    "closed terminal sessions (display-only); NOT live sessions — see /restart-readiness";
+
+/// Build the `GET /sessions/history` response envelope: the rows under
+/// `sessions`, plus the constant [`SESSIONS_HISTORY_SCOPE`] under `scope`.
+///
+/// Split out from the handler — and generic over the row type — so the shape is
+/// unit-testable without a live `SessionLifecycleStore`.
+fn history_envelope<T: serde::Serialize>(sessions: Vec<T>) -> serde_json::Value {
+    serde_json::json!({
+        "scope": SESSIONS_HISTORY_SCOPE,
+        "sessions": sessions,
+    })
+}
+
 /// `GET /sessions/history` — the DISPLAY-only "previous sessions" listing: the
 /// full registry (open + closed) merged with the append-only snapshot HISTORY
 /// (ids older than the 24 h registry retention), each row carrying its real
 /// `--resume` name, account, resume command, and a re-probed
 /// `transcriptExists` / `restorable`. Returns the same `Vec<PastSession>` JSON
-/// as the `terminal_session_list_history` Tauri command, under `{ sessions }`.
+/// as the `terminal_session_list_history` Tauri command, under `{ sessions }`,
+/// alongside a `scope` string naming what this listing does and does NOT cover
+/// ([`SESSIONS_HISTORY_SCOPE`]).
 async fn list_history(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<HistoryQuery>,
@@ -708,7 +733,7 @@ async fn list_history(
     };
     let sessions =
         crate::session::past_sessions::build_past_sessions(store.inner(), &snapshot_path, &opts);
-    Ok(Json(serde_json::json!({ "sessions": sessions })))
+    Ok(Json(history_envelope(sessions)))
 }
 
 // =============================================================================
@@ -938,6 +963,68 @@ mod tests {
     use super::*;
 
     const GENERIC: &str = "You are an AI assistant in a session initiated from the Coordinator.";
+
+    // =========================================================================
+    // GET /sessions/history — the scope key
+    //
+    // Plan `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner`
+    // Phase 2/D4.
+    // =========================================================================
+
+    #[test]
+    fn the_history_scope_disclaims_being_a_live_session_listing() {
+        assert!(!SESSIONS_HISTORY_SCOPE.is_empty());
+        assert!(
+            SESSIONS_HISTORY_SCOPE.contains("NOT live sessions"),
+            "the scope must disclaim covering live sessions: {SESSIONS_HISTORY_SCOPE}"
+        );
+        assert!(
+            SESSIONS_HISTORY_SCOPE.contains("/restart-readiness"),
+            "the scope must point at the surface that DOES answer it: {SESSIONS_HISTORY_SCOPE}"
+        );
+    }
+
+    #[test]
+    fn the_history_response_carries_scope_alongside_the_rows() {
+        let body = history_envelope(vec![
+            serde_json::json!({ "claudeSessionId": "a" }),
+            serde_json::json!({ "claudeSessionId": "b" }),
+        ]);
+
+        assert!(body.is_object());
+        assert_eq!(
+            body.get("scope").and_then(|v| v.as_str()),
+            Some(SESSIONS_HISTORY_SCOPE)
+        );
+
+        // `sessions` keeps its name and position — that is precisely why adding
+        // `scope` is non-breaking for `usePastSessions.ts`, which reads the key
+        // by name rather than treating the body as an array.
+        let rows = body
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .expect("`sessions` must be present and an array");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get("claudeSessionId").and_then(|v| v.as_str()),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn an_empty_history_still_says_what_it_covers() {
+        let body = history_envelope(Vec::<serde_json::Value>::new());
+
+        assert!(body
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()));
+        assert_eq!(
+            body.get("sessions").and_then(|v| v.as_array()),
+            Some(&vec![]),
+            "an empty history must serialize as `[]`, not null or absent: {body}"
+        );
+    }
 
     #[test]
     fn a_free_form_prompt_becomes_the_first_message_verbatim() {

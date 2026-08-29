@@ -58,22 +58,55 @@ pub async fn list_task_runs(
     Ok(Json(ApiResponse::success(runs)))
 }
 
-/// List only running task runs.
+/// The self-describing `scope` `GET /task-runs/running` carries on every
+/// response, naming the API port it filtered on.
+///
+/// Plan `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner`
+/// Phase 2/D4. An operator asking *"are there sessions on this box?"* reaches
+/// this endpoint by name, gets `[]` — truthful about *workflow task-runs* —
+/// and reads it as *"the runner is idle"* while dozens of terminal-hosted agent
+/// sessions run. This endpoint is deliberately NOT widened into a session
+/// census (that would build the second census D1 forbids); it is scoped, so the
+/// answer says what it covers.
+pub fn running_task_runs_scope(api_port: u16) -> String {
+    format!(
+        "workflow task-runs on API port {api_port}; NOT a session census — see /restart-readiness"
+    )
+}
+
+/// Build the `GET /task-runs/running` response envelope.
+///
+/// Split out from the handler — and generic over the row type — so the shape is
+/// unit-testable without a live database.
+fn running_task_runs_envelope<T: Serialize>(api_port: u16, task_runs: Vec<T>) -> serde_json::Value {
+    serde_json::json!({
+        "scope": running_task_runs_scope(api_port),
+        "task_runs": task_runs,
+    })
+}
+
+/// List only running task runs, as `{ scope, task_runs }`.
+///
+/// **This is an envelope, not a bare array** — see [`running_task_runs_scope`].
+/// The pre-2026-08-29 shape was `Vec<TaskRun>` at the top level; it was replaced
+/// outright (delete-over-deprecate) rather than dual-emitted, because leaving
+/// the bare array reachable preserves the exact misreading the change closes.
 pub async fn list_running_task_runs(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<Vec<TaskRun>>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let port = state
         .app_state
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    state
+    let runs = state
         .app_state
         .pg_db
         .get_running_task_runs(Some(port))
         .await
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(running_task_runs_envelope(port, runs)))
 }
 
 /// Request body for creating a task run.
@@ -3212,6 +3245,129 @@ mod tests {
         assert_eq!(
             dev_logs_dir_in(Path::new("some/root")),
             PathBuf::from("some/root").join(".dev-logs")
+        );
+    }
+
+    // =========================================================================
+    // GET /task-runs/running — the scope envelope
+    //
+    // Plan `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner`
+    // Phase 2/D4. These pin the SHAPE, which is the whole point of the change:
+    // an operator asked "are there sessions on this box?", got `[]` from this
+    // endpoint, and read it as "idle" while 23 live agent sessions ran.
+    // =========================================================================
+
+    /// A stand-in row. The envelope builder is generic over `Serialize`, so the
+    /// shape tests do not need a fully-populated `TaskRun` (nor a database).
+    #[derive(Serialize)]
+    struct Row {
+        id: &'static str,
+        status: &'static str,
+    }
+
+    #[test]
+    fn the_running_task_runs_scope_names_the_port_and_disclaims_a_session_census() {
+        let scope = running_task_runs_scope(9877);
+
+        // The port matters: temp/secondary runners bind 9877+, and the ledger
+        // is port-filtered, so "empty" means empty *for this port*.
+        assert!(
+            scope.contains("9877"),
+            "the scope must name the API port it filtered on: {scope}"
+        );
+        // The disclaimer is the load-bearing half — without it the endpoint is
+        // exactly as misleading as it was before.
+        assert!(
+            scope.contains("NOT a session census"),
+            "the scope must disclaim being a session census: {scope}"
+        );
+        assert!(
+            scope.contains("/restart-readiness"),
+            "the scope must point at the surface that DOES answer it: {scope}"
+        );
+    }
+
+    #[test]
+    fn the_running_task_runs_response_is_an_envelope_carrying_scope_and_rows() {
+        let body = running_task_runs_envelope(
+            9876,
+            vec![
+                Row {
+                    id: "run-a",
+                    status: "running",
+                },
+                Row {
+                    id: "run-b",
+                    status: "running",
+                },
+            ],
+        );
+
+        // Not a bare array — that shape is gone (delete-over-deprecate).
+        assert!(
+            body.is_object(),
+            "the response must be an object, not a bare array: {body}"
+        );
+
+        let scope = body
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .expect("`scope` must be present");
+        assert!(!scope.is_empty(), "`scope` must be non-empty");
+        assert_eq!(scope, running_task_runs_scope(9876));
+
+        let rows = body
+            .get("task_runs")
+            .and_then(|v| v.as_array())
+            .expect("`task_runs` must be present and an array");
+        assert_eq!(rows.len(), 2, "the envelope must carry every row: {body}");
+        assert_eq!(rows[0].get("id").and_then(|v| v.as_str()), Some("run-a"));
+        assert_eq!(rows[1].get("id").and_then(|v| v.as_str()), Some("run-b"));
+    }
+
+    #[test]
+    fn an_empty_ledger_still_says_what_it_covers() {
+        // The incident case. Empty must arrive WITH its scope, and `task_runs`
+        // must be an empty array rather than absent or null — an absent key
+        // reads as "unknown" to a consumer and as "idle" to a human, which is
+        // the exact failure this endpoint's envelope exists to close.
+        let body = running_task_runs_envelope(9876, Vec::<Row>::new());
+
+        assert!(body
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()));
+        assert_eq!(
+            body.get("task_runs").and_then(|v| v.as_array()),
+            Some(&vec![]),
+            "an empty ledger must serialize as `[]`, not null or absent: {body}"
+        );
+    }
+
+    #[test]
+    fn a_real_task_run_round_trips_through_the_envelope() {
+        // Guards the concrete instantiation the handler uses: `TaskRun`'s own
+        // `skip_serializing_if` attributes must not disturb the two envelope
+        // keys, and the rows must land under `task_runs` unflattened.
+        let run: TaskRun = serde_json::from_value(serde_json::json!({
+            "id": "tr-1",
+            "task_name": "build the thing",
+            "status": "running",
+            "sessions_count": 1,
+            "output_log": "",
+            "created_at": "2026-08-29T00:00:00Z",
+            "updated_at": "2026-08-29T00:00:00Z",
+        }))
+        .expect("minimal TaskRun must deserialize");
+
+        let body = running_task_runs_envelope(9876, vec![run]);
+        let rows = body.get("task_runs").and_then(|v| v.as_array()).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("id").and_then(|v| v.as_str()), Some("tr-1"));
+        assert_eq!(
+            rows[0].get("status").and_then(|v| v.as_str()),
+            Some("running")
         );
     }
 }

@@ -16,6 +16,7 @@ import {
 } from "react";
 import type { TaskActivityInfo } from "../types/dashboard/widget-registry";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { extractRunningTaskRuns } from "@/lib/running-task-runs";
 
 const POLL_INTERVAL_MS = 2000;
 
@@ -215,7 +216,8 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
       const tasksResponse = await tracedFetch(`${getApiBase()}/task-runs/running`);
       let tasks: RunningTaskData[] = [];
       if (tasksResponse.ok) {
-        tasks = await tasksResponse.json();
+        // `{ scope, task_runs }` envelope — never a bare array.
+        tasks = extractRunningTaskRuns<RunningTaskData>(await tasksResponse.json());
       }
 
       // Fetch bridges info

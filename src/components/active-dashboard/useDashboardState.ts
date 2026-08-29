@@ -15,6 +15,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useExecution } from "../../contexts";
 import type { ExecutionStatus, ExecutionState, ActionItem, ScreenshotsResult } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { extractRunningTaskRuns } from "@/lib/running-task-runs";
 import { createLogger } from "@/lib/logger";
 import { useRunnerEvents } from "@/hooks/graphql";
 
@@ -93,8 +94,8 @@ export function useDashboardState(): DashboardState {
     try {
       const response = await tracedFetch(`${getApiBase()}/task-runs/running`);
       if (response.ok) {
-        const tasks = await response.json();
-        const taskList = Array.isArray(tasks) ? tasks : [];
+        // `{ scope, task_runs }` envelope — never a bare array.
+        const taskList = extractRunningTaskRuns<RunningTask>(await response.json());
         setRunningTasks(taskList);
 
         // Use the running task's created_at as the start time (most accurate source)

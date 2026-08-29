@@ -3387,11 +3387,12 @@ async fn runner_has_active_tasks() -> bool {
             .await
             .ok()?;
         let body: serde_json::Value = resp.json().await.ok()?;
-        // Handler returns a bare array; tolerate an envelope like the
-        // discovery_tools consumer does.
-        body.get("data")
+        // The handler returns the scope envelope `{ scope, task_runs }`
+        // (`mcp::task_runs::list_running_task_runs`). `data` is still tolerated
+        // for the generic `ApiResponse` wrapper some sibling routes use.
+        body.get("task_runs")
             .and_then(|d| d.as_array())
-            .or_else(|| body.as_array())
+            .or_else(|| body.get("data").and_then(|d| d.as_array()))
             .map(|a| !a.is_empty())
     };
     match tokio::time::timeout(Duration::from_secs(2), probe).await {
