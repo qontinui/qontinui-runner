@@ -711,6 +711,15 @@ pub async fn set_runner_tier(tier: String) -> Result<SetRunnerTierResult, String
             settings::update_settings(|s| {
                 s.tier = parsed;
                 s.tier_initialized = true;
+                // THE ONLY WRITER of this field, by design. It records that a
+                // human picked this tier, which closes
+                // `settings::migrate_tier_in_place` permanently for this
+                // install — the inference re-runs whenever its signals change
+                // (pairing, headless launch), and the operator's own choice is
+                // the one thing that must never be overridden by it.
+                // `tier_initialized` cannot carry this fact: the inference
+                // writes that too.
+                s.tier_chosen_explicitly = true;
             })
             .map(|()| SetRunnerTierResult {
                 applied: true,

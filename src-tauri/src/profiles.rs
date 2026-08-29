@@ -533,6 +533,165 @@ impl TierRead {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runner-tier INFERENCE — the ONE rule, shared by both readers.
+//
+// There used to be two. `settings::migrate_tier_in_place` (the runner bin) is
+// the copy `require_tier_2()` sees through `load_settings`; `read_runner_tier`
+// below is the copy `coord_doctor` consults, and it carried a hand-mirrored
+// duplicate of the `runner_token` rule under the comment "mirror
+// `settings::migrate_tier_in_place`'s inference". A rule that must be mirrored
+// by hand is a rule that WILL drift — and it had: only one of the two ever
+// learned about `QONTINUI_SERVER_MODE`.
+//
+// So the rule lands here, in the lib, beside the reader and the writer, and
+// `settings::migrate_tier_in_place` calls it. This module's own doc gives the
+// argument: one module => one schema => writer and reader cannot drift.
+//
+// The inference is PURE — every signal arrives as a parameter, no env reads
+// and no I/O — so both call sites and the tests can drive every combination.
+// The probes live in thin wrappers at each call site.
+// ---------------------------------------------------------------------------
+
+/// The `settings.json::tier` value for Tier 0. Its counterpart is
+/// [`QONTINUI_ACCOUNT_TIER`]; there is deliberately no constant for
+/// `local_provider`, which no inference can ever produce (see
+/// [`tier_is_open_to_inference`]).
+pub const LOCAL_TIER: &str = "local";
+
+/// Everything the runner-tier inference is allowed to look at.
+///
+/// A struct rather than three positional `bool`s because the call sites read
+/// `TierSignals { paired, .. }` instead of `infer_tier(false, true, false)`,
+/// and because adding a fourth signal then lands as one named field rather
+/// than a fourth silent argument at every call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TierSignals {
+    /// `web_integration.runner_token` is present and non-empty.
+    ///
+    /// **Legacy.** `server_mode/mod.rs` records that the WS relay "no longer
+    /// consults" this field and authenticates with the device JWT from
+    /// `AuthManager` instead; it is retained only so legacy installs
+    /// round-trip it. Kept as a signal because a non-empty token still proves
+    /// the operator once signed into Qontinui on this box.
+    pub has_runner_token: bool,
+    /// `QONTINUI_SERVER_MODE` — this runner was launched headless, and a
+    /// headless runner exists to be driven over the network.
+    ///
+    /// **In-memory only, by construction.** It is a property of the READING
+    /// process's environment, not of the settings document, so
+    /// [`read_runner_tier_at`] always passes `false`: `coord_doctor` runs in a
+    /// different process whose env says nothing about how the runner was
+    /// launched. Pinned by `tier_matrix_tests`'
+    /// `server_mode_default_is_invisible_to_the_disk_reader`.
+    pub server_mode: bool,
+    /// A `paired_user.json` binding is on disk — [`crate::pair::device_is_paired`].
+    ///
+    /// Unlike `server_mode` this IS a disk fact, so both readers can and do
+    /// see it. A paired device is bound to a Qontinui account, which is what
+    /// Tier 2 *means*.
+    pub paired: bool,
+}
+
+/// What the inference resolved to. Only two arms: `local_provider` (Tier 1) is
+/// unreachable by inference — it exists only as an explicit operator choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferredTier {
+    /// Tier 0 — no signal fired.
+    Local,
+    /// Tier 2 — at least one account-binding signal fired.
+    QontinuiAccount,
+}
+
+impl InferredTier {
+    /// The serde snake_case `settings.json::tier` string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InferredTier::Local => LOCAL_TIER,
+            InferredTier::QontinuiAccount => QONTINUI_ACCOUNT_TIER,
+        }
+    }
+}
+
+/// The runner-tier inference: which tier an install resolves to when it has
+/// not been given one explicitly.
+///
+/// Any ONE of these lands the install in Tier 2 — the tier that is allowed to
+/// talk to coord:
+///
+/// 1. [`TierSignals::has_runner_token`] — the operator signed into Qontinui on
+///    this box before (legacy, but still proof of an account).
+/// 2. [`TierSignals::paired`] — this device holds a Qontinui account binding.
+///    A redeemed pairing IS a cloud-account bind, so this is not merely *a*
+///    better signal than the legacy token: it is the signal the rest of the
+///    system already runs on.
+/// 3. [`TierSignals::server_mode`] — launched headless, i.e. to be driven over
+///    the network, which requires the tier that talks to coord.
+///
+/// Otherwise Tier 0.
+///
+/// # This can only ever promote
+///
+/// The function has no way to express "demote": its callers apply it only
+/// where the persisted tier is absent or `local` (see
+/// [`tier_is_open_to_inference`]), and its non-`Local` arm is the single value
+/// [`QONTINUI_ACCOUNT_TIER`]. Silent demotion of a working primary is the top
+/// risk in this area and a known historical failure mode, so the shape of the
+/// rule rules it out rather than a guard catching it.
+pub fn infer_tier(signals: TierSignals) -> InferredTier {
+    if signals.has_runner_token || signals.paired || signals.server_mode {
+        InferredTier::QontinuiAccount
+    } else {
+        InferredTier::Local
+    }
+}
+
+/// Is an install's persisted tier still open to (re-)inference?
+///
+/// `persisted_tier` is the `settings.json::tier` string, or `None` when the
+/// document has no tier at all (a pre-tier install, or one that has never
+/// completed a load). `chosen_explicitly` is `settings.json::tier_chosen_explicitly`.
+///
+/// # Why this is not simply "have we inferred once already?"
+///
+/// It used to be. `settings::migrate_tier_in_place` was gated on
+/// `tier_initialized`, a ONE-SHOT latch — so a box that first booted before it
+/// was paired was stuck at `Local` permanently, and the only way out was a
+/// button in a WebView the headless box does not have. Re-running the
+/// inference when the signals change is the fix.
+///
+/// But the latch was load-bearing for a second reason: it stopped the
+/// inference from fighting an operator who deliberately chose Tier 0. So the
+/// unlatch has to distinguish **"never chosen"** from **"chosen as Local"**,
+/// and those two were genuinely indistinguishable — the inference and
+/// `commands::auth::set_runner_tier` both wrote the same
+/// `tier_initialized = true`. Hence `tier_chosen_explicitly`, written by
+/// `set_runner_tier` and by nothing else, `#[serde(default)]` so every
+/// existing install reads as "never chosen" and is eligible.
+///
+/// # The three arms
+///
+/// - `chosen_explicitly` ⇒ **closed**. The operator's word is final.
+/// - no tier / `local` ⇒ **open**. `Local` is exactly the value the inference
+///   itself produces, so on a document with no explicit choice recorded it is
+///   evidence of nothing.
+/// - any other tier ⇒ **closed**. `qontinui_account` has nowhere to be
+///   promoted to, and `local_provider` is unreachable by inference — the sole
+///   writer of Tier 1 is `set_runner_tier`, so finding it on disk IS an
+///   explicit choice, recorded before the field existed to say so. That is a
+///   deduction from the writer set, not a guess at intent: reading *`Local`*
+///   as a choice would be the guess, and it is the one this function refuses
+///   to make.
+pub fn tier_is_open_to_inference(persisted_tier: Option<&str>, chosen_explicitly: bool) -> bool {
+    if chosen_explicitly {
+        return false;
+    }
+    match persisted_tier.map(str::trim) {
+        None | Some("") => true,
+        Some(t) => t == LOCAL_TIER,
+    }
+}
+
 /// The persisted runner tier as the serde snake_case string
 /// (`"local"` | `"local_provider"` | `"qontinui_account"`).
 ///
@@ -540,24 +699,31 @@ impl TierRead {
 /// `Settings` struct is a main-binary module (not in lib.rs). Errors are
 /// PRESERVED as [`TierRead::Unknown`] — see the type docs for why.
 ///
-/// When the document parses but has no `tier` key (a pre-tier settings.json,
-/// before `migrate_tier_in_place` has run once), the tier is inferred from a
-/// non-empty `web_integration.runner_token` exactly as that migration does —
-/// otherwise a hosted install would read as `Absent` during the one boot
-/// before the migration persists.
+/// The pairing probe ([`crate::pair::device_is_paired`]) is taken here, in the
+/// env-facing wrapper, so [`read_runner_tier_at`] stays hermetic.
 pub fn read_runner_tier() -> TierRead {
     let (path, _path_source) = settings_json_path();
     let Some(path) = path else {
         return TierRead::Unknown("cannot resolve settings.json path".to_string());
     };
-    read_runner_tier_at(&path)
+    read_runner_tier_at(&path, crate::pair::device_is_paired())
 }
 
 /// Path-parameterized core of [`read_runner_tier`] — the reader half of the
 /// pair whose writer is [`promote_tier_to_account_at`]. Split for the same
 /// reason [`ensure_coord_url_at`] is: hermetic tests against a temp file, no
-/// process env.
-pub fn read_runner_tier_at(path: &std::path::Path) -> TierRead {
+/// process env. `paired` is injected for the same reason.
+///
+/// This is the reader `coord_doctor` consults, and it applies the SAME
+/// [`infer_tier`] / [`tier_is_open_to_inference`] rule that
+/// `settings::migrate_tier_in_place` applies in the runner bin — one rule, two
+/// call sites, no hand-mirrored duplicate. Concretely, a paired box whose
+/// `settings.json` still reads `tier: "local"` (the latched box the headless
+/// defect actually produces) reads back as `qontinui_account` here, which is
+/// what makes the doctor's tier check agree with the runner's own gate.
+///
+/// `server_mode` is deliberately NOT consulted: see [`TierSignals::server_mode`].
+pub fn read_runner_tier_at(path: &std::path::Path, paired: bool) -> TierRead {
     if !path.exists() {
         return TierRead::Absent;
     }
@@ -573,20 +739,33 @@ pub fn read_runner_tier_at(path: &std::path::Path) -> TierRead {
             return TierRead::Unknown(format!("parse {} failed: {e}", path.display()));
         }
     };
-    if let Some(t) = json.get("tier").and_then(|v| v.as_str()) {
-        return TierRead::Known(t.to_string());
-    }
-    // Pre-tier document: mirror `settings::migrate_tier_in_place`'s inference.
-    let has_runner_token = json
-        .get("web_integration")
-        .and_then(|w| w.get("runner_token"))
-        .and_then(|v| v.as_str())
-        .map(|s| !s.trim().is_empty())
+    let persisted = json.get("tier").and_then(|v| v.as_str());
+    let chosen_explicitly = json
+        .get("tier_chosen_explicitly")
+        .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if has_runner_token {
-        TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
-    } else {
-        TierRead::Absent
+    let signals = TierSignals {
+        has_runner_token: json
+            .get("web_integration")
+            .and_then(|w| w.get("runner_token"))
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false),
+        paired,
+        // A property of the reading process, not of this document.
+        server_mode: false,
+    };
+
+    if tier_is_open_to_inference(persisted, chosen_explicitly)
+        && infer_tier(signals) == InferredTier::QontinuiAccount
+    {
+        return TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string());
+    }
+    match persisted.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => TierRead::Known(t.to_string()),
+        // Parsed fine, carries no tier, and nothing infers one: a genuinely
+        // tier-less install. NOT `Known("local")` — see [`TierRead`].
+        None => TierRead::Absent,
     }
 }
 
@@ -1579,7 +1758,18 @@ mod tests {
     const NO_SUCH_PROFILE: &str = "__qontinui_test_no_such_profile__";
 
     /// Env vars every `connected_coord_base` test mutates.
-    const COORD_ENV_KEYS: &[&str] = &["COORD_HTTP_URL", "QONTINUI_ENV", "QONTINUI_CONFIG_DIR"];
+    // `QONTINUI_SECURE_STORAGE_DIR` is in the set because the tier is no
+    // longer a pure function of settings.json: `read_runner_tier` also probes
+    // `paired_user.json` (`pair::device_is_paired`), which resolves under that
+    // var. Without isolating it, these tests would read the DEVELOPER's real
+    // pairing state — and on a paired box every `TierRead::Absent` assertion
+    // below would flip to `Known("qontinui_account")`.
+    const COORD_ENV_KEYS: &[&str] = &[
+        "COORD_HTTP_URL",
+        "QONTINUI_ENV",
+        "QONTINUI_CONFIG_DIR",
+        "QONTINUI_SECURE_STORAGE_DIR",
+    ];
 
     /// Point the resolver at a hermetic config dir with nothing configured:
     /// no `COORD_HTTP_URL`, an unresolvable active profile, and `settings.json`
@@ -1589,6 +1779,8 @@ mod tests {
         std::env::remove_var("COORD_HTTP_URL");
         std::env::set_var("QONTINUI_ENV", NO_SUCH_PROFILE);
         std::env::set_var("QONTINUI_CONFIG_DIR", dir);
+        // Hermetic pairing state too — an empty dir means "not paired".
+        std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir);
         if let Some(body) = settings_json {
             std::fs::write(dir.join("settings.json"), body).unwrap();
         }
@@ -1988,6 +2180,172 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // The SHARED runner-tier inference — `infer_tier` +
+    // `tier_is_open_to_inference`, the one rule `settings::migrate_tier_in_place`
+    // and `read_runner_tier_at` both call. Pure: every signal is a parameter.
+    // ------------------------------------------------------------------
+
+    /// Any ONE account-binding signal lands the install in Tier 2, and only
+    /// the empty set yields Tier 0. Exhaustive over the 2^3 combinations —
+    /// there are eight, so there is no reason to sample.
+    #[test]
+    fn infer_tier_is_the_or_of_its_signals() {
+        for (has_runner_token, server_mode, paired) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            let got = infer_tier(TierSignals {
+                has_runner_token,
+                server_mode,
+                paired,
+            });
+            let want = if has_runner_token || server_mode || paired {
+                InferredTier::QontinuiAccount
+            } else {
+                InferredTier::Local
+            };
+            assert_eq!(
+                got, want,
+                "runner_token={has_runner_token} server_mode={server_mode} paired={paired}"
+            );
+        }
+        assert_eq!(InferredTier::Local.as_str(), LOCAL_TIER);
+        assert_eq!(
+            InferredTier::QontinuiAccount.as_str(),
+            QONTINUI_ACCOUNT_TIER
+        );
+    }
+
+    /// The eligibility rule, stated directly. `Local` is open because it is
+    /// exactly the value the inference produces; `local_provider` is closed
+    /// because NO inference can produce it, so finding it on disk is evidence
+    /// of an explicit choice made before the field existed to record one.
+    #[test]
+    fn tier_is_open_to_inference_arms() {
+        // Open: nothing recorded, or an inferred Local.
+        assert!(tier_is_open_to_inference(None, false));
+        assert!(tier_is_open_to_inference(Some(""), false));
+        assert!(tier_is_open_to_inference(Some("  "), false));
+        assert!(tier_is_open_to_inference(Some(LOCAL_TIER), false));
+
+        // Closed: the operator said so.
+        assert!(!tier_is_open_to_inference(None, true));
+        assert!(!tier_is_open_to_inference(Some(LOCAL_TIER), true));
+
+        // Closed: nothing to promote to / unreachable by inference.
+        assert!(!tier_is_open_to_inference(
+            Some(QONTINUI_ACCOUNT_TIER),
+            false
+        ));
+        assert!(!tier_is_open_to_inference(Some("local_provider"), false));
+
+        // Closed: an unrecognized value is somebody else's, not ours to
+        // overwrite.
+        assert!(!tier_is_open_to_inference(
+            Some("enterprise_someday"),
+            false
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // read_runner_tier_at — the lib-side reader `coord_doctor` consults,
+    // now sharing the inference above.
+    // ------------------------------------------------------------------
+
+    /// The live reproduction this plan was written from, in one test: a
+    /// correctly-paired box whose settings.json still reads `tier: "local"`.
+    /// Before Phase 3 the doctor reported `BLOCKED at: tier` on it.
+    #[test]
+    fn read_runner_tier_at_promotes_a_latched_local_document_when_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tier":"local","tier_initialized":true}"#).unwrap();
+
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ false),
+            TierRead::Known(LOCAL_TIER.to_string())
+        );
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ true),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
+        );
+    }
+
+    /// …and an explicit choice closes it in this reader too, from the
+    /// persisted `tier_chosen_explicitly` key. Both readers must agree, or
+    /// `coord doctor` and `require_tier_2()` disagree about the same box —
+    /// which is the class of defect this phase exists to remove.
+    #[test]
+    fn read_runner_tier_at_honours_an_explicit_local_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"tier":"local","tier_initialized":true,"tier_chosen_explicitly":true}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ true),
+            TierRead::Known(LOCAL_TIER.to_string()),
+            "an operator who chose Tier 0 keeps it even on a paired box"
+        );
+    }
+
+    /// A tier-less document + pairing is a promotion, not `Absent`; a
+    /// tier-less document with no signal at all stays `Absent` — the
+    /// tri-state's whole point is that "no tier" and "Tier 0" are different
+    /// facts.
+    #[test]
+    fn read_runner_tier_at_tierless_document_follows_the_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"web_integration":{"runner_token":""}}"#).unwrap();
+
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ false),
+            TierRead::Absent
+        );
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ true),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
+        );
+    }
+
+    /// The legacy signal still fires — `runner_token` is deprecated, not
+    /// removed, and an install carrying one must not regress to `Absent`.
+    #[test]
+    fn read_runner_tier_at_legacy_runner_token_still_infers_tier_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"web_integration":{"runner_token":"legacy"}}"#).unwrap();
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ false),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
+        );
+    }
+
+    /// NO-DOWNGRADE: an unreadable document is `Unknown`, and pairing does not
+    /// license a guess over it. Absence of evidence about the tier is not
+    /// evidence of a tier.
+    #[test]
+    fn read_runner_tier_at_unparseable_is_unknown_even_when_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(matches!(
+            read_runner_tier_at(&path, /* paired = */ true),
+            TierRead::Unknown(_)
+        ));
+    }
+
+    // ------------------------------------------------------------------
     // promote_tier_to_account_at — the ONE tier writer, shared by the
     // WebView pair door and the headless CLI pair door. Hermetic:
     // path-parameterized, `is_secondary` injected, temp dirs, no process env.
@@ -2019,7 +2377,7 @@ mod tests {
         // And the reader agrees with the writer — the property this module
         // exists to hold.
         assert_eq!(
-            read_runner_tier_at(&path),
+            read_runner_tier_at(&path, /* paired = */ false),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
