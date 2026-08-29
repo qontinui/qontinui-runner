@@ -3,7 +3,7 @@ import { LAYOUT_PRESETS, FLOW_GRID_ID, type SessionState } from "./useZoneLayout
 import type { UIAction } from "./useUIState";
 import type { Metrics } from "./useEventHistory";
 import { getById } from "./commands";
-import { GLOBAL_CHORDS, isCtrlShiftChord } from "@/lib/globalChords";
+import { GLOBAL_CHORDS, isCtrlShiftChord, matchesChord } from "@/lib/globalChords";
 
 interface UseKeyboardShortcutsParams {
   activeId: string | null;
@@ -230,12 +230,12 @@ export function useKeyboardShortcuts({
         zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id);
         return;
       }
-      // Ctrl+Shift+K — command palette. The letter comes from the shared
-      // chord TABLE (not an inline literal) because this chord is claimed
-      // from another component tree too: the KnowledgeBrowser now owns
-      // Ctrl+Shift+E (see `lib/globalChords`), so this no longer opens two
-      // overlays at once.
-      if (isCtrlShiftChord(e, GLOBAL_CHORDS.commandPalette)) {
+      // Ctrl+Shift+K — command palette. The chord comes from the shared
+      // TABLE (not an inline literal) because it is claimed from other
+      // component trees too: the KnowledgeBrowser owns Ctrl+Shift+E and
+      // unified search owns the SHIFTLESS Ctrl+K (see `lib/globalChords`),
+      // so this no longer opens two overlays at once.
+      if (matchesChord(e, GLOBAL_CHORDS.commandPalette)) {
         e.preventDefault();
         // Claims the chord for this surface. It does NOT suppress another
         // listener attached to `window` itself — only

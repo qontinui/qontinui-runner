@@ -46,6 +46,7 @@ import * as dagre from "@dagrejs/dagre";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { ChunkedGraphView, generateGiantSCC } from "@qontinui/workflow-ui/state-machine";
 import "@xyflow/react/dist/style.css";
+import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
 
 /**
  * Fixture toggle. Keyboard shortcut: Ctrl+Shift+G.
@@ -70,7 +71,10 @@ export function GiantSCCFixture() {
   // Keyboard shortcut: Ctrl+Shift+G.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && e.key === "G") {
+      // Via the shared table, not a literal `"G"`: with CapsLock on
+      // Shift reports a lowercase `"g"`, so the literal was dead exactly
+      // when the operator had CapsLock on.
+      if (matchesChord(e, GLOBAL_CHORDS.sccFixture)) {
         e.preventDefault();
         toggleOpen();
       }
