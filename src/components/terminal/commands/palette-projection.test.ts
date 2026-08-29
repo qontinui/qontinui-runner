@@ -12,8 +12,13 @@
  *   7. Projection is emitted in REGISTRY order, so an exact score tie
  *      breaks the same way it does in `resolve()`
  *   8. `scorePaletteLabel` scores a composed row label the way
- *      `resolve()` scores a registry action — slash form and
- *      description separately, with the within-tier slash tiebreak
+ *      `resolve()` scores a registry action — slash form, label and
+ *      params hint as separate candidates, with the within-tier slash
+ *      tiebreak
+ *   9. The two surfaces match the SAME candidate set. They did not: the
+ *      palette scored the params hint as part of the description at full
+ *      tier while the bar never saw it, so `ctx` listed `/spawn-ai` here
+ *      and rendered `No match` there.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -188,6 +193,120 @@ describe("palette ranking agrees with the CommandBar", () => {
     ] as const) {
       expect(paletteTop(query), `palette top for ${query}`).toBe(expected);
       expect(resolve(query, [])[0].action.id, `bar top for ${query}`).toBe(expected);
+    }
+  });
+});
+
+/**
+ * The full-ordering parity suite. The shipped tie test above checks only
+ * the TOP row for three queries; the divergence this closes was in the
+ * tail (`acc` → bar `["/resume"]`, palette `["/resume","/spawn-ai","/spawn-with"]`),
+ * which a top-row assertion cannot see.
+ */
+describe("the two surfaces match the same candidate set", () => {
+  /** The palette's own sort keys, run over the projection. */
+  function paletteOrder(query: string): string[] {
+    const rows = getRegistryPaletteActions();
+    const scored = rows
+      .map((row) => ({ row, m: scorePaletteLabel(row.label, query) }))
+      .filter((s): s is { row: (typeof rows)[number]; m: NonNullable<typeof s.m> } => s.m !== null);
+    scored.sort((a, b) => {
+      if (a.m.score !== b.m.score) return b.m.score - a.m.score;
+      if (a.m.fromSlash !== b.m.fromSlash) return a.m.fromSlash ? -1 : 1;
+      return 0;
+    });
+    return scored.map((s) => s.row.id.replace(/^registry:/, ""));
+  }
+
+  const barOrder = (query: string): string[] => resolve(query, []).map((m) => m.action.id);
+
+  /** The competitor set the divergence was measured against. */
+  function registerFleet(): void {
+    register(
+      action({
+        id: "spawn-ai",
+        slash: "/spawn-ai",
+        label: "Spawn AI session",
+        paramSchema: { count: "n", account: "s", context: "s" },
+      }),
+    );
+    register(
+      action({
+        id: "spawn-with",
+        slash: "/spawn-with",
+        label: "Spawn terminal with command",
+        paramSchema: { count: "n", command: "s" },
+      }),
+    );
+    register(
+      action({
+        id: "close",
+        slash: "/close",
+        label: "Close terminal",
+        paramSchema: { zone: "n", tabId: "s" },
+      }),
+    );
+    register(action({ id: "resume", slash: "/resume", label: "Resume session" }));
+    register(action({ id: "restart", slash: "/restart", label: "Restart session in zone" }));
+    register(action({ id: "auto-restart", slash: "/auto-restart", label: "Toggle auto-restart" }));
+    register(action({ id: "findings", slash: "/findings", label: "Toggle findings panel" }));
+    register(action({ id: "doc-finder", slash: "/doc-finder", label: "Open doc finder" }));
+    register(
+      action({ id: "notify", slash: "/desktop-notify", label: "Toggle desktop notifications" }),
+    );
+    register(action({ id: "layout", slash: "/layout", label: "Set zone layout" }));
+    register(action({ id: "analyze", slash: "/analyze", label: "Analyze terminal output" }));
+    register(action({ id: "spawn", slash: "/spawn", label: "Spawn plain terminal" }));
+    register(action({ id: "swap", slash: "/swap", label: "Swap two zones" }));
+  }
+
+  it("returns the identical ORDERING on both surfaces for the parity queries", () => {
+    registerFleet();
+    // The five queries pinned as already-working before this change; they
+    // must not regress. `resolve` caps at MAX_SUGGESTIONS, so compare the
+    // palette order truncated to the same length.
+    for (const query of ["rst", "fnd", "ntf", "lyt", "sp"]) {
+      const bar = barOrder(query);
+      expect(paletteOrder(query).slice(0, bar.length), `ordering for ${query}`).toEqual(bar);
+    }
+  });
+
+  it("resolves a params-hint-only query on BOTH surfaces, not just the palette", () => {
+    registerFleet();
+    // Each of these matched ONLY inside a params hint. The bar used to
+    // answer nothing at all.
+    for (const [query, expected] of [
+      ["ctx", "spawn-ai"],
+      ["tabid", "close"],
+    ] as const) {
+      expect(barOrder(query)[0], `bar top for ${query}`).toBe(expected);
+      expect(paletteOrder(query)[0], `palette top for ${query}`).toBe(expected);
+      expect(paletteOrder(query).slice(0, barOrder(query).length)).toEqual(barOrder(query));
+    }
+  });
+
+  it("never lets a params hit outrank a slash or label hit", () => {
+    registerFleet();
+    // `acc` hits `/spawn-ai`'s `account` param AND `/spawn-with`'s, but
+    // nothing's slash or label — so all three surfaces agree, and the
+    // banded rows sit below any real hit. Adding a label hit must push it
+    // to the front on both surfaces.
+    register(action({ id: "accounts", slash: "/zz9", label: "Accounts panel" }));
+    expect(barOrder("acc")[0]).toBe("accounts");
+    expect(paletteOrder("acc")[0]).toBe("accounts");
+    const bar = barOrder("acc");
+    expect(paletteOrder("acc").slice(0, bar.length)).toEqual(bar);
+  });
+
+  it("registry labels carry no trailing parens, so the hint split is unambiguous", () => {
+    // `scorePaletteLabel` peels the params hint back off a composed label
+    // with / \([^()]*\)$/. That is only sound while no action's own LABEL
+    // ends in a parenthesised group — pin it here rather than discover it
+    // as a mis-banded row.
+    registerFleet();
+    for (const row of getRegistryPaletteActions()) {
+      const label = row.label.split(" — ")[1] ?? "";
+      expect(label.replace(/ \([^()]*\)$/, "").endsWith(")"), row.label).toBe(false);
     }
   });
 });

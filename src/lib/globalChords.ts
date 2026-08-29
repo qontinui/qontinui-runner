@@ -32,6 +32,20 @@
  * fails when a global chord handler is hand-rolled instead of routed
  * through the predicates here.
  *
+ * A FOURTH round found the scanner itself too narrow to see the thing it
+ * was built to see. Its offender rule matched only a single-LETTER
+ * literal (`e.key === "k"`), on the theory that letters are what CapsLock
+ * re-cases — but `Ctrl+Tab`, `` Ctrl+` `` and `Ctrl+/` are chords too, and
+ * a hand-rolled `e.key === "Tab"` was live in BOTH
+ * `terminal/useKeyboardShortcuts` and `active-dashboard/ActiveRunsBar`
+ * while the enforcement test ran green. The table asserted "exactly two
+ * chord registries" and the code had three; the scanner could not see the
+ * third because a hand-rolled claim contributes no `matchesChord(...)`
+ * text for it to count. CapsLock was never the general defect — it was
+ * one symptom of the general defect, which is a chord claimed OUTSIDE
+ * this table. The scanner now flags a positively-modifier-qualified
+ * `e.key === "<any key name>"`, letter or not.
+ *
  * Leaf module (no React, no DOM beyond the `KeyboardEvent` shape) so it
  * is unit-testable under vitest's `environment: "node"` — same rationale
  * as `components/terminal/scrollKeys.ts`.
@@ -84,6 +98,20 @@ export const GLOBAL_CHORDS = {
   dashboardRefresh: { key: "r", shift: false, meta: true },
   /** HTML capture viewer search focus (`dom-captures/HtmlViewerModal`). */
   htmlViewerSearch: { key: "f", shift: false, meta: false },
+  /**
+   * Cycle FORWARD — Ctrl+Tab. Claimed by TWO surfaces: the terminal's
+   * zone/tab walk (`terminal/useKeyboardShortcuts`) and the active
+   * dashboard's run carousel (`active-dashboard/ActiveRunsBar`, live
+   * whenever ≥2 runs are active). Listed in the enforcement test's
+   * `KNOWN_SHARED_CHORDS` for exactly that reason.
+   */
+  cycleNext: { key: "tab", shift: false, meta: false },
+  /** Cycle BACKWARD — Ctrl+Shift+Tab. Same two claimants as {@link cycleNext}. */
+  cyclePrev: { key: "tab", shift: true, meta: false },
+  /** Second spelling of the dashboard's forward run cycle — Ctrl+`. */
+  runCycleAlt: { key: "`", shift: false, meta: false },
+  /** Terminal CommandBar focus (`terminal/CommandBar`) — Ctrl+/, no Shift. */
+  commandBar: { key: "/", shift: false, meta: false },
 } as const satisfies Record<string, GlobalChord>;
 
 /**
