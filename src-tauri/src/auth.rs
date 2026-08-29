@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use keyring::Entry;
 use serde::Deserialize;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -116,8 +117,73 @@ pub(crate) fn jwt_is_expired(token: &str) -> bool {
 /// waiting for a Keychain user-permission dialog that never resolves — three
 /// auth tests would hang past the 90-min step timeout. Setting this env var
 /// in CI bypasses the dialog cleanly.
-fn keychain_enabled() -> bool {
+///
+/// This is the pure env-var check. [`AuthManager::keychain_enabled`] is the
+/// call site every method actually uses — it additionally consults a
+/// test-only per-instance override (see
+/// [`AuthManager::with_storage_force_keychain`]) so a regression test can
+/// exercise the real keychain path even when the whole test binary runs
+/// under `QONTINUI_DISABLE_KEYCHAIN=1` (CI's default — `ci_node/manifest.rs`).
+fn keychain_enabled_env() -> bool {
     std::env::var_os("QONTINUI_DISABLE_KEYCHAIN").is_none()
+}
+
+/// How long a synchronous `keyring::Entry` call may run before we give up on
+/// it and treat the operation as failed. On Linux, `keyring`'s
+/// `sync-secret-service` backend is a *synchronous* D-Bus Secret Service
+/// client that can block **indefinitely** on an interactive unlock/Prompt
+/// round-trip a headless session can never complete — verified 2026-08-29
+/// even with a Secret Service provider registered and reachable on the bus
+/// (plan `2026-08-29-qontinui-profile-device-pair-never-exits`, Phase 1). A
+/// few seconds is generous for what is otherwise a local D-Bus round-trip,
+/// not a network call.
+const KEYCHAIN_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Runs a synchronous `keyring::Entry` operation (`f`) on a detached thread
+/// and bounds how long the calling thread waits for it via
+/// [`KEYCHAIN_CALL_TIMEOUT`].
+///
+/// Every keychain call in this module is documented "best effort" / "backup"
+/// / "fallback (migration)" — the encrypted file store is the source of
+/// truth (module doc above). A best-effort operation that can block the
+/// calling thread forever is not best-effort at all; this makes the bound
+/// real. On timeout the spawned thread is simply abandoned (never joined) —
+/// a leaked OS thread handle, not a leaked resource, and acceptable for a
+/// rare, already-degraded path. It does not block process exit: Rust does
+/// not wait for non-main threads on return from `main`.
+fn keyring_call_bounded<T, F>(op_name: &str, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("keyring-{op_name}"))
+        .spawn(move || {
+            // The receiver may already be gone (we timed out and moved on) —
+            // ignore the send error, there is nothing more to do.
+            let _ = tx.send(f());
+        });
+    if spawn_result.is_err() {
+        return Err(anyhow::anyhow!(
+            "failed to spawn thread for keychain op '{op_name}'"
+        ));
+    }
+    match rx.recv_timeout(KEYCHAIN_CALL_TIMEOUT) {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                "keychain call '{op_name}' did not return within {:?} — treating as a failed \
+                 (best-effort/fallback) keychain operation and proceeding. The underlying \
+                 thread is abandoned rather than blocking the caller.",
+                KEYCHAIN_CALL_TIMEOUT
+            );
+            Err(anyhow::anyhow!(
+                "keychain op '{op_name}' timed out after {:?}",
+                KEYCHAIN_CALL_TIMEOUT
+            ))
+        }
+    }
 }
 
 /// Manages authentication tokens and device ID storage.
@@ -138,6 +204,12 @@ pub struct AuthManager {
     /// before any mint. `None` only when the home directory is unresolvable
     /// (and, in tests, to exercise the no-machine.json fallback).
     machine_file: Option<std::path::PathBuf>,
+    /// Test-only override that forces [`Self::keychain_enabled`] to `true`
+    /// regardless of `QONTINUI_DISABLE_KEYCHAIN`. Compiled only under
+    /// `#[cfg(test)]` so it cannot affect a release binary. See
+    /// [`Self::with_storage_force_keychain`] for why this exists.
+    #[cfg(test)]
+    force_keychain_enabled: bool,
 }
 
 impl AuthManager {
@@ -152,7 +224,22 @@ impl AuthManager {
             secure_storage,
             service_name: SERVICE_NAME.to_string(),
             machine_file: crate::machine_identity::machine_file_path(),
+            #[cfg(test)]
+            force_keychain_enabled: false,
         }
+    }
+
+    /// Instance-level "is the keychain enabled?" check consulted by every
+    /// keychain call site in this module. Delegates to
+    /// [`keychain_enabled_env`] except under test, where
+    /// [`Self::force_keychain_enabled`] can override it — see
+    /// [`Self::with_storage_force_keychain`].
+    fn keychain_enabled(&self) -> bool {
+        #[cfg(test)]
+        if self.force_keychain_enabled {
+            return true;
+        }
+        keychain_enabled_env()
     }
 
     /// Creates an AuthManager with a custom SecureStorage for testing.
@@ -179,6 +266,32 @@ impl AuthManager {
             secure_storage,
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
             machine_file: None,
+            force_keychain_enabled: false,
+        }
+    }
+
+    /// As [`Self::with_storage`], but [`Self::keychain_enabled`] always
+    /// returns `true` for this instance, regardless of
+    /// `QONTINUI_DISABLE_KEYCHAIN`.
+    ///
+    /// Exists for exactly one caller: the pair-code hang regression test
+    /// (`pair::pair_code_hang_regression_tests`, plan
+    /// `2026-08-29-qontinui-profile-device-pair-never-exits` Phase 4). CI
+    /// runs the whole test binary with `QONTINUI_DISABLE_KEYCHAIN=1`
+    /// (`ci_node/manifest.rs`) so existing tests never touch the real OS
+    /// keychain — but that same env var would silently skip the keychain
+    /// write path the regression test exists to exercise, making it pass
+    /// vacuously on both the fixed and unfixed tree. An instance-level
+    /// override sidesteps this without mutating process-global env (which
+    /// would race every other test reading `QONTINUI_DISABLE_KEYCHAIN` in
+    /// parallel) and without touching any non-test code path.
+    #[cfg(test)]
+    pub fn with_storage_force_keychain(secure_storage: SecureStorage) -> Self {
+        Self {
+            secure_storage,
+            service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
+            machine_file: None,
+            force_keychain_enabled: true,
         }
     }
 
@@ -194,6 +307,7 @@ impl AuthManager {
             secure_storage,
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
             machine_file: Some(machine_file),
+            force_keychain_enabled: false,
         }
     }
 
@@ -244,22 +358,34 @@ impl AuthManager {
     }
 
     /// Stores tokens in the OS keychain (legacy/backup).
+    ///
+    /// Bounded by [`keyring_call_bounded`] — see its doc comment for why: the
+    /// synchronous `keyring::Entry::set_password()` call this makes can block
+    /// the calling thread indefinitely on Linux (plan
+    /// `2026-08-29-qontinui-profile-device-pair-never-exits`, the named
+    /// blocking frame that hung `qontinui_profile device pair` forever).
     fn store_tokens_in_keychain(&self, access_token: &str, refresh_token: &str) -> Result<()> {
-        if !keychain_enabled() {
+        if !self.keychain_enabled() {
             debug!("keychain disabled via QONTINUI_DISABLE_KEYCHAIN, skipping store");
             return Ok(());
         }
-        let entry_access = Entry::new(&self.service_name, "access_token")
-            .context("Failed to create keychain entry for access token")?;
-        let entry_refresh = Entry::new(&self.service_name, "refresh_token")
-            .context("Failed to create keychain entry for refresh token")?;
+        let service_name = self.service_name.clone();
+        let access_token = access_token.to_string();
+        let refresh_token = refresh_token.to_string();
+        keyring_call_bounded("store_tokens", move || {
+            let entry_access = Entry::new(&service_name, "access_token")
+                .context("Failed to create keychain entry for access token")?;
+            let entry_refresh = Entry::new(&service_name, "refresh_token")
+                .context("Failed to create keychain entry for refresh token")?;
 
-        entry_access
-            .set_password(access_token)
-            .context("Failed to store access token in keychain")?;
-        entry_refresh
-            .set_password(refresh_token)
-            .context("Failed to store refresh token in keychain")?;
+            entry_access
+                .set_password(&access_token)
+                .context("Failed to store access token in keychain")?;
+            entry_refresh
+                .set_password(&refresh_token)
+                .context("Failed to store refresh token in keychain")?;
+            Ok(())
+        })?;
 
         debug!("Tokens also stored in keychain (backup)");
         Ok(())
@@ -360,17 +486,24 @@ impl AuthManager {
     }
 
     /// Retrieves access token from keychain (legacy).
+    ///
+    /// Bounded — see [`keyring_call_bounded`]. `get_password()` is the exact
+    /// call already flagged as hang-prone by this module's doc comment
+    /// (`keychain_enabled_env`, formerly `keychain_enabled`, above).
     fn get_access_token_from_keychain(&self) -> Result<String> {
-        if !keychain_enabled() {
+        if !self.keychain_enabled() {
             return Err(anyhow::anyhow!(
                 "keychain disabled via QONTINUI_DISABLE_KEYCHAIN"
             ));
         }
-        let entry = Entry::new(&self.service_name, "access_token")
-            .context("Failed to create keychain entry for access token")?;
-        entry
-            .get_password()
-            .context("Failed to retrieve access token from keychain")
+        let service_name = self.service_name.clone();
+        keyring_call_bounded("get_access_token", move || {
+            let entry = Entry::new(&service_name, "access_token")
+                .context("Failed to create keychain entry for access token")?;
+            entry
+                .get_password()
+                .context("Failed to retrieve access token from keychain")
+        })
     }
 
     /// Retrieves the refresh token.
@@ -406,17 +539,22 @@ impl AuthManager {
     }
 
     /// Retrieves refresh token from keychain (legacy).
+    ///
+    /// Bounded — see [`keyring_call_bounded`].
     fn get_refresh_token_from_keychain(&self) -> Result<String> {
-        if !keychain_enabled() {
+        if !self.keychain_enabled() {
             return Err(anyhow::anyhow!(
                 "keychain disabled via QONTINUI_DISABLE_KEYCHAIN"
             ));
         }
-        let entry = Entry::new(&self.service_name, "refresh_token")
-            .context("Failed to create keychain entry for refresh token")?;
-        entry
-            .get_password()
-            .context("Failed to retrieve refresh token from keychain")
+        let service_name = self.service_name.clone();
+        keyring_call_bounded("get_refresh_token", move || {
+            let entry = Entry::new(&service_name, "refresh_token")
+                .context("Failed to create keychain entry for refresh token")?;
+            entry
+                .get_password()
+                .context("Failed to retrieve refresh token from keychain")
+        })
     }
 
     /// Clears ALL credentials from both storages — the device-JWT pair AND
@@ -610,20 +748,25 @@ impl AuthManager {
     }
 
     /// Clears tokens from keychain (legacy).
+    ///
+    /// Bounded — see [`keyring_call_bounded`].
     fn clear_tokens_from_keychain(&self) -> Result<()> {
-        if !keychain_enabled() {
+        if !self.keychain_enabled() {
             return Ok(());
         }
-        let entry_access = Entry::new(&self.service_name, "access_token")
-            .context("Failed to create keychain entry for access token")?;
-        let entry_refresh = Entry::new(&self.service_name, "refresh_token")
-            .context("Failed to create keychain entry for refresh token")?;
+        let service_name = self.service_name.clone();
+        keyring_call_bounded("clear_tokens", move || {
+            let entry_access = Entry::new(&service_name, "access_token")
+                .context("Failed to create keychain entry for access token")?;
+            let entry_refresh = Entry::new(&service_name, "refresh_token")
+                .context("Failed to create keychain entry for refresh token")?;
 
-        // Ignore errors if tokens don't exist
-        let _ = entry_access.delete_credential();
-        let _ = entry_refresh.delete_credential();
+            // Ignore errors if tokens don't exist
+            let _ = entry_access.delete_credential();
+            let _ = entry_refresh.delete_credential();
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Stores the device ID.
@@ -641,10 +784,19 @@ impl AuthManager {
             .store_device_id(device_id)
             .context("Failed to store device_id in secure storage")?;
 
-        // Also store in keychain (backup, best effort)
-        if keychain_enabled() {
-            if let Ok(entry) = Entry::new(&self.service_name, "device_id") {
-                let _ = entry.set_password(device_id);
+        // Also store in keychain (backup, best effort). Bounded — see
+        // `keyring_call_bounded`.
+        if self.keychain_enabled() {
+            let service_name = self.service_name.clone();
+            let device_id_owned = device_id.to_string();
+            if let Err(e) = keyring_call_bounded("store_device_id", move || {
+                let entry = Entry::new(&service_name, "device_id")
+                    .context("Failed to create keychain entry for device_id")?;
+                entry
+                    .set_password(&device_id_owned)
+                    .context("Failed to store device_id in keychain")
+            }) {
+                debug!("Could not store device_id in keychain (backup): {}", e);
             }
         }
 
@@ -757,20 +909,27 @@ impl AuthManager {
             return Ok(id);
         }
 
-        // Try keychain (for migration)
-        if keychain_enabled() {
-            if let Ok(entry) = Entry::new(&self.service_name, "device_id") {
-                if let Ok(id) = entry.get_password() {
-                    info!(
-                        "Retrieved existing device ID from keychain (migrating): {}",
-                        id
-                    );
-                    // Migrate to file storage
-                    if let Err(e) = self.secure_storage.store_device_id(&id) {
-                        warn!("Failed to migrate device ID to secure storage: {}", e);
-                    }
-                    return Ok(id);
+        // Try keychain (for migration). Bounded — see `keyring_call_bounded`;
+        // this is the same `Entry::get_password()` call the module doc
+        // comment on `keychain_enabled_env` (above) documents as hang-prone.
+        if self.keychain_enabled() {
+            let service_name = self.service_name.clone();
+            if let Ok(id) = keyring_call_bounded("get_device_id", move || {
+                let entry = Entry::new(&service_name, "device_id")
+                    .context("Failed to create keychain entry for device_id")?;
+                entry
+                    .get_password()
+                    .context("Failed to retrieve device_id from keychain")
+            }) {
+                info!(
+                    "Retrieved existing device ID from keychain (migrating): {}",
+                    id
+                );
+                // Migrate to file storage
+                if let Err(e) = self.secure_storage.store_device_id(&id) {
+                    warn!("Failed to migrate device ID to secure storage: {}", e);
                 }
+                return Ok(id);
             }
         }
 

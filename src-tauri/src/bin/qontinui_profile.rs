@@ -57,6 +57,7 @@
 //! Clap's derive macros short-circuit `--help` at every level for free,
 //! so the destructive paths are unreachable when help is requested.
 
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use qontinui_runner_lib::pair::{
     coord_http_base, derive_web_base_from_coord, pair_via_browser, pair_with_auth_token,
@@ -69,6 +70,7 @@ use qontinui_runner_lib::profiles::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -926,6 +928,27 @@ fn resolve_pair_code_base(coord_base: Option<&str>, web_base_env: Option<&str>) 
         .unwrap_or_else(|| PROD_API_BASE_URL.to_string())
 }
 
+/// Decode the `exp` (unix seconds) claim from a JWT's middle segment,
+/// without verifying its signature, and render it as an RFC3339 timestamp.
+/// Mirrors `auth::decode_jwt_exp` but kept local: that helper is
+/// `pub(crate)` to the `qontinui_runner_lib` crate, and this binary is a
+/// separate crate that cannot see it. Used only to print a human-readable
+/// token expiry in `cmd_device_pair`'s success output — `None` here just
+/// means "omit the field", it never fails the pair.
+fn decode_jwt_exp_display(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.trim().split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parts[1]))
+        .ok()?;
+    let claim: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    let exp = claim.get("exp")?.as_i64()?;
+    chrono::DateTime::from_timestamp(exp, 0).map(|dt| dt.to_rfc3339())
+}
+
 fn cmd_device_pair(
     auth_token: Option<&str>,
     pair_code: Option<&str>,
@@ -1080,10 +1103,42 @@ fn cmd_device_pair(
                      cleared ({e}); the runner UI may still show the sign-in screen"
                 );
             }
-            println!(
-                "device paired: user_id={} (device-token JWT saved to auth_tokens.enc)",
-                resp.user_id
+            // Durable outcome fields an operator needs even if the process is
+            // killed a moment later — plan
+            // `2026-08-29-qontinui-profile-device-pair-never-exits` Phase 3.
+            // `resp.exp` is populated on the pair-cli/auth-token/browser wire
+            // but the pair-code redeem response never carries it
+            // (`PairCodeRedeemResponse::into_pair_complete` sets `exp: None`
+            // deliberately — the web schema doesn't return it), so fall back
+            // to decoding the just-minted JWT's own `exp` claim.
+            let device_id_display = resp.device_id.as_deref().unwrap_or("<unknown>");
+            let exp_display = resp
+                .exp
+                .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+                .map(|dt| dt.to_rfc3339())
+                .or_else(|| decode_jwt_exp_display(&resp.token))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let dmk_stored = resp
+                .device_machine_key
+                .as_deref()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false);
+            let success_line = format!(
+                "device paired: user_id={} device_id={} tenant_id={} token_expires={} \
+                 dmk_stored={} (device-token JWT saved to auth_tokens.enc)",
+                resp.user_id, device_id_display, effective_tenant_id, exp_display, dmk_stored
             );
+
+            // Print + flush stdout explicitly, BEFORE any teardown, and also
+            // emit the same line to stderr (unbuffered by default). This is
+            // the plan's harm #2 fix: `println!` to a non-tty is
+            // block-buffered, so a kill after a hang below this point used to
+            // discard the only human-readable confirmation that pairing
+            // succeeded. The stderr copy survives independently of the
+            // stdout flush having reached the terminal driver.
+            println!("{success_line}");
+            let _ = std::io::stdout().flush();
+            eprintln!("{success_line}");
             ExitCode::SUCCESS
         }
         Err(e) => {
