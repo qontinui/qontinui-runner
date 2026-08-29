@@ -717,9 +717,7 @@ async fn materialize(
     //    resource_key, best-effort, exactly as the handoff receiver does.
     let device_id = registry.machine_id();
     for claim in &state.held_claims {
-        if let Err(e) =
-            super::handoff::reacquire_claim(http, coord_url, claim, device_id).await
-        {
+        if let Err(e) = super::handoff::reacquire_claim(http, coord_url, claim, device_id).await {
             tracing::warn!(
                 kind = %claim.kind,
                 resource_key = %claim.resource_key,
@@ -1327,8 +1325,7 @@ mod tests {
         // …and the record round-trips through the real store unchanged, so the
         // resolver is reading the shape the store actually persists.
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
         store.record_open(local_record("sess-x", "D:/local-checkout"));
         let stored = store.get("sess-x").expect("record round-trips");
         assert_eq!(

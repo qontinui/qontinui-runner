@@ -302,7 +302,10 @@ pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label:
                 return;
             };
             let Some(session) = tm.get(&terminal_id) else {
-                info!(terminal_id, label, "prompt-when-idle: terminal gone — standing down");
+                info!(
+                    terminal_id,
+                    label, "prompt-when-idle: terminal gone — standing down"
+                );
                 return;
             };
             let text = {
@@ -325,7 +328,9 @@ pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label:
                 // returning `()` in fee48d4c, which now reports the neutralized body.
                 match session.submit_prompt(&prompt) {
                     Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
-                    Err(e) => warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed"),
+                    Err(e) => {
+                        warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")
+                    }
                 }
                 return;
             }
