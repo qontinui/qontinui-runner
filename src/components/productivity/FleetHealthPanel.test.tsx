@@ -196,6 +196,53 @@ describe("deriveFleetView — coord-mode gating (§6.4)", () => {
     expect(v.coordDisabled).toBe(false);
     expect(v.machines).toHaveLength(1);
   });
+
+  /**
+   * The hole failing open leaves, and the backend answer that closes it.
+   *
+   * `gating.isolated` is false for the whole mount-to-first-answer window and
+   * false FOREVER on a runner build whose `get_coord_mode` rejects. In both
+   * cases `get_fleet_health` has already resolved the same configuration
+   * through `connected_coord_base`, refused to dial, and said so with
+   * `isolated: true`. Without reading it the panel renders that refusal as a
+   * healthy fleet of zero machines.
+   */
+  it("backend says isolated while the gate is still unknown → disabled anyway", () => {
+    const v = deriveFleetView({ ...okPayload(), isolated: true, coordBase: null }, unknown);
+    expect(v.coordDisabled).toBe(true);
+    expect(v.machines).toEqual([]);
+    expect(v.alerts).toEqual([]);
+    expect(v.rollup).toEqual({ critical: 0, warning: 0, info: 0 });
+  });
+
+  it("backend says isolated with no gating argument at all → still disabled", () => {
+    const v = deriveFleetView({ ...okPayload(), isolated: true, coordBase: null });
+    expect(v.coordDisabled).toBe(true);
+    expect(v.machines).toEqual([]);
+  });
+
+  /**
+   * The re-enable path must survive. An operator who connects an account gets
+   * a fresh poll whose payload carries `isolated: false`; if the panel latched
+   * on the stale `true` it would stay dark forever — the exact defect
+   * `CoordModeContext`'s `runner-tier-changed` listener exists to prevent, and
+   * one a second isolation source could quietly reintroduce.
+   */
+  it("backend says NOT isolated and the gate agrees → live again", () => {
+    const v = deriveFleetView({ ...okPayload(), isolated: false }, connected);
+    expect(v.coordDisabled).toBe(false);
+    expect(v.machines).toHaveLength(1);
+  });
+
+  /** An older backend omits the field entirely; that must read as "not
+   *  isolated", i.e. exactly the pre-§6.4 behaviour, never as isolated. */
+  it("backend omits `isolated` (older build) → gate alone decides", () => {
+    const payload = okPayload();
+    expect(payload.isolated).toBeUndefined();
+    expect(deriveFleetView(payload, connected).coordDisabled).toBe(false);
+    expect(deriveFleetView(payload, unknown).coordDisabled).toBe(false);
+    expect(deriveFleetView(payload, isolatedNoAccount).coordDisabled).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

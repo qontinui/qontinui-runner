@@ -2203,9 +2203,46 @@ pub async fn spawn_from_plan(
         .map_err(|e| format!("parse /agents/spawn response: {e}"))
 }
 
+/// The isolated-mode answer for [`get_fleet_health`]: the connected payload's
+/// own shape, emptied, carrying `isolated: true`.
+///
+/// Split out for the same reason [`spawn_base_or_isolated`] and
+/// [`overlapping_intents_for_base`] are — the arm is assertable without
+/// touching process env.
+///
+/// **Why `Ok` and not `Err`, when `spawn_from_plan` refuses out loud.** The two
+/// commands differ in what the operator asked for. A spawn is an action with an
+/// expected effect, so silence would be the "clicked and nothing happened"
+/// failure §6.4 exists to remove. Fleet health is a passive read on a panel
+/// that already renders its own reason, so an `Err` here would paint the
+/// retriable "coord unreachable" banner — blaming an outage for what is
+/// configuration, which is the precise misreading this gate was built to stop.
+/// [`list_overlapping_intents`] resolves the same trade-off the same way.
+///
+/// `isolated` is what keeps that quiet answer from reading as "a healthy fleet
+/// with no machines". The frontend gate fails OPEN on an unresolved mode, so
+/// during the mount window — and forever on a build whose `get_coord_mode`
+/// rejects — the panel would otherwise render an empty grid with no reason
+/// attached. This field lets it state the cause on the backend's authority
+/// rather than only on the context's.
+fn fleet_health_isolated_payload() -> serde_json::Value {
+    serde_json::json!({
+        "health": serde_json::Value::Null,
+        "alerts": [],
+        // `null`, not the guessed base: naming a coord we refused to dial is
+        // exactly the invented-endpoint answer this arm exists to stop.
+        "coordBase": serde_json::Value::Null,
+        "isolated": true,
+        // Not an auth failure — there is no coordinator to authenticate to.
+        // Reporting `unpaired` here would send the operator to re-pair a
+        // device against a coordinator that does not exist.
+        "auth": {"state": "ok"},
+    })
+}
+
 /// `get_fleet_health` — fetch coord's fleet-health rollup + active
 /// alerts in one call for the dashboard panel. Returns the merged JSON
-/// `{ health: <coord /fleet/health>, alerts: [...], coordBase, auth }`.
+/// `{ health: <coord /fleet/health>, alerts: [...], coordBase, isolated, auth }`.
 ///
 /// Both GETs carry the device-JWT (coord device-pairing token) when one
 /// is available locally. coord is anonymous TODAY, so the header is
@@ -2226,7 +2263,33 @@ pub async fn spawn_from_plan(
 /// alerts stay best-effort `[]` for NON-auth failures.
 #[tauri::command]
 pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
-    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
+    // `connected_coord_base` — the Option-family policy resolver, for the same
+    // reason `list_overlapping_intents` and `spawn_from_plan` use it: §6.4
+    // gates this panel on isolation, and the String-family sibling
+    // `coord_base_with_source` cannot express "isolated" at all.
+    //
+    // Of the three it is this one the String family cost the most, because it
+    // ATTACHES THE DEVICE JWT to both GETs. When
+    // `settings.json` cannot be READ the tier is UNKNOWN and that family
+    // guesses the PRODUCTION base — so an unreadable settings file was enough
+    // to send this runner's device bearer to
+    // `https://coord.qontinui.io/coord/fleet/health` off a membership it never
+    // established. `classify_connected` refuses exactly that egress ("absence
+    // of evidence about the tier is not evidence of membership").
+    //
+    // On a standalone install the same family invents `http://localhost:9870`,
+    // and because a transport error here is the panel's "coord unreachable —
+    // showing last known state" path, dialling that phantom MANUFACTURED a
+    // permanent red banner for what is configuration, not an outage.
+    //
+    // The §6.4 UI gate does not make this unreachable. It fails OPEN on an
+    // unresolved mode by design, which is the window every app start passes
+    // through — and where this panel's own Refresh control stays enabled — and
+    // it fails open PERMANENTLY on any runner build whose `get_coord_mode`
+    // rejects. See `fleet_health_isolated_payload`.
+    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+        return Ok(fleet_health_isolated_payload());
+    };
     let base = base.trim_end_matches('/');
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -2314,6 +2377,9 @@ pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
         "health": health,
         "alerts": alerts.get("alerts").cloned().unwrap_or(serde_json::json!([])),
         "coordBase": base,
+        // Always present on the connected arm too, so the panel reads one
+        // field rather than inferring isolation from an absent one.
+        "isolated": false,
         "auth": auth,
     }))
 }
@@ -2791,6 +2857,68 @@ mod launch_intent_tests {
     fn append_add_dir_no_args_returns_command_unchanged() {
         let cmd = "claude --dangerously-skip-permissions".to_string();
         assert_eq!(append_claude_add_dir(cmd.clone(), &[]), cmd);
+    }
+}
+
+/// The isolated arm of `get_fleet_health` — the third §6.4-gated coord surface,
+/// and the last one that still resolved its base through the String family.
+#[cfg(test)]
+mod fleet_health_isolated_tests {
+    use super::*;
+
+    /// The panel reads `isolated` to state a reason instead of rendering an
+    /// empty grid. If this field went missing, the fail-open window (and every
+    /// runner build whose `get_coord_mode` rejects) would show a standalone
+    /// install a healthy-looking fleet of zero machines.
+    #[test]
+    fn isolated_payload_is_marked_and_empty() {
+        let v = fleet_health_isolated_payload();
+        assert_eq!(v["isolated"], serde_json::json!(true));
+        assert_eq!(v["health"], serde_json::Value::Null);
+        assert_eq!(v["alerts"], serde_json::json!([]));
+    }
+
+    /// Isolation is not an auth failure. `unpaired`/`unauthorized` would send
+    /// the operator to re-pair a device against a coordinator that does not
+    /// exist.
+    #[test]
+    fn isolation_is_not_reported_as_an_auth_problem() {
+        let v = fleet_health_isolated_payload();
+        assert_eq!(
+            v["auth"]["state"],
+            serde_json::json!("ok"),
+            "isolation must not masquerade as an auth state: {v}"
+        );
+    }
+
+    /// The whole point of routing through `connected_coord_base`: no guessed
+    /// endpoint may reach the frontend. The String family would have put
+    /// `http://localhost:9870` here on a standalone install, and the PRODUCTION
+    /// base on an unreadable `settings.json`.
+    #[test]
+    fn isolated_payload_names_no_guessed_base() {
+        let v = fleet_health_isolated_payload();
+        assert_eq!(v["coordBase"], serde_json::Value::Null);
+        let rendered = v.to_string();
+        assert!(
+            !rendered.contains("localhost"),
+            "must not leak the dev guess: {rendered}"
+        );
+        assert!(
+            !rendered.contains("coord.qontinui.io"),
+            "must not leak prod: {rendered}"
+        );
+    }
+
+    /// The isolated arm must carry the SAME keys the connected arm does, or the
+    /// panel's `FleetHealth` destructuring silently reads `undefined` — which is
+    /// how an empty grid gets rendered as current.
+    #[test]
+    fn isolated_payload_matches_the_connected_shape() {
+        let v = fleet_health_isolated_payload();
+        for key in ["health", "alerts", "coordBase", "isolated", "auth"] {
+            assert!(v.get(key).is_some(), "missing `{key}` in {v}");
+        }
     }
 }
 

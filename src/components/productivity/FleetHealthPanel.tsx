@@ -112,7 +112,18 @@ export function deriveFleetView(
   // rendered outside CoordModeProvider) fails OPEN — see
   // CoordModeContext's header on why a wrongly-disabled panel is worse
   // than a wrongly-enabled one.
-  const coordDisabled = gating?.isolated ?? false;
+  //
+  // The BACKEND's own answer is the second source, and it is what covers the
+  // hole failing open leaves: `gating.isolated` is false for the whole
+  // mount-to-first-answer window, and false FOREVER on a runner build whose
+  // `get_coord_mode` rejects. In both cases `get_fleet_health` has already
+  // resolved the same config through `connected_coord_base` and refused to
+  // dial, so without reading `data.isolated` the panel would render that
+  // refusal as a healthy fleet of zero machines. Either source saying
+  // isolated is enough; neither can wrongly disable a CONNECTED runner,
+  // because both derive from the same configuration rather than from
+  // reachability.
+  const coordDisabled = (gating?.isolated ?? false) || data?.isolated === true;
   return {
     authState,
     isUnauthorized,

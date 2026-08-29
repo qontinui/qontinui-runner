@@ -451,7 +451,19 @@ export interface FleetHealth {
     as_of: string;
   } | null;
   alerts: FleetAlert[];
-  coordBase: string;
+  /** `null` on the isolated arm — there is no coordinator, and naming a
+   *  guessed one is what routing through the Option family removed. */
+  coordBase: string | null;
+  /** True when the BACKEND resolved the runner as isolated and refused to
+   *  dial. Distinct from the `CoordModeContext` gate, which is the same
+   *  answer read from the frontend: the gate fails OPEN on an unresolved
+   *  mode, so during the mount window — and permanently on a runner build
+   *  whose `get_coord_mode` rejects — this field is the only thing that
+   *  stops an empty grid rendering as a healthy fleet of zero machines.
+   *
+   *  Optional for back-compat with an older backend (absent → not isolated,
+   *  i.e. exactly the pre-§6.4 behaviour). */
+  isolated?: boolean;
   /** Optional for back-compat with an older backend (absent → `ok`). */
   auth?: FleetAuth;
 }
