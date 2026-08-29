@@ -1186,6 +1186,43 @@ fn cmd_device_pair(
                 resp.user_id, device_id_display, effective_tenant_id, exp_display, dmk_stored
             );
 
+            // Promote the runner to Tier 2 (`qontinui_account`) — the tier that
+            // is allowed to talk to coord. Redeeming a pairing IS a
+            // cloud-account bind, and this is the SAME writer the WebView door
+            // (`redeem_pair_code`) calls; before it existed, this headless door
+            // wrote the credentials and never touched the tier, so a headless
+            // box — the one that most needs Tier 2 — was the only box that
+            // could not reach it, and `coord doctor` reported `BLOCKED at:
+            // tier` on a correctly-paired device.
+            //
+            // Best-effort, exactly like the sign-out-marker clear above: a
+            // failed promotion must never fail a pairing that already
+            // persisted. The helper refuses a SECONDARY instance (it would
+            // demote the primary's shared settings.json) and refuses an
+            // unparseable settings.json (it would clobber recoverable state).
+            match qontinui_runner_lib::profiles::promote_tier_to_account() {
+                Ok(qontinui_runner_lib::profiles::TierPromotion::Promoted) => {
+                    println!("runner tier promoted to qontinui_account");
+                }
+                Ok(qontinui_runner_lib::profiles::TierPromotion::AlreadyAccount) => {
+                    println!("runner tier already qontinui_account");
+                }
+                Ok(qontinui_runner_lib::profiles::TierPromotion::SkippedSecondary) => {
+                    eprintln!(
+                        "warning: QONTINUI_INSTANCE_NAME is set, so this is a SECONDARY runner \
+                         instance — refusing to write the shared settings.json (it would demote \
+                         the primary). Run `device pair` from the primary, or set the tier there."
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: pairing persisted but the runner tier could not be promoted \
+                         ({e}); coord access stays blocked until settings.json::tier is \
+                         qontinui_account"
+                    );
+                }
+            }
+
             // Print + flush stdout explicitly, BEFORE any teardown, and also
             // emit the same line to stderr (unbuffered by default). This is
             // the plan's harm #2 fix: `println!` to a non-tty is

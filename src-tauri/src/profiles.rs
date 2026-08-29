@@ -550,10 +550,18 @@ pub fn read_runner_tier() -> TierRead {
     let Some(path) = path else {
         return TierRead::Unknown("cannot resolve settings.json path".to_string());
     };
+    read_runner_tier_at(&path)
+}
+
+/// Path-parameterized core of [`read_runner_tier`] — the reader half of the
+/// pair whose writer is [`promote_tier_to_account_at`]. Split for the same
+/// reason [`ensure_coord_url_at`] is: hermetic tests against a temp file, no
+/// process env.
+pub fn read_runner_tier_at(path: &std::path::Path) -> TierRead {
     if !path.exists() {
         return TierRead::Absent;
     }
-    let bytes = match std::fs::read(&path) {
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             return TierRead::Unknown(format!("read {} failed: {e}", path.display()));
@@ -580,6 +588,177 @@ pub fn read_runner_tier() -> TierRead {
     } else {
         TierRead::Absent
     }
+}
+
+// ---------------------------------------------------------------------------
+// Runner-tier WRITER — the ONE tier-promotion path.
+//
+// Deliberately beside [`read_runner_tier`]: one module ⇒ one schema ⇒ writer
+// and reader cannot drift. This is the module doc's own argument applied to the
+// half that was missing.
+//
+// It lives in the LIB rather than in `settings.rs` because `settings` is
+// declared in `main.rs` — the runner BIN's module tree — and the headless pair
+// door (`bin/qontinui_profile.rs`) is a second bin that links only this lib. So
+// `settings.rs` is literally unreachable from the door that most needs to
+// promote the tier, which is why the two doors disagreed in the first place:
+// `redeem_pair_code` (WebView-only) promoted, `qontinui_profile device pair`
+// (headless) did not. Both now call this.
+// ---------------------------------------------------------------------------
+
+/// What a tier promotion actually did. Every arm is a normal outcome — the
+/// callers are best-effort and log rather than fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierPromotion {
+    /// `settings.json` was rewritten: `tier = "qontinui_account"`,
+    /// `tier_initialized = true`. Every other key rode along untouched.
+    Promoted,
+    /// Already at `qontinui_account` with the init flag set — no write at all,
+    /// the file is byte-identical.
+    AlreadyAccount,
+    /// This runner is a SECONDARY instance, so nothing was read or written.
+    /// See [`crate::instance_env::is_secondary`] and the caller note on
+    /// [`promote_tier_to_account_at`].
+    SkippedSecondary,
+}
+
+impl TierPromotion {
+    /// Stable wire/log string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TierPromotion::Promoted => "promoted",
+            TierPromotion::AlreadyAccount => "already_qontinui_account",
+            TierPromotion::SkippedSecondary => "skipped_secondary",
+        }
+    }
+}
+
+impl std::fmt::Display for TierPromotion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Persist `tier = "qontinui_account"` (+ `tier_initialized = true`) into the
+/// runner's `settings.json`.
+///
+/// Called by BOTH doors that redeem a device pairing — `redeem_pair_code`
+/// (the Tauri command) and `qontinui_profile device pair` (the headless CLI) —
+/// because redeeming a pair code IS a cloud-account bind, and tier 2 is the
+/// tier that is allowed to talk to coord.
+///
+/// **Promotes only, never demotes**: the sole value this function can write is
+/// [`QONTINUI_ACCOUNT_TIER`].
+pub fn promote_tier_to_account() -> Result<TierPromotion> {
+    let (path, source) = settings_json_path();
+    let path = path.ok_or_else(|| anyhow!("cannot resolve settings.json path (source: {source})"))?;
+    promote_tier_to_account_at(&path, crate::instance_env::is_secondary())
+}
+
+/// Path-parameterized core of [`promote_tier_to_account`] (hermetic tests point
+/// it at a temp file and inject the predicate, so they never touch process env).
+///
+/// Honours all three conditions of the runner bin's own persist guard,
+/// `settings::should_persist_migration(needs_persist, is_secondary, provenance)`:
+///
+/// 1. **Something to persist.** A file already reading `qontinui_account` with
+///    `tier_initialized` set is left BYTE-IDENTICAL ([`TierPromotion::AlreadyAccount`]).
+/// 2. **`!is_secondary`.** A supervisor-launched runner carrying
+///    `QONTINUI_INSTANCE_NAME` must never write the shared `settings.json`:
+///    `settings::migrate_tier_in_place` infers `Local` for it (no
+///    `runner_token`), so a secondary write silently DEMOTES the primary on
+///    disk — the FOOTGUN GUARD in `settings::load_settings_full`. Note the
+///    nuance that guard documents: the path IS instance-scoped when
+///    `QONTINUI_CONFIG_DIR` is set, so the hazard is specifically a secondary
+///    with `QONTINUI_INSTANCE_NAME` and no `QONTINUI_CONFIG_DIR`. The
+///    predicate stays the conservative one anyway. Checked FIRST, before any
+///    I/O. Callers that can (the runner bin) should apply an in-memory-only
+///    tier overlay on this arm instead.
+/// 3. **Authoritative source.** Satisfied STRUCTURALLY by the `serde_json::Value`
+///    edit, exactly as [`ensure_coord_url_at`] does it: an unparseable
+///    `settings.json` is an `Err` ("refusing to overwrite"), never an
+///    all-defaults clobber. The lib has no `Settings` struct and must not
+///    synthesize one — a typed round-trip would silently drop every key the lib
+///    does not model.
+///
+/// An ABSENT `settings.json` is created carrying just these two keys. That is
+/// the fresh headless box: pairing before the runner has ever written its
+/// settings, which is precisely the case that would otherwise be latched at
+/// `Local` forever by the one-shot `migrate_tier_in_place`. Every remaining
+/// field comes from its serde default on the next load (pinned by
+/// `settings::minimal_promoted_settings_json_parses`).
+pub fn promote_tier_to_account_at(
+    path: &std::path::Path,
+    is_secondary: bool,
+) -> Result<TierPromotion> {
+    use serde_json::{Map, Value};
+
+    // Condition 2 — before any I/O at all.
+    if is_secondary {
+        return Ok(TierPromotion::SkippedSecondary);
+    }
+
+    if !path.exists() {
+        let mut root = Map::new();
+        root.insert(
+            "tier".to_string(),
+            Value::String(QONTINUI_ACCOUNT_TIER.to_string()),
+        );
+        root.insert("tier_initialized".to_string(), Value::Bool(true));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut bytes = serde_json::to_vec_pretty(&Value::Object(root))?;
+        bytes.push(b'\n');
+        std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        info!(
+            "promote_tier_to_account: created {} with tier={}",
+            path.display(),
+            QONTINUI_ACCOUNT_TIER
+        );
+        return Ok(TierPromotion::Promoted);
+    }
+
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    // Condition 3: a document we cannot parse is NOT authoritative state we may
+    // replace with our own two keys.
+    let mut root: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {} (refusing to overwrite)", path.display()))?;
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{}: root is not a JSON object", path.display()))?;
+
+    // Condition 1: nothing to persist ⇒ no write at all (byte-identical file).
+    let tier_is_account = root_obj
+        .get("tier")
+        .and_then(|v| v.as_str())
+        .map(|t| t == QONTINUI_ACCOUNT_TIER)
+        .unwrap_or(false);
+    let initialized = root_obj
+        .get("tier_initialized")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if tier_is_account && initialized {
+        return Ok(TierPromotion::AlreadyAccount);
+    }
+
+    // Insert ONLY the two target keys; every sibling — known or unknown — rides
+    // along in the Value tree untouched.
+    root_obj.insert(
+        "tier".to_string(),
+        Value::String(QONTINUI_ACCOUNT_TIER.to_string()),
+    );
+    root_obj.insert("tier_initialized".to_string(), Value::Bool(true));
+    let mut out = serde_json::to_vec_pretty(&root)?;
+    out.push(b'\n');
+    std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+    info!(
+        "promote_tier_to_account: set tier={} in {}",
+        QONTINUI_ACCOUNT_TIER,
+        path.display()
+    );
+    Ok(TierPromotion::Promoted)
 }
 
 // ---------------------------------------------------------------------------
@@ -1805,5 +1984,191 @@ mod tests {
         std::fs::write(&path, b"{not json").unwrap();
         assert!(ensure_coord_url_at(&path, None, PROD_COORD_WS_URL).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
+    }
+
+    // ------------------------------------------------------------------
+    // promote_tier_to_account_at — the ONE tier writer, shared by the
+    // WebView pair door and the headless CLI pair door. Hermetic:
+    // path-parameterized, `is_secondary` injected, temp dirs, no process env.
+    // ------------------------------------------------------------------
+
+    /// A box latched at Tier 0 by the one-shot `migrate_tier_in_place` is what
+    /// the headless defect actually produces. Promotion must move it.
+    #[test]
+    fn promote_tier_local_settings_becomes_qontinui_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "tier": "local",
+                "tier_initialized": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            promote_tier_to_account_at(&path, false).unwrap(),
+            TierPromotion::Promoted
+        );
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["tier"], QONTINUI_ACCOUNT_TIER);
+        assert_eq!(v["tier_initialized"], true);
+        // And the reader agrees with the writer — the property this module
+        // exists to hold.
+        assert_eq!(
+            read_runner_tier_at(&path),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
+        );
+    }
+
+    /// The `Value`-tree property, and the reason a typed round-trip is banned
+    /// here: the lib has no `Settings` struct, so synthesizing one would
+    /// silently destroy every key it does not model — which is most of them.
+    #[test]
+    fn promote_tier_preserves_unknown_sibling_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = serde_json::json!({
+            "tier": "local",
+            "tier_initialized": true,
+            "local_user_id": "1f0a1c2e-0000-4000-8000-000000000001",
+            "web_integration": {"runner_token": "", "enabled": true},
+            "saved_projects": [{"id": "p1", "path": "/tmp/p1"}],
+            "an_entirely_unmodelled_key": {"deep": [1, 2, {"three": true}]},
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+
+        assert_eq!(
+            promote_tier_to_account_at(&path, false).unwrap(),
+            TierPromotion::Promoted
+        );
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["tier"], QONTINUI_ACCOUNT_TIER);
+        assert_eq!(v["tier_initialized"], true);
+        assert_eq!(
+            v["local_user_id"],
+            "1f0a1c2e-0000-4000-8000-000000000001",
+            "an unrelated key must survive the promotion"
+        );
+        assert_eq!(v["web_integration"]["enabled"], true);
+        assert_eq!(v["saved_projects"][0]["id"], "p1");
+        assert_eq!(v["an_entirely_unmodelled_key"]["deep"][2]["three"], true);
+    }
+
+    /// Condition 1 (nothing to persist) + the no-demote rule: an
+    /// already-promoted file is not rewritten at all.
+    #[test]
+    fn promote_tier_already_account_is_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Quirky formatting on purpose: any write at all would change it.
+        let original =
+            "{\"tier\":\"qontinui_account\",   \"tier_initialized\":true,\n \"extra\":[1,2]}";
+        std::fs::write(&path, original).unwrap();
+
+        assert_eq!(
+            promote_tier_to_account_at(&path, false).unwrap(),
+            TierPromotion::AlreadyAccount
+        );
+        assert_eq!(
+            std::str::from_utf8(&std::fs::read(&path).unwrap()).unwrap(),
+            original,
+            "an already-qontinui_account settings.json must mean NO write at all"
+        );
+    }
+
+    /// Condition 3 (authoritative source), structurally: an unparseable
+    /// `settings.json` is refused, never replaced with our two keys.
+    #[test]
+    fn promote_tier_unparseable_file_is_refused_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{\"tier\": \"local\",").unwrap();
+
+        let err = promote_tier_to_account_at(&path, false).unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "the refusal must be explicit, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"tier\": \"local\",",
+            "a corrupt settings.json must be left byte-identical"
+        );
+    }
+
+    /// Condition 2 (`!is_secondary`) — the single most dangerous arm. A
+    /// secondary carrying `QONTINUI_INSTANCE_NAME` and no
+    /// `QONTINUI_CONFIG_DIR` resolves the PRIMARY's shared settings.json, so a
+    /// write here silently demotes the primary on its next load. Nothing may be
+    /// written, and nothing may even be read.
+    #[test]
+    fn promote_tier_secondary_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = "{\"tier\":\"local\",\"tier_initialized\":true}";
+        std::fs::write(&path, original).unwrap();
+
+        assert_eq!(
+            promote_tier_to_account_at(&path, true).unwrap(),
+            TierPromotion::SkippedSecondary
+        );
+        assert_eq!(
+            std::str::from_utf8(&std::fs::read(&path).unwrap()).unwrap(),
+            original,
+            "a secondary must never write the shared settings.json"
+        );
+
+        // Same predicate on a path that does not exist: still no file created.
+        let absent = dir.path().join("nope").join("settings.json");
+        assert_eq!(
+            promote_tier_to_account_at(&absent, true).unwrap(),
+            TierPromotion::SkippedSecondary
+        );
+        assert!(!absent.exists());
+    }
+
+    /// The fresh headless box: paired before the runner ever wrote a
+    /// settings.json. Without this arm the box is latched at `Local` by the
+    /// one-shot `migrate_tier_in_place` on its first boot.
+    #[test]
+    fn promote_tier_absent_file_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("com.qontinui.runner").join("settings.json");
+        assert_eq!(
+            promote_tier_to_account_at(&path, false).unwrap(),
+            TierPromotion::Promoted
+        );
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["tier"], QONTINUI_ACCOUNT_TIER);
+        assert_eq!(v["tier_initialized"], true);
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            2,
+            "a created settings.json carries ONLY the tier keys; every other \
+             field must come from its serde default"
+        );
+    }
+
+    /// Idempotence across the two doors: the CLI door promoting after the
+    /// WebView door already did must be a pure no-op.
+    #[test]
+    fn promote_tier_is_idempotent_across_both_doors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{\"tier\":\"local\",\"tier_initialized\":false}").unwrap();
+
+        assert_eq!(
+            promote_tier_to_account_at(&path, false).unwrap(),
+            TierPromotion::Promoted
+        );
+        let after_first = std::fs::read(&path).unwrap();
+        assert_eq!(
+            promote_tier_to_account_at(&path, false).unwrap(),
+            TierPromotion::AlreadyAccount
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), after_first);
     }
 }
