@@ -5926,11 +5926,14 @@ mod tests {
             "COORD_HTTP_URL",
             "QONTINUI_ENV",
             "QONTINUI_CONFIG_DIR",
+            // See the sibling test below: the tier also reads pairing state.
+            "QONTINUI_SECURE_STORAGE_DIR",
         ]);
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var("COORD_HTTP_URL");
         std::env::set_var("QONTINUI_ENV", "__qontinui_test_no_such_profile__");
         std::env::set_var("QONTINUI_CONFIG_DIR", dir.path());
+        std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir.path());
         std::fs::write(
             dir.path().join("settings.json"),
             r#"{"tier":"qontinui_account"}"#,
@@ -5963,12 +5966,22 @@ mod tests {
             "COORD_HTTP_URL",
             "QONTINUI_ENV",
             "QONTINUI_CONFIG_DIR",
+            // The tier is no longer a pure function of settings.json:
+            // `profiles::read_runner_tier` also probes `paired_user.json`
+            // (`pair::device_is_paired`), because a paired device is bound to a
+            // Qontinui account and that is what Tier 2 means. Without pinning
+            // this var the case below reads the DEVELOPER's real pairing state
+            // and a `tier: "local"` fixture resolves to `qontinui_account` —
+            // correct behaviour, wrong fixture.
+            "QONTINUI_SECURE_STORAGE_DIR",
         ]);
         for settings in [r#"{"tier":"local"}"#, "{not json"] {
             let dir = tempfile::tempdir().unwrap();
             std::env::remove_var("COORD_HTTP_URL");
             std::env::set_var("QONTINUI_ENV", "__qontinui_test_no_such_profile__");
             std::env::set_var("QONTINUI_CONFIG_DIR", dir.path());
+            // Empty dir ⇒ no `paired_user.json` ⇒ not paired.
+            std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir.path());
             std::fs::write(dir.path().join("settings.json"), settings).unwrap();
             assert_eq!(
                 qontinui_runner_lib::profiles::connected_coord_base(),
