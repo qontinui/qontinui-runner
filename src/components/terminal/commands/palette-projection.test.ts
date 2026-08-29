@@ -9,12 +9,17 @@
  *   5. Click handler invokes registry handler and swallows failures
  *   6. Click handler returns success to the operator's `void` shape
  *      (no throw on rejection)
- *   7. Projection is stable across calls — sorted by label
+ *   7. Projection is emitted in REGISTRY order, so an exact score tie
+ *      breaks the same way it does in `resolve()`
+ *   8. `scorePaletteLabel` scores a composed row label the way
+ *      `resolve()` scores a registry action — slash form and
+ *      description separately, with the within-tier slash tiebreak
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { getRegistryPaletteActions } from "./palette-projection";
+import { resolve } from "./resolve";
+import { getRegistryPaletteActions, scorePaletteLabel } from "./palette-projection";
 import { __resetForTest, register } from "./registry";
 import type { CommandAction } from "./types";
 
@@ -72,16 +77,17 @@ describe("getRegistryPaletteActions", () => {
     expect(getRegistryPaletteActions()[0].label).toBe("/x — X");
   });
 
-  it("sorts rows lexically by their composed label", () => {
+  it("emits rows in registry order, not alphabetically", () => {
+    // Lexical order was the palette half of a live divergence: `rst`
+    // ties `/restart` and `/auto-restart` at the identical score, so the
+    // winner is whatever the stable sort saw first. `resolve()` iterates
+    // the registry, so the palette must too — otherwise the two surfaces
+    // teach different slashes for the same query.
     register(action({ id: "z", slash: "/z", label: "Z" }));
     register(action({ id: "a", slash: "/a", label: "A" }));
     register(action({ id: "m", slash: "/m", label: "M" }));
     const labels = getRegistryPaletteActions().map((r) => r.label);
-    expect(labels).toEqual([
-      "/a — A",
-      "/m — M",
-      "/z — Z",
-    ]);
+    expect(labels).toEqual(["/z — Z", "/a — A", "/m — M"]);
   });
 
   it("click invokes the registry handler with empty args", async () => {
@@ -111,5 +117,77 @@ describe("getRegistryPaletteActions", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+});
+
+describe("scorePaletteLabel", () => {
+  it("scores the slash form on its own, keeping its prefix tier", () => {
+    // Composed as one string, `"/restart — …"` starts with `/`, so the
+    // slash lost its Tier-1 prefix band entirely.
+    const slash = scorePaletteLabel("/restart — Restart session in zone", "rest");
+    expect(slash?.score).toBe(204);
+    expect(slash?.fromSlash).toBe(true);
+    // Indices are shifted back into the composed label (past the `/`).
+    expect(slash?.indices).toEqual([1, 2, 3, 4]);
+  });
+
+  it("flags a match that reached into the description prose", () => {
+    const desc = scorePaletteLabel("/zzz — Restart something", "rst");
+    expect(desc?.fromSlash).toBe(false);
+    // "Restart" starts at index 7 of "/zzz — Restart something".
+    expect(desc?.indices[0]).toBe(7);
+  });
+
+  it("falls through to a plain label score for a row with no slash form", () => {
+    const plain = scorePaletteLabel("Focus zone 3: claude-gmail", "zone");
+    expect(plain?.fromSlash).toBe(false);
+    expect(plain?.score).toBeGreaterThan(0);
+  });
+
+  it("returns null when nothing matches", () => {
+    expect(scorePaletteLabel("/restart — Restart session in zone", "qqq")).toBeNull();
+  });
+});
+
+describe("palette ranking agrees with the CommandBar", () => {
+  /** The palette's sort keys, extracted so the parity test can run them. */
+  function paletteTop(query: string): string {
+    const rows = getRegistryPaletteActions();
+    const scored = rows
+      .map((row) => ({ row, m: scorePaletteLabel(row.label, query) }))
+      .filter((s): s is { row: (typeof rows)[number]; m: NonNullable<typeof s.m> } => s.m !== null);
+    scored.sort((a, b) => {
+      if (a.m.score !== b.m.score) return b.m.score - a.m.score;
+      if (a.m.fromSlash !== b.m.fromSlash) return a.m.fromSlash ? -1 : 1;
+      return 0;
+    });
+    return scored[0].row.id.replace(/^registry:/, "");
+  }
+
+  it("puts the same action first for the three shipped tie queries", () => {
+    // The live divergence, reproduced with the real competitors: a
+    // decoy whose LABEL ties (the within-tier slash tiebreak) plus a
+    // slash that ties and sorts EARLIER alphabetically (the registry
+    // order half). The palette used to answer /auto-restart, /doc-finder
+    // and the decoy respectively.
+    register(action({ id: "decoy-rst", slash: "/zz1", label: "Restart something" }));
+    register(action({ id: "restart", slash: "/restart", label: "Restart session in zone" }));
+    register(action({ id: "auto-restart", slash: "/auto-restart", label: "Toggle auto-restart" }));
+    register(action({ id: "decoy-fnd", slash: "/zz2", label: "Find node data" }));
+    register(action({ id: "findings", slash: "/findings", label: "Toggle findings panel" }));
+    register(action({ id: "doc-finder", slash: "/doc-finder", label: "Open doc finder" }));
+    register(action({ id: "decoy-ntf", slash: "/zz3", label: "Notify test flags" }));
+    register(
+      action({ id: "notify", slash: "/desktop-notify", label: "Toggle desktop notifications" }),
+    );
+
+    for (const [query, expected] of [
+      ["rst", "restart"],
+      ["fnd", "findings"],
+      ["ntf", "notify"],
+    ] as const) {
+      expect(paletteTop(query), `palette top for ${query}`).toBe(expected);
+      expect(resolve(query, [])[0].action.id, `bar top for ${query}`).toBe(expected);
+    }
   });
 });

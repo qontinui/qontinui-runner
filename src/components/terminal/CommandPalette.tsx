@@ -8,6 +8,7 @@ import { fuzzyScore } from "./commands/fuzzy";
 import {
   getAll as getRegistrySnapshot,
   getRegistryPaletteActions,
+  scorePaletteLabel,
   subscribe as subscribeToRegistry,
 } from "./commands";
 
@@ -402,60 +403,80 @@ export function CommandPalette({
     [onClose],
   );
 
-  // Filter by query with fuzzy scoring
-  const filtered = useMemo(() => {
-    if (!query.trim()) {
-      // Show recent commands first, then all actions
-      const recent: PaletteAction[] = [];
-      for (const rid of recentIds) {
-        const action = actions.find((a) => a.id === rid);
-        if (action) {
-          recent.push({ ...action, category: "Recent" });
-        }
-      }
-      // Remove duplicates from main list
-      const recentIdSet = new Set(recentIds);
-      const rest = actions.filter((a) => !recentIdSet.has(a.id));
-      return [...recent, ...rest];
-    }
+  // ONE scored pass, feeding both the ordering and the highlight
+  // indices. They used to be two separate `fuzzyScore` walks over the
+  // same actions — the exact shape that lets a scoring change land on
+  // one and not the other. `null` means "no query": browse mode.
+  const scored = useMemo(() => {
+    const q = query.trim();
+    if (!q) return null;
 
-    const q = query.toLowerCase().trim();
-    const scored: { action: PaletteAction; score: number; indices: number[] }[] = [];
+    const out: {
+      action: PaletteAction;
+      score: number;
+      indices: number[];
+      fromSlash: boolean;
+    }[] = [];
 
     for (const action of actions) {
-      const labelResult = fuzzyScore(action.label, q);
+      // Slash-aware: a registry row's label is `"/slash — Description"`,
+      // and the two halves are scored SEPARATELY so the palette ranks
+      // them the way the CommandBar's `resolve()` does.
+      const labelResult = scorePaletteLabel(action.label, q);
       const catResult = fuzzyScore(action.category, q);
       const best =
-        labelResult && catResult
-          ? labelResult.score >= catResult.score
-            ? labelResult
-            : null
-          : labelResult;
+        labelResult && (!catResult || labelResult.score >= catResult.score) ? labelResult : null;
 
       if (best) {
-        scored.push({ action, score: best.score, indices: best.indices });
+        out.push({
+          action,
+          score: best.score,
+          indices: best.indices,
+          fromSlash: best.fromSlash,
+        });
       } else if (catResult) {
-        scored.push({ action, score: catResult.score, indices: [] });
+        out.push({ action, score: catResult.score, indices: [], fromSlash: false });
       }
     }
 
-    return scored.sort((a, b) => b.score - a.score).map((s) => s.action);
-  }, [actions, query, recentIds]);
+    // Same sort keys as `commands/resolve.ts`, minus recency (the
+    // palette pins recents in browse mode instead): score first, then
+    // WHICH FIELD matched. Sorting on score alone left an exact tie to
+    // array order, so `rst` topped out at `/auto-restart` here while the
+    // bar completed `/restart`. Ties below both keys fall to registry
+    // order, which `getRegistryPaletteActions()` now preserves.
+    out.sort((a, b) => {
+      if (a.score !== b.score) return b.score - a.score;
+      if (a.fromSlash !== b.fromSlash) return a.fromSlash ? -1 : 1;
+      return 0;
+    });
+    return out;
+  }, [actions, query]);
 
-  // Match indices map for highlighting (kept separate to avoid extending PaletteAction)
+  const filtered = useMemo(() => {
+    if (scored) return scored.map((s) => s.action);
+
+    // Browse mode: recent commands first, then all actions.
+    const recent: PaletteAction[] = [];
+    for (const rid of recentIds) {
+      const action = actions.find((a) => a.id === rid);
+      if (action) {
+        recent.push({ ...action, category: "Recent" });
+      }
+    }
+    // Remove duplicates from main list
+    const recentIdSet = new Set(recentIds);
+    const rest = actions.filter((a) => !recentIdSet.has(a.id));
+    return [...recent, ...rest];
+  }, [scored, actions, recentIds]);
+
+  // Match indices for highlighting (kept out of PaletteAction), read off
+  // the same pass that produced the ordering.
   const matchIndicesMap = useMemo(() => {
     const map = new Map<string, number[]>();
-    if (!query.trim()) return map;
-
-    const q = query.toLowerCase().trim();
-    for (const action of actions) {
-      const labelResult = fuzzyScore(action.label, q);
-      if (labelResult) {
-        map.set(action.id, labelResult.indices);
-      }
-    }
+    for (const s of scored ?? []) map.set(s.action.id, s.indices);
     return map;
-  }, [actions, query]);
+  }, [scored]);
 
   // Reset selected index when query changes (derived state computed during render)
   if (query !== prevQuery) {

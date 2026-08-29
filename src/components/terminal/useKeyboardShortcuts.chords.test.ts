@@ -33,9 +33,10 @@ describe("useKeyboardShortcuts — chord matching", () => {
 
   it("routes every Ctrl+Shift chord through the shared predicate", () => {
     const chords = SOURCE.match(/isCtrlShiftChord\(e, [^)]+\)/g) ?? [];
-    // The table-driven palette chord plus every inline terminal chord.
     expect(chords.length).toBeGreaterThanOrEqual(20);
-    expect(chords).toContain("isCtrlShiftChord(e, GLOBAL_CHORDS.commandPalette)");
+    // The palette chord is claimed from another component tree too, so
+    // it is spelled by the shared TABLE rather than an inline letter.
+    expect(SOURCE).toContain("matchesChord(e, GLOBAL_CHORDS.commandPalette)");
     for (const letter of [
       "b",
       "t",

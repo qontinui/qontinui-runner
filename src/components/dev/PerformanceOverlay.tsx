@@ -16,6 +16,7 @@ import {
 import { getNetworkMonitor, type NetworkMonitorStats } from "../../lib/network-monitor";
 import { logPerformanceSummary, downloadReport } from "../../lib/performance-report";
 import { cn } from "../../lib/utils";
+import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
 
 // ============================================================================
 // Types
@@ -350,8 +351,11 @@ export function PerformanceOverlay({
   // Keyboard shortcut handler
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Ctrl+Shift+P to toggle
-      if (e.ctrlKey && e.shiftKey && e.key === "P") {
+      // Ctrl+Shift+P to toggle. Via the shared predicate, not a literal
+      // `"P"`: this overlay is mounted app-wide from `App.tsx`, and with
+      // CapsLock on Shift reports a lowercase `"p"`, so the literal was
+      // dead exactly when the operator had CapsLock on.
+      if (matchesChord(e, GLOBAL_CHORDS.performanceOverlay)) {
         e.preventDefault();
         setIsVisible((v) => !v);
       }

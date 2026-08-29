@@ -40,8 +40,8 @@ export type { PatternMatch } from "./patterns";
 
 export { callRegistry } from "./uibridge";
 
-export { getRegistryPaletteActions } from "./palette-projection";
-export type { PaletteActionLike } from "./palette-projection";
+export { getRegistryPaletteActions, scorePaletteLabel } from "./palette-projection";
+export type { PaletteActionLike, PaletteLabelMatch } from "./palette-projection";
 
 export { interpretCommand, normalizeInterpretKey } from "./interpret";
 export type { InterpretMatch, InterpretOptions } from "./interpret";
