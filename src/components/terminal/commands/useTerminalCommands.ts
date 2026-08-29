@@ -315,6 +315,27 @@ export function readCountArg(args: Record<string, unknown>, field: string = "cou
 }
 
 /**
+ * Upper bound on a single spawn. `/spawn`, `/spawn-ai` and `/spawn-with` all
+ * route through {@link resolveCount}, so declaring it once covers all three.
+ *
+ * The floor (`>= 1`) was always checked; there was no ceiling at all, and
+ * `/spawn 1000` is not a hypothetical — it rendered `✓`, created a thousand
+ * PTY subprocesses and a thousand xterm instances, and wedged the page hard
+ * enough to need a reboot. A verdict the operator never gets to read is the
+ * worst outcome this surface has.
+ *
+ * 24 rather than a round number, from what the page can actually show: past
+ * `full-grid` (9 zones) the layout synthesizes a 3-column scrolling flow-grid
+ * (`useZoneLayout.ts::synthesizeFlowGrid`), so 24 is 8 rows of it at the
+ * 300px minimum tile height — already ~2400px of grid, and 3x the 8-pane
+ * WebGL context budget (`TerminalInstance.tsx`) beyond which panes fall back
+ * to slower renderers. Anything past that is a typo, not an intent; anything
+ * short of it is a spawn a real operator might mean, and this refuses none of
+ * those. Spawning more is still possible — one `/spawn 24` at a time.
+ */
+export const MAX_SPAWN_COUNT = 24;
+
+/**
  * Resolve a count argument to the number to act on, or to the failure
  * the operator has to see. `absent` defaults to 1 — that is the
  * documented schema default (`"number (>= 1, defaults to 1)"`) and is
@@ -328,6 +349,9 @@ function resolveCount(args: Record<string, unknown>): { count: number } | Comman
   }
   const count = read.kind === "count" ? read.count : 1;
   if (count < 1) return fail("invalid-count", "count must be >= 1");
+  if (count > MAX_SPAWN_COUNT) {
+    return fail("invalid-count", `count must be <= ${MAX_SPAWN_COUNT} (asked for ${count})`);
+  }
   return { count };
 }
 
@@ -554,6 +578,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     slash: "/spawn",
     label: "Spawn plain terminal",
     description: "Spawn N plain PTY tabs in the user's default shell and zone-assign them.",
+    // Spends PROCESSES, not money: every tab is a live PTY the operator has
+    // to close by hand. Not something a Tier-2 pattern may reach behind a
+    // literal slash for another command (`rank.ts::safeToReroute`).
+    costly: true,
     paramSchema: SCHEMA.spawn,
     // Tier-2 patterns: "spawn 3", "spawn 3 plain".
     // Ordered BEFORE /spawn-ai's pattern in registration order so
@@ -640,6 +668,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     slash: "/spawn-with",
     label: "Spawn terminal with command",
     description: "Spawn N plain PTY tabs and auto-type the given shell command into each.",
+    // Strictly more than `/spawn`: N PTYs AND an arbitrary shell command
+    // typed into each of them.
+    costly: true,
     paramSchema: SCHEMA.spawnWith,
     handler: async (args: Record<string, unknown>): Promise<CommandResult<string[]>> => {
       const counted = resolveCount(args);
@@ -664,6 +695,11 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     id: "terminal.approve-all",
     slash: "/approve-all",
     label: "Approve all needs-input sessions",
+    // The most irreversible action on this page. It writes `y\r` into EVERY
+    // waiting PTY, so it can answer yes on an agent's behalf to a prompt
+    // that was itself asking to destroy something — and there is no undo for
+    // a keystroke already delivered to a subprocess.
+    destructive: true,
     description:
       "Sends 'y' followed by Enter to every session currently waiting on input. " +
       "Same behavior as Ctrl+Shift+Enter.",
@@ -698,14 +734,18 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   });
 
   // ── 7. /close ─────────────────────────────────────────────────────────
-  // `destructive: true` would trigger a confirm modal once Phase 4
-  // executor is in place; per plan §5(3) single-target close uses Undo
-  // instead of confirm. Mark `undoable: true` so the future executor
-  // captures pre-state. Today neither flag changes runtime behavior.
+  // `destructive: true` is live TODAY through `rank.ts::safeToReroute` — no
+  // Tier-2 pattern may reroute a literal slash for another command into it.
+  // It will additionally gate the Phase 4 executor's confirm modal, though
+  // per plan §5(3) single-target close is expected to use Undo instead of a
+  // confirm, which is what `undoable: true` is for.
   useCommandAction({
     id: "terminal.close",
     slash: "/close",
     label: "Close session",
+    // Kills a live PTY. `undoable` restores the ZONE assignment, not the
+    // process or its scrollback.
+    destructive: true,
     description:
       "Close a session by tab id (preferred when known) or 1-based zone index. " +
       "Without args, closes the currently focused session.",
@@ -797,6 +837,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     id: "terminal.restart",
     slash: "/restart",
     label: "Restart session in zone",
+    // Tears the session down and starts a new one in its place; the old
+    // process and its output are gone.
+    destructive: true,
     description:
       "Restart the session in the given zone (1-based) or the focused zone. " +
       "Only available when the session is in 'completed' or 'error' state.",
@@ -1162,7 +1205,18 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     handler: async (
       args: Record<string, unknown>,
     ): Promise<CommandResult<{ patterns: string[] }>> => {
-      const action = textArg(args, "action").toLowerCase();
+      // D13 — a bare `/auto-approve` used to report `unknown action ""`,
+      // which describes an argument the operator supplied as empty. They
+      // supplied nothing. `resolveText` is the three-state read that tells
+      // the two apart, and both arms want the same line here: absent and
+      // supplied-but-empty (`/auto-approve ""`, `/auto-approve " "`) are
+      // equally "you have not named a sub-command yet". Same shape as bare
+      // `/focus`, `/layout`, `/select-by-state` and `/analyze`.
+      const actionRead = resolveText(args, "action", { required: true });
+      if ("ok" in actionRead) {
+        return fail("invalid-args", "action is required (add, remove, list, clear)");
+      }
+      const action = actionRead.text.toLowerCase();
       const pattern = textArg(args, "pattern");
       const current = transitionEffects.autoApprovePatterns ?? [];
       if (action === "list") return ok({ patterns: current });
@@ -1297,6 +1351,8 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     slash: "/generate",
     aliases: ["/generate-workflow"],
     label: "Generate workflow",
+    // Runs a model over a whole Claude Code session transcript.
+    costly: true,
     description:
       "Generate a workflow from the latest Claude Code session in the active " +
       "terminal. Same as the Generate button in ZoneStatusBar.",
@@ -1338,6 +1394,8 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     id: "terminal.analyze",
     slash: "/analyze",
     label: "Analyze terminal output",
+    // Every `type` fans out to a metered Claude analysis.
+    costly: true,
     description:
       "Run a Claude analysis: session-summary, architecture, change-impact, " +
       "progress, cross-tab, page-architecture. Same as picking an option in " +
@@ -1372,6 +1430,12 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     slash: "/plan-implement",
     aliases: ["/implement"],
     label: "Build plan implementation workflow",
+    // Builds implement + review + next-steps AI steps for EVERY phase of the
+    // loaded plan — the largest single unit of metered work this page starts.
+    // `/plan-verify` is deliberately NOT marked: it is the lighter
+    // verification-only loop, and the two must not be flattened into one
+    // judgement just because they sit next to each other.
+    costly: true,
     description:
       "Build a plan-implementation workflow from the loaded plan file " +
       "(implement + review + next-steps per phase). Requires a PLAN*.md / " +

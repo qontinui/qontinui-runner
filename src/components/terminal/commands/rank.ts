@@ -199,15 +199,6 @@ export function chooseTier(
   return { head: null, shadowed: null };
 }
 
-/** {@link chooseTier}'s head, for callers that don't render the hint. */
-export function chooseHeadMatch(
-  tier1: readonly ResolveMatch[],
-  tier2: PatternMatch | null,
-  tier3: InterpretMatch | null,
-): HeadMatch | null {
-  return chooseTier(tier1, tier2, tier3).head;
-}
-
 /**
  * The "did you mean" suffix for a verdict on `ran`, or `null`.
  *

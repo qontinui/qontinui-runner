@@ -376,18 +376,23 @@ export function applyDeclaredFlags(
       continue;
     }
     const { text, removed } = stripFlagRuns(value, hits);
-    if (text.length > 0) {
-      out[key] = text;
-      continue;
-    }
-    // Nothing survived. Dropping the key rather than binding "" is
-    // deliberate WHEN A FLAG ATE THE FIELD: a field whose whole content WAS
-    // the flag was not supplied, and `readTextArg` reads "" as
-    // supplied-but-empty, which is a different (and erroring) state. A
-    // field that was ALREADY empty was supplied-and-empty and must keep
-    // reading that way — dropping it there would hand the handler back the
-    // "absent, so guess" arm this whole surface exists to close.
-    if (removed === 0) out[key] = value;
+    // Nothing survived AND a flag is what ate it: the field was not
+    // supplied. Dropping the key rather than binding "" is deliberate —
+    // `readTextArg` reads "" as supplied-but-empty, which is a different
+    // (and erroring) state.
+    if (text.length === 0 && removed > 0) continue;
+    // Otherwise the RESOLVED text is what the operator supplied, empty or
+    // not. Restoring the raw `value` here instead was D8: `tokenizeRich`
+    // resolves `""` to zero tokens, `removed` is 0 because no flag was
+    // involved, and the raw text — two literal quote CHARACTERS — was put
+    // back. `/orchestrate ""` then POSTed `start_orchestration_run` with
+    // `goal: "\"\""`, spending a conductor run on an empty argument, while
+    // `/orchestrate " "` correctly answered "a goal … is required".
+    // `/auto-approve add ""` armed a `""` rule and `/tag ""` reported
+    // `"""" is not a zone tag`. An empty quoted run is an EMPTY ARGUMENT,
+    // and supplied-and-empty is exactly the state "" already means here —
+    // so binding the resolution keeps that arm rather than inventing text.
+    out[key] = text;
   }
   return { ...out, ...found };
 }

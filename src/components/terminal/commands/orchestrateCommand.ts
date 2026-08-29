@@ -140,6 +140,11 @@ export function useOrchestrateCommand(): void {
     slash: "/orchestrate",
     aliases: ["/conduct", "/run-goal"],
     label: "Orchestrate a goal",
+    // Starts a conductor run: N metered worker sessions, spawned by the
+    // backend, on a page the operator then has to drain. Declared so
+    // `rank.ts::safeToReroute` can never route a literal slash for some
+    // other command into it.
+    costly: true,
     description:
       "Start an Approach-D conductor run. `/orchestrate <goal>` runs a free-form goal; " +
       "`/orchestrate <recipe-id> <args…>` seeds the goal from a named recipe (e.g. " +
