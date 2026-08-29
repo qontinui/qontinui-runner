@@ -906,7 +906,42 @@ fn select_pair_mode(
     }
 }
 
-/// Resolve the base URL for pair-code redemption. Three-step order:
+/// Which rung of [`resolve_pair_code_base`] produced the URL.
+///
+/// The three rungs have three DIFFERENT remediations when a redeem fails
+/// against the resolved host, and the URL alone does not distinguish them —
+/// `https://api.qontinui.io` looks identical whether it came from an operator
+/// export, from a coord_url in `profiles.json`, or from the compiled-in
+/// default. Reporting the winning arm turns "wrong host" from a guess into a
+/// one-line fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairCodeBaseSource {
+    /// `$QONTINUI_WEB_BASE` was set non-empty. Fix: correct or unset that var.
+    EnvOverride,
+    /// Derived from the active profile's `coord_url`. Fix: `qontinui_profile
+    /// use <name>` / edit that profile's coord_url.
+    DerivedFromCoord,
+    /// Nothing configured; the compiled-in production default. Fix: set
+    /// `$QONTINUI_WEB_BASE` (or configure a profile) if you are not pairing
+    /// against production.
+    ProdDefault,
+}
+
+impl PairCodeBaseSource {
+    /// Short operator-facing label naming the arm and how to change it.
+    fn as_str(self) -> &'static str {
+        match self {
+            PairCodeBaseSource::EnvOverride => "$QONTINUI_WEB_BASE override",
+            PairCodeBaseSource::DerivedFromCoord => "derived from the active profile's coord_url",
+            PairCodeBaseSource::ProdDefault => {
+                "compiled-in production default (no $QONTINUI_WEB_BASE, no profile)"
+            }
+        }
+    }
+}
+
+/// Resolve the base URL for pair-code redemption, WITH the arm that produced
+/// it. Three-step order:
 ///
 /// 1. `web_base_env` (`$QONTINUI_WEB_BASE`) — an explicit operator override,
 ///    always wins when set to a non-empty value.
@@ -918,12 +953,26 @@ fn select_pair_mode(
 ///    the box; it no longer needs a throwaway local-dev profile just to
 ///    satisfy a resolution this mode doesn't otherwise need. Fleet-join,
 ///    2026-08-24.
-fn resolve_pair_code_base(coord_base: Option<&str>, web_base_env: Option<&str>) -> String {
-    web_base_env
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| coord_base.map(derive_web_base_from_coord))
-        .unwrap_or_else(|| PROD_API_BASE_URL.to_string())
+///
+/// The [`PairCodeBaseSource`] half is returned rather than logged here so the
+/// function stays pure and the caller owns the output surface.
+fn resolve_pair_code_base(
+    coord_base: Option<&str>,
+    web_base_env: Option<&str>,
+) -> (String, PairCodeBaseSource) {
+    if let Some(explicit) = web_base_env.filter(|s| !s.is_empty()) {
+        return (explicit.to_string(), PairCodeBaseSource::EnvOverride);
+    }
+    match coord_base {
+        Some(base) => (
+            derive_web_base_from_coord(base),
+            PairCodeBaseSource::DerivedFromCoord,
+        ),
+        None => (
+            PROD_API_BASE_URL.to_string(),
+            PairCodeBaseSource::ProdDefault,
+        ),
+    }
 }
 
 fn cmd_device_pair(
@@ -1014,9 +1063,17 @@ fn cmd_device_pair(
             };
             // Pair codes redeem against the web backend. Resolution order
             // lives in `resolve_pair_code_base` — see its doc comment.
-            let web_base = resolve_pair_code_base(
+            let (web_base, base_source) = resolve_pair_code_base(
                 (!base.is_empty()).then_some(base.as_str()),
                 std::env::var("QONTINUI_WEB_BASE").ok().as_deref(),
+            );
+            // Print the URL *and* which rung produced it: the three rungs have
+            // three different fixes, and the URL alone does not say which one
+            // an operator staring at a failed redeem should reach for.
+            println!(
+                "Redeeming pair code against {} ({})",
+                web_base,
+                base_source.as_str()
             );
             pair_with_pair_code(&web_base, code, &device_id)
         }
@@ -1859,17 +1916,24 @@ mod tests {
                 Some("https://coord.qontinui.io:9870"),
                 Some("https://custom.example")
             ),
-            "https://custom.example"
+            (
+                "https://custom.example".to_string(),
+                PairCodeBaseSource::EnvOverride
+            )
         );
     }
 
     #[test]
     fn resolve_pair_code_base_ignores_an_empty_env_override() {
         // An empty string is not a real override — e.g. `QONTINUI_WEB_BASE=`
-        // in an env file. Falls through exactly as if unset.
+        // in an env file. Falls through exactly as if unset, and must report
+        // the arm that actually won rather than the one that was skipped.
         assert_eq!(
             resolve_pair_code_base(Some("https://coord.qontinui.io:9870"), Some("")),
-            "https://coord.qontinui.io"
+            (
+                "https://coord.qontinui.io".to_string(),
+                PairCodeBaseSource::DerivedFromCoord
+            )
         );
     }
 
@@ -1877,7 +1941,10 @@ mod tests {
     fn resolve_pair_code_base_falls_back_to_derived_coord_when_no_override() {
         assert_eq!(
             resolve_pair_code_base(Some("https://coord.qontinui.io:9870"), None),
-            "https://coord.qontinui.io"
+            (
+                "https://coord.qontinui.io".to_string(),
+                PairCodeBaseSource::DerivedFromCoord
+            )
         );
     }
 
@@ -1887,7 +1954,33 @@ mod tests {
         // (coord_base is None), no QONTINUI_WEB_BASE. Must resolve to the
         // fleet's real production API host, not error and not silently
         // point at localhost.
-        assert_eq!(resolve_pair_code_base(None, None), PROD_API_BASE_URL);
+        assert_eq!(
+            resolve_pair_code_base(None, None),
+            (PROD_API_BASE_URL.to_string(), PairCodeBaseSource::ProdDefault)
+        );
+    }
+
+    #[test]
+    fn pair_code_base_sources_have_distinct_operator_labels() {
+        // The whole point of the second return value: an operator reading the
+        // printed line must be able to tell the three rungs apart, because
+        // each has a different fix. Identical labels would be worse than none.
+        let labels = [
+            PairCodeBaseSource::EnvOverride.as_str(),
+            PairCodeBaseSource::DerivedFromCoord.as_str(),
+            PairCodeBaseSource::ProdDefault.as_str(),
+        ];
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(unique.len(), labels.len(), "labels must be distinct: {labels:?}");
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        // Each label must name the knob the operator would turn.
+        assert!(PairCodeBaseSource::EnvOverride
+            .as_str()
+            .contains("QONTINUI_WEB_BASE"));
+        assert!(PairCodeBaseSource::DerivedFromCoord
+            .as_str()
+            .contains("coord_url"));
+        assert!(PairCodeBaseSource::ProdDefault.as_str().contains("default"));
     }
 
     #[test]
