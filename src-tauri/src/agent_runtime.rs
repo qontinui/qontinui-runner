@@ -3268,6 +3268,9 @@ async fn run_continuation_terminal(
         zone_index: None,
         // Autonomous gate continuation → pin the agent git identity on the PTY.
         inject_agent_git_identity: true,
+        // A gate continuation is NEW work, not the continuation of a coord
+        // session row — no lineage claim.
+        coord_lineage: None,
     };
 
     // Provision `.mcp.json` so this continuation can reach coord coordination
@@ -3569,6 +3572,7 @@ async fn run_condition_check_terminal(
         zone_index: None,
         // A condition check commits nothing → keep the ambient host git identity.
         inject_agent_git_identity: false,
+        coord_lineage: None,
     };
 
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
@@ -3876,7 +3880,7 @@ fn payload_to_allocate_result(payload: &LaunchPayload) -> crate::agent_worktree:
 /// explicitly); the cooldown rides along on
 /// [`crate::ai_provider::ResolvedAccount::cooldown_remaining_secs`] and the
 /// caller warns.
-fn resolve_spawn_account_with(
+pub(crate) fn resolve_spawn_account_with(
     account: Option<&str>,
     resolve: impl FnOnce(
         &str,
@@ -3899,7 +3903,14 @@ fn resolve_spawn_account_with(
 }
 
 /// Production wiring of [`resolve_spawn_account_with`] against the live roster.
-fn resolve_spawn_account(
+///
+/// The ONE seam a caller pinning an account must go through — never
+/// [`crate::ai_provider::pick_best_account`], which is a side-effect-only
+/// ROTATION helper (it returns `()`, no-ops unless `account_selection_mode ==
+/// LeastUsage`, and every call site discards it), and never
+/// `switch_claude_account`, which would leak one spawn's account choice into
+/// every later spawn on this runner.
+pub(crate) fn resolve_spawn_account(
     account: Option<&str>,
 ) -> anyhow::Result<Option<crate::ai_provider::ResolvedAccount>> {
     resolve_spawn_account_with(account, crate::ai_provider::resolve_requested_account)

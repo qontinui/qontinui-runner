@@ -69,6 +69,7 @@ pub mod past_sessions;
 pub mod provider_adapter;
 pub mod reconcile;
 pub mod redact;
+pub mod respawn;
 pub mod restore_census; // Pre/post-restart session census — the G6 outcome check behind GET /control/sessions/restore-census
 pub mod restore_record_emitter;
 pub mod session_ledger; // Rebuild-safe, DISK-persisted open-session ledger — the post-rebuild "what did not come back" report (plan 2026-08-22-wip-custody, Phase 4)
@@ -585,12 +586,42 @@ impl SessionRegistry {
     /// [`coord_sync::CoordSync::mirror_legacy_session`]); with the flag
     /// off this is never reached.
     pub fn register_external(self: &Arc<Self>, intent: Intent) -> Result<Uuid, SessionError> {
+        self.register_external_with_lineage(intent, None, None)
+    }
+
+    /// [`SessionRegistry::register_external`] with an explicit lineage claim.
+    ///
+    /// Two optional stamps, both `None` on the plain mirror path (so that call
+    /// is byte-identical to what it was):
+    ///
+    /// - `parent_session_id` — the coord session this one CONTINUES. Threaded
+    ///   into the `Started` outbox payload, which the drain loop's
+    ///   `rebuild_create_body` forwards to coord's
+    ///   `CreateSessionRequest.parent_session_id` — the same durable
+    ///   parent→child link [`SessionRegistry::start_with_parent`] writes for
+    ///   the handoff receiver. The cross-machine respawn receiver
+    ///   ([`respawn`]) uses it so a respawned session is one link in the
+    ///   lineage chain rather than an orphan.
+    /// - `claude_code_session_id_override` — the Claude session id this row
+    ///   really carries. The default is the RUNNER's ambient id
+    ///   ([`ambient_claude_code_session_id`]), which is right for a mirror of a
+    ///   session started here and wrong for a `--resume` of someone else's
+    ///   session. `None` keeps the ambient value; it is never defaulted to a
+    ///   nil UUID or an empty string, either of which would read downstream as
+    ///   a real, joinable id.
+    pub fn register_external_with_lineage(
+        self: &Arc<Self>,
+        intent: Intent,
+        parent_session_id: Option<Uuid>,
+        claude_code_session_id_override: Option<String>,
+    ) -> Result<Uuid, SessionError> {
         intent.validate()?;
         let intent = stamp_session_tenant(intent);
 
         let id = uuid_v7();
         let now = chrono::Utc::now();
-        let claude_code_session_id = ambient_claude_code_session_id();
+        let claude_code_session_id =
+            claude_code_session_id_override.or_else(ambient_claude_code_session_id);
         let transport: DynTransport = Arc::new(transport::ExternalTransport);
 
         let record = SessionRecord {
@@ -601,7 +632,7 @@ impl SessionRegistry {
             started_at: now,
             last_heartbeat_at: Some(now),
             closed_at: None,
-            parent_session_id: None,
+            parent_session_id,
             claude_code_session_id: claude_code_session_id.clone(),
             transport,
             transport_handle: TransportHandle::External,
@@ -618,6 +649,9 @@ impl SessionRegistry {
             "intent": intent,
             "state": SessionState::Active.as_str(),
             "started_at": now,
+            // Null (the no-lineage case) is dropped by `rebuild_create_body`,
+            // so the plain mirror still posts no `parent_session_id` at all.
+            "parent_session_id": parent_session_id,
             "claude_code_session_id": claude_code_session_id,
         });
         self.coord_sync

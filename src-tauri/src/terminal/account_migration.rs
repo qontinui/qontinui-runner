@@ -54,7 +54,7 @@ pub const CLOSE_REASON_MIGRATED: &str = "account-migrated";
 /// Max migrations per Claude session within [`MIGRATION_CAP_WINDOW_MS`].
 /// A second hop is legitimate (the target can run dry too); an unbounded
 /// chain means every account is exhausted and migrating is pure churn.
-const MIGRATION_CAP: usize = 3;
+pub(crate) const MIGRATION_CAP: usize = 3;
 const MIGRATION_CAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Cooldown stamped on the exhausted source account so spawn-time selection
@@ -68,7 +68,7 @@ static MIGRATION_HISTORY: Mutex<Option<HashMap<String, Vec<i64>>>> = Mutex::new(
 
 /// Record-and-check the migration cap for a session. Returns `false` when
 /// the cap is exhausted (caller must not migrate).
-fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> bool {
+pub(crate) fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> bool {
     let Ok(mut hist) = MIGRATION_HISTORY.lock() else {
         return false;
     };
@@ -277,6 +277,18 @@ const BUSY_MARKER: &str = "esc to interrupt";
 /// and a genuinely-dry target is caught by the grid scanner firing a fresh
 /// migration hint on this terminal anyway.
 fn spawn_continue_nudge(terminal_id: String) {
+    spawn_prompt_when_idle(terminal_id, CONTINUE_NUDGE.to_string(), "continue-nudge");
+}
+
+/// The generalized idle-watcher behind [`spawn_continue_nudge`]: wait for the
+/// resumed CLI to paint its idle prompt, then submit `prompt` once.
+///
+/// Extracted so the respawn receiver
+/// ([`crate::session::respawn`]) can deliver coord's optional
+/// `initial_prompt` through the SAME bounded, stand-down-on-busy watcher
+/// instead of growing a second one that would drift from it. `label` only
+/// names the caller in the log lines.
+pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
     use tauri::Manager;
     tauri::async_runtime::spawn(async move {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
@@ -290,7 +302,7 @@ fn spawn_continue_nudge(terminal_id: String) {
                 return;
             };
             let Some(session) = tm.get(&terminal_id) else {
-                info!(terminal_id, "continue-nudge: terminal gone — standing down");
+                info!(terminal_id, label, "prompt-when-idle: terminal gone — standing down");
                 return;
             };
             let text = {
@@ -302,21 +314,26 @@ fn spawn_continue_nudge(terminal_id: String) {
             if normalized.contains(BUSY_MARKER) {
                 info!(
                     terminal_id,
-                    "continue-nudge: session already working — no nudge needed"
+                    label, "prompt-when-idle: session already working — no prompt needed"
                 );
                 return;
             }
             if normalized.contains(READY_MARKER) {
-                match session.submit_prompt(CONTINUE_NUDGE) {
-                    Ok(_) => info!(terminal_id, "continue-nudge submitted to migrated session"),
-                    Err(e) => warn!(terminal_id, error = %e, "continue-nudge submit failed"),
+                // Composes both sides of the 2026-08-29 rebase: OUR generalized
+                // `prompt`/`label` seam (one impl for the migration nudge and the
+                // respawn prompt), with MAIN's `Ok(_)` — `submit_prompt` stopped
+                // returning `()` in fee48d4c, which now reports the neutralized body.
+                match session.submit_prompt(&prompt) {
+                    Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
+                    Err(e) => warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed"),
                 }
                 return;
             }
             if std::time::Instant::now() >= deadline {
                 warn!(
                     terminal_id,
-                    "continue-nudge: resumed CLI never painted its idle prompt within 3m — giving up"
+                    label,
+                    "prompt-when-idle: resumed CLI never painted its idle prompt within 3m — giving up"
                 );
                 return;
             }
@@ -328,7 +345,7 @@ fn spawn_continue_nudge(terminal_id: String) {
 /// the target account's matching project dir. The source file is never
 /// modified or removed. Skips the copy when the destination already exists
 /// and is at least as large (idempotent retry).
-fn copy_transcript(
+pub(crate) fn copy_transcript(
     src_config_dir: &str,
     dst_config_dir: &str,
     working_dir: &str,
@@ -358,6 +375,132 @@ fn copy_transcript(
     std::fs::copy(&src, &dst)
         .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
     Ok(dst)
+}
+
+/// One resumed-Claude PTY spawn, described.
+///
+/// The parameter block for [`spawn_resumed_pane`], which is the shipped
+/// `claude --permission-mode bypassPermissions --resume <sid>` respawn — step 3
+/// of [`migrate_session`], lifted out verbatim so the cross-machine respawn
+/// receiver (`crate::session::respawn`) reuses it rather than growing a second,
+/// drifting copy of the launch-spec + capture-hint wiring.
+pub(crate) struct ResumeSpawn<'a> {
+    /// The Claude session id to `--resume`. NEVER synthesized: a caller with
+    /// no id must fail rather than invent one.
+    pub claude_session_id: &'a str,
+    /// The session's working dir — both the PTY cwd and the transcript
+    /// resolver's project path.
+    pub working_dir: &'a str,
+    /// Transcript to sniff the session's last real model from, so `--resume`
+    /// does not silently drop to the target account's default model. A missing
+    /// or unreadable file simply omits `--model`.
+    pub model_transcript: std::path::PathBuf,
+    /// `CLAUDE_CONFIG_DIR` for the new PTY — the TARGET account's dir. It also
+    /// keeps the durable restore record consistent (the record stores the dir
+    /// the session actually launched under).
+    pub config_dir: &'a str,
+    pub title: String,
+    pub page_id: String,
+    pub zone_index: i32,
+    /// Work unit the resumed session belongs to, carried onto the new coord
+    /// session's intent. `None` on the migration path (which keeps the coord
+    /// row it already had).
+    pub work_unit_slug: Option<String>,
+    /// Correlation topic carried onto the new coord session's intent.
+    pub correlation_topic: Option<String>,
+    /// `intent.repo` for the new coord session. `None` leaves it unset — the
+    /// PTY cwd is `working_dir` either way.
+    pub intent_repo: Option<String>,
+    /// Coord lineage to stamp on the new coord session row, when this respawn
+    /// continues a known coord session. `None` = no lineage claim (the
+    /// account-migration path, whose coord row is the same session moving).
+    pub coord_lineage: Option<crate::commands::terminal::CoordSessionLineage>,
+    /// Forwarded to the spawn-time resource gate. See the two call sites — they
+    /// answer it differently and each says why.
+    pub resource_override: bool,
+}
+
+/// Spawn `claude --permission-mode bypassPermissions [--model m] --resume <sid>`
+/// in a fresh PTY pinned to `spec.config_dir`, tracked in the lifecycle store
+/// and mirrored into coord. Returns `(terminal_id, coord_session_id)`.
+///
+/// Same resume form the boot-restore path uses (post-#547): bypassPermissions
+/// so the resumed session doesn't wedge on its first tool-approval prompt with
+/// nobody watching.
+///
+/// The account pin is threaded through `capture_hint.config_dir`, which is BOTH
+/// the `CLAUDE_CONFIG_DIR` handed to the PTY and the dir recorded on the durable
+/// restore record — deliberately one value, so a restore cannot resurrect the
+/// session under a different account than it ran on. It is never a
+/// `switch_claude_account` mutation, which would leak this one spawn's account
+/// choice into every later spawn on the box.
+pub(crate) fn spawn_resumed_pane(
+    app: &tauri::AppHandle,
+    terminal_manager: &std::sync::Arc<crate::terminal::TerminalManager>,
+    session_registry: &std::sync::Arc<crate::session::SessionRegistry>,
+    spec: ResumeSpawn<'_>,
+) -> Result<(String, Option<uuid::Uuid>), String> {
+    let model = transcript_last_model(&spec.model_transcript);
+    // Compose the respawn argv through the shared launch seam so the operator's
+    // global + per-account (destination) launch flags layer onto the required
+    // resume flags. `permission = BypassPermissions` preserves today's emitted
+    // `--permission-mode bypassPermissions`. The #782 transcript-sniffed model is
+    // fed as `spec.model`, so it wins over any template `--model` and the session
+    // keeps its actual model across the hop. `resume_id` names the exact session
+    // id. With no operator config the argv is the historical hand-built
+    // `claude --permission-mode bypassPermissions [--model m] --resume <id>`
+    // plus the `--settings <hook file>` pair below.
+    let launch_cfg =
+        crate::claude_session::launch_spec::LaunchConfig::from_settings(Some(spec.config_dir));
+    let command = crate::claude_session::launch_spec::render_argv(
+        &crate::claude_session::launch_spec::LaunchSpec {
+            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+            resume_id: Some(spec.claude_session_id.to_string()),
+            model,
+            // The hook carrier, spelled out because this respawn execs the
+            // resolved `claude_bin_path()` DIRECTLY — the identity shim, which
+            // is what appends `--settings` for a PATH-resolved `claude`, is not
+            // in this chain. Without it the migrated session runs with no
+            // `SessionStart` hook, and `SessionStart` on a `--resume` is exactly
+            // when the policy injection matters most: the session carries its
+            // old context but not the policies as they now stand
+            // ([`crate::mcp::policy_context`]). Empty on a materialize failure
+            // ⇒ no flag, which is the pre-existing behaviour.
+            extra_required: crate::session::claude_hook::direct_spawn_settings_args(),
+            ..Default::default()
+        },
+        &launch_cfg,
+        &crate::agent_runtime::claude_bin_path(),
+    );
+    let capture_hint = crate::commands::terminal::SessionCaptureHint {
+        config_dir: Some(spec.config_dir.to_string()),
+        working_dir: spec.working_dir.to_string(),
+        title: spec.title.clone(),
+        page_id: Some(spec.page_id.clone()),
+        // `--resume <id>` names the exact session id → synchronous pinned
+        // record (same row, new terminal/account/zone) + verification arm.
+        claude_session_id: Some(spec.claude_session_id.to_string()),
+        zone_index: Some(spec.zone_index),
+        // A resume preserves the original session's nature (operator or
+        // autonomous); don't force the agent identity onto an unknown session.
+        inject_agent_git_identity: false,
+        coord_lineage: spec.coord_lineage,
+    };
+    crate::commands::terminal::create_tracked_terminal_session_backend(
+        terminal_manager,
+        session_registry,
+        app.clone(),
+        spec.title,
+        spec.working_dir.to_string(),
+        spec.work_unit_slug,
+        spec.correlation_topic,
+        spec.intent_repo,
+        Some(command),
+        None,
+        capture_hint,
+        Some(spec.page_id),
+        spec.resource_override,
+    )
 }
 
 /// Perform the migration mechanics: transcript copy → close old pane →
@@ -418,85 +561,40 @@ pub fn migrate_session(
         );
     }
 
-    // 3. Respawn under the target account. Same resume form the boot-restore
-    // path uses (post-#547): bypassPermissions so the resumed session doesn't
-    // wedge on its first tool-approval prompt with nobody watching.
+    // 3. Respawn under the target account, through the SHARED resume seam
+    // ([`spawn_resumed_pane`]) — the same code path the respawn receiver
+    // (`crate::session::respawn`) uses, so the two never drift.
     let title = record.title.clone().unwrap_or_else(|| {
         format!(
             "Resumed {}",
             &record.claude_session_id[..8.min(record.claude_session_id.len())]
         )
     });
-    // Preserve the session's model across the account hop: `--resume` alone
-    // restores the conversation but the model falls back to the target
-    // account's default. The transcript records each assistant turn's model;
-    // the last one is what the session was actually running on.
-    let src_transcript = super::transcript::session_transcript_path(
-        Path::new(src_config_dir),
-        &working_dir,
-        &record.claude_session_id,
-    );
-    let model = transcript_last_model(&src_transcript);
-    // Compose the respawn argv through the shared launch seam so the operator's
-    // global + per-account (destination) launch flags layer onto the required
-    // resume flags. `permission = BypassPermissions` preserves today's emitted
-    // `--permission-mode bypassPermissions` (a resumed autonomous session must
-    // not stall on its first tool-approval prompt with nobody watching). The
-    // #782 transcript-sniffed model is fed as `spec.model`, so it wins over any
-    // template `--model` and the session keeps its actual model across the hop.
-    // `resume_id` names the exact session id. With no operator config the argv
-    // is the historical hand-built
-    // `claude --permission-mode bypassPermissions [--model m] --resume <id>`
-    // plus the `--settings <hook file>` pair below.
-    let launch_cfg =
-        crate::claude_session::launch_spec::LaunchConfig::from_settings(Some(dst_config_dir));
-    let command = crate::claude_session::launch_spec::render_argv(
-        &crate::claude_session::launch_spec::LaunchSpec {
-            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
-            resume_id: Some(record.claude_session_id.clone()),
-            model: model.clone(),
-            // The hook carrier, spelled out because this respawn execs the
-            // resolved `claude_bin_path()` DIRECTLY — the identity shim, which
-            // is what appends `--settings` for a PATH-resolved `claude`, is not
-            // in this chain. Without it the migrated session runs with no
-            // `SessionStart` hook, and `SessionStart` on a `--resume` is exactly
-            // when the policy injection matters most: the session carries its
-            // old context but not the policies as they now stand
-            // ([`crate::mcp::policy_context`]). Empty on a materialize failure
-            // ⇒ no flag, which is the pre-existing behaviour.
-            extra_required: crate::session::claude_hook::direct_spawn_settings_args(),
-            ..Default::default()
-        },
-        &launch_cfg,
-        &crate::agent_runtime::claude_bin_path(),
-    );
-    let capture_hint = crate::commands::terminal::SessionCaptureHint {
-        config_dir: Some(dst_config_dir.to_string()),
-        working_dir: working_dir.clone(),
-        title: title.clone(),
-        page_id: Some(record.page_id.clone()),
-        // `--resume <id>` names the exact session id → synchronous pinned
-        // record (same row, new terminal/account/zone) + verification arm.
-        claude_session_id: Some(record.claude_session_id.clone()),
-        zone_index: Some(record.zone_index),
-        // A migration respawn preserves the original session's nature (operator
-        // or autonomous); don't force the agent identity onto an unknown session.
-        inject_agent_git_identity: false,
-    };
-    let (new_terminal_id, _coord_id) =
-        crate::commands::terminal::create_tracked_terminal_session_backend(
-            &terminal_manager,
-            &session_registry,
-            app.clone(),
-            title.clone(),
-            working_dir.clone(),
-            None,
-            None,
-            None,
-            Some(command),
-            None,
-            capture_hint,
-            Some(record.page_id.clone()),
+    let new_terminal_id = spawn_resumed_pane(
+        app,
+        &terminal_manager,
+        &session_registry,
+        ResumeSpawn {
+            claude_session_id: &record.claude_session_id,
+            working_dir: &working_dir,
+            // Model is sniffed off the SOURCE transcript: `--resume` alone
+            // restores the conversation but the model falls back to the target
+            // account's default.
+            model_transcript: super::transcript::session_transcript_path(
+                Path::new(src_config_dir),
+                &working_dir,
+                &record.claude_session_id,
+            ),
+            config_dir: dst_config_dir,
+            title: title.clone(),
+            page_id: record.page_id.clone(),
+            zone_index: record.zone_index,
+            // The migration keeps the coord row it already had — it claims no
+            // new work-unit / topic / repo, and no lineage.
+            work_unit_slug: None,
+            correlation_topic: None,
+            intent_repo: None,
+            coord_lineage: None,
             // OVERRIDE — the one call site that passes `true`, and the only one
             // that should. An account migration is not the creation of a new
             // session: the operator's session already existed, this function has
@@ -506,9 +604,13 @@ pub fn migrate_session(
             // of the guard (plan §Part D step 5: never touch an already-running
             // session; this gate fires only when something NEW is created). The
             // migration is also commit-neutral by construction: one `claude`
-            // goes away, one comes back.
-            true,
-        )?;
+            // goes away, one comes back. A RESPAWN, by contrast, creates
+            // something genuinely new (its source is already closed) and passes
+            // `false`.
+            resource_override: true,
+        },
+    )?
+    .0;
 
     // The lifecycle row was re-opened synchronously by the pinned-id capture
     // hint inside `create_terminal_session_backend` (`--resume <id>` keys the
