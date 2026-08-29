@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Tests for `awaitWithTimeout` and `isThenable` — the auto-await helper
  * shared by the runner's two `page_evaluate` handlers
  * (`usePageEvents.ts::page_evaluate` legacy IPC branch and
@@ -22,7 +22,6 @@ import {
   describeEvaluateResult,
   isThenable,
   isElementActionAllowed,
-  resolveEvaluateTimeoutMs,
   PAGE_EVALUATE_MAX_TIMEOUT_MS,
   PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
   describeEvaluateBudget,
@@ -405,19 +404,24 @@ describe("describeEvaluateResult — unwrap:true discriminated shape", () => {
   });
 });
 
-describe("resolveEvaluateTimeoutMs — caller-supplied page/evaluate budget", () => {
+describe("describeEvaluateBudget — caller-supplied page/evaluate budget", () => {
   // The frontend deliberately gives up a small margin ahead of the Rust
   // dispatcher's identical wait so its more specific timeout message wins the
   // race deterministically.
   const MARGIN = 250;
+
+  // These cases are about the BUDGET ARITHMETIC only, which is what the
+  // retired `resolveEvaluateTimeoutMs` wrapper exposed. Provenance is asserted
+  // in the sibling describe block below.
+  const awaitMs = (raw: unknown) => describeEvaluateBudget(raw).awaitMs;
 
   it("honors a caller timeout above the default cap", () => {
     // THE GAP. The Rust dispatcher forwards the caller's clamped `timeoutMs`
     // and waits exactly that long, but the frontend used to ignore the field
     // and cap every await at 30s — so `timeoutMs: 600000` failed at 30s with
     // "did not resolve within 30.0s" while Rust was still waiting.
-    expect(resolveEvaluateTimeoutMs(60_000)).toBe(60_000 - MARGIN);
-    expect(resolveEvaluateTimeoutMs(PAGE_EVALUATE_MAX_TIMEOUT_MS)).toBe(
+    expect(awaitMs(60_000)).toBe(60_000 - MARGIN);
+    expect(awaitMs(PAGE_EVALUATE_MAX_TIMEOUT_MS)).toBe(
       PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN,
     );
   });
@@ -425,20 +429,20 @@ describe("resolveEvaluateTimeoutMs — caller-supplied page/evaluate budget", ()
   it("honors a caller timeout below the default cap", () => {
     // The Rust default is 10s, so awaiting the full 30s just kept a dead
     // request's expression alive after Rust had already returned 504.
-    expect(resolveEvaluateTimeoutMs(10_000)).toBe(10_000 - MARGIN);
-    expect(resolveEvaluateTimeoutMs(1_000)).toBe(1_000 - MARGIN);
+    expect(awaitMs(10_000)).toBe(10_000 - MARGIN);
+    expect(awaitMs(1_000)).toBe(1_000 - MARGIN);
   });
 
   it("never lets the margin drive the budget to zero", () => {
     // Below the Rust clamp floor these can only arrive from a hand-rolled
     // emit, but an instant-failure budget would be far worse than a short one.
-    expect(resolveEvaluateTimeoutMs(MARGIN)).toBe(MARGIN);
-    expect(resolveEvaluateTimeoutMs(1)).toBe(1);
+    expect(awaitMs(MARGIN)).toBe(MARGIN);
+    expect(awaitMs(1)).toBe(1);
   });
 
   it("clamps above the ceiling rather than trusting the payload", () => {
-    expect(resolveEvaluateTimeoutMs(5_000_000)).toBe(PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN);
-    expect(resolveEvaluateTimeoutMs(Number.POSITIVE_INFINITY)).toBe(
+    expect(awaitMs(5_000_000)).toBe(PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN);
+    expect(awaitMs(Number.POSITIVE_INFINITY)).toBe(
       PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
     );
   });
@@ -451,7 +455,7 @@ describe("resolveEvaluateTimeoutMs — caller-supplied page/evaluate budget", ()
     ["NaN", Number.NaN],
     ["a string", "60000"],
   ])("falls back to the default cap for %s", (_label, raw) => {
-    expect(resolveEvaluateTimeoutMs(raw)).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
+    expect(awaitMs(raw)).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
   });
 });
 
@@ -491,12 +495,6 @@ describe("describeEvaluateBudget + evaluateTimeoutMessage (U1: the 9.8s that rea
     expect(msg).toContain("250ms is reserved");
   });
 
-  it("stays byte-compatible with resolveEvaluateTimeoutMs", () => {
-    for (const raw of [undefined, null, 0, -1, NaN, "60000", 1, 1_000, 10_000, 600_000, 5_000_000]) {
-      expect(describeEvaluateBudget(raw).awaitMs).toBe(resolveEvaluateTimeoutMs(raw));
-    }
-  });
-
   it("treats a number flagged `rawIsDefault` as a DEFAULT, not the caller's", () => {
     // The Rust dispatcher defaults `timeout_ms` to 10 s BEFORE emitting, so the
     // absence of a number is not how a defaulted budget arrives on the tagged
@@ -522,7 +520,6 @@ describe("describeEvaluateBudget + evaluateTimeoutMessage (U1: the 9.8s that rea
       const flagged = describeEvaluateBudget(raw, { rawIsDefault: true });
       expect(flagged.awaitMs).toBe(plain.awaitMs);
       expect(flagged.requestedMs).toBe(plain.requestedMs);
-      expect(flagged.awaitMs).toBe(resolveEvaluateTimeoutMs(raw));
       expect(flagged.fromDefault).not.toBe(plain.fromDefault);
     }
   });

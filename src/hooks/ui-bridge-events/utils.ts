@@ -196,7 +196,7 @@ export function levenshtein(a: string, b: string): number {
  * route this value is reached only from a producer that predates
  * `tagged_page_evaluate`. The DEFAULT a tagged caller actually gets is the
  * Rust one; `timeout_from_default` is what says so. See
- * {@link resolveEvaluateTimeoutMs} and {@link describeEvaluateBudget}.
+ * {@link describeEvaluateBudget}.
  */
 export const PAGE_EVALUATE_PROMISE_TIMEOUT_MS = 30_000;
 
@@ -231,28 +231,6 @@ export const PAGE_EVALUATE_MIN_TIMEOUT_MS = 1_000;
  * Rust handler clamps to, and invisible at the 600 s ceiling.
  */
 const PAGE_EVALUATE_TIMEOUT_MARGIN_MS = 250;
-
-/**
- * Resolve the promise-await budget for one tagged evaluate request.
- *
- * The Rust dispatcher forwards the caller's `timeoutMs` (already clamped to
- * [1000, 600000]) on every `ui-bridge:evaluate-request` and waits exactly
- * that long for the response. The frontend used to ignore the field and
- * always await {@link PAGE_EVALUATE_PROMISE_TIMEOUT_MS}, which made the
- * documented ceiling unreachable: a caller asking for `timeoutMs: 600000`
- * to cover a genuinely long async expression got
- * `success: false, error: "…did not settle within 30s"` at 30 s, while the
- * Rust side was still willing to wait another nine and a half minutes.
- * Honoring the field lines both waits up with the caller's request, less
- * {@link PAGE_EVALUATE_TIMEOUT_MARGIN_MS}.
- *
- * Anything not a positive finite number (absent, `null`, `0`, `NaN`, a
- * string from a hand-rolled emit) falls back to the default cap rather than
- * producing an instant or infinite timeout.
- */
-export function resolveEvaluateTimeoutMs(raw: unknown): number {
-  return describeEvaluateBudget(raw).awaitMs;
-}
 
 /**
  * The budget behind one evaluate request, with the provenance a timeout error
@@ -295,8 +273,21 @@ export interface EvaluateBudgetOptions {
 
 /**
  * Resolve a raw `timeoutMs` into the await budget AND where that budget came
- * from — the single source of truth {@link resolveEvaluateTimeoutMs} and the
- * timeout message both read.
+ * from — the single source of truth for both the await and the timeout message.
+ *
+ * The Rust dispatcher forwards the caller's `timeoutMs` (already clamped to
+ * [1000, 600000]) on every `ui-bridge:evaluate-request` and waits exactly that
+ * long for the response. The frontend used to ignore the field and always await
+ * {@link PAGE_EVALUATE_PROMISE_TIMEOUT_MS}, which made the documented ceiling
+ * unreachable: a caller asking for `timeoutMs: 600000` to cover a genuinely
+ * long async expression got `success: false, error: "…did not settle within
+ * 30s"` at 30 s, while the Rust side was still willing to wait another nine and
+ * a half minutes. Honoring the field lines both waits up with the caller's
+ * request, less {@link PAGE_EVALUATE_TIMEOUT_MARGIN_MS}.
+ *
+ * Anything not a positive finite number (absent, `null`, `0`, `NaN`, a string
+ * from a hand-rolled emit) falls back to the default cap rather than producing
+ * an instant or infinite timeout.
  *
  * Split out because the message could not previously be honest. It reported
  * only the DERIVED number (`"9.8s"`), which is the default 10 000 ms less the
