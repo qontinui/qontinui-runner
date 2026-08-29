@@ -431,36 +431,6 @@ function resolveAccountConfigDir(
 }
 
 /**
- * F3 — pull a `--tenant <slug|uuid>` / `--tenant=<slug|uuid>` out of a
- * free-form context string.
- *
- * Needed because `/spawn-ai` reaches the handler by TWO routes and only one
- * of them is flag-aware: the slash route runs `parseArgs`, which strips
- * declared flags before binding (`parse.ts::extractFlags`), but the Tier-2
- * natural-language route binds regex named groups, so a `--tenant` typed
- * anywhere lands inside the wide `(?<context>.+)` group. Running this over
- * `context` normalizes both routes — and is a harmless no-op on the slash
- * route, where the flag is already gone.
- *
- * Returns the tenant (if any) and the context with the flag removed, so the
- * flag is never typed into the spawned session as part of its prompt.
- */
-export function splitTenantFlag(context: string | undefined): {
-  tenant?: string;
-  context?: string;
-} {
-  if (!context) return {};
-  const match = context.match(/(?:^|\s)--tenant(?:=|\s+)([\w-]+)(?=\s|$)/i);
-  if (!match) return { context };
-  const stripped = (
-    context.slice(0, match.index) + context.slice((match.index ?? 0) + match[0].length)
-  )
-    .replace(/\s+/g, " ")
-    .trim();
-  return { tenant: match[1], context: stripped.length > 0 ? stripped : undefined };
-}
-
-/**
  * F3 — resolve a `--tenant` argument to a bound tenant id.
  *
  * The backend takes a tenant UUID, but the operator sees the SHORT form
@@ -638,20 +608,24 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if ("ok" in accountRead) return accountRead;
       const configDir = resolveAccountConfigDir(accountRead.text, ctx.accounts);
       if (!configDir) return fail("no-account", "no matching Claude account");
-      // F3 — `--tenant` arrives either already-parsed (slash route, via the
-      // `"--tenant"` schema key) or still embedded in `context` (Tier-2
-      // regex route). `splitTenantFlag` normalizes the second case.
-      const rawContext = textArg(args, "context") || undefined;
-      const split = splitTenantFlag(rawContext);
-      // Same three-state read for the tenant. `--tenant=` bound `""`,
-      // read back as ABSENT, and spawned under the device default — the
-      // exact mis-binding this feature exists to prevent.
+      // F3 — `--tenant` is DECLARED as a flag (`SCHEMA.spawnAi["--tenant"]`)
+      // and is extracted by `parse.ts::applyDeclaredFlags`, which the
+      // CommandBar runs on every route's args. This handler used to carry
+      // its own `splitTenantFlag` regex to recover the flag out of `context`
+      // on the Tier-2 route; that was a per-flag patch for a per-route
+      // defect, so it fixed `--tenant` and left the next declared flag to
+      // rediscover the bug. Deleted in favour of the route-independent
+      // extraction — see `applyDeclaredFlags`.
+      const context = textArg(args, "context") || undefined;
+      // Three-state read for the tenant. `--tenant=` binds `""`, which read
+      // back as ABSENT under a two-state read and spawned under the device
+      // default — the exact mis-binding this feature exists to prevent.
       const tenantRead = resolveText(args, "tenant");
       if ("ok" in tenantRead) return tenantRead;
-      const rawTenant = tenantRead.text.trim() || split.tenant || undefined;
+      const rawTenant = tenantRead.text.trim() || undefined;
       const { tenantId, error } = resolveTenantArg(rawTenant, ctx.tenantCandidates);
       if (error) return fail("unknown-tenant", error);
-      const result = await ctx.spawnAi(count, configDir, split.context, tenantId);
+      const result = await ctx.spawnAi(count, configDir, context, tenantId);
       return spawnVerdict(result, count, "AI sessions");
     },
   });

@@ -1,6 +1,12 @@
 /**
  * F3 — `/spawn-ai --tenant` argument handling.
  *
+ * The `splitTenantFlag` block that used to sit here is gone with the helper
+ * it covered: recovering a declared flag out of a free-form `context` was a
+ * per-flag patch for a per-route defect. Flag extraction is route-independent
+ * now (`parse.ts::applyDeclaredFlags`), and its contract is covered in
+ * `resolve.test.ts` for every declared flag rather than for this one.
+ *
  * Runs under vitest's `environment: "node"` (no jsdom), so these exercise the
  * exported pure helpers rather than the hook — same split the rest of the
  * `commands/` specs use.
@@ -8,46 +14,11 @@
 
 import { describe, expect, it } from "vitest";
 
-import { resolveTenantArg, splitTenantFlag } from "./useTerminalCommands";
+import { resolveTenantArg } from "./useTerminalCommands";
 
 const A = "6b1f4b0e-0000-4000-8000-000000000001";
 const B = "6b1f4b0e-0000-4000-8000-000000000002";
 const C = "91ffaa20-0000-4000-8000-000000000003";
-
-describe("splitTenantFlag", () => {
-  it("returns nothing for an absent context", () => {
-    expect(splitTenantFlag(undefined)).toEqual({});
-  });
-
-  it("passes a flagless context through untouched", () => {
-    expect(splitTenantFlag("fix the failing test")).toEqual({ context: "fix the failing test" });
-  });
-
-  it("extracts a leading `--tenant value` and strips it from the prompt", () => {
-    expect(splitTenantFlag("--tenant pizzeria fix the bug")).toEqual({
-      tenant: "pizzeria",
-      context: "fix the bug",
-    });
-  });
-
-  it("extracts a trailing `--tenant=value`", () => {
-    expect(splitTenantFlag("fix the bug --tenant=pizzeria")).toEqual({
-      tenant: "pizzeria",
-      context: "fix the bug",
-    });
-  });
-
-  it("drops the context entirely when the flag was the whole of it", () => {
-    expect(splitTenantFlag("--tenant pizzeria")).toEqual({
-      tenant: "pizzeria",
-      context: undefined,
-    });
-  });
-
-  it("leaves a bare `--tenant` with no value alone", () => {
-    expect(splitTenantFlag("--tenant")).toEqual({ context: "--tenant" });
-  });
-});
 
 describe("resolveTenantArg", () => {
   const candidates = [A, B, C];

@@ -38,6 +38,22 @@ export interface ResolveMatch {
    *  alias; the caller hides other suggestions and renders the param
    *  preview row instead. */
   exact: boolean;
+  /**
+   * True when the exact hit came from input the operator spelled with the
+   * LEADING SLASH (`/spawn-ai …`, not `spawn-ai …`).
+   *
+   * `resolve` deliberately treats the two alike for MATCHING — typing
+   * `swap 1 2` should find `/swap`. But they are not alike as evidence of
+   * intent, and the CommandBar's tier ranking needs the difference: a
+   * literal slash form is the operator naming the command outright, so it
+   * outranks a Tier-2 regex, while a slashless phrase is English and stays
+   * in the shape-aware contest (`spawn 3 best` must keep routing to
+   * `/spawn-ai`, not to `/spawn` with `count: "3 best"`).
+   *
+   * Carried here rather than re-derived in the bar so the two cannot
+   * disagree about what "the operator typed a slash" means.
+   */
+  literal: boolean;
   /** True when the action's id is in the user's recents — pinned to the
    *  top of the empty-input dropdown, otherwise tie-breaks above
    *  same-score fuzzy hits. */
@@ -69,6 +85,7 @@ export function resolve(input: string, recents: readonly string[]): ResolveMatch
     return ordered.slice(0, MAX_SUGGESTIONS).map((action) => ({
       action,
       exact: false,
+      literal: false,
       recent: recentSet.has(action.id),
       indices: [],
     }));
@@ -77,13 +94,15 @@ export function resolve(input: string, recents: readonly string[]): ResolveMatch
   // ── Exact slash hit ────────────────────────────────────────────────
   const firstSpace = trimmed.search(/\s/);
   const head = firstSpace === -1 ? trimmed : trimmed.slice(0, firstSpace);
-  const slashForm = head.startsWith("/") ? head : `/${head}`;
+  const literal = head.startsWith("/");
+  const slashForm = literal ? head : `/${head}`;
   const exactHit = getBySlash(slashForm);
   if (exactHit) {
     return [
       {
         action: exactHit,
         exact: true,
+        literal,
         recent: recents.includes(exactHit.id),
         indices: [],
       },
@@ -122,6 +141,7 @@ export function resolve(input: string, recents: readonly string[]): ResolveMatch
     scored.push({
       action,
       exact: false,
+      literal: false,
       recent: recentSet.has(action.id),
       indices,
       _score: best.score,
