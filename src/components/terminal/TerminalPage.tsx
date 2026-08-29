@@ -121,6 +121,10 @@ function TerminalPageInner({
   onNavigateToActive: _onNavigateToActive,
   onSessionCountChange,
 }: TerminalPageProps) {
+  // The page root, handed to every global-chord listener this page owns so
+  // they can tell "the terminal is on screen" from "the terminal is mounted
+  // behind a `display:none` tab". See `lib/surfaceVisible`.
+  const pageRootRef = useRef<HTMLDivElement>(null);
   // F2 — the tenant the next spawn binds to (`SpawnTenantPicker` writes it)
   // and the device's persisted pin as the fallback.
   const { spawnTenantId, activeTenantId, candidates: tenantCandidates } = useTenant();
@@ -992,6 +996,10 @@ function TerminalPageInner({
       sessions: sessionManager.sessions,
       resumeSession: sessionManager.resumeSession,
     },
+    // App.tsx keeps this page mounted behind a `hidden` div on every other
+    // tab, so the hook's `window` listener outlives the page's visibility.
+    // Hand it the page root so its chords go inert off-screen.
+    surfaceRef: pageRootRef,
   });
 
   const writeWhenReady = (tabId: string, text: string, maxWaitMs = 5000) =>
@@ -1234,7 +1242,7 @@ function TerminalPageInner({
 
   return (
     <UIBridgeComponentScope componentId="terminal-page">
-      <div className="h-full flex flex-col bg-[#1a1b26]">
+      <div ref={pageRootRef} className="h-full flex flex-col bg-[#1a1b26]">
         {/* Phase 6 — top status strip. Renders nothing when no signal
             requires attention, keeping the top of viewport clean by
             default. Phase 9c demolition removed `TerminalTabBar` (was

@@ -15,8 +15,10 @@
 import { describe, it, expect } from "vitest";
 import {
   GLOBAL_CHORDS,
+  GLOBAL_DIGIT_CHORDS,
   isCtrlShiftChord,
   matchesChord,
+  matchesDigitChord,
   type ChordKeyLike,
   type GlobalChord,
 } from "./globalChords";
@@ -116,5 +118,73 @@ describe("isCtrlShiftChord", () => {
 
   it("does not match a different letter", () => {
     expect(isCtrlShiftChord(key({ key: "j" }), "k")).toBe(false);
+  });
+});
+
+describe("matchesDigitChord", () => {
+  const digit = (over: Partial<ChordKeyLike> = {}): ChordKeyLike => ({
+    key: "3",
+    ctrlKey: true,
+    shiftKey: false,
+    metaKey: false,
+    altKey: false,
+    ...over,
+  });
+
+  it("returns the digit inside the range", () => {
+    expect(matchesDigitChord(digit(), GLOBAL_DIGIT_CHORDS.dashboardWidget)).toBe(3);
+    expect(matchesDigitChord(digit({ key: "9" }), GLOBAL_DIGIT_CHORDS.terminalFocusZone)).toBe(9);
+  });
+
+  it("returns null outside the range", () => {
+    // Ctrl+9 is a focus-zone chord but NOT a dashboard-widget one.
+    expect(matchesDigitChord(digit({ key: "9" }), GLOBAL_DIGIT_CHORDS.dashboardWidget)).toBeNull();
+    expect(
+      matchesDigitChord(digit({ key: "0" }), GLOBAL_DIGIT_CHORDS.terminalFocusZone),
+    ).toBeNull();
+  });
+
+  it("matches Shift EXACTLY — the term DashboardPage was missing", () => {
+    // `(e.ctrlKey || e.metaKey) && e.key >= "1" && e.key <= "8"` had no
+    // shiftKey test at all. On a US layout shifted digits report
+    // punctuation so it looked fine; on a numpad or a non-US layout that
+    // reports a bare digit with Shift held, it was a second live
+    // claimant on the terminal's Ctrl+Shift+1..8 layout-preset chord.
+    expect(
+      matchesDigitChord(digit({ shiftKey: true }), GLOBAL_DIGIT_CHORDS.dashboardWidget),
+    ).toBeNull();
+    expect(
+      matchesDigitChord(digit({ shiftKey: true }), GLOBAL_DIGIT_CHORDS.terminalLayoutPreset),
+    ).toBe(3);
+    expect(matchesDigitChord(digit(), GLOBAL_DIGIT_CHORDS.terminalLayoutPreset)).toBeNull();
+  });
+
+  it("requires Ctrl, or Cmd only where the chord says meta", () => {
+    expect(
+      matchesDigitChord(
+        digit({ ctrlKey: false, metaKey: true }),
+        GLOBAL_DIGIT_CHORDS.dashboardWidget,
+      ),
+    ).toBe(3);
+    expect(
+      matchesDigitChord(
+        digit({ ctrlKey: false, metaKey: true }),
+        GLOBAL_DIGIT_CHORDS.terminalFocusZone,
+      ),
+    ).toBeNull();
+    expect(
+      matchesDigitChord(digit({ ctrlKey: false }), GLOBAL_DIGIT_CHORDS.dashboardWidget),
+    ).toBeNull();
+  });
+
+  it("rejects Alt — the `!e.altKey` term the focus-zone handler carried", () => {
+    expect(
+      matchesDigitChord(digit({ altKey: true }), GLOBAL_DIGIT_CHORDS.terminalFocusZone),
+    ).toBeNull();
+  });
+
+  it("rejects a non-digit key", () => {
+    expect(matchesDigitChord(digit({ key: "a" }), GLOBAL_DIGIT_CHORDS.dashboardWidget)).toBeNull();
+    expect(matchesDigitChord(digit({ key: "F3" }), GLOBAL_DIGIT_CHORDS.dashboardWidget)).toBeNull();
   });
 });

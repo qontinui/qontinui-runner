@@ -49,12 +49,13 @@ import {
   Package,
   RefreshCw,
   Sparkles,
+  Tag,
   TerminalSquare,
 } from "lucide-react";
 
 import type { SessionState } from "./useZoneLayout";
 
-import { useTerminalSession } from "./contexts";
+import { useTerminalSession, useZoneMetadata } from "./contexts";
 import { useHotField } from "./useTerminalHotStore";
 import { useWrapperTools } from "@/hooks/useWrapperTools";
 import { BatchActions } from "./BatchActions";
@@ -189,6 +190,16 @@ export function splitNeedsInput(
 export function StatusStrip() {
   const session = useTerminalSession();
   const { tabs, sessionStates, pageId, zoneLayout, workflowGen, sessionManager } = session;
+  // The tag filter's visible affordance. `/tag-clear`'s description has
+  // always promised it is "the same as clicking the 'All' pill in
+  // ZoneStatusBar" — and there was no such pill anywhere in `src/`, nor
+  // any reader of `activeTagFilters` at all. The pill below is that
+  // affordance, and it is also the operator's only feedback that a
+  // filter is on: without it, dimmed zones look like a rendering bug.
+  const { labelsAndTags } = useZoneMetadata();
+  const activeTagFilters = labelsAndTags.activeTagFilters;
+  const setActiveTagFilters = labelsAndTags.setActiveTagFilters;
+  const clearTagFilters = useCallback(() => setActiveTagFilters(new Set()), [setActiveTagFilters]);
   const fileLockStates = useHotField(pageId, "lockStates");
   const planFileName = workflowGen.planFileName;
   const isPlanLoading = workflowGen.isPlanLoading;
@@ -256,10 +267,7 @@ export function StatusStrip() {
   // tab-scoped one and any session-only surplus is reported as `+N external`.
   const { actionable: needsInputCount, external: externalNeedsInputCount } = useMemo(
     () =>
-      splitNeedsInput(
-        sessionNeedsInputCount,
-        countTabsInState(tabs, sessionStates, "needs-input"),
-      ),
+      splitNeedsInput(sessionNeedsInputCount, countTabsInState(tabs, sessionStates, "needs-input")),
     [sessionNeedsInputCount, tabs, sessionStates],
   );
 
@@ -313,6 +321,7 @@ export function StatusStrip() {
   // principle. The wrapper affordance now only renders when the strip is
   // already up for a genuine signal (attention, multi-zone, or a plan).
   const hasContent =
+    activeTagFilters.size > 0 ||
     needsInputCount > 0 ||
     externalNeedsInputCount > 0 ||
     errorCount > 0 ||
@@ -394,6 +403,18 @@ export function StatusStrip() {
             "Waiting Claude session(s) with no PTY tab in this window — " +
             "Tab-to-cycle and the batch buttons cannot reach them, so they are " +
             "reported separately rather than folded into the actionable count."
+          }
+        />
+      )}
+      {activeTagFilters.size > 0 && (
+        <Pill
+          icon={<Tag className="w-2.5 h-2.5" />}
+          text={`Tag: ${[...activeTagFilters].sort().join(", ")} · All`}
+          color="#bb9af7"
+          onClick={clearTagFilters}
+          title={
+            "Zones without one of these tags are dimmed. Click (or run /tag-clear) " +
+            "to show all zones again."
           }
         />
       )}
