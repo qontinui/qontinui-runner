@@ -1,0 +1,2394 @@
+# terminal CommandBar pipeline — golden characterization
+#
+# GENERATED. Do not hand-edit. Regenerate with:
+#   node scripts/terminal-command-corpus.mjs --update
+#
+# One line per corpus input:
+#   <input> TAB <route> TAB <actionId> TAB <args> TAB <verdict>
+#
+# The corpus is DERIVED from the action registry (slash forms, aliases and
+# every Tier-2 pattern, crossed with argument tails, quoting shapes and
+# declared-flag spellings), so adding a pattern adds rows here. That is
+# intended: the diff this file produces IS the review surface.
+#
+# A row changing action or args is a semantic change and needs a reason in
+# the PR. A row changing only its verdict may be the stubbed context in
+# realRegistry.testkit.ts moving instead — check that first.
+# tier: golden   inputs: 2376
+
+/analyze	literal	terminal.analyze	[]	error:invalid-args
+/analyze "1 gmail fix the bug"	literal	terminal.analyze	[["type","1 gmail fix the bug"]]	error:invalid-args
+/analyze "1 gmail fix the bug" --tenant	literal	terminal.analyze	[["type","1 gmail fix the bug --tenant"]]	error:invalid-args
+/analyze "3 best"	literal	terminal.analyze	[["type","3 best"]]	error:invalid-args
+/analyze "3 best" --tenant	literal	terminal.analyze	[["type","3 best --tenant"]]	error:invalid-args
+/analyze --tenant	literal	terminal.analyze	[["type","--tenant"]]	error:invalid-args
+/analyze 1 gmail fix the bug	literal	terminal.analyze	[["type","1 gmail fix the bug"]]	error:invalid-args
+/analyze 1 gmail fix the bug --tenant	literal	terminal.analyze	[["type","1 gmail fix the bug --tenant"]]	error:invalid-args
+/analyze 3 best	literal	terminal.analyze	[["type","3 best"]]	error:invalid-args
+/analyze 3 best --tenant	literal	terminal.analyze	[["type","3 best --tenant"]]	error:invalid-args
+/analyze architecture	pattern	terminal.analyze	[["type","architecture"]]	ok
+/analyze architecture --tenant	literal	terminal.analyze	[["type","architecture --tenant"]]	error:invalid-args
+/analyze change-impact	pattern	terminal.analyze	[["type","change-impact"]]	ok
+/analyze change-impact --tenant	literal	terminal.analyze	[["type","change-impact --tenant"]]	error:invalid-args
+/analyze cross-tab	pattern	terminal.analyze	[["type","cross-tab"]]	ok
+/analyze cross-tab --tenant	literal	terminal.analyze	[["type","cross-tab --tenant"]]	error:invalid-args
+/analyze page-architecture	pattern	terminal.analyze	[["type","page-architecture"]]	ok
+/analyze page-architecture --tenant	literal	terminal.analyze	[["type","page-architecture --tenant"]]	error:invalid-args
+/analyze progress	pattern	terminal.analyze	[["type","progress"]]	ok
+/analyze progress --tenant	literal	terminal.analyze	[["type","progress --tenant"]]	error:invalid-args
+/analyze session-summary	pattern	terminal.analyze	[["type","session-summary"]]	ok
+/analyze session-summary --tenant	literal	terminal.analyze	[["type","session-summary --tenant"]]	error:invalid-args
+/approve	pattern	terminal.approve-all	[]	ok
+/approve "1 gmail fix the bug"	none	-	null	none
+/approve "1 gmail fix the bug" --tenant	none	-	null	none
+/approve "3 best"	none	-	null	none
+/approve "3 best" --tenant	none	-	null	none
+/approve --tenant	none	-	null	none
+/approve 1 gmail fix the bug	none	-	null	none
+/approve 1 gmail fix the bug --tenant	none	-	null	none
+/approve 3 best	none	-	null	none
+/approve 3 best --tenant	none	-	null	none
+/approve all	pattern	terminal.approve-all	[]	ok
+/approve all "1 gmail fix the bug"	none	-	null	none
+/approve all "1 gmail fix the bug" --tenant	none	-	null	none
+/approve all "3 best"	none	-	null	none
+/approve all "3 best" --tenant	none	-	null	none
+/approve all --tenant	none	-	null	none
+/approve all 1 gmail fix the bug	none	-	null	none
+/approve all 1 gmail fix the bug --tenant	none	-	null	none
+/approve all 3 best	none	-	null	none
+/approve all 3 best --tenant	none	-	null	none
+/approve-all	literal	terminal.approve-all	[]	ok
+/approve-all "1 gmail fix the bug"	literal	terminal.approve-all	[]	unbound
+/approve-all "1 gmail fix the bug" --tenant	literal	terminal.approve-all	[]	unbound
+/approve-all "3 best"	literal	terminal.approve-all	[]	unbound
+/approve-all "3 best" --tenant	literal	terminal.approve-all	[]	unbound
+/approve-all --tenant	literal	terminal.approve-all	[]	unbound
+/approve-all 1 gmail fix the bug	literal	terminal.approve-all	[]	unbound
+/approve-all 1 gmail fix the bug --tenant	literal	terminal.approve-all	[]	unbound
+/approve-all 3 best	literal	terminal.approve-all	[]	unbound
+/approve-all 3 best --tenant	literal	terminal.approve-all	[]	unbound
+/auto focus	pattern	terminal.toggle-auto-focus	[]	ok
+/auto focus "1 gmail fix the bug"	none	-	null	none
+/auto focus "1 gmail fix the bug" --tenant	none	-	null	none
+/auto focus "3 best"	none	-	null	none
+/auto focus "3 best" --tenant	none	-	null	none
+/auto focus --tenant	none	-	null	none
+/auto focus 1 gmail fix the bug	none	-	null	none
+/auto focus 1 gmail fix the bug --tenant	none	-	null	none
+/auto focus 3 best	none	-	null	none
+/auto focus 3 best --tenant	none	-	null	none
+/auto restart	pattern	terminal.toggle-auto-restart	[]	ok
+/auto restart "1 gmail fix the bug"	none	-	null	none
+/auto restart "1 gmail fix the bug" --tenant	none	-	null	none
+/auto restart "3 best"	none	-	null	none
+/auto restart "3 best" --tenant	none	-	null	none
+/auto restart --tenant	none	-	null	none
+/auto restart 1 gmail fix the bug	none	-	null	none
+/auto restart 1 gmail fix the bug --tenant	none	-	null	none
+/auto restart 3 best	none	-	null	none
+/auto restart 3 best --tenant	none	-	null	none
+/auto-approve	literal	terminal.auto-approve	[]	error:invalid-args
+/auto-approve "1 gmail fix the bug"	literal	terminal.auto-approve	[["action","1 gmail fix the bug"]]	error:invalid-args
+/auto-approve "1 gmail fix the bug" --tenant	literal	terminal.auto-approve	[["action","1 gmail fix the bug"],["pattern","--tenant"]]	error:invalid-args
+/auto-approve "3 best"	literal	terminal.auto-approve	[["action","3 best"]]	error:invalid-args
+/auto-approve "3 best" --tenant	literal	terminal.auto-approve	[["action","3 best"],["pattern","--tenant"]]	error:invalid-args
+/auto-approve --tenant	literal	terminal.auto-approve	[["action","--tenant"]]	error:invalid-args
+/auto-approve 1 gmail fix the bug	literal	terminal.auto-approve	[["action",1],["pattern","gmail fix the bug"]]	error:invalid-args
+/auto-approve 1 gmail fix the bug --tenant	literal	terminal.auto-approve	[["action",1],["pattern","gmail fix the bug --tenant"]]	error:invalid-args
+/auto-approve 3 best	literal	terminal.auto-approve	[["action",3],["pattern","best"]]	error:invalid-args
+/auto-approve 3 best --tenant	literal	terminal.auto-approve	[["action",3],["pattern","best --tenant"]]	error:invalid-args
+/auto-approve add fix the bug	pattern	terminal.auto-approve	[["action","add"],["pattern","fix the bug"]]	ok
+/auto-approve add fix the bug --tenant	pattern	terminal.auto-approve	[["action","add"],["pattern","fix the bug --tenant"]]	ok
+/auto-approve clear	pattern	terminal.auto-approve	[["action","clear"]]	ok
+/auto-approve clear --tenant	literal	terminal.auto-approve	[["action","clear"],["pattern","--tenant"]]	ok
+/auto-approve list	pattern	terminal.auto-approve	[["action","list"]]	ok
+/auto-approve list --tenant	literal	terminal.auto-approve	[["action","list"],["pattern","--tenant"]]	ok
+/auto-approve remove fix the bug	pattern	terminal.auto-approve	[["action","remove"],["pattern","fix the bug"]]	error:unknown-pattern
+/auto-approve remove fix the bug --tenant	pattern	terminal.auto-approve	[["action","remove"],["pattern","fix the bug --tenant"]]	error:unknown-pattern
+/auto-focus	pattern	terminal.toggle-auto-focus	[]	ok
+/auto-focus "1 gmail fix the bug"	literal	terminal.toggle-auto-focus	[]	unbound
+/auto-focus "1 gmail fix the bug" --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+/auto-focus "3 best"	literal	terminal.toggle-auto-focus	[]	unbound
+/auto-focus "3 best" --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+/auto-focus --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+/auto-focus 1 gmail fix the bug	literal	terminal.toggle-auto-focus	[]	unbound
+/auto-focus 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+/auto-focus 3 best	literal	terminal.toggle-auto-focus	[]	unbound
+/auto-focus 3 best --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+/auto-restart	pattern	terminal.toggle-auto-restart	[]	ok
+/auto-restart "1 gmail fix the bug"	literal	terminal.toggle-auto-restart	[]	unbound
+/auto-restart "1 gmail fix the bug" --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+/auto-restart "3 best"	literal	terminal.toggle-auto-restart	[]	unbound
+/auto-restart "3 best" --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+/auto-restart --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+/auto-restart 1 gmail fix the bug	literal	terminal.toggle-auto-restart	[]	unbound
+/auto-restart 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+/auto-restart 3 best	literal	terminal.toggle-auto-restart	[]	unbound
+/auto-restart 3 best --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+/clear-tag	pattern	terminal.tag-clear	[]	ok
+/clear-tag "1 gmail fix the bug"	none	-	null	none
+/clear-tag "1 gmail fix the bug" --tenant	none	-	null	none
+/clear-tag "3 best"	none	-	null	none
+/clear-tag "3 best" --tenant	none	-	null	none
+/clear-tag --tenant	none	-	null	none
+/clear-tag 1 gmail fix the bug	none	-	null	none
+/clear-tag 1 gmail fix the bug --tenant	none	-	null	none
+/clear-tag 3 best	none	-	null	none
+/clear-tag 3 best --tenant	none	-	null	none
+/clear-tags	pattern	terminal.tag-clear	[]	ok
+/clear-tags "1 gmail fix the bug"	literal	terminal.tag-clear	[]	unbound
+/clear-tags "1 gmail fix the bug" --tenant	literal	terminal.tag-clear	[]	unbound
+/clear-tags "3 best"	literal	terminal.tag-clear	[]	unbound
+/clear-tags "3 best" --tenant	literal	terminal.tag-clear	[]	unbound
+/clear-tags --tenant	literal	terminal.tag-clear	[]	unbound
+/clear-tags 1 gmail fix the bug	literal	terminal.tag-clear	[]	unbound
+/clear-tags 1 gmail fix the bug --tenant	literal	terminal.tag-clear	[]	unbound
+/clear-tags 3 best	literal	terminal.tag-clear	[]	unbound
+/clear-tags 3 best --tenant	literal	terminal.tag-clear	[]	unbound
+/close	pattern	terminal.close	[]	ok
+/close "1 gmail fix the bug"	literal	terminal.close	[["zone","1 gmail fix the bug"]]	error:invalid-zone
+/close "1 gmail fix the bug" --tenant	literal	terminal.close	[["tabId","--tenant"],["zone","1 gmail fix the bug"]]	error:unknown-tab
+/close "3 best"	literal	terminal.close	[["zone","3 best"]]	error:invalid-zone
+/close "3 best" --tenant	literal	terminal.close	[["tabId","--tenant"],["zone","3 best"]]	error:unknown-tab
+/close --tenant	literal	terminal.close	[["zone","--tenant"]]	error:invalid-zone
+/close 1 gmail fix the bug	literal	terminal.close	[["tabId","gmail fix the bug"],["zone",1]]	error:unknown-tab
+/close 1 gmail fix the bug --tenant	literal	terminal.close	[["tabId","gmail fix the bug --tenant"],["zone",1]]	error:unknown-tab
+/close 3	pattern	terminal.close	[["zone",3]]	error:no-target
+/close 3 --tenant	literal	terminal.close	[["tabId","--tenant"],["zone",3]]	error:unknown-tab
+/close 3 best	literal	terminal.close	[["tabId","best"],["zone",3]]	error:unknown-tab
+/close 3 best --tenant	literal	terminal.close	[["tabId","best --tenant"],["zone",3]]	error:unknown-tab
+/conduct	literal	terminal.orchestrate	[]	error:invalid-args
+/conduct "1 gmail fix the bug"	literal	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+/conduct "1 gmail fix the bug" --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+/conduct "3 best"	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+/conduct "3 best" --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+/conduct --tenant	literal	terminal.orchestrate	[["goal","--tenant"]]	error:no-run-id
+/conduct 1 gmail fix the bug	literal	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+/conduct 1 gmail fix the bug --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+/conduct 3 best	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+/conduct 3 best --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+/copy names	pattern	terminal.copy-names	[]	error:no-sessions
+/copy names "1 gmail fix the bug"	none	-	null	none
+/copy names "1 gmail fix the bug" --tenant	none	-	null	none
+/copy names "3 best"	none	-	null	none
+/copy names "3 best" --tenant	none	-	null	none
+/copy names --tenant	none	-	null	none
+/copy names 1 gmail fix the bug	none	-	null	none
+/copy names 1 gmail fix the bug --tenant	none	-	null	none
+/copy names 3 best	none	-	null	none
+/copy names 3 best --tenant	none	-	null	none
+/copy sessions	pattern	terminal.copy-names	[]	error:no-sessions
+/copy sessions "1 gmail fix the bug"	none	-	null	none
+/copy sessions "1 gmail fix the bug" --tenant	none	-	null	none
+/copy sessions "3 best"	none	-	null	none
+/copy sessions "3 best" --tenant	none	-	null	none
+/copy sessions --tenant	none	-	null	none
+/copy sessions 1 gmail fix the bug	none	-	null	none
+/copy sessions 1 gmail fix the bug --tenant	none	-	null	none
+/copy sessions 3 best	none	-	null	none
+/copy sessions 3 best --tenant	none	-	null	none
+/copy-names	pattern	terminal.copy-names	[]	error:no-sessions
+/copy-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound
+/copy-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound
+/copy-names "3 best"	literal	terminal.copy-names	[]	unbound
+/copy-names "3 best" --tenant	literal	terminal.copy-names	[]	unbound
+/copy-names --tenant	literal	terminal.copy-names	[]	unbound
+/copy-names 1 gmail fix the bug	literal	terminal.copy-names	[]	unbound
+/copy-names 1 gmail fix the bug --tenant	literal	terminal.copy-names	[]	unbound
+/copy-names 3 best	literal	terminal.copy-names	[]	unbound
+/copy-names 3 best --tenant	literal	terminal.copy-names	[]	unbound
+/copy-sessions	pattern	terminal.copy-names	[]	error:no-sessions
+/copy-sessions "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound
+/copy-sessions "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound
+/copy-sessions "3 best"	literal	terminal.copy-names	[]	unbound
+/copy-sessions "3 best" --tenant	literal	terminal.copy-names	[]	unbound
+/copy-sessions --tenant	literal	terminal.copy-names	[]	unbound
+/copy-sessions 1 gmail fix the bug	literal	terminal.copy-names	[]	unbound
+/copy-sessions 1 gmail fix the bug --tenant	literal	terminal.copy-names	[]	unbound
+/copy-sessions 3 best	literal	terminal.copy-names	[]	unbound
+/copy-sessions 3 best --tenant	literal	terminal.copy-names	[]	unbound
+/desktop notify	pattern	terminal.toggle-desktop-notify	[]	ok
+/desktop notify "1 gmail fix the bug"	none	-	null	none
+/desktop notify "1 gmail fix the bug" --tenant	none	-	null	none
+/desktop notify "3 best"	none	-	null	none
+/desktop notify "3 best" --tenant	none	-	null	none
+/desktop notify --tenant	none	-	null	none
+/desktop notify 1 gmail fix the bug	none	-	null	none
+/desktop notify 1 gmail fix the bug --tenant	none	-	null	none
+/desktop notify 3 best	none	-	null	none
+/desktop notify 3 best --tenant	none	-	null	none
+/desktop-notify	pattern	terminal.toggle-desktop-notify	[]	ok
+/desktop-notify "1 gmail fix the bug"	literal	terminal.toggle-desktop-notify	[]	unbound
+/desktop-notify "1 gmail fix the bug" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/desktop-notify "3 best"	literal	terminal.toggle-desktop-notify	[]	unbound
+/desktop-notify "3 best" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/desktop-notify --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/desktop-notify 1 gmail fix the bug	literal	terminal.toggle-desktop-notify	[]	unbound
+/desktop-notify 1 gmail fix the bug --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/desktop-notify 3 best	literal	terminal.toggle-desktop-notify	[]	unbound
+/desktop-notify 3 best --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/doc	pattern	terminal.doc-finder	[]	ok
+/doc "1 gmail fix the bug"	literal	terminal.doc-finder	[]	unbound
+/doc "1 gmail fix the bug" --tenant	literal	terminal.doc-finder	[]	unbound
+/doc "3 best"	literal	terminal.doc-finder	[]	unbound
+/doc "3 best" --tenant	literal	terminal.doc-finder	[]	unbound
+/doc --tenant	literal	terminal.doc-finder	[]	unbound
+/doc 1 gmail fix the bug	literal	terminal.doc-finder	[]	unbound
+/doc 1 gmail fix the bug --tenant	literal	terminal.doc-finder	[]	unbound
+/doc 3 best	literal	terminal.doc-finder	[]	unbound
+/doc 3 best --tenant	literal	terminal.doc-finder	[]	unbound
+/doc-finder	pattern	terminal.doc-finder	[]	ok
+/doc-finder "1 gmail fix the bug"	literal	terminal.doc-finder	[]	unbound
+/doc-finder "1 gmail fix the bug" --tenant	literal	terminal.doc-finder	[]	unbound
+/doc-finder "3 best"	literal	terminal.doc-finder	[]	unbound
+/doc-finder "3 best" --tenant	literal	terminal.doc-finder	[]	unbound
+/doc-finder --tenant	literal	terminal.doc-finder	[]	unbound
+/doc-finder 1 gmail fix the bug	literal	terminal.doc-finder	[]	unbound
+/doc-finder 1 gmail fix the bug --tenant	literal	terminal.doc-finder	[]	unbound
+/doc-finder 3 best	literal	terminal.doc-finder	[]	unbound
+/doc-finder 3 best --tenant	literal	terminal.doc-finder	[]	unbound
+/docs	pattern	terminal.doc-finder	[]	ok
+/docs "1 gmail fix the bug"	literal	terminal.doc-finder	[]	unbound
+/docs "1 gmail fix the bug" --tenant	literal	terminal.doc-finder	[]	unbound
+/docs "3 best"	literal	terminal.doc-finder	[]	unbound
+/docs "3 best" --tenant	literal	terminal.doc-finder	[]	unbound
+/docs --tenant	literal	terminal.doc-finder	[]	unbound
+/docs 1 gmail fix the bug	literal	terminal.doc-finder	[]	unbound
+/docs 1 gmail fix the bug --tenant	literal	terminal.doc-finder	[]	unbound
+/docs 3 best	literal	terminal.doc-finder	[]	unbound
+/docs 3 best --tenant	literal	terminal.doc-finder	[]	unbound
+/events	pattern	terminal.history	[]	ok
+/events "1 gmail fix the bug"	literal	terminal.history	[]	unbound
+/events "1 gmail fix the bug" --tenant	literal	terminal.history	[]	unbound
+/events "3 best"	literal	terminal.history	[]	unbound
+/events "3 best" --tenant	literal	terminal.history	[]	unbound
+/events --tenant	literal	terminal.history	[]	unbound
+/events 1 gmail fix the bug	literal	terminal.history	[]	unbound
+/events 1 gmail fix the bug --tenant	literal	terminal.history	[]	unbound
+/events 3 best	literal	terminal.history	[]	unbound
+/events 3 best --tenant	literal	terminal.history	[]	unbound
+/export	pattern	terminal.export-all	[]	ok
+/export "1 gmail fix the bug"	literal	terminal.export-all	[]	unbound
+/export "1 gmail fix the bug" --tenant	literal	terminal.export-all	[]	unbound
+/export "3 best"	literal	terminal.export-all	[]	unbound
+/export "3 best" --tenant	literal	terminal.export-all	[]	unbound
+/export --tenant	literal	terminal.export-all	[]	unbound
+/export 1 gmail fix the bug	literal	terminal.export-all	[]	unbound
+/export 1 gmail fix the bug --tenant	literal	terminal.export-all	[]	unbound
+/export 3 best	literal	terminal.export-all	[]	unbound
+/export 3 best --tenant	literal	terminal.export-all	[]	unbound
+/export all	pattern	terminal.export-all	[]	ok
+/export all "1 gmail fix the bug"	literal	terminal.export-all	[]	unbound
+/export all "1 gmail fix the bug" --tenant	literal	terminal.export-all	[]	unbound
+/export all "3 best"	literal	terminal.export-all	[]	unbound
+/export all "3 best" --tenant	literal	terminal.export-all	[]	unbound
+/export all --tenant	literal	terminal.export-all	[]	unbound
+/export all 1 gmail fix the bug	literal	terminal.export-all	[]	unbound
+/export all 1 gmail fix the bug --tenant	literal	terminal.export-all	[]	unbound
+/export all 3 best	literal	terminal.export-all	[]	unbound
+/export all 3 best --tenant	literal	terminal.export-all	[]	unbound
+/export-all	literal	terminal.export-all	[]	ok
+/export-all "1 gmail fix the bug"	literal	terminal.export-all	[]	unbound
+/export-all "1 gmail fix the bug" --tenant	literal	terminal.export-all	[]	unbound
+/export-all "3 best"	literal	terminal.export-all	[]	unbound
+/export-all "3 best" --tenant	literal	terminal.export-all	[]	unbound
+/export-all --tenant	literal	terminal.export-all	[]	unbound
+/export-all 1 gmail fix the bug	literal	terminal.export-all	[]	unbound
+/export-all 1 gmail fix the bug --tenant	literal	terminal.export-all	[]	unbound
+/export-all 3 best	literal	terminal.export-all	[]	unbound
+/export-all 3 best --tenant	literal	terminal.export-all	[]	unbound
+/file ownership	pattern	terminal.toggle-file-ownership	[]	ok
+/file ownership "1 gmail fix the bug"	none	-	null	none
+/file ownership "1 gmail fix the bug" --tenant	none	-	null	none
+/file ownership "3 best"	none	-	null	none
+/file ownership "3 best" --tenant	none	-	null	none
+/file ownership --tenant	none	-	null	none
+/file ownership 1 gmail fix the bug	none	-	null	none
+/file ownership 1 gmail fix the bug --tenant	none	-	null	none
+/file ownership 3 best	none	-	null	none
+/file ownership 3 best --tenant	none	-	null	none
+/file-ownership	pattern	terminal.toggle-file-ownership	[]	ok
+/file-ownership "1 gmail fix the bug"	literal	terminal.toggle-file-ownership	[]	unbound
+/file-ownership "1 gmail fix the bug" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/file-ownership "3 best"	literal	terminal.toggle-file-ownership	[]	unbound
+/file-ownership "3 best" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/file-ownership --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/file-ownership 1 gmail fix the bug	literal	terminal.toggle-file-ownership	[]	unbound
+/file-ownership 1 gmail fix the bug --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/file-ownership 3 best	literal	terminal.toggle-file-ownership	[]	unbound
+/file-ownership 3 best --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/files	pattern	terminal.toggle-file-ownership	[]	ok
+/files "1 gmail fix the bug"	literal	terminal.toggle-file-ownership	[]	unbound
+/files "1 gmail fix the bug" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/files "3 best"	literal	terminal.toggle-file-ownership	[]	unbound
+/files "3 best" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/files --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/files 1 gmail fix the bug	literal	terminal.toggle-file-ownership	[]	unbound
+/files 1 gmail fix the bug --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/files 3 best	literal	terminal.toggle-file-ownership	[]	unbound
+/files 3 best --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/filter-tag	literal	terminal.tag-toggle	[]	error:invalid-args
+/filter-tag "1 gmail fix the bug"	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+/filter-tag "1 gmail fix the bug" --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+/filter-tag "3 best"	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+/filter-tag "3 best" --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+/filter-tag --tenant	pattern	terminal.tag-toggle	[["tag","--tenant"]]	error:unknown-tag
+/filter-tag 1 gmail fix the bug	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+/filter-tag 1 gmail fix the bug --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+/filter-tag 3 best	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+/filter-tag 3 best --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+/filter-tag gmail	pattern	terminal.tag-toggle	[["tag","gmail"]]	error:unknown-tag
+/filter-tag gmail --tenant	literal	terminal.tag-toggle	[["tag","gmail --tenant"]]	error:unknown-tag
+/findings	pattern	terminal.toggle-findings	[]	ok
+/findings "1 gmail fix the bug"	literal	terminal.toggle-findings	[]	unbound
+/findings "1 gmail fix the bug" --tenant	literal	terminal.toggle-findings	[]	unbound
+/findings "3 best"	literal	terminal.toggle-findings	[]	unbound
+/findings "3 best" --tenant	literal	terminal.toggle-findings	[]	unbound
+/findings --tenant	literal	terminal.toggle-findings	[]	unbound
+/findings 1 gmail fix the bug	literal	terminal.toggle-findings	[]	unbound
+/findings 1 gmail fix the bug --tenant	literal	terminal.toggle-findings	[]	unbound
+/findings 3 best	literal	terminal.toggle-findings	[]	unbound
+/findings 3 best --tenant	literal	terminal.toggle-findings	[]	unbound
+/focus	literal	terminal.focus	[]	error:invalid-args
+/focus "1 gmail fix the bug"	literal	terminal.focus	[["target","1 gmail fix the bug"]]	error:invalid-zone
+/focus "1 gmail fix the bug" --tenant	literal	terminal.focus	[["target","1 gmail fix the bug --tenant"]]	error:invalid-zone
+/focus "3 best"	literal	terminal.focus	[["target","3 best"]]	error:invalid-zone
+/focus "3 best" --tenant	literal	terminal.focus	[["target","3 best --tenant"]]	error:invalid-zone
+/focus --tenant	literal	terminal.focus	[["target","--tenant"]]	error:invalid-zone
+/focus 1 gmail fix the bug	literal	terminal.focus	[["target","1 gmail fix the bug"]]	error:invalid-zone
+/focus 1 gmail fix the bug --tenant	literal	terminal.focus	[["target","1 gmail fix the bug --tenant"]]	error:invalid-zone
+/focus 3	pattern	terminal.focus	[["target",3]]	ok
+/focus 3 --tenant	literal	terminal.focus	[["target","3 --tenant"]]	error:invalid-zone
+/focus 3 best	literal	terminal.focus	[["target","3 best"]]	error:invalid-zone
+/focus 3 best --tenant	literal	terminal.focus	[["target","3 best --tenant"]]	error:invalid-zone
+/focus mode	pattern	terminal.toggle-focus-mode	[]	ok
+/focus mode "1 gmail fix the bug"	literal	terminal.focus	[["target","mode 1 gmail fix the bug"]]	error:invalid-zone
+/focus mode "1 gmail fix the bug" --tenant	literal	terminal.focus	[["target","mode 1 gmail fix the bug --tenant"]]	error:invalid-zone
+/focus mode "3 best"	literal	terminal.focus	[["target","mode 3 best"]]	error:invalid-zone
+/focus mode "3 best" --tenant	literal	terminal.focus	[["target","mode 3 best --tenant"]]	error:invalid-zone
+/focus mode --tenant	literal	terminal.focus	[["target","mode --tenant"]]	error:invalid-zone
+/focus mode 1 gmail fix the bug	literal	terminal.focus	[["target","mode 1 gmail fix the bug"]]	error:invalid-zone
+/focus mode 1 gmail fix the bug --tenant	literal	terminal.focus	[["target","mode 1 gmail fix the bug --tenant"]]	error:invalid-zone
+/focus mode 3 best	literal	terminal.focus	[["target","mode 3 best"]]	error:invalid-zone
+/focus mode 3 best --tenant	literal	terminal.focus	[["target","mode 3 best --tenant"]]	error:invalid-zone
+/focus needs input	pattern	terminal.focus	[["target","needs input"]]	ok
+/focus needs input --tenant	literal	terminal.focus	[["target","needs input --tenant"]]	error:invalid-zone
+/focus needs-input	pattern	terminal.focus	[["target","needs-input"]]	ok
+/focus needs-input --tenant	literal	terminal.focus	[["target","needs-input --tenant"]]	error:invalid-zone
+/focus needs_input	pattern	terminal.focus	[["target","needs_input"]]	ok
+/focus needs_input --tenant	literal	terminal.focus	[["target","needs_input --tenant"]]	error:invalid-zone
+/focus needsinput	pattern	terminal.focus	[["target","needsinput"]]	ok
+/focus needsinput --tenant	literal	terminal.focus	[["target","needsinput --tenant"]]	error:invalid-zone
+/focus next	pattern	terminal.focus	[["target","next"]]	ok
+/focus next --tenant	literal	terminal.focus	[["target","next --tenant"]]	error:invalid-zone
+/focus prev	pattern	terminal.focus	[["target","prev"]]	ok
+/focus prev --tenant	literal	terminal.focus	[["target","prev --tenant"]]	error:invalid-zone
+/focus previous	pattern	terminal.focus	[["target","previous"]]	ok
+/focus previous --tenant	literal	terminal.focus	[["target","previous --tenant"]]	error:invalid-zone
+/focus-mode	pattern	terminal.toggle-focus-mode	[]	ok
+/focus-mode "1 gmail fix the bug"	literal	terminal.toggle-focus-mode	[]	unbound
+/focus-mode "1 gmail fix the bug" --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+/focus-mode "3 best"	literal	terminal.toggle-focus-mode	[]	unbound
+/focus-mode "3 best" --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+/focus-mode --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+/focus-mode 1 gmail fix the bug	literal	terminal.toggle-focus-mode	[]	unbound
+/focus-mode 1 gmail fix the bug --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+/focus-mode 3 best	literal	terminal.toggle-focus-mode	[]	unbound
+/focus-mode 3 best --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+/full-grid layout	pattern	terminal.layout	[["preset","full-grid"]]	ok
+/full-grid layout --tenant	none	-	null	none
+/fullgrid layout	pattern	terminal.layout	[["preset","fullgrid"]]	ok
+/fullgrid layout --tenant	none	-	null	none
+/fullscreen	pattern	terminal.maximize	[]	ok
+/fullscreen "1 gmail fix the bug"	none	-	null	none
+/fullscreen "1 gmail fix the bug" --tenant	none	-	null	none
+/fullscreen "3 best"	none	-	null	none
+/fullscreen "3 best" --tenant	none	-	null	none
+/fullscreen --tenant	none	-	null	none
+/fullscreen 1 gmail fix the bug	none	-	null	none
+/fullscreen 1 gmail fix the bug --tenant	none	-	null	none
+/fullscreen 3	pattern	terminal.maximize	[["zone",3]]	ok
+/fullscreen 3 --tenant	none	-	null	none
+/fullscreen 3 best	none	-	null	none
+/fullscreen 3 best --tenant	none	-	null	none
+/generate	pattern	terminal.generate-workflow	[]	error:no-session
+/generate "1 gmail fix the bug"	literal	terminal.generate-workflow	[]	unbound
+/generate "1 gmail fix the bug" --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate "3 best"	literal	terminal.generate-workflow	[]	unbound
+/generate "3 best" --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate 1 gmail fix the bug	literal	terminal.generate-workflow	[]	unbound
+/generate 1 gmail fix the bug --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate 3 best	literal	terminal.generate-workflow	[]	unbound
+/generate 3 best --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate workflow	pattern	terminal.generate-workflow	[]	error:no-session
+/generate workflow "1 gmail fix the bug"	literal	terminal.generate-workflow	[]	unbound
+/generate workflow "1 gmail fix the bug" --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate workflow "3 best"	literal	terminal.generate-workflow	[]	unbound
+/generate workflow "3 best" --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate workflow --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate workflow 1 gmail fix the bug	literal	terminal.generate-workflow	[]	unbound
+/generate workflow 1 gmail fix the bug --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate workflow 3 best	literal	terminal.generate-workflow	[]	unbound
+/generate workflow 3 best --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate-workflow	literal	terminal.generate-workflow	[]	error:no-session
+/generate-workflow "1 gmail fix the bug"	literal	terminal.generate-workflow	[]	unbound
+/generate-workflow "1 gmail fix the bug" --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate-workflow "3 best"	literal	terminal.generate-workflow	[]	unbound
+/generate-workflow "3 best" --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate-workflow --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate-workflow 1 gmail fix the bug	literal	terminal.generate-workflow	[]	unbound
+/generate-workflow 1 gmail fix the bug --tenant	literal	terminal.generate-workflow	[]	unbound
+/generate-workflow 3 best	literal	terminal.generate-workflow	[]	unbound
+/generate-workflow 3 best --tenant	literal	terminal.generate-workflow	[]	unbound
+/help	pattern	terminal.show-shortcuts	[]	ok
+/help "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound
+/help "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound
+/help "3 best"	literal	terminal.show-shortcuts	[]	unbound
+/help "3 best" --tenant	literal	terminal.show-shortcuts	[]	unbound
+/help --tenant	literal	terminal.show-shortcuts	[]	unbound
+/help 1 gmail fix the bug	literal	terminal.show-shortcuts	[]	unbound
+/help 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound
+/help 3 best	literal	terminal.show-shortcuts	[]	unbound
+/help 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound
+/history	pattern	terminal.history	[]	ok
+/history "1 gmail fix the bug"	literal	terminal.history	[]	unbound
+/history "1 gmail fix the bug" --tenant	literal	terminal.history	[]	unbound
+/history "3 best"	literal	terminal.history	[]	unbound
+/history "3 best" --tenant	literal	terminal.history	[]	unbound
+/history --tenant	literal	terminal.history	[]	unbound
+/history 1 gmail fix the bug	literal	terminal.history	[]	unbound
+/history 1 gmail fix the bug --tenant	literal	terminal.history	[]	unbound
+/history 3 best	literal	terminal.history	[]	unbound
+/history 3 best --tenant	literal	terminal.history	[]	unbound
+/implement	pattern	terminal.plan-implement	[]	error:no-plan
+/implement "1 gmail fix the bug"	literal	terminal.plan-implement	[]	unbound
+/implement "1 gmail fix the bug" --tenant	literal	terminal.plan-implement	[]	unbound
+/implement "3 best"	literal	terminal.plan-implement	[]	unbound
+/implement "3 best" --tenant	literal	terminal.plan-implement	[]	unbound
+/implement --tenant	literal	terminal.plan-implement	[]	unbound
+/implement 1 gmail fix the bug	literal	terminal.plan-implement	[]	unbound
+/implement 1 gmail fix the bug --tenant	literal	terminal.plan-implement	[]	unbound
+/implement 3 best	literal	terminal.plan-implement	[]	unbound
+/implement 3 best --tenant	literal	terminal.plan-implement	[]	unbound
+/keys	pattern	terminal.show-shortcuts	[]	ok
+/keys "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound
+/keys "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound
+/keys "3 best"	literal	terminal.show-shortcuts	[]	unbound
+/keys "3 best" --tenant	literal	terminal.show-shortcuts	[]	unbound
+/keys --tenant	literal	terminal.show-shortcuts	[]	unbound
+/keys 1 gmail fix the bug	literal	terminal.show-shortcuts	[]	unbound
+/keys 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound
+/keys 3 best	literal	terminal.show-shortcuts	[]	unbound
+/keys 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound
+/layout	literal	terminal.layout	[]	error:invalid-preset
+/layout "1 gmail fix the bug"	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset
+/layout "1 gmail fix the bug" --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset
+/layout "3 best"	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset
+/layout "3 best" --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset
+/layout --tenant	literal	terminal.layout	[["preset","--tenant"]]	error:invalid-preset
+/layout 1 gmail fix the bug	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset
+/layout 1 gmail fix the bug --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset
+/layout 3 best	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset
+/layout 3 best --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset
+/layout full-grid	pattern	terminal.layout	[["preset","full-grid"]]	ok
+/layout full-grid --tenant	literal	terminal.layout	[["preset","full-grid --tenant"]]	error:invalid-preset
+/layout fullgrid	pattern	terminal.layout	[["preset","fullgrid"]]	ok
+/layout fullgrid --tenant	literal	terminal.layout	[["preset","fullgrid --tenant"]]	error:invalid-preset
+/layout quad	pattern	terminal.layout	[["preset","quad"]]	ok
+/layout quad --tenant	literal	terminal.layout	[["preset","quad --tenant"]]	error:invalid-preset
+/layout single	pattern	terminal.layout	[["preset","single"]]	ok
+/layout single --tenant	literal	terminal.layout	[["preset","single --tenant"]]	error:invalid-preset
+/layout six-pack	pattern	terminal.layout	[["preset","six-pack"]]	ok
+/layout six-pack --tenant	literal	terminal.layout	[["preset","six-pack --tenant"]]	error:invalid-preset
+/layout sixpack	pattern	terminal.layout	[["preset","sixpack"]]	ok
+/layout sixpack --tenant	literal	terminal.layout	[["preset","sixpack --tenant"]]	error:invalid-preset
+/layout split	pattern	terminal.layout	[["preset","split"]]	ok
+/layout split --tenant	literal	terminal.layout	[["preset","split --tenant"]]	error:invalid-preset
+/maximize	pattern	terminal.maximize	[]	ok
+/maximize "1 gmail fix the bug"	literal	terminal.maximize	[["zone","1 gmail fix the bug"]]	error:invalid-zone
+/maximize "1 gmail fix the bug" --tenant	literal	terminal.maximize	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone
+/maximize "3 best"	literal	terminal.maximize	[["zone","3 best"]]	error:invalid-zone
+/maximize "3 best" --tenant	literal	terminal.maximize	[["zone","3 best --tenant"]]	error:invalid-zone
+/maximize --tenant	literal	terminal.maximize	[["zone","--tenant"]]	error:invalid-zone
+/maximize 1 gmail fix the bug	literal	terminal.maximize	[["zone","1 gmail fix the bug"]]	error:invalid-zone
+/maximize 1 gmail fix the bug --tenant	literal	terminal.maximize	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone
+/maximize 3	pattern	terminal.maximize	[["zone",3]]	ok
+/maximize 3 --tenant	literal	terminal.maximize	[["zone","3 --tenant"]]	error:invalid-zone
+/maximize 3 best	literal	terminal.maximize	[["zone","3 best"]]	error:invalid-zone
+/maximize 3 best --tenant	literal	terminal.maximize	[["zone","3 best --tenant"]]	error:invalid-zone
+/metrics	pattern	terminal.metrics	[]	ok
+/metrics "1 gmail fix the bug"	literal	terminal.metrics	[]	unbound
+/metrics "1 gmail fix the bug" --tenant	literal	terminal.metrics	[]	unbound
+/metrics "3 best"	literal	terminal.metrics	[]	unbound
+/metrics "3 best" --tenant	literal	terminal.metrics	[]	unbound
+/metrics --tenant	literal	terminal.metrics	[]	unbound
+/metrics 1 gmail fix the bug	literal	terminal.metrics	[]	unbound
+/metrics 1 gmail fix the bug --tenant	literal	terminal.metrics	[]	unbound
+/metrics 3 best	literal	terminal.metrics	[]	unbound
+/metrics 3 best --tenant	literal	terminal.metrics	[]	unbound
+/mute	pattern	terminal.mute	[]	ok
+/mute "1 gmail fix the bug"	literal	terminal.mute	[]	unbound
+/mute "1 gmail fix the bug" --tenant	literal	terminal.mute	[]	unbound
+/mute "3 best"	literal	terminal.mute	[]	unbound
+/mute "3 best" --tenant	literal	terminal.mute	[]	unbound
+/mute --tenant	literal	terminal.mute	[]	unbound
+/mute 1 gmail fix the bug	literal	terminal.mute	[]	unbound
+/mute 1 gmail fix the bug --tenant	literal	terminal.mute	[]	unbound
+/mute 3 best	literal	terminal.mute	[]	unbound
+/mute 3 best --tenant	literal	terminal.mute	[]	unbound
+/next session	pattern	terminal.focus	[["target","next"]]	ok
+/next session --tenant	none	-	null	none
+/notifications	pattern	terminal.toggle-desktop-notify	[]	ok
+/notifications "1 gmail fix the bug"	literal	terminal.toggle-desktop-notify	[]	unbound
+/notifications "1 gmail fix the bug" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/notifications "3 best"	literal	terminal.toggle-desktop-notify	[]	unbound
+/notifications "3 best" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/notifications --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/notifications 1 gmail fix the bug	literal	terminal.toggle-desktop-notify	[]	unbound
+/notifications 1 gmail fix the bug --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/notifications 3 best	literal	terminal.toggle-desktop-notify	[]	unbound
+/notifications 3 best --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/orchestrate	literal	terminal.orchestrate	[]	error:invalid-args
+/orchestrate "1 gmail fix the bug"	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+/orchestrate "1 gmail fix the bug" --tenant	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+/orchestrate "3 best"	pattern	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+/orchestrate "3 best" --tenant	pattern	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+/orchestrate --tenant	pattern	terminal.orchestrate	[["goal","--tenant"]]	error:no-run-id
+/orchestrate 1 gmail fix the bug	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+/orchestrate 1 gmail fix the bug --tenant	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+/orchestrate 3 best	pattern	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+/orchestrate 3 best --tenant	pattern	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+/orchestrate fix the bug	pattern	terminal.orchestrate	[["goal","fix the bug"]]	error:no-run-id
+/orchestrate fix the bug --tenant	pattern	terminal.orchestrate	[["goal","fix the bug --tenant"]]	error:no-run-id
+/plan refresh	pattern	terminal.plan-refresh	[]	ok
+/plan refresh "1 gmail fix the bug"	none	-	null	none
+/plan refresh "1 gmail fix the bug" --tenant	none	-	null	none
+/plan refresh "3 best"	none	-	null	none
+/plan refresh "3 best" --tenant	none	-	null	none
+/plan refresh --tenant	none	-	null	none
+/plan refresh 1 gmail fix the bug	none	-	null	none
+/plan refresh 1 gmail fix the bug --tenant	none	-	null	none
+/plan refresh 3 best	none	-	null	none
+/plan refresh 3 best --tenant	none	-	null	none
+/plan-implement	pattern	terminal.plan-implement	[]	error:no-plan
+/plan-implement "1 gmail fix the bug"	literal	terminal.plan-implement	[]	unbound
+/plan-implement "1 gmail fix the bug" --tenant	literal	terminal.plan-implement	[]	unbound
+/plan-implement "3 best"	literal	terminal.plan-implement	[]	unbound
+/plan-implement "3 best" --tenant	literal	terminal.plan-implement	[]	unbound
+/plan-implement --tenant	literal	terminal.plan-implement	[]	unbound
+/plan-implement 1 gmail fix the bug	literal	terminal.plan-implement	[]	unbound
+/plan-implement 1 gmail fix the bug --tenant	literal	terminal.plan-implement	[]	unbound
+/plan-implement 3 best	literal	terminal.plan-implement	[]	unbound
+/plan-implement 3 best --tenant	literal	terminal.plan-implement	[]	unbound
+/plan-refresh	pattern	terminal.plan-refresh	[]	ok
+/plan-refresh "1 gmail fix the bug"	literal	terminal.plan-refresh	[]	unbound
+/plan-refresh "1 gmail fix the bug" --tenant	literal	terminal.plan-refresh	[]	unbound
+/plan-refresh "3 best"	literal	terminal.plan-refresh	[]	unbound
+/plan-refresh "3 best" --tenant	literal	terminal.plan-refresh	[]	unbound
+/plan-refresh --tenant	literal	terminal.plan-refresh	[]	unbound
+/plan-refresh 1 gmail fix the bug	literal	terminal.plan-refresh	[]	unbound
+/plan-refresh 1 gmail fix the bug --tenant	literal	terminal.plan-refresh	[]	unbound
+/plan-refresh 3 best	literal	terminal.plan-refresh	[]	unbound
+/plan-refresh 3 best --tenant	literal	terminal.plan-refresh	[]	unbound
+/plan-verify	pattern	terminal.plan-verify	[]	error:no-plan
+/plan-verify "1 gmail fix the bug"	literal	terminal.plan-verify	[]	unbound
+/plan-verify "1 gmail fix the bug" --tenant	literal	terminal.plan-verify	[]	unbound
+/plan-verify "3 best"	literal	terminal.plan-verify	[]	unbound
+/plan-verify "3 best" --tenant	literal	terminal.plan-verify	[]	unbound
+/plan-verify --tenant	literal	terminal.plan-verify	[]	unbound
+/plan-verify 1 gmail fix the bug	literal	terminal.plan-verify	[]	unbound
+/plan-verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound
+/plan-verify 3 best	literal	terminal.plan-verify	[]	unbound
+/plan-verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound
+/prev session	pattern	terminal.focus	[["target","prev"]]	ok
+/prev session --tenant	none	-	null	none
+/previous session	pattern	terminal.focus	[["target","previous"]]	ok
+/previous session --tenant	none	-	null	none
+/prompt	pattern	terminal.prompt	[]	ok
+/prompt "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound
+/prompt "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound
+/prompt "3 best"	literal	terminal.prompt	[]	unbound
+/prompt "3 best" --tenant	literal	terminal.prompt	[]	unbound
+/prompt --tenant	literal	terminal.prompt	[]	unbound
+/prompt 1 gmail fix the bug	literal	terminal.prompt	[]	unbound
+/prompt 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound
+/prompt 3 best	literal	terminal.prompt	[]	unbound
+/prompt 3 best --tenant	literal	terminal.prompt	[]	unbound
+/prompt library	pattern	terminal.prompt	[]	ok
+/prompt library "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound
+/prompt library "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound
+/prompt library "3 best"	literal	terminal.prompt	[]	unbound
+/prompt library "3 best" --tenant	literal	terminal.prompt	[]	unbound
+/prompt library --tenant	literal	terminal.prompt	[]	unbound
+/prompt library 1 gmail fix the bug	literal	terminal.prompt	[]	unbound
+/prompt library 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound
+/prompt library 3 best	literal	terminal.prompt	[]	unbound
+/prompt library 3 best --tenant	literal	terminal.prompt	[]	unbound
+/prompt-library	pattern	terminal.prompt	[]	ok
+/prompt-library "1 gmail fix the bug"	none	-	null	none
+/prompt-library "1 gmail fix the bug" --tenant	none	-	null	none
+/prompt-library "3 best"	none	-	null	none
+/prompt-library "3 best" --tenant	none	-	null	none
+/prompt-library --tenant	none	-	null	none
+/prompt-library 1 gmail fix the bug	none	-	null	none
+/prompt-library 1 gmail fix the bug --tenant	none	-	null	none
+/prompt-library 3 best	none	-	null	none
+/prompt-library 3 best --tenant	none	-	null	none
+/prompts	pattern	terminal.prompt	[]	ok
+/prompts "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound
+/prompts "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound
+/prompts "3 best"	literal	terminal.prompt	[]	unbound
+/prompts "3 best" --tenant	literal	terminal.prompt	[]	unbound
+/prompts --tenant	literal	terminal.prompt	[]	unbound
+/prompts 1 gmail fix the bug	literal	terminal.prompt	[]	unbound
+/prompts 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound
+/prompts 3 best	literal	terminal.prompt	[]	unbound
+/prompts 3 best --tenant	literal	terminal.prompt	[]	unbound
+/quad layout	pattern	terminal.layout	[["preset","quad"]]	ok
+/quad layout --tenant	none	-	null	none
+/refresh plan	pattern	terminal.plan-refresh	[]	ok
+/refresh plan "1 gmail fix the bug"	none	-	null	none
+/refresh plan "1 gmail fix the bug" --tenant	none	-	null	none
+/refresh plan "3 best"	none	-	null	none
+/refresh plan "3 best" --tenant	none	-	null	none
+/refresh plan --tenant	none	-	null	none
+/refresh plan 1 gmail fix the bug	none	-	null	none
+/refresh plan 1 gmail fix the bug --tenant	none	-	null	none
+/refresh plan 3 best	none	-	null	none
+/refresh plan 3 best --tenant	none	-	null	none
+/refresh-plan	literal	terminal.plan-refresh	[]	ok
+/refresh-plan "1 gmail fix the bug"	literal	terminal.plan-refresh	[]	unbound
+/refresh-plan "1 gmail fix the bug" --tenant	literal	terminal.plan-refresh	[]	unbound
+/refresh-plan "3 best"	literal	terminal.plan-refresh	[]	unbound
+/refresh-plan "3 best" --tenant	literal	terminal.plan-refresh	[]	unbound
+/refresh-plan --tenant	literal	terminal.plan-refresh	[]	unbound
+/refresh-plan 1 gmail fix the bug	literal	terminal.plan-refresh	[]	unbound
+/refresh-plan 1 gmail fix the bug --tenant	literal	terminal.plan-refresh	[]	unbound
+/refresh-plan 3 best	literal	terminal.plan-refresh	[]	unbound
+/refresh-plan 3 best --tenant	literal	terminal.plan-refresh	[]	unbound
+/restart	pattern	terminal.restart	[]	error:not-restartable
+/restart "1 gmail fix the bug"	literal	terminal.restart	[["zone","1 gmail fix the bug"]]	error:invalid-zone
+/restart "1 gmail fix the bug" --tenant	literal	terminal.restart	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone
+/restart "3 best"	literal	terminal.restart	[["zone","3 best"]]	error:invalid-zone
+/restart "3 best" --tenant	literal	terminal.restart	[["zone","3 best --tenant"]]	error:invalid-zone
+/restart --tenant	literal	terminal.restart	[["zone","--tenant"]]	error:invalid-zone
+/restart 1 gmail fix the bug	literal	terminal.restart	[["zone","1 gmail fix the bug"]]	error:invalid-zone
+/restart 1 gmail fix the bug --tenant	literal	terminal.restart	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone
+/restart 3	pattern	terminal.restart	[["zone",3]]	error:not-restartable
+/restart 3 --tenant	literal	terminal.restart	[["zone","3 --tenant"]]	error:invalid-zone
+/restart 3 best	literal	terminal.restart	[["zone","3 best"]]	error:invalid-zone
+/restart 3 best --tenant	literal	terminal.restart	[["zone","3 best --tenant"]]	error:invalid-zone
+/resume	pattern	terminal.resume	[]	ok
+/resume "1 gmail fix the bug"	literal	terminal.resume	[]	unbound
+/resume "1 gmail fix the bug" --tenant	literal	terminal.resume	[]	unbound
+/resume "3 best"	literal	terminal.resume	[]	unbound
+/resume "3 best" --tenant	literal	terminal.resume	[]	unbound
+/resume --tenant	literal	terminal.resume	[]	unbound
+/resume 1 gmail fix the bug	literal	terminal.resume	[]	unbound
+/resume 1 gmail fix the bug --tenant	literal	terminal.resume	[]	unbound
+/resume 3 best	literal	terminal.resume	[]	unbound
+/resume 3 best --tenant	literal	terminal.resume	[]	unbound
+/run-goal	literal	terminal.orchestrate	[]	error:invalid-args
+/run-goal "1 gmail fix the bug"	literal	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+/run-goal "1 gmail fix the bug" --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+/run-goal "3 best"	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+/run-goal "3 best" --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+/run-goal --tenant	literal	terminal.orchestrate	[["goal","--tenant"]]	error:no-run-id
+/run-goal 1 gmail fix the bug	literal	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+/run-goal 1 gmail fix the bug --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+/run-goal 3 best	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+/run-goal 3 best --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+/save	pattern	terminal.save-workflow	[]	error:no-workflow
+/save "1 gmail fix the bug"	literal	terminal.save-workflow	[]	unbound
+/save "1 gmail fix the bug" --tenant	literal	terminal.save-workflow	[]	unbound
+/save "3 best"	literal	terminal.save-workflow	[]	unbound
+/save "3 best" --tenant	literal	terminal.save-workflow	[]	unbound
+/save --tenant	literal	terminal.save-workflow	[]	unbound
+/save 1 gmail fix the bug	literal	terminal.save-workflow	[]	unbound
+/save 1 gmail fix the bug --tenant	literal	terminal.save-workflow	[]	unbound
+/save 3 best	literal	terminal.save-workflow	[]	unbound
+/save 3 best --tenant	literal	terminal.save-workflow	[]	unbound
+/save workflow	pattern	terminal.save-workflow	[]	error:no-workflow
+/save workflow "1 gmail fix the bug"	literal	terminal.save-workflow	[]	unbound
+/save workflow "1 gmail fix the bug" --tenant	literal	terminal.save-workflow	[]	unbound
+/save workflow "3 best"	literal	terminal.save-workflow	[]	unbound
+/save workflow "3 best" --tenant	literal	terminal.save-workflow	[]	unbound
+/save workflow --tenant	literal	terminal.save-workflow	[]	unbound
+/save workflow 1 gmail fix the bug	literal	terminal.save-workflow	[]	unbound
+/save workflow 1 gmail fix the bug --tenant	literal	terminal.save-workflow	[]	unbound
+/save workflow 3 best	literal	terminal.save-workflow	[]	unbound
+/save workflow 3 best --tenant	literal	terminal.save-workflow	[]	unbound
+/save-workflow	literal	terminal.save-workflow	[]	error:no-workflow
+/save-workflow "1 gmail fix the bug"	literal	terminal.save-workflow	[]	unbound
+/save-workflow "1 gmail fix the bug" --tenant	literal	terminal.save-workflow	[]	unbound
+/save-workflow "3 best"	literal	terminal.save-workflow	[]	unbound
+/save-workflow "3 best" --tenant	literal	terminal.save-workflow	[]	unbound
+/save-workflow --tenant	literal	terminal.save-workflow	[]	unbound
+/save-workflow 1 gmail fix the bug	literal	terminal.save-workflow	[]	unbound
+/save-workflow 1 gmail fix the bug --tenant	literal	terminal.save-workflow	[]	unbound
+/save-workflow 3 best	literal	terminal.save-workflow	[]	unbound
+/save-workflow 3 best --tenant	literal	terminal.save-workflow	[]	unbound
+/select	fuzzy	terminal.select-by-state	[]	error:invalid-args
+/select "1 gmail fix the bug"	none	-	null	none
+/select "1 gmail fix the bug" --tenant	none	-	null	none
+/select "3 best"	none	-	null	none
+/select "3 best" --tenant	none	-	null	none
+/select --tenant	none	-	null	none
+/select 1 gmail fix the bug	none	-	null	none
+/select 1 gmail fix the bug --tenant	none	-	null	none
+/select 3 best	none	-	null	none
+/select 3 best --tenant	none	-	null	none
+/select completed	pattern	terminal.select-by-state	[["state","completed"]]	ok
+/select completed --tenant	none	-	null	none
+/select error	pattern	terminal.select-by-state	[["state","error"]]	ok
+/select error --tenant	none	-	null	none
+/select idle	pattern	terminal.select-by-state	[["state","idle"]]	ok
+/select idle --tenant	none	-	null	none
+/select needs input	pattern	terminal.select-by-state	[["state","needs input"]]	ok
+/select needs input --tenant	none	-	null	none
+/select needs-input	pattern	terminal.select-by-state	[["state","needs-input"]]	ok
+/select needs-input --tenant	none	-	null	none
+/select needs_input	pattern	terminal.select-by-state	[["state","needs_input"]]	ok
+/select needs_input --tenant	none	-	null	none
+/select needsinput	pattern	terminal.select-by-state	[["state","needsinput"]]	ok
+/select needsinput --tenant	none	-	null	none
+/select working	pattern	terminal.select-by-state	[["state","working"]]	ok
+/select working --tenant	none	-	null	none
+/select-by-state	literal	terminal.select-by-state	[]	error:invalid-args
+/select-by-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args
+/select-by-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args
+/select-by-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args
+/select-by-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args
+/select-by-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args
+/select-by-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args
+/select-by-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args
+/select-by-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args
+/select-by-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args
+/select-by-state completed	pattern	terminal.select-by-state	[["state","completed"]]	ok
+/select-by-state completed --tenant	literal	terminal.select-by-state	[["state","completed --tenant"]]	error:invalid-args
+/select-by-state error	pattern	terminal.select-by-state	[["state","error"]]	ok
+/select-by-state error --tenant	literal	terminal.select-by-state	[["state","error --tenant"]]	error:invalid-args
+/select-by-state idle	pattern	terminal.select-by-state	[["state","idle"]]	ok
+/select-by-state idle --tenant	literal	terminal.select-by-state	[["state","idle --tenant"]]	error:invalid-args
+/select-by-state needs input	pattern	terminal.select-by-state	[["state","needs input"]]	ok
+/select-by-state needs input --tenant	literal	terminal.select-by-state	[["state","needs input --tenant"]]	error:invalid-args
+/select-by-state needs-input	pattern	terminal.select-by-state	[["state","needs-input"]]	ok
+/select-by-state needs-input --tenant	literal	terminal.select-by-state	[["state","needs-input --tenant"]]	error:invalid-args
+/select-by-state needs_input	pattern	terminal.select-by-state	[["state","needs_input"]]	ok
+/select-by-state needs_input --tenant	literal	terminal.select-by-state	[["state","needs_input --tenant"]]	error:invalid-args
+/select-by-state needsinput	pattern	terminal.select-by-state	[["state","needsinput"]]	ok
+/select-by-state needsinput --tenant	literal	terminal.select-by-state	[["state","needsinput --tenant"]]	error:invalid-args
+/select-by-state working	pattern	terminal.select-by-state	[["state","working"]]	ok
+/select-by-state working --tenant	literal	terminal.select-by-state	[["state","working --tenant"]]	error:invalid-args
+/select-state	literal	terminal.select-by-state	[]	error:invalid-args
+/select-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args
+/select-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args
+/select-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args
+/select-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args
+/select-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args
+/select-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args
+/select-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args
+/select-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args
+/select-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args
+/session names	pattern	terminal.copy-names	[]	error:no-sessions
+/session names "1 gmail fix the bug"	none	-	null	none
+/session names "1 gmail fix the bug" --tenant	none	-	null	none
+/session names "3 best"	none	-	null	none
+/session names "3 best" --tenant	none	-	null	none
+/session names --tenant	none	-	null	none
+/session names 1 gmail fix the bug	none	-	null	none
+/session names 1 gmail fix the bug --tenant	none	-	null	none
+/session names 3 best	none	-	null	none
+/session names 3 best --tenant	none	-	null	none
+/session-names	pattern	terminal.copy-names	[]	error:no-sessions
+/session-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound
+/session-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound
+/session-names "3 best"	literal	terminal.copy-names	[]	unbound
+/session-names "3 best" --tenant	literal	terminal.copy-names	[]	unbound
+/session-names --tenant	literal	terminal.copy-names	[]	unbound
+/session-names 1 gmail fix the bug	literal	terminal.copy-names	[]	unbound
+/session-names 1 gmail fix the bug --tenant	literal	terminal.copy-names	[]	unbound
+/session-names 3 best	literal	terminal.copy-names	[]	unbound
+/session-names 3 best --tenant	literal	terminal.copy-names	[]	unbound
+/sessions	pattern	terminal.toggle-sessions-sidebar	[]	ok
+/sessions "1 gmail fix the bug"	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/sessions "1 gmail fix the bug" --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/sessions "3 best"	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/sessions "3 best" --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/sessions --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/sessions 1 gmail fix the bug	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/sessions 1 gmail fix the bug --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/sessions 3 best	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/sessions 3 best --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/shortcuts	pattern	terminal.show-shortcuts	[]	ok
+/shortcuts "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound
+/shortcuts "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound
+/shortcuts "3 best"	literal	terminal.show-shortcuts	[]	unbound
+/shortcuts "3 best" --tenant	literal	terminal.show-shortcuts	[]	unbound
+/shortcuts --tenant	literal	terminal.show-shortcuts	[]	unbound
+/shortcuts 1 gmail fix the bug	literal	terminal.show-shortcuts	[]	unbound
+/shortcuts 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound
+/shortcuts 3 best	literal	terminal.show-shortcuts	[]	unbound
+/shortcuts 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound
+/single layout	pattern	terminal.layout	[["preset","single"]]	ok
+/single layout --tenant	none	-	null	none
+/six-pack layout	pattern	terminal.layout	[["preset","six-pack"]]	ok
+/six-pack layout --tenant	none	-	null	none
+/sixpack layout	pattern	terminal.layout	[["preset","sixpack"]]	ok
+/sixpack layout --tenant	none	-	null	none
+/sort	pattern	terminal.sort-zones	[]	ok
+/sort "1 gmail fix the bug"	literal	terminal.sort-zones	[]	unbound
+/sort "1 gmail fix the bug" --tenant	literal	terminal.sort-zones	[]	unbound
+/sort "3 best"	literal	terminal.sort-zones	[]	unbound
+/sort "3 best" --tenant	literal	terminal.sort-zones	[]	unbound
+/sort --tenant	literal	terminal.sort-zones	[]	unbound
+/sort 1 gmail fix the bug	literal	terminal.sort-zones	[]	unbound
+/sort 1 gmail fix the bug --tenant	literal	terminal.sort-zones	[]	unbound
+/sort 3 best	literal	terminal.sort-zones	[]	unbound
+/sort 3 best --tenant	literal	terminal.sort-zones	[]	unbound
+/sort zones	pattern	terminal.sort-zones	[]	ok
+/sort zones "1 gmail fix the bug"	literal	terminal.sort-zones	[]	unbound
+/sort zones "1 gmail fix the bug" --tenant	literal	terminal.sort-zones	[]	unbound
+/sort zones "3 best"	literal	terminal.sort-zones	[]	unbound
+/sort zones "3 best" --tenant	literal	terminal.sort-zones	[]	unbound
+/sort zones --tenant	literal	terminal.sort-zones	[]	unbound
+/sort zones 1 gmail fix the bug	literal	terminal.sort-zones	[]	unbound
+/sort zones 1 gmail fix the bug --tenant	literal	terminal.sort-zones	[]	unbound
+/sort zones 3 best	literal	terminal.sort-zones	[]	unbound
+/sort zones 3 best --tenant	literal	terminal.sort-zones	[]	unbound
+/sort-zones	literal	terminal.sort-zones	[]	ok
+/sort-zones "1 gmail fix the bug"	literal	terminal.sort-zones	[]	unbound
+/sort-zones "1 gmail fix the bug" --tenant	literal	terminal.sort-zones	[]	unbound
+/sort-zones "3 best"	literal	terminal.sort-zones	[]	unbound
+/sort-zones "3 best" --tenant	literal	terminal.sort-zones	[]	unbound
+/sort-zones --tenant	literal	terminal.sort-zones	[]	unbound
+/sort-zones 1 gmail fix the bug	literal	terminal.sort-zones	[]	unbound
+/sort-zones 1 gmail fix the bug --tenant	literal	terminal.sort-zones	[]	unbound
+/sort-zones 3 best	literal	terminal.sort-zones	[]	unbound
+/sort-zones 3 best --tenant	literal	terminal.sort-zones	[]	unbound
+/sound	pattern	terminal.toggle-sound	[]	ok
+/sound "1 gmail fix the bug"	literal	terminal.toggle-sound	[]	unbound
+/sound "1 gmail fix the bug" --tenant	literal	terminal.toggle-sound	[]	unbound
+/sound "3 best"	literal	terminal.toggle-sound	[]	unbound
+/sound "3 best" --tenant	literal	terminal.toggle-sound	[]	unbound
+/sound --tenant	literal	terminal.toggle-sound	[]	unbound
+/sound 1 gmail fix the bug	literal	terminal.toggle-sound	[]	unbound
+/sound 1 gmail fix the bug --tenant	literal	terminal.toggle-sound	[]	unbound
+/sound 3 best	literal	terminal.toggle-sound	[]	unbound
+/sound 3 best --tenant	literal	terminal.toggle-sound	[]	unbound
+/spawn	literal	terminal.spawn	[]	ok
+/spawn "1 gmail fix the bug"	literal	terminal.spawn	[["count","1 gmail fix the bug"]]	error:invalid-count
+/spawn "1 gmail fix the bug" --tenant	literal	terminal.spawn	[["count","1 gmail fix the bug --tenant"]]	error:invalid-count
+/spawn "3 best"	literal	terminal.spawn	[["count","3 best"]]	error:invalid-count
+/spawn "3 best" --tenant	literal	terminal.spawn	[["count","3 best --tenant"]]	error:invalid-count
+/spawn --tenant	literal	terminal.spawn	[["count","--tenant"]]	error:invalid-count
+/spawn 1 gmail fix the bug	literal	terminal.spawn	[["count","1 gmail fix the bug"]]	error:invalid-count
+/spawn 1 gmail fix the bug --tenant	literal	terminal.spawn	[["count","1 gmail fix the bug --tenant"]]	error:invalid-count
+/spawn 3	pattern	terminal.spawn	[["count",3]]	ok
+/spawn 3 -	literal	terminal.spawn	[["count","3 -"]]	error:invalid-count
+/spawn 3 - --tenant	literal	terminal.spawn	[["count","3 - --tenant"]]	error:invalid-count
+/spawn 3 --tenant	literal	terminal.spawn	[["count","3 --tenant"]]	error:invalid-count
+/spawn 3 best	literal	terminal.spawn	[["count","3 best"]]	error:invalid-count
+/spawn 3 best --tenant	literal	terminal.spawn	[["count","3 best --tenant"]]	error:invalid-count
+/spawn 3 claude	literal	terminal.spawn	[["count","3 claude"]]	error:invalid-count
+/spawn 3 claude --tenant	literal	terminal.spawn	[["count","3 claude --tenant"]]	error:invalid-count
+/spawn 3 gmail	literal	terminal.spawn	[["count","3 gmail"]]	error:invalid-count
+/spawn 3 gmail --tenant	literal	terminal.spawn	[["count","3 gmail --tenant"]]	error:invalid-count
+/spawn 3 plain	pattern	terminal.spawn	[["count",3]]	ok
+/spawn 3 plain --tenant	literal	terminal.spawn	[["count","3 plain --tenant"]]	error:invalid-count
+/spawn-ai	literal	terminal.spawn-ai	[]	ok
+/spawn-ai "1 gmail fix the bug"	literal	terminal.spawn-ai	[["count","1 gmail fix the bug"]]	error:invalid-count
+/spawn-ai "1 gmail fix the bug" --tenant	literal	terminal.spawn-ai	[["count","1 gmail fix the bug"],["tenant",""]]	error:invalid-count
+/spawn-ai "3 best"	literal	terminal.spawn-ai	[["count","3 best"]]	error:invalid-count
+/spawn-ai "3 best" --tenant	literal	terminal.spawn-ai	[["count","3 best"],["tenant",""]]	error:invalid-count
+/spawn-ai --tenant	literal	terminal.spawn-ai	[["tenant",""]]	error:invalid-args
+/spawn-ai 1 gmail fix the bug	pattern	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",1]]	ok
+/spawn-ai 1 gmail fix the bug --tenant	literal	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",1],["tenant",""]]	error:invalid-args
+/spawn-ai 3 -	pattern	terminal.spawn-ai	[["account","-"],["count",3]]	error:no-account
+/spawn-ai 3 - --tenant	literal	terminal.spawn-ai	[["account","-"],["count",3],["tenant",""]]	error:no-account
+/spawn-ai 3 - fix the bug	pattern	terminal.spawn-ai	[["account","-"],["context","fix the bug"],["count",3]]	error:no-account
+/spawn-ai 3 - fix the bug --tenant	literal	terminal.spawn-ai	[["account","-"],["context","fix the bug"],["count",3],["tenant",""]]	error:no-account
+/spawn-ai 3 best	pattern	terminal.spawn-ai	[["account","best"],["count",3]]	ok
+/spawn-ai 3 best --tenant	literal	terminal.spawn-ai	[["account","best"],["count",3],["tenant",""]]	error:invalid-args
+/spawn-ai 3 best fix the bug	pattern	terminal.spawn-ai	[["account","best"],["context","fix the bug"],["count",3]]	ok
+/spawn-ai 3 best fix the bug --tenant	literal	terminal.spawn-ai	[["account","best"],["context","fix the bug"],["count",3],["tenant",""]]	error:invalid-args
+/spawn-ai 3 gmail	pattern	terminal.spawn-ai	[["account","gmail"],["count",3]]	ok
+/spawn-ai 3 gmail --tenant	literal	terminal.spawn-ai	[["account","gmail"],["count",3],["tenant",""]]	error:invalid-args
+/spawn-ai 3 gmail fix the bug	pattern	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",3]]	ok
+/spawn-ai 3 gmail fix the bug --tenant	literal	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",3],["tenant",""]]	error:invalid-args
+/spawn-best	literal	terminal.spawn-ai	[]	ok
+/spawn-best "1 gmail fix the bug"	literal	terminal.spawn-ai	[["count","1 gmail fix the bug"]]	error:invalid-count
+/spawn-best "1 gmail fix the bug" --tenant	literal	terminal.spawn-ai	[["count","1 gmail fix the bug"],["tenant",""]]	error:invalid-count
+/spawn-best "3 best"	literal	terminal.spawn-ai	[["count","3 best"]]	error:invalid-count
+/spawn-best "3 best" --tenant	literal	terminal.spawn-ai	[["count","3 best"],["tenant",""]]	error:invalid-count
+/spawn-best --tenant	literal	terminal.spawn-ai	[["tenant",""]]	error:invalid-args
+/spawn-best 1 gmail fix the bug	literal	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",1]]	ok
+/spawn-best 1 gmail fix the bug --tenant	literal	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",1],["tenant",""]]	error:invalid-args
+/spawn-best 3 best	literal	terminal.spawn-ai	[["account","best"],["count",3]]	ok
+/spawn-best 3 best --tenant	literal	terminal.spawn-ai	[["account","best"],["count",3],["tenant",""]]	error:invalid-args
+/spawn-with	literal	terminal.spawn-with	[]	error:invalid-command
+/spawn-with "1 gmail fix the bug"	literal	terminal.spawn-with	[["count","1 gmail fix the bug"]]	error:invalid-count
+/spawn-with "1 gmail fix the bug" --tenant	literal	terminal.spawn-with	[["command","--tenant"],["count","1 gmail fix the bug"]]	error:invalid-count
+/spawn-with "3 best"	literal	terminal.spawn-with	[["count","3 best"]]	error:invalid-count
+/spawn-with "3 best" --tenant	literal	terminal.spawn-with	[["command","--tenant"],["count","3 best"]]	error:invalid-count
+/spawn-with --tenant	literal	terminal.spawn-with	[["count","--tenant"]]	error:invalid-count
+/spawn-with 1 gmail fix the bug	literal	terminal.spawn-with	[["command","gmail fix the bug"],["count",1]]	ok
+/spawn-with 1 gmail fix the bug --tenant	literal	terminal.spawn-with	[["command","gmail fix the bug --tenant"],["count",1]]	ok
+/spawn-with 3 best	literal	terminal.spawn-with	[["command","best"],["count",3]]	ok
+/spawn-with 3 best --tenant	literal	terminal.spawn-with	[["command","best --tenant"],["count",3]]	ok
+/split layout	pattern	terminal.layout	[["preset","split"]]	ok
+/split layout --tenant	none	-	null	none
+/stats	pattern	terminal.metrics	[]	ok
+/stats "1 gmail fix the bug"	literal	terminal.metrics	[]	unbound
+/stats "1 gmail fix the bug" --tenant	literal	terminal.metrics	[]	unbound
+/stats "3 best"	literal	terminal.metrics	[]	unbound
+/stats "3 best" --tenant	literal	terminal.metrics	[]	unbound
+/stats --tenant	literal	terminal.metrics	[]	unbound
+/stats 1 gmail fix the bug	literal	terminal.metrics	[]	unbound
+/stats 1 gmail fix the bug --tenant	literal	terminal.metrics	[]	unbound
+/stats 3 best	literal	terminal.metrics	[]	unbound
+/stats 3 best --tenant	literal	terminal.metrics	[]	unbound
+/swap	literal	terminal.swap	[]	error:invalid-args
+/swap "1 gmail fix the bug"	literal	terminal.swap	[["a","1 gmail fix the bug"]]	error:invalid-zone
+/swap "1 gmail fix the bug" --tenant	literal	terminal.swap	[["a","1 gmail fix the bug"],["b","--tenant"]]	error:invalid-zone
+/swap "3 best"	literal	terminal.swap	[["a","3 best"]]	error:invalid-zone
+/swap "3 best" --tenant	literal	terminal.swap	[["a","3 best"],["b","--tenant"]]	error:invalid-zone
+/swap --tenant	literal	terminal.swap	[["a","--tenant"]]	error:invalid-zone
+/swap 1 gmail fix the bug	literal	terminal.swap	[["a",1],["b","gmail fix the bug"]]	error:invalid-zone
+/swap 1 gmail fix the bug --tenant	literal	terminal.swap	[["a",1],["b","gmail fix the bug --tenant"]]	error:invalid-zone
+/swap 3 3	pattern	terminal.swap	[["a",3],["b",3]]	ok
+/swap 3 3 --tenant	literal	terminal.swap	[["a",3],["b","3 --tenant"]]	error:invalid-zone
+/swap 3 best	literal	terminal.swap	[["a",3],["b","best"]]	error:invalid-zone
+/swap 3 best --tenant	literal	terminal.swap	[["a",3],["b","best --tenant"]]	error:invalid-zone
+/tag	literal	terminal.tag-toggle	[]	error:invalid-args
+/tag "1 gmail fix the bug"	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+/tag "1 gmail fix the bug" --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+/tag "3 best"	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+/tag "3 best" --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+/tag --tenant	pattern	terminal.tag-toggle	[["tag","--tenant"]]	error:unknown-tag
+/tag 1 gmail fix the bug	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+/tag 1 gmail fix the bug --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+/tag 3 best	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+/tag 3 best --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+/tag gmail	pattern	terminal.tag-toggle	[["tag","gmail"]]	error:unknown-tag
+/tag gmail --tenant	literal	terminal.tag-toggle	[["tag","gmail --tenant"]]	error:unknown-tag
+/tag-clear	pattern	terminal.tag-clear	[]	ok
+/tag-clear "1 gmail fix the bug"	literal	terminal.tag-clear	[]	unbound
+/tag-clear "1 gmail fix the bug" --tenant	literal	terminal.tag-clear	[]	unbound
+/tag-clear "3 best"	literal	terminal.tag-clear	[]	unbound
+/tag-clear "3 best" --tenant	literal	terminal.tag-clear	[]	unbound
+/tag-clear --tenant	literal	terminal.tag-clear	[]	unbound
+/tag-clear 1 gmail fix the bug	literal	terminal.tag-clear	[]	unbound
+/tag-clear 1 gmail fix the bug --tenant	literal	terminal.tag-clear	[]	unbound
+/tag-clear 3 best	literal	terminal.tag-clear	[]	unbound
+/tag-clear 3 best --tenant	literal	terminal.tag-clear	[]	unbound
+/tag-toggle	literal	terminal.tag-toggle	[]	error:invalid-args
+/tag-toggle "1 gmail fix the bug"	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+/tag-toggle "1 gmail fix the bug" --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+/tag-toggle "3 best"	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+/tag-toggle "3 best" --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+/tag-toggle --tenant	literal	terminal.tag-toggle	[["tag","--tenant"]]	error:unknown-tag
+/tag-toggle 1 gmail fix the bug	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+/tag-toggle 1 gmail fix the bug --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+/tag-toggle 3 best	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+/tag-toggle 3 best --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+/tags-clear	pattern	terminal.tag-clear	[]	ok
+/tags-clear "1 gmail fix the bug"	literal	terminal.tag-clear	[]	unbound
+/tags-clear "1 gmail fix the bug" --tenant	literal	terminal.tag-clear	[]	unbound
+/tags-clear "3 best"	literal	terminal.tag-clear	[]	unbound
+/tags-clear "3 best" --tenant	literal	terminal.tag-clear	[]	unbound
+/tags-clear --tenant	literal	terminal.tag-clear	[]	unbound
+/tags-clear 1 gmail fix the bug	literal	terminal.tag-clear	[]	unbound
+/tags-clear 1 gmail fix the bug --tenant	literal	terminal.tag-clear	[]	unbound
+/tags-clear 3 best	literal	terminal.tag-clear	[]	unbound
+/tags-clear 3 best --tenant	literal	terminal.tag-clear	[]	unbound
+/toggle auto focus	pattern	terminal.toggle-auto-focus	[]	ok
+/toggle auto focus "1 gmail fix the bug"	none	-	null	none
+/toggle auto focus "1 gmail fix the bug" --tenant	none	-	null	none
+/toggle auto focus "3 best"	none	-	null	none
+/toggle auto focus "3 best" --tenant	none	-	null	none
+/toggle auto focus --tenant	none	-	null	none
+/toggle auto focus 1 gmail fix the bug	none	-	null	none
+/toggle auto focus 1 gmail fix the bug --tenant	none	-	null	none
+/toggle auto focus 3 best	none	-	null	none
+/toggle auto focus 3 best --tenant	none	-	null	none
+/toggle auto restart	pattern	terminal.toggle-auto-restart	[]	ok
+/toggle auto restart "1 gmail fix the bug"	none	-	null	none
+/toggle auto restart "1 gmail fix the bug" --tenant	none	-	null	none
+/toggle auto restart "3 best"	none	-	null	none
+/toggle auto restart "3 best" --tenant	none	-	null	none
+/toggle auto restart --tenant	none	-	null	none
+/toggle auto restart 1 gmail fix the bug	none	-	null	none
+/toggle auto restart 1 gmail fix the bug --tenant	none	-	null	none
+/toggle auto restart 3 best	none	-	null	none
+/toggle auto restart 3 best --tenant	none	-	null	none
+/toggle auto-focus	pattern	terminal.toggle-auto-focus	[]	ok
+/toggle auto-focus "1 gmail fix the bug"	none	-	null	none
+/toggle auto-focus "1 gmail fix the bug" --tenant	none	-	null	none
+/toggle auto-focus "3 best"	none	-	null	none
+/toggle auto-focus "3 best" --tenant	none	-	null	none
+/toggle auto-focus --tenant	none	-	null	none
+/toggle auto-focus 1 gmail fix the bug	none	-	null	none
+/toggle auto-focus 1 gmail fix the bug --tenant	none	-	null	none
+/toggle auto-focus 3 best	none	-	null	none
+/toggle auto-focus 3 best --tenant	none	-	null	none
+/toggle auto-restart	pattern	terminal.toggle-auto-restart	[]	ok
+/toggle auto-restart "1 gmail fix the bug"	none	-	null	none
+/toggle auto-restart "1 gmail fix the bug" --tenant	none	-	null	none
+/toggle auto-restart "3 best"	none	-	null	none
+/toggle auto-restart "3 best" --tenant	none	-	null	none
+/toggle auto-restart --tenant	none	-	null	none
+/toggle auto-restart 1 gmail fix the bug	none	-	null	none
+/toggle auto-restart 1 gmail fix the bug --tenant	none	-	null	none
+/toggle auto-restart 3 best	none	-	null	none
+/toggle auto-restart 3 best --tenant	none	-	null	none
+/toggle findings	pattern	terminal.toggle-findings	[]	ok
+/toggle findings "1 gmail fix the bug"	none	-	null	none
+/toggle findings "1 gmail fix the bug" --tenant	none	-	null	none
+/toggle findings "3 best"	none	-	null	none
+/toggle findings "3 best" --tenant	none	-	null	none
+/toggle findings --tenant	none	-	null	none
+/toggle findings 1 gmail fix the bug	none	-	null	none
+/toggle findings 1 gmail fix the bug --tenant	none	-	null	none
+/toggle findings 3 best	none	-	null	none
+/toggle findings 3 best --tenant	none	-	null	none
+/toggle focus mode	pattern	terminal.toggle-focus-mode	[]	ok
+/toggle focus mode "1 gmail fix the bug"	none	-	null	none
+/toggle focus mode "1 gmail fix the bug" --tenant	none	-	null	none
+/toggle focus mode "3 best"	none	-	null	none
+/toggle focus mode "3 best" --tenant	none	-	null	none
+/toggle focus mode --tenant	none	-	null	none
+/toggle focus mode 1 gmail fix the bug	none	-	null	none
+/toggle focus mode 1 gmail fix the bug --tenant	none	-	null	none
+/toggle focus mode 3 best	none	-	null	none
+/toggle focus mode 3 best --tenant	none	-	null	none
+/toggle focus-mode	pattern	terminal.toggle-focus-mode	[]	ok
+/toggle focus-mode "1 gmail fix the bug"	none	-	null	none
+/toggle focus-mode "1 gmail fix the bug" --tenant	none	-	null	none
+/toggle focus-mode "3 best"	none	-	null	none
+/toggle focus-mode "3 best" --tenant	none	-	null	none
+/toggle focus-mode --tenant	none	-	null	none
+/toggle focus-mode 1 gmail fix the bug	none	-	null	none
+/toggle focus-mode 1 gmail fix the bug --tenant	none	-	null	none
+/toggle focus-mode 3 best	none	-	null	none
+/toggle focus-mode 3 best --tenant	none	-	null	none
+/toggle sessions	pattern	terminal.toggle-sessions-sidebar	[]	ok
+/toggle sessions "1 gmail fix the bug"	none	-	null	none
+/toggle sessions "1 gmail fix the bug" --tenant	none	-	null	none
+/toggle sessions "3 best"	none	-	null	none
+/toggle sessions "3 best" --tenant	none	-	null	none
+/toggle sessions --tenant	none	-	null	none
+/toggle sessions 1 gmail fix the bug	none	-	null	none
+/toggle sessions 1 gmail fix the bug --tenant	none	-	null	none
+/toggle sessions 3 best	none	-	null	none
+/toggle sessions 3 best --tenant	none	-	null	none
+/toggle sound	pattern	terminal.toggle-sound	[]	ok
+/toggle sound "1 gmail fix the bug"	none	-	null	none
+/toggle sound "1 gmail fix the bug" --tenant	none	-	null	none
+/toggle sound "3 best"	none	-	null	none
+/toggle sound "3 best" --tenant	none	-	null	none
+/toggle sound --tenant	none	-	null	none
+/toggle sound 1 gmail fix the bug	none	-	null	none
+/toggle sound 1 gmail fix the bug --tenant	none	-	null	none
+/toggle sound 3 best	none	-	null	none
+/toggle sound 3 best --tenant	none	-	null	none
+/toggle-auto-focus	literal	terminal.toggle-auto-focus	[]	ok
+/toggle-auto-focus "1 gmail fix the bug"	literal	terminal.toggle-auto-focus	[]	unbound
+/toggle-auto-focus "1 gmail fix the bug" --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+/toggle-auto-focus "3 best"	literal	terminal.toggle-auto-focus	[]	unbound
+/toggle-auto-focus "3 best" --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+/toggle-auto-focus --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+/toggle-auto-focus 1 gmail fix the bug	literal	terminal.toggle-auto-focus	[]	unbound
+/toggle-auto-focus 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+/toggle-auto-focus 3 best	literal	terminal.toggle-auto-focus	[]	unbound
+/toggle-auto-focus 3 best --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+/toggle-auto-restart	literal	terminal.toggle-auto-restart	[]	ok
+/toggle-auto-restart "1 gmail fix the bug"	literal	terminal.toggle-auto-restart	[]	unbound
+/toggle-auto-restart "1 gmail fix the bug" --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+/toggle-auto-restart "3 best"	literal	terminal.toggle-auto-restart	[]	unbound
+/toggle-auto-restart "3 best" --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+/toggle-auto-restart --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+/toggle-auto-restart 1 gmail fix the bug	literal	terminal.toggle-auto-restart	[]	unbound
+/toggle-auto-restart 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+/toggle-auto-restart 3 best	literal	terminal.toggle-auto-restart	[]	unbound
+/toggle-auto-restart 3 best --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+/toggle-file-ownership	literal	terminal.toggle-file-ownership	[]	ok
+/toggle-file-ownership "1 gmail fix the bug"	literal	terminal.toggle-file-ownership	[]	unbound
+/toggle-file-ownership "1 gmail fix the bug" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/toggle-file-ownership "3 best"	literal	terminal.toggle-file-ownership	[]	unbound
+/toggle-file-ownership "3 best" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/toggle-file-ownership --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/toggle-file-ownership 1 gmail fix the bug	literal	terminal.toggle-file-ownership	[]	unbound
+/toggle-file-ownership 1 gmail fix the bug --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/toggle-file-ownership 3 best	literal	terminal.toggle-file-ownership	[]	unbound
+/toggle-file-ownership 3 best --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+/toggle-findings	literal	terminal.toggle-findings	[]	ok
+/toggle-findings "1 gmail fix the bug"	literal	terminal.toggle-findings	[]	unbound
+/toggle-findings "1 gmail fix the bug" --tenant	literal	terminal.toggle-findings	[]	unbound
+/toggle-findings "3 best"	literal	terminal.toggle-findings	[]	unbound
+/toggle-findings "3 best" --tenant	literal	terminal.toggle-findings	[]	unbound
+/toggle-findings --tenant	literal	terminal.toggle-findings	[]	unbound
+/toggle-findings 1 gmail fix the bug	literal	terminal.toggle-findings	[]	unbound
+/toggle-findings 1 gmail fix the bug --tenant	literal	terminal.toggle-findings	[]	unbound
+/toggle-findings 3 best	literal	terminal.toggle-findings	[]	unbound
+/toggle-findings 3 best --tenant	literal	terminal.toggle-findings	[]	unbound
+/toggle-focus-mode	literal	terminal.toggle-focus-mode	[]	ok
+/toggle-focus-mode "1 gmail fix the bug"	literal	terminal.toggle-focus-mode	[]	unbound
+/toggle-focus-mode "1 gmail fix the bug" --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+/toggle-focus-mode "3 best"	literal	terminal.toggle-focus-mode	[]	unbound
+/toggle-focus-mode "3 best" --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+/toggle-focus-mode --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+/toggle-focus-mode 1 gmail fix the bug	literal	terminal.toggle-focus-mode	[]	unbound
+/toggle-focus-mode 1 gmail fix the bug --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+/toggle-focus-mode 3 best	literal	terminal.toggle-focus-mode	[]	unbound
+/toggle-focus-mode 3 best --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+/toggle-notifications	literal	terminal.toggle-desktop-notify	[]	ok
+/toggle-notifications "1 gmail fix the bug"	literal	terminal.toggle-desktop-notify	[]	unbound
+/toggle-notifications "1 gmail fix the bug" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/toggle-notifications "3 best"	literal	terminal.toggle-desktop-notify	[]	unbound
+/toggle-notifications "3 best" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/toggle-notifications --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/toggle-notifications 1 gmail fix the bug	literal	terminal.toggle-desktop-notify	[]	unbound
+/toggle-notifications 1 gmail fix the bug --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/toggle-notifications 3 best	literal	terminal.toggle-desktop-notify	[]	unbound
+/toggle-notifications 3 best --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+/toggle-sessions	literal	terminal.toggle-sessions-sidebar	[]	ok
+/toggle-sessions "1 gmail fix the bug"	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/toggle-sessions "1 gmail fix the bug" --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/toggle-sessions "3 best"	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/toggle-sessions "3 best" --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/toggle-sessions --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/toggle-sessions 1 gmail fix the bug	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/toggle-sessions 1 gmail fix the bug --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/toggle-sessions 3 best	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/toggle-sessions 3 best --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+/toggle-sound	literal	terminal.toggle-sound	[]	ok
+/toggle-sound "1 gmail fix the bug"	literal	terminal.toggle-sound	[]	unbound
+/toggle-sound "1 gmail fix the bug" --tenant	literal	terminal.toggle-sound	[]	unbound
+/toggle-sound "3 best"	literal	terminal.toggle-sound	[]	unbound
+/toggle-sound "3 best" --tenant	literal	terminal.toggle-sound	[]	unbound
+/toggle-sound --tenant	literal	terminal.toggle-sound	[]	unbound
+/toggle-sound 1 gmail fix the bug	literal	terminal.toggle-sound	[]	unbound
+/toggle-sound 1 gmail fix the bug --tenant	literal	terminal.toggle-sound	[]	unbound
+/toggle-sound 3 best	literal	terminal.toggle-sound	[]	unbound
+/toggle-sound 3 best --tenant	literal	terminal.toggle-sound	[]	unbound
+/unmute	pattern	terminal.unmute	[]	ok
+/unmute "1 gmail fix the bug"	literal	terminal.unmute	[]	unbound
+/unmute "1 gmail fix the bug" --tenant	literal	terminal.unmute	[]	unbound
+/unmute "3 best"	literal	terminal.unmute	[]	unbound
+/unmute "3 best" --tenant	literal	terminal.unmute	[]	unbound
+/unmute --tenant	literal	terminal.unmute	[]	unbound
+/unmute 1 gmail fix the bug	literal	terminal.unmute	[]	unbound
+/unmute 1 gmail fix the bug --tenant	literal	terminal.unmute	[]	unbound
+/unmute 3 best	literal	terminal.unmute	[]	unbound
+/unmute 3 best --tenant	literal	terminal.unmute	[]	unbound
+/verify	pattern	terminal.plan-verify	[]	error:no-plan
+/verify "1 gmail fix the bug"	literal	terminal.plan-verify	[]	unbound
+/verify "1 gmail fix the bug" --tenant	literal	terminal.plan-verify	[]	unbound
+/verify "3 best"	literal	terminal.plan-verify	[]	unbound
+/verify "3 best" --tenant	literal	terminal.plan-verify	[]	unbound
+/verify --tenant	literal	terminal.plan-verify	[]	unbound
+/verify 1 gmail fix the bug	literal	terminal.plan-verify	[]	unbound
+/verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound
+/verify 3 best	literal	terminal.plan-verify	[]	unbound
+/verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound
+/yes all	pattern	terminal.approve-all	[]	ok
+/yes all "1 gmail fix the bug"	none	-	null	none
+/yes all "1 gmail fix the bug" --tenant	none	-	null	none
+/yes all "3 best"	none	-	null	none
+/yes all "3 best" --tenant	none	-	null	none
+/yes all --tenant	none	-	null	none
+/yes all 1 gmail fix the bug	none	-	null	none
+/yes all 1 gmail fix the bug --tenant	none	-	null	none
+/yes all 3 best	none	-	null	none
+/yes all 3 best --tenant	none	-	null	none
+analyze	literal	terminal.analyze	[]	error:invalid-args
+analyze "1 gmail fix the bug"	literal	terminal.analyze	[["type","1 gmail fix the bug"]]	error:invalid-args
+analyze "1 gmail fix the bug" --tenant	literal	terminal.analyze	[["type","1 gmail fix the bug --tenant"]]	error:invalid-args
+analyze "3 best"	literal	terminal.analyze	[["type","3 best"]]	error:invalid-args
+analyze "3 best" --tenant	literal	terminal.analyze	[["type","3 best --tenant"]]	error:invalid-args
+analyze --tenant	literal	terminal.analyze	[["type","--tenant"]]	error:invalid-args
+analyze 1 gmail fix the bug	literal	terminal.analyze	[["type","1 gmail fix the bug"]]	error:invalid-args
+analyze 1 gmail fix the bug --tenant	literal	terminal.analyze	[["type","1 gmail fix the bug --tenant"]]	error:invalid-args
+analyze 3 best	literal	terminal.analyze	[["type","3 best"]]	error:invalid-args
+analyze 3 best --tenant	literal	terminal.analyze	[["type","3 best --tenant"]]	error:invalid-args
+analyze architecture	pattern	terminal.analyze	[["type","architecture"]]	ok
+analyze architecture --tenant	literal	terminal.analyze	[["type","architecture --tenant"]]	error:invalid-args
+analyze change-impact	pattern	terminal.analyze	[["type","change-impact"]]	ok
+analyze change-impact --tenant	literal	terminal.analyze	[["type","change-impact --tenant"]]	error:invalid-args
+analyze cross-tab	pattern	terminal.analyze	[["type","cross-tab"]]	ok
+analyze cross-tab --tenant	literal	terminal.analyze	[["type","cross-tab --tenant"]]	error:invalid-args
+analyze page-architecture	pattern	terminal.analyze	[["type","page-architecture"]]	ok
+analyze page-architecture --tenant	literal	terminal.analyze	[["type","page-architecture --tenant"]]	error:invalid-args
+analyze progress	pattern	terminal.analyze	[["type","progress"]]	ok
+analyze progress --tenant	literal	terminal.analyze	[["type","progress --tenant"]]	error:invalid-args
+analyze session-summary	pattern	terminal.analyze	[["type","session-summary"]]	ok
+analyze session-summary --tenant	literal	terminal.analyze	[["type","session-summary --tenant"]]	error:invalid-args
+approve	pattern	terminal.approve-all	[]	ok
+approve "1 gmail fix the bug"	none	-	null	none
+approve "1 gmail fix the bug" --tenant	none	-	null	none
+approve "3 best"	none	-	null	none
+approve "3 best" --tenant	none	-	null	none
+approve --tenant	none	-	null	none
+approve 1 gmail fix the bug	none	-	null	none
+approve 1 gmail fix the bug --tenant	none	-	null	none
+approve 3 best	none	-	null	none
+approve 3 best --tenant	none	-	null	none
+approve all	pattern	terminal.approve-all	[]	ok
+approve all "1 gmail fix the bug"	none	-	null	none
+approve all "1 gmail fix the bug" --tenant	none	-	null	none
+approve all "3 best"	none	-	null	none
+approve all "3 best" --tenant	none	-	null	none
+approve all --tenant	none	-	null	none
+approve all 1 gmail fix the bug	none	-	null	none
+approve all 1 gmail fix the bug --tenant	none	-	null	none
+approve all 3 best	none	-	null	none
+approve all 3 best --tenant	none	-	null	none
+approve-all	literal	terminal.approve-all	[]	ok
+approve-all "1 gmail fix the bug"	literal	terminal.approve-all	[]	unbound
+approve-all "1 gmail fix the bug" --tenant	literal	terminal.approve-all	[]	unbound
+approve-all "3 best"	literal	terminal.approve-all	[]	unbound
+approve-all "3 best" --tenant	literal	terminal.approve-all	[]	unbound
+approve-all --tenant	literal	terminal.approve-all	[]	unbound
+approve-all 1 gmail fix the bug	literal	terminal.approve-all	[]	unbound
+approve-all 1 gmail fix the bug --tenant	literal	terminal.approve-all	[]	unbound
+approve-all 3 best	literal	terminal.approve-all	[]	unbound
+approve-all 3 best --tenant	literal	terminal.approve-all	[]	unbound
+auto focus	pattern	terminal.toggle-auto-focus	[]	ok
+auto focus "1 gmail fix the bug"	none	-	null	none
+auto focus "1 gmail fix the bug" --tenant	none	-	null	none
+auto focus "3 best"	none	-	null	none
+auto focus "3 best" --tenant	none	-	null	none
+auto focus --tenant	none	-	null	none
+auto focus 1 gmail fix the bug	none	-	null	none
+auto focus 1 gmail fix the bug --tenant	none	-	null	none
+auto focus 3 best	none	-	null	none
+auto focus 3 best --tenant	none	-	null	none
+auto restart	pattern	terminal.toggle-auto-restart	[]	ok
+auto restart "1 gmail fix the bug"	none	-	null	none
+auto restart "1 gmail fix the bug" --tenant	none	-	null	none
+auto restart "3 best"	none	-	null	none
+auto restart "3 best" --tenant	none	-	null	none
+auto restart --tenant	none	-	null	none
+auto restart 1 gmail fix the bug	none	-	null	none
+auto restart 1 gmail fix the bug --tenant	none	-	null	none
+auto restart 3 best	none	-	null	none
+auto restart 3 best --tenant	none	-	null	none
+auto-approve	literal	terminal.auto-approve	[]	error:invalid-args
+auto-approve "1 gmail fix the bug"	literal	terminal.auto-approve	[["action","1 gmail fix the bug"]]	error:invalid-args
+auto-approve "1 gmail fix the bug" --tenant	literal	terminal.auto-approve	[["action","1 gmail fix the bug"],["pattern","--tenant"]]	error:invalid-args
+auto-approve "3 best"	literal	terminal.auto-approve	[["action","3 best"]]	error:invalid-args
+auto-approve "3 best" --tenant	literal	terminal.auto-approve	[["action","3 best"],["pattern","--tenant"]]	error:invalid-args
+auto-approve --tenant	literal	terminal.auto-approve	[["action","--tenant"]]	error:invalid-args
+auto-approve 1 gmail fix the bug	literal	terminal.auto-approve	[["action",1],["pattern","gmail fix the bug"]]	error:invalid-args
+auto-approve 1 gmail fix the bug --tenant	literal	terminal.auto-approve	[["action",1],["pattern","gmail fix the bug --tenant"]]	error:invalid-args
+auto-approve 3 best	literal	terminal.auto-approve	[["action",3],["pattern","best"]]	error:invalid-args
+auto-approve 3 best --tenant	literal	terminal.auto-approve	[["action",3],["pattern","best --tenant"]]	error:invalid-args
+auto-approve add fix the bug	pattern	terminal.auto-approve	[["action","add"],["pattern","fix the bug"]]	ok
+auto-approve add fix the bug --tenant	pattern	terminal.auto-approve	[["action","add"],["pattern","fix the bug --tenant"]]	ok
+auto-approve clear	pattern	terminal.auto-approve	[["action","clear"]]	ok
+auto-approve clear --tenant	literal	terminal.auto-approve	[["action","clear"],["pattern","--tenant"]]	ok
+auto-approve list	pattern	terminal.auto-approve	[["action","list"]]	ok
+auto-approve list --tenant	literal	terminal.auto-approve	[["action","list"],["pattern","--tenant"]]	ok
+auto-approve remove fix the bug	pattern	terminal.auto-approve	[["action","remove"],["pattern","fix the bug"]]	error:unknown-pattern
+auto-approve remove fix the bug --tenant	pattern	terminal.auto-approve	[["action","remove"],["pattern","fix the bug --tenant"]]	error:unknown-pattern
+auto-focus	pattern	terminal.toggle-auto-focus	[]	ok
+auto-focus "1 gmail fix the bug"	literal	terminal.toggle-auto-focus	[]	unbound
+auto-focus "1 gmail fix the bug" --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+auto-focus "3 best"	literal	terminal.toggle-auto-focus	[]	unbound
+auto-focus "3 best" --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+auto-focus --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+auto-focus 1 gmail fix the bug	literal	terminal.toggle-auto-focus	[]	unbound
+auto-focus 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+auto-focus 3 best	literal	terminal.toggle-auto-focus	[]	unbound
+auto-focus 3 best --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+auto-restart	pattern	terminal.toggle-auto-restart	[]	ok
+auto-restart "1 gmail fix the bug"	literal	terminal.toggle-auto-restart	[]	unbound
+auto-restart "1 gmail fix the bug" --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+auto-restart "3 best"	literal	terminal.toggle-auto-restart	[]	unbound
+auto-restart "3 best" --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+auto-restart --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+auto-restart 1 gmail fix the bug	literal	terminal.toggle-auto-restart	[]	unbound
+auto-restart 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+auto-restart 3 best	literal	terminal.toggle-auto-restart	[]	unbound
+auto-restart 3 best --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+clear-tag	pattern	terminal.tag-clear	[]	ok
+clear-tag "1 gmail fix the bug"	none	-	null	none
+clear-tag "1 gmail fix the bug" --tenant	none	-	null	none
+clear-tag "3 best"	none	-	null	none
+clear-tag "3 best" --tenant	none	-	null	none
+clear-tag --tenant	none	-	null	none
+clear-tag 1 gmail fix the bug	none	-	null	none
+clear-tag 1 gmail fix the bug --tenant	none	-	null	none
+clear-tag 3 best	none	-	null	none
+clear-tag 3 best --tenant	none	-	null	none
+clear-tags	pattern	terminal.tag-clear	[]	ok
+clear-tags "1 gmail fix the bug"	literal	terminal.tag-clear	[]	unbound
+clear-tags "1 gmail fix the bug" --tenant	literal	terminal.tag-clear	[]	unbound
+clear-tags "3 best"	literal	terminal.tag-clear	[]	unbound
+clear-tags "3 best" --tenant	literal	terminal.tag-clear	[]	unbound
+clear-tags --tenant	literal	terminal.tag-clear	[]	unbound
+clear-tags 1 gmail fix the bug	literal	terminal.tag-clear	[]	unbound
+clear-tags 1 gmail fix the bug --tenant	literal	terminal.tag-clear	[]	unbound
+clear-tags 3 best	literal	terminal.tag-clear	[]	unbound
+clear-tags 3 best --tenant	literal	terminal.tag-clear	[]	unbound
+close	pattern	terminal.close	[]	ok
+close "1 gmail fix the bug"	literal	terminal.close	[["zone","1 gmail fix the bug"]]	error:invalid-zone
+close "1 gmail fix the bug" --tenant	literal	terminal.close	[["tabId","--tenant"],["zone","1 gmail fix the bug"]]	error:unknown-tab
+close "3 best"	literal	terminal.close	[["zone","3 best"]]	error:invalid-zone
+close "3 best" --tenant	literal	terminal.close	[["tabId","--tenant"],["zone","3 best"]]	error:unknown-tab
+close --tenant	literal	terminal.close	[["zone","--tenant"]]	error:invalid-zone
+close 1 gmail fix the bug	literal	terminal.close	[["tabId","gmail fix the bug"],["zone",1]]	error:unknown-tab
+close 1 gmail fix the bug --tenant	literal	terminal.close	[["tabId","gmail fix the bug --tenant"],["zone",1]]	error:unknown-tab
+close 3	pattern	terminal.close	[["zone",3]]	error:no-target
+close 3 --tenant	literal	terminal.close	[["tabId","--tenant"],["zone",3]]	error:unknown-tab
+close 3 best	literal	terminal.close	[["tabId","best"],["zone",3]]	error:unknown-tab
+close 3 best --tenant	literal	terminal.close	[["tabId","best --tenant"],["zone",3]]	error:unknown-tab
+conduct	literal	terminal.orchestrate	[]	error:invalid-args
+conduct "1 gmail fix the bug"	literal	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+conduct "1 gmail fix the bug" --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+conduct "3 best"	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+conduct "3 best" --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+conduct --tenant	literal	terminal.orchestrate	[["goal","--tenant"]]	error:no-run-id
+conduct 1 gmail fix the bug	literal	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+conduct 1 gmail fix the bug --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+conduct 3 best	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+conduct 3 best --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+copy names	pattern	terminal.copy-names	[]	error:no-sessions
+copy names "1 gmail fix the bug"	none	-	null	none
+copy names "1 gmail fix the bug" --tenant	none	-	null	none
+copy names "3 best"	none	-	null	none
+copy names "3 best" --tenant	none	-	null	none
+copy names --tenant	none	-	null	none
+copy names 1 gmail fix the bug	none	-	null	none
+copy names 1 gmail fix the bug --tenant	none	-	null	none
+copy names 3 best	none	-	null	none
+copy names 3 best --tenant	none	-	null	none
+copy sessions	pattern	terminal.copy-names	[]	error:no-sessions
+copy sessions "1 gmail fix the bug"	none	-	null	none
+copy sessions "1 gmail fix the bug" --tenant	none	-	null	none
+copy sessions "3 best"	none	-	null	none
+copy sessions "3 best" --tenant	none	-	null	none
+copy sessions --tenant	none	-	null	none
+copy sessions 1 gmail fix the bug	none	-	null	none
+copy sessions 1 gmail fix the bug --tenant	none	-	null	none
+copy sessions 3 best	none	-	null	none
+copy sessions 3 best --tenant	none	-	null	none
+copy-names	pattern	terminal.copy-names	[]	error:no-sessions
+copy-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound
+copy-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound
+copy-names "3 best"	literal	terminal.copy-names	[]	unbound
+copy-names "3 best" --tenant	literal	terminal.copy-names	[]	unbound
+copy-names --tenant	literal	terminal.copy-names	[]	unbound
+copy-names 1 gmail fix the bug	literal	terminal.copy-names	[]	unbound
+copy-names 1 gmail fix the bug --tenant	literal	terminal.copy-names	[]	unbound
+copy-names 3 best	literal	terminal.copy-names	[]	unbound
+copy-names 3 best --tenant	literal	terminal.copy-names	[]	unbound
+copy-sessions	pattern	terminal.copy-names	[]	error:no-sessions
+copy-sessions "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound
+copy-sessions "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound
+copy-sessions "3 best"	literal	terminal.copy-names	[]	unbound
+copy-sessions "3 best" --tenant	literal	terminal.copy-names	[]	unbound
+copy-sessions --tenant	literal	terminal.copy-names	[]	unbound
+copy-sessions 1 gmail fix the bug	literal	terminal.copy-names	[]	unbound
+copy-sessions 1 gmail fix the bug --tenant	literal	terminal.copy-names	[]	unbound
+copy-sessions 3 best	literal	terminal.copy-names	[]	unbound
+copy-sessions 3 best --tenant	literal	terminal.copy-names	[]	unbound
+desktop notify	pattern	terminal.toggle-desktop-notify	[]	ok
+desktop notify "1 gmail fix the bug"	none	-	null	none
+desktop notify "1 gmail fix the bug" --tenant	none	-	null	none
+desktop notify "3 best"	none	-	null	none
+desktop notify "3 best" --tenant	none	-	null	none
+desktop notify --tenant	none	-	null	none
+desktop notify 1 gmail fix the bug	none	-	null	none
+desktop notify 1 gmail fix the bug --tenant	none	-	null	none
+desktop notify 3 best	none	-	null	none
+desktop notify 3 best --tenant	none	-	null	none
+desktop-notify	pattern	terminal.toggle-desktop-notify	[]	ok
+desktop-notify "1 gmail fix the bug"	literal	terminal.toggle-desktop-notify	[]	unbound
+desktop-notify "1 gmail fix the bug" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+desktop-notify "3 best"	literal	terminal.toggle-desktop-notify	[]	unbound
+desktop-notify "3 best" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+desktop-notify --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+desktop-notify 1 gmail fix the bug	literal	terminal.toggle-desktop-notify	[]	unbound
+desktop-notify 1 gmail fix the bug --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+desktop-notify 3 best	literal	terminal.toggle-desktop-notify	[]	unbound
+desktop-notify 3 best --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+doc	pattern	terminal.doc-finder	[]	ok
+doc "1 gmail fix the bug"	literal	terminal.doc-finder	[]	unbound
+doc "1 gmail fix the bug" --tenant	literal	terminal.doc-finder	[]	unbound
+doc "3 best"	literal	terminal.doc-finder	[]	unbound
+doc "3 best" --tenant	literal	terminal.doc-finder	[]	unbound
+doc --tenant	literal	terminal.doc-finder	[]	unbound
+doc 1 gmail fix the bug	literal	terminal.doc-finder	[]	unbound
+doc 1 gmail fix the bug --tenant	literal	terminal.doc-finder	[]	unbound
+doc 3 best	literal	terminal.doc-finder	[]	unbound
+doc 3 best --tenant	literal	terminal.doc-finder	[]	unbound
+doc-finder	pattern	terminal.doc-finder	[]	ok
+doc-finder "1 gmail fix the bug"	literal	terminal.doc-finder	[]	unbound
+doc-finder "1 gmail fix the bug" --tenant	literal	terminal.doc-finder	[]	unbound
+doc-finder "3 best"	literal	terminal.doc-finder	[]	unbound
+doc-finder "3 best" --tenant	literal	terminal.doc-finder	[]	unbound
+doc-finder --tenant	literal	terminal.doc-finder	[]	unbound
+doc-finder 1 gmail fix the bug	literal	terminal.doc-finder	[]	unbound
+doc-finder 1 gmail fix the bug --tenant	literal	terminal.doc-finder	[]	unbound
+doc-finder 3 best	literal	terminal.doc-finder	[]	unbound
+doc-finder 3 best --tenant	literal	terminal.doc-finder	[]	unbound
+docs	pattern	terminal.doc-finder	[]	ok
+docs "1 gmail fix the bug"	literal	terminal.doc-finder	[]	unbound
+docs "1 gmail fix the bug" --tenant	literal	terminal.doc-finder	[]	unbound
+docs "3 best"	literal	terminal.doc-finder	[]	unbound
+docs "3 best" --tenant	literal	terminal.doc-finder	[]	unbound
+docs --tenant	literal	terminal.doc-finder	[]	unbound
+docs 1 gmail fix the bug	literal	terminal.doc-finder	[]	unbound
+docs 1 gmail fix the bug --tenant	literal	terminal.doc-finder	[]	unbound
+docs 3 best	literal	terminal.doc-finder	[]	unbound
+docs 3 best --tenant	literal	terminal.doc-finder	[]	unbound
+events	pattern	terminal.history	[]	ok
+events "1 gmail fix the bug"	literal	terminal.history	[]	unbound
+events "1 gmail fix the bug" --tenant	literal	terminal.history	[]	unbound
+events "3 best"	literal	terminal.history	[]	unbound
+events "3 best" --tenant	literal	terminal.history	[]	unbound
+events --tenant	literal	terminal.history	[]	unbound
+events 1 gmail fix the bug	literal	terminal.history	[]	unbound
+events 1 gmail fix the bug --tenant	literal	terminal.history	[]	unbound
+events 3 best	literal	terminal.history	[]	unbound
+events 3 best --tenant	literal	terminal.history	[]	unbound
+export	pattern	terminal.export-all	[]	ok
+export "1 gmail fix the bug"	literal	terminal.export-all	[]	unbound
+export "1 gmail fix the bug" --tenant	literal	terminal.export-all	[]	unbound
+export "3 best"	literal	terminal.export-all	[]	unbound
+export "3 best" --tenant	literal	terminal.export-all	[]	unbound
+export --tenant	literal	terminal.export-all	[]	unbound
+export 1 gmail fix the bug	literal	terminal.export-all	[]	unbound
+export 1 gmail fix the bug --tenant	literal	terminal.export-all	[]	unbound
+export 3 best	literal	terminal.export-all	[]	unbound
+export 3 best --tenant	literal	terminal.export-all	[]	unbound
+export all	pattern	terminal.export-all	[]	ok
+export all "1 gmail fix the bug"	literal	terminal.export-all	[]	unbound
+export all "1 gmail fix the bug" --tenant	literal	terminal.export-all	[]	unbound
+export all "3 best"	literal	terminal.export-all	[]	unbound
+export all "3 best" --tenant	literal	terminal.export-all	[]	unbound
+export all --tenant	literal	terminal.export-all	[]	unbound
+export all 1 gmail fix the bug	literal	terminal.export-all	[]	unbound
+export all 1 gmail fix the bug --tenant	literal	terminal.export-all	[]	unbound
+export all 3 best	literal	terminal.export-all	[]	unbound
+export all 3 best --tenant	literal	terminal.export-all	[]	unbound
+export-all	literal	terminal.export-all	[]	ok
+export-all "1 gmail fix the bug"	literal	terminal.export-all	[]	unbound
+export-all "1 gmail fix the bug" --tenant	literal	terminal.export-all	[]	unbound
+export-all "3 best"	literal	terminal.export-all	[]	unbound
+export-all "3 best" --tenant	literal	terminal.export-all	[]	unbound
+export-all --tenant	literal	terminal.export-all	[]	unbound
+export-all 1 gmail fix the bug	literal	terminal.export-all	[]	unbound
+export-all 1 gmail fix the bug --tenant	literal	terminal.export-all	[]	unbound
+export-all 3 best	literal	terminal.export-all	[]	unbound
+export-all 3 best --tenant	literal	terminal.export-all	[]	unbound
+file ownership	pattern	terminal.toggle-file-ownership	[]	ok
+file ownership "1 gmail fix the bug"	none	-	null	none
+file ownership "1 gmail fix the bug" --tenant	none	-	null	none
+file ownership "3 best"	none	-	null	none
+file ownership "3 best" --tenant	none	-	null	none
+file ownership --tenant	none	-	null	none
+file ownership 1 gmail fix the bug	none	-	null	none
+file ownership 1 gmail fix the bug --tenant	none	-	null	none
+file ownership 3 best	none	-	null	none
+file ownership 3 best --tenant	none	-	null	none
+file-ownership	pattern	terminal.toggle-file-ownership	[]	ok
+file-ownership "1 gmail fix the bug"	literal	terminal.toggle-file-ownership	[]	unbound
+file-ownership "1 gmail fix the bug" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+file-ownership "3 best"	literal	terminal.toggle-file-ownership	[]	unbound
+file-ownership "3 best" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+file-ownership --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+file-ownership 1 gmail fix the bug	literal	terminal.toggle-file-ownership	[]	unbound
+file-ownership 1 gmail fix the bug --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+file-ownership 3 best	literal	terminal.toggle-file-ownership	[]	unbound
+file-ownership 3 best --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+files	pattern	terminal.toggle-file-ownership	[]	ok
+files "1 gmail fix the bug"	literal	terminal.toggle-file-ownership	[]	unbound
+files "1 gmail fix the bug" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+files "3 best"	literal	terminal.toggle-file-ownership	[]	unbound
+files "3 best" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+files --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+files 1 gmail fix the bug	literal	terminal.toggle-file-ownership	[]	unbound
+files 1 gmail fix the bug --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+files 3 best	literal	terminal.toggle-file-ownership	[]	unbound
+files 3 best --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+filter-tag	literal	terminal.tag-toggle	[]	error:invalid-args
+filter-tag "1 gmail fix the bug"	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+filter-tag "1 gmail fix the bug" --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+filter-tag "3 best"	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+filter-tag "3 best" --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+filter-tag --tenant	pattern	terminal.tag-toggle	[["tag","--tenant"]]	error:unknown-tag
+filter-tag 1 gmail fix the bug	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+filter-tag 1 gmail fix the bug --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+filter-tag 3 best	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+filter-tag 3 best --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+filter-tag gmail	pattern	terminal.tag-toggle	[["tag","gmail"]]	error:unknown-tag
+filter-tag gmail --tenant	literal	terminal.tag-toggle	[["tag","gmail --tenant"]]	error:unknown-tag
+findings	pattern	terminal.toggle-findings	[]	ok
+findings "1 gmail fix the bug"	literal	terminal.toggle-findings	[]	unbound
+findings "1 gmail fix the bug" --tenant	literal	terminal.toggle-findings	[]	unbound
+findings "3 best"	literal	terminal.toggle-findings	[]	unbound
+findings "3 best" --tenant	literal	terminal.toggle-findings	[]	unbound
+findings --tenant	literal	terminal.toggle-findings	[]	unbound
+findings 1 gmail fix the bug	literal	terminal.toggle-findings	[]	unbound
+findings 1 gmail fix the bug --tenant	literal	terminal.toggle-findings	[]	unbound
+findings 3 best	literal	terminal.toggle-findings	[]	unbound
+findings 3 best --tenant	literal	terminal.toggle-findings	[]	unbound
+focus	literal	terminal.focus	[]	error:invalid-args
+focus "1 gmail fix the bug"	literal	terminal.focus	[["target","1 gmail fix the bug"]]	error:invalid-zone
+focus "1 gmail fix the bug" --tenant	literal	terminal.focus	[["target","1 gmail fix the bug --tenant"]]	error:invalid-zone
+focus "3 best"	literal	terminal.focus	[["target","3 best"]]	error:invalid-zone
+focus "3 best" --tenant	literal	terminal.focus	[["target","3 best --tenant"]]	error:invalid-zone
+focus --tenant	literal	terminal.focus	[["target","--tenant"]]	error:invalid-zone
+focus 1 gmail fix the bug	literal	terminal.focus	[["target","1 gmail fix the bug"]]	error:invalid-zone
+focus 1 gmail fix the bug --tenant	literal	terminal.focus	[["target","1 gmail fix the bug --tenant"]]	error:invalid-zone
+focus 3	pattern	terminal.focus	[["target",3]]	ok
+focus 3 --tenant	literal	terminal.focus	[["target","3 --tenant"]]	error:invalid-zone
+focus 3 best	literal	terminal.focus	[["target","3 best"]]	error:invalid-zone
+focus 3 best --tenant	literal	terminal.focus	[["target","3 best --tenant"]]	error:invalid-zone
+focus mode	pattern	terminal.toggle-focus-mode	[]	ok
+focus mode "1 gmail fix the bug"	literal	terminal.focus	[["target","mode 1 gmail fix the bug"]]	error:invalid-zone
+focus mode "1 gmail fix the bug" --tenant	literal	terminal.focus	[["target","mode 1 gmail fix the bug --tenant"]]	error:invalid-zone
+focus mode "3 best"	literal	terminal.focus	[["target","mode 3 best"]]	error:invalid-zone
+focus mode "3 best" --tenant	literal	terminal.focus	[["target","mode 3 best --tenant"]]	error:invalid-zone
+focus mode --tenant	literal	terminal.focus	[["target","mode --tenant"]]	error:invalid-zone
+focus mode 1 gmail fix the bug	literal	terminal.focus	[["target","mode 1 gmail fix the bug"]]	error:invalid-zone
+focus mode 1 gmail fix the bug --tenant	literal	terminal.focus	[["target","mode 1 gmail fix the bug --tenant"]]	error:invalid-zone
+focus mode 3 best	literal	terminal.focus	[["target","mode 3 best"]]	error:invalid-zone
+focus mode 3 best --tenant	literal	terminal.focus	[["target","mode 3 best --tenant"]]	error:invalid-zone
+focus needs input	pattern	terminal.focus	[["target","needs input"]]	ok
+focus needs input --tenant	literal	terminal.focus	[["target","needs input --tenant"]]	error:invalid-zone
+focus needs-input	pattern	terminal.focus	[["target","needs-input"]]	ok
+focus needs-input --tenant	literal	terminal.focus	[["target","needs-input --tenant"]]	error:invalid-zone
+focus needs_input	pattern	terminal.focus	[["target","needs_input"]]	ok
+focus needs_input --tenant	literal	terminal.focus	[["target","needs_input --tenant"]]	error:invalid-zone
+focus needsinput	pattern	terminal.focus	[["target","needsinput"]]	ok
+focus needsinput --tenant	literal	terminal.focus	[["target","needsinput --tenant"]]	error:invalid-zone
+focus next	pattern	terminal.focus	[["target","next"]]	ok
+focus next --tenant	literal	terminal.focus	[["target","next --tenant"]]	error:invalid-zone
+focus prev	pattern	terminal.focus	[["target","prev"]]	ok
+focus prev --tenant	literal	terminal.focus	[["target","prev --tenant"]]	error:invalid-zone
+focus previous	pattern	terminal.focus	[["target","previous"]]	ok
+focus previous --tenant	literal	terminal.focus	[["target","previous --tenant"]]	error:invalid-zone
+focus-mode	pattern	terminal.toggle-focus-mode	[]	ok
+focus-mode "1 gmail fix the bug"	literal	terminal.toggle-focus-mode	[]	unbound
+focus-mode "1 gmail fix the bug" --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+focus-mode "3 best"	literal	terminal.toggle-focus-mode	[]	unbound
+focus-mode "3 best" --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+focus-mode --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+focus-mode 1 gmail fix the bug	literal	terminal.toggle-focus-mode	[]	unbound
+focus-mode 1 gmail fix the bug --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+focus-mode 3 best	literal	terminal.toggle-focus-mode	[]	unbound
+focus-mode 3 best --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+full-grid layout	pattern	terminal.layout	[["preset","full-grid"]]	ok
+full-grid layout --tenant	none	-	null	none
+fullgrid layout	pattern	terminal.layout	[["preset","fullgrid"]]	ok
+fullgrid layout --tenant	none	-	null	none
+fullscreen	pattern	terminal.maximize	[]	ok
+fullscreen "1 gmail fix the bug"	none	-	null	none
+fullscreen "1 gmail fix the bug" --tenant	none	-	null	none
+fullscreen "3 best"	none	-	null	none
+fullscreen "3 best" --tenant	none	-	null	none
+fullscreen --tenant	none	-	null	none
+fullscreen 1 gmail fix the bug	none	-	null	none
+fullscreen 1 gmail fix the bug --tenant	none	-	null	none
+fullscreen 3	pattern	terminal.maximize	[["zone",3]]	ok
+fullscreen 3 --tenant	none	-	null	none
+fullscreen 3 best	none	-	null	none
+fullscreen 3 best --tenant	none	-	null	none
+generate	pattern	terminal.generate-workflow	[]	error:no-session
+generate "1 gmail fix the bug"	literal	terminal.generate-workflow	[]	unbound
+generate "1 gmail fix the bug" --tenant	literal	terminal.generate-workflow	[]	unbound
+generate "3 best"	literal	terminal.generate-workflow	[]	unbound
+generate "3 best" --tenant	literal	terminal.generate-workflow	[]	unbound
+generate --tenant	literal	terminal.generate-workflow	[]	unbound
+generate 1 gmail fix the bug	literal	terminal.generate-workflow	[]	unbound
+generate 1 gmail fix the bug --tenant	literal	terminal.generate-workflow	[]	unbound
+generate 3 best	literal	terminal.generate-workflow	[]	unbound
+generate 3 best --tenant	literal	terminal.generate-workflow	[]	unbound
+generate workflow	pattern	terminal.generate-workflow	[]	error:no-session
+generate workflow "1 gmail fix the bug"	literal	terminal.generate-workflow	[]	unbound
+generate workflow "1 gmail fix the bug" --tenant	literal	terminal.generate-workflow	[]	unbound
+generate workflow "3 best"	literal	terminal.generate-workflow	[]	unbound
+generate workflow "3 best" --tenant	literal	terminal.generate-workflow	[]	unbound
+generate workflow --tenant	literal	terminal.generate-workflow	[]	unbound
+generate workflow 1 gmail fix the bug	literal	terminal.generate-workflow	[]	unbound
+generate workflow 1 gmail fix the bug --tenant	literal	terminal.generate-workflow	[]	unbound
+generate workflow 3 best	literal	terminal.generate-workflow	[]	unbound
+generate workflow 3 best --tenant	literal	terminal.generate-workflow	[]	unbound
+generate-workflow	literal	terminal.generate-workflow	[]	error:no-session
+generate-workflow "1 gmail fix the bug"	literal	terminal.generate-workflow	[]	unbound
+generate-workflow "1 gmail fix the bug" --tenant	literal	terminal.generate-workflow	[]	unbound
+generate-workflow "3 best"	literal	terminal.generate-workflow	[]	unbound
+generate-workflow "3 best" --tenant	literal	terminal.generate-workflow	[]	unbound
+generate-workflow --tenant	literal	terminal.generate-workflow	[]	unbound
+generate-workflow 1 gmail fix the bug	literal	terminal.generate-workflow	[]	unbound
+generate-workflow 1 gmail fix the bug --tenant	literal	terminal.generate-workflow	[]	unbound
+generate-workflow 3 best	literal	terminal.generate-workflow	[]	unbound
+generate-workflow 3 best --tenant	literal	terminal.generate-workflow	[]	unbound
+help	pattern	terminal.show-shortcuts	[]	ok
+help "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound
+help "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound
+help "3 best"	literal	terminal.show-shortcuts	[]	unbound
+help "3 best" --tenant	literal	terminal.show-shortcuts	[]	unbound
+help --tenant	literal	terminal.show-shortcuts	[]	unbound
+help 1 gmail fix the bug	literal	terminal.show-shortcuts	[]	unbound
+help 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound
+help 3 best	literal	terminal.show-shortcuts	[]	unbound
+help 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound
+history	pattern	terminal.history	[]	ok
+history "1 gmail fix the bug"	literal	terminal.history	[]	unbound
+history "1 gmail fix the bug" --tenant	literal	terminal.history	[]	unbound
+history "3 best"	literal	terminal.history	[]	unbound
+history "3 best" --tenant	literal	terminal.history	[]	unbound
+history --tenant	literal	terminal.history	[]	unbound
+history 1 gmail fix the bug	literal	terminal.history	[]	unbound
+history 1 gmail fix the bug --tenant	literal	terminal.history	[]	unbound
+history 3 best	literal	terminal.history	[]	unbound
+history 3 best --tenant	literal	terminal.history	[]	unbound
+implement	pattern	terminal.plan-implement	[]	error:no-plan
+implement "1 gmail fix the bug"	literal	terminal.plan-implement	[]	unbound
+implement "1 gmail fix the bug" --tenant	literal	terminal.plan-implement	[]	unbound
+implement "3 best"	literal	terminal.plan-implement	[]	unbound
+implement "3 best" --tenant	literal	terminal.plan-implement	[]	unbound
+implement --tenant	literal	terminal.plan-implement	[]	unbound
+implement 1 gmail fix the bug	literal	terminal.plan-implement	[]	unbound
+implement 1 gmail fix the bug --tenant	literal	terminal.plan-implement	[]	unbound
+implement 3 best	literal	terminal.plan-implement	[]	unbound
+implement 3 best --tenant	literal	terminal.plan-implement	[]	unbound
+keys	pattern	terminal.show-shortcuts	[]	ok
+keys "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound
+keys "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound
+keys "3 best"	literal	terminal.show-shortcuts	[]	unbound
+keys "3 best" --tenant	literal	terminal.show-shortcuts	[]	unbound
+keys --tenant	literal	terminal.show-shortcuts	[]	unbound
+keys 1 gmail fix the bug	literal	terminal.show-shortcuts	[]	unbound
+keys 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound
+keys 3 best	literal	terminal.show-shortcuts	[]	unbound
+keys 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound
+layout	literal	terminal.layout	[]	error:invalid-preset
+layout "1 gmail fix the bug"	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset
+layout "1 gmail fix the bug" --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset
+layout "3 best"	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset
+layout "3 best" --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset
+layout --tenant	literal	terminal.layout	[["preset","--tenant"]]	error:invalid-preset
+layout 1 gmail fix the bug	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset
+layout 1 gmail fix the bug --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset
+layout 3 best	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset
+layout 3 best --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset
+layout full-grid	pattern	terminal.layout	[["preset","full-grid"]]	ok
+layout full-grid --tenant	literal	terminal.layout	[["preset","full-grid --tenant"]]	error:invalid-preset
+layout fullgrid	pattern	terminal.layout	[["preset","fullgrid"]]	ok
+layout fullgrid --tenant	literal	terminal.layout	[["preset","fullgrid --tenant"]]	error:invalid-preset
+layout quad	pattern	terminal.layout	[["preset","quad"]]	ok
+layout quad --tenant	literal	terminal.layout	[["preset","quad --tenant"]]	error:invalid-preset
+layout single	pattern	terminal.layout	[["preset","single"]]	ok
+layout single --tenant	literal	terminal.layout	[["preset","single --tenant"]]	error:invalid-preset
+layout six-pack	pattern	terminal.layout	[["preset","six-pack"]]	ok
+layout six-pack --tenant	literal	terminal.layout	[["preset","six-pack --tenant"]]	error:invalid-preset
+layout sixpack	pattern	terminal.layout	[["preset","sixpack"]]	ok
+layout sixpack --tenant	literal	terminal.layout	[["preset","sixpack --tenant"]]	error:invalid-preset
+layout split	pattern	terminal.layout	[["preset","split"]]	ok
+layout split --tenant	literal	terminal.layout	[["preset","split --tenant"]]	error:invalid-preset
+maximize	pattern	terminal.maximize	[]	ok
+maximize "1 gmail fix the bug"	literal	terminal.maximize	[["zone","1 gmail fix the bug"]]	error:invalid-zone
+maximize "1 gmail fix the bug" --tenant	literal	terminal.maximize	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone
+maximize "3 best"	literal	terminal.maximize	[["zone","3 best"]]	error:invalid-zone
+maximize "3 best" --tenant	literal	terminal.maximize	[["zone","3 best --tenant"]]	error:invalid-zone
+maximize --tenant	literal	terminal.maximize	[["zone","--tenant"]]	error:invalid-zone
+maximize 1 gmail fix the bug	literal	terminal.maximize	[["zone","1 gmail fix the bug"]]	error:invalid-zone
+maximize 1 gmail fix the bug --tenant	literal	terminal.maximize	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone
+maximize 3	pattern	terminal.maximize	[["zone",3]]	ok
+maximize 3 --tenant	literal	terminal.maximize	[["zone","3 --tenant"]]	error:invalid-zone
+maximize 3 best	literal	terminal.maximize	[["zone","3 best"]]	error:invalid-zone
+maximize 3 best --tenant	literal	terminal.maximize	[["zone","3 best --tenant"]]	error:invalid-zone
+metrics	pattern	terminal.metrics	[]	ok
+metrics "1 gmail fix the bug"	literal	terminal.metrics	[]	unbound
+metrics "1 gmail fix the bug" --tenant	literal	terminal.metrics	[]	unbound
+metrics "3 best"	literal	terminal.metrics	[]	unbound
+metrics "3 best" --tenant	literal	terminal.metrics	[]	unbound
+metrics --tenant	literal	terminal.metrics	[]	unbound
+metrics 1 gmail fix the bug	literal	terminal.metrics	[]	unbound
+metrics 1 gmail fix the bug --tenant	literal	terminal.metrics	[]	unbound
+metrics 3 best	literal	terminal.metrics	[]	unbound
+metrics 3 best --tenant	literal	terminal.metrics	[]	unbound
+mute	pattern	terminal.mute	[]	ok
+mute "1 gmail fix the bug"	literal	terminal.mute	[]	unbound
+mute "1 gmail fix the bug" --tenant	literal	terminal.mute	[]	unbound
+mute "3 best"	literal	terminal.mute	[]	unbound
+mute "3 best" --tenant	literal	terminal.mute	[]	unbound
+mute --tenant	literal	terminal.mute	[]	unbound
+mute 1 gmail fix the bug	literal	terminal.mute	[]	unbound
+mute 1 gmail fix the bug --tenant	literal	terminal.mute	[]	unbound
+mute 3 best	literal	terminal.mute	[]	unbound
+mute 3 best --tenant	literal	terminal.mute	[]	unbound
+next session	pattern	terminal.focus	[["target","next"]]	ok
+next session --tenant	none	-	null	none
+notifications	pattern	terminal.toggle-desktop-notify	[]	ok
+notifications "1 gmail fix the bug"	literal	terminal.toggle-desktop-notify	[]	unbound
+notifications "1 gmail fix the bug" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+notifications "3 best"	literal	terminal.toggle-desktop-notify	[]	unbound
+notifications "3 best" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+notifications --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+notifications 1 gmail fix the bug	literal	terminal.toggle-desktop-notify	[]	unbound
+notifications 1 gmail fix the bug --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+notifications 3 best	literal	terminal.toggle-desktop-notify	[]	unbound
+notifications 3 best --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+orchestrate	literal	terminal.orchestrate	[]	error:invalid-args
+orchestrate "1 gmail fix the bug"	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+orchestrate "1 gmail fix the bug" --tenant	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+orchestrate "3 best"	pattern	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+orchestrate "3 best" --tenant	pattern	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+orchestrate --tenant	pattern	terminal.orchestrate	[["goal","--tenant"]]	error:no-run-id
+orchestrate 1 gmail fix the bug	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+orchestrate 1 gmail fix the bug --tenant	pattern	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+orchestrate 3 best	pattern	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+orchestrate 3 best --tenant	pattern	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+orchestrate fix the bug	pattern	terminal.orchestrate	[["goal","fix the bug"]]	error:no-run-id
+orchestrate fix the bug --tenant	pattern	terminal.orchestrate	[["goal","fix the bug --tenant"]]	error:no-run-id
+plan refresh	pattern	terminal.plan-refresh	[]	ok
+plan refresh "1 gmail fix the bug"	none	-	null	none
+plan refresh "1 gmail fix the bug" --tenant	none	-	null	none
+plan refresh "3 best"	none	-	null	none
+plan refresh "3 best" --tenant	none	-	null	none
+plan refresh --tenant	none	-	null	none
+plan refresh 1 gmail fix the bug	none	-	null	none
+plan refresh 1 gmail fix the bug --tenant	none	-	null	none
+plan refresh 3 best	none	-	null	none
+plan refresh 3 best --tenant	none	-	null	none
+plan-implement	pattern	terminal.plan-implement	[]	error:no-plan
+plan-implement "1 gmail fix the bug"	literal	terminal.plan-implement	[]	unbound
+plan-implement "1 gmail fix the bug" --tenant	literal	terminal.plan-implement	[]	unbound
+plan-implement "3 best"	literal	terminal.plan-implement	[]	unbound
+plan-implement "3 best" --tenant	literal	terminal.plan-implement	[]	unbound
+plan-implement --tenant	literal	terminal.plan-implement	[]	unbound
+plan-implement 1 gmail fix the bug	literal	terminal.plan-implement	[]	unbound
+plan-implement 1 gmail fix the bug --tenant	literal	terminal.plan-implement	[]	unbound
+plan-implement 3 best	literal	terminal.plan-implement	[]	unbound
+plan-implement 3 best --tenant	literal	terminal.plan-implement	[]	unbound
+plan-refresh	pattern	terminal.plan-refresh	[]	ok
+plan-refresh "1 gmail fix the bug"	literal	terminal.plan-refresh	[]	unbound
+plan-refresh "1 gmail fix the bug" --tenant	literal	terminal.plan-refresh	[]	unbound
+plan-refresh "3 best"	literal	terminal.plan-refresh	[]	unbound
+plan-refresh "3 best" --tenant	literal	terminal.plan-refresh	[]	unbound
+plan-refresh --tenant	literal	terminal.plan-refresh	[]	unbound
+plan-refresh 1 gmail fix the bug	literal	terminal.plan-refresh	[]	unbound
+plan-refresh 1 gmail fix the bug --tenant	literal	terminal.plan-refresh	[]	unbound
+plan-refresh 3 best	literal	terminal.plan-refresh	[]	unbound
+plan-refresh 3 best --tenant	literal	terminal.plan-refresh	[]	unbound
+plan-verify	pattern	terminal.plan-verify	[]	error:no-plan
+plan-verify "1 gmail fix the bug"	literal	terminal.plan-verify	[]	unbound
+plan-verify "1 gmail fix the bug" --tenant	literal	terminal.plan-verify	[]	unbound
+plan-verify "3 best"	literal	terminal.plan-verify	[]	unbound
+plan-verify "3 best" --tenant	literal	terminal.plan-verify	[]	unbound
+plan-verify --tenant	literal	terminal.plan-verify	[]	unbound
+plan-verify 1 gmail fix the bug	literal	terminal.plan-verify	[]	unbound
+plan-verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound
+plan-verify 3 best	literal	terminal.plan-verify	[]	unbound
+plan-verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound
+prev session	pattern	terminal.focus	[["target","prev"]]	ok
+prev session --tenant	none	-	null	none
+previous session	pattern	terminal.focus	[["target","previous"]]	ok
+previous session --tenant	none	-	null	none
+prompt	pattern	terminal.prompt	[]	ok
+prompt "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound
+prompt "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound
+prompt "3 best"	literal	terminal.prompt	[]	unbound
+prompt "3 best" --tenant	literal	terminal.prompt	[]	unbound
+prompt --tenant	literal	terminal.prompt	[]	unbound
+prompt 1 gmail fix the bug	literal	terminal.prompt	[]	unbound
+prompt 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound
+prompt 3 best	literal	terminal.prompt	[]	unbound
+prompt 3 best --tenant	literal	terminal.prompt	[]	unbound
+prompt library	pattern	terminal.prompt	[]	ok
+prompt library "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound
+prompt library "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound
+prompt library "3 best"	literal	terminal.prompt	[]	unbound
+prompt library "3 best" --tenant	literal	terminal.prompt	[]	unbound
+prompt library --tenant	literal	terminal.prompt	[]	unbound
+prompt library 1 gmail fix the bug	literal	terminal.prompt	[]	unbound
+prompt library 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound
+prompt library 3 best	literal	terminal.prompt	[]	unbound
+prompt library 3 best --tenant	literal	terminal.prompt	[]	unbound
+prompt-library	pattern	terminal.prompt	[]	ok
+prompt-library "1 gmail fix the bug"	none	-	null	none
+prompt-library "1 gmail fix the bug" --tenant	none	-	null	none
+prompt-library "3 best"	none	-	null	none
+prompt-library "3 best" --tenant	none	-	null	none
+prompt-library --tenant	none	-	null	none
+prompt-library 1 gmail fix the bug	none	-	null	none
+prompt-library 1 gmail fix the bug --tenant	none	-	null	none
+prompt-library 3 best	none	-	null	none
+prompt-library 3 best --tenant	none	-	null	none
+prompts	pattern	terminal.prompt	[]	ok
+prompts "1 gmail fix the bug"	literal	terminal.prompt	[]	unbound
+prompts "1 gmail fix the bug" --tenant	literal	terminal.prompt	[]	unbound
+prompts "3 best"	literal	terminal.prompt	[]	unbound
+prompts "3 best" --tenant	literal	terminal.prompt	[]	unbound
+prompts --tenant	literal	terminal.prompt	[]	unbound
+prompts 1 gmail fix the bug	literal	terminal.prompt	[]	unbound
+prompts 1 gmail fix the bug --tenant	literal	terminal.prompt	[]	unbound
+prompts 3 best	literal	terminal.prompt	[]	unbound
+prompts 3 best --tenant	literal	terminal.prompt	[]	unbound
+quad layout	pattern	terminal.layout	[["preset","quad"]]	ok
+quad layout --tenant	none	-	null	none
+refresh plan	pattern	terminal.plan-refresh	[]	ok
+refresh plan "1 gmail fix the bug"	none	-	null	none
+refresh plan "1 gmail fix the bug" --tenant	none	-	null	none
+refresh plan "3 best"	none	-	null	none
+refresh plan "3 best" --tenant	none	-	null	none
+refresh plan --tenant	none	-	null	none
+refresh plan 1 gmail fix the bug	none	-	null	none
+refresh plan 1 gmail fix the bug --tenant	none	-	null	none
+refresh plan 3 best	none	-	null	none
+refresh plan 3 best --tenant	none	-	null	none
+refresh-plan	literal	terminal.plan-refresh	[]	ok
+refresh-plan "1 gmail fix the bug"	literal	terminal.plan-refresh	[]	unbound
+refresh-plan "1 gmail fix the bug" --tenant	literal	terminal.plan-refresh	[]	unbound
+refresh-plan "3 best"	literal	terminal.plan-refresh	[]	unbound
+refresh-plan "3 best" --tenant	literal	terminal.plan-refresh	[]	unbound
+refresh-plan --tenant	literal	terminal.plan-refresh	[]	unbound
+refresh-plan 1 gmail fix the bug	literal	terminal.plan-refresh	[]	unbound
+refresh-plan 1 gmail fix the bug --tenant	literal	terminal.plan-refresh	[]	unbound
+refresh-plan 3 best	literal	terminal.plan-refresh	[]	unbound
+refresh-plan 3 best --tenant	literal	terminal.plan-refresh	[]	unbound
+restart	pattern	terminal.restart	[]	error:not-restartable
+restart "1 gmail fix the bug"	literal	terminal.restart	[["zone","1 gmail fix the bug"]]	error:invalid-zone
+restart "1 gmail fix the bug" --tenant	literal	terminal.restart	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone
+restart "3 best"	literal	terminal.restart	[["zone","3 best"]]	error:invalid-zone
+restart "3 best" --tenant	literal	terminal.restart	[["zone","3 best --tenant"]]	error:invalid-zone
+restart --tenant	literal	terminal.restart	[["zone","--tenant"]]	error:invalid-zone
+restart 1 gmail fix the bug	literal	terminal.restart	[["zone","1 gmail fix the bug"]]	error:invalid-zone
+restart 1 gmail fix the bug --tenant	literal	terminal.restart	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone
+restart 3	pattern	terminal.restart	[["zone",3]]	error:not-restartable
+restart 3 --tenant	literal	terminal.restart	[["zone","3 --tenant"]]	error:invalid-zone
+restart 3 best	literal	terminal.restart	[["zone","3 best"]]	error:invalid-zone
+restart 3 best --tenant	literal	terminal.restart	[["zone","3 best --tenant"]]	error:invalid-zone
+resume	pattern	terminal.resume	[]	ok
+resume "1 gmail fix the bug"	literal	terminal.resume	[]	unbound
+resume "1 gmail fix the bug" --tenant	literal	terminal.resume	[]	unbound
+resume "3 best"	literal	terminal.resume	[]	unbound
+resume "3 best" --tenant	literal	terminal.resume	[]	unbound
+resume --tenant	literal	terminal.resume	[]	unbound
+resume 1 gmail fix the bug	literal	terminal.resume	[]	unbound
+resume 1 gmail fix the bug --tenant	literal	terminal.resume	[]	unbound
+resume 3 best	literal	terminal.resume	[]	unbound
+resume 3 best --tenant	literal	terminal.resume	[]	unbound
+run-goal	literal	terminal.orchestrate	[]	error:invalid-args
+run-goal "1 gmail fix the bug"	literal	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+run-goal "1 gmail fix the bug" --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+run-goal "3 best"	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+run-goal "3 best" --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+run-goal --tenant	literal	terminal.orchestrate	[["goal","--tenant"]]	error:no-run-id
+run-goal 1 gmail fix the bug	literal	terminal.orchestrate	[["goal","1 gmail fix the bug"]]	error:no-run-id
+run-goal 1 gmail fix the bug --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id
+run-goal 3 best	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id
+run-goal 3 best --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id
+save	pattern	terminal.save-workflow	[]	error:no-workflow
+save "1 gmail fix the bug"	literal	terminal.save-workflow	[]	unbound
+save "1 gmail fix the bug" --tenant	literal	terminal.save-workflow	[]	unbound
+save "3 best"	literal	terminal.save-workflow	[]	unbound
+save "3 best" --tenant	literal	terminal.save-workflow	[]	unbound
+save --tenant	literal	terminal.save-workflow	[]	unbound
+save 1 gmail fix the bug	literal	terminal.save-workflow	[]	unbound
+save 1 gmail fix the bug --tenant	literal	terminal.save-workflow	[]	unbound
+save 3 best	literal	terminal.save-workflow	[]	unbound
+save 3 best --tenant	literal	terminal.save-workflow	[]	unbound
+save workflow	pattern	terminal.save-workflow	[]	error:no-workflow
+save workflow "1 gmail fix the bug"	literal	terminal.save-workflow	[]	unbound
+save workflow "1 gmail fix the bug" --tenant	literal	terminal.save-workflow	[]	unbound
+save workflow "3 best"	literal	terminal.save-workflow	[]	unbound
+save workflow "3 best" --tenant	literal	terminal.save-workflow	[]	unbound
+save workflow --tenant	literal	terminal.save-workflow	[]	unbound
+save workflow 1 gmail fix the bug	literal	terminal.save-workflow	[]	unbound
+save workflow 1 gmail fix the bug --tenant	literal	terminal.save-workflow	[]	unbound
+save workflow 3 best	literal	terminal.save-workflow	[]	unbound
+save workflow 3 best --tenant	literal	terminal.save-workflow	[]	unbound
+save-workflow	literal	terminal.save-workflow	[]	error:no-workflow
+save-workflow "1 gmail fix the bug"	literal	terminal.save-workflow	[]	unbound
+save-workflow "1 gmail fix the bug" --tenant	literal	terminal.save-workflow	[]	unbound
+save-workflow "3 best"	literal	terminal.save-workflow	[]	unbound
+save-workflow "3 best" --tenant	literal	terminal.save-workflow	[]	unbound
+save-workflow --tenant	literal	terminal.save-workflow	[]	unbound
+save-workflow 1 gmail fix the bug	literal	terminal.save-workflow	[]	unbound
+save-workflow 1 gmail fix the bug --tenant	literal	terminal.save-workflow	[]	unbound
+save-workflow 3 best	literal	terminal.save-workflow	[]	unbound
+save-workflow 3 best --tenant	literal	terminal.save-workflow	[]	unbound
+select	fuzzy	terminal.select-by-state	[]	error:invalid-args
+select "1 gmail fix the bug"	none	-	null	none
+select "1 gmail fix the bug" --tenant	none	-	null	none
+select "3 best"	none	-	null	none
+select "3 best" --tenant	none	-	null	none
+select --tenant	none	-	null	none
+select 1 gmail fix the bug	none	-	null	none
+select 1 gmail fix the bug --tenant	none	-	null	none
+select 3 best	none	-	null	none
+select 3 best --tenant	none	-	null	none
+select completed	pattern	terminal.select-by-state	[["state","completed"]]	ok
+select completed --tenant	none	-	null	none
+select error	pattern	terminal.select-by-state	[["state","error"]]	ok
+select error --tenant	none	-	null	none
+select idle	pattern	terminal.select-by-state	[["state","idle"]]	ok
+select idle --tenant	none	-	null	none
+select needs input	pattern	terminal.select-by-state	[["state","needs input"]]	ok
+select needs input --tenant	none	-	null	none
+select needs-input	pattern	terminal.select-by-state	[["state","needs-input"]]	ok
+select needs-input --tenant	none	-	null	none
+select needs_input	pattern	terminal.select-by-state	[["state","needs_input"]]	ok
+select needs_input --tenant	none	-	null	none
+select needsinput	pattern	terminal.select-by-state	[["state","needsinput"]]	ok
+select needsinput --tenant	none	-	null	none
+select working	pattern	terminal.select-by-state	[["state","working"]]	ok
+select working --tenant	none	-	null	none
+select-by-state	literal	terminal.select-by-state	[]	error:invalid-args
+select-by-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args
+select-by-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args
+select-by-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args
+select-by-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args
+select-by-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args
+select-by-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args
+select-by-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args
+select-by-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args
+select-by-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args
+select-by-state completed	pattern	terminal.select-by-state	[["state","completed"]]	ok
+select-by-state completed --tenant	literal	terminal.select-by-state	[["state","completed --tenant"]]	error:invalid-args
+select-by-state error	pattern	terminal.select-by-state	[["state","error"]]	ok
+select-by-state error --tenant	literal	terminal.select-by-state	[["state","error --tenant"]]	error:invalid-args
+select-by-state idle	pattern	terminal.select-by-state	[["state","idle"]]	ok
+select-by-state idle --tenant	literal	terminal.select-by-state	[["state","idle --tenant"]]	error:invalid-args
+select-by-state needs input	pattern	terminal.select-by-state	[["state","needs input"]]	ok
+select-by-state needs input --tenant	literal	terminal.select-by-state	[["state","needs input --tenant"]]	error:invalid-args
+select-by-state needs-input	pattern	terminal.select-by-state	[["state","needs-input"]]	ok
+select-by-state needs-input --tenant	literal	terminal.select-by-state	[["state","needs-input --tenant"]]	error:invalid-args
+select-by-state needs_input	pattern	terminal.select-by-state	[["state","needs_input"]]	ok
+select-by-state needs_input --tenant	literal	terminal.select-by-state	[["state","needs_input --tenant"]]	error:invalid-args
+select-by-state needsinput	pattern	terminal.select-by-state	[["state","needsinput"]]	ok
+select-by-state needsinput --tenant	literal	terminal.select-by-state	[["state","needsinput --tenant"]]	error:invalid-args
+select-by-state working	pattern	terminal.select-by-state	[["state","working"]]	ok
+select-by-state working --tenant	literal	terminal.select-by-state	[["state","working --tenant"]]	error:invalid-args
+select-state	literal	terminal.select-by-state	[]	error:invalid-args
+select-state "1 gmail fix the bug"	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args
+select-state "1 gmail fix the bug" --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args
+select-state "3 best"	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args
+select-state "3 best" --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args
+select-state --tenant	literal	terminal.select-by-state	[["state","--tenant"]]	error:invalid-args
+select-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 gmail fix the bug"]]	error:invalid-args
+select-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args
+select-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args
+select-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args
+session names	pattern	terminal.copy-names	[]	error:no-sessions
+session names "1 gmail fix the bug"	none	-	null	none
+session names "1 gmail fix the bug" --tenant	none	-	null	none
+session names "3 best"	none	-	null	none
+session names "3 best" --tenant	none	-	null	none
+session names --tenant	none	-	null	none
+session names 1 gmail fix the bug	none	-	null	none
+session names 1 gmail fix the bug --tenant	none	-	null	none
+session names 3 best	none	-	null	none
+session names 3 best --tenant	none	-	null	none
+session-names	pattern	terminal.copy-names	[]	error:no-sessions
+session-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound
+session-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound
+session-names "3 best"	literal	terminal.copy-names	[]	unbound
+session-names "3 best" --tenant	literal	terminal.copy-names	[]	unbound
+session-names --tenant	literal	terminal.copy-names	[]	unbound
+session-names 1 gmail fix the bug	literal	terminal.copy-names	[]	unbound
+session-names 1 gmail fix the bug --tenant	literal	terminal.copy-names	[]	unbound
+session-names 3 best	literal	terminal.copy-names	[]	unbound
+session-names 3 best --tenant	literal	terminal.copy-names	[]	unbound
+sessions	pattern	terminal.toggle-sessions-sidebar	[]	ok
+sessions "1 gmail fix the bug"	literal	terminal.toggle-sessions-sidebar	[]	unbound
+sessions "1 gmail fix the bug" --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+sessions "3 best"	literal	terminal.toggle-sessions-sidebar	[]	unbound
+sessions "3 best" --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+sessions --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+sessions 1 gmail fix the bug	literal	terminal.toggle-sessions-sidebar	[]	unbound
+sessions 1 gmail fix the bug --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+sessions 3 best	literal	terminal.toggle-sessions-sidebar	[]	unbound
+sessions 3 best --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+shortcuts	pattern	terminal.show-shortcuts	[]	ok
+shortcuts "1 gmail fix the bug"	literal	terminal.show-shortcuts	[]	unbound
+shortcuts "1 gmail fix the bug" --tenant	literal	terminal.show-shortcuts	[]	unbound
+shortcuts "3 best"	literal	terminal.show-shortcuts	[]	unbound
+shortcuts "3 best" --tenant	literal	terminal.show-shortcuts	[]	unbound
+shortcuts --tenant	literal	terminal.show-shortcuts	[]	unbound
+shortcuts 1 gmail fix the bug	literal	terminal.show-shortcuts	[]	unbound
+shortcuts 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound
+shortcuts 3 best	literal	terminal.show-shortcuts	[]	unbound
+shortcuts 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound
+single layout	pattern	terminal.layout	[["preset","single"]]	ok
+single layout --tenant	none	-	null	none
+six-pack layout	pattern	terminal.layout	[["preset","six-pack"]]	ok
+six-pack layout --tenant	none	-	null	none
+sixpack layout	pattern	terminal.layout	[["preset","sixpack"]]	ok
+sixpack layout --tenant	none	-	null	none
+sort	pattern	terminal.sort-zones	[]	ok
+sort "1 gmail fix the bug"	literal	terminal.sort-zones	[]	unbound
+sort "1 gmail fix the bug" --tenant	literal	terminal.sort-zones	[]	unbound
+sort "3 best"	literal	terminal.sort-zones	[]	unbound
+sort "3 best" --tenant	literal	terminal.sort-zones	[]	unbound
+sort --tenant	literal	terminal.sort-zones	[]	unbound
+sort 1 gmail fix the bug	literal	terminal.sort-zones	[]	unbound
+sort 1 gmail fix the bug --tenant	literal	terminal.sort-zones	[]	unbound
+sort 3 best	literal	terminal.sort-zones	[]	unbound
+sort 3 best --tenant	literal	terminal.sort-zones	[]	unbound
+sort zones	pattern	terminal.sort-zones	[]	ok
+sort zones "1 gmail fix the bug"	literal	terminal.sort-zones	[]	unbound
+sort zones "1 gmail fix the bug" --tenant	literal	terminal.sort-zones	[]	unbound
+sort zones "3 best"	literal	terminal.sort-zones	[]	unbound
+sort zones "3 best" --tenant	literal	terminal.sort-zones	[]	unbound
+sort zones --tenant	literal	terminal.sort-zones	[]	unbound
+sort zones 1 gmail fix the bug	literal	terminal.sort-zones	[]	unbound
+sort zones 1 gmail fix the bug --tenant	literal	terminal.sort-zones	[]	unbound
+sort zones 3 best	literal	terminal.sort-zones	[]	unbound
+sort zones 3 best --tenant	literal	terminal.sort-zones	[]	unbound
+sort-zones	literal	terminal.sort-zones	[]	ok
+sort-zones "1 gmail fix the bug"	literal	terminal.sort-zones	[]	unbound
+sort-zones "1 gmail fix the bug" --tenant	literal	terminal.sort-zones	[]	unbound
+sort-zones "3 best"	literal	terminal.sort-zones	[]	unbound
+sort-zones "3 best" --tenant	literal	terminal.sort-zones	[]	unbound
+sort-zones --tenant	literal	terminal.sort-zones	[]	unbound
+sort-zones 1 gmail fix the bug	literal	terminal.sort-zones	[]	unbound
+sort-zones 1 gmail fix the bug --tenant	literal	terminal.sort-zones	[]	unbound
+sort-zones 3 best	literal	terminal.sort-zones	[]	unbound
+sort-zones 3 best --tenant	literal	terminal.sort-zones	[]	unbound
+sound	pattern	terminal.toggle-sound	[]	ok
+sound "1 gmail fix the bug"	literal	terminal.toggle-sound	[]	unbound
+sound "1 gmail fix the bug" --tenant	literal	terminal.toggle-sound	[]	unbound
+sound "3 best"	literal	terminal.toggle-sound	[]	unbound
+sound "3 best" --tenant	literal	terminal.toggle-sound	[]	unbound
+sound --tenant	literal	terminal.toggle-sound	[]	unbound
+sound 1 gmail fix the bug	literal	terminal.toggle-sound	[]	unbound
+sound 1 gmail fix the bug --tenant	literal	terminal.toggle-sound	[]	unbound
+sound 3 best	literal	terminal.toggle-sound	[]	unbound
+sound 3 best --tenant	literal	terminal.toggle-sound	[]	unbound
+spawn	literal	terminal.spawn	[]	ok
+spawn "1 gmail fix the bug"	literal	terminal.spawn	[["count","1 gmail fix the bug"]]	error:invalid-count
+spawn "1 gmail fix the bug" --tenant	literal	terminal.spawn	[["count","1 gmail fix the bug --tenant"]]	error:invalid-count
+spawn "3 best"	literal	terminal.spawn	[["count","3 best"]]	error:invalid-count
+spawn "3 best" --tenant	literal	terminal.spawn	[["count","3 best --tenant"]]	error:invalid-count
+spawn --tenant	literal	terminal.spawn	[["count","--tenant"]]	error:invalid-count
+spawn 1 gmail fix the bug	literal	terminal.spawn	[["count","1 gmail fix the bug"]]	error:invalid-count
+spawn 1 gmail fix the bug --tenant	literal	terminal.spawn	[["count","1 gmail fix the bug --tenant"]]	error:invalid-count
+spawn 3	pattern	terminal.spawn	[["count",3]]	ok
+spawn 3 -	pattern	terminal.spawn-ai	[["account","-"],["count",3]]	error:no-account
+spawn 3 - --tenant	literal	terminal.spawn	[["count","3 - --tenant"]]	error:invalid-count
+spawn 3 --tenant	literal	terminal.spawn	[["count","3 --tenant"]]	error:invalid-count
+spawn 3 best	pattern	terminal.spawn-ai	[["account","best"],["count",3]]	ok
+spawn 3 best --tenant	literal	terminal.spawn	[["count","3 best --tenant"]]	error:invalid-count
+spawn 3 claude	pattern	terminal.spawn-ai	[["account","claude"],["count",3]]	error:no-account
+spawn 3 claude --tenant	literal	terminal.spawn	[["count","3 claude --tenant"]]	error:invalid-count
+spawn 3 gmail	pattern	terminal.spawn-ai	[["account","gmail"],["count",3]]	ok
+spawn 3 gmail --tenant	literal	terminal.spawn	[["count","3 gmail --tenant"]]	error:invalid-count
+spawn 3 plain	pattern	terminal.spawn	[["count",3]]	ok
+spawn 3 plain --tenant	literal	terminal.spawn	[["count","3 plain --tenant"]]	error:invalid-count
+spawn-ai	literal	terminal.spawn-ai	[]	ok
+spawn-ai "1 gmail fix the bug"	literal	terminal.spawn-ai	[["count","1 gmail fix the bug"]]	error:invalid-count
+spawn-ai "1 gmail fix the bug" --tenant	literal	terminal.spawn-ai	[["count","1 gmail fix the bug"],["tenant",""]]	error:invalid-count
+spawn-ai "3 best"	literal	terminal.spawn-ai	[["count","3 best"]]	error:invalid-count
+spawn-ai "3 best" --tenant	literal	terminal.spawn-ai	[["count","3 best"],["tenant",""]]	error:invalid-count
+spawn-ai --tenant	literal	terminal.spawn-ai	[["tenant",""]]	error:invalid-args
+spawn-ai 1 gmail fix the bug	pattern	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",1]]	ok
+spawn-ai 1 gmail fix the bug --tenant	literal	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",1],["tenant",""]]	error:invalid-args
+spawn-ai 3 -	pattern	terminal.spawn-ai	[["account","-"],["count",3]]	error:no-account
+spawn-ai 3 - --tenant	literal	terminal.spawn-ai	[["account","-"],["count",3],["tenant",""]]	error:no-account
+spawn-ai 3 - fix the bug	pattern	terminal.spawn-ai	[["account","-"],["context","fix the bug"],["count",3]]	error:no-account
+spawn-ai 3 - fix the bug --tenant	literal	terminal.spawn-ai	[["account","-"],["context","fix the bug"],["count",3],["tenant",""]]	error:no-account
+spawn-ai 3 best	pattern	terminal.spawn-ai	[["account","best"],["count",3]]	ok
+spawn-ai 3 best --tenant	literal	terminal.spawn-ai	[["account","best"],["count",3],["tenant",""]]	error:invalid-args
+spawn-ai 3 best fix the bug	pattern	terminal.spawn-ai	[["account","best"],["context","fix the bug"],["count",3]]	ok
+spawn-ai 3 best fix the bug --tenant	literal	terminal.spawn-ai	[["account","best"],["context","fix the bug"],["count",3],["tenant",""]]	error:invalid-args
+spawn-ai 3 gmail	pattern	terminal.spawn-ai	[["account","gmail"],["count",3]]	ok
+spawn-ai 3 gmail --tenant	literal	terminal.spawn-ai	[["account","gmail"],["count",3],["tenant",""]]	error:invalid-args
+spawn-ai 3 gmail fix the bug	pattern	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",3]]	ok
+spawn-ai 3 gmail fix the bug --tenant	literal	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",3],["tenant",""]]	error:invalid-args
+spawn-best	literal	terminal.spawn-ai	[]	ok
+spawn-best "1 gmail fix the bug"	literal	terminal.spawn-ai	[["count","1 gmail fix the bug"]]	error:invalid-count
+spawn-best "1 gmail fix the bug" --tenant	literal	terminal.spawn-ai	[["count","1 gmail fix the bug"],["tenant",""]]	error:invalid-count
+spawn-best "3 best"	literal	terminal.spawn-ai	[["count","3 best"]]	error:invalid-count
+spawn-best "3 best" --tenant	literal	terminal.spawn-ai	[["count","3 best"],["tenant",""]]	error:invalid-count
+spawn-best --tenant	literal	terminal.spawn-ai	[["tenant",""]]	error:invalid-args
+spawn-best 1 gmail fix the bug	literal	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",1]]	ok
+spawn-best 1 gmail fix the bug --tenant	literal	terminal.spawn-ai	[["account","gmail"],["context","fix the bug"],["count",1],["tenant",""]]	error:invalid-args
+spawn-best 3 best	literal	terminal.spawn-ai	[["account","best"],["count",3]]	ok
+spawn-best 3 best --tenant	literal	terminal.spawn-ai	[["account","best"],["count",3],["tenant",""]]	error:invalid-args
+spawn-with	literal	terminal.spawn-with	[]	error:invalid-command
+spawn-with "1 gmail fix the bug"	literal	terminal.spawn-with	[["count","1 gmail fix the bug"]]	error:invalid-count
+spawn-with "1 gmail fix the bug" --tenant	literal	terminal.spawn-with	[["command","--tenant"],["count","1 gmail fix the bug"]]	error:invalid-count
+spawn-with "3 best"	literal	terminal.spawn-with	[["count","3 best"]]	error:invalid-count
+spawn-with "3 best" --tenant	literal	terminal.spawn-with	[["command","--tenant"],["count","3 best"]]	error:invalid-count
+spawn-with --tenant	literal	terminal.spawn-with	[["count","--tenant"]]	error:invalid-count
+spawn-with 1 gmail fix the bug	literal	terminal.spawn-with	[["command","gmail fix the bug"],["count",1]]	ok
+spawn-with 1 gmail fix the bug --tenant	literal	terminal.spawn-with	[["command","gmail fix the bug --tenant"],["count",1]]	ok
+spawn-with 3 best	literal	terminal.spawn-with	[["command","best"],["count",3]]	ok
+spawn-with 3 best --tenant	literal	terminal.spawn-with	[["command","best --tenant"],["count",3]]	ok
+split layout	pattern	terminal.layout	[["preset","split"]]	ok
+split layout --tenant	none	-	null	none
+stats	pattern	terminal.metrics	[]	ok
+stats "1 gmail fix the bug"	literal	terminal.metrics	[]	unbound
+stats "1 gmail fix the bug" --tenant	literal	terminal.metrics	[]	unbound
+stats "3 best"	literal	terminal.metrics	[]	unbound
+stats "3 best" --tenant	literal	terminal.metrics	[]	unbound
+stats --tenant	literal	terminal.metrics	[]	unbound
+stats 1 gmail fix the bug	literal	terminal.metrics	[]	unbound
+stats 1 gmail fix the bug --tenant	literal	terminal.metrics	[]	unbound
+stats 3 best	literal	terminal.metrics	[]	unbound
+stats 3 best --tenant	literal	terminal.metrics	[]	unbound
+swap	literal	terminal.swap	[]	error:invalid-args
+swap "1 gmail fix the bug"	literal	terminal.swap	[["a","1 gmail fix the bug"]]	error:invalid-zone
+swap "1 gmail fix the bug" --tenant	literal	terminal.swap	[["a","1 gmail fix the bug"],["b","--tenant"]]	error:invalid-zone
+swap "3 best"	literal	terminal.swap	[["a","3 best"]]	error:invalid-zone
+swap "3 best" --tenant	literal	terminal.swap	[["a","3 best"],["b","--tenant"]]	error:invalid-zone
+swap --tenant	literal	terminal.swap	[["a","--tenant"]]	error:invalid-zone
+swap 1 gmail fix the bug	literal	terminal.swap	[["a",1],["b","gmail fix the bug"]]	error:invalid-zone
+swap 1 gmail fix the bug --tenant	literal	terminal.swap	[["a",1],["b","gmail fix the bug --tenant"]]	error:invalid-zone
+swap 3 3	pattern	terminal.swap	[["a",3],["b",3]]	ok
+swap 3 3 --tenant	literal	terminal.swap	[["a",3],["b","3 --tenant"]]	error:invalid-zone
+swap 3 best	literal	terminal.swap	[["a",3],["b","best"]]	error:invalid-zone
+swap 3 best --tenant	literal	terminal.swap	[["a",3],["b","best --tenant"]]	error:invalid-zone
+tag	literal	terminal.tag-toggle	[]	error:invalid-args
+tag "1 gmail fix the bug"	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+tag "1 gmail fix the bug" --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+tag "3 best"	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+tag "3 best" --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+tag --tenant	pattern	terminal.tag-toggle	[["tag","--tenant"]]	error:unknown-tag
+tag 1 gmail fix the bug	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+tag 1 gmail fix the bug --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+tag 3 best	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+tag 3 best --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+tag gmail	pattern	terminal.tag-toggle	[["tag","gmail"]]	error:unknown-tag
+tag gmail --tenant	literal	terminal.tag-toggle	[["tag","gmail --tenant"]]	error:unknown-tag
+tag-clear	pattern	terminal.tag-clear	[]	ok
+tag-clear "1 gmail fix the bug"	literal	terminal.tag-clear	[]	unbound
+tag-clear "1 gmail fix the bug" --tenant	literal	terminal.tag-clear	[]	unbound
+tag-clear "3 best"	literal	terminal.tag-clear	[]	unbound
+tag-clear "3 best" --tenant	literal	terminal.tag-clear	[]	unbound
+tag-clear --tenant	literal	terminal.tag-clear	[]	unbound
+tag-clear 1 gmail fix the bug	literal	terminal.tag-clear	[]	unbound
+tag-clear 1 gmail fix the bug --tenant	literal	terminal.tag-clear	[]	unbound
+tag-clear 3 best	literal	terminal.tag-clear	[]	unbound
+tag-clear 3 best --tenant	literal	terminal.tag-clear	[]	unbound
+tag-toggle	literal	terminal.tag-toggle	[]	error:invalid-args
+tag-toggle "1 gmail fix the bug"	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+tag-toggle "1 gmail fix the bug" --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+tag-toggle "3 best"	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+tag-toggle "3 best" --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+tag-toggle --tenant	literal	terminal.tag-toggle	[["tag","--tenant"]]	error:unknown-tag
+tag-toggle 1 gmail fix the bug	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug"]]	error:unknown-tag
+tag-toggle 1 gmail fix the bug --tenant	literal	terminal.tag-toggle	[["tag","1 gmail fix the bug --tenant"]]	error:unknown-tag
+tag-toggle 3 best	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-tag
+tag-toggle 3 best --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag
+tags-clear	pattern	terminal.tag-clear	[]	ok
+tags-clear "1 gmail fix the bug"	literal	terminal.tag-clear	[]	unbound
+tags-clear "1 gmail fix the bug" --tenant	literal	terminal.tag-clear	[]	unbound
+tags-clear "3 best"	literal	terminal.tag-clear	[]	unbound
+tags-clear "3 best" --tenant	literal	terminal.tag-clear	[]	unbound
+tags-clear --tenant	literal	terminal.tag-clear	[]	unbound
+tags-clear 1 gmail fix the bug	literal	terminal.tag-clear	[]	unbound
+tags-clear 1 gmail fix the bug --tenant	literal	terminal.tag-clear	[]	unbound
+tags-clear 3 best	literal	terminal.tag-clear	[]	unbound
+tags-clear 3 best --tenant	literal	terminal.tag-clear	[]	unbound
+toggle auto focus	pattern	terminal.toggle-auto-focus	[]	ok
+toggle auto focus "1 gmail fix the bug"	none	-	null	none
+toggle auto focus "1 gmail fix the bug" --tenant	none	-	null	none
+toggle auto focus "3 best"	none	-	null	none
+toggle auto focus "3 best" --tenant	none	-	null	none
+toggle auto focus --tenant	none	-	null	none
+toggle auto focus 1 gmail fix the bug	none	-	null	none
+toggle auto focus 1 gmail fix the bug --tenant	none	-	null	none
+toggle auto focus 3 best	none	-	null	none
+toggle auto focus 3 best --tenant	none	-	null	none
+toggle auto restart	pattern	terminal.toggle-auto-restart	[]	ok
+toggle auto restart "1 gmail fix the bug"	none	-	null	none
+toggle auto restart "1 gmail fix the bug" --tenant	none	-	null	none
+toggle auto restart "3 best"	none	-	null	none
+toggle auto restart "3 best" --tenant	none	-	null	none
+toggle auto restart --tenant	none	-	null	none
+toggle auto restart 1 gmail fix the bug	none	-	null	none
+toggle auto restart 1 gmail fix the bug --tenant	none	-	null	none
+toggle auto restart 3 best	none	-	null	none
+toggle auto restart 3 best --tenant	none	-	null	none
+toggle auto-focus	pattern	terminal.toggle-auto-focus	[]	ok
+toggle auto-focus "1 gmail fix the bug"	none	-	null	none
+toggle auto-focus "1 gmail fix the bug" --tenant	none	-	null	none
+toggle auto-focus "3 best"	none	-	null	none
+toggle auto-focus "3 best" --tenant	none	-	null	none
+toggle auto-focus --tenant	none	-	null	none
+toggle auto-focus 1 gmail fix the bug	none	-	null	none
+toggle auto-focus 1 gmail fix the bug --tenant	none	-	null	none
+toggle auto-focus 3 best	none	-	null	none
+toggle auto-focus 3 best --tenant	none	-	null	none
+toggle auto-restart	pattern	terminal.toggle-auto-restart	[]	ok
+toggle auto-restart "1 gmail fix the bug"	none	-	null	none
+toggle auto-restart "1 gmail fix the bug" --tenant	none	-	null	none
+toggle auto-restart "3 best"	none	-	null	none
+toggle auto-restart "3 best" --tenant	none	-	null	none
+toggle auto-restart --tenant	none	-	null	none
+toggle auto-restart 1 gmail fix the bug	none	-	null	none
+toggle auto-restart 1 gmail fix the bug --tenant	none	-	null	none
+toggle auto-restart 3 best	none	-	null	none
+toggle auto-restart 3 best --tenant	none	-	null	none
+toggle findings	pattern	terminal.toggle-findings	[]	ok
+toggle findings "1 gmail fix the bug"	none	-	null	none
+toggle findings "1 gmail fix the bug" --tenant	none	-	null	none
+toggle findings "3 best"	none	-	null	none
+toggle findings "3 best" --tenant	none	-	null	none
+toggle findings --tenant	none	-	null	none
+toggle findings 1 gmail fix the bug	none	-	null	none
+toggle findings 1 gmail fix the bug --tenant	none	-	null	none
+toggle findings 3 best	none	-	null	none
+toggle findings 3 best --tenant	none	-	null	none
+toggle focus mode	pattern	terminal.toggle-focus-mode	[]	ok
+toggle focus mode "1 gmail fix the bug"	none	-	null	none
+toggle focus mode "1 gmail fix the bug" --tenant	none	-	null	none
+toggle focus mode "3 best"	none	-	null	none
+toggle focus mode "3 best" --tenant	none	-	null	none
+toggle focus mode --tenant	none	-	null	none
+toggle focus mode 1 gmail fix the bug	none	-	null	none
+toggle focus mode 1 gmail fix the bug --tenant	none	-	null	none
+toggle focus mode 3 best	none	-	null	none
+toggle focus mode 3 best --tenant	none	-	null	none
+toggle focus-mode	pattern	terminal.toggle-focus-mode	[]	ok
+toggle focus-mode "1 gmail fix the bug"	none	-	null	none
+toggle focus-mode "1 gmail fix the bug" --tenant	none	-	null	none
+toggle focus-mode "3 best"	none	-	null	none
+toggle focus-mode "3 best" --tenant	none	-	null	none
+toggle focus-mode --tenant	none	-	null	none
+toggle focus-mode 1 gmail fix the bug	none	-	null	none
+toggle focus-mode 1 gmail fix the bug --tenant	none	-	null	none
+toggle focus-mode 3 best	none	-	null	none
+toggle focus-mode 3 best --tenant	none	-	null	none
+toggle sessions	pattern	terminal.toggle-sessions-sidebar	[]	ok
+toggle sessions "1 gmail fix the bug"	none	-	null	none
+toggle sessions "1 gmail fix the bug" --tenant	none	-	null	none
+toggle sessions "3 best"	none	-	null	none
+toggle sessions "3 best" --tenant	none	-	null	none
+toggle sessions --tenant	none	-	null	none
+toggle sessions 1 gmail fix the bug	none	-	null	none
+toggle sessions 1 gmail fix the bug --tenant	none	-	null	none
+toggle sessions 3 best	none	-	null	none
+toggle sessions 3 best --tenant	none	-	null	none
+toggle sound	pattern	terminal.toggle-sound	[]	ok
+toggle sound "1 gmail fix the bug"	none	-	null	none
+toggle sound "1 gmail fix the bug" --tenant	none	-	null	none
+toggle sound "3 best"	none	-	null	none
+toggle sound "3 best" --tenant	none	-	null	none
+toggle sound --tenant	none	-	null	none
+toggle sound 1 gmail fix the bug	none	-	null	none
+toggle sound 1 gmail fix the bug --tenant	none	-	null	none
+toggle sound 3 best	none	-	null	none
+toggle sound 3 best --tenant	none	-	null	none
+toggle-auto-focus	literal	terminal.toggle-auto-focus	[]	ok
+toggle-auto-focus "1 gmail fix the bug"	literal	terminal.toggle-auto-focus	[]	unbound
+toggle-auto-focus "1 gmail fix the bug" --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+toggle-auto-focus "3 best"	literal	terminal.toggle-auto-focus	[]	unbound
+toggle-auto-focus "3 best" --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+toggle-auto-focus --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+toggle-auto-focus 1 gmail fix the bug	literal	terminal.toggle-auto-focus	[]	unbound
+toggle-auto-focus 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+toggle-auto-focus 3 best	literal	terminal.toggle-auto-focus	[]	unbound
+toggle-auto-focus 3 best --tenant	literal	terminal.toggle-auto-focus	[]	unbound
+toggle-auto-restart	literal	terminal.toggle-auto-restart	[]	ok
+toggle-auto-restart "1 gmail fix the bug"	literal	terminal.toggle-auto-restart	[]	unbound
+toggle-auto-restart "1 gmail fix the bug" --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+toggle-auto-restart "3 best"	literal	terminal.toggle-auto-restart	[]	unbound
+toggle-auto-restart "3 best" --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+toggle-auto-restart --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+toggle-auto-restart 1 gmail fix the bug	literal	terminal.toggle-auto-restart	[]	unbound
+toggle-auto-restart 1 gmail fix the bug --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+toggle-auto-restart 3 best	literal	terminal.toggle-auto-restart	[]	unbound
+toggle-auto-restart 3 best --tenant	literal	terminal.toggle-auto-restart	[]	unbound
+toggle-file-ownership	literal	terminal.toggle-file-ownership	[]	ok
+toggle-file-ownership "1 gmail fix the bug"	literal	terminal.toggle-file-ownership	[]	unbound
+toggle-file-ownership "1 gmail fix the bug" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+toggle-file-ownership "3 best"	literal	terminal.toggle-file-ownership	[]	unbound
+toggle-file-ownership "3 best" --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+toggle-file-ownership --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+toggle-file-ownership 1 gmail fix the bug	literal	terminal.toggle-file-ownership	[]	unbound
+toggle-file-ownership 1 gmail fix the bug --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+toggle-file-ownership 3 best	literal	terminal.toggle-file-ownership	[]	unbound
+toggle-file-ownership 3 best --tenant	literal	terminal.toggle-file-ownership	[]	unbound
+toggle-findings	literal	terminal.toggle-findings	[]	ok
+toggle-findings "1 gmail fix the bug"	literal	terminal.toggle-findings	[]	unbound
+toggle-findings "1 gmail fix the bug" --tenant	literal	terminal.toggle-findings	[]	unbound
+toggle-findings "3 best"	literal	terminal.toggle-findings	[]	unbound
+toggle-findings "3 best" --tenant	literal	terminal.toggle-findings	[]	unbound
+toggle-findings --tenant	literal	terminal.toggle-findings	[]	unbound
+toggle-findings 1 gmail fix the bug	literal	terminal.toggle-findings	[]	unbound
+toggle-findings 1 gmail fix the bug --tenant	literal	terminal.toggle-findings	[]	unbound
+toggle-findings 3 best	literal	terminal.toggle-findings	[]	unbound
+toggle-findings 3 best --tenant	literal	terminal.toggle-findings	[]	unbound
+toggle-focus-mode	literal	terminal.toggle-focus-mode	[]	ok
+toggle-focus-mode "1 gmail fix the bug"	literal	terminal.toggle-focus-mode	[]	unbound
+toggle-focus-mode "1 gmail fix the bug" --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+toggle-focus-mode "3 best"	literal	terminal.toggle-focus-mode	[]	unbound
+toggle-focus-mode "3 best" --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+toggle-focus-mode --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+toggle-focus-mode 1 gmail fix the bug	literal	terminal.toggle-focus-mode	[]	unbound
+toggle-focus-mode 1 gmail fix the bug --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+toggle-focus-mode 3 best	literal	terminal.toggle-focus-mode	[]	unbound
+toggle-focus-mode 3 best --tenant	literal	terminal.toggle-focus-mode	[]	unbound
+toggle-notifications	literal	terminal.toggle-desktop-notify	[]	ok
+toggle-notifications "1 gmail fix the bug"	literal	terminal.toggle-desktop-notify	[]	unbound
+toggle-notifications "1 gmail fix the bug" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+toggle-notifications "3 best"	literal	terminal.toggle-desktop-notify	[]	unbound
+toggle-notifications "3 best" --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+toggle-notifications --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+toggle-notifications 1 gmail fix the bug	literal	terminal.toggle-desktop-notify	[]	unbound
+toggle-notifications 1 gmail fix the bug --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+toggle-notifications 3 best	literal	terminal.toggle-desktop-notify	[]	unbound
+toggle-notifications 3 best --tenant	literal	terminal.toggle-desktop-notify	[]	unbound
+toggle-sessions	literal	terminal.toggle-sessions-sidebar	[]	ok
+toggle-sessions "1 gmail fix the bug"	literal	terminal.toggle-sessions-sidebar	[]	unbound
+toggle-sessions "1 gmail fix the bug" --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+toggle-sessions "3 best"	literal	terminal.toggle-sessions-sidebar	[]	unbound
+toggle-sessions "3 best" --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+toggle-sessions --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+toggle-sessions 1 gmail fix the bug	literal	terminal.toggle-sessions-sidebar	[]	unbound
+toggle-sessions 1 gmail fix the bug --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+toggle-sessions 3 best	literal	terminal.toggle-sessions-sidebar	[]	unbound
+toggle-sessions 3 best --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound
+toggle-sound	literal	terminal.toggle-sound	[]	ok
+toggle-sound "1 gmail fix the bug"	literal	terminal.toggle-sound	[]	unbound
+toggle-sound "1 gmail fix the bug" --tenant	literal	terminal.toggle-sound	[]	unbound
+toggle-sound "3 best"	literal	terminal.toggle-sound	[]	unbound
+toggle-sound "3 best" --tenant	literal	terminal.toggle-sound	[]	unbound
+toggle-sound --tenant	literal	terminal.toggle-sound	[]	unbound
+toggle-sound 1 gmail fix the bug	literal	terminal.toggle-sound	[]	unbound
+toggle-sound 1 gmail fix the bug --tenant	literal	terminal.toggle-sound	[]	unbound
+toggle-sound 3 best	literal	terminal.toggle-sound	[]	unbound
+toggle-sound 3 best --tenant	literal	terminal.toggle-sound	[]	unbound
+unmute	pattern	terminal.unmute	[]	ok
+unmute "1 gmail fix the bug"	literal	terminal.unmute	[]	unbound
+unmute "1 gmail fix the bug" --tenant	literal	terminal.unmute	[]	unbound
+unmute "3 best"	literal	terminal.unmute	[]	unbound
+unmute "3 best" --tenant	literal	terminal.unmute	[]	unbound
+unmute --tenant	literal	terminal.unmute	[]	unbound
+unmute 1 gmail fix the bug	literal	terminal.unmute	[]	unbound
+unmute 1 gmail fix the bug --tenant	literal	terminal.unmute	[]	unbound
+unmute 3 best	literal	terminal.unmute	[]	unbound
+unmute 3 best --tenant	literal	terminal.unmute	[]	unbound
+verify	pattern	terminal.plan-verify	[]	error:no-plan
+verify "1 gmail fix the bug"	literal	terminal.plan-verify	[]	unbound
+verify "1 gmail fix the bug" --tenant	literal	terminal.plan-verify	[]	unbound
+verify "3 best"	literal	terminal.plan-verify	[]	unbound
+verify "3 best" --tenant	literal	terminal.plan-verify	[]	unbound
+verify --tenant	literal	terminal.plan-verify	[]	unbound
+verify 1 gmail fix the bug	literal	terminal.plan-verify	[]	unbound
+verify 1 gmail fix the bug --tenant	literal	terminal.plan-verify	[]	unbound
+verify 3 best	literal	terminal.plan-verify	[]	unbound
+verify 3 best --tenant	literal	terminal.plan-verify	[]	unbound
+yes all	pattern	terminal.approve-all	[]	ok
+yes all "1 gmail fix the bug"	none	-	null	none
+yes all "1 gmail fix the bug" --tenant	none	-	null	none
+yes all "3 best"	none	-	null	none
+yes all "3 best" --tenant	none	-	null	none
+yes all --tenant	none	-	null	none
+yes all 1 gmail fix the bug	none	-	null	none
+yes all 1 gmail fix the bug --tenant	none	-	null	none
+yes all 3 best	none	-	null	none
+yes all 3 best --tenant	none	-	null	none

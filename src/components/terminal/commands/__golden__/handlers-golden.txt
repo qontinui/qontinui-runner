@@ -1,0 +1,90 @@
+# terminal CommandBar handlers — golden characterization
+#
+# GENERATED. Regenerate with:
+#   TERMINAL_GOLDEN_UPDATE=1 npx vitest run src/components/terminal/commands/handlers.test.ts
+#
+# <actionId> TAB <arg bag> TAB <args> TAB <verdict> TAB <effects called> TAB <evidence?>
+#
+# `evidence=false` means every closure the handler called returned nothing,
+# so the verdict on that row was ASSERTED, not derived. See the module
+# docstring: characterized, not endorsed.
+terminal.analyze	canonical	[["type","architecture"]]	ok	analysis.handleAnalyze	false
+terminal.analyze	empty	[]	error:invalid-args	-	false
+terminal.approve-all	canonical	[]	ok	-	false
+terminal.approve-all	empty	[]	ok	-	false
+terminal.auto-approve	canonical	[["action","list"],["pattern","p"]]	ok	-	false
+terminal.auto-approve	empty	[]	error:invalid-args	-	false
+terminal.close	canonical	[["tabId","tab-a"],["zone",1]]	ok	session.closeTerminal	false
+terminal.close	empty	[]	ok	session.closeTerminal	false
+terminal.copy-names	canonical	[]	error:no-sessions	invoke	true
+terminal.copy-names	empty	[]	error:no-sessions	invoke	true
+terminal.doc-finder	canonical	[]	ok	ctx.openDocFinder	false
+terminal.doc-finder	empty	[]	ok	ctx.openDocFinder	false
+terminal.export-all	canonical	[]	ok	ctx.exportAll	false
+terminal.export-all	empty	[]	ok	ctx.exportAll	false
+terminal.focus	canonical	[["target","next"]]	ok	zone.focusNextZone	false
+terminal.focus	empty	[]	error:invalid-args	-	false
+terminal.generate-workflow	canonical	[]	error:no-session	workflow.generate	true
+terminal.generate-workflow	empty	[]	error:no-session	workflow.generate	true
+terminal.history	canonical	[]	ok	ctx.showCard	false
+terminal.history	empty	[]	ok	ctx.showCard	false
+terminal.layout	canonical	[["preset","quad"]]	ok	zone.setLayoutId	false
+terminal.layout	empty	[]	error:invalid-preset	-	false
+terminal.maximize	canonical	[["zone",1]]	ok	zone.toggleMaximize	false
+terminal.maximize	empty	[]	ok	zone.toggleMaximize	false
+terminal.metrics	canonical	[]	ok	ctx.showCard	false
+terminal.metrics	empty	[]	ok	ctx.showCard	false
+terminal.mute	canonical	[]	ok	-	false
+terminal.mute	empty	[]	ok	-	false
+terminal.orchestrate	canonical	[["goal","ship it"]]	error:no-run-id	invoke	true
+terminal.orchestrate	empty	[]	error:invalid-args	-	false
+terminal.plan-implement	canonical	[]	error:no-plan	-	false
+terminal.plan-implement	empty	[]	error:no-plan	-	false
+terminal.plan-refresh	canonical	[]	ok	workflow.loadPlanContent	true
+terminal.plan-refresh	empty	[]	ok	workflow.loadPlanContent	true
+terminal.plan-verify	canonical	[]	error:no-plan	-	false
+terminal.plan-verify	empty	[]	error:no-plan	-	false
+terminal.prompt	canonical	[]	ok	ctx.openPromptModal	false
+terminal.prompt	empty	[]	ok	ctx.openPromptModal	false
+terminal.restart	canonical	[["zone",1]]	error:not-restartable	-	false
+terminal.restart	empty	[]	error:not-restartable	-	false
+terminal.resume	canonical	[]	ok	workflow.setShowSidebar	false
+terminal.resume	empty	[]	ok	workflow.setShowSidebar	false
+terminal.save-workflow	canonical	[]	error:no-workflow	-	false
+terminal.save-workflow	empty	[]	error:no-workflow	-	false
+terminal.select-by-state	canonical	[["state","idle"]]	ok	ui.dispatch	false
+terminal.select-by-state	empty	[]	error:invalid-args	-	false
+terminal.show-shortcuts	canonical	[]	ok	ui.dispatch	false
+terminal.show-shortcuts	empty	[]	ok	ui.dispatch	false
+terminal.sort-zones	canonical	[]	ok	ctx.sortZones	false
+terminal.sort-zones	empty	[]	ok	ctx.sortZones	false
+terminal.spawn	canonical	[["count",1]]	ok	ctx.spawnPlain	true
+terminal.spawn	empty	[]	ok	ctx.spawnPlain	true
+terminal.spawn-ai	canonical	[["account","gmail"],["context","hello"],["count",1]]	ok	ctx.spawnAi	true
+terminal.spawn-ai	empty	[]	ok	ctx.spawnAi	true
+terminal.spawn-with	canonical	[["command","ls"],["count",1]]	ok	ctx.spawnPlain	true
+terminal.spawn-with	empty	[]	error:invalid-command	-	false
+terminal.swap	canonical	[["a",1],["b",2]]	ok	zone.assignTabToZone,zone.assignTabToZone	false
+terminal.swap	empty	[]	error:invalid-args	-	false
+terminal.tag-clear	canonical	[]	ok	tags.setActiveTagFilters	false
+terminal.tag-clear	empty	[]	ok	tags.setActiveTagFilters	false
+terminal.tag-toggle	canonical	[["tag","alpha"]]	ok	tags.setActiveTagFilters	false
+terminal.tag-toggle	empty	[]	error:invalid-args	-	false
+terminal.toggle-auto-focus	canonical	[]	ok	effects.toggleAutoFocus	false
+terminal.toggle-auto-focus	empty	[]	ok	effects.toggleAutoFocus	false
+terminal.toggle-auto-restart	canonical	[]	ok	effects.setAutoRestart	false
+terminal.toggle-auto-restart	empty	[]	ok	effects.setAutoRestart	false
+terminal.toggle-desktop-notify	canonical	[]	ok	effects.setDesktopNotify	false
+terminal.toggle-desktop-notify	empty	[]	ok	effects.setDesktopNotify	false
+terminal.toggle-file-ownership	canonical	[]	ok	workflow.setRightPanelMode	false
+terminal.toggle-file-ownership	empty	[]	ok	workflow.setRightPanelMode	false
+terminal.toggle-findings	canonical	[]	ok	findings.toggle	false
+terminal.toggle-findings	empty	[]	ok	findings.toggle	false
+terminal.toggle-focus-mode	canonical	[]	ok	ui.toggleFocusMode	false
+terminal.toggle-focus-mode	empty	[]	ok	ui.toggleFocusMode	false
+terminal.toggle-sessions-sidebar	canonical	[]	ok	workflow.setShowSidebar	false
+terminal.toggle-sessions-sidebar	empty	[]	ok	workflow.setShowSidebar	false
+terminal.toggle-sound	canonical	[]	ok	effects.toggleSound	false
+terminal.toggle-sound	empty	[]	ok	effects.toggleSound	false
+terminal.unmute	canonical	[]	ok	effects.toggleSound	false
+terminal.unmute	empty	[]	ok	effects.toggleSound	false
