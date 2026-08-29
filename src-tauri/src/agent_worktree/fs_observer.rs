@@ -386,7 +386,11 @@ fn repo_basename(repo_slug: &str) -> Option<String> {
 /// POST a pre-built [`FsObservationsRequest`] to coord. Best-effort: any
 /// transport error or non-2xx logs at `debug`/`warn` and returns `Ok(())` —
 /// the producer NEVER surfaces a coord failure to the caller.
-async fn post_observations(coord_http_base: &str, body: &FsObservationsRequest) {
+async fn post_observations(
+    coord_http_base: &str,
+    body: &FsObservationsRequest,
+    tenant: crate::auth::TenantScope,
+) {
     if body.observations.is_empty() {
         return;
     }
@@ -412,8 +416,12 @@ async fn post_observations(coord_http_base: &str, body: &FsObservationsRequest) 
     // `qontinui_runner_lib::auth` — this module compiles into the bin target,
     // and the lib path would bump the lib crate's separate counter statics,
     // invisible to the bin's `DATA_PLANE_TOTAL/AUTHED` coverage readout.
-    // coord-tenant-scope(session-owed): the sole producer is IsolatedEditContext::drop, which has self.agent_id and the session's worktree set -- yet passes None into the tenant_id slot with the in-source note that it is "not resolved in this context". Phase 5.
-    let req = crate::auth::attach_device_auth(client.post(&url));
+    // Phase 5 — `body.tenant_id` above is the route's tenancy and the bearer is
+    // matched to it. The producer used to pass a literal `None` into that slot
+    // with an in-source note that it was "not resolved in this context"; it now
+    // resolves from the context's own session id, and states `Unresolved` when
+    // that genuinely cannot answer instead of silently defaulting.
+    let req = crate::auth::attach_device_auth_for(client.post(&url), tenant);
     match req.json(body).send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -450,6 +458,13 @@ async fn post_observations(coord_http_base: &str, body: &FsObservationsRequest) 
 ///
 /// `agent_id` / `correlation_id` are resolved from the session/worktree
 /// context by the caller; `None` is fine (coord's fields are all optional).
+///
+/// `tenant` is the OWNING session's scope (Phase 5, plan
+/// `2026-08-29-runner-work-scoped-writes-default-tenant-credential` §D1).
+/// `FsObservationsRequest.tenant_id` is the route's sole tenancy carrier —
+/// coord's handler takes no auth extractor — so it is populated from the scope,
+/// and the bearer is matched to it so the two can never disagree.
+#[allow(clippy::too_many_arguments)]
 pub async fn push_worktree_observations(
     coord_http_base: &str,
     worktree_path: &Path,
@@ -457,7 +472,7 @@ pub async fn push_worktree_observations(
     repo_slug: &str,
     agent_id: Option<String>,
     correlation_id: Option<uuid::Uuid>,
-    tenant_id: Option<uuid::Uuid>,
+    tenant: crate::auth::TenantScope,
 ) {
     if !fs_observer_enabled() {
         return;
@@ -488,11 +503,11 @@ pub async fn push_worktree_observations(
         agent_id,
         correlation_id,
         repo: repo_basename(repo_slug),
-        tenant_id,
+        tenant_id: tenant.declared_tenant(),
         observations,
     };
 
-    post_observations(coord_http_base, &body).await;
+    post_observations(coord_http_base, &body, tenant).await;
 }
 
 /// Convenience used by the `Drop` hook: spawn the best-effort push on the
@@ -506,7 +521,7 @@ pub fn spawn_push_worktree_observations(
     repo_slug: String,
     agent_id: Option<String>,
     correlation_id: Option<uuid::Uuid>,
-    tenant_id: Option<uuid::Uuid>,
+    tenant: crate::auth::TenantScope,
 ) {
     // Only spawn if there's a runtime; `Handle::try_current` avoids a panic in
     // non-async drop contexts (e.g. unit tests dropping the context).
@@ -522,7 +537,7 @@ pub fn spawn_push_worktree_observations(
             &repo_slug,
             agent_id,
             correlation_id,
-            tenant_id,
+            tenant,
         )
         .await;
     });

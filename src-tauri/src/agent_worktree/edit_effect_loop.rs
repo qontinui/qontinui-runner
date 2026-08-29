@@ -147,6 +147,14 @@ pub struct VerifyRequest {
     pub tests_predicted: Vec<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub predicted_post_blob_shas: BTreeMap<String, String>,
+    /// Phase 5 (plan `2026-08-29-runner-work-scoped-writes-default-tenant-credential`
+    /// §D1): coord's `VerifyRequest.tenant_id` (`edit_effects.rs:1638`) is the
+    /// route's SOLE tenancy carrier — `post_verify` takes no auth extractor, so
+    /// the bearer decides nothing here. This field existed coord-side and the
+    /// runner never set it. Omitted when the owning session's tenant is
+    /// unknown, so coord resolves rather than being handed a guess.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<uuid::Uuid>,
 }
 
 /// Derive a bare repo basename from a coord repo slug. Coord stores `repo` as
@@ -232,7 +240,7 @@ async fn post_predict_and_check(
             return None;
         }
     };
-    // coord-tenant-scope(session-owed): driven from IsolatedEditContext acquire/drop, so a session's worktree set is the context -- but coord's PredictRequest has no tenant field and no auth extractor, so this route carries no tenant dimension. Phase 5.
+    // coord-tenant-scope(session-noop): driven from IsolatedEditContext acquire/drop, so a session's worktree set IS the context -- but coord's PredictRequest has no tenant field and post_predict_and_check takes no auth extractor, so the route persists no tenant and reads no bearer. Nothing to thread. Terminal.
     match crate::auth::attach_device_auth(client.post(&url).json(body))
         .send()
         .await
@@ -276,7 +284,11 @@ async fn post_predict_and_check(
 
 /// POST the pre-built verify body to coord and log the composed outcome. Best-
 /// effort: any transport error or non-2xx logs and returns.
-async fn post_verify(coord_http_base: &str, body: &VerifyRequest) {
+async fn post_verify(
+    coord_http_base: &str,
+    body: &VerifyRequest,
+    tenant: crate::auth::TenantScope,
+) {
     let url = format!(
         "{}/coord/edits/verify",
         coord_http_base.trim_end_matches('/')
@@ -291,8 +303,12 @@ async fn post_verify(coord_http_base: &str, body: &VerifyRequest) {
             return;
         }
     };
-    // coord-tenant-scope(session-owed): same session context; coord's VerifyRequest.tenant_id exists and is the sole carrier (no auth extractor), but this module never sets it. Phase 5.
-    match crate::auth::attach_device_auth(client.post(&url).json(body))
+    // Phase 5 — the body above declares the tenant (the route's sole carrier);
+    // the bearer is matched to it so the two never disagree, and so the eventual
+    // arrival of an auth extractor on this route does not silently re-open the
+    // defect. `Unresolved` degrades on a multi-bound device rather than
+    // presenting the default binding's credential beside a tenant-less body.
+    match crate::auth::attach_device_auth_for(client.post(&url).json(body), tenant)
         .send()
         .await
     {
@@ -367,6 +383,7 @@ fn build_verify_request(
     head_sha: Option<String>,
     correlation_id: uuid::Uuid,
     stash: &StashedPrediction,
+    tenant: crate::auth::TenantScope,
 ) -> VerifyRequest {
     let paths: Vec<String> = declared_overlap_paths
         .iter()
@@ -380,6 +397,7 @@ fn build_verify_request(
         head_sha,
         tests_predicted: stash.affected_tests.clone(),
         predicted_post_blob_shas: stash.predicted_post_blob_shas.clone(),
+        tenant_id: tenant.declared_tenant(),
     }
 }
 
@@ -434,6 +452,7 @@ pub fn spawn_predict(
 /// Called from [`super::isolated_edit::IsolatedEditContext`]'s `Drop`, after the
 /// Ξ_FS observations push, under the SAME `correlation_id` so the prediction and
 /// its verification tie together in coord.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_verify(
     coord_http_base: String,
     worktree_path: PathBuf,
@@ -441,6 +460,7 @@ pub fn spawn_verify(
     declared_overlap_paths: Vec<String>,
     correlation_id: uuid::Uuid,
     stash: PredictionStash,
+    tenant: crate::auth::TenantScope,
 ) {
     if !edit_effect_loop_enabled() {
         return;
@@ -462,8 +482,9 @@ pub fn spawn_verify(
             head_sha,
             correlation_id,
             &stashed,
+            tenant,
         );
-        post_verify(&coord_http_base, &body).await;
+        post_verify(&coord_http_base, &body, tenant).await;
     });
 }
 
@@ -562,6 +583,7 @@ mod tests {
             Some("newhead".to_string()),
             cid,
             &stash,
+            crate::auth::TenantScope::Owned(uuid::Uuid::from_u128(9)),
         );
         let v = serde_json::to_value(&req).expect("serialize");
         assert_eq!(v["repo"], "qontinui-runner");
@@ -569,6 +591,8 @@ mod tests {
         assert_eq!(v["paths"].as_array().unwrap().len(), 1);
         assert_eq!(v["tests_predicted"].as_array().unwrap().len(), 2);
         assert_eq!(v["predicted_post_blob_shas"]["src/a.rs"], "deadbeef");
+        // Phase 5: the owning tenant reaches the route's sole tenancy carrier.
+        assert_eq!(v["tenant_id"], uuid::Uuid::from_u128(9).to_string());
     }
 
     #[test]
@@ -581,12 +605,16 @@ mod tests {
             None,
             uuid::Uuid::nil(),
             &StashedPrediction::default(),
+            crate::auth::TenantScope::Unresolved,
         );
         let v = serde_json::to_value(&req).expect("serialize");
         assert!(v.get("tests_predicted").is_none());
         assert!(v.get("predicted_post_blob_shas").is_none());
         assert!(v.get("head_sha").is_none());
         assert!(v.get("paths").is_some());
+        // An UNRESOLVED tenant declares nothing rather than guessing — coord's
+        // own resolution then decides, and counts it.
+        assert!(v.get("tenant_id").is_none());
     }
 
     // ---- response parsing -------------------------------------------------

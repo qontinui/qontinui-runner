@@ -324,9 +324,14 @@ fn register_blocking(req: &HandleRegisterRequest) -> Option<String> {
     // tokio runtime, from the same default slot this used to read by hand. The
     // gain is that the call finally reaches the coverage counters.
     //
-    // `None`: coord resolves this row's tenant from the registered handle, and
-    // the hand-rolled read was always the default slot's.
-    let r = crate::auth::attach_device_auth_blocking(client.post(&url).json(req), None);
+    // `Device`: coord resolves this row's tenant from the registered handle,
+    // never from the bearer, so no slot choice can move the row — the default
+    // is correct by construction, which is exactly what that variant asserts.
+    // Not `Unresolved`: nothing here failed to resolve.
+    let r = crate::auth::attach_device_auth_blocking(
+        client.post(&url).json(req),
+        crate::auth::TenantScope::Device,
+    );
 
     match r.send() {
         Ok(resp) if resp.status().is_success() => {

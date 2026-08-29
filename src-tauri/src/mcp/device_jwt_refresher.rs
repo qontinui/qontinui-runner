@@ -451,15 +451,17 @@ async fn publish_coord_credential_status(
     // written under that tenant, so the bearer comes from that tenant's slot.
     // Safe on this surface because the tenant IS the device default
     // (`resolve_active_tenant_id`, falling back to the JWT's own claim), so the
-    // two agree by construction. Note `None` here selects the DEFAULT
-    // BINDING's JWT — it is not an anonymous send — which is why passing the
-    // resolved tenant rather than relying on `None` is what keeps this honest
-    // on a multi-bound box. A non-default slot miss then sends unauthenticated
-    // rather than presenting another tenant's JWT
-    // (`auth::select_device_bearer`).
-    match crate::auth::attach_device_auth_for(client.post(&url).json(&body), tenant_id.as_ref())
-        .send()
-        .await
+    // two agree by construction — which is exactly why the absent case is
+    // `TenantScope::Device` and not `Unresolved`: nothing failed to resolve, so
+    // the D2 degrade must not arm on a device-status publish. A non-default
+    // slot miss then sends unauthenticated rather than presenting another
+    // tenant's JWT (`auth::select_device_bearer`).
+    match crate::auth::attach_device_auth_for(
+        client.post(&url).json(&body),
+        crate::auth::TenantScope::for_device_default(tenant_id),
+    )
+    .send()
+    .await
     {
         Ok(resp) if resp.status().is_success() => {}
         Ok(resp) => {

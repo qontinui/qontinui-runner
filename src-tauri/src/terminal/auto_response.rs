@@ -835,8 +835,22 @@ mod resolve {
         };
         // Device-JWT bearer on a POST — the same write-path attach the coord
         // producers use (collapses to anonymous when unpaired).
-        // coord-tenant-scope(session-owed): coord_session_id is a parameter (:820) and rides in the body, but coord takes the tenant from FleetPrincipal -- the body's session id is not a tenancy input. Phase 5.
-        let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
+        //
+        // Phase 5: `/coord/policies/resolve` is FleetPrincipal-authed and takes
+        // its tenant from the PRINCIPAL — the body's `coord_session_id` is not a
+        // tenancy input — so the bearer is the only thing that decides which
+        // tenant's policy set answers. `coord_session_id` here IS a registry id
+        // (`TerminalSession::coord_session_id`, set from
+        // `SessionRegistry::register_external`), so the registry can answer.
+        //
+        // `crate::auth`, not `qontinui_runner_lib::auth`: this module compiles
+        // into the bin target only, so the lib path would bump the lib crate's
+        // separate counter statics — the same reason `fs_observer` records for
+        // its own attach — and the two crates' `TenantScope` are distinct types.
+        let req = crate::auth::attach_device_auth_for(
+            client.post(&url),
+            crate::session::session_tenant_scope(coord_session_id),
+        );
         let resp = match req.json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -946,8 +960,15 @@ mod report {
         };
         // Device-JWT bearer on the write path (collapses to anonymous when
         // unpaired), mirroring `mod resolve`.
-        // coord-tenant-scope(session-owed): ident.coord_session_id is in scope (:923, :936), but coord derives BOTH tenant and device from the principal, never the body. Phase 5.
-        let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
+        //
+        // Phase 5: coord's `prompt_injections` handler derives BOTH tenant and
+        // device from the FleetPrincipal, "never the body", so the bearer is
+        // the row's tenancy. `ident.coord_session_id` is the registry id the
+        // scheduler already resolved, so the registry answers here too.
+        let req = crate::auth::attach_device_auth_for(
+            client.post(&url),
+            crate::session::session_tenant_scope(ident.coord_session_id),
+        );
         match req.json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {

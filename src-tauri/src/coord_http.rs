@@ -112,21 +112,23 @@ pub fn coord_get(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
     qontinui_runner_lib::auth::attach_device_auth(client.get(url))
 }
 
-/// Tenant-selecting variant of [`coord_get`] (Phase 8b, plan
+/// Tenant-STATING variant of [`coord_get`] (Phase 8b, plan
 /// `2026-07-02-session-scoped-multi-tenant-device-binding` §D4):
-/// `Some(tenant)` attaches that binding's device-JWT slot, `None` the
-/// default binding's (identical to [`coord_get`]). Slot-miss posture is
-/// `auth::device_bearer_for`'s: a non-default tenant with no slot sends the
-/// request UNAUTHENTICATED (never another tenant's credential). Session-
-/// scoped readers pass the owning session's tenant; everything else keeps
-/// using [`coord_get`] and gets the default slot by construction.
+/// `TenantScope::Owned(t)` attaches that binding's device-JWT slot,
+/// `TenantScope::Device` the default binding's (identical to [`coord_get`]),
+/// and `TenantScope::Unresolved` degrades to unauthenticated on a multi-bound
+/// device. Slot-miss posture is `auth::device_bearer_for`'s: a non-default
+/// tenant with no slot sends the request UNAUTHENTICATED (never another
+/// tenant's credential). This is the seam census E1 names as the resolution
+/// for [`coord_get`]'s 21 cross-class callers — each states its own scope here
+/// instead of inheriting one helper's guess.
 #[allow(dead_code)] // seam: session-scoped GET readers adopt as they gain tenants
 pub fn coord_get_for(
     client: &reqwest::Client,
     url: impl reqwest::IntoUrl,
-    tenant: Option<&uuid::Uuid>,
+    scope: qontinui_runner_lib::auth::TenantScope,
 ) -> reqwest::RequestBuilder {
-    qontinui_runner_lib::auth::attach_device_auth_for(client.get(url), tenant)
+    qontinui_runner_lib::auth::attach_device_auth_for(client.get(url), scope)
 }
 
 /// True iff a non-empty device-JWT is currently stored.

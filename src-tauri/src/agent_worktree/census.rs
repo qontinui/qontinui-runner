@@ -720,9 +720,15 @@ impl ChunkPoster {
         // tenant's credential (`auth::select_device_bearer`), so the worst
         // case is the pre-existing anonymous send — never a cross-tenant
         // attribution, which would be worse than the status quo.
+        //
+        // `for_device_default`: `self.tenant_id` is `resolve_tenant_id()`, i.e.
+        // `machine.json::active_tenant_id`. A machine that names no default is
+        // `Unpinned`, not `Unresolvable` (the same split
+        // `session::tenant_pin::TenantPin` draws), so its absence must NOT arm
+        // the D2 degrade — the census is this device's own view of itself.
         match crate::auth::attach_device_auth_for(
             client.post(url).json(&body),
-            self.tenant_id.as_ref(),
+            crate::auth::TenantScope::for_device_default(self.tenant_id),
         )
         .send()
         .await

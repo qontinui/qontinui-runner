@@ -105,6 +105,8 @@ use super::restore_record_emitter::{RESTORE_RECORD_EVENT, TIER_FULL};
 use super::session_lifecycle_store::{
     SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
 };
+use crate::auth::TenantScope;
+
 use super::{SessionKind, SessionRegistry};
 
 /// Reconnect backoff floor for the push-subscriber WS loop. Matches the
@@ -213,17 +215,18 @@ struct TriggerBody {
 /// the dashboard hits coord directly through the proxy, this exists for
 /// a runner-initiated handoff and is exercised by the unit test).
 ///
-/// `tenant` is the SOURCE session's tenant. `/sessions/{id}/…` is a
+/// `tenant` is the SOURCE session's scope. `/sessions/{id}/…` is a
 /// per-session route, so it presents that session's device-JWT slot rather than
 /// the device default — the same rule the drain loop and the output pipe
-/// follow. `None` falls back to the default binding (never another tenant's
-/// slot), which is what a caller that cannot resolve the session should pass.
+/// follow. A caller that cannot resolve the session passes
+/// [`TenantScope::Unresolved`], which keeps the default binding on a
+/// single-bound device and degrades to unauthenticated on a multi-bound one.
 pub async fn trigger_handoff(
     http: &reqwest::Client,
     coord_url: &str,
     source_session_id: Uuid,
     target_device_id: Uuid,
-    tenant: Option<Uuid>,
+    tenant: TenantScope,
 ) -> Result<(), HandoffError> {
     let url = format!(
         "{}/sessions/{}/handoff",
@@ -232,7 +235,7 @@ pub async fn trigger_handoff(
     );
     let resp = crate::auth::attach_device_auth_for(
         http.post(&url).json(&TriggerBody { target_device_id }),
-        tenant.as_ref(),
+        tenant,
     )
     .send()
     .await
@@ -636,6 +639,10 @@ async fn materialize(
     let state = fetch_state(http, coord_url, handoff.source_session_id).await?;
 
     let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE)?;
+    // Captured before `intent` moves into the registry: the child inherits the
+    // SOURCE session's tenant (`build_child_intent` carries `tenant_id` across),
+    // and the claims re-acquired below belong to that same tenant.
+    let tenant = TenantScope::for_session(intent.tenant_id);
 
     // Start the child session locally with lineage back to the source.
     let child = registry
@@ -654,7 +661,7 @@ async fn materialize(
     // the session row + scrollback are the load-bearing artifacts.
     let device_id = registry.machine_id();
     for claim in &state.held_claims {
-        if let Err(e) = reacquire_claim(http, coord_url, claim, device_id).await {
+        if let Err(e) = reacquire_claim(http, coord_url, claim, device_id, tenant).await {
             tracing::warn!(
                 kind = %claim.kind,
                 resource_key = %claim.resource_key,
@@ -1054,20 +1061,33 @@ pub(super) fn build_child_intent(
 
 /// Re-acquire one claim under `device_id` via `POST /claims/acquire`.
 /// The kind string maps to coord's `ClaimKind` snake_case wire form.
+/// `tenant` is the SOURCE session's scope, carried down from the child intent
+/// `build_child_intent` just derived (Phase 5, plan
+/// `2026-08-29-runner-work-scoped-writes-default-tenant-credential` §D1). Passed
+/// rather than looked up because the caller is already holding it: the claim
+/// being re-acquired belongs to the session being moved, and coord stamps
+/// `metadata.tenant_id` on the acquire audit row from the body it is given.
+///
+/// `pub(super)` because `session::respawn` re-acquires the same claims for the
+/// same reason; it derives its `tenant` from its own `child_intent`, so the two
+/// callers agree by construction rather than by convention.
 pub(super) async fn reacquire_claim(
     http: &reqwest::Client,
     coord_url: &str,
     claim: &HeldClaim,
     device_id: Uuid,
+    tenant: TenantScope,
 ) -> Result<(), HandoffError> {
     let url = format!("{}/claims/acquire", coord_url.trim_end_matches('/'));
-    let body = json!({
+    let mut body = json!({
         "kind": claim.kind,
         "resource_key": claim.resource_key,
         "machine_id": device_id.to_string(),
     });
-    // coord-tenant-scope(session-owed): the handoff's source session is this module's whole subject, yet the body (:1024-1028) sends only {kind, resource_key, machine_id} -- not even agent_session_id, let alone tenant_id. Phase 5.
-    let resp = crate::auth::attach_device_auth(http.post(&url).json(&body))
+    if let Some(t) = tenant.declared_tenant() {
+        body["tenant_id"] = json!(t);
+    }
+    let resp = crate::auth::attach_device_auth_for(http.post(&url).json(&body), tenant)
         .send()
         .await
         .map_err(|e| HandoffError::Http(format!("POST {url}: {e}")))?;
@@ -1093,7 +1113,7 @@ async fn close_source(
         coord_url.trim_end_matches('/'),
         source_session_id
     );
-    // coord-tenant-scope(session-owed): source_session_id is the fn's parameter (:1048). E2: DELETE /sessions/{id} is mounted on coord's admin-gated operator_admin_writes router, whose own comment asserts the runner does NOT call it -- no credential slot fixes this. Phase 5.
+    // coord-tenant-scope(escalated): source_session_id is the fn's parameter, so a tenant IS resolvable here -- but census E2 found DELETE /sessions/{id} mounted on coord's admin-gated operator_admin_writes router, which needs the coord `admin` role from a forwarded Cognito operator bearer and whose own comment asserts "the runner does NOT call these". No device-JWT slot satisfies that, so the open question is whether the mount or this call is wrong, not which credential to present. Census E2.
     let resp = crate::auth::attach_device_auth(http.delete(&url))
         .send()
         .await
