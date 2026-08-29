@@ -519,7 +519,12 @@ pub(super) fn build_snapshot(root: &Path, opts: &ClassifyOptions) -> DiskSurveyS
                 error: e.clone(),
             })
             .collect(),
-        read_errors_total: enumeration.read_errors_total,
+        // Through the enumeration's own fail-closed reader, not the raw
+        // counter: a `read_errors` moved without its total would otherwise
+        // arrive here as a total SMALLER than the list beside it, and
+        // `ScanStats::read_errors_seen` would then be healing a desync it was
+        // handed rather than one it could have prevented.
+        read_errors_total: enumeration.read_errors_seen(),
         entry_errors: enumeration.entry_errors,
         depth_limited_dirs: enumeration.depth_limited_dirs,
         reparse_dirs_skipped: enumeration.reparse_dirs_skipped,
@@ -920,10 +925,30 @@ pub(super) fn assemble(
     // died at boot reads exactly like one taken on schedule to anyone who reads
     // the sentence rather than the enum. The sibling this route was modelled on
     // (`on_demand::survey`) appends the same clause to its own note.
+    // The REMEDY has to agree with what the code will actually do. `?refresh=1`
+    // routes through `spawn_rebuild`, which declines outright while a walk is
+    // already in flight — so advising it unconditionally told the operator to
+    // take an action this process would refuse, on the one surface built so a
+    // reader is never told something the machine contradicts. `refreshing` is
+    // already in this payload (`census_refreshing`) and is the same fact.
+    //
+    // The CAUSE is left unstated on purpose. A stale snapshot means the
+    // periodic walk did not refresh it, and there are two reasons for that
+    // which this function cannot tell apart: the surveyor is running here and
+    // is late, or it is not running here at all — every instance that does not
+    // own the shared root skips it by design (`spawn_disk_surveyor`), so on
+    // those a snapshot is stale the moment it ages out and "overdue" would be
+    // false. Saying only what is observable keeps the sentence true on both.
     let note = match status {
+        SurveyStatus::Stale if refreshing => format!(
+            "{note} This snapshot is STALE — older than twice the survey cadence, so the disk may \
+             have moved since. A fresh walk is ALREADY in flight; re-read shortly rather than \
+             asking for another."
+        ),
         SurveyStatus::Stale => format!(
-            "{note} This snapshot is STALE — older than twice the survey cadence, so the walk is \
-             overdue and the disk may have moved since. Pass `?refresh=1` to start a fresh one."
+            "{note} This snapshot is STALE — older than twice the survey cadence, so the periodic \
+             walk has not refreshed it and the disk may have moved since. Pass `?refresh=1` to \
+             start a fresh one."
         ),
         _ => note,
     };
@@ -1931,6 +1956,52 @@ mod tests {
             "a fresh snapshot must not cry wolf: {}",
             fresh.census_note
         );
+    }
+
+    /// A stale snapshot does not advise a refresh the process would REFUSE.
+    ///
+    /// `?refresh=1` routes through `spawn_rebuild`, which returns `false`
+    /// outright while `build_active()` — so telling an operator to ask for one
+    /// while a walk is already running is advice this code will not act on, on
+    /// the one surface whose whole purpose is that a reader is never told
+    /// something the machine contradicts. `refreshing` is the same fact the
+    /// payload already publishes as `census_refreshing`.
+    #[test]
+    fn a_stale_snapshot_does_not_advise_a_refresh_that_is_already_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        mk_target_root(&tmp.path().join("target-wt-old"));
+        let snapshot = build_snapshot(tmp.path(), &clean_opts());
+        let much_later = snapshot.taken_at + chrono::Duration::days(30);
+
+        let refreshing = assemble(Some(&snapshot), None, None, true, much_later);
+        assert_eq!(refreshing.census_status, SurveyStatus::Stale);
+        assert!(refreshing.census_refreshing, "the payload agrees");
+        assert!(
+            refreshing.census_note.contains("STALE"),
+            "still flagged: {}",
+            refreshing.census_note
+        );
+        assert!(
+            refreshing.census_note.contains("ALREADY in flight"),
+            "a walk is running, so the note must say so: {}",
+            refreshing.census_note
+        );
+        assert!(
+            !refreshing.census_note.contains("?refresh=1"),
+            "and must not ask for one `spawn_rebuild` would decline: {}",
+            refreshing.census_note
+        );
+
+        // Non-vacuous, and the property this must NOT break: with nothing in
+        // flight the remedy is still offered, because there it works.
+        let idle = assemble(Some(&snapshot), None, None, false, much_later);
+        assert!(!idle.census_refreshing);
+        assert!(
+            idle.census_note.contains("?refresh=1"),
+            "an idle stale snapshot keeps the remedy: {}",
+            idle.census_note
+        );
+        assert!(!idle.census_note.contains("ALREADY in flight"));
     }
 
     /// The note counts EVERY failed read, not just the recorded sample.
