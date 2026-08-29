@@ -102,27 +102,202 @@ pub async fn ui_bridge_with_diff_handler(
         info!("UI Bridge API: Batch execute with diff");
         wrap_ipc_result(ui_bridge_request_sync(&state, "execute_batch_with_diff", body).await)
     } else {
-        // Single operation — wrap into execute_with_diff format
-        // ChangeTracker.executeWithDiff expects { elementAction: { elementId, action, params } }
         info!("UI Bridge API: Single execute with diff");
-        let element_id = body.get("elementId").cloned().unwrap_or_default();
-        let operation = body.get("operation").cloned().unwrap_or_default();
-        let params = body
-            .get("params")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let payload = serde_json::json!({
-            "elementAction": {
-                "elementId": element_id,
-                "action": operation,
-                "params": params,
-            },
-            // Also pass flat fields for commandHandlers.ts compatibility
+        let payload = with_diff_single_payload(body);
+        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_with_diff", payload).await)
+    }
+}
+
+/// Build the `execute_with_diff` payload for the single-operation arm of
+/// `/control/with-diff`, by ADDING the `elementAction` envelope to the caller's
+/// body rather than rebuilding the body from it.
+///
+/// `ChangeTracker.executeWithDiff` takes an `ActionWithDiffRequest`, whose
+/// `elementAction` is only one of ten declared fields — the others being
+/// `instruction`, `settleTimeout`, `settleMinStable`, `scope`, `categorize`,
+/// `timeline`, `timelineInterval`, `summaryBudget` and `analyzeStructured`.
+/// This arm used to emit a payload built from scratch out of
+/// `{elementId, operation, params}`, so **every one of those nine was silently
+/// dropped**: a caller scoping the diff with `{"scope": "#main"}` or capping it
+/// with `{"summaryBudget": 500}` got neither, while the request still reported
+/// success. The batch arm forwards the body whole, so the two arms of one
+/// endpoint disagreed — the asymmetry named in
+/// `plans/2026-08-25-ui-bridge-request-path-loses-fields-structurally.md`,
+/// and the reason this hop is now additive.
+///
+/// A non-object body is returned untouched: it cannot carry a field.
+fn with_diff_single_payload(body: serde_json::Value) -> serde_json::Value {
+    let mut payload = body;
+    let element_id = payload.get("elementId").cloned().unwrap_or_default();
+    // `operation` is this endpoint's own spelling for the action name; a caller
+    // following the SDK type sends `action`. Accept both rather than failing
+    // whichever half is not the historical one — the same tolerance
+    // `request::step_action_payload` applies to `elementId` / `element_id`.
+    let operation = payload
+        .get("operation")
+        .or_else(|| payload.get("action"))
+        .cloned()
+        .unwrap_or_default();
+    let params = payload
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    // Synthesize the envelope only for a body that actually names an element
+    // action. `instruction` and `elementAction` are mutually exclusive on
+    // `ActionWithDiffRequest`, and the old code emitted an all-null
+    // `elementAction` unconditionally — junk that could never dispatch, and
+    // which would now shadow the `instruction` arm that forwarding whole makes
+    // reachable for the first time. A body naming neither an element nor an
+    // operation is forwarded untouched.
+    let names_an_action = !element_id.is_null() || !operation.is_null();
+    let element_id_flat = element_id.clone();
+    let params_flat = params.clone();
+
+    if let Some(obj) = payload.as_object_mut().filter(|_| names_an_action) {
+        // Do not clobber an `elementAction` the caller built themselves — that
+        // is the SDK-native shape, and is already what the receiver wants.
+        let envelope = serde_json::json!({
             "elementId": element_id,
-            "action": operation,
+            "action": operation.clone(),
             "params": params,
         });
-        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_with_diff", payload).await)
+        obj.entry("elementAction").or_insert(envelope);
+        // Flat siblings for commandHandlers.ts compatibility — the same trio
+        // the rebuilt payload always carried. `or_insert` rather than a plain
+        // insert so a caller's own value is never overwritten: `action` is
+        // filled only when they spelled it `operation`, and `elementId` /
+        // `params` only when they were absent (where the old payload emitted
+        // an explicit `null`, which this preserves).
+        obj.entry("action").or_insert(operation);
+        obj.entry("elementId").or_insert(element_id_flat);
+        obj.entry("params").or_insert(params_flat);
+    }
+    payload
+}
+
+#[cfg(test)]
+mod with_diff_single_payload_tests {
+    use super::with_diff_single_payload;
+    use serde_json::json;
+
+    #[test]
+    fn builds_the_element_action_envelope_from_operation() {
+        let payload = with_diff_single_payload(json!({
+            "elementId": "btn-1",
+            "operation": "type",
+            "params": {"text": "hello"},
+        }));
+
+        assert_eq!(
+            payload["elementAction"],
+            json!({"elementId": "btn-1", "action": "type", "params": {"text": "hello"}})
+        );
+        // Flat siblings preserved for commandHandlers.ts.
+        assert_eq!(payload["elementId"], json!("btn-1"));
+        assert_eq!(payload["action"], json!("type"));
+        assert_eq!(payload["params"], json!({"text": "hello"}));
+    }
+
+    /// The regression this helper exists for: every `ActionWithDiffRequest`
+    /// option other than `elementAction` used to be dropped on the floor.
+    #[test]
+    fn preserves_every_action_with_diff_option() {
+        let payload = with_diff_single_payload(json!({
+            "elementId": "btn-1",
+            "operation": "click",
+            "settleTimeout": 9000,
+            "settleMinStable": 250,
+            "scope": "#main",
+            "categorize": false,
+            "timeline": true,
+            "timelineInterval": 50,
+            "summaryBudget": 500,
+            "analyzeStructured": true,
+        }));
+
+        assert_eq!(payload["settleTimeout"], json!(9000));
+        assert_eq!(payload["settleMinStable"], json!(250));
+        assert_eq!(payload["scope"], json!("#main"));
+        assert_eq!(payload["categorize"], json!(false));
+        assert_eq!(payload["timeline"], json!(true));
+        assert_eq!(payload["timelineInterval"], json!(50));
+        assert_eq!(payload["summaryBudget"], json!(500));
+        assert_eq!(payload["analyzeStructured"], json!(true));
+    }
+
+    /// Forwarding is by identity, so a field this repo has never heard of
+    /// survives the hop. Rebuilding field-by-field fails this test rather than
+    /// shipping silently.
+    #[test]
+    fn forwards_an_unknown_future_field() {
+        let payload = with_diff_single_payload(json!({
+            "elementId": "btn-1",
+            "operation": "click",
+            "unknownFutureOptIn": {"nested": [1, 2, 3]},
+        }));
+
+        assert_eq!(payload["unknownFutureOptIn"], json!({"nested": [1, 2, 3]}));
+    }
+
+    #[test]
+    fn accepts_the_sdk_action_spelling() {
+        let payload = with_diff_single_payload(json!({
+            "elementId": "btn-1",
+            "action": "focus",
+        }));
+
+        assert_eq!(payload["elementAction"]["action"], json!("focus"));
+        // The caller's own `action` is not overwritten.
+        assert_eq!(payload["action"], json!("focus"));
+    }
+
+    #[test]
+    fn does_not_clobber_a_caller_built_envelope() {
+        let payload = with_diff_single_payload(json!({
+            // The caller names the element inside the envelope AND flat, so
+            // the synthesis path runs and must still defer to their envelope.
+            "elementId": "btn-9",
+            "elementAction": {"elementId": "btn-9", "action": "submit"},
+            "scope": "#form",
+        }));
+
+        assert_eq!(
+            payload["elementAction"],
+            json!({"elementId": "btn-9", "action": "submit"})
+        );
+        assert_eq!(payload["scope"], json!("#form"));
+    }
+
+    /// `instruction` and `elementAction` are mutually exclusive. The old code
+    /// synthesized an all-null `elementAction` unconditionally, which would
+    /// shadow the instruction arm that forwarding whole makes reachable.
+    #[test]
+    fn an_instruction_only_body_gets_no_synthesized_envelope() {
+        let payload = with_diff_single_payload(json!({"instruction": "click save"}));
+
+        assert_eq!(payload["instruction"], json!("click save"));
+        assert!(payload.get("elementAction").is_none());
+        assert!(payload.get("action").is_none());
+    }
+
+    /// The rebuilt payload always carried a flat `{elementId, action, params}`
+    /// trio for commandHandlers.ts, including explicit nulls when the caller
+    /// omitted them. Forwarding the body whole must not quietly drop that.
+    #[test]
+    fn always_emits_the_flat_compat_trio() {
+        let payload = with_diff_single_payload(json!({"operation": "click"}));
+
+        assert_eq!(payload["action"], json!("click"));
+        assert_eq!(payload["elementId"], json!(null));
+        assert_eq!(payload["params"], json!(null));
+        assert_eq!(payload["elementAction"]["elementId"], json!(null));
+    }
+
+    #[test]
+    fn a_non_object_body_is_returned_untouched() {
+        assert_eq!(with_diff_single_payload(json!("nope")), json!("nope"));
+        assert_eq!(with_diff_single_payload(json!(null)), json!(null));
     }
 }
 

@@ -22,6 +22,7 @@ import {
   describeEvaluateResult,
   isThenable,
   isElementActionAllowed,
+  toControlActionRequest,
   PAGE_EVALUATE_MAX_TIMEOUT_MS,
   PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
   describeEvaluateBudget,
@@ -76,9 +77,7 @@ describe("awaitWithTimeout", () => {
   });
 
   it("propagates rejections from the awaited Promise", async () => {
-    await expect(
-      awaitWithTimeout(Promise.reject(new Error("boom")), 1000),
-    ).rejects.toThrow("boom");
+    await expect(awaitWithTimeout(Promise.reject(new Error("boom")), 1000)).rejects.toThrow("boom");
   });
 
   it("propagates rejections from async IIFE that throws", async () => {
@@ -167,9 +166,9 @@ describe("isElementActionAllowed — execute_action per-element gate", () => {
     // advertises click but not hoverClick; hoverClick must still be allowed so
     // it reaches actionExecutor.performHoverClick instead of being rejected
     // pre-dispatch (mirrors the runner Rust is_action_advertised exemption).
-    expect(isElementActionAllowed(["focus", "blur", "click", "hover", "middleClick"], "hoverClick")).toBe(
-      true,
-    );
+    expect(
+      isElementActionAllowed(["focus", "blur", "click", "hover", "middleClick"], "hoverClick"),
+    ).toBe(true);
   });
 
   it("does NOT exempt hoverClick when click is absent", () => {
@@ -236,19 +235,16 @@ describe("compileEvaluateExpression — page_evaluate wrapping", () => {
     ["10; 20; 30", 30],
     ["function f(){return 9}; f()", 9],
     ["'x'; 'y'", "y"],
-  ])(
-    "returns the LAST statement's value, not the first, for %j",
-    (expression, expected) => {
-      // THE ARM-2 WRONG-VALUE BUG. `new Function("return 1+1; 2+2")()` compiles
-      // and returns 2 — the FIRST statement — so the unguarded arm 2 won ahead
-      // of the completion-value arm and the caller got a confidently wrong
-      // number under `success: true`. Measured on the shipped build:
-      // `1+1; 2+2`->2, `10; 20; 30`->10, `function f(){return 9}; f()`->the
-      // function object. A `var` prefix masks it entirely (`return var q = …`
-      // is a SyntaxError), which is why every earlier probe missed it.
-      expect(compileEvaluateExpression(expression as string)()).toBe(expected);
-    },
-  );
+  ])("returns the LAST statement's value, not the first, for %j", (expression, expected) => {
+    // THE ARM-2 WRONG-VALUE BUG. `new Function("return 1+1; 2+2")()` compiles
+    // and returns 2 — the FIRST statement — so the unguarded arm 2 won ahead
+    // of the completion-value arm and the caller got a confidently wrong
+    // number under `success: true`. Measured on the shipped build:
+    // `1+1; 2+2`->2, `10; 20; 30`->10, `function f(){return 9}; f()`->the
+    // function object. A `var` prefix masks it entirely (`return var q = …`
+    // is a SyntaxError), which is why every earlier probe missed it.
+    expect(compileEvaluateExpression(expression as string)()).toBe(expected);
+  });
 
   it("returns the LAST statement's value for a leading object literal", () => {
     // Same bug, object-valued: arm 2 returned `{a:1}` for input whose last
@@ -620,5 +616,71 @@ describe("describeEvaluateBudget + evaluateTimeoutMessage (U1: the 9.8s that rea
     expect(evaluateTimeoutMessage(5_000)).toBe(
       "page_evaluate: Promise did not resolve within 5.0s",
     );
+  });
+});
+
+describe("toControlActionRequest - the envelope is carried by identity", () => {
+  it("wraps a bare string action (the SDK proxy-fallback shape)", () => {
+    expect(toControlActionRequest("click")).toEqual({ action: "click" });
+  });
+
+  it("keeps params and waitOptions, the three fields that always survived", () => {
+    const envelope = {
+      action: "type",
+      params: { text: "hello" },
+      waitOptions: { timeout: 500 },
+    };
+    expect(toControlActionRequest(envelope)).toEqual(envelope);
+  });
+
+  /**
+   * The regression this seam exists for. `executeAction` takes a full
+   * `ControlActionRequest`, but this hop used to rebuild it from a hardcoded
+   * {action, params, waitOptions} triple - so every other declared field was
+   * dropped HERE, one hop after the runner started forwarding them whole.
+   */
+  it("keeps every other declared ControlActionRequest field", () => {
+    const envelope = {
+      action: "click",
+      requestId: "req-1",
+      captureAfter: true,
+      retryOptions: { maxRetries: 2, retryDelay: 10 },
+      waitAfter: "idle",
+      waitAfterTimeout: 9000,
+      waitAfterMinStable: 250,
+      verifyEffect: true,
+    };
+    expect(toControlActionRequest(envelope)).toEqual(envelope);
+  });
+
+  /**
+   * Identity forwarding means a field no code in this repo knows about still
+   * survives the hop. Reintroducing a field-by-field rebuild fails here rather
+   * than shipping silently.
+   */
+  it("keeps an unknown future opt-in", () => {
+    const envelope = { action: "click", unknownFutureOptIn: { nested: [1, 2, 3] } };
+    expect(toControlActionRequest(envelope)).toEqual(envelope);
+  });
+
+  it("copies rather than aliasing the caller's object", () => {
+    const envelope = { action: "click", params: { a: 1 } };
+    const out = toControlActionRequest(envelope);
+    expect(out).not.toBe(envelope);
+    expect(out).toEqual(envelope);
+  });
+
+  it("yields an empty action name for a shape that cannot carry one", () => {
+    expect(toControlActionRequest(null)).toEqual({ action: "" });
+    expect(toControlActionRequest(undefined)).toEqual({ action: "" });
+    expect(toControlActionRequest(42)).toEqual({ action: "" });
+    expect(toControlActionRequest(true)).toEqual({ action: "" });
+  });
+
+  it("normalizes a non-string action name while keeping the rest of the envelope", () => {
+    expect(toControlActionRequest({ action: null, params: { a: 1 } })).toEqual({
+      action: "",
+      params: { a: 1 },
+    });
   });
 });

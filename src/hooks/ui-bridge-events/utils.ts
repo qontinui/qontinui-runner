@@ -823,3 +823,42 @@ export function isElementActionAllowed(allowedActions: readonly string[], action
   if (action === "hoverClick" && allowedActions.includes("click")) return true;
   return false;
 }
+
+/**
+ * Normalize the `action` field of an `execute_action` payload into the request
+ * object handed to `bridge.executeAction`.
+ *
+ * **This is the frontend half of the element-action wire convention**; the Rust
+ * half is `mcp/ui_bridge/request.rs::element_action_payload`. `action` arrives
+ * as EITHER a bare string (the SDK proxy fallback) or the whole envelope
+ * `{ action, params, waitOptions, ... }` (every control endpoint).
+ *
+ * The envelope is carried BY IDENTITY. `executeAction` accepts a full
+ * `ControlActionRequest`, but this hop used to rebuild it from a hardcoded
+ * `{action, params, waitOptions}` triple, so `verifyEffect`, `captureAfter`,
+ * `retryOptions`, `requestId` and the `waitAfter*` trio were dropped here even
+ * when a caller sent them. That made this the LAST lossy hop on the path: the
+ * runner now forwards the envelope whole, and this rebuild threw the extra
+ * fields away one hop later, so a new opt-in still reached nothing end to end.
+ *
+ * `windowLabel` is deliberately NOT special-cased: the runner hoists it out of
+ * the envelope onto the payload root, so it never arrives in here.
+ */
+export function toControlActionRequest(
+  action: unknown,
+): Record<string, unknown> & { action: string } {
+  if (typeof action === "string") return { action };
+  if (action !== null && typeof action === "object") {
+    const envelope = { ...(action as Record<string, unknown>) };
+    // Normalize only the action NAME, and only when it is not already a
+    // string. Every other key is left exactly as the caller sent it.
+    return {
+      ...envelope,
+      action: typeof envelope.action === "string" ? envelope.action : "",
+    };
+  }
+  // null / boolean / number cannot carry an action name. An empty name keeps
+  // the per-element allow gate (and, failing that, the SDK's own supported-set
+  // validation) the rejection point, rather than throwing here.
+  return { action: "" };
+}

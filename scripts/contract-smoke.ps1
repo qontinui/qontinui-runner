@@ -198,7 +198,18 @@ $BODY_FIXTURES = @{
     "POST /ai/bookmarks"                      = '{"name":"smoke"}'
     "POST /ai/wait-for-element-condition"     = '{"id":"dummy-id","condition":"visible","timeoutMs":100}'
     "POST /ai/wait-for-element"               = '{"id":"dummy-id","timeoutMs":100}'
-    "POST /control/batch-execute"             = '{"steps":[]}'
+    # The handler reads `actions`, not `steps`. Probed with `{"steps":[]}` this
+    # route matched no key at all and -- because the array was read with
+    # `unwrap_or_default()` -- returned 200 having executed NOTHING, so the
+    # probe exercised no code past the request decode while the endpoint was
+    # outright broken (every "action" step failed on an `id`/`elementId`
+    # mismatch until #1160). An EMPTY array is equally vacuous, so the fix is
+    # not just the key: a one-step body drives the real per-step dispatch loop,
+    # which is what turns a 5xx in that loop (a FAIL under $DEFAULT_OK_STATUS)
+    # into something this probe can see at all. The step itself fails --
+    # `dummy-id` is not registered -- and the handler still answers 200, which
+    # is the pass condition here.
+    "POST /control/batch-execute"             = '{"actions":[{"type":"action","elementId":"dummy-id","action":"click"}]}'
     "POST /control/page/click-by-text"        = '{"text":"smoke"}'
     "POST /control/page/click-by-selector"    = '{"selector":"#smoke"}'
     "POST /control/page/type-into"            = '{"selector":"#smoke","text":"x"}'

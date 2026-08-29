@@ -110,10 +110,14 @@ export function useChangeTrackingEvents(
                 },
                 refreshElements: () => {},
                 snapshotManager: manager,
+                // Forward the request BY IDENTITY — see the twin below. The
+                // hardcoded `{action, params}` pair dropped `waitOptions` and
+                // every other `ControlActionRequest` field on the
+                // execute_with_diff path.
                 executeElementAction: async (id, request) => {
                   const result = await currentBridge.executeAction(id, {
+                    ...request,
                     action: request.action,
-                    params: request.params,
                   });
                   return result;
                 },
@@ -340,13 +344,18 @@ export function useChangeTrackingEvents(
                 },
                 refreshElements: () => {},
                 snapshotManager: manager,
-                executeElementAction: async (
-                  id: string,
-                  request: { action: string; params?: Record<string, unknown> },
-                ) => {
+                // Forward the request BY IDENTITY. The local
+                // `{action, params}` annotation this used to carry was not just
+                // a narrow forward — it *re-declared* the parameter type, so
+                // the compiler could not see that `waitOptions` and every other
+                // `ControlActionRequest` field were being dropped on the way to
+                // `executeAction`. Dropping the annotation restores the
+                // contextual type (the sibling site above never had one) and
+                // the spread stops this hop losing fields.
+                executeElementAction: async (id, request) => {
                   const result = await currentBridge.executeAction(id, {
+                    ...request,
                     action: request.action,
-                    params: request.params,
                   });
                   return result;
                 },
