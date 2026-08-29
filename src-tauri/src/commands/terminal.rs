@@ -1665,6 +1665,37 @@ pub(crate) struct SessionCaptureHint {
     /// continuations); the operator's own terminals leave it `false` and keep
     /// their host git identity. See `crate::agent_runtime::agent_git_identity_env`.
     pub inject_agent_git_identity: bool,
+    /// Coord lineage for this spawn, when it CONTINUES a known coord session
+    /// rather than starting fresh. `None` (every pre-existing caller) leaves
+    /// today's behaviour byte-for-byte: no `parent_session_id`, and the
+    /// ambient Claude Code session id on the mirrored row.
+    ///
+    /// Set by the cross-machine respawn receiver
+    /// ([`crate::session::respawn`]) so the respawned session is one link in
+    /// the lineage chain — the same `parent_session_id` stamp
+    /// [`crate::session::SessionRegistry::start_with_parent`] gives the handoff
+    /// receiver — rather than an orphan.
+    pub coord_lineage: Option<CoordSessionLineage>,
+}
+
+/// Lineage a backend spawn claims on the coord session row it mirrors.
+///
+/// Two fields, one purpose: make a continued session findable FROM its source.
+/// Both are stamped on the `Started` outbox payload, which the drain loop's
+/// `rebuild_create_body` forwards to coord's `CreateSessionRequest`.
+#[derive(Debug, Clone)]
+pub(crate) struct CoordSessionLineage {
+    /// The coord session id this spawn continues — coord indexes children by
+    /// `parent_session_id`, so this is the durable source→child link.
+    pub parent_session_id: uuid::Uuid,
+    /// The Claude session id the child actually resumes, stamped on the row's
+    /// `claude_code_session_id` bridge so the console can join the respawned
+    /// session to its transcript.
+    ///
+    /// `None` is UNKNOWN and leaves the ambient value alone — never a nil UUID
+    /// and never an empty string, either of which would read downstream as a
+    /// real, joinable id.
+    pub claude_code_session_id: Option<String>,
 }
 
 /// Untracked-backend-spawn guardrail (plan
@@ -1863,8 +1894,21 @@ pub(crate) fn create_terminal_session_backend(
         tenant_id: None,
     };
 
+    // Lineage, read BEFORE the hint is destructured below. `None` for every
+    // pre-existing caller ⇒ `register_external_with_lineage` behaves exactly
+    // like the `register_external` call this replaced.
+    let lineage = capture_hint.as_ref().and_then(|h| h.coord_lineage.clone());
+    let (parent_session_id, claude_code_session_id_override) = match lineage {
+        Some(l) => (Some(l.parent_session_id), l.claude_code_session_id),
+        None => (None, None),
+    };
+
     let mut coord_session_id: Option<uuid::Uuid> = None;
-    match session_registry.register_external(intent) {
+    match session_registry.register_external_with_lineage(
+        intent,
+        parent_session_id,
+        claude_code_session_id_override,
+    ) {
         Ok(coord_id) => {
             coord_session_id = Some(coord_id);
             if let Some(session) = terminal_manager.get(&info.id) {
@@ -1932,6 +1976,8 @@ pub(crate) fn create_terminal_session_backend(
                 zone_index: hint_zone_index,
                 // Consumed earlier (env injection at spawn); not needed here.
                 inject_agent_git_identity: _,
+                // Consumed earlier (coord registration above).
+                coord_lineage: _,
             } = hint;
             // Single source of truth for the recorded page: the hint's page_id
             // (set by the caller to the picked page), defaulting to "default".
@@ -2488,6 +2534,7 @@ mod tests {
             claude_session_id: Some("pinned-1".to_string()),
             zone_index: None,
             inject_agent_git_identity: false,
+            coord_lineage: None,
         });
         warn_untracked_backend_spawn(&hint, "Hinted", "/work/dir");
         assert_eq!(

@@ -69,6 +69,21 @@
 //!    event carries `parent_session_id`, which is the durable
 //!    `handoff_to` link (parent → child by `parent_session_id` index).
 //!
+//! ## This loop also carries the RESPAWN arm
+//!
+//! Coord publishes `respawn_request` on the SAME
+//! `qontinui.sessions.<tenant>.<device>.<kind>` family (plan
+//! `2026-08-26-sessions-console-consolidation` §6 Phase 5), so
+//! [`connect_and_pump`] forwards every frame to [`super::respawn`] as well and
+//! [`connect_and_pump`]'s on-connect catch-up runs
+//! [`super::respawn::run_catchup`] beside this module's own. The two arms are
+//! disambiguated ONLY by the channel's trailing segment —
+//! [`parse_handoff_push`] requires `.handoff_request`,
+//! [`super::respawn::parse_respawn_push`] requires `.respawn_request` — so
+//! neither swallows the other's frames and nothing is materialized twice.
+//! A respawn deliberately does NOT run step 6 below: its source is already
+//! closed, which is the premise of the feature.
+//!
 //! Step 3 happening before step 6 is deliberate: the source is only torn
 //! down once the child exists, so a failed materialization leaves the
 //! source intact and the next push/catch-up retries. Idempotency: coord's
@@ -104,6 +119,12 @@ const RECONNECT_BACKOFF_CEIL: Duration = Duration::from_secs(60);
 /// build/claim event to this socket. The handoff payload lands on
 /// `qontinui.sessions.<tenant>.<target-machine>.handoff_request`.
 const SESSION_WS_PATTERN: &str = "qontinui.sessions.*";
+
+/// Purpose suffix a HANDOFF stamps on the child intent. Parameterised (rather
+/// than inlined) because the respawn receiver reuses
+/// [`build_child_intent`] and must say what it actually did — a respawn is not
+/// a continuation of a live session.
+pub(super) const HANDOFF_CONTINUATION_NOTE: &str = "continued here";
 
 // ---------------------------------------------------------------------------
 // Wire types — mirror `qontinui-coord/src/sessions.rs` Phase 7 shapes.
@@ -349,6 +370,12 @@ async fn connect_and_pump(
     // doesn't abort the pump (the push path still works, and the next
     // reconnect retries the catch-up).
     run_catchup(registry, lifecycle_store, http, coord_url, device_id).await;
+    // …and the RESPAWN catch-up, on its own coord route. Separate on purpose:
+    // the handoff read filters `s.state <> 'closed'` (fatal for a respawn,
+    // whose source is closed by construction) and `PendingHandoff` carries
+    // neither the account pin nor the Claude session id. Plan
+    // `2026-08-26-sessions-console-consolidation` §6 Phase 5.
+    super::respawn::run_catchup(registry, lifecycle_store, http, coord_url, device_id).await;
 
     while let Some(msg) = ws.next().await {
         let msg = msg.map_err(|e| HandoffError::Http(format!("coord /ws recv: {e}")))?;
@@ -435,6 +462,23 @@ async fn handle_push_frame(
     device_id: Uuid,
     text: &str,
 ) {
+    // The RESPAWN arm shares this one socket (coord publishes respawns on the
+    // same `qontinui.sessions.<tenant>.<device>.<kind>` family). The two arms
+    // are disambiguated ONLY by the channel's trailing segment — this parser
+    // requires `.handoff_request`, `parse_respawn_push` requires
+    // `.respawn_request` — so neither can swallow the other's frames and no
+    // frame is materialized twice. Both directions are asserted in
+    // `respawn`'s tests.
+    super::respawn::handle_push_frame(
+        registry,
+        lifecycle_store,
+        http,
+        coord_url,
+        device_id,
+        text,
+    )
+    .await;
+
     let Some(handoff) = parse_handoff_push(text, device_id) else {
         return;
     };
@@ -450,7 +494,7 @@ async fn handle_push_frame(
 /// handoff for this device (so the pump can ignore it). Factored out so
 /// the unit tests can exercise the channel-matching + payload-decode
 /// without a live WS.
-fn parse_handoff_push(text: &str, device_id: Uuid) -> Option<PendingHandoff> {
+pub(super) fn parse_handoff_push(text: &str, device_id: Uuid) -> Option<PendingHandoff> {
     let envelope: serde_json::Value = serde_json::from_str(text).ok()?;
 
     // Coord `/ws` envelope: {"channel": "<subject>", "payload": "<json>"}.
@@ -559,7 +603,7 @@ async fn fetch_pending(
 }
 
 /// Fetch the state-transfer bundle for a source session.
-async fn fetch_state(
+pub(super) async fn fetch_state(
     http: &reqwest::Client,
     coord_url: &str,
     source_session_id: Uuid,
@@ -598,7 +642,7 @@ async fn materialize(
 ) -> Result<(), HandoffError> {
     let state = fetch_state(http, coord_url, handoff.source_session_id).await?;
 
-    let intent = build_child_intent(&state)?;
+    let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE)?;
 
     // Start the child session locally with lineage back to the source.
     let child = registry
@@ -920,7 +964,10 @@ fn registry_record_from_restore_payload(
 /// from `repo` (the PTY transport uses `intent.repo` as the working
 /// dir); `declared_paths` + branch carry over verbatim. The purpose is
 /// annotated so the dashboard shows the lineage at a glance.
-fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
+pub(super) fn build_child_intent(
+    state: &HandoffState,
+    continuation_note: &str,
+) -> Result<Intent, HandoffError> {
     let kind = SessionKind::parse(&state.session_kind).ok_or_else(|| {
         HandoffError::Parse(format!("unknown session_kind: {}", state.session_kind))
     })?;
@@ -933,7 +980,7 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
         .get("purpose")
         .and_then(|v| v.as_str())
         .unwrap_or("handoff session");
-    let purpose = format!("{source_purpose} (continued here)");
+    let purpose = format!("{source_purpose} ({continuation_note})");
     let declared_paths = src
         .get("declared_paths")
         .and_then(|v| v.as_array())
@@ -1014,7 +1061,7 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
 
 /// Re-acquire one claim under `device_id` via `POST /claims/acquire`.
 /// The kind string maps to coord's `ClaimKind` snake_case wire form.
-async fn reacquire_claim(
+pub(super) async fn reacquire_claim(
     http: &reqwest::Client,
     coord_url: &str,
     claim: &HeldClaim,
@@ -1104,7 +1151,7 @@ mod tests {
     #[test]
     fn build_child_intent_threads_cwd_and_purpose() {
         let state = make_state("terminal_shell");
-        let intent = build_child_intent(&state).unwrap();
+        let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE).unwrap();
         assert_eq!(intent.kind, SessionKind::TerminalShell);
         assert_eq!(intent.repo.as_deref(), Some("qontinui-runner"));
         assert_eq!(intent.branch.as_deref(), Some("main"));
@@ -1130,7 +1177,7 @@ mod tests {
             held_claims: vec![],
             output_chunks: vec![],
         };
-        let intent = build_child_intent(&state).unwrap();
+        let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE).unwrap();
         assert_eq!(intent.kind, SessionKind::TerminalClaude);
         assert!(intent.purpose.contains("handoff session"));
         assert!(intent.declared_paths.is_empty());
@@ -1154,7 +1201,7 @@ mod tests {
     fn build_child_intent_reads_legacy_plan_slug_key() {
         // Un-renamed coord (every coord shipping today) writes `plan_slug`.
         let state = state_with_intent_key("plan_slug", "2026-07-28-some-unit");
-        let intent = build_child_intent(&state).unwrap();
+        let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE).unwrap();
         assert_eq!(
             intent.work_unit_slug.as_deref(),
             Some("2026-07-28-some-unit")
@@ -1177,7 +1224,7 @@ mod tests {
     fn build_child_intent_reads_new_work_unit_slug_key() {
         // Post-rename coord writes `work_unit_slug`.
         let state = state_with_intent_key("work_unit_slug", "2026-07-28-some-unit");
-        let intent = build_child_intent(&state).unwrap();
+        let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE).unwrap();
         assert_eq!(
             intent.work_unit_slug.as_deref(),
             Some("2026-07-28-some-unit")
@@ -1193,13 +1240,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("work_unit_slug".to_string(), json!("new-name"));
-        let intent = build_child_intent(&state).unwrap();
+        let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE).unwrap();
         assert_eq!(intent.work_unit_slug.as_deref(), Some("new-name"));
     }
 
     #[test]
     fn build_child_intent_absent_slug_is_none() {
-        let intent = build_child_intent(&make_state("terminal_shell")).unwrap();
+        let intent =
+            build_child_intent(&make_state("terminal_shell"), HANDOFF_CONTINUATION_NOTE).unwrap();
         assert_eq!(intent.work_unit_slug, None);
     }
 
@@ -1216,7 +1264,7 @@ mod tests {
         let obj = state.intent.as_object_mut().unwrap();
         obj.insert("work_unit_slug".to_string(), serde_json::Value::Null);
         obj.insert("plan_slug".to_string(), json!("2026-07-28-some-unit"));
-        let intent = build_child_intent(&state).unwrap();
+        let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE).unwrap();
         assert_eq!(
             intent.work_unit_slug.as_deref(),
             Some("2026-07-28-some-unit"),
@@ -1230,14 +1278,14 @@ mod tests {
         let obj = state.intent.as_object_mut().unwrap();
         obj.insert("work_unit_slug".to_string(), serde_json::Value::Null);
         obj.insert("plan_slug".to_string(), serde_json::Value::Null);
-        let intent = build_child_intent(&state).unwrap();
+        let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE).unwrap();
         assert_eq!(intent.work_unit_slug, None);
     }
 
     #[test]
     fn build_child_intent_rejects_unknown_kind() {
         let state = make_state("nonsense_kind");
-        let err = build_child_intent(&state).unwrap_err();
+        let err = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE).unwrap_err();
         assert!(matches!(err, HandoffError::Parse(_)));
     }
 

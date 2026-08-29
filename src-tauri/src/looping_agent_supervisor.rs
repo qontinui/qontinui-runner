@@ -1065,6 +1065,7 @@ async fn spawn_looping_agent_terminal(
         zone_index: None,
         // Autonomous agent → pin the agent git identity on the PTY.
         inject_agent_git_identity: true,
+        coord_lineage: None,
     };
 
     let (terminal_id, _coord_session) =
