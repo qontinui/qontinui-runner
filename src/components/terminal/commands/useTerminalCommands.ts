@@ -58,6 +58,7 @@ import {
 } from "../liveClaudeSessions";
 import { FLOW_GRID_ID, LAYOUT_PRESETS } from "../useZoneLayout";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
+import { textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { useOrchestrateCommand } from "./orchestrateCommand";
@@ -270,6 +271,67 @@ export function readZoneArg(args: Record<string, unknown>, field: string = "zone
 }
 
 /**
+ * Three-state read of a `count` argument — the exact mirror of
+ * {@link readZoneArg}, and for the exact same reason.
+ *
+ * The spawn handlers used to read `typeof args.count === "number" ?
+ * args.count : 1`. `parse.ts::coerceToken` only turns a CLEAN numeric
+ * literal into a `number`, so `/spawn abc` bound `count: "abc"` — a
+ * string — and that ternary collapsed it to the same `1` that a bare
+ * `/spawn` produces. The bar then rendered `[ok] /spawn ✓` for a typo,
+ * having silently created one terminal instead of the N the operator
+ * asked for. Identical shape to the zone bug: a field that was SUPPLIED
+ * but doesn't parse must never be indistinguishable from a field that
+ * was never supplied at all.
+ *
+ * Non-integers are `invalid` too, not floored. `/spawn 2.7` used to
+ * create THREE terminals and then report success, because
+ * `spawnVerdict(ids, 2.7)` asks `3 < 2.7` — false. Rounding a count the
+ * operator did not write is a guess; naming the bad token is not.
+ */
+export type CountArgRead =
+  | { kind: "absent" }
+  | { kind: "invalid"; raw: string }
+  | { kind: "count"; count: number };
+
+/**
+ * Read a positive-integer count out of an args bag. Accepts a literal
+ * integer or its string form; anything else that was actually supplied
+ * is `invalid` rather than `absent`.
+ */
+export function readCountArg(args: Record<string, unknown>, field: string = "count"): CountArgRead {
+  const v = args[field];
+  if (v === undefined || v === null) return { kind: "absent" };
+  if (typeof v === "number") {
+    return Number.isInteger(v) ? { kind: "count", count: v } : { kind: "invalid", raw: String(v) };
+  }
+  if (typeof v === "string") {
+    const trimmed = v.trim();
+    if (trimmed === "") return { kind: "absent" };
+    const n = Number(trimmed);
+    return Number.isInteger(n) ? { kind: "count", count: n } : { kind: "invalid", raw: trimmed };
+  }
+  return { kind: "invalid", raw: String(v) };
+}
+
+/**
+ * Resolve a count argument to the number to act on, or to the failure
+ * the operator has to see. `absent` defaults to 1 — that is the
+ * documented schema default (`"number (>= 1, defaults to 1)"`) and is
+ * the one state where guessing is legitimate, because the operator
+ * asked for nothing.
+ */
+function resolveCount(args: Record<string, unknown>): { count: number } | CommandResult<never> {
+  const read = readCountArg(args);
+  if (read.kind === "invalid") {
+    return fail("invalid-count", `"${read.raw}" is not a count`);
+  }
+  const count = read.kind === "count" ? read.count : 1;
+  if (count < 1) return fail("invalid-count", "count must be >= 1");
+  return { count };
+}
+
+/**
  * Outcome of resolving a zone argument to a 0-based grid index.
  *
  * `supplied` rides on the resolved states so a handler can tell "the
@@ -477,8 +539,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     // captured by spawn-ai's wider account regex.
     patterns: [/^spawn\s+(?<count>\d+)(?:\s+plain)?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult<string[]>> => {
-      const count = typeof args.count === "number" ? args.count : 1;
-      if (count < 1) return fail("invalid-count", "count must be >= 1");
+      const counted = resolveCount(args);
+      if ("ok" in counted) return counted;
+      const { count } = counted;
       const result = await ctx.spawnPlain(count);
       return spawnVerdict(result, count);
     },
@@ -511,17 +574,17 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       /^spawn\s+(?<count>\d+)\s+(?<account>best|claude|[\w-]+)$/i,
     ],
     handler: async (args: Record<string, unknown>): Promise<CommandResult<string[]>> => {
-      const count = typeof args.count === "number" ? args.count : 1;
-      if (count < 1) return fail("invalid-count", "count must be >= 1");
-      const configDir = resolveAccountConfigDir(args.account, ctx.accounts);
+      const counted = resolveCount(args);
+      if ("ok" in counted) return counted;
+      const { count } = counted;
+      const configDir = resolveAccountConfigDir(textArg(args, "account"), ctx.accounts);
       if (!configDir) return fail("no-account", "no matching Claude account");
       // F3 — `--tenant` arrives either already-parsed (slash route, via the
       // `"--tenant"` schema key) or still embedded in `context` (Tier-2
       // regex route). `splitTenantFlag` normalizes the second case.
-      const rawContext = typeof args.context === "string" ? args.context : undefined;
+      const rawContext = textArg(args, "context") || undefined;
       const split = splitTenantFlag(rawContext);
-      const rawTenant =
-        (typeof args.tenant === "string" ? args.tenant.trim() : "") || split.tenant || undefined;
+      const rawTenant = textArg(args, "tenant").trim() || split.tenant || undefined;
       const { tenantId, error } = resolveTenantArg(rawTenant, ctx.tenantCandidates);
       if (error) return fail("unknown-tenant", error);
       const result = await ctx.spawnAi(count, configDir, split.context, tenantId);
@@ -537,9 +600,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     description: "Spawn N plain PTY tabs and auto-type the given shell command into each.",
     paramSchema: SCHEMA.spawnWith,
     handler: async (args: Record<string, unknown>): Promise<CommandResult<string[]>> => {
-      const count = typeof args.count === "number" ? args.count : 1;
-      if (count < 1) return fail("invalid-count", "count must be >= 1");
-      const command = typeof args.command === "string" ? args.command : "";
+      const counted = resolveCount(args);
+      if ("ok" in counted) return counted;
+      const { count } = counted;
+      const command = textArg(args, "command");
       if (!command) return fail("invalid-command", "command is required");
       const result = await ctx.spawnPlain(count, command);
       return spawnVerdict(result, count);
@@ -604,7 +668,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     undoable: true,
     patterns: [/^close(?:\s+(?<zone>\d+))?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
-      const explicitTabId = typeof args.tabId === "string" ? args.tabId : null;
+      const explicitTabId = textArg(args, "tabId") || null;
       if (explicitTabId) {
         closeTerminal(explicitTabId);
         return ok();
@@ -650,7 +714,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       /^(?<preset>single|split|quad|six-?pack|full-?grid)\s+layout$/i,
     ],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
-      const preset = typeof args.preset === "string" ? args.preset.toLowerCase() : "";
+      const preset = textArg(args, "preset").toLowerCase();
       // Normalize "six-pack" / "sixpack" → "six-pack"; same for full-grid.
       const normalized = preset.replace(/sixpack/, "six-pack").replace(/fullgrid/, "full-grid");
       // `setLayoutId` drops an unknown id silently, so an unvalidated
@@ -1040,8 +1104,8 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     handler: async (
       args: Record<string, unknown>,
     ): Promise<CommandResult<{ patterns: string[] }>> => {
-      const action = typeof args.action === "string" ? args.action.toLowerCase() : "";
-      const pattern = typeof args.pattern === "string" ? args.pattern : "";
+      const action = textArg(args, "action").toLowerCase();
+      const pattern = textArg(args, "pattern");
       const current = transitionEffects.autoApprovePatterns ?? [];
       if (action === "list") return ok({ patterns: current });
       if (action === "clear") {
@@ -1083,7 +1147,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     },
     patterns: [/^select(?:-by-state)?\s+(?<state>idle|working|needs[-_ ]?input|completed|error)$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
-      const raw = typeof args.state === "string" ? args.state.toLowerCase() : "";
+      const raw = textArg(args, "state").toLowerCase();
       const state = /^needs[-_ ]?input$/.test(raw) ? "needs-input" : raw;
       const valid = ["idle", "working", "needs-input", "completed", "error"];
       if (!valid.includes(state)) {
@@ -1113,7 +1177,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     paramSchema: { tag: "string (tag name; case-sensitive match against zone labels)" },
     patterns: [/^tag\s+(?<tag>\S+)$/i, /^filter-tag\s+(?<tag>\S+)$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
-      const tag = typeof args.tag === "string" ? args.tag.trim() : "";
+      const tag = textArg(args, "tag").trim();
       if (!tag) return fail("invalid-args", "tag required");
       labelsAndTags.setActiveTagFilters((prev) => {
         const next = new Set(prev);
@@ -1205,7 +1269,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       /^analyze\s+(?<type>session-summary|architecture|change-impact|progress|cross-tab|page-architecture)$/i,
     ],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
-      const raw = typeof args.type === "string" ? args.type.toLowerCase() : "";
+      const raw = textArg(args, "type").toLowerCase();
       const valid = [
         "session-summary",
         "architecture",

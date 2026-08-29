@@ -13,6 +13,7 @@ import { CompactRunCard } from "./CompactRunCard";
 import { NewRunDialog } from "./NewRunDialog";
 import { Button } from "../ui";
 import { getAccentColors } from "@/design-system";
+import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
 
 /**
  * Props for ActiveRunsBar.
@@ -120,16 +121,25 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
     if (!hasMultipleRuns) return;
 
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
-      // Ctrl+Tab or Ctrl+` to cycle to next run
-      if (e.ctrlKey && (e.key === "Tab" || e.key === "`")) {
+      // Ctrl+Tab / Ctrl+` (next) and Ctrl+Shift+Tab (previous), routed
+      // through the shared chord table. `matchesChord` matches Shift
+      // EXACTLY, which also repairs a live double-fire: the old forward
+      // test carried no `shiftKey` check, so Ctrl+Shift+Tab ran the
+      // forward branch AND the backward branch in one press and the
+      // selection landed back where it started.
+      //
+      // These are the same two chords `terminal/useKeyboardShortcuts`
+      // claims for its zone walk — a genuine two-surface claim, pinned in
+      // `globalChords.enforcement.test.ts`'s `KNOWN_SHARED_CHORDS`.
+      if (matchesChord(e, GLOBAL_CHORDS.cycleNext) || matchesChord(e, GLOBAL_CHORDS.runCycleAlt)) {
         e.preventDefault();
         const currentIndex = activeRuns.findIndex((r) => r.runId === selectedRunId);
         const nextIndex = (currentIndex + 1) % activeRuns.length;
         selectRun(activeRuns[nextIndex].runId);
+        return;
       }
 
-      // Ctrl+Shift+Tab to cycle to previous run
-      if (e.ctrlKey && e.shiftKey && e.key === "Tab") {
+      if (matchesChord(e, GLOBAL_CHORDS.cyclePrev)) {
         e.preventDefault();
         const currentIndex = activeRuns.findIndex((r) => r.runId === selectedRunId);
         const prevIndex = currentIndex <= 0 ? activeRuns.length - 1 : currentIndex - 1;

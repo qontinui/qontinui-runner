@@ -101,3 +101,70 @@ export function fuzzyScore(text: string, query: string): FuzzyMatch | null {
 
   return null;
 }
+
+/**
+ * Score band for a match that landed ONLY in an action's parameter hint.
+ *
+ * The two command surfaces used to match different candidate sets. The
+ * CommandBar scored `slash` + `label`; the palette scored `slash` +
+ * `"<label><paramsHint>"`, because it composes its row label as
+ * `"/spawn-ai — Spawn AI session (count, account, context)"` and split
+ * that string on `" — "`. So `ctx` listed `/spawn-ai` in the palette and
+ * rendered `No match` in the bar; `tabid` listed `/close` in the palette
+ * and nothing in the bar; `acc` listed three rows against the bar's one.
+ * Every palette-only hit matched inside the params hint. The palette was
+ * teaching a slash the bar then refused to resolve.
+ *
+ * Both surfaces now score the hint, so a parameter name — `account`,
+ * `context`, `goal`, `tabId` — is a usable search term everywhere. It is
+ * banded far below zero so it can never outrank a slash or label hit:
+ * Tier 3 bottoms out at `0` for those, and a params hit tops out around
+ * `PARAMS_HINT_BAND + 200 + query.length`. Convergence upward — the
+ * affordance the palette already had, made real on both surfaces —
+ * rather than deleting it from the palette to match the bar.
+ */
+export const PARAMS_HINT_BAND = -1000;
+
+/** A {@link fuzzyScore} result plus WHICH candidate field produced it. */
+export interface CommandCandidateMatch extends FuzzyMatch {
+  field: "slash" | "label" | "params";
+}
+
+/**
+ * The one ranking function behind both command surfaces: score an
+ * action's slash body, its label, and its parameter hint, and return the
+ * winner tagged with the field it came from.
+ *
+ * Slash beats label at an exact score tie (the caller's secondary sort
+ * key needs `field` for the cross-action version of the same tie). The
+ * params hint is consulted only when neither slash nor label matches —
+ * an equivalent formulation of the band, and one round of scoring
+ * cheaper.
+ *
+ * `indices` are positions within the WINNING field's own text; callers
+ * shift them into whatever composed string they render.
+ */
+export function scoreCommandCandidates(
+  slashBody: string,
+  label: string,
+  paramsHint: string,
+  query: string,
+): CommandCandidateMatch | null {
+  const slashMatch = fuzzyScore(slashBody, query);
+  const labelMatch = fuzzyScore(label, query);
+  const best =
+    slashMatch !== null && (labelMatch === null || slashMatch.score >= labelMatch.score)
+      ? slashMatch
+      : labelMatch;
+  if (best !== null) {
+    return { ...best, field: best === slashMatch ? "slash" : "label" };
+  }
+  if (paramsHint === "") return null;
+  const paramsMatch = fuzzyScore(paramsHint, query);
+  if (paramsMatch === null) return null;
+  return {
+    score: PARAMS_HINT_BAND + paramsMatch.score,
+    indices: paramsMatch.indices,
+    field: "params",
+  };
+}

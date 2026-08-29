@@ -15,7 +15,8 @@
 
 import { describe, expect, it } from "vitest";
 
-import { LAYOUT_IDS, readZoneArg, resolveZoneTarget } from "./useTerminalCommands";
+import { readTextArg, textArg } from "./parse";
+import { LAYOUT_IDS, readCountArg, readZoneArg, resolveZoneTarget } from "./useTerminalCommands";
 
 describe("readZoneArg", () => {
   it("reports an omitted field as absent, not as a zero", () => {
@@ -121,5 +122,73 @@ describe("LAYOUT_IDS", () => {
 
   it("does not contain a bogus preset", () => {
     expect(LAYOUT_IDS).not.toContain("bogus");
+  });
+});
+
+/**
+ * `count` is the same contract as `zone`, and it was the one field the
+ * contract had never been applied to. There was NO coverage at all:
+ * `grep -rn "invalid-count" src` matched only the three `count < 1`
+ * guards, and neither this file nor `spawnVerdict.test.ts` mentioned a
+ * non-numeric count. `/spawn abc` therefore rendered `[ok] /spawn ✓`
+ * after silently creating ONE terminal.
+ */
+describe("readCountArg", () => {
+  it("reports an omitted field as absent, so the schema default can apply", () => {
+    expect(readCountArg({})).toEqual({ kind: "absent" });
+    expect(readCountArg({ count: undefined })).toEqual({ kind: "absent" });
+    expect(readCountArg({ count: null })).toEqual({ kind: "absent" });
+    expect(readCountArg({ count: "  " })).toEqual({ kind: "absent" });
+  });
+
+  it("reads an integer count from either the number or its string form", () => {
+    expect(readCountArg({ count: 3 })).toEqual({ kind: "count", count: 3 });
+    expect(readCountArg({ count: "3" })).toEqual({ kind: "count", count: 3 });
+    expect(readCountArg({ count: " 3 " })).toEqual({ kind: "count", count: 3 });
+  });
+
+  it("reports a supplied-but-unparseable count as INVALID, not absent", () => {
+    // The live defect: `parse.ts::coerceToken` leaves "abc" a string, and
+    // `typeof args.count === "number" ? args.count : 1` collapsed that to
+    // the same 1 a bare `/spawn` produces.
+    expect(readCountArg({ count: "abc" })).toEqual({ kind: "invalid", raw: "abc" });
+    expect(readCountArg({ count: NaN })).toEqual({ kind: "invalid", raw: "NaN" });
+    expect(readCountArg({ count: Infinity })).toMatchObject({ kind: "invalid" });
+    expect(readCountArg({ count: {} })).toMatchObject({ kind: "invalid" });
+  });
+
+  it("rejects a NON-INTEGER count rather than rounding it", () => {
+    // `/spawn 2.7` created THREE terminals and reported success, because
+    // `spawnVerdict(ids, 2.7)` asks `3 < 2.7` — false.
+    expect(readCountArg({ count: 2.7 })).toEqual({ kind: "invalid", raw: "2.7" });
+    expect(readCountArg({ count: "2.7" })).toEqual({ kind: "invalid", raw: "2.7" });
+  });
+
+  it("reads a non-default field name", () => {
+    expect(readCountArg({ n: 4 }, "n")).toEqual({ kind: "count", count: 4 });
+  });
+});
+
+/**
+ * The string half of the same class. `coerceToken` turns a clean numeric
+ * literal into a `number`, and every `typeof args.x === "string" ? x : ""`
+ * read that as ABSENT — so `/spawn-with 2 5` answered "command is
+ * required" for a command that was supplied, and `/spawn-ai 2 3` silently
+ * launched the "best" account instead of failing on the unknown one.
+ */
+describe("readTextArg", () => {
+  it("reports an omitted or blank field as absent", () => {
+    expect(readTextArg({}, "command")).toEqual({ kind: "absent" });
+    expect(readTextArg({ command: null }, "command")).toEqual({ kind: "absent" });
+    expect(readTextArg({ command: "   " }, "command")).toEqual({ kind: "absent" });
+  });
+
+  it("keeps a supplied token that coerceToken turned into a number", () => {
+    expect(readTextArg({ command: 5 }, "command")).toEqual({ kind: "text", text: "5" });
+    expect(textArg({ account: 3 }, "account")).toBe("3");
+  });
+
+  it("passes a normal string through untouched", () => {
+    expect(readTextArg({ command: "htop" }, "command")).toEqual({ kind: "text", text: "htop" });
   });
 });

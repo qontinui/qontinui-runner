@@ -36,7 +36,8 @@
  * the handler takes params.
  */
 
-import { fuzzyScore, type FuzzyMatch } from "./fuzzy";
+import { fuzzyScore, scoreCommandCandidates, type FuzzyMatch } from "./fuzzy";
+import { describeParams } from "./parse";
 import { getAll } from "./registry";
 import type { CommandAction } from "./types";
 import { callRegistry } from "./uibridge";
@@ -54,14 +55,6 @@ export interface PaletteActionLike {
   category: string;
   priority: number;
   action: () => void;
-}
-
-/** Format an action's `paramSchema` field list for inline label hint. */
-function describeParams(schema: Record<string, unknown> | undefined): string {
-  if (!schema) return "";
-  const keys = Object.keys(schema);
-  if (keys.length === 0) return "";
-  return ` (${keys.join(", ")})`;
 }
 
 /**
@@ -140,6 +133,15 @@ export interface PaletteLabelMatch extends FuzzyMatch {
  *
  * Rows with no slash form (the palette's per-zone / per-tab enumerations)
  * fall through to a plain label score with `fromSlash: false`.
+ *
+ * THREE candidates now, not two: the composed description carries the
+ * params hint (`" (count, account, context)"`) and this function used to
+ * score it as part of the description at full tier. That is what made
+ * `ctx`, `tabid` and `acc` list rows here that the CommandBar answered
+ * `No match` for. The hint is split back out and scored in its own band
+ * by `scoreCommandCandidates`, which `resolve()` runs over the same three
+ * fields — so the surfaces match the same candidate set and rank it the
+ * same way.
  */
 export function scorePaletteLabel(label: string, query: string): PaletteLabelMatch | null {
   const sep = label.indexOf(SLASH_LABEL_SEPARATOR);
@@ -152,22 +154,27 @@ export function scorePaletteLabel(label: string, query: string): PaletteLabelMat
   // slash does not bias the prefix tier.
   const slashBody = label.slice(1, sep);
   const description = label.slice(sep + SLASH_LABEL_SEPARATOR.length);
+  // Peel the params hint back off the description. `toPaletteRow`
+  // composed it as `<label><describeParams(schema)>`, and
+  // `describeParams` emits ` (a, b, c)` — no nested parens — so the
+  // trailing group is recoverable. `registryLabelsCarryNoTrailingParens`
+  // in this module's test pins the one assumption that makes it safe.
+  const hintAt = description.search(/ \([^()]*\)$/);
+  const labelBody = hintAt === -1 ? description : description.slice(0, hintAt);
+  const paramsHint = hintAt === -1 ? "" : description.slice(hintAt);
+
   const q = query.replace(/^\//, "");
-  const slashMatch = fuzzyScore(slashBody, q);
-  const descMatch = fuzzyScore(description, q);
-  const best =
-    slashMatch !== null && (descMatch === null || slashMatch.score >= descMatch.score)
-      ? slashMatch
-      : descMatch;
+  const best = scoreCommandCandidates(slashBody, labelBody, paramsHint, q);
   if (best === null) return null;
 
-  const fromSlash = best === slashMatch;
   // Shift indices back into the composed label so the highlight renderer
   // marks the right characters.
-  const offset = fromSlash ? 1 : sep + SLASH_LABEL_SEPARATOR.length;
+  const descStart = sep + SLASH_LABEL_SEPARATOR.length;
+  const offset =
+    best.field === "slash" ? 1 : best.field === "label" ? descStart : descStart + labelBody.length;
   return {
     score: best.score,
     indices: best.indices.map((i) => i + offset),
-    fromSlash,
+    fromSlash: best.field === "slash",
   };
 }
