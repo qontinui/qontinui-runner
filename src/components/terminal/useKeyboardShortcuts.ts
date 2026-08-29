@@ -88,8 +88,12 @@ interface UseKeyboardShortcutsParams {
    * listeners on the same target both run. Guarding the listener on the
    * surface it acts on is the class fix — a chord for an off-screen
    * surface is neither claimed nor swallowed.
+   *
+   * REQUIRED, not optional. An optional ref that a future call site
+   * forgets fails CLOSED — every chord silently dead — which is the
+   * hardest kind of regression to notice on a keyboard surface.
    */
-  surfaceRef?: React.RefObject<HTMLElement | null>;
+  surfaceRef: React.RefObject<HTMLElement | null>;
 }
 
 export function useKeyboardShortcuts({
@@ -125,7 +129,7 @@ export function useKeyboardShortcuts({
     // sidebar, all of it.
     const handler = (e: KeyboardEvent) => {
       // Off-screen surface → every chord below is inert. See `surfaceRef`.
-      if (!isSurfaceVisible(surfaceRef?.current)) return;
+      if (!isSurfaceVisible(surfaceRef.current)) return;
       if (isCtrlShiftChord(e, "t")) {
         e.preventDefault();
         createAndAssignTerminal();
