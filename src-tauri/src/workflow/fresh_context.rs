@@ -33,7 +33,29 @@ pub fn build_fresh_context_prompt(
     // Variables
     if !variables.is_empty() {
         let mut var_section = String::from("### Current Variables\n");
-        for (key, val) in variables {
+        // Render in sorted key order, NOT `HashMap` iteration order.
+        //
+        // `variables_as_map` builds a fresh `HashMap` per call (`dag_context.rs`),
+        // and `HashMap::new()` seeds a fresh `RandomState` per instance — so the
+        // order varies per constructed map, not merely per process. That makes
+        // this text nondeterministic across runs with identical inputs, which
+        // costs three things:
+        //
+        //  1. The step fingerprint hashes `prompt_content`, so a `context: fresh`
+        //     prompt node would compute a DIFFERENT digest on every resume and
+        //     never replay — permanently re-executing and re-billing exactly the
+        //     node class that is most expensive to re-run, while logging "the
+        //     definition or its inputs changed" when nothing changed.
+        //  2. The prompt actually sent to the model varied run to run.
+        //  3. `MAX_STATE_SUMMARY_CHARS` truncation below is order-dependent, so
+        //     which variables survive the cut was effectively random.
+        //
+        // Sorting fixes all three. Two or more resolvable variables are needed to
+        // observe any of it, which is why it stayed invisible.
+        let mut keys: Vec<&String> = variables.keys().collect();
+        keys.sort();
+        for key in keys {
+            let val = &variables[key];
             let val_str = match val {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -128,6 +150,69 @@ mod tests {
         assert!(prompt.contains("status"));
         assert!(prompt.contains("running"));
         assert!(prompt.contains("count"));
+    }
+
+    /// Regression guard for the `context: fresh` replay defect.
+    ///
+    /// `variables_as_map` (`workflow/dag_context.rs`) builds a FRESH `HashMap`
+    /// per call, and `HashMap::new()` seeds a fresh `RandomState` per instance
+    /// — so iteration order varies per constructed map, not merely per
+    /// process. This text is written into `cfg.prompt_content` by the
+    /// `prepared_config` block in `dag_driver.rs` and then hashed by
+    /// `node_fingerprint`, so unsorted iteration made a `context: fresh` prompt
+    /// node compute a different digest on every resume: it could never replay,
+    /// re-executing and re-billing the most expensive node class while logging
+    /// "the definition or its inputs changed" when nothing had.
+    ///
+    /// This test fails if anyone reverts to `variables.iter()`.
+    #[test]
+    fn test_variables_render_in_sorted_order_and_are_deterministic() {
+        // Insertion order is deliberately NOT sorted order, and deliberately
+        // different between the two maps — with 5 keys, a `HashMap` whose
+        // ordering leaked would have to reproduce the same permutation twice
+        // from two independently seeded `RandomState`s.
+        let mut first = HashMap::new();
+        first.insert("zulu".to_string(), json!("z-val"));
+        first.insert("alpha".to_string(), json!(1));
+        first.insert("mike".to_string(), json!("m-val"));
+        first.insert("bravo".to_string(), json!(true));
+        first.insert("yankee".to_string(), json!("y-val"));
+
+        let mut second = HashMap::new();
+        second.insert("mike".to_string(), json!("m-val"));
+        second.insert("yankee".to_string(), json!("y-val"));
+        second.insert("bravo".to_string(), json!(true));
+        second.insert("zulu".to_string(), json!("z-val"));
+        second.insert("alpha".to_string(), json!(1));
+
+        let rendered_first = build_fresh_context_prompt("Base.", 7, &first, &[], &[]);
+        let rendered_second = build_fresh_context_prompt("Base.", 7, &second, &[], &[]);
+
+        // Byte-identical output from two independently constructed maps with
+        // the same contents — this is exactly what the fingerprint hashes.
+        assert_eq!(
+            rendered_first, rendered_second,
+            "the fresh-context prompt must be byte-identical for equal variable \
+             maps, or `node_fingerprint` changes on every resume and replay is \
+             permanently disabled"
+        );
+
+        // And the order is specifically SORTED, not merely stable.
+        let positions: Vec<usize> = ["alpha", "bravo", "mike", "yankee", "zulu"]
+            .iter()
+            .map(|k| {
+                rendered_first
+                    .find(&format!("- **{}**:", k))
+                    .unwrap_or_else(|| panic!("variable line for `{}` is missing", k))
+            })
+            .collect();
+        let mut sorted_positions = positions.clone();
+        sorted_positions.sort_unstable();
+        assert_eq!(
+            positions, sorted_positions,
+            "variable lines must appear in sorted key order; got offsets {:?}",
+            positions
+        );
     }
 
     #[test]

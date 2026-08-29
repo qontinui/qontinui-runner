@@ -8,7 +8,9 @@ use crate::step_metadata::{StepDetails, StepMetadata};
 use crate::step_registry::{StepEventKind, StepEventLogger};
 use crate::step_types::StepType;
 use crate::unified_ai_session::{AiSessionConfig, UnifiedAiSessionExecutor};
-use crate::workflow_state::{CheckpointManager, StepCheckpoint};
+use crate::workflow_state::{
+    config_fingerprint, configs_fingerprint, CheckpointManager, StepCheckpoint,
+};
 use crate::AppState;
 
 use super::super::phase_configs::{CompletionConfig, CompletionResult};
@@ -250,6 +252,9 @@ impl CompletionExecutor {
                 let step_name = step.name.as_deref().unwrap_or(&step.step_type);
                 let journal_type =
                     StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
+                // Automation steps never call a model, so no phase-level
+                // model/provider override is folded in: a model swap must not
+                // invalidate a shell command's replay.
                 let replayed = journalled_step(
                     checkpoint_mgr,
                     execution_id,
@@ -260,6 +265,7 @@ impl CompletionExecutor {
                     &step.step_type,
                     journal_type.as_str(),
                     step_name,
+                    &config_fingerprint(step, None, None),
                 )
                 .as_ref()
                 .and_then(decode_journalled_step_result);
@@ -298,6 +304,10 @@ impl CompletionExecutor {
                         StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
                     let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
+                    // Same arguments as the replay lookup above - if the two
+                    // disagreed, this step could never replay again.
+                    let step_fp = config_fingerprint(step, None, None);
+
                     // Use Some(0) instead of None for iteration to ensure SQLite
                     // UNIQUE constraint works correctly (NULL != NULL in SQLite)
                     let mut checkpoint = StepCheckpoint::new(
@@ -309,7 +319,8 @@ impl CompletionExecutor {
                         step_type.as_str(),
                     )
                     .with_step_name(step_name)
-                    .with_stage_index(stage_index);
+                    .with_stage_index(stage_index)
+                    .with_fingerprint(&step_fp);
                     checkpoint.mark_started();
                     if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
                         warn!("Failed to save completion step checkpoint: {}", e);
@@ -342,6 +353,10 @@ impl CompletionExecutor {
                         StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
                     let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
+                    // Same arguments as the replay lookup above - if the two
+                    // disagreed, this step could never replay again.
+                    let step_fp = config_fingerprint(step, None, None);
+
                     // Use Some(0) instead of None for iteration to ensure SQLite
                     // UNIQUE constraint works correctly (NULL != NULL in SQLite)
                     let mut checkpoint = StepCheckpoint::new(
@@ -353,7 +368,8 @@ impl CompletionExecutor {
                         step_type.as_str(),
                     )
                     .with_step_name(step_name)
-                    .with_stage_index(stage_index);
+                    .with_stage_index(stage_index)
+                    .with_fingerprint(&step_fp);
 
                     let duration_ms = step_result.duration_ms as i64;
                     if step_result.success {
@@ -469,6 +485,16 @@ impl CompletionExecutor {
 
                     let step_idx = step_index_offset + response_step_count;
 
+                    // One fingerprint for this step, used by the replay lookup
+                    // and by every checkpoint write below. The step-level model
+                    // beats the phase override, matching how `step_model` is
+                    // resolved further down.
+                    let resp_fp = config_fingerprint(
+                        step,
+                        model_override.as_deref(),
+                        provider_override.as_deref(),
+                    );
+
                     // Crash-recovery replay: a response-mode prompt already
                     // journalled as complete returns its recorded output rather
                     // than calling (and paying for) the model again.
@@ -482,6 +508,7 @@ impl CompletionExecutor {
                         &step.step_type,
                         "prompt",
                         step_name,
+                        &resp_fp,
                     )
                     .as_ref()
                     .and_then(decode_journalled_ai_output)
@@ -531,7 +558,8 @@ impl CompletionExecutor {
                         "prompt",
                     )
                     .with_step_name(step_name)
-                    .with_stage_index(stage_index);
+                    .with_stage_index(stage_index)
+                    .with_fingerprint(&resp_fp);
                     resp_checkpoint.mark_started();
                     if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                         warn!(
@@ -633,7 +661,8 @@ impl CompletionExecutor {
                                 "prompt",
                             )
                             .with_step_name(step_name)
-                            .with_stage_index(stage_index);
+                            .with_stage_index(stage_index)
+                            .with_fingerprint(&resp_fp);
                             resp_checkpoint.mark_success(Some(output.clone()), duration_ms as i64);
                             if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                                 warn!("Failed to save completion response-mode step completion checkpoint: {}", e);
@@ -695,7 +724,8 @@ impl CompletionExecutor {
                                 "prompt",
                             )
                             .with_step_name(step_name)
-                            .with_stage_index(stage_index);
+                            .with_stage_index(stage_index)
+                            .with_fingerprint(&resp_fp);
                             resp_checkpoint.mark_failed(&e, duration_ms as i64);
                             if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                                 warn!("Failed to save completion response-mode step failure checkpoint: {}", e);
@@ -757,6 +787,16 @@ impl CompletionExecutor {
                     "Completion AI Task",
                 );
 
+                // The consolidated prompt is a pure function of these step
+                // definitions, so hashing the definitions is equivalent to
+                // hashing the built prompt AND is available here, before it is
+                // assembled.
+                let ai_fp = configs_fingerprint(
+                    &session_prompt_steps,
+                    model_override.as_deref(),
+                    provider_override.as_deref(),
+                );
+
                 // Crash-recovery replay: the consolidated completion AI
                 // session is the most expensive step in the phase. If it is
                 // already journalled as complete, skip it outright rather than
@@ -771,6 +811,7 @@ impl CompletionExecutor {
                     "ai_session",
                     "ai_session",
                     &step_name,
+                    &ai_fp,
                 )
                 .as_ref()
                 .and_then(decode_journalled_ai_output);
@@ -793,7 +834,8 @@ impl CompletionExecutor {
                         "ai_session",
                     )
                     .with_step_name(&step_name)
-                    .with_stage_index(stage_index);
+                    .with_stage_index(stage_index)
+                    .with_fingerprint(&ai_fp);
                     ai_checkpoint.mark_started();
                     if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
                         warn!("Failed to save completion AI step checkpoint: {}", e);
@@ -862,7 +904,8 @@ impl CompletionExecutor {
                             "ai_session",
                         )
                         .with_step_name(&step_name)
-                        .with_stage_index(stage_index);
+                        .with_stage_index(stage_index)
+                        .with_fingerprint(&ai_fp);
 
                         if result.success {
                             ai_completion_checkpoint

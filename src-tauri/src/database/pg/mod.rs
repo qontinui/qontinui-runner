@@ -50,6 +50,7 @@ pub mod meta_optimizer;
 pub mod misc_crud;
 pub mod observations;
 pub mod online_learning;
+pub mod optional_column;
 pub mod orchestration;
 pub mod orchestration_loop;
 pub mod phase_results;

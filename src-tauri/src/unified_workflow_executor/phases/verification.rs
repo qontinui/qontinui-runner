@@ -14,7 +14,7 @@ use crate::step_executor::{
 use crate::step_metadata::{StepDetails, StepMetadata};
 use crate::step_registry::{StepEventKind, StepEventLogger};
 use crate::step_types::StepType;
-use crate::workflow_state::{CheckpointManager, StepCheckpoint};
+use crate::workflow_state::{config_fingerprint, CheckpointManager, StepCheckpoint};
 use crate::AppState;
 
 use super::super::phase_configs::{VerificationConfig, VerificationResult};
@@ -209,7 +209,15 @@ impl VerificationExecutor {
                 warn!("Failed to log verification step start event: {}", e);
             }
 
-            // Save step checkpoint as "running"
+            // Save step checkpoint as "running".
+            //
+            // The fingerprint is written even though NOTHING replays a
+            // verification checkpoint (`phases::phase_is_replayable` excludes
+            // the whole phase: a verification step is an OBSERVATION of the
+            // system under test, and a resumed run has to re-observe). The row
+            // is still an honest record of what was run, and leaving the column
+            // NULL here would make "no fingerprint" ambiguous between "this
+            // phase never writes one" and "this build predates the column".
             let mut checkpoint = StepCheckpoint::new(
                 execution_id,
                 "unified",
@@ -219,7 +227,8 @@ impl VerificationExecutor {
                 step_type.as_str(),
             )
             .with_step_name(step_name)
-            .with_stage_index(stage_index);
+            .with_stage_index(stage_index)
+            .with_fingerprint(config_fingerprint(step, None, None));
             checkpoint.mark_started();
             if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
                 warn!("Failed to save verification step checkpoint: {}", e);
@@ -264,7 +273,8 @@ impl VerificationExecutor {
                 step_type.as_str(),
             )
             .with_step_name(step_name)
-            .with_stage_index(stage_index);
+            .with_stage_index(stage_index)
+            .with_fingerprint(config_fingerprint(step, None, None));
 
             let duration_ms = step_result.duration_ms as i64;
             if step_result.success {

@@ -10,8 +10,18 @@
 //!
 //! Before dispatching a node, the driver queries the event log. If a
 //! `completed` event already exists for that `(execution_id, node_id)` pair
-//! the cached output is used and the node is not re-executed. This makes DAG
+//! **and its `step_fingerprint` still matches the work about to run**, the
+//! cached output is used and the node is not re-executed. This makes DAG
 //! execution idempotent across runner restarts.
+//!
+//! The fingerprint is what stops idempotence from becoming staleness. The
+//! journal key carries no content at all, so before it existed, editing a
+//! node's prompt and re-running under the same `execution_id` served the OLD
+//! output while still reporting a resume. A row whose fingerprint differs — or
+//! that has none, which is every row written before the column shipped — is a
+//! MISS: the node re-executes and the journal is rewritten. See
+//! `crate::workflow_state::fingerprint` for exactly which inputs are hashed
+//! and which are deliberately not.
 //!
 //! Loop-body work is journaled the same way, under the composite key
 //! `"<loop_node_id>/iter<N>/<body_node_id>"` (see `loop_body_journal_key`),
@@ -41,13 +51,15 @@ use tracing::{error, info, warn};
 
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
-use crate::database::pg::event_log::EventType;
+use crate::database::pg::event_log::{EventType, NodeReplay};
 use crate::step_executor::executor_types::ExecutionStepConfig;
 use crate::step_executor::StepExecutor;
 use crate::workflow::dag_executor::NodeOutcome;
 use crate::workflow::dag_parser::dag_to_step_configs;
 use crate::workflow::dag_runtime::{DagRuntime, DagWorkflowResult, LayerAdvance};
 use crate::workflow::dag_schema::{ContextMode, DagNodeDef, DagWorkflowDef};
+use crate::workflow::variable_engine::VariableStore;
+use crate::workflow_state::StepFingerprint;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -131,12 +143,15 @@ pub async fn execute_dag_workflow(
 
                 // Log skipped nodes to the event log.
                 for s in &skipped {
+                    // No fingerprint: a skipped node produced no output, and
+                    // only `completed` rows are ever replayed.
                     journal_append(
                         &pg_db,
                         &execution_id,
                         &s.node_id,
                         EventType::Skipped,
                         Some(&json!({ "reason": s.reason })),
+                        None,
                     )
                     .await;
                 }
@@ -149,8 +164,58 @@ pub async fn execute_dag_workflow(
                     let pg = pg_db.clone();
                     let exec_id = execution_id.clone();
 
+                    // ── Resolve the step config BEFORE the replay check ──────
+                    // The replay lookup is fingerprint-gated, and the
+                    // fingerprint is taken from the RESOLVED config (a
+                    // fresh-context prompt included), so the config has to
+                    // exist first. This is a reordering only: the "no step
+                    // config" branch below still marks the node failed exactly
+                    // as it did, and `resolve_node_context` is a pure function
+                    // of the node definition plus the current variable store.
+                    let prepared_config: Option<ExecutionStepConfig> =
+                        config_map.get(&node_id).cloned().map(|mut cfg| {
+                            // Feature 2: fresh context for prompt nodes.
+                            if cfg.step_type == "prompt" {
+                                if let Some(node_def) = def.nodes.get(&node_id) {
+                                    if matches!(node_def.context, Some(ContextMode::Fresh)) {
+                                        let variables_snapshot = runtime.variable_store().clone();
+                                        if let Some(fresh_prompt) =
+                                            crate::workflow::dag_context::resolve_node_context(
+                                                node_def,
+                                                "", // base_prompt not available at dag_driver level
+                                                0,  // iteration 0 for single-pass DAG
+                                                &variables_snapshot,
+                                                &[], // no verification failures in DAG context
+                                                &[], // no iteration diffs in DAG context
+                                            )
+                                        {
+                                            cfg.prompt_content = Some(fresh_prompt);
+                                        }
+                                    }
+                                }
+                            }
+                            cfg
+                        });
+
+                    // An unresolvable config yields an EMPTY fingerprint, which
+                    // never matches — so the node re-executes rather than
+                    // replaying against a definition we could not read.
+                    let node_fingerprint = prepared_config
+                        .as_ref()
+                        .map(|cfg| {
+                            dag_node_fingerprint(
+                                cfg,
+                                def.nodes.get(&node_id),
+                                &config_map,
+                                runtime.variable_store(),
+                            )
+                        })
+                        .unwrap_or_default();
+
                     // ── Crash-recovery replay check ──────────────────────────
-                    let cached = pg.event_log_node_completed(&exec_id, &node_id).await;
+                    let cached = pg
+                        .event_log_node_completed(&exec_id, &node_id, &node_fingerprint)
+                        .await;
 
                     if let Err(ref e) = cached {
                         // Not knowing is not the same as "not completed": the
@@ -164,7 +229,44 @@ pub async fn execute_dag_workflow(
                         );
                     }
 
-                    if let Ok(Some(cached_output)) = cached {
+                    if let Ok(NodeReplay::FingerprintMismatch { ref stored }) = cached {
+                        // Distinguishable from "no journal row" on purpose:
+                        // this node DID complete here, but the row does not
+                        // vouch for the current definition. The re-execution is
+                        // correct either way — but the CAUSE is not.
+                        //
+                        // `stored: None` is not "the inputs changed": it is a
+                        // row that carries no fingerprint at all, either a
+                        // legacy row or — while the `step_fingerprint`
+                        // migration is merged but not yet DEPLOYED — every row,
+                        // because the column read comes back absent. Reporting
+                        // that as "the definition changed" would make the
+                        // undeployed-migration window indistinguishable from a
+                        // real edit, and during that window it is the only
+                        // thing this log would say.
+                        if stored.is_none() {
+                            info!(
+                                execution_id = %exec_id,
+                                node_id = %node_id,
+                                journalled_fingerprint = ?stored,
+                                expected_fingerprint = %node_fingerprint,
+                                "Replay skipped: no journalled fingerprint (legacy row, or the \
+                                 step_fingerprint migration is not yet deployed) — node will be \
+                                 re-executed"
+                            );
+                        } else {
+                            info!(
+                                execution_id = %exec_id,
+                                node_id = %node_id,
+                                journalled_fingerprint = ?stored,
+                                expected_fingerprint = %node_fingerprint,
+                                "Replay skipped: the node definition or its inputs changed since \
+                                 the journalled run — node will be re-executed"
+                            );
+                        }
+                    }
+
+                    if let Ok(NodeReplay::Hit(cached_output)) = cached {
                         info!(
                             node_id = %node_id,
                             "Replaying completed node from event log (crash recovery)"
@@ -216,6 +318,7 @@ pub async fn execute_dag_workflow(
                                 Some(
                                     &json!({ "error": e, "reason": "sub_workflow_depth_exceeded" }),
                                 ),
+                                Some(&node_fingerprint),
                             )
                             .await;
                             node_futures.push(Box::pin(async move {
@@ -238,9 +341,9 @@ pub async fn execute_dag_workflow(
                         }
                     }
 
-                    // ── Look up the pre-computed step config ─────────────────
-                    let mut step_config = match config_map.get(&node_id) {
-                        Some(cfg) => cfg.clone(),
+                    // ── Take the config resolved above ──────────────────────
+                    let step_config = match prepared_config {
+                        Some(cfg) => cfg,
                         None => {
                             warn!(
                                 node_id = %node_id,
@@ -266,31 +369,6 @@ pub async fn execute_dag_workflow(
                         }
                     };
 
-                    // ── Feature 2: Fresh context for prompt nodes ────────────
-                    // Before entering the async block, check if this prompt node
-                    // requires fresh context.  We resolve it here (synchronously,
-                    // before the future is spawned) so we don't need to move the
-                    // variable store into the future.
-                    if step_config.step_type == "prompt" {
-                        if let Some(node_def) = def.nodes.get(&node_id) {
-                            if matches!(node_def.context, Some(ContextMode::Fresh)) {
-                                let variables_snapshot = runtime.variable_store().clone();
-                                if let Some(fresh_prompt) =
-                                    crate::workflow::dag_context::resolve_node_context(
-                                        node_def,
-                                        "", // base_prompt not available at dag_driver level
-                                        0,  // iteration 0 for single-pass DAG
-                                        &variables_snapshot,
-                                        &[], // no verification failures in DAG context
-                                        &[], // no iteration diffs in DAG context
-                                    )
-                                {
-                                    step_config.prompt_content = Some(fresh_prompt);
-                                }
-                            }
-                        }
-                    }
-
                     // ── Feature 1: Extract retry config before async block ───
                     // Clone the retry config values from the definition BEFORE
                     // entering the async block so we don't borrow `def` inside.
@@ -310,7 +388,15 @@ pub async fn execute_dag_workflow(
                         };
 
                     // ── Log Started event ────────────────────────────────────
-                    journal_append(&pg, &exec_id, &node_id, EventType::Started, None).await;
+                    journal_append(
+                        &pg,
+                        &exec_id,
+                        &node_id,
+                        EventType::Started,
+                        None,
+                        Some(&node_fingerprint),
+                    )
+                    .await;
 
                     // ── Feature 3: Loop node inline execution ────────────────
                     // dag_loop nodes are handled by the driver, not StepExecutor.
@@ -328,6 +414,7 @@ pub async fn execute_dag_workflow(
                         let exec_id_log_loop = exec_id.clone();
                         let node_id_log_loop = node_id.clone();
                         let config_map_loop = config_map.clone();
+                        let fingerprint_loop = node_fingerprint.clone();
 
                         let fut = async move {
                             let (outcome, output_data, duration_ms) = match loop_node_def {
@@ -368,6 +455,7 @@ pub async fn execute_dag_workflow(
                                 &node_id_log_loop,
                                 event_type,
                                 Some(&event_data),
+                                Some(&fingerprint_loop),
                             )
                             .await;
 
@@ -399,6 +487,7 @@ pub async fn execute_dag_workflow(
                     let pg_log = pg.clone();
                     let exec_id_log = exec_id.clone();
                     let node_id_log = node_id.clone();
+                    let fingerprint_log = node_fingerprint.clone();
 
                     // ── Dispatch node execution as a future ──────────────────
                     // Each node builds its own StepExecutor from cloned Arcs to
@@ -439,6 +528,7 @@ pub async fn execute_dag_workflow(
                                 &node_id_log,
                                 EventType::Retried,
                                 Some(&json!({ "attempt": attempt, "error": error })),
+                                Some(&fingerprint_log),
                             )
                             .await;
 
@@ -480,6 +570,7 @@ pub async fn execute_dag_workflow(
                             &node_id_log,
                             event_type,
                             Some(&event_data),
+                            Some(&fingerprint_log),
                         )
                         .await;
 
@@ -537,12 +628,15 @@ pub async fn execute_dag_workflow(
                     "DAG workflow cancelled"
                 );
                 // Log the cancellation to the event log with a sentinel node_id.
+                // `__workflow__` is a sentinel key, not a step: it has no
+                // definition to fingerprint and is never replayed.
                 journal_append(
                     &pg_db,
                     &execution_id,
                     "__workflow__",
                     EventType::Cancelled,
                     Some(&json!({ "reason": reason })),
+                    None,
                 )
                 .await;
                 break;
@@ -654,12 +748,13 @@ async fn execute_loop_node(
             // Keyed so iteration 3 of a body node is distinct work from
             // iteration 7 — see `loop_body_journal_key`.
             let journal_key = loop_body_journal_key(node_id, iteration, body_id);
+            let body_fingerprint = loop_body_fingerprint(&step, node_id, iteration);
 
             match pg_db
-                .event_log_node_completed(execution_id, &journal_key)
+                .event_log_node_completed(execution_id, &journal_key, &body_fingerprint)
                 .await
             {
-                Ok(Some(recorded)) => {
+                Ok(NodeReplay::Hit(recorded)) => {
                     info!(
                         node_id,
                         body_id,
@@ -672,7 +767,21 @@ async fn execute_loop_node(
                     last_output = recorded.get("output").cloned().filter(|v| !v.is_null());
                     continue;
                 }
-                Ok(None) => {}
+                Ok(NodeReplay::FingerprintMismatch { stored }) => {
+                    // Not the same as "never ran here": this iteration IS
+                    // journalled, but the body step's definition changed since.
+                    info!(
+                        node_id,
+                        body_id,
+                        iteration,
+                        journal_key = %journal_key,
+                        journalled_fingerprint = ?stored,
+                        expected_fingerprint = %body_fingerprint,
+                        "Replay skipped: the loop body definition changed since the journalled \
+                         run — body node will be re-executed"
+                    );
+                }
+                Ok(NodeReplay::NoRow) => {}
                 Err(e) => {
                     warn!(
                         node_id,
@@ -718,6 +827,7 @@ async fn execute_loop_node(
                     "body_node_id": body_id,
                     "iteration": iteration,
                 })),
+                Some(&body_fingerprint),
             )
             .await;
 
@@ -810,6 +920,99 @@ async fn execute_loop_node(
 /// than the re-execution a lost record causes.
 const JOURNAL_APPEND_ATTEMPTS: u32 = 3;
 
+/// Content fingerprint for one DAG node.
+///
+/// Hashed:
+///
+/// * the node's RESOLVED prompt (fresh-context substitution already applied by
+///   the caller), its model and provider;
+/// * the whole authored `ExecutionStepConfig`;
+/// * the node's `DagNodeDef`. This is NOT redundant with the config:
+///   `dag_to_step_configs` projects a node onto the executor's flat step shape
+///   and drops fields that have no executor meaning — `loop_body`, `until`,
+///   `until_bash`, `max_loop_iterations`, `commit_interval`, `when`,
+///   `trigger_rule`, `retry`, `approval`, `workflow_ref`. Every one of those is
+///   authored, and every one changes what the node does. Hashing the whole
+///   `DagNodeDef` covers fields added later by construction, rather than by
+///   someone remembering to extend a list;
+/// * for a `dag_loop` node, the `ExecutionStepConfig` of every body step it
+///   names, in `loop_body` order. The loop node's own journal row replays the
+///   WHOLE loop, so without this, editing a body step's prompt would leave the
+///   loop node's fingerprint untouched and serve the stale loop output — the
+///   exact stale hit this column exists to prevent;
+/// * the resolved values of the node's DECLARED `inputs` map.
+///
+/// Deliberately NOT hashed: the execution id, the layer index, timings, or the
+/// outputs of upstream nodes this node does not declare an input from. A DAG
+/// almost always contains at least one nondeterministic step (a shell command
+/// whose output embeds a timestamp or a commit sha); hashing every reachable
+/// upstream output would make that one step invalidate everything downstream of
+/// it on every single resume, which silently disables replay for the whole
+/// graph. `inputs` is the declared data-flow contract, and that is the line.
+fn dag_node_fingerprint(
+    cfg: &ExecutionStepConfig,
+    node_def: Option<&DagNodeDef>,
+    config_map: &HashMap<String, ExecutionStepConfig>,
+    variables: &VariableStore,
+) -> String {
+    let mut fp = StepFingerprint::new()
+        .with_prompt_opt(cfg.prompt_content.as_deref())
+        .with_model(cfg.model.as_deref())
+        .with_provider(cfg.provider.as_deref())
+        .with_definition(cfg);
+
+    if let Some(nd) = node_def {
+        fp = fp.with_definition(nd);
+
+        // A loop node replays its whole body from one journal row, so the body
+        // definitions are part of what determines its output.
+        if let Some(body_ids) = nd.loop_body.as_ref() {
+            for body_id in body_ids {
+                match config_map.get(body_id) {
+                    Some(body_cfg) => fp = fp.with_definition(body_cfg),
+                    // A named-but-missing body step is itself a change in the
+                    // loop's meaning; record it rather than silently skipping,
+                    // which would make a broken loop hash the same as a loop
+                    // with one fewer step.
+                    None => fp = fp.with_slice(format!("missing_body.{}", body_id), "1"),
+                }
+            }
+        }
+
+        if let Some(inputs) = nd.inputs.as_ref() {
+            let resolved = variables.resolve_inputs(inputs);
+            fp = fp.with_upstream_values(resolved.iter());
+        }
+    }
+
+    fp.digest()
+}
+
+/// Content fingerprint for one loop-body step execution.
+///
+/// The loop node id and iteration are folded in even though
+/// [`loop_body_journal_key`] already separates them: the fingerprint is then
+/// self-describing, so a future change to the key shape cannot silently make
+/// two iterations look like the same work.
+///
+/// KNOWN GAP, stated rather than hidden: `execute_loop_node` holds no variable
+/// store, so a body step's DECLARED `inputs` contribute their references (via
+/// the config) but not their resolved values. A body step whose prompt consumes
+/// an upstream value can therefore still replay after that value changed. The
+/// loop-body journal is bounded per iteration and is pruned by
+/// `commit_interval`, so the exposure is one loop's worth of steps, not the
+/// graph.
+fn loop_body_fingerprint(cfg: &ExecutionStepConfig, loop_node_id: &str, iteration: u32) -> String {
+    StepFingerprint::new()
+        .with_prompt_opt(cfg.prompt_content.as_deref())
+        .with_model(cfg.model.as_deref())
+        .with_provider(cfg.provider.as_deref())
+        .with_definition(cfg)
+        .with_slice("loop_node_id", loop_node_id)
+        .with_slice("iteration", iteration.to_string())
+        .digest()
+}
+
 /// Journal key for one loop-body node execution.
 ///
 /// The outer DAG journal is keyed `(execution_id, node_id)`, which is too
@@ -850,12 +1053,19 @@ async fn journal_append(
     node_id: &str,
     event_type: EventType,
     event_data: Option<&serde_json::Value>,
+    step_fingerprint: Option<&str>,
 ) {
     let mut last_error = String::new();
 
     for attempt in 1..=JOURNAL_APPEND_ATTEMPTS {
         match pg
-            .event_log_append(execution_id, node_id, &event_type, event_data)
+            .event_log_append(
+                execution_id,
+                node_id,
+                &event_type,
+                event_data,
+                step_fingerprint,
+            )
             .await
         {
             Ok(_) => return,
@@ -951,5 +1161,186 @@ mod tests {
         );
         // A sibling node whose id merely shares a prefix is NOT in the subtree.
         assert!(!"build-other".starts_with("build/"));
+    }
+
+    // ── Node fingerprints (Phase 3b) ────────────────────────────────────────
+
+    fn node_def(value: serde_json::Value) -> DagNodeDef {
+        serde_json::from_value(value).expect("DagNodeDef fixture")
+    }
+
+    fn prompt_cfg(prompt: &str) -> ExecutionStepConfig {
+        ExecutionStepConfig {
+            step_type: "prompt".to_string(),
+            prompt_content: Some(prompt.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Identical inputs replay; without this the `assert_ne!` tests below could
+    /// all pass because nothing ever matches.
+    #[test]
+    fn node_fingerprint_is_stable_for_identical_inputs() {
+        let cfg = prompt_cfg("summarise the diff");
+        let nd = node_def(serde_json::json!({ "prompt": "summarise the diff" }));
+        let map = HashMap::new();
+        let vars = VariableStore::new();
+        assert_eq!(
+            dag_node_fingerprint(&cfg, Some(&nd), &map, &vars),
+            dag_node_fingerprint(&cfg, Some(&nd), &map, &vars)
+        );
+    }
+
+    /// The headline defect: an edited prompt must not serve the cached output.
+    #[test]
+    fn node_fingerprint_changes_when_the_prompt_changes() {
+        let nd = node_def(serde_json::json!({ "prompt": "p" }));
+        let map = HashMap::new();
+        let vars = VariableStore::new();
+        assert_ne!(
+            dag_node_fingerprint(&prompt_cfg("before"), Some(&nd), &map, &vars),
+            dag_node_fingerprint(&prompt_cfg("after"), Some(&nd), &map, &vars),
+        );
+    }
+
+    #[test]
+    fn node_fingerprint_changes_when_the_model_changes() {
+        let nd = node_def(serde_json::json!({ "prompt": "p" }));
+        let map = HashMap::new();
+        let vars = VariableStore::new();
+        let mut a = prompt_cfg("p");
+        a.model = Some("model-1".into());
+        let mut b = prompt_cfg("p");
+        b.model = Some("model-2".into());
+        assert_ne!(
+            dag_node_fingerprint(&a, Some(&nd), &map, &vars),
+            dag_node_fingerprint(&b, Some(&nd), &map, &vars),
+        );
+    }
+
+    /// A DECLARED upstream input whose VALUE changed must miss.
+    #[test]
+    fn node_fingerprint_changes_when_a_declared_upstream_value_changes() {
+        let cfg = prompt_cfg("summarise $report");
+        let nd = node_def(serde_json::json!({
+            "prompt": "summarise $report",
+            "inputs": { "report": "upstream.output" }
+        }));
+        let map = HashMap::new();
+
+        let mut before = VariableStore::new();
+        before.set_output("upstream", serde_json::json!({ "output": "all green" }));
+        let mut after = VariableStore::new();
+        after.set_output("upstream", serde_json::json!({ "output": "3 failures" }));
+
+        assert_ne!(
+            dag_node_fingerprint(&cfg, Some(&nd), &map, &before),
+            dag_node_fingerprint(&cfg, Some(&nd), &map, &after),
+            "a changed upstream input value must re-execute the node"
+        );
+        // ...and an unchanged one still replays.
+        assert_eq!(
+            dag_node_fingerprint(&cfg, Some(&nd), &map, &before),
+            dag_node_fingerprint(&cfg, Some(&nd), &map, &before),
+        );
+    }
+
+    /// `dag_to_step_configs` drops loop fields, so the node definition has to
+    /// be hashed as well as the config.
+    #[test]
+    fn node_fingerprint_covers_loop_fields_the_step_config_does_not_carry() {
+        let cfg = ExecutionStepConfig {
+            step_type: "dag_loop".to_string(),
+            ..Default::default()
+        };
+        let map = HashMap::new();
+        let vars = VariableStore::new();
+        let a = node_def(serde_json::json!({
+            "loop_body": ["compile"], "max_loop_iterations": 3
+        }));
+        let b = node_def(serde_json::json!({
+            "loop_body": ["compile"], "max_loop_iterations": 9
+        }));
+        assert_ne!(
+            dag_node_fingerprint(&cfg, Some(&a), &map, &vars),
+            dag_node_fingerprint(&cfg, Some(&b), &map, &vars),
+            "an edited loop bound is not visible in ExecutionStepConfig at all"
+        );
+    }
+
+    /// A loop node's single journal row replays the WHOLE loop, so editing a
+    /// body step must invalidate the loop node too - otherwise the loop replays
+    /// its stale output and the edited body step never runs.
+    #[test]
+    fn loop_node_fingerprint_covers_its_body_step_definitions() {
+        let cfg = ExecutionStepConfig {
+            step_type: "dag_loop".to_string(),
+            ..Default::default()
+        };
+        let nd = node_def(serde_json::json!({ "loop_body": ["compile"] }));
+        let vars = VariableStore::new();
+
+        let mut before = HashMap::new();
+        before.insert("compile".to_string(), prompt_cfg("build it"));
+        let mut after = HashMap::new();
+        after.insert("compile".to_string(), prompt_cfg("build it, but faster"));
+
+        assert_ne!(
+            dag_node_fingerprint(&cfg, Some(&nd), &before, &vars),
+            dag_node_fingerprint(&cfg, Some(&nd), &after, &vars),
+        );
+
+        // A body step that vanished from the config map is a change too, not a
+        // silent no-op.
+        assert_ne!(
+            dag_node_fingerprint(&cfg, Some(&nd), &before, &vars),
+            dag_node_fingerprint(&cfg, Some(&nd), &HashMap::new(), &vars),
+        );
+    }
+
+    /// Editing one node must not invalidate its peers - that is what keeps an
+    /// edit's re-billing bounded to the edited node.
+    #[test]
+    fn editing_one_node_does_not_change_a_peer_fingerprint() {
+        let map = HashMap::new();
+        let vars = VariableStore::new();
+        let peer_cfg = prompt_cfg("peer prompt");
+        let peer_def = node_def(serde_json::json!({ "prompt": "peer prompt" }));
+        let before = dag_node_fingerprint(&peer_cfg, Some(&peer_def), &map, &vars);
+
+        // A completely different node is edited.
+        let _edited = dag_node_fingerprint(
+            &prompt_cfg("edited"),
+            Some(&node_def(serde_json::json!({ "prompt": "edited" }))),
+            &map,
+            &vars,
+        );
+
+        assert_eq!(
+            before,
+            dag_node_fingerprint(&peer_cfg, Some(&peer_def), &map, &vars),
+            "the peer must still replay"
+        );
+    }
+
+    #[test]
+    fn loop_body_fingerprint_separates_iterations_and_tracks_the_definition() {
+        let cfg = prompt_cfg("do the thing");
+        assert_ne!(
+            loop_body_fingerprint(&cfg, "build", 0),
+            loop_body_fingerprint(&cfg, "build", 1),
+        );
+        assert_ne!(
+            loop_body_fingerprint(&cfg, "build", 0),
+            loop_body_fingerprint(&cfg, "deploy", 0),
+        );
+        assert_ne!(
+            loop_body_fingerprint(&cfg, "build", 0),
+            loop_body_fingerprint(&prompt_cfg("do the OTHER thing"), "build", 0),
+        );
+        assert_eq!(
+            loop_body_fingerprint(&cfg, "build", 0),
+            loop_body_fingerprint(&cfg, "build", 0),
+        );
     }
 }
