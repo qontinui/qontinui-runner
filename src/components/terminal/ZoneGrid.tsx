@@ -1259,9 +1259,7 @@ function ZoneCellInner({
   return (
     <div
       ref={cellRef}
-      className={`group relative overflow-hidden ${isFlashing ? "zone-flash" : ""} ${
-        outputSearchQuery && !searchMatch ? "opacity-40" : ""
-      } ${tagFilteredOut ? "opacity-25" : ""}`}
+      className={`group relative overflow-hidden ${isFlashing ? "zone-flash" : ""}`}
       // Ground truth for the tag filter, readable through the UI Bridge
       // without inferring anything from a computed opacity.
       data-zone-tag-filter={tagFilterActive ? (tagFilteredOut ? "hidden" : "shown") : undefined}
@@ -1292,7 +1290,23 @@ function ZoneCellInner({
         borderRadius: "4px",
         boxShadow: zoneShadow,
         transition: "border-color 0.2s, box-shadow 0.2s, opacity 0.3s",
-        opacity: focusMode && !isFocused && state !== "needs-input" && state !== "error" ? 0.3 : 1,
+        // EVERY dim lives in this one inline value, most-specific first.
+        //
+        // The output-search dim used to be a Tailwind `opacity-40` CLASS on
+        // the same element — and an inline `style.opacity` beats a class,
+        // so `opacity: 1` from the focus-mode expression below silently
+        // won and the search dim never rendered at all. The tag filter was
+        // written the same way and had the same non-effect; a `data-`
+        // attribute test passed while the page showed nothing. Two
+        // competing mechanisms for one property is the whole bug, so there
+        // is now exactly one.
+        opacity: tagFilteredOut
+          ? 0.25
+          : outputSearchQuery && !searchMatch
+            ? 0.4
+            : focusMode && !isFocused && state !== "needs-input" && state !== "error"
+              ? 0.3
+              : 1,
         animation: isFlashing ? "zone-flash-border 1s ease-out" : undefined,
         ...(firstTagColor
           ? {
