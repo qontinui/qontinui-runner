@@ -4,19 +4,31 @@
  * plan §4 Phase 2 so both surfaces use the same scorer — operators
  * shouldn't see different orderings between the two entry points.
  *
- * Three tiers with deliberately wide gaps so prefix matches always
- * beat word-boundary matches, which always beat sequential fuzzy:
+ * Three tiers banded into NON-OVERLAPPING ranges so, for a given query,
+ * a prefix match always beats a word-boundary match, which always beats
+ * a sequential fuzzy match:
  *
- *   - **Prefix match** (`100 + query.length`) — text starts with the
- *     query. Highest priority; almost always the intended completion
- *     when an operator types `/sp` to mean `/spawn`.
- *   - **Word-boundary match** (`70 + query.length`) — query characters
- *     hit at the start of `/`, `-`, `_`, `:`, or space-delimited tokens
- *     in order. Captures the `sba` → `/spawn-best-account` case
- *     idiomatic in CLI fuzzy finders (Cmd+P, fzf).
- *   - **Sequential fuzzy** (`30 + (50 - spread)` clamped at 0) —
- *     characters appear in order anywhere in the text; spread penalty
- *     means `/sa` matches `/spawn-ai` better than `/spawn-with-shell-args`.
+ *   - **Prefix match** (`200 + query.length`, so `>= 201`) — text starts
+ *     with the query. Highest priority; almost always the intended
+ *     completion when an operator types `/sp` to mean `/spawn`.
+ *   - **Word-boundary match** (`100 + query.length`, so `>= 101`) — query
+ *     characters hit at the start of `/`, `-`, `_`, `:`, or
+ *     space-delimited tokens in order. Captures the `sba` →
+ *     `/spawn-best-account` case idiomatic in CLI fuzzy finders
+ *     (Cmd+P, fzf).
+ *   - **Sequential fuzzy** (`max(0, 50 - spread)`, so `<= 50`) —
+ *     characters appear in order anywhere in the text, with no word
+ *     starting the query; the spread penalty ranks a tight run of
+ *     matched characters above a run scattered across the text.
+ *
+ * The bands used to OVERLAP: Tier 3 topped out at `30 + 50 = 80` while
+ * Tier 2 started at `70 + 1 = 71`, so a Tier-3 hit on an action's LABEL
+ * could outrank a Tier-2 hit on its SLASH. Typing `lyt` scored
+ * `/layout`'s slash body 73 (word boundary) and `/analyze`'s label
+ * "Analyze terminal output" 75 (sequential), so Tab completed
+ * `/analyze`. Since both tiers add at most `query.length` — and every
+ * caller only ever compares scores produced for the SAME query — the
+ * bands below cannot cross.
  *
  * Returns `null` when no match exists; the caller filters by truthiness.
  */
@@ -39,7 +51,7 @@ export function fuzzyScore(text: string, query: string): FuzzyMatch | null {
   // ── Tier 1: prefix match ────────────────────────────────────────────
   if (lower.startsWith(q)) {
     return {
-      score: 100 + q.length,
+      score: 200 + q.length,
       indices: Array.from({ length: q.length }, (_, i) => i),
     };
   }
@@ -61,7 +73,7 @@ export function fuzzyScore(text: string, query: string): FuzzyMatch | null {
     wordStart += word.length + 1;
   }
   if (qi === q.length) {
-    return { score: 70 + q.length, indices: wordBoundaryIndices };
+    return { score: 100 + q.length, indices: wordBoundaryIndices };
   }
 
   // ── Tier 3: sequential fuzzy ────────────────────────────────────────
@@ -75,8 +87,7 @@ export function fuzzyScore(text: string, query: string): FuzzyMatch | null {
   }
   if (si === q.length) {
     const spread = indices[indices.length - 1] - indices[0];
-    const compactness = Math.max(0, 50 - spread);
-    return { score: 30 + compactness, indices };
+    return { score: Math.max(0, 50 - spread), indices };
   }
 
   return null;

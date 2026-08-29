@@ -3,6 +3,7 @@ import { LAYOUT_PRESETS, FLOW_GRID_ID, type SessionState } from "./useZoneLayout
 import type { UIAction } from "./useUIState";
 import type { Metrics } from "./useEventHistory";
 import { getById } from "./commands";
+import { GLOBAL_CHORDS, isCtrlShiftChord } from "@/lib/globalChords";
 
 interface UseKeyboardShortcutsParams {
   activeId: string | null;
@@ -218,8 +219,21 @@ export function useKeyboardShortcuts({
         zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id);
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "K") {
+      // Ctrl+Shift+K — command palette. Matched case-insensitively via the
+      // shared chord table: with CapsLock on, Shift yields a lowercase
+      // `e.key`, and the literal `"K"` test made the chord miss here while
+      // the KnowledgeBrowser's `"K" || "k"` test still fired. The
+      // KnowledgeBrowser now owns Ctrl+Shift+E (see `lib/globalChords`), so
+      // this no longer opens two overlays at once.
+      if (isCtrlShiftChord(e, GLOBAL_CHORDS.commandPalette)) {
         e.preventDefault();
+        // Claims the chord for this surface. It does NOT suppress another
+        // listener attached to `window` itself — only
+        // `stopImmediatePropagation` would, and that would silently break
+        // whichever handler happened to register second. Distinct letters
+        // per surface is the fix; this just keeps the event from
+        // travelling any further.
+        e.stopPropagation();
         dispatch({ type: "TOGGLE_COMMAND_PALETTE" });
         return;
       }

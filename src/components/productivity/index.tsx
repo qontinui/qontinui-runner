@@ -109,7 +109,7 @@ export function ProductivityPage() {
           onClick={() => setKnowledgeModalOpen(true)}
           data-ui-bridge-id="productivity.open-knowledge-modal"
           className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium border border-border text-foreground hover:bg-muted/30"
-          title="Open knowledge browser (Ctrl+Shift+K)"
+          title="Open knowledge browser (Ctrl+Shift+E)"
         >
           <BookOpen className="w-3.5 h-3.5" />
           Knowledge
@@ -123,7 +123,7 @@ export function ProductivityPage() {
         {view === "knowledge" && <KnowledgeBrowser mode="inline" />}
       </div>
 
-      {/* Top-bar-button-triggered modal. Ctrl+Shift+K is mounted globally
+      {/* Top-bar-button-triggered modal. Ctrl+Shift+E is mounted globally
           at the App level so it works from any page; here the button
           provides an in-tab trigger for users who prefer mouse. */}
       <KnowledgeBrowser

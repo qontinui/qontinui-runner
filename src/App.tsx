@@ -1047,7 +1047,7 @@ function AuthOverlayInertBoundary({ children }: { children: ReactNode }) {
 }
 
 /**
- * Global Ctrl+Shift+K trigger for the knowledge browser modal. Mounted
+ * Global Ctrl+Shift+E trigger for the knowledge browser modal. Mounted
  * at the AppContent root so the hotkey works from any tab.
  */
 function GlobalKnowledgeBrowser() {
