@@ -125,28 +125,65 @@ impl DoctorReport {
 // Pure first-red-stops driver (injectable check fns → unit-testable)
 // ===========================================================================
 
+/// What running one check produced: the verdict, the human detail, and —
+/// optionally — a fix that REFINES the check's static one.
+///
+/// # Why a check may override its own fix
+///
+/// The blocked report's last line is `BLOCKED at: <name> — <fix>`, so `fix` is
+/// the string an operator actually acts on. For most checks one static
+/// remediation covers every way they can fail, and sourcing it from
+/// [`CHECK_SPECS`] is what stops the generated onboarding doc drifting from
+/// the live report.
+///
+/// The tier check is the exception, and it is the exception for the same
+/// NO-DOWNGRADE reason the tri-state [`crate::profiles::TierRead`] exists:
+/// "settings.json is unreadable" and "the tier is set to local" are different
+/// faults with genuinely different fixes, and telling an operator with a
+/// corrupt settings.json to "set the runner tier" sends them to the wrong
+/// place. A check that can distinguish its failures must be able to say so.
+///
+/// `None` (the common case — `From<(bool, String)>` produces it) means "use
+/// the static spec fix".
+pub struct CheckOutcome {
+    pub ok: bool,
+    pub detail: String,
+    pub fix: Option<String>,
+}
+
+impl From<(bool, String)> for CheckOutcome {
+    fn from((ok, detail): (bool, String)) -> Self {
+        Self {
+            ok,
+            detail,
+            fix: None,
+        }
+    }
+}
+
 /// A single check: a static name + fix, plus a thunk that runs the predicate
-/// and returns `(ok, detail)`. The thunk is `FnOnce` so a check can own
-/// resources; the driver only ever calls it once.
+/// and returns a [`CheckOutcome`] (a bare `(ok, detail)` tuple converts into
+/// one). The thunk is `FnOnce` so a check can own resources; the driver only
+/// ever calls it once.
 pub struct Check<'a> {
     pub name: &'static str,
     pub fix: &'static str,
-    pub run: Box<dyn FnOnce() -> (bool, String) + 'a>,
+    pub run: Box<dyn FnOnce() -> CheckOutcome + 'a>,
     /// See [`CheckResult::advisory`]. Constructed via [`Check::advisory`].
     pub advisory: bool,
 }
 
 impl<'a> Check<'a> {
     /// A BLOCKING check: a failure stops the chain and fails the report.
-    pub fn new(
+    pub fn new<R: Into<CheckOutcome>>(
         name: &'static str,
         fix: &'static str,
-        run: impl FnOnce() -> (bool, String) + 'a,
+        run: impl FnOnce() -> R + 'a,
     ) -> Self {
         Self {
             name,
             fix,
-            run: Box::new(run),
+            run: Box::new(move || run().into()),
             advisory: false,
         }
     }
@@ -155,15 +192,15 @@ impl<'a> Check<'a> {
     /// continues and the overall verdict is unaffected. Use for findings that
     /// are worth an operator's attention yet do not stop this runner from
     /// registering gates.
-    pub fn advisory(
+    pub fn advisory<R: Into<CheckOutcome>>(
         name: &'static str,
         fix: &'static str,
-        run: impl FnOnce() -> (bool, String) + 'a,
+        run: impl FnOnce() -> R + 'a,
     ) -> Self {
         Self {
             name,
             fix,
-            run: Box::new(run),
+            run: Box::new(move || run().into()),
             advisory: true,
         }
     }
@@ -176,11 +213,14 @@ impl<'a> Check<'a> {
     /// constructor independently lets the doc claim a check blocks while the
     /// live chain treats it as advisory (or vice versa). Here they are one
     /// value.
-    pub fn from_spec(spec: &'static CheckSpec, run: impl FnOnce() -> (bool, String) + 'a) -> Self {
+    pub fn from_spec<R: Into<CheckOutcome>>(
+        spec: &'static CheckSpec,
+        run: impl FnOnce() -> R + 'a,
+    ) -> Self {
         Self {
             name: spec.name,
             fix: spec.fix,
-            run: Box::new(run),
+            run: Box::new(move || run().into()),
             advisory: spec.advisory,
         }
     }
@@ -211,14 +251,19 @@ pub fn run_checks(checks: Vec<Check<'_>>) -> DoctorReport {
             continue;
         }
         let name = check.name;
-        let fix = check.fix;
+        let spec_fix = check.fix;
         let advisory = check.advisory;
-        let (ok, detail) = (check.run)();
+        let outcome = (check.run)();
+        let ok = outcome.ok;
         results.push(CheckResult {
             name: name.to_string(),
             ok,
-            detail,
-            fix: fix.to_string(),
+            detail: outcome.detail,
+            // A check that can distinguish its own failure modes may REFINE
+            // the static fix (see [`CheckOutcome::fix`]); everything else
+            // reports the spec's, which is what keeps the generated
+            // onboarding doc and the live report in step.
+            fix: outcome.fix.unwrap_or_else(|| spec_fix.to_string()),
             advisory,
         });
         if !ok && !advisory {
@@ -1019,7 +1064,27 @@ impl TierEvidence {
     }
 }
 
-/// The tier check's verdict + message: PURE over `(tier read x evidence)`.
+/// The remediation for a box that is credentialed and only lacks the tier.
+pub const TIER_FIX_UNPIN: &str = "this box is already paired — nothing else is \
+missing. Clear settings.json::tier_chosen_explicitly (or set tier to \
+qontinui_account) so the pairing inference can resolve Tier 2";
+
+/// The remediation for a box that holds no Qontinui account binding at all.
+pub const TIER_FIX_PAIR: &str = "pair this device — headless: `qontinui_profile \
+device pair --pair-code <code>`, which promotes the tier as it pairs; in the \
+app: Settings \u{2192} Account. A headless runner can also be launched with \
+QONTINUI_SERVER_MODE=1, which defaults it to the tier that talks to coord";
+
+/// The remediation when `settings.json` could not be read. NO-DOWNGRADE
+/// applies to the FIX as much as to the detail: the blocked report's last line
+/// is the one an operator acts on, so it must not tell them to set a tier on
+/// top of a file nothing could read.
+pub const TIER_FIX_UNREADABLE: &str = "this is NOT a tier problem — repair the \
+unreadable/corrupt settings.json (or the QONTINUI_CONFIG_DIR it resolves to) \
+first. Do NOT set a tier on top of a file that could not be read";
+
+/// The tier check's verdict, message AND remediation: PURE over
+/// `(tier read x evidence)`.
 ///
 /// Extracted from the check closure so every combination is unit-testable
 /// without a live runner, a temp `settings.json`, or process env — the closure
@@ -1039,6 +1104,10 @@ impl TierEvidence {
 /// 3. **No credential** — non-account AND no account binding at all.
 /// 4. **UNKNOWN** — `settings.json` unreadable.
 ///
+/// Each shape carries its OWN fix (see [`CheckOutcome::fix`]), because the
+/// blocked report's last line is the one an operator acts on and the four
+/// shapes do not share a remedy.
+///
 /// # NO-DOWNGRADE (non-negotiable)
 ///
 /// The [`crate::profiles::TierRead::Unknown`] arm reports UNKNOWN and nothing
@@ -1046,15 +1115,16 @@ impl TierEvidence {
 /// guess at the contents of a file we failed to read: reporting "tier is local"
 /// (or "tier is qontinui_account") for what is really an unreadable
 /// `settings.json` sends the operator to the wrong remediation entirely. The
-/// tri-state stays tri-state, and this arm deliberately consumes no evidence.
+/// tri-state stays tri-state, this arm deliberately consumes no evidence, and
+/// its fix says so too.
 pub fn tier_check_verdict(
     tier: &crate::profiles::TierRead,
     evidence: &TierEvidence,
-) -> (bool, String) {
+) -> CheckOutcome {
     use crate::profiles::{TierRead, QONTINUI_ACCOUNT_TIER};
-    match tier {
+    let (ok, detail, fix): (bool, String, Option<&'static str>) = match tier {
         TierRead::Known(t) if t.as_str() == QONTINUI_ACCOUNT_TIER => {
-            (true, "runner tier is Qontinui account".into())
+            (true, "runner tier is Qontinui account".to_string(), None)
         }
         TierRead::Known(t) if evidence.paired => (
             false,
@@ -1068,17 +1138,17 @@ pub fn tier_check_verdict(
                  local_provider.",
                 evidence.summary()
             ),
+            Some(TIER_FIX_UNPIN),
         ),
         TierRead::Known(t) => (
             false,
             format!(
                 "runner tier is {t} (not qontinui_account), and this box holds \
                  no Qontinui account binding: {}. This is 'no credential', not \
-                 'credentialed but unauthorized' — pair this device (headless: \
-                 `qontinui_profile device pair --pair-code <code>`, which \
-                 promotes the tier as it pairs).",
+                 'credentialed but unauthorized'.",
                 evidence.summary()
             ),
+            Some(TIER_FIX_PAIR),
         ),
         TierRead::Absent if evidence.paired => (
             false,
@@ -1089,6 +1159,7 @@ pub fn tier_check_verdict(
                  settings.json::tier_chosen_explicitly.)",
                 evidence.summary()
             ),
+            Some(TIER_FIX_UNPIN),
         ),
         TierRead::Absent => (
             false,
@@ -1101,16 +1172,24 @@ pub fn tier_check_verdict(
                  not consider it.)",
                 evidence.summary()
             ),
+            Some(TIER_FIX_PAIR),
         ),
         // NO-DOWNGRADE: do not report "runner tier is local" when the real
         // fault is that settings.json could not be read — that sends the
         // operator to the wrong remediation. This arm reads NO evidence: a
         // paired box with an unreadable settings.json is still UNKNOWN, never
-        // a guess in either direction.
+        // a guess in either direction. The FIX is redirected too, for exactly
+        // the same reason.
         TierRead::Unknown(e) => (
             false,
             format!("runner tier is UNKNOWN — settings.json unreadable ({e})"),
+            Some(TIER_FIX_UNREADABLE),
         ),
+    };
+    CheckOutcome {
+        ok,
+        detail,
+        fix: fix.map(str::to_string),
     }
 }
 
@@ -1886,22 +1965,22 @@ mod tests {
 
     #[test]
     fn qontinui_account_tier_passes_cleanly() {
-        let (ok, detail) = tier_check_verdict(
+        let out = tier_check_verdict(
             &known(crate::profiles::QONTINUI_ACCOUNT_TIER),
             &TierEvidence::default(),
         );
-        assert!(ok, "qontinui_account must pass: {detail}");
-        assert_eq!(detail, "runner tier is Qontinui account");
+        assert!(out.ok, "qontinui_account must pass: {}", out.detail);
+        assert_eq!(out.detail, "runner tier is Qontinui account");
+        assert_eq!(out.fix, None, "a passing check refines no fix");
         // …and the verdict does not change with the evidence: a green tier
         // explains itself, which is why the live closure never touches the
         // credential store on this path.
-        assert_eq!(
-            tier_check_verdict(
-                &known(crate::profiles::QONTINUI_ACCOUNT_TIER),
-                &credentialed()
-            ),
-            (true, "runner tier is Qontinui account".to_string())
+        let out = tier_check_verdict(
+            &known(crate::profiles::QONTINUI_ACCOUNT_TIER),
+            &credentialed(),
         );
+        assert!(out.ok);
+        assert_eq!(out.detail, "runner tier is Qontinui account");
     }
 
     /// THE reproduction: a box that is paired, tenant-bound and holding a
@@ -1910,8 +1989,9 @@ mod tests {
     /// does not exist on a headless box.
     #[test]
     fn paired_but_local_reports_credentialed_but_not_authorized() {
-        let (ok, detail) = tier_check_verdict(&known("local"), &credentialed());
-        assert!(!ok, "a non-account tier still blocks");
+        let out = tier_check_verdict(&known("local"), &credentialed());
+        let detail = &out.detail;
+        assert!(!out.ok, "a non-account tier still blocks");
         assert!(
             detail.contains("Credentialed but NOT authorized"),
             "paired box must be diagnosed as credentialed: {detail}"
@@ -1926,6 +2006,8 @@ mod tests {
         // shared inference would otherwise have resolved qontinui_account.
         assert!(detail.contains("tier_chosen_explicitly"), "{detail}");
         assert!(detail.contains("runner tier is local"), "{detail}");
+        // The remediation matches the diagnosis: unpin, do not "pair".
+        assert_eq!(out.fix.as_deref(), Some(TIER_FIX_UNPIN));
     }
 
     /// The other side of the same fork: same tier value, no credential. This
@@ -1933,64 +2015,89 @@ mod tests {
     /// different (pair the device, versus un-pin the tier).
     #[test]
     fn unpaired_local_reports_no_credential_not_credentialed() {
-        let (ok, detail) = tier_check_verdict(&known("local"), &uncredentialed());
-        assert!(!ok);
+        let out = tier_check_verdict(&known("local"), &uncredentialed());
+        let detail = &out.detail;
+        assert!(!out.ok);
         assert!(
             !detail.contains("Credentialed but NOT authorized"),
             "an unpaired box must not be reported as credentialed: {detail}"
         );
         assert!(detail.contains("no Qontinui account binding"), "{detail}");
         assert!(detail.contains("NOT paired"), "{detail}");
+        assert_eq!(out.fix.as_deref(), Some(TIER_FIX_PAIR));
         assert!(
-            detail.contains("qontinui_profile device pair"),
-            "the headless remedy belongs in the message: {detail}"
+            TIER_FIX_PAIR.contains("qontinui_profile device pair"),
+            "the headless door belongs in the remediation"
         );
     }
 
-    /// The two `local` boxes must be distinguishable from the message alone —
-    /// that distinction IS Phase 4a.
+    /// The two `local` boxes must be distinguishable from the message AND the
+    /// remediation alone — that distinction IS Phase 4a.
     #[test]
     fn the_two_local_boxes_produce_different_diagnoses() {
-        let paired = tier_check_verdict(&known("local"), &credentialed()).1;
-        let unpaired = tier_check_verdict(&known("local"), &uncredentialed()).1;
-        assert_ne!(paired, unpaired);
+        let paired = tier_check_verdict(&known("local"), &credentialed());
+        let unpaired = tier_check_verdict(&known("local"), &uncredentialed());
+        assert_ne!(paired.detail, unpaired.detail);
+        assert_ne!(paired.fix, unpaired.fix);
     }
 
     /// Tier 1 is reachable only as an explicit operator choice, so a paired
     /// box reading `local_provider` is the same "pinned" shape.
     #[test]
     fn paired_local_provider_is_also_credentialed_but_not_authorized() {
-        let (ok, detail) = tier_check_verdict(&known("local_provider"), &credentialed());
-        assert!(!ok);
-        assert!(detail.contains("runner tier is local_provider"), "{detail}");
+        let out = tier_check_verdict(&known("local_provider"), &credentialed());
+        assert!(!out.ok);
         assert!(
-            detail.contains("Credentialed but NOT authorized"),
-            "{detail}"
+            out.detail.contains("runner tier is local_provider"),
+            "{}",
+            out.detail
         );
+        assert!(
+            out.detail.contains("Credentialed but NOT authorized"),
+            "{}",
+            out.detail
+        );
+        assert_eq!(out.fix.as_deref(), Some(TIER_FIX_UNPIN));
     }
 
     /// NO-DOWNGRADE, the regression guard. An unreadable settings.json is
     /// UNKNOWN — and stays UNKNOWN even on a fully credentialed box. Pairing
     /// evidence is not a licence to guess at a file we failed to read.
+    ///
+    /// The guard covers the FIX too: the blocked report's last line is the one
+    /// an operator acts on, so "set runner tier to Qontinui account" on top of
+    /// an unreadable settings.json is the same misdirection in a different
+    /// field.
     #[test]
     fn unknown_tier_stays_unknown_even_when_paired() {
         for evidence in [credentialed(), uncredentialed()] {
-            let (ok, detail) = tier_check_verdict(
+            let out = tier_check_verdict(
                 &crate::profiles::TierRead::Unknown("permission denied".to_string()),
                 &evidence,
             );
-            assert!(!ok);
+            assert!(!out.ok);
             assert_eq!(
-                detail, "runner tier is UNKNOWN — settings.json unreadable (permission denied)",
+                out.detail, "runner tier is UNKNOWN — settings.json unreadable (permission denied)",
                 "the Unknown arm must report UNKNOWN verbatim and consume no evidence"
             );
             assert!(
-                !detail.contains("tier is local"),
+                !out.detail.contains("tier is local"),
                 "NO-DOWNGRADE violated — an unreadable settings.json was reported as local"
             );
             assert!(
-                !detail.contains("Credentialed but NOT authorized"),
+                !out.detail.contains("Credentialed but NOT authorized"),
                 "NO-DOWNGRADE violated — pairing evidence leaked into the UNKNOWN arm"
+            );
+            assert_eq!(
+                out.fix.as_deref(),
+                Some(TIER_FIX_UNREADABLE),
+                "NO-DOWNGRADE violated — the UNKNOWN arm must not carry a set-the-tier fix"
+            );
+            let fix = out.fix.unwrap();
+            assert!(fix.contains("NOT a tier problem"), "{fix}");
+            assert!(
+                !fix.contains("device pair") && !fix.contains("tier_chosen_explicitly"),
+                "the UNKNOWN fix must not prescribe a tier action: {fix}"
             );
         }
     }
@@ -2002,9 +2109,9 @@ mod tests {
     /// the reading process, not of the document.
     #[test]
     fn absent_tier_names_the_signals_actually_consulted() {
-        let (ok, detail) =
-            tier_check_verdict(&crate::profiles::TierRead::Absent, &uncredentialed());
-        assert!(!ok);
+        let out = tier_check_verdict(&crate::profiles::TierRead::Absent, &uncredentialed());
+        let detail = &out.detail;
+        assert!(!out.ok);
         assert!(detail.contains("settings.json has no tier"), "{detail}");
         assert!(detail.contains("web_integration.runner_token"), "{detail}");
         assert!(detail.contains("paired_user.json"), "{detail}");
@@ -2017,17 +2124,20 @@ mod tests {
             detail.contains("QONTINUI_SERVER_MODE is a property of the RUNNING runner"),
             "{detail}"
         );
+        assert_eq!(out.fix.as_deref(), Some(TIER_FIX_PAIR));
     }
 
     #[test]
     fn absent_tier_on_a_paired_box_is_still_credentialed_but_not_authorized() {
-        let (ok, detail) = tier_check_verdict(&crate::profiles::TierRead::Absent, &credentialed());
-        assert!(!ok);
+        let out = tier_check_verdict(&crate::profiles::TierRead::Absent, &credentialed());
+        assert!(!out.ok);
         assert!(
-            detail.contains("Credentialed but NOT authorized"),
-            "{detail}"
+            out.detail.contains("Credentialed but NOT authorized"),
+            "{}",
+            out.detail
         );
-        assert!(detail.contains("carries no tier"), "{detail}");
+        assert!(out.detail.contains("carries no tier"), "{}", out.detail);
+        assert_eq!(out.fix.as_deref(), Some(TIER_FIX_UNPIN));
     }
 
     /// An unreadable credential store must not be reported as "no bearer" —
@@ -2040,7 +2150,7 @@ mod tests {
             tenant_id: None,
             credential: CredentialEvidence::Unreadable,
         };
-        let (_, detail) = tier_check_verdict(&known("local"), &ev);
+        let detail = tier_check_verdict(&known("local"), &ev).detail;
         assert!(
             detail.contains("bearer is UNKNOWN (not absent)"),
             "{detail}"
@@ -2070,10 +2180,32 @@ mod tests {
         );
     }
 
-    /// The operator-facing last line of a blocked report is the `fix`, not the
-    /// detail — so the headless remedies have to be IN the spec string, or the
-    /// box the plan was written from still gets pointed at a button it has no
-    /// window for.
+    /// A refined fix must actually reach the rendered report — the driver
+    /// falls back to the spec string, so a silently-dropped override would
+    /// look exactly like the bug this phase fixes.
+    #[test]
+    fn a_refined_fix_reaches_the_report_and_the_blocked_line() {
+        let report = run_checks(vec![Check::new("tier", "static-spec-fix", || {
+            CheckOutcome {
+                ok: false,
+                detail: "d".into(),
+                fix: Some("refined-fix".into()),
+            }
+        })]);
+        assert_eq!(report.checks[0].fix, "refined-fix");
+        assert!(report.render().contains("BLOCKED at: tier — refined-fix"));
+    }
+
+    /// …and a check that refines nothing still reports the spec string, which
+    /// is what keeps the generated onboarding doc honest for the other nine.
+    #[test]
+    fn an_unrefined_check_still_reports_the_spec_fix() {
+        let report = run_checks(vec![Check::new("x", "static-spec-fix", || {
+            (false, "d".to_string())
+        })]);
+        assert_eq!(report.checks[0].fix, "static-spec-fix");
+    }
+
     #[test]
     fn tier_fix_names_the_doors_a_headless_box_actually_has() {
         let fix = CHECK_SPECS.iter().find(|s| s.name == "tier").unwrap().fix;
@@ -2112,10 +2244,28 @@ mod tests {
                 c.name, blocking_specs[i].name
             );
             // The live `fix` is sourced from the spec → must match too.
-            assert_eq!(
-                c.fix, blocking_specs[i].fix,
-                "fix at blocking position {i} drifted from CHECK_SPECS"
-            );
+            //
+            // ONE exception, and it is declared here rather than discovered:
+            // `tier` REFINES its fix per diagnosis (see [`CheckOutcome::fix`]),
+            // because "settings.json is unreadable" and "the tier is pinned to
+            // local" have genuinely different remedies and the blocked line is
+            // what an operator acts on. Its refinements are pinned by name
+            // above (TIER_FIX_UNPIN / TIER_FIX_PAIR / TIER_FIX_UNREADABLE), so
+            // they are still exhaustively asserted — just not against the doc.
+            if c.name == "tier" {
+                assert!(
+                    c.fix == blocking_specs[i].fix
+                        || [TIER_FIX_UNPIN, TIER_FIX_PAIR, TIER_FIX_UNREADABLE]
+                            .contains(&c.fix.as_str()),
+                    "the tier check reported an unregistered fix: {:?}",
+                    c.fix
+                );
+            } else {
+                assert_eq!(
+                    c.fix, blocking_specs[i].fix,
+                    "fix at blocking position {i} drifted from CHECK_SPECS"
+                );
+            }
         }
 
         for c in report.checks.iter().filter(|c| c.advisory) {
