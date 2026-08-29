@@ -458,6 +458,26 @@ impl Enumeration {
             self.read_errors.push((path, error));
         }
     }
+
+    /// How many reads failed, as every honesty branch must count them.
+    ///
+    /// The SAME fail-closed reader
+    /// [`super::disk_survey::ScanStats::read_errors_seen`] applies to the copy
+    /// of these two fields that goes on the wire — and the source they are
+    /// copied from had none, which is the half that matters more: the survey's
+    /// copy is healed at the `build_snapshot` boundary, but
+    /// [`run_cycle`] read `read_errors_total` RAW, so a `read_errors` moved
+    /// without its counter under-reported in [`ReapSummary`] and in the cycle
+    /// log with nothing to catch it.
+    ///
+    /// Taking the larger fails **closed**: a counter someone forgot to
+    /// increment can never shrink the count below the errors actually
+    /// recorded, so the failure mode of the split is an over-report of
+    /// incompleteness rather than a fabricated measured zero — the one answer
+    /// this module exists to make impossible.
+    pub fn read_errors_seen(&self) -> usize {
+        self.read_errors_total.max(self.read_errors.len())
+    }
 }
 
 /// What a directory's `.git` entry says — the ONLY discriminator between a
@@ -1517,7 +1537,9 @@ pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
         // The TOTAL, not `read_errors.len()` — the detail list is capped at
         // `MAX_RECORDED_READ_ERRORS` and reading its length here would make the
         // cycle log under-report a locked subtree as exactly 100 failures.
-        read_errors: enumeration.read_errors_total,
+        // Through `read_errors_seen` rather than the raw counter, so the two
+        // fields going out of step can only ever OVER-report incompleteness.
+        read_errors: enumeration.read_errors_seen(),
         entry_errors: enumeration.entry_errors,
         depth_limited_dirs: enumeration.depth_limited_dirs,
         reparse_dirs_skipped: enumeration.reparse_dirs_skipped,
@@ -1642,7 +1664,9 @@ pub struct ReapSummary {
     /// age), not because anything was observed.
     pub skipped_unknown: usize,
     /// Directories whose read failed during the walk (`read_dir` open, or the
-    /// `.git` ownership probe).
+    /// `.git` ownership probe). The UNCAPPED count — read through
+    /// [`Enumeration::read_errors_seen`], never from the recorded sample, whose
+    /// length stops at [`MAX_RECORDED_READ_ERRORS`].
     pub read_errors: usize,
     /// Directory entries that errored mid-iteration.
     pub entry_errors: usize,
@@ -1682,6 +1706,17 @@ pub struct ReapSummary {
 /// what a machine PUBLISHES to coord, and this loop publishes nothing and holds
 /// no machine identity. What is being arbitrated here is disk work, so the
 /// disk-work predicate is the right one.
+///
+/// ## And it yields to the preview's walk on the instance that keeps both
+///
+/// The instance gate deduplicates the two identical walks ACROSS processes; it
+/// does nothing about them inside one. On the owning instance both loops
+/// survive, running the same `enumerate_all` and the same sizing pass over the
+/// same disk, with cadences that collide every hour. Each tick therefore skips
+/// while [`super::disk_survey::build_active`] holds — one-directional, because
+/// the preview must never yield (INV-D1: it answers mid-build, mid-emergency
+/// and coord-unreachable) and this loop is the one that ticks four times as
+/// often and is dry-run by default.
 pub fn spawn_orphan_reaper() {
     if !crate::instance::owns_shared_root_state() {
         info!(
@@ -1706,6 +1741,38 @@ pub fn spawn_orphan_reaper() {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
+            // Yield the tick while the reclaim preview is mid-walk. Gating the
+            // reaper per INSTANCE left the two identical walks still racing
+            // each other ON the owning one: both run `enumerate_all` and size
+            // every candidate over the whole machine, and their cadences line
+            // up every hour, so the box this feature exists for was paying for
+            // two concurrent full-machine sizing walks over the same disk.
+            //
+            // ONE-DIRECTIONAL, and deliberately so. The preview never yields to
+            // the reaper (INV-D1: it must answer mid-build, mid-emergency and
+            // coord-unreachable), and it is the reaper that can afford to wait
+            // — it ticks four times as often, so a skipped cycle costs 900 s of
+            // latency on hygiene that is dry-run by default. Skipping, never
+            // queueing, matches the `MissedTickBehavior::Skip` already on this
+            // interval.
+            //
+            // Correctness, not only cost: once the arming flag is flipped, a
+            // reap running underneath a survey walk leaves the published
+            // snapshot advertising reclaimable bytes for paths already removed
+            // — drift between the preview and the verb, which this module's
+            // whole design (one classifier, both engines) exists to prevent.
+            //
+            // Advisory rather than a lock: the survey can still start just
+            // after this reads false. That is the correct strength for a cost
+            // and consistency guard whose failure mode is one redundant walk.
+            if super::disk_survey::build_active() {
+                info!(
+                    "orphan_target_reaper: a reclaim-preview walk is in flight — skipping this \
+                     cycle rather than running the same machine-wide walk beside it. The next \
+                     tick proceeds normally."
+                );
+                continue;
+            }
             if let Err(e) = tokio::task::spawn_blocking(tick_once).await {
                 warn!("orphan_target_reaper: cycle task panicked/cancelled: {e}");
             }
@@ -2488,6 +2555,116 @@ mod tests {",
         small.record_read_error(PathBuf::from("/ws/one"), "denied".to_string());
         assert_eq!(small.read_errors_total, 1);
         assert_eq!(small.read_errors.len(), 1);
+    }
+
+    /// The cap-and-count split fails CLOSED at its SOURCE, not only at the copy.
+    ///
+    /// `ScanStats::read_errors_seen` heals a desynced pair on the way to the
+    /// wire, so the survey was covered. The reaper was not: `run_cycle` read
+    /// `read_errors_total` raw, so a `read_errors` moved without its counter
+    /// under-reported in `ReapSummary` and in the cycle log with nothing to
+    /// catch it. Both readers now go through the same fail-closed accessor, so
+    /// the failure mode of the split is an OVER-report of incompleteness — the
+    /// direction that cannot fabricate a clean walk.
+    #[test]
+    fn a_desynced_enumeration_over_reports_rather_than_under_reports() {
+        let mut e = Enumeration::default();
+        e.read_errors.push((
+            PathBuf::from("/ws/pushed-past-the-seam"),
+            "denied".to_string(),
+        ));
+        assert_eq!(e.read_errors_total, 0, "the counter was never moved");
+        assert_eq!(
+            e.read_errors_seen(),
+            1,
+            "and the reader must not certify a walk clean while an error sits in the list"
+        );
+
+        // Non-vacuous, and the property this must not break: the cap still
+        // wins whenever the counter is the larger of the two, which is the
+        // whole point of keeping an uncapped total.
+        let mut capped = Enumeration::default();
+        for i in 0..(MAX_RECORDED_READ_ERRORS * 2) {
+            capped.record_read_error(PathBuf::from(format!("/ws/d-{i}")), "denied".to_string());
+        }
+        assert_eq!(capped.read_errors.len(), MAX_RECORDED_READ_ERRORS);
+        assert_eq!(capped.read_errors_seen(), MAX_RECORDED_READ_ERRORS * 2);
+    }
+
+    /// Nothing pushes a read error past the `record_read_error` seam.
+    ///
+    /// The cap is only as good as the single door it is enforced at, and both
+    /// `Enumeration` fields are `pub` — a direct `read_errors.push` compiles
+    /// fine, moves the list without the count, and silently un-caps the wire.
+    /// The seam was DOCUMENTED as the only way in when it was added; this is
+    /// what makes that true. Source-level because the property is "no such call
+    /// exists", which no runtime assertion can observe.
+    #[test]
+    fn read_errors_are_only_ever_appended_through_the_recording_seam() {
+        const SRC: &str = include_str!("orphan_target_reaper.rs");
+        let prod = SRC
+            .split_once(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+        // The one legitimate push is inside `record_read_error` itself.
+        let seam = prod
+            .split_once("fn record_read_error(")
+            .map(|(_, after)| after)
+            .expect("the recording seam must exist; move this pin if it is renamed");
+        let seam_body = seam.split_once("\n    }\n").map(|(b, _)| b).unwrap_or(seam);
+        assert_eq!(
+            seam_body.matches("read_errors.push(").count(),
+            1,
+            "the seam itself appends exactly once"
+        );
+        assert_eq!(
+            prod.matches("read_errors.push(").count(),
+            1,
+            "a read error was appended outside `record_read_error`, which moves the list without \
+             `read_errors_total` and un-caps what goes into every `GET /disk/reclaimable` response"
+        );
+    }
+
+    /// The periodic cycle yields while a reclaim-preview walk is in flight.
+    ///
+    /// Source-level for the same reason the instance gate's pin is: the
+    /// predicate reads process-global state parallel test threads mutate.
+    ///
+    /// Gating per INSTANCE left the two identical machine-wide walks still
+    /// racing each other ON the owning one — same `enumerate_all`, same sizing,
+    /// cadences colliding every hour. One-directional by design: the preview
+    /// never yields (INV-D1), and the reaper is the one that ticks four times
+    /// as often and is dry-run by default.
+    #[test]
+    fn the_periodic_cycle_yields_to_an_in_flight_preview_walk() {
+        const SRC: &str = include_str!("orphan_target_reaper.rs");
+        let prod = SRC
+            .split_once(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+        let spawn = prod
+            .split_once("pub fn spawn_orphan_reaper() {")
+            .map(|(_, after)| after)
+            .expect("spawn_orphan_reaper must exist; move this pin if it is renamed");
+        let body = spawn.split_once("\n}\n").map(|(b, _)| b).unwrap_or(spawn);
+        assert!(
+            body.contains("disk_survey::build_active()"),
+            "the 900s full-machine walk is spawned without consulting the preview's walk, so both \
+             run the same sizing pass over the same disk at once on the owning instance"
+        );
+        assert!(
+            body.contains("continue"),
+            "and it must SKIP the tick rather than block on it — queueing behind a multi-minute \
+             walk would defeat `MissedTickBehavior::Skip` on this interval"
+        );
     }
 
     /// The periodic reaper is instance-gated, exactly like the reclaim preview.
