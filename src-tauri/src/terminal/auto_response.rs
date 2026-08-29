@@ -835,6 +835,7 @@ mod resolve {
         };
         // Device-JWT bearer on a POST — the same write-path attach the coord
         // producers use (collapses to anonymous when unpaired).
+        // coord-tenant-scope(session-owed): coord_session_id is a parameter (:820) and rides in the body, but coord takes the tenant from FleetPrincipal -- the body's session id is not a tenancy input. Phase 5.
         let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
         let resp = match req.json(&body).send().await {
             Ok(r) => r,
@@ -945,6 +946,7 @@ mod report {
         };
         // Device-JWT bearer on the write path (collapses to anonymous when
         // unpaired), mirroring `mod resolve`.
+        // coord-tenant-scope(session-owed): ident.coord_session_id is in scope (:923, :936), but coord derives BOTH tenant and device from the principal, never the body. Phase 5.
         let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
         match req.json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {}

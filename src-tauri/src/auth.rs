@@ -1162,6 +1162,158 @@ fn default_binding_tenant() -> Option<Uuid> {
     Uuid::parse_str(raw.trim()).ok()
 }
 
+/// How many tenant bindings this device holds, per `paired_user.json`.
+///
+/// The D2 degrade rule keys on this count, so its failure direction is chosen
+/// deliberately: **every unreadable state counts as ONE.** A device that cannot
+/// state its bindings is not evidence of a multi-tenant device, and the cost of
+/// the two errors is wildly asymmetric — under-counting leaves today's
+/// behaviour exactly as it is, while over-counting degrades live writes to
+/// unauthenticated on a machine that was fine. That is the same priority
+/// `coord_mcp::session_tenant_or_refuse` recorded when it refused to fail
+/// closed on an `Unpinned` machine: *"the failure mode of refusing too eagerly
+/// is an outage on healthy machines, which is strictly worse than the silent
+/// default-tenant write on a machine that is genuinely broken."*
+///
+/// Counts the v2 `bindings` array when present, else the legacy single
+/// `tenant_id` entry (mirroring `pair::PairedUserFile::effective_bindings`).
+/// Kept as a local minimal reader for the same reason [`default_binding_tenant`]
+/// is: `auth` compiles into BOTH the lib and bin crates while `pair` is
+/// lib-only.
+fn device_binding_count() -> usize {
+    let Some(base) = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))
+    else {
+        return 1;
+    };
+    let Ok(bytes) = std::fs::read(base.join("paired_user.json")) else {
+        return 1;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return 1;
+    };
+    binding_count_from_value(&value)
+}
+
+/// The parse half of [`device_binding_count`], split out so the v2/legacy
+/// asymmetry is testable without touching the filesystem.
+///
+/// A `bindings` array that is present but EMPTY falls through to the legacy
+/// shape rather than reporting zero — `effective_bindings` does the same, and
+/// an empty array is an unpaired or half-written file, not a statement that the
+/// device holds no tenant.
+pub(crate) fn binding_count_from_value(value: &serde_json::Value) -> usize {
+    if let Some(arr) = value.get("bindings").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            return arr.len();
+        }
+    }
+    // Legacy single-entry shape: one binding iff it names a tenant at all.
+    if value.get("tenant_id").and_then(|v| v.as_str()).is_some() {
+        return 1;
+    }
+    1
+}
+
+/// What a call site knows about the tenant that owns the row it is writing —
+/// D1's classification key, made typed.
+///
+/// ## Why a type and not `Option<Uuid>`
+///
+/// `Option<Uuid>` collapses two outcomes that MUST diverge on a multi-bound
+/// device:
+///
+/// - *"this row has no tenant dimension — it is keyed by `device_id` and the
+///   default binding is correct by construction"*, and
+/// - *"this row does have an owning tenant and I could not work out which"*.
+///
+/// Both spell `None`, and `None` presents the DEFAULT binding's credential. So
+/// on a device paired to more than one tenant the second case silently writes a
+/// row under the wrong tenant — on every route where coord derives ownership
+/// from the verified bearer (`ident.require_tenant()`), which has no fallback.
+/// That is the entire defect this type closes, and the collapse is why 52 call
+/// sites accumulated under a doc comment that already told them not to.
+///
+/// It is the same fix, one layer down, that [`crate::session::tenant_pin::TenantPin`]
+/// made for `machine.json`: separate the legitimate absence from the failure so
+/// the fail-closed decision becomes expressible.
+///
+/// | Variant | Meaning | Credential presented |
+/// |---|---|---|
+/// | [`TenantScope::Owned`] | the owning tenant is known | that binding's `device_jwt:<t>` slot |
+/// | [`TenantScope::Device`] | no tenant dimension (heartbeat, device registration, device maintenance) | the default binding's slot |
+/// | [`TenantScope::Unresolved`] | the row has an owner the caller could not resolve | the default slot on a single-bound device; **nothing** on a multi-bound one |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantScope {
+    /// The owning tenant is known. Present THAT binding's slot, and never
+    /// another's — slot-miss posture is [`select_device_bearer`]'s.
+    Owned(Uuid),
+    /// This row has no tenant dimension: it is keyed by `device_id` alone, so
+    /// the default binding's credential is correct by construction and stays
+    /// correct however many tenants are paired. Heartbeats, device
+    /// registration, device maintenance.
+    Device,
+    /// This row HAS an owning tenant, and the caller could not resolve it.
+    /// Distinct from [`TenantScope::Device`] precisely so the degrade below can
+    /// fire without touching the callers for which the default is right.
+    Unresolved,
+}
+
+/// Resolve the bearer for a typed scope — the D2 degrade rule, in one place.
+///
+/// Pure over its injected parts (an [`AuthManager`] over a temp-dir
+/// [`SecureStorage::with_path`], an explicit default tenant, an explicit
+/// binding count) so every cell of the table below is hermetically testable
+/// with no process-global env mutation.
+///
+/// | Scope | Single-bound device | Multi-bound device |
+/// |---|---|---|
+/// | `Owned(t)` | `t`'s slot | `t`'s slot |
+/// | `Device` | default slot | default slot |
+/// | `Unresolved` | default slot — **unchanged** | **unauthenticated** |
+///
+/// The `Unresolved` row is the whole rule. A blanket *"unresolvable → send
+/// nothing"* would regress every correctly-configured single-tenant machine,
+/// where the default binding simply IS the owning tenant and today's write is
+/// right; conditioning on the binding count collapses the rule to exactly that
+/// blanket form on precisely the machines where the hazard is real.
+pub(crate) fn select_scoped_bearer(
+    am: &AuthManager,
+    scope: TenantScope,
+    default_tenant: Option<Uuid>,
+    binding_count: usize,
+) -> Option<String> {
+    match scope {
+        TenantScope::Owned(t) => select_device_bearer(am, Some(&t), default_tenant),
+        TenantScope::Device => select_device_bearer(am, None, default_tenant),
+        TenantScope::Unresolved if binding_count > 1 => {
+            warn_once_unresolved_on_multi_bound(binding_count);
+            None
+        }
+        TenantScope::Unresolved => select_device_bearer(am, None, default_tenant),
+    }
+}
+
+/// Warn once per process that an unresolved-tenant write degraded to
+/// unauthenticated on a multi-bound device.
+///
+/// Once per process, not per call: the sites that degrade include periodic
+/// loops, and a per-call warning would bury the signal it exists to raise.
+fn warn_once_unresolved_on_multi_bound(binding_count: usize) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        warn!(
+            "coord data-plane: a tenant-owned write could not resolve its owning tenant on a \
+             device holding {binding_count} bindings — sending it UNAUTHENTICATED rather than \
+             presenting the default binding's credential, which would attribute the row to the \
+             wrong tenant. Coord's server-side resolution decides the outcome and counts it."
+        );
+    });
+}
+
 /// Attach the device-JWT bearer to a coord data-plane request when one is
 /// available, otherwise return the builder unchanged. Also drives the
 /// auth-coverage metric (the dogfood signal Phase 1 gates on): every call is
@@ -2111,6 +2263,187 @@ mod bearer_selection_tests {
         let a = tenant(0x22);
         assert_eq!(select_device_bearer(&mgr, Some(&a), None), None);
         assert_eq!(select_device_bearer(&mgr, None, None), None);
+    }
+
+    // ========================================================================
+    // D2 — the degrade rule, one test per cell of `select_scoped_bearer`'s
+    // table. These are the Phase-4 pins: they must stay green while Phases 5
+    // and 6 change which scope each call site declares, and they must FAIL if
+    // a device-scoped caller is switched to a tenant slot.
+    // ========================================================================
+
+    /// `Device` presents the default binding's slot — on a SINGLE-bound device.
+    /// The by-construction guarantee for heartbeat / registration / device
+    /// maintenance, unchanged from the unparameterized wrapper.
+    #[test]
+    fn device_scope_presents_default_slot_when_single_bound() {
+        let mgr = create_test_auth_manager("scope_device_single_bound");
+        let a = tenant(0xA1);
+        mgr.store_tokens("default.jwt", "").unwrap();
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Device, Some(a), 1).as_deref(),
+            Some("default.jwt")
+        );
+    }
+
+    /// THE Phase-4 invariant: a device-scoped caller is UNAFFECTED by the
+    /// binding count. Pairing a second tenant must not change what a heartbeat
+    /// presents — if this test ever fails, a `D`-scope site has been
+    /// misclassified as tenant-owned.
+    #[test]
+    fn device_scope_is_unchanged_on_a_multi_bound_device() {
+        let mgr = create_test_auth_manager("scope_device_multi_bound");
+        let a = tenant(0xA2);
+        let b = tenant(0xB2);
+        mgr.store_tokens("default.jwt", "").unwrap();
+        mgr.store_tenant_device_jwt(&a, "jwt.a").unwrap();
+        mgr.store_tenant_device_jwt(&b, "jwt.b").unwrap();
+        for count in [1usize, 2, 7] {
+            assert_eq!(
+                select_scoped_bearer(&mgr, TenantScope::Device, Some(a), count).as_deref(),
+                Some("default.jwt"),
+                "device-scoped selection must not vary with binding count ({count})"
+            );
+        }
+    }
+
+    /// `Owned(t)` presents `t`'s slot, not the default's — on both a single-
+    /// and a multi-bound device.
+    #[test]
+    fn owned_scope_presents_that_tenants_slot() {
+        let mgr = create_test_auth_manager("scope_owned_slot");
+        let a = tenant(0xA3);
+        let b = tenant(0xB3);
+        mgr.store_tokens("default.jwt", "").unwrap();
+        mgr.store_tenant_device_jwt(&b, "jwt.b").unwrap();
+        for count in [1usize, 2] {
+            assert_eq!(
+                select_scoped_bearer(&mgr, TenantScope::Owned(b), Some(a), count).as_deref(),
+                Some("jwt.b"),
+                "Owned must select the owning tenant's slot (binding count {count})"
+            );
+        }
+    }
+
+    /// `Owned(t)` on a slot MISS for a non-default tenant sends nothing — it
+    /// must never fall back to the default binding's credential. Inherited
+    /// from `select_device_bearer`; pinned here so the scope layer cannot
+    /// quietly reintroduce the substitution.
+    #[test]
+    fn owned_scope_never_substitutes_another_tenants_credential() {
+        let mgr = create_test_auth_manager("scope_owned_slot_miss");
+        let a = tenant(0xA4);
+        let b = tenant(0xB4);
+        mgr.store_tokens("default.jwt", "").unwrap();
+        // No slot stored for `b`.
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Owned(b), Some(a), 2),
+            None,
+            "a slot miss for a non-default tenant must degrade to unauthenticated"
+        );
+    }
+
+    /// D2's no-regression half: on a SINGLE-bound device an unresolved tenant
+    /// still presents the default slot, because there the default binding IS
+    /// the owning tenant. A blanket refusal here is the outage D2 exists to
+    /// avoid.
+    #[test]
+    fn unresolved_scope_keeps_default_slot_on_single_bound_device() {
+        let mgr = create_test_auth_manager("scope_unresolved_single");
+        let a = tenant(0xA5);
+        mgr.store_tokens("default.jwt", "").unwrap();
+        for count in [0usize, 1] {
+            assert_eq!(
+                select_scoped_bearer(&mgr, TenantScope::Unresolved, Some(a), count).as_deref(),
+                Some("default.jwt"),
+                "single-bound (count {count}) must be unchanged"
+            );
+        }
+    }
+
+    /// D2's teeth: on a MULTI-bound device an unresolved tenant degrades to
+    /// unauthenticated rather than presenting the default binding's credential,
+    /// which coord would attribute to the wrong tenant.
+    #[test]
+    fn unresolved_scope_degrades_to_unauthenticated_on_multi_bound_device() {
+        let mgr = create_test_auth_manager("scope_unresolved_multi");
+        let a = tenant(0xA6);
+        let b = tenant(0xB6);
+        mgr.store_tokens("default.jwt", "").unwrap();
+        mgr.store_tenant_device_jwt(&a, "jwt.a").unwrap();
+        mgr.store_tenant_device_jwt(&b, "jwt.b").unwrap();
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Unresolved, Some(a), 2),
+            None,
+            "multi-bound + unresolved must send nothing, never the default binding's JWT"
+        );
+    }
+
+    /// `Unresolved` and `Device` are the two `None`s the old `Option<Uuid>`
+    /// collapsed. This test is the collapse, made visible: they agree on a
+    /// single-bound device and DIVERGE on a multi-bound one. If they ever agree
+    /// on a multi-bound device, the type has stopped earning its existence.
+    #[test]
+    fn unresolved_and_device_diverge_exactly_when_multi_bound() {
+        let mgr = create_test_auth_manager("scope_two_nones_diverge");
+        let a = tenant(0xA7);
+        mgr.store_tokens("default.jwt", "").unwrap();
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Unresolved, Some(a), 1),
+            select_scoped_bearer(&mgr, TenantScope::Device, Some(a), 1),
+            "single-bound: the two former `None`s must behave identically"
+        );
+        assert_ne!(
+            select_scoped_bearer(&mgr, TenantScope::Unresolved, Some(a), 2),
+            select_scoped_bearer(&mgr, TenantScope::Device, Some(a), 2),
+            "multi-bound: they must diverge — that divergence IS the fix"
+        );
+    }
+
+    // ---- binding count: the input the degrade rule keys on ----------------
+
+    /// The v2 `bindings` array is the count when present and non-empty.
+    #[test]
+    fn binding_count_reads_the_v2_bindings_array() {
+        let v: serde_json::Value = serde_json::json!({
+            "user_id": "u",
+            "default_tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bindings": [
+                {"tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "user_id": "u"},
+                {"tenant_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "user_id": "u"}
+            ]
+        });
+        assert_eq!(binding_count_from_value(&v), 2);
+    }
+
+    /// A legacy v1 file naming one tenant counts as one binding.
+    #[test]
+    fn binding_count_handles_the_legacy_single_entry_shape() {
+        let v: serde_json::Value = serde_json::json!({
+            "user_id": "u",
+            "tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        });
+        assert_eq!(binding_count_from_value(&v), 1);
+    }
+
+    /// Every degenerate shape counts as ONE, never as many. The asymmetry is
+    /// deliberate: under-counting preserves today's behaviour, over-counting
+    /// degrades live writes on a healthy machine.
+    #[test]
+    fn binding_count_fails_toward_one_never_toward_degrading() {
+        for v in [
+            serde_json::json!({}),
+            serde_json::json!({"user_id": "u"}),
+            serde_json::json!({"user_id": "u", "bindings": []}),
+            serde_json::json!({"bindings": "not-an-array"}),
+            serde_json::json!({"tenant_id": 7}),
+        ] {
+            assert_eq!(
+                binding_count_from_value(&v),
+                1,
+                "degenerate paired_user.json must count as one binding: {v}"
+            );
+        }
     }
 }
 

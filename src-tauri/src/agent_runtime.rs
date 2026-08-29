@@ -2239,6 +2239,7 @@ async fn post_continuation_poll_report(device_id: uuid::Uuid, counts: PollRunCou
         return;
     };
     let body = ContinuationPollReportBody::new(device_id, counts);
+    // coord-tenant-scope(device): body is ContinuationPollReportBody::new(device_id, counts) (:2241); coord's poll-report row has no tenant column and the handler takes no auth extractor.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -2398,6 +2399,7 @@ async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> 
         };
     };
     let body = ContinuationConsumedBody::claim(device_id);
+    // coord-tenant-scope(device): only gate_id and device_id are in scope (:2390); the continuation-consumed ack is keyed gate_id+device_id, with no auth extractor and no tenant.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -2436,6 +2438,7 @@ async fn post_continuation_outcome(
         return;
     };
     let body = ContinuationConsumedBody::outcome(device_id, spawned, detail);
+    // coord-tenant-scope(device): ContinuationConsumedBody::outcome(device_id, ..) (:2438); same device-keyed route, no session id anywhere in scope.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -2527,6 +2530,7 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
         return;
     };
     let body = ContinuationDeferredBody { device_id, reason };
+    // coord-tenant-scope(device): ContinuationDeferredBody{device_id, reason} (:2529); same unauthenticated device-keyed posture, no tenant column.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -2588,6 +2592,7 @@ async fn post_unit_dispatch_consumed(dispatch_id: uuid::Uuid, device_id: uuid::U
         return;
     };
     let body = UnitDispatchConsumedBody { device_id };
+    // coord-tenant-scope(device): UnitDispatchConsumedBody{device_id} (:2590); coord marks the dispatch consumed by dispatch_id alone -- no tenant, no auth extractor.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -4804,6 +4809,7 @@ async fn post_log_line(agent_id: uuid::Uuid, line: &LogLine) -> bool {
     let Some(client) = crate::coord_http::coord_client() else {
         return false;
     };
+    // coord-tenant-scope(session-owed): agent_id is the fn's first parameter (:4799), but coord resolves the tenant from coord.agent_worktrees by that agent_id and never reads the bearer -- correctness is downstream of allocate. Phase 5.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(3))
         .json(line)
@@ -4854,6 +4860,7 @@ async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
     };
     let client = crate::coord_http::coord_client()
         .ok_or_else(|| anyhow::anyhow!("no shared coord client"))?;
+    // coord-tenant-scope(session-owed): payload.agent_session_id (:77) and payload.agent_id (:75) are in scope, yet the claim body (:4849-4854) sends neither, nor ClaimRequest.tenant_id. Phase 5.
     let resp = crate::auth::attach_device_auth(client.post(format!("{base}/claims/heartbeat")))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -4895,6 +4902,7 @@ async fn report_spawn_complete(
     let Some(client) = crate::coord_http::coord_client() else {
         return;
     };
+    // coord-tenant-scope(session-owed): agent_id is a parameter (:4872); spawn-complete only flips agent_worktrees.status by agent_id and persists no tenant, so no bearer is read. Phase 5.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -4943,6 +4951,7 @@ async fn report_spawn_failed(
     let Some(client) = crate::coord_http::coord_client() else {
         return;
     };
+    // coord-tenant-scope(session-owed): agent_id is a parameter; spawn-failed likewise only sets status=abandoned by agent_id and persists no tenant. Phase 5.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)

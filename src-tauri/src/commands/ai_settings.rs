@@ -1567,6 +1567,7 @@ mod usage_twin_report {
             Ok(c) => c,
             Err(_) => return,
         };
+        // coord-tenant-scope(device): the payload is this machine's whole Claude-account roster (:1540-1561) -- a device property, with no session and no artifact in scope.
         let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
         match req.json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {

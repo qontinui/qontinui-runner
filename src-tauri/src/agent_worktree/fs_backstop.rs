@@ -338,6 +338,7 @@ async fn post_canonical_drift(coord_base: &str, body: &CanonicalDriftRequest) {
     };
     // Attach the device-JWT bearer when available (same write-path attach the
     // fs_observer producer uses; collapses to an anonymous send when unpaired).
+    // coord-tenant-scope(work-owed): a machine-wide scan of the shared canonical checkouts, one row per dirty repo and no session by construction; CanonicalDriftRequest.tenant_id is filled from machine.json::active_tenant_id -- machine-global, wrong on a multi-project box. Phase 6.
     let req = crate::auth::attach_device_auth(client.post(&url));
     match req.json(body).send().await {
         Ok(resp) => {

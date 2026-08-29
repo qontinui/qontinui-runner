@@ -1314,6 +1314,7 @@ fn upstream_error(what: &str, status: reqwest::StatusCode, text: String) -> anyh
 impl ArtifactSink for HttpArtifactSink {
     async fn upsert(&self, body: &ArtifactUpsert) -> Result<UpsertResult> {
         let url = format!("{}/api/v1/plan-library", self.base);
+        // coord-tenant-scope(work-owed): the sink holds only base+client with no session id -- and this targets qontinui-web, NOT coord: its axis is organization_id derived from the authenticated principal, never the body. E3: whether a coord tenant maps onto a web org is unresolved. Phase 6.
         let resp = crate::auth::attach_device_auth(self.client.post(&url).json(body))
             .send()
             .await
@@ -1376,6 +1377,7 @@ impl ArtifactSink for HttpArtifactSink {
             "relation": relation,
             "note": note,
         });
+        // coord-tenant-scope(work-owed): same session-less web sink; qontinui-web derives organization_id from the principal, not from this body. E3 applies. Phase 6.
         let resp = crate::auth::attach_device_auth(self.client.post(&url).json(&body))
             .send()
             .await

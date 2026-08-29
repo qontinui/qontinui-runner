@@ -489,6 +489,7 @@ async fn post_budget_with_retry(
     let mut last_err = String::new();
     let backoff_ms: [u64; 6] = [2_000, 4_000, 8_000, 16_000, 32_000, 60_000];
     for (attempt, delay_ms) in backoff_ms.iter().enumerate() {
+        // coord-tenant-scope(device): device_id (:481) is the only identity in scope; the budget row is device-keyed and coord's handler reads no tenant at all.
         match crate::auth::attach_device_auth(client.post(&url).json(body))
             .send()
             .await
@@ -1393,6 +1394,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
 
+    // coord-tenant-scope(device): device registration -- the payload already carries tenant_id = bindings.default_tenant and tenant_ids (:1374-1388); the default binding IS the right answer here.
     let resp = crate::auth::attach_device_auth(client.post(&url).json(&payload))
         .send()
         .await
@@ -2726,6 +2728,7 @@ async fn request_and_apply_pull(
         body["tenant_id"] = serde_json::json!(t);
     }
     let url = format!("{base}/coord/trees/pull-decision");
+    // coord-tenant-scope(device): body already carries device_id and, when present, the publisher's own tenant_id (:2725-2727); coord resolves per-publisher and reads no bearer.
     let resp = match crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -2932,6 +2935,7 @@ async fn record_pull_outcome(
         "reasoning": reasoning,
     });
     let url = format!("{base}/coord/trees/pull-decision/record");
+    // coord-tenant-scope(device): body is {device_id, resolution_id, chosen_option, reasoning} -- this route has no tenant field; coord reads the tenant back off the resolution_id row.
     if let Err(e) = crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -3167,6 +3171,7 @@ pub async fn publish_tree_state() -> Result<(), String> {
         // repo, which dominates it by orders of magnitude; the coverage-log
         // rate floor in `auth::coverage_log_due` handles the one effect that
         // did scale badly here (a summary line every 25 calls).
+        // coord-tenant-scope(device): canonical trees are device-scoped; payload.tenant_id was already set to publisher_tenant at :3155 and coord reads no bearer on /coord/trees/upsert.
         let upsert_ok = match crate::auth::attach_device_auth(client.post(&url).json(&payload))
             .send()
             .await
@@ -3320,6 +3325,7 @@ async fn run_auto_fresh_cycle() -> Result<(), String> {
     );
 
     let client = reqwest::Client::new();
+    // coord-tenant-scope(device): device_id (:3310) is the only identity; read-only, and coord serves the union of this device's own bindings unless a tenant_id query param narrows it.
     let response = crate::auth::attach_device_auth(client.get(&url))
         .send()
         .await
