@@ -53,6 +53,8 @@ import {
   type InterpretMatch,
   getAll,
   interpretCommand,
+  applyDeclaredFlags,
+  chooseHeadMatch,
   matchPattern,
   parseArgs,
   unboundTokens,
@@ -203,21 +205,24 @@ export function CommandBar() {
   // /orchestrate case — landed and vanished while the operator was still
   // watching the grid.
 
-  // Match list — Tier 3 (AI), then Tier 2 (regex patterns), then Tier 1
-  // (exact slash / fuzzy). Higher tiers WIN because shape-aware routing
-  // beats verb-only routing: Tier-1's exact `/spawn` hit would let
-  // parseArgs mis-bind `count` to "3 best" via the free-form catch-all,
-  // and Tier-3's free-text understanding routes phrasings neither
-  // tier-1 nor tier-2 can catch. When a higher tier hits, its action is
-  // filtered out of the lower tiers so the dropdown doesn't show the
-  // same row twice. Pre-parsed args from the higher tier (regex named
-  // groups for Tier-2, model output for Tier-3) ride on the match as
-  // `presetArgs` so `execute` can skip `parseArgs` and use them
-  // directly.
+  // Match list. WHICH TIER OWNS THE INPUT is decided by
+  // `commands/rank.ts::chooseHeadMatch` — a literal slash form beats
+  // everything, and among the rest the shape-aware tiers beat the verb-only
+  // one. The rule and the bug that produced it (a Tier-2 regex outranking
+  // `/spawn-ai` and silently discarding its declared `--tenant` flag) are
+  // documented there, in one place, rather than in a comment here that the
+  // resolver cannot be tested against.
+  //
+  // When a higher tier wins, its action is filtered out of Tier 1's list so
+  // the dropdown doesn't show the same row twice. Pre-parsed args from that
+  // tier (regex named groups for Tier 2, model output for Tier 3) ride on
+  // the match as `presetArgs`.
   const matches = useMemo(() => {
     type LocalMatch = {
       action: CommandAction;
       exact: boolean;
+      /** See `commands/rank.ts` — the leading `/` the operator typed. */
+      literal: boolean;
       recent: boolean;
       indices: number[];
       /** Pre-extracted args from Tier-2 / Tier-3. Bypasses parseArgs. */
@@ -228,29 +233,20 @@ export function CommandBar() {
       /** Model self-confidence for Tier-3 entries. */
       confidence?: number;
     };
-    const tier2 = matchPattern(query);
     const tier1 = resolve(query, recents);
-    const tier3 = tier3Match;
-
-    const headMatch: LocalMatch | null = tier3
+    const head = chooseHeadMatch(tier1, matchPattern(query), tier3Match);
+    const headMatch: LocalMatch | null = head
       ? {
-          action: tier3.action,
+          action: head.action,
           exact: true,
-          recent: recents.includes(tier3.action.id),
+          literal: false,
+          recent: recents.includes(head.action.id),
           indices: [],
-          presetArgs: tier3.args,
-          tier: "ai",
-          confidence: tier3.confidence,
+          presetArgs: head.presetArgs,
+          tier: head.tier === "ai" ? "ai" : undefined,
+          confidence: head.confidence,
         }
-      : tier2
-        ? {
-            action: tier2.action,
-            exact: true,
-            recent: recents.includes(tier2.action.id),
-            indices: [],
-            presetArgs: tier2.args,
-          }
-        : null;
+      : null;
 
     if (!headMatch) return tier1 as LocalMatch[];
 
@@ -385,7 +381,15 @@ export function CommandBar() {
       // verbatim rather than re-parsing positionally (positional parse
       // on "spawn 3 best" against /spawn's 1-field schema would silently
       // mis-bind).
-      const args = presetArgs ?? parseArgs(rawInput, action);
+      //
+      // `applyDeclaredFlags` then runs on EVERY route, not just the slash
+      // one. Flag extraction used to be a property of `parseArgs`, which
+      // made it a property of the route that calls `parseArgs` — so a
+      // Tier-2 pattern ending in `.+` swallowed `/spawn-ai`'s declared
+      // `--tenant` and the handler's tenant guard never ran. Any future
+      // declared flag would have inherited that silently; it is a
+      // route-independent step now so it cannot.
+      const args = applyDeclaredFlags(presetArgs ?? parseArgs(rawInput, action), rawInput, action);
       // Trailing junk on a no-argument command. Only the SLASH route can
       // carry it — Tier-2/Tier-3 arrive with `presetArgs` already bound —
       // and only for an empty schema, where `parseArgs`'s catch-all is

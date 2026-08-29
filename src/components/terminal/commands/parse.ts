@@ -123,14 +123,96 @@ export function extractFlags(
       continue;
     }
     // `--name value` — consumes the NEXT token as the value.
-    if (known.has(body) && i + 1 < tokens.length) {
-      flags[body] = coerceToken(tokens[i + 1]);
+    if (known.has(body)) {
+      const next = tokens[i + 1];
+      // A declared flag with nothing usable after it was SUPPLIED and left
+      // EMPTY — the same state as `--name=`, and it must read as the same
+      // state. Leaving the token in the positional stream instead made
+      // `/spawn-ai 1 gmail --tenant` bind `context: "--tenant"`: the tenant
+      // read back ABSENT (so the spawn silently took the device default) and
+      // the literal flag text was typed into the new session as its prompt.
+      if (next === undefined || isDeclaredFlagToken(next, known)) {
+        flags[body] = "";
+        continue;
+      }
+      flags[body] = coerceToken(next);
       i++;
       continue;
     }
     rest.push(token);
   }
   return { flags, rest };
+}
+
+/** True when `token` spells one of the `known` declared flags. */
+function isDeclaredFlagToken(token: string, known: ReadonlySet<string>): boolean {
+  if (!token.startsWith(FLAG_PREFIX)) return false;
+  const body = token.slice(FLAG_PREFIX.length);
+  const eq = body.indexOf("=");
+  return known.has(eq > 0 ? body.slice(0, eq) : body);
+}
+
+/**
+ * Merge an action's DECLARED `--flags` into an already-bound arg bag, and
+ * scrub the flag text out of any string field that swallowed it.
+ *
+ * This is the route-independent half of flag handling, and it exists because
+ * making it a property of {@link parseArgs} made it a property of ONE ROUTE.
+ * `CommandBar.execute` reads `presetArgs ?? parseArgs(...)`, so a Tier-2 /
+ * Tier-3 hit skipped the parser entirely — and `/spawn-ai`'s Tier-2 pattern
+ * ends in `(?<context>.+)`, which swallowed `--tenant=` whole. The declared
+ * flag was never extracted, the handler's three-state tenant guard therefore
+ * never ran, and `/spawn-ai 1 gmail --tenant=` spawned under the device
+ * default while the byte-identical `/spawn-best 1 gmail --tenant=` correctly
+ * refused. Same action, same args, split purely on which regex matched first.
+ *
+ * A per-flag recovery in the handler (the deleted `splitTenantFlag`) closed
+ * that for `--tenant` only; the next declared flag would inherit the bug
+ * silently, and any future pattern with a `.+` tail would re-open it. So the
+ * extraction is applied to EVERY route's args instead, from the RAW INPUT,
+ * which is the only text guaranteed to still carry the flag whatever the
+ * matching tier did with it.
+ *
+ * A no-op for actions declaring no flags, and idempotent on the slash route
+ * where {@link parseArgs} already stripped them.
+ */
+export function applyDeclaredFlags(
+  args: Record<string, unknown>,
+  input: string,
+  action: CommandAction,
+): Record<string, unknown> {
+  const schemaKeys = action.paramSchema ? Object.keys(action.paramSchema) : [];
+  if (!schemaKeys.some((k) => k.startsWith(FLAG_PREFIX))) return args;
+
+  // The RAW INPUT is the authority, and it is consulted FIRST for a reason.
+  // Only a flag the operator typed as a top-level token counts; one that
+  // appears only inside a QUOTED run is prompt text they quoted on purpose.
+  // `/spawn-ai 3 best "fix the --tenant handling"` must keep its prompt
+  // intact — `tokenize` treats the quoted run as one token, so no flag is
+  // found and the args are returned untouched.
+  const trimmed = input.trim();
+  const firstSpace = trimmed.search(/\s/);
+  const tail = firstSpace === -1 ? "" : trimmed.slice(firstSpace + 1).trim();
+  const found: Record<string, unknown> =
+    tail.length > 0 ? extractFlags(tokenize(tail), schemaKeys).flags : {};
+  if (Object.keys(found).length === 0) return args;
+
+  // The flag WAS typed at the top level, so any string field the higher tier
+  // bound has swallowed it (the `(?<context>.+)` case). Strip it back out, so
+  // it is never typed into the spawned session as part of its prompt.
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (typeof value !== "string" || !value.includes(FLAG_PREFIX)) {
+      out[key] = value;
+      continue;
+    }
+    const stripped = extractFlags(tokenize(value), schemaKeys).rest.join(" ");
+    // Dropping the key rather than binding "" is deliberate: a field whose
+    // whole content WAS the flag was not supplied, and `readTextArg` reads
+    // "" as supplied-but-empty, which is an error state.
+    if (stripped.length > 0) out[key] = stripped;
+  }
+  return { ...out, ...found };
 }
 
 /**
