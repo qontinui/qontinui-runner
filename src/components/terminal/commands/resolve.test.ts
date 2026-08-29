@@ -9,7 +9,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { parseArgs, tokenize, coerceToken, extractFlags } from "./parse";
+import { applyDeclaredFlags, parseArgs, tokenize, coerceToken, extractFlags } from "./parse";
 import { __resetForTest, register } from "./registry";
 import { resolve } from "./resolve";
 import type { CommandAction } from "./types";
@@ -91,6 +91,31 @@ describe("resolve — exact slash hit", () => {
     register(action({ id: "swap", slash: "/swap" }));
     const matches = resolve("/swap", ["swap"]);
     expect(matches[0].recent).toBe(true);
+  });
+
+  // `literal` is what lets the CommandBar rank an exact hit ABOVE a Tier-2
+  // regex without also handing `spawn 3 best` (English) to `/spawn`. The
+  // resolver matches both spellings; only one of them is the operator
+  // naming the command outright.
+  it("marks a LEADING-SLASH exact hit as literal", () => {
+    register(action({ id: "spawn-ai", slash: "/spawn-ai" }));
+    expect(resolve("/spawn-ai 1 gmail --tenant=", [])[0].literal).toBe(true);
+  });
+
+  it("marks a slashless exact hit as NOT literal", () => {
+    register(action({ id: "spawn", slash: "/spawn" }));
+    expect(resolve("spawn 3 best", [])[0].literal).toBe(false);
+  });
+
+  it("marks a literal ALIAS hit as literal too", () => {
+    register(action({ id: "spawn-ai", slash: "/spawn-ai", aliases: ["/spawn-best"] }));
+    expect(resolve("/spawn-best 1 gmail", [])[0].literal).toBe(true);
+  });
+
+  it("never marks a fuzzy or empty-input row as literal", () => {
+    register(action({ id: "layout", slash: "/layout", label: "Change layout preset" }));
+    expect(resolve("", []).every((m) => !m.literal)).toBe(true);
+    expect(resolve("lyt", []).every((m) => !m.literal)).toBe(true);
   });
 });
 
@@ -328,12 +353,136 @@ describe("parse — declared --flags", () => {
     });
   });
 
-  it("does not consume a trailing flag with no value", () => {
+  // A declared flag typed with NO value is SUPPLIED-AND-EMPTY, which is the
+  // same state as `--tenant=` and must read as the same state. It used to
+  // fall through to positional binding, so `/spawn-ai 3 best --tenant` bound
+  // `context: "--tenant"`: the tenant read back ABSENT (silently spawning
+  // under the device default) and the flag text was typed into the new
+  // session as its prompt. Binding "" is what lets `resolveText` say
+  // "tenant was supplied but empty".
+  it("binds a value-less declared flag as SUPPLIED-but-empty, not as prompt text", () => {
     expect(parseArgs("/spawn-ai 3 best --tenant", spawnAi)).toEqual({
       count: 3,
       account: "best",
-      context: "--tenant",
+      tenant: "",
     });
+  });
+
+  it("does not eat a following declared flag as the value of the one before it", () => {
+    const twoFlags = action({
+      id: "two-flags",
+      slash: "/two-flags",
+      paramSchema: { count: "n", "--tenant": "s", "--zone": "n" },
+    });
+    expect(parseArgs("/two-flags 3 --tenant --zone 4", twoFlags)).toEqual({
+      count: 3,
+      tenant: "",
+      zone: 4,
+    });
+  });
+});
+
+// The ROUTE-INDEPENDENT half. `parseArgs` runs on the slash route only;
+// `applyDeclaredFlags` runs on every route's args, which is what stops a
+// Tier-2 pattern with a `(?<context>.+)` tail from swallowing a declared
+// flag whole. D1 of manual-test-loop iteration 7: `/spawn-ai 1 gmail
+// --tenant=` spawned under the device default while `/spawn-best 1 gmail
+// --tenant=` — same action, same args — correctly refused, split purely on
+// which regex matched.
+describe("parse — applyDeclaredFlags", () => {
+  const spawnAi = action({
+    id: "spawn-ai",
+    slash: "/spawn-ai",
+    paramSchema: { count: "n", account: "s", context: "s", "--tenant": "s" },
+  });
+  const noFlags = action({
+    id: "spawn",
+    slash: "/spawn",
+    paramSchema: { count: "n" },
+  });
+
+  it("is a no-op for an action declaring no flags", () => {
+    const args = { count: 3 };
+    expect(applyDeclaredFlags(args, "/spawn 3 --tenant=x", noFlags)).toBe(args);
+  });
+
+  it("recovers an EMPTY flag a Tier-2 catch-all swallowed into `context`", () => {
+    // What `matchPattern` binds for `spawn-ai 1 gmail --tenant=`.
+    expect(
+      applyDeclaredFlags(
+        { count: 1, account: "gmail", context: "--tenant=" },
+        "/spawn-ai 1 gmail --tenant=",
+        spawnAi,
+      ),
+    ).toEqual({ count: 1, account: "gmail", tenant: "" });
+  });
+
+  it("recovers a value-less flag the catch-all swallowed", () => {
+    expect(
+      applyDeclaredFlags(
+        { count: 1, account: "gmail", context: "--tenant" },
+        "/spawn-ai 1 gmail --tenant",
+        spawnAi,
+      ),
+    ).toEqual({ count: 1, account: "gmail", tenant: "" });
+  });
+
+  it("recovers a dotted value and strips it from the prompt", () => {
+    expect(
+      applyDeclaredFlags(
+        { count: 1, account: "gmail", context: "--tenant=a.b fix the bug" },
+        "/spawn-ai 1 gmail --tenant=a.b fix the bug",
+        spawnAi,
+      ),
+    ).toEqual({ count: 1, account: "gmail", context: "fix the bug", tenant: "a.b" });
+  });
+
+  it("recovers the space form and keeps the rest of the prompt in order", () => {
+    expect(
+      applyDeclaredFlags(
+        { count: 1, account: "gmail", context: "fix the bug --tenant pizzeria now" },
+        "/spawn-ai 1 gmail fix the bug --tenant pizzeria now",
+        spawnAi,
+      ),
+    ).toEqual({
+      count: 1,
+      account: "gmail",
+      context: "fix the bug now",
+      tenant: "pizzeria",
+    });
+  });
+
+  it("leaves an UNDECLARED --flag in the prompt", () => {
+    const args = { count: 1, account: "gmail", context: "rerun with --verbose set" };
+    expect(applyDeclaredFlags(args, "/spawn-ai 1 gmail rerun with --verbose set", spawnAi)).toEqual(
+      args,
+    );
+  });
+
+  it("is idempotent on the slash route, where parseArgs already extracted", () => {
+    const input = "/spawn-ai 3 best --tenant pizzeria fix the bug";
+    const once = parseArgs(input, spawnAi);
+    expect(applyDeclaredFlags(once, input, spawnAi)).toEqual(once);
+  });
+
+  it("leaves a QUOTED --flag inside a prompt alone", () => {
+    // `tokenize` treats a quoted run as one token, so the raw input carries
+    // no top-level flag and nothing is extracted or stripped. Without the
+    // raw-input-first gate this scrubbed the operator's own prompt text.
+    const input = '/spawn-ai 3 best "fix the --tenant handling"';
+    const once = parseArgs(input, spawnAi);
+    expect(once).toEqual({ count: 3, account: "best", context: "fix the --tenant handling" });
+    expect(applyDeclaredFlags(once, input, spawnAi)).toEqual(once);
+  });
+
+  it("keeps a Tier-3 binding the raw input never spelled as a flag", () => {
+    expect(
+      applyDeclaredFlags(
+        { count: 1, account: "gmail", tenant: "pizzeria" },
+        "spin up one gmail session for the pizzeria tenant",
+        spawnAi,
+      ),
+    ).toEqual({ count: 1, account: "gmail", tenant: "pizzeria" });
   });
 });
 
