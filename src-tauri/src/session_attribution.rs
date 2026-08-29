@@ -28,10 +28,41 @@
 //!
 //! ## Gate (default OFF)
 //!
-//! `COORD_SESSION_ATTRIBUTION_ENABLED` — default OFF. The feature has no live
-//! consumer yet (coord's `coord.primary_trees.dirty_files` is the consumer once
-//! armed), so default-off is the safe rollout. When off the spawner logs
+//! `COORD_SESSION_ATTRIBUTION_ENABLED` — default OFF. When off the spawner logs
 //! "disabled" once and returns without starting the task.
+//!
+//! **The consumers are live, and have been since coord#630** (merged
+//! 2026-06-14; both landed in the same commit, `07313763`). This header used
+//! to say "the feature has no live consumer yet"; that was stale, and it also
+//! named the wrong table. Two consumers read `coord.wip_attribution` — the table
+//! this loop fills:
+//!
+//! - `stale_wip_watcher`'s `orphaned_wip` branch. `stale_wip_watcher::spawn` is
+//!   called unconditionally during coord startup and `enabled()` is false only
+//!   for an explicit `QONTINUI_COORD_STALE_WIP_ENABLED=0`, so it is default-ON;
+//!   every cycle runs the orphan branch, leader-gated only.
+//! - the `GET /coord/trees/wip-owners/:device_id` ownership join.
+//!
+//! `coord.primary_trees.dirty_files` is NOT the consumer — it is the *other
+//! side* of both joins (the tree publisher's output, which our `file` field is
+//! shaped to line up with). The old wording had the direction backwards.
+//!
+//! **What staying dark actually costs.** coord's `collect_orphan_inputs` reaches
+//! `coord.wip_attribution` through an INNER `JOIN`, so while this loop is off the
+//! join yields zero rows for every device and the `orphaned_wip` alert **cannot
+//! fire at all** — it is not merely quiet. The sibling `stale_wip` branch reads
+//! `coord.primary_trees` alone, is unaffected, and has been firing normally
+//! throughout; its alerts are therefore not evidence that the orphan half works.
+//!
+//! So the reason to stay default-off is *not* an absent consumer. It is the
+//! unsettled cost/privacy question about parsing every hosted session's
+//! transcript on a loop on every fleet host — an operator call, tracked in
+//! `qontinui-dev-notes/plans/2026-06-14-coord-wip-authorship-attribution.md`.
+//!
+//! (coord sites are named by symbol and route rather than by line — line numbers
+//! for exactly these sites have already rotted twice. They live in
+//! `crates/coord/src/{main,routes,stale_wip_watcher,wip_attribution}.rs`, a path
+//! prefix that is itself newer than the citations in that plan.)
 //!
 //! ## Offset / dedup
 //!
