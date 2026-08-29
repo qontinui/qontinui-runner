@@ -515,8 +515,14 @@ pub fn settings_json_path() -> (Option<PathBuf>, SettingsJsonPathSource) {
 pub enum TierRead {
     /// settings.json parsed and carries this tier value.
     Known(String),
-    /// settings.json parsed but has no usable `tier` (and no `runner_token` to
-    /// infer one from) — a genuinely tier-less install.
+    /// settings.json parsed (or was simply absent) and carries no usable
+    /// `tier`, and NONE of the signals [`read_runner_tier_at`] consults
+    /// inferred one — neither `web_integration.runner_token` nor a device
+    /// pairing (`paired_user.json`). A genuinely tier-less install.
+    ///
+    /// `QONTINUI_SERVER_MODE` is deliberately absent from that list: it is a
+    /// property of the READING process, not of the document, so the disk
+    /// reader always passes it as `false` (see [`TierSignals::server_mode`]).
     Absent,
     /// settings.json could not be read or parsed. The tier is UNKNOWN.
     Unknown(String),
