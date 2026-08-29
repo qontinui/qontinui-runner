@@ -198,9 +198,7 @@ impl RunnerLaunchEnv {
         let api_url = std::env::var("QONTINUI_API_URL")
             .ok()
             .filter(|s| !s.is_empty());
-        let server_mode = std::env::var("QONTINUI_SERVER_MODE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let server_mode = server_mode_from_env();
 
         let window = WindowEnvHints {
             x: parse_env::<i32>("QONTINUI_WINDOW_X"),
@@ -264,6 +262,28 @@ pub type SharedLaunchEnv = Arc<RunnerLaunchEnv>;
 
 fn parse_env<T: std::str::FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok()?.parse().ok()
+}
+
+/// The one parse of `QONTINUI_SERVER_MODE` (`1` / `true`, case-insensitive)
+/// in the tree. [`RunnerLaunchEnv::read_uncached`] delegates to it, exactly as
+/// it delegates to `crate::instance::*` for the instance vars — "one parsing
+/// point per var" is this module's stated migration policy, not a per-consumer
+/// snapshot requirement.
+///
+/// # Why a free function and not `launch_env.server_mode`
+///
+/// `settings::load_settings_full` needs the flag (a headless runner defaults
+/// to the tier that talks to coord — `migrate_tier_in_place`), and it cannot
+/// use the typed snapshot for it. The snapshot lives on Tauri app state, and
+/// [`first_read`] is `None` until `main()` has taken it — but settings are
+/// loaded from paths that run before, beside and entirely outside `main()`'s
+/// setup (the `config_report` path, tests, `update_settings`). A `None` there
+/// would silently read as "not headless", i.e. the exact defect this reuse
+/// exists to prevent. So the accessor is shared instead of the value.
+pub fn server_mode_from_env() -> bool {
+    std::env::var("QONTINUI_SERVER_MODE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
