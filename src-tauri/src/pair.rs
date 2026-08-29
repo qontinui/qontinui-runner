@@ -470,6 +470,66 @@ fn read_paired_user_id() -> Option<String> {
     Some(parsed.user_id)
 }
 
+/// Is this device bound to a Qontinui account — i.e. has it been paired?
+///
+/// This is a **tier signal**. Tier 2 (`qontinui_account`) means "bound to a
+/// Qontinui account", and a redeemed pairing is exactly that bind, so the
+/// runner-tier inference consults this (see
+/// [`crate::profiles::infer_tier`]). Before that inference existed, tier was
+/// keyed only on `web_integration.runner_token` — a field
+/// `server_mode/mod.rs` records as legacy and *"no longer consulted by the WS
+/// relay (it authenticates with the device JWT from `AuthManager`)"*. So the
+/// runner inferred its tier from a token nothing authenticates with any more,
+/// while the bind the system actually runs on went unread.
+///
+/// # Why the `paired_user.json` binding and NOT the device JWT
+///
+/// A live device JWT would be the *narrower* signal, and it is the wrong one
+/// here for three independent reasons:
+///
+/// 1. **Cost.** This is called from `settings::load_settings_full`, which the
+///    cloud relay loop re-reads on every iteration. Reading the binding file
+///    is one small `read` + `serde_json` parse of a file the loader is
+///    already sitting next to. The JWT lives in the credential store, whose
+///    read can block on an **OS keychain unlock** — a hot-path settings load
+///    must never do that.
+/// 2. **Side effects.** [`crate::secure_storage`] reads can prompt, unlock,
+///    and fail in ways that are indistinguishable from "unpaired"
+///    ([`StoredTokenRead::Unreadable`] exists precisely because that
+///    conflation was a shipped bug). A tier must not flip on a store that is
+///    merely locked.
+/// 3. **Lifetime.** Device JWTs live ~4h and are refreshed in the background.
+///    Keying a *product tier* on a credential that expires hourly would make
+///    the tier flap — and a flap toward Tier 0 is a silent demotion, the top
+///    risk this whole change is written around. The binding entry, by
+///    contrast, changes only when someone pairs or unpairs.
+///
+/// `false` therefore means "no binding file, or one carrying no binding at
+/// all". It is deliberately **not** an assertion that the credential store is
+/// empty; the tier inference only ever *promotes* on this signal, so a
+/// false-negative costs a promotion, never a demotion.
+///
+/// [`StoredTokenRead::Unreadable`]: crate::secure_storage::StoredTokenRead
+pub fn device_is_paired() -> bool {
+    match paired_user_path() {
+        Some(p) => device_is_paired_at(&p),
+        None => false,
+    }
+}
+
+/// Path-parameterized core of [`device_is_paired`] — hermetic tests point it
+/// at a temp file rather than the process's real data dir.
+///
+/// True when the file parses AND carries a binding: either a non-empty legacy
+/// `user_id`, or at least one v2 `bindings` entry. A missing or unparseable
+/// file is `false` (see the promote-only note on [`device_is_paired`]).
+pub fn device_is_paired_at(path: &std::path::Path) -> bool {
+    let Some(pf) = read_paired_user_file_at(path) else {
+        return false;
+    };
+    !pf.user_id.trim().is_empty() || !pf.effective_bindings().is_empty()
+}
+
 /// Read the cached DEFAULT tenant_id from `paired_user.json`. Returns
 /// `None` if the file is missing OR no tenant is recorded (legacy file
 /// written before the 2026-05-22 schema bump). Used by
@@ -2805,6 +2865,67 @@ mod tests {
     #[test]
     fn paired_user_path_with_none_falls_back_to_data_local_dir() {
         assert_eq!(paired_user_path_with(None), fallback_paired_user_path());
+    }
+
+    // ------------------------------------------------------------------
+    // `device_is_paired_at` — the RUNNER-TIER signal (plan
+    // 2026-08-29-headless-runner-tier-never-reaches-qontinui-account,
+    // Phase 3). Hermetic: a temp file, never the process's real data dir.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn device_is_paired_at_missing_file_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!device_is_paired_at(&dir.path().join("paired_user.json")));
+    }
+
+    /// An unparseable file is `false`, not a panic and not `true`. The tier
+    /// inference only ever PROMOTES on this signal, so a false negative
+    /// costs a promotion and can never demote.
+    #[test]
+    fn device_is_paired_at_unparseable_file_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paired_user.json");
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(!device_is_paired_at(&path));
+    }
+
+    /// A legacy (v1) file — the shape every install written before the
+    /// 2026-05-22 schema bump carries — is a binding.
+    #[test]
+    fn device_is_paired_at_legacy_user_id_only_is_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paired_user.json");
+        std::fs::write(
+            &path,
+            r#"{"user_id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .unwrap();
+        assert!(device_is_paired_at(&path));
+    }
+
+    /// The v2 multi-entry shape, with the legacy `user_id` mirror blank —
+    /// the binding array alone must still read as paired.
+    #[test]
+    fn device_is_paired_at_v2_bindings_without_legacy_mirror_is_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paired_user.json");
+        std::fs::write(
+            &path,
+            r#"{"user_id":"","bindings":[{"tenant_id":"c231d9da-0000-4000-8000-000000000001","user_id":"11111111-1111-4111-8111-111111111111"}]}"#,
+        )
+        .unwrap();
+        assert!(device_is_paired_at(&path));
+    }
+
+    /// A file that parses but carries no binding at all is NOT paired —
+    /// e.g. one left behind with its fields emptied.
+    #[test]
+    fn device_is_paired_at_empty_binding_set_is_not_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paired_user.json");
+        std::fs::write(&path, r#"{"user_id":"   ","bindings":[]}"#).unwrap();
+        assert!(!device_is_paired_at(&path));
     }
 }
 

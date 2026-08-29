@@ -16,12 +16,17 @@
 //! boundary:
 //!
 //! - `settings::migrate_tier_in_place` (Phase 2 — settings migration; also the
-//!   headless `QONTINUI_SERVER_MODE` tier default)
+//!   headless `QONTINUI_SERVER_MODE` tier default, and the device-pairing
+//!   signal + unlatch)
+//! - `qontinui_runner_lib::profiles::infer_tier` +
+//!   `::tier_is_open_to_inference` (the ONE shared rule both tier readers now
+//!   call — there were two hand-mirrored copies until they drifted)
 //! - `settings::apply_tier_env_overlay` + `settings::apply_in_memory_tier_overlay`
 //!   (the two overlays stacked over that inference, in `load_settings_full`'s
 //!   order)
 //! - `qontinui_runner_lib::profiles::read_runner_tier_at` (the SECOND, lib-side
-//!   tier reader — the one `coord_doctor` consults, which sees no overlay)
+//!   tier reader — the one `coord_doctor` consults; it sees no in-memory
+//!   overlay and no process env, but it DOES see disk signals like pairing)
 //! - `commands::auth::require_tier_2_for` (Phase 2 — auth-command gate)
 //! - `mcp::backend_relay::should_relay_idle_with` (Phase 4 — relay gate;
 //!   note: the live `should_relay_idle` wrapper reads `AuthManager` from
@@ -46,8 +51,14 @@
 //! | 2d| `headless_server_mode_infers_qontinui_account`   | fresh install + `QONTINUI_SERVER_MODE` → Tier 2 |
 //! | 2e| `runner_tier_env_overlay_beats_the_headless_default` | `QONTINUI_RUNNER_TIER=local` wins over 2d |
 //! | 2f| `runtime_tier_override_beats_the_headless_default`   | `set_runner_tier` wins over 2d *and* 2e |
-//! | 2g| `tier_initialized_short_circuits_the_headless_default` | the one-shot sentinel is untouched by 2d |
-//! | 2h| `server_mode_default_is_invisible_to_the_disk_reader`  | 2d is in-memory: the lib reader still says `Absent` |
+//! | 2g| `an_explicit_tier_choice_short_circuits_the_headless_default` | `tier_chosen_explicitly` closes the inference for good |
+//! | 2h| `server_mode_default_is_invisible_to_the_disk_reader`  | process signals do not cross to the disk reader |
+//! | 2i| `paired_box_infers_tier_2_in_both_readers`       | paired + empty `runner_token` → Tier 2 in BOTH readers |
+//! | 2j| `inferred_local_is_re_inferred_but_an_explicit_one_is_not` | the unlatch, and the distinction it turns on |
+//! | 2k| `re_inference_never_demotes`                     | unpairing a Tier 2 box does not demote it |
+//! | 2l| `settings_without_tier_chosen_explicitly_reads_false` | the upgrade path: absent key ⇒ eligible |
+//! | 2m| `sign_out_state_is_not_demoted_by_the_re_inference`  | signed-out-but-Tier-2 stays Tier 2 |
+//! | 2n| `unpaired_tokenless_desktop_box_still_resolves_local` | the desktop regression guard |
 //! | 3 | `require_tier_2_blocks_local_and_local_provider` | Tier 0/1 → `AuthError` |
 //! | 3b| `require_tier_2_permits_qontinui_account`        | Tier 2 → `Ok` |
 //! | 4 | `relay_idles_when_tier_local`                    | gate predicate idles in Tier 0/1 |
@@ -127,7 +138,9 @@ fn tier_inference_from_runner_token_promotes() {
 
     // Run the migration in-memory (no disk I/O).
     let mut s = s;
-    let migrated = crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ false);
+    let migrated = crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ false, /* paired = */ false,
+    );
     assert!(migrated, "migration must report it ran");
     assert_eq!(s.tier, RunnerTier::QontinuiAccount);
     assert!(s.tier_initialized);
@@ -139,7 +152,9 @@ fn tier_inference_without_runner_token_stays_local() {
     let mut s: Settings = serde_json::from_str(json).expect("must deserialize");
     s.tier_initialized = false;
 
-    let migrated = crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ false);
+    let migrated = crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ false, /* paired = */ false,
+    );
     assert!(migrated);
     assert_eq!(s.tier, RunnerTier::Local);
     assert!(s.tier_initialized);
@@ -170,7 +185,9 @@ fn desktop_install_without_server_mode_stays_local() {
     let mut s = Settings::default();
     assert!(!s.tier_initialized, "fixture must be a fresh install");
 
-    let migrated = crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ false);
+    let migrated = crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ false, /* paired = */ false,
+    );
     assert!(migrated, "a fresh install must still be migrated");
     assert_eq!(
         s.tier,
@@ -187,7 +204,9 @@ fn headless_server_mode_infers_qontinui_account() {
     let mut s = Settings::default();
     assert!(s.web_integration.runner_token.is_empty(), "no legacy token");
 
-    let migrated = crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ true);
+    let migrated = crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ true, /* paired = */ false,
+    );
     assert!(migrated, "migration must report it ran");
     assert_eq!(
         s.tier,
@@ -204,7 +223,9 @@ fn headless_server_mode_infers_qontinui_account() {
 #[test]
 fn runner_tier_env_overlay_beats_the_headless_default() {
     let mut s = Settings::default();
-    crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ true);
+    crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ true, /* paired = */ false,
+    );
     assert_eq!(s.tier, RunnerTier::QontinuiAccount, "default applied first");
 
     // `load_settings_full` step 2 — the parsed `QONTINUI_RUNNER_TIER` value.
@@ -231,7 +252,9 @@ fn runtime_tier_override_beats_the_headless_default() {
     let mut s = Settings::default();
 
     // 1. inference (headless default)
-    crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ true);
+    crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ true, /* paired = */ false,
+    );
     assert_eq!(s.tier, RunnerTier::QontinuiAccount);
 
     // 2. spawn-time env overlay — deliberately set to Tier 2 as well, so the
@@ -251,62 +274,85 @@ fn runtime_tier_override_beats_the_headless_default() {
 
     // And `None` (no runtime choice was ever made) must change nothing.
     let mut s2 = Settings::default();
-    crate::settings::migrate_tier_in_place(&mut s2, /* server_mode = */ true);
+    crate::settings::migrate_tier_in_place(
+        &mut s2, /* server_mode = */ true, /* paired = */ false,
+    );
     crate::settings::apply_in_memory_tier_overlay(&mut s2, None);
     assert_eq!(s2.tier, RunnerTier::QontinuiAccount);
 }
 
-/// The one-shot sentinel is untouched by this phase: once `tier_initialized` is
-/// set, NOTHING is re-inferred — not from `runner_token`, not from server mode.
-/// A headless box whose operator already chose Tier 0 keeps it.
+/// The sentinel that closes the inference is `tier_chosen_explicitly` — the
+/// operator's own choice, recorded by `commands::auth::set_runner_tier` and by
+/// nothing else. Once it is set, NOTHING is re-inferred: not `runner_token`,
+/// not server mode, not pairing.
+///
+/// **This test asserted `tier_initialized` until Phase 3.** That sentinel was a
+/// one-shot latch, and the whole point of the phase is that it latched the
+/// wrong thing: a box that first booted before it was paired was stuck at
+/// `Local` forever, with the only exit a button in a WebView a headless box
+/// does not have. `tier_initialized` could not stand in for a choice because
+/// the *inference itself* writes it — so "never chosen" and "chose Local" were
+/// the same document. See `inferred_local_is_re_inferred_but_an_explicit_one_is_not`
+/// for the pair of cases that are now distinguished.
 #[test]
-fn tier_initialized_short_circuits_the_headless_default() {
+fn an_explicit_tier_choice_short_circuits_the_headless_default() {
     let mut s = settings_with(RunnerTier::Local, "");
     s.tier_initialized = true;
+    s.tier_chosen_explicitly = true;
 
-    let migrated = crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ true);
+    let migrated = crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ true, /* paired = */ true,
+    );
     assert!(
         !migrated,
-        "an initialized install must not be re-migrated, headless or not"
+        "an explicitly-chosen tier must never be re-inferred — headless, paired, or both"
     );
     assert_eq!(
         s.tier,
         RunnerTier::Local,
-        "server mode must not re-promote an install that already has a tier"
+        "server mode and pairing must not re-promote a box whose owner chose Tier 0"
     );
 
-    // Same for a Tier 1 install (the shape `migrate_tier_is_no_op_once_initialized`
-    // guards in settings.rs) — server mode adds no new way to clobber it.
+    // A Tier 1 install is closed even WITHOUT the field, because nothing but
+    // `set_runner_tier` can produce `local_provider` — no inference has an arm
+    // for it. That is a deduction from the writer set, not a guess at intent.
     let mut s = settings_with(RunnerTier::LocalProvider, "");
     s.tier_initialized = true;
+    assert!(!s.tier_chosen_explicitly, "the pre-Phase-3 upgrade shape");
     assert!(!crate::settings::migrate_tier_in_place(
-        &mut s, /* server_mode = */ true
+        &mut s, /* server_mode = */ true, /* paired = */ true
     ));
     assert_eq!(s.tier, RunnerTier::LocalProvider);
+
+    // And Tier 2 is closed for the trivial reason: there is nothing above it.
+    let mut s = settings_with(RunnerTier::QontinuiAccount, "");
+    s.tier_initialized = true;
+    assert!(!crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ false, /* paired = */ false
+    ));
+    assert_eq!(s.tier, RunnerTier::QontinuiAccount);
 }
 
-/// **The negative, and it is deliberate — do NOT "fix" this test.**
+/// **The negative, and it is still deliberate — do NOT "fix" this test.**
 ///
-/// The headless default is a *migration result*, i.e. in-memory. A secondary
-/// never persists a migration at all, and a primary persists it only through
-/// `settings::should_persist_migration`. Meanwhile there is a SECOND tier
-/// reader: `qontinui_runner_lib::profiles::read_runner_tier`, a raw
-/// `settings.json` parse that sees no overlay and no unpersisted migration —
-/// and it is the one `coord_doctor` check 2 consults.
+/// `server_mode` is a property of the READING PROCESS's environment, not of the
+/// settings document: `coord_doctor` runs in a process whose env says nothing
+/// about how the runner was launched. So `profiles::read_runner_tier_at` —
+/// the second tier reader, the one the doctor consults — always passes
+/// `server_mode: false`, and the headless default stays invisible to it until
+/// a load persists a tier.
 ///
-/// So on a fresh headless box, Phase 2 alone unblocks the four
-/// `require_tier_2()` commands and the relay gate while `coord doctor` still
-/// reports `local`. That is correct behaviour for a doctor that reports
-/// PERSISTED state, and the plan
-/// (`2026-08-29-headless-runner-tier-never-reaches-qontinui-account`) assigns
-/// closing that gap to **Phase 4**, which owns the doctor.
+/// **Phase 3 changed what this test is about, so read the new boundary.** Both
+/// readers now share ONE inference (`profiles::infer_tier`), so the disk reader
+/// DOES see pairing — pairing is a fact on disk, and
+/// `paired_box_infers_tier_2_in_both_readers` pins that it is seen. The line
+/// this test defends is narrower and sharper than "the disk reader is behind":
+/// it is **disk signals cross; process signals do not**. Phase 4 owns the
+/// doctor's reporting; it does not own this boundary, which is structural.
 ///
-/// This test pins the boundary so it is read off the suite rather than
-/// rediscovered on a live box. When Phase 4 lands, update it WITH that phase.
-///
-/// (The one temp file in this suite. The module doc's "no temp dir" rule is
-/// about keeping *predicates* pure; the whole point here is that the other
-/// reader is a disk read, and there is no way to assert that without one.)
+/// (One of the two temp files in this suite. The module doc's "no temp dir"
+/// rule is about keeping *predicates* pure; the whole point here is that the
+/// other reader is a disk read, and there is no way to assert that without one.)
 #[test]
 fn server_mode_default_is_invisible_to_the_disk_reader() {
     use qontinui_runner_lib::profiles::{read_runner_tier_at, TierRead};
@@ -319,18 +365,296 @@ fn server_mode_default_is_invisible_to_the_disk_reader() {
     // In memory, the headless default resolves this install to Tier 2 …
     let mut s: Settings = serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
         .expect("must deserialize");
-    crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ true);
+    crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ true, /* paired = */ false,
+    );
     assert_eq!(s.tier, RunnerTier::QontinuiAccount);
 
     // … and the on-disk document is unchanged, so the lib-side reader — the
-    // one `coord_doctor` uses — still reports Absent. NOT `Known("local")`
-    // and NOT `Unknown`: the file parsed fine, it simply has no tier.
+    // one `coord_doctor` uses, and which cannot observe THIS process's
+    // `QONTINUI_SERVER_MODE` — still reports Absent. NOT `Known("local")`
+    // and NOT `Unknown`: the file parsed fine, it simply has no tier and
+    // nothing on disk infers one.
     assert_eq!(
-        read_runner_tier_at(&path),
+        read_runner_tier_at(&path, /* paired = */ false),
         TierRead::Absent,
         "the in-memory headless default must be invisible to the raw \
-         settings.json reader — coord_doctor reports PERSISTED state, and \
-         Phase 4 owns closing that gap"
+         settings.json reader — server mode is a property of the reading \
+         process, not of the document"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// #2i–#2n — Device pairing as a tier signal, and the unlatch, per plan
+//           `2026-08-29-headless-runner-tier-never-reaches-qontinui-account`
+//           Phase 3.
+//
+// Before this phase the inference consulted only `web_integration.runner_token`
+// — a field `server_mode/mod.rs` records as LEGACY and "no longer consulted by
+// the WS relay (it authenticates with the device JWT from `AuthManager`)". So
+// the runner inferred its tier from a token nothing authenticates with any
+// more, while the account bind the system actually runs on went unread.
+// Pairing IS that bind: a paired device is bound to a Qontinui account, which
+// is precisely what Tier 2 means.
+//
+// The signal is the `paired_user.json` binding entry, NOT the device JWT —
+// see `pair::device_is_paired` for why (keychain cost, unreadable-vs-unpaired
+// conflation, and a ~4h credential lifetime that would make a PRODUCT TIER
+// flap).
+// ----------------------------------------------------------------------------
+
+/// **The test that proves the duplicate is gone.**
+///
+/// A paired box with an EMPTY `runner_token` infers Tier 2 — asserted against
+/// BOTH readers, because they are different code paths for different consumers:
+/// `settings::migrate_tier_in_place` is what `require_tier_2()` sees through
+/// `load_settings`, and `profiles::read_runner_tier_at` is what `coord_doctor`
+/// consults. They used to carry two hand-mirrored copies of the rule; they now
+/// call one shared `profiles::infer_tier`, so teaching one and not the other is
+/// no longer expressible.
+#[test]
+fn paired_box_infers_tier_2_in_both_readers() {
+    use qontinui_runner_lib::profiles::{read_runner_tier_at, TierRead, QONTINUI_ACCOUNT_TIER};
+
+    // Reader 1 — the runner bin's `Settings` path.
+    let mut s = Settings::default();
+    assert!(s.web_integration.runner_token.is_empty(), "no legacy token");
+    let migrated = crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ false, /* paired = */ true,
+    );
+    assert!(migrated, "migration must report it ran");
+    assert_eq!(
+        s.tier,
+        RunnerTier::QontinuiAccount,
+        "a paired device is bound to a Qontinui account — that is what Tier 2 means"
+    );
+
+    // Reader 2 — the lib-side raw `settings.json` parse `coord_doctor` uses.
+    // The document is the LATCHED box the headless defect actually produces:
+    // `tier: "local"`, sentinel set, no explicit choice ever recorded.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("settings.json");
+    std::fs::write(
+        &path,
+        r#"{"tier":"local","tier_initialized":true,"web_integration":{"runner_token":""}}"#,
+    )
+    .expect("write");
+
+    assert_eq!(
+        read_runner_tier_at(&path, /* paired = */ false),
+        TierRead::Known("local".to_string()),
+        "unpaired, this document reads exactly as it is written"
+    );
+    assert_eq!(
+        read_runner_tier_at(&path, /* paired = */ true),
+        TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
+        "paired, the SAME document must read as Tier 2 in the doctor's reader \
+         too — otherwise teaching only the settings-side inference leaves \
+         `coord doctor` red on a correctly-paired box, which is the exact \
+         symptom this plan was written from"
+    );
+}
+
+/// The unlatch, and the distinction it turns on: an install latched at `Local`
+/// by the INFERENCE is re-inferred when the signals change; one whose operator
+/// chose `Local` is not. Same tier value, same sentinel — only
+/// `tier_chosen_explicitly` separates them, which is why the field had to exist.
+#[test]
+fn inferred_local_is_re_inferred_but_an_explicit_one_is_not() {
+    // (a) Booted unpaired: the inference latched it at Tier 0.
+    let mut inferred = Settings::default();
+    assert!(crate::settings::migrate_tier_in_place(
+        &mut inferred,
+        /* server_mode = */ false,
+        /* paired = */ false
+    ));
+    assert_eq!(inferred.tier, RunnerTier::Local);
+    assert!(inferred.tier_initialized, "the sentinel is set");
+    assert!(
+        !inferred.tier_chosen_explicitly,
+        "an inference must never claim the operator chose"
+    );
+
+    // (b) The operator's explicit Tier 0, as `set_runner_tier` writes it.
+    let mut chosen = Settings {
+        tier: RunnerTier::Local,
+        tier_initialized: true,
+        tier_chosen_explicitly: true,
+        ..Settings::default()
+    };
+
+    // The box is then paired. Only (a) moves.
+    assert!(
+        crate::settings::migrate_tier_in_place(
+            &mut inferred,
+            /* server_mode = */ false,
+            /* paired = */ true
+        ),
+        "the one-shot latch is gone: a box that booted before it was paired \
+         must not be stuck at Tier 0 forever"
+    );
+    assert_eq!(inferred.tier, RunnerTier::QontinuiAccount);
+
+    assert!(
+        !crate::settings::migrate_tier_in_place(
+            &mut chosen,
+            /* server_mode = */ false,
+            /* paired = */ true
+        ),
+        "an explicit opt-out must survive pairing"
+    );
+    assert_eq!(chosen.tier, RunnerTier::Local);
+}
+
+/// The re-inference can only ever PROMOTE. Unpairing a box that reached Tier 2
+/// does not demote it — silent demotion of a working primary is the top risk in
+/// this area and a known historical failure mode, so it is ruled out by the
+/// shape of the rule (`tier_is_open_to_inference` closes on any tier but
+/// `local`), not by a guard that could be forgotten.
+#[test]
+fn re_inference_never_demotes() {
+    let mut s = Settings::default();
+    crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ false, /* paired = */ true,
+    );
+    assert_eq!(s.tier, RunnerTier::QontinuiAccount);
+
+    // Every signal now gone — and the tier stands.
+    assert!(
+        !crate::settings::migrate_tier_in_place(
+            &mut s, /* server_mode = */ false, /* paired = */ false
+        ),
+        "an unpaired Tier 2 box must not be re-inferred at all"
+    );
+    assert_eq!(s.tier, RunnerTier::QontinuiAccount);
+}
+
+/// **The upgrade path.** A settings document written before this phase carries
+/// no `tier_chosen_explicitly` key at all. It must deserialize as `false`
+/// ("never chosen") and therefore be ELIGIBLE for re-inference — that is what
+/// rescues every already-latched box in the field, including the headless one
+/// this plan was written from.
+///
+/// Asserted in both readers, because both must agree on what an absent key
+/// means.
+#[test]
+fn settings_without_tier_chosen_explicitly_reads_false() {
+    use qontinui_runner_lib::profiles::{
+        read_runner_tier_at, tier_is_open_to_inference, TierRead, QONTINUI_ACCOUNT_TIER,
+    };
+
+    // Reader 1 — serde default on the typed struct.
+    let json = r#"{"tier":"local","tier_initialized":true}"#;
+    let mut s: Settings = serde_json::from_str(json).expect("must deserialize");
+    assert!(
+        !s.tier_chosen_explicitly,
+        "an absent key must read as 'never chosen', not 'chosen'"
+    );
+    assert!(crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ false, /* paired = */ true
+    ));
+    assert_eq!(s.tier, RunnerTier::QontinuiAccount);
+
+    // Reader 2 — the raw JSON parse, where the key is simply missing.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, json).expect("write");
+    assert_eq!(
+        read_runner_tier_at(&path, /* paired = */ true),
+        TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
+    );
+
+    // And the shared predicate itself, stated directly.
+    assert!(tier_is_open_to_inference(
+        Some("local"),
+        /* chosen_explicitly = */ false
+    ));
+    assert!(!tier_is_open_to_inference(
+        Some("local"),
+        /* chosen_explicitly = */ true
+    ));
+    assert!(tier_is_open_to_inference(
+        None, /* chosen_explicitly = */ false
+    ));
+    assert!(!tier_is_open_to_inference(
+        Some("local_provider"),
+        /* chosen_explicitly = */ false
+    ));
+    assert!(!tier_is_open_to_inference(
+        Some(QONTINUI_ACCOUNT_TIER),
+        /* chosen_explicitly = */ false
+    ));
+}
+
+/// **Sign-out must not be undone by the re-inference.** `qontinui_sign_out`
+/// deliberately KEEPS `tier = QontinuiAccount` (`commands/auth.rs`: "so the App
+/// gate renders LoginScreen for this Tier-2-unauthenticated state instead of
+/// falling through to the synthesized local-guest app shell") while clearing
+/// `runner_token` and `qontinui_user_id`.
+///
+/// That is a Tier 2 install with NO `runner_token`, which is exactly the shape
+/// the inference would have resolved to `Local` — so a re-inference that could
+/// demote would silently undo sign-out's deliberate choice on the next settings
+/// load, on every box, paired or not. It cannot: Tier 2 is closed to inference.
+#[test]
+fn sign_out_state_is_not_demoted_by_the_re_inference() {
+    // The exact post-sign-out document.
+    let s = Settings {
+        tier: RunnerTier::QontinuiAccount,
+        tier_initialized: true,
+        qontinui_user_id: None,
+        ..Settings::default()
+    };
+    assert!(
+        s.web_integration.runner_token.is_empty(),
+        "sign-out clears the runner_token"
+    );
+    assert!(
+        !s.tier_chosen_explicitly,
+        "sign-out is not an explicit tier choice and must not claim to be one"
+    );
+
+    for paired in [true, false] {
+        let mut s = s.clone();
+        assert!(
+            !crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ false, paired),
+            "signed out, paired={paired}: nothing to re-infer"
+        );
+        assert_eq!(
+            s.tier,
+            RunnerTier::QontinuiAccount,
+            "a signed-out-but-still-Tier-2 box must stay Tier 2 so the App gate \
+             renders LoginScreen — paired={paired}"
+        );
+    }
+}
+
+/// The regression guard on every desktop install: unpaired, tokenless, not
+/// headless ⇒ Tier 0, exactly as before any of this. Stated separately from
+/// `desktop_install_without_server_mode_stays_local` because that one predates
+/// pairing being a signal at all, and this is the combination that matters now.
+#[test]
+fn unpaired_tokenless_desktop_box_still_resolves_local() {
+    use qontinui_runner_lib::profiles::{read_runner_tier_at, TierRead};
+
+    let mut s = Settings::default();
+    assert!(crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ false, /* paired = */ false
+    ));
+    assert_eq!(
+        s.tier,
+        RunnerTier::Local,
+        "pairing must not leak Tier 2 into ordinary desktop installs"
+    );
+
+    // And the disk reader agrees — a tier-less, tokenless, unpaired document
+    // is genuinely tier-less.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, r#"{"web_integration":{"runner_token":""}}"#).expect("write");
+    assert_eq!(
+        read_runner_tier_at(&path, /* paired = */ false),
+        TierRead::Absent
     );
 }
 

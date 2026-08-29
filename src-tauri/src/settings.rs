@@ -27,6 +27,20 @@ pub enum RunnerTier {
     QontinuiAccount,
 }
 
+impl RunnerTier {
+    /// The serde snake_case `settings.json::tier` string — the same wire value
+    /// `qontinui_runner_lib::profiles` reads and writes. Kept in sync with the
+    /// `#[serde(rename_all = "snake_case")]` above by the round-trip test
+    /// `runner_tier_as_str_matches_serde`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunnerTier::Local => qontinui_runner_lib::profiles::LOCAL_TIER,
+            RunnerTier::LocalProvider => "local_provider",
+            RunnerTier::QontinuiAccount => qontinui_runner_lib::profiles::QONTINUI_ACCOUNT_TIER,
+        }
+    }
+}
+
 // ============================================================================
 // AI Settings
 // ============================================================================
@@ -1714,7 +1728,9 @@ mod tier_tests {
             ..Settings::default()
         };
 
-        let migrated = migrate_tier_in_place(&mut s, /* server_mode = */ false);
+        let migrated = migrate_tier_in_place(
+            &mut s, /* server_mode = */ false, /* paired = */ false,
+        );
         assert!(migrated, "must report migration performed");
         assert_eq!(s.tier, RunnerTier::QontinuiAccount);
         assert!(s.tier_initialized);
@@ -1730,7 +1746,9 @@ mod tier_tests {
         };
         s.web_integration.runner_token.clear();
 
-        let migrated = migrate_tier_in_place(&mut s, /* server_mode = */ false);
+        let migrated = migrate_tier_in_place(
+            &mut s, /* server_mode = */ false, /* paired = */ false,
+        );
         assert!(migrated);
         assert_eq!(s.tier, RunnerTier::Local);
         assert!(s.tier_initialized);
@@ -1738,6 +1756,10 @@ mod tier_tests {
 
     /// Tier-inference must be a one-shot: once `tier_initialized` is true,
     /// subsequent loads must not overwrite a deliberate user tier choice.
+    /// Tier 1 is closed to inference: nothing but `set_runner_tier` can
+    /// produce `local_provider`, so finding it on disk IS an explicit choice —
+    /// which is why this stays a no-op even though the Phase 3 unlatch removed
+    /// the blanket `tier_initialized` early return.
     #[test]
     fn migrate_tier_is_no_op_once_initialized() {
         let mut s = Settings {
@@ -1750,7 +1772,9 @@ mod tier_tests {
             ..Settings::default()
         };
 
-        let migrated = migrate_tier_in_place(&mut s, /* server_mode = */ false);
+        let migrated = migrate_tier_in_place(
+            &mut s, /* server_mode = */ false, /* paired = */ false,
+        );
         assert!(!migrated, "must not re-migrate when initialized");
         assert_eq!(s.tier, RunnerTier::LocalProvider);
     }
@@ -1763,6 +1787,45 @@ mod tier_tests {
         assert_eq!(json, "\"local_provider\"");
         let json = serde_json::to_string(&RunnerTier::Local).unwrap();
         assert_eq!(json, "\"local\"");
+    }
+
+    /// [`RunnerTier::as_str`] is the bridge between the bin's typed tier and
+    /// the lib's string one (`profiles::infer_tier` /
+    /// `tier_is_open_to_inference` speak strings, because the lib has no
+    /// `Settings`). A drift between it and the serde representation would let
+    /// the two tier readers disagree about the same document — exactly the
+    /// class of defect the shared inference removed — so it is pinned against
+    /// serde itself rather than against a second hand-written literal.
+    #[test]
+    fn runner_tier_as_str_matches_serde() {
+        for t in [
+            RunnerTier::Local,
+            RunnerTier::LocalProvider,
+            RunnerTier::QontinuiAccount,
+        ] {
+            let via_serde = serde_json::to_value(t).unwrap();
+            assert_eq!(
+                via_serde,
+                serde_json::Value::String(t.as_str().to_string()),
+                "as_str drifted from the serde wire value for {t:?}"
+            );
+        }
+    }
+
+    /// The upgrade path, at the struct level: a settings document written
+    /// before Phase 3 has no `tier_chosen_explicitly` key and must read
+    /// `false` — "never chosen", hence eligible for re-inference. The
+    /// behavioural half is `tier_matrix_tests`'
+    /// `settings_without_tier_chosen_explicitly_reads_false`.
+    #[test]
+    fn tier_chosen_explicitly_defaults_false_on_a_pre_phase_3_document() {
+        let s: Settings =
+            serde_json::from_str(r#"{"tier":"local","tier_initialized":true}"#).unwrap();
+        assert!(!s.tier_chosen_explicitly);
+        assert!(
+            !Settings::default().tier_chosen_explicitly,
+            "and a fresh install has made no choice either"
+        );
     }
 
     /// Env-var overlay must override a migrated Tier 2 down to Local — the
@@ -2570,6 +2633,26 @@ pub struct Settings {
     /// already populated land in `QontinuiAccount` exactly once.
     #[serde(default)]
     pub tier_initialized: bool,
+    /// Set true **only** by `commands::auth::set_runner_tier` — the
+    /// SetupWizard's TierStep, i.e. the operator's own, explicit choice.
+    ///
+    /// This is tier PROVENANCE, and it is what makes the inference safe to
+    /// re-run. `tier_initialized` cannot answer "did a human pick this?":
+    /// the inference and `set_runner_tier` both write it, so "never chosen"
+    /// and "chose Local" were indistinguishable — and conflating them means
+    /// silently re-promoting a box whose owner deliberately opted out.
+    ///
+    /// `#[serde(default)]` ⇒ every install written before this field existed
+    /// reads `false` ("never chosen") and is therefore eligible for
+    /// re-inference. That is deliberately the upgrade path (pinned by
+    /// `settings_without_tier_chosen_explicitly_reads_false`), and it is safe
+    /// because the re-inference can only promote — see
+    /// `qontinui_runner_lib::profiles::tier_is_open_to_inference`.
+    ///
+    /// Written by nothing else: not by `migrate_tier_in_place`, not by the
+    /// pair doors, not by `qontinui_sign_out`.
+    #[serde(default)]
+    pub tier_chosen_explicitly: bool,
     /// Per-`~/.qontinui/`-dir UUID identifying this install for local-DB rows.
     /// Populated lazily by `load_settings` when empty. Persists across Tier
     /// upgrades and Tier-2 sign-outs — never replaced by the Qontinui user id.
@@ -3732,11 +3815,20 @@ pub fn load_settings_full() -> LoadedSettings {
     // persist.
     let mut needs_persist = false;
     if provenance.is_authoritative() {
-        // The headless default's ONE read of `QONTINUI_SERVER_MODE`, taken
-        // through the launch-env module that owns the parse. Threaded in as a
-        // parameter so `migrate_tier_in_place` stays a pure, fully testable
-        // helper.
-        if migrate_tier_in_place(&mut settings, crate::launch_env::server_mode_from_env()) {
+        // The tier inference's TWO probes, both taken here so
+        // `migrate_tier_in_place` stays a pure, fully testable helper:
+        //
+        // * `QONTINUI_SERVER_MODE`, through the launch-env module that owns
+        //   the single parse of it;
+        // * device pairing, through the lib's `paired_user.json` reader. One
+        //   small file read — deliberately NOT a credential-store read, which
+        //   can block on an OS keychain unlock and must never happen on a
+        //   settings load (see `pair::device_is_paired` for the full argument).
+        if migrate_tier_in_place(
+            &mut settings,
+            crate::launch_env::server_mode_from_env(),
+            qontinui_runner_lib::pair::device_is_paired(),
+        ) {
             needs_persist = true;
         }
         if settings.local_user_id.trim().is_empty() {
@@ -3972,50 +4064,108 @@ pub(crate) fn apply_in_memory_tier_overlay(
     }
 }
 
-/// One-shot tier inference. When `tier_initialized` is false (i.e. the
-/// loaded settings.json was written before tier existed, or the field was
-/// stripped), infer the tier from two signals, in this order:
+/// Resolve this install's runner tier from its persisted state, in place.
+/// Returns `true` if `settings` was changed (caller should persist).
 ///
-/// 1. a non-empty `web_integration.runner_token` — the user previously signed
-///    into Qontinui, so they belong in Tier 2;
-/// 2. `server_mode` — this runner was launched headless
-///    (`QONTINUI_SERVER_MODE`), and a headless runner exists to be driven over
-///    the network. Tier 2 is the tier that is allowed to talk to coord, so a
-///    headless box with no tier of its own defaults there rather than to
-///    `Local`.
+/// # One rule, in the lib
 ///
-/// Otherwise `Local`. Returns `true` if a migration was performed (caller
-/// should persist).
+/// The rule itself is NOT here. It is
+/// [`qontinui_runner_lib::profiles::infer_tier`] +
+/// [`tier_is_open_to_inference`], because there is a SECOND tier reader —
+/// `profiles::read_runner_tier`, the raw `settings.json` parse that
+/// `coord_doctor` consults — and it used to carry a hand-mirrored copy of this
+/// function's inference. That copy had already drifted (only one of the two
+/// ever learned about `QONTINUI_SERVER_MODE`). This function is now the thin
+/// wrapper that maps a `Settings` onto the shared rule; the other reader maps
+/// a `serde_json::Value` onto the same one.
 ///
-/// # This is a product posture default, not a bug fix
+/// [`tier_is_open_to_inference`]: qontinui_runner_lib::profiles::tier_is_open_to_inference
+///
+/// # It is no longer one-shot
+///
+/// It used to return early on `tier_initialized`, which made it a one-shot
+/// latch: a box that first booted before it was paired was stuck at `Local`
+/// forever, and the only exit was a button in a WebView a headless box does
+/// not have. The gate is now `tier_chosen_explicitly` — the operator's own
+/// choice, and nothing else, is final. See
+/// [`Settings::tier_chosen_explicitly`] and `tier_is_open_to_inference` for
+/// why the two had to be separated, and why re-inference can only ever
+/// promote (never demote) a box that has already been initialized.
+///
+/// # Why the signals are parameters
+///
+/// So this stays a pure, fully testable mapping: `tier_matrix_tests` drives
+/// every combination with no process env and no temp dir. `QONTINUI_SERVER_MODE`
+/// is parsed exactly once in the tree, by
+/// [`crate::launch_env::server_mode_from_env`]; `paired` comes from
+/// [`qontinui_runner_lib::pair::device_is_paired`]. `load_settings_full` takes
+/// both probes and threads them in. Re-reading either inline here would add a
+/// second probe site — which is precisely how the `runner_token` inference
+/// came to exist twice.
+///
+/// # This is a product posture default, not a pure bug fix
 ///
 /// Tier 0 (`Local`) advertises "no Qontinui account, no cloud round-trips".
-/// Signal 2 makes a headless box default to the **cloud** tier, which is the
-/// operator's explicit instruction (plan
-/// `2026-08-29-headless-runner-tier-never-reaches-qontinui-account`, Phase 2)
-/// and the precondition for driving a remote runner at all. It is a default,
-/// never a trap: a headless deploy that genuinely wants Tier 0 says so with
+/// The `server_mode` signal makes a headless box default to the **cloud**
+/// tier, which is the operator's explicit instruction (plan
+/// `2026-08-29-headless-runner-tier-never-reaches-qontinui-account`) and the
+/// precondition for driving a remote runner at all. It is a default, never a
+/// trap: a headless deploy that genuinely wants Tier 0 says so with
 /// `QONTINUI_RUNNER_TIER=local` or a runtime `set_runner_tier("local")`, and
 /// **both still win** — this inference sits at the BOTTOM of the stack in
 /// [`load_settings_full`], with [`apply_tier_env_overlay`] and then
-/// [`apply_in_memory_tier_overlay`] applied over it, in that order.
-///
-/// # Why `server_mode` is a parameter
-///
-/// This helper is deliberately pure (no env, no IO) so `tier_matrix_tests` and
-/// the unit tests below can drive every combination against an in-memory
-/// `Settings`. The flag is parsed exactly once in the tree, by
-/// [`crate::launch_env::server_mode_from_env`]; `load_settings_full` reads it
-/// there and threads it in. Re-reading `QONTINUI_SERVER_MODE` inline here would
-/// add a second parsing site for a var the launch-env module already owns —
-/// which is precisely how the `runner_token` inference came to exist twice.
-pub(crate) fn migrate_tier_in_place(settings: &mut Settings, server_mode: bool) -> bool {
-    if settings.tier_initialized {
+/// [`apply_in_memory_tier_overlay`] applied over it, in that order. And
+/// `set_runner_tier` now records `tier_chosen_explicitly`, so that choice also
+/// closes this function permanently rather than only for one boot.
+pub(crate) fn migrate_tier_in_place(
+    settings: &mut Settings,
+    server_mode: bool,
+    paired: bool,
+) -> bool {
+    use qontinui_runner_lib::profiles::{
+        infer_tier, tier_is_open_to_inference, InferredTier, TierSignals,
+    };
+
+    // A document that has never been initialized has no persisted tier at all,
+    // whatever `settings.tier`'s `#[default]` says it is.
+    let persisted = settings.tier_initialized.then(|| settings.tier.as_str());
+    if !tier_is_open_to_inference(persisted, settings.tier_chosen_explicitly) {
         return false;
     }
-    if !settings.web_integration.runner_token.trim().is_empty() {
-        settings.tier = RunnerTier::QontinuiAccount;
-    } else if server_mode {
+
+    let inferred = infer_tier(TierSignals {
+        has_runner_token: !settings.web_integration.runner_token.trim().is_empty(),
+        server_mode,
+        paired,
+    });
+    let new_tier = match inferred {
+        InferredTier::Local => RunnerTier::Local,
+        InferredTier::QontinuiAccount => RunnerTier::QontinuiAccount,
+    };
+
+    if settings.tier_initialized && settings.tier == new_tier {
+        // Already resolved to exactly this, and the sentinel is set: nothing to
+        // write. Keeps `needs_persist` false on the steady-state load, which
+        // the relay loop performs on every iteration.
+        return false;
+    }
+
+    if settings.tier_initialized {
+        // The unlatch firing. `tier_is_open_to_inference` guarantees the
+        // persisted tier was `local`, and `new_tier != settings.tier` here, so
+        // this branch can only be Local -> QontinuiAccount. A demotion is
+        // unreachable by construction, not merely unlikely — silent demotion
+        // of a working primary is the top risk in this area.
+        info!(
+            "runner tier re-inferred from local to {} (runner_token={}, server_mode={}, \
+             paired={}) — this install never recorded an explicit tier choice. Set it \
+             with the SetupWizard's tier step (or QONTINUI_RUNNER_TIER=local) to pin it.",
+            new_tier.as_str(),
+            !settings.web_integration.runner_token.trim().is_empty(),
+            server_mode,
+            paired
+        );
+    } else if server_mode && new_tier == RunnerTier::QontinuiAccount {
         // Logged once per process: on a secondary the migration never
         // persists, so it re-runs on every settings load (the relay loop
         // re-reads every iteration) and would otherwise bury real signal.
@@ -4027,10 +4177,9 @@ pub(crate) fn migrate_tier_in_place(settings: &mut Settings, server_mode: bool) 
                  Set QONTINUI_RUNNER_TIER=local to opt out; it overrides this default."
             );
         });
-        settings.tier = RunnerTier::QontinuiAccount;
-    } else {
-        settings.tier = RunnerTier::Local;
     }
+
+    settings.tier = new_tier;
     settings.tier_initialized = true;
     true
 }
@@ -4954,7 +5103,7 @@ mod openai_compatible_defaults_tests {
         // And the one-shot inference is now a no-op on that document.
         let mut s = loaded.settings.clone();
         assert!(
-            !migrate_tier_in_place(&mut s, /* server_mode = */ false),
+            !migrate_tier_in_place(&mut s, /* server_mode = */ false, /* paired = */ false),
             "a promoted document must need no migration"
         );
         assert_eq!(s.tier, RunnerTier::QontinuiAccount);
