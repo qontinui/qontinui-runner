@@ -383,4 +383,153 @@ mod tests {
             }
         }
     }
+
+    /// Content probe selecting the bundled commands that teach the
+    /// `IN PROGRESS` delivery guard: a command teaches it iff it names the read
+    /// the whole guard is built on.
+    ///
+    /// Scoped by CONTENT rather than by filename, for the same reason
+    /// [`bundled_gate_registration_commands_teach_the_mechanics`] is — the
+    /// module doc's "nothing may assume the bundle is two commands" applies to
+    /// its tests too. Today this selects exactly `/vet-plan` and
+    /// `/implement-plan` and nothing else in the bundle; a third command that
+    /// grows the guard is covered the day it does.
+    const DELIVERY_READ: &str = "coord_work_unit_list_citations";
+
+    /// The fail-closed clauses of the `IN PROGRESS` delivery guard, as
+    /// `(token, why it is load-bearing)`.
+    ///
+    /// Every one of these was added by a LATER REVIEW ROUND than the one that
+    /// shipped the guard, and each closed a hole that read as complete prose
+    /// until someone traced one concrete response shape through it. Nothing but
+    /// a reader's care has held them in place since — and `implement-plan.md`'s
+    /// own "keep the two in sync" instruction had no enforcement at all, which
+    /// is the gap this test closes.
+    ///
+    /// Matched case-insensitively on purpose. The two bodies legitimately
+    /// differ on sentence position (`Arm 6 is the DEFAULT` where the table
+    /// introduces it, `arm 6 is the DEFAULT` mid-sentence where the other file
+    /// cites it), and the invariant is that the RULE is present — not that the
+    /// two bodies are byte-identical, which they are not and need not be.
+    const IN_PROGRESS_DELIVERY_GUARD_CLAUSES: &[(&str, &str)] = &[
+        (
+            "4, 3, 2, 1, 5, then 6",
+            "the arm table's EVALUATION ORDER. Several responses match more than one \
+             row, and the conclusive, permissive arms are 1 and 5 — so a reader taking \
+             the table top-down reaches \"proceed to vet\" before ever reaching the \
+             UNKNOWN arms, which turns a degraded read into a confident observation of \
+             not-delivered",
+        ),
+        (
+            "arm 6",
+            "the fail-closed DEFAULT arm. Written first as \"anything else\" on arm 5, it \
+             put coord being down, a dead transport, and the superset route's degraded \
+             200 all onto \"a clean, complete observation of not delivered -> proceed\" \
+             — the exact inversion of `verification-and-evidence` \
+             `unknown-must-not-render-as-a-default`, applied to the fleet's \
+             highest-base-rate failure",
+        ),
+        (
+            "unidentified default",
+            "the STOP for an `IN PROGRESS` stamp carrying no session marker, or one that \
+             cannot be positively attributed to the reading session. Without it an \
+             unmarked stamp — hand-written, operator-written, or predating the marker \
+             convention — matches no case and falls back to overwrite, which is \
+             verbatim the regression the section opens by forbidding",
+        ),
+        (
+            "route to closeout",
+            "arm 1's terminal disposition — the one arm that stops a run whose work has \
+             ALREADY LANDED. Without it a shipped plan is re-vetted and its phase agents \
+             re-run against `main`, which is how PR #479 came to be built against work \
+             PR #468 had already merged",
+        ),
+    ];
+
+    /// Every bundled command that teaches the `IN PROGRESS` delivery guard must
+    /// carry all of [`IN_PROGRESS_DELIVERY_GUARD_CLAUSES`].
+    ///
+    /// These bodies are what actually ship (see the module doc): on a device
+    /// with no `qontinui-claude-config` checkout they are the ONLY copy, so a
+    /// clause missing here is a clause the fleet does not have.
+    #[test]
+    fn bundled_delivery_guard_commands_carry_the_fail_closed_clauses() {
+        let mut checked = 0usize;
+        for (name, contents) in FLEET_COMMANDS {
+            if !contents.contains(DELIVERY_READ) {
+                continue;
+            }
+            checked += 1;
+            let haystack = contents.to_lowercase();
+            for (token, why) in IN_PROGRESS_DELIVERY_GUARD_CLAUSES {
+                assert!(
+                    haystack.contains(&token.to_lowercase()),
+                    "bundled agent command {name} teaches the `IN PROGRESS` delivery \
+                     guard (it names {DELIVERY_READ}) but never mentions {token:?} — \
+                     {why}. Without it this command's copy of the guard fails OPEN, and \
+                     the failure is silent: the prose still reads complete. Add it in \
+                     src-tauri/src/fleet_commands/{name}.md"
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "no bundled command mentions {DELIVERY_READ:?} — either the bundle lost its \
+             `IN PROGRESS` delivery guard entirely or this guard's content probe went \
+             stale. Both need a human look; neither is a passing test"
+        );
+    }
+
+    /// Cross-command section pointers, as `(anchor text, the command that
+    /// defines it)`.
+    ///
+    /// `/implement-plan` does not restate the disposition table — it points at
+    /// `/vet-plan`'s section by heading text. That is the deliberate design
+    /// (the section was made explicitly shared across commands rather than
+    /// duplicated), which makes the pointer a wiring edge like any other.
+    const CROSS_COMMAND_SECTION_ANCHORS: &[(&str, &str)] =
+        &[("`IN PROGRESS` is CONDITIONALLY overwritable", "vet-plan")];
+
+    /// A bundled command's pointer at another bundled command's section must
+    /// resolve inside the bundle.
+    ///
+    /// Renaming the heading would leave the pointer dangling with nothing
+    /// failing: the reader who follows it finds no such section and falls back
+    /// to the pre-guard behaviour, which is overwrite. On a device with no
+    /// `qontinui-claude-config` checkout there is no second place the reader
+    /// could resolve it from.
+    #[test]
+    fn cross_command_section_pointers_resolve_within_the_bundle() {
+        for (anchor, target) in CROSS_COMMAND_SECTION_ANCHORS {
+            let mut defined = false;
+            let mut citers: Vec<&&str> = Vec::new();
+            for (name, contents) in FLEET_COMMANDS {
+                if !contents.contains(anchor) {
+                    continue;
+                }
+                if name == target {
+                    defined = true;
+                } else {
+                    citers.push(name);
+                }
+            }
+            // Checked first: with no citer left there is no edge to dangle, and
+            // the honest failure is that this guard went stale — not that the
+            // target dropped a heading nobody points at any more.
+            assert!(
+                !citers.is_empty(),
+                "no bundled command cites {anchor:?}, so this guard is watching an edge \
+                 that no longer exists. Drop the row from \
+                 CROSS_COMMAND_SECTION_ANCHORS, or restore the citation that was lost"
+            );
+            assert!(
+                defined,
+                "bundled agent command(s) {citers:?} point readers at {target}'s \
+                 {anchor:?} section, but {target} no longer contains that text. Either \
+                 restore the heading in src-tauri/src/fleet_commands/{target}.md or \
+                 update every citation of it — a dangling pointer here drops the reader \
+                 back to the behaviour the section exists to forbid"
+            );
+        }
+    }
 }
