@@ -4,7 +4,7 @@
  * V1 surface for `productivity_knowledge`. Two modes:
  *
  *   - `modal` (default) — rendered as a centred modal over the app, with
- *     a backdrop. Triggered globally via `Ctrl+Shift+K` and via a
+ *     a backdrop. Triggered globally via `Ctrl+Shift+E` and via a
  *     "Knowledge" button on the Productivity tab top bar.
  *   - `inline` — embedded as a full-height panel in the Productivity
  *     tab's `knowledge` sub-view. No backdrop, no close button.
@@ -20,6 +20,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BookOpen, Search, X, Loader2, AlertCircle, ChevronDown, ChevronRight } from "lucide-react";
 import { searchKnowledge, type KnowledgeHit } from "./knowledgeApi";
+import { GLOBAL_CHORDS, isCtrlShiftChord } from "@/lib/globalChords";
 
 export interface KnowledgeBrowserProps {
   /**
@@ -285,13 +286,19 @@ export function KnowledgeBrowser({ mode = "modal", open = true, onClose }: Knowl
 export default KnowledgeBrowser;
 
 // ============================================================================
-// Global Ctrl+Shift+K trigger
+// Global Ctrl+Shift+E trigger
 // ============================================================================
 
 /**
- * Hook that toggles a state value when the user presses Ctrl+Shift+K
+ * Hook that toggles a state value when the user presses Ctrl+Shift+E
  * anywhere in the app. Mounted once at the App.tsx level (or wherever
  * we want the global shortcut to live). Returns `[open, setOpen]`.
+ *
+ * This used to listen for Ctrl+Shift+K, which the terminal's
+ * `useKeyboardShortcuts` already owns for the command palette. Both
+ * listeners sit on `window`, so both ran and the chord opened two
+ * overlays at once; the letters are now owned separately in
+ * `lib/globalChords`.
  *
  * UI Bridge automation can also trigger the modal by dispatching a
  * `productivity-open-knowledge-modal` CustomEvent on `window`, since
@@ -302,7 +309,7 @@ export function useKnowledgeBrowserHotkey(): [boolean, (v: boolean) => void] {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     const keyHandler = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && (e.key === "K" || e.key === "k")) {
+      if (isCtrlShiftChord(e, GLOBAL_CHORDS.knowledgeBrowser)) {
         e.preventDefault();
         setOpen((v) => !v);
       }
