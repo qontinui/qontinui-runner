@@ -20,7 +20,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BookOpen, Search, X, Loader2, AlertCircle, ChevronDown, ChevronRight } from "lucide-react";
 import { searchKnowledge, type KnowledgeHit } from "./knowledgeApi";
-import { GLOBAL_CHORDS, isCtrlShiftChord } from "@/lib/globalChords";
+import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
 
 export interface KnowledgeBrowserProps {
   /**
@@ -309,7 +309,7 @@ export function useKnowledgeBrowserHotkey(): [boolean, (v: boolean) => void] {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     const keyHandler = (e: KeyboardEvent) => {
-      if (isCtrlShiftChord(e, GLOBAL_CHORDS.knowledgeBrowser)) {
+      if (matchesChord(e, GLOBAL_CHORDS.knowledgeBrowser)) {
         e.preventDefault();
         setOpen((v) => !v);
       }

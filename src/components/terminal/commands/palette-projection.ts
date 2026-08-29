@@ -36,6 +36,7 @@
  * the handler takes params.
  */
 
+import { fuzzyScore, type FuzzyMatch } from "./fuzzy";
 import { getAll } from "./registry";
 import type { CommandAction } from "./types";
 import { callRegistry } from "./uibridge";
@@ -69,19 +70,24 @@ function describeParams(schema: Record<string, unknown> | undefined): string {
  * warning and require operators to use the CommandBar — see file
  * docstring for the rationale.
  *
- * Sorted by `slash` lexically (so registry rows cluster predictably);
- * the palette's outer sort will re-key by priority + category. We hand
- * out priority `0` (top of the "non-Recent" block, just below
+ * Emitted in REGISTRY order, which is the order `resolve()` iterates.
+ * This used to be a lexical sort by label, and that is what made the two
+ * surfaces disagree: `rst` is a word-boundary hit at the identical score
+ * on both `/restart` and `/auto-restart`, so the winner is whatever the
+ * (stable) sort saw first — registration order in the CommandBar,
+ * alphabetical order in the palette. The bar completed `/restart` while
+ * the palette's top row was `/auto-restart`; same for `fnd`
+ * (`/findings` vs `/doc-finder`). A tie has to break the same way on
+ * both surfaces or the palette is teaching the wrong slash. It also
+ * makes the EMPTY-query browse order agree, since `resolve("")` lists
+ * the registry in the same order.
+ *
+ * We hand out priority `0` (top of the "non-Recent" block, just below
  * `approve-all`'s `-1`) so registry actions surface immediately when
  * the palette opens with an empty query.
  */
 export function getRegistryPaletteActions(): PaletteActionLike[] {
-  const out: PaletteActionLike[] = [];
-  for (const action of getAll()) {
-    out.push(toPaletteRow(action));
-  }
-  out.sort((a, b) => a.label.localeCompare(b.label));
-  return out;
+  return getAll().map(toPaletteRow);
 }
 
 function toPaletteRow(action: CommandAction): PaletteActionLike {
@@ -107,5 +113,61 @@ function toPaletteRow(action: CommandAction): PaletteActionLike {
         );
       });
     },
+  };
+}
+
+/** Separator between a registry row's slash form and its description. */
+export const SLASH_LABEL_SEPARATOR = " — ";
+
+export interface PaletteLabelMatch extends FuzzyMatch {
+  /** True when the winning match sat entirely inside the leading slash
+   *  form rather than reaching into the description prose after it. */
+  fromSlash: boolean;
+}
+
+/**
+ * Score a palette row's composed label the way {@link resolve} scores a
+ * registry action: slash form and description as SEPARATE candidates,
+ * plus the flag that breaks a within-tier tie toward the slash.
+ *
+ * Scoring the composed `"/restart — Restart session in zone"` as one
+ * string is not equivalent. It costs the slash its Tier-1 prefix band
+ * (nothing starts with `/restart` except the `/`), and it erases which
+ * field matched — so an action whose DESCRIPTION happens to tie
+ * outranked one whose SLASH matched, purely on array order. The
+ * CommandBar has broken that tie toward the slash since the re-banding;
+ * this is the same rule, on the palette side.
+ *
+ * Rows with no slash form (the palette's per-zone / per-tab enumerations)
+ * fall through to a plain label score with `fromSlash: false`.
+ */
+export function scorePaletteLabel(label: string, query: string): PaletteLabelMatch | null {
+  const sep = label.indexOf(SLASH_LABEL_SEPARATOR);
+  if (!label.startsWith("/") || sep === -1) {
+    const plain = fuzzyScore(label, query);
+    return plain === null ? null : { ...plain, fromSlash: false };
+  }
+
+  // Strip the leading `/` from BOTH sides, as `resolve()` does, so the
+  // slash does not bias the prefix tier.
+  const slashBody = label.slice(1, sep);
+  const description = label.slice(sep + SLASH_LABEL_SEPARATOR.length);
+  const q = query.replace(/^\//, "");
+  const slashMatch = fuzzyScore(slashBody, q);
+  const descMatch = fuzzyScore(description, q);
+  const best =
+    slashMatch !== null && (descMatch === null || slashMatch.score >= descMatch.score)
+      ? slashMatch
+      : descMatch;
+  if (best === null) return null;
+
+  const fromSlash = best === slashMatch;
+  // Shift indices back into the composed label so the highlight renderer
+  // marks the right characters.
+  const offset = fromSlash ? 1 : sep + SLASH_LABEL_SEPARATOR.length;
+  return {
+    score: best.score,
+    indices: best.indices.map((i) => i + offset),
+    fromSlash,
   };
 }
