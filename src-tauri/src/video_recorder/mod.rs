@@ -49,6 +49,26 @@ pub struct VideoRecordingService {
     state: Arc<Mutex<RecordingState>>,
 }
 
+/// The ffmpeg `x11grab` `-i` value for a resolved `$DISPLAY`.
+///
+/// The recorder used to hardcode `":0.0"`, and it was the ONLY consumer that
+/// did: `xcap`, `wmctrl`/`xdotool` and AT-SPI all read `$DISPLAY` out of the
+/// process environment. On a headless box provisioned with a virtual display
+/// (Xvfb on `:99`) that meant every other subsystem followed the Xvfb while the
+/// recording grabbed a screen that does not exist.
+///
+/// `None` (unset or empty `DISPLAY`) keeps the historical `":0.0"` verbatim, so
+/// a headed runner's ffmpeg argv is byte-identical to before. A set value is
+/// passed through as-is — x11grab's input is `[host]:display[.screen]` with the
+/// screen optional, so `:99` is a complete input.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn x11grab_input(display: Option<&str>) -> String {
+    match display.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => d.to_string(),
+        None => ":0.0".to_string(),
+    }
+}
+
 impl VideoRecordingService {
     pub fn new() -> Self {
         Self {
@@ -293,7 +313,9 @@ impl VideoRecordingService {
             args.push("-framerate".to_string());
             args.push(config.fps.to_string());
             args.push("-i".to_string());
-            args.push(":0.0".to_string()); // Default X11 display
+            args.push(x11grab_input(
+                crate::automation_stack::resolve_display().as_deref(),
+            ));
         }
 
         // Codec settings
@@ -373,6 +395,32 @@ mod tests {
         assert_eq!(config.fps, 15);
         assert_eq!(config.quality, "medium");
         assert_eq!(config.codec, "h264");
+    }
+
+    /// `DISPLAY` set → that display is what x11grab grabs; unset → the
+    /// historical `:0.0`, so a headed runner's argv does not change.
+    #[test]
+    fn test_x11grab_input_follows_display() {
+        assert_eq!(x11grab_input(Some(":99")), ":99");
+        assert_eq!(x11grab_input(Some(":1.0")), ":1.0");
+        assert_eq!(
+            x11grab_input(Some("remote.example.com:0")),
+            "remote.example.com:0"
+        );
+        // Unset, empty and whitespace-only all fall back to the old default.
+        assert_eq!(x11grab_input(None), ":0.0");
+        assert_eq!(x11grab_input(Some("")), ":0.0");
+        assert_eq!(x11grab_input(Some("   ")), ":0.0");
+    }
+
+    /// The recorder resolves the display through the SAME helper `/health`
+    /// reports, so the two can never disagree about which display this box
+    /// automates.
+    #[test]
+    fn test_x11grab_input_matches_resolved_display() {
+        let resolved = crate::automation_stack::resolve_display();
+        let expected = resolved.clone().unwrap_or_else(|| ":0.0".to_string());
+        assert_eq!(x11grab_input(resolved.as_deref()), expected);
     }
 
     #[test]

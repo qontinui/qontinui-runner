@@ -47,6 +47,7 @@ mod api_request;
 mod asset_headers;
 mod auth;
 mod auto_commit;
+mod automation_stack; // Can this box drive a GUI? — /health `automationStack` + the shared $DISPLAY resolution
 mod backup;
 mod build_drift;
 mod check_executor;
@@ -3747,6 +3748,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // deployed to the live primary" is visible at a glance.
                 tauri::async_runtime::spawn(async move {
                     build_drift::run_periodic().await;
+                });
+
+                // Automation-stack health (plan 2026-08-29-merytshost-has-no-
+                // display-stack-for-ui-automation, Phase 5): the display
+                // binding and the X11 tool lookups are cheap enough to run
+                // inline on /health, but the AT-SPI bus probe is a D-Bus round
+                // trip, so it runs out-of-band under a hard timeout and
+                // publishes its last pass — /health never blocks on it and
+                // reports an explicit `unknown` until the first pass lands.
+                tauri::async_runtime::spawn(async move {
+                    automation_stack::run_periodic().await;
                 });
 
                 // Plan §Phase 3/7/10 — start the coord-sync background loops
