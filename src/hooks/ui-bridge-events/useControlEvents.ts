@@ -8,6 +8,7 @@ import {
   serializeElement,
   serializeComponent,
   isElementActionAllowed,
+  toControlActionRequest,
 } from "./utils";
 
 /**
@@ -130,8 +131,13 @@ export function useControlEvents(
           }
 
           // Normalize: action may be a string (from SDK proxy fallback)
-          // or an object { action, params, waitOptions } (from control endpoint)
-          const actionObj = typeof action === "string" ? { action } : action;
+          // or the whole envelope { action, params, waitOptions, ... } (from a
+          // control endpoint). `toControlActionRequest` carries the envelope by
+          // identity — see its doc for what rebuilding it used to drop.
+          const actionObj = toControlActionRequest(action);
+          // The dispatched action NAME, read back off the normalized envelope
+          // so the gate below and the executor agree on one value.
+          const actionName = actionObj.action;
 
           // Action-not-allowed pre-check: when the element is registered and
           // we already know its declared action set, surface a hint with the
@@ -151,12 +157,12 @@ export function useControlEvents(
             // `isElementActionAllowed` exempts `hoverClick` (a click-variant)
             // wherever `click` is advertised, mirroring the runner-side Rust
             // `is_action_advertised` gate so the two layers can't disagree.
-            if (!isElementActionAllowed(allowedActions, actionObj.action)) {
+            if (!isElementActionAllowed(allowedActions, actionName)) {
               await sendResponse({
                 requestId,
                 type,
                 success: false,
-                error: `Action '${actionObj.action}' is not allowed for element '${elementId}'`,
+                error: `Action '${actionName}' is not allowed for element '${elementId}'`,
                 hint: { allowedActions },
                 timestamp: Date.now(),
               });
@@ -164,11 +170,13 @@ export function useControlEvents(
             }
           }
 
-          const result = await currentBridge.executeAction(elementId, {
-            action: actionObj.action,
-            params: actionObj.params,
-            waitOptions: actionObj.waitOptions,
-          });
+          // `actionObj` is already the caller's envelope carried by identity,
+          // so it goes to the executor as-is: no field-by-field rebuild, and a
+          // field added to `ControlActionRequest` needs no change here.
+          const result = await currentBridge.executeAction(
+            elementId,
+            actionObj as Parameters<typeof currentBridge.executeAction>[1],
+          );
 
           // If the action failed because the element wasn't found at all,
           // enrich the response with closest-match element-id suggestions

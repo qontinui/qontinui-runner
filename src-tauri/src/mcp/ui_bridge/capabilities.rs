@@ -382,21 +382,87 @@ pub async fn ui_bridge_expect_text_handler(
 // Tier 3.2 — Mixed action/wait/snapshot batch execution
 // ============================================================================
 
+/// Resolve the step array for `/control/batch-execute`, accepting both
+/// spellings.
+///
+/// This endpoint reads `actions` while its sibling `/control/batch` reads
+/// `steps`, and nothing reconciled them: the repo's own
+/// `scripts/contract-smoke.ps1` probed this route with `{"steps":[]}` — a key
+/// matching neither the handler nor any caller. The old `unwrap_or_default()`
+/// then turned that mismatch into an EMPTY batch returning 200 success having
+/// executed nothing, so the endpoint's only in-repo probe could not have
+/// detected it being broken. That is part of why the `id` / `elementId` defect
+/// fixed alongside `request::element_action_payload` survived here as long as
+/// it did.
+///
+/// An empty batch stays a legitimate no-op, but it now has to be *requested*
+/// (`{"actions": []}`); a body carrying neither key is malformed and says so,
+/// which is what makes a vacuous probe impossible to reintroduce silently.
+fn resolve_batch_steps(
+    request: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>, (&'static str, &'static str)> {
+    let found = ["actions", "steps"]
+        .into_iter()
+        .find_map(|k| request.get(k));
+
+    match found {
+        Some(serde_json::Value::Array(arr)) => Ok(arr.clone()),
+        Some(_) => Err((
+            "steps_not_an_array",
+            "`actions` (alias: `steps`) must be an array of steps",
+        )),
+        None => Err((
+            "steps_missing",
+            "request must carry an `actions` array (alias: `steps`)",
+        )),
+    }
+}
+
+/// Read the stop-on-error flag for `/control/batch-execute`, accepting the
+/// spellings its sibling endpoints use. This handler read only snake_case while
+/// `/control/batch` reads `stopOnError` / `stopOnFailure`, so a caller moving
+/// between the two silently lost the flag and fell back to the `true` default.
+fn batch_stop_on_error(request: &serde_json::Value) -> bool {
+    ["stop_on_error", "stopOnError", "stopOnFailure"]
+        .into_iter()
+        .find_map(|k| request.get(k).and_then(|v| v.as_bool()))
+        .unwrap_or(true)
+}
+
+/// Build the 400 for a `/control/batch-execute` body that carries no usable
+/// step array, matching the error envelope `/control/batch` already returns for
+/// an oversized batch.
+fn batch_execute_bad_request(error: &str, detail: &str) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(
+                serde_json::to_string(&serde_json::json!({
+                    "error": error,
+                    "detail": detail,
+                }))
+                .unwrap_or_default(),
+            ),
+            error_detail: None,
+            hint: None,
+            code: None,
+            suggestions: None,
+        }),
+    )
+}
+
 /// POST /ui-bridge/control/batch-execute
 pub async fn ui_bridge_control_batch_execute_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let actions = request
-        .get("actions")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let stop_on_error = request
-        .get("stop_on_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let actions = match resolve_batch_steps(&request) {
+        Ok(steps) => steps,
+        Err((error, detail)) => return Err(batch_execute_bad_request(error, detail)),
+    };
+    let stop_on_error = batch_stop_on_error(&request);
 
     let total = actions.len();
 
@@ -1582,5 +1648,79 @@ mod pong_provenance_tests {
     #[test]
     fn missing_source_is_accepted_not_rejected() {
         assert_eq!(parse("").source, None);
+    }
+}
+
+#[cfg(test)]
+mod batch_execute_request_tests {
+    use super::{batch_stop_on_error, resolve_batch_steps};
+    use serde_json::json;
+
+    #[test]
+    fn reads_the_canonical_actions_key() {
+        let steps = resolve_batch_steps(&json!({"actions": [{"type": "wait", "ms": 1}]}))
+            .expect("actions is the canonical key");
+        assert_eq!(steps.len(), 1);
+    }
+
+    /// `/control/batch` spells the same array `steps`. Accepting the alias is
+    /// what stops a caller moving between the two sibling endpoints from
+    /// silently executing nothing.
+    #[test]
+    fn accepts_the_steps_alias() {
+        let steps = resolve_batch_steps(&json!({"steps": [{"type": "wait", "ms": 1}]}))
+            .expect("steps is accepted as an alias");
+        assert_eq!(steps.len(), 1);
+    }
+
+    #[test]
+    fn actions_wins_when_both_are_present() {
+        let steps = resolve_batch_steps(&json!({
+            "actions": [{"type": "wait", "ms": 1}],
+            "steps": [],
+        }))
+        .expect("both keys present");
+        assert_eq!(steps.len(), 1);
+    }
+
+    /// The regression that made the repo's only probe of this endpoint
+    /// vacuous: a body with neither key used to become an empty batch and
+    /// return 200 success, so a totally broken endpoint still probed green.
+    #[test]
+    fn a_body_with_no_step_array_is_rejected() {
+        let err = resolve_batch_steps(&json!({"stopOnError": false}))
+            .expect_err("neither key present must be an error, not an empty batch");
+        assert_eq!(err.0, "steps_missing");
+    }
+
+    #[test]
+    fn a_non_array_step_field_is_rejected() {
+        let err = resolve_batch_steps(&json!({"actions": "click"}))
+            .expect_err("a non-array `actions` is malformed");
+        assert_eq!(err.0, "steps_not_an_array");
+    }
+
+    /// An empty batch stays legal - it just has to be asked for.
+    #[test]
+    fn an_explicitly_empty_batch_is_a_no_op_not_an_error() {
+        let steps = resolve_batch_steps(&json!({"actions": []})).expect("explicit empty is legal");
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn stop_on_error_defaults_to_true() {
+        assert!(batch_stop_on_error(&json!({"actions": []})));
+    }
+
+    #[test]
+    fn stop_on_error_accepts_every_sibling_spelling() {
+        assert!(!batch_stop_on_error(&json!({"stop_on_error": false})));
+        assert!(!batch_stop_on_error(&json!({"stopOnError": false})));
+        assert!(!batch_stop_on_error(&json!({"stopOnFailure": false})));
+    }
+
+    #[test]
+    fn a_non_bool_flag_falls_back_to_the_default() {
+        assert!(batch_stop_on_error(&json!({"stop_on_error": "no"})));
     }
 }

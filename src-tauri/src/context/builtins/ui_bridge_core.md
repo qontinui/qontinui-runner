@@ -196,8 +196,8 @@ Prefer these primitives over `sleep N && re-discover`; they all already exist. E
 
 **Batch** — use when a manual-test sequence would otherwise need 3+ round-trips:
 
-- `POST /ui-bridge/control/batch-execute` — mixed `action` / `wait` / `snapshot` steps, serial, with `stop_on_error` default `true`.
-- `POST /ui-bridge/control/batch` and `POST /ui-bridge/control/batch-actions` — pure action batches with timing and pre/post snapshot diff.
+- `POST /ui-bridge/control/batch-execute` — mixed `action` / `wait` / `snapshot` steps, serial. Body `{ "actions": [...] }` (alias: `steps`), with `stop_on_error` (aliases: `stopOnError`, `stopOnFailure`) default `true`. A body carrying **neither** array key is a `400 steps_missing` — an empty batch is legal but has to be asked for (`{"actions": []}`), because silently succeeding on a key mismatch is what let this endpoint probe green while broken.
+- `POST /ui-bridge/control/batch` and `POST /ui-bridge/control/batch-actions` — pure action batches with timing and pre/post snapshot diff. `/control/batch` spells the same array `steps`.
 
 **Tauri invoke proxy** — drop the `page/evaluate + window.__TAURI_INTERNALS__.invoke(...)` boilerplate:
 
