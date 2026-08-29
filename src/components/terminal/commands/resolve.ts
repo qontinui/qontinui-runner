@@ -12,7 +12,9 @@
  *
  *   2. **Fuzzy match** against `slash` + `label` for everything else.
  *      Uses the shared {@link fuzzyScore} so the CommandBar and the
- *      `Ctrl+Shift+K` palette never disagree on ranking.
+ *      `Ctrl+Shift+K` palette never disagree on ranking. The scorer's
+ *      disjoint bands settle slash-vs-label ACROSS tiers; the sort below
+ *      settles it WITHIN a tier, where the two can still tie exactly.
  *
  * Recents (per-runner-instance, persisted to {@link instanceStorage}
  * under `terminal-command-bar-recents`) are pulled to the top of the
@@ -92,7 +94,7 @@ export function resolve(input: string, recents: readonly string[]): ResolveMatch
   // compare query-without-slash to slash-without-slash.)
   const query = trimmed.replace(/^\//, "");
   const recentSet = new Set(recents);
-  const scored: Array<ResolveMatch & { _score: number }> = [];
+  const scored: Array<ResolveMatch & { _score: number; _fromSlash: boolean }> = [];
   for (const action of getAll()) {
     const slashBody = action.slash.replace(/^\//, "");
     const slashMatch = fuzzyScore(slashBody, query);
@@ -103,25 +105,43 @@ export function resolve(input: string, recents: readonly string[]): ResolveMatch
     // Indices are positions in the slash (with leading "/") for the
     // highlight renderer; shift by +1 when they came from the
     // slash-without-leading-`/` body.
-    const indices = best === slashMatch ? slashMatch.indices.map((i) => i + 1) : [];
+    const fromSlash = best === slashMatch;
+    const indices = fromSlash ? best.indices.map((i) => i + 1) : [];
     scored.push({
       action,
       exact: false,
       recent: recentSet.has(action.id),
       indices,
       _score: best.score,
+      _fromSlash: fromSlash,
     });
   }
 
-  // Score first, recency only as a TIE-BREAK. Recency as an absolute
-  // sort key outranked the match quality itself: with `/spawn` in
-  // recents, typing `/sw` put `/spawn` (a word-boundary hit) above
-  // `/swap` (a prefix hit), so Tab completed the wrong command.
+  // Sort keys, in order:
+  //
+  //   1. **Score.** The fuzzy bands are disjoint per query, so this is
+  //      "prefix beats word-boundary beats sequential", full stop.
+  //
+  //   2. **Which FIELD matched.** Re-banding the scorer made a slash hit
+  //      outrank a label hit ACROSS tiers, but said nothing about a tie
+  //      WITHIN one: `rst` is a word-boundary hit on `/restart`'s slash
+  //      body *and* on `/auto-restart`'s, `fnd` ties `/findings` with
+  //      `/doc-finder`, `ntf` ties `/desktop-notify` with its own label —
+  //      all at the identical score, so the winner was whichever action
+  //      happened to be REGISTERED first. Registration order is not a
+  //      ranking signal. The slash is what the operator is typing toward
+  //      and what Tab completes, so at equal score it wins.
+  //
+  //   3. **Recency**, last. Recency as an absolute sort key outranked
+  //      match quality itself: with `/spawn` in recents, typing `/sw` put
+  //      `/spawn` (a word-boundary hit) above `/swap` (a prefix hit), so
+  //      Tab completed the wrong command.
   scored.sort((a, b) => {
     if (a._score !== b._score) return b._score - a._score;
+    if (a._fromSlash !== b._fromSlash) return a._fromSlash ? -1 : 1;
     if (a.recent !== b.recent) return a.recent ? -1 : 1;
     return 0;
   });
 
-  return scored.slice(0, MAX_SUGGESTIONS).map(({ _score: _, ...rest }) => rest);
+  return scored.slice(0, MAX_SUGGESTIONS).map(({ _score: _s, _fromSlash: _f, ...rest }) => rest);
 }

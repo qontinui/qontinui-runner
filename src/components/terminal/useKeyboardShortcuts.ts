@@ -92,13 +92,21 @@ export function useKeyboardShortcuts({
   sessionManager,
 }: UseKeyboardShortcutsParams) {
   useEffect(() => {
+    // Every `Ctrl+Shift+<key>` test below goes through `isCtrlShiftChord`,
+    // which lowercases both sides. A literal `e.key === "T"` is a CapsLock
+    // trap: with CapsLock on, Shift INVERTS the case, so the browser
+    // reports `"t"` and the chord silently does nothing. Only Ctrl+Shift+K
+    // had been normalised (it collided with the KnowledgeBrowser, which is
+    // how anyone noticed); the ~20 chords around it were all dead under
+    // CapsLock — new terminal, close, maximize, swap, restart, the session
+    // sidebar, all of it.
     const handler = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && e.key === "T") {
+      if (isCtrlShiftChord(e, "t")) {
         e.preventDefault();
         createAndAssignTerminal();
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "W") {
+      if (isCtrlShiftChord(e, "w")) {
         e.preventDefault();
         if (activeId) closeTerminal(activeId);
         return;
@@ -118,32 +126,32 @@ export function useKeyboardShortcuts({
         }
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "N") {
+      if (isCtrlShiftChord(e, "n")) {
         e.preventDefault();
         zoneLayout.focusNextNeedsInput(sessionStates);
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "F") {
+      if (isCtrlShiftChord(e, "f")) {
         e.preventDefault();
         zoneLayout.toggleMaximize(zoneLayout.focusedZone);
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "M") {
+      if (isCtrlShiftChord(e, "m")) {
         e.preventDefault();
         dispatch({ type: "CYCLE_VIEW_MODE" });
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "A") {
+      if (isCtrlShiftChord(e, "a")) {
         e.preventDefault();
         transitionEffects.toggleAutoFocus();
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "S") {
+      if (isCtrlShiftChord(e, "s")) {
         e.preventDefault();
         transitionEffects.toggleSound();
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "Enter") {
+      if (isCtrlShiftChord(e, "Enter")) {
         e.preventDefault();
         const waiting = tabs.filter((t) => sessionStates[t.id] === "needs-input");
         incrementMetric("totalApprovals", waiting.length);
@@ -153,6 +161,9 @@ export function useKeyboardShortcuts({
         }
         return;
       }
+      // Digits, not a single key — a range test, so it can't route through
+      // `isCtrlShiftChord`. CapsLock does not affect digit keys, so the
+      // trap the helper exists for doesn't reach this branch.
       if (e.ctrlKey && e.shiftKey && e.key >= "1" && e.key <= "8") {
         e.preventDefault();
         const num = parseInt(e.key, 10);
@@ -172,7 +183,7 @@ export function useKeyboardShortcuts({
         }
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "X") {
+      if (isCtrlShiftChord(e, "x")) {
         e.preventDefault();
         if (swapSource === null) {
           dispatch({ type: "SET_SWAP_SOURCE", payload: zoneLayout.focusedZone });
@@ -187,27 +198,27 @@ export function useKeyboardShortcuts({
         }
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "/") {
+      if (isCtrlShiftChord(e, "/")) {
         e.preventDefault();
         dispatch({ type: "TOGGLE_OUTPUT_SEARCH" });
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "O") {
+      if (isCtrlShiftChord(e, "o")) {
         e.preventDefault();
         labelsAndTags.togglePin(zoneLayout.focusedZone);
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "D") {
+      if (isCtrlShiftChord(e, "d")) {
         e.preventDefault();
         dispatch({ type: "TOGGLE_FOCUS_MODE" });
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "R") {
+      if (isCtrlShiftChord(e, "r")) {
         e.preventDefault();
         handleRestartInZone(zoneLayout.focusedZone);
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "L") {
+      if (isCtrlShiftChord(e, "l")) {
         e.preventDefault();
         // In flow-grid (synthetic id, not in LAYOUT_PRESETS) `findIndex` returns
         // -1 and the cycle would jump to preset[0]/`single`, collapsing 10+ live
@@ -219,12 +230,11 @@ export function useKeyboardShortcuts({
         zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id);
         return;
       }
-      // Ctrl+Shift+K — command palette. Matched case-insensitively via the
-      // shared chord table: with CapsLock on, Shift yields a lowercase
-      // `e.key`, and the literal `"K"` test made the chord miss here while
-      // the KnowledgeBrowser's `"K" || "k"` test still fired. The
-      // KnowledgeBrowser now owns Ctrl+Shift+E (see `lib/globalChords`), so
-      // this no longer opens two overlays at once.
+      // Ctrl+Shift+K — command palette. The letter comes from the shared
+      // chord TABLE (not an inline literal) because this chord is claimed
+      // from another component tree too: the KnowledgeBrowser now owns
+      // Ctrl+Shift+E (see `lib/globalChords`), so this no longer opens two
+      // overlays at once.
       if (isCtrlShiftChord(e, GLOBAL_CHORDS.commandPalette)) {
         e.preventDefault();
         // Claims the chord for this surface. It does NOT suppress another
@@ -237,17 +247,17 @@ export function useKeyboardShortcuts({
         dispatch({ type: "TOGGLE_COMMAND_PALETTE" });
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "I") {
+      if (isCtrlShiftChord(e, "i")) {
         e.preventDefault();
         dispatch({ type: "TOGGLE_TIMELINE" });
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "P") {
+      if (isCtrlShiftChord(e, "p")) {
         e.preventDefault();
         dispatch({ type: "TOGGLE_CONTROL_PANEL" });
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "G") {
+      if (isCtrlShiftChord(e, "g")) {
         e.preventDefault();
         if (labelsAndTags.allTags.length === 0) return;
         labelsAndTags.setActiveTagFilters((prev) => {
@@ -261,7 +271,7 @@ export function useKeyboardShortcuts({
         });
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "?") {
+      if (isCtrlShiftChord(e, "?")) {
         e.preventDefault();
         dispatch({ type: "TOGGLE_SHORTCUTS" });
         return;
@@ -272,29 +282,29 @@ export function useKeyboardShortcuts({
       // handler closes over the page's `showCard`. The hook has no
       // `showCard` of its own, so reaching the registry by id is the
       // clean path (no prop-drilling a card callback through every page).
-      if (e.ctrlKey && e.shiftKey && e.key === "H") {
+      if (isCtrlShiftChord(e, "h")) {
         e.preventDefault();
         void getById("terminal.history")?.handler({}, { source: "hotkey" });
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "ArrowLeft") {
+      if (isCtrlShiftChord(e, "ArrowLeft")) {
         e.preventDefault();
         focusHistory.goBack();
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "ArrowRight") {
+      if (isCtrlShiftChord(e, "ArrowRight")) {
         e.preventDefault();
         focusHistory.goForward();
         return;
       }
       // Ctrl+Shift+B: Toggle session manager sidebar
-      if (e.ctrlKey && e.shiftKey && e.key === "B") {
+      if (isCtrlShiftChord(e, "b")) {
         e.preventDefault();
         workflowGen.setShowSidebar((v) => !v);
         return;
       }
       // Ctrl+Shift+J: Jump to next frozen session (resume first frozen)
-      if (e.ctrlKey && e.shiftKey && e.key === "J") {
+      if (isCtrlShiftChord(e, "j")) {
         e.preventDefault();
         if (sessionManager) {
           const frozen = sessionManager.sessions.find(
