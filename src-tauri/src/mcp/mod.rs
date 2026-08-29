@@ -124,6 +124,7 @@ pub mod recordings;
 pub mod reflection;
 pub mod reflection_api;
 pub mod relay_routable;
+pub mod restart_readiness;
 pub mod restate_api;
 pub mod reviews;
 pub mod saved_api_requests;

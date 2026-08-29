@@ -6318,6 +6318,26 @@ pub fn create_router(
         // here before its hard taskkill so in-flight turns flush, dirty
         // worktrees are stashed to refs/wip/*, and coord claims persist.
         .route("/drain", post(drain_handler))
+        // Phase 1 of `2026-08-29-no-single-answer-to-is-it-safe-to-restart-
+        // the-runner`: the ONE surface that answers "is it safe to restart
+        // this runner?". An operator nearly destroyed 23 live agent sessions
+        // because `/task-runs/running` (a port-filtered workflow ledger)
+        // returned `[]` and `/sessions/history` (display-only, past sessions)
+        // showed one closed row — both truthful about their own question, both
+        // reading as idle, while the authoritative count sat nested inside
+        // `/health` → `data.sessionTracking`.
+        //
+        // Computes a FRESH `tracking_health` pass per request rather than
+        // reading that 600 s-stale cache, reports the terminal-hosted and
+        // AI/task-run planes SEPARATELY (a drain covers only the latter), and
+        // fails closed on every unknown. Deliberately on THIS router and NOT
+        // in `route_entries()` — same reasoning as
+        // `/coord-mcp/tool-policy` below: the manifest contract binds only
+        // `mcp/ui_bridge/<family>` routes.
+        .route(
+            "/restart-readiness",
+            get(crate::mcp::restart_readiness::restart_readiness_handler),
+        )
         // Manually trigger the dead-webview recovery ladder (plan
         // 2026-08-01-runner-dead-webview-is-invisible-to-health, Phase 2). An
         // operator/debug affordance ONLY — the shipped detection path is the

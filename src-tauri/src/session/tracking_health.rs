@@ -61,7 +61,7 @@ use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSes
 use crate::terminal::TerminalManager;
 
 /// How often the periodic cross-reference runs.
-const CHECK_INTERVAL: Duration = Duration::from_secs(600);
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(600);
 /// Boot delay before the first check — lets boot-restore re-open its records
 /// and the restored PTYs register, so the first tick doesn't report the
 /// restore window itself as drift.
@@ -173,6 +173,54 @@ impl TrackingHealthReport {
     pub fn is_clean(&self) -> bool {
         self.live_untracked.is_empty() && self.tracked_dead.is_empty()
     }
+}
+
+/// One completed cross-reference pass, plus the open records it was computed
+/// against.
+///
+/// [`compute`] returns the records so an on-demand caller (the
+/// `/restart-readiness` verdict, plan
+/// `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner` Phase 1)
+/// can render a per-session list without re-reading the store — the report
+/// alone carries only counts plus the two drift lists.
+#[derive(Debug, Clone)]
+pub struct TrackingHealthPass {
+    pub report: TrackingHealthReport,
+    /// The open lifecycle records `report` was cross-referenced against.
+    pub open_records: Vec<TerminalSessionRecord>,
+}
+
+/// Reference instant for the PID-reuse guard: the runner primary's OWN boot
+/// time, captured once and shared by EVERY caller of [`evaluate`].
+///
+/// ⚠ Read the doc comment on `claude_present_in_inclusive_subtree` before
+/// touching this. It is deliberately NOT `now()` and deliberately NOT a
+/// per-record `opened_at`: a later record can legitimately reuse an
+/// already-running terminal whose PID predates that record, and an
+/// `opened_at`-keyed guard falsely flips such live idle sessions to
+/// tracked-dead (measured live 2026-07-03: all 9 `trackedDead` were this
+/// artifact). Substituting `now()` in an on-demand caller would reintroduce
+/// exactly that defect for every session on the box.
+///
+/// Hoisted out of `run_periodic`'s local so the on-demand `/restart-readiness`
+/// pass computes against the identical reference — two passes keyed on
+/// different instants could disagree, which is the D1 "second census" failure
+/// this plan forbids.
+static PRIMARY_BOOT_UNIX_MILLIS: OnceLock<i64> = OnceLock::new();
+
+/// Set the primary-boot reference instant (first writer wins), returning the
+/// effective value. Called once from startup (`main.rs` setup) before the API
+/// server can serve a readiness request, and again — harmlessly — by
+/// [`run_periodic`] so the periodic task still works if startup never set it.
+pub fn set_primary_boot_unix_millis(ms: i64) -> i64 {
+    *PRIMARY_BOOT_UNIX_MILLIS.get_or_init(|| ms)
+}
+
+/// The primary-boot reference instant, or `None` if startup has not set it
+/// yet. An on-demand caller MUST treat `None` as UNKNOWN (fail closed) rather
+/// than substituting `now()` — see [`PRIMARY_BOOT_UNIX_MILLIS`].
+pub fn primary_boot_unix_millis() -> Option<i64> {
+    PRIMARY_BOOT_UNIX_MILLIS.get().copied()
 }
 
 /// Latest completed report — `/health` reads this; the periodic task is the
@@ -308,20 +356,36 @@ pub fn evaluate(
 // Periodic task
 // ---------------------------------------------------------------------------
 
-/// One live pass: snapshot the process table, cross-reference, log + publish.
-/// Skips (keeping the previous result) when the snapshot helper failed — an
-/// empty parent map means "couldn't see the process table", not "no drift"
-/// (same posture as the liveness poll's `tick_snapshot_ok`).
-async fn run_once(
+/// One live cross-reference pass — snapshot the process table, resolve the
+/// exempt planes, run [`evaluate`]. **Computes only**: it neither logs a
+/// verdict nor publishes to the `latest()` cache.
+///
+/// This is the single shared body behind both consumers:
+///
+/// - [`run_periodic`] → [`run_once`], which logs + `store_latest`s the result;
+/// - `GET /restart-readiness` (`mcp/restart_readiness.rs`), which calls this
+///   directly so its verdict is FRESH rather than up to `CHECK_INTERVAL`
+///   (600 s) stale.
+///
+/// Splitting rather than copying is load-bearing: two counting bodies could
+/// disagree, and a readiness verdict that disagrees with `/health` is worse
+/// than the buried-but-consistent number it replaces (plan
+/// `2026-08-29-no-single-answer-…` D1).
+///
+/// Returns `None` when the process snapshot helper failed — an empty parent
+/// map means "couldn't see the process table", **not** "no drift". Each caller
+/// owns the posture for that: the periodic task skips the pass (fail-open,
+/// keeping the previous result — same as the liveness poll's
+/// `tick_snapshot_ok`), while the readiness endpoint MUST fail closed.
+pub async fn compute(
     terminal_manager: &Arc<TerminalManager>,
     store: &Arc<SessionLifecycleStore>,
     session_manager: &Arc<crate::claude_session::SessionManager>,
     primary_boot_unix_millis: i64,
-) {
+) -> Option<TrackingHealthPass> {
     let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
     if snap.parent_map.is_empty() {
-        debug!("session tracking health: process snapshot unavailable — skipping this pass");
-        return;
+        return None;
     }
 
     let open = store.open_records();
@@ -351,6 +415,35 @@ async fn run_once(
         primary_boot_unix_millis,
         chrono::Utc::now().timestamp_millis(),
     );
+
+    Some(TrackingHealthPass {
+        report,
+        open_records: open,
+    })
+}
+
+/// One live pass for the PERIODIC task: [`compute`], then log + publish.
+/// Skips (keeping the previous result) when the snapshot helper failed — an
+/// empty parent map means "couldn't see the process table", not "no drift"
+/// (same posture as the liveness poll's `tick_snapshot_ok`).
+async fn run_once(
+    terminal_manager: &Arc<TerminalManager>,
+    store: &Arc<SessionLifecycleStore>,
+    session_manager: &Arc<crate::claude_session::SessionManager>,
+    primary_boot_unix_millis: i64,
+) {
+    let Some(pass) = compute(
+        terminal_manager,
+        store,
+        session_manager,
+        primary_boot_unix_millis,
+    )
+    .await
+    else {
+        debug!("session tracking health: process snapshot unavailable — skipping this pass");
+        return;
+    };
+    let report = pass.report;
 
     if report.is_clean() {
         debug!(
@@ -387,12 +480,17 @@ pub async fn run_periodic(
     store: Arc<SessionLifecycleStore>,
     session_manager: Arc<crate::claude_session::SessionManager>,
 ) {
-    // Reference instant for the PID-reuse guard: this primary's own boot time
-    // (captured once, at task spawn — effectively boot time), NOT a per-record
-    // `opened_at`. Same idiom as the liveness poll in main.rs; see the doc
-    // comment on `claude_present_in_inclusive_subtree` for the incident
-    // writeup (2026-07-03).
-    let primary_boot_unix_millis = chrono::Utc::now().timestamp_millis();
+    // Reference instant for the PID-reuse guard: this primary's own boot time,
+    // NOT a per-record `opened_at`. Same idiom as the liveness poll in main.rs;
+    // see the doc comment on `claude_present_in_inclusive_subtree` for the
+    // incident writeup (2026-07-03).
+    //
+    // Now shared via the process-global `OnceLock` so the on-demand
+    // `/restart-readiness` pass keys on the IDENTICAL instant. Startup sets it
+    // before the API server binds; this `get_or_init` is the fallback for a
+    // build/path where it didn't, and is a no-op when it did.
+    let primary_boot_unix_millis =
+        set_primary_boot_unix_millis(chrono::Utc::now().timestamp_millis());
     tokio::time::sleep(INITIAL_DELAY).await;
     loop {
         run_once(
