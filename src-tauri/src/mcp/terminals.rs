@@ -490,6 +490,11 @@ pub async fn get_buffer_handler(
 /// body is arbitrary caller-supplied text — so the response reports what
 /// actually reached the PTY: `bytes` is the real wire length and `sanitized`
 /// says whether the neutralizer changed the body.
+///
+/// A rewrite is also logged at the choke point itself
+/// ([`crate::terminal::session::TerminalSession::submit_prompt`]), which is
+/// how the *other* producers — none of which sees this response — find out
+/// that a body of theirs was altered.
 pub async fn submit_prompt_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -504,13 +509,13 @@ pub async fn submit_prompt_handler(
         )
     })?;
 
-    // Ask the choke point what it will write. `message.len() + framing` is
+    // Let the choke point say what it wrote. `message.len() + framing` is
     // NOT the answer: the body is neutralized before it is framed, so a
     // message carrying a paste marker or control bytes reaches the PTY
-    // shorter than it arrived.
-    let payload = crate::terminal::session::submit_payload_info(&request.message);
-
-    session.submit_prompt(&request.message).map_err(|e| {
+    // shorter than it arrived. Taking the numbers from `submit_prompt`'s
+    // return rather than recomputing them here also stops this route from
+    // running the neutralizer over the same untrusted body twice.
+    let payload = session.submit_prompt(&request.message).map_err(|e| {
         error!("HTTP: Failed to submit prompt to terminal {}: {}", id, e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
