@@ -296,10 +296,30 @@ impl SpillSlice {
 
 /// A session's spill directory, plus the retention policy that bounds it.
 ///
-/// One store per process. The one piece of mutable state it carries is
-/// [`SpillStore::issued`] — the ids THIS process published — behind a mutex;
-/// nothing else needs one, because `put` is the only mutator and
-/// [`crate::fs_atomic`] already makes concurrent writers to the same path safe.
+/// One store per process. Its mutable state is [`SpillStore::issued`] — the
+/// ids THIS process published, each with the sequence it was published at —
+/// behind a mutex, plus two counters that need no lock of their own
+/// ([`SpillStore::next_issue_seq`] and
+/// [`field@SpillStore::dropped_own_session`], both atomics). Nothing else does,
+/// because `put` is the only mutator and [`crate::fs_atomic`] already makes
+/// concurrent writers to the same path safe.
+///
+/// **`put` being the only mutator is also a SINGLE-WRITER assumption, and it is
+/// unenforced.** No method takes `&mut self` and the type is `Sync`, so the
+/// compiler cannot serialize writers and permits two threads to `put`
+/// concurrently. Nothing today does: in `wrappers_mcp`, `put` is reachable only
+/// from the single stdin dispatch loop, and the one spawned thread (the SSE
+/// consumer) never touches the store. If a second writer ever appeared, three
+/// things break, none of them caught by a test: the write and the sequence are
+/// taken separately in `put`,
+/// so two writers can land on disk in one order and take sequences in the
+/// other, and `issue_seq` stops meaning "the order locators were handed out";
+/// a sweep running between another thread's write and its `issued` insert sees
+/// that record as foreign and under-counts the cap; and two concurrent sweeps
+/// evict from the same head of the queue, over-deleting and making
+/// [`SpillStore::enforce_byte_bound`]'s "some deletion above failed" warning
+/// blame the filesystem for a race. Give this type a real writer lock before
+/// handing it a second writer — do not assume the atomics are enough.
 #[derive(Debug)]
 pub struct SpillStore {
     /// `<app-data>/mcp-spill/` — the parent of every session's directory. The
@@ -338,9 +358,15 @@ pub struct SpillStore {
     /// order this process handed locators out, and it is free to keep.
     issued: Mutex<HashMap<String, u64>>,
     /// Hands out the next [`SpillStore::issued`] sequence number. Monotone for
-    /// the life of the process; never reused, and never reset by eviction (a
+    /// the life of THIS STORE; never reused, and never reset by eviction (a
     /// dropped record stays issued — that is what keeps the honesty counter
     /// honest).
+    ///
+    /// Per-store rather than per-process, which is the same thing in the
+    /// binary that has one but not in a test that opens two over one root. That
+    /// is not a hazard: sequences are only ever compared between records the
+    /// SAME store issued, because [`SpillStore::issued`] is what decides
+    /// [`SpillFile::ours`] and a second store's records are foreign to this one.
     next_issue_seq: AtomicU64,
     /// Spills THIS PROCESS issued that retention then deleted.
     ///
@@ -720,17 +746,25 @@ impl SpillStore {
     /// it was issued. The sequence only decides ties, which is precisely where
     /// the old key had nothing to say.
     ///
-    /// Filtering before sorting is also what keeps `issue_seq`'s `u64::MAX`
-    /// sentinel out of the comparator: a record that is not ours has no
-    /// sequence, and is neither counted nor evictable
-    /// ([`SpillFile::ours`]).
+    /// **The filter is not an optimisation and the sort is not a safety net.**
+    /// A record that is not ours has no sequence and is neither counted nor
+    /// evictable ([`SpillFile::ours`]), and because `modified` is the PRIMARY
+    /// key an unfiltered sort would interleave foreign records with ours by
+    /// mtime — so a foreign record older than everything we hold leads the
+    /// queue and is evicted first. That is not a corner case: a long-running
+    /// neighbour owns the oldest files on disk precisely because it is still
+    /// going. Dropping the filter therefore reinstates the cross-session dead
+    /// pointer [`SpillStore::enforce_byte_bound`] exists to prevent; it does
+    /// not degrade gracefully. Since `issue_seq` is an `Option`, and `None`
+    /// sorts BEFORE every `Some`, an unfiltered sort would also put foreign
+    /// records first within every mtime tie.
     ///
     /// Kept as its own function so the ordering can be tested directly, without
     /// a filesystem and without depending on a clock tick to produce the tie —
     /// the failure mode above is unreachable from a test that writes real files
     /// and hopes.
     fn evictable_oldest_first(files: &[SpillFile]) -> Vec<&SpillFile> {
-        let mut ours: Vec<&SpillFile> = files.iter().filter(|f| f.ours).collect();
+        let mut ours: Vec<&SpillFile> = files.iter().filter(|f| f.ours()).collect();
         ours.sort_by_key(|f| (f.modified, f.issue_seq));
         ours
     }
@@ -808,6 +842,8 @@ impl SpillStore {
         // `SpillFile::ours` is the entire predicate, on both sides of the
         // ledger: these are the bytes counted, and these are the files
         // deletable. See this function's doc for why they must be one set.
+        // Counting the SORTED, FILTERED vector rather than `files` is what
+        // keeps those two sides the same set by construction.
         let ours = Self::evictable_oldest_first(files);
         let mut total = ours
             .iter()
@@ -919,8 +955,7 @@ impl SpillStore {
                     path,
                     bytes: meta.len(),
                     modified: meta.modified().unwrap_or(UNIX_EPOCH),
-                    ours: issue_seq.is_some(),
-                    issue_seq: issue_seq.unwrap_or(u64::MAX),
+                    issue_seq,
                     kind,
                 });
             }
@@ -944,7 +979,7 @@ impl SpillStore {
             );
             return false;
         }
-        if f.ours {
+        if f.ours() {
             let n = self.dropped_own_session.fetch_add(1, Ordering::Relaxed) + 1;
             eprintln!(
                 "{LOG_PREFIX} WARNING dropped a spill THIS SERVER ISSUED {} ({} bytes, \
@@ -1065,26 +1100,45 @@ struct SpillFile {
     path: PathBuf,
     bytes: u64,
     modified: SystemTime,
-    /// A published record whose id THIS process issued — not merely a file in
-    /// our session directory. See [`SpillStore::issued`] for why the two are
-    /// different questions.
+    /// `Some(seq)` exactly when this is a published record whose id THIS
+    /// process issued — not merely a file in our session directory; see
+    /// [`SpillStore::issued`] for why the two are different questions — where
+    /// `seq` is its position in the sequence of locators we handed out.
+    /// `None` for a temp and for every foreign record.
     ///
-    /// **This flag IS the byte bound**, both halves of it: what it marks is
-    /// what counts against `max_own_bytes` and what may be deleted to get back
-    /// under it ([`SpillStore::enforce_byte_bound`]). [`SpillStore::collect`]
-    /// can only set it on a [`SpillKind::Record`] — a temp has no published id
-    /// — so temps and every foreign record fall outside both halves together,
-    /// which is exactly the symmetry that keeps the bound's target reachable.
-    ours: bool,
-    /// This record's position in the sequence of locators THIS process handed
-    /// out ([`SpillStore::issued`]), or `u64::MAX` when it is not ours.
-    ///
-    /// The sentinel is never compared: [`SpillStore::evictable_oldest_first`]
-    /// filters on `ours` before it sorts, so only real sequences reach the
-    /// comparator. `u64::MAX` rather than `0` so that a future reader who sorts
-    /// without filtering gets foreign records last instead of evicted first.
-    issue_seq: u64,
+    /// **One field, because it is one fact.** "Did we issue this?" and "when
+    /// did we issue it?" are answered by the same lookup in
+    /// [`SpillStore::collect`], and splitting them across a `bool` and a
+    /// sentinel `u64` let the two disagree — a `SpillFile` built by hand with
+    /// `ours: true` and a sentinel sequence would have put `u64::MAX` straight
+    /// into the comparator. As an `Option` that state cannot be written down.
+    issue_seq: Option<u64>,
     kind: SpillKind,
+}
+
+impl SpillFile {
+    /// Whether THIS process issued this record — i.e. whether it is a locator
+    /// we have already handed to a model.
+    ///
+    /// **This predicate IS the byte bound**, both halves of it: what it marks
+    /// is what counts against `max_own_bytes` and what may be deleted to get
+    /// back under it ([`SpillStore::enforce_byte_bound`]).
+    /// [`SpillStore::collect`] can only make it true for a
+    /// [`SpillKind::Record`] — a temp has no published id — so temps and every
+    /// foreign record fall outside both halves together, which is exactly the
+    /// symmetry that keeps the bound's target reachable.
+    ///
+    /// **Filtering on this is the ONLY thing that protects a neighbour's
+    /// record**, and nothing about the sort order is a second line of defence:
+    /// [`SpillStore::evictable_oldest_first`] sorts on `modified` FIRST, so an
+    /// unfiltered sort interleaves foreign records with ours by mtime and can
+    /// put one at the head of the eviction queue — reinstating precisely the
+    /// cross-session dead pointer that [`SpillStore::enforce_byte_bound`]'s doc
+    /// argues is the worst failure mode in this module. Never drop the filter
+    /// on the theory that the ordering will spare them.
+    fn ours(&self) -> bool {
+        self.issue_seq.is_some()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,32 +1493,73 @@ mod tests {
             path: PathBuf::from(format!("{seq}.spill")),
             bytes: 1_204,
             modified: tied,
-            ours,
-            issue_seq: if ours { seq } else { u64::MAX },
+            issue_seq: if ours { Some(seq) } else { None },
             kind: SpillKind::Record,
         };
 
         // Reversed on purpose — newest issued first.
         let files = vec![mk(2, true), mk(1, true), mk(0, true)];
-        let order: Vec<u64> = SpillStore::evictable_oldest_first(&files)
+        let order: Vec<Option<u64>> = SpillStore::evictable_oldest_first(&files)
             .iter()
             .map(|f| f.issue_seq)
             .collect();
         assert_eq!(
             order,
-            vec![0, 1, 2],
+            vec![Some(0), Some(1), Some(2)],
             "with mtimes tied, eviction order must be the order the locators \
              were issued — not the order the directory was walked in"
         );
 
         // And a record we did not issue is neither counted nor evictable, so it
-        // must not reach the comparator at all (its `issue_seq` is a sentinel).
+        // must not reach the comparator at all.
         let with_foreign = vec![mk(1, true), mk(0, false), mk(0, true)];
         let kept = SpillStore::evictable_oldest_first(&with_foreign);
         assert_eq!(kept.len(), 2, "a foreign record is not evictable");
         assert!(
-            kept.iter().all(|f| f.ours),
-            "the sentinel seq must never sort a foreign record into the queue"
+            kept.iter().all(|f| f.ours()),
+            "a record we did not issue must never enter the eviction queue"
+        );
+    }
+
+    #[test]
+    fn spill_eviction_keeps_mtime_primary_when_it_disagrees_with_issue_order() {
+        // The OTHER half of `evictable_oldest_first`'s rule, and the half no
+        // other test discriminates. The key is `(modified, issue_seq)`, not
+        // `(issue_seq, modified)`: mtime is PRIMARY and the sequence only
+        // breaks ties, which is what keeps behaviour byte-for-byte unchanged
+        // wherever mtime already separates two records.
+        //
+        // Every other test in this module has mtime order AGREEING with issue
+        // order — the three `age_file` tests that stamp our OWN records stamp
+        // them in issue order, and the two tie tests give both records one
+        // mtime — so the whole suite passes with the tuple swapped. (Measured,
+        // not assumed: with the key swapped to `(issue_seq, modified)` this
+        // test fails and the other 26 pass.) Only a record whose mtime moved
+        // AFTER it was issued tells the two keys apart, and that is exactly the
+        // case the function's doc calls out by name.
+        let older = SystemTime::now() - Duration::from_secs(300);
+        let newer = SystemTime::now() - Duration::from_secs(30);
+        let mk = |seq: u64, modified: SystemTime| SpillFile {
+            path: PathBuf::from(format!("{seq}.spill")),
+            bytes: 1_204,
+            modified,
+            issue_seq: Some(seq),
+            kind: SpillKind::Record,
+        };
+
+        // Issued FIRST but touched since, so it is the NEWER file on disk; and
+        // issued second but never touched, so it is the older file.
+        let files = vec![mk(0, newer), mk(1, older)];
+        let order: Vec<Option<u64>> = SpillStore::evictable_oldest_first(&files)
+            .iter()
+            .map(|f| f.issue_seq)
+            .collect();
+        assert_eq!(
+            order,
+            vec![Some(1), Some(0)],
+            "mtime must stay PRIMARY: the older file evicts first even though \
+             it was issued second — the issue sequence breaks ties, it does not \
+             override the clock"
         );
     }
 
