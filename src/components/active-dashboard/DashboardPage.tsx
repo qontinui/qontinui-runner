@@ -32,6 +32,7 @@ import type { BreakpointSnapshot } from "./types";
 import { getApiBase, tracedFetch, fetchBreakpoints, resumeBreakpoint } from "@/lib/runner-api";
 import { useTaskRunControls } from "@/hooks/graphql";
 import { createLogger } from "@/lib/logger";
+import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
 
 const log = createLogger("Dashboard");
 
@@ -518,8 +519,10 @@ export function DashboardPage({
         return;
       }
 
-      // Ctrl+R -> refresh data
-      if ((e.ctrlKey || e.metaKey) && e.key === "r") {
+      // Ctrl+R -> refresh data. Through the shared predicate so CapsLock
+      // (which reports `"R"` with no Shift held) still refreshes, and so
+      // Ctrl+SHIFT+R keeps reaching the browser's hard reload.
+      if (matchesChord(e, GLOBAL_CHORDS.dashboardRefresh)) {
         e.preventDefault();
         refresh();
         return;

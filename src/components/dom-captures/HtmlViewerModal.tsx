@@ -8,6 +8,7 @@ import { useState, useEffect, useRef } from "react";
 import { X, Copy, Download, Check, Search, Globe, FileCode, Clock, RefreshCw } from "lucide-react";
 import { useDomCaptureHtml } from "../../hooks/useDomCaptures";
 import type { DomCapture } from "../../types/domCapture";
+import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
 
 /** Format bytes to human readable size */
 function formatSize(bytes: number): string {
@@ -78,8 +79,9 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
       if (e.key === "Escape") {
         onClose();
       }
-      // Ctrl+F to focus search
-      if (e.ctrlKey && e.key === "f") {
+      // Ctrl+F to focus search. Through the shared predicate: with
+      // CapsLock on `e.key` is `"F"`, which the literal missed.
+      if (matchesChord(e, GLOBAL_CHORDS.htmlViewerSearch)) {
         e.preventDefault();
         document.getElementById("html-search")?.focus();
       }

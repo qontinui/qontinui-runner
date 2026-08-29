@@ -4,10 +4,20 @@
  * Global unified search modal triggered by Cmd+K / Ctrl+K.
  * Searches across findings, fixes, rules, errors, and workflows
  * using the knowledge graph unified search endpoint.
+ *
+ * The chord is declared in `lib/globalChords` rather than tested inline.
+ * It used to be `(e.metaKey || e.ctrlKey) && e.key === "k"` — no
+ * `shiftKey` test — so `Ctrl+Shift+k` (the lowercase `e.key` Shift
+ * reports while CapsLock is on) opened this full-screen `z-50` modal ON
+ * TOP of the terminal's `Ctrl+Shift+K` palette, and the `autoFocus`
+ * input below stole the caret. `Ctrl+Shift+K` was unaffected, which is
+ * what made it read as a CapsLock bug rather than a missing modifier
+ * test. Routing through the table is what keeps the two apart.
  */
 
 import { useEffect, useState } from "react";
 import { Search, FileText, Wrench, Brain, AlertCircle, BookOpen, Workflow } from "lucide-react";
+import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
 import { useUnifiedSearch } from "../../hooks/useGraphAnalytics";
 import type { UnifiedSearchResult } from "../../hooks/useGraphAnalytics";
 
@@ -37,7 +47,7 @@ export function CommandPalette() {
   // Cmd+K / Ctrl+K handler
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+      if (matchesChord(e, GLOBAL_CHORDS.unifiedSearch)) {
         e.preventDefault();
         setOpen((prev) => !prev);
       }
