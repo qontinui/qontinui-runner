@@ -160,8 +160,9 @@ pub(crate) fn resolve_api_base_url(
     // typing a value at this process's start, which is a deliberate act with a
     // visible cause; the persisted rung is a JSON file written once, months
     // ago, possibly by a DEBUG build of this same runner.
-    let persisted_loopback_rejected =
-        !is_debug && persisted.as_deref().is_some_and(is_loopback_backend_url);
+    let persisted_loopback_rejected = persisted
+        .as_deref()
+        .is_some_and(|p| persisted_backend_url_refused(p, is_debug));
     let persisted = if persisted_loopback_rejected {
         None
     } else {
@@ -190,6 +191,42 @@ pub(crate) fn resolve_api_base_url(
             }
         });
     (pick.trim().trim_end_matches('/').to_string(), arm)
+}
+
+/// Would a build with this `is_debug` flag REFUSE `raw` as the persisted
+/// `web_integration.backend_url`?
+///
+/// This is the SINGLE expression of the release-build loopback refusal
+/// documented on [`resolve_api_base_url`]. It exists as a named predicate
+/// rather than an inline `!is_debug && …` because the persisted field has
+/// readers OUTSIDE the four-rung ladder, and a refusal only the ladder honours
+/// is not a refusal — it is a DIVERGENCE, which is the precise fault the ladder
+/// was built to prevent.
+///
+/// # Who else has to ask
+///
+/// Two subsystems dial the persisted `backend_url` without going through
+/// [`get_api_base_url`], and both are load-bearing for the outage that
+/// motivated the refusal:
+///
+/// - [`crate::mcp::device_jwt_refresher`] MINTS the device JWT against it. The
+///   relay DIALS [`get_api_base_url`]. If only one of the two refuses, the
+///   runner mints a credential at one backend and presents it at another —
+///   re-opening the prod/local device-JWT split that the persisted rung was
+///   added to close (plan `2026-07-08-runner-relay-honor-persisted-backend-url`),
+///   only pointing the other way.
+/// - [`crate::memory::tenant_sync::resolve_web_base`] uploads the tenant's
+///   memory records to it, and its own contract is that it yields the SAME base
+///   the relay and every `/api/v1/*` caller use.
+///
+/// `is_debug` is a parameter rather than a `cfg!` so the rule stays pure and
+/// unit-testable at both settings; live callers pass `cfg!(debug_assertions)`.
+///
+/// A blank value is NOT refused — it is not loopback, it is unset, and each
+/// caller already has its own "nothing configured" branch that must keep
+/// firing.
+pub(crate) fn persisted_backend_url_refused(raw: &str, is_debug: bool) -> bool {
+    !is_debug && is_loopback_backend_url(raw)
 }
 
 /// Does this backend URL point at the LOCAL machine's loopback interface?
@@ -833,6 +870,70 @@ mod tests {
                 "release build must honour persisted remote {remote}"
             );
             assert_eq!(url, remote.trim_end_matches('/'));
+        }
+    }
+
+    /// The predicate the OUT-OF-LADDER readers ask agrees with the ladder's own
+    /// verdict, for every spelling, at both build settings.
+    ///
+    /// This is the anti-divergence assertion. `device_jwt_refresher` (which
+    /// MINTS the device JWT) and `memory::tenant_sync::resolve_web_base` (which
+    /// uploads memory records) read the persisted `backend_url` directly, so a
+    /// refusal only `resolve_api_base_url` honoured would mean the runner mints
+    /// a credential at one backend and presents it at another. Asserting the
+    /// two against each other — rather than restating the rule — is what makes
+    /// that class of drift a test failure instead of a production outage.
+    #[test]
+    fn refusal_predicate_agrees_with_the_ladder_at_both_build_settings() {
+        let loopback = [
+            "http://127.0.0.1:8000",
+            "http://LOCALHOST:8000",
+            "http://api.localhost:8000",
+            "http://127.1.2.3:8000",
+            "http://[::1]:8000",
+            "127.0.0.1:8000",
+            "::1",
+        ];
+        let remote = [
+            "https://api.qontinui.io",
+            "http://192.168.1.50:8000",
+            "https://localhost.example.test",
+            "http://128.0.0.1:8000",
+        ];
+        for is_debug in [true, false] {
+            for candidate in loopback.iter().chain(remote.iter()) {
+                let (_, arm) =
+                    resolve_api_base_url(None, None, Some((*candidate).to_string()), is_debug);
+                let ladder_refused = arm == ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected;
+                assert_eq!(
+                    persisted_backend_url_refused(candidate, is_debug),
+                    ladder_refused,
+                    "predicate and ladder must agree on {candidate} (is_debug={is_debug})"
+                );
+                // And the refusal is exactly "release AND loopback".
+                assert_eq!(
+                    ladder_refused,
+                    !is_debug && loopback.contains(candidate),
+                    "unexpected verdict for {candidate} (is_debug={is_debug})"
+                );
+            }
+        }
+    }
+
+    /// A BLANK persisted value is unset, not loopback. Both out-of-ladder
+    /// readers have their own "nothing configured" branch below the check —
+    /// the refresher's `pair_base.is_empty()` bail and `resolve_web_base`'s
+    /// fall-through — and refusing blank here would jump the queue and hide
+    /// the unconfigured case behind a loopback verdict it does not deserve.
+    #[test]
+    fn blank_persisted_backend_url_is_not_refused() {
+        for blank in ["", "   ", "\t\n"] {
+            for is_debug in [true, false] {
+                assert!(
+                    !persisted_backend_url_refused(blank, is_debug),
+                    "blank must be unset, not refused (is_debug={is_debug})"
+                );
+            }
         }
     }
 
