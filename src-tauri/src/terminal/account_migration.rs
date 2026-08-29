@@ -308,7 +308,7 @@ fn spawn_continue_nudge(terminal_id: String) {
             }
             if normalized.contains(READY_MARKER) {
                 match session.submit_prompt(CONTINUE_NUDGE) {
-                    Ok(()) => info!(terminal_id, "continue-nudge submitted to migrated session"),
+                    Ok(_) => info!(terminal_id, "continue-nudge submitted to migrated session"),
                     Err(e) => warn!(terminal_id, error = %e, "continue-nudge submit failed"),
                 }
                 return;

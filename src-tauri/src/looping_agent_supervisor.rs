@@ -562,7 +562,7 @@ async fn supervise_one(
         Action::Nudge => {
             let Some((tid, session)) = &live else { return };
             match session.submit_prompt(&playbook::nudge_prompt(&rec.def.journal_path)) {
-                Ok(()) => {
+                Ok(_) => {
                     info!(
                         agent = %rec.def.id,
                         terminal = %tid,
