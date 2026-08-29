@@ -21,10 +21,19 @@ export type { FuzzyMatch } from "./fuzzy";
 export { resolve } from "./resolve";
 export type { ResolveMatch } from "./resolve";
 
-export { applyDeclaredFlags, coerceToken, parseArgs, tokenize, unboundTokens } from "./parse";
+export {
+  applyDeclaredFlags,
+  coerceToken,
+  extractFlags,
+  parseArgs,
+  tokenize,
+  tokenizeRich,
+  unboundTokens,
+} from "./parse";
+export type { ArgOrigin, FlagHit, Token } from "./parse";
 
-export { chooseHeadMatch, hasLiteralSlashHit } from "./rank";
-export type { HeadMatch } from "./rank";
+export { chooseHeadMatch, chooseTier, didYouMean } from "./rank";
+export type { HeadMatch, TierChoice } from "./rank";
 
 export { matchPattern } from "./patterns";
 export type { PatternMatch } from "./patterns";

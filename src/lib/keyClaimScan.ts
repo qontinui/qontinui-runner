@@ -73,6 +73,46 @@
  *   resolution and no type checker, so the scan stays a pure syntactic
  *   pass over text.
  *
+ * ## The escape set THIS scanner had, and why the framing was wrong
+ *
+ * Inverting the recognition removed the regex escape set; it did not make
+ * the scanner complete, and the first version of this file said its own
+ * residual gaps were "all INTERPROCEDURAL or fully dynamic — closing them
+ * needs a type checker or a call graph". That framing was false of the
+ * largest gap it actually had, and saying it is part of why the gap went
+ * unlooked-for. Iteration 8 of the manual-test loop found nine more
+ * spellings walking straight through:
+ *
+ *     (e).ctrlKey && (e).key === "z"
+ *     e!.ctrlKey && e!.key === "z"
+ *     (e as KeyboardEvent).ctrlKey && (e as KeyboardEvent).key === "z"
+ *     e.ctrlKey && e.nativeEvent.key === "z"
+ *     e.nativeEvent.ctrlKey && e.nativeEvent.key === "z"
+ *     this.ev.ctrlKey && this.ev.key === "z"
+ *     evs[0].ctrlKey && evs[0].key === "z"
+ *     const isUndo = (ev: KeyboardEvent) => ev.ctrlKey && ev.key === "z"
+ *     switch (true) { case e.ctrlKey: if (e.key === "z") act(); }
+ *
+ * Every one is PURELY SYNTACTIC and lives in a single expression. Seven of
+ * them are one receiver test — `ts.isIdentifier(expr)` — refusing a
+ * receiver that is a parenthesis, a non-null assertion, a cast, or one hop
+ * down a chain; `nativeEvent` was already listed in {@link EVENT_NAMES}, so
+ * React's own idiom had been INTENDED to be covered and could never arrive
+ * in the node shape the test demanded. The other two are positions
+ * `guardModifiers` had no arm for: an arrow's concise body, and a
+ * `switch (true)` case clause.
+ *
+ * The miss was SILENT rather than an over-report because the receiver test
+ * was ASYMMETRIC: `positiveModifiers` matched ANY property access, so the
+ * modifier half of the claim was still seen and only the key half went
+ * missing — and a claim needs both. A pair of parentheses is
+ * Prettier-stable and reads to a reviewer as noise.
+ *
+ * All nine are closed. The residual escapes that remain really are
+ * interprocedural or nameless, and `globalChords.enforcement.test.ts`
+ * property E now pins them as CLASSES with several spellings each, plus a
+ * count — so the floor moving in EITHER direction goes red.
+ *
  * ## Not app code
  *
  * This module is imported ONLY by `globalChords.enforcement.test.ts`. It
@@ -275,6 +315,89 @@ function isNegated(node: ts.Node): boolean {
 }
 
 /**
+ * Strip the wrappers that change a receiver's SPELLING and nothing else:
+ * `(e)`, `e!`, `e as KeyboardEvent`, `<KeyboardEvent>e`, `e satisfies …`.
+ *
+ * These are the cheapest possible evasion of a receiver test, and the one
+ * a reviewer is least likely to see: a pair of parentheses is
+ * Prettier-stable and reads as noise. `(e).ctrlKey && (e).key === "z"` was
+ * a silent GREEN — not because the claim was hidden, but because the
+ * receiver was no longer an `Identifier` node. Unwrapping here means the
+ * rule is stated once and every caller inherits it.
+ */
+function unwrapReceiver(node: ts.Node): ts.Node {
+  let cur = node;
+  for (;;) {
+    if (ts.isParenthesizedExpression(cur) || ts.isNonNullExpression(cur)) {
+      cur = cur.expression;
+      continue;
+    }
+    if (ts.isAsExpression(cur) || ts.isSatisfiesExpression(cur)) {
+      cur = cur.expression;
+      continue;
+    }
+    if (ts.isTypeAssertionExpression(cur)) {
+      cur = cur.expression;
+      continue;
+    }
+    return cur;
+  }
+}
+
+/**
+ * A stable key for a RECEIVER EXPRESSION — `e`, `this.ev`, `e.nativeEvent`,
+ * `evs[0]` — or `null` when the shape is one this pass cannot name.
+ *
+ * Why a key and not an identifier name: pass 1 recorded only
+ * `ts.isIdentifier(receiver)` receivers, so a keyboard event reached
+ * through anything else was invisible to the whole scanner. `e.nativeEvent`
+ * is React's own idiom and `nativeEvent` was already in `EVENT_NAMES`, yet
+ * `e.nativeEvent.key` could never reach the test — the name was listed for
+ * a node shape that never arrived. Keying by normalized TEXT generalizes
+ * the existing "a receiver from which a modifier or an unambiguous key
+ * field is read is a keyboard event" rule to every receiver shape, without
+ * a type checker: it is the same syntactic evidence, no longer restricted
+ * to one node kind.
+ */
+function receiverKey(node: ts.Node): string | null {
+  const n = unwrapReceiver(node);
+  if (ts.isIdentifier(n)) return n.text;
+  if (n.kind === ts.SyntaxKind.ThisKeyword) return "this";
+  if (ts.isPropertyAccessExpression(n)) {
+    const base = receiverKey(n.expression);
+    return base === null ? null : `${base}.${n.name.text}`;
+  }
+  if (ts.isElementAccessExpression(n)) {
+    const base = receiverKey(n.expression);
+    if (base === null) return null;
+    const arg = n.argumentExpression;
+    const lit = literalText(arg);
+    if (lit !== null) return `${base}[${JSON.stringify(lit)}]`;
+    if (ts.isNumericLiteral(arg)) return `${base}[${arg.text}]`;
+    if (ts.isIdentifier(arg)) return `${base}[${arg.text}]`;
+    return null;
+  }
+  return null;
+}
+
+/**
+ * The trailing NAME of a receiver chain — `nativeEvent` for
+ * `e.nativeEvent`, `ev` for `this.ev`, `e` for `(e)`.
+ *
+ * This is what lets the {@link EVENT_NAMES} heuristic apply to a chain at
+ * all. Without it the heuristic only ever saw bare identifiers, so
+ * `e.ctrlKey && e.nativeEvent.key === "z"` — one modifier read short of
+ * the fully-qualified spelling — walked straight through.
+ */
+function receiverName(node: ts.Node): string | null {
+  const n = unwrapReceiver(node);
+  if (ts.isIdentifier(n)) return n.text;
+  if (ts.isPropertyAccessExpression(n)) return n.name.text;
+  if (ts.isElementAccessExpression(n)) return literalText(n.argumentExpression);
+  return null;
+}
+
+/**
  * True when the identifier is a NAME being declared or addressed rather
  * than a value being read.
  *
@@ -326,26 +449,29 @@ export function scanKeyClaims(text: string, fileName = "input.tsx"): FileScan {
     if ((ts.isParameter(n) || ts.isVariableDeclaration(n)) && n.type && ts.isIdentifier(n.name)) {
       if (/KeyboardEvent|KeyLike/.test(n.type.getText(sf))) events.add(n.name.text);
     }
-    if (ts.isPropertyAccessExpression(n) && ts.isIdentifier(n.expression)) {
+    // The receiver is keyed by NORMALIZED TEXT, not required to be an
+    // identifier: `evs[0].ctrlKey`, `this.ev.ctrlKey` and
+    // `e.nativeEvent.ctrlKey` are the same evidence as `e.ctrlKey` and were
+    // simply the wrong node kind to be seen.
+    if (ts.isPropertyAccessExpression(n)) {
       const p = n.name.text;
       if (MODIFIER_TAG.has(p) || STRONG_KEY_FIELDS.has(p) || p === "getModifierState") {
-        events.add(n.expression.text);
+        const key = receiverKey(n.expression);
+        if (key !== null) events.add(key);
       }
     }
-    if (ts.isElementAccessExpression(n) && ts.isIdentifier(n.expression)) {
+    if (ts.isElementAccessExpression(n)) {
       const lit = literalText(n.argumentExpression);
-      if (lit && (MODIFIER_TAG.has(lit) || STRONG_KEY_FIELDS.has(lit)))
-        events.add(n.expression.text);
+      if (lit && (MODIFIER_TAG.has(lit) || STRONG_KEY_FIELDS.has(lit))) {
+        const key = receiverKey(n.expression);
+        if (key !== null) events.add(key);
+      }
     }
-    if (
-      ts.isVariableDeclaration(n) &&
-      ts.isObjectBindingPattern(n.name) &&
-      n.initializer &&
-      ts.isIdentifier(n.initializer)
-    ) {
+    if (ts.isVariableDeclaration(n) && ts.isObjectBindingPattern(n.name) && n.initializer) {
       const props = n.name.elements.map((el) => (el.propertyName ?? el.name).getText(sf));
       if (props.some((p) => MODIFIER_TAG.has(p) || STRONG_KEY_FIELDS.has(p))) {
-        events.add(n.initializer.text);
+        const key = receiverKey(n.initializer);
+        if (key !== null) events.add(key);
       }
     }
     // Inline key-listener registrations: `addEventListener("keydown", fn)`,
@@ -365,8 +491,28 @@ export function scanKeyClaims(text: string, fileName = "input.tsx"): FileScan {
   };
   pass1(sf);
 
-  const isEventLike = (expr: ts.Node): boolean =>
-    ts.isIdentifier(expr) && (events.has(expr.text) || EVENT_NAMES.has(expr.text));
+  /**
+   * True when `expr` names a keyboard event.
+   *
+   * Both halves are receiver-shape-independent by construction. The
+   * SPELLING half unwraps `( )`, `!`, and `as`/`satisfies` casts, which
+   * change nothing about what is being read. The CHAIN half keys on the
+   * normalized receiver text and on the chain's trailing name, so
+   * `e.nativeEvent`, `this.ev` and `evs[0]` are recognised exactly as `e`
+   * is — the evidence was always the same, only the node kind differed.
+   *
+   * The previous `ts.isIdentifier(expr) && …` was asymmetric with
+   * `positiveModifiers`, which matches ANY `PropertyAccessExpression`. That
+   * asymmetry is why the gap was SILENT rather than an over-report: the
+   * modifier half of a claim was still seen, the key half was not, and a
+   * claim needs both.
+   */
+  const isEventLike = (expr: ts.Node): boolean => {
+    const key = receiverKey(expr);
+    if (key !== null && events.has(key)) return true;
+    const name = receiverName(expr);
+    return name !== null && EVENT_NAMES.has(name);
+  };
 
   /* ── pass 2: aliases for the key value and for the modifiers ───────── */
 
@@ -624,6 +770,24 @@ export function scanKeyClaims(text: string, fileName = "input.tsx"): FileScan {
         add(positiveModifiers(p));
       } else if (ts.isReturnStatement(p) && p.expression) {
         add(positiveModifiers(p.expression));
+      } else if (ts.isArrowFunction(p) && p.body === cur && !ts.isBlock(p.body)) {
+        // An arrow's CONCISE body is the same expression a `return` arm
+        // would carry, and it was the only statement-shaped position with
+        // no arm here. `const isUndo = (e: KeyboardEvent) => e.ctrlKey &&
+        // e.key === "z";` therefore scanned GREEN — a claim whose modifier
+        // sits three tokens from its key read, in one expression, and the
+        // single most natural way to hoist a chord test into a predicate.
+        // The `{ return … }` and ternary spellings of the same helper were
+        // both RED, which is the shape of an accident rather than a limit.
+        add(positiveModifiers(p.body, true));
+      } else if (ts.isCaseClause(p) && p.expression !== cur) {
+        // `switch (true) { case e.ctrlKey: … }` — the discriminant is the
+        // literal `true` and the assertion lives in the CLAUSE. The switch
+        // arm above reads only the discriminant, so the clause's own test
+        // was never consulted. Excluded when the read IS the clause
+        // expression, which is the ordinary `switch (e.key) { case … }`
+        // registry the switch arm already handles.
+        add(positiveModifiers(p.expression, true));
       }
       // A preceding `if (!e.ctrlKey) return;` in the same block asserts the
       // modifier for everything after it — see `inheritedGuards`.

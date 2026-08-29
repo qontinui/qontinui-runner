@@ -54,7 +54,8 @@ import {
   getAll,
   interpretCommand,
   applyDeclaredFlags,
-  chooseHeadMatch,
+  chooseTier,
+  didYouMean,
   matchPattern,
   parseArgs,
   unboundTokens,
@@ -234,7 +235,7 @@ export function CommandBar() {
       confidence?: number;
     };
     const tier1 = resolve(query, recents);
-    const head = chooseHeadMatch(tier1, matchPattern(query), tier3Match);
+    const { head } = chooseTier(tier1, matchPattern(query), tier3Match);
     const headMatch: LocalMatch | null = head
       ? {
           action: head.action,
@@ -389,7 +390,24 @@ export function CommandBar() {
       // `--tenant` and the handler's tenant guard never ran. Any future
       // declared flag would have inherited that silently; it is a
       // route-independent step now so it cannot.
-      const args = applyDeclaredFlags(presetArgs ?? parseArgs(rawInput, action), rawInput, action);
+      // `origin` is load-bearing, not bookkeeping: the parsed bag was built
+      // from the raw input with its quoting intact, so re-scanning its string
+      // fields can only destroy information (it deleted words out of a quoted
+      // prompt — `parse.ts::applyDeclaredFlags`). A preset bag never saw the
+      // schema and still carries raw text, so it gets the full treatment.
+      const preset = presetArgs !== undefined;
+      const args = applyDeclaredFlags(
+        preset ? presetArgs : parseArgs(rawInput, action),
+        rawInput,
+        action,
+        preset ? "preset" : "parsed",
+      );
+      // A Tier-2 phrasing the literal slash outranked because it names a
+      // COSTLY (or destructive) neighbour. The protection stays — `/spawn`
+      // must not launch paid sessions — but it stops being a dead end: every
+      // failure verdict below names the command that would have run.
+      const hint = didYouMean(rawInput, action, matchPattern(rawInput));
+      const withHint = (text: string): string => (hint ? `${text} — ${hint}` : text);
       // Trailing junk on a no-argument command. Only the SLASH route can
       // carry it — Tier-2/Tier-3 arrive with `presetArgs` already bound —
       // and only for an empty schema, where `parseArgs`'s catch-all is
@@ -400,7 +418,7 @@ export function CommandBar() {
         if (extra.length > 0) {
           setStatus({
             kind: "error",
-            text: `${action.slash}: takes no arguments (got "${extra.join(" ")}")`,
+            text: withHint(`${action.slash}: takes no arguments (got "${extra.join(" ")}")`),
           });
           return;
         }
@@ -412,7 +430,7 @@ export function CommandBar() {
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        setStatus({ kind: "error", text: `${action.slash}: ${message}` });
+        setStatus({ kind: "error", text: withHint(`${action.slash}: ${message}`) });
         return;
       }
       if (result.ok) {
@@ -433,7 +451,7 @@ export function CommandBar() {
       } else {
         setStatus({
           kind: "error",
-          text: `${action.slash}: ${result.message ?? result.code}`,
+          text: withHint(`${action.slash}: ${result.message ?? result.code}`),
         });
       }
     },
@@ -521,9 +539,18 @@ export function CommandBar() {
       // If the user clicks an action that takes args and they haven't typed
       // any AND we didn't pattern-match preset args, populate the input
       // rather than executing — they probably wanted to fill in the args.
+      //
+      // "Pattern-matched preset args" means args the pattern actually BOUND,
+      // not merely that a pattern matched. Since a literal slash now yields
+      // to its own Tier-2 pattern (`rank.ts::chooseTier`), a bare `/close`
+      // arrives here with `presetArgs: {}` — the zone group is optional and
+      // matched nothing. Reading that as "the pattern filled the args in"
+      // turned a CLICK on the `/close` row from "prefill `/close ` so I can
+      // name a zone" into "close the focused zone now".
       const hasArgs = action.paramSchema && Object.keys(action.paramSchema).length > 0;
       const argsTyped = query.trim().length > action.slash.length;
-      if (hasArgs && !argsTyped && !presetArgs) {
+      const presetBound = presetArgs !== undefined && Object.keys(presetArgs).length > 0;
+      if (hasArgs && !argsTyped && !presetBound) {
         // No `setSelectedIdx(idx)` here: `idx` indexes the list built for
         // the OLD query, and the new query (`/slash `) is an exact hit
         // resolving to a single row. The derived reset above puts the

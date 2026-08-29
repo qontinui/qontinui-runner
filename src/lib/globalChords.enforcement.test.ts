@@ -332,6 +332,36 @@ const OFFENDERS: Array<[string, string]> = [
     'const { key, shiftKey, ctrlKey } = e;\n  if (ctrlKey && !shiftKey) { if (key === "Home") act(); }',
     "GREEN — `scrollKeys.ts`'s own live spelling",
   ],
+
+  // ── the AST scanner's OWN escape set: GREEN against it until iteration 8
+  //    (D6). Every one is a RECEIVER spelled a way `ts.isIdentifier` could
+  //    not see — a pair of parentheses, a non-null assertion, a cast, or one
+  //    hop down a chain. Purely syntactic, single-expression, no type
+  //    checker involved; the claim was never hidden, only its receiver's
+  //    node kind. The asymmetry that made the miss SILENT: `positiveModifiers`
+  //    matched ANY property access, so the modifier half was still seen and
+  //    only the key half went missing — and a claim needs both.
+  ['(e).ctrlKey && (e).key === "z";', "GREEN — parenthesised receiver"],
+  ['e!.ctrlKey && e!.key === "z";', "GREEN — non-null-asserted receiver"],
+  [
+    '(e as KeyboardEvent).ctrlKey && (e as KeyboardEvent).key === "z";',
+    "GREEN — cast receiver",
+  ],
+  ['e.ctrlKey && e.nativeEvent.key === "z";', "GREEN — React's `nativeEvent`, one hop"],
+  ['e.nativeEvent.ctrlKey && e.nativeEvent.key === "z";', "GREEN — `nativeEvent` on both halves"],
+  ['this.ev.ctrlKey && this.ev.key === "z";', "GREEN — member receiver"],
+  ['evs[0].ctrlKey && evs[0].key === "z";', "GREEN — indexed receiver"],
+  [
+    'const isUndo = (ev: KeyboardEvent) => ev.ctrlKey && ev.key === "z";',
+    "GREEN — an arrow's CONCISE body: the modifier and the key read are three " +
+      "tokens apart in ONE expression, and it was the only statement-shaped " +
+      "position with no arm in `guardModifiers`. The `{ return … }` and ternary " +
+      "spellings of the same helper were both RED.",
+  ],
+  [
+    'switch (true) { case e.ctrlKey: if (e.key === "z") act(); }',
+    "GREEN — assertion in the CASE CLAUSE, not the discriminant",
+  ],
 ];
 
 /**
@@ -378,71 +408,240 @@ describe("the scanner can actually fail", () => {
   });
 
   /**
-   * The limits of THIS mechanism, probed and pinned.
+   * The limits of THIS mechanism, probed and pinned AS CLASSES.
    *
    * A mechanism whose limits have not been probed is not verified — that
    * is the lesson of the previous five, each of which was believed
    * complete until the next spelling arrived. So the residual escapes are
    * written down rather than discovered later.
    *
-   * `RED` rows are spellings this scanner DOES catch and the regex did
-   * not; they are here so a refactor that quietly loses one goes red.
-   * `GREEN` rows are honest gaps. All four are INTERPROCEDURAL or
-   * fully dynamic — the key value or the modifier crosses a function
-   * boundary the syntactic pass cannot follow — and closing them needs a
-   * type checker or a call graph, not another rule. None of the four is
-   * live in `src/` today; they are recorded so the next reader knows
-   * exactly where the floor is.
+   * ## Why classes and not strings
+   *
+   * The previous version pinned TEN LITERAL SNIPPETS, which cannot go red
+   * when the floor MOVES — only when one of those exact strings does. Two
+   * spellings one token away from a pinned row were unpinned and behaved
+   * differently from nothing at all: `Object.values(e).at(3)` and
+   * `MODS.some(…)`. What is pinned here instead is a CLASS plus several
+   * spellings OF that class, and the assertion is that every spelling
+   * agrees with its class's verdict. A variant that disagrees is either a
+   * new escape or a floor that has shrunk, and both have to be written
+   * down before this file goes green again. The COUNT of escaping classes
+   * is pinned separately, so neither direction can pass silently.
+   *
+   * ## The framing that was wrong
+   *
+   * The previous version said its four escapes were "all INTERPROCEDURAL
+   * or fully dynamic — closing them needs a type checker or a call graph".
+   * That was false of the largest class it had, and the claim is what made
+   * the class invisible: a receiver spelled `(e)`, `e!`, `(e as
+   * KeyboardEvent)` or `e.nativeEvent` is purely SYNTACTIC and lives in a
+   * single expression. It needed a receiver unwrap and a chain-aware rule,
+   * not a compiler. So did an arrow's concise body. Both are closed above.
+   *
+   * What remains is genuinely interprocedural or genuinely nameless, and
+   * says so per class.
    */
-  const ESCAPE_PROBES: Array<[string, boolean, string]> = [
-    [
-      'const t = e; const u = t; if (u.ctrlKey && u.key === "z") act();',
-      true,
-      "two-hop event alias",
-    ],
-    [
-      'const k2 = e.key; const k3 = k2; if (e.ctrlKey && k3 === "z") act();',
-      true,
-      "two-hop key alias",
-    ],
-    [
-      'if (e.ctrlKey) { const f = () => { if (e.key === "z") act(); }; f(); }',
-      true,
-      "key test in a closure under a modifier guard",
-    ],
-    ['const F = "key"; e.ctrlKey && e[F] === "z";', true, "dynamic field name"],
-    ['e.ctrlKey && Reflect.get(e, "key") === "z";', true, "Reflect.get"],
-    ['const { ["key"]: k } = e; e.ctrlKey && k === "z";', true, "computed binding property"],
-    // ── the floor ──
-    [
-      'function h(x) { if (x.key === "z") act(); } if (e.ctrlKey) h(e);',
-      false,
-      "ESCAPES: key test in a helper whose parameter is neither event-named nor typed — " +
-        "the modifier is in the caller, the key test in the callee",
-    ],
-    [
-      'const g = (o) => o.key; e.ctrlKey && g(e) === "z";',
-      false,
-      "ESCAPES: the key value is extracted by a helper and returned",
-    ],
-    [
-      'const MODS = ["ctrlKey"]; if (MODS.every((m) => e[m])) { if (e.key === "z") act(); }',
-      false,
-      "ESCAPES: modifier asserted through a data table inside a nested callback — " +
-        "`positiveModifiers` must not descend into nested functions, or an unrelated " +
-        "`e.ctrlKey` deep in a handler would taint every bare-key test in it",
-    ],
-    [
-      'e.ctrlKey && Object.values(e)[3] === "z";',
-      false,
-      "ESCAPES: positional read off `Object.values`, no field name anywhere",
-    ],
+  interface ProbeClass {
+    /** What the class IS — the property, not one of its spellings. */
+    name: string;
+    /** True when the scanner catches EVERY spelling below. */
+    caught: boolean;
+    /** Why it escapes. Required when `caught` is false. */
+    why?: string;
+    /** Several spellings of the SAME class. All must agree with `caught`. */
+    spellings: string[];
+  }
+
+  const PROBE_CLASSES: ProbeClass[] = [
+    {
+      name: "event alias chain",
+      caught: true,
+      spellings: [
+        'const t = e; const u = t; if (u.ctrlKey && u.key === "z") act();',
+        'const t = e; const u = t; const v = u; if (v.ctrlKey && v.key === "z") act();',
+      ],
+    },
+    {
+      name: "key alias chain",
+      caught: true,
+      spellings: [
+        'const k2 = e.key; const k3 = k2; if (e.ctrlKey && k3 === "z") act();',
+        'const k2 = e.key; if (e.ctrlKey && k2 === "z") act();',
+      ],
+    },
+    {
+      name: "key test in a closure under a modifier guard",
+      caught: true,
+      spellings: [
+        'if (e.ctrlKey) { const f = () => { if (e.key === "z") act(); }; f(); }',
+        'if (e.ctrlKey) { [1].forEach(() => { if (e.key === "z") act(); }); }',
+      ],
+    },
+    {
+      name: "dynamic field name",
+      caught: true,
+      spellings: [
+        'const F = "key"; e.ctrlKey && e[F] === "z";',
+        'const FIELDS = ["key"]; e.ctrlKey && e[FIELDS[0]] === "z";',
+      ],
+    },
+    {
+      name: "Reflect.get",
+      caught: true,
+      spellings: [
+        'e.ctrlKey && Reflect.get(e, "key") === "z";',
+        'const F2 = "key"; e.ctrlKey && Reflect.get(e, F2) === "z";',
+      ],
+    },
+    {
+      name: "computed / renamed binding property",
+      caught: true,
+      spellings: [
+        'const { ["key"]: k } = e; e.ctrlKey && k === "z";',
+        'const { key: k, ctrlKey: c } = e; if (c && k === "z") act();',
+      ],
+    },
+    {
+      // Closed by D6 of manual-test-loop iteration 8.
+      name: "receiver spelled around the identifier test",
+      caught: true,
+      spellings: [
+        '(e).ctrlKey && (e).key === "z";',
+        'e!.ctrlKey && e!.key === "z";',
+        '(e as KeyboardEvent).ctrlKey && (e as KeyboardEvent).key === "z";',
+        '((e))!.ctrlKey && ((e as KeyboardEvent)).key === "z";',
+        'e.ctrlKey && e.nativeEvent.key === "z";',
+        'e.nativeEvent.ctrlKey && e.nativeEvent.key === "z";',
+        'this.ev.ctrlKey && this.ev.key === "z";',
+        'evs[0].ctrlKey && evs[0].key === "z";',
+        'const g = { e }; g.e.ctrlKey && g.e.key === "z";',
+        'e?.ctrlKey && e?.key === "z";',
+      ],
+    },
+    {
+      // Also closed by iteration 8 — found by probing for a SIXTH class
+      // rather than by re-reading the five that were already written down.
+      name: "modifier and key read in an expression-bodied position",
+      caught: true,
+      spellings: [
+        'const isUndo = (ev: KeyboardEvent) => ev.ctrlKey && ev.key === "z";',
+        'const isUndo2 = (ev: KeyboardEvent) => ev.ctrlKey && /^[a-z]$/.test(ev.key);',
+        'switch (true) { case e.ctrlKey: if (e.key === "z") act(); }',
+        'switch (true) { case e.ctrlKey && !e.shiftKey: if (e.key === "z") act(); }',
+      ],
+    },
+    {
+      // Was an ESCAPE until iteration 8: the arrow-concise-body arm above
+      // reaches the dynamic `e[m]` inside the callback, which the scanner
+      // already counts as both a possible key read and a possible modifier
+      // assertion. The floor SHRANK; recording that is the point of pinning
+      // a class rather than a string.
+      name: "modifier asserted through a data table inside a nested callback",
+      caught: true,
+      spellings: [
+        'const MODS = ["ctrlKey"]; if (MODS.every((m) => e[m])) { if (e.key === "z") act(); }',
+        'const MODS = ["ctrlKey"]; if (MODS.some((m) => e[m])) { if (e.key === "z") act(); }',
+        'const MODS = ["ctrlKey"]; if (MODS.filter((m) => e[m]).length > 0) { if (e.key === "z") act(); }',
+      ],
+    },
+
+    /* ── the floor ── */
+
+    {
+      name: "key test in a helper whose parameter is neither event-named nor typed",
+      caught: false,
+      why:
+        "ESCAPES, interprocedural: the modifier is in the CALLER and the key test in " +
+        "the callee, and the callee's receiver carries no evidence at all — no typed " +
+        "parameter, no conventional name, no unambiguous field read. Closing it needs " +
+        "a call graph.",
+      spellings: [
+        'function h(x) { if (x.key === "z") act(); } if (e.ctrlKey) h(e);',
+        'const h2 = (x) => { if (x.key === "z") act(); }; if (e.ctrlKey) h2(e);',
+      ],
+    },
+    {
+      name: "key test in a helper whose parameter IS a recognised event",
+      caught: false,
+      why:
+        "ESCAPES, interprocedural, and STRICTLY WEAKER than the class above — the " +
+        "receiver is recognised (`x: KeyboardEvent`), the key READ is counted, and only " +
+        "the modifier is missing because it is asserted at the call site. This is the " +
+        "refactor a reader reaches for when hoisting a chord test out of a handler, so " +
+        "it is the escape most likely to be written by accident. Closing it needs the " +
+        "same call graph: the guard walk would have to follow `h(e)` into `h`.",
+      spellings: [
+        'function h3(x: KeyboardEvent) { if (x.key === "z") act(); } if (e.ctrlKey) h3(e);',
+        'const h4 = (x: KeyboardEvent) => { if (x.key === "z") act(); }; if (e.ctrlKey) h4(e);',
+        'function h5(ev) { if (ev.key === "z") act(); } if (e.ctrlKey) h5(e);',
+      ],
+    },
+    {
+      name: "the key value is extracted by a helper and returned",
+      caught: false,
+      why:
+        "ESCAPES, interprocedural: the field name is read inside the helper and only " +
+        "its VALUE crosses back, so nothing at the comparison site names a key field.",
+      spellings: [
+        'const g = (o) => o.key; e.ctrlKey && g(e) === "z";',
+        'function g2(o) { return o.key; } e.ctrlKey && g2(e) === "z";',
+      ],
+    },
+    {
+      name: "positional read with no field name anywhere",
+      caught: false,
+      why:
+        "ESCAPES, fully dynamic: the key is addressed by POSITION in a derived " +
+        "collection, so there is no field name, no receiver, and no literal for any " +
+        "syntactic rule to key on.",
+      spellings: [
+        'e.ctrlKey && Object.values(e)[3] === "z";',
+        'e.ctrlKey && Object.values(e).at(3) === "z";',
+        'e.ctrlKey && Object.entries(e)[3][1] === "z";',
+      ],
+    },
   ];
 
-  it("has exactly the residual escapes it says it has", () => {
-    for (const [snippet, caught, why] of ESCAPE_PROBES) {
-      expect(claimsInSnippet(snippet).length > 0, `${why}: ${snippet}`).toBe(caught);
-      expect(claimsInRealFile(snippet).length > 0, `in-file — ${why}: ${snippet}`).toBe(caught);
+  /** The floor, as a NUMBER, so shrinking it is as loud as growing it. */
+  const ESCAPING_CLASS_COUNT = 4;
+
+  it("catches every spelling of every class it claims to catch", () => {
+    for (const c of PROBE_CLASSES.filter((x) => x.caught)) {
+      for (const snippet of c.spellings) {
+        expect(claimsInSnippet(snippet).length, `${c.name}: ${snippet}`).toBeGreaterThan(0);
+        expect(
+          claimsInRealFile(snippet).length,
+          `in-file — ${c.name}: ${snippet}`,
+        ).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("escapes on every spelling of every class it admits escaping", () => {
+    // The direction that matters most: a variant of a declared escape that
+    // is quietly CAUGHT means the floor moved and this file did not say so.
+    for (const c of PROBE_CLASSES.filter((x) => !x.caught)) {
+      expect(c.why, `${c.name} must say why it escapes`).toBeTruthy();
+      for (const snippet of c.spellings) {
+        expect(claimsInSnippet(snippet), `${c.name}: ${snippet}`).toEqual([]);
+        expect(claimsInRealFile(snippet), `in-file — ${c.name}: ${snippet}`).toEqual([]);
+      }
+    }
+  });
+
+  it("has exactly the number of escaping classes it declares", () => {
+    const escaping = PROBE_CLASSES.filter((c) => !c.caught);
+    expect(escaping.map((c) => c.name)).toEqual([
+      "key test in a helper whose parameter is neither event-named nor typed",
+      "key test in a helper whose parameter IS a recognised event",
+      "the key value is extracted by a helper and returned",
+      "positional read with no field name anywhere",
+    ]);
+    expect(escaping).toHaveLength(ESCAPING_CLASS_COUNT);
+    // Every class carries more than one spelling, or it is a pinned string
+    // wearing a class's name — the exact defect this rework replaced.
+    for (const c of PROBE_CLASSES) {
+      expect(c.spellings.length, `${c.name} needs >1 spelling`).toBeGreaterThan(1);
     }
   });
 
