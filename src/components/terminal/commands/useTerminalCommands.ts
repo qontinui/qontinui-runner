@@ -577,6 +577,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     slash: "/spawn-ai",
     aliases: ["/spawn-best"],
     label: "Spawn AI session",
+    // The one action on this page that SPENDS. `rank.ts::chooseTier` reads
+    // it: a literal `/spawn 3 best` is never rerouted here behind the
+    // operator's back — it errors and NAMES this command instead.
+    costly: true,
     description:
       'Spawn N Claude CLI sessions in a specific account. account="best" picks the ' +
       "lowest-utilization account. context (optional) is typed after `claude` starts.",

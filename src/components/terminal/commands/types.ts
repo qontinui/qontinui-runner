@@ -112,6 +112,19 @@ export interface CommandAction<TArgs = Record<string, unknown>, TResult = unknow
   patterns?: RegExp[];
   /** Requires a confirm modal before execution. See plan §5(3). */
   destructive?: boolean;
+  /**
+   * Running this SPENDS something the operator cannot get back — metered
+   * AI capacity, in the one case that exists today (`terminal.spawn-ai`).
+   *
+   * Read by `rank.ts::chooseTier`. A LITERAL slash form is never rerouted
+   * INTO a costly action by a Tier-2 pattern, because typing `/spawn` must
+   * not silently launch paid Claude sessions; it is rerouted freely into a
+   * free one, because guessing right there costs nothing (`/focus mode` →
+   * `/focus-mode`). Declared here rather than as a list of ids in the
+   * ranker so the next action that must not be auto-reached says so about
+   * itself, next to the handler that does the spending.
+   */
+  costly?: boolean;
   /** Pre-state snapshot captured by the executor for Undo. */
   undoable?: boolean;
   /** The action body. */
