@@ -25,7 +25,8 @@
  * OUT of positional binding; it is filled only by `--name value` or
  * `--name=value` anywhere on the line (see `FLAG_PREFIX`). Added for
  * `/spawn-ai --tenant <slug|uuid>`, whose optionality can't be expressed
- * positionally alongside a free-form trailing prompt.
+ * positionally alongside a free-form trailing prompt. A flag spelling
+ * inside a QUOTED run is prompt text, never syntax — see {@link Token}.
  */
 
 import type { CommandAction } from "./types";
@@ -45,31 +46,79 @@ import type { CommandAction } from "./types";
 export const FLAG_PREFIX = "--";
 
 /**
- * Split a string into whitespace-separated tokens, treating
- * double-quoted runs as a single token. Quotes are stripped from
- * the resulting tokens.
+ * One token, WITH the fact that decided whether it is text or syntax.
+ *
+ * `quoted` is the whole reason this type exists. {@link tokenize} strips
+ * the quote characters, and a stripped token is indistinguishable from one
+ * the operator never quoted — which is how `/spawn-ai 1 gmail "--tenant"`
+ * came to read its PROMPT as a declared flag (supplied-but-empty tenant,
+ * zero terminals), and how a quoted `--tenant` inside a longer prompt came
+ * to eat the word after it. Quoting is not decoration on this surface; it
+ * is the operator saying "this run is text", and every consumer that
+ * decides text-vs-syntax needs to hear it.
  */
-export function tokenize(input: string): string[] {
-  const tokens: string[] = [];
+export interface Token {
+  /** The token's text, with the surrounding quote characters removed. */
+  text: string;
+  /**
+   * True when the token BEGAN inside a double-quoted run — i.e. the
+   * operator opened a quote before any of its characters.
+   *
+   * Deliberately "began", not "contains": `--tenant="my org"` is a FLAG
+   * whose value happens to be quoted, and reading it as prompt text would
+   * break the one spelling that always worked.
+   */
+  quoted: boolean;
+}
+
+/**
+ * Split a string into whitespace-separated tokens, treating double-quoted
+ * runs as a single token, and REPORT which tokens were quoted.
+ *
+ * {@link tokenize} is the text-only projection of this; use that where the
+ * quoting genuinely does not matter, and this everywhere a token's meaning
+ * depends on whether the operator quoted it.
+ */
+export function tokenizeRich(input: string): Token[] {
+  const tokens: Token[] = [];
   let current = "";
+  let quoted = false;
   let inQuote = false;
+  const flush = (): void => {
+    if (current.length > 0) tokens.push({ text: current, quoted });
+    current = "";
+    quoted = false;
+  };
   for (let i = 0; i < input.length; i++) {
     const c = input[i];
     if (c === '"') {
+      // The quote OPENS the token → the token is text, not syntax. A quote
+      // that opens after content (`--tenant="x y"`) leaves the token alone.
+      if (current.length === 0 && !inQuote) quoted = true;
       inQuote = !inQuote;
       continue;
     }
     if (!inQuote && /\s/.test(c)) {
-      if (current.length > 0) {
-        tokens.push(current);
-        current = "";
-      }
+      flush();
       continue;
     }
     current += c;
   }
-  if (current.length > 0) tokens.push(current);
+  flush();
   return tokens;
+}
+
+/**
+ * Split a string into whitespace-separated tokens, treating
+ * double-quoted runs as a single token. Quotes are stripped from
+ * the resulting tokens.
+ *
+ * Byte-for-byte the old behaviour — it is {@link tokenizeRich} with the
+ * quoting dropped, so the two can never disagree about where the token
+ * boundaries are.
+ */
+export function tokenize(input: string): string[] {
+  return tokenizeRich(input).map((t) => t.text);
 }
 
 /**
@@ -85,17 +134,51 @@ export function coerceToken(token: string): string | number {
 }
 
 /**
+ * One declared flag as it was actually spelled on the line.
+ *
+ * `consumed` is what makes the SCRUB in {@link applyDeclaredFlags}
+ * precise rather than a re-parse. A re-parse over already-bound text asks
+ * "does this look like a flag?", which is a question the text can no
+ * longer answer once its quoting is gone; `consumed` asks "is this the
+ * exact run the operator typed as a flag?", which it can.
+ */
+export interface FlagHit {
+  /** Bare flag name, without {@link FLAG_PREFIX}. */
+  name: string;
+  /** The coerced value bound for the flag. */
+  value: string | number;
+  /**
+   * The token TEXTS this flag consumed, in order: one for `--name=value`,
+   * two for `--name value`.
+   */
+  consumed: string[];
+}
+
+/** Normalize a mixed token list to {@link Token}s. A bare string is
+ *  UNQUOTED — the callers that pass strings are tests and callers for
+ *  whom quoting genuinely cannot apply. */
+function asTokens(tokens: readonly (string | Token)[]): Token[] {
+  return tokens.map((t) => (typeof t === "string" ? { text: t, quoted: false } : t));
+}
+
+/**
  * Split declared `--flags` (see [`FLAG_PREFIX`]) out of a token stream.
- * Returns the parsed flag values keyed by bare name, plus the remaining
- * tokens in order for positional binding.
+ * Returns the parsed flag values keyed by bare name, the remaining tokens
+ * in order for positional binding, and the per-flag {@link FlagHit}s.
+ *
+ * A QUOTED token is never a flag NAME. `/spawn-ai 1 gmail "--tenant"` is
+ * an operator quoting their prompt, and reading it as a bare declared flag
+ * answered "tenant was supplied but empty" and spawned nothing. A quoted
+ * token is still usable as a flag's VALUE (`--tenant "my org"`), because
+ * there the quoting is about the value's spaces, not about its meaning.
  *
  * Exported for unit tests — the ordering guarantee (flags never disturb
  * positional fields) is the whole point of the pre-pass.
  */
 export function extractFlags(
-  tokens: string[],
-  schemaKeys: string[],
-): { flags: Record<string, unknown>; rest: string[] } {
+  tokens: readonly (string | Token)[],
+  schemaKeys: readonly string[],
+): { flags: Record<string, unknown>; rest: string[]; hits: FlagHit[] } {
   // Only keys the action DECLARED as flags (`--name` in its paramSchema) are
   // recognized. An unknown `--foo` stays in the positional stream so a
   // free-form `context` prompt containing a dash-dash word survives intact.
@@ -104,27 +187,31 @@ export function extractFlags(
   );
   const flags: Record<string, unknown> = {};
   const rest: string[] = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-    if (!token.startsWith(FLAG_PREFIX)) {
-      rest.push(token);
+  const hits: FlagHit[] = [];
+  const list = asTokens(tokens);
+  for (let i = 0; i < list.length; i++) {
+    const token = list[i];
+    if (token.quoted || !token.text.startsWith(FLAG_PREFIX)) {
+      rest.push(token.text);
       continue;
     }
-    const body = token.slice(FLAG_PREFIX.length);
+    const body = token.text.slice(FLAG_PREFIX.length);
     const eq = body.indexOf("=");
     // `--name=value`
     if (eq > 0) {
       const name = body.slice(0, eq);
       if (known.has(name)) {
-        flags[name] = coerceToken(body.slice(eq + 1));
+        const value = coerceToken(body.slice(eq + 1));
+        flags[name] = value;
+        hits.push({ name, value, consumed: [token.text] });
         continue;
       }
-      rest.push(token);
+      rest.push(token.text);
       continue;
     }
     // `--name value` — consumes the NEXT token as the value.
     if (known.has(body)) {
-      const next = tokens[i + 1];
+      const next = list[i + 1];
       // A declared flag with nothing usable after it was SUPPLIED and left
       // EMPTY — the same state as `--name=`, and it must read as the same
       // state. Leaving the token in the positional stream instead made
@@ -133,28 +220,79 @@ export function extractFlags(
       // the literal flag text was typed into the new session as its prompt.
       if (next === undefined || isDeclaredFlagToken(next, known)) {
         flags[body] = "";
+        hits.push({ name: body, value: "", consumed: [token.text] });
         continue;
       }
-      flags[body] = coerceToken(next);
+      const value = coerceToken(next.text);
+      flags[body] = value;
+      hits.push({ name: body, value, consumed: [token.text, next.text] });
       i++;
       continue;
     }
-    rest.push(token);
+    rest.push(token.text);
   }
-  return { flags, rest };
+  return { flags, rest, hits };
 }
 
-/** True when `token` spells one of the `known` declared flags. */
-function isDeclaredFlagToken(token: string, known: ReadonlySet<string>): boolean {
-  if (!token.startsWith(FLAG_PREFIX)) return false;
-  const body = token.slice(FLAG_PREFIX.length);
+/** True when `token` spells one of the `known` declared flags. A QUOTED
+ *  token never does — it is the flag's value, not the next flag. */
+function isDeclaredFlagToken(token: Token, known: ReadonlySet<string>): boolean {
+  if (token.quoted || !token.text.startsWith(FLAG_PREFIX)) return false;
+  const body = token.text.slice(FLAG_PREFIX.length);
   const eq = body.indexOf("=");
   return known.has(eq > 0 ? body.slice(0, eq) : body);
 }
 
 /**
- * Merge an action's DECLARED `--flags` into an already-bound arg bag, and
- * scrub the flag text out of any string field that swallowed it.
+ * Remove the EXACT runs `hits` consumed from an already-bound field value,
+ * and return the value re-joined with its quoting resolved.
+ *
+ * Exact-run removal, not a re-parse. A re-parse over this text was the D1
+ * defect: `context: "fix the --tenant handling"` (quotes already gone) was
+ * re-scanned, `--tenant` read as a bare declared flag, and it ate the word
+ * after it — so `/spawn-ai 1 gmail --tenant=2299 "fix the --tenant
+ * handling"` typed `fix the` into the new session and the top-level
+ * `tenant` overwrote the swallowed one, making the loss invisible.
+ *
+ * Matching on `consumed` cannot do that: it removes only text the operator
+ * really typed as a top-level flag, once per occurrence, and never a token
+ * that opened with a quote.
+ */
+function stripFlagRuns(value: string, hits: readonly FlagHit[]): { text: string; removed: number } {
+  const toks = tokenizeRich(value);
+  let removed = 0;
+  for (const hit of hits) {
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i];
+      if (t.quoted || t.text !== hit.consumed[0]) continue;
+      if (hit.consumed.length === 2 && toks[i + 1]?.text !== hit.consumed[1]) continue;
+      toks.splice(i, hit.consumed.length);
+      removed++;
+      break;
+    }
+  }
+  return { text: toks.map((t) => t.text).join(" "), removed };
+}
+
+/**
+ * Where an arg bag came from — which decides whether its string fields
+ * still carry the operator's RAW text or have already been normalized.
+ *
+ * This distinction is the D1 fix. The previous version had no notion of
+ * origin and re-scanned every route's bound fields, so on the SLASH route
+ * it re-parsed text {@link parseArgs} had already stripped of both flags
+ * and quotes, and deleted words out of the operator's prompt.
+ */
+export type ArgOrigin =
+  /** {@link parseArgs} produced the bag from the raw input, quoting intact. */
+  | "parsed"
+  /** A higher tier (a Tier-2 regex group, Tier-3 model output) bound it
+   *  from text that never saw the action's `paramSchema`. */
+  | "preset";
+
+/**
+ * Merge an action's DECLARED `--flags` into a PRESET arg bag, and resolve
+ * the raw text its string fields still carry.
  *
  * This is the route-independent half of flag handling, and it exists because
  * making it a property of {@link parseArgs} made it a property of ONE ROUTE.
@@ -169,48 +307,87 @@ function isDeclaredFlagToken(token: string, known: ReadonlySet<string>): boolean
  * A per-flag recovery in the handler (the deleted `splitTenantFlag`) closed
  * that for `--tenant` only; the next declared flag would inherit the bug
  * silently, and any future pattern with a `.+` tail would re-open it. So the
- * extraction is applied to EVERY route's args instead, from the RAW INPUT,
- * which is the only text guaranteed to still carry the flag whatever the
- * matching tier did with it.
+ * extraction is applied to EVERY PRESET route's args instead, from the RAW
+ * INPUT, which is the only text guaranteed to still carry the flag whatever
+ * the matching tier did with it.
  *
- * A no-op for actions declaring no flags, and idempotent on the slash route
- * where {@link parseArgs} already stripped them.
+ * ## `"parsed"` is a NO-OP, and the claim that it was "idempotent" was false
+ *
+ * The previous version said this step was "idempotent on the slash route
+ * where `parseArgs` already stripped them". It was not, and the difference
+ * cost an operator their prompt:
+ *
+ *     /spawn-ai 1 gmail --tenant=2299 "fix the --tenant handling"
+ *       status  /spawn-ai ✓   tenant  2299…  (correct)
+ *       typed into the session:  "fix the"   ← "--tenant handling" DELETED
+ *
+ * `parseArgs` had already bound `context: "fix the --tenant handling"` —
+ * correctly, because `tokenize` kept the quoted run whole. The scrub then
+ * re-tokenized THAT value, where the quotes no longer exist, read
+ * `--tenant` as a bare declared flag, and let it eat `handling`. The
+ * top-level `tenant` overwrote the swallowed one on the way out, so the
+ * verdict line looked right and the loss was invisible.
+ *
+ * So the parsed route returns untouched: {@link parseArgs} extracted the
+ * declared flags from the raw input with the quoting still present, which
+ * is strictly more information than this function can recover afterwards.
+ * There is nothing left here to do that would not be damage.
+ *
+ * ## The QUOTING half is NOT gated on declared flags
+ *
+ * Only the FLAG half is skipped for an action that declares none. Gating
+ * the quote resolution on it too was a defect found by re-deriving the
+ * resolution delta rather than by reasoning about the change: `/tag`,
+ * `/orchestrate` and `/auto-approve` bind through Tier-2 groups as well,
+ * declare no flags, and so kept their raw quote characters — `/orchestrate
+ * "fix the thing"` handed the conductor a goal spelled with the quotes in
+ * it, which the slash route never did.
  */
 export function applyDeclaredFlags(
   args: Record<string, unknown>,
   input: string,
   action: CommandAction,
+  origin: ArgOrigin,
 ): Record<string, unknown> {
+  if (origin === "parsed") return args;
   const schemaKeys = action.paramSchema ? Object.keys(action.paramSchema) : [];
-  if (!schemaKeys.some((k) => k.startsWith(FLAG_PREFIX))) return args;
 
-  // The RAW INPUT is the authority, and it is consulted FIRST for a reason.
-  // Only a flag the operator typed as a top-level token counts; one that
-  // appears only inside a QUOTED run is prompt text they quoted on purpose.
-  // `/spawn-ai 3 best "fix the --tenant handling"` must keep its prompt
-  // intact — `tokenize` treats the quoted run as one token, so no flag is
-  // found and the args are returned untouched.
+  // The RAW INPUT is the authority. Only a flag the operator typed as a
+  // top-level token counts; one that appears only inside a QUOTED run is
+  // prompt text they quoted on purpose — `tokenizeRich` is what carries
+  // that distinction this far, and `extractFlags` is what honours it.
   const trimmed = input.trim();
   const firstSpace = trimmed.search(/\s/);
   const tail = firstSpace === -1 ? "" : trimmed.slice(firstSpace + 1).trim();
-  const found: Record<string, unknown> =
-    tail.length > 0 ? extractFlags(tokenize(tail), schemaKeys).flags : {};
-  if (Object.keys(found).length === 0) return args;
+  const { flags: found, hits } =
+    tail.length > 0 && schemaKeys.some((k) => k.startsWith(FLAG_PREFIX))
+      ? extractFlags(tokenizeRich(tail), schemaKeys)
+      : { flags: {} as Record<string, unknown>, hits: [] as FlagHit[] };
 
-  // The flag WAS typed at the top level, so any string field the higher tier
-  // bound has swallowed it (the `(?<context>.+)` case). Strip it back out, so
-  // it is never typed into the spawned session as part of its prompt.
+  // Every string field is resolved, not only the ones a flag landed in.
+  // A Tier-2 group is a slice of the RAW input, so it still carries the
+  // operator's quote characters (`context: '"fix the thing"'`); leaving
+  // them in typed them verbatim into the spawned session, which the slash
+  // route never did. One normalization, so the two routes agree.
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(args)) {
-    if (typeof value !== "string" || !value.includes(FLAG_PREFIX)) {
+    if (typeof value !== "string") {
       out[key] = value;
       continue;
     }
-    const stripped = extractFlags(tokenize(value), schemaKeys).rest.join(" ");
-    // Dropping the key rather than binding "" is deliberate: a field whose
-    // whole content WAS the flag was not supplied, and `readTextArg` reads
-    // "" as supplied-but-empty, which is an error state.
-    if (stripped.length > 0) out[key] = stripped;
+    const { text, removed } = stripFlagRuns(value, hits);
+    if (text.length > 0) {
+      out[key] = text;
+      continue;
+    }
+    // Nothing survived. Dropping the key rather than binding "" is
+    // deliberate WHEN A FLAG ATE THE FIELD: a field whose whole content WAS
+    // the flag was not supplied, and `readTextArg` reads "" as
+    // supplied-but-empty, which is a different (and erroring) state. A
+    // field that was ALREADY empty was supplied-and-empty and must keep
+    // reading that way — dropping it there would hand the handler back the
+    // "absent, so guess" arm this whole surface exists to close.
+    if (removed === 0) out[key] = value;
   }
   return { ...out, ...found };
 }
@@ -231,7 +408,7 @@ export function parseArgs(input: string, action: CommandAction): Record<string, 
   // Pull declared `--flags` out BEFORE positional binding, so an optional
   // flag anywhere in the line can't shift the positional fields (and can't be
   // swallowed by the free-form catch-all tail below).
-  const { flags, rest: positional } = extractFlags(tokenize(rest), schemaKeys);
+  const { flags, rest: positional } = extractFlags(tokenizeRich(rest), schemaKeys);
   const tokens = positional;
   const fieldOrder = schemaKeys.filter((k) => !k.startsWith(FLAG_PREFIX));
   const args: Record<string, unknown> = { ...flags };
@@ -278,7 +455,7 @@ export function unboundTokens(input: string, action: CommandAction): string[] {
   const schemaKeys = action.paramSchema ? Object.keys(action.paramSchema) : [];
   const fieldOrder = schemaKeys.filter((k) => !k.startsWith(FLAG_PREFIX));
   if (fieldOrder.length > 0) return [];
-  return extractFlags(tokenize(rest), schemaKeys).rest;
+  return extractFlags(tokenizeRich(rest), schemaKeys).rest;
 }
 
 /**

@@ -9,7 +9,14 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { applyDeclaredFlags, parseArgs, tokenize, coerceToken, extractFlags } from "./parse";
+import {
+  applyDeclaredFlags,
+  parseArgs,
+  tokenize,
+  tokenizeRich,
+  coerceToken,
+  extractFlags,
+} from "./parse";
 import { __resetForTest, register } from "./registry";
 import { resolve } from "./resolve";
 import type { CommandAction } from "./types";
@@ -382,13 +389,18 @@ describe("parse — declared --flags", () => {
   });
 });
 
-// The ROUTE-INDEPENDENT half. `parseArgs` runs on the slash route only;
-// `applyDeclaredFlags` runs on every route's args, which is what stops a
-// Tier-2 pattern with a `(?<context>.+)` tail from swallowing a declared
-// flag whole. D1 of manual-test-loop iteration 7: `/spawn-ai 1 gmail
-// --tenant=` spawned under the device default while `/spawn-best 1 gmail
-// --tenant=` — same action, same args — correctly refused, split purely on
-// which regex matched.
+// The PRESET-ROUTE half. `parseArgs` runs on the slash route only;
+// `applyDeclaredFlags` runs on every PRESET route's args, which is what
+// stops a Tier-2 pattern with a `(?<context>.+)` tail from swallowing a
+// declared flag whole. D1 of manual-test-loop iteration 7: `/spawn-ai 1
+// gmail --tenant=` spawned under the device default while `/spawn-best 1
+// gmail --tenant=` — same action, same args — correctly refused, split
+// purely on which regex matched.
+//
+// The `origin` argument is D1 of iteration 8. Applying the scrub to the
+// PARSED route too re-tokenized text `parseArgs` had already stripped of
+// its quotes, so a `--tenant` the operator had QUOTED into their prompt
+// read as a bare flag and ate the word after it.
 describe("parse — applyDeclaredFlags", () => {
   const spawnAi = action({
     id: "spawn-ai",
@@ -401,9 +413,32 @@ describe("parse — applyDeclaredFlags", () => {
     paramSchema: { count: "n" },
   });
 
-  it("is a no-op for an action declaring no flags", () => {
+  it("extracts nothing for an action declaring no flags", () => {
     const args = { count: 3 };
-    expect(applyDeclaredFlags(args, "/spawn 3 --tenant=x", noFlags)).toBe(args);
+    expect(applyDeclaredFlags(args, "/spawn 3 --tenant=x", noFlags, "preset")).toEqual(args);
+  });
+
+  it("still resolves QUOTING for an action declaring no flags", () => {
+    // Found by re-deriving the resolution delta, not by reasoning about the
+    // change: gating the quote resolution on "declares a flag" left every
+    // no-flag action's Tier-2 group spelled with its quotes still in it.
+    const tag = action({ id: "tag", slash: "/tag", paramSchema: { tag: "s" } });
+    expect(applyDeclaredFlags({ tag: '"--tenant"' }, '/tag "--tenant"', tag, "preset")).toEqual({
+      tag: "--tenant",
+    });
+    const orch = action({ id: "orch", slash: "/orchestrate", paramSchema: { goal: "s" } });
+    expect(
+      applyDeclaredFlags({ goal: '"fix the thing"' }, '/orchestrate "fix the thing"', orch, "preset"),
+    ).toEqual({ goal: "fix the thing" });
+    // Spacing INSIDE a quoted run is the operator's, and survives.
+    expect(
+      applyDeclaredFlags(
+        { goal: '"fix  the   thing"' },
+        '/orchestrate "fix  the   thing"',
+        orch,
+        "preset",
+      ),
+    ).toEqual({ goal: "fix  the   thing" });
   });
 
   it("recovers an EMPTY flag a Tier-2 catch-all swallowed into `context`", () => {
@@ -413,6 +448,7 @@ describe("parse — applyDeclaredFlags", () => {
         { count: 1, account: "gmail", context: "--tenant=" },
         "/spawn-ai 1 gmail --tenant=",
         spawnAi,
+        "preset",
       ),
     ).toEqual({ count: 1, account: "gmail", tenant: "" });
   });
@@ -423,6 +459,7 @@ describe("parse — applyDeclaredFlags", () => {
         { count: 1, account: "gmail", context: "--tenant" },
         "/spawn-ai 1 gmail --tenant",
         spawnAi,
+        "preset",
       ),
     ).toEqual({ count: 1, account: "gmail", tenant: "" });
   });
@@ -433,6 +470,7 @@ describe("parse — applyDeclaredFlags", () => {
         { count: 1, account: "gmail", context: "--tenant=a.b fix the bug" },
         "/spawn-ai 1 gmail --tenant=a.b fix the bug",
         spawnAi,
+        "preset",
       ),
     ).toEqual({ count: 1, account: "gmail", context: "fix the bug", tenant: "a.b" });
   });
@@ -443,6 +481,7 @@ describe("parse — applyDeclaredFlags", () => {
         { count: 1, account: "gmail", context: "fix the bug --tenant pizzeria now" },
         "/spawn-ai 1 gmail fix the bug --tenant pizzeria now",
         spawnAi,
+        "preset",
       ),
     ).toEqual({
       count: 1,
@@ -454,25 +493,98 @@ describe("parse — applyDeclaredFlags", () => {
 
   it("leaves an UNDECLARED --flag in the prompt", () => {
     const args = { count: 1, account: "gmail", context: "rerun with --verbose set" };
-    expect(applyDeclaredFlags(args, "/spawn-ai 1 gmail rerun with --verbose set", spawnAi)).toEqual(
-      args,
-    );
+    expect(
+      applyDeclaredFlags(args, "/spawn-ai 1 gmail rerun with --verbose set", spawnAi, "preset"),
+    ).toEqual(args);
   });
 
-  it("is idempotent on the slash route, where parseArgs already extracted", () => {
+  // ── D1, iteration 8 ────────────────────────────────────────────────
+  // The parsed route is a NO-OP, not "idempotent". `parseArgs` extracted
+  // the flags from the raw input while the quoting was still there, which
+  // is strictly more than this function can recover afterwards.
+  it("is a NO-OP on the parsed route, where parseArgs already extracted", () => {
     const input = "/spawn-ai 3 best --tenant pizzeria fix the bug";
     const once = parseArgs(input, spawnAi);
-    expect(applyDeclaredFlags(once, input, spawnAi)).toEqual(once);
+    expect(applyDeclaredFlags(once, input, spawnAi, "parsed")).toBe(once);
   });
 
-  it("leaves a QUOTED --flag inside a prompt alone", () => {
-    // `tokenize` treats a quoted run as one token, so the raw input carries
-    // no top-level flag and nothing is extracted or stripped. Without the
-    // raw-input-first gate this scrubbed the operator's own prompt text.
+  it("keeps a quoted prompt BYTE-INTACT on the parsed route WITH a top-level flag", () => {
+    // Measured on-page and lost: the status line read `/spawn-ai ✓` with the
+    // right tenant while the session was typed `fix the` — the scrub had
+    // re-read the operator's quoted `--tenant` as a flag and eaten
+    // `handling`, and the top-level tenant then overwrote the swallowed one
+    // so nothing in the verdict could show it.
+    const input = '/spawn-ai 1 gmail --tenant=2299 "fix the --tenant handling"';
+    const once = parseArgs(input, spawnAi);
+    expect(once).toEqual({
+      count: 1,
+      account: "gmail",
+      context: "fix the --tenant handling",
+      tenant: 2299,
+    });
+    expect(applyDeclaredFlags(once, input, spawnAi, "parsed")).toEqual(once);
+  });
+
+  it("leaves a QUOTED --flag inside a prompt alone on BOTH routes", () => {
     const input = '/spawn-ai 3 best "fix the --tenant handling"';
     const once = parseArgs(input, spawnAi);
     expect(once).toEqual({ count: 3, account: "best", context: "fix the --tenant handling" });
-    expect(applyDeclaredFlags(once, input, spawnAi)).toEqual(once);
+    expect(applyDeclaredFlags(once, input, spawnAi, "parsed")).toBe(once);
+    // The Tier-2 group is a slice of the RAW input, so it still carries the
+    // quote characters; the preset route resolves them and finds no flag.
+    expect(
+      applyDeclaredFlags(
+        { count: 3, account: "best", context: '"fix the --tenant handling"' },
+        input,
+        spawnAi,
+        "preset",
+      ),
+    ).toEqual(once);
+  });
+
+  it("strips ONLY the run the operator typed as a flag", () => {
+    // The prompt's own `--tenant=other` is not the flag that was found, so
+    // exact-run matching leaves it where it is.
+    expect(
+      applyDeclaredFlags(
+        { count: 1, account: "gmail", context: '--tenant=2299 "about --tenant=other"' },
+        '/spawn-ai 1 gmail --tenant=2299 "about --tenant=other"',
+        spawnAi,
+        "preset",
+      ),
+    ).toEqual({
+      count: 1,
+      account: "gmail",
+      context: "about --tenant=other",
+      tenant: 2299,
+    });
+  });
+
+  it("resolves a Tier-2 group's quoting even when no flag was typed", () => {
+    // Without this the quote characters were typed verbatim into the spawned
+    // session, which the slash route never did for the same input.
+    expect(
+      applyDeclaredFlags(
+        { count: 3, account: "best", context: '"fix the failing test"' },
+        'spawn-ai 3 best "fix the failing test"',
+        spawnAi,
+        "preset",
+      ),
+    ).toEqual({ count: 3, account: "best", context: "fix the failing test" });
+  });
+
+  it("keeps an ALREADY-EMPTY string field supplied-but-empty", () => {
+    // Dropping the key is only correct when a flag ATE the field. A field
+    // that arrived empty must keep reading as supplied-and-empty, or the
+    // handler gets back the "absent, so guess" arm.
+    expect(
+      applyDeclaredFlags(
+        { count: 1, account: "", context: "hi" },
+        "/spawn-ai 1 --tenant=x hi",
+        spawnAi,
+        "preset",
+      ),
+    ).toEqual({ count: 1, account: "", context: "hi", tenant: "x" });
   });
 
   it("keeps a Tier-3 binding the raw input never spelled as a flag", () => {
@@ -481,8 +593,73 @@ describe("parse — applyDeclaredFlags", () => {
         { count: 1, account: "gmail", tenant: "pizzeria" },
         "spin up one gmail session for the pizzeria tenant",
         spawnAi,
+        "preset",
       ),
     ).toEqual({ count: 1, account: "gmail", tenant: "pizzeria" });
+  });
+});
+
+// ── D2, iteration 8 ──────────────────────────────────────────────────
+// A quoted run that is ENTIRELY a declared flag is prompt text. `tokenize`
+// stripped the quotes before `extractFlags` ever saw them, so a one-word
+// quoted run was indistinguishable from a top-level flag: `/spawn-ai 1
+// gmail "--tenant"` answered "tenant was supplied but empty" and spawned
+// nothing. `"a --tenant=x b"` was already safe — the protection held only
+// while the quoted run had other words in it.
+describe("parse — quoting is carried, not inferred", () => {
+  const spawnAi = action({
+    id: "spawn-ai",
+    slash: "/spawn-ai",
+    paramSchema: { count: "n", account: "s", context: "s", "--tenant": "s" },
+  });
+
+  it("reads a wholly-quoted declared flag as prompt text", () => {
+    const input = '/spawn-ai 1 gmail "--tenant"';
+    expect(parseArgs(input, spawnAi)).toEqual({
+      count: 1,
+      account: "gmail",
+      context: "--tenant",
+    });
+    expect(applyDeclaredFlags(parseArgs(input, spawnAi), input, spawnAi, "parsed")).toEqual({
+      count: 1,
+      account: "gmail",
+      context: "--tenant",
+    });
+  });
+
+  it("still reads an UNQUOTED bare declared flag as a flag", () => {
+    expect(parseArgs("/spawn-ai 1 gmail --tenant", spawnAi)).toEqual({
+      count: 1,
+      account: "gmail",
+      tenant: "",
+    });
+  });
+
+  it("accepts a QUOTED value for a flag", () => {
+    expect(parseArgs('/spawn-ai 1 gmail --tenant "my org" go', spawnAi)).toEqual({
+      count: 1,
+      account: "gmail",
+      context: "go",
+      tenant: "my org",
+    });
+  });
+
+  it("keeps a quoted VALUE on `--name=` a flag — the quote opens AFTER the name", () => {
+    expect(parseArgs('/spawn-ai 1 gmail --tenant="my org" go', spawnAi)).toEqual({
+      count: 1,
+      account: "gmail",
+      context: "go",
+      tenant: "my org",
+    });
+  });
+
+  it("reports quoting on tokenizeRich and hides it on tokenize", () => {
+    expect(tokenizeRich('a "b c" --d')).toEqual([
+      { text: "a", quoted: false },
+      { text: "b c", quoted: true },
+      { text: "--d", quoted: false },
+    ]);
+    expect(tokenize('a "b c" --d')).toEqual(["a", "b c", "--d"]);
   });
 });
 
@@ -490,6 +667,7 @@ describe("parse — extractFlags", () => {
   it("returns tokens untouched when the schema declares no flags", () => {
     expect(extractFlags(["3", "best", "--tenant", "x"], ["count", "account"])).toEqual({
       flags: {},
+      hits: [],
       rest: ["3", "best", "--tenant", "x"],
     });
   });
@@ -497,6 +675,7 @@ describe("parse — extractFlags", () => {
   it("coerces numeric flag values like positional tokens do", () => {
     expect(extractFlags(["--zone", "4"], ["--zone"])).toEqual({
       flags: { zone: 4 },
+      hits: [{ name: "zone", value: 4, consumed: ["--zone", "4"] }],
       rest: [],
     });
   });
