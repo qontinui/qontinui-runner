@@ -127,6 +127,9 @@ export function CommandBar() {
   const [query, setQuery] = useState("");
   const [focused, setFocused] = useState(false);
   const [selectedIdx, setSelectedIdx] = useState(0);
+  /** Previous `query`, so the selection can be reset the moment the
+   *  query changes — see the derived-state block below `matches`. */
+  const [prevQuery, setPrevQuery] = useState("");
   const [status, setStatus] = useState<StatusLine | null>(null);
   const [recents, setRecents] = useState<string[]>(() =>
     instanceStorage.getJSON<string[]>(RECENTS_STORAGE_KEY, []),
@@ -288,7 +291,36 @@ export function CommandBar() {
     };
   }, [query, recents]);
 
-  // Keep the selection in range when the match list shrinks.
+  // ── The selection belongs to ONE query ─────────────────────────────
+  // `matches` is recomputed from scratch on every query change, so index
+  // N in the old list names a different command (or none) in the new
+  // one. Index 0 — the top-ranked match for the query now in the input —
+  // is the only index that survives the change meaningfully.
+  //
+  // Clamping against `matches.length`, which is all this used to do, is
+  // NOT the same guarantee: a stale index stays *in range* whenever the
+  // new list is at least as long, and the bar then executes a command
+  // the operator never selected. Measured on-page: type `sp`, ArrowDown
+  // twice (selection on `/select-by-state`), then type `lyt` — the
+  // dropdown re-rendered as [/layout, /analyze, /select-by-state],
+  // `aria-activedescendant` still pointed at `select-by-state`, and
+  // Enter ran it.
+  //
+  // Written as derived state (React's "adjust state during render",
+  // already the idiom in `CommandPalette.tsx`) rather than a reset
+  // inside `handleChange`, because `query` is mutated from six places —
+  // typing, ArrowUp/ArrowDown history recall, Tab completion, Escape, a
+  // suggestion click that pre-fills args, and the post-execute clear.
+  // Keying off the VALUE covers every one of them, including a path
+  // added later that nobody remembers to patch.
+  if (query !== prevQuery) {
+    setPrevQuery(query);
+    setSelectedIdx(0);
+  }
+
+  // Keep the selection in range when the match list shrinks WITHOUT the
+  // query changing — a registry unregister, or the async Tier-3 match
+  // being cleared.
   useEffect(() => {
     if (selectedIdx >= matches.length) {
       setSelectedIdx(0);
@@ -358,6 +390,9 @@ export function CommandBar() {
           text: `${action.slash} ✓`,
         });
         setQuery("");
+        // Explicit even though the derived reset covers a query CHANGE:
+        // running off an already-empty input (the recents palette) leaves
+        // `query` at "" and the reset would not fire.
         setSelectedIdx(0);
         inputRef.current?.blur();
       } else {
@@ -426,6 +461,8 @@ export function CommandBar() {
       if (e.key === "Escape") {
         e.preventDefault();
         setQuery("");
+        // Same reason as in `execute`: Escape on an already-empty input
+        // is not a query change, so the derived reset does not fire.
         setSelectedIdx(0);
         setHistoryIdx(-1);
         inputRef.current?.blur();
@@ -436,22 +473,27 @@ export function CommandBar() {
   );
 
   // Typing anything by hand leaves history-browsing mode — the recalled
-  // entry has become a fresh edit, not a cursor position.
+  // entry has become a fresh edit, not a cursor position. The suggestion
+  // selection is NOT reset here: it is reset for every query mutation at
+  // once, in the derived block above.
   const handleChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     setQuery(e.target.value);
     setHistoryIdx(-1);
   }, []);
 
   const handleSuggestionClick = useCallback(
-    (action: CommandAction, idx: number, presetArgs?: Record<string, unknown>, tier?: "ai") => {
+    (action: CommandAction, presetArgs?: Record<string, unknown>, tier?: "ai") => {
       // If the user clicks an action that takes args and they haven't typed
       // any AND we didn't pattern-match preset args, populate the input
       // rather than executing — they probably wanted to fill in the args.
       const hasArgs = action.paramSchema && Object.keys(action.paramSchema).length > 0;
       const argsTyped = query.trim().length > action.slash.length;
       if (hasArgs && !argsTyped && !presetArgs) {
+        // No `setSelectedIdx(idx)` here: `idx` indexes the list built for
+        // the OLD query, and the new query (`/slash `) is an exact hit
+        // resolving to a single row. The derived reset above puts the
+        // selection on it.
         setQuery(`${action.slash} `);
-        setSelectedIdx(idx);
         inputRef.current?.focus();
         return;
       }
@@ -610,7 +652,7 @@ export function CommandBar() {
                         value={m.action.slash}
                         type="button"
                         onMouseDown={(e) => e.preventDefault() /* keep input focus */}
-                        onClick={() => handleSuggestionClick(m.action, idx, m.presetArgs, m.tier)}
+                        onClick={() => handleSuggestionClick(m.action, m.presetArgs, m.tier)}
                         onMouseEnter={() => setSelectedIdx(idx)}
                         className={`w-full flex items-center gap-2 px-3 py-1 text-[11px] text-left transition-colors ${
                           idx === selectedIdx
