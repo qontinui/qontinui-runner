@@ -1,0 +1,697 @@
+name: sibling pin bump
+
+# Keeps `.github/sibling-pins.conf` from rotting.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS — a stale pin is a real cost, not a free win
+# ---------------------------------------------------------------------------
+#
+# #1158 stopped CI cloning `ui-bridge` and `qontinui-web` floating, because a
+# floating clone made every peer repo's merge button a write to this repo's
+# `main` (measured: a 5h+ merge-train outage on 2026-08-20 with no runner commit
+# involved — see the manifest's header). It pinned them to recorded commits
+# instead.
+#
+# That trade is only worth taking WITH this workflow. A pin nobody updates
+# silently freezes the contract: `sdk_manifest_routes_are_exposed_by_runner`
+# keeps asserting against a months-old `UI_BRIDGE_ROUTES` and goes on passing
+# while real SDK↔runner divergence accumulates unseen. That trades a LOUD
+# failure (main red, everyone stops) for a QUIET one (a green check that means
+# nothing), which is strictly worse under this fleet's `silent-empty-is-unknown`
+# posture. Expect no fewer drift findings than before pinning — only
+# better-timed ones, arriving on a bump PR that blocks one PR instead of on
+# `main`, where it blocks the repo.
+#
+# ---------------------------------------------------------------------------
+# WHY A SCHEDULED POLL HERE, NOT A `repository_dispatch` FROM THE SIBLING
+# ---------------------------------------------------------------------------
+#
+# Both were on the table (plan 2026-08-20-runner-unpinned-sibling-clones-red-main,
+# D4). Dispatch is push-based and its failure mode is SILENCE: it needs a
+# cross-repo PAT installed in every sibling plus a workflow in every sibling, and
+# if the token expires, a sibling's workflow is edited, or a repo joins the
+# manifest without one, nothing fires and nothing says so. That is precisely the
+# quiet failure this job exists to prevent. A poll living HERE fails loudly in
+# THIS repo's Actions tab, and its staleness is readable straight off the
+# manifest whether or not the job ever ran.
+#
+# It also scales the right way: one job iterating the manifest covers every
+# present and future entry, where dispatch scales as N repos x (one workflow +
+# one secret), each independently rot-able. The only thing dispatch would buy is
+# latency — a bump within minutes of a sibling land rather than within a day —
+# and latency is not a property this design values: the point of pinning is to
+# move the signal off `main` onto a branch, not to learn sooner.
+#
+# ---------------------------------------------------------------------------
+# TRIGGER POSTURE
+# ---------------------------------------------------------------------------
+#
+#   - schedule (daily): the bump cadence itself. Behind-ness is surfaced as a
+#     draft PR, never as a red.
+#   - workflow_dispatch: bump on demand when a sibling lands something you want
+#     now. Also the only way to satisfy "the mechanism has produced one bump PR"
+#     without waiting a day.
+#   - pull_request (paths: the manifest + this file): VALIDATE ONLY. It checks
+#     that every entry parses the way `.github/actions/checkout-sibling` will
+#     parse it and that every recorded SHA is a real commit in the sibling — the
+#     two ways a hand-edit breaks CI for everyone. It deliberately does NOT fail
+#     on a pin merely being BEHIND: behind-ness is the normal state between
+#     bumps, and reddening every manifest PR for it would make the manifest
+#     un-editable.
+#
+# Self-inclusion in the `paths:` filter is mandatory, not decorative:
+# `src-tauri/tests/workflow_paths_self_inclusion.rs` enforces it, and a
+# paths-filtered gate that omits its own path does not run on the PR that edits
+# it — a check that passes because it never ran.
+#
+# NOT A REQUIRED CHECK, and it must not become one. coord scores `main` from the
+# last run of each workflow and only a `push` event establishes that baseline
+# (`crates/coord/src/ci_baseline.rs`: `assert!(!establishes_main_baseline
+# (Some("schedule")))`). A schedule-driven required check would freeze the
+# baseline with no in-repo commit able to thaw it. The bump lands as an ordinary
+# draft PR and is gated by the ordinary required checks on that PR.
+#
+# ---------------------------------------------------------------------------
+# THE PR-CREATION PRECONDITION
+# ---------------------------------------------------------------------------
+#
+# This repo has "Allow GitHub Actions to create and approve pull requests"
+# DISABLED (`can_approve_pull_request_reviews: false`), so `GITHUB_TOKEN` cannot
+# open the bump PR no matter what `permissions:` says. CLORINDE_AUTOCOMMIT_TOKEN
+# — this repo's existing CI auto-commit PAT, already used by
+# atlas-exclude-fresh.yml and clorinde-bindings-fresh.yml — is what opens it.
+#
+# The PAT is load-bearing for a SECOND reason, and it is the more important one:
+# a PAT-authored push fires `pull_request` workflows, which `GITHUB_TOKEN`
+# deliberately does not. The whole value of a bump PR is that the drift test
+# RUNS on it before the new SHA reaches `main`. A GITHUB_TOKEN-authored bump PR
+# would carry no checks at all and would be a pin change nobody verified — the
+# vacuous green this plan exists to remove, arriving through the fix.
+
+on:
+  schedule:
+    # Offset from atlas-exclude-fresh.yml's 06:17 so the two nightlies do not
+    # contend for runners.
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/sibling-pins.conf"
+      # Self-inclusion — see TRIGGER POSTURE above. Enforced by
+      # src-tauri/tests/workflow_paths_self_inclusion.rs.
+      - ".github/workflows/sibling-pin-bump.yml"
+
+# Stated explicitly rather than inherited from the repo-level
+# `default_workflow_permissions`, which is an operator-flippable setting
+# invisible in this file. This workflow does not resolve a sibling ref, so it
+# needs no `pull-requests: read` at workflow level; the `bump` job states its
+# own wider block.
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Two runs on main (the nightly plus a dispatch, or two dispatches) would
+    # otherwise interleave `checkout -B` / `push --force` on the same bot branch
+    # and both call `gh pr create`, leaving the losing run's tip on the branch
+    # and reddening the other on "a pull request already exists".
+    # cancel-in-progress: false so a dispatch never kills a nightly mid-push.
+    concurrency:
+      group: sibling-pin-bump-${{ github.ref }}
+      cancel-in-progress: false
+
+    # `contents: write` pushes the bump branch; `pull-requests: write` lets the
+    # bump step list/edit/reopen its PR. A job-level block REPLACES the
+    # workflow-level one wholesale rather than merging with it, so everything
+    # this job needs is stated here. Permissions are not event-conditional — a
+    # same-repo `pull_request` run carries this token too — so the gating is in
+    # each step's `if:`, not in the token. (Fork PRs are capped read-only by
+    # GitHub regardless.)
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      # The bump path pushes a branch, so it needs a token that can write. The
+      # PAT is withheld on `pull_request` entirely, so a PR run — including one
+      # from a fork — never gets a token stronger than GITHUB_TOKEN. Mirrors
+      # atlas-exclude-fresh.yml's checkout.
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ (github.event_name != 'pull_request' && secrets.CLORINDE_AUTOCOMMIT_TOKEN) || secrets.GITHUB_TOKEN }}
+
+      - name: Resolve each pinned sibling's current default-branch head
+        id: scan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANIFEST: .github/sibling-pins.conf
+          # Via env, never `${{ }}`-spliced into the script body — the same
+          # discipline checkout-sibling states as its property 1 and
+          # atlas-exclude-fresh.yml keeps. The exposure from a default-branch
+          # name is near-nil; honouring the invariant uniformly is the point,
+          # because the next value someone adds here may not be.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::$MANIFEST does not exist. This workflow bumps that manifest; without it there is nothing to keep current, and .github/actions/checkout-sibling would be silently resolving every sibling by default branch — the floating checkout #1158 removed."
+            exit 1
+          fi
+
+          # PARSE EXACTLY AS THE READER PARSES. checkout-sibling's `apply_pin`
+          # strips `#.*`, then matches `$1 == <repo>` and takes `$2`, requiring
+          # NF == 2. Anything this job would write that the reader then rejects
+          # is a self-inflicted red on every consumer, so the two must agree
+          # field-for-field. Keep this awk in step with that function.
+          #
+          # `tr -d '\r'` mirrors the reader's own `matches="${matches//$'\r'/}"`
+          # (action.yml). Without it a CRLF-committed manifest — which the
+          # reader ACCEPTS — dies here on the 40-hex check with a message
+          # blaming the SHA when the fault is the line ending. It fails closed
+          # either way; the point is that the two parsers must not disagree
+          # about what a valid file is.
+          entries="$(tr -d '\r' < "$MANIFEST" | awk '{ sub(/#.*/, ""); if (NF == 0) next; print NR "\t" NF "\t" $1 "\t" $2 }')"
+
+          if [ -z "$entries" ]; then
+            echo "::error::$MANIFEST contains no pin entries — every sibling would resolve by default branch, i.e. float. If that is genuinely intended, delete the manifest and the pin-file input rather than leaving an empty one that looks deliberate."
+            exit 1
+          fi
+
+          drift=false
+          fresh="$RUNNER_TEMP/sibling-pins.fresh.conf"
+          report="$RUNNER_TEMP/sibling-pins.report.txt"
+          cp "$MANIFEST" "$fresh"
+          : > "$report"
+
+          seen=""
+          while IFS=$'\t' read -r lineno nf repo pin; do
+            [ -z "${lineno:-}" ] && continue
+
+            # A duplicate entry makes the manifest say something different from
+            # what CI does; the reader hard-fails on it, so catch it here where
+            # the message can name BOTH lines — which is the only thing this
+            # copy of the check adds over the reader's, so `seen` carries the
+            # line number alongside the repo rather than the repo alone.
+            # Each entry is `<repo> <lineno>` and newline-TERMINATED, and the
+            # probe carries a leading newline, so `\n<repo> ` is an exact
+            # first-field membership test rather than a substring one. Building
+            # `probe` once — rather than prefixing only inside the `case` — is
+            # what makes the `first=` extraction below work when the duplicate's
+            # first occurrence is the very first entry in the list.
+            probe=$'\n'"$seen"
+            case "$probe" in
+              *$'\n'"$repo"' '*)
+                first="${probe#*$'\n'"$repo" }"
+                first="${first%%$'\n'*}"
+                echo "::error::$MANIFEST lists $repo more than once — first at line $first, again at line $lineno. Exactly one tree can be checked out, so the file is ambiguous about which commit CI builds against. Keep one entry and delete the rest."
+                exit 1 ;;
+            esac
+            seen="${seen}${repo} ${lineno}"$'\n'
+
+            case "$repo" in
+              */*) : ;;
+              *)
+                echo "::error::$MANIFEST line $lineno: '$repo' is not an <owner>/<repo> pair."
+                exit 1 ;;
+            esac
+
+            # Split "listed" from "usable" the same way the reader does. An
+            # entry with no SHA after it is a half-finished bump, and treating
+            # it as 'unpinned' would silently reinstate the floating checkout.
+            if [ "$nf" -lt 2 ]; then
+              echo "::error::$MANIFEST line $lineno lists $repo with no commit SHA after it. Record a full SHA or delete the line entirely to float on purpose — do not leave it half-written."
+              exit 1
+            fi
+            if [ "$nf" -gt 2 ]; then
+              echo "::error::$MANIFEST line $lineno: $repo has $nf fields; expected exactly 2 (<owner>/<repo> <40-hex-sha>). Trailing text must be a '#' comment."
+              exit 1
+            fi
+            case "$pin" in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
+              *)
+                echo "::error::$MANIFEST line $lineno pins $repo to '$pin', which is not a 40-character lowercase hex commit SHA."
+                exit 1 ;;
+            esac
+
+            # The recorded SHA must still EXIST. A sibling force-push or a
+            # branch deletion can orphan it, and then every consumer's
+            # `git fetch --depth 1 origin <sha>` fails — a red that reads as an
+            # infra flake rather than as "the pin points at nothing".
+            if ! gh api "repos/$repo/commits/$pin" --jq '.sha' >/dev/null 2>"$RUNNER_TEMP/err.txt"; then
+              echo "::error::$repo's pinned commit $pin could not be read from GitHub. If it was orphaned by a force-push, every consumer's pinned fetch is already broken; if this was a transient API failure, re-run. gh said:"
+              sed 's/^/::error::  /' "$RUNNER_TEMP/err.txt"
+              exit 1
+            fi
+
+            # An unanswered probe is UNKNOWN, never "no new commit". Reporting a
+            # pin as current because the API did not answer is the same
+            # fail-open the checkout action's five-way status split exists to
+            # prevent, and here it would be permanent: the job would go green
+            # every night while the pin froze.
+            if ! branch="$(gh api "repos/$repo" --jq '.default_branch' 2>"$RUNNER_TEMP/err.txt")"; then
+              echo "::error::Could not read $repo's default branch. An unanswered probe is UNKNOWN, not 'nothing to bump' — refusing to report the pin current. gh said:"
+              sed 's/^/::error::  /' "$RUNNER_TEMP/err.txt"
+              exit 1
+            fi
+            if ! head="$(gh api "repos/$repo/commits/$branch" --jq '.sha' 2>"$RUNNER_TEMP/err.txt")"; then
+              echo "::error::Could not read $repo@$branch's head commit. UNKNOWN, not 'unchanged'. gh said:"
+              sed 's/^/::error::  /' "$RUNNER_TEMP/err.txt"
+              exit 1
+            fi
+
+            # Never write into the manifest a value we have not shape-checked —
+            # a garbled read must not become a pin the reader then hard-fails
+            # on for everyone.
+            case "$head" in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
+              *)
+                echo "::error::GitHub returned '$head' as $repo@$branch's head, which is not a 40-character lowercase hex SHA. Refusing to write it into $MANIFEST."
+                exit 1 ;;
+            esac
+
+            # ANCESTRY, not just existence. `repos/<r>/commits/<sha>` above
+            # succeeds for ANY commit object in the repo — including the head of
+            # an unmerged PR branch or an abandoned one — so existence alone
+            # lets a hand-edit pin CI to a tree that is not on the sibling's
+            # default branch and still validate cleanly. That silently forfeits
+            # the property the pin buys (only a landed sibling commit can move
+            # this repo's contract). `compare` answers it at no extra cost,
+            # since this call was already being made for the commit count.
+            #
+            # No `|| true` and no `2>/dev/null`: this read is load-bearing now,
+            # and an unanswered probe is UNKNOWN, not "ancestry fine".
+            if ! cmp_json="$(gh api "repos/$repo/compare/$pin...$head" 2>"$RUNNER_TEMP/err.txt")"; then
+              echo "::error::Could not compare $repo $pin...$head. UNKNOWN, not 'unchanged'. gh said:"
+              sed 's/^/::error::  /' "$RUNNER_TEMP/err.txt"
+              exit 1
+            fi
+            cmp_status="$(printf '%s' "$cmp_json" | jq -r '.status')"
+            behind="$(printf '%s' "$cmp_json" | jq -r '.ahead_by')"
+
+            # `compare/<base>...<head>` reports the status of HEAD relative to
+            # BASE, and here BASE is the pin. So a healthy stale pin reads
+            # `ahead` (the branch has moved on past it) and a current one reads
+            # `identical`. `behind` means the branch is BEHIND the pin — the pin
+            # names a commit not on it — and `diverged` means the pin sits on
+            # some other line of development entirely. Both of those are the
+            # not-landed case this check exists to catch.
+            #
+            # Verified against the live API while writing this: the ui-bridge
+            # pin, 14 commits stale, returns `ahead`. Getting this the wrong way
+            # round would red every ordinary stale pin and green every unlanded
+            # one — i.e. invert the check into exactly the wrong gate.
+            case "$cmp_status" in
+              identical|ahead) : ;;
+              *)
+                echo "::error::$MANIFEST pins $repo to $pin. Comparing $pin...$head reports '$cmp_status', so the pin is not an ancestor of $branch."
+                echo "::error::A pin must name a commit that LANDED on $repo@$branch. Pinning an unmerged or abandoned commit means this repo's CI compiles and asserts against a tree nobody else has, which forfeits the whole point of the pin."
+                echo "::error::Record a landed commit: gh api repos/$repo/commits/$branch --jq .sha"
+                exit 1 ;;
+            esac
+
+            if [ "$cmp_status" = "identical" ]; then
+              printf '%-28s current  %s\n' "$repo" "$pin" >> "$report"
+              continue
+            fi
+
+            drift=true
+            printf '%-28s BEHIND   %s -> %s  (+%s commits on %s)\n' "$repo" "$pin" "$head" "$behind" "$branch" >> "$report"
+
+            # Rewrite ONLY the SHA token on that one line, leaving every comment
+            # and every other line byte-identical. `sub` replaces the first
+            # match on the line; the 40-hex pin cannot collide with the
+            # <owner>/<repo> field, and hex is regex-safe as a pattern.
+            # `sub()` cannot split or join a record, so line numbering in
+            # $fresh stays identical to $MANIFEST across every pass and the
+            # $lineno captured from the original stays valid.
+            #
+            # The substitution COUNT is asserted rather than assumed. A per-line
+            # no-op would leave that entry at its old SHA while the report and
+            # the PR body both claim it moved — and the file-level contradiction
+            # guard below cannot see it, because a second, successfully-bumped
+            # entry keeps the index dirty. Silent partial bumps are the exact
+            # quiet failure this workflow exists to remove.
+            if ! awk -v ln="$lineno" -v old="$pin" -v new="$head" \
+                 'NR == ln { n += sub(old, new) } { print } END { exit(n == 1 ? 0 : 1) }' \
+                 "$fresh" > "$fresh.tmp"; then
+              echo "::error::Rewriting $repo's pin on line $lineno of $MANIFEST substituted no SHA (or more than one). Refusing to ship a bump PR that claims a change it did not make."
+              exit 1
+            fi
+            mv "$fresh.tmp" "$fresh"
+          done <<< "$entries"
+
+          # -------------------------------------------------------------------
+          # NO ENTRY MAY SILENTLY DISAPPEAR.
+          # -------------------------------------------------------------------
+          # Removing a line is the one edit that undoes #1158 while looking
+          # innocuous and passing every check above. checkout-sibling treats an
+          # absent repo as "not listed — resolving by default branch"
+          # (action.yml), i.e. it RESTORES the floating clone that held the merge
+          # train for 5h+ on 2026-08-20. The scan cannot notice, because it
+          # iterates this file: the entry it would have checked is simply gone.
+          #
+          # ci-integrity.yml does not cover this. It triggers only on
+          # .github/workflows/** and .github/actions/**, so a PR touching ONLY
+          # the manifest never fires it. And the manifest deliberately must NOT
+          # be added to its GATING list: that list means "editing this is
+          # high-trust, red the PR", and the bump PR edits this file EVERY DAY
+          # by design — gating it there would make the automation require an
+          # operator click daily, which is the mechanism defeating itself.
+          #
+          # So the invariant is narrower and exactly right: a SHA may change
+          # freely (that is the bump), but a repo may only LEAVE the manifest in
+          # a PR that also edits ci.yml — the file that decides whether that
+          # sibling is checked out at all. ci.yml IS in ci-integrity's GATING
+          # list, so a genuine removal routes through operator review, while the
+          # daily bump does not.
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            if ! base_manifest="$(gh api "repos/$REPO/contents/$MANIFEST?ref=$BASE_REF" \
+                                   -H "Accept: application/vnd.github.raw" 2>"$RUNNER_TEMP/err.txt")"; then
+              echo "::error::Could not read $MANIFEST from the base ref '$BASE_REF'. UNKNOWN, not 'nothing was removed' — refusing to wave through a manifest whose base this run could not see. gh said:"
+              sed 's/^/::error::  /' "$RUNNER_TEMP/err.txt"
+              exit 1
+            fi
+
+            base_repos="$(printf '%s' "$base_manifest" | tr -d '\r' \
+              | awk '{ sub(/#.*/, ""); if (NF == 0) next; print $1 }')"
+
+            removed=""
+            while IFS= read -r base_repo; do
+              [ -z "$base_repo" ] && continue
+              case $'\n'"$seen" in
+                *$'\n'"$base_repo"' '*) continue ;;
+              esac
+              removed="${removed}${base_repo}"$'\n'
+            done <<< "$base_repos"
+
+            if [ -n "$removed" ]; then
+              # The escape hatch is REAL, not advice: a removal is allowed when
+              # this PR also touches ci.yml, because that is where the sibling's
+              # checkout lives and ci.yml is in ci-integrity's GATING list — so
+              # the PR reds there and an operator reviews it. Without this
+              # branch the message below would promise a route that the check
+              # itself refuses, which is worse than no message.
+              #
+              # No `|| true`: if the changed-file list cannot be read, that is
+              # UNKNOWN, and UNKNOWN must not resolve to "the hatch applies".
+              if ! changed="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" \
+                                --jq '.[] | .filename, (.previous_filename // empty)' \
+                                2>"$RUNNER_TEMP/err.txt")"; then
+                echo "::error::This PR removes pin entries, and the changed-file list could not be read to check whether ci.yml changed too. UNKNOWN is not permission. gh said:"
+                sed 's/^/::error::  /' "$RUNNER_TEMP/err.txt"
+                exit 1
+              fi
+
+              if printf '%s\n' "$changed" | grep -qxF ".github/workflows/ci.yml"; then
+                echo "::warning::This PR removes pin entries from $MANIFEST and also edits .github/workflows/ci.yml — allowed, on the assumption the sibling's checkout is being removed with it. ci-integrity.yml will red this PR for the ci.yml edit, so an operator reviews the pair."
+                while IFS= read -r r; do
+                  [ -n "$r" ] && echo "::warning::  un-pinned: $r"
+                done <<< "$removed"
+              else
+                echo "::error::This PR removes pin entries from $MANIFEST:"
+                while IFS= read -r r; do
+                  [ -n "$r" ] && echo "::error::  - $r"
+                done <<< "$removed"
+                echo "::error::A repo absent from this file is resolved by DEFAULT BRANCH, i.e. cloned floating — the coupling #1158 removed, and the one that held this repo's merge train for 5h+ on 2026-08-20 with no runner commit involved."
+                echo "::error::If un-pinning is genuinely intended, stop checking that sibling out in the same PR: remove its checkout-sibling step from .github/workflows/ci.yml. That file is guarded by ci-integrity.yml, so the change gets the operator review a re-float deserves — and this check then permits the removal."
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "Pin status:"
+          sed 's/^/  /' "$report"
+          {
+            echo "### sibling pin status"
+            echo ""
+            echo '```'
+            cat "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Self-heal only from the default branch on a schedule/dispatch. A
+          # pull_request run has validated the manifest above and stops there:
+          # being BEHIND is the normal state between bumps, and reddening every
+          # manifest PR for it would make the manifest un-editable.
+          #
+          # The default branch is read from the event payload rather than
+          # hardcoded, and an EMPTY one is a hard fail rather than a quiet
+          # `self_heal=false`. Empty would compare unequal to every ref, so the
+          # job would go green every night having bumped nothing — the frozen
+          # pin this workflow exists to prevent, reintroduced by its own guard.
+          if [ -z "${DEFAULT_BRANCH:-}" ]; then
+            echo "::error::github.event.repository.default_branch was empty, so this run cannot tell whether it is on the default branch. Refusing to silently skip the bump — that would be a green run that froze the pin."
+            exit 1
+          fi
+
+          self_heal=false
+          if [ "$drift" = "true" ] \
+             && [ "$GITHUB_EVENT_NAME" != "pull_request" ] \
+             && [ "$GITHUB_REF" = "refs/heads/${DEFAULT_BRANCH}" ]; then
+            self_heal=true
+          fi
+
+          {
+            echo "drift=$drift"
+            echo "self_heal=$self_heal"
+          } >> "$GITHUB_OUTPUT"
+
+          # Behind-but-not-self-healing splits two ways, and only one of them is
+          # benign. On a pull_request it is the NORMAL state between bumps —
+          # reddening every manifest PR for it would make the manifest
+          # un-editable, which is why this arm diverges from
+          # atlas-exclude-fresh.yml's unconditional exit 1.
+          #
+          # A schedule or dispatch off a NON-default ref is the other case, and
+          # it is not benign: an operator dispatched this job expecting a bump
+          # and would otherwise get a green run, no PR, and one log line. That
+          # is the silent no-op this whole workflow exists to remove, so it reds
+          # exactly as atlas does.
+          if [ "$drift" = "true" ] && [ "$self_heal" != "true" ]; then
+            if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+              echo "Pins are behind. That is the normal state between bumps and is NOT a PR failure — the scheduled run opens the bump PR. Validation above is what gates this PR."
+            else
+              echo "::error::Pins are behind and this run cannot self-heal: event=$GITHUB_EVENT_NAME is on ref=$GITHUB_REF, not refs/heads/$DEFAULT_BRANCH."
+              echo "::error::The bump PR is branched from the triggering commit, so it must be dispatched from $DEFAULT_BRANCH. Re-run with: gh workflow run sibling-pin-bump.yml --ref $DEFAULT_BRANCH"
+              echo "::error::Failing rather than exiting green: a dispatch that silently bumps nothing is the frozen pin this workflow exists to prevent."
+              exit 1
+            fi
+          fi
+
+      # One long-lived branch, force-rebuilt from the triggering commit every
+      # run, so N days of sibling movement converge on ONE pull request rather
+      # than N. Pins current => this step is skipped entirely, so a quiet day
+      # writes nothing at all.
+      - name: Open or update the pin bump PR
+        if: steps.scan.outputs.self_heal == 'true'
+        shell: bash
+        env:
+          # Same PAT as the checkout, so push and PR are authored consistently.
+          # The checkout additionally withholds it on pull_request; that clause
+          # is unnecessary here because this step is gated to schedule/dispatch
+          # on the default branch and never runs on a PR. Whether the PAT was
+          # actually available changes what a reviewer must do next, so it is
+          # surfaced in the body.
+          GH_TOKEN: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN || secrets.GITHUB_TOKEN }}
+          PAT_AVAILABLE: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN != '' }}
+          REPO: ${{ github.repository }}
+          BRANCH: chore/sibling-pin-bump
+          TITLE: "chore(ci): bump sibling pins to current sibling heads"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MANIFEST: .github/sibling-pins.conf
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Resolve the PR BEFORE touching the branch. Once a human marks it
+          # ready for review it can be a live merge-train candidate, and moving
+          # the branch tip out from under an in-flight proposal is a known wedge
+          # class in this fleet.
+          #
+          # NO `|| true`. An error suppressed into an empty value reads as a
+          # confident "there is no PR" and skips the ready-guard below, letting
+          # a transient gh 403 force-push under a live candidate — the exact
+          # wedge the guard exists to prevent. `// empty` already covers the
+          # genuinely-absent case.
+          existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open \
+            --json number --jq '.[0].number // empty')"
+
+          if [ -n "$existing_num" ]; then
+            # Queried separately rather than parsed out of one "<num> <bool>"
+            # string: that parse depends on gh emitting raw scalars, and if it
+            # ever quoted them every draft PR would read as ready and this step
+            # would become a permanent SILENT no-op — the failure class this
+            # workflow exists to remove.
+            existing_draft="$(gh pr view "$existing_num" --repo "$REPO" --json isDraft --jq '.isDraft')"
+            if [ "$existing_draft" != "true" ]; then
+              echo "::warning::Bump PR #$existing_num is marked ready for review (possible merge-train candidate)."
+              echo "::warning::Not force-pushing '$BRANCH' under it. The run after it lands bumps against the new main."
+              # Exiting green with a further bump undelivered would be the same
+              # void this workflow closes, and a PR can sit marked-ready in the
+              # train for days. Deliver it as a comment on the PR the human is
+              # already watching, keyed on a hash of the status block so a PR
+              # that sits there does not collect an identical comment daily.
+              status_sha="$(sha256sum "$RUNNER_TEMP/sibling-pins.report.txt" | cut -c1-16)"
+              # Materialize before grepping rather than piping into `grep -q`:
+              # grep exits early on a match, SIGPIPEs gh, and under `pipefail`
+              # that turns a successful dedup HIT into a non-zero pipeline —
+              # i.e. the dedup would fail open and comment every day, the exact
+              # spam it exists to prevent.
+              # `gh pr view --json comments` returns ONE capped page (~100).
+              # This PR is designed to sit marked-ready for days collecting a
+              # comment per day, so past the cap the dedup marker scrolls out of
+              # the response, the grep misses, and the step comments daily — the
+              # spam the marker exists to prevent, arriving exactly when the PR
+              # has been ignored longest. `--paginate` on the REST comments
+              # endpoint has no such cap.
+              gh api --paginate "repos/$REPO/issues/$existing_num/comments" \
+                --jq '.[].body' > "$RUNNER_TEMP/pr-comments.txt"
+              if grep -qF "sibling-pin-drift:$status_sha" "$RUNNER_TEMP/pr-comments.txt"; then
+                echo "Pin status unchanged since the last comment on #$existing_num; not commenting again."
+              else
+                {
+                  printf 'The siblings moved again after this PR was marked ready for review, so `%s` was **not** force-pushed — it may be a live merge-train candidate.\n\n' "$BRANCH"
+                  printf 'Run: %s\n\n' "$RUN_URL"
+                  printf 'Once this PR lands, the next scheduled run bumps against the new `main`.\n\n```\n'
+                  cat "$RUNNER_TEMP/sibling-pins.report.txt"
+                  printf '```\n\n<!-- sibling-pin-drift:%s -->\n' "$status_sha"
+                } > "$RUNNER_TEMP/pr-comment.md"
+                gh pr comment "$existing_num" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-comment.md"
+                echo "Commented the new pin status on #$existing_num."
+              fi
+              exit 0
+            fi
+          fi
+
+          # Rebuild the branch from THIS run's triggering commit every time, so
+          # the PR stays a one-commit diff against current main and never
+          # accumulates a stale base. Anchored on $GITHUB_SHA rather than bare
+          # HEAD, which is only the default branch by convention.
+          git checkout -B "$BRANCH" "$GITHUB_SHA"
+          cp "$RUNNER_TEMP/sibling-pins.fresh.conf" "$MANIFEST"
+
+          # Explicit path, never `git add -A`.
+          git add -- "$MANIFEST"
+          if git diff --cached --quiet; then
+            # Contradiction guard. This step only runs when the scan found a
+            # differing head, and the rewrite above changes the SHA token on
+            # that line, so a clean index is unreachable by construction —
+            # which is exactly why it exits 1 rather than 0. A ::warning:: on a
+            # green run would be precisely as invisible as a frozen pin.
+            echo "::error::Drift was reported but $MANIFEST already matches the resolved heads. This should be unreachable — investigate before trusting the scan."
+            exit 1
+          fi
+          git commit -m "$TITLE"
+
+          # Plain --force is correct here, not a footgun: the branch is
+          # bot-owned, single-purpose, and deliberately rebuilt each run.
+          # --force-with-lease would be theatre — we never fetched it, so there
+          # is no lease to check.
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+
+          body="$RUNNER_TEMP/pr-body.md"
+          {
+            printf 'Automated by the `sibling pin bump` workflow: %s\n\n' "$RUN_URL"
+            # Quoted heredocs throughout: the body is full of backticks, which
+            # an unquoted heredoc would run as command substitution.
+            cat <<'EOF'
+          `.github/sibling-pins.conf` records which sibling COMMIT this repo's CI compiles and
+          asserts against. This PR moves the recorded commits up to each sibling's current
+          default-branch head.
+
+          **This PR going red is the mechanism working, not a failure.** It means a sibling
+          changed something this repo has not adapted to yet — most often a new
+          `UI_BRIDGE_ROUTES` entry that `sdk_manifest_routes_are_exposed_by_runner` can see is
+          unwired. Before pinning, that same divergence arrived on `main` and held the whole
+          merge train. Fix it **in this PR** (wire the route), then land the bump and the
+          adaptation together.
+
+          ### Pin status
+
+          ```
+          EOF
+            cat "$RUNNER_TEMP/sibling-pins.report.txt"
+            cat <<'EOF'
+          ```
+
+          ---
+
+          **Opened as a draft on purpose**, so a PR that may carry no checks cannot sit in a
+          merge-train slot. Mark it ready for review once CI is satisfied.
+          EOF
+            if [ "$PAT_AVAILABLE" = "true" ]; then
+              cat <<'EOF'
+
+          Authored with the repo's CI PAT, so normal `pull_request` checks fire on it as usual —
+          which is the point: the drift test runs on this branch instead of on `main`.
+          EOF
+            else
+              cat <<'EOF'
+
+          Authored with `GITHUB_TOKEN`, which by design does **not** fire `pull_request`
+          workflows — so it starts with no checks at all, and the drift test this bump exists
+          to exercise has NOT run. Close and reopen it (that fires `reopened`), or push an
+          empty commit, before trusting it.
+          EOF
+            fi
+            cat <<'EOF'
+
+          This branch is force-rebuilt from `main` on every scheduled run, so it stays a
+          one-commit diff and later sibling movement updates THIS PR instead of opening another.
+          EOF
+          } > "$body"
+
+          if [ -z "$existing_num" ]; then
+            # A CLOSED (not merged) PR would otherwise let `gh pr create`
+            # succeed every day — GitHub allows a new PR for a head whose
+            # previous PR was closed — turning "one PR" into one per day.
+            # Reopen the maintainer's PR instead. `mergedAt` is the
+            # discriminator: gh reports state CLOSED for merged PRs too, and a
+            # merged one must never be reopened. `first`, not `last`: gh returns
+            # newest-first. No `|| true`, same reason as the open lookup above.
+            existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state closed \
+              --json number,mergedAt --jq 'map(select(.mergedAt == null)) | first | .number // empty')"
+            if [ -n "$existing_num" ]; then
+              echo "Reopening previously closed bump PR #$existing_num."
+              gh pr reopen "$existing_num" --repo "$REPO"
+            fi
+          fi
+
+          if [ -n "$existing_num" ]; then
+            gh pr edit "$existing_num" --repo "$REPO" --title "$TITLE" --body-file "$body"
+            url="$(gh pr view "$existing_num" --repo "$REPO" --json url --jq .url)"
+            echo "Updated bump PR: $url"
+          else
+            # A failure here is almost always CONFIGURATION rather than drift:
+            # this repo has "Allow GitHub Actions to create and approve pull
+            # requests" disabled, and a fine-grained PAT needs
+            # `Pull requests: write` on top of `Contents: write`. (Other 422
+            # causes exist — a >65536-char body, a branch-protection refusal —
+            # so gh's own stderr above is the authority.) Fail the job: the
+            # branch was pushed, so the fix is one click away, but a run that
+            # found a real bump and could not deliver it must not end green.
+            if ! url="$(gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft --title "$TITLE" --body-file "$body")"; then
+              echo "::error::Branch '$BRANCH' was pushed with the bumped pins, but opening its PR failed."
+              echo "::error::Usually permissions/config, not the bump itself (see gh's error above). Fix EITHER of:"
+              echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
+              echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO."
+              echo "::error::Meanwhile, open the PR by hand from '$BRANCH' — the bump is already committed there."
+              exit 1
+            fi
+            echo "Opened bump PR: $url"
+          fi
+          {
+            echo ""
+            echo "Bump PR: $url"
+          } >> "$GITHUB_STEP_SUMMARY"
