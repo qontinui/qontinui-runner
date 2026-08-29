@@ -1956,7 +1956,10 @@ mod tests {
         // point at localhost.
         assert_eq!(
             resolve_pair_code_base(None, None),
-            (PROD_API_BASE_URL.to_string(), PairCodeBaseSource::ProdDefault)
+            (
+                PROD_API_BASE_URL.to_string(),
+                PairCodeBaseSource::ProdDefault
+            )
         );
     }
 
@@ -1971,7 +1974,11 @@ mod tests {
             PairCodeBaseSource::ProdDefault.as_str(),
         ];
         let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
-        assert_eq!(unique.len(), labels.len(), "labels must be distinct: {labels:?}");
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "labels must be distinct: {labels:?}"
+        );
         assert!(labels.iter().all(|l| !l.is_empty()));
         // Each label must name the knob the operator would turn.
         assert!(PairCodeBaseSource::EnvOverride

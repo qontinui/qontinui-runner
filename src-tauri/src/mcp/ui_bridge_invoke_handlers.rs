@@ -459,9 +459,10 @@ mod server_mode_gate_tests {
             !crate::webview_recovery::is_server_mode(),
             "a test process is not a server-mode runner"
         );
-        assert!(
-            no_webview_rejection("dismiss_recent_crash", crate::webview_recovery::is_server_mode())
-                .is_none()
-        );
+        assert!(no_webview_rejection(
+            "dismiss_recent_crash",
+            crate::webview_recovery::is_server_mode()
+        )
+        .is_none());
     }
 }
