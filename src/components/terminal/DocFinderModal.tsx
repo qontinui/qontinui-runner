@@ -4,6 +4,7 @@ import { readDir, readTextFile } from "@tauri-apps/plugin-fs";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { FileText, Search, X, FolderOpen, Brain, Loader2 } from "lucide-react";
 import { pathSeparatorFor, normalizeRoot, joinPath, relativeToRoot } from "./docFinderPaths";
+import { fuzzyScore } from "./commands/fuzzy";
 
 /* ── Types ────────────────────────────────────────────────────────────── */
 
@@ -106,54 +107,15 @@ async function scanForDocs(root: string, maxDepth = 5, maxFiles = 1000): Promise
 
 /* ── Fuzzy match scoring ──────────────────────────────────────────────── */
 
-function fuzzyScore(text: string, query: string): { score: number; indices: number[] } | null {
-  const lower = text.toLowerCase();
-  const q = query.toLowerCase();
-
-  // Exact prefix match - highest score
-  if (lower.startsWith(q)) {
-    return {
-      score: 100 + q.length,
-      indices: Array.from({ length: q.length }, (_, i) => i),
-    };
-  }
-
-  // Word boundary match
-  const words = lower.split(/[\s\-_./\\]/);
-  let wordStart = 0;
-  const wordBoundaryIndices: number[] = [];
-  let qi = 0;
-  for (const word of words) {
-    if (qi < q.length && word.startsWith(q[qi])) {
-      for (let wi = 0; wi < word.length && qi < q.length; wi++) {
-        if (word[wi] === q[qi]) {
-          wordBoundaryIndices.push(wordStart + wi);
-          qi++;
-        }
-      }
-    }
-    wordStart += word.length + 1;
-  }
-  if (qi === q.length) {
-    return { score: 70 + q.length, indices: wordBoundaryIndices };
-  }
-
-  // Sequential character match (fuzzy)
-  const indices: number[] = [];
-  let si = 0;
-  for (let i = 0; i < lower.length && si < q.length; i++) {
-    if (lower[i] === q[si]) {
-      indices.push(i);
-      si++;
-    }
-  }
-  if (si === q.length) {
-    const spread = indices[indices.length - 1] - indices[0];
-    return { score: 30 + Math.max(0, 50 - spread), indices };
-  }
-
-  return null;
-}
+// Scoring lives in `commands/fuzzy` — the ONE scorer the CommandBar, the
+// Ctrl+Shift+K palette and this modal all rank with. This file used to
+// carry a private copy, and the copy still had the overlapping bands the
+// shared one was fixed for (word-boundary `70 + len` vs sequential
+// `30 + max(0, 50 - spread)`, i.e. 30..80 — so a sequential hit could
+// outrank a word-boundary hit and the doc list ordered by accident). The
+// copy is deleted rather than re-banded so it cannot drift a third time;
+// the shared scorer's word-separator class carries `.` and `\` for the
+// file paths scored here.
 
 function renderHighlighted(text: string, indices: number[]): ReactNode {
   if (indices.length === 0) return text;

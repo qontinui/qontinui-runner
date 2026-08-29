@@ -1,8 +1,12 @@
 /**
- * Fuzzy scoring used by the CommandBar (Tier 1 resolver) and the
- * Ctrl+Shift+K palette. Extracted from `CommandPalette.tsx:10-58` per
- * plan §4 Phase 2 so both surfaces use the same scorer — operators
- * shouldn't see different orderings between the two entry points.
+ * Fuzzy scoring used by the CommandBar (Tier 1 resolver), the
+ * Ctrl+Shift+K palette, and the doc-finder's file search. Extracted from
+ * `CommandPalette.tsx:10-58` per plan §4 Phase 2 so every surface uses
+ * the same scorer — operators shouldn't see different orderings between
+ * entry points, and a scorer that exists in one place cannot be fixed in
+ * one place and left broken in another (which is exactly what happened:
+ * `DocFinderModal.tsx` carried a private copy that still had the
+ * overlapping bands described below long after they were fixed here).
  *
  * Three tiers banded into NON-OVERLAPPING ranges so, for a given query,
  * a prefix match always beats a word-boundary match, which always beats
@@ -57,7 +61,12 @@ export function fuzzyScore(text: string, query: string): FuzzyMatch | null {
   }
 
   // ── Tier 2: word-boundary match ─────────────────────────────────────
-  const words = lower.split(/[\s\-_:/]/);
+  // The separator class covers command shapes (`/`, `-`, `_`, `:`,
+  // space) AND file-path shapes (`.`, `\`), because DocFinderModal
+  // scores relative paths like `docs\api\ui-bridge.md` through this same
+  // function. It used to carry a private copy for exactly that reason;
+  // widening the class here is what let the copy be deleted.
+  const words = lower.split(/[\s\-_:./\\]/);
   let wordStart = 0;
   const wordBoundaryIndices: number[] = [];
   let qi = 0;

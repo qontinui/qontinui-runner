@@ -11,6 +11,20 @@ import {
   subscribe as subscribeToRegistry,
 } from "./commands";
 
+/** DOM id of the results listbox, referenced by the input's
+ *  `aria-controls` / `aria-activedescendant`. */
+const LISTBOX_ID = "command-palette-listbox";
+
+/** Stable per-row DOM id + `data-page-element` token, so the keyboard
+ *  selection is READABLE from outside the app. The rows used to be
+ *  `role="button"` with the highlight living only in a Tailwind class —
+ *  no listbox, no option, no `aria-selected`, no `data-page-element` —
+ *  so nothing outside React could tell which row Enter would run. Mirrors
+ *  `CommandBar.tsx`'s `optionId` / `suggestionElementId`. */
+function paletteOptionId(actionId: string): string {
+  return `command-palette-option-${actionId}`;
+}
+
 function renderHighlightedLabel(label: string, indices: number[]): ReactNode {
   if (indices.length === 0) return label;
   const indexSet = new Set(indices);
@@ -108,10 +122,7 @@ export function CommandPalette({
   // `useCommandAction` registration appears in the palette without a
   // re-mount. Snapshot identity is stable between mutations, so this is
   // cheap re-key for the useMemo below.
-  const registrySnapshot = useSyncExternalStore(
-    subscribeToRegistry,
-    getRegistrySnapshot,
-  );
+  const registrySnapshot = useSyncExternalStore(subscribeToRegistry, getRegistrySnapshot);
 
   // Build action list
   const actions = useMemo(() => {
@@ -501,7 +512,10 @@ export function CommandPalette({
         if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-2xl w-[440px] max-h-[60vh] flex flex-col overflow-hidden">
+      <div
+        data-page-element="command-palette"
+        className="bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-2xl w-[440px] max-h-[60vh] flex flex-col overflow-hidden"
+      >
         {/* Search input */}
         <div className="flex items-center gap-2 px-4 py-3 border-b border-[#2a2d3d]">
           <Search className="w-4 h-4 text-[#565f89] shrink-0" />
@@ -511,6 +525,18 @@ export function CommandPalette({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Type a command..."
+            data-page-element="command-palette-input"
+            // Stable accessible name — the placeholder is not one to rely
+            // on, and the combobox/listbox pairing is what makes the
+            // selected row addressable from outside.
+            aria-label="Command palette"
+            role="combobox"
+            aria-expanded={filtered.length > 0}
+            aria-autocomplete="list"
+            aria-controls={filtered.length > 0 ? LISTBOX_ID : undefined}
+            aria-activedescendant={
+              filtered[selectedIndex] ? paletteOptionId(filtered[selectedIndex].id) : undefined
+            }
             className="flex-1 bg-transparent text-sm text-[#c0caf5] placeholder-[#565f89] outline-hidden"
           />
           <kbd className="text-[9px] font-mono text-[#565f89] bg-[#2a2d3d] rounded px-1.5 py-0.5">
@@ -518,49 +544,61 @@ export function CommandPalette({
           </kbd>
         </div>
 
-        {/* Results list */}
-        <div ref={listRef} className="flex-1 overflow-y-auto scrollbar-dark py-1">
+        {/* Results list. `role="listbox"` + one `role="option"` per row is
+            what makes the keyboard selection readable from outside — same
+            contract as CommandBar's suggestion dropdown. `listRef` is on
+            the listbox itself so the scroll-into-view index and the option
+            index are the same list (the "Clear recent commands" button is
+            a SIBLING of the listbox, not an option inside it). */}
+        <div className="flex-1 overflow-y-auto scrollbar-dark py-1">
           {filtered.length === 0 ? (
             <div className="px-4 py-6 text-center text-[12px] text-[#565f89]">
               No matching commands
             </div>
           ) : (
             <>
-              {filtered.map((action, i) => (
-                <div
-                  key={action.id}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => executeAction(action)}
-                  onMouseEnter={() => setSelectedIndex(i)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") executeAction(action);
-                  }}
-                  className={`flex items-center justify-between px-4 py-1.5 cursor-pointer transition-colors ${
-                    i === selectedIndex
-                      ? "bg-[#7aa2f7]/15 text-[#c0caf5]"
-                      : "text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
-                  }`}
-                >
-                  <div className="flex items-center gap-2 min-w-0">
-                    <span
-                      className={`text-[9px] uppercase tracking-wider w-14 shrink-0 ${
-                        action.category === "Recent" ? "text-[#7aa2f7]" : "text-[#565f89]"
-                      }`}
-                    >
-                      {action.category}
-                    </span>
-                    <span className="text-[12px] truncate">
-                      {renderHighlightedLabel(action.label, matchIndicesMap.get(action.id) ?? [])}
-                    </span>
+              <div ref={listRef} id={LISTBOX_ID} role="listbox" aria-label="Palette commands">
+                {filtered.map((action, i) => (
+                  <div
+                    key={action.id}
+                    id={paletteOptionId(action.id)}
+                    data-page-element={paletteOptionId(action.id)}
+                    role="option"
+                    aria-selected={i === selectedIndex}
+                    onClick={() => executeAction(action)}
+                    onMouseEnter={() => setSelectedIndex(i)}
+                    // No per-row `tabIndex`/`onKeyDown`: this is the
+                    // aria-activedescendant pattern, where focus stays on
+                    // the input and the window-level keydown handler above
+                    // owns ArrowUp/ArrowDown/Enter. Rows were previously
+                    // `role="button" tabIndex={0}`, which put 100+ stops in
+                    // the tab order for a list the keyboard already drives.
+                    className={`flex items-center justify-between px-4 py-1.5 cursor-pointer transition-colors ${
+                      i === selectedIndex
+                        ? "bg-[#7aa2f7]/15 text-[#c0caf5]"
+                        : "text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span
+                        className={`text-[9px] uppercase tracking-wider w-14 shrink-0 ${
+                          action.category === "Recent" ? "text-[#7aa2f7]" : "text-[#565f89]"
+                        }`}
+                      >
+                        {action.category}
+                      </span>
+                      <span className="text-[12px] truncate">
+                        {renderHighlightedLabel(action.label, matchIndicesMap.get(action.id) ?? [])}
+                      </span>
+                    </div>
+                    {action.shortcut && (
+                      <kbd className="text-[9px] font-mono text-[#565f89] bg-[#2a2d3d] border border-[#3b3d57] rounded px-1 py-0.5 ml-3 shrink-0 whitespace-nowrap">
+                        {action.shortcut}
+                      </kbd>
+                    )}
                   </div>
-                  {action.shortcut && (
-                    <kbd className="text-[9px] font-mono text-[#565f89] bg-[#2a2d3d] border border-[#3b3d57] rounded px-1 py-0.5 ml-3 shrink-0 whitespace-nowrap">
-                      {action.shortcut}
-                    </kbd>
-                  )}
-                </div>
-              ))}
+                ))}
+              </div>
               {!query.trim() && recentIds.length > 0 && (
                 <button
                   onClick={() => {

@@ -202,6 +202,36 @@ function fail(code: string, message?: string): CommandResult<never> {
 }
 
 /**
+ * Turn a spawn closure's return into an HONEST verdict.
+ *
+ * `ctx.spawnPlain` / `ctx.spawnAi` resolve to the tab ids they actually
+ * created, or to `void` when the page's spawn closure bailed before
+ * creating anything (Tauri unavailable, PTY spawn refused, no account
+ * resolved downstream). The old `ok(Array.isArray(result) ? result : [])`
+ * therefore rendered `✓` for a `/spawn 2` that produced ZERO terminals —
+ * the same false-success class as the `/generate` bug: a verdict derived
+ * from "the call returned" rather than from what the call produced.
+ *
+ * The count is load-bearing, not just the emptiness: a partial spawn
+ * (2 requested, 1 created) is a failure the operator has to see, because
+ * the grid will not look like what they asked for.
+ *
+ * Exported so the contract is unit-testable without mounting the hook,
+ * same split as `resolveZoneTarget` / `resolveTenantArg`.
+ */
+export function spawnVerdict(
+  result: string[] | void,
+  count: number,
+  what: string = "terminals",
+): CommandResult<string[]> {
+  const ids = Array.isArray(result) ? result : [];
+  if (ids.length < count) {
+    return fail("spawn-failed", `spawned ${ids.length} of ${count} ${what}`);
+  }
+  return ok(ids);
+}
+
+/**
  * Three-state read of a zone argument.
  *
  * The middle state is the whole point of the type. A field that was
@@ -450,7 +480,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const count = typeof args.count === "number" ? args.count : 1;
       if (count < 1) return fail("invalid-count", "count must be >= 1");
       const result = await ctx.spawnPlain(count);
-      return ok(Array.isArray(result) ? result : []);
+      return spawnVerdict(result, count);
     },
   });
 
@@ -495,7 +525,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const { tenantId, error } = resolveTenantArg(rawTenant, ctx.tenantCandidates);
       if (error) return fail("unknown-tenant", error);
       const result = await ctx.spawnAi(count, configDir, split.context, tenantId);
-      return ok(Array.isArray(result) ? result : []);
+      return spawnVerdict(result, count, "AI sessions");
     },
   });
 
@@ -512,7 +542,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const command = typeof args.command === "string" ? args.command : "";
       if (!command) return fail("invalid-command", "command is required");
       const result = await ctx.spawnPlain(count, command);
-      return ok(Array.isArray(result) ? result : []);
+      return spawnVerdict(result, count);
     },
   });
 

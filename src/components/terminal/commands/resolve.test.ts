@@ -137,6 +137,56 @@ describe("resolve — fuzzy match", () => {
     expect(matches[0].action.id).toBe("layout");
   });
 
+  it("breaks a WITHIN-tier slash/label tie toward the slash", () => {
+    // Re-banding the scorer made a slash hit outrank a label hit ACROSS
+    // tiers. It said nothing about a tie WITHIN one: here both actions
+    // take a word-boundary hit at the identical score — one on its SLASH
+    // body, one only on its LABEL — and the winner used to be whichever
+    // was registered first. The label-only action is registered FIRST on
+    // purpose, so registration order would give the wrong answer.
+    register(action({ id: "label-only", slash: "/zzz", label: "Restart something" }));
+    register(action({ id: "restart", slash: "/restart", label: "Restart session in zone" }));
+    const matches = resolve("rst", []);
+    expect(matches[0].action.id).toBe("restart");
+  });
+
+  it("puts the slash tiebreak ABOVE recency", () => {
+    // Recency is the weakest signal: which field matched is part of match
+    // quality, and iteration 1 already demoted recency below quality.
+    register(action({ id: "label-only", slash: "/zzz", label: "Restart something" }));
+    register(action({ id: "restart", slash: "/restart", label: "Restart session in zone" }));
+    const matches = resolve("rst", ["label-only"]);
+    expect(matches[0].action.id).toBe("restart");
+  });
+
+  it("keeps the shipped registry's three tie queries on their slash", () => {
+    // The queries that tie in the live registry, each with a decoy whose
+    // LABEL scores identically. Decoys are registered first so the
+    // pre-fix registration-order fallback would pick them.
+    register(action({ id: "decoy-rst", slash: "/zz1", label: "Restart something" }));
+    register(action({ id: "restart", slash: "/restart", label: "Restart session in zone" }));
+    register(action({ id: "decoy-fnd", slash: "/zz2", label: "Find node data" }));
+    register(action({ id: "findings", slash: "/findings", label: "Toggle findings panel" }));
+    register(action({ id: "decoy-ntf", slash: "/zz3", label: "Notify test flags" }));
+    register(
+      action({ id: "notify", slash: "/desktop-notify", label: "Toggle desktop notifications" }),
+    );
+    expect(resolve("rst", [])[0].action.id).toBe("restart");
+    expect(resolve("fnd", [])[0].action.id).toBe("findings");
+    expect(resolve("ntf", [])[0].action.id).toBe("notify");
+  });
+
+  it("does NOT let the slash tiebreak beat a strictly better label score", () => {
+    // The tiebreak is within-tier only — it must never promote a worse
+    // match, which is exactly the failure mode the recency demotion
+    // fixed. `/xlay` is a Tier-3 sequential hit on its SLASH; "Layout
+    // everything" is a Tier-1 prefix hit on a LABEL. Score wins.
+    register(action({ id: "seq-slash", slash: "/xlay", label: "Nothing relevant" }));
+    register(action({ id: "prefix-label", slash: "/zzz", label: "Layout everything" }));
+    const matches = resolve("lay", []);
+    expect(matches[0].action.id).toBe("prefix-label");
+  });
+
   it("caps to 8 suggestions", () => {
     for (let i = 0; i < 12; i++) {
       register(action({ id: `n${i}`, slash: `/n${i}`, label: `N${i}` }));
