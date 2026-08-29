@@ -24,7 +24,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Runtime, State};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::commands::compartments::IntegrationCompartment;
 use crate::commands::AppState;
@@ -695,18 +695,39 @@ pub async fn redeem_pair_code(
     // the Settings UI also promotes after redeem, but a headless / UI-Bridge
     // caller that doesn't run the FE path still ends up online. Idempotent —
     // a no-op when already at Tier 2.
-    {
-        if settings::load_settings().tier != settings::RunnerTier::QontinuiAccount {
-            if crate::instance::is_secondary() {
-                warn!("redeem_pair_code: secondary runner — applying tier in-memory only, skipping save_settings");
-            } else if let Err(e) = settings::update_settings(|s| {
-                s.tier = settings::RunnerTier::QontinuiAccount;
-                s.tier_initialized = true;
-            }) {
-                warn!("redeem_pair_code: tier promotion persist failed (continuing): {e}");
+    //
+    // The write itself lives in `qontinui_runner_lib::profiles` — the SAME
+    // helper the headless CLI door (`qontinui_profile device pair`) calls.
+    // That door used to write the pairing credentials and never touch the
+    // tier, so the box that most needs Tier 2 was the only one that could not
+    // reach it. One writer, two doors: they cannot drift again. The helper
+    // owns all three conditions of `settings::should_persist_migration` —
+    // nothing-to-persist, `!is_secondary`, and (structurally, via its
+    // `serde_json::Value` edit) an authoritative source.
+    match qontinui_runner_lib::profiles::promote_tier_to_account() {
+        Ok(qontinui_runner_lib::profiles::TierPromotion::Promoted) => {
+            info!("redeem_pair_code: promoted runner to Tier QontinuiAccount");
+        }
+        Ok(qontinui_runner_lib::profiles::TierPromotion::AlreadyAccount) => {
+            debug!("redeem_pair_code: runner already at Tier QontinuiAccount — no settings write");
+        }
+        Ok(qontinui_runner_lib::profiles::TierPromotion::SkippedSecondary) => {
+            // A secondary must never write the shared settings.json (it would
+            // demote the primary), but THIS process still holds a device JWT
+            // and needs Tier 2 to bring its relay online — so apply the tier
+            // as the in-memory-only overlay, which is never persisted.
+            // Guarded on there being no runtime override already: an explicit
+            // operator choice (`set_runner_tier`) is authoritative over an
+            // inferred promotion, and that precedence must not be inverted.
+            if settings::in_memory_tier().is_none() {
+                settings::set_in_memory_tier(settings::RunnerTier::QontinuiAccount);
+                warn!("redeem_pair_code: secondary runner — applying tier in-memory only, skipping the settings.json write");
             } else {
-                info!("redeem_pair_code: promoted runner to Tier QontinuiAccount");
+                warn!("redeem_pair_code: secondary runner with an explicit runtime tier override — leaving it alone");
             }
+        }
+        Err(e) => {
+            warn!("redeem_pair_code: tier promotion persist failed (continuing): {e}");
         }
     }
 

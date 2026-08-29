@@ -36,6 +36,15 @@ pub mod tauri_event_payloads;
 // operator never performed).
 pub mod fs_atomic;
 
+// Runner instance identity from the process env (`QONTINUI_INSTANCE_NAME`) —
+// the ONE primary/secondary predicate. In the lib for the same reason as
+// `fs_atomic`: the runner bin's tier-persist guard and the `qontinui_profile`
+// bin's headless pair door must agree on "is this a secondary?", and a second
+// bin cannot import from the runner bin's module tree. `crate::instance`
+// (bin-only — it reaches into `crate::mcp::types`) re-exports it, so there is
+// exactly one implementation. See `profiles::promote_tier_to_account`.
+pub mod instance_env;
+
 // Exposed for the `qontinui_profile device pair` CLI (and any other binary
 // that needs the encrypted token store outside the Tauri runtime). Both
 // modules are Tauri-free.

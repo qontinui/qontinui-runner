@@ -3324,7 +3324,11 @@ pub fn set_in_memory_tier(tier: RunnerTier) {
 }
 
 /// The in-memory tier override, if one was set. See [`TIER_OVERRIDE`].
-fn in_memory_tier() -> Option<RunnerTier> {
+///
+/// `pub(crate)` so `redeem_pair_code` can honour the precedence rule when the
+/// shared tier writer refuses a secondary: an explicit runtime choice beats an
+/// inferred promotion, so the overlay is applied only when none is set.
+pub(crate) fn in_memory_tier() -> Option<RunnerTier> {
     TIER_OVERRIDE.read().ok().and_then(|g| *g)
 }
 
@@ -4834,6 +4838,56 @@ mod openai_compatible_defaults_tests {
             Some("second-and-longer"),
             "an mtime/size change must invalidate the cached parse"
         );
+    }
+
+    // ── shared tier writer × this module's reader ───────────────────────────
+
+    /// The tier WRITE lives in the lib (`profiles::promote_tier_to_account_at`)
+    /// because `settings` is in the runner BIN's module tree and the headless
+    /// pair door is a second bin. This test pins the contract across that
+    /// boundary in both directions:
+    ///
+    /// * the `settings.json` the lib CREATES on a fresh headless box — two keys
+    ///   and nothing else — must deserialize into a full [`Settings`], every
+    ///   other field coming from its serde default; and
+    /// * the tier it wrote must read back as [`RunnerTier::QontinuiAccount`]
+    ///   with `tier_initialized` set, so `migrate_tier_in_place` does not
+    ///   re-infer `Local` over it on the next boot.
+    ///
+    /// Without this, the lib could silently write a document the bin cannot
+    /// parse — which `load_settings` reports as NON-authoritative and therefore
+    /// as a runner with no tier at all.
+    #[test]
+    fn minimal_promoted_settings_json_parses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let outcome = qontinui_runner_lib::profiles::promote_tier_to_account_at(&path, false)
+            .expect("the lib writer must create an absent settings.json");
+        assert_eq!(
+            outcome,
+            qontinui_runner_lib::profiles::TierPromotion::Promoted
+        );
+
+        let loaded = read_settings_from_path(&path);
+        assert_eq!(
+            loaded.provenance,
+            SettingsProvenance::Loaded,
+            "the lib-created settings.json must parse as an AUTHORITATIVE load"
+        );
+        assert_eq!(loaded.settings.tier, RunnerTier::QontinuiAccount);
+        assert!(
+            loaded.settings.tier_initialized,
+            "tier_initialized must be set, or migrate_tier_in_place re-infers Local over it"
+        );
+
+        // And the one-shot inference is now a no-op on that document.
+        let mut s = loaded.settings.clone();
+        assert!(
+            !migrate_tier_in_place(&mut s),
+            "a promoted document must need no migration"
+        );
+        assert_eq!(s.tier, RunnerTier::QontinuiAccount);
     }
 
     /// A corrupt file must never be cached: the "settings unreadable" banner

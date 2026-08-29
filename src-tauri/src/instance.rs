@@ -14,21 +14,16 @@
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info};
 
-/// The raw instance name from the env, if set and non-empty.
-pub fn instance_name() -> Option<String> {
-    std::env::var("QONTINUI_INSTANCE_NAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
-/// True when this runner was launched as a non-primary instance.
+/// The env-identity primitives live in the LIB crate
+/// ([`qontinui_runner_lib::instance_env`]) so the `qontinui_profile` bin —
+/// which cannot import from the runner bin's module tree — shares the SAME
+/// primary/secondary predicate the settings/tier persist guards use. Re-exported
+/// here so every `crate::instance::{instance_name, is_secondary}` call site in
+/// this bin keeps resolving, against exactly one implementation.
 ///
-/// Note: this is a weaker check than `process_capture::primary_proxy::is_secondary`
-/// — it only requires the instance name, not a primary port — because path
-/// isolation should kick in even when the secondary has no primary to proxy to.
-pub fn is_secondary() -> bool {
-    instance_name().is_some()
-}
+/// The rest of this module stays bin-side: it reaches into `crate::mcp::types`
+/// and `crate::session`, neither of which is in the lib.
+pub use qontinui_runner_lib::instance_env::{instance_name, is_secondary};
 
 /// True iff this runner is the canonical instance — the one allowed to own
 /// SHARED, machine-wide state that is not path-isolated per instance.
