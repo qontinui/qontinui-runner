@@ -1029,9 +1029,13 @@ fn flush_batch(
     // the coverage readout entirely, which is the exact defect that readout
     // exists to expose.
     //
-    // `None`: the route resolves the row's tenant from the body `device_id`,
-    // and the token read here was always the default slot's.
-    let req = crate::auth::attach_device_auth_blocking(client.post(&url).json(&batch), None);
+    // `Device`: the route resolves the row's tenant from the path `agent_id`
+    // (coord's `resolve_tenant_from_agent_id`) and never reads the bearer, so
+    // no slot choice can move the row. Not `Unresolved` — nothing failed here.
+    let req = crate::auth::attach_device_auth_blocking(
+        client.post(&url).json(&batch),
+        crate::auth::TenantScope::Device,
+    );
 
     match req.send() {
         Ok(resp) if resp.status().is_success() => {

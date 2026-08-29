@@ -78,6 +78,8 @@ use serde_json::{json, Value as JsonValue};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::auth::TenantScope;
+
 use super::dual_write::DualWriteGate;
 use super::local_store::{OutboxEvent, OutboxRecord, OutboxWriter};
 use super::{Intent, SessionEventKind, SessionRegistry, SessionState};
@@ -238,16 +240,17 @@ impl CoordSync {
         self.inner.http.clone()
     }
 
-    /// The tenant that owns `session_id`, for per-session credential
+    /// The tenant scope that owns `session_id`, for per-session credential
     /// selection by callers outside this module.
     ///
     /// Only for callers that KNOW the registry already holds the session —
     /// `SessionRegistry::attach_output_pipe`, which runs after the record is
     /// inserted. Callers on a pre-insert path must pass the intent's tenant
-    /// down instead (see [`CoordSync::probe_resume`]), because `None` here is
-    /// indistinguishable from "unknown" and resolves to the DEFAULT binding,
-    /// not to an anonymous send.
-    pub fn session_tenant(&self, session_id: Uuid) -> Option<Uuid> {
+    /// down instead (see [`CoordSync::probe_resume`]); this returns
+    /// [`TenantScope::Unresolved`] there, which is honest but degrades on a
+    /// multi-bound device rather than resolving to the tenant the caller could
+    /// have supplied.
+    pub fn session_tenant(&self, session_id: Uuid) -> TenantScope {
         session_tenant_by_id(&self.inner, session_id)
     }
 
@@ -341,12 +344,11 @@ impl CoordSync {
     /// `tenant` is the OWNING session's tenant and must be supplied by the
     /// caller — it cannot be resolved here. This probe runs *before*
     /// `insert_resumed_record`, so the registry provably does not hold
-    /// `session_id` yet; a [`session_tenant_by_id`] lookup would return `None`
-    /// on every call. And `None` does not mean "send anonymously" — it selects
-    /// the DEFAULT binding's JWT, so a self-resolving version would present the
-    /// default tenant's credential for another tenant's session on a route
-    /// where coord derives the row's tenant from the verified bearer. The
-    /// caller has the intent; it passes the tenant down.
+    /// `session_id` yet; a [`session_tenant_by_id`] lookup would answer
+    /// [`TenantScope::Unresolved`] on every call, which on a multi-bound device
+    /// degrades the probe to unauthenticated for a session whose tenant the
+    /// caller was holding all along. The caller has the intent; it passes the
+    /// tenant down.
     pub async fn probe_resume(&self, session_id: Uuid, tenant: Option<Uuid>) -> ResumeProbe {
         let base = self.inner.coord_url.trim_end_matches('/');
         let url = format!("{base}/sessions/{session_id}");
@@ -360,7 +362,7 @@ impl CoordSync {
         // predicate over all of them.
         match crate::auth::attach_device_auth_for(
             self.inner.http.patch(&url).json(&body),
-            tenant.as_ref(),
+            TenantScope::for_session(tenant),
         )
         .send()
         .await
@@ -752,11 +754,17 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
 
     // Phase 8b (plan 2026-07-02-session-scoped-multi-tenant-device-binding
     // §D4) — per-session credential selection: every push presents the
-    // OWNING SESSION's device-JWT slot. `None` (session tenant unknown —
-    // pre-8b outbox rows, registry gone after restart, single-tenant
-    // installs) keeps the default slot, byte-identical to the old behavior.
-    let tenant = record_session_tenant(inner, rec);
-    let tenant_ref = tenant.as_ref();
+    // OWNING SESSION's device-JWT slot.
+    //
+    // Phase 5 of `2026-08-29-runner-work-scoped-writes-default-tenant-credential`
+    // typed the unknown arm. Every outbox record belongs to a session, so an
+    // unknown tenant here (pre-8b rows, registry gone after a restart, a
+    // session stamped before any default existed) is a resolution FAILURE, not
+    // "this route has no tenant" — `TenantScope::Unresolved`. That keeps the
+    // default slot on a single-bound device, byte-identical to the old
+    // behaviour, and degrades to unauthenticated on a multi-bound one instead
+    // of filing another tenant's session row.
+    let scope = record_session_tenant(inner, rec);
 
     let result = match kind {
         "started" => {
@@ -765,14 +773,14 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // session start; we just forward it.
             let body = rebuild_create_body(rec);
             let url = format!("{base}/sessions");
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), tenant_ref)
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
                 .send()
                 .await
         }
         "heartbeat" => {
             let url = format!("{base}/sessions/{}", rec.session_id);
             let body = json!({ "heartbeat": true });
-            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), tenant_ref)
+            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -781,20 +789,20 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // The payload carries whatever fields the runner changed —
             // forward the subset coord understands.
             let body = state_change_body(&rec.payload);
-            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), tenant_ref)
+            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
                 .send()
                 .await
         }
         "closed" => {
             let url = format!("{base}/sessions/{}", rec.session_id);
-            crate::auth::attach_device_auth_for(inner.http.delete(&url), tenant_ref)
+            crate::auth::attach_device_auth_for(inner.http.delete(&url), scope)
                 .send()
                 .await
         }
         "claim_stolen" => {
             let url = format!("{base}/sessions/{}/steal", rec.session_id);
             let body = steal_body(rec);
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), tenant_ref)
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -807,7 +815,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // stamps last_progress_at=now() when the body omits it.
             let url = format!("{base}/sessions/{}", rec.session_id);
             let body = progress_body(&rec.payload);
-            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), tenant_ref)
+            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -817,20 +825,18 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // HelperTaskRegistrar — forward it verbatim. Phase 8b: this is a
             // SESSION-scoped data-plane push (the helper task is created by an
             // owning session), so it presents that session's device-JWT slot
-            // via `attach_device_auth_for(tenant_ref)` like every other
-            // per-session arm above — `None` keeps the default slot,
-            // byte-identical to the pre-8b bare `attach_device_auth`.
+            // via `attach_device_auth_for(scope)` like every other
+            // per-session arm above — an `Unresolved` scope keeps the default
+            // slot on a single-bound device, byte-identical to the pre-8b bare
+            // `attach_device_auth`.
             // Responses take the dedicated best-effort path in
             // `helper_task_outcome` (201 provenance capture, the
             // `helper_task_queue_unavailable` 503 drop, bounded retry for
             // everything else).
             let url = format!("{base}/coord/helper-tasks");
-            crate::auth::attach_device_auth_for(
-                inner.http.post(&url).json(&rec.payload),
-                tenant_ref,
-            )
-            .send()
-            .await
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
+                .send()
+                .await
         }
         "commit_report" => {
             // Commit ↔ session lineage push-report (plan
@@ -843,9 +849,11 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             let url = format!("{base}/coord/commits/report");
             let mut rb = crate::auth::attach_device_auth_for(
                 inner.http.post(&url).json(&rec.payload),
-                tenant_ref,
+                scope,
             );
-            if let Some(tid) = tenant.or_else(crate::session::dual_write::resolve_active_tenant_id)
+            if let Some(tid) = scope
+                .declared_tenant()
+                .or_else(crate::session::dual_write::resolve_active_tenant_id)
             {
                 rb = rb.header("X-Qontinui-Tenant-Id", tid.to_string());
             }
@@ -861,7 +869,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // (session_id, stream, chunk_offset), so a replay is a no-op.
             let url = format!("{base}/sessions/{}/output", rec.session_id);
             let body = output_chunk_body(&rec.payload);
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), tenant_ref)
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -880,7 +888,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 "event_kind": rec.event_kind,
                 "payload": rec.payload,
             });
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), tenant_ref)
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -977,10 +985,12 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
 /// 2. The live [`SessionRegistry`] record for `rec.session_id` — thin
 ///    payloads (heartbeat / state_change / closed) carry no intent, but the
 ///    registry still holds the session's stamped tenant while it's alive.
-/// 3. `None` — replayed rows for sessions the registry no longer holds
-///    (post-restart) and pre-8b rows. Callers treat `None` as "default
-///    slot", the pre-8b behavior, so nothing regresses.
-fn record_session_tenant(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> Option<Uuid> {
+/// 3. [`TenantScope::Unresolved`] — replayed rows for sessions the registry no
+///    longer holds (post-restart) and pre-8b rows. A single-bound device still
+///    presents the default slot (the pre-8b behavior, so nothing regresses); a
+///    multi-bound one degrades to unauthenticated rather than filing the row
+///    under whichever tenant happens to be default.
+fn record_session_tenant(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> TenantScope {
     let from_payload = rec
         .payload
         .get("intent")
@@ -988,8 +998,8 @@ fn record_session_tenant(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> Opt
         .or_else(|| rec.payload.get("tenant_id"))
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s.trim()).ok());
-    if from_payload.is_some() {
-        return from_payload;
+    if let Some(t) = from_payload {
+        return TenantScope::Owned(t);
     }
     session_tenant_by_id(inner, rec.session_id)
 }
@@ -998,19 +1008,23 @@ fn record_session_tenant(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> Opt
 ///
 /// The registry arm of [`record_session_tenant`], split out because two
 /// callers need a tenant from a bare `session_id` with no outbox record in
-/// hand: [`CoordSync::probe_resume`] and the output pipe. `None` whenever the
-/// registry is gone (post-restart), the session is unknown, or its intent
-/// carries no tenant — which selects the default binding, the pre-8b
-/// behaviour.
-fn session_tenant_by_id(inner: &Arc<CoordSyncInner>, session_id: Uuid) -> Option<Uuid> {
-    inner
-        .registry
-        .lock()
-        .expect("coord_sync registry slot poisoned")
-        .as_ref()
-        .and_then(Weak::upgrade)
-        .and_then(|reg| reg.describe_by_id(session_id).ok())
-        .and_then(|d| d.intent.tenant_id)
+/// hand: [`CoordSync::probe_resume`] and the output pipe.
+///
+/// [`TenantScope::Unresolved`] whenever the registry is gone (post-restart),
+/// the session is unknown, or its intent carries no tenant. It is never
+/// [`TenantScope::Device`]: a session row HAS an owning tenant, so failing to
+/// find it is a failure, and the D2 degrade is what should decide the outcome.
+fn session_tenant_by_id(inner: &Arc<CoordSyncInner>, session_id: Uuid) -> TenantScope {
+    TenantScope::for_session(
+        inner
+            .registry
+            .lock()
+            .expect("coord_sync registry slot poisoned")
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|reg| reg.describe_by_id(session_id).ok())
+            .and_then(|d| d.intent.tenant_id),
+    )
 }
 
 /// Response handling for `helper_task_created` POSTs — best-effort posture.
@@ -2014,7 +2028,7 @@ mod tests {
         );
         assert_eq!(
             record_session_tenant(&coord.inner, &rec1),
-            Some(intent_tenant)
+            TenantScope::Owned(intent_tenant)
         );
 
         // 2. top-level payload tenant_id when the intent has none.
@@ -2024,7 +2038,7 @@ mod tests {
         );
         assert_eq!(
             record_session_tenant(&coord.inner, &rec2),
-            Some(payload_tenant)
+            TenantScope::Owned(payload_tenant)
         );
 
         // 3. thin payload (heartbeat shape) → the live registry record's
@@ -2035,12 +2049,18 @@ mod tests {
         let rec3 = mk(handle.id(), json!({ "at": chrono::Utc::now() }));
         assert_eq!(
             record_session_tenant(&coord.inner, &rec3),
-            Some(registry_tenant)
+            TenantScope::Owned(registry_tenant)
         );
 
-        // 4. unknown session + thin payload → None (default slot).
+        // 4. unknown session + thin payload → Unresolved. NOT `Device`: the
+        //    row has an owning session, we just cannot name its tenant, and
+        //    that distinction is what arms the D2 degrade on a multi-bound
+        //    device while leaving a single-bound one on the default slot.
         let rec4 = mk(Uuid::new_v4(), json!({}));
-        assert_eq!(record_session_tenant(&coord.inner, &rec4), None);
+        assert_eq!(
+            record_session_tenant(&coord.inner, &rec4),
+            TenantScope::Unresolved
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

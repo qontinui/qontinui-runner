@@ -135,7 +135,7 @@ pub async fn post_question(
 
     let mut last_err: Option<CoordQuestionError> = None;
     for attempt in 0..2 {
-        // coord-tenant-scope(session-owed): agent_id, agent_session_id and device_id are all parameters (:109, :114, :115), but coord resolves the tenant from the path agent_id -- not the bearer and not the body. Phase 5.
+        // coord-tenant-scope(session-noop): agent_id, agent_session_id and device_id are all parameters, but coord's post_ask_question resolves the tenant with resolve_tenant_from_agent_id off the PATH agent_id -- not the bearer, not the body -- on an anonymous device-keyed write. No credential change reaches this row; its tenancy is set at allocate. Terminal.
         match crate::auth::attach_device_auth(client.post(&url).json(&body))
             .send()
             .await

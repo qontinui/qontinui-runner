@@ -717,7 +717,19 @@ async fn materialize(
     //    resource_key, best-effort, exactly as the handoff receiver does.
     let device_id = registry.machine_id();
     for claim in &state.held_claims {
-        if let Err(e) = super::handoff::reacquire_claim(http, coord_url, claim, device_id).await {
+        // Same derivation the handoff receiver uses: a respawned session inherits
+        // the SOURCE session's tenant via `build_child_intent`, and the claims
+        // re-acquired here belong to that tenant — not to this device's default
+        // binding, which on a multi-bound box would be a different tenant.
+        if let Err(e) = super::handoff::reacquire_claim(
+            http,
+            coord_url,
+            claim,
+            device_id,
+            crate::auth::TenantScope::for_session(child_intent.tenant_id),
+        )
+        .await
+        {
             tracing::warn!(
                 kind = %claim.kind,
                 resource_key = %claim.resource_key,

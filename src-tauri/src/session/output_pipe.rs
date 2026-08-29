@@ -48,6 +48,8 @@ use base64::Engine;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::auth::TenantScope;
+
 use super::coord_sync::CoordSync;
 use super::redact::redact_secrets;
 
@@ -78,20 +80,19 @@ const MAX_BUFFER_BYTES: usize = 512 * 1024;
 /// `redact` is the resolved [`Intent::effective_redact_secrets`] value.
 /// `rx` is the transport's output broadcast receiver.
 ///
-/// `tenant` is the OWNING session's tenant, supplied by the caller. It is not
-/// resolved here on purpose: `start_inner` spawns this pipe *before* inserting
-/// the session record, so a self-resolving pipe would race the registry and
-/// publish early chunks under the DEFAULT binding — and on this route coord
-/// derives the row's tenant from the verified bearer, so that files another
-/// tenant's transcript with no observable. `None` still means the default
-/// binding (never another tenant's slot), which is why the caller must be the
-/// one to decide.
+/// `tenant` is the OWNING session's scope, supplied by the caller. It is not
+/// resolved here: this pipe can start BEFORE the session record is inserted, so
+/// a self-resolving version would answer `Unresolved` for early chunks and
+/// (on a multi-bound device) drop their authentication for no reason. A wrong
+/// `Owned` would be worse still — `/sessions/{id}/output` is a route where
+/// coord derives the row's tenant from the verified bearer, so it would file
+/// another tenant's transcript with no observable.
 pub fn spawn(
     coord_sync: CoordSync,
     session_id: Uuid,
     rx: broadcast::Receiver<String>,
     redact: bool,
-    tenant: Option<Uuid>,
+    tenant: TenantScope,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_pipe(coord_sync, session_id, rx, redact, tenant))
 }
@@ -104,7 +105,7 @@ async fn run_pipe(
     session_id: Uuid,
     mut rx: broadcast::Receiver<String>,
     redact: bool,
-    tenant: Option<Uuid>,
+    tenant: TenantScope,
 ) {
     let http = coord_sync.http_client();
     let base = coord_sync.coord_url().trim_end_matches('/').to_string();
@@ -143,7 +144,7 @@ async fn run_pipe(
                                 if buffer.len() >= FLUSH_BYTES {
                                     flush(
                                         &http, &url, session_id, &mut buffer,
-                                        &mut next_offset, tenant.as_ref(),
+                                        &mut next_offset, tenant,
                                     )
                                     .await;
                                 }
@@ -157,7 +158,7 @@ async fn run_pipe(
                                     );
                                     flush(
                                         &http, &url, session_id, &mut buffer,
-                                        &mut next_offset, tenant.as_ref(),
+                                        &mut next_offset, tenant,
                                     )
                                     .await;
                                 }
@@ -187,7 +188,7 @@ async fn run_pipe(
                         // Terminal closed. Final flush + exit.
                         flush(
                             &http, &url, session_id, &mut buffer, &mut next_offset,
-                            tenant.as_ref(),
+                            tenant,
                         )
                         .await;
                         tracing::info!(
@@ -204,7 +205,7 @@ async fn run_pipe(
                 if !buffer.is_empty() {
                     flush(
                         &http, &url, session_id, &mut buffer, &mut next_offset,
-                        tenant.as_ref(),
+                        tenant,
                     )
                     .await;
                 }
@@ -226,7 +227,7 @@ async fn flush(
     session_id: Uuid,
     buffer: &mut Vec<u8>,
     next_offset: &mut i64,
-    tenant: Option<&Uuid>,
+    tenant: TenantScope,
 ) {
     if buffer.is_empty() {
         return;

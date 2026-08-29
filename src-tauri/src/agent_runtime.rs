@@ -449,6 +449,14 @@ struct ClaimHeartbeat {
     resource_key: String,
     machine_id: String,
     ttl_seconds: i64,
+    /// D1's declared-tenant half: coord's `ClaimRequest.tenant_id` is what it
+    /// validates against `coord.tenant_devices` and stamps into the claim
+    /// audit row's `metadata.tenant_id`. Omitted from the wire when the owning
+    /// tenant is not known — coord then resolves server-side and counts it,
+    /// which is strictly better than declaring a guess on a route where the
+    /// body IS the tenancy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<uuid::Uuid>,
 }
 
 // =============================================================================
@@ -4820,7 +4828,7 @@ async fn post_log_line(agent_id: uuid::Uuid, line: &LogLine) -> bool {
     let Some(client) = crate::coord_http::coord_client() else {
         return false;
     };
-    // coord-tenant-scope(session-owed): agent_id is the fn's first parameter (:4799), but coord resolves the tenant from coord.agent_worktrees by that agent_id and never reads the bearer -- correctness is downstream of allocate. Phase 5.
+    // coord-tenant-scope(session-noop): agent_id is the fn's first parameter, but coord's agent_logs::post_log takes NO auth extractor and resolves the tenant with resolve_tenant_from_agent_id (SELECT tenant_id FROM coord.agent_worktrees WHERE agent_id=$1). The bearer is never read, so no slot choice can move this row -- its correctness is entirely downstream of the /agents/allocate body, which Phase 5 now populates. Terminal.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(3))
         .json(line)
@@ -4863,20 +4871,30 @@ async fn run_heartbeat_loop(payload: LaunchPayload) {
 
 async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
     let base = connected_coord_base().ok_or_else(|| anyhow::anyhow!("no coord_url"))?;
+    // Phase 5 — this is NOT a device heartbeat: it renews the spawned agent's
+    // `phase` claim, a row coord stamps with a tenant. Both halves of D1's rule
+    // apply, so the owning session supplies the declared `tenant_id` AND the
+    // bearer slot. `payload.agent_session_id` is coord's id for the agent's
+    // session and is only a registry id when this runner started it, so the
+    // common answer here is `Unresolved` — which keeps today's default slot on
+    // a single-bound device and degrades on a multi-bound one rather than
+    // renewing another tenant's claim under its credential.
+    let scope = crate::session::session_tenant_scope(payload.agent_session_id);
     let body = ClaimHeartbeat {
         kind: "phase".to_string(),
         resource_key: payload.claim_token.clone(),
         machine_id: payload.target_device_id.to_string(),
         ttl_seconds: 3600,
+        tenant_id: scope.declared_tenant(),
     };
     let client = crate::coord_http::coord_client()
         .ok_or_else(|| anyhow::anyhow!("no shared coord client"))?;
-    // coord-tenant-scope(session-owed): payload.agent_session_id (:77) and payload.agent_id (:75) are in scope, yet the claim body (:4849-4854) sends neither, nor ClaimRequest.tenant_id. Phase 5.
-    let resp = crate::auth::attach_device_auth(client.post(format!("{base}/claims/heartbeat")))
-        .timeout(Duration::from_secs(5))
-        .json(&body)
-        .send()
-        .await?;
+    let resp =
+        crate::auth::attach_device_auth_for(client.post(format!("{base}/claims/heartbeat")), scope)
+            .timeout(Duration::from_secs(5))
+            .json(&body)
+            .send()
+            .await?;
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!(
             "claims heartbeat returned {}",
@@ -4913,7 +4931,7 @@ async fn report_spawn_complete(
     let Some(client) = crate::coord_http::coord_client() else {
         return;
     };
-    // coord-tenant-scope(session-owed): agent_id is a parameter (:4872); spawn-complete only flips agent_worktrees.status by agent_id and persists no tenant, so no bearer is read. Phase 5.
+    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-complete only flips agent_worktrees.status by agent_id, persists no tenant and takes no auth extractor. Nothing to thread. Terminal.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -4962,7 +4980,7 @@ async fn report_spawn_failed(
     let Some(client) = crate::coord_http::coord_client() else {
         return;
     };
-    // coord-tenant-scope(session-owed): agent_id is a parameter; spawn-failed likewise only sets status=abandoned by agent_id and persists no tenant. Phase 5.
+    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed likewise only sets status=abandoned by agent_id, persists no tenant and takes no auth extractor. Nothing to thread. Terminal.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)

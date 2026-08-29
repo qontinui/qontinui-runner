@@ -90,6 +90,16 @@ impl Drop for IsolatedEditContext {
         // best-effort and fire-and-forget — a coord failure NEVER blocks the
         // session teardown. One `correlation_id` per drop groups a multi-repo
         // logical edit (matching coord's predict/verify correlation model).
+        //
+        // Phase 5 (plan `2026-08-29-runner-work-scoped-writes-default-tenant-credential`)
+        // — the tenant IS resolvable in this context after all. The claims this
+        // context holds carry the spawn's `agent_session_id` (that is what
+        // `session_id()` reads), so the owning session's registry record can be
+        // asked, exactly as `coord_sync` asks it. Resolved ONCE and shared by
+        // both drop-time producers below so a single teardown cannot file its
+        // observations under one tenant and its verify under another.
+        let tenant = crate::session::session_tenant_scope(self.session_id());
+
         if super::fs_observer::fs_observer_enabled() {
             let correlation_id = Some(uuid::Uuid::new_v4());
             for w in &self.worktrees {
@@ -100,7 +110,7 @@ impl Drop for IsolatedEditContext {
                     w.repo.clone(),
                     Some(self.agent_id.clone()),
                     correlation_id,
-                    None, // tenant_id not resolved in this context
+                    tenant,
                 );
             }
         }
@@ -121,6 +131,7 @@ impl Drop for IsolatedEditContext {
                 self.edit_loop_declared_paths.clone(),
                 self.edit_loop_correlation_id,
                 self.edit_loop_stash.clone(),
+                tenant,
             );
         }
 
