@@ -1244,22 +1244,85 @@ pub(crate) fn binding_count_from_value(value: &serde_json::Value) -> usize {
 /// | Variant | Meaning | Credential presented |
 /// |---|---|---|
 /// | [`TenantScope::Owned`] | the owning tenant is known | that binding's `device_jwt:<t>` slot |
-/// | [`TenantScope::Device`] | no tenant dimension (heartbeat, device registration, device maintenance) | the default binding's slot |
+/// | [`TenantScope::Device`] | the bearer carries no tenancy on this route | the default binding's slot |
 /// | [`TenantScope::Unresolved`] | the row has an owner the caller could not resolve | the default slot on a single-bound device; **nothing** on a multi-bound one |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TenantScope {
     /// The owning tenant is known. Present THAT binding's slot, and never
     /// another's — slot-miss posture is [`select_device_bearer`]'s.
     Owned(Uuid),
-    /// This row has no tenant dimension: it is keyed by `device_id` alone, so
-    /// the default binding's credential is correct by construction and stays
-    /// correct however many tenants are paired. Heartbeats, device
-    /// registration, device maintenance.
+    /// The bearer carries no tenancy on this route, so the default binding's
+    /// credential is correct by construction and stays correct however many
+    /// tenants are paired. Two positively-established shapes reach this, and
+    /// they are one decision, not two:
+    ///
+    /// - the row genuinely has no tenant dimension — it is keyed by
+    ///   `device_id` alone (heartbeats, device registration, device
+    ///   maintenance, the continuation acks); and
+    /// - the row HAS a tenant, but coord derives it from a field the caller
+    ///   already supplies and never reads the bearer at all (`POST
+    ///   /agents/{id}/log` and `/ask-question` resolve it from the path
+    ///   `agent_id`; the session-handle register from the handle).
+    ///
+    /// In both, selecting a different slot changes nothing about where the row
+    /// lands — which is exactly what makes the default correct rather than
+    /// merely tolerated. What this variant must NEVER mean is "I could not work
+    /// it out"; that is [`TenantScope::Unresolved`].
     Device,
     /// This row HAS an owning tenant, and the caller could not resolve it.
     /// Distinct from [`TenantScope::Device`] precisely so the degrade below can
     /// fire without touching the callers for which the default is right.
     Unresolved,
+}
+
+impl TenantScope {
+    /// Classify a tenant read from a SESSION (the registry's stamped
+    /// `intent.tenant_id`, or an intent the caller is holding).
+    ///
+    /// Absence is [`TenantScope::Unresolved`], never [`TenantScope::Device`]:
+    /// a session-owned row always has an owning tenant, so a `None` here is a
+    /// resolution FAILURE — the registry no longer holds the session, the id
+    /// was never a registry id, or the session was stamped before a default
+    /// existed. Calling that `Device` would re-collapse the two outcomes this
+    /// type exists to separate.
+    pub fn for_session(tenant: Option<Uuid>) -> Self {
+        match tenant {
+            Some(t) => TenantScope::Owned(t),
+            None => TenantScope::Unresolved,
+        }
+    }
+
+    /// Classify a tenant read from the DEVICE's own default binding
+    /// (`machine.json::active_tenant_id` via
+    /// `crate::session::dual_write::resolve_active_tenant_id` /
+    /// `fleet::resolve_tenant_id`).
+    ///
+    /// Absence is [`TenantScope::Device`], not `Unresolved`: the machine
+    /// declaring no default IS the legitimate single-tenant shape (the MSI
+    /// ships `machine.json` without the field — the same `Unpinned` vs
+    /// `Unresolvable` split `crate::session::tenant_pin::TenantPin` draws).
+    /// Nothing failed, so nothing should degrade.
+    pub fn for_device_default(tenant: Option<Uuid>) -> Self {
+        match tenant {
+            Some(t) => TenantScope::Owned(t),
+            None => TenantScope::Device,
+        }
+    }
+
+    /// The tenant to DECLARE in a request body, for routes that carry a
+    /// `tenant_id` field (D1's rule: populate the field AND present that
+    /// tenant's bearer, because fixing only one half fixes only one class).
+    ///
+    /// `Device` and `Unresolved` both yield `None` — declare nothing and let
+    /// coord's server-side resolution decide, which it counts. Writing a
+    /// guessed tenant into the body would be strictly worse than the bearer
+    /// defect: on a body-derived route it is the row's tenancy, not a metric.
+    pub fn declared_tenant(self) -> Option<Uuid> {
+        match self {
+            TenantScope::Owned(t) => Some(t),
+            TenantScope::Device | TenantScope::Unresolved => None,
+        }
+    }
 }
 
 /// Resolve the bearer for a typed scope — the D2 degrade rule, in one place.
@@ -1286,15 +1349,46 @@ pub(crate) fn select_scoped_bearer(
     default_tenant: Option<Uuid>,
     binding_count: usize,
 ) -> Option<String> {
+    select_scoped_bearer_lazy(am, scope, default_tenant, || binding_count)
+}
+
+/// [`select_scoped_bearer`] with the binding count read on demand.
+///
+/// Only the `Unresolved` arm consults it, and reading it costs a
+/// `paired_user.json` parse (see [`device_binding_count`]). Every outbound
+/// coord call goes through this, so the `Owned`/`Device` paths — which are all
+/// but a handful of them — must not pay for a fact they never look at. The
+/// eager wrapper above is what the hermetic tests drive, because a plain
+/// `usize` is the honest shape for a table-driven assertion.
+pub(crate) fn select_scoped_bearer_lazy(
+    am: &AuthManager,
+    scope: TenantScope,
+    default_tenant: Option<Uuid>,
+    binding_count: impl FnOnce() -> usize,
+) -> Option<String> {
     match scope {
         TenantScope::Owned(t) => select_device_bearer(am, Some(&t), default_tenant),
         TenantScope::Device => select_device_bearer(am, None, default_tenant),
-        TenantScope::Unresolved if binding_count > 1 => {
-            warn_once_unresolved_on_multi_bound(binding_count);
-            None
+        TenantScope::Unresolved => {
+            let count = binding_count();
+            if count > 1 {
+                warn_once_unresolved_on_multi_bound(count);
+                return None;
+            }
+            select_device_bearer(am, None, default_tenant)
         }
-        TenantScope::Unresolved => select_device_bearer(am, None, default_tenant),
     }
+}
+
+/// Scope-selecting sibling of [`device_bearer_for`] — the single resolver both
+/// transports of the credential seam share.
+pub fn device_bearer_scoped(scope: TenantScope) -> Option<String> {
+    select_scoped_bearer_lazy(
+        &AuthManager::new(),
+        scope,
+        default_binding_tenant(),
+        device_binding_count,
+    )
 }
 
 /// Warn once per process that an unresolved-tenant write degraded to
@@ -1327,28 +1421,40 @@ fn warn_once_unresolved_on_multi_bound(binding_count: usize) {
 /// `coord-auth-exempt(<kind>)` at the call site and pinned by `coord_auth_pin`;
 /// they are counted by neither term, which is why the summary line names its
 /// own scope.
+///
+/// **This wrapper ASSERTS [`TenantScope::Device`]** — "the bearer carries no
+/// tenancy on this route". That is a claim about the route, not a shrug, so
+/// every call site must declare which class it is in with a
+/// `coord-tenant-scope(<kind>)` annotation that `coord_auth_pin` enforces and
+/// counts. A caller whose row does have an owner it could not name states
+/// [`TenantScope::Unresolved`] through [`attach_device_auth_for`] instead —
+/// that is the distinction the whole type exists for.
 pub fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    attach_device_auth_for(rb, None)
+    attach_device_auth_for(rb, TenantScope::Device)
 }
 
-/// Tenant-selecting variant of [`attach_device_auth`] (Phase 8b, plan §D4):
-/// `Some(tenant)` presents that binding's device-JWT slot, `None` the default
-/// binding's.
+/// The tenant-STATING form of [`attach_device_auth`] — the one seam where a
+/// caller says which tenant owns the row it is writing (Phase 8b, plan §D4;
+/// Phase 5 of `2026-08-29-runner-work-scoped-writes-default-tenant-credential`).
 ///
-/// **`None` is not "anonymous".** It selects the DEFAULT binding's JWT, so a
-/// caller that cannot resolve its request's tenant and passes `None` presents
-/// the default tenant's credential — on a route where coord derives the row's
-/// tenant from the verified bearer, that is a cross-tenant write. Session-scoped
-/// callers must therefore obtain the owning session's tenant from a source that
-/// can actually answer, not pass `None` and hope. Slot-miss posture is [`device_bearer_for`]'s (never another
-/// tenant's credential — degrade to unauthenticated). Session-scoped callers
-/// pass the owning session's tenant; device-scoped callers use the plain
-/// [`attach_device_auth`] and keep the default slot by construction.
+/// **The parameter is a [`TenantScope`], not an `Option<Uuid>`, and that is the
+/// whole point.** It used to take `Option<&Uuid>`, where `None` meant two
+/// irreconcilable things — *"this route takes no tenancy from the bearer"* and
+/// *"this row has an owner and I could not work out who"* — and silently
+/// presented the DEFAULT binding's credential for both. On a multi-bound device
+/// the second is a cross-tenant write on every route where coord derives
+/// ownership from the verified bearer (`ident.require_tenant()`, which has no
+/// fallback). A caller can no longer spell that ambiguity: it states
+/// [`TenantScope::Device`], [`TenantScope::Owned`] or [`TenantScope::Unresolved`],
+/// and the D2 degrade in [`select_scoped_bearer`] does the rest.
+///
+/// Slot-miss posture is [`device_bearer_for`]'s and is unchanged: never another
+/// tenant's credential — degrade to unauthenticated.
 pub fn attach_device_auth_for(
     rb: reqwest::RequestBuilder,
-    tenant: Option<&Uuid>,
+    scope: TenantScope,
 ) -> reqwest::RequestBuilder {
-    match count_and_resolve_bearer(tenant) {
+    match count_and_resolve_bearer(scope) {
         Some(token) => rb.header("Authorization", format!("Bearer {token}")),
         None => rb,
     }
@@ -1371,8 +1477,8 @@ pub fn attach_device_auth_for(
 /// async builder — buys nothing: `reqwest::blocking::RequestBuilder::header`
 /// takes the identical header pair, so the adapter is one match arm.
 ///
-/// Takes `tenant` for the same reason [`attach_device_auth_for`] does, and NOT
-/// as a convenience: its callers post bodies declaring an explicit
+/// Takes a [`TenantScope`] for the same reason [`attach_device_auth_for`] does,
+/// and NOT as a convenience: its callers post bodies declaring an explicit
 /// `tenant_id`, and [`select_device_bearer`]'s fail-soft invariant is that a
 /// request for tenant X must never carry tenant Y's credential. A
 /// tenant-less blocking helper could not honour that on a multi-bound box —
@@ -1381,9 +1487,9 @@ pub fn attach_device_auth_for(
 /// so that door cannot be opened by accident.
 pub fn attach_device_auth_blocking(
     rb: reqwest::blocking::RequestBuilder,
-    tenant: Option<&Uuid>,
+    scope: TenantScope,
 ) -> reqwest::blocking::RequestBuilder {
-    match count_and_resolve_bearer(tenant) {
+    match count_and_resolve_bearer(scope) {
         Some(token) => rb.header("Authorization", format!("Bearer {token}")),
         None => rb,
     }
@@ -1393,14 +1499,15 @@ pub fn attach_device_auth_blocking(
 ///
 /// The transport-independent core of [`attach_device_auth_for`] and
 /// [`attach_device_auth_blocking`]. Returns `None` when no credential is held
-/// (unpaired runner, non-default tenant slot miss) — the caller then sends the
-/// request unauthenticated, which coord still accepts.
+/// (unpaired runner, non-default tenant slot miss) or when the D2 degrade
+/// fired (an `Unresolved` scope on a multi-bound device) — the caller then
+/// sends the request unauthenticated, which coord still accepts.
 ///
 /// The returned token is only ever moved into a request header; it must never
 /// reach a log line or a process argument.
-fn count_and_resolve_bearer(tenant: Option<&Uuid>) -> Option<String> {
+fn count_and_resolve_bearer(scope: TenantScope) -> Option<String> {
     let total = DATA_PLANE_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let bearer = device_bearer_for(tenant);
+    let bearer = device_bearer_scoped(scope);
     if bearer.is_some() {
         DATA_PLANE_AUTHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2398,6 +2505,71 @@ mod bearer_selection_tests {
             select_scoped_bearer(&mgr, TenantScope::Device, Some(a), 2),
             "multi-bound: they must diverge — that divergence IS the fix"
         );
+    }
+
+    // ---- the constructors: which absence means which ----------------------
+
+    /// `for_session` and `for_device_default` disagree on `None`, and that
+    /// disagreement is the entire Phase-5 classification decision made in one
+    /// place instead of at 12 call sites. A session-owned row always HAS an
+    /// owning tenant, so a missing one is a FAILURE (`Unresolved`, degrades on
+    /// a multi-bound device). A device that names no default binding is the
+    /// legitimate single-tenant shape, so a missing one is not a failure
+    /// (`Device`, never degrades).
+    #[test]
+    fn the_two_constructors_disagree_on_absence_and_agree_on_presence() {
+        let t = tenant(0xC1);
+        assert_eq!(TenantScope::for_session(Some(t)), TenantScope::Owned(t));
+        assert_eq!(
+            TenantScope::for_device_default(Some(t)),
+            TenantScope::Owned(t)
+        );
+        assert_eq!(TenantScope::for_session(None), TenantScope::Unresolved);
+        assert_eq!(TenantScope::for_device_default(None), TenantScope::Device);
+        assert_ne!(
+            TenantScope::for_session(None),
+            TenantScope::for_device_default(None),
+            "collapsing these back together is the defect Phase 5 closed"
+        );
+    }
+
+    /// `declared_tenant` is D1's OTHER half: the value a body-derived route
+    /// puts on the wire. It must be `Some` only for `Owned` — declaring a
+    /// guessed tenant on `/agents/allocate` or `/claims/acquire` would BE the
+    /// misattribution, not a metric about one, because there the body IS the
+    /// tenancy and coord's extractor rejects nothing.
+    #[test]
+    fn declared_tenant_is_some_only_for_owned() {
+        let t = tenant(0xC2);
+        assert_eq!(TenantScope::Owned(t).declared_tenant(), Some(t));
+        assert_eq!(TenantScope::Device.declared_tenant(), None);
+        assert_eq!(TenantScope::Unresolved.declared_tenant(), None);
+    }
+
+    /// The lazy resolver must not read `paired_user.json` for a scope that
+    /// never consults the count. Every outbound coord call goes through it, so
+    /// an eager read would put a file parse on the hot path for a fact
+    /// `Owned`/`Device` do not look at. Proven by a counter that panics if
+    /// touched.
+    #[test]
+    fn only_the_unresolved_arm_reads_the_binding_count() {
+        let mgr = create_test_auth_manager("scope_lazy_binding_count");
+        let a = tenant(0xC3);
+        mgr.store_tokens("default.jwt", "").unwrap();
+        mgr.store_tenant_device_jwt(&a, "jwt.a").unwrap();
+
+        for scope in [TenantScope::Device, TenantScope::Owned(a)] {
+            let _ = select_scoped_bearer_lazy(&mgr, scope, Some(a), || {
+                panic!("{scope:?} must not read the binding count")
+            });
+        }
+
+        let mut reads = 0usize;
+        let _ = select_scoped_bearer_lazy(&mgr, TenantScope::Unresolved, Some(a), || {
+            reads += 1;
+            1
+        });
+        assert_eq!(reads, 1, "Unresolved must consult the count exactly once");
     }
 
     // ---- binding count: the input the degrade rule keys on ----------------

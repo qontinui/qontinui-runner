@@ -1172,7 +1172,7 @@ fn register_with_coord(
     // credential, which is `auth::select_device_bearer`'s documented posture.
     let resp = qontinui_runner_lib::auth::attach_device_auth_blocking(
         client.post(&url).json(&body),
-        Some(&tenant_uuid),
+        qontinui_runner_lib::auth::TenantScope::Owned(tenant_uuid),
     )
     .send()
     .map_err(|e| format!("POST {} failed (coord unreachable?): {}", url, e))?;

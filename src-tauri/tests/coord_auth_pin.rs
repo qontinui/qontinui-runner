@@ -661,11 +661,11 @@ fn pinned_coord_reads_attach_device_auth() {
 // The pin above answers "is this coord write authenticated at all". It cannot
 // answer the question that follows, and the two are independent: a write can be
 // perfectly authenticated and still land under the wrong tenant, because
-// `auth::attach_device_auth` is `attach_device_auth_for(rb, None)` and `None`
-// selects the DEFAULT binding's JWT. On every coord route that derives row
-// ownership from the verified bearer — `ident.require_tenant()`, which has no
-// fallback — a caller that could not work out its own tenant and used the
-// defaulting wrapper writes a row under whichever tenant happens to be default.
+// `auth::attach_device_auth` presents the DEFAULT binding's JWT. On every coord
+// route that derives row ownership from the verified bearer —
+// `ident.require_tenant()`, which has no fallback — a caller that could not work
+// out its own tenant and used the defaulting wrapper writes a row under
+// whichever tenant happens to be default.
 //
 // On a single-bound device that is right by accident. It becomes a real
 // cross-tenant write the moment a second tenant is paired to the same box, and
@@ -673,6 +673,15 @@ fn pinned_coord_reads_attach_device_auth() {
 // said "pass `None` and hope" is wrong since Phase 8b, and 52 call sites
 // accumulated under it anyway. A convention that lives only in a doc comment is
 // how you get 52 of them.
+//
+// Phase 5 (plan `2026-08-29-runner-work-scoped-writes-default-tenant-credential`)
+// closed the ambiguity in the TYPE rather than in prose: the stating seam now
+// takes an `auth::TenantScope`, so `Device` ("the bearer carries no tenancy
+// here") and `Unresolved` ("this row has an owner I could not name") are no
+// longer the same `None`, and only the second degrades on a multi-bound device.
+// `attach_device_auth` is now literally `attach_device_auth_for(rb,
+// TenantScope::Device)` — an ASSERTION about the route, which is exactly why
+// every use of it still owes the annotation this file counts.
 //
 // So the same method the pin above used on the first axis applies to the
 // second: not a hand-listed set of *writers*, but a predicate over all of them.
@@ -697,21 +706,32 @@ const DEFAULTING_CALL: &str = "attach_device_auth(";
 /// Every legal tenant-scope kind, with what it means. A kind outside this set
 /// is a typo or an invention, and either way the test rejects it.
 ///
-/// Three of the four are terminal states of a classification; `device` is the
-/// only one that is a permanent *allowlist*. The two `-owed` kinds are debts
-/// with a named creditor: they exist so the count can be watched to zero rather
-/// than tracked in a document that rots.
+/// `device`, `session-noop` and `escalated` are TERMINAL — no future phase
+/// lowers them. `device` is the reviewed allowlist; `work-owed` is the one
+/// remaining debt, with a named creditor, so its count can be watched to zero
+/// rather than tracked in a document that rots.
+///
+/// `session-owed` is gone: Phase 5 emptied it. Twelve of its nineteen sites now
+/// state their tenant in code (`attach_device_auth_for(.., TenantScope)`) and
+/// so need no annotation at all; six were reclassified `session-noop` and one
+/// `escalated`. A `-owed` kind that could never reach zero would be worse than
+/// no count, which is why the six terminal ones did not simply keep waiting for
+/// a phase that has nothing to give them.
 const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
     (
         "device",
-        "no tenant dimension — the row is keyed by device_id, so the default \
+        "the bearer carries no tenancy on this route — either the row is keyed \
+         by device_id with no tenant dimension, or coord derives the tenant \
+         from another field the caller already supplies. Either way the default \
          binding is correct by construction and stays correct however many \
          tenants are paired. The reviewed allowlist.",
     ),
     (
-        "session-owed",
-        "session-scoped: a session/agent id is in scope, so the owning \
-         session's tenant is the right answer. Still defaulting — owes Phase 5.",
+        "session-noop",
+        "session-scoped, but the route carries no tenant the runner can set: it \
+         persists none, or coord derives it from another request field (the \
+         path agent_id, an already-stamped claim). TERMINAL — nothing to \
+         thread, and no credential choice can move the row.",
     ),
     (
         "work-owed",
@@ -721,9 +741,10 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
     ),
     (
         "escalated",
-        "cannot be given one class from the code — a shared helper whose \
-         callers span classes. Classifying it would require splitting the \
-         helper, which is a change, not an annotation.",
+        "cannot be resolved by a credential choice at all — a shared helper \
+         whose callers span classes, or a route the runner may not be entitled \
+         to call. The open question is the call or the mount, not the slot, so \
+         classifying it would require a change rather than an annotation.",
     ),
 ];
 
@@ -735,20 +756,19 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
 /// hand-reviewed list of *classifications*, and it should have to change
 /// whenever one does.
 ///
-/// It also gives Phases 5 and 6 a mechanical finish line. When
-/// `session-owed` reaches 0 the S class is threaded; when `work-owed` reaches
-/// 0 the W class is resolved; `device` is what should remain.
+/// It also gives Phase 6 a mechanical finish line: when `work-owed` reaches 0
+/// the W class is resolved, and `device` + the two terminal kinds are what
+/// should remain. Phase 5 already drove `session-owed` to 0 and its rows are
+/// gone from this table.
 const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "device", 5),
-    ("agent_runtime.rs", "session-owed", 4),
-    ("agent_worktree/edit_effect_loop.rs", "session-owed", 2),
+    ("agent_runtime.rs", "session-noop", 3),
+    ("agent_worktree/edit_effect_loop.rs", "session-noop", 1),
     ("agent_worktree/fs_backstop.rs", "work-owed", 1),
-    ("agent_worktree/fs_observer.rs", "session-owed", 1),
-    ("agent_worktree/mod.rs", "session-owed", 4),
     ("commands/ai_settings.rs", "device", 1),
-    ("commands/claims.rs", "session-owed", 3),
+    ("commands/claims.rs", "session-noop", 1),
     ("coord_http.rs", "escalated", 1),
-    ("coord_questions.rs", "session-owed", 1),
+    ("coord_questions.rs", "session-noop", 1),
     ("fleet.rs", "device", 6),
     ("git_supervision/commit_forwarder.rs", "work-owed", 1),
     ("install_effects_producer/coord_client.rs", "work-owed", 2),
@@ -758,18 +778,21 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("plan_workunit_adapter/body_push.rs", "work-owed", 2),
     ("plan_workunit_adapter/push.rs", "work-owed", 5),
     ("repo_detection.rs", "work-owed", 1),
-    ("session/handoff.rs", "session-owed", 2),
-    ("terminal/auto_response.rs", "session-owed", 2),
+    ("session/handoff.rs", "escalated", 1),
 ];
 
 /// Totals across the whole table, asserted independently of the per-file rows
 /// so a transcription slip in one direction cannot be cancelled by another.
-/// These are the Phase-2 census figures (52 sites at `ebbd3c70`).
+/// The Phase-2 census measured 52 sites at `ebbd3c70` (device 18, session-owed
+/// 19, work-owed 14, escalated 1). Phase 5 removed 12 of the 19 from the
+/// DEFAULTING wrapper entirely — they state their tenant in code now, so they
+/// are no longer scanned here at all — and reclassified the remaining seven
+/// (six `session-noop`, one `escalated`). 52 − 12 = 40.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 18),
-    ("session-owed", 19),
+    ("session-noop", 6),
     ("work-owed", 14),
-    ("escalated", 1),
+    ("escalated", 2),
 ];
 
 /// Extract the kind from `coord-tenant-scope(<kind>):`.
@@ -923,9 +946,12 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 52,
-        "expected the 52 defaulting call sites measured at ebbd3c70; found {sites}. A change \
-         here is fine — it just has to be deliberate."
+        sites, 40,
+        "expected 40 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+         session-scoped ones Phase 5 moved onto the tenant-STATING seam; found {sites}. A \
+         change here is fine — it just has to be deliberate. It goes DOWN when a site adopts \
+         `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
+         defaulting caller, which is the event this number exists to make visible."
     );
 }
 

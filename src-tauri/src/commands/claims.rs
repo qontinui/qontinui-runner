@@ -126,7 +126,22 @@ pub async fn claims_acquire(args: AcquireArgs) -> Result<AcquireResultDto, Strin
     let base = base.trim_end_matches('/');
     let url = format!("{base}/claims/acquire");
 
-    let body = serde_json::json!({
+    // Phase 5 — coord validates a declared `ClaimRequest.tenant_id` against
+    // `coord.tenant_devices` and stamps it into the claim audit row, so this
+    // states the owning session's tenant on BOTH halves (body + bearer) rather
+    // than defaulting. `args.agent_session_id` arrives from the frontend, so
+    // the registry is the only thing that can turn it into a tenant — there is
+    // no Rust caller to thread one down from.
+    //
+    // `agent_session_id` is `Option<String>` on this DTO (the frontend sends a
+    // string), so it is parsed here rather than assumed: a value that is not a
+    // UUID names no registry session and correctly yields `Unresolved`.
+    let scope = crate::session::session_tenant_scope(
+        args.agent_session_id
+            .as_deref()
+            .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok()),
+    );
+    let mut body = serde_json::json!({
         "kind": args.kind,
         "resource_key": args.resource_key,
         "machine_id": args.machine_id,
@@ -134,10 +149,12 @@ pub async fn claims_acquire(args: AcquireArgs) -> Result<AcquireResultDto, Strin
         "ttl_seconds": args.ttl_seconds,
         "metadata": args.metadata,
     });
+    if let Some(t) = scope.declared_tenant() {
+        body["tenant_id"] = serde_json::json!(t);
+    }
 
     let client = http_client()?;
-    // coord-tenant-scope(session-owed): args.agent_session_id is on the wire (:133) but args has no tenant field and none is sent; coord's data-plane extractor here is observe-only. Phase 5.
-    let resp = crate::auth::attach_device_auth(client.post(&url).json(&body))
+    let resp = crate::auth::attach_device_auth_for(client.post(&url).json(&body), scope)
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -173,7 +190,14 @@ pub async fn claims_release(args: ReleaseArgs) -> Result<ReleaseResultDto, Strin
     let base = base.trim_end_matches('/');
     let url = format!("{base}/claims/release");
 
-    let body = serde_json::json!({
+    // Phase 5 — same rule as the acquire this releases; the release verb's audit
+    // row is tenant-stamped too.
+    let scope = crate::session::session_tenant_scope(
+        args.agent_session_id
+            .as_deref()
+            .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok()),
+    );
+    let mut body = serde_json::json!({
         "kind": args.kind,
         "resource_key": args.resource_key,
         "machine_id": args.machine_id,
@@ -183,10 +207,12 @@ pub async fn claims_release(args: ReleaseArgs) -> Result<ReleaseResultDto, Strin
         // (the owner-token match key). The rest are ignored.
         "metadata": serde_json::Value::Object(Default::default()),
     });
+    if let Some(t) = scope.declared_tenant() {
+        body["tenant_id"] = serde_json::json!(t);
+    }
 
     let client = http_client()?;
-    // coord-tenant-scope(session-owed): args.agent_session_id is on the wire (:179); no tenant is sent on the release verb either. Phase 5.
-    let resp = crate::auth::attach_device_auth(client.post(&url).json(&body))
+    let resp = crate::auth::attach_device_auth_for(client.post(&url).json(&body), scope)
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -241,7 +267,7 @@ pub async fn claims_steal(args: StealArgs) -> Result<StealResultDto, String> {
     });
 
     let client = http_client()?;
-    // coord-tenant-scope(session-owed): body is {kind, resource_key, machine_id, reason} -- StealRequest has no tenant field and steal mutates an already-stamped claim, so the bearer is an authorization input, not a tenancy one. Phase 5.
+    // coord-tenant-scope(session-noop): body is {kind, resource_key, machine_id, reason} -- StealRequest has no tenant field and steal mutates an already-stamped claim whose tenancy is fixed. The bearer here is an AUTHORIZATION input (coord matches the originator machine_id claim), not a tenancy one, so no slot choice can move a row. Terminal.
     let mut req = crate::auth::attach_device_auth(client.post(&url).json(&body));
     // If the admin secret is exposed via env on the runner host
     // (operator-managed runner deploys), forward it. Most production

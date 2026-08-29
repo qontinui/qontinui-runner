@@ -89,6 +89,8 @@ use serde_json::{json, Value as JsonValue};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::auth::TenantScope;
+
 pub use coord_sync::ResumeProbe;
 pub use intent::{Intent, IntentError};
 pub use transport::{DynTransport, ExternalTransport, Transport, TransportError, TransportHandle};
@@ -404,6 +406,63 @@ fn stamp_session_tenant(mut intent: Intent) -> Intent {
     intent
 }
 
+/// Resolve the [`TenantScope`] of the session that owns a coord write, from
+/// the ONE shipped carrier of that fact: the live [`SessionRegistry`].
+///
+/// ## Why this is a published accessor and not a new ambient context
+///
+/// Plan `2026-08-29-runner-work-scoped-writes-default-tenant-credential` §D1
+/// rejected *"a new task-local / ambient session context"* on the grounds that
+/// it would be a **second carrier** beside the registry, i.e. two sources of
+/// truth for one fact. This is not that. It reads the same registry
+/// [`coord_sync::CoordSync`] already reads (`session_tenant_by_id`), through
+/// the same `Arc<SessionRegistry>` `main.rs` already manages, and stores
+/// nothing of its own. The distinction is the whole reason it is allowed:
+/// publishing a read path to the shipped carrier adds no state, while an
+/// ambient context would.
+///
+/// It goes through the process-global [`crate::tauri_app_handle`] rather than a
+/// registry-specific global for the same reason — that slot is already the
+/// runner's way of reaching managed state from a background task, and a second
+/// slot holding a `Weak` to the same `Arc` would be one more thing to keep in
+/// step with `main.rs::setup`.
+///
+/// ## What each answer means
+///
+/// - `Some(id)` naming a live session with a stamped tenant → [`TenantScope::Owned`].
+/// - `None`, an id the registry does not hold, or a session stamped with no
+///   tenant → [`TenantScope::Unresolved`], because a session-owned row always
+///   HAS an owning tenant. It is deliberately NOT [`TenantScope::Device`]: the
+///   D2 degrade fires on `Unresolved` (unauthenticated on a multi-bound device,
+///   the default slot on a single-bound one, which is today's behaviour), and
+///   calling it `Device` would re-collapse exactly the two outcomes the type
+///   exists to separate.
+///
+/// The id space matters here and is not uniform. Registry ids are what
+/// `SessionRegistry::register_external` mints and what
+/// `TerminalSession::coord_session_id` carries, so the auto-response reporters
+/// resolve. The claim path's `agent_session_id` is a looser space — some
+/// callers pass an orchestration `task_run_id`, some pass `None` for an
+/// operator-created terminal — and those resolve to `Unresolved`, which is the
+/// honest answer rather than a guess.
+///
+/// **Never call this while holding `SessionRegistry::sessions`.** It takes that
+/// lock itself; `attach_output_pipe` documents the same ordering constraint for
+/// `CoordSync::session_tenant`.
+pub fn session_tenant_scope(session_id: Option<Uuid>) -> TenantScope {
+    use tauri::Manager;
+    let Some(id) = session_id else {
+        return TenantScope::Unresolved;
+    };
+    let Some(app) = crate::tauri_app_handle::current() else {
+        return TenantScope::Unresolved;
+    };
+    let Some(registry) = app.try_state::<Arc<SessionRegistry>>() else {
+        return TenantScope::Unresolved;
+    };
+    registry.tenant_scope_of(id)
+}
+
 impl SessionRegistry {
     pub fn new(
         machine_id: Uuid,
@@ -473,7 +532,7 @@ impl SessionRegistry {
                     id,
                     rx,
                     intent.effective_redact_secrets(),
-                    intent.tenant_id,
+                    TenantScope::for_session(intent.tenant_id),
                 )),
                 None => {
                     tracing::debug!(
@@ -966,6 +1025,20 @@ impl SessionRegistry {
         self.describe(id)
     }
 
+    /// The [`TenantScope`] of a session this registry holds — the hermetically
+    /// testable half of [`session_tenant_scope`], which is otherwise a Tauri
+    /// state lookup with no seam.
+    ///
+    /// An unknown id and a known session with no stamped tenant both yield
+    /// [`TenantScope::Unresolved`]; see [`session_tenant_scope`] for why that
+    /// is not [`TenantScope::Device`].
+    pub fn tenant_scope_of(&self, id: Uuid) -> TenantScope {
+        match self.describe_by_id(id) {
+            Ok(d) => TenantScope::for_session(d.intent.tenant_id),
+            Err(_) => TenantScope::Unresolved,
+        }
+    }
+
     /// Close-by-id — same idempotent semantics as
     /// [`SessionHandle::close`].
     pub fn close_by_id(&self, id: Uuid) -> Result<(), SessionError> {
@@ -1198,6 +1271,46 @@ mod tests {
             redact_secrets: None,
             tenant_id: None,
         }
+    }
+
+    /// Phase 5 (plan `2026-08-29-runner-work-scoped-writes-default-tenant-credential`)
+    /// — the registry is the S-class tenant source, and `tenant_scope_of` is the
+    /// read the 12 threaded call sites reach it through. The three answers must
+    /// be distinguishable: a stamped session is `Owned`, an id the registry does
+    /// not hold is `Unresolved`, and a session stamped with NO tenant is also
+    /// `Unresolved` — never `Device`, because a session row has an owning tenant
+    /// whether or not we can name it, and only `Unresolved` arms the D2 degrade.
+    #[test]
+    fn tenant_scope_of_distinguishes_owned_from_both_unknowns() {
+        let (registry, _dir) = make_registry();
+        let tenant = Uuid::from_u128(0xD1);
+
+        let mut stamped = shell_intent();
+        stamped.tenant_id = Some(tenant);
+        let owned = registry.start(stamped).unwrap();
+        assert_eq!(
+            registry.tenant_scope_of(owned.id()),
+            TenantScope::Owned(tenant)
+        );
+
+        // Live session, no tenant stamped (single-tenant install with no
+        // configured default): the row still has an owner we cannot name.
+        let bare = registry.start(shell_intent()).unwrap();
+        assert_eq!(registry.tenant_scope_of(bare.id()), TenantScope::Unresolved);
+
+        // An id the registry never held — the claim path's `agent_session_id`
+        // is a looser space than the registry's (orchestration `task_run_id`s
+        // land here), which is exactly why this must not resolve to anything.
+        assert_eq!(
+            registry.tenant_scope_of(Uuid::new_v4()),
+            TenantScope::Unresolved
+        );
+
+        assert_ne!(
+            registry.tenant_scope_of(bare.id()),
+            TenantScope::Device,
+            "an unstamped session must never be reported as having no tenant dimension"
+        );
     }
 
     /// Phase 8 — a transport that exposes a real output broadcast so the

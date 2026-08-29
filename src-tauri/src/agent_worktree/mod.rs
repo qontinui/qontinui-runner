@@ -244,20 +244,34 @@ enum AcquireOutcome {
 /// other's claim (plan 2026-06-03-coord-session-scoped-claim-owner).
 /// Machine-level acquirers (daemons, the merge scheduler) pass `None`,
 /// which coord maps to the legacy bare-machine owner token.
+///
+/// `tenant` is the OWNING session's scope (Phase 5, plan
+/// `2026-08-29-runner-work-scoped-writes-default-tenant-credential` §D1).
+/// Coord's `ClaimRequest.tenant_id` is validated against `coord.tenant_devices`
+/// and stamped into the claim audit row's `metadata.tenant_id`, so it is a
+/// tenancy input and D1's rule requires it be populated with the same tenant
+/// the bearer names. Unlike `agent_session_id` the key is OMITTED rather than
+/// nulled when unknown: `null` and absent are identical to coord here, and
+/// omitting keeps the wire shape a caller can read as "declared nothing".
 fn claim_request_body(
     kind: &str,
     resource_key: &str,
     machine_id: &uuid::Uuid,
     agent_session_id: Option<uuid::Uuid>,
+    tenant: crate::auth::TenantScope,
     metadata: serde_json::Value,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "kind": kind,
         "resource_key": resource_key,
         "machine_id": machine_id.to_string(),
         "agent_session_id": agent_session_id,
         "metadata": metadata,
-    })
+    });
+    if let Some(t) = tenant.declared_tenant() {
+        body["tenant_id"] = serde_json::json!(t);
+    }
+    body
 }
 
 async fn pre_allocate_claim(
@@ -277,22 +291,30 @@ async fn pre_allocate_claim(
     if let Some(phase) = &ctx.phase {
         metadata["phase"] = serde_json::json!(phase);
     }
+    // Phase 5 — the claim row coord writes is tenant-stamped, so both halves of
+    // D1's rule apply: declare the tenant in the body AND present that tenant's
+    // slot. `agent_session_id` is a loose id space here (some callers pass an
+    // orchestration `task_run_id`, the operator's own terminal passes `None`),
+    // so `Unresolved` is the common and honest answer — default slot on a
+    // single-bound device, unauthenticated on a multi-bound one.
+    let scope = crate::session::session_tenant_scope(agent_session_id);
     let body = claim_request_body(
         ctx.kind,
         &ctx.resource_key,
         machine_id,
         agent_session_id,
+        scope,
         metadata,
     );
 
     let client =
         crate::coord_http::coord_client().ok_or_else(|| "no shared coord client".to_string())?;
-    // coord-tenant-scope(session-owed): agent_session_id is a parameter (:266) and already rides in claim_request_body, but tenant_id is not sent and the bearer still defaults. Phase 5.
-    let resp = crate::auth::attach_device_auth(
+    let resp = crate::auth::attach_device_auth_for(
         client
             .post(&url)
             .timeout(Duration::from_secs(10))
             .json(&body),
+        scope,
     )
     .send()
     .await
@@ -629,21 +651,26 @@ async fn heartbeat_once(
     resource_key: &str,
 ) -> Result<HeartbeatTickOutcome, String> {
     let url = format!("{}/claims/heartbeat", coord_http_base.trim_end_matches('/'));
+    // Phase 5 — same rule as the acquire this renews: declare the tenant and
+    // present its slot. Resolved per tick rather than captured at spawn so a
+    // session that registers after the heartbeat loop starts is picked up.
+    let scope = crate::session::session_tenant_scope(agent_session_id);
     let body = claim_request_body(
         kind,
         resource_key,
         &machine_id,
         agent_session_id,
+        scope,
         serde_json::json!({}),
     );
     let client =
         crate::coord_http::coord_client().ok_or_else(|| "no shared coord client".to_string())?;
-    // coord-tenant-scope(session-owed): agent_session_id is a parameter (:626) and rides in the body; ClaimRequest.tenant_id is still unpopulated and the bearer still defaults. Phase 5.
-    let resp = crate::auth::attach_device_auth(
+    let resp = crate::auth::attach_device_auth_for(
         client
             .post(&url)
             .timeout(Duration::from_secs(5))
             .json(&body),
+        scope,
     )
     .send()
     .await
@@ -683,23 +710,28 @@ pub async fn release_claim_best_effort(
     resource_key: &str,
 ) {
     let url = format!("{}/claims/release", coord_http_base.trim_end_matches('/'));
+    // Phase 5 — the release verb matches the acquire's owner token, and coord
+    // stamps `metadata.tenant_id` on the release audit row too, so it states
+    // the same scope rather than defaulting.
+    let scope = crate::session::session_tenant_scope(agent_session_id);
     let body = claim_request_body(
         kind,
         resource_key,
         &machine_id,
         agent_session_id,
+        scope,
         serde_json::json!({}),
     );
     let Some(client) = crate::coord_http::coord_client() else {
         warn!("release_claim_best_effort: no shared coord client");
         return;
     };
-    // coord-tenant-scope(session-owed): agent_session_id is a parameter (:679) and rides in the body; the tenant slot is still empty on the release verb. Phase 5.
-    match crate::auth::attach_device_auth(
+    match crate::auth::attach_device_auth_for(
         client
             .post(&url)
             .timeout(Duration::from_secs(5))
             .json(&body),
+        scope,
     )
     .send()
     .await
@@ -1237,20 +1269,46 @@ fn reanchor_by_agent_id(contents: &str, agent_id: &str, local_root: &str) -> Str
 /// Option<Uuid>` (null and absent both map to `None`) and persists it on
 /// the worktree rows, keying the per-session footprint-confidence
 /// downgrade (plan 2026-06-06-twin-worktree-phase7-informed-isolation).
+///
+/// `tenant` is the OWNING session's scope, and on THIS route the body is the
+/// tenancy, not the bearer (Phase 5, plan
+/// `2026-08-29-runner-work-scoped-writes-default-tenant-credential` §D1/§Phase 5).
+/// Coord's `post_allocate` resolves ownership as: explicit
+/// `AllocateRequest.tenant_id` → the device's sole binding → the legacy
+/// `coord.devices.tenant_id` pointer, and its auth extractor is observe-only
+/// (`DataPlaneAuthObservation`, `Rejection = Infallible`). So changing only the
+/// credential here would move a divergence metric and leave the row exactly
+/// where it was. The bearer is set to match anyway, so that metric stays quiet
+/// and coord's eventual flip of the route to `require` does not break
+/// allocation.
+///
+/// The key is OMITTED when the tenant is unknown, so coord's sole-binding arm
+/// keeps running unchanged — declaring a guessed tenant on a body-derived route
+/// would BE the misattribution, not a metric about one.
+///
+/// `work_unit_id` (`agent_worktrees.rs:137`) stays absent: the runner has no
+/// work unit in scope on this path, so there is no second derivation to agree
+/// with. When one is threaded here, its tenant and this one must be asserted
+/// equal rather than resolved twice.
 fn allocate_request_body(
     machine_id: &uuid::Uuid,
     agent_session_id: Option<uuid::Uuid>,
     repos: &[RepoRequest],
     intent: Option<&str>,
     declared_overlap_paths: Option<&[String]>,
+    tenant: crate::auth::TenantScope,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "device_id": machine_id.to_string(),
         "repos": repos,
         "intent": intent,
         "declared_overlap_paths": declared_overlap_paths,
         "agent_session_id": agent_session_id,
-    })
+    });
+    if let Some(t) = tenant.declared_tenant() {
+        body["tenant_id"] = serde_json::json!(t);
+    }
+    body
 }
 
 /// Call coord's `/agents/allocate` and then `git worktree add` for each
@@ -1372,20 +1430,22 @@ pub async fn allocate_and_materialize_with_claim(
         }
     }
 
+    let scope = crate::session::session_tenant_scope(agent_session_id);
     let body = allocate_request_body(
         machine_id,
         agent_session_id,
         repos,
         intent,
         declared_overlap_paths,
+        scope,
     );
 
     let url = format!("{}/agents/allocate", coord_http_base.trim_end_matches('/'));
-    // coord-tenant-scope(session-owed): allocate_request_body carries agent_session_id but omits tenant_id and work_unit_id entirely (:1237-1251); coord's extractor is observe-only, so changing the bearer alone would move a metric, not the row. Phase 5.
-    let resp = crate::auth::attach_device_auth(reqwest::Client::new().post(&url).json(&body))
-        .send()
-        .await
-        .map_err(|e| AllocateError::Other(format!("POST {url}: {e}")))?;
+    let resp =
+        crate::auth::attach_device_auth_for(reqwest::Client::new().post(&url).json(&body), scope)
+            .send()
+            .await
+            .map_err(|e| AllocateError::Other(format!("POST {url}: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
@@ -2169,6 +2229,7 @@ mod tests {
             "plan:p:phase:1",
             &machine,
             Some(session),
+            crate::auth::TenantScope::Unresolved,
             serde_json::json!({}),
         );
         assert_eq!(body["kind"], "phase");
@@ -2243,6 +2304,7 @@ mod tests {
             &repos,
             Some("editing coord"),
             Some(paths.as_slice()),
+            crate::auth::TenantScope::Unresolved,
         );
         assert_eq!(body["device_id"], machine.to_string());
         assert_eq!(body["agent_session_id"], session.to_string());
@@ -2256,7 +2318,14 @@ mod tests {
         assert_eq!(body["repos"][1]["parent_sha"], "deadbeef");
 
         // Session absent → the key is still present and explicitly null.
-        let body2 = allocate_request_body(&machine, None, &repos, None, None);
+        let body2 = allocate_request_body(
+            &machine,
+            None,
+            &repos,
+            None,
+            None,
+            crate::auth::TenantScope::Unresolved,
+        );
         assert!(
             body2.as_object().unwrap().contains_key("agent_session_id"),
             "agent_session_id key must always be present on the wire"
@@ -2271,12 +2340,75 @@ mod tests {
         // falls back to the legacy bare-machine owner token rather than
         // mis-parsing a missing key.
         let machine = uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
-        let body = claim_request_body("file_glob", "src/**", &machine, None, serde_json::json!({}));
+        let body = claim_request_body(
+            "file_glob",
+            "src/**",
+            &machine,
+            None,
+            crate::auth::TenantScope::Unresolved,
+            serde_json::json!({}),
+        );
         assert!(
             body.as_object().unwrap().contains_key("agent_session_id"),
             "agent_session_id key must always be present on the wire"
         );
         assert!(body["agent_session_id"].is_null());
+    }
+
+    #[test]
+    fn claim_and_allocate_bodies_declare_the_owning_tenant_only_when_it_is_known() {
+        // Phase 5, D1's declared-tenant half. `/claims/*` stamps
+        // `metadata.tenant_id` from `ClaimRequest.tenant_id`, and
+        // `/agents/allocate` resolves ownership from the BODY (its auth
+        // extractor rejects nothing), so both must carry the owning tenant when
+        // it is known — and must carry NOTHING when it is not, so coord's
+        // sole-binding arm still runs instead of being handed a guess.
+        let machine = uuid::Uuid::parse_str("66666666-6666-6666-6666-666666666666").unwrap();
+        let session = uuid::Uuid::parse_str("77777777-7777-7777-7777-777777777777").unwrap();
+        let tenant = uuid::Uuid::parse_str("88888888-8888-8888-8888-888888888888").unwrap();
+        let repos = vec![RepoRequest {
+            repo: "qontinui-coord".to_string(),
+            parent_sha: None,
+        }];
+
+        for scope in [
+            crate::auth::TenantScope::Unresolved,
+            crate::auth::TenantScope::Device,
+        ] {
+            let claim = claim_request_body(
+                "phase",
+                "plan:p:phase:1",
+                &machine,
+                Some(session),
+                scope,
+                serde_json::json!({}),
+            );
+            assert!(
+                !claim.as_object().unwrap().contains_key("tenant_id"),
+                "{scope:?} must declare no tenant on a claim body"
+            );
+            let alloc = allocate_request_body(&machine, Some(session), &repos, None, None, scope);
+            assert!(
+                !alloc.as_object().unwrap().contains_key("tenant_id"),
+                "{scope:?} must declare no tenant on an allocate body"
+            );
+        }
+
+        let owned = crate::auth::TenantScope::Owned(tenant);
+        let claim = claim_request_body(
+            "phase",
+            "plan:p:phase:1",
+            &machine,
+            Some(session),
+            owned,
+            serde_json::json!({}),
+        );
+        assert_eq!(claim["tenant_id"], tenant.to_string());
+        let alloc = allocate_request_body(&machine, Some(session), &repos, None, None, owned);
+        assert_eq!(alloc["tenant_id"], tenant.to_string());
+        // The pre-existing wire contract is untouched by the added field.
+        assert_eq!(alloc["agent_session_id"], session.to_string());
+        assert_eq!(claim["machine_id"], machine.to_string());
     }
 
     #[test]

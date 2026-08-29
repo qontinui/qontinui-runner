@@ -492,9 +492,16 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
             // selected from the same tenant's slot. A slot miss sends
             // unauthenticated (never another tenant's JWT) — see
             // `auth::select_device_bearer`.
+            //
+            // `for_device_default`, not `for_session`: this is a machine-wide
+            // WIP scan whose declared tenant IS the device's own binding
+            // (`fleet::resolve_tenant_id`). A machine that names no default is
+            // the legitimate single-tenant shape, so its absence is `Device` —
+            // nothing failed to resolve, and degrading a whole-device scan to
+            // unauthenticated would buy nothing.
             match crate::auth::attach_device_auth_for(
                 client.post(&url).json(&payload),
-                tenant_id.as_ref(),
+                crate::auth::TenantScope::for_device_default(tenant_id),
             )
             .send()
             .await
