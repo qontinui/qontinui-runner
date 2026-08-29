@@ -1909,12 +1909,22 @@ mod tests {
         )
         .unwrap();
         let body = "x".repeat(1024);
-        // These three writes land inside one clock tick on a fast host, so
-        // their mtimes tie. This test leans on the store evicting the
-        // FIRST-ISSUED anyway — a guarantee `SpillStore::evictable_oldest_first`
-        // makes explicitly by tie-breaking on issue order. Before it did, the
-        // sort fell through to `read_dir` order and this assertion failed at
-        // random, reddening `main` (run 33021749396 attempt 2, 2026-08-27).
+        // These three writes may land inside one clock tick on a fast host, in
+        // which case their mtimes tie. This test leans on the store evicting
+        // the FIRST-ISSUED either way — a guarantee
+        // `SpillStore::evictable_oldest_first` makes explicitly by tie-breaking
+        // on issue order. Before it did, the sort fell through to `read_dir`
+        // order and this assertion failed at random, reddening `main`
+        // (run 33021749396 attempt 2, 2026-08-27).
+        //
+        // Which of the two paths runs here is up to the host clock and is NOT
+        // asserted; the tie itself is forced deterministically over in
+        // `mcp_spill.rs`, by `spill_eviction_order_is_issue_order_when_mtimes_tie`
+        // and `spill_byte_bound_evicts_the_first_issued_when_every_mtime_is_equal`.
+        // That is where the ordering coverage lives — this test is about the
+        // error MESSAGE, and needs only that the record it reads back is the
+        // one eviction takes, which both paths make the first-issued.
+        //
         // Do NOT "fix" a recurrence by stamping the mtimes apart here: that
         // would hide a real eviction-ordering regression rather than catch it.
         let first = store.put("t", "text/plain", false, &body).unwrap();
