@@ -8,8 +8,11 @@ use std::sync::OnceLock;
 use tracing::{error, info, warn};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+    JobObjectBasicLimitInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    SetInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 
@@ -232,12 +235,101 @@ impl ScopedKillOnCloseJob {
     }
 }
 
+/// `(active processes, active-process limit)` for the job object **this**
+/// process belongs to, or `None`.
+///
+/// The Windows arm of the fleet's saturation telemetry (plan
+/// `2026-08-27-fleet-telemetry-has-no-saturation-dimension-but-memory`,
+/// Phase 3): `coord.device_resource_samples.saturation_source = 'job_object'`
+/// names exactly this instrument, and this is its only publisher.
+///
+/// ## Why a job object, and why nothing else
+///
+/// Windows exposes **no** system-wide thread or handle ceiling. `GetPerformance
+/// Info` reports live `ThreadCount` / `HandleCount` / `ProcessCount` and no
+/// bound for any of them, and the per-process handle-table maximum (2^24) is
+/// not a system quantity. A job object's `ActiveProcessLimit` is the one
+/// readable, real, *enforced* bound in this family — so where a job sets one it
+/// is published, and where none is set the honest publish is **nothing at all**.
+///
+/// ## `None` is deliberately total, not partial
+///
+/// A count without its ceiling is worse than silence downstream: coord grades
+/// the saturation axis the moment a row carries any of the four columns, and a
+/// missing half grades `Unknown`, which outranks `Warn` and `Ok` in the
+/// worst-of composition — so half a pair would strip the row of its perfectly
+/// good memory and disk verdicts. Hence one function returning a complete pair
+/// or nothing, rather than two independent readers.
+///
+/// `NULL` as the job handle asks about the calling process's own job, which
+/// fails with `ERROR_ACCESS_DENIED` when there is none. On a desktop runner
+/// that is the ordinary case — this process is not itself assigned to the
+/// global job (only its children are) — so a failure here is not logged.
+pub fn current_job_pid_saturation() -> Option<(i64, i64)> {
+    // SAFETY: both calls write into a correctly-sized, zeroed struct of the
+    // type each info class names, and the length passed is that struct's size.
+    unsafe {
+        let mut returned: u32 = 0;
+
+        let mut limits: JOBOBJECT_BASIC_LIMIT_INFORMATION = std::mem::zeroed();
+        if QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectBasicLimitInformation,
+            &mut limits as *mut _ as *mut _,
+            std::mem::size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
+            &mut returned,
+        ) == 0
+        {
+            return None;
+        }
+        // A job with no ActiveProcessLimit bounds nothing, and
+        // `ActiveProcessLimit` is then simply unset rather than "unlimited" —
+        // reading it regardless would publish a fabricated ceiling.
+        if limits.LimitFlags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS == 0 {
+            return None;
+        }
+        let max = i64::from(limits.ActiveProcessLimit);
+        if max <= 0 {
+            return None;
+        }
+
+        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+        if QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectBasicAccountingInformation,
+            &mut accounting as *mut _ as *mut _,
+            std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            &mut returned,
+        ) == 0
+        {
+            return None;
+        }
+
+        Some((i64::from(accounting.ActiveProcesses), max))
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use std::os::windows::io::AsRawHandle;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    /// The saturation probe reports a COMPLETE pair or nothing — never a count
+    /// with a fabricated ceiling, and never a ceiling of 0.
+    #[test]
+    fn job_pid_saturation_is_a_complete_pair_or_nothing() {
+        // Environment-dependent by nature (a job with an `ActiveProcessLimit`
+        // on some hosts, none on a plain desktop or in CI), so the assertion is
+        // on the SHAPE — which is the load-bearing part: coord grades the
+        // saturation axis as soon as any of the four columns is present, so a
+        // half-pair or a zero ceiling would pin the whole row to `unknown`.
+        if let Some((used, max)) = current_job_pid_saturation() {
+            assert!(max > 0, "a ceiling of 0 is not a ceiling");
+            assert!(used >= 0, "an active-process count cannot be negative");
+        }
+    }
 
     /// `None` must still yield a usable job — the agent pusher's case,
     /// where only the kill-on-close reap is wanted and a memory ceiling

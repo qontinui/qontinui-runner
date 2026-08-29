@@ -29,4 +29,6 @@
 pub mod job_object;
 
 #[cfg(windows)]
-pub use job_object::{assign_process_to_job, init_job_object, ScopedKillOnCloseJob};
+pub use job_object::{
+    assign_process_to_job, current_job_pid_saturation, init_job_object, ScopedKillOnCloseJob,
+};
