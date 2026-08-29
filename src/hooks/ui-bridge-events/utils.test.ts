@@ -497,6 +497,55 @@ describe("describeEvaluateBudget + evaluateTimeoutMessage (U1: the 9.8s that rea
     }
   });
 
+  it("treats a number flagged `rawIsDefault` as a DEFAULT, not the caller's", () => {
+    // The Rust dispatcher defaults `timeout_ms` to 10 s BEFORE emitting, so the
+    // absence of a number is not how a defaulted budget arrives on the tagged
+    // route. Inferring provenance from `raw` alone re-created the misattribution
+    // this whole function exists to remove.
+    const budget = describeEvaluateBudget(10_000, { rawIsDefault: true });
+    expect(budget.fromDefault).toBe(true);
+    expect(budget.requestedMs).toBe(10_000);
+
+    const msg = evaluateTimeoutMessage(budget.awaitMs, budget);
+    // This is the message #1173's description advertised. It was unreachable:
+    // 10.0s can only come from the Rust default, which always arrived flagged
+    // as caller-supplied.
+    expect(msg).toContain("did not resolve within 10.0s");
+    expect(msg).toContain("awaited 9.8s");
+    expect(msg).toContain("DEFAULT budget, not a cap");
+    expect(msg).not.toContain("came from the `timeoutMs` you sent");
+  });
+
+  it("leaves the budget itself untouched — the flag moves provenance only", () => {
+    for (const raw of [1, 1_000, 10_000, 600_000, 5_000_000]) {
+      const plain = describeEvaluateBudget(raw);
+      const flagged = describeEvaluateBudget(raw, { rawIsDefault: true });
+      expect(flagged.awaitMs).toBe(plain.awaitMs);
+      expect(flagged.requestedMs).toBe(plain.requestedMs);
+      expect(flagged.awaitMs).toBe(resolveEvaluateTimeoutMs(raw));
+      expect(flagged.fromDefault).not.toBe(plain.fromDefault);
+    }
+  });
+
+  it("defaults to caller-attribution for a producer predating the flag", () => {
+    // An older `page.rs` or a hand-rolled emit sends no `timeout_from_default`.
+    // `undefined` and `false` must both keep the pre-existing reading, so the
+    // flag can only ever ADD provenance.
+    for (const opts of [undefined, {}, { rawIsDefault: false }, { rawIsDefault: undefined }]) {
+      expect(describeEvaluateBudget(60_000, opts).fromDefault).toBe(false);
+    }
+  });
+
+  it("keeps reporting an absent budget as a default whatever the flag says", () => {
+    // No usable number → the frontend's own 30 s default, which nobody chose.
+    // A `rawIsDefault: false` must not be able to relabel that as the caller's.
+    for (const opts of [undefined, { rawIsDefault: false }, { rawIsDefault: true }]) {
+      const budget = describeEvaluateBudget(undefined, opts);
+      expect(budget.fromDefault).toBe(true);
+      expect(budget.requestedMs).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
+    }
+  });
+
   it("keeps the frontend-vs-Rust discriminator verbatim", () => {
     // This leading clause is how a caller tells a frontend timeout from the
     // Rust side's generic "UI Bridge page_evaluate timed out after Xms".

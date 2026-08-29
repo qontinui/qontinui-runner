@@ -820,6 +820,30 @@ pub async fn ui_bridge_query_selector_handler(
 /// pin one explicitly. Matches the legacy IPC timeout envelope.
 const DEFAULT_PAGE_EVALUATE_TIMEOUT_MS: u64 = 10_000;
 
+/// Resolve a caller's optional `timeoutMs` into the budget to emit AND whether
+/// that budget is the caller's own choice.
+///
+/// Both halves have to leave this function together. `unwrap_or` alone erases
+/// the distinction, and the erasure is not recoverable downstream: the frontend
+/// receives a concrete number either way, so it has no way to tell a budget the
+/// caller asked for from one we supplied. That is not cosmetic — the frontend's
+/// timeout message names the provenance, so an erased flag makes it tell a
+/// caller who sent nothing that the budget "came from the `timeoutMs` you
+/// sent", which is the misattribution the message was rewritten to remove.
+/// `POST /ui-bridge/control/page/evaluate-raw` is the unarguable case: the
+/// whole body is the expression, so it has no `timeoutMs` field at all and
+/// always arrives here as `None`.
+///
+/// Consumer: `describeEvaluateBudget` in
+/// `src/hooks/ui-bridge-events/utils.ts`, via the `timeout_from_default` field
+/// on the `ui-bridge:evaluate-request` payload.
+fn resolve_evaluate_budget(requested_ms: Option<u64>) -> (u64, bool) {
+    match requested_ms {
+        Some(ms) => (ms, false),
+        None => (DEFAULT_PAGE_EVALUATE_TIMEOUT_MS, true),
+    }
+}
+
 /// Dispatch a page/evaluate request over the tagged
 /// `ui-bridge:evaluate-request` / `ui-bridge:evaluate-response` event pair,
 /// correlating the response through [`EvaluateRequestStore`].
@@ -841,7 +865,7 @@ async fn tagged_page_evaluate(
     allow_network_requests: bool,
     window_label: &str,
 ) -> Result<serde_json::Value, String> {
-    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_PAGE_EVALUATE_TIMEOUT_MS);
+    let (timeout_ms, timeout_from_default) = resolve_evaluate_budget(timeout_ms);
     let request_id = uuid::Uuid::new_v4().to_string();
 
     // Fail fast for a non-existent target window — mirrors the guard in
@@ -880,6 +904,15 @@ async fn tagged_page_evaluate(
         // fallback in `helpers.rs`, which can legitimately report
         // `"[object Promise]"`.
         "timeout_ms": timeout_ms,
+        // Provenance for `timeout_ms`, so the frontend's timeout message can
+        // say whether the caller chose that budget. `timeout_ms` alone cannot
+        // answer that — it is always a concrete number by the time it is
+        // emitted, whether the caller sent it or the `unwrap_or` above
+        // supplied it. snake_case to match the rest of this payload
+        // (request_id / timeout_ms / allow_network_requests). Additive: a
+        // frontend that predates the field falls back to reading the number
+        // as caller-supplied, which is the pre-existing behaviour.
+        "timeout_from_default": timeout_from_default,
         // Forward the explicit network-request opt-in to the frontend
         // blocklist gate. snake_case to match the rest of this IPC payload's
         // convention (await_promise / timeout_ms / request_id).
@@ -2635,9 +2668,46 @@ mod page_evaluate_tagging_tests {
     //! arriving response has to round-trip through `deliver(request_id, …)`,
     //! so showing the store's id-keyed routing is correct is equivalent to
     //! showing the handler path is correct.
+    use super::{resolve_evaluate_budget, DEFAULT_PAGE_EVALUATE_TIMEOUT_MS};
     use crate::ui_bridge_evaluate::{EvaluateRequestStore, EvaluateResponse};
     use std::sync::Arc;
     use tokio::sync::oneshot;
+
+    /// An omitted `timeoutMs` must reach the frontend as the default budget
+    /// AND as a budget the caller did not choose.
+    ///
+    /// The second half is the one that regressed: `unwrap_or` alone produced
+    /// the right NUMBER while erasing the provenance, so the frontend told a
+    /// caller who sent nothing that the budget "came from the `timeoutMs` you
+    /// sent". `page/evaluate-raw` always lands on this arm — it has no
+    /// `timeoutMs` field for a caller to send.
+    #[test]
+    fn an_omitted_timeout_is_flagged_as_the_default() {
+        let (timeout_ms, from_default) = resolve_evaluate_budget(None);
+        assert_eq!(timeout_ms, DEFAULT_PAGE_EVALUATE_TIMEOUT_MS);
+        assert!(
+            from_default,
+            "an omitted timeoutMs is OUR default, not the caller's choice"
+        );
+    }
+
+    /// A caller-supplied budget is forwarded verbatim and attributed to the
+    /// caller — including when it happens to equal our default, which is the
+    /// case the number alone can never distinguish.
+    #[test]
+    fn a_supplied_timeout_is_forwarded_and_attributed_to_the_caller() {
+        for requested in [1_000_u64, 10_000, 60_000, 600_000] {
+            let (timeout_ms, from_default) = resolve_evaluate_budget(Some(requested));
+            assert_eq!(
+                timeout_ms, requested,
+                "the caller's budget is forwarded verbatim"
+            );
+            assert!(
+                !from_default,
+                "timeoutMs={requested} was chosen by the caller, even when it equals our default"
+            );
+        }
+    }
 
     /// Fire two concurrent "page_evaluate" calls through the store-level
     /// surface that `tagged_page_evaluate` relies on. Each call registers
