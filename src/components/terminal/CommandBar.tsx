@@ -207,12 +207,15 @@ export function CommandBar() {
   // watching the grid.
 
   // Match list. WHICH TIER OWNS THE INPUT is decided by
-  // `commands/rank.ts::chooseHeadMatch` — a literal slash form beats
-  // everything, and among the rest the shape-aware tiers beat the verb-only
-  // one. The rule and the bug that produced it (a Tier-2 regex outranking
-  // `/spawn-ai` and silently discarding its declared `--tenant` flag) are
-  // documented there, in one place, rather than in a comment here that the
-  // resolver cannot be tested against.
+  // `commands/rank.ts::chooseTier`, and "a literal slash beats everything"
+  // has NOT been the rule since iteration 8: a literal slash yields to a
+  // Tier-2 pattern naming the SAME action (only the pattern knows what its
+  // own trailing token means), reroutes to a DIFFERENT action only when that
+  // action declares itself neither `costly` nor `destructive`, and otherwise
+  // runs while the alternative is named in a "did you mean" hint. Among the
+  // rest the shape-aware tiers beat the verb-only one. The rule and the bugs
+  // that produced it live there, in one place, rather than in a comment here
+  // that the resolver cannot be tested against.
   //
   // When a higher tier wins, its action is filtered out of Tier 1's list so
   // the dropdown doesn't show the same row twice. Pre-parsed args from that

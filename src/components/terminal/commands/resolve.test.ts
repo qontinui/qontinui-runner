@@ -16,6 +16,8 @@ import {
   tokenizeRich,
   coerceToken,
   extractFlags,
+  readTextArg,
+  textArg,
 } from "./parse";
 import { __resetForTest, register } from "./registry";
 import { resolve } from "./resolve";
@@ -678,5 +680,64 @@ describe("parse — extractFlags", () => {
       hits: [{ name: "zone", value: 4, consumed: ["--zone", "4"] }],
       rest: [],
     });
+  });
+});
+
+describe("parse — an empty QUOTED run is an empty ARGUMENT", () => {
+  /**
+   * D8 (manual-test-loop iteration 10). `stripFlagRuns` tokenizes `""` to
+   * zero tokens and reported `removed: 0`, so `applyDeclaredFlags` restored
+   * the RAW text — two literal quote characters. `/orchestrate ""` then
+   * actually POSTed `start_orchestration_run({goal: '""'})`, spending a
+   * conductor run, while `/orchestrate " "` correctly refused.
+   */
+  const noFlags = (id: string): CommandAction => ({
+    id,
+    slash: `/${id}`,
+    label: id,
+    description: id,
+    paramSchema: { goal: "s" },
+    handler: async () => ({ ok: true as const }),
+  });
+
+  it('resolves `""` to the empty string, not to two quote characters', () => {
+    const a = noFlags("orchestrate");
+    expect(applyDeclaredFlags({ goal: '""' }, '/orchestrate ""', a, "preset")).toEqual({
+      goal: "",
+    });
+  });
+
+  it('reads the same as `" "` and as the unquoted empty tail', () => {
+    const a = noFlags("orchestrate");
+    const quoted = applyDeclaredFlags({ goal: '""' }, '/orchestrate ""', a, "preset");
+    const spaced = applyDeclaredFlags({ goal: " " }, '/orchestrate " "', a, "preset");
+    expect(textArg(quoted, "goal")).toBe(textArg(spaced, "goal"));
+    expect(readTextArg(quoted, "goal").kind).toBe("invalid");
+    expect(readTextArg(spaced, "goal").kind).toBe("invalid");
+  });
+
+  it("keeps supplied-and-empty SUPPLIED — it does not drop the key", () => {
+    const a = noFlags("tag");
+    const out = applyDeclaredFlags({ goal: '""' }, '/tag ""', a, "preset");
+    expect("goal" in out).toBe(true);
+  });
+
+  it("still DROPS a field whose whole content was a declared flag run", () => {
+    const a: CommandAction = {
+      id: "spawn-ai",
+      slash: "/spawn-ai",
+      label: "s",
+      description: "s",
+      paramSchema: { count: "n", context: "s", "--tenant": "s" },
+      handler: async () => ({ ok: true as const }),
+    };
+    const out = applyDeclaredFlags(
+      { count: 1, context: "--tenant 2299" },
+      "/spawn-ai 1 --tenant 2299",
+      a,
+      "preset",
+    );
+    expect("context" in out).toBe(false);
+    expect(out.tenant).toBe(2299);
   });
 });

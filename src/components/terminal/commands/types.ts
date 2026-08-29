@@ -91,9 +91,8 @@ export interface ResolverContext {
  *   map positionally into `paramSchema` field order. Live alongside
  *   the action def so adding a phrasing doesn't require touching the
  *   resolver. Empty/undefined = the action only matches by slash + AI.
- * - `destructive` gates the executor's confirm modal. Today only used
- *   by multi-target close/kill actions per plan §5(3); single-target
- *   destructive actions rely on `undoable` + a 3s Undo affordance.
+ * - `destructive` / `costly` are the action's own statement that it must
+ *   not be auto-reached; see the two fields below for what reads them.
  */
 export interface CommandAction<TArgs = Record<string, unknown>, TResult = unknown> {
   /** Stable wire contract, e.g. `"terminal.spawn-ai"`. */
@@ -110,11 +109,29 @@ export interface CommandAction<TArgs = Record<string, unknown>, TResult = unknow
   paramSchema?: Record<string, unknown>;
   /** Regex patterns for Tier-2 matching. */
   patterns?: RegExp[];
-  /** Requires a confirm modal before execution. See plan §5(3). */
+  /**
+   * Running this DESTROYS something the operator cannot get back — a live
+   * PTY, a session's output, or a keystroke already delivered to a
+   * subprocess.
+   *
+   * Read TODAY by `rank.ts::safeToReroute`, the twin of {@link costly}: a
+   * literal slash form is never rerouted INTO a destructive action by a
+   * Tier-2 pattern. It is also the flag the Phase 4 executor's confirm modal
+   * will gate on (plan §5(3)); single-target actions additionally carry
+   * `undoable` for the 3s Undo affordance.
+   *
+   * It went undeclared on every action for as long as it existed, which made
+   * `safeToReroute`'s second half dead code — one declarant of `costly` was
+   * the entire guard. A guard with no declarants does not fail loudly; it
+   * silently permits, which is the wrong direction for this one.
+   */
   destructive?: boolean;
   /**
-   * Running this SPENDS something the operator cannot get back — metered
-   * AI capacity, in the one case that exists today (`terminal.spawn-ai`).
+   * Running this SPENDS something the operator cannot get back — metered AI
+   * capacity (`terminal.spawn-ai`, `terminal.orchestrate`,
+   * `terminal.analyze`, `terminal.generate-workflow`,
+   * `terminal.plan-implement`) or live PTY subprocesses the operator then has
+   * to close by hand (`terminal.spawn`, `terminal.spawn-with`).
    *
    * Read by `rank.ts::chooseTier`. A LITERAL slash form is never rerouted
    * INTO a costly action by a Tier-2 pattern, because typing `/spawn` must
