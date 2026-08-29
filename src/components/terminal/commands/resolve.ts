@@ -10,7 +10,8 @@
  *      — once they typed `/swap`, they don't want `/spawn` showing up
  *      below their args.
  *
- *   2. **Fuzzy match** against `slash` + `label` for everything else.
+ *   2. **Fuzzy match** against `slash` + `label` + the action's PARAMS
+ *      HINT for everything else.
  *      Uses the shared {@link fuzzyScore} so the CommandBar and the
  *      `Ctrl+Shift+K` palette never disagree on ranking. The scorer's
  *      disjoint bands settle slash-vs-label ACROSS tiers; the sort below
@@ -26,7 +27,8 @@
  * surface; the CommandBar isn't.
  */
 
-import { fuzzyScore } from "./fuzzy";
+import { scoreCommandCandidates } from "./fuzzy";
+import { describeParams } from "./parse";
 import { getAll, getBySlash } from "./registry";
 import type { CommandAction } from "./types";
 
@@ -97,15 +99,25 @@ export function resolve(input: string, recents: readonly string[]): ResolveMatch
   const scored: Array<ResolveMatch & { _score: number; _fromSlash: boolean }> = [];
   for (const action of getAll()) {
     const slashBody = action.slash.replace(/^\//, "");
-    const slashMatch = fuzzyScore(slashBody, query);
-    const labelMatch = fuzzyScore(action.label, query);
-    const best =
-      slashMatch && (!labelMatch || slashMatch.score >= labelMatch.score) ? slashMatch : labelMatch;
+    // Third candidate: the action's PARAMETER HINT, in its own band far
+    // below every slash/label hit (`fuzzy.ts::PARAMS_HINT_BAND`). The bar
+    // scored only slash + label while the palette also scored the hint,
+    // so the palette advertised `/spawn-ai` for `ctx` and `/close` for
+    // `tabid` and the bar then rendered `No match` for the very slash it
+    // had just taught. Parameter names are real search terms; the fix
+    // converges the bar UP to the palette rather than deleting the
+    // affordance, and the band keeps it from ever outranking a real hit.
+    const best = scoreCommandCandidates(
+      slashBody,
+      action.label,
+      describeParams(action.paramSchema),
+      query,
+    );
     if (!best) continue;
     // Indices are positions in the slash (with leading "/") for the
     // highlight renderer; shift by +1 when they came from the
     // slash-without-leading-`/` body.
-    const fromSlash = best === slashMatch;
+    const fromSlash = best.field === "slash";
     const indices = fromSlash ? best.indices.map((i) => i + 1) : [];
     scored.push({
       action,

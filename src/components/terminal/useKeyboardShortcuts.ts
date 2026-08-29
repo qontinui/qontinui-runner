@@ -111,17 +111,24 @@ export function useKeyboardShortcuts({
         if (activeId) closeTerminal(activeId);
         return;
       }
-      if (e.ctrlKey && e.key === "Tab") {
+      // Ctrl+Tab / Ctrl+Shift+Tab. Routed through the shared table rather
+      // than a hand-rolled `e.key === "Tab"`: `active-dashboard/ActiveRunsBar`
+      // claims the same two chords on its own `window` listener, so both
+      // handlers run on one press. That collision is documented in
+      // `KNOWN_SHARED_CHORDS`; the hand-rolled spelling made it invisible
+      // to the enforcement scanner, which is the defect this routing closes.
+      const cyclePrev = matchesChord(e, GLOBAL_CHORDS.cyclePrev);
+      if (matchesChord(e, GLOBAL_CHORDS.cycleNext) || cyclePrev) {
         e.preventDefault();
         if (zoneLayout.isMultiZone) {
-          if (e.shiftKey) {
+          if (cyclePrev) {
             zoneLayout.focusPrevZone();
           } else {
             zoneLayout.focusNextZone();
           }
         } else if (tabs.length > 1 && activeId) {
           const idx = tabs.findIndex((t) => t.id === activeId);
-          const next = e.shiftKey ? (idx - 1 + tabs.length) % tabs.length : (idx + 1) % tabs.length;
+          const next = cyclePrev ? (idx - 1 + tabs.length) % tabs.length : (idx + 1) % tabs.length;
           setActiveId(tabs[next].id);
         }
         return;

@@ -40,6 +40,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { instanceStorage } from "@/lib/instance-storage";
+import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
 
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
 import { SessionManagerToggle } from "./SessionManagerToggle";
@@ -169,7 +170,11 @@ export function CommandBar() {
   //    "control-_" character from reaching the focused terminal.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === "/") {
+      // `matchesChord` covers Ctrl and the exact Shift state; Alt stays an
+      // explicit extra term because the shared table deliberately does not
+      // inspect it (see `globalChords`), and this handler has always
+      // required Alt to be absent.
+      if (matchesChord(e, GLOBAL_CHORDS.commandBar) && !e.altKey) {
         e.preventDefault();
         e.stopPropagation();
         inputRef.current?.focus();

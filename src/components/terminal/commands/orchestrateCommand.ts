@@ -30,6 +30,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+import { textArg } from "./parse";
 import { resolveRecipe } from "./recipes";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { useCommandAction } from "./useCommandAction";
@@ -156,7 +157,7 @@ export function useOrchestrateCommand(): void {
       args: Record<string, unknown>,
       _ctx: ResolverContext,
     ): Promise<CommandResult<{ runId: string }>> => {
-      const raw = typeof args.goal === "string" ? args.goal : "";
+      const raw = textArg(args, "goal");
       const plan = planOrchestration(raw);
       if (!plan) return fail("invalid-args", "a goal (or recipe-id + args) is required");
 

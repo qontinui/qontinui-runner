@@ -172,3 +172,55 @@ export function parseArgs(input: string, action: CommandAction): Record<string, 
   }
   return args;
 }
+
+/**
+ * Two-state read of a TEXT argument, with a supplied non-string
+ * preserved rather than dropped.
+ *
+ * Same family as `useTerminalCommands.ts::readCountArg`: {@link coerceToken}
+ * turns a clean numeric literal into a `number`, so `/spawn-with 2 5`
+ * bound `command: 5` and every `typeof args.x === "string" ? x : ""` in
+ * the HANDLERS read that as ABSENT. `/spawn-with 2 5` answered "command is
+ * required" for a command that was supplied, and `/spawn-ai 2 3` was
+ * worse than that — `resolveAccountConfigDir` maps `""` to "best", so a
+ * mistyped account silently launched the highest-headroom one instead.
+ * Stringifying the token the operator actually typed keeps the field
+ * SUPPLIED, which is what lets the existing "unknown account" /
+ * "invalid command" paths report the truth.
+ */
+export function readTextArg(
+  args: Record<string, unknown>,
+  field: string,
+): { kind: "absent" } | { kind: "text"; text: string } {
+  const v = args[field];
+  if (v === undefined || v === null) return { kind: "absent" };
+  if (typeof v === "string")
+    return v.trim() === "" ? { kind: "absent" } : { kind: "text", text: v };
+  if (typeof v === "number" || typeof v === "boolean") {
+    return { kind: "text", text: String(v) };
+  }
+  return { kind: "absent" };
+}
+
+/** The text of a supplied text arg, or `""` when it was never supplied. */
+export function textArg(args: Record<string, unknown>, field: string): string {
+  const read = readTextArg(args, field);
+  return read.kind === "text" ? read.text : "";
+}
+
+/**
+ * Format an action's `paramSchema` field list as the inline hint the
+ * palette appends to a row label (`" (count, account, context)"`), or
+ * `""` when the action takes no arguments.
+ *
+ * Lives here rather than in the palette projection because BOTH command
+ * surfaces now score this text — see `fuzzy.ts::PARAMS_HINT_BAND`. When
+ * only the palette composed it, only the palette could match it, which
+ * is precisely how the two surfaces came to answer different questions.
+ */
+export function describeParams(schema: Record<string, unknown> | undefined): string {
+  if (!schema) return "";
+  const keys = Object.keys(schema);
+  if (keys.length === 0) return "";
+  return ` (${keys.join(", ")})`;
+}
