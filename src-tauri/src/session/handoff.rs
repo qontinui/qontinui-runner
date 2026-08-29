@@ -469,15 +469,8 @@ async fn handle_push_frame(
     // `.respawn_request` — so neither can swallow the other's frames and no
     // frame is materialized twice. Both directions are asserted in
     // `respawn`'s tests.
-    super::respawn::handle_push_frame(
-        registry,
-        lifecycle_store,
-        http,
-        coord_url,
-        device_id,
-        text,
-    )
-    .await;
+    super::respawn::handle_push_frame(registry, lifecycle_store, http, coord_url, device_id, text)
+        .await;
 
     let Some(handoff) = parse_handoff_push(text, device_id) else {
         return;
