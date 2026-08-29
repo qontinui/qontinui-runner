@@ -30,6 +30,13 @@ export interface SessionBoundPayload {
   origin: string;
   /** Whether the registry record was written confirmed. */
   confirmed: boolean;
+  /**
+   * Did the PROVIDER report this id about itself (its SessionStart hook), or
+   * did the runner infer it? Only a self-report may CORRECT an id a tab already
+   * holds — see `applySessionBound`. Optional on the wire so an older backend
+   * that omits it is read as the safe value, `false`.
+   */
+  providerReported?: boolean;
 }
 
 /** The tab update a `session-bound` event resolves to. */
@@ -44,11 +51,32 @@ export interface SessionBoundUpdate {
  * Decide the tab update for one `session-bound` event.
  *
  * Returns `null` (no-op) when:
- *  - no tab matches the payload's terminal id (tab closed / other window), or
- *  - the tab ALREADY has a `claudeSessionId` — the launch-menu pin / resume
- *    path / a prior event got there first and stays authoritative for the tab;
- *    the backend registry (which the binder already wrote) is the truth for
- *    restore either way, so the frontend never re-stamps.
+ *  - no tab matches the payload's terminal id (tab closed / other window),
+ *  - the tab already holds the SAME id (nothing to change), or
+ *  - the tab holds a DIFFERENT id and the bind is not provider-reported — the
+ *    launch-menu pin / resume path stays put, and no runner INFERENCE may
+ *    overwrite it.
+ *
+ * It DOES re-stamp when the tab holds a different id and the provider itself
+ * reported the new one. The previous rule bailed on the mere PRESENCE of a
+ * `claudeSessionId`, which made the spawn-time PREDICTION permanent: the runner
+ * stamps the tab with the `--session-id` it passes the provider, and whenever
+ * the provider adopts a different id instead (every resume of a pre-existing
+ * session, any rebind of a live session onto a new PTY) the tab kept the
+ * prediction forever. The session-info dropdown reads this field, so it queried
+ * an id no record was ever written under and rendered
+ * `unavailable — session_not_found` while the store held a complete projection
+ * for the session actually running in that PTY. Measured live 2026-08-29: zone
+ * 1's tab held `a20acdbb…`, its terminal `ecb3d767` was bound to `44aadb3e…`,
+ * and the dropdown showed nothing for five landed PRs.
+ *
+ * The gate is `providerReported`, NOT the `origin` grade, and the difference is
+ * load-bearing: reconcile's rung-2 bind is graded `authoritative` as well, but
+ * its id is lifted from the anchor process's typed `--session-id` — the
+ * runner's own prediction. Gating on grade would let that bind overwrite a true
+ * id with the guess, reinstating this defect in the opposite direction. Only
+ * the provider's SessionStart hook reports an id about itself, and only it
+ * corrects.
  *
  * Pure + exported for unit tests.
  */
@@ -59,7 +87,8 @@ export function applySessionBound(
   if (!payload.terminalId || !payload.sessionId) return null;
   const tab = tabs.find((t) => t.id === payload.terminalId);
   if (!tab) return null;
-  if (tab.claudeSessionId) return null;
+  if (tab.claudeSessionId === payload.sessionId) return null;
+  if (tab.claudeSessionId && payload.providerReported !== true) return null;
   return {
     tabId: tab.id,
     claudeSessionId: payload.sessionId,

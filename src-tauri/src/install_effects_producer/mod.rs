@@ -255,6 +255,25 @@ async fn post_session_open(
                 source = %req.source.as_deref().unwrap_or("?"),
                 "control/session-open: session recorded authoritatively"
             );
+            // The store now holds the truth, but the FRONTEND tab does not.
+            // `tab.claudeSessionId` is stamped at spawn from the id the runner
+            // PREDICTED (the `--session-id` the identity shim passes), and the
+            // session-info dropdown reads that field. When the provider adopts
+            // a different id — every resume of a pre-existing session, and any
+            // rebind of a live session onto a new PTY — the tab keeps the
+            // prediction, the dropdown queries an id no record was ever
+            // written under, and `session_info_get` answers
+            // `unavailable: session_not_found` for a session the store can
+            // project perfectly. Measured live 2026-08-29 on the primary:
+            // zone 1's tab held `a20acdbb…` while terminal `ecb3d767` was
+            // bound to `44aadb3e…` with a complete 5-opened/5-landed ledger.
+            //
+            // The binder→tab channel that fixes exactly this already exists;
+            // it was simply never wired to the authoritative path, only to the
+            // reconcile poll (`main.rs::emit_session_bound`). Emit it here too.
+            // Fire-and-forget: the registry write above is already durable, so
+            // an emit failure costs a stale tab, never a lost session.
+            emit_session_bound_for_open(&state.app_handle, &req, &provider);
             Ok(Json(ApiResponse::success(())))
         }
         None => {
@@ -267,6 +286,56 @@ async fn post_session_open(
             // 200: the hook is confirmation-only; never wedge provider startup.
             Ok(Json(ApiResponse::success(())))
         }
+    }
+}
+
+/// Emit the `session-bound` tab-stamp event for a `/control/session-open`.
+///
+/// `POST /control/session-open` is the MOST authoritative bind the runner has:
+/// it is the provider's own SessionStart hook reporting the id the provider
+/// actually adopted. Until this existed, the only emitter of
+/// [`SESSION_BOUND_EVENT`] was the reconcile poll in `main.rs`, so the strongest
+/// evidence in the system was the one grade that never reached the tab.
+///
+/// `origin` is [`ORIGIN_AUTHORITATIVE`] and `confirmed` is `true` because that
+/// is precisely what `record_session_open_into` just wrote — the payload
+/// mirrors the record rather than asserting anything of its own.
+///
+/// `provider_reported: true` is the field that actually licenses a correction,
+/// and it is set ONLY here. Grade alone would be the wrong gate: reconcile's
+/// rung-2 bind is `authoritative` too, but its id is lifted from the typed
+/// `--session-id` — the runner's own prediction — so honouring it as a
+/// correction would overwrite a true id with the guess.
+fn emit_session_bound_for_open(
+    app_handle: &tauri::AppHandle,
+    req: &SessionOpenRequest,
+    provider: &str,
+) {
+    use crate::session::reconcile::{SessionBoundPayload, SESSION_BOUND_EVENT};
+    use crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE;
+    use tauri::Emitter;
+
+    let payload = SessionBoundPayload {
+        terminal_id: req.terminal_id.clone(),
+        session_id: req.session_id.clone(),
+        // Empty string is the wire contract's "unknown", never a path.
+        config_dir: req.config_dir.clone().unwrap_or_default(),
+        origin: ORIGIN_AUTHORITATIVE.to_string(),
+        confirmed: true,
+        // The provider reported this id about ITSELF. This is the one bind in
+        // the runner allowed to correct a tab that already holds a (predicted)
+        // id — see `applySessionBound`.
+        provider_reported: true,
+    };
+    if let Err(e) = app_handle.emit(SESSION_BOUND_EVENT, payload) {
+        warn!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            provider = %provider,
+            error = %e,
+            "control/session-open: session-bound emit failed \
+             (tab stamp skipped; registry already durable)"
+        );
     }
 }
 

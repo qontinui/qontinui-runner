@@ -1191,6 +1191,19 @@ pub struct SessionBoundPayload {
     /// store normalizes on write; this mirrors what was written.
     pub origin: String,
     pub confirmed: bool,
+    /// Did the PROVIDER report this id about itself, or did the runner infer it?
+    ///
+    /// `origin` alone cannot answer that, and the difference decides whether a
+    /// bind may CORRECT an id a tab already holds. A rung-2 reconcile bind is
+    /// graded [`BindOrigin::Authoritative`] because the id was lifted from the
+    /// anchor process's typed `--session-id` — but that is precisely the id the
+    /// runner PREDICTED and passed in, so it is worth nothing as a correction:
+    /// letting it overwrite would clobber a true id with the guess.
+    ///
+    /// Only `POST /control/session-open` — the provider's own SessionStart hook,
+    /// reporting the id it actually adopted — sets this `true`. Everything this
+    /// module produces is an inference and leaves it `false`.
+    pub provider_reported: bool,
 }
 
 /// Event name for the binder→frontend tab-stamp channel.
@@ -1215,6 +1228,10 @@ pub fn session_bound_payloads(actions: &[ReconcileAction]) -> Vec<SessionBoundPa
                 config_dir: config_dir.clone(),
                 origin: origin.as_origin_const().to_string(),
                 confirmed: *confirmed,
+                // Everything this module binds is inferred by the runner, never
+                // self-reported by the provider — including the rung-2
+                // `authoritative` bind, whose id IS the runner's prediction.
+                provider_reported: false,
             }),
             _ => None,
         })
