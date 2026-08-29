@@ -406,11 +406,14 @@ mod tests {
     /// own "keep the two in sync" instruction had no enforcement at all, which
     /// is the gap this test closes.
     ///
-    /// Matched case-insensitively on purpose. The two bodies legitimately
-    /// differ on sentence position (`Arm 6 is the DEFAULT` where the table
-    /// introduces it, `arm 6 is the DEFAULT` mid-sentence where the other file
-    /// cites it), and the invariant is that the RULE is present — not that the
-    /// two bodies are byte-identical, which they are not and need not be.
+    /// Matched case-insensitively, unlike its case-sensitive neighbour above.
+    /// These tokens are prose, and the two bodies do differ on sentence
+    /// position (`Arm 6 is the DEFAULT` where the table introduces it, `arm 6
+    /// is the DEFAULT` mid-sentence where the other file cites it). Both files
+    /// happen to also carry a lowercase occurrence today, so this is defensive
+    /// rather than currently load-bearing — but capitalisation at a sentence
+    /// start is not part of the rule, and a guard that fired on it would be
+    /// asserting prose style instead of the invariant.
     const IN_PROGRESS_DELIVERY_GUARD_CLAUSES: &[(&str, &str)] = &[
         (
             "4, 3, 2, 1, 5, then 6",
@@ -472,6 +475,27 @@ mod tests {
                 );
             }
         }
+        // A command can leave this guard's scope SILENTLY: drop the delivery
+        // read from `implement-plan.md` while keeping its pointer sentence and
+        // `checked` falls to 1 with every assertion above still green. So close
+        // the loop from the other side — anything that CITES the shared section
+        // must also name the read that section is built on. That is exactly the
+        // "keep the two in sync" instruction the files state and could not
+        // enforce, and unlike a `checked >= 2` floor it assumes nothing about
+        // how many commands are in the bundle.
+        for (anchor, _) in CROSS_COMMAND_SECTION_ANCHORS {
+            for (name, contents) in FLEET_COMMANDS {
+                assert!(
+                    !contents.contains(anchor) || contents.contains(DELIVERY_READ),
+                    "bundled agent command {name} points readers at the {anchor:?} \
+                     section but no longer names {DELIVERY_READ}, so it has dropped out \
+                     of this guard's scope while still telling a reader to apply that \
+                     section's disposition — the clauses above stop being checked for \
+                     it and nothing else notices. Restore the delivery read in \
+                     src-tauri/src/fleet_commands/{name}.md, or remove the pointer"
+                );
+            }
+        }
         assert!(
             checked > 0,
             "no bundled command mentions {DELIVERY_READ:?} — either the bundle lost its \
@@ -500,6 +524,11 @@ mod tests {
     /// could resolve it from.
     #[test]
     fn cross_command_section_pointers_resolve_within_the_bundle() {
+        assert!(
+            !CROSS_COMMAND_SECTION_ANCHORS.is_empty(),
+            "CROSS_COMMAND_SECTION_ANCHORS is empty, so this test asserts nothing. The \
+             bundle's cross-command pointers did not stop existing; the table did"
+        );
         for (anchor, target) in CROSS_COMMAND_SECTION_ANCHORS {
             let mut defined = false;
             let mut citers: Vec<&&str> = Vec::new();
@@ -508,7 +537,11 @@ mod tests {
                     continue;
                 }
                 if name == target {
-                    defined = true;
+                    // `# ` + the anchor matches the heading at ANY level and
+                    // does NOT match a prose mention, so a heading renamed while
+                    // the old wording survives elsewhere in the file still fails
+                    // — the case that would otherwise dangle the pointer silently.
+                    defined = contents.contains(&format!("# {anchor}"));
                 } else {
                     citers.push(name);
                 }
