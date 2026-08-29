@@ -348,8 +348,19 @@ export function PerformanceOverlay({
 
   const updateIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Keyboard shortcut handler
+  // Keyboard shortcut handler.
+  //
+  // DEV-gated at the LISTENER, not only at the render. The `if
+  // (!import.meta.env.DEV) return null` below sits AFTER every hook, so it
+  // is a render gate and nothing more: in the production bundle the JSX
+  // was dead-code-eliminated to a bare `null` while this component still
+  // attached a `window` keydown listener, `preventDefault()`ed
+  // `Ctrl+Shift+P` (stealing it from the terminal's TOGGLE_CONTROL_PANEL,
+  // its only other claimant) and ran a 1 Hz `setInterval` subscribed to
+  // the performance and network monitors — a dead surface holding a live
+  // chord and a live timer. With the gate here, production claims neither.
   useEffect(() => {
+    if (!import.meta.env.DEV) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       // Ctrl+Shift+P to toggle. Via the shared predicate, not a literal
       // `"P"`: this overlay is mounted app-wide from `App.tsx`, and with
@@ -365,8 +376,12 @@ export function PerformanceOverlay({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
-  // Subscribe to metrics updates
+  // Subscribe to metrics updates. DEV-gated for the same reason as the
+  // keydown listener above: `isVisible` can only become true through that
+  // listener, but the gate is stated explicitly here so the timer's
+  // absence in production does not depend on reasoning about another hook.
   useEffect(() => {
+    if (!import.meta.env.DEV) return;
     if (!isVisible) return;
 
     const monitor = getPerformanceMonitor();

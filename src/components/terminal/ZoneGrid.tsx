@@ -257,6 +257,14 @@ function ZoneGridInner({
   const onTogglePin = labelsAndTags.togglePin;
   const labelColorMap = labelsAndTags.labelColorMap;
   const zoneTags = labelsAndTags.zoneTags;
+  // The READER for `activeTagFilters`. Until now the set had three
+  // occurrences in all of `src/` — its declaration, its initializer and
+  // its return — and no consumer whatsoever, so `/tag`, `/tag-toggle`,
+  // `/filter-tag`, `/tag-clear` and Ctrl+Shift+G all rendered a verdict
+  // for a state change nothing looked at. `/tag`'s own description
+  // promises it "narrows the visible zones to those matching the
+  // selected tags"; this is where that becomes true.
+  const activeTagFilters = labelsAndTags.activeTagFilters;
   const zoneNotes = labelsAndTags.zoneNotes;
   const onSetZoneNote = labelsAndTags.setZoneNote;
   const transitionEffects = useTransitionEffects();
@@ -757,6 +765,7 @@ function ZoneGridInner({
           onRestartInZone={onRestartInZone}
           labelColorMap={labelColorMap}
           zoneTags={zoneTags}
+          activeTagFilters={activeTagFilters}
           commandHistories={commandHistories}
           focusMode={focusMode}
           zoneNotes={zoneNotes}
@@ -976,6 +985,7 @@ function ZoneCellInner({
   onRestartInZone,
   labelColorMap,
   zoneTags,
+  activeTagFilters,
   commandHistories,
   focusMode,
   zoneNotes,
@@ -1038,6 +1048,19 @@ function ZoneCellInner({
   onRestartInZone?: (zoneIndex: number) => void;
   labelColorMap?: Record<string, string>;
   zoneTags?: Record<number, string[]>;
+  /**
+   * Tags the operator is filtering on. EMPTY means "no filter" — every
+   * zone shows. Otherwise a zone is dimmed unless it carries at least
+   * one of them (OR, not AND).
+   *
+   * OR is the semantics the surface implies. `/tag <name>` TOGGLES a tag
+   * into a set and `/tag-clear`'s description calls itself "the 'All'
+   * pill", which is pill-filter language — pills accumulate alternatives.
+   * AND would also make Ctrl+Shift+G incoherent: it cycles the set to
+   * exactly ONE tag at a time, so an AND reading would give it no way to
+   * express a two-tag selection at all.
+   */
+  activeTagFilters?: Set<string>;
   commandHistories?: Record<string, { command: string; exitCode: number; timestamp: number }[]>;
   focusMode?: boolean;
   zoneNotes?: Record<number, string>;
@@ -1204,6 +1227,14 @@ function ZoneCellInner({
   const firstTagColor = zoneTags?.[zoneIdx]?.[0]
     ? labelColorMap?.[zoneTags[zoneIdx][0]]
     : undefined;
+  // Tag filter. Dimming (rather than unmounting) is the precedent this
+  // grid already sets for `outputSearchQuery` a few lines below, and it
+  // is the only honest option in a fixed CSS grid: removing a cell would
+  // leave a hole where the layout preset put it, and would tear down the
+  // zone's live PTY with it.
+  const tagFilterActive = (activeTagFilters?.size ?? 0) > 0;
+  const tagFilteredOut =
+    tagFilterActive && !(zoneTags?.[zoneIdx] ?? []).some((t) => activeTagFilters?.has(t));
   const stateColor = STATE_COLORS[state];
 
   const baseBoxShadow = isDropTarget
@@ -1230,7 +1261,10 @@ function ZoneCellInner({
       ref={cellRef}
       className={`group relative overflow-hidden ${isFlashing ? "zone-flash" : ""} ${
         outputSearchQuery && !searchMatch ? "opacity-40" : ""
-      }`}
+      } ${tagFilteredOut ? "opacity-25" : ""}`}
+      // Ground truth for the tag filter, readable through the UI Bridge
+      // without inferring anything from a computed opacity.
+      data-zone-tag-filter={tagFilterActive ? (tagFilteredOut ? "hidden" : "shown") : undefined}
       style={{
         gridColumn: zone.col,
         gridRow: zone.row,

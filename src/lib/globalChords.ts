@@ -57,6 +57,7 @@ export interface ChordKeyLike {
   ctrlKey: boolean;
   shiftKey: boolean;
   metaKey?: boolean;
+  altKey?: boolean;
 }
 
 /** A chord's spelling: the key the browser reports, plus its modifiers. */
@@ -113,6 +114,83 @@ export const GLOBAL_CHORDS = {
   /** Terminal CommandBar focus (`terminal/CommandBar`) — Ctrl+/, no Shift. */
   commandBar: { key: "/", shift: false, meta: false },
 } as const satisfies Record<string, GlobalChord>;
+
+/**
+ * A chord whose key is a contiguous DIGIT RANGE rather than one key —
+ * `Ctrl+1..8`, `Ctrl+Shift+1..8`, `Ctrl+1..9`.
+ *
+ * These could not live in {@link GLOBAL_CHORDS} because that table is
+ * keyed by a single `e.key`, and that is exactly why they stayed
+ * hand-rolled as `e.key >= "1" && e.key <= "8"` range comparisons in two
+ * files at once — a spelling the enforcement scanner's claim counters
+ * could not see, so the collision below was invisible to every test in
+ * the suite while it fired live on the page.
+ *
+ * The scanner expands a range into its individual `ctrl+<digit>`
+ * spellings, so a range claimed from two files reports as eight shared
+ * chords rather than as nothing.
+ */
+export interface GlobalDigitChord {
+  /** Lowest digit of the range, inclusive. */
+  from: number;
+  /** Highest digit of the range, inclusive. */
+  to: number;
+  /** Whether Shift is PART of the chord. `false` means Shift must be ABSENT. */
+  shift: boolean;
+  /** Whether Cmd (⌘) also spells this chord. */
+  meta: boolean;
+}
+
+/**
+ * Every digit-range chord claimed by a `window`/`document` listener.
+ *
+ * `dashboardWidget` and `terminalFocusZone` OVERLAP on `Ctrl+1..8`. That
+ * was a live two-handler double-fire: `active-dashboard/DashboardPage`
+ * and `terminal/useKeyboardShortcuts` both attach to `window`, and
+ * `TerminalPage` stays MOUNTED (merely `display:none`) on every other
+ * tab — so one `Ctrl+3` pressed on the Active dashboard switched the
+ * dashboard widget AND moved the terminal's focused zone. The fix is not
+ * to reassign a documented shortcut on either surface: it is that the
+ * terminal's listener is now inert while its surface is not visible
+ * (`isSurfaceVisible`), and `DashboardPage` only mounts on the Active
+ * tab. The static overlap is therefore pinned in the enforcement test's
+ * `KNOWN_SHARED_CHORDS` as never-simultaneously-live, not as a share.
+ */
+export const GLOBAL_DIGIT_CHORDS = {
+  /** Active-dashboard widget-by-position (`active-dashboard/DashboardPage`). */
+  dashboardWidget: { from: 1, to: 8, shift: false, meta: true },
+  /** Terminal layout preset by number (`terminal/useKeyboardShortcuts`). */
+  terminalLayoutPreset: { from: 1, to: 8, shift: true, meta: false },
+  /** Terminal focus-zone by number (`terminal/useKeyboardShortcuts`). */
+  terminalFocusZone: { from: 1, to: 9, shift: false, meta: false },
+} as const satisfies Record<string, GlobalDigitChord>;
+
+/**
+ * The digit the event spells for `chord`, or `null` when it does not
+ * spell it.
+ *
+ * Shift is matched EXACTLY, same as {@link matchesChord} — which is the
+ * half `DashboardPage` was missing entirely. It tested
+ * `(e.ctrlKey || e.metaKey) && e.key >= "1" && e.key <= "8"` with NO
+ * `shiftKey` term, so `Ctrl+Shift+1..8` had a single claimant only by
+ * accident of the US layout (where shifted digits report punctuation).
+ * On a numpad or a non-US layout that reports a bare digit with Shift
+ * held, it was a second live collision — with the terminal's LAYOUT
+ * preset chord, on top of the zone-focus one.
+ *
+ * Alt IS inspected here, unlike {@link matchesChord}: `Ctrl+Alt+<digit>`
+ * is an OS-level chord on several platforms, and the terminal's
+ * focus-zone handler has always carried an explicit `!e.altKey` term
+ * that would otherwise be dropped by the routing.
+ */
+export function matchesDigitChord(e: ChordKeyLike, chord: GlobalDigitChord): number | null {
+  if (!(e.ctrlKey || (chord.meta && e.metaKey === true))) return null;
+  if (e.shiftKey !== chord.shift) return null;
+  if (e.altKey === true) return null;
+  if (!/^[0-9]$/.test(e.key)) return null;
+  const n = Number(e.key);
+  return n >= chord.from && n <= chord.to ? n : null;
+}
 
 /**
  * True when the event spells `chord`, case-insensitively.
