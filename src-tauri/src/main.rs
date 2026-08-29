@@ -1048,12 +1048,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `mcp_api::start_server`. We do NOT spawn the old executor here
                 // — two consumers of the same mailbox would double-inject.
                 let _ = session_bus::spawn_session_bus_executor; // keep module live
-                                                                 // Hook-free, runner-side WIP-attribution capture (sibling of
-                                                                 // the tree publisher above). Reads each hosted session's Claude
-                                                                 // transcript forward-only and POSTs file-edit attribution to
-                                                                 // coord's /coord/wip-attribution. Gated OFF by default
-                                                                 // (COORD_SESSION_ATTRIBUTION_ENABLED) — no live consumer yet, so
-                                                                 // it's a no-op until armed. See `session_attribution`.
+
+                // Hook-free, runner-side WIP-attribution capture (sibling of
+                // the tree publisher above). Reads each hosted session's Claude
+                // transcript forward-only and POSTs file-edit attribution to
+                // coord's /coord/wip-attribution. Gated OFF by default
+                // (COORD_SESSION_ATTRIBUTION_ENABLED), so it's a no-op until
+                // armed — but NOT for want of a consumer: coord's `orphaned_wip`
+                // watcher branch and the `wip-owners` join both read the table
+                // this would fill, and the former's INNER JOIN means it cannot
+                // fire at all while we stay dark. What gates arming is the
+                // cost/privacy of transcript parsing at fleet scale. Full
+                // reasoning in the `session_attribution` module header.
                 session_attribution::spawn_session_attribution();
                 // Ξ_Worktree census (Phase 1) — periodic disk-footprint
                 // + junction-status + volume-free-space census of every
