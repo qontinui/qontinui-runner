@@ -127,6 +127,7 @@ impl CoordInstallClient {
                 return;
             }
         };
+        // coord-tenant-scope(work-owed): the producer's identity set is repo_path + correlation_id (types.rs:32-57) -- no session id; coord's FsObservationsRequest.tenant_id is the sole carrier and this request type never populates it. Phase 6.
         let rb = crate::auth::attach_device_auth(client.post(&url));
         match rb.json(req).send().await {
             Ok(resp) => {
@@ -167,6 +168,7 @@ impl CoordInstallClient {
         // the rest of the runner's bin-target data plane (the dogfood auth
         // signal). Both copies read the same on-disk token, but only one set of
         // counters is the one operators watch.
+        // coord-tenant-scope(work-owed): same session-less, repo-keyed producer over three routes: only /coord/installs/declare reads a tenant (it prefers principal.tenant_id); predict-and-check and verify persist none. Phase 6.
         let rb = crate::auth::attach_device_auth(self.client.post(&url));
         let resp = rb
             .json(body)

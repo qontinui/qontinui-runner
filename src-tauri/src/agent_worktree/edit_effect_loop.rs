@@ -232,6 +232,7 @@ async fn post_predict_and_check(
             return None;
         }
     };
+    // coord-tenant-scope(session-owed): driven from IsolatedEditContext acquire/drop, so a session's worktree set is the context -- but coord's PredictRequest has no tenant field and no auth extractor, so this route carries no tenant dimension. Phase 5.
     match crate::auth::attach_device_auth(client.post(&url).json(body))
         .send()
         .await
@@ -290,6 +291,7 @@ async fn post_verify(coord_http_base: &str, body: &VerifyRequest) {
             return;
         }
     };
+    // coord-tenant-scope(session-owed): same session context; coord's VerifyRequest.tenant_id exists and is the sole carrier (no auth extractor), but this module never sets it. Phase 5.
     match crate::auth::attach_device_auth(client.post(&url).json(body))
         .send()
         .await

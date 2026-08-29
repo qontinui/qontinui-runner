@@ -1066,6 +1066,7 @@ pub(super) async fn reacquire_claim(
         "resource_key": claim.resource_key,
         "machine_id": device_id.to_string(),
     });
+    // coord-tenant-scope(session-owed): the handoff's source session is this module's whole subject, yet the body (:1024-1028) sends only {kind, resource_key, machine_id} -- not even agent_session_id, let alone tenant_id. Phase 5.
     let resp = crate::auth::attach_device_auth(http.post(&url).json(&body))
         .send()
         .await
@@ -1092,6 +1093,7 @@ async fn close_source(
         coord_url.trim_end_matches('/'),
         source_session_id
     );
+    // coord-tenant-scope(session-owed): source_session_id is the fn's parameter (:1048). E2: DELETE /sessions/{id} is mounted on coord's admin-gated operator_admin_writes router, whose own comment asserts the runner does NOT call it -- no credential slot fixes this. Phase 5.
     let resp = crate::auth::attach_device_auth(http.delete(&url))
         .send()
         .await

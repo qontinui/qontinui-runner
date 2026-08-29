@@ -352,6 +352,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
             "{}/coord/work-units?slug_prefix={}&limit=500",
             self.base, slug
         );
+        // coord-tenant-scope(work-owed): the periodic plan scan holds only self.base + self.client -- no session id exists in this module; the plan's repo is the only tenancy signal. Phase 6. (E4: this operator-tier route 403s a device JWT today, whatever the tenant.)
         let resp = crate::auth::attach_device_auth(self.client.get(&url))
             .send()
             .await
@@ -388,6 +389,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
         //  "transitioned_at":..}, ...]} ordered newest-first (coord's SQL
         // `ORDER BY transitioned_at DESC`). We want the newest row's `by_actor`.
         let url = format!("{}/coord/work-units/{}/history", self.base, slug);
+        // coord-tenant-scope(work-owed): same session-less sink; the slug is the only tenancy signal. Phase 6. (E4: /coord/work-units/:slug/history is likewise TenantId-gated and 403s a device JWT.)
         let resp = crate::auth::attach_device_auth(self.client.get(&url))
             .send()
             .await
@@ -418,6 +420,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
 
     async fn upsert(&self, body: &UpsertBody) -> Result<()> {
         let url = format!("{}/coord/work-units/upsert", self.base);
+        // coord-tenant-scope(work-owed): the headline site -- no session id in scope; coord's post_upsert lifts the tenant from the JWT claim and UpsertRequest has no tenant field, so the plan's repo must resolve it. Phase 6.
         let resp = crate::auth::attach_device_auth(self.client.post(&url).json(body))
             .send()
             .await
@@ -432,6 +435,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
 
     async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()> {
         let url = format!("{}/coord/work-units/{}/transition", self.base, slug);
+        // coord-tenant-scope(work-owed): same session-less sink; coord's post_transition uses the same tenant_from_claims(&auth), so the slug's repo is the only tenancy signal. Phase 6.
         let resp = crate::auth::attach_device_auth(self.client.post(&url).json(body))
             .send()
             .await
@@ -447,6 +451,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
     async fn set_deps(&self, slug: &str, depends_on: &[String]) -> Result<SetDepsOutcome> {
         let url = format!("{}/coord/work-units/{}/deps", self.base, slug);
         let body = serde_json::json!({ "depends_on": depends_on });
+        // coord-tenant-scope(work-owed): same session-less sink; the deps route is tenant-scoped fail-closed off the JWT, so the plan's repo must supply the tenant. Phase 6.
         let resp = crate::auth::attach_device_auth(self.client.post(&url).json(&body))
             .send()
             .await

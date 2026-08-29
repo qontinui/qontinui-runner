@@ -287,6 +287,7 @@ async fn pre_allocate_claim(
 
     let client =
         crate::coord_http::coord_client().ok_or_else(|| "no shared coord client".to_string())?;
+    // coord-tenant-scope(session-owed): agent_session_id is a parameter (:266) and already rides in claim_request_body, but tenant_id is not sent and the bearer still defaults. Phase 5.
     let resp = crate::auth::attach_device_auth(
         client
             .post(&url)
@@ -637,6 +638,7 @@ async fn heartbeat_once(
     );
     let client =
         crate::coord_http::coord_client().ok_or_else(|| "no shared coord client".to_string())?;
+    // coord-tenant-scope(session-owed): agent_session_id is a parameter (:626) and rides in the body; ClaimRequest.tenant_id is still unpopulated and the bearer still defaults. Phase 5.
     let resp = crate::auth::attach_device_auth(
         client
             .post(&url)
@@ -692,6 +694,7 @@ pub async fn release_claim_best_effort(
         warn!("release_claim_best_effort: no shared coord client");
         return;
     };
+    // coord-tenant-scope(session-owed): agent_session_id is a parameter (:679) and rides in the body; the tenant slot is still empty on the release verb. Phase 5.
     match crate::auth::attach_device_auth(
         client
             .post(&url)
@@ -1378,6 +1381,7 @@ pub async fn allocate_and_materialize_with_claim(
     );
 
     let url = format!("{}/agents/allocate", coord_http_base.trim_end_matches('/'));
+    // coord-tenant-scope(session-owed): allocate_request_body carries agent_session_id but omits tenant_id and work_unit_id entirely (:1237-1251); coord's extractor is observe-only, so changing the bearer alone would move a metric, not the row. Phase 5.
     let resp = crate::auth::attach_device_auth(reqwest::Client::new().post(&url).json(&body))
         .send()
         .await

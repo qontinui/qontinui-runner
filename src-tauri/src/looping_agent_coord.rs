@@ -134,6 +134,7 @@ async fn fetch_desired_state() -> Result<Vec<CoordDesiredState>, String> {
     let url = format!("{base}/coord/agent-desired-state");
     let client = http_client()?;
 
+    // coord-tenant-scope(device): fleet-wide supervisor poll -- only base is in scope (:133); coord lifts the tenant from the JWT so a device reads only its own fleet's desired state.
     let resp = crate::auth::attach_device_auth(client.get(&url))
         .send()
         .await
@@ -230,6 +231,7 @@ pub async fn acquire_slot(
     let url = format!("{base}/claims/acquire");
     let body = claim_body(resource_key, machine_id, agent_id, claude_session_id);
 
+    // coord-tenant-scope(device): the Tier-0 per-machine slot lease: claim_body sets agent_session_id: Value::Null explicitly (:206) and no tenant_id -- sending nothing is correct.
     let resp = match crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -274,6 +276,7 @@ pub async fn heartbeat_slot(
     let url = format!("{base}/claims/heartbeat");
     let body = claim_body(resource_key, machine_id, agent_id, claude_session_id);
 
+    // coord-tenant-scope(device): same per-machine slot lease, heartbeat verb; same claim_body with the session id explicitly null.
     let resp = match crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -304,6 +307,7 @@ pub async fn release_slot(resource_key: &str, machine_id: &uuid::Uuid, agent_id:
     };
     let url = format!("{base}/claims/release");
     let body = claim_body(resource_key, machine_id, agent_id, None);
+    // coord-tenant-scope(device): same per-machine slot lease, release verb; claude_session_id is passed None at :306.
     match crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -331,6 +335,7 @@ pub async fn fetch_playbook(name: &str) -> Option<String> {
     let client = http_client().ok()?;
     let url = format!("{base}/coord/agent-playbook/{name}");
 
+    // coord-tenant-scope(device): only name and base are in scope (:330-332); the fleet playbook is a per-tenant document and the device default IS the fleet this runner belongs to.
     let resp = crate::auth::attach_device_auth(client.get(&url))
         .send()
         .await

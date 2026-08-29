@@ -651,3 +651,308 @@ fn pinned_coord_reads_attach_device_auth() {
         );
     }
 }
+
+// ============================================================================
+// Second axis: WHICH TENANT.
+//
+// Plan `2026-08-29-runner-work-scoped-writes-default-tenant-credential`,
+// Phase 4.
+//
+// The pin above answers "is this coord write authenticated at all". It cannot
+// answer the question that follows, and the two are independent: a write can be
+// perfectly authenticated and still land under the wrong tenant, because
+// `auth::attach_device_auth` is `attach_device_auth_for(rb, None)` and `None`
+// selects the DEFAULT binding's JWT. On every coord route that derives row
+// ownership from the verified bearer — `ident.require_tenant()`, which has no
+// fallback — a caller that could not work out its own tenant and used the
+// defaulting wrapper writes a row under whichever tenant happens to be default.
+//
+// On a single-bound device that is right by accident. It becomes a real
+// cross-tenant write the moment a second tenant is paired to the same box, and
+// nothing in the tree would notice: `attach_device_auth`'s own doc comment has
+// said "pass `None` and hope" is wrong since Phase 8b, and 52 call sites
+// accumulated under it anyway. A convention that lives only in a doc comment is
+// how you get 52 of them.
+//
+// So the same method the pin above used on the first axis applies to the
+// second: not a hand-listed set of *writers*, but a predicate over all of them.
+// Every use of the DEFAULTING wrapper must declare, at the site, which class it
+// is in — and `EXPECTED_TENANT_SCOPES` pins the per-file counts so a new one
+// cannot join any class without someone editing this table.
+//
+// Sites that call `attach_device_auth_for` need no annotation: they have
+// already stated their tenant in code, where it is visible and type-checked.
+// That asymmetry is the point — the annotation is the cost of using the
+// wrapper that decides for you.
+// ============================================================================
+
+/// The marker a tenant-scope annotation must carry.
+const TENANT_SCOPE_MARKER: &str = "coord-tenant-scope(";
+
+/// The defaulting wrapper. Matching on the trailing `(` is what separates it
+/// from `attach_device_auth_for(` / `attach_device_auth_blocking(`, which are
+/// the tenant-STATING forms and are deliberately out of scope here.
+const DEFAULTING_CALL: &str = "attach_device_auth(";
+
+/// Every legal tenant-scope kind, with what it means. A kind outside this set
+/// is a typo or an invention, and either way the test rejects it.
+///
+/// Three of the four are terminal states of a classification; `device` is the
+/// only one that is a permanent *allowlist*. The two `-owed` kinds are debts
+/// with a named creditor: they exist so the count can be watched to zero rather
+/// than tracked in a document that rots.
+const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
+    (
+        "device",
+        "no tenant dimension — the row is keyed by device_id, so the default \
+         binding is correct by construction and stays correct however many \
+         tenants are paired. The reviewed allowlist.",
+    ),
+    (
+        "session-owed",
+        "session-scoped: a session/agent id is in scope, so the owning \
+         session's tenant is the right answer. Still defaulting — owes Phase 5.",
+    ),
+    (
+        "work-owed",
+        "work-scoped and session-less: the tenant is a property of an artifact \
+         (a plan, a work unit, a repo), so there is no session to ask. Owes \
+         Phase 6's repo-derived resolution.",
+    ),
+    (
+        "escalated",
+        "cannot be given one class from the code — a shared helper whose \
+         callers span classes. Classifying it would require splitting the \
+         helper, which is a change, not an annotation.",
+    ),
+];
+
+/// Per-(file, kind) counts of tenant-scope annotations.
+///
+/// Pinned for the same reason [`EXPECTED_EXEMPTIONS`] is: "every site is
+/// annotated" alone would let a new defaulting call site join the `device`
+/// allowlist by writing a plausible-looking comment. This table is a
+/// hand-reviewed list of *classifications*, and it should have to change
+/// whenever one does.
+///
+/// It also gives Phases 5 and 6 a mechanical finish line. When
+/// `session-owed` reaches 0 the S class is threaded; when `work-owed` reaches
+/// 0 the W class is resolved; `device` is what should remain.
+const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
+    ("agent_runtime.rs", "device", 5),
+    ("agent_runtime.rs", "session-owed", 4),
+    ("agent_worktree/edit_effect_loop.rs", "session-owed", 2),
+    ("agent_worktree/fs_backstop.rs", "work-owed", 1),
+    ("agent_worktree/fs_observer.rs", "session-owed", 1),
+    ("agent_worktree/mod.rs", "session-owed", 4),
+    ("commands/ai_settings.rs", "device", 1),
+    ("commands/claims.rs", "session-owed", 3),
+    ("coord_http.rs", "escalated", 1),
+    ("coord_questions.rs", "session-owed", 1),
+    ("fleet.rs", "device", 6),
+    ("git_supervision/commit_forwarder.rs", "work-owed", 1),
+    ("install_effects_producer/coord_client.rs", "work-owed", 2),
+    ("looping_agent_coord.rs", "device", 5),
+    ("mcp/plan_library.rs", "work-owed", 2),
+    ("mcp/probe_executor.rs", "device", 1),
+    ("plan_workunit_adapter/body_push.rs", "work-owed", 2),
+    ("plan_workunit_adapter/push.rs", "work-owed", 5),
+    ("repo_detection.rs", "work-owed", 1),
+    ("session/handoff.rs", "session-owed", 2),
+    ("terminal/auto_response.rs", "session-owed", 2),
+];
+
+/// Totals across the whole table, asserted independently of the per-file rows
+/// so a transcription slip in one direction cannot be cancelled by another.
+/// These are the Phase-2 census figures (52 sites at `ebbd3c70`).
+const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
+    ("device", 18),
+    ("session-owed", 19),
+    ("work-owed", 14),
+    ("escalated", 1),
+];
+
+/// Extract the kind from `coord-tenant-scope(<kind>):`.
+fn tenant_scope_kind(window: &str) -> Option<String> {
+    let at = window.find(TENANT_SCOPE_MARKER)?;
+    let rest = &window[at + TENANT_SCOPE_MARKER.len()..];
+    let close = rest.find(')')?;
+    Some(rest[..close].trim().to_string())
+}
+
+#[test]
+fn every_defaulting_call_site_declares_its_tenant_scope() {
+    let root = src_root();
+    let mut files = Vec::new();
+    rust_files(&root, &mut files);
+    files.sort();
+
+    let mut sites = 0usize;
+    let mut unannotated: Vec<Site> = Vec::new();
+    let mut bad_kinds: Vec<(Site, String)> = Vec::new();
+    let mut empty_reasons: Vec<Site> = Vec::new();
+    let mut found: BTreeMap<(String, String), usize> = BTreeMap::new();
+
+    for path in &files {
+        let rel = path
+            .strip_prefix(&root)
+            .expect("path under src")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let body = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        if !body.contains(DEFAULTING_CALL) {
+            continue;
+        }
+        let lines: Vec<&str> = body.lines().collect();
+        let test_ranges = cfg_test_ranges(&lines);
+
+        for (i, line) in lines.iter().enumerate() {
+            // Comment-stripped, for the same reason every other scan here is:
+            // this file and `auth.rs` both NAME the wrapper in prose, and prose
+            // must never be scored as a call site.
+            let code = code_only(&lines, i, i);
+            if !code.contains(DEFAULTING_CALL) {
+                continue;
+            }
+            // The definition itself is not a call site.
+            if code.contains(&format!("fn {DEFAULTING_CALL}")) {
+                continue;
+            }
+            if test_ranges.iter().any(|(a, b)| i >= *a && i <= *b) {
+                continue;
+            }
+            sites += 1;
+
+            let (window, _stmt_start) = annotation_block(&lines, i);
+            let site = Site {
+                file: rel.clone(),
+                line: i + 1,
+                text: line.trim().to_string(),
+            };
+            let Some(kind) = tenant_scope_kind(&window) else {
+                unannotated.push(site);
+                continue;
+            };
+            if !TENANT_SCOPE_KINDS.iter().any(|(k, _)| *k == kind) {
+                bad_kinds.push((site, kind));
+                continue;
+            }
+            // A kind with no reason after it is an annotation in form only.
+            let after = window
+                .split_once(&format!("{TENANT_SCOPE_MARKER}{kind}):"))
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or("");
+            if after.is_empty() {
+                empty_reasons.push(site);
+                continue;
+            }
+            *found.entry((rel.clone(), kind)).or_default() += 1;
+        }
+    }
+
+    assert!(
+        unannotated.is_empty(),
+        "{} call site(s) use the DEFAULTING `attach_device_auth` without declaring a tenant \
+         scope:\n{}\n\nEvery use of the defaulting wrapper must say which class it is in, \
+         because `None` is not 'anonymous' — it presents the DEFAULT binding's credential. \
+         Either state the tenant in code (`attach_device_auth_for(.., tenant)`), which needs no \
+         annotation, or add `// coord-tenant-scope(<kind>): <reason>` above the statement AND a \
+         row in EXPECTED_TENANT_SCOPES. Legal kinds:\n{}",
+        unannotated.len(),
+        unannotated
+            .iter()
+            .map(|s| format!("  {}:{}  {}", s.file, s.line, s.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        TENANT_SCOPE_KINDS
+            .iter()
+            .map(|(k, why)| format!("  {k}: {why}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    assert!(
+        bad_kinds.is_empty(),
+        "unknown tenant-scope kind(s):\n{}",
+        bad_kinds
+            .iter()
+            .map(|(s, k)| format!("  {}:{}  `{k}`", s.file, s.line))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    assert!(
+        empty_reasons.is_empty(),
+        "tenant-scope annotation(s) with no reason after the kind:\n{}\n\nThe reason lives at \
+         the site so it cannot drift from the code it classifies.",
+        empty_reasons
+            .iter()
+            .map(|s| format!("  {}:{}", s.file, s.line))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    let expected: BTreeMap<(String, String), usize> = EXPECTED_TENANT_SCOPES
+        .iter()
+        .map(|(f, k, n)| ((f.to_string(), k.to_string()), *n))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the tenant-scope classification changed. This is a REVIEW prompt, not a nuisance: a \
+         site moving between classes changes which tenant its writes land under. Update \
+         EXPECTED_TENANT_SCOPES in tests/coord_auth_pin.rs — and if a site joined `device`, \
+         confirm its coord route really has no tenant dimension before you do."
+    );
+
+    // Totals, checked independently of the per-file rows.
+    let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
+    for ((_, kind), n) in &found {
+        *totals.entry(kind.as_str()).or_default() += n;
+    }
+    for (kind, want) in EXPECTED_TENANT_SCOPE_TOTALS {
+        let got = totals.get(kind).copied().unwrap_or(0);
+        assert_eq!(
+            got, *want,
+            "tenant-scope `{kind}`: found {got}, expected {want}. If a phase legitimately moved \
+             sites out of a class, lower the number here in the SAME commit — a debt count that \
+             is not watched is not a debt."
+        );
+    }
+
+    let total: usize = totals.values().sum();
+    assert_eq!(
+        total, sites,
+        "every scanned defaulting call site should have been classified"
+    );
+    assert_eq!(
+        sites, 52,
+        "expected the 52 defaulting call sites measured at ebbd3c70; found {sites}. A change \
+         here is fine — it just has to be deliberate."
+    );
+}
+
+#[test]
+fn tenant_scope_kinds_are_a_closed_distinct_set() {
+    let mut seen = std::collections::BTreeSet::new();
+    for (kind, why) in TENANT_SCOPE_KINDS {
+        assert!(
+            seen.insert(*kind),
+            "TENANT_SCOPE_KINDS lists `{kind}` twice"
+        );
+        assert!(!why.trim().is_empty(), "kind `{kind}` has no meaning given");
+    }
+    for (file, kind, n) in EXPECTED_TENANT_SCOPES {
+        assert!(
+            seen.contains(kind),
+            "EXPECTED_TENANT_SCOPES names unknown kind `{kind}` for {file}"
+        );
+        assert!(
+            *n > 0,
+            "EXPECTED_TENANT_SCOPES row for {file}/{kind} is 0 — delete the row instead"
+        );
+    }
+    for (kind, _) in EXPECTED_TENANT_SCOPE_TOTALS {
+        assert!(
+            seen.contains(*kind),
+            "EXPECTED_TENANT_SCOPE_TOTALS names unknown kind `{kind}`"
+        );
+    }
+}

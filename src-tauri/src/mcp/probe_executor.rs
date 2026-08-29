@@ -417,6 +417,7 @@ async fn tick_once() -> Result<usize, String> {
     for probe in &pull.probes {
         let result = execute_probe(&probe.probe_kind, &probe.probe_args).await;
         let result_url = format!("{base}/coord/probes/{}/result", probe.id);
+        // coord-tenant-scope(device): device_id from census::load_device_id_pub() (:389) is the only identity; coord requires the JWT's own device_id and a device may only pull ITS OWN probes.
         match qontinui_runner_lib::auth::attach_device_auth(client.post(&result_url))
             .json(&result)
             .send()
