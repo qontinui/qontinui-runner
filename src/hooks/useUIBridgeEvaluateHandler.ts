@@ -10,7 +10,10 @@
  *     | POST /ui-bridge/control/page/evaluate { expression }
  *     v
  * Axum handler (mcp/ui_bridge.rs::page_evaluate_inner → tagged_page_evaluate)
- *     | emit("ui-bridge:evaluate-request", { request_id, expression, await_promise, timeout_ms })
+ *     | emit("ui-bridge:evaluate-request",
+ *     |   { request_id, expression, timeout_ms, timeout_from_default,
+ *     |     allow_network_requests, windowLabel })
+ *     |   (NOT await_promise — this flow always auto-awaits; see below)
  *     v
  * This Hook
  *     | compileEvaluateExpression(expression)()  (security-gated)
@@ -92,9 +95,10 @@ interface EvaluateRequestPayload {
    * it the frontend sees an ordinary number and tells a caller who sent
    * nothing that the budget "came from the `timeoutMs` you sent" — the same
    * misattributed provenance the message was rewritten to remove, one seam
-   * further along. `POST /ui-bridge/control/page/evaluate-raw` is the clearest
-   * case: it takes the expression as the whole body and so has no `timeoutMs`
-   * field at all.
+   * further along. This affects BOTH tagged routes: most callers hit it by
+   * omitting `timeoutMs` from a `POST /page/evaluate` body, and
+   * `POST /page/evaluate-raw` hits it on every call, since it takes the
+   * expression as the whole body and so has no `timeoutMs` field at all.
    *
    * Absent → treat `timeout_ms` as caller-supplied (a producer predating the
    * field; unchanged behaviour).

@@ -421,9 +421,7 @@ describe("describeEvaluateBudget — caller-supplied page/evaluate budget", () =
     // and cap every await at 30s — so `timeoutMs: 600000` failed at 30s with
     // "did not resolve within 30.0s" while Rust was still waiting.
     expect(awaitMs(60_000)).toBe(60_000 - MARGIN);
-    expect(awaitMs(PAGE_EVALUATE_MAX_TIMEOUT_MS)).toBe(
-      PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN,
-    );
+    expect(awaitMs(PAGE_EVALUATE_MAX_TIMEOUT_MS)).toBe(PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN);
   });
 
   it("honors a caller timeout below the default cap", () => {
@@ -442,9 +440,7 @@ describe("describeEvaluateBudget — caller-supplied page/evaluate budget", () =
 
   it("clamps above the ceiling rather than trusting the payload", () => {
     expect(awaitMs(5_000_000)).toBe(PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN);
-    expect(awaitMs(Number.POSITIVE_INFINITY)).toBe(
-      PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
-    );
+    expect(awaitMs(Number.POSITIVE_INFINITY)).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
   });
 
   it.each([
@@ -458,7 +454,6 @@ describe("describeEvaluateBudget — caller-supplied page/evaluate budget", () =
     expect(awaitMs(raw)).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
   });
 });
-
 
 describe("describeEvaluateBudget + evaluateTimeoutMessage (U1: the 9.8s that read as a cap)", () => {
   it("reports the DEFAULT as a default, not as a cap", () => {
@@ -512,6 +507,11 @@ describe("describeEvaluateBudget + evaluateTimeoutMessage (U1: the 9.8s that rea
     expect(msg).toContain("awaited 9.8s");
     expect(msg).toContain("DEFAULT budget, not a cap");
     expect(msg).not.toContain("came from the `timeoutMs` you sent");
+    // The remediation must name the ROUTE. `page/evaluate-raw` reaches this
+    // arm on every call and has no `timeoutMs` field, so a bare "pass
+    // `timeoutMs`" would send that caller looking for something their route
+    // does not accept.
+    expect(msg).toContain("POST /ui-bridge/control/page/evaluate");
   });
 
   it("leaves the budget itself untouched — the flag moves provenance only", () => {
