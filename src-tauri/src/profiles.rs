@@ -724,20 +724,28 @@ pub fn read_runner_tier() -> TierRead {
 ///
 /// `server_mode` is deliberately NOT consulted: see [`TierSignals::server_mode`].
 pub fn read_runner_tier_at(path: &std::path::Path, paired: bool) -> TierRead {
-    if !path.exists() {
-        return TierRead::Absent;
-    }
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            return TierRead::Unknown(format!("read {} failed: {e}", path.display()));
+    // An ABSENT settings.json is a document with no tier, not a different kind
+    // of fact — so it goes through the same inference as a present-but-tierless
+    // one, from an empty object. Otherwise a paired box that had never written
+    // its settings (the fresh headless install, exactly the case
+    // `promote_tier_to_account_at` creates a file for) would read `Absent` here
+    // while the runner itself resolved Tier 2 — the two readers disagreeing
+    // again, in the one place the rule is supposed to be shared.
+    let json: serde_json::Value = if path.exists() {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                return TierRead::Unknown(format!("read {} failed: {e}", path.display()));
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(j) => j,
+            Err(e) => {
+                return TierRead::Unknown(format!("parse {} failed: {e}", path.display()));
+            }
         }
-    };
-    let json: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(j) => j,
-        Err(e) => {
-            return TierRead::Unknown(format!("parse {} failed: {e}", path.display()));
-        }
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
     };
     let persisted = json.get("tier").and_then(|v| v.as_str());
     let chosen_explicitly = json
@@ -2327,6 +2335,26 @@ mod tests {
         std::fs::write(&path, r#"{"web_integration":{"runner_token":"legacy"}}"#).unwrap();
         assert_eq!(
             read_runner_tier_at(&path, /* paired = */ false),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
+        );
+    }
+
+    /// An ABSENT settings.json is a tier-less document, not a separate fact:
+    /// unpaired it is `Absent`, paired it is Tier 2. The fresh headless
+    /// install pairs before the runner has ever written its settings, and the
+    /// two readers must not disagree about that box either.
+    #[test]
+    fn read_runner_tier_at_absent_file_follows_the_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert!(!path.exists());
+
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ false),
+            TierRead::Absent
+        );
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ true),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
