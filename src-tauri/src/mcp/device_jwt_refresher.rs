@@ -1473,12 +1473,40 @@ async fn refresher_loop(
                         }
                     },
                 };
-                let pair_base = settings_snapshot
+                // The base a device JWT is MINTED against must be the base the
+                // relay DIALS, or the runner presents a credential to a backend
+                // that never issued it.
+                //
+                // `api_config` refuses a LOOPBACK persisted `backend_url` on a
+                // RELEASE build (see `api_config::resolve_api_base_url`), so on
+                // such a runner the relay dials the release default. Reading the
+                // persisted field raw here would leave this loop minting against
+                // `127.0.0.1:8000` while the relay talks to production — the
+                // prod/local device-JWT split the persisted rung was introduced
+                // to close (plan 2026-07-08), re-opened pointing the other way.
+                //
+                // So a refused value defers to `get_api_base_url()` — the one
+                // authority — rather than to a second copy of rung 4 here. The
+                // two can then not disagree by construction. A runner whose
+                // persisted value is honoured (every debug build, and every
+                // release build pointed at a real remote backend) takes the
+                // same path it always did.
+                let persisted_pair_base = settings_snapshot
                     .web_integration
                     .backend_url
                     .trim()
                     .trim_end_matches('/')
                     .to_string();
+                let pair_base = if crate::api_config::persisted_backend_url_refused(
+                    &persisted_pair_base,
+                    cfg!(debug_assertions),
+                ) {
+                    // Blank is not refused (it is unset, not loopback), so the
+                    // empty-check below still guards the unconfigured case.
+                    crate::api_config::get_api_base_url()
+                } else {
+                    persisted_pair_base
+                };
                 if pair_base.is_empty() {
                     warn!("device_jwt_refresher: backend_url empty — cannot pair");
                     if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
