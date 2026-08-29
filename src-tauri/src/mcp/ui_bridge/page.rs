@@ -1005,9 +1005,30 @@ async fn tagged_page_evaluate(
                 .ui_bridge_evaluate_store
                 .cancel(window_label, &request_id)
                 .await;
+            // The LEADING CLAUSE stays verbatim: it is the documented
+            // discriminator between this generic Rust timeout and the
+            // frontend's precise "Promise did not resolve within Xs" (see
+            // PAGE_EVALUATE_TIMEOUT_MARGIN_MS in
+            // `src/hooks/ui-bridge-events/utils.ts`). Only a provenance clause
+            // is appended.
+            //
+            // The frontend normally wins the race by that 250 ms margin, so
+            // this branch is what a caller sees when NO frontend listener
+            // answers at all — every window rejecting the request on the
+            // own-label filter, a dedupe drop, or a window not yet mounted.
+            // Without the clause, such a caller gets a bare `10000ms` and no
+            // hint that the budget was ours or that a knob exists — the same
+            // defect the frontend message was rewritten to close, on the
+            // sibling path.
             Err(format!(
-                "UI Bridge page_evaluate timed out after {}ms",
-                timeout_ms
+                "UI Bridge page_evaluate timed out after {timeout_ms}ms. {}",
+                if timeout_from_default {
+                    "That is the DEFAULT budget, not a cap - pass `timeoutMs` on \
+                     POST /ui-bridge/control/page/evaluate to raise it (clamped to \
+                     1000-600000ms)."
+                } else {
+                    "That budget came from the `timeoutMs` you sent."
+                }
             ))
         }
     }

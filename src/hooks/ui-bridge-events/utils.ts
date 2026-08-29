@@ -193,9 +193,9 @@ export function levenshtein(a: string, b: string): number {
  * whose payload carries no timeout. It is also the tagged evaluate handler's
  * fallback when a request omits `timeout_ms` — but a current `page.rs` always
  * emits a number (its own 10 s default when the caller sent none), so on that
- * route this value is reached only from a producer that predates
- * `tagged_page_evaluate`. The DEFAULT a tagged caller actually gets is the
- * Rust one; `timeout_from_default` is what says so. See
+ * route this value is reached only from a build predating the `timeout_ms`
+ * field, or a hand-rolled emit. The DEFAULT a tagged caller actually gets is
+ * the Rust one; `timeout_from_default` is what says so. See
  * {@link describeEvaluateBudget}.
  */
 export const PAGE_EVALUATE_PROMISE_TIMEOUT_MS = 30_000;
@@ -302,9 +302,13 @@ export interface EvaluateBudgetOptions {
  * `raw` is always a concrete number there — and inferring provenance from
  * `raw` alone re-created the very defect this function was split out to fix,
  * one seam further along: a caller who sent nothing was told "That budget came
- * from the `timeoutMs` you sent". `page/evaluate-raw` made that unarguable —
- * it has no `timeoutMs` field for a caller to send, and still got that
- * sentence.
+ * from the `timeoutMs` you sent".
+ *
+ * That hit BOTH tagged routes. The common one is `POST /page/evaluate` with a
+ * body that simply omits `timeoutMs` (`page.rs` maps the `Option` through its
+ * clamp, so an omitted field stays `None`). `page/evaluate-raw` is merely the
+ * unarguable one: its whole body is the expression, so it has no `timeoutMs`
+ * field for a caller to send, and it still got that sentence.
  */
 export function describeEvaluateBudget(
   raw: unknown,
@@ -706,8 +710,15 @@ export function evaluateTimeoutMessage(timeoutMs: number, budget?: EvaluateBudge
   if (!budget) {
     return `page_evaluate: Promise did not resolve within ${secs(timeoutMs)}`;
   }
+  // The remediation names the ROUTE, not just the field. `page/evaluate-raw`
+  // reaches this arm on every call — its whole body is the expression, so it
+  // has no `timeoutMs` field — and "pass `timeoutMs`" with no route is
+  // unactionable there. Naming `POST /page/evaluate` tells that caller what to
+  // actually do (switch routes) instead of sending them hunting for a field
+  // their route does not accept.
   const source = budget.fromDefault
-    ? `That is the DEFAULT budget, not a cap — pass \`timeoutMs\` to raise it`
+    ? `That is the DEFAULT budget, not a cap — pass \`timeoutMs\` on ` +
+      `POST /ui-bridge/control/page/evaluate to raise it`
     : `That budget came from the \`timeoutMs\` you sent`;
   return (
     `page_evaluate: Promise did not resolve within ${secs(budget.requestedMs)} ` +
