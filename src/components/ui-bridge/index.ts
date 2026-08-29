@@ -18,7 +18,6 @@ export { ConnectedUIBridgeInspector } from "./ConnectedUIBridgeInspector";
 export { ConnectionPanel } from "./ConnectionPanel";
 export type { ActiveSource } from "./ConnectionPanel";
 export { RawApiPanel } from "./RawApiPanel";
-export { SearchComparisonPanel } from "./SearchComparisonPanel";
 export { ElementDescriptionPanel } from "./ElementDescriptionPanel";
 export { NaturalLanguagePanel } from "./NaturalLanguagePanel";
 export { ElementTreeView } from "./ElementTreeView";

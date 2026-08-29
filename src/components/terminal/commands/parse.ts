@@ -174,8 +174,35 @@ export function parseArgs(input: string, action: CommandAction): Record<string, 
 }
 
 /**
- * Two-state read of a TEXT argument, with a supplied non-string
- * preserved rather than dropped.
+ * Positional tokens the action's `paramSchema` cannot absorb.
+ *
+ * `parseArgs`'s free-form catch-all is guarded on `fieldOrder.length > 0`,
+ * so a command with an EMPTY schema silently drops everything typed after
+ * it: `/mute please stop` bound `{}`, ran the bare `/mute` and rendered
+ * `✓` — an honest verdict for a command the operator did not type. Every
+ * other honesty fix in this surface is about the same thing: a `✓` must
+ * describe what happened, and here it described a subset.
+ *
+ * Returns `[]` when the schema HAS positional fields, because there the
+ * catch-all folds the tail into the last one on purpose (a `/spawn-ai`
+ * context is a multi-word prompt that may have lost its quoting).
+ */
+export function unboundTokens(input: string, action: CommandAction): string[] {
+  const trimmed = input.trim();
+  const firstSpace = trimmed.search(/\s/);
+  if (firstSpace === -1) return [];
+  const rest = trimmed.slice(firstSpace + 1).trim();
+  if (rest.length === 0) return [];
+  const schemaKeys = action.paramSchema ? Object.keys(action.paramSchema) : [];
+  const fieldOrder = schemaKeys.filter((k) => !k.startsWith(FLAG_PREFIX));
+  if (fieldOrder.length > 0) return [];
+  return extractFlags(tokenize(rest), schemaKeys).rest;
+}
+
+/**
+ * THREE-state read of a TEXT argument — the exact mirror of
+ * `useTerminalCommands.ts::readZoneArg` and `::readCountArg`, and for
+ * the exact same reason.
  *
  * Same family as `useTerminalCommands.ts::readCountArg`: {@link coerceToken}
  * turns a clean numeric literal into a `number`, so `/spawn-with 2 5`
@@ -187,22 +214,44 @@ export function parseArgs(input: string, action: CommandAction): Record<string, 
  * Stringifying the token the operator actually typed keeps the field
  * SUPPLIED, which is what lets the existing "unknown account" /
  * "invalid command" paths report the truth.
+ *
+ * That closed the `number` case only, and the two-state shape it left
+ * behind reopened the same hole one spelling over. A field SUPPLIED but
+ * empty (`--tenant=`, `{account: {}}`) mapped to ABSENT, and absent is
+ * the one state where a handler is entitled to guess:
+ * `resolveAccountConfigDir` reads `""` as `"best"` and launches the
+ * highest-headroom account, and `/spawn-ai 2 gmail --tenant=` binds the
+ * device default — verbatim the mis-bindings the tenant feature and this
+ * docstring both exist to prevent. `invalid` is now its own arm, so a
+ * supplied-but-unusable value names itself instead of vanishing.
  */
-export function readTextArg(
-  args: Record<string, unknown>,
-  field: string,
-): { kind: "absent" } | { kind: "text"; text: string } {
+export type TextArgRead =
+  | { kind: "absent" }
+  | { kind: "invalid"; raw: string }
+  | { kind: "text"; text: string };
+
+export function readTextArg(args: Record<string, unknown>, field: string): TextArgRead {
   const v = args[field];
   if (v === undefined || v === null) return { kind: "absent" };
   if (typeof v === "string")
-    return v.trim() === "" ? { kind: "absent" } : { kind: "text", text: v };
+    return v.trim() === "" ? { kind: "invalid", raw: v } : { kind: "text", text: v };
   if (typeof v === "number" || typeof v === "boolean") {
     return { kind: "text", text: String(v) };
   }
-  return { kind: "absent" };
+  // An object/array reached the bag (`{account: {}}`). It was SUPPLIED;
+  // reporting it as absent is what let it become "best".
+  return { kind: "invalid", raw: typeof v === "object" ? JSON.stringify(v) : String(v) };
 }
 
-/** The text of a supplied text arg, or `""` when it was never supplied. */
+/**
+ * The text of a supplied text arg, or `""` for absent AND invalid.
+ *
+ * Lossy by construction — it is kept for the callers whose field is
+ * genuinely optional and free-form, where "" and "not given" mean the
+ * same thing. Any caller that would GUESS on an empty value must use
+ * `useTerminalCommands.ts::resolveText` instead, the way every count
+ * caller uses `resolveCount`.
+ */
 export function textArg(args: Record<string, unknown>, field: string): string {
   const read = readTextArg(args, field);
   return read.kind === "text" ? read.text : "";

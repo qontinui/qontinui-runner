@@ -6,21 +6,9 @@
  * `plans/2026-05-28-terminal-page-redesign-plan.md` for the full design.
  */
 
-export type {
-  CommandAction,
-  CommandResult,
-  RegistryListener,
-  ResolverContext,
-} from "./types";
+export type { CommandAction, CommandResult, RegistryListener, ResolverContext } from "./types";
 
-export {
-  getAll,
-  getById,
-  getBySlash,
-  register,
-  subscribe,
-  unregister,
-} from "./registry";
+export { getAll, getById, getBySlash, register, subscribe, unregister } from "./registry";
 
 export { useCommandAction } from "./useCommandAction";
 
@@ -33,7 +21,7 @@ export type { FuzzyMatch } from "./fuzzy";
 export { resolve } from "./resolve";
 export type { ResolveMatch } from "./resolve";
 
-export { coerceToken, parseArgs, tokenize } from "./parse";
+export { coerceToken, parseArgs, tokenize, unboundTokens } from "./parse";
 
 export { matchPattern } from "./patterns";
 export type { PatternMatch } from "./patterns";
@@ -54,9 +42,5 @@ export {
 } from "./orchestrateCommand";
 export type { TerminalOpenPageDetail } from "./orchestrateCommand";
 
-export {
-  RECIPES,
-  resolveRecipe,
-  fillTemplate,
-} from "./recipes";
+export { RECIPES, resolveRecipe, fillTemplate } from "./recipes";
 export type { OrchestrationRecipe, ResolvedRecipe } from "./recipes";

@@ -32,7 +32,12 @@ import type { BreakpointSnapshot } from "./types";
 import { getApiBase, tracedFetch, fetchBreakpoints, resumeBreakpoint } from "@/lib/runner-api";
 import { useTaskRunControls } from "@/hooks/graphql";
 import { createLogger } from "@/lib/logger";
-import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
+import {
+  GLOBAL_CHORDS,
+  GLOBAL_DIGIT_CHORDS,
+  matchesChord,
+  matchesDigitChord,
+} from "@/lib/globalChords";
 
 const log = createLogger("Dashboard");
 
@@ -508,10 +513,20 @@ export function DashboardPage({
         return;
       }
 
-      // Ctrl+1..8 -> switch widget by position
-      if ((e.ctrlKey || e.metaKey) && e.key >= "1" && e.key <= "8") {
+      // Ctrl+1..8 -> switch widget by position. Through the shared
+      // DIGIT-RANGE predicate, not a hand-rolled `e.key >= "1"` range
+      // comparison: the hand-rolled form carried NO `shiftKey` test at
+      // all, so `Ctrl+Shift+1..8` reached this branch on any layout that
+      // reports a bare digit with Shift held (numpad, non-US) — a second
+      // claimant on the terminal's layout-preset chord. It was also
+      // invisible to the chord scanner, which is how the `Ctrl+1..8`
+      // double-fire with `terminal/useKeyboardShortcuts` survived: one
+      // press on this page switched the widget AND moved the terminal's
+      // focused zone.
+      const widgetDigit = matchesDigitChord(e, GLOBAL_DIGIT_CHORDS.dashboardWidget);
+      if (widgetDigit !== null) {
         e.preventDefault();
-        const index = parseInt(e.key) - 1;
+        const index = widgetDigit - 1;
         const widgets = state.layout.detectedWidgets;
         if (index < widgets.length) {
           setActiveWidget(widgets[index]);
