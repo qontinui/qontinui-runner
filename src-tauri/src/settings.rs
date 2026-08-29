@@ -4156,15 +4156,26 @@ pub(crate) fn migrate_tier_in_place(
         // this branch can only be Local -> QontinuiAccount. A demotion is
         // unreachable by construction, not merely unlikely — silent demotion
         // of a working primary is the top risk in this area.
-        info!(
-            "runner tier re-inferred from local to {} (runner_token={}, server_mode={}, \
-             paired={}) — this install never recorded an explicit tier choice. Set it \
-             with the SetupWizard's tier step (or QONTINUI_RUNNER_TIER=local) to pin it.",
-            new_tier.as_str(),
+        //
+        // Logged once per process, for the same reason the headless default
+        // below is: a SECONDARY never persists the migration, so this branch
+        // re-runs on every settings load (the relay loop re-reads on every
+        // iteration) and would otherwise bury real signal.
+        static UNLATCHED: std::sync::Once = std::sync::Once::new();
+        let (token, mode, was_paired) = (
             !settings.web_integration.runner_token.trim().is_empty(),
             server_mode,
-            paired
+            paired,
         );
+        let to = new_tier.as_str();
+        UNLATCHED.call_once(|| {
+            info!(
+                "runner tier re-inferred from local to {to} (runner_token={token}, \
+                 server_mode={mode}, paired={was_paired}) — this install never recorded \
+                 an explicit tier choice. Pick one in the SetupWizard's tier step (or \
+                 set QONTINUI_RUNNER_TIER=local) to pin it."
+            );
+        });
     } else if server_mode && new_tier == RunnerTier::QontinuiAccount {
         // Logged once per process: on a secondary the migration never
         // persists, so it re-runs on every settings load (the relay loop
