@@ -301,6 +301,13 @@ mod tests {
             "COORD_HTTP_URL",
             "QONTINUI_ENV",
             "QONTINUI_CONFIG_DIR",
+            // The tier is no longer a pure function of settings.json:
+            // `profiles::read_runner_tier` also probes `paired_user.json`
+            // (`pair::device_is_paired`) — a paired device is bound to a
+            // Qontinui account, which is what Tier 2 means. Unpinned, the
+            // `tier: "local"` case below reads the DEVELOPER's real pairing
+            // state and resolves to `qontinui_account`.
+            "QONTINUI_SECURE_STORAGE_DIR",
         ]);
         let device = uuid::Uuid::nil();
         // (settings.json body, expected ws url)
@@ -321,6 +328,8 @@ mod tests {
             std::env::remove_var("COORD_HTTP_URL");
             std::env::set_var("QONTINUI_ENV", "__qontinui_test_no_such_profile__");
             std::env::set_var("QONTINUI_CONFIG_DIR", dir.path());
+            // Empty dir ⇒ no `paired_user.json` ⇒ not paired.
+            std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir.path());
             std::fs::write(dir.path().join("settings.json"), settings).unwrap();
 
             let gate = qontinui_runner_lib::profiles::connected_coord_base();
