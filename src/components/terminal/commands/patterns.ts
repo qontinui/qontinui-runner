@@ -23,7 +23,7 @@
  * is Tier 1's job, and AI (Phase 8) catches everything else.
  */
 
-import { coerceToken } from "./parse";
+import { coerceToken, extractFlags, FLAG_PREFIX, tokenizeRich } from "./parse";
 import { getAll } from "./registry";
 import type { CommandAction } from "./types";
 
@@ -37,6 +37,41 @@ export interface PatternMatch {
 }
 
 /**
+ * True when the operator typed one of `action`'s OWN declared `--flags` as a
+ * top-level token on this line.
+ *
+ * A declared flag is SYNTAX, and a regex named group is text: nothing stops
+ * `(?<account>[\w-]+)` from matching the flag NAME and `(?<context>.+)` from
+ * eating its value. `/spawn-ai 1 --tenant 2299` bound
+ * `{count: 1, account: "--tenant", context: 2299}` and answered "no matching
+ * Claude account" — while the byte-identical `/spawn-best 1 --tenant 2299`
+ * and `/spawn-ai 1 --tenant=2299` both spawned, because neither reaches a
+ * pattern. Same action, same intent, three verdicts.
+ *
+ * `applyDeclaredFlags`' post-hoc scrub cannot repair that: it removes an
+ * EXACT consumed run from ONE already-bound field, and here the run's two
+ * tokens landed in two DIFFERENT fields — one of which `coerceToken` had
+ * already turned into a `number`, which the scrub never even inspects.
+ *
+ * So the pattern route declines the input instead. {@link parseArgs} pulls
+ * declared flags out BEFORE positional binding, from the raw text with its
+ * quoting intact, which is the one reading that cannot mis-bind them — and
+ * Tier 1 always has the action, because every pattern's leading token is
+ * either the action's own slash form or a phrase whose head resolves to it.
+ *
+ * Declared per ACTION, out of its own `paramSchema`, so this is not a fix for
+ * `--tenant`: the next declared flag on any action, matched by any pattern,
+ * is covered the day it is declared. QUOTED tokens are excluded by
+ * {@link extractFlags}, so a prompt that merely SAYS `"--tenant"` is still
+ * prompt text and still routes through its pattern.
+ */
+function carriesDeclaredFlag(input: string, action: CommandAction): boolean {
+  const schemaKeys = action.paramSchema ? Object.keys(action.paramSchema) : [];
+  if (!schemaKeys.some((k) => k.startsWith(FLAG_PREFIX))) return false;
+  return extractFlags(tokenizeRich(input), schemaKeys).hits.length > 0;
+}
+
+/**
  * Try every registered action's patterns against the input. Returns the
  * first match in registration order (deterministic — the registry is a
  * plain `Map` that preserves insertion order).
@@ -44,6 +79,10 @@ export interface PatternMatch {
  * Input normalisation:
  *   - Leading `/` stripped so `/swap 1 2` and `swap 1 2` are equivalent.
  *   - Whitespace trimmed at both ends.
+ *
+ * An action whose OWN declared `--flags` appear on the line is skipped
+ * entirely — see {@link carriesDeclaredFlag} for why a named group must never
+ * be allowed to bind flag syntax.
  *
  * Case-sensitivity is per-pattern; the initial set in
  * {@link useTerminalCommands} uses the `i` flag throughout so operators
@@ -55,6 +94,7 @@ export function matchPattern(input: string): PatternMatch | null {
 
   for (const action of getAll()) {
     if (!action.patterns || action.patterns.length === 0) continue;
+    if (carriesDeclaredFlag(trimmed, action)) continue;
     for (const pattern of action.patterns) {
       const match = pattern.exec(trimmed);
       if (!match) continue;

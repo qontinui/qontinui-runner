@@ -187,3 +187,65 @@ describe("matchPattern — free-form trailing group", () => {
     });
   });
 });
+
+describe("matchPattern — a DECLARED flag is syntax, not a capture group", () => {
+  /**
+   * D1 (manual-test-loop iteration 10). `(?<account>[\w-]+)` happily matched
+   * the flag NAME and the free-form tail ate its value, so
+   * `/spawn-ai 1 --tenant 2299` bound `account: "--tenant"` and answered
+   * "no matching Claude account" while `/spawn-best 1 --tenant 2299` and
+   * `/spawn-ai 1 --tenant=2299` both spawned. The pattern route now declines
+   * the input so `parseArgs` — which extracts flags BEFORE positional
+   * binding, from text whose quoting is intact — owns it.
+   */
+  const spawnAi = action({
+    id: "spawn-ai",
+    slash: "/spawn-ai",
+    paramSchema: { count: "n", account: "s", context: "s", "--tenant": "s" },
+    patterns: [/^spawn-ai\s+(?<count>\d+)\s+(?<account>[\w-]+|best)(?:\s+(?<context>.+))?$/i],
+  });
+
+  it("declines when a declared flag is a top-level token", () => {
+    register(spawnAi);
+    expect(matchPattern("/spawn-ai 1 --tenant 2299")).toBeNull();
+    expect(matchPattern("spawn-ai 1 --tenant 2299")).toBeNull();
+    expect(matchPattern("/spawn-ai 1 gmail --tenant 2299")).toBeNull();
+    expect(matchPattern("/spawn-ai 1 gmail --tenant=2299")).toBeNull();
+    expect(matchPattern("/spawn-ai 1 gmail --tenant")).toBeNull();
+  });
+
+  it("still matches when no declared flag was typed", () => {
+    register(spawnAi);
+    expect(matchPattern("/spawn-ai 1 gmail")?.args).toEqual({ count: 1, account: "gmail" });
+    expect(matchPattern("/spawn-ai 1 gmail do the thing")?.args).toEqual({
+      count: 1,
+      account: "gmail",
+      context: "do the thing",
+    });
+  });
+
+  it("a QUOTED flag spelling is prompt text and keeps its pattern", () => {
+    register(spawnAi);
+    expect(matchPattern('/spawn-ai 1 gmail "--tenant is a word"')?.action.id).toBe("spawn-ai");
+  });
+
+  it("is per-ACTION: an UNDECLARED --flag does not disturb anyone", () => {
+    register(spawnAi);
+    // `--nope` is not in spawn-ai's schema, so it is ordinary prompt text.
+    expect(matchPattern("/spawn-ai 1 gmail --nope 3")?.args).toEqual({
+      count: 1,
+      account: "gmail",
+      context: "--nope 3",
+    });
+    // And an action that declares NO flags is never consulted about them.
+    register(
+      action({
+        id: "tag",
+        slash: "/tag",
+        paramSchema: { tag: "s" },
+        patterns: [/^tag\s+(?<tag>\S+)$/i],
+      }),
+    );
+    expect(matchPattern("/tag --tenant")?.args).toEqual({ tag: "--tenant" });
+  });
+});

@@ -32,7 +32,7 @@ export {
 } from "./parse";
 export type { ArgOrigin, FlagHit, Token } from "./parse";
 
-export { chooseHeadMatch, chooseTier, didYouMean } from "./rank";
+export { chooseTier, didYouMean } from "./rank";
 export type { HeadMatch, TierChoice } from "./rank";
 
 export { matchPattern } from "./patterns";
