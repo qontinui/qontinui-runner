@@ -14,9 +14,9 @@ Verifies: a Claude account with live credentials is present (a valid ~/.claude/.
 
 ### 2. Runner tier is Qontinui account (`tier`)
 
-Verifies: the runner tier is set to qontinui_account (settings.json::tier == "qontinui_account")
+Verifies: the runner tier RESOLVES to qontinui_account — either settings.json::tier says so, or the shared inference (`profiles::infer_tier`: a device pairing, or a legacy web_integration.runner_token) supplies it on a document that records no explicit operator choice. When a box that IS credentialed still resolves non-account, the report says so — "credentialed but not authorized" is a different failure from "no credential" and has a different fix
 
-**Fix:** set runner tier to Qontinui account
+**Fix:** set runner tier to Qontinui account — app: Settings → Account; headless: `qontinui_profile device pair --pair-code <code>` promotes it, or launch with QONTINUI_SERVER_MODE=1; if this box is already paired and still reads non-account, an explicit choice is pinning it — clear settings.json::tier_chosen_explicitly
 
 ### 3. Credential store readable (`credential_store_readable`)
 

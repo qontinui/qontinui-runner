@@ -281,9 +281,19 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
     CheckSpec {
         name: "tier",
         title: "Runner tier is Qontinui account",
-        verifies: "the runner tier is set to qontinui_account \
-                   (settings.json::tier == \"qontinui_account\")",
-        fix: "set runner tier to Qontinui account",
+        verifies: "the runner tier RESOLVES to qontinui_account — either \
+                   settings.json::tier says so, or the shared inference \
+                   (`profiles::infer_tier`: a device pairing, or a legacy \
+                   web_integration.runner_token) supplies it on a document that \
+                   records no explicit operator choice. When a box that IS \
+                   credentialed still resolves non-account, the report says so \
+                   — \"credentialed but not authorized\" is a different failure \
+                   from \"no credential\" and has a different fix",
+        fix: "set runner tier to Qontinui account — app: Settings \u{2192} Account; \
+              headless: `qontinui_profile device pair --pair-code <code>` promotes \
+              it, or launch with QONTINUI_SERVER_MODE=1; if this box is already \
+              paired and still reads non-account, an explicit choice is pinning it \
+              \u{2014} clear settings.json::tier_chosen_explicitly",
         advisory: false,
     },
     CheckSpec {
@@ -459,8 +469,12 @@ pub struct DoctorInputs {
 /// Each check reuses the canonical state:
 /// 1. Claude account — `.credentials.json` validity (same paths + expiry logic
 ///    as `ai_provider::oauth_refresh::default_location_has_valid_credentials`).
-/// 2. Tier — `settings.json::tier == "qontinui_account"`, tri-state so an
-///    unreadable settings.json reports as UNKNOWN rather than `local`.
+/// 2. Tier — the tier RESOLVES to `qontinui_account` (`profiles::read_runner_tier`,
+///    which applies the shared inference), tri-state so an unreadable
+///    settings.json reports as UNKNOWN rather than `local`. On a non-account
+///    tier it also reports the box's credential state, so "credentialed but
+///    NOT authorized" reads differently from "no credential" — see
+///    [`tier_check_verdict`].
 ///    2b. Credential store readable — a store read ERROR is reported as
 ///    itself, ahead of every bearer-consuming check it would otherwise
 ///    misdiagnose.
@@ -493,6 +507,15 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
     let s_markers = spec("no_inherited_session_markers");
     let s_dcr = spec("mcp_json_not_dcr_escalating");
 
+    // ONE credential-store read, lazily taken, shared by check 2 (tier) and
+    // check 3 (credential_store_readable). See [`SharedTokenProbe`].
+    //
+    // M4 / NO-DOWNGRADE is UNAFFECTED: the check ORDER below is unchanged, so
+    // `credential_store_readable` still sits ahead of every bearer-CONSUMING
+    // check. Sharing the read does not move it; the tier check consumes no
+    // bearer, it only reports whether one is there.
+    let token_probe = SharedTokenProbe::default();
+
     let checks = vec![
         Check::new(s_claude.name, s_claude.fix, move || {
             let ok = claude_account_has_valid_credentials(cfg_dir.as_deref());
@@ -508,29 +531,33 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
                 )
             }
         }),
-        Check::new(s_tier.name, s_tier.fix, || {
-            match read_runner_tier() {
-                crate::profiles::TierRead::Known(t)
-                    if t == crate::profiles::QONTINUI_ACCOUNT_TIER =>
-                {
-                    (true, "runner tier is Qontinui account".into())
+        // The tier check reports the WHOLE truth: not just the field, but what
+        // the box's credential state says about it. A paired, tenant-bound,
+        // bearer-holding box that reads `local` is "credentialed but NOT
+        // authorized" — a materially different failure from "this box has no
+        // credential", with a different fix. The verdict itself is the pure
+        // `tier_check_verdict`; this closure only gathers the observations.
+        {
+            let probe = token_probe.clone();
+            Check::new(s_tier.name, s_tier.fix, move || {
+                let tier = read_runner_tier();
+                // A tier that already resolves to qontinui_account needs no
+                // evidence to explain itself, so the credential store is not
+                // touched at all on the green path.
+                if tier.known() == Some(crate::profiles::QONTINUI_ACCOUNT_TIER) {
+                    return tier_check_verdict(&tier, &TierEvidence::default());
                 }
-                crate::profiles::TierRead::Known(t) => {
-                    (false, format!("runner tier is {t} (not qontinui_account)"))
-                }
-                crate::profiles::TierRead::Absent => (
-                    false,
-                    "settings.json has no tier (and no runner_token to infer one from)".into(),
-                ),
-                // NO-DOWNGRADE: do not report "runner tier is local" when the
-                // real fault is that settings.json could not be read — that
-                // sends the operator to the wrong remediation.
-                crate::profiles::TierRead::Unknown(e) => (
-                    false,
-                    format!("runner tier is UNKNOWN — settings.json unreadable ({e})"),
-                ),
-            }
-        }),
+                let evidence = TierEvidence {
+                    // `pair::device_is_paired` is a plain `paired_user.json`
+                    // read — no credential store, no OS keychain — so asking
+                    // it here costs the doctor nothing.
+                    paired: crate::pair::device_is_paired(),
+                    tenant_id: crate::pair::read_paired_tenant_id_from_disk(),
+                    credential: CredentialEvidence::from_store_read(probe.read()),
+                };
+                tier_check_verdict(&tier, &evidence)
+            })
+        },
         // M4 / NO-DOWNGRADE: the credential-store read is its own check, placed
         // AHEAD of every check that consumes a bearer. Previously each consumer
         // did `get_access_token().ok().unwrap_or_default()` (or `.ok()`),
@@ -540,10 +567,12 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
         // stops at the first red, an unreadable store now reports itself
         // instead of blaming the next check in line.
         {
-            let auth_ref = crate::auth::AuthManager::new();
+            // Same ONE store read the tier check above may already have taken
+            // (see `SharedTokenProbe`): the two must never disagree about what
+            // the store said, and the doctor must not pay for two round-trips.
+            let probe = token_probe.clone();
             Check::new(s_cred_store.name, s_cred_store.fix, move || {
-                let read = auth_ref.probe_access_token();
-                match read {
+                match probe.read() {
                     crate::secure_storage::StoredTokenRead::Unreadable(e) => (
                         false,
                         format!(
@@ -885,6 +914,204 @@ fn macos_keychain_has_claude_credentials() -> bool {
 /// local".
 fn read_runner_tier() -> crate::profiles::TierRead {
     crate::profiles::read_runner_tier()
+}
+
+/// A ONE-SHOT, lazily-taken read of the credential store, shared by the tier
+/// check and the `credential_store_readable` check that follows it.
+///
+/// Shared rather than taken twice for two reasons. The cheap one: the tier
+/// check must not add a second keychain round-trip to every doctor run. The
+/// load-bearing one: two independent reads could DISAGREE (a store that flips
+/// between the checks), and a report whose check 2 says "a bearer is stored"
+/// while check 3 says "unreadable" is worse than either answer alone.
+///
+/// Lazily taken, so the green path pays nothing: a tier that already resolves
+/// to `qontinui_account` never asks, and if the chain then stops before check 3
+/// the store is never touched.
+#[derive(Clone, Default)]
+struct SharedTokenProbe(std::rc::Rc<std::cell::OnceCell<crate::secure_storage::StoredTokenRead>>);
+
+impl SharedTokenProbe {
+    /// The store read, taken on first call and memoized thereafter.
+    fn read(&self) -> &crate::secure_storage::StoredTokenRead {
+        self.0
+            .get_or_init(|| crate::auth::AuthManager::new().probe_access_token())
+    }
+}
+
+/// What the credential store said about the access-token slot, projected down
+/// to the three facts the tier report needs.
+///
+/// `Unreadable` is kept distinct from `NoBearer` for the same reason
+/// [`crate::profiles::TierRead`] is tri-state: "we could not read it" is not
+/// the fact "there is nothing there", and collapsing the two sends the
+/// operator to the wrong fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CredentialEvidence {
+    /// A non-empty bearer is stored.
+    BearerPresent,
+    /// The store read cleanly and the slot is empty.
+    #[default]
+    NoBearer,
+    /// The store could not be READ — the bearer is UNKNOWN, not absent.
+    Unreadable,
+}
+
+impl CredentialEvidence {
+    /// Project a raw store read onto this three-way fact.
+    pub fn from_store_read(read: &crate::secure_storage::StoredTokenRead) -> Self {
+        use crate::secure_storage::StoredTokenRead;
+        match read {
+            StoredTokenRead::Present(t) if !t.trim().is_empty() => Self::BearerPresent,
+            StoredTokenRead::Present(_) | StoredTokenRead::Absent => Self::NoBearer,
+            StoredTokenRead::Unreadable(_) => Self::Unreadable,
+        }
+    }
+}
+
+/// Everything the tier check observed about this box BESIDES the tier field
+/// itself — the input that lets it tell *"credentialed but not authorized"*
+/// apart from *"no credential"*.
+///
+/// Every field is already gathered elsewhere in the same chain
+/// (`paired_signed_in`, `credential_store_readable`, `tenant_resolvable`), so
+/// populating it is a reporting change, not new I/O — the credential read is
+/// literally the same one, via [`SharedTokenProbe`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TierEvidence {
+    /// `paired_user.json` carries an account binding
+    /// ([`crate::pair::device_is_paired`] — a plain file read, no keychain).
+    pub paired: bool,
+    /// The tenant this device is bound to, from `paired_user.json`.
+    pub tenant_id: Option<String>,
+    /// What the credential store said about the access-token slot.
+    pub credential: CredentialEvidence,
+}
+
+impl TierEvidence {
+    /// The observed facts as one clause, in the order an operator reads them:
+    /// pairing, tenant, bearer.
+    fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::with_capacity(3);
+        parts.push(
+            if self.paired {
+                "paired (paired_user.json carries an account binding)"
+            } else {
+                "NOT paired (paired_user.json carries no account binding)"
+            }
+            .to_string(),
+        );
+        parts.push(match &self.tenant_id {
+            Some(t) => format!("bound to tenant {t}"),
+            None => "no tenant recorded in paired_user.json".to_string(),
+        });
+        parts.push(
+            match self.credential {
+                CredentialEvidence::BearerPresent => "a bearer is stored in the access-token slot",
+                CredentialEvidence::NoBearer => "the access-token slot is empty",
+                CredentialEvidence::Unreadable => {
+                    "the credential store is UNREADABLE, so the bearer is UNKNOWN (not absent)"
+                }
+            }
+            .to_string(),
+        );
+        parts.join(", ")
+    }
+}
+
+/// The tier check's verdict + message: PURE over `(tier read x evidence)`.
+///
+/// Extracted from the check closure so every combination is unit-testable
+/// without a live runner, a temp `settings.json`, or process env — the closure
+/// above now only *gathers* observations and hands them here.
+///
+/// # The four shapes it distinguishes
+///
+/// 1. **Authorized** — resolves to `qontinui_account`. Green.
+/// 2. **Credentialed but NOT authorized** — a paired box that still resolves
+///    non-account. Since `profiles::read_runner_tier` applies the shared
+///    inference, pairing ALONE would have resolved `qontinui_account`; so
+///    reaching this arm proves something is actively pinning the tier (an
+///    explicit `tier_chosen_explicitly`, or an explicitly-chosen
+///    `local_provider`). Naming that is the whole point: "set runner tier to
+///    Qontinui account" is the wrong instruction on a headless box, and
+///    "you are not signed in" is simply false on this one.
+/// 3. **No credential** — non-account AND no account binding at all.
+/// 4. **UNKNOWN** — `settings.json` unreadable.
+///
+/// # NO-DOWNGRADE (non-negotiable)
+///
+/// The [`crate::profiles::TierRead::Unknown`] arm reports UNKNOWN and nothing
+/// else, **even when the box is paired**. Pairing evidence is not a licence to
+/// guess at the contents of a file we failed to read: reporting "tier is local"
+/// (or "tier is qontinui_account") for what is really an unreadable
+/// `settings.json` sends the operator to the wrong remediation entirely. The
+/// tri-state stays tri-state, and this arm deliberately consumes no evidence.
+pub fn tier_check_verdict(
+    tier: &crate::profiles::TierRead,
+    evidence: &TierEvidence,
+) -> (bool, String) {
+    use crate::profiles::{TierRead, QONTINUI_ACCOUNT_TIER};
+    match tier {
+        TierRead::Known(t) if t.as_str() == QONTINUI_ACCOUNT_TIER => {
+            (true, "runner tier is Qontinui account".into())
+        }
+        TierRead::Known(t) if evidence.paired => (
+            false,
+            format!(
+                "runner tier is {t} (not qontinui_account) — but this box IS \
+                 credentialed: {}. Credentialed but NOT authorized: the tier \
+                 field is the only thing withholding coord access. Pairing \
+                 alone infers qontinui_account, so something is pinning the \
+                 tier — an explicit operator choice \
+                 (settings.json::tier_chosen_explicitly) or an explicitly-set \
+                 local_provider.",
+                evidence.summary()
+            ),
+        ),
+        TierRead::Known(t) => (
+            false,
+            format!(
+                "runner tier is {t} (not qontinui_account), and this box holds \
+                 no Qontinui account binding: {}. This is 'no credential', not \
+                 'credentialed but unauthorized' — pair this device (headless: \
+                 `qontinui_profile device pair --pair-code <code>`, which \
+                 promotes the tier as it pairs).",
+                evidence.summary()
+            ),
+        ),
+        TierRead::Absent if evidence.paired => (
+            false,
+            format!(
+                "settings.json carries no tier — but this box IS credentialed: \
+                 {}. Credentialed but NOT authorized. (Reaching this arm at all \
+                 means the pairing inference was closed by an explicit \
+                 settings.json::tier_chosen_explicitly.)",
+                evidence.summary()
+            ),
+        ),
+        TierRead::Absent => (
+            false,
+            format!(
+                "settings.json has no tier, and none of the signals this reader \
+                 consults infers one — no web_integration.runner_token and no \
+                 device pairing (paired_user.json). Observed: {}. \
+                 (QONTINUI_SERVER_MODE is a property of the RUNNING runner's \
+                 process, not of the settings document, so this disk read does \
+                 not consider it.)",
+                evidence.summary()
+            ),
+        ),
+        // NO-DOWNGRADE: do not report "runner tier is local" when the real
+        // fault is that settings.json could not be read — that sends the
+        // operator to the wrong remediation. This arm reads NO evidence: a
+        // paired box with an unreadable settings.json is still UNKNOWN, never
+        // a guess in either direction.
+        TierRead::Unknown(e) => (
+            false,
+            format!("runner tier is UNKNOWN — settings.json unreadable ({e})"),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1624,6 +1851,235 @@ mod tests {
         // editors to regenerate instead.
         assert!(doc.contains("GENERATED FILE"));
         assert!(doc.contains("--onboarding-doc"));
+    }
+
+    // ------------------------------------------------------------------
+    // Check 2 — the tier verdict. `tier_check_verdict` is PURE, so every
+    // combination is driven directly: no temp settings.json, no
+    // QONTINUI_CONFIG_DIR / QONTINUI_SECURE_STORAGE_DIR pinning, no env lock.
+    // (Plan 2026-08-29-headless-runner-tier-never-reaches-qontinui-account,
+    // Phase 4.)
+    // ------------------------------------------------------------------
+
+    /// The paired-and-provisioned box the plan was written from: paired,
+    /// tenant-bound, holding a bearer.
+    fn credentialed() -> TierEvidence {
+        TierEvidence {
+            paired: true,
+            tenant_id: Some("c231d9da-0000-0000-0000-000000000000".to_string()),
+            credential: CredentialEvidence::BearerPresent,
+        }
+    }
+
+    /// A box that has never been bound to a Qontinui account at all.
+    fn uncredentialed() -> TierEvidence {
+        TierEvidence {
+            paired: false,
+            tenant_id: None,
+            credential: CredentialEvidence::NoBearer,
+        }
+    }
+
+    fn known(t: &str) -> crate::profiles::TierRead {
+        crate::profiles::TierRead::Known(t.to_string())
+    }
+
+    #[test]
+    fn qontinui_account_tier_passes_cleanly() {
+        let (ok, detail) = tier_check_verdict(
+            &known(crate::profiles::QONTINUI_ACCOUNT_TIER),
+            &TierEvidence::default(),
+        );
+        assert!(ok, "qontinui_account must pass: {detail}");
+        assert_eq!(detail, "runner tier is Qontinui account");
+        // …and the verdict does not change with the evidence: a green tier
+        // explains itself, which is why the live closure never touches the
+        // credential store on this path.
+        assert_eq!(
+            tier_check_verdict(
+                &known(crate::profiles::QONTINUI_ACCOUNT_TIER),
+                &credentialed()
+            ),
+            (true, "runner tier is Qontinui account".to_string())
+        );
+    }
+
+    /// THE reproduction: a box that is paired, tenant-bound and holding a
+    /// bearer, whose tier field still reads `local`. The old message named
+    /// only the field; the operator's only listed remedy was a button that
+    /// does not exist on a headless box.
+    #[test]
+    fn paired_but_local_reports_credentialed_but_not_authorized() {
+        let (ok, detail) = tier_check_verdict(&known("local"), &credentialed());
+        assert!(!ok, "a non-account tier still blocks");
+        assert!(
+            detail.contains("Credentialed but NOT authorized"),
+            "paired box must be diagnosed as credentialed: {detail}"
+        );
+        assert!(detail.contains("paired (paired_user.json"), "{detail}");
+        assert!(
+            detail.contains("bound to tenant c231d9da-0000-0000-0000-000000000000"),
+            "{detail}"
+        );
+        assert!(detail.contains("a bearer is stored"), "{detail}");
+        // It names WHAT is pinning the tier, because on a paired box the
+        // shared inference would otherwise have resolved qontinui_account.
+        assert!(detail.contains("tier_chosen_explicitly"), "{detail}");
+        assert!(detail.contains("runner tier is local"), "{detail}");
+    }
+
+    /// The other side of the same fork: same tier value, no credential. This
+    /// must NOT read as "credentialed but unauthorized" — the fix is entirely
+    /// different (pair the device, versus un-pin the tier).
+    #[test]
+    fn unpaired_local_reports_no_credential_not_credentialed() {
+        let (ok, detail) = tier_check_verdict(&known("local"), &uncredentialed());
+        assert!(!ok);
+        assert!(
+            !detail.contains("Credentialed but NOT authorized"),
+            "an unpaired box must not be reported as credentialed: {detail}"
+        );
+        assert!(detail.contains("no Qontinui account binding"), "{detail}");
+        assert!(detail.contains("NOT paired"), "{detail}");
+        assert!(
+            detail.contains("qontinui_profile device pair"),
+            "the headless remedy belongs in the message: {detail}"
+        );
+    }
+
+    /// The two `local` boxes must be distinguishable from the message alone —
+    /// that distinction IS Phase 4a.
+    #[test]
+    fn the_two_local_boxes_produce_different_diagnoses() {
+        let paired = tier_check_verdict(&known("local"), &credentialed()).1;
+        let unpaired = tier_check_verdict(&known("local"), &uncredentialed()).1;
+        assert_ne!(paired, unpaired);
+    }
+
+    /// Tier 1 is reachable only as an explicit operator choice, so a paired
+    /// box reading `local_provider` is the same "pinned" shape.
+    #[test]
+    fn paired_local_provider_is_also_credentialed_but_not_authorized() {
+        let (ok, detail) = tier_check_verdict(&known("local_provider"), &credentialed());
+        assert!(!ok);
+        assert!(detail.contains("runner tier is local_provider"), "{detail}");
+        assert!(
+            detail.contains("Credentialed but NOT authorized"),
+            "{detail}"
+        );
+    }
+
+    /// NO-DOWNGRADE, the regression guard. An unreadable settings.json is
+    /// UNKNOWN — and stays UNKNOWN even on a fully credentialed box. Pairing
+    /// evidence is not a licence to guess at a file we failed to read.
+    #[test]
+    fn unknown_tier_stays_unknown_even_when_paired() {
+        for evidence in [credentialed(), uncredentialed()] {
+            let (ok, detail) = tier_check_verdict(
+                &crate::profiles::TierRead::Unknown("permission denied".to_string()),
+                &evidence,
+            );
+            assert!(!ok);
+            assert_eq!(
+                detail, "runner tier is UNKNOWN — settings.json unreadable (permission denied)",
+                "the Unknown arm must report UNKNOWN verbatim and consume no evidence"
+            );
+            assert!(
+                !detail.contains("tier is local"),
+                "NO-DOWNGRADE violated — an unreadable settings.json was reported as local"
+            );
+            assert!(
+                !detail.contains("Credentialed but NOT authorized"),
+                "NO-DOWNGRADE violated — pairing evidence leaked into the UNKNOWN arm"
+            );
+        }
+    }
+
+    /// Phase 4b: the `Absent` message used to claim `runner_token` was the
+    /// only signal that could infer a tier. Phase 3 made pairing a signal too,
+    /// so the string must name what the reader actually consults — and must
+    /// NOT imply it consults `QONTINUI_SERVER_MODE`, which is a property of
+    /// the reading process, not of the document.
+    #[test]
+    fn absent_tier_names_the_signals_actually_consulted() {
+        let (ok, detail) =
+            tier_check_verdict(&crate::profiles::TierRead::Absent, &uncredentialed());
+        assert!(!ok);
+        assert!(detail.contains("settings.json has no tier"), "{detail}");
+        assert!(detail.contains("web_integration.runner_token"), "{detail}");
+        assert!(detail.contains("paired_user.json"), "{detail}");
+        assert!(
+            !detail.contains("(and no runner_token to infer one from)"),
+            "the stale single-signal claim survived: {detail}"
+        );
+        // Named only to say it is NOT consulted here.
+        assert!(
+            detail.contains("QONTINUI_SERVER_MODE is a property of the RUNNING runner"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn absent_tier_on_a_paired_box_is_still_credentialed_but_not_authorized() {
+        let (ok, detail) = tier_check_verdict(&crate::profiles::TierRead::Absent, &credentialed());
+        assert!(!ok);
+        assert!(
+            detail.contains("Credentialed but NOT authorized"),
+            "{detail}"
+        );
+        assert!(detail.contains("carries no tier"), "{detail}");
+    }
+
+    /// An unreadable credential store must not be reported as "no bearer" —
+    /// the same absence-is-not-unknown rule the tri-state `TierRead` encodes,
+    /// applied to the store.
+    #[test]
+    fn unreadable_credential_store_reads_as_unknown_bearer_not_empty() {
+        let ev = TierEvidence {
+            paired: true,
+            tenant_id: None,
+            credential: CredentialEvidence::Unreadable,
+        };
+        let (_, detail) = tier_check_verdict(&known("local"), &ev);
+        assert!(
+            detail.contains("bearer is UNKNOWN (not absent)"),
+            "{detail}"
+        );
+        assert!(!detail.contains("access-token slot is empty"), "{detail}");
+    }
+
+    #[test]
+    fn credential_evidence_projects_the_store_read_faithfully() {
+        use crate::secure_storage::StoredTokenRead;
+        assert_eq!(
+            CredentialEvidence::from_store_read(&StoredTokenRead::Present("t".into())),
+            CredentialEvidence::BearerPresent
+        );
+        // A whitespace-only slot is not a bearer.
+        assert_eq!(
+            CredentialEvidence::from_store_read(&StoredTokenRead::Present("   ".into())),
+            CredentialEvidence::NoBearer
+        );
+        assert_eq!(
+            CredentialEvidence::from_store_read(&StoredTokenRead::Absent),
+            CredentialEvidence::NoBearer
+        );
+        assert_eq!(
+            CredentialEvidence::from_store_read(&StoredTokenRead::Unreadable("boom".into())),
+            CredentialEvidence::Unreadable
+        );
+    }
+
+    /// The operator-facing last line of a blocked report is the `fix`, not the
+    /// detail — so the headless remedies have to be IN the spec string, or the
+    /// box the plan was written from still gets pointed at a button it has no
+    /// window for.
+    #[test]
+    fn tier_fix_names_the_doors_a_headless_box_actually_has() {
+        let fix = CHECK_SPECS.iter().find(|s| s.name == "tier").unwrap().fix;
+        assert!(fix.contains("qontinui_profile device pair"), "{fix}");
+        assert!(fix.contains("QONTINUI_SERVER_MODE=1"), "{fix}");
+        assert!(fix.contains("tier_chosen_explicitly"), "{fix}");
     }
 
     #[test]
