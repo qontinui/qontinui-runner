@@ -67,7 +67,11 @@ interface EvaluateRequestPayload {
    * (10 s) when the caller omitted it. This is exactly how long the Rust
    * dispatcher will wait for the response, so the handler awaits a
    * top-level Promise for the same budget — see
-   * {@link describeEvaluateBudget}. Absent → the 30 s default budget.
+   * {@link describeEvaluateBudget}. Absent → the 30 s default budget, which a
+   * current `page.rs` never produces: it substitutes its own default before
+   * emitting, so this field always arrives set. Read
+   * {@link EvaluateRequestPayload.timeout_from_default}, not the absence of
+   * this field, to tell a caller's budget from a default one.
    *
    * There is deliberately no `await_promise` field. The Rust side used to
    * forward one and nothing here read it: this flow ALWAYS auto-awaits,
@@ -78,6 +82,24 @@ interface EvaluateRequestPayload {
    * `"[object Promise]"` instead.
    */
   timeout_ms?: number;
+  /**
+   * True when {@link EvaluateRequestPayload.timeout_ms} is the Rust
+   * dispatcher's own default rather than a budget the caller chose
+   * (`page.rs::tagged_page_evaluate`, which captures this before its
+   * `unwrap_or` erases the distinction).
+   *
+   * Load-bearing for the timeout MESSAGE only, never for the budget: without
+   * it the frontend sees an ordinary number and tells a caller who sent
+   * nothing that the budget "came from the `timeoutMs` you sent" — the same
+   * misattributed provenance the message was rewritten to remove, one seam
+   * further along. `POST /ui-bridge/control/page/evaluate-raw` is the clearest
+   * case: it takes the expression as the whole body and so has no `timeoutMs`
+   * field at all.
+   *
+   * Absent → treat `timeout_ms` as caller-supplied (a producer predating the
+   * field; unchanged behaviour).
+   */
+  timeout_from_default?: boolean;
   /**
    * EXPLICIT opt-in. When true, relaxes only the four network-related
    * blocks (fetch / XMLHttpRequest / sendBeacon / WebSocket) so test
@@ -217,7 +239,9 @@ export async function handleEvaluateRequest(
       rejectIfDangerous(expression, allow_network_requests === true);
       const resolved = await evaluateExpression(
         expression,
-        describeEvaluateBudget(payload.timeout_ms),
+        describeEvaluateBudget(payload.timeout_ms, {
+          rawIsDefault: payload.timeout_from_default === true,
+        }),
       );
       // ONE shape, always: `{ value, type }`. The SAME shaper the legacy
       // `usePageEvents.ts::page_evaluate` branch uses, so the two routes

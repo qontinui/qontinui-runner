@@ -190,9 +190,13 @@ export function levenshtein(a: string, b: string): number {
  * round-trip, batch DOM scan) while still bounding the worst case.
  *
  * Applies to the legacy IPC `page_evaluate` branch (`usePageEvents.ts`),
- * whose payload carries no timeout, and to the tagged evaluate handler
- * (`useUIBridgeEvaluateHandler.ts`) when the request omits `timeout_ms` —
- * see {@link resolveEvaluateTimeoutMs}.
+ * whose payload carries no timeout. It is also the tagged evaluate handler's
+ * fallback when a request omits `timeout_ms` — but a current `page.rs` always
+ * emits a number (its own 10 s default when the caller sent none), so on that
+ * route this value is reached only from a producer that predates
+ * `tagged_page_evaluate`. The DEFAULT a tagged caller actually gets is the
+ * Rust one; `timeout_from_default` is what says so. See
+ * {@link resolveEvaluateTimeoutMs} and {@link describeEvaluateBudget}.
  */
 export const PAGE_EVALUATE_PROMISE_TIMEOUT_MS = 30_000;
 
@@ -263,8 +267,30 @@ export interface EvaluateBudget {
    * True when the caller sent no usable `timeoutMs` and this is the default.
    * The difference is the whole point of the timeout message: a default the
    * caller never chose reads as an undocumented cap, and the fix is to say so.
+   *
+   * "Default" means *nobody chose it*, which is NOT the same as "this payload
+   * carried no number" — the Rust dispatcher substitutes its own default
+   * before emitting, so on the tagged route a defaulted budget arrives as a
+   * concrete number. {@link describeEvaluateBudget}'s `rawIsDefault` option is
+   * how that provenance survives the seam.
    */
   fromDefault: boolean;
+}
+
+/**
+ * Out-of-band provenance for a `timeoutMs` that has already been defaulted by
+ * the time it reaches this module.
+ */
+export interface EvaluateBudgetOptions {
+  /**
+   * True when `raw` is a number the CALLER did not choose — the Rust
+   * dispatcher's `DEFAULT_PAGE_EVALUATE_TIMEOUT_MS` substituted into
+   * `timeout_ms` before the emit (`page.rs::tagged_page_evaluate`). Carried on
+   * the request as `timeout_from_default`. Absent/false → the number is the
+   * caller's own, which is the correct reading for any producer that predates
+   * the flag.
+   */
+  rawIsDefault?: boolean;
 }
 
 /**
@@ -278,8 +304,21 @@ export interface EvaluateBudget {
  * arbitrary 9.8 s and reasonably read it as a hard cap on `page_evaluate`.
  * It is neither hard nor a cap: it is this request's own default budget, and
  * the field to raise it already exists.
+ *
+ * `opts.rawIsDefault` exists because the absence of a number is NOT how a
+ * defaulted budget reaches this function on the tagged route. `page.rs`
+ * substitutes `DEFAULT_PAGE_EVALUATE_TIMEOUT_MS` (10 s) before it emits, so
+ * `raw` is always a concrete number there — and inferring provenance from
+ * `raw` alone re-created the very defect this function was split out to fix,
+ * one seam further along: a caller who sent nothing was told "That budget came
+ * from the `timeoutMs` you sent". `page/evaluate-raw` made that unarguable —
+ * it has no `timeoutMs` field for a caller to send, and still got that
+ * sentence.
  */
-export function describeEvaluateBudget(raw: unknown): EvaluateBudget {
+export function describeEvaluateBudget(
+  raw: unknown,
+  opts?: EvaluateBudgetOptions,
+): EvaluateBudget {
   if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
     return {
       awaitMs: PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
@@ -294,7 +333,7 @@ export function describeEvaluateBudget(raw: unknown): EvaluateBudget {
     requestedMs > PAGE_EVALUATE_TIMEOUT_MARGIN_MS
       ? requestedMs - PAGE_EVALUATE_TIMEOUT_MARGIN_MS
       : requestedMs;
-  return { awaitMs, requestedMs, fromDefault: false };
+  return { awaitMs, requestedMs, fromDefault: opts?.rawIsDefault === true };
 }
 
 /**
