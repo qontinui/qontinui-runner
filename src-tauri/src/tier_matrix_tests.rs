@@ -15,7 +15,13 @@
 //! Instead, this module exercises the **pure helpers** that gate each tier
 //! boundary:
 //!
-//! - `settings::migrate_tier_in_place` (Phase 2 — settings migration)
+//! - `settings::migrate_tier_in_place` (Phase 2 — settings migration; also the
+//!   headless `QONTINUI_SERVER_MODE` tier default)
+//! - `settings::apply_tier_env_overlay` + `settings::apply_in_memory_tier_overlay`
+//!   (the two overlays stacked over that inference, in `load_settings_full`'s
+//!   order)
+//! - `qontinui_runner_lib::profiles::read_runner_tier_at` (the SECOND, lib-side
+//!   tier reader — the one `coord_doctor` consults, which sees no overlay)
 //! - `commands::auth::require_tier_2_for` (Phase 2 — auth-command gate)
 //! - `mcp::backend_relay::should_relay_idle_with` (Phase 4 — relay gate;
 //!   note: the live `should_relay_idle` wrapper reads `AuthManager` from
@@ -36,6 +42,12 @@
 //! | 1 | `tier_defaults_to_local_on_fresh_settings`       | `Settings::default()` is Tier 0 |
 //! | 2 | `tier_inference_from_runner_token_promotes`      | non-empty `runner_token` → Tier 2 |
 //! | 2b| `tier_inference_without_runner_token_stays_local`| empty `runner_token` → Tier 0 |
+//! | 2c| `desktop_install_without_server_mode_stays_local` | fresh install, not headless → Tier 0 |
+//! | 2d| `headless_server_mode_infers_qontinui_account`   | fresh install + `QONTINUI_SERVER_MODE` → Tier 2 |
+//! | 2e| `runner_tier_env_overlay_beats_the_headless_default` | `QONTINUI_RUNNER_TIER=local` wins over 2d |
+//! | 2f| `runtime_tier_override_beats_the_headless_default`   | `set_runner_tier` wins over 2d *and* 2e |
+//! | 2g| `tier_initialized_short_circuits_the_headless_default` | the one-shot sentinel is untouched by 2d |
+//! | 2h| `server_mode_default_is_invisible_to_the_disk_reader`  | 2d is in-memory: the lib reader still says `Absent` |
 //! | 3 | `require_tier_2_blocks_local_and_local_provider` | Tier 0/1 → `AuthError` |
 //! | 3b| `require_tier_2_permits_qontinui_account`        | Tier 2 → `Ok` |
 //! | 4 | `relay_idles_when_tier_local`                    | gate predicate idles in Tier 0/1 |
@@ -115,7 +127,7 @@ fn tier_inference_from_runner_token_promotes() {
 
     // Run the migration in-memory (no disk I/O).
     let mut s = s;
-    let migrated = crate::settings::migrate_tier_in_place(&mut s);
+    let migrated = crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ false);
     assert!(migrated, "migration must report it ran");
     assert_eq!(s.tier, RunnerTier::QontinuiAccount);
     assert!(s.tier_initialized);
@@ -127,10 +139,199 @@ fn tier_inference_without_runner_token_stays_local() {
     let mut s: Settings = serde_json::from_str(json).expect("must deserialize");
     s.tier_initialized = false;
 
-    let migrated = crate::settings::migrate_tier_in_place(&mut s);
+    let migrated = crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ false);
     assert!(migrated);
     assert_eq!(s.tier, RunnerTier::Local);
     assert!(s.tier_initialized);
+}
+
+// ----------------------------------------------------------------------------
+// #2c–#2h — The headless (`QONTINUI_SERVER_MODE`) tier default and its
+//           precedence, per plan
+//           `2026-08-29-headless-runner-tier-never-reaches-qontinui-account`
+//           Phase 2.
+//
+// A headless runner exists to be driven over the network, and Tier 2 is the
+// only tier allowed to talk to coord — so a headless box with no tier of its
+// own defaults there instead of to `Local`. Tier 0 advertises "no cloud
+// round-trips", so this is a deliberate product-posture default, not a bug
+// fix; the tests below pin that it stays a DEFAULT and never becomes a trap.
+//
+// `server_mode` is threaded into `migrate_tier_in_place` as a parameter
+// (parsed once, by `launch_env::server_mode_from_env`, and read by
+// `load_settings_full`) precisely so this file can drive every combination
+// with no process env, matching the module doc above.
+// ----------------------------------------------------------------------------
+
+/// The regression guard on every existing desktop install: not headless, no
+/// `runner_token` ⇒ Tier 0, exactly as before this phase.
+#[test]
+fn desktop_install_without_server_mode_stays_local() {
+    let mut s = Settings::default();
+    assert!(!s.tier_initialized, "fixture must be a fresh install");
+
+    let migrated = crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ false);
+    assert!(migrated, "a fresh install must still be migrated");
+    assert_eq!(
+        s.tier,
+        RunnerTier::Local,
+        "a windowed install with no runner_token must keep landing in Tier 0 — \
+         the headless default must not leak into desktop installs"
+    );
+    assert!(s.tier_initialized);
+}
+
+/// Fresh install + headless ⇒ Tier 2. This is the phase.
+#[test]
+fn headless_server_mode_infers_qontinui_account() {
+    let mut s = Settings::default();
+    assert!(s.web_integration.runner_token.is_empty(), "no legacy token");
+
+    let migrated = crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ true);
+    assert!(migrated, "migration must report it ran");
+    assert_eq!(
+        s.tier,
+        RunnerTier::QontinuiAccount,
+        "QONTINUI_SERVER_MODE with no explicit tier must default to the tier \
+         that talks to coord"
+    );
+    assert!(s.tier_initialized);
+}
+
+/// Escape hatch 1: the spawn-time `QONTINUI_RUNNER_TIER` env overlay is applied
+/// AFTER the inference in `load_settings_full`, so it wins. A headless deploy
+/// that genuinely wants Tier 0 can still say so.
+#[test]
+fn runner_tier_env_overlay_beats_the_headless_default() {
+    let mut s = Settings::default();
+    crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ true);
+    assert_eq!(s.tier, RunnerTier::QontinuiAccount, "default applied first");
+
+    // `load_settings_full` step 2 — the parsed `QONTINUI_RUNNER_TIER` value.
+    crate::settings::apply_tier_env_overlay(&mut s, "local");
+    assert_eq!(
+        s.tier,
+        RunnerTier::Local,
+        "QONTINUI_RUNNER_TIER=local must override the headless default — \
+         the default may be opinionated, it may not be a trap"
+    );
+}
+
+/// Escape hatch 2, and the top of the stack: the runtime override that
+/// `commands::auth::set_runner_tier` writes (`settings::set_in_memory_tier` →
+/// `TIER_OVERRIDE` → `in_memory_tier()`) is applied LAST, so an explicit
+/// operator choice made after boot beats BOTH the env overlay and the headless
+/// default.
+///
+/// Driven through the same three helpers `load_settings_full` calls, in its
+/// order, with the override value supplied directly — `TIER_OVERRIDE` is a
+/// process-wide global and this suite mutates no globals (see the module doc).
+#[test]
+fn runtime_tier_override_beats_the_headless_default() {
+    let mut s = Settings::default();
+
+    // 1. inference (headless default)
+    crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ true);
+    assert_eq!(s.tier, RunnerTier::QontinuiAccount);
+
+    // 2. spawn-time env overlay — deliberately set to Tier 2 as well, so the
+    //    only thing that can produce `Local` below is the runtime override.
+    crate::settings::apply_tier_env_overlay(&mut s, "qontinui_account");
+    assert_eq!(s.tier, RunnerTier::QontinuiAccount);
+
+    // 3. runtime override — what `set_runner_tier("local")` leaves behind.
+    crate::settings::apply_in_memory_tier_overlay(&mut s, Some(RunnerTier::Local));
+    assert_eq!(
+        s.tier,
+        RunnerTier::Local,
+        "a runtime set_runner_tier choice must beat both the env overlay and \
+         the headless default"
+    );
+    assert!(s.tier_initialized);
+
+    // And `None` (no runtime choice was ever made) must change nothing.
+    let mut s2 = Settings::default();
+    crate::settings::migrate_tier_in_place(&mut s2, /* server_mode = */ true);
+    crate::settings::apply_in_memory_tier_overlay(&mut s2, None);
+    assert_eq!(s2.tier, RunnerTier::QontinuiAccount);
+}
+
+/// The one-shot sentinel is untouched by this phase: once `tier_initialized` is
+/// set, NOTHING is re-inferred — not from `runner_token`, not from server mode.
+/// A headless box whose operator already chose Tier 0 keeps it.
+#[test]
+fn tier_initialized_short_circuits_the_headless_default() {
+    let mut s = settings_with(RunnerTier::Local, "");
+    s.tier_initialized = true;
+
+    let migrated = crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ true);
+    assert!(
+        !migrated,
+        "an initialized install must not be re-migrated, headless or not"
+    );
+    assert_eq!(
+        s.tier,
+        RunnerTier::Local,
+        "server mode must not re-promote an install that already has a tier"
+    );
+
+    // Same for a Tier 1 install (the shape `migrate_tier_is_no_op_once_initialized`
+    // guards in settings.rs) — server mode adds no new way to clobber it.
+    let mut s = settings_with(RunnerTier::LocalProvider, "");
+    s.tier_initialized = true;
+    assert!(!crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ true
+    ));
+    assert_eq!(s.tier, RunnerTier::LocalProvider);
+}
+
+/// **The negative, and it is deliberate — do NOT "fix" this test.**
+///
+/// The headless default is a *migration result*, i.e. in-memory. A secondary
+/// never persists a migration at all, and a primary persists it only through
+/// `settings::should_persist_migration`. Meanwhile there is a SECOND tier
+/// reader: `qontinui_runner_lib::profiles::read_runner_tier`, a raw
+/// `settings.json` parse that sees no overlay and no unpersisted migration —
+/// and it is the one `coord_doctor` check 2 consults.
+///
+/// So on a fresh headless box, Phase 2 alone unblocks the four
+/// `require_tier_2()` commands and the relay gate while `coord doctor` still
+/// reports `local`. That is correct behaviour for a doctor that reports
+/// PERSISTED state, and the plan
+/// (`2026-08-29-headless-runner-tier-never-reaches-qontinui-account`) assigns
+/// closing that gap to **Phase 4**, which owns the doctor.
+///
+/// This test pins the boundary so it is read off the suite rather than
+/// rediscovered on a live box. When Phase 4 lands, update it WITH that phase.
+///
+/// (The one temp file in this suite. The module doc's "no temp dir" rule is
+/// about keeping *predicates* pure; the whole point here is that the other
+/// reader is a disk read, and there is no way to assert that without one.)
+#[test]
+fn server_mode_default_is_invisible_to_the_disk_reader() {
+    use qontinui_runner_lib::profiles::{read_runner_tier_at, TierRead};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("settings.json");
+    // A tier-less document with no legacy `runner_token` — a fresh install.
+    std::fs::write(&path, r#"{"web_integration":{"runner_token":""}}"#).expect("write");
+
+    // In memory, the headless default resolves this install to Tier 2 …
+    let mut s: Settings = serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+        .expect("must deserialize");
+    crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ true);
+    assert_eq!(s.tier, RunnerTier::QontinuiAccount);
+
+    // … and the on-disk document is unchanged, so the lib-side reader — the
+    // one `coord_doctor` uses — still reports Absent. NOT `Known("local")`
+    // and NOT `Unknown`: the file parsed fine, it simply has no tier.
+    assert_eq!(
+        read_runner_tier_at(&path),
+        TierRead::Absent,
+        "the in-memory headless default must be invisible to the raw \
+         settings.json reader — coord_doctor reports PERSISTED state, and \
+         Phase 4 owns closing that gap"
+    );
 }
 
 // ----------------------------------------------------------------------------

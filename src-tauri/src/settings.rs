@@ -1714,7 +1714,7 @@ mod tier_tests {
             ..Settings::default()
         };
 
-        let migrated = migrate_tier_in_place(&mut s);
+        let migrated = migrate_tier_in_place(&mut s, /* server_mode = */ false);
         assert!(migrated, "must report migration performed");
         assert_eq!(s.tier, RunnerTier::QontinuiAccount);
         assert!(s.tier_initialized);
@@ -1730,7 +1730,7 @@ mod tier_tests {
         };
         s.web_integration.runner_token.clear();
 
-        let migrated = migrate_tier_in_place(&mut s);
+        let migrated = migrate_tier_in_place(&mut s, /* server_mode = */ false);
         assert!(migrated);
         assert_eq!(s.tier, RunnerTier::Local);
         assert!(s.tier_initialized);
@@ -1750,7 +1750,7 @@ mod tier_tests {
             ..Settings::default()
         };
 
-        let migrated = migrate_tier_in_place(&mut s);
+        let migrated = migrate_tier_in_place(&mut s, /* server_mode = */ false);
         assert!(!migrated, "must not re-migrate when initialized");
         assert_eq!(s.tier, RunnerTier::LocalProvider);
     }
@@ -3732,7 +3732,11 @@ pub fn load_settings_full() -> LoadedSettings {
     // persist.
     let mut needs_persist = false;
     if provenance.is_authoritative() {
-        if migrate_tier_in_place(&mut settings) {
+        // The headless default's ONE read of `QONTINUI_SERVER_MODE`, taken
+        // through the launch-env module that owns the parse. Threaded in as a
+        // parameter so `migrate_tier_in_place` stays a pure, fully testable
+        // helper.
+        if migrate_tier_in_place(&mut settings, crate::launch_env::server_mode_from_env()) {
             needs_persist = true;
         }
         if settings.local_user_id.trim().is_empty() {
@@ -3799,10 +3803,7 @@ pub fn load_settings_full() -> LoadedSettings {
     // overlay above — the operator/driver picked this tier after boot.
     // In-memory only; `update_settings` reads the raw on-disk document, so
     // this can never reach a settings file.
-    if let Some(t) = in_memory_tier() {
-        settings.tier = t;
-        settings.tier_initialized = true;
-    }
+    apply_in_memory_tier_overlay(&mut settings, in_memory_tier());
 
     // One-shot post-upgrade detector: if Tier 2 + has a runner_token + the
     // access_token slot does NOT look like a JWT (likely the legacy opaque
@@ -3943,20 +3944,89 @@ pub(crate) fn apply_tier_env_overlay(settings: &mut Settings, raw: &str) {
     }
 }
 
+/// Apply the runtime in-memory tier override (`set_runner_tier`, i.e.
+/// [`TIER_OVERRIDE`]) as the LAST overlay on `settings.tier`. `None` leaves the
+/// settings untouched.
+///
+/// This is the top of the tier precedence stack. [`load_settings_full`] runs,
+/// in order:
+///
+/// 1. [`migrate_tier_in_place`] — the persisted-state inference, including the
+///    headless (`QONTINUI_SERVER_MODE`) default;
+/// 2. [`apply_tier_env_overlay`] — the spawn-time `QONTINUI_RUNNER_TIER`;
+/// 3. this — the operator's explicit runtime choice, which therefore beats
+///    both.
+///
+/// Factored out of `load_settings_full` for the same reason
+/// [`apply_tier_env_overlay`] was: so unit tests can exercise the precedence
+/// against a fixture `Settings` without mutating a process-wide global (see
+/// `feedback_env_var_tests_serialize`). In-memory only — `update_settings`
+/// reads the raw on-disk document, so an overlay can never reach a file.
+pub(crate) fn apply_in_memory_tier_overlay(
+    settings: &mut Settings,
+    override_tier: Option<RunnerTier>,
+) {
+    if let Some(t) = override_tier {
+        settings.tier = t;
+        settings.tier_initialized = true;
+    }
+}
+
 /// One-shot tier inference. When `tier_initialized` is false (i.e. the
 /// loaded settings.json was written before tier existed, or the field was
-/// stripped), infer the tier from `web_integration.runner_token` — a
-/// non-empty token implies the user previously signed into Qontinui and
-/// should land in Tier 2. Returns `true` if a migration was performed
-/// (caller should persist).
+/// stripped), infer the tier from two signals, in this order:
 ///
-/// Factored out so unit tests can drive it against an in-memory `Settings`
-/// without touching the real settings file.
-pub(crate) fn migrate_tier_in_place(settings: &mut Settings) -> bool {
+/// 1. a non-empty `web_integration.runner_token` — the user previously signed
+///    into Qontinui, so they belong in Tier 2;
+/// 2. `server_mode` — this runner was launched headless
+///    (`QONTINUI_SERVER_MODE`), and a headless runner exists to be driven over
+///    the network. Tier 2 is the tier that is allowed to talk to coord, so a
+///    headless box with no tier of its own defaults there rather than to
+///    `Local`.
+///
+/// Otherwise `Local`. Returns `true` if a migration was performed (caller
+/// should persist).
+///
+/// # This is a product posture default, not a bug fix
+///
+/// Tier 0 (`Local`) advertises "no Qontinui account, no cloud round-trips".
+/// Signal 2 makes a headless box default to the **cloud** tier, which is the
+/// operator's explicit instruction (plan
+/// `2026-08-29-headless-runner-tier-never-reaches-qontinui-account`, Phase 2)
+/// and the precondition for driving a remote runner at all. It is a default,
+/// never a trap: a headless deploy that genuinely wants Tier 0 says so with
+/// `QONTINUI_RUNNER_TIER=local` or a runtime `set_runner_tier("local")`, and
+/// **both still win** — this inference sits at the BOTTOM of the stack in
+/// [`load_settings_full`], with [`apply_tier_env_overlay`] and then
+/// [`apply_in_memory_tier_overlay`] applied over it, in that order.
+///
+/// # Why `server_mode` is a parameter
+///
+/// This helper is deliberately pure (no env, no IO) so `tier_matrix_tests` and
+/// the unit tests below can drive every combination against an in-memory
+/// `Settings`. The flag is parsed exactly once in the tree, by
+/// [`crate::launch_env::server_mode_from_env`]; `load_settings_full` reads it
+/// there and threads it in. Re-reading `QONTINUI_SERVER_MODE` inline here would
+/// add a second parsing site for a var the launch-env module already owns —
+/// which is precisely how the `runner_token` inference came to exist twice.
+pub(crate) fn migrate_tier_in_place(settings: &mut Settings, server_mode: bool) -> bool {
     if settings.tier_initialized {
         return false;
     }
     if !settings.web_integration.runner_token.trim().is_empty() {
+        settings.tier = RunnerTier::QontinuiAccount;
+    } else if server_mode {
+        // Logged once per process: on a secondary the migration never
+        // persists, so it re-runs on every settings load (the relay loop
+        // re-reads every iteration) and would otherwise bury real signal.
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            info!(
+                "QONTINUI_SERVER_MODE is set and this install has no tier of its own — \
+                 defaulting to tier=qontinui_account (the tier that talks to coord). \
+                 Set QONTINUI_RUNNER_TIER=local to opt out; it overrides this default."
+            );
+        });
         settings.tier = RunnerTier::QontinuiAccount;
     } else {
         settings.tier = RunnerTier::Local;
@@ -4884,7 +4954,7 @@ mod openai_compatible_defaults_tests {
         // And the one-shot inference is now a no-op on that document.
         let mut s = loaded.settings.clone();
         assert!(
-            !migrate_tier_in_place(&mut s),
+            !migrate_tier_in_place(&mut s, /* server_mode = */ false),
             "a promoted document must need no migration"
         );
         assert_eq!(s.tier, RunnerTier::QontinuiAccount);

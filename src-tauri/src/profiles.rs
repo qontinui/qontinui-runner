@@ -651,7 +651,8 @@ impl std::fmt::Display for TierPromotion {
 /// [`QONTINUI_ACCOUNT_TIER`].
 pub fn promote_tier_to_account() -> Result<TierPromotion> {
     let (path, source) = settings_json_path();
-    let path = path.ok_or_else(|| anyhow!("cannot resolve settings.json path (source: {source})"))?;
+    let path =
+        path.ok_or_else(|| anyhow!("cannot resolve settings.json path (source: {source})"))?;
     promote_tier_to_account_at(&path, crate::instance_env::is_secondary())
 }
 
@@ -2048,8 +2049,7 @@ mod tests {
         assert_eq!(v["tier"], QONTINUI_ACCOUNT_TIER);
         assert_eq!(v["tier_initialized"], true);
         assert_eq!(
-            v["local_user_id"],
-            "1f0a1c2e-0000-4000-8000-000000000001",
+            v["local_user_id"], "1f0a1c2e-0000-4000-8000-000000000001",
             "an unrelated key must survive the promotion"
         );
         assert_eq!(v["web_integration"]["enabled"], true);
