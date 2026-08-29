@@ -58,7 +58,7 @@ import {
 } from "../liveClaudeSessions";
 import { FLOW_GRID_ID, LAYOUT_PRESETS } from "../useZoneLayout";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
-import { textArg } from "./parse";
+import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { useOrchestrateCommand } from "./orchestrateCommand";
@@ -332,6 +332,44 @@ function resolveCount(args: Record<string, unknown>): { count: number } | Comman
 }
 
 /**
+ * Resolve a TEXT argument to the string to act on, or to the failure the
+ * operator has to see — the exact mirror of {@link resolveCount}.
+ *
+ * `absent` yields `""`, which is the one state where a handler may
+ * legitimately fall back to a default: the operator asked for nothing.
+ * `invalid` — supplied but empty, or supplied as a non-scalar — is an
+ * ERROR, because guessing there is guessing at something the operator
+ * did type. That is not hypothetical: `resolveAccountConfigDir` maps
+ * `""` to `"best"` and launches the highest-headroom Claude account, and
+ * `/spawn-ai 2 gmail --tenant=` used to spawn under the device default.
+ *
+ * `required` additionally rejects `absent`, for the fields whose schema
+ * declares no default.
+ */
+function resolveText(
+  args: Record<string, unknown>,
+  field: string,
+  opts: { required?: boolean } = {},
+): { text: string } | { ok: false; code: string; message: string } {
+  const read = readTextArg(args, field);
+  if (read.kind === "invalid") {
+    return {
+      ok: false,
+      code: "invalid-args",
+      message:
+        read.raw.trim() === ""
+          ? `${field} was supplied but empty`
+          : `"${read.raw}" is not a valid ${field}`,
+    };
+  }
+  if (read.kind === "absent") {
+    if (opts.required) return { ok: false, code: "invalid-args", message: `${field} is required` };
+    return { text: "" };
+  }
+  return { text: read.text };
+}
+
+/**
  * Outcome of resolving a zone argument to a 0-based grid index.
  *
  * `supplied` rides on the resolved states so a handler can tell "the
@@ -518,6 +556,20 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         const found = zoneLayout.focusNextNeedsInput(sessionStates);
         return found ? ok() : fail("none-needs-input");
       }
+      // D9 — a bare `/focus` used to render `✓` for a no-op. `SCHEMA.focus`
+      // declares `target` with NO default (unlike `count`, whose schema
+      // says "defaults to 1"), so absent is not a state this command can
+      // guess from: `resolveZone({zone: undefined})` fell back to the
+      // ALREADY-focused zone and reported success. Every other command
+      // rejects its absent required arg; this one is now no exception.
+      if (target === undefined || target === null || target === "") {
+        if (args.zone === undefined || args.zone === null || args.zone === "") {
+          return fail(
+            "invalid-args",
+            "target is required (a zone number, next, prev or needs-input)",
+          );
+        }
+      }
       const zone = resolveZone({ zone: target ?? args.zone });
       if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
       if (zone.kind === "out-of-range") return fail("out-of-range");
@@ -577,14 +629,26 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const counted = resolveCount(args);
       if ("ok" in counted) return counted;
       const { count } = counted;
-      const configDir = resolveAccountConfigDir(textArg(args, "account"), ctx.accounts);
+      // Through `resolveText`, not `textArg`: an account SUPPLIED but
+      // empty (`{account: {}}`, `--account=`) used to read back as absent,
+      // and `resolveAccountConfigDir` maps absent to "best" — silently
+      // launching the highest-headroom account for a value the operator
+      // did type. Absent still means "best"; supplied-but-empty is an error.
+      const accountRead = resolveText(args, "account");
+      if ("ok" in accountRead) return accountRead;
+      const configDir = resolveAccountConfigDir(accountRead.text, ctx.accounts);
       if (!configDir) return fail("no-account", "no matching Claude account");
       // F3 — `--tenant` arrives either already-parsed (slash route, via the
       // `"--tenant"` schema key) or still embedded in `context` (Tier-2
       // regex route). `splitTenantFlag` normalizes the second case.
       const rawContext = textArg(args, "context") || undefined;
       const split = splitTenantFlag(rawContext);
-      const rawTenant = textArg(args, "tenant").trim() || split.tenant || undefined;
+      // Same three-state read for the tenant. `--tenant=` bound `""`,
+      // read back as ABSENT, and spawned under the device default — the
+      // exact mis-binding this feature exists to prevent.
+      const tenantRead = resolveText(args, "tenant");
+      if ("ok" in tenantRead) return tenantRead;
+      const rawTenant = tenantRead.text.trim() || split.tenant || undefined;
       const { tenantId, error } = resolveTenantArg(rawTenant, ctx.tenantCandidates);
       if (error) return fail("unknown-tenant", error);
       const result = await ctx.spawnAi(count, configDir, split.context, tenantId);
@@ -603,8 +667,11 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const counted = resolveCount(args);
       if ("ok" in counted) return counted;
       const { count } = counted;
-      const command = textArg(args, "command");
-      if (!command) return fail("invalid-command", "command is required");
+      // `required: true` — SCHEMA.spawnWith declares no default for
+      // `command`, so absent is an error, and so is supplied-but-empty.
+      const commandRead = resolveText(args, "command", { required: true });
+      if ("ok" in commandRead) return fail("invalid-command", commandRead.message);
+      const { text: command } = commandRead;
       const result = await ctx.spawnPlain(count, command);
       return spawnVerdict(result, count);
     },
@@ -668,8 +735,21 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     undoable: true,
     patterns: [/^close(?:\s+(?<zone>\d+))?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
-      const explicitTabId = textArg(args, "tabId") || null;
+      // D4 — a tab id that names no live session used to render `✓`.
+      // `closeTerminal` is a total no-op for an unknown id (its
+      // `prev.filter(t => t.id !== id)` removes nothing, and the Rust
+      // rejection is swallowed by `.catch(() => {})`), and because tabId
+      // takes precedence the zone the operator ALSO named was discarded —
+      // so `/close 2 --tabId=bogus` reported success having closed
+      // nothing at all. Membership is checked before acting, and the
+      // error names the id, in the voice of `/focus bogus`.
+      const tabIdRead = resolveText(args, "tabId");
+      if ("ok" in tabIdRead) return tabIdRead;
+      const explicitTabId = tabIdRead.text || null;
       if (explicitTabId) {
+        if (!tabs.some((t) => t.id === explicitTabId)) {
+          return fail("unknown-tab", `"${explicitTabId}" is not an open tab id`);
+        }
         closeTerminal(explicitTabId);
         return ok();
       }
@@ -1120,6 +1200,15 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       }
       if (action === "remove") {
         if (!pattern) return fail("invalid-args", "pattern required for remove");
+        // D5 — the exact-equality filter has no membership guard, so
+        // removing a pattern that was never in the list rendered `✓` and
+        // told the operator a LIVE auto-approve rule was gone. An
+        // auto-approve rule answers `y` on the operator's behalf; being
+        // wrong about whether one is armed is the worst verdict in this
+        // command's surface.
+        if (!current.includes(pattern)) {
+          return fail("unknown-pattern", `"${pattern}" is not an auto-approve pattern`);
+        }
         const next = current.filter((p) => p !== pattern);
         transitionEffects.setAutoApprovePatterns(next);
         return ok({ patterns: next });
@@ -1179,6 +1268,19 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
       const tag = textArg(args, "tag").trim();
       if (!tag) return fail("invalid-args", "tag required");
+      // Now that `activeTagFilters` actually narrows the grid, a filter on
+      // a tag no zone carries dims EVERY zone — so a `✓` for an unknown
+      // tag reads as a rendering fault rather than as a typo. Toggling a
+      // tag that is already ACTIVE stays legal whatever `allTags` says, so
+      // a filter can always be taken back off after its zone was relabelled.
+      if (!labelsAndTags.allTags.includes(tag) && !labelsAndTags.activeTagFilters.has(tag)) {
+        return fail(
+          "unknown-tag",
+          labelsAndTags.allTags.length === 0
+            ? `no zone carries any tag yet (label a zone first)`
+            : `"${tag}" is not a zone tag (have: ${labelsAndTags.allTags.join(", ")})`,
+        );
+      }
       labelsAndTags.setActiveTagFilters((prev) => {
         const next = new Set(prev);
         if (next.has(tag)) next.delete(tag);

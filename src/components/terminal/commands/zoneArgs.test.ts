@@ -177,10 +177,34 @@ describe("readCountArg", () => {
  * launched the "best" account instead of failing on the unknown one.
  */
 describe("readTextArg", () => {
-  it("reports an omitted or blank field as absent", () => {
+  it("reports an OMITTED field as absent", () => {
     expect(readTextArg({}, "command")).toEqual({ kind: "absent" });
     expect(readTextArg({ command: null }, "command")).toEqual({ kind: "absent" });
-    expect(readTextArg({ command: "   " }, "command")).toEqual({ kind: "absent" });
+  });
+
+  // DELIBERATE CONTRACT CHANGE. This spec used to pin `{ command: "   " }`
+  // as ABSENT, in the same file that documents why absent-vs-supplied must
+  // never be collapsed — so it pinned the two-state hole as correct while
+  // its sibling reads (`readZoneArg`, `readCountArg`) were both three-state.
+  // Absent is the one state a handler may guess from, and these values were
+  // SUPPLIED: `resolveAccountConfigDir` reads `""` as "best" and launches
+  // the highest-headroom account, and `--tenant=` bound the device default.
+  it("reports a SUPPLIED but empty field as invalid, not absent", () => {
+    expect(readTextArg({ command: "   " }, "command")).toEqual({ kind: "invalid", raw: "   " });
+    expect(readTextArg({ command: "" }, "command")).toEqual({ kind: "invalid", raw: "" });
+  });
+
+  it("reports a supplied non-scalar as invalid rather than dropping it", () => {
+    expect(readTextArg({ account: {} }, "account")).toEqual({ kind: "invalid", raw: "{}" });
+    expect(readTextArg({ account: [1] }, "account")).toEqual({ kind: "invalid", raw: "[1]" });
+  });
+
+  it("still erases absent-vs-invalid for the lossy `textArg` helper", () => {
+    // `textArg` is unchanged on purpose — it serves the callers whose
+    // field is genuinely optional. Anything that would GUESS on an empty
+    // value uses `resolveText` instead.
+    expect(textArg({}, "command")).toBe("");
+    expect(textArg({ command: "  " }, "command")).toBe("");
   });
 
   it("keeps a supplied token that coerceToken turned into a number", () => {

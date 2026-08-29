@@ -41,6 +41,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 
 import { instanceStorage } from "@/lib/instance-storage";
 import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
+import { isSurfaceVisible } from "@/lib/surfaceVisible";
 
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
 import { SessionManagerToggle } from "./SessionManagerToggle";
@@ -54,6 +55,7 @@ import {
   interpretCommand,
   matchPattern,
   parseArgs,
+  unboundTokens,
   resolve,
   subscribe,
 } from "./commands";
@@ -175,6 +177,15 @@ export function CommandBar() {
       // inspect it (see `globalChords`), and this handler has always
       // required Alt to be absent.
       if (matchesChord(e, GLOBAL_CHORDS.commandBar) && !e.altKey) {
+        // The input is the surface this chord acts on, so it is also the
+        // honest visibility test. `App.tsx` keeps the terminal page mounted
+        // behind a `hidden` div on every other tab: without this guard the
+        // chord `preventDefault()`ed and `stopPropagation()`ed app-wide —
+        // capture phase, so it beat every other listener — and then focused
+        // nothing, because `.focus()` on an element in a `display:none`
+        // subtree is a no-op. Claiming a key you cannot act on is the same
+        // defect as the `Ctrl+1..8` double-fire, one surface over.
+        if (!isSurfaceVisible(inputRef.current)) return;
         e.preventDefault();
         e.stopPropagation();
         inputRef.current?.focus();
@@ -375,6 +386,21 @@ export function CommandBar() {
       // on "spawn 3 best" against /spawn's 1-field schema would silently
       // mis-bind).
       const args = presetArgs ?? parseArgs(rawInput, action);
+      // Trailing junk on a no-argument command. Only the SLASH route can
+      // carry it — Tier-2/Tier-3 arrive with `presetArgs` already bound —
+      // and only for an empty schema, where `parseArgs`'s catch-all is
+      // guarded off and quietly discards every token. `/mute please stop`
+      // used to render `/mute ✓`.
+      if (!presetArgs) {
+        const extra = unboundTokens(rawInput, action);
+        if (extra.length > 0) {
+          setStatus({
+            kind: "error",
+            text: `${action.slash}: takes no arguments (got "${extra.join(" ")}")`,
+          });
+          return;
+        }
+      }
       let result: CommandResult;
       try {
         result = await action.handler(args, {

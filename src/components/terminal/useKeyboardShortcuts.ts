@@ -3,7 +3,14 @@ import { LAYOUT_PRESETS, FLOW_GRID_ID, type SessionState } from "./useZoneLayout
 import type { UIAction } from "./useUIState";
 import type { Metrics } from "./useEventHistory";
 import { getById } from "./commands";
-import { GLOBAL_CHORDS, isCtrlShiftChord, matchesChord } from "@/lib/globalChords";
+import {
+  GLOBAL_CHORDS,
+  GLOBAL_DIGIT_CHORDS,
+  isCtrlShiftChord,
+  matchesChord,
+  matchesDigitChord,
+} from "@/lib/globalChords";
+import { isSurfaceVisible } from "@/lib/surfaceVisible";
 
 interface UseKeyboardShortcutsParams {
   activeId: string | null;
@@ -68,6 +75,21 @@ interface UseKeyboardShortcutsParams {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     resumeSession: (session: any) => void;
   };
+  /**
+   * The terminal page's root element. Every chord below is inert while
+   * it is not visible.
+   *
+   * `App.tsx` keeps `TerminalPage` MOUNTED behind a `hidden` div on every
+   * other tab so PTYs survive a tab switch — and this `window` listener
+   * survived with it, leaving all ~23 chords live on the Builder, Logs
+   * and the Active dashboard. That is not a theoretical leak: one
+   * `Ctrl+3` pressed on the Active dashboard switched the dashboard's
+   * widget AND moved this page's focused zone, because two `window`
+   * listeners on the same target both run. Guarding the listener on the
+   * surface it acts on is the class fix — a chord for an off-screen
+   * surface is neither claimed nor swallowed.
+   */
+  surfaceRef?: React.RefObject<HTMLElement | null>;
 }
 
 export function useKeyboardShortcuts({
@@ -90,6 +112,7 @@ export function useKeyboardShortcuts({
   terminalRefs,
   workflowGen,
   sessionManager,
+  surfaceRef,
 }: UseKeyboardShortcutsParams) {
   useEffect(() => {
     // Every `Ctrl+Shift+<key>` test below goes through `isCtrlShiftChord`,
@@ -101,6 +124,8 @@ export function useKeyboardShortcuts({
     // CapsLock — new terminal, close, maximize, swap, restart, the session
     // sidebar, all of it.
     const handler = (e: KeyboardEvent) => {
+      // Off-screen surface → every chord below is inert. See `surfaceRef`.
+      if (!isSurfaceVisible(surfaceRef?.current)) return;
       if (isCtrlShiftChord(e, "t")) {
         e.preventDefault();
         createAndAssignTerminal();
@@ -168,21 +193,29 @@ export function useKeyboardShortcuts({
         }
         return;
       }
-      // Digits, not a single key — a range test, so it can't route through
-      // `isCtrlShiftChord`. CapsLock does not affect digit keys, so the
-      // trap the helper exists for doesn't reach this branch.
-      if (e.ctrlKey && e.shiftKey && e.key >= "1" && e.key <= "8") {
+      // Digit RANGES. They used to be hand-rolled `e.key >= "1" && e.key
+      // <= "8"` comparisons on the theory that a range "can't route
+      // through `isCtrlShiftChord`" — true of that helper, and the reason
+      // both ranges stayed outside every chord table. The scanner's claim
+      // counters see only `matchesChord(...)` / `isCtrlShiftChord(...)`
+      // text, so a range contributed NOTHING to count: the `Ctrl+1..8`
+      // collision with `active-dashboard/DashboardPage` (one press moved
+      // this page's focused zone while the operator was on the dashboard)
+      // was invisible to a suite that was green. `matchesDigitChord`
+      // gives the range a spelling the scanner can expand and count.
+      const presetDigit = matchesDigitChord(e, GLOBAL_DIGIT_CHORDS.terminalLayoutPreset);
+      if (presetDigit !== null) {
         e.preventDefault();
-        const num = parseInt(e.key, 10);
-        const preset = LAYOUT_PRESETS.find((l) => l.shortcutKey === num);
+        const preset = LAYOUT_PRESETS.find((l) => l.shortcutKey === presetDigit);
         if (preset) {
           zoneLayout.setLayoutId(preset.id);
         }
         return;
       }
-      if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key >= "1" && e.key <= "9") {
+      const zoneDigit = matchesDigitChord(e, GLOBAL_DIGIT_CHORDS.terminalFocusZone);
+      if (zoneDigit !== null) {
         if (zoneLayout.isMultiZone) {
-          const zoneIdx = parseInt(e.key, 10) - 1;
+          const zoneIdx = zoneDigit - 1;
           if (zoneIdx < zoneLayout.layout.zones.length) {
             e.preventDefault();
             zoneLayout.setFocusedZone(zoneIdx);
@@ -368,5 +401,6 @@ export function useKeyboardShortcuts({
     addHistoryEvent,
     terminalRefs,
     sessionManager,
+    surfaceRef,
   ]);
 }
