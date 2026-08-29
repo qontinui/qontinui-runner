@@ -99,8 +99,10 @@ function Wait-ForApplyButton {
 
 function Get-RecentSpecTaskId {
     try {
+        # `{ scope, task_runs }` envelope, not a bare array (plan
+        # 2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner, Phase 2).
         $resp = (Invoke-WebRequest -Uri "$RUNNER_API/task-runs/running" -UseBasicParsing -ErrorAction Stop).Content | ConvertFrom-Json
-        $task = $resp | Where-Object { $_.task_name -like "Spec Chat:*" } | Select-Object -First 1
+        $task = $resp.task_runs | Where-Object { $_.task_name -like "Spec Chat:*" } | Select-Object -First 1
         if ($task) { return $task.id }
     } catch {}
     return $null

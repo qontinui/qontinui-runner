@@ -128,8 +128,10 @@ function Click-UIElement {
 
 function Get-RecentSpecTaskId {
     try {
+        # `{ scope, task_runs }` envelope, not a bare array (plan
+        # 2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner, Phase 2).
         $resp = (Invoke-WebRequest -Uri "$RUNNER_API/task-runs/running" -UseBasicParsing -ErrorAction Stop).Content | ConvertFrom-Json
-        $task = $resp | Where-Object { $_.task_name -like "Spec Chat:*" } | Select-Object -First 1
+        $task = $resp.task_runs | Where-Object { $_.task_name -like "Spec Chat:*" } | Select-Object -First 1
         if ($task) { return $task.id }
     } catch {}
     return $null
@@ -140,7 +142,7 @@ function Get-NewSpecTaskId {
     param([string[]]$ExcludeIds)
     try {
         $resp = (Invoke-WebRequest -Uri "$RUNNER_API/task-runs/running" -UseBasicParsing -ErrorAction Stop).Content | ConvertFrom-Json
-        $task = $resp | Where-Object { $_.task_name -like "Spec Chat:*" -and $ExcludeIds -notcontains $_.id } | Select-Object -First 1
+        $task = $resp.task_runs | Where-Object { $_.task_name -like "Spec Chat:*" -and $ExcludeIds -notcontains $_.id } | Select-Object -First 1
         if ($task) { return $task.id }
     } catch {}
     return $null
@@ -152,7 +154,7 @@ function Get-TaskForSpec {
     param([string]$DescriptionPrefix, [string[]]$ExcludeIds = @())
     try {
         $resp = (Invoke-WebRequest -Uri "$RUNNER_API/task-runs/running" -UseBasicParsing -ErrorAction Stop).Content | ConvertFrom-Json
-        $candidates = $resp | Where-Object { $_.task_name -like "Spec Chat:*" -and $ExcludeIds -notcontains $_.id }
+        $candidates = $resp.task_runs | Where-Object { $_.task_name -like "Spec Chat:*" -and $ExcludeIds -notcontains $_.id }
         if ($DescriptionPrefix) {
             $match = $candidates | Where-Object { $_.task_name -like "Spec Chat: $DescriptionPrefix*" } | Select-Object -First 1
             if ($match) { return $match.id }
@@ -345,7 +347,7 @@ foreach ($entry in $specs.GetEnumerator()) {
     $preSendIds = @()
     try {
         $pre = (Invoke-WebRequest -Uri "$RUNNER_API/task-runs/running" -UseBasicParsing -ErrorAction Stop).Content | ConvertFrom-Json
-        $preSendIds = @($pre | Where-Object { $_.task_name -like "Spec Chat:*" } | Select-Object -ExpandProperty id)
+        $preSendIds = @($pre.task_runs | Where-Object { $_.task_name -like "Spec Chat:*" } | Select-Object -ExpandProperty id)
     } catch {}
 
     # Click the spec tree item to navigate to this spec's chat
