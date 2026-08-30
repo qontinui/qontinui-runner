@@ -56,8 +56,15 @@
  * side instead of running it is what missed a whole class in one round.
  */
 
+import {
+  buildAiProbes,
+  buildCorpus,
+  buildDirectProbes,
+  type CorpusTier,
+  type ProbeCase,
+} from "./corpus.testkit";
 import type { CommandAction } from "./types";
-import { canonicalArgs, run, type Route } from "./pipeline.testkit";
+import { canonicalArgs, run, runViaRegistryRoute, type Route } from "./pipeline.testkit";
 
 /** What the pipeline did with one input, in a form that compares cleanly. */
 export interface OutcomeRecord {
@@ -133,9 +140,19 @@ export interface Delta {
  * Installs `state` into the module registry, so callers must save and restore
  * the registry themselves if they care about it afterwards (the specs do).
  */
+export interface ProbeSet {
+  /** Tier-3 probes — an injected `InterpretMatch` per row. */
+  ai: readonly ProbeCase[];
+  /** `callRegistry` probes — no CommandBar at all. */
+  direct: readonly ProbeCase[];
+}
+
+const NO_PROBES: ProbeSet = { ai: [], direct: [] };
+
 export async function captureSnapshot(
   state: PipelineState,
   corpus: readonly string[],
+  probes: ProbeSet = NO_PROBES,
 ): Promise<Snapshot> {
   const registry = await import("./registry");
   registry.__resetForTest();
@@ -148,15 +165,51 @@ export async function captureSnapshot(
   const out: Snapshot = new Map();
   for (const input of corpus) {
     const o = await run(input, lookup);
-    out.set(input, {
-      route: o.route,
-      actionId: o.actionId ?? "-",
-      args: canonicalArgs(o.args),
-      verdict: o.verdict,
-      status: o.status ? `${o.status.kind} ${o.status.text}` : "-",
+    out.set(input, record(o));
+  }
+  // Tier 3: the model is INJECTED, never spawned. Everything downstream of
+  // `chooseTier` — the binding, the validation, the arity gate, the real
+  // handler — is the product's own code.
+  for (const probe of probes.ai) {
+    const action = registry.getById(probe.actionId);
+    if (!action) continue;
+    const o = await run(probe.input, lookup, [], {
+      action,
+      args: probe.args,
+      confidence: 0.9,
     });
+    out.set(probe.key, record(o));
+  }
+  // The direct route, through the real `uibridge.ts`.
+  for (const probe of probes.direct) {
+    if (!registry.getById(probe.actionId)) continue;
+    out.set(probe.key, record(await runViaRegistryRoute(probe.actionId, probe.args, lookup)));
   }
   return out;
+}
+
+const record = (o: Awaited<ReturnType<typeof run>>): OutcomeRecord => ({
+  route: o.route,
+  actionId: o.actionId ?? "-",
+  args: canonicalArgs(o.args),
+  verdict: o.verdict,
+  status: o.status ? `${o.status.kind} ${o.status.text}` : "-",
+});
+
+/**
+ * Capture EVERY route for `tier` — the typed corpus plus both probe corpora.
+ *
+ * The one entry point the golden file, the sweep and the cross-commit
+ * snapshots all use, so a route added here cannot be added to some of them and
+ * forgotten in the rest. The self-checks below keep calling
+ * {@link captureSnapshot} directly: they mutate the registry to manufacture a
+ * delta, and probe rows would measure the mutation rather than the harness.
+ */
+export async function captureTier(state: PipelineState, tier: CorpusTier): Promise<Snapshot> {
+  return captureSnapshot(state, buildCorpus(state.actions, tier), {
+    ai: buildAiProbes(state.actions, tier),
+    direct: buildDirectProbes(state.actions, tier),
+  });
 }
 
 const ran = (verdict: string): boolean => verdict === "ok";
@@ -285,6 +338,18 @@ const HEADER = [
   "# every Tier-2 pattern, crossed with argument tails, quoting shapes and",
   "# declared-flag spellings), so adding a pattern adds rows here. That is",
   "# intended: the diff this file produces IS the review surface.",
+  "#",
+  "# Rows whose key starts with a guillemet are the two routes a TYPED input",
+  "# cannot reach, so they carry a hand-authored arg bag instead:",
+  "#   «ai» <actionId> [<bag>] <input>   Tier 3 — the model named the action",
+  "#                                      and returned <bag>. `chooseTier`'s",
+  "#                                      Tier-3 arm was otherwise entered by",
+  "#                                      no corpus input at all.",
+  "#   «direct» <actionId> [<bag>]        `callRegistry` — UI Bridge handlers,",
+  "#                                      suggestion chips, palette clicks and",
+  "#                                      the Ctrl+Shift+H hotkey.",
+  "# The bags are in `corpus.testkit.ts::ARG_BAGS`; `bool` / `object` / `array`",
+  "# are the JSON shapes a regex group and a token can never produce.",
   "#",
   "# A row changing action or args is a semantic change and needs a reason in",
   "# the PR. A row changing only its verdict may be the stubbed context in",
