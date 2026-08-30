@@ -9,11 +9,38 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { resolvedAction } from "./bind";
 import { matchPattern } from "./patterns";
-import { chooseTier, didYouMean } from "./rank";
+import { chooseTier, didYouMean, type TierChoice } from "./rank";
 import { __resetForTest, register } from "./registry";
 import { resolve } from "./resolve";
 import type { CommandAction } from "./types";
+
+/**
+ * The head's action, or `null` for the `none` arm.
+ *
+ * `TierChoice.head` is a TOTAL sum type now, so "no tier owns this" is the
+ * `none` ARM rather than a `null` that also had to mean "the literal slash
+ * won" — see `bind.ts` for why that overload was the defect. These two
+ * readers keep the assertions below about the RULE rather than about the
+ * encoding.
+ */
+const headAction = (choice: TierChoice): CommandAction | null => resolvedAction(choice.head);
+
+/**
+ * The RAW evidence the winning tier captured: regex groups for `pattern`,
+ * the model's own JSON for `ai`, `null` for the arms that captured nothing.
+ *
+ * Uncoerced on purpose — `chooseTier` no longer binds arguments, it reports
+ * what its tier saw. `crossRoute.test.ts` is what checks the two routes still
+ * agree after `bind.ts` coerces.
+ */
+const headEvidence = (choice: TierChoice): Record<string, unknown> | null => {
+  const h = choice.head;
+  if (h.kind === "pattern") return h.groups;
+  if (h.kind === "ai") return h.modelArgs;
+  return null;
+};
 
 afterEach(() => {
   __resetForTest();
@@ -99,24 +126,24 @@ describe("chooseTier — literal slash meets its own Tier-2 pattern", () => {
     registerFixtures();
     // `parseArgs` cannot rescue this one: `/spawn`'s free-form catch-all
     // folds the trailing token INTO `count`, binding `"3 plain"`.
-    const { head, shadowed } = choose("/spawn 3 plain");
-    expect(head?.action.id).toBe("terminal.spawn");
-    expect(head?.presetArgs).toEqual({ count: 3 });
-    expect(head?.tier).toBe("pattern");
-    expect(shadowed).toBeNull();
+    const c = choose("/spawn 3 plain");
+    expect(headAction(c)?.id).toBe("terminal.spawn");
+    expect(headEvidence(c)).toEqual({ count: "3" });
+    expect(c.head.kind).toBe("pattern");
+    expect(c.shadowed).toBeNull();
   });
 
   it("yields for an ALIAS of the same action", () => {
     registerFixtures();
-    const { head } = choose("/sort zones");
-    expect(head?.action.id).toBe("terminal.sort-zones");
-    expect(head?.presetArgs).toEqual({});
+    const c = choose("/sort zones");
+    expect(headAction(c)?.id).toBe("terminal.sort-zones");
+    expect(headEvidence(c)).toEqual({});
   });
 
   it("keeps the slashless spelling working exactly as before", () => {
     registerFixtures();
-    expect(choose("sort zones").head?.action.id).toBe("terminal.sort-zones");
-    expect(choose("spawn 3 plain").head?.presetArgs).toEqual({ count: 3 });
+    expect(headAction(choose("sort zones"))?.id).toBe("terminal.sort-zones");
+    expect(headEvidence(choose("spawn 3 plain"))).toEqual({ count: "3" });
   });
 });
 
@@ -126,7 +153,7 @@ describe("chooseTier — literal slash meets a DIFFERENT action's pattern", () =
     const { head, shadowed } = choose("/spawn 3 best");
     // The literal form the operator typed still runs — typing `/spawn` must
     // never launch paid AI sessions.
-    expect(head).toBeNull();
+    expect(head.kind).toBe("none");
     expect(shadowed?.action.id).toBe("terminal.spawn-ai");
   });
 
@@ -141,7 +168,7 @@ describe("chooseTier — literal slash meets a DIFFERENT action's pattern", () =
   it("refuses to reroute into a DESTRUCTIVE action", () => {
     registerFixtures();
     const { head, shadowed } = choose("/close everything");
-    expect(head).toBeNull();
+    expect(head.kind).toBe("none");
     expect(shadowed?.action.id).toBe("terminal.nuke");
   });
 
@@ -150,10 +177,10 @@ describe("chooseTier — literal slash meets a DIFFERENT action's pattern", () =
     // `^focus[ -]mode$` spells the space form on purpose, and nothing is
     // spent by guessing right. Overridable: declare the target `costly` or
     // `destructive` and the literal slash wins again.
-    const { head, shadowed } = choose("/focus mode");
-    expect(head?.action.id).toBe("terminal.toggle-focus-mode");
-    expect(head?.tier).toBe("pattern");
-    expect(shadowed).toBeNull();
+    const c = choose("/focus mode");
+    expect(headAction(c)?.id).toBe("terminal.toggle-focus-mode");
+    expect(c.head.kind).toBe("pattern");
+    expect(c.shadowed).toBeNull();
   });
 
   it("emits no hint when the Tier-2 hit IS what ran", () => {
@@ -172,18 +199,18 @@ describe("chooseTier — literal slash meets a DIFFERENT action's pattern", () =
 describe("chooseTier — everything else is unchanged", () => {
   it("leaves a literal slash with no pattern on Tier 1", () => {
     registerFixtures();
-    expect(choose("/spawn-ai 1 gmail").head).toBeNull();
+    expect(choose("/spawn-ai 1 gmail").head.kind).toBe("none");
   });
 
   it("still lets Tier 2 win outright for a slashless phrase", () => {
     registerFixtures();
-    const { head } = choose("spawn 3 best");
-    expect(head?.action.id).toBe("terminal.spawn-ai");
-    expect(head?.presetArgs).toEqual({ count: 3, account: "best" });
+    const c = choose("spawn 3 best");
+    expect(headAction(c)?.id).toBe("terminal.spawn-ai");
+    expect(headEvidence(c)).toEqual({ count: "3", account: "best" });
   });
 
   it("returns nothing when no tier hit", () => {
     registerFixtures();
-    expect(choose("zzzqqq").head).toBeNull();
+    expect(choose("zzzqqq").head.kind).toBe("none");
   });
 });

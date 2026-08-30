@@ -65,7 +65,7 @@
  *
  * It was also a live correctness bug (manual-test-loop iteration 7, D1)
  * that made the literal form rank at all. Tier-2 winning meant
- * `CommandBar.execute` took the `presetArgs` branch and never ran
+ * `CommandBar.execute` took the preset branch and never ran
  * `parseArgs`, so `/spawn-ai`'s DECLARED `--tenant` flag was never
  * extracted — the pattern's `(?<context>.+)` tail had swallowed it — and
  * the handler's three-state tenant guard never ran. Measured on-page:
@@ -94,40 +94,31 @@
  * `.+` tail to rediscover this bug in silence.
  */
 
+import { NO_RESOLUTION, type Resolution } from "./bind";
 import type { InterpretMatch } from "./interpret";
 import type { PatternMatch } from "./patterns";
 import type { ResolveMatch } from "./resolve";
 import type { CommandAction } from "./types";
 
 /**
- * The single match that leads the dropdown when a higher tier owns the
- * input, or `null` when Tier 1's own list stands unmodified.
- */
-export interface HeadMatch {
-  action: CommandAction;
-  /**
-   * Args the winning tier already extracted — regex named groups for
-   * Tier 2, model output for Tier 3. `execute` uses these instead of a
-   * positional re-parse (which would mis-bind), then runs declared-flag
-   * extraction over them.
-   */
-  presetArgs: Record<string, unknown>;
-  /** Which tier won. Surfaced in the dropdown for `ai`. */
-  tier: "ai" | "pattern";
-  /** Model self-confidence — Tier 3 only. */
-  confidence?: number;
-}
-
-/**
- * The full tier verdict: which match Enter runs, and the Tier-2 phrasing a
- * literal slash outranked when one exists.
+ * The full tier verdict: which resolution Enter runs, and the Tier-2 phrasing
+ * a literal slash outranked when one exists.
+ *
+ * `head` is a TOTAL {@link Resolution}, `none` included. It used to be
+ * `HeadMatch | null`, and that `null` meant two different things — "the
+ * literal slash won, re-parse positionally" and "no tier owns this" — which
+ * the component then had to re-derive downstream from whether `presetArgs` was
+ * `undefined`. The head also used to carry `presetArgs`, i.e. arguments the
+ * resolver had already BOUND; it now carries only what its tier observed, and
+ * `bind.ts::bindCommand` is the single place that turns evidence into
+ * arguments. See `bind.ts` for why that `??` was a hidden tag check.
  *
  * `shadowed` is not decoration. Without it the literal-slash protection is
  * a dead end — the operator types `/spawn 3 best`, gets `"3 best" is not a
  * count`, and is told nothing about the command that WOULD have run.
  */
 export interface TierChoice {
-  head: HeadMatch | null;
+  head: Resolution;
   /**
    * A Tier-2 match the LITERAL slash outranked because it names a
    * different action that must not be auto-reached. `null` whenever the
@@ -163,40 +154,37 @@ export function chooseTier(
   tier2: PatternMatch | null,
   tier3: InterpretMatch | null,
 ): TierChoice {
+  const patternHead = (hit: PatternMatch): Resolution => ({
+    kind: "pattern",
+    action: hit.action,
+    groups: hit.groups,
+  });
   const literalHit = tier1.find((m) => m.exact && m.literal);
   if (literalHit) {
-    if (!tier2) return { head: null, shadowed: null };
+    if (!tier2) return { head: NO_RESOLUTION, shadowed: null };
     // Same action, or a reroute that costs nothing: take the pattern's
-    // args. It is the only reading that knows what its own trailing token
+    // reading. It is the only one that knows what its own trailing token
     // means.
     if (tier2.action.id === literalHit.action.id || safeToReroute(tier2.action)) {
-      return {
-        head: { action: tier2.action, presetArgs: tier2.args, tier: "pattern" },
-        shadowed: null,
-      };
+      return { head: patternHead(tier2), shadowed: null };
     }
     // A costly or destructive neighbour. The literal slash the operator
     // typed runs; the alternative is NAMED rather than swallowed.
-    return { head: null, shadowed: tier2 };
+    return { head: NO_RESOLUTION, shadowed: tier2 };
   }
   if (tier3) {
     return {
       head: {
+        kind: "ai",
         action: tier3.action,
-        presetArgs: tier3.args,
-        tier: "ai",
+        modelArgs: tier3.args,
         confidence: tier3.confidence,
       },
       shadowed: null,
     };
   }
-  if (tier2) {
-    return {
-      head: { action: tier2.action, presetArgs: tier2.args, tier: "pattern" },
-      shadowed: null,
-    };
-  }
-  return { head: null, shadowed: null };
+  if (tier2) return { head: patternHead(tier2), shadowed: null };
+  return { head: NO_RESOLUTION, shadowed: null };
 }
 
 /**

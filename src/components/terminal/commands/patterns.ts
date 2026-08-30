@@ -23,17 +23,25 @@
  * is Tier 1's job, and AI (Phase 8) catches everything else.
  */
 
-import { coerceToken, extractFlags, FLAG_PREFIX, tokenizeRich } from "./parse";
+import { extractFlags, FLAG_PREFIX, tokenizeRich } from "./parse";
 import { getAll } from "./registry";
 import type { CommandAction } from "./types";
 
 export interface PatternMatch {
   action: CommandAction;
-  /** Pre-extracted args, mapped from the regex's named capture groups
-   *  (and numeric-coerced via {@link coerceToken}). The CommandBar
-   *  bypasses {@link parseArgs} and feeds these straight to the
-   *  handler. */
-  args: Record<string, unknown>;
+  /**
+   * The regex's named capture groups, RAW — slices of the input, in the
+   * operator's own spelling and quoting. EVIDENCE, not arguments.
+   *
+   * This used to be `args`, numeric-coerced right here inside the resolver,
+   * and that is what made Tier 2's output already-bound arguments. The
+   * CommandBar then had no way to tell "Tier 2 bound these" from "nobody bound
+   * anything" except by asking whether the field was `undefined`, which is the
+   * `presetArgs ?? parseArgs(...)` that `bind.ts` exists to remove. Coercion
+   * now happens once, in `bind.ts::coerceArgValues`, alongside every other
+   * tier's — the resolver names the action and hands over what it saw.
+   */
+  groups: Record<string, string>;
 }
 
 /**
@@ -98,14 +106,16 @@ export function matchPattern(input: string): PatternMatch | null {
     for (const pattern of action.patterns) {
       const match = pattern.exec(trimmed);
       if (!match) continue;
-      const args: Record<string, unknown> = {};
+      const groups: Record<string, string> = {};
       if (match.groups) {
         for (const [name, value] of Object.entries(match.groups)) {
+          // An optional group that did not participate is ABSENT, not empty —
+          // `/close` with no zone must not bind `zone: ""`.
           if (value === undefined) continue;
-          args[name] = coerceToken(value);
+          groups[name] = value;
         }
       }
-      return { action, args };
+      return { action, groups };
     }
   }
   return null;
