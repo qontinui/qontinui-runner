@@ -702,7 +702,11 @@ pub(crate) struct BriefingDial {
     /// to the compiled-in builtin. That is a reading about the CACHE, not a
     /// statement that coord has no such document.
     pub(crate) present: bool,
-    /// The row's `current_version` as the cache holds it.
+    /// The row's `current_version` as the cache holds it. `None` when the cache
+    /// holds no document under this name AND when it holds one whose version is
+    /// `0` — the value a list row with no `current_version` and an older
+    /// build's store entry both decode to, which the version gate below already
+    /// refuses to read as a generation number.
     pub(crate) version: Option<i64>,
     /// **The cache's own last-refresh time** (RFC 3339), as coord confirmed it.
     /// This is the sub-fact caches 1-3 cannot supply — see
@@ -807,7 +811,13 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
                 Some(doc) => BriefingDial {
                     name,
                     present: true,
-                    version: Some(doc.version),
+                    // `0` is UNKNOWN, not a generation — the same rule the
+                    // version gate below enforces, and the reason
+                    // `config_report_cmd` renders `None` as `v?`. Reported
+                    // verbatim it printed `runner-session=v0`, which made that
+                    // arm unreachable and stated a version the runner does not
+                    // have.
+                    version: Some(doc.version).filter(|v| *v != 0),
                     // Empty string is the serde default for a store written by
                     // a build that predates the field — report that as UNKNOWN
                     // rather than as an empty timestamp.
@@ -3067,6 +3077,59 @@ mod tests {
             BriefingProvenance::Cached,
             "a claimed `coord` must be force-relabelled"
         );
+    }
+
+    /// The briefing rows of [`dial_snapshot`], which nothing exercised.
+    ///
+    /// `config_report_cmd` already renders a `None` version as `v?` and an
+    /// empty stamp as `UNKNOWN`. The stamp arm was reachable; the version arm
+    /// was not, because a PRESENT document mapped to `Some(doc.version)`
+    /// unconditionally — so a document the runner holds at the UNKNOWN version
+    /// `0` was reported to the operator as `runner-session=v0`, a generation
+    /// number it does not have. Same rule as the version gate in this module
+    /// and as `session_briefing::Provenance`.
+    #[test]
+    fn the_briefing_dial_reports_an_unknown_version_as_absent() {
+        let pin = pin_plan_capture_level_for_test("off");
+
+        pin.set_briefing(
+            BRIEFING_RUNNER_SESSION,
+            briefing_for_test("body", 7, BriefingProvenance::Coord),
+        );
+        let mut zero = briefing_for_test("body", 0, BriefingProvenance::Cached);
+        zero.fetched_at = String::new();
+        pin.set_briefing(BRIEFING_PLAN_CAPTURE_CLAUSE, zero);
+
+        let dial = dial_snapshot();
+        let row = |name: &str| {
+            dial.briefings
+                .iter()
+                .find(|b| b.name == name)
+                .expect("every BRIEFING_NAMES entry has a row")
+        };
+
+        let known = row(BRIEFING_RUNNER_SESSION);
+        assert!(known.present);
+        assert_eq!(known.version, Some(7));
+        assert_eq!(known.provenance, Some("coord"));
+        assert_eq!(
+            known.fetched_at.as_deref(),
+            Some("2026-08-20T00:00:00+00:00")
+        );
+
+        // PRESENT with an UNKNOWN version — the two are independent facts, and
+        // reporting the document as absent would be the opposite lie.
+        let unknown = row(BRIEFING_PLAN_CAPTURE_CLAUSE);
+        assert!(unknown.present);
+        assert_eq!(unknown.version, None);
+        assert_eq!(unknown.fetched_at, None);
+        assert_eq!(unknown.provenance, Some("cached"));
+
+        // A name with nothing cached still gets a row, marked absent.
+        let missing = row(BRIEFING_AI_SESSION_RULES);
+        assert!(!missing.present);
+        assert_eq!(missing.version, None);
+        assert_eq!(missing.provenance, None);
     }
 
     /// **The briefing store's READ path creates nothing** — driven against a

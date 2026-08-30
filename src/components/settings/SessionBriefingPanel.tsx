@@ -154,7 +154,7 @@ function PlanCaptureClauseView({ clause }: { clause: PlanCaptureClauseState }) {
         <div className="min-w-0">
           <h5 className="text-sm font-medium">Plan-capture clause</h5>
           <p className="text-[10px] text-muted-foreground">
-            {describePlanCaptureClause(clause.included)}
+            {describePlanCaptureClause(clause.included, clause.provenance)}
           </p>
         </div>
         <ProvenanceBadge detail={clause.provenance_detail} provenance={clause.provenance} />
