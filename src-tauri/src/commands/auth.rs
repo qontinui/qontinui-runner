@@ -1265,8 +1265,11 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
         })?;
     }
 
-    // Kick the relay — now that tier != QontinuiAccount, the cloud relay
-    // task enters its idle-await-kick state and drops the WS.
+    // Kick the relay so it re-evaluates its gate and drops the WS. What moved
+    // the gate is `clear_all_credentials` above: `should_relay_idle_with`
+    // requires Tier 2 AND a device JWT, and the access-token slot is now empty.
+    // The tier deliberately STAYS `QontinuiAccount` (see the write above), so
+    // it is the credential, not the tier, that idles the relay.
     tokio::spawn(async {
         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
     });
