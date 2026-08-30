@@ -6115,7 +6115,10 @@ pub fn create_router(
                  (no .mcp.json written; an unregistered nonce on a STALE port is rewritten \
                  instead, and counts under `rewrote`); \
                  rewrote {} session config(s), upgraded {} session config header shape(s) \
-                 (nonce preserved), root self-heal = {root_action:?} \
+                 (nonce preserved), REFUSED a repair on {} agent-principal-marked config(s) \
+                 (agent-scoped credentials this boot must not adopt or rewrite — non-zero \
+                 means agent sessions outlived the previous runner and need re-spawning), \
+                 root self-heal = {root_action:?} \
                  (instance {reconcile_instance}, bound port :{reconcile_bound_port}); \
                  on-disk .mcp.json census (workspace root only, depth <= 4, dependency and \
                  build trees pruned — a FLOOR, not the whole disk): {census_line}",
@@ -6124,6 +6127,7 @@ pub fn create_router(
                 session_counts.adopted,
                 session_counts.rewritten,
                 session_counts.upgraded,
+                session_counts.refused_agent_marked,
             );
             if matches!(root_action, crate::coord_mcp::RootReconcileAction::Rewrite)
                 && restore.inserted == 0
