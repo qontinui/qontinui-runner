@@ -21,7 +21,22 @@ const MEMORY_WARNING_THRESHOLD_MB: u64 = 1024; // 1 GB
 /// Thread count threshold to trigger a warning.
 /// Set to 150 to avoid false positives — the runner legitimately uses 100-130
 /// threads during normal operation (tokio runtime, bridges, background tasks).
-const THREAD_WARNING_THRESHOLD: usize = 150;
+///
+/// **The 100-130 band above is STALE, measured 2026-08-30.** A live, idle
+/// runner (debug build, embedded Postgres, full bridge set) sampled every 3 s
+/// on the Linux dev box sat at **150-151** threads — at and just over this
+/// threshold, so this line now fires as a matter of course rather than on an
+/// anomaly. The number is left alone deliberately: this is a LOG threshold,
+/// where the cost of a false positive is one line a minute, and re-measuring
+/// the band on every platform is not this change's job.
+///
+/// It is `pub(crate)` so the spawn gate can say what it is NOT: the gate's
+/// thread ceilings ([`crate::settings::SessionGuardSettings::warn_thread_count`],
+/// [`crate::resource_guard::THREAD_CEILING_MIN`]) must sit strictly ABOVE this
+/// number, and a test pins that. A ceiling at a count the process already
+/// carries at rest would refuse or warn on every spawn forever — which is what
+/// reusing this constant verbatim as the gate's warn ceiling would have done.
+pub(crate) const THREAD_WARNING_THRESHOLD: usize = 150;
 
 /// How often the monitor self-probes `/livez`.
 const SELF_PROBE_INTERVAL_SECS: u64 = 5;
@@ -716,9 +731,35 @@ fn get_memory_usage() -> u64 {
     0
 }
 
-/// Get current thread count
-fn get_thread_count() -> usize {
-    // This is an approximation - we count threads by looking at the process
+/// This process's OS thread count, or `None` when the count is genuinely
+/// UNREADABLE.
+///
+/// ## Why an `Option` and not the `0` its caller used to get
+///
+/// Every arm below has a failure path, and a live process always owns at least
+/// the thread asking the question — so `0` is not a low reading, it is a
+/// sensor failure wearing a reading's clothes. That distinction is load-bearing
+/// now that [`crate::resource_guard`] compares this number against a CEILING:
+/// read as a quantity, `0` is the most reassuring value the type can hold, and
+/// a guard that silently reads "perfectly idle" out of a failed snapshot is a
+/// guard that is missing on exactly the boxes whose instrumentation is already
+/// suffering. `None` is UNKNOWN, and this fleet's guards fail OPEN on UNKNOWN
+/// (`resource_guard`'s "Fail OPEN, always").
+///
+/// ## Cost, because this now runs on the spawn path
+///
+/// [`crate::resource_guard::probe_for_spawn`] calls this synchronously on a
+/// tokio worker immediately before a PTY opens, so whatever this touches, a
+/// runtime worker waits for. Both arms are in-process reads of an OS table: no
+/// subprocess, no WMI, no network, no `sysinfo` refresh. The Windows arm is the
+/// more expensive of the two — `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)`
+/// snapshots the SYSTEM-wide thread table and this walks it filtering on our
+/// PID — but it is the same call the health monitor has made every 60 s since
+/// this module shipped, it allocates nothing on the heap, and it is bounded by
+/// the number of threads on the box (thousands, not millions). It is still
+/// cheaper than the WMI query whose UNTIMED variant wedged the runner on
+/// 2026-08-29, which is the incident this lane exists to keep from repeating.
+pub(crate) fn thread_count_reading() -> Option<usize> {
     #[cfg(target_os = "windows")]
     {
         use std::mem::MaybeUninit;
@@ -731,13 +772,15 @@ fn get_thread_count() -> usize {
             let current_pid = GetCurrentProcessId();
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
             if snapshot == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-                return 0;
+                // The snapshot handle failed — under memory pressure, which is
+                // precisely when the caller most wants an answer. UNKNOWN.
+                return None;
             }
 
             let mut te32 = MaybeUninit::<THREADENTRY32>::uninit();
             (*te32.as_mut_ptr()).dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
 
-            let mut count = 0;
+            let mut count = 0usize;
 
             if Thread32First(snapshot, te32.as_mut_ptr()) != 0 {
                 loop {
@@ -752,19 +795,34 @@ fn get_thread_count() -> usize {
             }
 
             windows_sys::Win32::Foundation::CloseHandle(snapshot);
-            count
+            // A zero count means `Thread32First` failed or the walk never saw
+            // this process — impossible for a live process, so it is the
+            // enumeration that failed, not the thread count that is zero.
+            (count > 0).then_some(count)
         }
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        // On Linux, count entries in /proc/self/task
-        if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
-            entries.count()
-        } else {
-            0
-        }
+        // Linux: `/proc/self/task` has one entry per thread. An unreadable
+        // `/proc` (macOS, which has no procfs at all, or a container that
+        // hides it) is UNKNOWN rather than zero — same argument as above, and
+        // the arm that keeps this lane harmless off Windows exactly as the
+        // free-commit lane is harmless there.
+        let count = std::fs::read_dir("/proc/self/task").ok()?.count();
+        (count > 0).then_some(count)
     }
+}
+
+/// Get current thread count, with an unreadable sensor rendered as `0`.
+///
+/// The health monitor's own surfaces ([`HealthMetrics`], [`HealthStatus`]) are
+/// a `usize` on the wire and compare against a warning threshold, where a `0`
+/// on a failed read is merely a missing warning. Anything making a DECISION
+/// from this number must use [`thread_count_reading`] instead and handle the
+/// `None`.
+fn get_thread_count() -> usize {
+    thread_count_reading().unwrap_or(0)
 }
 
 /// Get process start time

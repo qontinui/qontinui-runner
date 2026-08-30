@@ -2305,8 +2305,20 @@ impl Default for CiNodeSettings {
 // 2026-08-07-runner-resource-guard-and-session-protection, Part B item 2)
 // ============================================================================
 
-/// Machine-owner floors that protect **live interactive sessions** from being
-/// killed by Windows commit exhaustion.
+/// Machine-owner limits that protect **live interactive sessions** from being
+/// killed by Windows commit exhaustion, and the runner process itself from
+/// being wedged by a spawn burst.
+///
+/// ## Two lanes, two directions
+///
+/// Four numbers, one switch. The first pair are FLOORS on free commit (lower
+/// is worse); the second pair are CEILINGS on this process's OS thread count
+/// (higher is worse), added after the 2026-08-29 wedge in which a burst of
+/// ~130 concurrent session spawns put 540 threads in the process — 119 of them
+/// mid-`CreateProcess` — against tokio's 512-slot blocking pool. The free-commit
+/// lane structurally could not see that: the box had memory, it had run out of
+/// threads. Both lanes are read by the same gate
+/// ([`crate::resource_guard`]) and produce the same three verdicts.
 ///
 /// This answers a different question from [`CiNodeSettings`]: not "may coord
 /// send this box more CI work" but "is this box safe enough to keep letting the
@@ -2367,11 +2379,80 @@ pub struct SessionGuardSettings {
     /// warning. Default 1.5 GiB.
     #[serde(default = "default_session_guard_critical_free_commit_bytes")]
     pub critical_free_commit_bytes: u64,
-    /// Master switch for the whole guard. Default **TRUE**, unlike
+    /// OS threads in the runner process **above** which spawning a new session
+    /// is still allowed but the user is warned. Default 256.
+    ///
+    /// ## A CEILING, not a floor — the direction is inverted here
+    ///
+    /// The two `*_free_commit_bytes` fields above are floors: LOWER is worse.
+    /// These two are ceilings: HIGHER is worse. Everything downstream mirrors
+    /// accordingly — the effective limit is a `min` over the three terms rather
+    /// than a `max` ([`crate::resource_guard::tighten_ceiling`]), the ladder
+    /// invariant is `critical >= warn` rather than `critical <= warn`
+    /// ([`crate::resource_guard::coerce_ceiling_ladder`]), and the clamp that
+    /// keeps a machine spawnable pushes the limit UP
+    /// ([`crate::resource_guard::THREAD_CEILING_MIN`]) rather than down.
+    ///
+    /// ## Why 256 — and why NOT the health monitor's 150
+    ///
+    /// Both ceilings on this lane are fractions of the one resource they
+    /// protect: tokio's blocking pool, whose default `max_blocking_threads` is
+    /// **512**. 256 is half of it — half the pool consumed is the point where
+    /// back-pressure starts being worth its cost, and it is the number
+    /// `thread_pressure`'s WARN band hands to a gate continuation deciding
+    /// whether to wait.
+    ///
+    /// The obvious alternative was to reuse
+    /// [`crate::health_monitor::THREAD_WARNING_THRESHOLD`] (150) so this lane
+    /// carried no second opinion about the same quantity. **Measurement killed
+    /// it.** Sampled every 3 s on 2026-08-30, a live idle runner (debug build,
+    /// embedded Postgres, full bridge set) sat at **150-151** threads — on and
+    /// over that constant. A warn ceiling there fires on every spawn of an idle
+    /// machine, which is not a warning, it is a permanent toast; and via Phase 1
+    /// of the load-aware-admission plan it would defer every gate continuation
+    /// on a box doing nothing. The relationship to that constant is kept, but as
+    /// an ORDERING rather than an equality: `resource_guard`'s tests pin both
+    /// ceilings strictly above it, so the spawn gate can never fire before the
+    /// health monitor's own "this is unusual" line.
+    #[serde(default = "default_session_guard_warn_thread_count")]
+    pub warn_thread_count: usize,
+    /// OS threads in the runner process above which a new spawn is refused by
+    /// default (always overridable at the point of refusal). Default 400.
+    ///
+    /// ## Why 400
+    ///
+    /// tokio's blocking pool is the resource this protects, and its default
+    /// `max_blocking_threads` is **512** — confirmed unreconfigured in every
+    /// runtime this binary actually runs on: the only two
+    /// `.max_blocking_threads(…)` calls in `src-tauri` are inside
+    /// `health_monitor`'s own `#[test]` fixtures (which build 1- and 2-slot
+    /// runtimes on purpose, to saturate them), and every production runtime
+    /// built by hand (`logging.rs`, `off_runtime.rs`, `main.rs`) sets only
+    /// `worker_threads`. When the
+    /// primary runner wedged on 2026-08-29 the process carried **540** threads,
+    /// 119 of them inside `CreateProcess`: the pool was full and every further
+    /// blocking call was queued behind a spawn that could not finish.
+    ///
+    /// 400 leaves ~112 slots of the 512 for the runtime's own core workers, the
+    /// reactor, the dedicated health/watchdog threads, and — the reason it is
+    /// not 500 — the race this gate cannot close: the reading is taken before
+    /// the PTY opens, and a burst of concurrent admissions can each pass the
+    /// ceiling and only then create their threads. A margin narrower than the
+    /// burst that caused the incident (~130 concurrent spawns) would let the
+    /// gate say yes 130 times at 500 and land at 630.
+    #[serde(default = "default_session_guard_critical_thread_count")]
+    pub critical_thread_count: usize,
+    /// Master switch for the whole guard — **both lanes**, the free-commit
+    /// floors and the thread ceilings alike. Default **TRUE**, unlike
     /// [`CiNodeSettings::enabled`]: `ci_node` opts a machine INTO accepting
     /// remote work, so off is the safe default there; this guard only ever
     /// warns the owner about their own machine, so off is the *unsafe* default
     /// — it is the state the fleet was already in on the night of the incident.
+    ///
+    /// One switch for two lanes on purpose: they are one guard answering one
+    /// question ("should this machine start another session right now?") from
+    /// two sensors, and an operator who turns the guard off has said what they
+    /// mean about the question, not about a sensor.
     #[serde(default = "default_session_guard_enabled")]
     pub enabled: bool,
 }
@@ -2387,6 +2468,19 @@ fn default_session_guard_critical_free_commit_bytes() -> u64 {
     3 * 1024 * 1024 * 1024 / 2
 }
 
+/// 256 threads — half tokio's 512-slot blocking pool. See
+/// [`SessionGuardSettings::warn_thread_count`] for why it is not the health
+/// monitor's 150, which a live runner was measured sitting on.
+fn default_session_guard_warn_thread_count() -> usize {
+    256
+}
+
+/// 400 threads — see [`SessionGuardSettings::critical_thread_count`] for the
+/// 512-slot blocking pool and the 540-thread wedge this is sized against.
+fn default_session_guard_critical_thread_count() -> usize {
+    400
+}
+
 fn default_session_guard_enabled() -> bool {
     true
 }
@@ -2396,6 +2490,8 @@ impl Default for SessionGuardSettings {
         Self {
             warn_free_commit_bytes: default_session_guard_warn_free_commit_bytes(),
             critical_free_commit_bytes: default_session_guard_critical_free_commit_bytes(),
+            warn_thread_count: default_session_guard_warn_thread_count(),
+            critical_thread_count: default_session_guard_critical_thread_count(),
             enabled: default_session_guard_enabled(),
         }
     }

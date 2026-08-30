@@ -10,6 +10,16 @@
  *     Claude Code sessions died inside runner-spawned terminals while the
  *     windows stayed open. Nothing local was watching; these floors are what
  *     watches.
+ *
+ *     **This panel edits the free-commit half of that group only.** Since
+ *     `2026-08-30-load-aware-spawn-admission-control` the same struct also
+ *     carries two OS-thread CEILINGS (`warn_thread_count` /
+ *     `critical_thread_count`, defaults 256 / 400 against tokio's 512-slot
+ *     blocking pool), enforced by the same gate and edited today only through
+ *     `settings.json` or the fleet term. The save command reads them back and
+ *     writes them through untouched, so saving from here can never reset a
+ *     lane this panel does not show — but a control for them is the honest
+ *     next step, not a second hand-edited surface.
  *   - `ci_node` (`settings::CiNodeSettings`) — the floors that decide whether
  *     coord may send this box CI work. It had NO settings UI before this panel
  *     and `settings.rs` documented it as hand-edited JSON; shipping the first

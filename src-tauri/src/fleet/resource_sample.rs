@@ -94,6 +94,18 @@ pub(crate) fn jittered_sleep(interval_secs: u64) -> Duration {
 pub(crate) enum Lane {
     Host,
     Wsl,
+    /// The runner process's own OS thread budget.
+    ///
+    /// **Never published as a sample lane** — a `ResourceSample` describes a
+    /// machine-level pool that coord ranks across machines, and this one is a
+    /// property of a single process. It lives in this enum for the reason the
+    /// [`Lane::as_str`] doc gives: the spawn gate's fleet-limit cache selects a
+    /// lane's limits by this string, and the thread ceiling needs a lookup key
+    /// (`mcp::fleet_policy_poller::SessionFloorsByLane::for_lane`,
+    /// `resource_guard::effective_thread_ceilings`). A second bare `"threads"`
+    /// literal in one of those two places is exactly how a renamed lane becomes
+    /// a silently empty lookup instead of a compile error.
+    Threads,
 }
 
 impl Lane {
@@ -108,6 +120,7 @@ impl Lane {
         match self {
             Lane::Host => "host",
             Lane::Wsl => "wsl",
+            Lane::Threads => "threads",
         }
     }
 }
