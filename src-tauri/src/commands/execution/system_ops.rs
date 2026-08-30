@@ -213,6 +213,7 @@ pub fn open_folder(path: String) -> Result<CommandResponse, String> {
 
     #[cfg(target_os = "windows")]
     {
+        // console-ok: a GUI file manager, not a console program.
         Command::new("explorer")
             .arg(&path)
             .spawn()
@@ -221,6 +222,7 @@ pub fn open_folder(path: String) -> Result<CommandResponse, String> {
 
     #[cfg(target_os = "macos")]
     {
+        // console-ok: macOS reveal — never reached on Windows.
         Command::new("open")
             .arg(&path)
             .spawn()
@@ -229,6 +231,7 @@ pub fn open_folder(path: String) -> Result<CommandResponse, String> {
 
     #[cfg(target_os = "linux")]
     {
+        // console-ok: Linux reveal — never reached on Windows.
         Command::new("xdg-open")
             .arg(&path)
             .spawn()

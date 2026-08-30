@@ -815,6 +815,7 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
     // rendered a passing row for a seam pointing sessions at a dead socket.
     crate::agent_runtime::finalize_headless_child_env(&mut headless);
 
+    // console-ok: built to fingerprint the seam env, never spawned (see above).
     let mut claude_session = std::process::Command::new("claude");
     crate::claude_session::session::ClaudeSession::finalize_child_env(
         &mut claude_session,
@@ -822,6 +823,7 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
         "(config-report probe)",
     );
 
+    // console-ok: built to fingerprint the seam env, never spawned (see above).
     let mut ai_child = std::process::Command::new("claude");
     crate::ai_provider::process::prepare_ai_child_env(&mut ai_child);
 

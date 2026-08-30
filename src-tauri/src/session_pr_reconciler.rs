@@ -160,8 +160,17 @@ async fn output_with_timeout(cmd: &mut Command, budget: Duration, what: &str) ->
 
 /// `git -C <dir> <args…>` under [`GIT_COMMAND_TIMEOUT`]. Every git invocation
 /// in this module goes through here; `None` is "git could not answer".
+///
+/// `tokio_no_window`, not a bare `Command::new`: the runner is a GUI-subsystem
+/// process in release builds (`main.rs`'s `windows_subsystem = "windows"`), so
+/// on Windows a console child spawned without `CREATE_NO_WINDOW` allocates its
+/// own console — a visible window that flashes open and shut. This reconciler
+/// forks git several times per session per 30s tick, which is the highest-rate
+/// spawn site in the runner; spawned bare it is a continuous flicker on any
+/// installed (non-debug) build. Same defect as commit 2318026ae, which this
+/// module was written one week after and so never inherited.
 async fn run_git(dir: &str, args: &[&str]) -> Option<Output> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::process_helpers::tokio_no_window("git");
     cmd.arg("-C").arg(dir).args(args);
     let what = format!("git {} (in {dir})", args.join(" "));
     output_with_timeout(&mut cmd, GIT_COMMAND_TIMEOUT, &what).await
@@ -1664,7 +1673,9 @@ pub(crate) async fn resolve_github_token() -> Option<String> {
     // exactly how a total outage came to be mistaken for "the fix does not
     // work". A timeout here yields the same `None` ("no token") the error path
     // already returns, so the tick fails FAST and visibly instead of hanging.
-    let mut cmd = Command::new("gh");
+    // `tokio_no_window` for the same reason `run_git` uses it — this one runs
+    // once per tick even when every git call is cache-served.
+    let mut cmd = crate::process_helpers::tokio_no_window("gh");
     cmd.args(["auth", "token"]);
     let out = output_with_timeout(&mut cmd, GH_TOKEN_TIMEOUT, "gh auth token").await?;
     if !out.status.success() {

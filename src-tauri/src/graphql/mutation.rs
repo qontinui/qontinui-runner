@@ -338,6 +338,7 @@ impl MutationRoot {
             }
             #[cfg(not(target_os = "windows"))]
             {
+                // console-ok: the non-Windows arm; the Windows one above is suppressed.
                 let _ = std::process::Command::new("kill")
                     .args(["-9", &pid.to_string()])
                     .output();

@@ -222,6 +222,7 @@ fn activate_window_windows_by_pid(pid: u32) -> bool {
 #[cfg(target_os = "linux")]
 fn list_windows_linux(filter: Option<&str>) -> Vec<WindowInfo> {
     // Try wmctrl first, fall back to xdotool.
+    // console-ok: Linux window manager (X11) — never reached on Windows.
     if let Ok(output) = std::process::Command::new("wmctrl")
         .args(["-l", "-p"])
         .output()
@@ -232,6 +233,7 @@ fn list_windows_linux(filter: Option<&str>) -> Vec<WindowInfo> {
     }
 
     // Fallback: xdotool
+    // console-ok: Linux window manager (X11) — never reached on Windows.
     if let Ok(output) = std::process::Command::new("xdotool")
         .args(["search", "--name", ""])
         .output()
@@ -299,6 +301,7 @@ fn parse_xdotool_output(stdout: &str, filter: Option<&str>) -> Vec<WindowInfo> {
         }
 
         // Get window name via xdotool
+        // console-ok: Linux window manager (X11) — never reached on Windows.
         let title = std::process::Command::new("xdotool")
             .args(["getwindowname", wid])
             .output()
@@ -312,6 +315,7 @@ fn parse_xdotool_output(stdout: &str, filter: Option<&str>) -> Vec<WindowInfo> {
             }
         }
 
+        // console-ok: Linux window manager (X11) — never reached on Windows.
         let pid = std::process::Command::new("xdotool")
             .args(["getwindowpid", wid])
             .output()
@@ -341,6 +345,7 @@ fn parse_xdotool_output(stdout: &str, filter: Option<&str>) -> Vec<WindowInfo> {
 #[cfg(target_os = "linux")]
 fn activate_window_linux_by_pid(pid: u32) -> bool {
     // Try wmctrl first: find window ID for PID, then activate.
+    // console-ok: Linux window manager (X11) — never reached on Windows.
     if let Ok(output) = std::process::Command::new("wmctrl")
         .args(["-l", "-p"])
         .output()
@@ -353,6 +358,7 @@ fn activate_window_linux_by_pid(pid: u32) -> bool {
                     if let Ok(wnd_pid) = parts[2].parse::<u32>() {
                         if wnd_pid == pid {
                             let wid = parts[0];
+                            // console-ok: Linux window manager (X11) — never reached on Windows.
                             return std::process::Command::new("wmctrl")
                                 .args(["-i", "-a", wid])
                                 .status()
@@ -366,12 +372,14 @@ fn activate_window_linux_by_pid(pid: u32) -> bool {
     }
 
     // Fallback: xdotool search by pid, then activate first match.
+    // console-ok: Linux window manager (X11) — never reached on Windows.
     if let Ok(output) = std::process::Command::new("xdotool")
         .args(["search", "--pid", &pid.to_string()])
         .output()
     {
         if output.status.success() {
             if let Some(wid) = String::from_utf8_lossy(&output.stdout).lines().next() {
+                // console-ok: Linux window manager (X11) — never reached on Windows.
                 return std::process::Command::new("xdotool")
                     .args(["windowactivate", wid.trim()])
                     .status()
@@ -402,6 +410,7 @@ fn list_windows_macos(filter: Option<&str>) -> Vec<WindowInfo> {
         return output
     "#;
 
+    // console-ok: macOS AppleScript — never reached on Windows.
     let output = match std::process::Command::new("osascript")
         .args(["-e", script])
         .output()
@@ -451,6 +460,7 @@ fn activate_window_macos_by_pid(pid: u32) -> bool {
         r#"tell application "System Events" to set frontmost of (first process whose unix id is {}) to true"#,
         pid
     );
+    // console-ok: macOS AppleScript — never reached on Windows.
     std::process::Command::new("osascript")
         .args(["-e", &script])
         .status()

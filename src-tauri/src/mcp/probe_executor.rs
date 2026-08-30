@@ -182,7 +182,7 @@ fn git_read(worktree: &Path, args: &[&str]) -> Option<String> {
         Some(sub) if READ_ONLY_GIT.contains(sub) => {}
         _ => return None,
     }
-    let out = std::process::Command::new("git")
+    let out = crate::process_helpers::no_window("git")
         .arg("-C")
         .arg(worktree)
         .args(args)
