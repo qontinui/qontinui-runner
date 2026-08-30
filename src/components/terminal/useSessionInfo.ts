@@ -183,6 +183,8 @@ export type SessionInfoField =
   | "tenant"
   | "task-run"
   | "working-dir"
+  | "recorded-page"
+  | "recorded-zone"
   | "provider"
   | "origin"
   | "opened-at"
@@ -545,6 +547,26 @@ export interface InfoRowSpec {
   copyable: boolean;
 }
 
+/**
+ * The recorded `zoneIndex` as the operator reads it — 1-based, matching the
+ * trigger label ("zone 3"), with the `-1` sentinel spelled out.
+ *
+ * `-1` stays a RAW value rather than becoming `unknown`: the record definitely
+ * holds it, so what needs spelling is its MEANING, not its presence. It is also
+ * deliberately not rendered as a confident "unassigned" — the store cannot tell
+ * the frontend ASSERTING that a tab was dragged out of every zone from a writer
+ * that simply had no view of the grid, and those are different claims.
+ *
+ * This is the RECORD's placement, not the live tab's, and the two can disagree:
+ * restore filters by the recorded page, so a session whose record drifted onto
+ * a page the grid never mounts is silently unrestorable. Surfacing it is what
+ * makes that visible before the next restart rather than after it. Pure.
+ */
+export function formatRecordedZone(zoneIndex: number): string {
+  if (!Number.isInteger(zoneIndex)) return UNKNOWN_TEXT;
+  return zoneIndex >= 0 ? `Zone ${zoneIndex + 1}` : "none recorded";
+}
+
 /** Epoch milliseconds → `YYYY-MM-DD HH:MM:SSZ`; `null` for a non-finite or
  * unset stamp, which renders as `unknown` rather than `1970-01-01`. Pure. */
 export function formatEpochMs(ms: number | null): string | null {
@@ -553,7 +575,7 @@ export function formatEpochMs(ms: number | null): string | null {
 }
 
 /**
- * The panel's labelled rows, one per D1 field group, ALWAYS all fifteen —
+ * The panel's labelled rows, one per D1 field group, ALWAYS all seventeen —
  * a field with no value renders `unknown`, it does not vanish (R2). Pure —
  * unit-tested, so the UI Bridge id/field contract is checkable without a DOM.
  */
@@ -628,6 +650,19 @@ export function sessionInfoRows(body: SessionInfoBody): InfoRowSpec[] {
     row("tenant", "Tenant", identity.tenantId, undefined, true),
     row("task-run", "Task run", identity.taskRunId, undefined, true),
     row("working-dir", "Working dir", placement.workingDir, undefined, true),
+    // The two placement fields the projection has always returned and nothing
+    // ever rendered. They are what BOOT RESTORE keys off, so a drift here is
+    // invisible until a restart drops the session.
+    row("recorded-page", "Recorded page", placement.pageId || null, undefined, true),
+    row(
+      "recorded-zone",
+      "Recorded zone",
+      // `-1` IS a value the record holds, so it stays raw; only a missing or
+      // non-integer index is an absence. Matches `backendValueForField` in
+      // `scripts/uibridge-session-info.test.mjs`, which compares raw to raw.
+      Number.isInteger(placement.zoneIndex) ? String(placement.zoneIndex) : null,
+      formatRecordedZone(placement.zoneIndex),
+    ),
     row("provider", "Provider", lifecycle.provider),
     row("origin", "Origin", lifecycle.origin),
     row(

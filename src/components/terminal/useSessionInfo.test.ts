@@ -25,6 +25,7 @@ import { describe, it, expect } from "vitest";
 import {
   deriveTrigger,
   formatEpochMs,
+  formatRecordedZone,
   isProvisionalIdentity,
   PROVISIONAL_SUFFIX,
   normalizeSessionInfo,
@@ -533,7 +534,7 @@ describe("sessionInfoElementId", () => {
 });
 
 describe("sessionInfoRows", () => {
-  it("emits all fifteen fields, in the D5 order, all four ids among them (D2)", () => {
+  it("emits all seventeen fields, in the D5 order, all four ids among them (D2)", () => {
     expect(sessionInfoRows(body()).map((r) => r.field)).toEqual([
       "account",
       "name",
@@ -543,6 +544,8 @@ describe("sessionInfoRows", () => {
       "tenant",
       "task-run",
       "working-dir",
+      "recorded-page",
+      "recorded-zone",
       "provider",
       "origin",
       "opened-at",
@@ -634,7 +637,51 @@ describe("sessionInfoRows", () => {
       "tenant",
       "task-run",
       "working-dir",
+      "recorded-page",
     ]);
+  });
+
+  /**
+   * The record's OWN placement, which the projection has always returned and
+   * the panel never showed. It is what boot restore keys off, so it is worth
+   * reading precisely when it DISAGREES with the live tab — a record on a page
+   * the grid never mounts is silently unrestorable.
+   */
+  it("surfaces the recorded placement, raw index and all", () => {
+    const rows = sessionInfoRows(body());
+    const byField = Object.fromEntries(rows.map((r) => [r.field, r]));
+
+    expect(byField["recorded-page"].value).toBe("default");
+    expect(byField["recorded-page"].display).toBe("default");
+
+    // Raw value stays the index a UI Bridge client can compare against the
+    // backend; only the DISPLAY is 1-based, matching the trigger label.
+    expect(byField["recorded-zone"].value).toBe("3");
+    expect(byField["recorded-zone"].display).toBe("Zone 4");
+  });
+
+  it("spells the -1 sentinel instead of printing a zone that does not exist", () => {
+    const rows = sessionInfoRows(
+      body({ placement: { pageId: "", zoneIndex: -1, workingDir: null } }),
+    );
+    const byField = Object.fromEntries(rows.map((r) => [r.field, r]));
+
+    // -1 is DATA, not an absence: the raw value survives so a client can see
+    // exactly what the record holds...
+    expect(byField["recorded-zone"].value).toBe("-1");
+    expect(byField["recorded-zone"].display).toBe("none recorded");
+    // ...while an EMPTY page really is absent, and renders as unknown.
+    expect(byField["recorded-page"].value).toBeNull();
+    expect(byField["recorded-page"].display).toBe(UNKNOWN_TEXT);
+  });
+});
+
+describe("formatRecordedZone", () => {
+  it("is 1-based for a real zone and spells every non-zone", () => {
+    expect(formatRecordedZone(0)).toBe("Zone 1");
+    expect(formatRecordedZone(8)).toBe("Zone 9");
+    expect(formatRecordedZone(-1)).toBe("none recorded");
+    expect(formatRecordedZone(Number.NaN)).toBe(UNKNOWN_TEXT);
   });
 });
 

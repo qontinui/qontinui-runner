@@ -69,6 +69,45 @@ describe("applySessionBound", () => {
   });
 
   /**
+   * The account must survive the correction. `record_session_open_into` keeps a
+   * known `config_dir` when the provider's hook omits one — the hook does not
+   * always report an account — so a bind can legitimately arrive with an empty
+   * `configDir`. The listener applies this update by SPREAD, so passing
+   * `undefined` through would blank a populated `claudeConfigDir` and
+   * `rememberSessionId` would persist the blank. Harmless while a bind could
+   * only stamp an unbound tab; reachable the moment a provider-reported bind
+   * can correct a populated one.
+   */
+  it("a correction with no configDir keeps the account the tab already knew", () => {
+    const tabs = [
+      {
+        id: "term-1",
+        claudeSessionId: "a20acdbb-predicted",
+        claudeConfigDir: "C:/claude/.claude-gmail",
+      },
+    ];
+    expect(
+      applySessionBound(tabs, payload({ configDir: "", providerReported: true }))?.claudeConfigDir,
+    ).toBe("C:/claude/.claude-gmail");
+  });
+
+  it("a correction that DOES carry an account still moves it — that is the fix working", () => {
+    const tabs = [
+      {
+        id: "term-1",
+        claudeSessionId: "a20acdbb-predicted",
+        claudeConfigDir: "C:/claude/.claude-gmail",
+      },
+    ];
+    expect(
+      applySessionBound(
+        tabs,
+        payload({ configDir: "C:/claude/.claude-paktis", providerReported: true }),
+      )?.claudeConfigDir,
+    ).toBe("C:/claude/.claude-paktis");
+  });
+
+  /**
    * The hazard that makes `providerReported` — not the `origin` grade — the
    * gate. Reconcile's rung-2 bind lifts its id from the anchor process's typed
    * `--session-id`, which IS the runner's prediction, yet grades it

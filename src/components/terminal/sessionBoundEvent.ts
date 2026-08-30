@@ -50,6 +50,9 @@ export interface SessionBoundUpdate {
 /**
  * Decide the tab update for one `session-bound` event.
  *
+ * A config dir the payload does not carry leaves the tab's existing one alone
+ * — an omission is not a claim of absence, and the update is applied by spread.
+ *
  * Returns `null` (no-op) when:
  *  - no tab matches the payload's terminal id (tab closed / other window),
  *  - the tab already holds the SAME id (nothing to change), or
@@ -81,7 +84,9 @@ export interface SessionBoundUpdate {
  * Pure + exported for unit tests.
  */
 export function applySessionBound(
-  tabs: ReadonlyArray<Pick<TerminalTab, "id"> & { claudeSessionId?: string }>,
+  tabs: ReadonlyArray<
+    Pick<TerminalTab, "id"> & { claudeSessionId?: string; claudeConfigDir?: string }
+  >,
   payload: SessionBoundPayload,
 ): SessionBoundUpdate | null {
   if (!payload.terminalId || !payload.sessionId) return null;
@@ -92,6 +97,13 @@ export function applySessionBound(
   return {
     tabId: tab.id,
     claudeSessionId: payload.sessionId,
-    claudeConfigDir: payload.configDir || undefined,
+    // An OMITTED config dir is not a claim that there isn't one. The caller
+    // applies this update by spread, so passing `undefined` through would
+    // ERASE a known account (and persist the erasure to `lastKnownSessionIds`)
+    // — reachable now that a provider-reported bind can correct a tab that is
+    // already populated. The empty string is the wire contract's "unknown", so
+    // an unknown falls back to what the tab already holds. A bind that DOES
+    // carry an account still overwrites: that is the correction working.
+    claudeConfigDir: payload.configDir || tab.claudeConfigDir || undefined,
   };
 }

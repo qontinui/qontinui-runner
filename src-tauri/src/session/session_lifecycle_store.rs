@@ -182,6 +182,17 @@ pub const ORIGIN_RECONCILED: &str = "reconciled";
 /// (auto-resume-eligible), unlike the conservative `reconciled`/mtime guess.
 pub const ORIGIN_OBSERVED: &str = "observed";
 
+/// The `zone_index` sentinel for "this session sits in no zone".
+///
+/// It carries TWO meanings and the writer decides which: the frontend writes it
+/// to ASSERT that a tab was dragged out of every zone (past the 9-zone ceiling a
+/// live tab is genuinely unassigned), while a backstop that simply has no view
+/// of the grid means "unknown". Only the asserting writer may persist it —
+/// [`crate::session::reconcile`] carries the terminal's existing zone forward
+/// instead, because an unknown that overwrites a known value is not a default,
+/// it is data loss. Mirrors `UNZONED_INDEX` in `src/components/terminal/sessionRecordArgs.ts`.
+pub const UNZONED_ZONE_INDEX: i32 = -1;
+
 /// Normalize a possibly-legacy `origin` value to the current vocabulary. Maps
 /// the pre-migration `bind_origin` values (`"pinned"`→`"authoritative"`,
 /// `"guessed"`→`"reconciled"`) and passes the new values through unchanged —

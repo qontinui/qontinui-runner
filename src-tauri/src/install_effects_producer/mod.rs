@@ -273,7 +273,23 @@ async fn post_session_open(
             // reconcile poll (`main.rs::emit_session_bound`). Emit it here too.
             // Fire-and-forget: the registry write above is already durable, so
             // an emit failure costs a stale tab, never a lost session.
-            emit_session_bound_for_open(&state.app_handle, &req, &provider);
+            //
+            // The account is read back from the RECORD, never from `req`. The
+            // hook does not always report `config_dir`, and
+            // `record_session_open_into` deliberately keeps a known account
+            // over such an omission — so mirroring the request instead would
+            // emit an EMPTY config dir. That was harmless while a bind could
+            // only ever stamp an UNBOUND tab, but a provider-reported bind now
+            // CORRECTS a tab that already holds an id, and the frontend applies
+            // the payload's fields wholesale: an empty one would blank the
+            // account the tab already knew and persist the blank to
+            // `lastKnownSessionIds`. Mirroring the record keeps the store and
+            // the tab telling the same story.
+            let recorded_config_dir = store
+                .get(&req.session_id)
+                .and_then(|r| r.config_dir)
+                .unwrap_or_default();
+            emit_session_bound_for_open(&state.app_handle, &req, &provider, &recorded_config_dir);
             Ok(Json(ApiResponse::success(())))
         }
         None => {
@@ -301,6 +317,10 @@ async fn post_session_open(
 /// is precisely what `record_session_open_into` just wrote — the payload
 /// mirrors the record rather than asserting anything of its own.
 ///
+/// `recorded_config_dir` is the account the STORE now holds, not the one the
+/// request carried: the hook may omit `config_dir`, and the record keeps a
+/// previously-known account over that omission.
+///
 /// `provider_reported: true` is the field that actually licenses a correction,
 /// and it is set ONLY here. Grade alone would be the wrong gate: reconcile's
 /// rung-2 bind is `authoritative` too, but its id is lifted from the typed
@@ -310,6 +330,7 @@ fn emit_session_bound_for_open(
     app_handle: &tauri::AppHandle,
     req: &SessionOpenRequest,
     provider: &str,
+    recorded_config_dir: &str,
 ) {
     use crate::session::reconcile::{SessionBoundPayload, SESSION_BOUND_EVENT};
     use crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE;
@@ -318,8 +339,9 @@ fn emit_session_bound_for_open(
     let payload = SessionBoundPayload {
         terminal_id: req.terminal_id.clone(),
         session_id: req.session_id.clone(),
-        // Empty string is the wire contract's "unknown", never a path.
-        config_dir: req.config_dir.clone().unwrap_or_default(),
+        // Empty string is the wire contract's "unknown", never a path. This is
+        // the account as RECORDED — see the caller for why not `req`.
+        config_dir: recorded_config_dir.to_string(),
         origin: ORIGIN_AUTHORITATIVE.to_string(),
         confirmed: true,
         // The provider reported this id about ITSELF. This is the one bind in
@@ -974,41 +996,67 @@ fn normalize_msys_cwd(cwd: &str) -> String {
 /// non-restorable). Only a record the hook creates FIRST (capture-miss: the
 /// hook beat every other writer) uses the hook's own cwd/title — normalized
 /// from MSYS to a Windows path so a later restore can actually spawn there.
+///
+/// Layout is inherited by TERMINAL, not only by session id. The id the provider
+/// reports is not always the id the runner PREDICTED — every resume of a
+/// pre-existing session, and any rebind of a live session onto a new PTY,
+/// adopts a different one, which is the whole reason this route now emits
+/// `session-bound` so the tab can be corrected. But `store.get(&req.session_id)`
+/// misses in exactly that case, and the "hook created it first" arm then wrote
+/// `("default", 0)` — stranding the REAL session on the never-mounted page while
+/// the row that knew the true placement was the sibling `record_open` was about
+/// to supersede on this very terminal. So: fall back to the still-open record on
+/// the SAME TERMINAL before falling back to the hook's own context. The terminal
+/// is the right key — the grid page and zone are properties of where the PTY
+/// sits, not of whichever session id currently owns it.
 fn record_session_open_into(
     store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
     req: &SessionOpenRequest,
     provider: &str,
 ) {
     let existing = store.get(&req.session_id);
-    let (page_id, zone_index, working_dir, title) = match &existing {
-        Some(prior) => (
-            prior.page_id.clone(),
-            prior.zone_index,
-            prior.working_dir.clone().unwrap_or_default(),
-            prior.title.clone().unwrap_or_else(|| provider.to_string()),
-        ),
-        None => {
-            let raw_cwd = req.cwd.clone().unwrap_or_default();
-            #[cfg(windows)]
-            let working_dir = normalize_msys_cwd(&raw_cwd);
-            #[cfg(not(windows))]
-            let working_dir = raw_cwd;
-            let title = req
-                .cwd
-                .as_deref()
-                .and_then(|c| c.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(provider)
-                .to_string();
-            ("default".to_string(), 0, working_dir, title)
-        }
-    };
+    // Only consulted when the provider's id has no record of its own; see the
+    // "inherited by TERMINAL" paragraph above.
+    let terminal_prior = existing
+        .is_none()
+        .then(|| store.find_open_by_terminal(&req.terminal_id))
+        .flatten();
+    let (page_id, zone_index, working_dir, title) =
+        match existing.as_ref().or(terminal_prior.as_ref()) {
+            Some(prior) => (
+                prior.page_id.clone(),
+                prior.zone_index,
+                prior.working_dir.clone().unwrap_or_default(),
+                prior.title.clone().unwrap_or_else(|| provider.to_string()),
+            ),
+            None => {
+                let raw_cwd = req.cwd.clone().unwrap_or_default();
+                #[cfg(windows)]
+                let working_dir = normalize_msys_cwd(&raw_cwd);
+                #[cfg(not(windows))]
+                let working_dir = raw_cwd;
+                let title = req
+                    .cwd
+                    .as_deref()
+                    .and_then(|c| c.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(provider)
+                    .to_string();
+                ("default".to_string(), 0, working_dir, title)
+            }
+        };
     // config_dir: the hook DOES know the real account (CLAUDE_CONFIG_DIR) —
-    // take it when present, but never erase a known one with None.
+    // take it when present, but never erase a known one with None. The terminal
+    // fallback is last and follows the same reasoning as the layout fields
+    // above: one PTY runs one account, so a hook that omits the account for a
+    // newly-adopted id should inherit the one the terminal is already running
+    // under rather than record none. A hook that DOES report an account always
+    // wins, so a genuine account change is still recorded.
     let config_dir = req
         .config_dir
         .clone()
-        .or_else(|| existing.as_ref().and_then(|r| r.config_dir.clone()));
+        .or_else(|| existing.as_ref().and_then(|r| r.config_dir.clone()))
+        .or_else(|| terminal_prior.as_ref().and_then(|r| r.config_dir.clone()));
     crate::commands::terminal::record_pinned_session_open(
         store,
         req.session_id.clone(),
@@ -2394,6 +2442,158 @@ mod tests {
             "config dir not erased by a None from the hook"
         );
         assert!(rec.confirmed_at.is_some(), "hook still confirms");
+    }
+
+    /// The case PR #1201 exists for: the provider adopts an id the runner did
+    /// NOT predict, so the hook's `session_id` has no record of its own.
+    ///
+    /// The record must still land where the TERMINAL actually is. Looking up by
+    /// session id alone misses here, and the "hook created it first" arm then
+    /// wrote `("default", 0)` — putting the real session on a page the grid
+    /// never mounts, which is the strand class
+    /// `session_open_preserves_existing_layout_fields` guards against in the
+    /// same-id direction. The row that knows the true placement is the
+    /// prediction's row on this very terminal, which `record_open` is about to
+    /// supersede — so read it BEFORE it is retired.
+    #[test]
+    fn session_open_under_a_new_id_inherits_the_terminals_placement() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        // The runner's spawn-time PREDICTION, on the real page/zone.
+        store.record_open(TerminalSessionRecord {
+            claude_session_id: "predicted-id".to_string(),
+            config_dir: Some("C:\\claude\\.claude-gmail".to_string()),
+            working_dir: Some("D:\\qontinui-root".to_string()),
+            page_id: "bf44dfd5-real-page".to_string(),
+            zone_index: 2,
+            title: Some("fleet-cobalt-parrot".to_string()),
+            terminal_id: "term-1".to_string(),
+            opened_at: 0,
+            last_seen_at: 0,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: "claude".to_string(),
+            origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
+            restore_pending_at: None,
+            confirmed_at: None,
+            handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
+        });
+
+        // The provider reports a DIFFERENT id about itself, from bash.
+        let req = SessionOpenRequest {
+            terminal_id: "term-1".to_string(),
+            session_id: "provider-adopted-id".to_string(),
+            source: Some("startup".to_string()),
+            provider: Some("claude".to_string()),
+            config_dir: None,
+            cwd: Some("/d/qontinui-root".to_string()),
+        };
+        record_session_open_into(&store, &req, "claude");
+
+        let rec = store
+            .get("provider-adopted-id")
+            .expect("hook record written");
+        assert_eq!(
+            rec.page_id, "bf44dfd5-real-page",
+            "inherited the terminal's page — NOT stranded on the never-mounted \"default\""
+        );
+        assert_eq!(rec.zone_index, 2, "inherited the terminal's zone, not 0");
+        assert_eq!(
+            rec.title.as_deref(),
+            Some("fleet-cobalt-parrot"),
+            "inherited the terminal's title over the hook's cwd-derived guess"
+        );
+        assert_eq!(
+            rec.config_dir.as_deref(),
+            Some("C:\\claude\\.claude-gmail"),
+            "inherited the account the terminal is already running under"
+        );
+        assert!(rec.confirmed_at.is_some(), "hook still confirms");
+        assert_eq!(
+            store.get("predicted-id").unwrap().state,
+            "closed",
+            "the prediction's row is still superseded — inheriting is not resurrecting"
+        );
+    }
+
+    /// Inheriting is bounded by the terminal: a hook for a terminal the store
+    /// knows nothing about still falls back to its own context, and must not
+    /// borrow placement from some unrelated session.
+    #[test]
+    fn session_open_on_an_unknown_terminal_still_uses_the_hooks_own_context() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        // A record on a DIFFERENT terminal — must not be borrowed from.
+        store.record_open(TerminalSessionRecord {
+            claude_session_id: "elsewhere".to_string(),
+            config_dir: None,
+            working_dir: Some("D:\\other".to_string()),
+            page_id: "some-other-page".to_string(),
+            zone_index: 7,
+            title: Some("other".to_string()),
+            terminal_id: "term-other".to_string(),
+            opened_at: 0,
+            last_seen_at: 0,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: "claude".to_string(),
+            origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
+            restore_pending_at: None,
+            confirmed_at: None,
+            handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
+        });
+
+        let req = SessionOpenRequest {
+            terminal_id: "term-fresh".to_string(),
+            session_id: "fresh-id".to_string(),
+            source: Some("startup".to_string()),
+            provider: Some("claude".to_string()),
+            config_dir: None,
+            cwd: Some("/d/qontinui-root".to_string()),
+        };
+        record_session_open_into(&store, &req, "claude");
+
+        let rec = store.get("fresh-id").expect("hook record written");
+        assert_eq!(
+            rec.page_id, "default",
+            "no terminal record ⇒ the hook's own default"
+        );
+        assert_eq!(rec.zone_index, 0);
+        assert_eq!(
+            rec.title.as_deref(),
+            Some("qontinui-root"),
+            "title still derived from the hook's cwd"
+        );
     }
 
     /// MSYS drive-path normalization for hook-created records (Windows).

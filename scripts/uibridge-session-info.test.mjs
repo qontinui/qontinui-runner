@@ -144,7 +144,7 @@ const NEVER_KILL = ["node", "node.exe", "powershell", "powershell.exe", "pwsh", 
 /** The runner's own image name — the only thing T10 is allowed to stop. */
 const RUNNER_PROCESS_NAME = "qontinui-runner";
 
-/** The fourteen addressable row fields (plan D5). */
+/** The sixteen addressable row fields (plan D5). */
 const INFO_FIELDS = [
   "account",
   "name",
@@ -154,6 +154,8 @@ const INFO_FIELDS = [
   "tenant",
   "task-run",
   "working-dir",
+  "recorded-page",
+  "recorded-zone",
   "provider",
   "origin",
   "opened-at",
@@ -1633,6 +1635,14 @@ function backendValueForField(body, field) {
       return identity?.taskRunId ?? null;
     case "working-dir":
       return placement?.workingDir ?? null;
+    // The RECORD's placement. `pageId` follows the ordinary unknown contract
+    // (empty ⇒ never observed), but `zoneIndex` does NOT: `-1` is a value the
+    // record genuinely holds, so it is compared as the raw string "-1" rather
+    // than as an absence — only a missing/non-integer index is unknown.
+    case "recorded-page":
+      return placement?.pageId ? String(placement.pageId) : null;
+    case "recorded-zone":
+      return Number.isInteger(placement?.zoneIndex) ? String(placement.zoneIndex) : null;
     case "provider":
       return lifecycle?.provider ?? null;
     case "origin":
