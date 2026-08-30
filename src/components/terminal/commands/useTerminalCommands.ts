@@ -647,8 +647,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // from `layout.zones.length` alone would answer `focused 1 zone` for a
       // no-op, which is the very shape this phase removes.
       if (target === "next" || target === "prev") {
-        const moved =
-          target === "next" ? zoneLayout.focusNextZone() : zoneLayout.focusPrevZone();
+        const moved = target === "next" ? zoneLayout.focusNextZone() : zoneLayout.focusPrevZone();
         return deriveVerdict({
           produced: moved,
           verb: "focused",
@@ -844,10 +843,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       return ok(
         effect("approved", "session", report.delivered, {
           requested: report.targeted,
-          detail:
-            report.delivered === report.targeted
-              ? undefined
-              : describeUndelivered(report),
+          detail: report.delivered === report.targeted ? undefined : describeUndelivered(report),
         }),
       );
     },
@@ -1584,9 +1580,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         else next.add(tag);
         return next;
       });
-      return ok(
-        stateEffect(wasActive ? "cleared" : "applied", `tag filter "${tag}"`, true),
-      );
+      return ok(stateEffect(wasActive ? "cleared" : "applied", `tag filter "${tag}"`, true));
     },
   });
 
@@ -1804,18 +1798,18 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // with no rows is a card with nothing in it, and that is what the
       // operator needs to know.
       const spec = buildMetricsCardSpec({
-          metrics: metricsRef.current,
-          sessionStates,
-          tabs,
-          autoApproveCount: transitionEffects.autoApproveCount ?? 0,
-          autoRestartCount: transitionEffects.autoRestartCount ?? 0,
-          stateTimeAccum: stateTimeAccumRef.current,
-          // Read the hot maps lazily at command time — subscribing would
-          // re-register every command action on each output frame.
-          lastOutputLines: getTerminalHotStore(pageId).getField("lastOutputLines"),
-          assignments: zoneLayout.assignments,
-          zoneLabels: labelsAndTags.zoneLabels,
-          stateDurations: getTerminalHotStore(pageId).getField("stateDurations"),
+        metrics: metricsRef.current,
+        sessionStates,
+        tabs,
+        autoApproveCount: transitionEffects.autoApproveCount ?? 0,
+        autoRestartCount: transitionEffects.autoRestartCount ?? 0,
+        stateTimeAccum: stateTimeAccumRef.current,
+        // Read the hot maps lazily at command time — subscribing would
+        // re-register every command action on each output frame.
+        lastOutputLines: getTerminalHotStore(pageId).getField("lastOutputLines"),
+        assignments: zoneLayout.assignments,
+        zoneLabels: labelsAndTags.zoneLabels,
+        stateDurations: getTerminalHotStore(pageId).getField("stateDurations"),
       });
       ctx.showCard(spec);
       return ok(effect("showed", "metric", countCardRows(spec)));

@@ -113,9 +113,7 @@ export interface EffectReport {
 export function isEffectReport(value: unknown): value is EffectReport {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Partial<EffectReport>;
-  return (
-    typeof v.verb === "string" && typeof v.noun === "string" && typeof v.affected === "number"
-  );
+  return typeof v.verb === "string" && typeof v.noun === "string" && typeof v.affected === "number";
 }
 
 /** Build an {@link EffectReport}. Terser than the object literal at 20 call sites. */

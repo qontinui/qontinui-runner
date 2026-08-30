@@ -21,6 +21,7 @@
 import { useCallback, useMemo, useState } from "react";
 import { CheckCheck, X, Send, MousePointerClick, HelpCircle } from "lucide-react";
 
+import { deliverApprovals } from "./approveAll";
 import type { SessionState } from "./useZoneLayout";
 import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
 
@@ -28,6 +29,22 @@ import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
 const APPROVE_CONFIRM_THRESHOLD = 3;
 const CONFIRM_TIMEOUT_MS = 4000;
 const LAST_ACTION_TIMEOUT_MS = 3000;
+
+/**
+ * The flash-message wording, from what LANDED and what was aimed at.
+ *
+ * It names both numbers only when they differ, so the ordinary case stays
+ * "Approved 3 sessions" and a partial batch cannot read as a complete one.
+ * That distinction is the entire reason these three actions were changed: the
+ * count used to be the loop counter, so "Approved 5 sessions" was printed for
+ * five iterations regardless of how many writes reached a process.
+ */
+function summarize(verb: string, delivered: number, targeted: number): string {
+  const noun = `session${delivered !== 1 ? "s" : ""}`;
+  const body =
+    delivered === targeted ? `${delivered} ${noun}` : `${delivered} of ${targeted} ${noun}`;
+  return verb ? `${verb} ${body}` : body;
+}
 
 function expandTemplate(
   template: string,
@@ -74,26 +91,45 @@ export function BatchActions() {
     [tabs, sessionStates],
   );
 
-  const writeToTab = useCallback(
-    (tabId: string, text: string) => {
-      const ref = terminalRefs.current.get(tabId);
-      ref?.current?.writeToTerminal(text);
+  /**
+   * Write to one pane and say whether it LANDED.
+   *
+   * It was `ref?.current?.writeToTerminal(text)` — a silent optional chain
+   * that is a no-op for any pane without a mounted `TerminalInstance`, which
+   * under flow-grid virtualization is the normal state for an offscreen zone.
+   * Every counter in this component was a LOOP counter incremented next to
+   * that call, so "Approved 5 sessions" and the `totalApprovals` metric were
+   * both derived from how many tabs were iterated, never from how many writes
+   * reached a process. `deliverApprovals` gives an unmounted pane a real route
+   * (`terminal_write` by id) and returns the envelope.
+   */
+  const deliver = useCallback(
+    async (tabId: string, text: string): Promise<number> => {
+      const report = await deliverApprovals([tabId], terminalRefs.current, text);
+      return report.delivered;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- terminalRefs is a stable ref object
     [],
   );
 
+  /**
+   * Record the batch. `delivered` is what landed; `targeted` is what was aimed
+   * at, and the log line names both when they differ — the same wording the
+   * command, chord and overlay paths use, so one operator reading the history
+   * sees one vocabulary rather than three.
+   */
   const onMetrics = useCallback(
-    (type: "approve" | "reject" | "broadcast", count: number) => {
+    (type: "approve" | "reject" | "broadcast", delivered: number, targeted: number) => {
+      const detail = summarize("", delivered, targeted).trim();
       if (type === "approve") {
-        incrementMetric("totalApprovals", count);
-        addHistoryEvent("Batch approve", `${count} sessions`, undefined, "#9ece6a");
+        incrementMetric("totalApprovals", delivered);
+        addHistoryEvent("Batch approve", detail, undefined, "#9ece6a");
       } else if (type === "reject") {
-        incrementMetric("totalRejections", count);
-        addHistoryEvent("Batch reject", `${count} sessions`, undefined, "#f7768e");
+        incrementMetric("totalRejections", delivered);
+        addHistoryEvent("Batch reject", detail, undefined, "#f7768e");
       } else if (type === "broadcast") {
-        incrementMetric("totalBroadcasts", count);
-        addHistoryEvent("Broadcast", `${count} sessions`, undefined, "#7aa2f7");
+        incrementMetric("totalBroadcasts", delivered);
+        addHistoryEvent("Broadcast", detail, undefined, "#7aa2f7");
       }
     },
     [incrementMetric, addHistoryEvent],
@@ -116,15 +152,14 @@ export function BatchActions() {
 
   const onClearSelection = useCallback(() => dispatch({ type: "CLEAR_SELECTION" }), [dispatch]);
 
-  const runApprove = useCallback(() => {
+  const runApprove = useCallback(async () => {
     let count = 0;
     for (const tab of needsInputTabs) {
-      writeToTab(tab.id, "y\r");
-      count++;
+      count += await deliver(tab.id, "y\r");
     }
-    onMetrics("approve", count);
-    flashAction(`Approved ${count} session${count !== 1 ? "s" : ""}`);
-  }, [needsInputTabs, writeToTab, onMetrics, flashAction]);
+    onMetrics("approve", count, needsInputTabs.length);
+    flashAction(summarize("Approved", count, needsInputTabs.length));
+  }, [needsInputTabs, deliver, onMetrics, flashAction]);
 
   const handleApproveAll = useCallback(() => {
     // Large batch → arm a one-shot confirm instead of firing blind.
@@ -134,25 +169,25 @@ export function BatchActions() {
       return;
     }
     setConfirmApprove(false);
-    runApprove();
+    void runApprove();
   }, [needsInputTabs.length, confirmApprove, runApprove]);
 
-  const handleRejectAll = useCallback(() => {
+  const handleRejectAll = useCallback(async () => {
     setConfirmApprove(false);
     let count = 0;
     for (const tab of needsInputTabs) {
-      writeToTab(tab.id, "n\r");
-      count++;
+      count += await deliver(tab.id, "n\r");
     }
-    onMetrics("reject", count);
-    flashAction(`Rejected ${count} session${count !== 1 ? "s" : ""}`);
-  }, [needsInputTabs, writeToTab, onMetrics, flashAction]);
+    onMetrics("reject", count, needsInputTabs.length);
+    flashAction(summarize("Rejected", count, needsInputTabs.length));
+  }, [needsInputTabs, deliver, onMetrics, flashAction]);
 
   const hasTemplateVars = /\{(zone|n|title|tag)\}/.test(broadcastInput);
 
-  const handleBroadcast = useCallback(() => {
+  const handleBroadcast = useCallback(async () => {
     if (!broadcastInput.trim()) return;
     let count = 0;
+    let targeted = 0;
 
     if (assignments && hasTemplateVars) {
       // Template mode: expand per-zone with contextual variables.
@@ -162,6 +197,7 @@ export function BatchActions() {
         if (state !== "needs-input") continue;
         if (hasSelection && selectedZones && !selectedZones.has(Number(zoneStr))) continue;
         n++;
+        targeted++;
         const zoneIdx = Number(zoneStr);
         const tab = tabs.find((t) => t.id === tabId);
         const tags =
@@ -177,25 +213,24 @@ export function BatchActions() {
           tag: tags[0] ?? "",
         });
 
-        writeToTab(tabId, expanded + "\r");
-        count++;
+        count += await deliver(tabId, expanded + "\r");
       }
     } else {
       // Plain text mode: send identical text to all targets.
+      targeted = needsInputTabs.length;
       for (const tab of needsInputTabs) {
-        writeToTab(tab.id, broadcastInput + "\r");
-        count++;
+        count += await deliver(tab.id, broadcastInput + "\r");
       }
     }
 
-    onMetrics("broadcast", count);
-    flashAction(`Sent to ${count} session${count !== 1 ? "s" : ""}`);
+    onMetrics("broadcast", count, targeted);
+    flashAction(summarize("Sent to", count, targeted));
     setBroadcastInput("");
     setShowBroadcast(false);
   }, [
     broadcastInput,
     needsInputTabs,
-    writeToTab,
+    deliver,
     onMetrics,
     flashAction,
     assignments,
@@ -303,7 +338,7 @@ export function BatchActions() {
             value={broadcastInput}
             onChange={(e) => setBroadcastInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") handleBroadcast();
+              if (e.key === "Enter") void handleBroadcast();
               if (e.key === "Escape") setShowBroadcast(false);
               e.stopPropagation();
             }}

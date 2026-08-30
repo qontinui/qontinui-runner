@@ -180,9 +180,7 @@ describe("handlers — every registered handler is invocable", () => {
   it("pins the handlers that report ✓ without any evidence", async () => {
     const rows = await characterize();
     const found = rows
-      .filter(
-        (r) => r.bag === "canonical" && r.verdict === "ok" && !r.evidence && r.report === "-",
-      )
+      .filter((r) => r.bag === "canonical" && r.verdict === "ok" && !r.evidence && r.report === "-")
       .map((r) => r.id)
       .sort();
     expect(

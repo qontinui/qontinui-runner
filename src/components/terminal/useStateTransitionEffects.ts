@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { deliverApprovals } from "./approveAll";
 import { instanceStorage } from "@/lib/instance-storage";
 import type { SessionState } from "./useZoneLayout";
 import { playNeedsInputChime, playCompletionChime, playErrorAlert } from "./notificationSound";
@@ -246,11 +247,26 @@ export function useStateTransitionEffects(
           }
         });
         if (matched) {
-          const ref = terminalRefs.get(tabId);
-          ref?.current?.writeToTerminal("y\r");
-          setAutoApproveCount((c) => c + 1);
+          // The same delivery path `/approve-all`, Ctrl+Shift+Enter and the
+          // overlay buttons use, and the reason this one matters most: an
+          // auto-approve rule answers `y` on the operator's behalf with no
+          // one watching. `ref?.current?.writeToTerminal("y\r")` is a silent
+          // no-op for any pane without a mounted `TerminalInstance` — which
+          // for a headless polling workflow, the exact case this feature
+          // exists for, is the COMMON state — and the counter and history
+          // event fired regardless. So the page recorded auto-approvals that
+          // reached no process, and `/metrics` renders that counter.
+          //
+          // Fire-and-forget by construction (this is a state-transition
+          // effect, not a command), but the count and the log entry now wait
+          // on the envelope. A write that did not land leaves no trace,
+          // which is the honest record: the prompt is still waiting.
           const tab = tabs.find((t) => t.id === tabId);
-          addHistoryEvent("Auto-approved", tab?.title ?? tabId, undefined, "#9ece6a");
+          void deliverApprovals([tabId], terminalRefs, "y\r").then((report) => {
+            if (report.delivered === 0) return;
+            setAutoApproveCount((c) => c + report.delivered);
+            addHistoryEvent("Auto-approved", tab?.title ?? tabId, undefined, "#9ece6a");
+          });
         }
       }
     }
