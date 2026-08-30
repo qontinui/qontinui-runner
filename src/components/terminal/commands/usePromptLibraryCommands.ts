@@ -29,6 +29,7 @@ import type { PromptTemplate } from "../promptLibraryApi";
 import { renderPromptTemplate } from "../renderPromptTemplate";
 import { getBySlash, register } from "./registry";
 import type { CommandAction, CommandResult } from "./types";
+import { effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
 
 export interface PromptLibraryCommandsContext {
   /** The fetched library (stable identity between fetches). */
@@ -42,35 +43,37 @@ export interface PromptLibraryCommandsContext {
   insertIntoFocused: (text: string) => boolean;
 }
 
-function ok(): CommandResult {
-  return { ok: true };
-}
-
-function fail(code: string, message?: string): CommandResult {
-  return { ok: false, code, message };
-}
-
 /** Run a parameterless prompt's default action immediately. */
 async function runDefaultAction(
   prompt: PromptTemplate,
   ctx: PromptLibraryCommandsContext,
-): Promise<CommandResult> {
+): Promise<CommandResult<EffectReport>> {
   // Parameterless — still render so stray `{{placeholders}}` blank out
   // rather than being typed into a session verbatim.
   const text = renderPromptTemplate(prompt.body, {});
   switch (prompt.default_action) {
     case "insert": {
+      // `insertIntoFocused` already reported honestly (false = no focused
+      // session); it is the RENDERER that could not say which prompt landed.
       if (!ctx.insertIntoFocused(text)) {
         return fail("no-focused-session", "no focused terminal session to insert into");
       }
-      return ok();
+      return ok(effect("inserted", "prompt", 1, { detail: prompt.title }));
     }
     case "copy": {
       const copied = await writeClipboard(text);
-      return copied ? ok() : fail("copy-failed", "could not write to the clipboard");
+      return copied
+        ? ok(effect("copied", "prompt", 1, { detail: prompt.title }))
+        : fail("copy-failed", "could not write to the clipboard");
     }
     case "spawn":
     default:
+      // `spawnWithText` is `void | Promise<void>` on this context and is
+      // implemented in `TerminalPage` by a closure that resolves without a
+      // value even when it bailed on "no Claude account configured". That
+      // one is NOT converted here: it is a page-level closure with its own
+      // notification channel, and inventing a signal for it would be the
+      // assertion this phase removes. See the phase report.
       await ctx.spawnWithText(text);
       return ok();
   }

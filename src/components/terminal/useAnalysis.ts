@@ -5,6 +5,21 @@ import { type AnalysisType } from "./TerminalAnalysisPanel";
 import type { CommandHistoryEntry } from "./useShellIntegration";
 import type { CommandResponse } from "./types";
 
+/**
+ * What an analysis run actually produced.
+ *
+ * `handleAnalyze` used to be `Promise<void>` and routed BOTH of its failure
+ * arms — a backend `success: false`, and a thrown IPC — into `analysisError`
+ * state, which the `/analyze` command handler has no way to read back. So a
+ * metered Claude call that came back empty or errored still rendered as a
+ * success in the command bar. The panel keeps its state (that is how the
+ * right-hand panel renders); this envelope is for the callers that need a
+ * verdict rather than a render.
+ */
+export type AnalysisOutcome =
+  | { ok: true; panels: number }
+  | { ok: false; message: string };
+
 interface UseAnalysisParams {
   activeId: string | null;
   tabs: Array<{ id: string; title: string }>;
@@ -30,7 +45,7 @@ export function useAnalysis({
   analysisType: AnalysisType;
   analysisPanels: CanvasPanel[] | null;
   analysisError: string | undefined;
-  handleAnalyze: (type: AnalysisType) => Promise<void>;
+  handleAnalyze: (type: AnalysisType) => Promise<AnalysisOutcome>;
 } {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisType, setAnalysisType] = useState<AnalysisType>("session-summary");
@@ -38,7 +53,7 @@ export function useAnalysis({
   const [analysisError, setAnalysisError] = useState<string | undefined>();
 
   const handleAnalyze = useCallback(
-    async (type: AnalysisType) => {
+    async (type: AnalysisType): Promise<AnalysisOutcome> => {
       setAnalysisType(type);
       setIsAnalyzing(true);
       setAnalysisPanels(null);
@@ -112,12 +127,17 @@ export function useAnalysis({
 
         if (result.success && result.data) {
           const data = result.data as { panels?: CanvasPanel[] };
-          setAnalysisPanels(data.panels ?? []);
-        } else {
-          setAnalysisError(result.message || "Analysis failed");
+          const panels = data.panels ?? [];
+          setAnalysisPanels(panels);
+          return { ok: true, panels: panels.length };
         }
+        const message = result.message || "Analysis failed";
+        setAnalysisError(message);
+        return { ok: false, message };
       } catch (err) {
-        setAnalysisError(err instanceof Error ? err.message : "Analysis failed");
+        const message = err instanceof Error ? err.message : "Analysis failed";
+        setAnalysisError(message);
+        return { ok: false, message };
       } finally {
         setIsAnalyzing(false);
       }

@@ -51,6 +51,8 @@ import {
   type CommandAction,
   type CommandResult,
   type InterpretMatch,
+  describeReport,
+  isEffectReport,
   getAll,
   interpretCommand,
   applyDeclaredFlags,
@@ -106,8 +108,38 @@ const PLACEHOLDER_EXAMPLES = [
   "/swap 1 3",
 ];
 
+/**
+ * The three verdicts this bar can render.
+ *
+ * `noop` is a PRODUCT DECISION, made here and stated here.
+ *
+ * A handler that reports `{affected: 0}` did nothing. Rendering that as `✓`
+ * is the defect this phase exists to close — it is exactly what let
+ * `/approve-all` claim three approvals having delivered zero keystrokes. But
+ * rendering it as an ERROR is wrong too, and not marginally so:
+ *
+ *  - `/tag-clear` with no filter active, `/mute` when already muted,
+ *    `/layout quad` when the grid is already quad — these are LEGITIMATE
+ *    outcomes of correct commands. `/mute` is idempotent BY DESIGN; it was
+ *    split out of `/sound` precisely so that running it twice leaves the
+ *    sound off. Calling the second run an error would make the command's
+ *    reason for existing look like a fault.
+ *  - Errors on this surface carry a "did you mean" hint and are the operator's
+ *    signal to retype. Retyping a no-op produces the same no-op. Training the
+ *    operator to ignore red is a strictly worse outcome than one grey line.
+ *  - Mechanically: verdicts are pinned by `__golden__/pipeline-golden.txt` as
+ *    `ok` / `error:<code>`. Turning no-ops into errors would flip thousands of
+ *    corpus rows and change what every downstream consumer of
+ *    `CommandResult.ok` sees, for a rendering concern.
+ *
+ * So a no-op stays `ok` at the `CommandResult` level and gets its OWN verdict
+ * at the render level: distinct text ("no tag filters cleared"), distinct
+ * colour (neutral, not green), and a distinct `data-status-kind="noop"` that
+ * a UI Bridge assertion can read. The invariant that matters is the one the
+ * bare `✓` broke: **a no-op must never render identically to an effect.**
+ */
 interface StatusLine {
-  kind: "ok" | "error";
+  kind: "ok" | "noop" | "error";
   text: string;
 }
 
@@ -438,13 +470,24 @@ export function CommandBar() {
       }
       if (result.ok) {
         persistRecent(action.id);
-        // Result.value may be `undefined` (action just ran) — render the
-        // slash itself so the operator gets the "yes, that happened"
-        // confirmation regardless of return shape.
-        setStatus({
-          kind: "ok",
-          text: `${action.slash} ✓`,
-        });
+        // CONSULT `result.value`. The renderer used to compose
+        // `${action.slash} ✓` and throw the value away, which made the
+        // status line structurally incapable of telling a no-op from an
+        // effect — every handler on the page reported the same sentence.
+        //
+        // A handler that reports an `EffectReport` gets its numbers rendered;
+        // one that does not still gets the bare `✓`, so this is an
+        // improvement for the converted handlers and a no-change for the
+        // rest, which is what lets a handler be converted independently.
+        const report = isEffectReport(result.value) ? result.value : null;
+        setStatus(
+          report
+            ? {
+                kind: report.affected === 0 ? "noop" : "ok",
+                text: `${action.slash} ${report.affected === 0 ? "·" : "✓"} ${describeReport(report)}`,
+              }
+            : { kind: "ok", text: `${action.slash} ✓` },
+        );
         setQuery("");
         // Explicit even though the derived reset covers a query CHANGE:
         // running off an already-empty input (the recents palette) leaves
@@ -639,7 +682,15 @@ export function CommandBar() {
               >
                 <span
                   className={
-                    status.kind === "ok" ? "text-[#9ece6a] font-mono" : "text-[#f7768e] font-mono"
+                    // Three verdicts, three colours — green for an effect,
+                    // muted grey for a no-op, red for a failure. The grey is
+                    // load-bearing: an operator scanning this line has to be
+                    // able to see "nothing happened" without reading it.
+                    status.kind === "ok"
+                      ? "text-[#9ece6a] font-mono"
+                      : status.kind === "noop"
+                        ? "text-[#a9b1d6] font-mono"
+                        : "text-[#f7768e] font-mono"
                   }
                 >
                   {status.text}

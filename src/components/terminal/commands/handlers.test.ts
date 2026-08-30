@@ -11,21 +11,30 @@
  *
  * ## What is CHARACTERIZED and what is ENDORSED
  *
- * 29 of the 40 handlers answer `ok` after calling only closures that return
- * NOTHING. They cannot have derived that verdict; they asserted it. Deriving
- * it needs the effects themselves to return evidence — `sortZones()` saying
- * how many zones it moved, `writeToTerminal` saying it reached a PTY — which
- * is a production change and therefore a later phase.
+ * When this file was written, 29 of the 40 handlers answered `ok` after
+ * calling only closures that returned NOTHING. They could not have derived
+ * that verdict; they asserted it. Deriving it needed the effects themselves
+ * to return evidence — `sortZones()` saying how many zones it moved,
+ * `writeToTerminal` saying it reached a PTY — which was a production change
+ * and therefore a later phase.
  *
- * So this file PINS today's answers rather than endorsing them. The pinned
- * list below and the golden table in `__golden__/handlers-golden.txt` exist
- * so that when the effects do start returning evidence, the verdicts that
- * change show up as a reviewable diff instead of a silent semantic shift —
- * and so that a new handler joining the evidence-free set is a decision
- * somebody signs, not an accident.
+ * **That phase has landed.** The pinned list below is what remains, and the
+ * golden table has grown a REPORT column carrying each handler's
+ * `EffectReport` — so a verdict is now checkable against the numbers the
+ * handler claims, not just against `ok` / `error`.
  *
- * Cases marked "characterized, not endorsed" are ones where the `✓` is
- * PROVABLY wrong about a no-op today.
+ * Two things count as deriving a verdict, and the golden distinguishes them:
+ *
+ *  - the EFFECT reported (`evidence=true`) — a write envelope, a delivery
+ *    count, a spawn's id list;
+ *  - the handler OBSERVED the store's pre-state and compared (`report=`
+ *    non-empty with `evidence=false`) — `/tag-clear` reading how many filters
+ *    were active before clearing them. A React setter cannot be read back
+ *    synchronously, so for a state transition the pre-state IS the honest
+ *    observation available, and it is falsifiable: it reports zero.
+ *
+ * A row with NEITHER is an unearned `✓`, and that set is what
+ * `OK_WITHOUT_EVIDENCE` pins.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -36,6 +45,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { canonicalArgs, run } from "./pipeline.testkit";
 import { loadRealRegistry, type RealRegistryHarness } from "./realRegistry.testkit";
+import { isEffectReport } from "./verdict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GOLDEN_PATH = resolvePath(HERE, "__golden__", "handlers-golden.txt");
@@ -89,6 +99,22 @@ interface HandlerRow {
   effects: string;
   /** Did ANY closure the handler called hand back a value? */
   evidence: boolean;
+  /**
+   * The handler's own `EffectReport`, rendered — `"-"` when it reported none.
+   *
+   * This is the column that makes the table check a NUMBER rather than a
+   * boolean. `terminal.approve-all` answering `ok` is not interesting; it
+   * answering `approved 0 of 1` on a fixture with no mounted panes is the
+   * whole point, and only this column can see it.
+   */
+  report: string;
+}
+
+/** Render an `EffectReport` for the golden table, or `"-"`. */
+function renderReport(value: unknown): string {
+  if (!isEffectReport(value)) return "-";
+  const req = value.requested === undefined ? "" : `/${value.requested}`;
+  return `${value.verb} ${value.affected}${req} ${value.noun}${value.kind === "state" ? " [state]" : ""}`;
 }
 
 async function characterize(): Promise<HandlerRow[]> {
@@ -98,9 +124,11 @@ async function characterize(): Promise<HandlerRow[]> {
       const args = bag === "canonical" ? canonicalBag(action.paramSchema) : {};
       h.reset();
       let verdict: string;
+      let report = "-";
       try {
         const r = await action.handler(args as never, { source: "test" });
         verdict = r.ok ? "ok" : `error:${r.code}`;
+        if (r.ok) report = renderReport(r.value);
       } catch {
         verdict = "threw";
       }
@@ -111,6 +139,7 @@ async function characterize(): Promise<HandlerRow[]> {
         verdict,
         effects: h.calls.map((c) => c.name).join(",") || "-",
         evidence: h.calls.some((c) => c.evidence),
+        report,
       });
     }
   }
@@ -120,46 +149,25 @@ async function characterize(): Promise<HandlerRow[]> {
 // ── The pinned evidence-free set ─────────────────────────────────────
 
 /**
- * Handlers that answer `ok` having called only closures that return nothing.
+ * Handlers that answer `ok` having neither read a closure's return NOR
+ * reported an `EffectReport` of their own.
  *
- * CHARACTERIZED, NOT ENDORSED. Every entry is a `✓` the handler asserted
- * rather than derived. The list is pinned so the later phase's fix — effects
- * that return evidence, verdicts derived from it — produces a diff here.
+ * This is the residue of the 29 that were pinned here before effects started
+ * reporting. Every remaining entry needs a reason, and each has one recorded
+ * in `PINNED_REASONS` below — a list with no reasons attached is the shape
+ * that let this set grow silently in the first place.
  *
  * A new action joining this list is not automatically wrong. It IS a decision
  * that should be visible in review, which is the whole point of pinning it.
  */
-const OK_WITHOUT_EVIDENCE = [
-  "terminal.analyze",
-  "terminal.approve-all",
-  "terminal.auto-approve",
-  "terminal.close",
-  "terminal.doc-finder",
-  "terminal.export-all",
-  "terminal.focus",
-  "terminal.history",
-  "terminal.layout",
-  "terminal.maximize",
-  "terminal.metrics",
-  "terminal.mute",
-  "terminal.prompt",
-  "terminal.resume",
-  "terminal.select-by-state",
-  "terminal.show-shortcuts",
-  "terminal.sort-zones",
-  "terminal.swap",
-  "terminal.tag-clear",
-  "terminal.tag-toggle",
-  "terminal.toggle-auto-focus",
-  "terminal.toggle-auto-restart",
-  "terminal.toggle-desktop-notify",
-  "terminal.toggle-file-ownership",
-  "terminal.toggle-findings",
-  "terminal.toggle-focus-mode",
-  "terminal.toggle-sessions-sidebar",
-  "terminal.toggle-sound",
-  "terminal.unmute",
-];
+const OK_WITHOUT_EVIDENCE: string[] = [];
+
+/**
+ * Why each still-pinned handler cannot report — one line per entry, and the
+ * test below fails if the two lists disagree, so a handler cannot be pinned
+ * without a reason or carry a reason without being pinned.
+ */
+const PINNED_REASONS: Record<string, string> = {};
 
 describe("handlers — every registered handler is invocable", () => {
   it("runs all of them on both a canonical and an empty arg bag", async () => {
@@ -172,91 +180,143 @@ describe("handlers — every registered handler is invocable", () => {
   it("pins the handlers that report ✓ without any evidence", async () => {
     const rows = await characterize();
     const found = rows
-      .filter((r) => r.bag === "canonical" && r.verdict === "ok" && !r.evidence)
+      .filter(
+        (r) => r.bag === "canonical" && r.verdict === "ok" && !r.evidence && r.report === "-",
+      )
       .map((r) => r.id)
       .sort();
     expect(
       found,
-      "The set of handlers that answer `ok` after calling only evidence-free " +
-        "closures has changed. If a handler LEFT the set it now derives its " +
-        "verdict — good, remove it from OK_WITHOUT_EVIDENCE. If one JOINED it, " +
-        "that is a new unearned `✓` and needs a reason.",
+      "The set of handlers that answer `ok` having neither read an effect's " +
+        "return nor reported an EffectReport has changed. If a handler LEFT " +
+        "the set it now derives its verdict — good, remove it from " +
+        "OK_WITHOUT_EVIDENCE. If one JOINED it, that is a new unearned `✓` " +
+        "and needs a reason in PINNED_REASONS.",
     ).toEqual([...OK_WITHOUT_EVIDENCE].sort());
-    // Anti-vacuity: this is a majority of the registry, not a rounding error.
-    expect(found.length).toBeGreaterThan(h.actions.length / 2);
+    // Every pin carries a reason, and every reason pins something. Without
+    // this the list decays back into an unexplained set of ids.
+    expect(Object.keys(PINNED_REASONS).sort()).toEqual([...OK_WITHOUT_EVIDENCE].sort());
+  });
+
+  it("the majority of handlers now DERIVE their verdict", async () => {
+    // The anti-vacuity assertion, inverted. It used to read "more than half
+    // the registry answers `ok` without evidence" — which was true, and was
+    // the defect. The same measurement now has to come out the other way, so
+    // a regression that quietly re-broadens the assertion cannot pass.
+    const rows = await characterize();
+    const succeeded = rows.filter((r) => r.bag === "canonical" && r.verdict === "ok");
+    const derived = succeeded.filter((r) => r.evidence || r.report !== "-");
+    expect(derived.length).toBeGreaterThan(succeeded.length / 2);
   });
 });
 
 // ── Named provable no-ops ────────────────────────────────────────────
 
-describe("handlers — a ✓ that is provably wrong about a no-op", () => {
+describe("handlers — the no-ops that used to render as effects", () => {
+  const reportOf = (value: unknown) => {
+    if (!isEffectReport(value)) throw new Error("handler reported no EffectReport");
+    return value;
+  };
+
   /**
-   * CHARACTERIZED, NOT ENDORSED.
+   * THE PRIORITY CASE, now inverted.
    *
-   * `/approve-all` writes `y\r` into every waiting PTY via
-   * `terminalRefs.current.get(id)?.current?.writeToTerminal(...)`. With no ref
-   * registered for the waiting tab the optional chain short-circuits and
-   * NOTHING is written — yet the handler returns `ok({ approved: waiting.length })`,
-   * counting sessions it merely INTENDED to approve. The operator sees
-   * `/approve-all ✓` for the most irreversible command on the page having
-   * delivered zero keystrokes.
+   * `/approve-all` used to write `y\r` through
+   * `terminalRefs.current.get(id)?.current?.writeToTerminal(...)`, an optional
+   * chain that short-circuits silently when no `TerminalInstance` is mounted
+   * — the normal state for an offscreen flow-grid zone. It then returned
+   * `ok({ approved: waiting.length })`, counting sessions it merely INTENDED
+   * to reach. The fixture below is exactly that situation: one tab in
+   * `needs-input`, `terminalRefs` empty.
    *
-   * The count is derived from the wrong quantity (tabs in `needs-input`)
-   * rather than from the writes that actually landed. Fixing it is a
-   * production change; this pins the current answer.
+   * The count now comes from DELIVERY. One session was targeted, zero
+   * envelopes came back successful, and the report says both — so the status
+   * line renders "approved 0 of 1 session" instead of `✓`.
    */
-  it("`/approve-all` reports ✓ with no PTY reached", async () => {
+  it("`/approve-all` counts DELIVERIES, not intentions, with no PTY reached", async () => {
     h.reset();
     const o = await run("/approve-all", (id) => h.byId(id));
     expect(o.actionId).toBe("terminal.approve-all");
     expect(o.verdict).toBe("ok");
-    expect(h.calls).toEqual([]);
+    // It went through the delivery path at all — the old code called nothing
+    // observable whatsoever, which is why this ledger used to be empty.
+    expect(h.callNames()).toEqual(["ctx.approveAll"]);
+    // It targeted the ONE waiting tab, not both tabs.
+    expect(h.calls[0].args[0]).toEqual(["tab-a"]);
+    expect(h.calls[0].args[1]).toBe("y\r");
+    const report = reportOf(o.value);
+    expect(report.affected).toBe(0);
+    expect(report.requested).toBe(1);
   });
 
   /**
-   * CHARACTERIZED, NOT ENDORSED. `/tag-clear` calls `setActiveTagFilters(new
-   * Set())` unconditionally and answers `✓` whether or not a filter was
-   * active. Nothing in the return distinguishes "cleared three filters" from
-   * "there was nothing to clear".
+   * `/tag-clear` calls `setActiveTagFilters(new Set())` unconditionally. The
+   * setter is still void — a React setter cannot report — so the verdict
+   * comes from the OBSERVED pre-state: how many filters were active before.
+   * The fixture has none, so it reports zero and the bar renders it neutrally.
    */
-  it("`/tag-clear` reports ✓ when no filter was active", async () => {
+  it("`/tag-clear` reports ZERO when no filter was active", async () => {
     h.reset();
     const o = await run("/tag-clear", (id) => h.byId(id));
     expect(o.verdict).toBe("ok");
     expect(h.callNames()).toEqual(["tags.setActiveTagFilters"]);
+    // The closure still hands back nothing; the report is what changed.
     expect(h.calls.every((c) => !c.evidence)).toBe(true);
+    expect(reportOf(o.value).affected).toBe(0);
   });
 
   /**
-   * CHARACTERIZED, NOT ENDORSED. `/layout quad` when the layout is ALREADY
-   * `quad` calls `setLayoutId("quad")` and answers `✓` — indistinguishable
-   * from a layout that actually changed.
+   * `/layout quad` on a grid that is already quad no longer calls
+   * `setLayoutId` at all — the pre-state check short-circuits it — and
+   * reports zero.
    */
-  it("`/layout quad` reports ✓ when the layout is already quad", async () => {
+  it("`/layout quad` reports ZERO, and does not call the setter, when already quad", async () => {
     h.reset();
     const o = await run("/layout quad", (id) => h.byId(id));
     expect(o.verdict).toBe("ok");
-    expect(h.calls.map((c) => [c.name, c.args])).toEqual([["zone.setLayoutId", ["quad"]]]);
-    expect(h.calls.every((c) => !c.evidence)).toBe(true);
+    expect(h.callNames()).toEqual([]);
+    expect(reportOf(o.value).affected).toBe(0);
   });
 
   /**
-   * CHARACTERIZED, NOT ENDORSED. `sortZones` and `exportAll` are `() => void`
-   * on the context interface, so no `✓` from either can be derived — the
-   * handler cannot learn whether a single zone moved or a single byte was
-   * written.
+   * `sortZones` and `exportAll` were `() => void` on the context interface,
+   * so no `✓` from either could be derived. Both now report: how many zone
+   * assignments actually moved, and how many sessions actually reached disk
+   * (with the operator dismissing the save dialog as its own outcome).
    */
-  it("`/sort-zones` and `/export-all` report ✓ from a void closure", async () => {
-    for (const [input, effect] of [
-      ["/sort-zones", "ctx.sortZones"],
-      ["/export-all", "ctx.exportAll"],
-    ] as const) {
-      h.reset();
-      const o = await run(input, (id) => h.byId(id));
-      expect(o.verdict, input).toBe("ok");
-      expect(h.callNames(), input).toEqual([effect]);
-      expect(h.calls[0].evidence, input).toBe(false);
-    }
+  it("`/sort-zones` and `/export-all` read what their closures report", async () => {
+    h.reset();
+    const sorted = await run("/sort-zones", (id) => h.byId(id));
+    expect(sorted.verdict).toBe("ok");
+    expect(h.callNames()).toEqual(["ctx.sortZones"]);
+    expect(h.calls[0].evidence).toBe(true);
+    // The fixture's grid is already in state order, so nothing moved.
+    expect(reportOf(sorted.value).affected).toBe(0);
+
+    h.reset();
+    const exported = await run("/export-all", (id) => h.byId(id));
+    expect(exported.verdict).toBe("ok");
+    expect(h.callNames()).toEqual(["ctx.exportAll"]);
+    expect(h.calls[0].evidence).toBe(true);
+    expect(reportOf(exported.value).affected).toBe(2);
+  });
+
+  /**
+   * The idempotent pair. `/mute` twice is not a fault — it is why the action
+   * exists apart from `/sound` — but the second run must not look like the
+   * first. With the fixture's sound already OFF, the very first `/mute`
+   * reports zero.
+   */
+  it("`/mute` on already-muted sound reports a no-op, not an effect", async () => {
+    h.reset();
+    const o = await run("/mute", (id) => h.byId(id));
+    expect(o.verdict).toBe("ok");
+    // It did not toggle anything — the guard was already there; what is new
+    // is that the verdict says so.
+    expect(h.callNames()).toEqual([]);
+    const report = reportOf(o.value);
+    expect(report.affected).toBe(0);
+    expect(report.kind).toBe("state");
   });
 });
 
@@ -387,15 +447,23 @@ describe("handlers — golden characterization table", () => {
         "# GENERATED. Regenerate with:",
         "#   TERMINAL_GOLDEN_UPDATE=1 npx vitest run src/components/terminal/commands/handlers.test.ts",
         "#",
-        "# <actionId> TAB <arg bag> TAB <args> TAB <verdict> TAB <effects called> TAB <evidence?>",
+        "# <actionId> TAB <arg bag> TAB <args> TAB <verdict> TAB <effects called> TAB <evidence?> TAB <report>",
         "#",
-        "# `evidence=false` means every closure the handler called returned nothing,",
-        "# so the verdict on that row was ASSERTED, not derived. See the module",
-        "# docstring: characterized, not endorsed.",
+        "# `evidence=false` means every closure the handler called returned nothing.",
+        "# `report=-` means the handler reported no EffectReport either. A row with",
+        "# BOTH is an `ok` that was ASSERTED rather than derived — the shape this",
+        "# table exists to keep visible.",
+        "#",
+        "# `report` reads `<verb> <affected>[/<requested>] <noun>`; `[state]` marks a",
+        "# preference/mode report, where affected 1 = it moved and 0 = it was already",
+        "# in that state.",
         "",
       ].join("\n") +
       rows
-        .map((r) => `${r.id}\t${r.bag}\t${r.args}\t${r.verdict}\t${r.effects}\t${r.evidence}`)
+        .map(
+          (r) =>
+            `${r.id}\t${r.bag}\t${r.args}\t${r.verdict}\t${r.effects}\t${r.evidence}\t${r.report}`,
+        )
         .sort()
         .join("\n") +
       "\n";
