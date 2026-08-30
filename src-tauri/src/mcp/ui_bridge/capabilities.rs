@@ -571,7 +571,10 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                     // runner's own literal-key form. Both were missing here, so
                     // this manifest advertised no key dispatch at all.
                     "page/send-keys", "key",
-                    "workflows", "specs", "query-selector", "keyboard-shortcuts", "batch"],
+                    "workflows", "specs", "query-selector", "keyboard-shortcuts", "batch",
+                    // Listed here for the first time — see the `batchExecute`
+                    // entry below for why its absence mattered.
+                    "batch-execute"],
                 "batch": {
                     "method": "POST",
                     "path": "/ui-bridge/control/batch",
@@ -580,6 +583,27 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                     "body": {
                         "steps": "[{ elementId, action, params? }]",
                         "stopOnError": "boolean (default: true)"
+                    }
+                },
+                // `/control/batch-execute` is a live route that this manifest
+                // did not list at all, so the only in-repo description of its
+                // body was the smoke probe -- which posted the WRONG key and
+                // still passed. An undocumented endpoint whose handler
+                // silently accepted a key mismatch is how the `id`/`elementId`
+                // defect survived; documenting the grammar is the other half
+                // of that fix.
+                "batchExecute": {
+                    "method": "POST",
+                    "path": "/ui-bridge/control/batch-execute",
+                    "description": "Execute mixed action / wait / snapshot steps serially. Unlike `batch`, steps are typed and need not all be element actions.",
+                    "body": {
+                        "actions": "[{ type: 'action'|'wait'|'snapshot', ... }] (alias: `steps`) — REQUIRED; a body carrying neither key is a 400 `steps_missing`, an empty batch must be asked for explicitly as []",
+                        "stopOnError": "boolean (default: true) (aliases: `stop_on_error`, `stopOnFailure`)"
+                    },
+                    "stepShapes": {
+                        "action": "{ type: 'action', elementId (alias: `element_id`), action: string | { action, params?, waitOptions?, ... }, params? }",
+                        "wait": "{ type: 'wait', ms: number }",
+                        "snapshot": "{ type: 'snapshot' }"
                     }
                 },
                 "navigateAndWait": {
