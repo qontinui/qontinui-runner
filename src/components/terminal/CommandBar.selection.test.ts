@@ -93,9 +93,9 @@ describe("CommandBar resets the selection on every query change", () => {
     // (`onMouseEnter` still sets one, legitimately: hovering selects a
     // row inside the CURRENT list, which is not a query change.)
     expect(SOURCE).toMatch(
-      /const handleSuggestionClick = useCallback\(\s*\(\s*action: CommandAction,\s*presetArgs\?/,
+      /const handleSuggestionClick = useCallback\(\s*\(resolution: Resolution\)/,
     );
-    expect(SOURCE).toContain("handleSuggestionClick(m.action, m.presetArgs, m.tier)");
+    expect(SOURCE).toContain("handleSuggestionClick(m.resolution)");
   });
 
   it("keeps the clamp only for list changes that are NOT query changes", () => {
