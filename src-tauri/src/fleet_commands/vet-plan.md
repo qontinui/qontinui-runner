@@ -28,6 +28,41 @@ Plan paths resolve from two environment variables. The qontinui runner injects t
 into agent sessions from its `paths.plans_dir` / `paths.plans_archive_dir` settings;
 a session launched outside the runner will not have them.
 
+> **The DB is authoritative for reads; this directory is an AUTHORING surface**
+> *(plan `2026-08-16-plan-corpus-authority-and-run-provenance`, D2/D3 — canonical
+> statement in `CLAUDE.md` -> "Plan corpus authority").* Discovery, search and
+> selection resolve against `agent.work_artifacts` behind qontinui-web; the
+> shipped runner scanner flows filesystem edits INTO it (the half that writes
+> *this* layer is opt-in — see the population caveat below). So:
+>
+> * **`$QONTINUI_PLANS_DIR` being unset is NOT an error and NOT a dead end.** It
+>   is a supported configuration — a tenant may author entirely through the web
+>   UI and own no plans directory at all. Resolve the plan from the corpus
+>   instead of asking the operator to invent a path.
+> * **`qontinui-dev-notes` is this fleet's OPTIONAL export target**, never a
+>   requirement. No tenant needs a git repo to author, vet or ship a plan.
+> * **A corpus that ANSWERS is not a corpus that is POPULATED.** The scanner
+>   flows filesystem edits into the operational layer (`coord.work_units`)
+>   whenever a plans dir and a coord base resolve, but the **body sync** that
+>   fills the document layer (`body_push.rs` -> `agent.work_artifacts`) is
+>   **opt-in** — built only under `QONTINUI_PLAN_LIBRARY_SYNC=1`, and gated
+>   again per cycle on the tenant's `plan_capture` dial. **Either missing is a
+>   silent no-op**, so a `200` carrying an empty list is **UNKNOWN, not "no
+>   such plan"**: treat any zero-result corpus read as UNKNOWN unless you have
+>   positively confirmed the body sync is on for this device.
+> * **Do not probe by stem with `q`.** `GET /api/v1/plan-library?q=` matches
+>   **title and body, NOT the slug**, so a by-stem `q` probe returns a false
+>   negative for a plan that IS present. The exact door is
+>   `?kind=plan&work_unit_slug=<stem>`; failing that, page `?kind=plan&limit=200`
+>   and match `slug` yourself.
+> * **When qontinui-web is unreachable**, read the local degraded-mode cache:
+>   `$QONTINUI_PLAN_CACHE_DIR` (default `C:/claude/plan-corpus-cache/`) —
+>   `PLANS-CACHE.md` for the index, `bodies/<kind>__<slug>.md` for bodies.
+>   Refresh with `qontinui-claude-config/scripts/render-plan-cache.ps1
+>   -MaxAgeHours 0`. **Say plainly that you are reading a cache and quote its
+>   Rendered stamp**, and treat a stale or absent cache as **UNKNOWN, never
+>   empty** — "this render did not see it" is not "it does not exist".
+
 - **`$QONTINUI_PLANS_DIR`** — the directory plans live in. **If it is unset, ask the
   user once where plans live, or fall back to `<workspace-root>/plans`** (a `plans/`
   directory beside the repos this session is working in). Never assume an absolute
@@ -41,6 +76,21 @@ a session launched outside the runner will not have them.
 Neither directory has to be inside a git repo. Where this skill commits a plan edit it
 first checks `git -C "<dir>" rev-parse --is-inside-work-tree`; if that fails, the edit
 on disk is the whole ritual.
+
+**Precondition — if the plan you are about to vet is untracked, commit and push it
+first**, stamped `DRAFT`, from a worktree (never the primary/shared checkout); then
+vet. This is mechanical, not hygiene: an untracked plan is invisible to coord's
+`conflict_check`, unreadable by any peer, and outside the durable record. Plans are
+supposed to be authored at `DRAFT` and committed at creation; committing one here is
+repairing that, not replacing it.
+
+Committing it does **not**, however, make the coord work unit attestable. `vetted`
+is an *attested* registry status whose attester must differ from the unit's recorded
+owner, and the comparison is on the actor key `device:<uuid>` — which carries no
+session id, so every device-JWT session on this machine is ONE actor. A peer holding
+a genuine agent JWT (`device:<d>:agent:<a>`) is a distinct key and does qualify; on a
+device-JWT-only fleet there is no such peer. Publishing the plan buys reviewability,
+not a qualifying attester. §5.4 covers what to write instead.
 
 ## Decision policy (binding)
 
@@ -150,6 +200,179 @@ If the skill aborts before Step 5 (e.g. the plan was already SHIPPED
 and the user declined to overwrite), fire the clearing POST
 best-effort. If that also fails, `prune_stale()` TTLs the row within
 an hour.
+
+### 0.2. Reserve the PLAN in coord (before the first edit)
+
+**`/vet-plan` writes the plan file in place — Step 4's `Edit` calls are
+mutations, and this command's own contract calls the plan "the deliverable."**
+Until 2026-08-25 this command took **no** claim, reserve, or conflict check of
+any kind: its only coord write was the Step 0 status UPSERT (observability,
+explicitly non-gating) and the §5.4 work-unit upsert, which fires at the END,
+after every edit has already landed on disk. Two sessions vetting the same plan,
+or a vetter and an implementer on the same plan, shared **no key at all** and so
+could never collide — the filesystem's last-writer-wins was the entire
+mutual-exclusion mechanism. That is the hole this step closes.
+
+This is the same reserve `/preflight` step 0 specifies
+(`.claude/skills/preflight/SKILL.md` → "0. Reserve the plan (free today — do this
+FIRST)"), on the same key, and `/implement-plan` Step 0.48 and `/vet-imp`
+Step 1.1 issue the identical call. Wiring all three lifecycle commands to one
+protocol makes **`/preflight` load-bearing for the entire plan lifecycle** — the
+accepted trade: one implementation to keep correct beats four that drift.
+
+**Granularity.** The reserve key is the **plan**, not a phase:
+`plan:<plan-stem>` means *"this document is mine to move."* `/implement-plan`
+Step 0.6's `plan:<plan-stem>:phase:<n>` claim is a strictly nested second
+granularity meaning *"this phase's agent is mine to spawn."* A vetter and an
+implementer share no phase number, so only the plan key can ever see them
+collide.
+
+#### Resolution
+
+1. **`<plan-stem>`** — the plan filename without `.md` or directory prefix; the
+   same stem Step 0 computed. This is the canonical cross-agent key that
+   `coord.plans`, `coord.sessions.plan_slug`, `unit_ready` gates, the
+   `Plan: <stem>` PR marker and `Depends-On:` all use.
+2. **Machine UUID** — the UUID Step 0 resolved (`QONTINUI_MACHINE_ID`, else
+   `~/.qontinui/machine.json` `"device_id"`, else the legacy `"machine_id"`).
+   Reuse it; do not re-resolve. **The wire field does not follow the local key:**
+   `/claims/*` takes `machine_id`, `POST /coord/status` takes `device_id`.
+3. **`AGENT_SESSION_ID`** — resolve once and reuse for acquire and release:
+
+   ```bash
+   AGENT_SESSION_ID="${QONTINUI_AGENT_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
+   ```
+
+   `CLAUDE_CODE_SESSION_ID` is the harness session UUID — per-session-unique. If
+   both are empty (older Claude Code), omit the field; never send an empty
+   string.
+4. **Coord HTTP base** — `COORD_HTTP_URL`, else `https://coord.qontinui.io`
+   (Step 0's base).
+
+#### The reserve call
+
+Preferred — over MCP, which also scans sibling open PRs for the same slot:
+
+```
+coord_reserve_resource(kind="plan", name="<plan-stem>")
+```
+
+Fallback that survives a dead MCP transport — and this fallback is the *point*,
+not a courtesy. `POST /claims/acquire` is **unauthenticated** (verified
+422-on-empty-body 2026-08-21 and again 2026-08-25: *"missing field `kind`"*, not
+a 401), while `coord_reserve_resource` has **no HTTP route at all**:
+
+```bash
+curl -fsS -X POST "$COORD_HTTP_URL/claims/acquire" \
+  -H "Content-Type: application/json" \
+  -d "$(cat <<EOF
+{
+  "kind": "semantic_resource",
+  "resource_key": "plan:<plan-stem>",
+  "machine_id": "<machine_id>",
+  "agent_session_id": "$AGENT_SESSION_ID",
+  "metadata": {
+    "plan": "<absolute-plan-path>",
+    "skill": "vet-plan"
+  }
+}
+EOF
+)"
+```
+
+**Send the owner token.** `/preflight`'s written HTTP fallback omits both
+`machine_id` and `agent_session_id`; this call must carry them. Without
+`<machine_id>:<agent_session_id>` a second session **on this same box** silently
+takes over the first's reservation — the identical bug that plan
+`2026-06-03-coord-session-scoped-claim-owner-plan` (SHIPPED 2026-06-03; coord
+PR #271 makes `acquire` SET/compare the owner token and the heartbeat/release Lua
+match on it, qontinui-claude-config PR #49 sends it) fixed for phase claims.
+
+#### Branch on the result
+
+- **`granted` / `claimed`** — a fresh reservation. **This run is the OWNER and
+  therefore the releaser** (Step 5, after the VETTED stamp). Proceed to Step 0.9.
+- **`renewed`**, or a **`held` whose `current_holder_session` equals your own
+  `$AGENT_SESSION_ID`** — this session already holds the reserve. This is the
+  normal outcome under `/vet-imp`, which reserved at its Step 1.1 and then
+  invoked this skill inside the same harness session. **A re-reserve by the same
+  owner token is a renewal, not a conflict** — proceed, and do **not** release at
+  the end of this run; the acquirer releases.
+- **`held` by a DIFFERENT owner — STOP.** Do not edit the plan and do not stamp
+  it. Report the holder and surface to the operator via `AskUserQuestion`
+  (header `Plan reserved`, options **Abort** / **Wait** — poll every 30 s, then
+  re-acquire). When `current_holder` equals THIS machine and
+  `current_holder_session` differs, say so explicitly rather than implying a
+  different box:
+
+  ```
+  Another session on THIS machine (session <current_holder_session>) already
+  holds plan:<plan-stem>.
+  ```
+
+  It is a STOP, not a warning. The reason the reserve sits ahead of every `Edit`
+  is precisely that stopping here leaves no trail in the plan file.
+- **`fork_risk`, or a non-empty `forking_siblings`** — no hard holder, but
+  sibling PRs are already racing this plan. Not a clear: name them in the Step 6
+  report and read them before deciding the plan's claims are current.
+- **`topic_conflict` / `topic_unknown` / `invalid_topic`** — surface verbatim and
+  abort. Not expected from this call shape; handle defensively.
+
+#### When the reserve cannot be ANSWERED — fail CLOSED
+
+> **Coord unreachable** (connection error, timeout, non-2xx, unparseable body)
+> on a device that DID resolve a machine UUID: this is **UNKNOWN, not free.** Do
+> not edit the plan. Report the transport failure verbatim, run `/coord-revive`,
+> and re-issue over the door it reports LIVE. If no door is live, surface to the
+> operator via `AskUserQuestion` (**Abort** / **Proceed uncoordinated**) —
+> proceeding is a decision someone makes, never a default reached by falling
+> through an undocumented branch.
+
+**Skip-and-warn only when there is no machine UUID at all.** If neither
+`QONTINUI_MACHINE_ID` nor `~/.qontinui/machine.json` supplies one, emit a
+single-line warning (`⚠️ plan reserve skipped: no machine_id available —
+vetting without reserve coordination`) and proceed. This is the *only* branch
+that proceeds without a reserve, and the asymmetry is deliberate: a device with
+no machine UUID **cannot participate in coordination at all** (permitting it is a
+stated trade), whereas a registered device that merely cannot *reach* coord is a
+full participant whose peers are invisible — the case where proceeding is most
+dangerous. Same observable ("no reserve acquired"), **opposite** correct
+response. Collapsing them is the `silent-empty-is-unknown` class (served policy
+`verification-and-evidence`) applied to a mutex.
+
+#### Is a plan reserve MANDATORY? Ask the grammar registry, not this file
+
+`/implement-plan` Step 0.7.5 owns the rule: *a resource is mandatory-reserve iff
+coord has a **registered `SemanticResource` grammar** for it AND it is NOT
+land-time re-pointable*, with the grammar registry as the single source of truth
+and an explicit prohibition on hand-maintained lists in the skills. A plan
+document satisfies the second half — a plan is never land-time re-pointable.
+
+**The `plan` grammar IS registered** (coord, 2026-08-25 — the sibling half of
+this plan's Phase 4). Read the live registry rather than this sentence:
+
+```bash
+curl -s "$COORD_HTTP_URL/coord/claims/semantic-resource-grammars"
+```
+
+It serves `{class, key_shape, description, land_time_repointable}` plus the rule
+text, and `plan` (`plan:<plan-stem>`, not land-time re-pointable) resolves
+`mandatory_reserve: true`. The reserve response echoes the same verdict under
+`grammar`. So the plan reserve is **mandatory now, by the rule** — not by a list
+in this file. If the registry ever stops serving `plan`, the reserve degrades to
+advisory automatically and correctly; that is the mechanism working, not a
+regression.
+
+> Note the registry did not exist before 2026-08-25. Step 0.7.5 named it as the
+> single source of truth while the classes lived only in prose — so "ask the
+> registry" was unanswerable, and the honest reading of any earlier
+> mandatory-vs-advisory claim in these files is UNKNOWN. It is answerable now.
+
+Mandatory governs whether *skipping* the call is a violation; it softens no
+branch above. Always issue the call, always STOP on a foreign `held`, always fail
+closed on an unanswerable one. Do not write `plan` into a hand-maintained
+mandatory list here — that is what Step 0.7.5 forbids and what the registry
+replaces.
 
 ### 0.25. Capture the status block and read delivery — BEFORE any edit
 
@@ -345,6 +568,11 @@ Categorize what you find:
 Don't flag style preferences or hypothetical concerns — only material defects.
 
 ### 4. Edit the plan in place
+
+**These are this command's first writes.** Do not reach them unless step 0.2's
+plan reserve returned `granted` / `claimed` / `renewed` (or took the documented
+no-machine-UUID skip). A foreign `held`, or a reserve that could not be answered,
+stops the run before any `Edit`.
 
 Use `Edit` (not `Write`) to surgically fix the plan, preserving the author's voice and structure. Specifically:
 - **Add a "Discovered prior art" section** near the top if the plan missed existing infrastructure. Include a small table with `Piece | Location | Notes`.
@@ -560,6 +788,31 @@ After stamping, fire the clearing `POST /coord/status` documented in
 Step 0 with `current_task: null` so the dashboard tile stops showing
 this vet session as in-flight.
 
+**Then release the plan reserve — only if THIS run acquired it.** In the same
+try/finally (so it fires on every abort path too, including the step 0.2 conflict
+flow's **Abort**):
+
+```bash
+curl -fsS -X POST "$COORD_HTTP_URL/claims/release" \
+  -H "Content-Type: application/json" \
+  -d "$(cat <<EOF
+{
+  "kind": "semantic_resource",
+  "resource_key": "plan:<plan-stem>",
+  "machine_id": "<machine_id>",
+  "agent_session_id": "$AGENT_SESSION_ID"
+}
+EOF
+)"
+```
+
+The release MUST carry the SAME `agent_session_id` used at acquire — the owner
+token is the match key, so omitting it (or sending a different session) returns
+`"not_held"` and leaves the reservation to TTL out. **Skip the release entirely
+if step 0.2 returned `renewed`**: under `/vet-imp` the orchestrator acquired the
+reserve and `/implement-plan` still has to run on it, so releasing here would
+unreserve the plan mid-lifecycle. `"not_held"` is otherwise fine and idempotent.
+
 ### 5.4. Register a `unit_ready` gate for the vetted plan (dispatchable-work queue)
 
 *(canonical spec: `_gate-registration` — keep copies in sync)*
@@ -609,24 +862,36 @@ decisions only — see the predicate guidance in `_gate-registration`).
 >
 > *Why the inversion is acceptable.* `/implement-plan` **cancels this pending
 > continuation when it stamps IN PROGRESS** (its Step 0.5, via
-> `POST $COORD_HTTP_URL/coord/gates/<gate_id>/continuation-cancel` — the same
+> `POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel` — the same
 > takeover mechanism its Step 0.6 has always used), so the moment the in-session
 > implementation genuinely takes over it retires the queued spawn itself.
 >
-> **Be precise about the residual gap: the cancel is post-dispatch-only.** A
-> 404 from that route means the continuation has not dispatched YET — it is
-> still armed, and this route cannot touch it (`_gate-registration` →
-> "Continuation cancel + refresh"). At the IN PROGRESS stamp that is the
-> *expected* state, so `/implement-plan` Step 0.5 also applies the pre-dispatch
-> remedy (mute/reject the gate) and, failing that, reports honestly that a
-> redundant terminal may still spawn. A spawn that does slip through lands on a
-> plan already stamped IN PROGRESS and should stand down at Step 0.45
-> reconnaissance / Step 0.6 claim conflict.
+> **Both windows are reachable from the implementing session**, so a completed
+> chain genuinely retires its own net. The cancel is post-dispatch-only — a 404
+> means the continuation has not dispatched yet — but the pre-dispatch window has
+> its own agent-reachable remedy, and which window you land in is just timing (a
+> `unit_ready` gate whose `ready_status` matches the status you just transitioned
+> clears, and dispatches, within seconds of registration):
 >
-> So the honest trade is not "duplicate runs are impossible" — it is: a
-> **silent** strand (old behaviour, plan rots unnoticed) has been exchanged for
-> a **visible** redundant terminal in the residual case, which the operator can
-> see and close, and which two further gates should stop on their own.
+> | window | remedy from THIS session |
+> |---|---|
+> | pre-dispatch (`dispatched_at == null`) | `POST .../coord/gates/<id>/agent/mute` or `.../agent/reject`, or `coord_withdraw_gate` — `run_gate_sweep` skips muted gates and dispatch only happens on clear |
+> | post-dispatch, unconsumed | `POST .../coord/gates/<id>/agent/continuation-cancel` → `200 {"cancelled":true}` |
+> | already consumed | `409 already_consumed` — the spawn happened; report it, do not claim a clean takeover |
+>
+> **This paragraph used to say the residual was unavoidable.** It said the cancel
+> could not land from the session doing the work and that a redundant terminal
+> "may still spawn" — because it named the OPERATOR route, which answers an agent
+> `401 operator context missing; SSO required`. That belief cost a real spawn
+> (gate `7902e457`, `continuation_consumed_outcome: "spawned"`, 2026-08-20,
+> against a plan already stamped SHIPPED). Exercised end-to-end on the agent twin
+> 2026-08-21, gate `336701f1`: dispatched 09:39:44Z, cancelled from the
+> implementing session at its IN PROGRESS stamp, `200 {"cancelled":true}`.
+>
+> So the honest trade is now: a **silent** strand (old behaviour — plan rots
+> unnoticed) has been exchanged for a net the completing chain retires itself.
+> Step 0.45 reconnaissance and the Step 0.6 claim conflict remain the second line
+> of defence for a spawn that slips through — they are no longer the first.
 >
 > *Why the inversion is now necessary.* The old default disabled the safety net
 > at exactly the moment it was needed. `/vet-imp` stalled after vetting
@@ -679,7 +944,7 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
 
 > **Agent sessions: use the device-authed work-unit door.** A vetting agent holds
 > a coord **device JWT** (carrying `tenant_id`) but **no `OperatorContext`**. The
-> `/coord/work-units/*` routes live on coord's `require_jwt` sub-router, so a
+> work-unit **write** routes live on coord's `require_jwt` sub-router, so a
 > device JWT resolves `tenant_id` server-side and CAN upsert + register — the old
 > operator-only `/coord/plans/*` wall (which 403'd a vetting agent and silently
 > broke §5.4 auto-dispatch) is gone. Registration is now **TWO calls** — upsert
@@ -696,6 +961,23 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
 > `/coord/gates/register` are removed (coord P4) — do not use them.
 > (`2026-06-15-coord-device-authed-plan-ready-gate-registration`, generalized to
 > work units.)
+>
+> **Reads are on the `agent-` paths, not the write paths.**
+> `GET /coord/work-units/<slug>` and `GET /coord/gates` are the operator
+> dashboard's `TenantId`-tier routes and answer a device JWT with **403
+> `tenant_not_resolved`**. The device-authed read doors are
+> `GET $COORD_HTTP_URL/coord/agent-work-units/<slug>` (returns `{work_unit,
+> recent_history, citations}`) and `GET $COORD_HTTP_URL/coord/agent-gates`
+> (same query params as the operator gates list, incl. `work_unit_id` and
+> `phase_name`). `/coord/agent-gates` is the **read** door; the gate **writes**
+> have their own device-authed twins under an `/agent/` **INFIX** —
+> `POST /coord/gates/:gate_id/agent/{reject,reopen,mute,unmute,snooze,
+> continuation-cancel,force-clear,audience}`. Note the two spellings: `agent-`
+> PREFIX for reads, `/agent/` INFIX for writes. `attest` **and `withdraw`** are
+> device-authed on their BARE paths (no twin exists, and there is no operator
+> withdraw route at all). `continuation-consumed` / `continuation-deferred` are
+> unauthenticated — the runner's delivery-ack loop, out of your scope but not out
+> of reach. **`approve` is the only genuinely operator-only gate verb.**
 
 1. **Upsert the work unit and capture `work_unit_id`.**
    `POST $COORD_HTTP_URL/coord/work-units/upsert` with
@@ -713,22 +995,18 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    (continuation-less) and note it in the report.
 3. **Check for an existing gate** anchored to this work unit
    (`GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>` — find an OPEN
-   `unit_ready` gate for this plan). Mind the `agent-` prefix: the unprefixed
-   `GET /coord/gates` is the operator dashboard's `TenantId`-tier route and answers
-   a device JWT **403 `tenant_not_resolved`** — the same wrong-door trap Step A
-   describes below, and the same verb-not-prefix split (the gate `POST`s keep their
-   own paths; only the `GET`s have an `agent-` door). Both run the same
-   `list_gates_core` body and take the same filters, so nothing else here changes.
-   If one exists, **refresh** it (re-register / update the
+   `unit_ready` gate for this plan). If one exists, **refresh** it (re-register / update the
    continuation) rather than creating a duplicate. **Before refreshing, cancel
    the prior gate's PENDING continuation** so the old queued runner-terminal spawn
    does not fire alongside the new one: for any row in that GET with
    `continuation_dispatched_at != null ∧ continuation_consumed_at == null ∧
    continuation_cancelled_at == null`, fire
-   `POST $COORD_HTTP_URL/coord/gates/:gate_id/continuation-cancel`
-   `{cancelled_by:"<this session>", reason:"refreshed — superseded by re-registration"}`
-   (`TenantId` auth, tenant derives server-side — an operator/`TenantId`-only
-   route). Best-effort: a 404 = nothing pending; a 409 `already_consumed` = a spawn
+   `POST $COORD_HTTP_URL/coord/gates/:gate_id/agent/continuation-cancel`
+   `{reason:"refreshed — superseded by re-registration"}` — the device-authed
+   `/agent/` **infix** twin, so the device session does the whole loop itself:
+   `/coord/agent-gates` discovers the pending continuation and this route retires
+   it. `cancelled_by` derives from the JWT and is not a body field. (The
+   unprefixed route is the operator's and answers an agent 401.) Best-effort: a 404 = nothing pending; a 409 `already_consumed` = a spawn
    already happened (report it, don't pretend the cancel landed). (canonical spec:
    `_gate-registration` → "Continuation cancel + refresh".)
 4. **Set the work unit's registry status** — the prerequisite for step 5's
@@ -832,9 +1110,8 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      `warnings[]` or a "cannot evaluate" `initial_verdict_reason` means the row
      exists and the gate can never clear. Re-check the predicate against a
      control, re-register on one coord can evaluate, withdraw the unusable one,
-     and quote the NEW `gate_id`. Full procedure and the tool names: the
-     **Warnings honesty** bullet in the flagged-items section below. Canonical:
-     `_gate-registration` → "Registration warnings".
+     and quote the NEW `gate_id`. Canonical: `_gate-registration` →
+     "Registration warnings".
 
 (If coord doesn't yet accept `unit_ready` — e.g. the deploy that ships the
 work-unit surface hasn't landed — report the gate as NOT registered with the
@@ -888,14 +1165,13 @@ derivation this whole ordering exists to protect.
 > a device JWT **403 `tenant_not_resolved`**. The split is by VERB, not by prefix:
 > the `POST` writes under `/coord/work-units/…` (`/upsert`, `/transition`,
 > `/register-gate`, …) *are* device-authed, which is why Steps B and C below keep
-> that path — it is only the `GET`s that moved to `agent-work-units`. (Same
-> operator-vs-`agent-` door split as `/coord/prompt-documents` vs
-> `/coord/agent-prompt-documents`; the `agent-` read doors are the generalization
-> of that pattern to work units.) Getting it wrong is not cosmetic: a 403 yields
-> no status, so the skip rule cannot fire AND Step C has no value for its
-> `from_status` guard — **both** protections against demoting an attested unit
-> fail from one wrong URL, and the failure reads as a credential problem rather
-> than a wrong door.
+> that path — it is only the `GET`s that moved to `agent-work-units`. Same
+> operator-vs-`agent-` door split the transport blockquote above already calls
+> out; it is restated here because getting it wrong is not cosmetic. A 403 yields
+> no status, so the skip
+> rule cannot fire AND Step C has no value for its `from_status` guard — **both**
+> protections against demoting an attested unit fail from one wrong URL, and the
+> failure reads as a credential problem rather than a wrong door.
 >
 > If the status is genuinely unavailable — you discarded the upsert response AND
 > the re-read fails — that is **UNKNOWN, not `draft`**. Do not invent a
@@ -1045,9 +1321,9 @@ leave it in the report.
   note the gate_id in the report.
 - **Anchor (zero user input):** `work_unit_id` (a UUID) from
   `POST $COORD_HTTP_URL/coord/work-units/upsert` with the plan stem as `slug`
-  (capture the returned `work_unit_id`; or `GET /coord/agent-work-units/<slug>` →
-  `.work_unit.id` — the `agent-` read door, since the unprefixed `GET` is
-  `TenantId`-tier and 403s a device JWT);
+  (capture the returned `work_unit_id`; or the device-authed
+  `GET /coord/agent-work-units/<slug>` — the operator `GET /coord/work-units/<slug>`
+  403s a device JWT);
   `phase_name` from the relevant phase/section heading. Anchor = (work_unit_id,
   phase_name).
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
@@ -1133,7 +1409,7 @@ leave it in the report.
   to the status that actually landed (`vetted`, else the Free fallback
   `vetted_unattested`); a hardcoded Attested value on a unit you own never clears,
   since an owner may not attest (§5.4 has the full procedure; canonical:
-  `_gate-registration`) — (**NOT** `operator_approval` — `operator_approval`
+  `_gate-registration`). (**NOT** `operator_approval` — `operator_approval`
   is for genuine human decisions, not a work queue); schema/alembic-at-head →
   `migration_at_head` `{schema}`; infra drift cleared → `infra_drift_clear`; a repo
   file/workflow existing → ⛔ `file_exists` is **KNOWN BROKEN (2026-08-05): it 403s
@@ -1177,9 +1453,14 @@ leave it in the report.
   continuation-carrying gate too) — `GET .../coord/agent-gates?work_unit_id=<id>` for rows
   with `continuation_dispatched_at != null ∧ continuation_consumed_at == null ∧
   continuation_cancelled_at == null`, then
-  `POST .../coord/gates/:gate_id/continuation-cancel {cancelled_by, reason}`
-  (`TenantId` auth, best-effort). (canonical spec: `_gate-registration` →
-  "Continuation cancel + refresh".)
+  `POST .../coord/gates/:gate_id/agent/continuation-cancel {reason}` — the
+  device-authed `/agent/` **infix** twin, so a device session does the whole loop
+  itself: `/coord/agent-gates` discovers the pending continuation and this route
+  retires it. `cancelled_by` derives from the JWT and is not a body field.
+  Best-effort. (This bullet used to say the cancel "stays operator-only" and that
+  a device session had to reach an operator door; that was wrong — it named the
+  unprefixed OPERATOR route, which answers an agent 401.) (canonical spec:
+  `_gate-registration` → "Continuation cancel + refresh".)
 
 **Attest-on-completion (close the loop).** Vetting normally registers gates
 rather than completing gated work — but if this run also COMPLETES work that a
@@ -1187,13 +1468,15 @@ registered gate was watching, it MUST attest that gate (otherwise an agent-fact
 gate rots open until a human clicks it).
 
 - **Find the gate:** by the `gate_id` recorded at registration, or by lookup
-  `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>&phase_name=<name>` (the
-  device-authed read door — the unprefixed `/coord/gates` 403s a device JWT) — the OPEN
-  gate whose condition the completed work satisfies.
+  `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>&phase_name=<name>` — the OPEN
+  gate whose condition the completed work satisfies. That is the **device-authed**
+  read door; the operator `GET /coord/gates` is `TenantId`-only and 403s a device
+  JWT (a wrong-door 403, not a missing gate).
 - **Attest (unchanged — keyed by `gate_id`):** prefer MCP `coord_attest_gate` (pass
   `gate_id` — works from a device session since attest takes no upsert); fall back to
   the device loopback forwarder `POST http://127.0.0.1:{runner_port}/coord-mcp/gates/{gate_id}/attest`
-  (header `X-Coord-Mcp-Proxy-Key`, no body bearer — maskless fallback), then the
+  (header `X-Coord-Mcp-Proxy-Key`, or `Authorization: Bearer <nonce>` on configs
+  written after the Phase 2 header move — no body bearer; maskless fallback), then the
   direct device-authed `POST $COORD_HTTP_URL/coord/gates/:gate_id/attest`. Tenant
   derives server-side — never pass it. Legal only on an OPEN `operator_approval`
   gate with `clearance_audience = 'agent'` in the caller's own tenant; coord flips
@@ -1257,6 +1540,12 @@ instruction fired and `/vet-imp`'s Steps 3-5 were never reached.
 
 ## Rules
 
+- **Reserve before the first `Edit`.** Step 0.2's plan reserve is the exclusion
+  primitive for this command; it runs ahead of every write so that a foreign
+  `held` stops the run with the plan file untouched. A `held` held by a different
+  owner is a STOP, and a reserve that coord could not answer is UNKNOWN — fail
+  closed. The only branch that proceeds unreserved is a device with no machine
+  UUID at all.
 - **Edit the plan, don't rewrite it.** Surgical changes only. Preserve the author's structure unless an entire section is wrong.
 - **Cite the code.** Every claim added to the plan should reference a file:line. "Almost certainly exists" is not good enough.
 - **Verify memories before quoting them.** `MEMORY.md` entries are point-in-time observations; check the current code before treating a memory as fact.

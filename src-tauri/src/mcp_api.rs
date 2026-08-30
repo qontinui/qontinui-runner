@@ -4088,9 +4088,24 @@ async fn coord_claims_by_resource_handler(
 /// so it can never smuggle a path (`..`, `/`, `%2f`, …) past the fixed route
 /// template.
 ///
-/// Note: coord's continuation-cancel route is operator/`TenantId`-only (not
-/// device-authed), so it is deliberately excluded — a `ContinuationCancel`
-/// variant would never authenticate through this device-JWT path anyway.
+/// Note: there is no `ContinuationCancel` variant, and the reason is NOT the one
+/// this comment used to give. It said the route "is operator/`TenantId`-only (not
+/// device-authed)". That is false, and it is the exact false floor that cost this
+/// fleet four sessions of misdiagnosis: coord exposes continuation-cancel at BOTH
+/// tiers — the operator spelling `POST /coord/gates/{id}/continuation-cancel` on
+/// `operator_admin_writes`, AND the `/agent/` infix twin
+/// `POST /coord/gates/{id}/agent/continuation-cancel` on `gates_agent_authed`
+/// behind `require_jwt`, which a device JWT authenticates against perfectly well.
+///
+/// The exclusion still stands, on a different and better reason: the agent twin is
+/// reachable DIRECTLY at `$COORD_HTTP_URL` from any session holding a device JWT,
+/// so routing it through this forwarder would add a hop that buys nothing. The
+/// forwarder exists for callers that have only the loopback nonce, and the MCP
+/// door already covers them — `coord_cancel_continuation` is in
+/// `COORD_MCP_ALLOWED_TOOLS`.
+///
+/// Do not "fix" this by adding the variant. Do not cite it as evidence that the
+/// verb is operator-only either; that reading is what this note exists to stop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CoordWriteTarget {
     /// `POST {coord}/coord/gates/{gate_id}/attest`

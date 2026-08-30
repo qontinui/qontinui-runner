@@ -358,6 +358,107 @@ mod tests {
         }
     }
 
+    /// Route TIER guard: no bundled command may tell an agent to POST a gate
+    /// verb at its OPERATOR spelling.
+    ///
+    /// Six of coord's gate verbs exist twice — an operator route on
+    /// `operator_admin_writes` behind `require_role("admin")`, and an `/agent/`
+    /// **infix** twin on `gates_agent_authed` behind `require_jwt`. A spawned
+    /// session holds a device/agent JWT, so the operator spelling answers it
+    /// `401 operator context missing; SSO required`. That 401 reads as a
+    /// credential wall, and at least five sessions concluded one — one of them
+    /// leaking a queued terminal for ~22 hours — when the only wrong variable
+    /// was the URL.
+    ///
+    /// This is the rule from `qontinui-claude-config`'s check #21
+    /// (`scripts/lint-gate-route-tier.py`), ported rather than re-derived. That
+    /// linter's `SCAN_GLOBS` resolve under its own `repo_root()`, so it
+    /// structurally cannot see this bundle — and this bundle is the copy a
+    /// spawned session actually reads, because
+    /// [`provision_fleet_commands_for_session`] writes it into the session's
+    /// cwd. The rule travels; the diff does not. A cross-repo content sync
+    /// would give the bundle a second way to go stale, which is the objection
+    /// that linter's own docstring makes, and makes correctly.
+    ///
+    /// Plan: `2026-08-22-fleet-command-fork-sends-agents-to-the-operator-gate-door`,
+    /// Phase 2.
+    #[test]
+    fn staged_fleet_commands_never_name_an_operator_tier_gate_route() {
+        // Verbs coord exposes at BOTH tiers — `qontinui-coord`
+        // `crates/coord/src/routes.rs`, the `gates_agent_authed` sub-router.
+        // Naming the bare path for one of these is the defect.
+        const TWIN_VERBS: &[&str] = &[
+            "reject",
+            "reopen",
+            "mute",
+            "unmute",
+            "snooze",
+            "continuation-cancel",
+            "force-clear",
+            "audience",
+        ];
+
+        // Deliberately NOT listed, so a future reader does not "fix" them into
+        // the twin form — those routes do not exist:
+        //   `approve`                  — genuinely operator-only.
+        //   `attest`, `withdraw`       — device-authed on the BARE path.
+        //   `continuation-consumed`,
+        //   `continuation-deferred`    — unauthenticated runner delivery acks.
+
+        // What discriminates the twin form is the ANCHOR CLASS, not a
+        // lookbehind (which `regex` has not got, and does not need here): the
+        // anchor cannot cross a `/`, so the verb must sit in the segment
+        // immediately after the gate id. `/coord/gates/<id>/agent/mute` fails
+        // to match because `agent` is not a twin verb and there is no second
+        // `/coord/gates/` to re-anchor on.
+        let pattern = format!(
+            r"/coord/gates/(?P<anchor>[^/\s`]+)/(?P<verb>{})\b",
+            TWIN_VERBS.join("|")
+        );
+        let re = regex::Regex::new(&pattern).expect("route-tier pattern compiles");
+
+        let mut findings: Vec<String> = Vec::new();
+        for (name, contents) in FLEET_COMMANDS {
+            for (idx, line) in contents.lines().enumerate() {
+                for caps in re.captures_iter(line) {
+                    // The one residual the anchor class cannot cover: a gate id
+                    // literally spelled `agent`, i.e. the correct twin form.
+                    if &caps["anchor"] == "agent" {
+                        continue;
+                    }
+                    // A doc legitimately names the operator route when it is
+                    // documenting the OPERATOR's door. SAME LINE ONLY — these
+                    // bodies say "operator" dozens of times per section, so a
+                    // wider window would exempt genuine defects. Prose cases
+                    // that span lines carry the explicit marker instead.
+                    if line.contains("lint-gate-route-tier: allow")
+                        || line.to_ascii_lowercase().contains("operator")
+                    {
+                        continue;
+                    }
+                    findings.push(format!(
+                        "  {name}.md:{} names `{}` at its operator spelling\n    {}",
+                        idx + 1,
+                        &caps["verb"],
+                        line.trim()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            findings.is_empty(),
+            "bundled agent command(s) instruct an agent to POST an operator-tier gate \
+             route. A device/agent JWT gets `401 operator context missing; SSO required` \
+             there. Use the `/agent/` INFIX twin instead \
+             (`POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/<verb>`) — or, if the \
+             line really is documenting the operator's own door, say `operator` on it \
+             or add the `lint-gate-route-tier: allow` marker. Prefer re-staging the file \
+             from qontinui-claude-config `origin/main` over hand-patching it:\n{}",
+            findings.join("\n")
+        );
+    }
+
     /// The bundled commands must never acquire the operator's absolute plan
     /// paths. Scope to the specific hardcode patterns that were neutralized —
     /// NOT bare `qontinui-dev-notes`, which legitimately appears as a repo name.
