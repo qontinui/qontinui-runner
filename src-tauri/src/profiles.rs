@@ -581,31 +581,40 @@ impl TierRead {
 // The probes live in thin wrappers at each call site.
 // ---------------------------------------------------------------------------
 
-/// The `settings.json::tier` value for Tier 0. Its counterpart is
-/// [`QONTINUI_ACCOUNT_TIER`]; there is deliberately no constant for
-/// `local_provider`, which no inference can ever produce (see
-/// [`tier_is_open_to_inference`]).
+/// The `settings.json::tier` value for Tier 0 — the arm [`infer_tier`] resolves
+/// to when no signal fires. Its Tier 2 counterpart is [`QONTINUI_ACCOUNT_TIER`].
 pub const LOCAL_TIER: &str = "local";
 
 /// The `settings.json::tier` value for Tier 1.
 ///
-/// No inference can ever produce it (see [`tier_is_open_to_inference`]) — it
-/// exists only as an explicit operator choice — but [`parse_tier_value`] must
-/// still recognize it, because the `QONTINUI_RUNNER_TIER` env overlay and the
-/// runtime override can both name it.
+/// No inference can ever produce it — [`InferredTier`] has only two arms, and
+/// [`tier_is_open_to_inference`] additionally closes a document that already
+/// carries it — so it exists only as an explicit operator choice. It still
+/// needs a constant: [`TIER_VALUES`] and therefore [`parse_tier_value`] must
+/// recognize it, because the `QONTINUI_RUNNER_TIER` env overlay, the runtime
+/// override and `qontinui_profile tier --set` can all name it. (This module
+/// used to argue the opposite — that no constant was warranted — which was
+/// true only while nothing here parsed an operator's tier string.)
 pub const LOCAL_PROVIDER_TIER: &str = "local_provider";
 
-/// Parse a tier value from an operator-supplied string (the
-/// `QONTINUI_RUNNER_TIER` env var, the `qontinui_profile tier --set` argument,
-/// the runtime override) into its canonical `settings.json::tier` spelling.
-/// `None` for anything unrecognized.
+/// Parse an operator-supplied tier string — the `QONTINUI_RUNNER_TIER` env var,
+/// or a value handed to the runtime override — into its canonical
+/// `settings.json::tier` spelling. `None` for anything unrecognized.
+///
+/// The accepted set is [`TIER_VALUES`], not a list restated here, so a tier
+/// added to the enum cannot be recognized by one door and not the other.
 ///
 /// Case-insensitive and whitespace-tolerant, because
 /// `settings::apply_tier_env_overlay` has always been both and this is now the
-/// one parse behind it — the runner bin maps the result onto `RunnerTier`
+/// one parse behind it: the runner bin maps the result onto `RunnerTier`
 /// through `RunnerTier::from_wire`, and [`ProcessTierInputs::from_env`] uses it
 /// directly. One parse ⇒ the process reader and `load_settings_full` cannot
 /// disagree about which values are even recognized.
+///
+/// [`set_tier_choice_at`] (the `qontinui_profile tier --set` door) deliberately
+/// does NOT go through this: it validates against [`TIER_VALUES`] EXACTLY,
+/// because it writes the operator's string into the document and a settings
+/// file must carry the canonical spelling, not whatever case the shell had.
 ///
 /// It does NOT log an unrecognized value: [`read_runner_tier`] runs on hot
 /// paths ([`coord_base_policy`] re-reads on every call), so a line here would
@@ -613,15 +622,7 @@ pub const LOCAL_PROVIDER_TIER: &str = "local_provider";
 /// the runner bin, where the value came from.
 pub fn parse_tier_value(raw: &str) -> Option<&'static str> {
     let normalized = raw.trim().to_ascii_lowercase();
-    if normalized == LOCAL_TIER {
-        Some(LOCAL_TIER)
-    } else if normalized == LOCAL_PROVIDER_TIER {
-        Some(LOCAL_PROVIDER_TIER)
-    } else if normalized == QONTINUI_ACCOUNT_TIER {
-        Some(QONTINUI_ACCOUNT_TIER)
-    } else {
-        None
-    }
+    TIER_VALUES.iter().find(|v| **v == normalized).copied()
 }
 
 /// Process-global, in-memory-only tier override — the operator's RUNTIME
@@ -642,8 +643,10 @@ pub fn parse_tier_value(raw: &str) -> Option<&'static str> {
 ///
 /// It holds the canonical wire string rather than the bin's `RunnerTier` enum,
 /// which the lib has no access to; `settings::in_memory_tier` maps it back
-/// through `RunnerTier::from_wire`. Only [`parse_tier_value`] spellings can
-/// reach it, so that map is total.
+/// through `RunnerTier::from_wire`, whose `expect` rests on that map being
+/// total. It is: every writer in the tree stores a `RunnerTier::as_str` value,
+/// and those are exactly [`TIER_VALUES`] — pinned by
+/// `tier_matrix_tests::runner_tier_from_wire_is_total_over_parse_tier_value`.
 ///
 /// In-memory only: `settings::update_settings` starts from the raw on-disk
 /// document and the tier WRITER here
@@ -655,9 +658,9 @@ static RUNTIME_TIER_OVERRIDE: std::sync::RwLock<Option<&'static str>> =
 /// Set (or with `None`, clear) the process-global runtime tier override.
 /// See [`RUNTIME_TIER_OVERRIDE`].
 ///
-/// `&'static str` rather than `String`: every value that may be stored is one
-/// of the three [`parse_tier_value`] constants, and taking the static type
-/// makes an unparsed value unrepresentable rather than merely discouraged.
+/// `&'static str` rather than `String`: the values that belong here are the
+/// [`TIER_VALUES`] constants themselves, so the static lifetime is the natural
+/// type and a caller has to go out of its way to pass anything else.
 pub fn set_runtime_tier_override(tier: Option<&'static str>) {
     if let Ok(mut guard) = RUNTIME_TIER_OVERRIDE.write() {
         *guard = tier;
@@ -676,8 +679,8 @@ pub fn runtime_tier_override() -> Option<&'static str> {
 ///
 /// # Why this type exists
 ///
-/// [`read_runner_tier`] is the PROCESS reader, and for two releases it was one
-/// only in part: it consulted `QONTINUI_SERVER_MODE` and nothing else, while
+/// [`read_runner_tier`] is the PROCESS reader, and it was one only in part: it
+/// consulted `QONTINUI_SERVER_MODE` and nothing else, while
 /// `settings::load_settings_full` in the same process additionally applied the
 /// `QONTINUI_RUNNER_TOKEN` overlay, the `QONTINUI_RUNNER_TIER` overlay and the
 /// runtime override. The two therefore disagreed on every box that used any of
@@ -1197,12 +1200,19 @@ pub fn read_runner_tier_at(
 /// This keeps `coord_doctor`'s NO-DOWNGRADE rule intact where it matters:
 /// [`read_runner_tier_from_document`] passes [`ProcessTierInputs::none`], so
 /// the doctor still reports UNKNOWN and never guesses a tier from an unreadable
-/// file. For the PROCESS reader it is instead what makes the two readers agree
-/// on this input too — `settings::load_settings_full` applies both overlays to
-/// the defaulted `Settings` it synthesizes for an unreadable file, so
-/// `QONTINUI_RUNNER_TIER=local` really does mean `local` there, and an `Unknown`
-/// here would send [`apply_tier_policy`] to the production coord base on the
-/// exact configuration the opt-out exists to prevent.
+/// file.
+///
+/// For the PROCESS reader the overlay has to win, because
+/// `settings::load_settings_full` applies both overlays OUTSIDE its
+/// authoritative-provenance guard — to the defaulted `Settings` it synthesizes
+/// for an unreadable file — so `settings::load_settings().tier` really is
+/// `Local` there. An `Unknown` here would instead send [`apply_tier_policy`] to
+/// the PRODUCTION coord base, on the exact configuration the opt-out exists to
+/// prevent.
+///
+/// (`settings::resolve_tier` still reports `Unknown` for that load, and rightly
+/// so — it answers "did we read this install's tier?", not "what tier is this
+/// process running at?". The reader here is the second question.)
 fn unreadable_or_overlay(reason: String, process: &ProcessTierInputs) -> TierRead {
     match process.overlay() {
         Some(t) => TierRead::Known(t.to_string()),
@@ -1368,7 +1378,7 @@ pub fn clear_tier_choice_at(path: &std::path::Path, is_secondary: bool) -> Resul
 /// spelling of `settings::RunnerTier`). Named here because the lib has no
 /// `RunnerTier` — see [`apply_tier_edit_at`] on why there is no typed
 /// round-trip.
-pub const TIER_VALUES: &[&str] = &[LOCAL_TIER, "local_provider", QONTINUI_ACCOUNT_TIER];
+pub const TIER_VALUES: &[&str] = &[LOCAL_TIER, LOCAL_PROVIDER_TIER, QONTINUI_ACCOUNT_TIER];
 
 /// Apply a [`TierEdit`] to `settings.json` as a `serde_json::Value`-tree edit.
 ///

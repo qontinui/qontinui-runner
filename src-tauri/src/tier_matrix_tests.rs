@@ -486,13 +486,14 @@ fn a_disk_runner_token_promotion_is_still_durable() {
 
 /// Escape hatch 2, and the top of the stack: the runtime override that
 /// `commands::auth::set_runner_tier` writes (`settings::set_in_memory_tier` →
-/// `TIER_OVERRIDE` → `in_memory_tier()`) is applied LAST, so an explicit
-/// operator choice made after boot beats BOTH the env overlay and the headless
-/// default.
+/// `profiles::set_runtime_tier_override` → `settings::in_memory_tier()`) is
+/// applied LAST, so an explicit operator choice made after boot beats BOTH the
+/// env overlay and the headless default.
 ///
 /// Driven through the same three helpers `load_settings_full` calls, in its
-/// order, with the override value supplied directly — `TIER_OVERRIDE` is a
-/// process-wide global and this suite mutates no globals (see the module doc).
+/// order, with the override value supplied directly — the override itself is a
+/// process-wide global, and this test mutates none (the #2o family is where the
+/// global is exercised for real; see the module doc).
 #[test]
 fn runtime_tier_override_beats_the_headless_default() {
     let mut s = Settings::default();

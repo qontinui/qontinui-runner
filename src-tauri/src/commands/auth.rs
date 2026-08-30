@@ -679,11 +679,11 @@ pub struct SetRunnerTierResult {
 /// `spawn_blocking` keeps the file I/O off it.
 #[tauri::command]
 pub async fn set_runner_tier(tier: String) -> Result<SetRunnerTierResult, String> {
-    let parsed = match tier.as_str() {
-        "local" => settings::RunnerTier::Local,
-        "local_provider" => settings::RunnerTier::LocalProvider,
-        "qontinui_account" => settings::RunnerTier::QontinuiAccount,
-        other => return Err(format!("invalid tier: {}", other)),
+    // Through the lib's single `parse_tier_value`, not a fourth copy of the
+    // three spellings: this command and `profiles::read_runner_tier` end up
+    // writing and reading the same override, so they must agree on what parses.
+    let Some(parsed) = settings::RunnerTier::from_wire(&tier) else {
+        return Err(format!("invalid tier: {}", tier));
     };
     let is_secondary = crate::instance::is_secondary();
     // Blocking file I/O (`fs::read_to_string`, `create_dir_all`, and the
