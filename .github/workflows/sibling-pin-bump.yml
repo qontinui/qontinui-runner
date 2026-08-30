@@ -411,7 +411,17 @@ jobs:
                 exit 1
               fi
 
-              if printf '%s\n' "$changed" | grep -qxF ".github/workflows/ci.yml"; then
+              # Herestring, NOT `printf | grep -q`. `grep -q` exits on the first
+              # match, which SIGPIPEs the writer, and under `pipefail` that turns
+              # a successful HIT into rc 141 — so the `if` would fall to the ELSE
+              # branch and reject the PR. Measured on a dev box: 1500 paths
+              # (58KB) rc 0, 1800 paths (70KB) rc 141. That is reachable by the
+              # exact PR this hatch exists for — a mass rename or a generated-
+              # bindings regen that also un-pins a sibling — and it would tell
+              # the author to do the thing they had already done. Same hazard the
+              # comments dedup below materializes a file to avoid; closed the
+              # same way, without the pipe.
+              if grep -qxF ".github/workflows/ci.yml" <<< "$changed"; then
                 echo "::warning::This PR removes pin entries from $MANIFEST and also edits .github/workflows/ci.yml — allowed, on the assumption the sibling's checkout is being removed with it. ci-integrity.yml will red this PR for the ci.yml edit, so an operator reviews the pair."
                 while IFS= read -r r; do
                   [ -n "$r" ] && echo "::warning::  un-pinned: $r"
@@ -514,6 +524,32 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # EVERY PR-mutating gh call routes through this — create, edit, reopen
+          # and comment alike — because ONE permission gates all four, and when
+          # it is missing the push still SUCCEEDS and only the PR call fails.
+          # That reads as an unrelated infra blip rather than as a one-line
+          # settings fix.
+          #
+          # This is not hypothetical. atlas-exclude-fresh.yml — same PAT, same
+          # step shape, the workflow this one is modelled on — has been failing
+          # its scheduled run this way for weeks (e.g. run 33253101117,
+          # 2026-08-29: "Resource not accessible by personal access token
+          # (reopenPullRequest)" immediately after a successful push). It carries
+          # the fix only on its `gh pr create` path, so the reopen/edit path that
+          # actually fires reds nightly with nothing but gh's raw one-liner.
+          # Printing the remedy at every exit point is what keeps this workflow
+          # from inheriting that.
+          pr_write_failed() {
+            echo "::error::$1 failed for '$BRANCH'. The bumped pins ARE committed and pushed to that branch — the bump itself worked."
+            echo "::error::This is almost always PERMISSIONS, not the bump. Fix EITHER of:"
+            echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
+            echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO — it needs that IN ADDITION to 'Contents: write', and one fine-grained 'Pull requests' permission covers create, edit, reopen and comment together."
+            echo "::error::Option (b) is the narrower fix: (a) also lets every workflow APPROVE pull requests, which weakens the review boundary an auto-merging fleet depends on."
+            echo "::error::Meanwhile, open or update the PR by hand from '$BRANCH' — the bump is already committed there."
+            echo "::error::gh's own error above is the authoritative reason (other causes exist: a >65536-char body, a branch-protection refusal)."
+            exit 1
+          }
+
           # Resolve the PR BEFORE touching the branch. Once a human marks it
           # ready for review it can be a live merge-train candidate, and moving
           # the branch tip out from under an in-flight proposal is a known wedge
@@ -567,7 +603,8 @@ jobs:
                   cat "$RUNNER_TEMP/sibling-pins.report.txt"
                   printf '```\n\n<!-- sibling-pin-drift:%s -->\n' "$status_sha"
                 } > "$RUNNER_TEMP/pr-comment.md"
-                gh pr comment "$existing_num" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-comment.md"
+                gh pr comment "$existing_num" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-comment.md" \
+                  || pr_write_failed "gh pr comment on #$existing_num"
                 echo "Commented the new pin status on #$existing_num."
               fi
               exit 0
@@ -664,30 +701,23 @@ jobs:
               --json number,mergedAt --jq 'map(select(.mergedAt == null)) | first | .number // empty')"
             if [ -n "$existing_num" ]; then
               echo "Reopening previously closed bump PR #$existing_num."
-              gh pr reopen "$existing_num" --repo "$REPO"
+              gh pr reopen "$existing_num" --repo "$REPO" \
+                || pr_write_failed "gh pr reopen #$existing_num"
             fi
           fi
 
           if [ -n "$existing_num" ]; then
-            gh pr edit "$existing_num" --repo "$REPO" --title "$TITLE" --body-file "$body"
+            gh pr edit "$existing_num" --repo "$REPO" --title "$TITLE" --body-file "$body" \
+              || pr_write_failed "gh pr edit #$existing_num"
             url="$(gh pr view "$existing_num" --repo "$REPO" --json url --jq .url)"
             echo "Updated bump PR: $url"
           else
-            # A failure here is almost always CONFIGURATION rather than drift:
-            # this repo has "Allow GitHub Actions to create and approve pull
-            # requests" disabled, and a fine-grained PAT needs
-            # `Pull requests: write` on top of `Contents: write`. (Other 422
-            # causes exist — a >65536-char body, a branch-protection refusal —
-            # so gh's own stderr above is the authority.) Fail the job: the
-            # branch was pushed, so the fix is one click away, but a run that
+            # A failure here is almost always CONFIGURATION rather than drift —
+            # see pr_write_failed above for the two fixes. Fail the job: the
+            # branch was pushed, so the fix is one setting away, but a run that
             # found a real bump and could not deliver it must not end green.
             if ! url="$(gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft --title "$TITLE" --body-file "$body")"; then
-              echo "::error::Branch '$BRANCH' was pushed with the bumped pins, but opening its PR failed."
-              echo "::error::Usually permissions/config, not the bump itself (see gh's error above). Fix EITHER of:"
-              echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
-              echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO."
-              echo "::error::Meanwhile, open the PR by hand from '$BRANCH' — the bump is already committed there."
-              exit 1
+              pr_write_failed "gh pr create"
             fi
             echo "Opened bump PR: $url"
           fi
