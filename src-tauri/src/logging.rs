@@ -1317,7 +1317,11 @@ mod default_filter_tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(target: "wry::webview", "webview creation failed");
         });
-        assert_eq!(seen.load(Ordering::SeqCst), 1, "wry warnings are filtered out");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "wry warnings are filtered out"
+        );
     }
 
     /// The level choice, stated as a test: `tao` at `info` and below is chatty
