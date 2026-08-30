@@ -40,6 +40,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::Serialize;
 use tracing::{debug, warn};
 
@@ -1001,7 +1002,7 @@ fn resolve_tenant_id() -> Option<String> {
 
 /// Collect every lane this machine has, as one observation instant.
 pub(crate) async fn collect() -> Vec<ResourceSample> {
-    let host = tokio::task::spawn_blocking(collect_host_lane).await.ok();
+    let host = spawn_blocking_tracked(collect_host_lane).await.ok();
     let wsl = collect_wsl_lane().await;
     host.into_iter().chain(wsl).collect()
 }

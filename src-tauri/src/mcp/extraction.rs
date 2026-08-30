@@ -14,6 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Web Extraction Types
@@ -525,7 +526,7 @@ pub async fn start_web_extraction(
     let extraction_state = state.extraction_state.clone();
     let extraction_id_for_state = extraction_id.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             bridge.send_command("start_web_extraction", Some(params))
         })?
@@ -587,7 +588,7 @@ pub async fn start_vision_extraction(
 
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             bridge.send_command("run_vision_extraction", Some(params))
         })?
@@ -625,7 +626,7 @@ pub async fn stop_web_extraction(
     let app_state = state.app_state.clone();
     let extraction_state = state.extraction_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             bridge.send_command("stop_web_extraction", None)
         })?
@@ -792,7 +793,7 @@ pub async fn start_uitars_extraction(
 
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             bridge.send_command("start_uitars_extraction", Some(params))
         })?
@@ -829,7 +830,7 @@ pub async fn stop_uitars_extraction(
 
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             bridge.send_command("stop_uitars_extraction", None)
         })?
@@ -863,7 +864,7 @@ pub async fn get_uitars_extraction_status(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -925,7 +926,7 @@ pub async fn get_uitars_extraction_results(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -1017,7 +1018,7 @@ pub async fn run_vision_extraction(
     });
 
     // Use spawn_blocking for the synchronous bridge operation
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -1115,7 +1116,7 @@ pub async fn pattern_find(
     });
 
     // Use spawn_blocking for the synchronous bridge operation
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -1213,7 +1214,7 @@ pub async fn pattern_find_all(
     });
 
     // Use spawn_blocking for the synchronous bridge operation
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());

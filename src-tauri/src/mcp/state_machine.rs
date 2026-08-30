@@ -20,6 +20,7 @@ use crate::state_machine_configs::{
     CreateSmConfigRequest, CreateSmStateRequest, CreateSmTransitionRequest, SmConfig, SmConfigFull,
     SmImportRequest, SmState, SmTransition,
 };
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Types
@@ -57,7 +58,7 @@ pub async fn load_state_machine(
     let params = serde_json::json!({ "config": request.config });
     let timeout = std::time::Duration::from_secs(30);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -110,7 +111,7 @@ pub async fn get_state_machine_status(
     let app_state = state.app_state.clone();
     let timeout = std::time::Duration::from_secs(10);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -161,7 +162,7 @@ pub async fn get_active_states(
     let app_state = state.app_state.clone();
     let timeout = std::time::Duration::from_secs(15);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -217,7 +218,7 @@ pub async fn execute_transition(
     let params = serde_json::json!({ "transition_id": request.transition_id });
     let timeout = std::time::Duration::from_secs(30);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -275,7 +276,7 @@ pub async fn navigate_to_states(
     let params = serde_json::json!({ "target_states": request.target_states });
     let timeout = std::time::Duration::from_secs(60);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -331,7 +332,7 @@ pub async fn get_available_transitions(
     // Try Python bridge first for live transition availability
     let bridge_result = {
         let app_state_clone = app_state.clone();
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             with_default_bridge(&app_state_clone, |bridge| {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
@@ -373,7 +374,7 @@ pub async fn get_available_transitions(
     info!("State Machine API: Falling back to SQLite for transition data");
     let status_result = {
         let app_state_clone = app_state.clone();
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             with_default_bridge(&app_state_clone, |bridge| {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
@@ -478,7 +479,7 @@ pub async fn get_permitted_triggers(
     let params = serde_json::json!({ "active_state_ids": active_state_ids });
     let timeout = std::time::Duration::from_secs(10);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -536,7 +537,7 @@ pub async fn get_blocked_triggers(
     let params = serde_json::json!({ "active_state_ids": active_state_ids });
     let timeout = std::time::Duration::from_secs(10);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -596,7 +597,7 @@ pub async fn get_mermaid_diagram(
     let params = serde_json::json!({ "active_state_ids": active_state_ids });
     let timeout = std::time::Duration::from_secs(10);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -645,7 +646,7 @@ pub async fn clear_state_machine(
     let app_state = state.app_state.clone();
     let timeout = std::time::Duration::from_secs(10);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -1432,7 +1433,7 @@ pub async fn auto_load_default_state_machine(app_state: &Arc<crate::commands::Ap
     let timeout = std::time::Duration::from_secs(120);
     let app_state_for_bridge = app_state.clone();
 
-    let dispatch = tokio::task::spawn_blocking(move || {
+    let dispatch = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state_for_bridge, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());

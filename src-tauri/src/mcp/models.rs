@@ -15,6 +15,7 @@ use tracing::{error, info};
 use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::timeout_config::Timeouts;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Types
@@ -56,7 +57,7 @@ pub async fn list_models(
 
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -121,7 +122,7 @@ pub async fn download_model(
     });
 
     // Model downloads can take a long time, use 10 minute timeout
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -184,7 +185,7 @@ pub async fn delete_model(
         "model_id": request.model_id,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -244,7 +245,7 @@ pub async fn get_model_status(
         "model_id": model_id,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -300,7 +301,7 @@ pub async fn get_models_disk_usage(
 
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());

@@ -49,6 +49,7 @@
 
 use std::time::Duration;
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use tauri::WebviewWindow;
 
 /// How long to wait for the event loop to answer a geometry getter.
@@ -110,7 +111,7 @@ pub struct WindowGeometry {
 /// [`WindowProbeError`].
 pub async fn geometry(window: &WebviewWindow) -> Result<WindowGeometry, WindowProbeError> {
     let window = window.clone();
-    let handle = tokio::task::spawn_blocking(move || {
+    let handle = spawn_blocking_tracked(move || {
         let scale = window.scale_factor().unwrap_or(1.0);
         let pos = window.inner_position().unwrap_or_default();
         let size = window.inner_size().unwrap_or_default();
@@ -143,7 +144,7 @@ pub async fn inner_size(
     window: &WebviewWindow,
 ) -> Result<Option<tauri::PhysicalSize<u32>>, WindowProbeError> {
     let window = window.clone();
-    let handle = tokio::task::spawn_blocking(move || window.inner_size().ok());
+    let handle = spawn_blocking_tracked(move || window.inner_size().ok());
 
     match tokio::time::timeout(WINDOW_GETTER_TIMEOUT, handle).await {
         Ok(Ok(size)) => Ok(size),
@@ -155,7 +156,7 @@ pub async fn inner_size(
 /// Bounded `scale_factor()`, for callers that need only the scale.
 pub async fn scale_factor(window: &WebviewWindow) -> Result<f64, WindowProbeError> {
     let window = window.clone();
-    let handle = tokio::task::spawn_blocking(move || window.scale_factor().unwrap_or(1.0));
+    let handle = spawn_blocking_tracked(move || window.scale_factor().unwrap_or(1.0));
 
     match tokio::time::timeout(WINDOW_GETTER_TIMEOUT, handle).await {
         Ok(Ok(scale)) => Ok(scale),

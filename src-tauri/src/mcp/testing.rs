@@ -14,6 +14,7 @@ use tracing::{error, info};
 
 use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Types
@@ -169,7 +170,7 @@ pub async fn start_integration_test(
         "metadata": request.metadata,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -225,7 +226,7 @@ pub async fn get_test_run_status(
         "run_id": run_id,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -268,7 +269,7 @@ pub async fn get_integration_test_results(
         "run_id": run_id,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -315,7 +316,7 @@ pub async fn list_integration_test_runs(
         "limit": limit,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -388,7 +389,7 @@ pub async fn mock_gui_action(
         }
     };
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -427,7 +428,7 @@ pub async fn get_testing_states(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -465,7 +466,7 @@ pub async fn get_testing_transitions(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -509,7 +510,7 @@ pub async fn find_testing_path(
         "to_state": request.to_state,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -554,7 +555,7 @@ pub async fn traverse_to_state(
         "execute": request.execute,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -596,7 +597,7 @@ pub async fn get_testing_active_states(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -639,7 +640,7 @@ pub async fn set_testing_mock_mode(
         "mode": request.mode,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -677,7 +678,7 @@ pub async fn get_mocked_actions(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -715,7 +716,7 @@ pub async fn clear_mocked_actions(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -761,7 +762,7 @@ pub async fn run_testing_assertion(
         "timeout_seconds": request.timeout_seconds,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -800,7 +801,7 @@ pub async fn end_integration_test(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());

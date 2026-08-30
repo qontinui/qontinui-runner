@@ -43,6 +43,7 @@ use tracing::{debug, info, warn};
 use super::auto_response_fleet::{FleetRule, RuleAction, ScoringOption};
 use super::output_scan::normalize;
 use crate::settings::BackoffConfig;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// The compiled, hot-path form of a rule's action.
 ///
@@ -289,7 +290,7 @@ pub fn spawn_grid_scan_loop() {
             ticker.tick().await;
             // Join errors are non-fatal: a panicked sweep is logged and the
             // loop keeps ticking (a dead scanner is worse than a skipped tick).
-            if let Err(e) = tokio::task::spawn_blocking(scan_once_blocking).await {
+            if let Err(e) = spawn_blocking_tracked(scan_once_blocking).await {
                 warn!(error = %e, "auto_response: grid-scan task panicked");
             }
         }
@@ -616,6 +617,7 @@ mod scheduler {
 /// only impure piece (spawns the one-shot CLI on a blocking thread).
 mod scoring {
     use super::ScoringOption;
+    use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
     use std::time::Duration;
     use tracing::{debug, warn};
 
@@ -724,7 +726,7 @@ mod scoring {
     /// exit, timeout, or unparseable output — every failure fails closed.
     pub(super) async fn run_cli_scorer(prompt: String) -> Option<serde_json::Value> {
         let timeout = score_timeout();
-        let raw = tokio::task::spawn_blocking(move || {
+        let raw = spawn_blocking_tracked(move || {
             let settings = crate::settings::load_settings();
             crate::ai_provider::score_options_via_cli(&prompt, &settings.ai.claude_cli, timeout)
         })

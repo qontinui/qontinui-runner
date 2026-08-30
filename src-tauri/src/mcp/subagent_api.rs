@@ -12,6 +12,7 @@ use tracing::info;
 
 use crate::mcp::types::{ApiResponse, ApiState};
 use crate::subagent::{execute_analysis, SubagentAnalysisRequest};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new().route("/subagent/analyze", post(analyze_handler))
@@ -27,7 +28,7 @@ async fn analyze_handler(
         request.provider,
         request.file_refs.len()
     );
-    match tokio::task::spawn_blocking(move || execute_analysis(&request)).await {
+    match spawn_blocking_tracked(move || execute_analysis(&request)).await {
         Ok(Ok(text)) => Json(ApiResponse::success(text)),
         Ok(Err(e)) => Json(ApiResponse::error(e.to_string())),
         Err(e) => Json(ApiResponse::error(format!(

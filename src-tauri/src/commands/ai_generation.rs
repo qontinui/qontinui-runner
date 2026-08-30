@@ -20,6 +20,7 @@ use crate::commands::CommandResponse;
 use crate::error::AppError;
 use crate::executor::with_default_bridge_compartment;
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -73,7 +74,7 @@ pub async fn generate_context_with_ai(
     let user_prompt = input.user_prompt;
 
     // Execute via spawn_blocking since PythonBridge uses block_on internally
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": user_prompt,
             "ai_provider": ai_provider,
@@ -173,7 +174,7 @@ pub async fn generate_api_request_with_ai(
     let user_prompt = input.user_prompt;
     let base_url = input.base_url;
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": user_prompt,
             "base_url": base_url,
@@ -275,7 +276,7 @@ pub async fn generate_task_prompt_with_ai(
     let user_prompt = input.user_prompt;
     let mode = input.mode;
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": user_prompt,
             "mode": mode,
@@ -397,7 +398,7 @@ pub async fn suggest_exploration_strategy_with_ai(
     let available_states = input.available_states;
     let available_transitions = input.available_transitions;
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_goal": user_goal,
             "available_states": available_states,
@@ -538,7 +539,7 @@ pub async fn generate_test_and_agentic_step(
     let page_context = input.page_context;
     let context_ids = input.context_ids;
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": user_prompt,
             "page_context": page_context,
@@ -658,7 +659,7 @@ pub async fn explore_flow_step(
     let provider_settings = build_provider_settings(&ai_settings);
     let bridge_compartment = bridge.inner().clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": input.user_prompt,
             "current_elements": input.current_elements,
@@ -799,7 +800,7 @@ pub async fn generate_element_ai_description(
     let prompt = build_element_description_prompt(&input);
 
     // Route through the provider system (respects user's configured provider)
-    let ai_response = tokio::task::spawn_blocking(move || {
+    let ai_response = spawn_blocking_tracked(move || {
         let context = TaskContext::from_prompt(&prompt);
         ai_provider::run_prompt_with_routing(&prompt, &context, None)
     })

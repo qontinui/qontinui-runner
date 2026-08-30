@@ -21,6 +21,7 @@ use tracing::info;
 
 use crate::mcp::types::ApiState;
 use crate::terminal::TerminalManager;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Safelist
@@ -333,7 +334,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 .inner()
                 .clone();
             let id = a.terminal_id.clone();
-            match tokio::task::spawn_blocking(move || tm.close(&id)).await {
+            match spawn_blocking_tracked(move || tm.close(&id)).await {
                 Ok(Ok(())) => TauriInvokeResponse::ok(serde_json::json!({ "success": true })),
                 Ok(Err(e)) => TauriInvokeResponse::err(e),
                 Err(e) => TauriInvokeResponse::err(format!("Join error: {}", e)),

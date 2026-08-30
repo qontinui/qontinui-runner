@@ -20,6 +20,7 @@ use tracing::{error, info, warn};
 
 use crate::mcp::types::ApiState;
 use crate::screen;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Default Sunshine admin API port
 const SUNSHINE_API_PORT: u16 = 47990;
@@ -173,7 +174,7 @@ pub async fn get_screenshot(Query(query): Query<ScreenshotQuery>) -> impl IntoRe
     let window_title = query.window_title.clone();
 
     // xcap capture must run on a blocking thread (Windows COM/GDI)
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         capture_screenshot(monitor_index, window_title.as_deref(), quality)
     })
     .await;

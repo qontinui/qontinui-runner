@@ -79,6 +79,7 @@ use crate::mcp::awas::{
 use crate::mcp::shared::get_workspace_paths_internal;
 use crate::mcp::types::ApiState;
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // Cached embedding-service probe state. Module-scope so heartbeats can read
 // the reachability bit without running the full async probe path — the
@@ -390,7 +391,7 @@ fn pr_credential_health() -> serde_json::Value {
         // Off the hot path: the process spawn runs on a blocking thread and
         // stores its result for the NEXT /health read. The child is hard-capped
         // at PR_CRED_PROBE_CHILD_TIMEOUT, so the in-flight flag always frees.
-        tokio::task::spawn_blocking(|| {
+        spawn_blocking_tracked(|| {
             let probe = run_pr_credential_probe();
             if let Ok(mut slot) = pr_cred_result_slot().lock() {
                 *slot = Some(probe);
@@ -981,7 +982,7 @@ async fn drain_handler(
     let timeout = crate::drain::configured_timeout();
     // The drain sequence is synchronous (blocking git + bounded polling), so
     // run it on a blocking thread to keep the async executor free.
-    let summary = tokio::task::spawn_blocking(move || crate::drain::drain(&app_handle, timeout))
+    let summary = spawn_blocking_tracked(move || crate::drain::drain(&app_handle, timeout))
         .await
         .unwrap_or_else(|e| {
             tracing::error!("drain task panicked: {e}");
@@ -5667,7 +5668,7 @@ pub fn create_router(
             // unregistered/expired nonce). AFTER the restore so the registered
             // set is authoritative; on a blocking thread because it does TCP
             // liveness probes + file I/O.
-            let reaped = tokio::task::spawn_blocking(move || {
+            let reaped = spawn_blocking_tracked(move || {
                 crate::coord_mcp::reap_stale_session_restore_configs(reconcile_bound_port)
             })
             .await

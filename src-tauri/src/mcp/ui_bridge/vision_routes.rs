@@ -41,6 +41,7 @@ use super::vision_ai::{self, OcrClient, VlmClient};
 use super::vision_frame_source::resolve_frame_provider;
 use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Request / response shapes (mirrors plan §3.2)
@@ -569,7 +570,7 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
         }
     }
 
-    let (rgba, monitor_scale) = tokio::task::spawn_blocking(move || {
+    let (rgba, monitor_scale) = spawn_blocking_tracked(move || {
         super::screenshots::capture_runner_window_crop(x, y, w, h, scale)
     })
     .await

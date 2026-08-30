@@ -40,6 +40,7 @@ use tracing::{error, info, warn};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::terminal::types::TerminalInfo;
 use crate::terminal::TerminalManager;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // The steward roster
@@ -562,7 +563,7 @@ pub async fn steward_start_handler(
                 );
                 let mgr = terminal_manager.clone();
                 let orphan = info.id.clone();
-                let _ = tokio::task::spawn_blocking(move || mgr.close(&orphan)).await;
+                let _ = spawn_blocking_tracked(move || mgr.close(&orphan)).await;
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(api_error(format!(
@@ -643,7 +644,7 @@ pub async fn steward_stop_handler(
 
     info!("HTTP: Stopping {} (terminal {})", spec.skill, terminal_id);
 
-    tokio::task::spawn_blocking(move || manager.close(&terminal_id))
+    spawn_blocking_tracked(move || manager.close(&terminal_id))
         .await
         .map_err(|e| {
             error!(

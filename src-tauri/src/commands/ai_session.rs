@@ -24,6 +24,7 @@ use crate::database::CreateTaskRunInput;
 use crate::execution_context::AiSessionContext;
 use crate::mcp::shared::AiOutputEvent;
 use crate::unified_workflows::UnifiedWorkflowExt;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Session state event payload (emitted on state transitions).
 #[derive(Debug, Clone, Serialize)]
@@ -547,7 +548,7 @@ pub async fn create_ai_session(
     let handle = app_handle.clone();
     let trid = task_run_id.clone();
     let name_for_ctx = name.clone();
-    let spawn_task = tokio::task::spawn_blocking(move || {
+    let spawn_task = spawn_blocking_tracked(move || {
         let working_dir = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
@@ -968,7 +969,7 @@ pub async fn generate_workflow_from_session(
     // health.app_state() keeps the legacy passthrough greppable.
     let app_state_for_gen = health.app_state().clone();
 
-    let gen_result = tokio::task::spawn_blocking(move || {
+    let gen_result = spawn_blocking_tracked(move || {
         let (response, mut artifact) = crate::workflow_generation::generate_workflow(
             request,
             doctor_handle.as_ref(),
@@ -1944,7 +1945,7 @@ pub async fn resume_ai_sessions(
         let agent_log_emitter = coord_session_id
             .and_then(crate::claude_session::coord_register::AgentLogEmitter::start);
 
-        let spawn_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let spawn_result = spawn_blocking_tracked(move || -> Result<(), String> {
             let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
 
             // Pin/resume the CLI session id to the task_run_id. `is_resume` is

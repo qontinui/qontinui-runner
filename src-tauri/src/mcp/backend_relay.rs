@@ -69,6 +69,7 @@ use uuid::Uuid;
 
 use crate::mcp::task_supervisor;
 use crate::mcp::types::ApiState;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Consecutive registration rejections after which the relay stops kicking
 /// the device-JWT refresher.
@@ -2102,7 +2103,7 @@ async fn handle_devenv_enroll(data: &Value) -> Option<Value> {
             machine_id,
             environment_id,
         } = request;
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             let backend = enroll::resolve_backend_base(None)?;
             // Only the SERVER-minted machine_id from the frame may be asserted —
             // it is a devenv `devenv_machines.id`. There is deliberately no local
@@ -2466,7 +2467,7 @@ async fn handle_dispatch(api_state: &Arc<ApiState>, data: &Value) -> Option<Valu
 
     let workflow_id_for_task = workflow_id.clone();
     let parent_owned = parent_task_run_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         crate::unified_workflow_executor::auto_run::launch_workflow_by_id(
             deps,
             &workflow_id_for_task,
@@ -3036,7 +3037,7 @@ async fn handle_chat_generate_workflow(api_state: &Arc<ApiState>, data: &Value) 
     let artifact_task_run_id = task_run_id.clone();
     let app_state_for_gen = api_state.app_state.clone();
 
-    let gen_result = tokio::task::spawn_blocking(move || {
+    let gen_result = spawn_blocking_tracked(move || {
         let (response, mut artifact) = crate::workflow_generation::generate_workflow(
             request,
             doctor_handle.as_ref(),
@@ -3361,7 +3362,7 @@ async fn handle_terminal_close(api_state: &Arc<ApiState>, data: &Value) -> Optio
 
         let tm_clone = tm.clone();
         let id_clone = terminal_id.clone();
-        match tokio::task::spawn_blocking(move || tm_clone.close(&id_clone)).await {
+        match spawn_blocking_tracked(move || tm_clone.close(&id_clone)).await {
             Ok(Ok(())) => Some(serde_json::json!({
                 "type": "terminal_closed",
                 "terminal_id": terminal_id,

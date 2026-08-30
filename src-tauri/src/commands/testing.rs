@@ -17,6 +17,7 @@ use crate::test_executor::{
     execute_test, execute_test_suite, RepoTestConfig, TestCategory, TestDefinition,
     TestExecutionResult, TestStatus, TestSuiteSummary, TestType, VisionConfig,
 };
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -1337,7 +1338,7 @@ pub async fn generate_test_with_ai(
     });
 
     // SQLite: complex function — Python bridge IPC for AI test generation (sync bridge call)
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         if !is_default_bridge_running_compartment(&bridge_compartment) {
             return CommandResponse {
                 success: false,

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// A registered UI Bridge `disclosure` (a `<details>/<summary>` or accordion-
 /// style hidden panel) on a runner page.
@@ -473,7 +474,7 @@ pub async fn plan_intent_handler(
     // Pin the Claude account with the most remaining quota for the duration
     // of this prompt-home submission. No-op unless multi-account least-usage
     // mode is enabled in settings.
-    let ai_response = tokio::task::spawn_blocking(move || {
+    let ai_response = spawn_blocking_tracked(move || {
         crate::ai_provider::pick_best_account();
         crate::ai_provider::routing::run_prompt_sync(&full_prompt, None)
     })

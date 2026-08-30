@@ -29,6 +29,7 @@ use tracing::{error, info};
 
 use crate::mcp::types::ApiState;
 use crate::screen::{CapturedScreenshot, MonitorManager};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ── Query types ─────────────────────────────────────────────────────────────
 
@@ -77,7 +78,7 @@ pub async fn get_capture(
     };
 
     // xcap capture must run on a blocking thread (Windows COM/GDI).
-    let result = tokio::task::spawn_blocking(move || capture_png(monitor, region)).await;
+    let result = spawn_blocking_tracked(move || capture_png(monitor, region)).await;
 
     match result {
         Ok(Ok(png_bytes)) => {
@@ -112,7 +113,7 @@ pub async fn get_capture(
 
 /// `GET /vga/monitors` — monitor enumeration as JSON.
 pub async fn get_monitors(State(_state): State<Arc<ApiState>>) -> Response {
-    let result = tokio::task::spawn_blocking(enumerate_monitors).await;
+    let result = spawn_blocking_tracked(enumerate_monitors).await;
 
     match result {
         Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),

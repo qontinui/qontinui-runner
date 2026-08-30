@@ -72,6 +72,7 @@ use super::on_demand::{humanize_secs, volume_headroom, CensusStatus};
 use super::orphan_target_reaper::{
     self as reaper, Candidate, ClassifyOptions, DirtyProbe, SkipReason, TargetClass,
 };
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Env override for the survey interval (seconds). Default 3600 s, floored
 /// 300 s — the walk sizes every cargo target root on the machine, so a tight
@@ -989,7 +990,7 @@ pub(super) async fn build_and_publish() -> bool {
     // The walk stats every file under every cargo target root on the machine —
     // a synchronous multi-minute disk walk. Run it on the blocking pool so the
     // async runtime is never pinned for the duration.
-    let built = tokio::task::spawn_blocking(move || build_snapshot(&root, &opts)).await;
+    let built = spawn_blocking_tracked(move || build_snapshot(&root, &opts)).await;
     BUILD_ACTIVE.store(false, Ordering::Release);
     match built {
         Ok(snapshot) => {

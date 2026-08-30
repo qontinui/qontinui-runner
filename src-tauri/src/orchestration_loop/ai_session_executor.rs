@@ -34,6 +34,7 @@ use uuid::Uuid;
 use crate::claude_session::manager::SessionManager;
 use crate::claude_session::state::SessionState;
 use crate::orchestration_loop::ledger::{Subtask, SubtaskState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// How long [`dispatch_subtask`] queues for a parallel fan-out admission slot.
 ///
@@ -380,7 +381,7 @@ pub async fn dispatch_subtask(
     // carries the run id too for at-a-glance triage in coord + logs.
     let task_name = format!("worker:{} [run {}]", subtask.task_id, run_id);
     let wd = working_dir.clone();
-    let spawn_result: Result<(), String> = tokio::task::spawn_blocking(move || {
+    let spawn_result: Result<(), String> = spawn_blocking_tracked(move || {
         // AiSessionContext tags this worker's output events with the
         // task_run_id so the tab + transcript bind to this worker. Mirrors
         // `create_ai_session`'s `AiSessionContext::setup`.

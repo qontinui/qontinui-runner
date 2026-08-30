@@ -40,6 +40,7 @@ pub mod common;
 pub mod uia3;
 
 use common::{detect_patterns, interact_with_element, FocusChangedHandler, UiaState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ---------------------------------------------------------------------------
 // Backend trait
@@ -155,7 +156,7 @@ impl UiaAdapter {
             }
         };
 
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             let backend = select_backend(choice);
             uia3::init_state(backend.as_ref())
         })
@@ -179,7 +180,7 @@ impl PlatformAdapter for UiaAdapter {
         // Resolve the root element on a blocking thread.
         let find_state = state.clone();
         let send_root =
-            tokio::task::spawn_blocking(move || uia3::find_root(&find_state, target)).await??;
+            spawn_blocking_tracked(move || uia3::find_root(&find_state, target)).await??;
 
         // Rebuild the Arc<UiaState> with the root element set, keeping the
         // existing handle table.
@@ -215,7 +216,7 @@ impl PlatformAdapter for UiaAdapter {
             .ok_or_else(|| anyhow!("UIA adapter not connected"))?
             .clone();
 
-        tokio::task::spawn_blocking(move || state.capture_tree(max_depth, include_hidden)).await?
+        spawn_blocking_tracked(move || state.capture_tree(max_depth, include_hidden)).await?
     }
 
     async fn subscribe_events(&self) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>> {
@@ -226,7 +227,7 @@ impl PlatformAdapter for UiaAdapter {
 
         let (tx, rx) = mpsc::channel::<A11yEvent>(256);
 
-        tokio::task::spawn_blocking(move || unsafe {
+        spawn_blocking_tracked(move || unsafe {
             let handler = FocusChangedHandler { tx };
             let handler: IUIAutomationFocusChangedEventHandler = handler.into();
             if let Err(e) = state.automation.AddFocusChangedEventHandler(None, &handler) {
@@ -249,7 +250,7 @@ impl PlatformAdapter for UiaAdapter {
             .ok_or_else(|| anyhow!("UIA adapter not connected"))?
             .clone();
 
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             let element = state
                 .handles
                 .get(platform_handle)
@@ -266,7 +267,7 @@ impl PlatformAdapter for UiaAdapter {
             None => return vec![],
         };
 
-        tokio::task::spawn_blocking(move || match state.handles.get(platform_handle) {
+        spawn_blocking_tracked(move || match state.handles.get(platform_handle) {
             Some(element) => detect_patterns(&element),
             None => vec![],
         })

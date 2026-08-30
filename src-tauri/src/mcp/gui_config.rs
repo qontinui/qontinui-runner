@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::executor::{get_or_create_default_bridge, with_default_bridge};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Types
@@ -185,7 +186,7 @@ pub async fn capture_elements(
     });
 
     let app_state_clone = state.app_state.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state_clone, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -249,7 +250,7 @@ pub async fn build_gui_config(
     });
 
     let app_state_clone = state.app_state.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state_clone, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -334,7 +335,7 @@ pub async fn capture_multi_state(
     });
 
     let app_state_clone = state.app_state.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state_clone, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -433,7 +434,7 @@ pub async fn start_executor(
     info!("GUI Config: Starting Python executor via HTTP");
 
     let app_state = state.app_state.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         get_or_create_default_bridge(&app_state).map_err(|e| {
             error!("Failed to start Python executor: {}", e);
             format!("Failed to start Python executor: {}", e)

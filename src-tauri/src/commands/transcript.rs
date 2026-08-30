@@ -6,6 +6,7 @@
 use crate::commands::compartments::{ExecutionCompartment, HealthCompartment, StorageCompartment};
 use crate::commands::CommandResponse;
 use crate::terminal::transcript;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -756,7 +757,7 @@ pub async fn transcript_read_user_prompts(
 
     // Reading and parsing a transcript is blocking file I/O — on the largest
     // real transcript here, 10.4 MB. Keep it off the async worker.
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         for dir in &config_dirs {
             if let Ok(r) = transcript::read_user_prompts(dir, &project, &session_id, since_mtime_ms)
             {
@@ -880,7 +881,7 @@ pub async fn transcript_session_digests(
     // one the sick runtime cannot disable — `off_runtime::deadline`, never
     // `tokio::time::timeout`.
     let digest_task =
-        tokio::task::spawn_blocking(move || transcript::session_digests_batch(&all_sessions));
+        spawn_blocking_tracked(move || transcript::session_digests_batch(&all_sessions));
     let digest_bound = crate::off_runtime::deadline(DIGEST_WAIT_TIMEOUT);
     let digests = tokio::select! {
         joined = digest_task => match joined {
@@ -1058,7 +1059,7 @@ pub async fn generate_workflow_standalone(
     // catch_unwind safety net: converts any latent panic inside the generation
     // pipeline (e.g. a future PG deserialization drift) into a clean structured
     // error response instead of a bare JoinError::Panic bubbling to the frontend.
-    let gen_result = tokio::task::spawn_blocking(move || {
+    let gen_result = spawn_blocking_tracked(move || {
         use std::panic::{catch_unwind, AssertUnwindSafe};
         let panic_result = catch_unwind(AssertUnwindSafe(|| {
             crate::workflow_generation::generate_workflow(

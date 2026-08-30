@@ -19,6 +19,7 @@ use crate::commands::hooks::{
 };
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::orchestrator::hooks::{Hook, HookAction, HookCondition, HookContext, HookTrigger};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use uuid::Uuid;
 
 // ============================================================================
@@ -706,7 +707,7 @@ async fn test_hook(
     };
 
     // HookExecutor::execute_trigger is sync, run in blocking task
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let executor = HookExecutor::new(vec![hook]);
         let results = executor.execute_trigger(HookTrigger::PreExecution, &hook_context);
 

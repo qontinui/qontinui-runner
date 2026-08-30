@@ -13,6 +13,7 @@ use tracing::{error, info};
 
 use super::compartments::BridgeCompartment;
 use super::CommandResponse;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // Migrated to BridgeCompartment (Workstream C proof-of-pattern).
 
@@ -79,7 +80,7 @@ pub async fn set_debug_settings(
         // Use async check to avoid nested runtime panic
         if manager.is_default_bridge_running_async().await {
             let manager_clone = manager.clone();
-            tokio::task::spawn_blocking(move || {
+            spawn_blocking_tracked(move || {
                 manager_clone.with_default_bridge(|bridge| {
                     bridge
                         .set_debug_settings(enable_image_debug, top_matches_count)

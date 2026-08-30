@@ -9,6 +9,7 @@ use super::remote_client::RunnerClient;
 use super::types::{DiagnosePhaseConfig, DiagnosticResult, RootCauseCategory};
 use crate::ai_provider::routing::run_prompt_with_model_override;
 use crate::ai_router::TaskContext;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Run the full diagnostic evaluation: capture state, run assertions, triage if failed.
 pub async fn run_diagnostic(
@@ -96,7 +97,7 @@ pub async fn run_diagnostic(
     );
 
     let model_override = config.model_override.clone();
-    let triage_result = tokio::task::spawn_blocking(move || {
+    let triage_result = spawn_blocking_tracked(move || {
         let context = TaskContext::from_prompt(&triage_prompt);
         run_prompt_with_model_override(
             &triage_prompt,

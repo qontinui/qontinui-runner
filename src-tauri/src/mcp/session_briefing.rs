@@ -58,6 +58,7 @@ use crate::mcp::fleet_policy_poller::{
     BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION,
 };
 use crate::mcp::types::{ApiResponse, ApiState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ===========================================================================
 // The closed placeholder vocabulary
@@ -631,7 +632,7 @@ pub async fn session_briefing_handler(
     // tokio worker on it for every panel load is not acceptable on a shared
     // runtime.
     let supervisor_available =
-        tokio::task::spawn_blocking(crate::mcp::auto_continue::check_supervisor_available)
+        spawn_blocking_tracked(crate::mcp::auto_continue::check_supervisor_available)
             .await
             .unwrap_or(false);
     let rules = crate::mcp::ai_session::runner_rules_prefix(supervisor_available, api_port);

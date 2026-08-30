@@ -60,6 +60,7 @@ use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use super::fs_observer::FsObservation;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Env flag that turns the fs_observer backstop on. Default off. Accepts the
 /// usual truthy values; anything else (including unset) is false. Matches the
@@ -414,7 +415,7 @@ pub async fn tick_once() -> Result<(), String> {
     // Disk-walk + git (status probe + libgit2 diff per dirty checkout) is a
     // synchronous multi-second walk — run it off the async worker, matching
     // the census/reclaim pattern.
-    let candidates = tokio::task::spawn_blocking(move || scan_drift_candidates(&root))
+    let candidates = spawn_blocking_tracked(move || scan_drift_candidates(&root))
         .await
         .map_err(|e| format!("fs_backstop scan panicked: {e}"))?;
 

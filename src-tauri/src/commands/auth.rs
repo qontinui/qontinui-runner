@@ -35,6 +35,7 @@ use tracing::{error, info, warn};
 
 use crate::api_config::get_api_base_url;
 use crate::settings;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Resolve the user bearer the runner presents to the web backend for
 /// Cognito-authenticated calls (`/api/v1/auth/users/me`, `/api/v1/projects`).
@@ -691,6 +692,10 @@ pub async fn set_runner_tier(tier: String) -> Result<SetRunnerTierResult, String
     // UI thread. The in-memory branch is cheap but goes through the same hop
     // so both arms have one shape.
     let result = tauri::async_runtime::spawn_blocking(move || {
+        // Counted for the wedge diagnostics' blocking-pool saturation figure.
+        // `tauri::async_runtime::spawn_blocking` delegates to tokio's pool, so an
+        // uncounted body here would make "N/512 slots in use" undercount.
+        let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
         if is_secondary {
             // NOT a no-op any more: actually apply the tier for this process.
             settings::set_in_memory_tier(parsed);
@@ -807,7 +812,7 @@ async fn cognito_sign_in_impl(
     // 1. RFC-8252 PKCE login (blocking — browser + loopback). Run on a
     //    worker thread so it doesn't block the tokio runtime.
     info!("cognito_sign_in: starting RFC-8252 PKCE login");
-    let login = tokio::task::spawn_blocking(move || {
+    let login = spawn_blocking_tracked(move || {
         qontinui_runner_lib::cognito::pkce_login(identity_provider.as_deref())
     })
     .await
@@ -898,7 +903,7 @@ async fn finalize_signed_in(
     let cognito_access = login.access_token.clone();
     let device_b = device_id.clone();
     let sub_b = login.sub.clone();
-    let pair_resp = tokio::task::spawn_blocking(move || {
+    let pair_resp = spawn_blocking_tracked(move || {
         pair_with_auth_token_with_ids(
             &base_b,
             &cognito_access,
@@ -1059,7 +1064,7 @@ async fn cognito_sign_in_password_impl(
 
     // Blocking reqwest call — run on a worker thread off the tokio runtime.
     // `password` is moved into the closure and dropped there; it is never logged.
-    let login = tokio::task::spawn_blocking(move || {
+    let login = spawn_blocking_tracked(move || {
         qontinui_runner_lib::cognito::password_login(&email, &password)
     })
     .await

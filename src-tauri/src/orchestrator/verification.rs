@@ -96,6 +96,7 @@ use crate::ai_router::TaskContext;
 use crate::commands::AppState;
 use crate::state_explorer::{ExplorationConfig, ExplorationStatus, ExplorationTask};
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Result of resolving a Playwright script ID from the database.
 enum ResolvedScript {
@@ -1157,7 +1158,7 @@ impl AiVerifier {
             let goal_clone = Arc::clone(&goal_summary);
             let doctor_handle_clone = self.doctor_handle.clone();
 
-            let handle = tokio::task::spawn_blocking(move || {
+            let handle = spawn_blocking_tracked(move || {
                 let verifier = AiVerifier::new(doctor_handle_clone);
                 verifier.verify_criterion(&criterion_clone, &screenshot_clone, &goal_clone)
             });

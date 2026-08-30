@@ -45,6 +45,7 @@ use tracing::{debug, info, warn};
 use crate::ai_provider::routing::run_prompt_with_structured_output;
 use crate::database::pg::PgDb;
 use crate::database::types::ActivityTimelineInput;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Tunables (per plan)
@@ -348,7 +349,7 @@ pub async fn emit_extraction_script(
     let gemma_settings_for_call = gemma_settings_snapshot.clone();
 
     let llm_call = async move {
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             call_provider(
                 provider_mode,
                 &system_prefix_for_call,

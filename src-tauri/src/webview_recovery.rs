@@ -52,6 +52,7 @@ use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
 use crate::window_placement::WindowPlacement;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ─────────────────────────── tuning constants ────────────────────────────
 
@@ -1207,7 +1208,7 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     //   with a free latch — the recreate it would unblock dispatches through
     //   that same loop.
     let app_for_build = app.clone();
-    let built = tokio::task::spawn_blocking(move || build_main_window(&app_for_build, &spec))
+    let built = spawn_blocking_tracked(move || build_main_window(&app_for_build, &spec))
         .await
         .map_err(|e| format!("recreate task panicked: {e}"))?;
 

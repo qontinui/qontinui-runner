@@ -19,6 +19,7 @@ use tracing::info;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::workflow_generation::evaluation;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Request Types
@@ -91,7 +92,7 @@ async fn evaluate_workflow_handler(
 
     let runner_port = crate::mcp::types::runner_api_port(&state.app_state);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         evaluation::evaluate_workflow(
             &body.workflow,
             body.acceptance_criteria.as_ref(),
@@ -131,7 +132,7 @@ async fn evaluate_step_handler(
 ) -> Result<Json<ApiResponse<evaluation::StepEvaluation>>, (StatusCode, Json<ApiResponse<()>>)> {
     let doctor_handle = state.doctor_handle.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         evaluation::evaluate_step(
             &body.step,
             body.acceptance_criteria.as_ref(),
@@ -161,7 +162,7 @@ async fn repair_guidance_handler(
     let doctor_handle = state.doctor_handle.clone();
 
     let runner_port = crate::mcp::types::runner_api_port(&state.app_state);
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let eval = evaluation::evaluate_workflow(
             &body.workflow,
             body.acceptance_criteria.as_ref(),

@@ -146,6 +146,7 @@ use tracing::{debug, info};
 
 use super::continuation_verdict::{coord_client_parts, http_client};
 use crate::session::session_lifecycle_store::SessionLifecycleStore;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ===========================================================================
 // Constants
@@ -1217,7 +1218,7 @@ async fn observe_turn_end_inner(hook_input: &Value) -> Option<ComplianceNudge> {
     // Reading and JSON-parsing a multi-MB transcript window is synchronous
     // work; running it on the async worker would stall every other request the
     // runner's API is serving.
-    let report = tokio::task::spawn_blocking(move || detect(&transcript))
+    let report = spawn_blocking_tracked(move || detect(&transcript))
         .await
         .ok()??;
 
@@ -1408,7 +1409,7 @@ async fn finalize_impl(session_id: &str, config_dir: Option<&str>, working_dir: 
     };
     // Same reason as the turn-end path: the read + per-line parse is
     // synchronous and must not run on the async worker.
-    let Ok(Some(report)) = tokio::task::spawn_blocking(move || detect(&path)).await else {
+    let Ok(Some(report)) = spawn_blocking_tracked(move || detect(&path)).await else {
         return;
     };
     let _ = emit(session_id, report.as_ref()).await;

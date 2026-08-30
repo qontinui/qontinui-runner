@@ -38,6 +38,7 @@ use super::{scope_project_dir, Envelope};
 use crate::mcp::types::ApiState;
 use crate::workflow_generation::code_graph::{BlastRadius, CodeGraph, ResolutionKind};
 use crate::workflow_generation::import_resolver::ImportResolver;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ===========================================================================
 // Request bodies (plan §3.1)
@@ -119,7 +120,7 @@ async fn diff_impact(
 
     // Build the resolved graph (CPU-bound parse) off the async runtime.
     let dir = project_dir.clone();
-    let graph = tokio::task::spawn_blocking(move || CodeGraph::build(&dir))
+    let graph = spawn_blocking_tracked(move || CodeGraph::build(&dir))
         .await
         .unwrap_or_else(|_| empty_graph());
 
@@ -181,7 +182,7 @@ async fn resolve_import(
     let from_file = req.from_file.clone();
     let specifier = req.specifier.clone();
     let dir = project_dir.clone();
-    let (resolution, coverage) = tokio::task::spawn_blocking(move || {
+    let (resolution, coverage) = spawn_blocking_tracked(move || {
         let graph = CodeGraph::build(&dir);
         let cov = graph_coverage(&graph);
         let resolver = ImportResolver::new(&graph, &dir);
