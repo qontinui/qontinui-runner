@@ -459,7 +459,13 @@ impl SpawnGate {
     /// limit ("the 256-thread **warn** ceiling"), and pairing it with the
     /// observation here is what keeps a caller from quoting one verdict's word
     /// beside another verdict's number.
-    fn tripped(&self) -> Option<(&'static str, &GateObservation)> {
+    ///
+    /// `pub(crate)` because `agent_runtime`'s continuation guard needs exactly
+    /// this pair to report a deferral honestly, and the alternative — matching
+    /// on the variants there and spelling `"warn"` / `"critical"` a second time
+    /// — is a duplicated severity vocabulary that can drift out of step with
+    /// this one. Widening the visibility keeps a single author for the word.
+    pub(crate) fn tripped(&self) -> Option<(&'static str, &GateObservation)> {
         match self {
             SpawnGate::Proceed => None,
             SpawnGate::Warn(observation) => Some(("warn", observation)),
