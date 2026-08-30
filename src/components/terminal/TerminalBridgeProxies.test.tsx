@@ -496,6 +496,81 @@ describe("TerminalBridgeProxies pasteText — bracketed-paste read by id (item 6
   });
 });
 
+describe("TerminalBridgeProxies getScrollback — `maxLines` typed, not coerced (iter 25)", () => {
+  /** 40 lines in the PTY ring, base64'd exactly as the Rust command returns them. */
+  function seedRing(lineCount = 40): void {
+    const text = Array.from({ length: lineCount }, (_, i) => `line-${i}`).join("\n");
+    const bytes = new TextEncoder().encode(text);
+    const b64 = btoa(String.fromCharCode(...bytes));
+    invoke.mockImplementation(async (cmd: string) => {
+      // `success: true` is REQUIRED: `readLocalScrollbackRing` (the seam this
+      // path now reads through) returns null unless the envelope reports
+      // success, where the previous direct `invoke` read only `data.data`.
+      if (cmd === "terminal_get_scrollback")
+        return { success: true, data: { data: b64, startOffset: 0, endOffset: bytes.length } };
+      if (cmd === "terminal_get_bracketed_paste") return { data: { bracketedPaste: false } };
+      return {};
+    });
+  }
+
+  /** Did the handler read the ring at all? A rejection must not. */
+  function ringReadCount(): number {
+    return invoke.mock.calls.filter(
+      (c) => (c as unknown as [string])[0] === "terminal_get_scrollback",
+    ).length;
+  }
+
+  it("honours a positive integer bound", async () => {
+    seedRing();
+    const read = handlerFor(LIVE_TABS, "term-live", "getScrollback");
+    expect(await read({ maxLines: 1 })).toBe("line-39");
+    expect((await read({ maxLines: 3 })) as string).toBe("line-37\nline-38\nline-39");
+  });
+
+  it("defaults to the whole ring when `maxLines` is absent", async () => {
+    seedRing();
+    const read = handlerFor(LIVE_TABS, "term-live", "getScrollback");
+    expect(((await read({})) as string).split("\n")).toHaveLength(40);
+    expect(((await read()) as string).split("\n")).toHaveLength(40);
+  });
+
+  // THE DIVERGENCE. Each of these returned the WHOLE 42-line buffer here and
+  // an EMPTY STRING on the mounted path, both answering HTTP 200 `success:true`.
+  it.each([
+    ["an object", { a: 1 }],
+    ["a string", "abc"],
+    ["a numeric string", "3"],
+    ["an array", [1]],
+    ["a boolean", true],
+    ["null", null],
+  ])("throws SCROLLBACK_MAX_LINES_INVALID for %s instead of guessing", async (_l, value) => {
+    seedRing();
+    const read = handlerFor(LIVE_TABS, "term-live", "getScrollback");
+    await expect(read({ maxLines: value })).rejects.toThrow("SCROLLBACK_MAX_LINES_INVALID");
+    // Load-bearing: it refuses BEFORE the IPC, so there is no partial answer
+    // that could be mistaken for a real read.
+    expect(ringReadCount()).toBe(0);
+  });
+
+  it.each([
+    ["0 — the stated call: rejected, not served as an empty read", 0],
+    ["a negative bound", -5],
+  ])("throws SCROLLBACK_MAX_LINES_INVALID for %s", async (_l, value) => {
+    seedRing();
+    const read = handlerFor(LIVE_TABS, "term-live", "getScrollback");
+    await expect(read({ maxLines: value })).rejects.toThrow("SCROLLBACK_MAX_LINES_INVALID");
+    expect(ringReadCount()).toBe(0);
+  });
+
+  it("carries a machine-readable .code, which is what the SDK hoists", async () => {
+    seedRing();
+    const read = handlerFor(LIVE_TABS, "term-live", "getScrollback");
+    await expect(read({ maxLines: "abc" })).rejects.toMatchObject({
+      code: "SCROLLBACK_MAX_LINES_INVALID",
+    });
+  });
+});
+
 // ── divergence guards ───────────────────────────────────────────
 // The behavioral tests above prove THIS path is right. These prove the two
 // paths cannot silently drift apart again: iteration 21 fixed one of them and
@@ -506,6 +581,21 @@ const PATHS = ["TerminalInstance.tsx", "TerminalBridgeProxies.tsx"] as const;
 
 function sourceOf(file: string): string {
   return readFileSync(resolve(__dirname, file), "utf8");
+}
+
+/**
+ * A file's CODE, with comments removed.
+ *
+ * Load-bearing for the "this shape is gone" guards below: the defects these
+ * files fixed are described, verbatim and by design, in the doc comments that
+ * explain WHY the fix exists. A raw substring scan therefore reports the
+ * explanation as if it were the defect — and the only way to keep it green
+ * would be to delete the explanation, which is the wrong direction.
+ */
+function codeOf(file: string): string {
+  return sourceOf(file)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^[ \t]*\/\/.*$/gm, "");
 }
 
 describe("both sendKeys paths route through the same translator", () => {
@@ -609,5 +699,61 @@ describe("the proxy advertises the same action surface as a mounted pane (item 5
     expect(sourceOf("TerminalInstance.tsx")).toMatch(
       new RegExp(`\\n\\s+${action}: \\{\\n\\s+id: "${action}"`),
     );
+  });
+});
+
+describe("both scrollback paths route through the same bound guard (iter 25)", () => {
+  it.each(PATHS.map((f) => [f]))("%s validates `maxLines` with requireMaxLines", (file) => {
+    const source = sourceOf(file);
+    expect(source).toContain('from "./terminalScrollbackParams"');
+    expect(source).toMatch(/requireMaxLines\(maxLines\)/);
+  });
+
+  it("neither path still ASSERTS the automation payload is a number", () => {
+    for (const file of PATHS) {
+      // `(params || {}) as { maxLines?: number }` was the whole bug in one
+      // line: a cast, not a check, over a value that arrives from an HTTP
+      // request. It poisoned the slice arithmetic with NaN — and because the
+      // two paths slice by DIFFERENT expressions, `slice(NaN)` returned the
+      // whole buffer here while `NaN < total` returned nothing there.
+      const code = codeOf(file);
+      expect(code).not.toMatch(/params \|\| \{\}\) as \{ maxLines\?: number \}/);
+      expect(code).toMatch(/params \|\| \{\}\) as \{ maxLines\?: unknown \}/);
+    }
+  });
+
+  it("neither path defaults `maxLines` at the destructure, behind the guard's back", () => {
+    for (const file of PATHS) {
+      // `const { maxLines = 500 }` applies only to `undefined`, so it let
+      // `null` and every other malformed value straight through to the
+      // arithmetic. The default now lives in the validator, where BOTH paths
+      // read the same one.
+      expect(codeOf(file)).not.toMatch(/maxLines = 500/);
+    }
+  });
+});
+
+describe("both key paths reject a malformed `modifiers` (iter 25 P0)", () => {
+  // The translator is shared (`toPtySequence`, pinned above), so validating
+  // inside it is what makes the two paths agree by construction. This guard
+  // stops a future edit from re-introducing the cast at either call site.
+  it("the shared translator validates rather than casting", () => {
+    const source = codeOf("terminalKeySequence.ts");
+    expect(source).toMatch(/requireModifiers\(desc\.modifiers, key\)/);
+    // `desc.modifiers ?? {}` is the P0 in one line: a malformed value became
+    // "no modifiers" and the WRONG BYTES went into a live PTY — `bytes: 1`
+    // either way, so undetectable by the caller.
+    expect(source).not.toMatch(/desc\.modifiers \?\? \{\}/);
+  });
+
+  it("neither path interprets a modifier flag for itself", () => {
+    for (const file of PATHS) {
+      const code = codeOf(file);
+      // Each path hands the whole payload to the translator and reads no flag
+      // off it — a second reader is how the two paths diverged on `keys` in the
+      // first place (iterations 21 and 23).
+      expect(code).toMatch(/toPtySequence\(keys\)/);
+      expect(code).not.toMatch(/modifiers\s*[.?[]/);
+    }
   });
 });

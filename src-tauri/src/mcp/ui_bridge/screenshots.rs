@@ -1674,12 +1674,30 @@ mod sweep_discover_tests {
     /// failure shape as the `sendKeys` translation living on one terminal path
     /// and not the other (iterations 22 and 23).
     ///
-    /// So: every `discover` request issued from this file goes through
-    /// `discover_all_elements_payload()`, and none builds its own options
-    /// literal. A NEW sweep added here — `/control/visibility`, whose handler is
-    /// in flight on another branch at the time of writing — must call the helper
-    /// rather than re-inline `{"options": {"includeHidden": true}}`; if it does
-    /// not, this test is what says so.
+    /// ## The rule this pins, and why it is SEMANTIC rather than syntactic
+    ///
+    /// Every `discover` request issued from this file must ask for the SAME
+    /// element set: `includeHidden: true` AND `interactiveOnly: false`. A site
+    /// satisfies that either by calling `discover_all_elements_payload()` —
+    /// still the preferred form, since a helper cannot drift — **or** by
+    /// stating both filters in its own literal. Both spellings ask the identical
+    /// question, and the question is the property worth defending; requiring one
+    /// SPELLING of it was an over-reach this guard has now been narrowed out of.
+    ///
+    /// That narrowing is a correction, not a concession. `/control/visibility`
+    /// — the sweep this guard was written in anticipation of — was authored on
+    /// a SIBLING branch whose tree has no `discover_all_elements_payload()` in
+    /// it, so the only way that handler could have satisfied the old syntactic
+    /// rule was to define a SECOND copy of the helper — which would then
+    /// collide as a duplicate definition the moment the two branches merged. A
+    /// guard whose only satisfying move breaks the merge is testing the wrong
+    /// thing. Measured (manual-test-loop iteration 25): the two branches were
+    /// each green ALONE and RED TOGETHER, on this test and nothing else.
+    ///
+    /// It is NOT weakened to a no-op. A literal that states `includeHidden`
+    /// while leaving `interactiveOnly` at the SDK's `true` default — the exact
+    /// shape of the original defect, and of `/control/visibility` as first
+    /// written — still fails here, which is the whole reason the guard exists.
     #[test]
     fn discover_payload_is_shared_by_every_sweep() {
         // Scan only the PRODUCTION half of the file: everything below the
@@ -1699,16 +1717,16 @@ mod sweep_discover_tests {
                 continue;
             }
             sites += 1;
-            // The request site spans a few lines; a window after the action
-            // name covers the payload argument.
-            let window = &production[at..(at + 400).min(production.len())];
             assert!(
-                window.contains("discover_all_elements_payload()"),
-                "a `discover` request site in screenshots.rs does not use \
-                 discover_all_elements_payload(). Every page-wide sweep must ask \
-                 for the SAME element set (includeHidden + interactiveOnly: false); \
-                 an inline options literal is how the two sweeps diverged. \
-                 Offending site at byte {at}."
+                site_asks_for_every_element(production, at),
+                "a `discover` request site in screenshots.rs does not ask for the \
+                 full element set. Every page-wide sweep must ask the SAME \
+                 question — `includeHidden: true` AND `interactiveOnly: false` — \
+                 either by calling discover_all_elements_payload() or by stating \
+                 BOTH filters in its own literal. Stating only `includeHidden` \
+                 leaves the SDK's `interactiveOnly: true` default in force, which \
+                 silently drops every heading, paragraph and badge; that is how \
+                 the sweeps diverged. Offending site at byte {at}."
             );
         }
         assert!(
@@ -1716,5 +1734,57 @@ mod sweep_discover_tests {
             "expected at least one discover request site in this module; if the \
              sweeps moved, move this guard with them rather than deleting it"
         );
+    }
+
+    /// Does the `discover` request at `at` ask for hidden AND non-interactive
+    /// elements?
+    ///
+    /// Resolves the payload ARGUMENT rather than eyeballing a fixed window,
+    /// because the two accepted spellings sit on opposite sides of the call: a
+    /// helper is written inline AS the argument, while a literal is
+    /// conventionally bound to a `let` a few lines ABOVE it. A forward-only
+    /// window sees the first and misses the second.
+    fn site_asks_for_every_element(production: &str, at: usize) -> bool {
+        let arg = call_argument_text(&production[at..]);
+        if arg.contains("discover_all_elements_payload()") {
+            return true;
+        }
+        // An inline literal — check the argument text itself…
+        if states_both_filters(arg) {
+            return true;
+        }
+        // …otherwise the argument is a binding; read the `let` that made it.
+        let ident = arg.rsplit(',').next().unwrap_or("").trim();
+        if ident.is_empty() || !ident.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return false;
+        }
+        match production[..at].rfind(&format!("let {ident} ")) {
+            Some(binding) => states_both_filters(&production[binding..at]),
+            None => false,
+        }
+    }
+
+    /// The text of a call's arguments: from `rest`'s start to the paren that
+    /// closes the enclosing call. Depth-tracked, so a nested `helper()` does not
+    /// terminate the scan early.
+    fn call_argument_text(rest: &str) -> &str {
+        let mut depth = 0usize;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' if depth == 0 => return &rest[..i],
+                ')' => depth -= 1,
+                _ => {}
+            }
+        }
+        rest
+    }
+
+    /// Both filters stated, whitespace-insensitively — a `json!` body is macro
+    /// input, which rustfmt does not normalize, so its spacing is whatever the
+    /// author typed.
+    fn states_both_filters(text: &str) -> bool {
+        let dense: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        dense.contains("\"includeHidden\":true") && dense.contains("\"interactiveOnly\":false")
     }
 }
