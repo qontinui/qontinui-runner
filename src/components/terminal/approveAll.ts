@@ -48,14 +48,34 @@
  * double keystroke is not.
  */
 
-import type { RefObject } from "react";
-
-import type { TerminalInstanceHandle } from "./TerminalInstance";
 import { writePtyById } from "./writePtyById";
 import type { TerminalWriteResult } from "./terminalWriteResult";
 
 /** Machine-readable failure code: the write path gave back no envelope. */
 export const TERMINAL_WRITE_UNREPORTED = "TERMINAL_WRITE_UNREPORTED";
+
+/**
+ * The MINIMUM a mounted pane has to offer to be written to.
+ *
+ * Deliberately structural rather than `TerminalInstanceHandle`. Three callers
+ * reach this module and they hold three different views of the same map:
+ * `useKeyboardShortcuts` declares its own `{writeToTerminal: (data: string) =>
+ * void}`, `TerminalOverlays` and `TerminalPage` hold the full handle. Naming
+ * the concrete handle here would force all three to converge on the type that
+ * transitively pulls `@xterm/addon-canvas` — which touches `self` at module
+ * init and crashes under the runner's `environment: "node"` vitest config.
+ * That is the same leaf-module constraint `terminalWriteResult.ts` documents,
+ * and it is why this file is testable at all.
+ *
+ * The return is `unknown` on purpose: an older handle answers `void`, and
+ * {@link readEnvelope} is the one place that decides what a non-envelope means.
+ */
+export interface ApprovalWriteTarget {
+  writeToTerminal: (text: string) => unknown;
+}
+
+/** The mounted-pane map, in the narrowest shape this module needs. */
+export type ApprovalRefs = Map<string, { readonly current: ApprovalWriteTarget | null }>;
 
 /** The route a delivery took, so a report can say WHERE it failed. */
 export type DeliveryRoute = "mounted" | "by-id";
@@ -124,7 +144,7 @@ function failureOf(envelope: TerminalWriteResult | null): Pick<ApprovalDelivery,
  */
 export async function deliverApprovals(
   tabIds: readonly string[],
-  terminalRefs: Map<string, RefObject<TerminalInstanceHandle | null>>,
+  terminalRefs: ApprovalRefs,
   text: string,
   opts: {
     writeById?: WriteById;

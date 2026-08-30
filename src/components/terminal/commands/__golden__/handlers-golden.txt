@@ -27,13 +27,13 @@ terminal.doc-finder	canonical	[]	ok	ctx.openDocFinder	true	opened 1 the doc find
 terminal.doc-finder	empty	[]	ok	ctx.openDocFinder	true	opened 1 the doc finder [state]
 terminal.export-all	canonical	[]	ok	ctx.exportAll	true	exported 2 session
 terminal.export-all	empty	[]	ok	ctx.exportAll	true	exported 2 session
-terminal.focus	canonical	[["target","next"]]	ok	zone.focusNextZone	false	focused 1 zone
+terminal.focus	canonical	[["target","next"]]	ok	zone.focusNextZone	true	focused 1 zone
 terminal.focus	empty	[]	error:invalid-args	-	false	-
 terminal.generate-workflow	canonical	[]	error:no-session	workflow.generate	true	-
 terminal.generate-workflow	empty	[]	error:no-session	workflow.generate	true	-
 terminal.history	canonical	[]	ok	ctx.showCard	false	showed 0 event
 terminal.history	empty	[]	ok	ctx.showCard	false	showed 0 event
-terminal.layout	canonical	[["preset","quad"]]	ok	-	false	changed 0 layout
+terminal.layout	canonical	[["preset","quad"]]	ok	zone.setLayoutId	false	changed 0 layout
 terminal.layout	empty	[]	error:invalid-preset	-	false	-
 terminal.maximize	canonical	[["zone",1]]	ok	zone.toggleMaximize	false	maximized 1 zone 1 [state]
 terminal.maximize	empty	[]	ok	zone.toggleMaximize	false	maximized 1 zone 1 [state]

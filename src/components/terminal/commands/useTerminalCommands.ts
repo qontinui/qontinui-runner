@@ -641,19 +641,20 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
           : typeof raw === "string" && /^needs[-_ ]?input$/.test(raw)
             ? "needs-input"
             : raw;
-      // `focusNextZone` / `focusPrevZone` are `() => void`, but the verdict
-      // does not need them to speak: with fewer than two zones there is
-      // nowhere to move, and that is observable from the layout the handler
-      // already holds. A single-zone grid answering `✓` to `/focus next` was
-      // a no-op rendered as an effect.
-      const zoneCount = zoneLayout.layout.zones.length;
+      // These two now REPORT whether focus moved, which is the only honest
+      // source for it: the cap is `min(zones, tabs)` — a four-zone grid
+      // holding one session has nowhere to go — and re-deriving that here
+      // from `layout.zones.length` alone would answer `focused 1 zone` for a
+      // no-op, which is the very shape this phase removes.
       if (target === "next" || target === "prev") {
-        if (zoneCount < 2) {
-          return ok(effect("focused", "zone", 0, { detail: `only ${zoneCount} zone in the grid` }));
-        }
-        if (target === "next") zoneLayout.focusNextZone();
-        else zoneLayout.focusPrevZone();
-        return ok(effect("focused", "zone", 1));
+        const moved =
+          target === "next" ? zoneLayout.focusNextZone() : zoneLayout.focusPrevZone();
+        return deriveVerdict({
+          produced: moved,
+          verb: "focused",
+          noun: "zone",
+          detail: moved.changed ? undefined : "no other session to focus",
+        });
       }
       if (target === "needs-input") {
         // Already honest: `focusNextNeedsInput` returns whether it found one.
@@ -965,19 +966,26 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if (!LAYOUT_IDS.includes(normalized)) {
         return fail("invalid-preset", `preset must be one of: ${LAYOUT_IDS.join(", ")}`);
       }
-      // Observed pre-state. `/layout quad` on a grid that is already quad
-      // called `setLayoutId("quad")` and rendered `✓` — indistinguishable
-      // from a layout that actually moved. `handlers.test.ts` pins that exact
-      // case, and this is the line that changes its answer.
-      // `layoutId` (the STATE `setLayoutId` writes), not `layout.id` (derived,
-      // and synthesized for the past-9 flow grid).
-      if (zoneLayout.layoutId === normalized) {
-        return ok(
-          effect("changed", "layout", 0, { detail: `already ${normalized}` }),
-        );
-      }
+      // Observed pre-state, read off `layoutId` (the STATE `setLayoutId`
+      // writes) rather than `layout.id` (derived, and synthesized for the
+      // past-9 flow grid).
+      const wasAlready = zoneLayout.layoutId === normalized;
+      // The call is UNCONDITIONAL, and deliberately so. `setLayoutId`
+      // delegates to `applyLayout`, which does three things besides writing
+      // the id: it clears the maximized zone, re-flows unassigned tabs into
+      // empty zones (`applyLayoutAssignments`), and clamps the focused zone.
+      // So re-applying the CURRENT preset is a real operation — it is how an
+      // operator un-maximizes and re-packs the grid — and short-circuiting it
+      // on `layoutId` equality would have silently deleted that, including
+      // for `ZoneLayoutPicker`, which routes its clicks through this handler.
+      // What was dishonest was never the call; it was reporting the same `✓`
+      // whether or not the PRESET moved.
       zoneLayout.setLayoutId(normalized);
-      return ok(effect("changed", "layout", 1, { detail: normalized }));
+      return ok(
+        effect("changed", "layout", wasAlready ? 0 : 1, {
+          detail: wasAlready ? `already ${normalized}; grid re-packed` : normalized,
+        }),
+      );
     },
   });
 

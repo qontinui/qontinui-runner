@@ -180,8 +180,13 @@ async function build(): Promise<RealRegistryHarness> {
         // whether it is maximizing or restoring.
         maximizedZone: null,
         assignments: { 0: "tab-a", 1: "tab-b" },
-        focusNextZone: rec("zone.focusNextZone", undefined),
-        focusPrevZone: rec("zone.focusPrevZone", undefined),
+        // `{changed}` = "focus actually moved". The cap these two apply is
+        // `min(zones, tabs)`, which the handler cannot see — so the stub has
+        // to answer in the same shape the product does, or the fixture would
+        // model a `focusNextZone` that reports nothing and the handler's
+        // verdict would go back to being asserted.
+        focusNextZone: rec("zone.focusNextZone", { changed: true }),
+        focusPrevZone: rec("zone.focusPrevZone", { changed: true }),
         // `true` = "a needs-input zone was found and focused". The `false`
         // arm is what `/focus needs-input` reports as a failure, so the
         // truthy stub pins the SUCCESS path; specs that want the other arm

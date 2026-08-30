@@ -12,22 +12,22 @@
  * — the same leaf-module split as `terminalWriteResult.ts`.
  */
 
-import type { RefObject } from "react";
 import { describe, expect, it, vi } from "vitest";
 
-import { deliverApprovals, TERMINAL_WRITE_UNREPORTED, type WriteById } from "./approveAll";
+import {
+  deliverApprovals,
+  TERMINAL_WRITE_UNREPORTED,
+  type ApprovalRefs,
+  type ApprovalWriteTarget,
+  type WriteById,
+} from "./approveAll";
 import { TERMINAL_EXITED, type TerminalWriteResult } from "./terminalWriteResult";
-import type { TerminalInstanceHandle } from "./TerminalInstance";
 
-type Refs = Map<string, RefObject<TerminalInstanceHandle | null>>;
+type Refs = ApprovalRefs;
 
 /** A mounted pane whose write answers with the given envelope. */
-function mounted(result: TerminalWriteResult | undefined): RefObject<TerminalInstanceHandle | null> {
-  return {
-    current: {
-      writeToTerminal: vi.fn(async () => result),
-    } as unknown as TerminalInstanceHandle,
-  };
+function mounted(result: TerminalWriteResult | undefined): { current: ApprovalWriteTarget | null } {
+  return { current: { writeToTerminal: vi.fn(async () => result) } };
 }
 
 const okEnvelope: TerminalWriteResult = { success: true, bytes: 2 };
@@ -118,12 +118,12 @@ describe("deliverApprovals — the count is deliveries, not intentions", () => {
   });
 
   it("one throwing pane does not cap the approval at the panes before it", async () => {
-    const throwing: RefObject<TerminalInstanceHandle | null> = {
+    const throwing: { current: ApprovalWriteTarget | null } = {
       current: {
         writeToTerminal: vi.fn(async () => {
           throw new Error("boom");
         }),
-      } as unknown as TerminalInstanceHandle,
+      },
     };
     const refs: Refs = new Map([
       ["a", mounted(okEnvelope)],

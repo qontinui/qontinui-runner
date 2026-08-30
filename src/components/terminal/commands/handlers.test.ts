@@ -266,15 +266,22 @@ describe("handlers — the no-ops that used to render as effects", () => {
   });
 
   /**
-   * `/layout quad` on a grid that is already quad no longer calls
-   * `setLayoutId` at all — the pre-state check short-circuits it — and
-   * reports zero.
+   * `/layout quad` on a grid that is already quad reports ZERO — and STILL
+   * calls the setter.
+   *
+   * Both halves are load-bearing, and the second one is a defect this file
+   * caught in the fix for the first. `setLayoutId` delegates to `applyLayout`,
+   * which also clears the maximized zone, re-flows unassigned tabs into empty
+   * zones and clamps the focused zone — so re-applying the current preset is a
+   * real operation, and skipping it "because nothing changed" silently deletes
+   * the operator's re-pack (and `ZoneLayoutPicker`'s, which routes through
+   * this same handler). What was dishonest was the `✓`, never the call.
    */
-  it("`/layout quad` reports ZERO, and does not call the setter, when already quad", async () => {
+  it("`/layout quad` reports ZERO but STILL re-applies, when already quad", async () => {
     h.reset();
     const o = await run("/layout quad", (id) => h.byId(id));
     expect(o.verdict).toBe("ok");
-    expect(h.callNames()).toEqual([]);
+    expect(h.calls.map((c) => [c.name, c.args])).toEqual([["zone.setLayoutId", ["quad"]]]);
     expect(reportOf(o.value).affected).toBe(0);
   });
 

@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { LAYOUT_PRESETS, FLOW_GRID_ID, type SessionState } from "./useZoneLayout";
 import type { UIAction } from "./useUIState";
 import type { Metrics } from "./useEventHistory";
+import { deliverApprovals } from "./approveAll";
 import { getById } from "./commands";
 import {
   GLOBAL_CHORDS,
@@ -189,12 +190,31 @@ export function useKeyboardShortcuts({
       }
       if (isCtrlShiftChord(e, "Enter")) {
         e.preventDefault();
+        // Same delivery path as `/approve-all` and the overlay button.
+        //
+        // This chord is where the silent-skip cost the most: it incremented
+        // `totalApprovals` and wrote an "N sessions" history event from
+        // `waiting.length` BEFORE writing anything, through an optional chain
+        // that is a no-op for any pane without a mounted `TerminalInstance`.
+        // So the page's metrics card and event log recorded approvals that
+        // reached no process — and those are exactly the numbers `/metrics`
+        // and `/history` render. The counter now counts deliveries.
         const waiting = tabs.filter((t) => sessionStates[t.id] === "needs-input");
-        incrementMetric("totalApprovals", waiting.length);
-        addHistoryEvent("Approve all", `${waiting.length} sessions`, undefined, "#9ece6a");
-        for (const tab of waiting) {
-          terminalRefs.get(tab.id)?.current?.writeToTerminal("y\r");
-        }
+        void deliverApprovals(
+          waiting.map((t) => t.id),
+          terminalRefs,
+          "y\r",
+        ).then((report) => {
+          if (report.delivered > 0) incrementMetric("totalApprovals", report.delivered);
+          addHistoryEvent(
+            "Approve all",
+            report.delivered === report.targeted
+              ? `${report.delivered} sessions`
+              : `${report.delivered} of ${report.targeted} sessions`,
+            undefined,
+            report.delivered === report.targeted ? "#9ece6a" : "#e0af68",
+          );
+        });
         return;
       }
       // Digit RANGES. They used to be hand-rolled `e.key >= "1" && e.key
