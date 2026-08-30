@@ -163,32 +163,45 @@ async fn fetch_registered_repos(coord_base: &str) -> Result<Vec<String>, String>
         .unwrap_or_default())
 }
 
+/// Budget for every `git` call in this module.
+///
+/// All of them are local `rev-parse` / `config --local` writes, i.e.
+/// milliseconds when healthy; the hang class is an `index.lock`. Not periodic,
+/// but BURST-prone: the whole `setup_credential_helper` path runs once per
+/// `terminal_create` / `spawn_worker_session`, and ~130 concurrent session
+/// spawns were observed during the 2026-08-30 wedge — 130 unbounded
+/// `.output()` calls behind one wedged git is 130 lost blocking-pool threads.
+const GIT_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 fn is_git_repo(working_dir: &Path) -> bool {
-    crate::process_helpers::no_window("git")
-        .args([
-            "-C",
-            &working_dir.to_string_lossy(),
-            "rev-parse",
-            "--git-dir",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args([
+        "-C",
+        &working_dir.to_string_lossy(),
+        "rev-parse",
+        "--git-dir",
+    ]);
+    matches!(
+        crate::process_helpers::run_probe(
+            cmd,
+            GIT_CONFIG_TIMEOUT,
+            "credential_helper: git rev-parse --git-dir"
+        ),
+        crate::process_helpers::ProbeOutcome::Captured(_)
+    )
 }
 
 fn git_config_local(working_dir: &Path, key: &str, value: &str) -> Result<(), String> {
-    let output = crate::process_helpers::no_window("git")
-        .args([
-            "-C",
-            &working_dir.to_string_lossy(),
-            "config",
-            "--local",
-            key,
-            value,
-        ])
-        .output()
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args([
+        "-C",
+        &working_dir.to_string_lossy(),
+        "config",
+        "--local",
+        key,
+        value,
+    ]);
+    let output = crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT)
         .map_err(|e| format!("run git config: {e}"))?;
 
     if !output.status.success() {
@@ -224,16 +237,16 @@ fn set_git_credential_helper(
 /// posture as the credential.helper write.
 fn set_git_low_speed_bounds(working_dir: &Path) -> Result<(), String> {
     for (key, value) in [("http.lowSpeedLimit", "1024"), ("http.lowSpeedTime", "60")] {
-        let output = crate::process_helpers::no_window("git")
-            .args([
-                "-C",
-                &working_dir.to_string_lossy(),
-                "config",
-                "--local",
-                key,
-                value,
-            ])
-            .output()
+        let mut cmd = crate::process_helpers::no_window("git");
+        cmd.args([
+            "-C",
+            &working_dir.to_string_lossy(),
+            "config",
+            "--local",
+            key,
+            value,
+        ]);
+        let output = crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT)
             .map_err(|e| format!("run git config {key}: {e}"))?;
 
         if !output.status.success() {
@@ -282,9 +295,9 @@ fn git_config_cmd(config_file: Option<&Path>) -> std::process::Command {
 }
 
 fn git_config_get_all_at(config_file: Option<&Path>, key: &str) -> Result<Vec<String>, String> {
-    let output = git_config_cmd(config_file)
-        .args(["--get-all", key])
-        .output()
+    let mut cmd = git_config_cmd(config_file);
+    cmd.args(["--get-all", key]);
+    let output = crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT)
         .map_err(|e| format!("run git config --get-all {key}: {e}"))?;
 
     if output.status.success() {
@@ -314,9 +327,9 @@ fn git_config_get_all_at(config_file: Option<&Path>, key: &str) -> Result<Vec<St
 }
 
 fn git_config_add_at(config_file: Option<&Path>, key: &str, value: &str) -> Result<(), String> {
-    let output = git_config_cmd(config_file)
-        .args(["--add", key, value])
-        .output()
+    let mut cmd = git_config_cmd(config_file);
+    cmd.args(["--add", key, value]);
+    let output = crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT)
         .map_err(|e| format!("run git config --add {key}: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -326,9 +339,9 @@ fn git_config_add_at(config_file: Option<&Path>, key: &str, value: &str) -> Resu
 }
 
 fn git_config_unset_all_at(config_file: Option<&Path>, key: &str) -> Result<(), String> {
-    let output = git_config_cmd(config_file)
-        .args(["--unset-all", key])
-        .output()
+    let mut cmd = git_config_cmd(config_file);
+    cmd.args(["--unset-all", key]);
+    let output = crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT)
         .map_err(|e| format!("run git config --unset-all {key}: {e}"))?;
     match output.status.code() {
         // 5 = "you try to unset an option which does not exist" — fine, the
@@ -810,16 +823,16 @@ pub fn cleanup_credential_helper(session_id: &str) {
         // store by full path and re-prompts per path — the very prompt class
         // this subsystem exists to eliminate.
         for key in INSTALLED_LOCAL_KEYS {
-            let output = crate::process_helpers::no_window("git")
-                .args([
-                    "-C",
-                    &dir.to_string_lossy(),
-                    "config",
-                    "--local",
-                    "--unset-all",
-                    key,
-                ])
-                .output();
+            let mut cmd = crate::process_helpers::no_window("git");
+            cmd.args([
+                "-C",
+                &dir.to_string_lossy(),
+                "config",
+                "--local",
+                "--unset-all",
+                key,
+            ]);
+            let output = crate::process_helpers::output_with_timeout(cmd, GIT_CONFIG_TIMEOUT);
             match output {
                 // Exit code 5 = key not present — the desired end state already
                 // holds (e.g. the operator hand-cleaned the repo).

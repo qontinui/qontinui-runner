@@ -58,6 +58,13 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "chrono"] }
 tracing-appender = "0.2"
+# Tokio runtime instrumentation for the `tokio-console` debugger. OPTIONAL and
+# absent from `default`, so a normal build never resolves, downloads or
+# compiles it — it is pulled in only by the `debug-tokio-console` feature
+# below, which additionally requires `RUSTFLAGS="--cfg tokio_unstable"`.
+# 0.5.0 is the current release and is built against tracing-subscriber 0.3 /
+# tokio 1.x, matching the versions this crate already pins.
+console-subscriber = { version = "0.5.0", optional = true }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 url = "2"
@@ -288,6 +295,27 @@ spec-authoring = []
 # Off by default; enable with `--features spec-authoring,pg_integration_tests`
 # when a live PG (canonical or local) is available.
 pg_integration_tests = []
+# DEVELOPER-ONLY tokio-console wiring (Phase 5 of
+# `2026-08-30-runner-blocking-pool-exhaustion-and-wedge-diagnostics`). Layers
+# `console_subscriber` alongside the existing logging stack so a developer can
+# attach the `tokio-console` client and watch the runtime's own task graph —
+# per-task poll durations, what each task is awaiting, task-level contention.
+# That is the one thing the native OS-level census added by Phase 4 (threads,
+# handles, child processes) structurally CANNOT see: it can prove the process
+# is wedged, not which async task is stalled or for how long.
+#
+# NOT SHIPPED, and deliberately not reachable from a normal build:
+#   * it is absent from `default`, so `console-subscriber` is never compiled;
+#   * `console_subscriber` additionally requires the build-wide
+#     `--cfg tokio_unstable` rustc flag, which is set NOWHERE in this repo (not
+#     in `.cargo/config.toml`, not in `build.rs`) — a developer must pass it in
+#     `RUSTFLAGS` at invocation time, and `build.rs` fails the build with a
+#     one-line explanation if this feature is on without it.
+# `tokio_unstable` opts the whole dependency graph into tokio's explicitly
+# unstable API surface, which is not something a shipped desktop binary should
+# be built against. See `src/logging.rs` (`mod tokio_console`) and
+# `docs/tokio-console.md` for the exact developer invocation.
+debug-tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 
 [[bin]]
 name = "mock_claude_cli"

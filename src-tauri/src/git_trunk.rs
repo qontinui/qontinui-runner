@@ -26,6 +26,19 @@
 
 use std::path::Path;
 
+use crate::process_helpers::{run_probe, ProbeOutcome};
+
+/// Budget for a trunk-resolution git read.
+///
+/// Every caller is a periodic one — the 300s worktree census, the 900s build
+/// drift check, the 60s tree publisher, the 60s MCP probe executor — and each
+/// runs on a blocking-pool thread. The commands are local plumbing reads
+/// (`symbolic-ref`, `rev-parse`, `config`, `for-each-ref`, `ls-remote` is NOT
+/// in the allowlist), so a healthy call is milliseconds and the only realistic
+/// hang is a lock or a stalled filesystem. Without this bound one wedged repo
+/// removed a pool thread permanently, on four independent timers.
+const TRUNK_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Every git subcommand this module can run. Both are read-only, which is
 /// what lets [`crate::mcp::probe_executor`] — whose whole contract is that a
 /// probe never writes — call the resolver without widening its own
@@ -49,15 +62,12 @@ fn git_capture(repo: &Path, args: &[&str]) -> Option<String> {
     let dir = repo.to_str()?;
     let mut full: Vec<&str> = vec!["-C", dir];
     full.extend_from_slice(args);
-    let out = crate::process_helpers::no_window("git")
-        .args(&full)
-        .output()
-        .ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        None
-    }
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(&full);
+    let ProbeOutcome::Captured(stdout) = run_probe(cmd, TRUNK_GIT_TIMEOUT, "git_trunk: git") else {
+        return None;
+    };
+    Some(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 /// Resolve the repo's trunk remote-tracking ref for `repo` — e.g.

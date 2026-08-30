@@ -39,6 +39,7 @@ use tracing::{info, warn};
 
 use crate::mcp::types::ApiState;
 use crate::settings::{self, RunnerTier};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Frontend event fired when the runner goes credential-dark on a HARD Cognito
 /// refresh failure (the refresh token is expired/revoked — no headless
@@ -684,7 +685,7 @@ pub(crate) async fn try_refresh_once(
 
     // pair_with_auth_token_with_ids is reqwest::blocking — must run via
     // spawn_blocking or it stalls the tokio runtime.
-    let pair_join = tokio::task::spawn_blocking(move || {
+    let pair_join = spawn_blocking_tracked(move || {
         qontinui_runner_lib::pair::pair_with_auth_token_with_ids(
             &base, &token, &did, &uid, tenant_id,
         )
@@ -1607,8 +1608,7 @@ pub(crate) async fn refresh_cognito_bearer(
         info!("device_jwt_refresher: Cognito access token stale — refreshing first");
         let rt = refresh_token.clone();
         let refreshed =
-            tokio::task::spawn_blocking(move || qontinui_runner_lib::cognito::refresh_tokens(&rt))
-                .await;
+            spawn_blocking_tracked(move || qontinui_runner_lib::cognito::refresh_tokens(&rt)).await;
         match refreshed {
             Ok(Ok(resp)) => {
                 let expires_at = chrono::Utc::now().timestamp() + resp.expires_in;

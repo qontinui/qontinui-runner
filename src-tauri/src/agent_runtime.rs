@@ -62,6 +62,7 @@ use tracing::{debug, error, info, warn};
 /// its single definition in `profiles`. Every coord surface in this module
 /// no-ops when it is `None` (the runner is standalone).
 use qontinui_runner_lib::profiles::connected_coord_base;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // =============================================================================
 // Wire shapes (mirror of qontinui-coord/src/agents_spawn.rs)
@@ -3487,7 +3488,7 @@ async fn run_continuation_terminal(
     // (same as the worker-tab spawn path) so the continuation /implement-plan
     // session does not stall on interactive Bash permission prompts — an
     // unattended gate continuation has no operator to answer them.
-    let claude_bin = tokio::task::spawn_blocking(resolve_claude_bin)
+    let claude_bin = spawn_blocking_tracked(resolve_claude_bin)
         .await
         .unwrap_or_else(|_| claude_bin_path());
     // Phase 2c — `--add-dir=<sibling>` (attached form — see the
@@ -3513,7 +3514,7 @@ async fn run_continuation_terminal(
     // launch template for the shared launch seam below. Resolved BEFORE the argv
     // build so its per-account command can layer in. spawn_blocking: the
     // selector reads settings + cooldown state.
-    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
     let (selected_config_dir, _config_dir_source) = {
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
@@ -3836,7 +3837,7 @@ async fn run_condition_check_terminal(
     // Pinned session id + interactive positional-prompt argv (no `--add-dir`:
     // no sibling worktrees). spawn_blocking: resolve_claude_bin does blocking
     // PATH filesystem stats.
-    let claude_bin = tokio::task::spawn_blocking(resolve_claude_bin)
+    let claude_bin = spawn_blocking_tracked(resolve_claude_bin)
         .await
         .unwrap_or_else(|_| claude_bin_path());
     let pinned_session_id = uuid::Uuid::new_v4().to_string();
@@ -3845,7 +3846,7 @@ async fn run_condition_check_terminal(
     // spawned `claude` never dies instantly under a quota-exhausted default.
     // Resolved BEFORE the argv build so its per-account launch command can layer
     // into the shared launch seam.
-    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
     let (selected_config_dir, _config_dir_source) = {
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
@@ -4090,7 +4091,7 @@ async fn run_continuation_headless(
     // Select the most-available account once before spawning (pins the resolved
     // config dir that `spawn_claude_child` reads). spawn_blocking: the selector
     // reads settings + cooldown state.
-    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
     // Provision coord-mcp for the headless session so it receives coord's
     // session-start `instructions` preamble and can call coord_declare_intent —
     // parity with the terminal continuation path.
@@ -4448,7 +4449,7 @@ async fn run_agent_subprocess(
     // override exists to avoid — and its result would be ignored anyway, since
     // the override is passed to every (re)spawn below.
     if pinned_config_dir.is_none() {
-        let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+        let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
     }
 
     loop {
@@ -4829,12 +4830,21 @@ pub(crate) fn agent_git_identity_env() -> Vec<(String, String)> {
 /// box still attributes autonomous commits to its owner with zero config.
 fn host_git_identity() -> (Option<String>, Option<String>) {
     fn get(args: &[&str]) -> Option<String> {
-        crate::process_helpers::no_window("git")
-            .args(args)
-            .output()
+        // Bounded: runs per autonomous commit. `git config --get` blocks on a
+        // held config lock like any other git command.
+        let mut cmd = crate::process_helpers::no_window("git");
+        cmd.args(args);
+        let crate::process_helpers::ProbeOutcome::Captured(stdout) =
+            crate::process_helpers::run_probe(
+                cmd,
+                std::time::Duration::from_secs(20),
+                "agent_runtime: git config --get",
+            )
+        else {
+            return None;
+        };
+        String::from_utf8(stdout)
             .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }

@@ -1,0 +1,116 @@
+name: forbid untimed subprocess waits
+
+# Phase 1 enforcement deliverable of plan
+# `2026-08-30-runner-blocking-pool-exhaustion-and-wedge-diagnostics`.
+#
+# WHAT IT FORBIDS: a NEW `std::process::Command` waited on with no time bound —
+# `.output()`, `.status()`, `Child::wait()`, `Child::wait_with_output()` — in
+# `src-tauri/src/**/*.rs`, unless the enclosing function is listed with a
+# written reason in `scripts/untimed-subprocess-baseline.json`.
+#
+# WHY IT EXISTS: those four calls have NO timeout. A child that never exits
+# parks the calling thread forever, and when that thread came from tokio's
+# blocking pool it is never given back. tokio's default `max_blocking_threads`
+# is 512. On 2026-08-30 eight independent PERIODIC callers each leaked one
+# thread per tick until the pool was exhausted; `spawn_blocking` then stopped
+# scheduling at all, which starved the PG pool, which disabled `zombie_sweep`,
+# which made the spiral self-reinforcing until `/livez` went dark.
+#
+# That was the FOURTH independently-discovered instance of the same defect
+# shape, across two incidents four days apart. Code review did not catch it any
+# of the first three times, so review is a demonstrated-insufficient control
+# here and the class gets a machine check. A one-time grep-and-fix would have
+# left the class open for a fifth.
+#
+# THE SANCTIONED BOUNDED WRAPPERS (src-tauri/src/process_helpers.rs):
+#
+#   run_with_timeout(cmd: Command, timeout: Duration) -> io::Result<TimedOutput>
+#   output_with_timeout(cmd: Command, timeout: Duration) -> io::Result<Output>
+#   run_probe(cmd: Command, timeout: Duration, label: &str) -> ProbeOutcome
+#
+# A site routed through any of these never calls `.output()`/`.status()` at all
+# — it hands the BUILT command to the wrapper — so "is it bounded?" needs no
+# heuristic. The presence of the blocking wait IS the finding.
+#
+# WHY `.spawn()` IS NOT IN THE PATTERN: `.spawn()` returns immediately and parks
+# nothing. Gating it would fire on every deliberately-detached long-lived child
+# (the python sidecar, ffmpeg, rathole, claude CLI sessions, terminal spawns,
+# the managed services in process_capture) and on every hand-rolled bounded
+# `spawn` + `try_wait` poll loop — a large, legitimate, statically
+# indistinguishable population, i.e. exactly the false-positive flood that gets
+# a gate disabled. The defect is the unbounded WAIT, so the gate follows the
+# wait. That also covers the `spawn`-then-`wait` shape a bare-`spawn` rule
+# would have had to allow through anyway. `try_wait()` is absent on purpose: it
+# does not block.
+#
+# HOW std IS TOLD FROM tokio: not by regex — 53 files use both, and `reqwest`'s
+# `Response::status()` alone would produce hundreds of false hits. The checker
+# resolves each blocking wait's RECEIVER back to its constructor (`no_window` /
+# `cmd_no_window` / `std::process::Command::new` = sync and gated;
+# `tokio_no_window` / `tokio_cmd_no_window` / `tokio::process::Command::new` =
+# async and ignored, because an awaited async wait occupies no blocking-pool
+# thread). Anything it cannot resolve to a sync origin is NOT flagged. Full
+# rationale, and the list of what is skipped wholesale (`#[cfg(test)]` items,
+# `process_helpers.rs` itself, a `wait()` that follows a `kill()`), is in the
+# module docstring of `scripts/check_untimed_subprocess.py`.
+#
+# THE BASELINE IS A RATCHET. `scripts/untimed-subprocess-baseline.json`
+# enumerates the surviving sites — one-shot CLI paths, user-triggered actions,
+# startup and shutdown work, and commands whose runtime is unbounded by design
+# (a build, a Playwright run) — keyed by `<path>::<fn>` with a REQUIRED written
+# reason. The count per entry is checked in BOTH directions, so the baseline
+# can only shrink and cannot silently rot, and `--update-baseline` cannot
+# smuggle an exemption in: a regenerated entry arrives with an empty reason and
+# is rejected until a human writes one. Adding an entry for a PERIODIC caller
+# is a policy violation, not a lint fix.
+#
+# NOT PATH-FILTERED, deliberately — same posture as forbid-runner-schema.yml,
+# and the opposite of forbid-sibling-clone.yml. Two reasons:
+#   1. The gate's inputs are the whole Rust tree PLUS the checker PLUS the
+#      baseline. Enumerating that as a `paths:` filter is a list that rots — a
+#      PR that only edits the baseline JSON, or that renames a directory, would
+#      slip a wrongly-filtered gate. The check costs ~5s of stdlib Python over
+#      the whole 37 MB Rust tree, so filtering buys nothing worth that risk.
+#   2. Because it is unfiltered it creates a check-run on EVERY PR, so it does
+#      not carry forbid-sibling-clone's hazard — a path-filtered trigger makes
+#      no check-run on a non-matching PR, so registering one as required leaves
+#      it "Expected" forever and wedges every unrelated PR (the 2026-06-26 fleet
+#      wedge). This gate is therefore *eligible* to be a required context.
+#
+# It is still NOT REGISTERED as one today: red CI is this repo's sanctioned
+# merge-stopper and `main` carries pre-existing red, so promoting a brand-new
+# gate to required is an operator decision about ruleset 16044811, not a
+# side-effect of adding the workflow. Do not register it without making that
+# call explicitly.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  forbid-untimed-subprocess:
+    name: Forbid untimed std::process::Command waits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scan src-tauri/src for unbounded blocking subprocess waits
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Pure stdlib — no `pip install` step, so this leg cannot go red on a
+          # package-index outage. The same command is what a developer runs
+          # locally before pushing (on the Windows dev box: `python
+          # scripts\check_untimed_subprocess.py`).
+          python3 scripts/check_untimed_subprocess.py --ci

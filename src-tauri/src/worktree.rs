@@ -1085,11 +1085,19 @@ fn get_head_commit(repo_path: &Path) -> Result<String, String> {
     Ok(output.trim().to_string())
 }
 
+/// Budget for a worktree-management git command.
+///
+/// Generous because `create_worktree` fetches and `merge_worktree` merges —
+/// both can legitimately take a while on a large repo — but bounded, because
+/// the hang classes here are `index.lock`, a credential prompt and an
+/// unreachable remote, and these run on blocking threads driven by MCP tools
+/// an agent can invoke in a loop.
+const WORKTREE_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub(crate) fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = crate::process_helpers::no_window("git")
-        .args(args)
-        .current_dir(repo_path)
-        .output()
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(args).current_dir(repo_path);
+    let output = crate::process_helpers::output_with_timeout(cmd, WORKTREE_GIT_TIMEOUT)
         .map_err(|e| format!("Failed to run git: {}", e))?;
 
     if output.status.success() {
@@ -1104,10 +1112,9 @@ pub(crate) fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String,
 }
 
 fn run_git_command_with_status(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = crate::process_helpers::no_window("git")
-        .args(args)
-        .current_dir(repo_path)
-        .output()
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(args).current_dir(repo_path);
+    let output = crate::process_helpers::output_with_timeout(cmd, WORKTREE_GIT_TIMEOUT)
         .map_err(|e| format!("Failed to run git: {}", e))?;
 
     if output.status.success() {

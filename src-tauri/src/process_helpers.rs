@@ -6,6 +6,8 @@
 //! transparent passthroughs.
 
 /// Create a `std::process::Command` with `CREATE_NO_WINDOW` on Windows.
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
 pub fn no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
     #[cfg(target_os = "windows")]
@@ -246,6 +248,112 @@ pub fn run_with_timeout(
     }
 }
 
+/// Drop-in bounded replacement for `Command::output()`.
+///
+/// Returns exactly what [`std::process::Command::output`] returns, so a call
+/// site converts by wrapping the built command and leaving every downstream
+/// arm (`.ok()?`, `.and_then(|o| …)`, `match { Ok(o) if o.status.success() … }`)
+/// untouched — EXCEPT that a child which overruns `timeout` is killed, reaped,
+/// and surfaced as `Err(ErrorKind::TimedOut)` instead of parking the calling
+/// thread forever.
+///
+/// Use this where the caller already has bespoke handling for `Output` and a
+/// timeout is honestly just one more way to fail; use [`run_probe`] where the
+/// caller only wants stdout-or-degrade.
+pub fn output_with_timeout(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    let label = format!("{:?}", cmd);
+    match run_with_timeout(cmd, timeout) {
+        Ok(TimedOutput::Completed(o)) => Ok(o),
+        Ok(TimedOutput::TimedOut { pid, reaped }) => {
+            tracing::warn!(
+                child_pid = pid,
+                reaped,
+                timeout_secs = timeout.as_secs(),
+                "subprocess timed out and was killed: {label}"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "{label} exceeded its {}s budget and was killed (pid={pid}, reaped={reaped})",
+                    timeout.as_secs()
+                ),
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Why a [`run_probe`] call degraded — carried so a caller (or a test) can
+/// tell a real timeout apart from an ordinary non-zero exit.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DegradeReason {
+    /// The child exited non-zero inside the budget.
+    Status,
+    /// The child could not be spawned at all.
+    SpawnError,
+    /// The child overran the budget and was killed. `reaped` says whether the
+    /// follow-up `wait()` succeeded, so a leaked zombie is observable.
+    TimedOut { pid: u32, reaped: bool },
+}
+
+/// Outcome of one bounded external probe — see [`run_probe`].
+#[derive(Debug)]
+pub enum ProbeOutcome {
+    /// The child exited 0 inside the budget; carries its raw stdout.
+    Captured(Vec<u8>),
+    /// Anything else. Callers of this shape all degrade identically (empty
+    /// result / `None` / `false`); the reason is for the log and for tests.
+    Degraded(DegradeReason),
+}
+
+/// Run one external probe under a hard budget, mapping every failure mode onto
+/// [`ProbeOutcome::Degraded`] and emitting a WARN naming `label`.
+///
+/// This is the ergonomic form of [`run_with_timeout`] for the overwhelmingly
+/// common "shell out, read stdout, degrade on anything else" shape — the shape
+/// that produced the 2026-08-23 and 2026-08-30 runner wedges when written as a
+/// bare `Command::output()`. Prefer it over hand-rolling the four match arms:
+/// a caller that forgets the `TimedOut` arm is exactly how the defect recurs.
+///
+/// `label` is used verbatim in the WARN, so pass something that identifies the
+/// module and the operation (e.g. `"process_tree: PowerShell snapshot"`).
+pub fn run_probe(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+    label: &str,
+) -> ProbeOutcome {
+    match run_with_timeout(cmd, timeout) {
+        Ok(TimedOutput::Completed(o)) if o.status.success() => ProbeOutcome::Captured(o.stdout),
+        Ok(TimedOutput::Completed(o)) => {
+            tracing::warn!(
+                "{label} failed (status={:?}, stderr={})",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            );
+            ProbeOutcome::Degraded(DegradeReason::Status)
+        }
+        Ok(TimedOutput::TimedOut { pid, reaped }) => {
+            // WARN, not debug: a silent timeout just relocates the mystery.
+            // The killed pid + the budget are what make the next incident
+            // diagnosable from the log alone.
+            tracing::warn!(
+                child_pid = pid,
+                reaped,
+                timeout_secs = timeout.as_secs(),
+                "{label} timed out and was killed — degrading this pass"
+            );
+            ProbeOutcome::Degraded(DegradeReason::TimedOut { pid, reaped })
+        }
+        Err(e) => {
+            tracing::warn!("{label} spawn error: {e}");
+            ProbeOutcome::Degraded(DegradeReason::SpawnError)
+        }
+    }
+}
+
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
@@ -291,6 +399,144 @@ mod timeout_tests {
             elapsed < budget * 8,
             "run_with_timeout blocked for {elapsed:?}, budget was {budget:?}"
         );
+    }
+
+    // ── Bounded-probe / blocking-pool regression tests (2026-08-30 Phase 2) ──
+    //
+    // `run_probe` is the seam every `#[cfg(windows)]`-gated WMI / netstat /
+    // lsof call site now routes through, and it lives here — in the LIB — on
+    // purpose: the leaking call sites are Windows-only, so without an
+    // un-gated seam the bounded-execution behaviour could never be exercised
+    // by CI on any other platform. Each of these fails if the routing is
+    // reverted to a bare `Command::output()`.
+
+    /// A hung probe must give its thread back inside the budget, kill the
+    /// child, and reap it.
+    #[test]
+    fn run_probe_degrades_within_budget_and_reaps() {
+        let budget = Duration::from_millis(300);
+        let started = Instant::now();
+        let outcome = run_probe(sleeper(), budget, "test: hung probe");
+        let elapsed = started.elapsed();
+
+        match outcome {
+            ProbeOutcome::Degraded(DegradeReason::TimedOut { pid, reaped }) => {
+                assert!(pid > 0, "the killed child must report its pid");
+                assert!(
+                    reaped,
+                    "a timed-out child must be reaped, not left a zombie"
+                );
+            }
+            other => panic!("expected a TimedOut degrade, got {other:?}"),
+        }
+        assert!(
+            elapsed < budget * 8,
+            "run_probe held its thread for {elapsed:?} against a {budget:?} budget"
+        );
+    }
+
+    /// A non-zero exit is a `Status` degrade, NOT a timeout — the two must
+    /// stay distinguishable or the WARN and this test both lose their meaning.
+    #[test]
+    fn run_probe_distinguishes_a_failing_child_from_a_hung_one() {
+        #[cfg(target_os = "windows")]
+        let cmd = {
+            let mut c = no_window("cmd.exe");
+            c.args(["/C", "exit 3"]);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let cmd = {
+            let mut c = no_window("sh");
+            c.args(["-c", "exit 3"]);
+            c
+        };
+        assert!(matches!(
+            run_probe(cmd, Duration::from_secs(20), "test: failing probe"),
+            ProbeOutcome::Degraded(DegradeReason::Status)
+        ));
+    }
+
+    /// `output_with_timeout` must surface a hang as `ErrorKind::TimedOut`, so
+    /// every call site's existing `Err` arm covers it — and must NOT report it
+    /// as a completed child with a non-zero status.
+    #[test]
+    fn output_with_timeout_reports_a_hang_as_an_io_timeout() {
+        let budget = Duration::from_millis(300);
+        let started = Instant::now();
+        let err = output_with_timeout(sleeper(), budget)
+            .expect_err("a hung child must be Err, never Ok(Output)");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pid=") && msg.contains("reaped=true"),
+            "the error must name the killed pid and prove it was reaped; got {msg:?}"
+        );
+        assert!(started.elapsed() < budget * 8);
+    }
+
+    /// **The wedge itself, in miniature.**
+    ///
+    /// Before the fix, a degraded WMI provider meant every periodic caller's
+    /// probe permanently consumed one blocking-pool thread; because the
+    /// callers re-fire on independent timers the stuck threads accumulated
+    /// until tokio's 512-thread default was exhausted and `spawn_blocking`
+    /// stopped scheduling anything at all.
+    ///
+    /// Here: a pool capped at `K`, `N > K` concurrent probes that ALL hang.
+    /// The assertions are (a) every probe returns rather than parking forever,
+    /// and (b) — the one that actually separates fixed from broken — a
+    /// SUBSEQUENT `spawn_blocking` is still scheduled promptly, i.e. the
+    /// threads went back to the pool. With an unbounded `.output()` the
+    /// follow-up never runs and the outer `timeout` FAILS the test instead of
+    /// hanging CI for the sleeper's full minute.
+    #[test]
+    fn hung_probes_do_not_permanently_consume_the_blocking_pool() {
+        const K: usize = 4; // blocking-pool cap
+        const N: usize = 16; // concurrent hanging probes, comfortably > K
+        let budget = Duration::from_millis(300);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(K)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        rt.block_on(async move {
+            let timed_out = tokio::time::timeout(Duration::from_secs(30), async move {
+                let mut handles = Vec::with_capacity(N);
+                for _ in 0..N {
+                    handles.push(spawn_blocking_tracked(move || {
+                        run_probe(sleeper(), budget, "test: pool-pressure probe")
+                    }));
+                }
+                let mut n = 0usize;
+                for h in handles {
+                    match h.await.expect("blocking task must not panic") {
+                        ProbeOutcome::Degraded(DegradeReason::TimedOut { reaped, .. }) => {
+                            assert!(reaped, "every timed-out child must be reaped");
+                            n += 1;
+                        }
+                        other => panic!("expected every probe to time out, got {other:?}"),
+                    }
+                }
+                n
+            })
+            .await
+            .expect("the hanging probes never returned — the blocking pool is wedged");
+
+            assert_eq!(timed_out, N, "every probe must report a bounded timeout");
+
+            // The load-bearing half: the pool must be usable again. Had the
+            // threads leaked, this never gets a slot.
+            let reused =
+                tokio::time::timeout(Duration::from_secs(10), spawn_blocking_tracked(|| 7u32))
+                    .await
+                    .expect("the blocking pool was still saturated after the probes returned")
+                    .expect("blocking task must not panic");
+            assert_eq!(reused, 7);
+        });
     }
 
     /// The fast path must still deliver the child's real output.

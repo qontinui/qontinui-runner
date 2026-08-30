@@ -584,6 +584,17 @@ pub async fn tick_once(state: &Arc<DirtyPollerState>) -> Result<TickOutcome> {
     })
 }
 
+/// Budget for one `git` call in the dirty poll.
+///
+/// These are `tokio::process` calls, so a hang cannot exhaust the BLOCKING
+/// pool the way the 2026-08-30 incident's synchronous sites did — but an
+/// awaited `output()` with no bound still stalls this 5s poller indefinitely,
+/// and `kill_on_drop` only helps when something actually drops the future.
+/// The timeout is what makes that drop happen. Both calls are local plumbing
+/// on a working tree, so 60s is far past any healthy latency while still
+/// bounding a wedged `git` (contended `index.lock`, a stuck filesystem).
+const DIRTY_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// `git status --porcelain` + `git diff --shortstat HEAD` for one
 /// worktree.
 async fn read_worktree_dirty(t: &DirtyTarget) -> Result<WorktreeDirty> {
@@ -593,15 +604,25 @@ async fn read_worktree_dirty(t: &DirtyTarget) -> Result<WorktreeDirty> {
     // otherwise just closes the handle and leaves `git` running. Leaking a
     // child on teardown is the same class of bug this module is being
     // fixed for; `agent_pusher` already does this for its `git push`.
-    let status_out = crate::process_helpers::tokio_no_window("git")
-        .arg("-C")
-        .arg(&t.worktree_path)
-        .arg("status")
-        .arg("--porcelain")
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| format!("git status in {}", t.worktree_path.display()))?;
+    let status_out = tokio::time::timeout(
+        DIRTY_GIT_TIMEOUT,
+        crate::process_helpers::tokio_no_window("git")
+            .arg("-C")
+            .arg(&t.worktree_path)
+            .arg("status")
+            .arg("--porcelain")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "git status in {} exceeded its {:?} budget",
+            t.worktree_path.display(),
+            DIRTY_GIT_TIMEOUT
+        )
+    })?
+    .with_context(|| format!("git status in {}", t.worktree_path.display()))?;
     if !status_out.status.success() {
         anyhow::bail!(
             "git status exited {:?}: {}",
@@ -611,16 +632,26 @@ async fn read_worktree_dirty(t: &DirtyTarget) -> Result<WorktreeDirty> {
     }
     let files = parse_porcelain(&String::from_utf8_lossy(&status_out.stdout));
 
-    let shortstat_out = crate::process_helpers::tokio_no_window("git")
-        .arg("-C")
-        .arg(&t.worktree_path)
-        .arg("diff")
-        .arg("--shortstat")
-        .arg("HEAD")
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| format!("git diff --shortstat in {}", t.worktree_path.display()))?;
+    let shortstat_out = tokio::time::timeout(
+        DIRTY_GIT_TIMEOUT,
+        crate::process_helpers::tokio_no_window("git")
+            .arg("-C")
+            .arg(&t.worktree_path)
+            .arg("diff")
+            .arg("--shortstat")
+            .arg("HEAD")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "git diff --shortstat in {} exceeded its {:?} budget",
+            t.worktree_path.display(),
+            DIRTY_GIT_TIMEOUT
+        )
+    })?
+    .with_context(|| format!("git diff --shortstat in {}", t.worktree_path.display()))?;
     // shortstat can legitimately exit non-zero on an unborn HEAD; treat
     // any failure as "no tracked-diff stats" rather than erroring out.
     let (files_changed, insertions, deletions) = if shortstat_out.status.success() {

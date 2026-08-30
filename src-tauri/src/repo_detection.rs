@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde_json::json;
 use tauri::Emitter;
 use tokio::sync::RwLock;
@@ -24,16 +25,20 @@ static REGISTERED_REPOS_CACHE: once_cell::sync::Lazy<RwLock<(Instant, CanonicalR
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub fn detect_repo_slug(working_dir: &str) -> Option<String> {
-    let output = crate::process_helpers::no_window("git")
-        .args(["-C", working_dir, "remote", "get-url", "origin"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    // Bounded. This is not periodic, but it IS burst-prone: it fires once per
+    // `terminal_create` / `spawn_worker_session`, and ~130 concurrent session
+    // spawns were observed during the 2026-08-30 wedge. 130 unbounded
+    // `.output()` calls behind one wedged git is 130 blocking-pool threads.
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", working_dir, "remote", "get-url", "origin"]);
+    let crate::process_helpers::ProbeOutcome::Captured(stdout) = crate::process_helpers::run_probe(
+        cmd,
+        std::time::Duration::from_secs(20),
+        "repo_detection: git remote get-url origin",
+    ) else {
         return None;
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    };
+    let url = String::from_utf8_lossy(&stdout).trim().to_string();
     parse_repo_slug(&url)
 }
 
@@ -169,7 +174,7 @@ pub async fn tenant_for_repo(
         Some(s) => Some(s),
         None => match working_dir.filter(|d| !d.trim().is_empty()) {
             // `git remote get-url` shells out — keep it off the async runtime.
-            Some(dir) => tokio::task::spawn_blocking(move || detect_repo_slug(&dir))
+            Some(dir) => spawn_blocking_tracked(move || detect_repo_slug(&dir))
                 .await
                 .ok()
                 .flatten(),
@@ -210,7 +215,7 @@ pub async fn check_and_emit_unregistered(
         _ => return,
     };
 
-    let slug = match tokio::task::spawn_blocking(move || detect_repo_slug(&dir)).await {
+    let slug = match spawn_blocking_tracked(move || detect_repo_slug(&dir)).await {
         Ok(Some(s)) => s,
         _ => return,
     };

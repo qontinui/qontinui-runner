@@ -7,6 +7,7 @@
 //! async judge spawners that run fire-and-forget after a workflow completes.
 
 use chrono::Utc;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -351,17 +352,16 @@ pub fn spawn_llm_judge_if_eligible(
         };
 
         // 2. Call the LLM judge (blocking AI call)
-        let results =
-            match tokio::task::spawn_blocking(move || llm_judge::evaluate_sync(&input)).await {
-                Ok(results) => results,
-                Err(e) => {
-                    warn!(
-                        "LLM judge: spawn_blocking panicked for {}: {}",
-                        task_run_id, e
-                    );
-                    return;
-                }
-            };
+        let results = match spawn_blocking_tracked(move || llm_judge::evaluate_sync(&input)).await {
+            Ok(results) => results,
+            Err(e) => {
+                warn!(
+                    "LLM judge: spawn_blocking panicked for {}: {}",
+                    task_run_id, e
+                );
+                return;
+            }
+        };
 
         if results.is_empty() {
             debug!("LLM judge: no results for task {}", task_run_id);
@@ -436,7 +436,7 @@ pub fn spawn_rag_judge_if_eligible(
         };
 
         // 4. Call the RAG judge (blocking AI call)
-        let results = match tokio::task::spawn_blocking(move || {
+        let results = match spawn_blocking_tracked(move || {
             crate::meta_optimizer::agentic_metrics::rag_judge::evaluate_rag_sync(&input)
         })
         .await

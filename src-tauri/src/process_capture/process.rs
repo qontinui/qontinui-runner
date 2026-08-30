@@ -290,10 +290,17 @@ impl ManagedProcess {
         if let Some(pid) = self.runtime.pid {
             #[cfg(windows)]
             {
-                // On Windows, use taskkill to kill the process tree
-                let _ = crate::process_helpers::no_window("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .output();
+                // On Windows, use taskkill to kill the process tree.
+                // Bounded: `stop()` is reached from the 30s restate health
+                // loop's restart path, and a `taskkill` that never returns
+                // used to park this tokio worker thread outright.
+                let mut kill_cmd = crate::process_helpers::no_window("taskkill");
+                kill_cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+                let _ = crate::process_helpers::run_probe(
+                    kill_cmd,
+                    Duration::from_secs(10),
+                    "process_capture::process: taskkill",
+                );
             }
 
             #[cfg(not(windows))]

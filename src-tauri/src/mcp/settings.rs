@@ -20,6 +20,7 @@ use crate::commands::backup::{ComprehensiveExport, ComprehensiveImportResult};
 use crate::config_facade;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::settings;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Request / Response types
@@ -77,7 +78,7 @@ pub struct DeviceInfoResponse {
 /// GET /settings/general
 async fn get_general_settings(
 ) -> Result<Json<ApiResponse<GeneralSettingsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(|| {
+    let result = spawn_blocking_tracked(|| {
         let s = settings::load_settings();
         GeneralSettingsPayload {
             auto_load_last_config: s.auto_load_last_config,
@@ -102,7 +103,7 @@ async fn get_general_settings(
 async fn save_general_settings(
     Json(payload): Json<GeneralSettingsPayload>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         settings::update_settings(|s| {
             s.auto_load_last_config = payload.auto_load_last_config;
             s.include_summary_step_by_default = payload.include_summary_step_by_default;
@@ -141,7 +142,7 @@ async fn save_general_settings(
 /// GET /settings/app-mode
 async fn get_app_mode(
 ) -> Result<Json<ApiResponse<AppModePayload>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(|| {
+    let result = spawn_blocking_tracked(|| {
         let s = settings::load_settings();
         AppModePayload { mode: s.app_mode }
     })
@@ -163,17 +164,16 @@ async fn save_app_mode(
     Json(payload): Json<AppModePayload>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     let mode = payload.mode.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        settings::update_settings(|s| s.app_mode = payload.mode)
-    })
-    .await
-    .map_err(|e| {
-        error!("Failed to save app mode: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task failed: {}", e))),
-        )
-    })?;
+    let result =
+        spawn_blocking_tracked(move || settings::update_settings(|s| s.app_mode = payload.mode))
+            .await
+            .map_err(|e| {
+                error!("Failed to save app mode: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Task failed: {}", e))),
+                )
+            })?;
 
     match result {
         Ok(()) => {
@@ -199,7 +199,7 @@ async fn save_app_mode(
 /// GET /settings/ai
 async fn get_ai_settings(
 ) -> Result<Json<ApiResponse<settings::AiSettings>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(settings::get_ai_settings)
+    let result = spawn_blocking_tracked(settings::get_ai_settings)
         .await
         .map_err(|e| {
             error!("Failed to get AI settings: {}", e);
@@ -216,7 +216,7 @@ async fn get_ai_settings(
 async fn save_ai_settings(
     Json(payload): Json<settings::AiSettings>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || settings::save_ai_settings(payload))
+    let result = spawn_blocking_tracked(move || settings::save_ai_settings(payload))
         .await
         .map_err(|e| {
             error!("Failed to save AI settings: {}", e);
@@ -268,7 +268,7 @@ pub struct PathPredictionToggleResponse {
 async fn save_ai_path_prediction_enabled(
     Json(payload): Json<PathPredictionTogglePayload>,
 ) -> Result<Json<ApiResponse<PathPredictionToggleResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let mut current = settings::get_ai_settings();
         current.ai_path_prediction_enabled = payload.enabled;
         settings::save_ai_settings(current).map(|()| payload.enabled)
@@ -297,7 +297,7 @@ async fn save_ai_path_prediction_enabled(
 async fn save_ai_api_key(
     Json(req): Json<SaveApiKeyRequest>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         config_facade::ai_keychain()
             .store(&req.provider, &req.api_key)
             .map_err(|e| format!("Failed to store API key: {}", e))
@@ -324,7 +324,7 @@ async fn save_ai_api_key(
 async fn delete_ai_api_key(
     Path(provider): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         config_facade::ai_keychain()
             .delete(&provider)
             .map_err(|e| format!("Failed to delete API key: {}", e))
@@ -348,7 +348,7 @@ async fn delete_ai_api_key(
 async fn has_ai_api_key(
     Path(provider): Path<String>,
 ) -> Result<Json<ApiResponse<bool>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         config_facade::ai_keychain()
             .exists(&provider)
             .map_err(|e| format!("Failed to check API key: {}", e))
@@ -375,7 +375,7 @@ async fn has_ai_api_key(
 /// GET /settings/agentic
 async fn get_agentic_settings(
 ) -> Result<Json<ApiResponse<AgenticSettingsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(|| {
+    let result = spawn_blocking_tracked(|| {
         let ai = settings::get_ai_settings();
         AgenticSettingsPayload {
             compression: ai.compression,
@@ -399,7 +399,7 @@ async fn get_agentic_settings(
 async fn save_agentic_settings(
     Json(payload): Json<AgenticSettingsPayload>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let mut ai = settings::get_ai_settings();
         ai.compression = payload.compression;
         ai.retry = payload.retry;
@@ -431,7 +431,7 @@ async fn save_agentic_settings(
 /// GET /settings/debug
 async fn get_debug_settings(
 ) -> Result<Json<ApiResponse<settings::DebugSettings>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(settings::get_debug_settings)
+    let result = spawn_blocking_tracked(settings::get_debug_settings)
         .await
         .map_err(|e| {
             error!("Failed to get debug settings: {}", e);
@@ -448,7 +448,7 @@ async fn get_debug_settings(
 async fn save_debug_settings(
     Json(payload): Json<settings::DebugSettings>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || settings::save_debug_settings(payload))
+    let result = spawn_blocking_tracked(move || settings::save_debug_settings(payload))
         .await
         .map_err(|e| {
             error!("Failed to save debug settings: {}", e);
@@ -474,7 +474,7 @@ async fn save_debug_settings(
 /// GET /settings/playwright
 async fn get_playwright_settings(
 ) -> Result<Json<ApiResponse<settings::PlaywrightSettings>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(settings::get_playwright_settings)
+    let result = spawn_blocking_tracked(settings::get_playwright_settings)
         .await
         .map_err(|e| {
             error!("Failed to get Playwright settings: {}", e);
@@ -491,7 +491,7 @@ async fn get_playwright_settings(
 async fn save_playwright_settings(
     Json(payload): Json<settings::PlaywrightSettings>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || settings::save_playwright_settings(payload))
+    let result = spawn_blocking_tracked(move || settings::save_playwright_settings(payload))
         .await
         .map_err(|e| {
             error!("Failed to save Playwright settings: {}", e);
@@ -513,7 +513,7 @@ async fn save_playwright_settings(
 /// GET /settings/playwright/has-password
 async fn has_playwright_password(
 ) -> Result<Json<ApiResponse<bool>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(|| {
+    let result = spawn_blocking_tracked(|| {
         config_facade::playwright_keychain()
             .exists(config_facade::keychain_keys::PLAYWRIGHT_PASSWORD)
             .map_err(|e| format!("Failed to check password: {}", e))
@@ -536,7 +536,7 @@ async fn has_playwright_password(
 /// DELETE /settings/playwright/password
 async fn delete_playwright_password(
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(|| {
+    let result = spawn_blocking_tracked(|| {
         config_facade::playwright_keychain()
             .delete(config_facade::keychain_keys::PLAYWRIGHT_PASSWORD)
             .map_err(|e| format!("Failed to delete password: {}", e))
@@ -563,7 +563,7 @@ async fn delete_playwright_password(
 /// GET /settings/self-healing
 async fn get_self_healing_settings(
 ) -> Result<Json<ApiResponse<settings::SelfHealingSettings>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(settings::get_self_healing_settings)
+    let result = spawn_blocking_tracked(settings::get_self_healing_settings)
         .await
         .map_err(|e| {
             error!("Failed to get self-healing settings: {}", e);
@@ -580,7 +580,7 @@ async fn get_self_healing_settings(
 async fn save_self_healing_settings(
     Json(payload): Json<settings::SelfHealingSettings>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || settings::save_self_healing_settings(payload))
+    let result = spawn_blocking_tracked(move || settings::save_self_healing_settings(payload))
         .await
         .map_err(|e| {
             error!("Failed to save self-healing settings: {}", e);
@@ -603,7 +603,7 @@ async fn save_self_healing_settings(
 async fn save_self_healing_api_key(
     Json(req): Json<SaveApiKeyRequest>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         config_facade::self_healing_keychain()
             .store(&req.provider, &req.api_key)
             .map_err(|e| format!("Failed to store API key: {}", e))
@@ -630,7 +630,7 @@ async fn save_self_healing_api_key(
 async fn delete_self_healing_api_key(
     Path(provider): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         config_facade::self_healing_keychain()
             .delete(&provider)
             .map_err(|e| format!("Failed to delete API key: {}", e))
@@ -654,7 +654,7 @@ async fn delete_self_healing_api_key(
 async fn has_self_healing_api_key(
     Path(provider): Path<String>,
 ) -> Result<Json<ApiResponse<bool>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         config_facade::self_healing_keychain()
             .exists(&provider)
             .map_err(|e| format!("Failed to check API key: {}", e))
@@ -681,7 +681,7 @@ async fn has_self_healing_api_key(
 /// GET /settings/mobile
 async fn get_mobile_settings(
 ) -> Result<Json<ApiResponse<settings::MobileSettings>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(settings::get_mobile_settings)
+    let result = spawn_blocking_tracked(settings::get_mobile_settings)
         .await
         .map_err(|e| {
             error!("Failed to get mobile settings: {}", e);
@@ -698,7 +698,7 @@ async fn get_mobile_settings(
 async fn save_mobile_settings(
     Json(payload): Json<settings::MobileSettings>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || settings::save_mobile_settings(payload))
+    let result = spawn_blocking_tracked(move || settings::save_mobile_settings(payload))
         .await
         .map_err(|e| {
             error!("Failed to save mobile settings: {}", e);
@@ -726,7 +726,7 @@ async fn get_storage_info(
     State(api_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = api_state.app_state.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let storage =
             crate::safe_lock::safe_lock_or_recover(&app_state.local_storage, "local_storage");
         let usage = storage
@@ -763,7 +763,7 @@ async fn cleanup_storage(
     Json(req): Json<StorageCleanupRequest>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = api_state.app_state.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let storage =
             crate::safe_lock::safe_lock_or_recover(&app_state.local_storage, "local_storage");
         storage
@@ -793,7 +793,7 @@ async fn clear_all_storage(
     State(api_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = api_state.app_state.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let storage =
             crate::safe_lock::safe_lock_or_recover(&app_state.local_storage, "local_storage");
         storage
@@ -825,7 +825,7 @@ async fn clear_all_storage(
 /// GET /settings/device-info
 async fn get_device_info(
 ) -> Result<Json<ApiResponse<DeviceInfoResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(|| {
+    let result = spawn_blocking_tracked(|| {
         let device_id = crate::runtime_env::get_runner_id();
         let device_name = hostname::get().ok().and_then(|h| h.into_string().ok());
         let platform = std::env::consts::OS.to_string();
@@ -913,7 +913,7 @@ pub struct AccessibilitySettingsPayload {
 /// GET /settings/accessibility
 async fn get_accessibility_settings(
 ) -> Result<Json<ApiResponse<AccessibilitySettingsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(|| {
+    let result = spawn_blocking_tracked(|| {
         let s = settings::get_accessibility_settings();
         AccessibilitySettingsPayload {
             use_rust_accessibility: s.use_rust_accessibility,
@@ -959,7 +959,7 @@ pub struct ClaudeConfigDirsPayload {
 /// GET /settings/claude-config-dirs
 async fn get_claude_config_dirs_setting(
 ) -> Result<Json<ApiResponse<ClaudeConfigDirsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let dirs = tokio::task::spawn_blocking(settings::get_claude_config_dirs)
+    let dirs = spawn_blocking_tracked(settings::get_claude_config_dirs)
         .await
         .map_err(|e| {
             error!("Failed to get claude config dirs: {}", e);
@@ -980,7 +980,7 @@ async fn get_claude_config_dirs_setting(
 async fn save_claude_config_dirs_setting(
     Json(payload): Json<ClaudeConfigDirsPayload>,
 ) -> Result<Json<ApiResponse<ClaudeConfigDirsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let valid_dirs: Vec<String> = payload
             .dirs
             .into_iter()
@@ -1009,7 +1009,7 @@ async fn save_claude_config_dirs_setting(
 /// GET /settings/discovery-ports
 async fn get_discovery_ports_setting(
 ) -> Result<Json<ApiResponse<DiscoveryPortsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let ports = tokio::task::spawn_blocking(settings::get_discovery_ports)
+    let ports = spawn_blocking_tracked(settings::get_discovery_ports)
         .await
         .map_err(|e| {
             error!("Failed to get discovery ports: {}", e);
@@ -1026,7 +1026,7 @@ async fn get_discovery_ports_setting(
 async fn save_discovery_ports_setting(
     Json(payload): Json<DiscoveryPortsPayload>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || settings::save_discovery_ports(payload.ports))
+    let result = spawn_blocking_tracked(move || settings::save_discovery_ports(payload.ports))
         .await
         .map_err(|e| {
             error!("Failed to save discovery ports: {}", e);

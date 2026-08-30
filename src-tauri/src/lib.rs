@@ -3,6 +3,18 @@ use std::fs;
 use std::sync::OnceLock;
 use tauri::Manager;
 
+// Self-alias so `qontinui_runner_lib::…` paths resolve INSIDE this crate too.
+//
+// Seven modules (`process_helpers`, `auth`, `fs_atomic`, …) are compiled into
+// BOTH this lib and the `qontinui-runner` bin, and the bin reaches lib items by
+// their external path. Without this alias a call site in one of those shared
+// modules would need a different path depending on which crate is compiling it.
+// With it, `qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked` is
+// one spelling that works everywhere — which is what lets the blocking-pool
+// counter be a single static shared by both crates instead of two that each
+// see half the traffic.
+extern crate self as qontinui_runner_lib;
+
 pub mod accessibility;
 // Pure install-interception core (classify + gate + wire types), shared by the
 // `qontinui-runner` bin (via `install_effects_producer::intercept`) AND the
@@ -147,6 +159,11 @@ pub mod looping_agent;
 // edges), richer than coord's old slug+status projection. Later phases add the
 // push client + trigger as siblings under this module.
 pub mod plan_workunit_adapter;
+
+// Wedge diagnostics (Phase 4 of
+// `2026-08-30-runner-blocking-pool-exhaustion-and-wedge-diagnostics`). In the
+// LIB crate so both crates' `spawn_blocking` sites share ONE counter.
+pub mod wedge_diagnostics;
 
 // ============================================================================
 // Test-only: shared process-wide env lock
