@@ -140,18 +140,52 @@ pub(crate) enum Provenance {
     BuiltinRejected { version: i64 },
 }
 
+/// Version `0` is UNKNOWN, never a generation number.
+///
+/// It is what a coord list row carrying no `current_version` decodes to and
+/// what a persisted cache entry written by a build predating the field carries.
+/// `fleet_policy_poller`'s version gate already refuses to read `0 == 0` as
+/// "current" for exactly this reason, and says why in a comment naming the
+/// string this function exists to stop: printing `[briefing: coord … v0]` for
+/// text whose generation the runner cannot state is the "claiming a coord
+/// version" lie the plan forbids, in its quietest form.
+fn known_version(version: i64) -> Option<i64> {
+    (version != 0).then_some(version)
+}
+
+/// How a version renders on the `coord` arm of [`Provenance::describe`]: `v7`,
+/// or the honest absence when the runner cannot state which generation it
+/// holds. The other two arms already carry a parenthetical and fold the
+/// absence into it rather than stacking a second one.
+fn version_suffix(version: i64) -> String {
+    match known_version(version) {
+        Some(v) => format!("v{v}"),
+        None => "(version unknown)".to_string(),
+    }
+}
+
 impl Provenance {
     /// The bracket-free description, e.g. `coord session_briefing/runner-session v7`.
+    ///
+    /// A version of `0` renders as `(version unknown)` rather than `v0` — see
+    /// [`known_version`].
     pub(crate) fn describe(&self) -> String {
         match self {
             Provenance::Coord { name, version } => {
-                format!("coord {BRIEFING_KIND}/{name} v{version}")
+                format!("coord {BRIEFING_KIND}/{name} {}", version_suffix(*version))
             }
-            Provenance::Cached { version } => format!("cached v{version} (stale)"),
+            // The two parentheticals collapse into one rather than reading
+            // `cached (version unknown) (stale)` — this is a line humans read
+            // out of transcripts.
+            Provenance::Cached { version } => match known_version(*version) {
+                Some(v) => format!("cached v{v} (stale)"),
+                None => "cached (version unknown, stale)".to_string(),
+            },
             Provenance::Builtin => "builtin-fallback".to_string(),
-            Provenance::BuiltinRejected { version } => {
-                format!("builtin-fallback (rejected coord v{version})")
-            }
+            Provenance::BuiltinRejected { version } => match known_version(*version) {
+                Some(v) => format!("builtin-fallback (rejected coord v{v})"),
+                None => "builtin-fallback (rejected coord body of unknown version)".to_string(),
+            },
         }
     }
 
@@ -177,9 +211,16 @@ impl Provenance {
     /// builtin was. A rejected version is deliberately NOT reported here — it
     /// was not rendered, and reporting it would be the exact "claiming a coord
     /// version while serving the builtin" lie the plan forbids.
+    ///
+    /// `None` ALSO for a document-backed block whose version is `0`
+    /// ([`known_version`]), so `GET /session-briefing` reports the same absence
+    /// to a `curl` reader that the settings panel already renders as
+    /// `— (unknown)`. The two must not disagree: they describe one fact.
     pub(crate) fn rendered_version(&self) -> Option<i64> {
         match self {
-            Provenance::Coord { version, .. } | Provenance::Cached { version } => Some(*version),
+            Provenance::Coord { version, .. } | Provenance::Cached { version } => {
+                known_version(*version)
+            }
             Provenance::Builtin | Provenance::BuiltinRejected { .. } => None,
         }
     }
@@ -497,30 +538,46 @@ pub(crate) fn runner_api_base(api_port: u16) -> String {
 // Phase 4 — the visibility route
 // ===========================================================================
 
-/// JSON for one rendered block.
+/// The four keys that say WHERE a piece of the prompt came from.
+///
+/// Every document-state reading in this payload emits them from HERE — the two
+/// text blocks and the plan-capture clause alike. The clause used to spell them
+/// out by hand in a `json!` literal, which is the same drift the payload
+/// factoring was done to close, one level down: a rename in `block_json` would
+/// have left the clause serving the old key names, and the panel reads the two
+/// through one shared `BlockMetaRow`.
 ///
 /// Returns the MAP rather than a `Value`, so a caller that has to add a field
 /// to it — every caller does — needs no `as_object_mut()` and therefore has no
 /// unwrap-or-skip branch. The `Value` form left the assembly below either
 /// panicking on the request path or silently dropping every key it wanted to
 /// add, and neither is a thing a visibility route should be able to do.
+fn document_state_json(
+    provenance: &Provenance,
+    fetched_at: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut state = serde_json::Map::new();
+    state.insert("provenance".to_string(), json!(provenance.kind()));
+    state.insert(
+        "provenance_detail".to_string(),
+        json!(provenance.describe()),
+    );
+    state.insert(
+        "document_version".to_string(),
+        json!(provenance.rendered_version()),
+    );
+    state.insert("fetched_at".to_string(), json!(fetched_at));
+    state
+}
+
+/// JSON for one rendered block: its document state, plus the text itself.
 fn block_json(
     text: &str,
     provenance: &Provenance,
     fetched_at: Option<&str>,
 ) -> serde_json::Map<String, Value> {
-    let mut block = serde_json::Map::new();
+    let mut block = document_state_json(provenance, fetched_at);
     block.insert("text".to_string(), json!(text));
-    block.insert("provenance".to_string(), json!(provenance.kind()));
-    block.insert(
-        "provenance_detail".to_string(),
-        json!(provenance.describe()),
-    );
-    block.insert(
-        "document_version".to_string(),
-        json!(provenance.rendered_version()),
-    );
-    block.insert("fetched_at".to_string(), json!(fetched_at));
     block
 }
 
@@ -577,16 +634,15 @@ fn briefing_payload(
         "plan_capture_clause_included".to_string(),
         json!(clause.included),
     );
+    let mut clause_json = document_state_json(&clause.provenance, clause.fetched_at.as_deref());
+    clause_json.insert("included".to_string(), json!(clause.included));
+    clause_json.insert(
+        "document".to_string(),
+        json!(format!("{BRIEFING_KIND}/{BRIEFING_PLAN_CAPTURE_CLAUSE}")),
+    );
     obj.insert(
         "plan_capture_clause".to_string(),
-        json!({
-            "included": clause.included,
-            "document": format!("{BRIEFING_KIND}/{BRIEFING_PLAN_CAPTURE_CLAUSE}"),
-            "provenance": clause.provenance.kind(),
-            "provenance_detail": clause.provenance.describe(),
-            "document_version": clause.provenance.rendered_version(),
-            "fetched_at": clause.fetched_at,
-        }),
+        Value::Object(clause_json),
     );
 
     let mut rules_json = block_json(&rules.text, &rules.provenance, rules.fetched_at.as_deref());
@@ -824,6 +880,143 @@ mod tests {
             Provenance::BuiltinRejected { version: 7 }.line(),
             "[briefing: builtin-fallback (rejected coord v7)]"
         );
+    }
+
+    /// Version `0` is UNKNOWN, and every surface that renders a version has to
+    /// say so — not just the settings panel's `version:` field.
+    ///
+    /// `describe()` is the string that lands on LINE 2 of the system prompt of
+    /// every session this runner hosts, and in the panel's provenance badge.
+    /// `fleet_policy_poller`'s version gate names `[briefing: coord … v0]` in
+    /// its own comment as the claim the plan forbids, and then a list row with
+    /// no `current_version` reaches `store_briefing(name, body, 0)` anyway —
+    /// with provenance `Coord`, because the body really was fetched. Only the
+    /// generation is unknown.
+    #[test]
+    fn version_zero_is_reported_as_unknown_not_as_v0() {
+        let coord = Provenance::Coord {
+            name: BRIEFING_RUNNER_SESSION.to_string(),
+            version: 0,
+        };
+        assert_eq!(
+            coord.line(),
+            "[briefing: coord session_briefing/runner-session (version unknown)]"
+        );
+        assert!(!coord.describe().contains("v0"));
+        // Still a coord body — the UNKNOWN is about the generation only.
+        assert_eq!(coord.kind(), "coord");
+        assert_eq!(coord.rendered_version(), None);
+
+        let cached = Provenance::Cached { version: 0 };
+        assert_eq!(cached.line(), "[briefing: cached (version unknown, stale)]");
+        assert_eq!(cached.rendered_version(), None);
+        // Still `cached`, and it still SAYS stale — the unknown is the version.
+        assert_eq!(cached.kind(), "cached");
+
+        let rejected = Provenance::BuiltinRejected { version: 0 };
+        assert_eq!(
+            rejected.line(),
+            "[briefing: builtin-fallback (rejected coord body of unknown version)]"
+        );
+        assert!(!rejected.describe().contains("v0"));
+
+        // A real version is untouched by the rule.
+        assert_eq!(
+            Provenance::Cached { version: 1 }.rendered_version(),
+            Some(1)
+        );
+        assert_eq!(known_version(0), None);
+        assert_eq!(known_version(7), Some(7));
+    }
+
+    /// The route serves the same absence the panel renders. Before this, a
+    /// `curl` reader got `"document_version": 0` while the panel beside it
+    /// printed `— (unknown)` — one fact, two answers.
+    #[test]
+    fn the_payload_reports_an_unknown_version_as_null() {
+        let rules = crate::mcp::ai_session::RenderedRules {
+            text: "RULES".to_string(),
+            provenance: Provenance::Cached { version: 0 },
+            fetched_at: None,
+        };
+        let clause = ClauseReport {
+            included: false,
+            provenance: Provenance::Coord {
+                name: BRIEFING_PLAN_CAPTURE_CLAUSE.to_string(),
+                version: 0,
+            },
+            fetched_at: None,
+        };
+        let payload = briefing_payload(
+            9876,
+            "BRIEFING",
+            &Provenance::Coord {
+                name: BRIEFING_RUNNER_SESSION.to_string(),
+                version: 0,
+            },
+            None,
+            &clause,
+            &rules,
+        );
+
+        assert_eq!(payload["document_version"], Value::Null);
+        assert_eq!(
+            payload["plan_capture_clause"]["document_version"],
+            Value::Null
+        );
+        assert_eq!(payload["ai_session_rules"]["document_version"], Value::Null);
+        // …and the coarse token still says the text came from a document, so
+        // the panel reads `— (unknown)` rather than `— (compiled-in fallback)`.
+        assert_eq!(payload["provenance"], "coord");
+        assert_eq!(payload["plan_capture_clause"]["provenance"], "coord");
+    }
+
+    /// The clause's document state is emitted by the SAME function as the two
+    /// text blocks', so it cannot drift from what the panel's shared
+    /// `BlockMetaRow` reads. Asserted structurally rather than by eye: a key
+    /// added to `document_state_json` must appear on all three.
+    #[test]
+    fn every_document_state_reading_carries_the_same_keys() {
+        let rules = crate::mcp::ai_session::RenderedRules {
+            text: "RULES".to_string(),
+            provenance: Provenance::Builtin,
+            fetched_at: None,
+        };
+        let clause = ClauseReport {
+            included: false,
+            provenance: Provenance::Builtin,
+            fetched_at: None,
+        };
+        let payload = briefing_payload(9876, "B", &Provenance::Builtin, None, &clause, &rules);
+
+        let keys = |v: &Value| {
+            let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let state_keys = keys(&Value::Object(document_state_json(
+            &Provenance::Builtin,
+            None,
+        )));
+        assert_eq!(
+            state_keys,
+            vec![
+                "document_version".to_string(),
+                "fetched_at".to_string(),
+                "provenance".to_string(),
+                "provenance_detail".to_string(),
+            ]
+        );
+        for reading in [
+            &payload,
+            &payload["plan_capture_clause"],
+            &payload["ai_session_rules"],
+        ] {
+            let present = keys(reading);
+            for key in &state_keys {
+                assert!(present.contains(key), "missing `{key}` in {reading}");
+            }
+        }
     }
 
     /// A REJECTED coord body must never be reported as a rendered version —
