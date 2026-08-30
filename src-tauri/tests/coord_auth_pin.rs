@@ -168,7 +168,12 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("dirty_poller/mod.rs", "agent-jwt", 1),
     ("env_agent/enroll.rs", "not-coord", 1),
     ("fleet/resource_sample.rs", "device-jwt-required", 1),
-    ("main.rs", "not-coord", 1),
+    // Relocated, not added: this is the same single loopback POST telling the
+    // PRIMARY instance that a secondary is stopping. It moved out of `main.rs`
+    // when the close handler's blocking teardown was collapsed into one
+    // implementation off the native UI thread. Kind and count are unchanged,
+    // so the coverage readout has no new hole.
+    ("mcp/ai_session.rs", "not-coord", 1),
     ("mcp/device_jwt_refresher.rs", "not-coord", 1),
     ("mcp/device_jwt_refresher.rs", "self-refresh", 2),
     ("mcp/session_compliance.rs", "device-jwt-required", 1),
