@@ -98,7 +98,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::census::is_junction;
+use super::census::{is_junction, CloneRootness};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Default reclaim poll cadence — 300s (5 min), matching the census.
@@ -521,6 +521,26 @@ fn unlink_junction(path: &Path) -> Result<(), String> {
 /// and covers every caller — coord-issued instructions, the coord-absent
 /// backstop sweep, and anything added later — so a classifier defect upstream
 /// can cost a wasted instruction but never a repository.
+///
+/// ### An independent last mile cannot rest on a two-state predicate
+///
+/// It used to read `path.join(".git").is_dir()`, which is not a proof of
+/// anything: `is_dir()` TRAVERSES symlinks and folds `EACCES` / `ENOTDIR` /
+/// `EIO` / `ELOOP` / a dead mount into `false` — and `false` here means "not a
+/// clone", i.e. "delete it". A real clone whose `.git` is a symlink to a
+/// volume that is no longer mounted read `false`, passed the guard, and had
+/// its whole working tree removed by the `remove_dir_all` below. The guard
+/// was independent of the upstream classifier but not of the filesystem's
+/// error paths, and a last mile that folds errors into permission is not a
+/// last mile.
+///
+/// It now reads [`census::probe_clone_rootness`], which is tri-state for
+/// exactly the reason [`super::dirty::GitPresence`] is: only
+/// [`CloneRootness::NotCloneRoot`] is a MEASUREMENT of "safe to remove
+/// recursively", and it is the only value this gate lets through. A clone
+/// refuses; a path whose clone-ness could not be established refuses too, with
+/// its own message, because "we could not look" is not "there is nothing
+/// there".
 pub(super) fn remove_worktree(path: &Path) -> Result<(), String> {
     if !path.exists() {
         debug!(
@@ -529,14 +549,28 @@ pub(super) fn remove_worktree(path: &Path) -> Result<(), String> {
         );
         return Ok(());
     }
-    if super::census::is_git_clone_root(path) {
-        // Err, not a silent Ok: this must not be counted as a removal, and it
-        // must be loud enough to diagnose the upstream misclassification.
-        return Err(format!(
-            "refusing to remove {} — `.git` is a DIRECTORY, so this is a real \
-             clone, not a linked worktree (INV-W5)",
-            path.display()
-        ));
+    // Err, not a silent Ok, on BOTH refusing arms: neither must be counted as a
+    // removal, and both must be loud enough to diagnose what stopped it.
+    match super::census::probe_clone_rootness(path) {
+        CloneRootness::NotCloneRoot => {}
+        CloneRootness::CloneRoot => {
+            return Err(format!(
+                "refusing to remove {} — `.git` is a DIRECTORY, so this is a real \
+                 clone, not a linked worktree (INV-W5)",
+                path.display()
+            ));
+        }
+        CloneRootness::Undetermined => {
+            return Err(format!(
+                "refusing to remove {} — could not determine whether `.git` is a \
+                 clone's object store: it is a symlink we will not traverse, or \
+                 the lookup failed for a reason that is not NotFound (EACCES, \
+                 ENOTDIR, EIO, ELOOP, a dead mount). An unmeasured path is not a \
+                 measured absence, and this is the last mile before \
+                 remove_dir_all (INV-W5)",
+                path.display()
+            ));
+        }
     }
     let path_str = path.to_string_lossy().to_string();
     // `git -C <wt> worktree remove --force <wt>` prunes the registration.
@@ -1762,6 +1796,144 @@ mod tests {
         assert!(err.contains("INV-W5"), "unexpected error: {err}");
         assert!(clone.join(".git").is_dir(), "object store must survive");
         assert!(clone.join("src.rs").exists(), "worktree files must survive");
+    }
+
+    /// The pre-fix predicate, reproduced verbatim so every case below can be
+    /// shown to have gone the OTHER way under it. `true` here meant "a clone —
+    /// refuse"; `false` meant "not a clone — fall through to `remove_dir_all`".
+    fn legacy_is_dir_clone_root(path: &Path) -> bool {
+        path.join(".git").is_dir()
+    }
+
+    /// INV-W5, the case the tri-state exists for. A REAL CLONE whose `.git` is
+    /// a symlink to a gitdir that is gone (volume unmounted, store moved).
+    ///
+    /// NEUTER CHECK: `is_dir()` traverses, the target is absent, so it says
+    /// `false` = "not a clone" = delete — and `remove_dir_all` then succeeds,
+    /// because the *files* were always readable. The whole working tree goes.
+    #[cfg(unix)]
+    #[test]
+    fn remove_worktree_refuses_a_dangling_git_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("qontinui-coord");
+        std::fs::create_dir_all(&clone).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/moved-gitdir", clone.join(".git")).unwrap();
+        std::fs::write(clone.join("src.rs"), b"work").unwrap();
+
+        assert!(
+            !legacy_is_dir_clone_root(&clone),
+            "pre-fix predicate said NOT-a-clone, i.e. it authorized the delete"
+        );
+        assert_eq!(
+            super::super::census::probe_clone_rootness(&clone),
+            CloneRootness::Undetermined
+        );
+
+        let err = remove_worktree(&clone).expect_err("an unmeasurable path must not be removed");
+        assert!(err.contains("INV-W5"), "unexpected error: {err}");
+        assert!(clone.join("src.rs").exists(), "worktree files must survive");
+    }
+
+    /// A `.git` symlink that resolves to a real object store is refused for the
+    /// same reason: we do not traverse, so it is `Undetermined`, not
+    /// `CloneRoot`. Outcome-identical to the old predicate here (which said
+    /// "clone" and refused) — recorded so the change of REASON is deliberate
+    /// rather than accidental.
+    #[cfg(unix)]
+    #[test]
+    fn remove_worktree_refuses_a_git_symlink_to_a_live_object_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("elsewhere.git");
+        std::fs::create_dir_all(&store).unwrap();
+        let clone = dir.path().join("qontinui-coord");
+        std::fs::create_dir_all(&clone).unwrap();
+        std::os::unix::fs::symlink(&store, clone.join(".git")).unwrap();
+
+        assert!(legacy_is_dir_clone_root(&clone));
+        assert_eq!(
+            super::super::census::probe_clone_rootness(&clone),
+            CloneRootness::Undetermined
+        );
+        let err = remove_worktree(&clone).expect_err("refuse");
+        assert!(err.contains("INV-W5"), "unexpected error: {err}");
+        assert!(clone.exists());
+    }
+
+    /// The `.git` lookup fails with `EACCES` because the candidate directory
+    /// itself is mode 000.
+    ///
+    /// NEUTER CHECK: `is_dir()` maps EACCES to `false` exactly as it maps
+    /// ENOENT — indistinguishable — so the old guard fell through to
+    /// `remove_dir_all` on a directory it had never managed to look inside.
+    #[cfg(unix)]
+    #[test]
+    fn remove_worktree_refuses_an_unreadable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("qontinui-coord-wt-x");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /x/.git/worktrees/y").unwrap();
+        std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let rootness = super::super::census::probe_clone_rootness(&wt);
+        let legacy = legacy_is_dir_clone_root(&wt);
+        let verdict = remove_worktree(&wt);
+        // Restore BEFORE asserting so a failure still lets the tempdir clean up.
+        std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if rootness != CloneRootness::Undetermined {
+            // root / CAP_DAC_OVERRIDE ignores mode bits: nothing to assert.
+            eprintln!("skipping: this process can read a mode-000 directory (root?)");
+            return;
+        }
+        assert!(
+            !legacy,
+            "precondition: is_dir() maps EACCES to false, exactly like ENOENT"
+        );
+        let err = verdict.expect_err("an unreadable candidate must not be removed");
+        assert!(err.contains("INV-W5"), "unexpected error: {err}");
+        assert!(wt.exists(), "the tree must survive");
+    }
+
+    /// `ENOTDIR`: the candidate is a regular FILE, so `<path>/.git` cannot even
+    /// be looked up.
+    ///
+    /// NEUTER CHECK: `is_dir()` folds ENOTDIR into `false` too, so the old
+    /// guard passed it to `remove_dir_all` — which fails with a raw io error
+    /// rather than the named invariant.
+    #[test]
+    fn remove_worktree_refuses_a_path_that_is_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("qontinui-coord-wt-file");
+        std::fs::write(&f, b"not a directory").unwrap();
+
+        assert!(!legacy_is_dir_clone_root(&f));
+        assert_eq!(
+            super::super::census::probe_clone_rootness(&f),
+            CloneRootness::Undetermined
+        );
+        let err = remove_worktree(&f).expect_err("refuse");
+        assert!(err.contains("INV-W5"), "unexpected error: {err}");
+        assert!(f.exists());
+    }
+
+    /// The guard must NOT become a blanket refusal. A directory MEASURED to
+    /// have no `.git` at all is a plain dir, not a repository, and the backstop
+    /// sweep's whole job is removing those.
+    #[test]
+    fn remove_worktree_still_removes_a_genuinely_non_clone_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("qontinui-coord-wt-husk");
+        std::fs::create_dir_all(plain.join("nested")).unwrap();
+        std::fs::write(plain.join("nested").join("a.txt"), b"junk").unwrap();
+
+        assert_eq!(
+            super::super::census::probe_clone_rootness(&plain),
+            CloneRootness::NotCloneRoot
+        );
+        remove_worktree(&plain).expect("a plain directory is still removable");
+        assert!(!plain.exists());
     }
 
     /// The guard must not block the case reclaim actually exists for: a linked

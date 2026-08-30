@@ -140,6 +140,15 @@ export function getStatusColor(status: FeatureHealth["status"]): string {
     // absence of a verdict, and painting it red or amber would read as one.
     case "unknown":
       return "#6B7280";
+    // The switch is exhaustive over today's union, so TypeScript is satisfied
+    // without this — but `groupByStatus` has a runtime fallback for a status a
+    // NEWER BACKEND might send, and that value reaches here too. Without a
+    // default this function returns `undefined` from a `: string` signature,
+    // which lands in a `<Cell fill={...}>` and paints nothing. An unrecognised
+    // status is exactly "we could not classify it", so it takes the same grey
+    // as `unknown` rather than a colour that would read as a verdict.
+    default:
+      return "#6B7280";
   }
 }
 
@@ -157,6 +166,11 @@ export function getStatusLabel(status: FeatureHealth["status"]): string {
     case "abandoned":
       return "Abandoned";
     case "unknown":
+      return "Unknown";
+    // Same reason as `getStatusColor`'s default: the `groupByStatus` fallback
+    // can route an unrecognised backend status here, and `undefined` from a
+    // `: string` signature renders as an empty label.
+    default:
       return "Unknown";
   }
 }

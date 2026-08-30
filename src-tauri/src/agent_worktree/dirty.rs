@@ -112,8 +112,20 @@ pub(crate) fn porcelain_is_dirty(porcelain: &str) -> bool {
 /// uncommitted work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirtyVerdict {
-    /// `git status --porcelain` answered and reported nothing that removal
-    /// would lose (runner scaffolding does not count — see the module docs).
+    /// **Nothing removal would lose is present, and we MEASURED that.** Two
+    /// evidence paths reach it, and they are both measurements:
+    ///
+    /// 1. `git status --porcelain` answered and reported nothing that removal
+    ///    would lose (runner scaffolding does not count — see the module docs);
+    /// 2. the probe DEGRADED, but [`probe_git_presence`] measured
+    ///    [`GitPresence::Absent`] — a directory with no `.git` is not a
+    ///    worktree, so there is no uncommitted git work in it to lose. That is
+    ///    the carve-out in [`verdict_from_outcome`], and it rests on
+    ///    `NotFound` specifically, never on an error we did not understand.
+    ///
+    /// The variant is deliberately not split by which path produced it: both
+    /// are a founded statement that removal loses nothing, and the ONE state
+    /// that is not is [`DirtyVerdict::Unknown`].
     Clean,
     /// `git status --porcelain` answered and reported real work.
     Dirty,
@@ -139,7 +151,8 @@ impl DirtyVerdict {
         !self.permits_removal()
     }
 
-    /// Did the probe actually MEASURE this tree?
+    /// **Is the dirtiness this verdict publishes a FOUNDED statement about
+    /// the tree?** `true` for everything except [`DirtyVerdict::Unknown`].
     ///
     /// The companion to [`Self::as_conservative_bool`], and the reason both
     /// exist: that method deliberately collapses `Dirty` and `Unknown` onto
@@ -149,6 +162,33 @@ impl DirtyVerdict {
     /// both is lying about one of them. Publish this beside the bool
     /// (`census::WorktreeCensus::is_dirty_known`) so the distinction survives
     /// the collapse instead of being re-derived from nothing downstream.
+    ///
+    /// ## It is NOT "did `git status` answer" — and the difference is the
+    /// `.git`-absent carve-out
+    ///
+    /// The round-3 review flagged this method for returning `true` on the
+    /// carve-out arm, where `git status` degraded. That reading is correct
+    /// about the *subprocess* and wrong about the *question*: the carve-out's
+    /// `Clean` is founded on a different measurement — [`GitPresence::Absent`],
+    /// a `NotFound` from [`probe_git_presence`] — and the value it publishes
+    /// (`is_dirty = false`) is exactly what that measurement establishes. The
+    /// resolution is that this predicate is defined on the VERDICT's footing,
+    /// not on which child ran, and `Clean` has two founded paths (see its
+    /// docs). Concretely:
+    ///
+    /// * answering `false` here for the carve-out would put every
+    ///   `.git`-less directory into the "we could not read it" population that
+    ///   [`super::on_demand::SkipReason::DirtinessUnknown`] refuses on — which
+    ///   is the ~34% false-dirty backlog this module was written to reclaim,
+    ///   made permanently unreclaimable again, and by a signal that says
+    ///   "unreadable" about a directory we read perfectly well;
+    /// * no consumer describes a `Clean` row as holding work, so `true` here
+    ///   licenses no sentence about uncommitted work that is not measured.
+    ///
+    /// **Invariant, pinned by a test:** `permits_removal() ⇒ is_known()`. A
+    /// removal-permitting verdict is by construction a founded one, and a
+    /// future refactor that separates them has changed the meaning of one of
+    /// them.
     pub(crate) fn is_known(self) -> bool {
         !matches!(self, DirtyVerdict::Unknown)
     }
@@ -268,6 +308,15 @@ pub(crate) fn verdict_from_outcome(
         crate::process_helpers::ProbeOutcome::Degraded(_) => DirtyVerdict::Unknown,
     }
 }
+
+/// Budget for ONE reclaim-scoped dirtiness probe.
+///
+/// Declared here, with the probe seam, so a second call site cannot pick a
+/// different number. [`super::reclaim`] still carries its own private
+/// `RECLAIM_CMD_TIMEOUT` with the same value for its other git children; the
+/// dirtiness probe specifically should be migrated onto this one.
+pub(crate) const RECLAIM_DIRTY_PROBE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 /// Run one bounded, reclaim-scoped dirtiness probe against `path`.
 ///
@@ -458,6 +507,53 @@ mod tests {
         );
         assert_eq!(v, DirtyVerdict::Clean);
         assert!(v.permits_removal());
+    }
+
+    /// **`is_known()` is defined on the verdict's footing, not on whether the
+    /// `git status` child answered** — the round-3 review's question, decided
+    /// and pinned.
+    ///
+    /// The carve-out arm degrades `git status` and still publishes
+    /// `is_known() == true`, because its `Clean` rests on a different
+    /// measurement: `GitPresence::Absent`, i.e. a `NotFound`. The value it
+    /// publishes (`is_dirty = false`) is precisely what that establishes.
+    ///
+    /// The alternative — "known iff the child answered" — is what this test
+    /// exists to forbid: it would sort every `.git`-less directory into the
+    /// unreadable population that `SkipReason::DirtinessUnknown` refuses on,
+    /// which is the ~34% false-dirty backlog made unreclaimable again.
+    #[test]
+    fn a_clean_verdict_is_known_however_it_was_founded() {
+        let by_status =
+            verdict_from_outcome(&ProbeOutcome::Captured(b"".to_vec()), GitPresence::Present);
+        let by_carve_out = verdict_from_outcome(&degraded_status(), GitPresence::Absent);
+        assert_eq!(by_status, DirtyVerdict::Clean);
+        assert_eq!(by_carve_out, DirtyVerdict::Clean);
+        assert!(
+            by_carve_out.is_known(),
+            "the carve-out's `is_dirty = false` IS the measured absence of a `.git` — \
+             calling it unknown would refuse every non-repo directory as unreadable"
+        );
+
+        // THE INVARIANT: anything that may be removed is founded. Exhaustive
+        // over the verdict set, so a future variant has to face it.
+        for v in [
+            DirtyVerdict::Clean,
+            DirtyVerdict::Dirty,
+            DirtyVerdict::Unknown,
+        ] {
+            assert!(
+                !v.permits_removal() || v.is_known(),
+                "{v:?}: a removal-permitting verdict must be a founded one"
+            );
+            // And the two unfounded/conservative readings stay in lockstep:
+            // exactly `Unknown` is both "not known" and "not clean".
+            assert_eq!(!v.is_known(), v == DirtyVerdict::Unknown);
+        }
+    }
+
+    fn degraded_status() -> ProbeOutcome {
+        ProbeOutcome::Degraded(DegradeReason::Status)
     }
 
     /// The success arms still answer from the porcelain payload.

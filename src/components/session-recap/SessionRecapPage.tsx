@@ -49,11 +49,23 @@ export function SessionRecapPage() {
         body: JSON.stringify({
           topic_key: `session-recap-${date}`,
           observation_type: "session_recap",
+          // `recap.summary` now carries `scan_complete` / `repos_not_started`
+          // / `repos_cut_short`, so the persisted blob can no longer look
+          // complete when it is not. The repo NAMES live outside the summary,
+          // so they are attached here — an observation saying "partial" that
+          // cannot say partial about WHAT is barely better than silence.
           content: JSON.stringify(recap.summary),
           metadata: {
             total_files: recap.summary.total_files,
             total_repos: recap.summary.total_repos,
             lookback,
+            scan_complete: recap.summary.scan_complete,
+            repos_not_started: recap.repos_skipped
+              .filter((g) => g.state === "not-started")
+              .map((g) => g.repo),
+            repos_cut_short: recap.repos_skipped
+              .filter((g) => g.state === "cut-short")
+              .map((g) => g.repo),
           },
         }),
       });
@@ -155,6 +167,7 @@ export function SessionRecapPage() {
               summary={recap.summary}
               repos={recap.repos_touched}
               lookback={recap.timespan.lookback_spec}
+              scanGaps={recap.repos_skipped}
             />
           </div>
 

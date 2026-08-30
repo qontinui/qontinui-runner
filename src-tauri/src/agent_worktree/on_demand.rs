@@ -94,6 +94,19 @@ pub enum SkipReason {
     /// coord's census verdict and by the runner's own execution-time
     /// `git status --porcelain`.
     Dirty,
+    /// **G1, on a tree nobody could read.** `git status --porcelain` did not
+    /// answer (timed out, failed to spawn, or exited non-zero against a
+    /// `.git` that is present or undeterminable — [`super::dirty::DirtyVerdict::Unknown`]),
+    /// so [`CandidateFacts::is_dirty`] is `true` only because "not provably
+    /// clean" fails closed.
+    ///
+    /// The GATE outcome is identical to [`SkipReason::Dirty`] — both refuse,
+    /// which is the whole point of the fail-closed bool. The DESCRIPTION is
+    /// not: `Dirty`'s detail tells the operator to "commit or stash it first",
+    /// and for a tree on a dead mount or behind a wedged git that is an
+    /// instruction which fails for exactly the reason the probe did. This
+    /// reason exists so the panel says what actually happened.
+    DirtinessUnknown,
     /// Phase-2 `retention='pinned'` — kept for follow-up work.
     Pinned,
     /// **G3** — another live session/claim references this path.
@@ -129,6 +142,7 @@ impl SkipReason {
     pub fn as_str(self) -> &'static str {
         match self {
             SkipReason::Dirty => "dirty",
+            SkipReason::DirtinessUnknown => "dirtiness-unknown",
             SkipReason::Pinned => "pinned",
             SkipReason::SessionLive => "session-live",
             SkipReason::Building => "building",
@@ -149,6 +163,11 @@ impl SkipReason {
     pub fn detail(self) -> &'static str {
         match self {
             SkipReason::Dirty => "Uncommitted work in this tree (G1) — commit or stash it first.",
+            SkipReason::DirtinessUnknown => {
+                "Dirtiness could NOT be measured — `git status` did not answer here (G1 fails \
+                 closed). This is not a claim that the tree holds work: inspect the path \
+                 (dead mount, permissions, wedged git) — committing will fail the same way."
+            }
             SkipReason::Pinned => {
                 "Pinned for follow-up work (retention='pinned') — unpin to reclaim."
             }
@@ -197,7 +216,7 @@ impl SkipReason {
 /// Every fact needed to decide ONE worktree, pre-resolved by the caller.
 /// PURE input: no DB, no disk, no clock — so the guard is exhaustively
 /// unit-testable (mirrors coord's own `CandidateInput`/`gate` shape).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CandidateFacts {
     /// coord emitted an `action: "remove"` instruction for this path — i.e.
     /// its G1–G5 (+ Phase-2 pin) gate CLEARED it.
@@ -206,6 +225,14 @@ pub struct CandidateFacts {
     pub coord_block_reason: Option<SkipReason>,
     /// G1 — dirty per the census AND/OR the runner's own `git status`.
     pub is_dirty: bool,
+    /// Whether [`Self::is_dirty`] is a MEASUREMENT or the fail-closed default
+    /// an unreadable tree gets (`census::WorktreeCensus::is_dirty_known`).
+    ///
+    /// [`classify`] refuses either way — G1 is inviolable — but it refuses
+    /// under [`SkipReason::DirtinessUnknown`] rather than [`SkipReason::Dirty`]
+    /// when this is `false`, because the two need different operator action
+    /// and only one of them is a statement about uncommitted work.
+    pub is_dirty_known: bool,
     /// Phase-2 retention pin.
     pub pinned: bool,
     /// G3 — another live session/claim on the path.
@@ -216,6 +243,28 @@ pub struct CandidateFacts {
     pub root_exists: bool,
     /// coord could not be reached — no decision, therefore no eligibility.
     pub coord_unreachable: bool,
+}
+
+/// Hand-written rather than derived, for ONE field: `is_dirty_known` must
+/// default to `true` ("measured"), not to `bool::default()`. A derived
+/// `Default` would make every `..Default::default()` construction assert that
+/// its dirtiness was never measured, which is the loudest possible refusal
+/// (and a fabrication in the other direction). The default facts describe a
+/// clean, measured, idle tree.
+impl Default for CandidateFacts {
+    fn default() -> Self {
+        Self {
+            coord_reapable: false,
+            coord_block_reason: None,
+            is_dirty: false,
+            is_dirty_known: true,
+            pinned: false,
+            session_live: false,
+            building: false,
+            root_exists: false,
+            coord_unreachable: false,
+        }
+    }
 }
 
 /// The verdict for one worktree.
@@ -237,7 +286,14 @@ pub fn classify(f: &CandidateFacts) -> Decision {
     if !f.root_exists {
         return Decision::Skip(SkipReason::Absent);
     }
-    // G1 — inviolable, first, always.
+    // G1 — inviolable, first, always. Split in two by whether the dirtiness
+    // was MEASURED: identical refusal, different sentence. The unmeasured arm
+    // is checked FIRST and independently of `is_dirty`, so a producer that
+    // ever publishes `is_dirty_known: false` alongside a `false` bool still
+    // fails closed instead of being reaped.
+    if !f.is_dirty_known {
+        return Decision::Skip(SkipReason::DirtinessUnknown);
+    }
     if f.is_dirty {
         return Decision::Skip(SkipReason::Dirty);
     }
@@ -1135,6 +1191,9 @@ fn build_survey_items(
             // Census `is_dirty` is the survey-time G1 signal; the execution
             // path re-runs `git status --porcelain` before touching anything.
             is_dirty: w.is_dirty,
+            // The half that says whether the line above is a measurement. The
+            // gate does not change; the refusal SENTENCE does.
+            is_dirty_known: w.is_dirty_known,
             pinned,
             session_live,
             // Census carries the G6 probe result from the last walk; the
@@ -1172,7 +1231,9 @@ fn build_survey_items(
                 reason,
                 reason_detail,
                 is_dirty: a.facts.is_dirty,
-                is_dirty_known: a.census.is_dirty_known,
+                // From the FACTS, not the census row, so the field the panel
+                // renders and the field `classify` decided on are one value.
+                is_dirty_known: a.facts.is_dirty_known,
                 building: a.facts.building,
                 pinned: a.facts.pinned,
                 landed_in_main: a.census.landed_in_main,
@@ -1405,13 +1466,23 @@ fn execute_targets(targets: Vec<SurveyItem>, dry_run: bool) -> ReclaimOutcome {
         // cache only ever proposes CANDIDATES. Every runner-owned guard below
         // is re-evaluated against live disk right here, immediately before the
         // removal — a stale census can never authorize a deletion.
+        let exec_dirty = super::dirty::probe_reclaim_dirty(
+            &path,
+            super::dirty::RECLAIM_DIRTY_PROBE_TIMEOUT,
+            "worktree_reclaim: git status --porcelain",
+        );
         let facts = CandidateFacts {
             // coord cleared it in the pull we just made (that half is always
             // live — `fetch_pull` is not cached).
             coord_reapable: true,
             coord_block_reason: None,
-            // G1 — the authoritative, execution-time dirty check.
-            is_dirty: reclaim::worktree_is_dirty(&path),
+            // G1 — the authoritative, execution-time dirty check. The
+            // VERDICT, not `reclaim::worktree_is_dirty`'s collapsed bool: the
+            // refusal this produces is logged, and "uncommitted work in this
+            // tree" is as much a fabrication in a log line as it is in the
+            // panel when `git status` never answered.
+            is_dirty: exec_dirty.as_conservative_bool(),
+            is_dirty_known: exec_dirty.is_known(),
             pinned: item.pinned,
             session_live: false,
             // G6 — fresh probe; the survey's value came from the last census.
@@ -1595,12 +1666,31 @@ pub struct WipOrphanReport {
     /// as WIP.
     pub wip_total: usize,
     /// Of those, how many the census could NOT read at all
-    /// ([`SurveyItem::is_dirty_known`] is `false`). Each appears in
-    /// [`Self::orphans`] with `orphan_reason: "dirtiness-unknown"`. A non-zero
-    /// value means [`Self::wip_total`] is a LOWER BOUND — the report is
-    /// incomplete, not empty.
+    /// ([`SurveyItem::is_dirty_known`] is `false`). Such a row appears in
+    /// [`Self::orphans`] with `orphan_reason: "dirtiness-unknown"` **unless
+    /// its owner is live**, exactly like every other arm. A non-zero value
+    /// means [`Self::wip_total`] is a LOWER BOUND — the report is incomplete,
+    /// not empty.
     pub wip_unreadable: usize,
     pub orphans: Vec<WipOrphan>,
+    /// Of [`Self::orphans`], how many came in through a MEASURED-work arm
+    /// (`unattributed-wip` | `custody-stale` | `owner-closed` |
+    /// `owner-liveness-unknown`). A subset of [`Self::wip_total`].
+    ///
+    /// Published because [`Self::note`] states the report's arithmetic in
+    /// prose, and a prose count nobody can check against a field is exactly
+    /// the shape the round-3 review found wrong here: `orphans.len()` was
+    /// framed as a subset of [`Self::wip_total`] after the
+    /// `dirtiness-unknown` arm made it a superset of neither.
+    ///
+    /// **Invariant:** `orphans_with_measured_wip + orphans_with_unknown_dirtiness
+    /// == orphans.len()`, `orphans_with_measured_wip <= wip_total`, and
+    /// `orphans_with_unknown_dirtiness <= wip_unreadable`.
+    pub orphans_with_measured_wip: usize,
+    /// Of [`Self::orphans`], how many came in through the `dirtiness-unknown`
+    /// arm — rows that assert NOTHING about uncommitted work. A subset of
+    /// [`Self::wip_unreadable`]; see [`Self::orphans_with_measured_wip`].
+    pub orphans_with_unknown_dirtiness: usize,
     /// The predicate, spelled out on the wire so nobody has to infer it from
     /// the row count.
     pub predicate: &'static str,
@@ -1647,7 +1737,16 @@ pub const WIP_ORPHAN_PREDICATE: &str =
      custody-stale | owner-closed | owner-liveness-unknown)";
 
 fn orphan_reason_for(item: &SurveyItem) -> Option<&'static str> {
-    if !item.is_dirty {
+    // The published predicate's first clause, spelled the way
+    // [`WIP_ORPHAN_PREDICATE`] states it: `is_dirty` **OR** dirtiness
+    // unmeasurable. Testing `is_dirty` alone was VACUOUS-BUT-WRONG — vacuous
+    // only because today's single producer derives the bool from
+    // `DirtyVerdict::as_conservative_bool()`, which collapses `Unknown` onto
+    // `true`. The two fields are independent `pub bool`s on a public struct,
+    // so a second producer (or a census that ever stops failing closed) would
+    // silently drop every unreadable tree out of the report while the
+    // advertised predicate still promised them.
+    if !item.is_dirty && item.is_dirty_known {
         return None;
     }
     // A LIVE owner's dirty tree is not an orphan — that is the difference
@@ -1759,12 +1858,26 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
             // rendered safely yields NO line — the same omit-never-guess rule
             // the unknown-account-root case already follows.
             let quoted_path = custody::shell_quote_path(&item.worktree_path);
+            // GATE ON THE MEASUREMENT, for every command that acts on the
+            // tree's CONTENTS. A `dirtiness-unknown` row is here because
+            // `git status --porcelain` did not answer; `git stash apply`
+            // fails for the identical reason, and `claude --resume` drops an
+            // agent into a tree whose git is wedged or whose mount is dead.
+            // The row's own `wip_summary` says nothing measured any work
+            // here, so rendering a recover-your-WIP line beside it is the
+            // aggregate defect `census::WorktreeCensus::is_dirty_known` was
+            // added to stop, one row down. `inspect_command` below is
+            // DELIBERATELY still offered: it is the one line that answers the
+            // question the row is actually asking.
+            let dirtiness_measured = item.is_dirty_known;
             let resume_command = match (
                 item.session_id.as_deref(),
                 item.config_dir.as_deref(),
                 quoted_path.as_deref(),
             ) {
-                (Some(id), Some(dir), Some(path)) if custody::is_shell_safe_token(id) => {
+                (Some(id), Some(dir), Some(path))
+                    if dirtiness_measured && custody::is_shell_safe_token(id) =>
+                {
                     custody::shell_quote_path(dir).map(|dir| {
                         format!("cd \"{path}\" && CLAUDE_CONFIG_DIR=\"{dir}\" claude --resume {id}")
                     })
@@ -1781,16 +1894,17 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
             // says the work "exists ONLY in this worktree". Contradicting
             // ourselves in the direction of data loss is the one thing this
             // surface must never do.
-            let recover_wip_command = custody::wip_state_is_captured(item.wip_state.as_deref())
-                .then(
-                    || match (item.wip_commit.as_deref(), quoted_path.as_deref()) {
-                        (Some(c), Some(path)) if custody::is_shell_safe_token(c) => {
-                            Some(format!("git -C \"{path}\" stash apply {c}"))
-                        }
-                        _ => None,
-                    },
-                )
-                .flatten();
+            let recover_wip_command = (dirtiness_measured
+                && custody::wip_state_is_captured(item.wip_state.as_deref()))
+            .then(
+                || match (item.wip_commit.as_deref(), quoted_path.as_deref()) {
+                    (Some(c), Some(path)) if custody::is_shell_safe_token(c) => {
+                        Some(format!("git -C \"{path}\" stash apply {c}"))
+                    }
+                    _ => None,
+                },
+            )
+            .flatten();
             Some(WipOrphan {
                 id: item.id.clone(),
                 worktree_path: item.worktree_path.clone(),
@@ -1843,22 +1957,41 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
             .then(a.id.cmp(&b.id))
     });
 
+    // The report's two populations, counted from the rows themselves. The
+    // note below states the arithmetic in prose and MUST NOT frame one as a
+    // subset of the other: before the `dirtiness-unknown` arm existed,
+    // `orphans ⊆ dirty-and-measured` was structurally true and the old
+    // sentence ("N reported ... out of M that hold measured work") was sound.
+    // The arm broke it — `orphans.len()` counts rows the WIP denominator
+    // deliberately excludes — so a fixture with one unreadable tree rendered
+    // "1 row(s) reported ... out of 0 that hold measured work". That is the
+    // aggregate form of the very fabrication `census::WorktreeCensus::
+    // is_dirty_known` exists to stop. Each count is now stated against the
+    // population it is actually drawn from.
+    let orphans_with_unknown_dirtiness = orphans
+        .iter()
+        .filter(|o| o.orphan_reason == "dirtiness-unknown")
+        .count();
+    let orphans_with_measured_wip = orphans.len() - orphans_with_unknown_dirtiness;
+
     let note = match survey.census_status {
         CensusStatus::Pending => "No disk snapshot yet — this is NOT 'nothing is orphaned', \
              it is 'not known yet'."
             .to_string(),
         _ => format!(
-            "{} row(s) reported: worktrees holding uncommitted work with no live owner, out \
-             of {} that hold measured work{}. {}",
+            "{} row(s) reported = {} of {} worktree(s) holding MEASURED uncommitted work \
+             whose owner is not live{}. {}",
             orphans.len(),
+            orphans_with_measured_wip,
             wip_total,
             if wip_unreadable == 0 {
                 String::new()
             } else {
                 format!(
-                    ", plus {wip_unreadable} whose dirtiness could NOT be measured at all \
-                     (`orphan_reason: dirtiness-unknown`) — those counts are a lower bound, \
-                     not an all-clear"
+                    ", plus {orphans_with_unknown_dirtiness} of {wip_unreadable} whose \
+                     dirtiness could NOT be measured at all (`orphan_reason: \
+                     dirtiness-unknown`) — nothing measured work in those, so the WIP count \
+                     is a lower bound, not an all-clear"
                 )
             },
             if survey.summary.session_roots_scanned == 0 {
@@ -1879,6 +2012,8 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
         wip_total,
         wip_unreadable,
         orphans,
+        orphans_with_measured_wip,
+        orphans_with_unknown_dirtiness,
         predicate: WIP_ORPHAN_PREDICATE,
         note,
         session_roots_scanned: survey.summary.session_roots_scanned,
@@ -1904,6 +2039,7 @@ mod tests {
             coord_reapable: true,
             coord_block_reason: None,
             is_dirty: false,
+            is_dirty_known: true,
             pinned: false,
             session_live: false,
             building: false,
@@ -3067,7 +3203,75 @@ mod tests {
         assert!(u.is_dirty, "the G1 bool still fails closed");
         assert!(!u.is_dirty_known);
         assert_eq!(u.status, "blocked");
-        assert_eq!(u.reason, Some("dirty"));
+        // The REFUSAL is identical; the SENTENCE is not. `dirty` here told the
+        // operator "commit or stash it first" for a tree on a dead mount — an
+        // instruction that fails for the very reason the probe did.
+        assert_eq!(u.reason, Some("dirtiness-unknown"));
+        let detail = u.reason_detail.expect("a refusal is never unexplained");
+        assert!(
+            detail.contains("could NOT be measured"),
+            "the panel must say the probe never answered: {detail}"
+        );
+        assert!(
+            !detail.contains("commit or stash"),
+            "must not hand out an instruction that fails the same way: {detail}"
+        );
+    }
+
+    /// The panel keys its badge and its tone off `reason`, so the two arms of
+    /// G1 must be distinguishable there — and a MEASURED dirty tree must keep
+    /// the actionable sentence it has always had.
+    #[test]
+    fn a_measured_dirty_tree_keeps_the_commit_or_stash_sentence() {
+        let measured = attributed_row("D:/qontinui-root/wt-measured", OWNER, 1_000);
+        let (items, _) = build_survey_items(&[measured], None, &directory(), None, 1_060);
+        let m = &items[0];
+        assert!(m.is_dirty && m.is_dirty_known);
+        assert_eq!(m.reason, Some("dirty"));
+        assert!(m
+            .reason_detail
+            .expect("detail")
+            .contains("commit or stash it first"));
+    }
+
+    /// The guard itself, at the unit level. Both arms refuse — that is G1 and
+    /// it is inviolable — and the unmeasured arm refuses even if a future
+    /// producer ever hands us `is_dirty: false` alongside it.
+    #[test]
+    fn the_guard_splits_g1_by_whether_the_dirtiness_was_measured() {
+        let base = CandidateFacts {
+            root_exists: true,
+            coord_reapable: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify(&CandidateFacts {
+                is_dirty: true,
+                is_dirty_known: true,
+                ..base.clone()
+            }),
+            Decision::Skip(SkipReason::Dirty)
+        );
+        assert_eq!(
+            classify(&CandidateFacts {
+                is_dirty: true,
+                is_dirty_known: false,
+                ..base.clone()
+            }),
+            Decision::Skip(SkipReason::DirtinessUnknown)
+        );
+        assert_eq!(
+            classify(&CandidateFacts {
+                is_dirty: false,
+                is_dirty_known: false,
+                ..base.clone()
+            }),
+            Decision::Skip(SkipReason::DirtinessUnknown),
+            "an unmeasured tree fails closed on its own, not on the fail-closed bool"
+        );
+        // And the default facts describe a MEASURED clean tree, so the
+        // hand-written `Default` cannot silently block every construction.
+        assert_eq!(classify(&base), Decision::Reap);
     }
 
     /// The triage row must SAY it could not read the tree — not render
@@ -3114,6 +3318,210 @@ mod tests {
         // The published predicate carries the new arm, so a reader does not
         // have to infer the vocabulary from the rows present.
         assert!(report.predicate.contains("dirtiness-unknown"));
+    }
+
+    /// **The note's arithmetic, not a substring of it.**
+    ///
+    /// `orphans.len()` counts BOTH arms; `wip_total` deliberately counts only
+    /// the measured one. The old sentence framed the first as a subset of the
+    /// second — "1 row(s) reported: worktrees holding uncommitted work with no
+    /// live owner, out of 0 that hold measured work" — which is the
+    /// aggregate-level form of the very fabrication `is_dirty_known` exists to
+    /// stop. Each count must now be stated against the population it is
+    /// actually drawn from, and the two must partition the rows.
+    #[test]
+    fn the_note_states_each_count_against_the_population_it_is_drawn_from() {
+        // 1 measured-WIP orphan, 1 unreadable orphan, 1 measured-WIP row whose
+        // owner is LIVE (counted in wip_total, not an orphan).
+        let measured_orphan = attributed_row("D:/qontinui-root/wt-stale", OWNER, 1_000);
+        let mut live = attributed_row("D:/qontinui-root/wt-live", OWNER, 9_990);
+        live.custody_session_id = Some(OWNER.to_string());
+        let unreadable = unreadable_row("D:/qontinui-root/wt-unreadable");
+
+        let s = survey_of(
+            vec![measured_orphan, live, unreadable],
+            &directory(),
+            10_000,
+        );
+        let report = build_wip_orphans(&s, chrono::Utc::now());
+
+        // The populations, each measured independently of the prose.
+        assert_eq!(report.wip_total, 2, "two MEASURED dirty trees");
+        assert_eq!(report.wip_unreadable, 1);
+        assert_eq!(report.orphans.len(), 2, "the live owner's tree is not one");
+        assert_eq!(report.orphans_with_measured_wip, 1);
+        assert_eq!(report.orphans_with_unknown_dirtiness, 1);
+
+        // THE INVARIANTS the old sentence violated.
+        assert_eq!(
+            report.orphans_with_measured_wip + report.orphans_with_unknown_dirtiness,
+            report.orphans.len(),
+            "every reported row belongs to exactly one arm"
+        );
+        assert!(
+            report.orphans_with_measured_wip <= report.wip_total,
+            "the measured-WIP orphan count is a SUBSET of the measured-WIP population"
+        );
+        assert!(
+            report.orphans_with_unknown_dirtiness <= report.wip_unreadable,
+            "the unreadable orphan count is a SUBSET of the unreadable population"
+        );
+
+        // And the prose says exactly those numbers — no count is presented
+        // "out of" a population it is not drawn from.
+        let expected_head = format!(
+            "{} row(s) reported = {} of {} worktree(s) holding MEASURED uncommitted work",
+            report.orphans.len(),
+            report.orphans_with_measured_wip,
+            report.wip_total
+        );
+        assert!(
+            report.note.starts_with(&expected_head),
+            "note must open with the arithmetic it is claiming.\n  expected: {expected_head}\n  got:      {}",
+            report.note
+        );
+        let expected_unknown = format!(
+            ", plus {} of {} whose dirtiness could NOT be measured",
+            report.orphans_with_unknown_dirtiness, report.wip_unreadable
+        );
+        assert!(
+            report.note.contains(&expected_unknown),
+            "note must state the unreadable arm against ITS population.\n  expected: {expected_unknown}\n  got:      {}",
+            report.note
+        );
+        // The exact shape the fixture that shipped this defect rendered.
+        assert!(
+            !report.note.contains("out of 0 that hold measured work"),
+            "the superset-framed sentence must be gone: {}",
+            report.note
+        );
+    }
+
+    /// The regression the round-3 review found: the report's own fixture
+    /// (`orphans = 1, wip_total = 0, wip_unreadable = 1`) used to render a
+    /// count "out of 0". Same arithmetic assertions, on the degenerate shape.
+    #[test]
+    fn a_report_of_only_unreadable_rows_never_counts_them_out_of_the_wip_total() {
+        let s = survey_of(
+            vec![unreadable_row("D:/qontinui-root/wt-unreadable")],
+            &directory(),
+            1_000,
+        );
+        let report = build_wip_orphans(&s, chrono::Utc::now());
+
+        assert_eq!(report.orphans.len(), 1);
+        assert_eq!(report.wip_total, 0);
+        assert_eq!(report.orphans_with_measured_wip, 0);
+        assert_eq!(report.orphans_with_unknown_dirtiness, 1);
+        assert!(
+            report
+                .note
+                .starts_with("1 row(s) reported = 0 of 0 worktree(s) holding MEASURED"),
+            "the 1 must NOT be framed as drawn from the 0: {}",
+            report.note
+        );
+        assert!(
+            report
+                .note
+                .contains("plus 1 of 1 whose dirtiness could NOT be measured"),
+            "and the row it IS drawn from must be named: {}",
+            report.note
+        );
+    }
+
+    /// **`git stash apply` and `--resume` are not offered for a tree nobody
+    /// could read.** A `dirtiness-unknown` row can still carry a custody
+    /// record from an earlier turn — `wip_state: captured`, a `wip_commit`, an
+    /// account root — so both lines used to render beside a summary that says
+    /// nothing measured any work here. `git stash apply` fails for the exact
+    /// reason the probe did, and `--resume` drops an agent into the wedged
+    /// tree. `census.rs` names this pairing as the defect; only the sentence
+    /// had been fixed.
+    #[test]
+    fn an_unreadable_row_renders_no_stash_and_no_resume_only_the_inspect_line() {
+        let wt = "D:/qontinui-root/wt-unreadable-with-record";
+        let mut w = attributed_row(wt, OWNER, 0); // stale owner, captured WIP
+        w.is_dirty_known = false;
+
+        // Precondition: this fixture DOES carry everything both lines need.
+        assert_eq!(w.custody_wip_state.as_deref(), Some("captured"));
+        assert!(w.custody_wip_commit.is_some());
+
+        let s = survey_of(vec![w], &directory(), 1_000_000);
+        let report = build_wip_orphans(&s, chrono::Utc::now());
+        let o = &report.orphans[0];
+
+        assert_eq!(o.orphan_reason, "dirtiness-unknown");
+        assert_eq!(
+            o.recover_wip_command, None,
+            "a stash-apply line fails the same way the probe did"
+        );
+        assert_eq!(
+            o.resume_command, None,
+            "never send an agent into a tree whose git did not answer"
+        );
+        // The raw fields are still published — the report withholds the
+        // COMMANDS, not the evidence.
+        assert_eq!(o.wip_state.as_deref(), Some("captured"));
+        assert!(o.wip_commit.is_some());
+        // And the one line that answers the row's actual question is offered.
+        assert!(o.inspect_command.contains("status --porcelain"));
+    }
+
+    /// The other side of the same gate: a MEASURED row with the identical
+    /// custody record still gets both lines. The suppression is keyed on the
+    /// measurement, not on the record.
+    #[test]
+    fn a_measured_row_with_the_same_record_still_gets_both_commands() {
+        let wt = "D:/qontinui-root/wt-measured-with-record";
+        let s = survey_of(vec![attributed_row(wt, OWNER, 0)], &directory(), 1_000_000);
+        let report = build_wip_orphans(&s, chrono::Utc::now());
+        let o = &report.orphans[0];
+
+        assert_ne!(o.orphan_reason, "dirtiness-unknown");
+        assert!(
+            o.recover_wip_command
+                .as_deref()
+                .is_some_and(|c| c.contains("stash apply")),
+            "a measured WIP row keeps its recovery line"
+        );
+        assert!(o.resume_command.is_some());
+    }
+
+    /// [`WIP_ORPHAN_PREDICATE`] advertises "(is_dirty **OR** dirtiness
+    /// unmeasurable)". `orphan_reason_for` tested `is_dirty` alone, which is
+    /// vacuously equivalent ONLY because today's single producer derives that
+    /// bool from `DirtyVerdict::as_conservative_bool()`. They are two
+    /// independent `pub bool`s on a public struct, so this pins the published
+    /// predicate against the field combination a second producer would create.
+    #[test]
+    fn the_predicate_admits_an_unmeasured_row_even_if_the_bool_says_clean() {
+        let mut item = unreadable_survey_item();
+        item.is_dirty = false; // the combination the published predicate covers
+        item.is_dirty_known = false;
+        assert_eq!(
+            orphan_reason_for(&item),
+            Some("dirtiness-unknown"),
+            "the code must implement the predicate it publishes"
+        );
+
+        // A measured-clean row is still not an orphan — the OR did not widen
+        // the report to everything.
+        item.is_dirty_known = true;
+        assert_eq!(orphan_reason_for(&item), None);
+    }
+
+    /// A survey item with no owner and no measurement — the shape the
+    /// predicate test drives directly.
+    fn unreadable_survey_item() -> SurveyItem {
+        let (items, _) = build_survey_items(
+            &[unreadable_row("D:/qontinui-root/wt-predicate")],
+            None,
+            &directory(),
+            None,
+            1_000,
+        );
+        items.into_iter().next().expect("one row")
     }
 
     /// A LIVE owner still keeps a row out — unreadable or not. The report is a

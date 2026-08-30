@@ -50,19 +50,19 @@ struct SessionRecap {
     /// out of a complete scan is NOT exhaustion — nothing was lost — and used
     /// to be reported as such.
     git_budget_exhausted: bool,
-    /// Repos whose scan was skipped **or cut short** — and the field means
-    /// both, because both are now recorded:
+    /// Repos whose scan was skipped **or cut short**, each carrying WHICH of
+    /// the two it was — see [`RepoScanGapState`].
     ///
-    /// * **skipped** — the budget was already spent when the repo came up, so
-    ///   no git child ran for it at all;
-    /// * **cut short** — the scan started and at least one of its git children
-    ///   was then refused for want of budget, so this repo's summary is
-    ///   partial (typically the `--numstat` landed and the content diff did
-    ///   not, leaving `types_defined` / `endpoints_added` empty for a reason
-    ///   that is not "there were none").
+    /// It used to be a flat `Vec<String>` holding both, which conflated two
+    /// materially different outcomes: a repo nothing was learned about, and a
+    /// repo whose partial findings are already in `repos_touched` and in
+    /// `summary`. The second appears in BOTH lists, so a reader of the flat
+    /// list could not tell whether a name meant "absent from the recap" or
+    /// "present in the recap but incomplete" — and `summary.total_repos`
+    /// counted it as a fully scanned repo either way.
     ///
     /// Empty on a complete scan, and empty is the ONLY reading of "complete".
-    repos_skipped: Vec<String>,
+    repos_skipped: Vec<RepoScanGap>,
     repos_touched: Vec<RepoSummary>,
     files_created: Vec<FileChange>,
     files_modified: Vec<FileChange>,
@@ -73,6 +73,84 @@ struct SessionRecap {
     ui_components: Vec<ComponentInfo>,
     dependency_graph: Vec<DependencyEdge>,
     summary: RecapSummary,
+}
+
+/// Which kind of hole the git budget left in one repo's scan.
+///
+/// The distinction is the difference between "this repo is missing from the
+/// recap" and "this repo is IN the recap and what it says is incomplete" —
+/// two different follow-up actions, and only one of them contaminates the
+/// numbers the caller is reading.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum RepoScanGapState {
+    /// The aggregate budget was already spent when this repo came up, so NO
+    /// git child ran for it at all. It contributes nothing anywhere: no
+    /// `repos_touched` entry, no files, no types. Its absence from the recap
+    /// is a budget artefact, not a statement that it was untouched.
+    NotStarted,
+    /// The scan STARTED and at least one of its git children was then refused
+    /// for want of budget, so this repo contributes a PARTIAL summary —
+    /// typically the `--numstat` landed and `get_diff_content` did not,
+    /// leaving `types_defined` / `endpoints_added` / `database_changes` /
+    /// `ui_components` empty for a reason that is not "there were none".
+    ///
+    /// A repo in this state appears in `repos_touched` **as well as** here.
+    CutShort,
+}
+
+impl RepoScanGapState {
+    /// One operator-facing sentence, so a consumer never has to re-derive the
+    /// meaning of the token.
+    fn detail(self) -> &'static str {
+        match self {
+            RepoScanGapState::NotStarted => {
+                "Not scanned at all — the aggregate git budget was already spent when this \
+                 repo came up. Its absence from this recap says nothing about whether it changed."
+            }
+            RepoScanGapState::CutShort => {
+                "Scanned only in part — a git child was refused for want of budget partway \
+                 through. What this repo contributes here is incomplete, and empty type / \
+                 endpoint / table lists for it do not mean there were none."
+            }
+        }
+    }
+}
+
+/// One repo the git budget cost the scan something on.
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct RepoScanGap {
+    repo: String,
+    state: RepoScanGapState,
+    detail: &'static str,
+}
+
+impl RepoScanGap {
+    fn new(repo: String, state: RepoScanGapState) -> Self {
+        Self {
+            repo,
+            state,
+            detail: state.detail(),
+        }
+    }
+}
+
+/// The partiality triple a scan's gap list implies:
+/// `(scan_complete, repos_not_started, repos_cut_short)`.
+///
+/// Pure, and the ONLY place the three are derived, so
+/// [`RecapSummary::scan_complete`] can never disagree with
+/// [`SessionRecap::git_budget_exhausted`] or with the list itself.
+fn partiality(gaps: &[RepoScanGap]) -> (bool, u32, u32) {
+    let not_started = gaps
+        .iter()
+        .filter(|g| g.state == RepoScanGapState::NotStarted)
+        .count() as u32;
+    let cut_short = gaps
+        .iter()
+        .filter(|g| g.state == RepoScanGapState::CutShort)
+        .count() as u32;
+    (gaps.is_empty(), not_started, cut_short)
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -145,6 +223,9 @@ struct DependencyEdge {
 #[derive(Debug, Serialize, Clone)]
 struct RecapSummary {
     total_files: u32,
+    /// Repos that contributed at least one file change. **Not** "repos
+    /// scanned": a repo counted here may still have been CUT SHORT, in which
+    /// case its numbers are partial — see [`Self::repos_cut_short`].
     total_repos: u32,
     total_lines_added: u32,
     total_lines_removed: u32,
@@ -153,6 +234,26 @@ struct RecapSummary {
     new_tables: u32,
     new_components: u32,
     categories: HashMap<String, u32>,
+
+    // --- partiality, INSIDE the summary ------------------------------------
+    //
+    // These live here rather than only beside it because the summary is the
+    // part that gets DETACHED and persisted: the recap page's "Save to
+    // Memory" writes `JSON.stringify(recap.summary)` into the observations
+    // store. Without them, a truncated scan is filed as a complete one, and
+    // every later reader of that observation sees "3 repos, 0 new endpoints"
+    // with nothing to say the endpoints were never looked for.
+    /// `false` ⇒ this recap is PARTIAL. Exactly `repos_skipped.is_empty()`
+    /// negated, i.e. the same statement as `git_budget_exhausted`, carried
+    /// where it survives serialization of the summary alone.
+    scan_complete: bool,
+    /// Repos no git child ran for at all (`RepoScanGapState::NotStarted`).
+    /// They are missing from every list in this recap.
+    repos_not_started: u32,
+    /// Repos whose scan began and was cut short
+    /// (`RepoScanGapState::CutShort`). They ARE counted in
+    /// [`Self::total_repos`], and their contribution is incomplete.
+    repos_cut_short: u32,
 }
 
 // ============================================================================
@@ -238,6 +339,8 @@ async fn analyze_handler(
         *categories.entry(f.category.clone()).or_insert(0) += 1;
     }
 
+    let (scan_complete, repos_not_started, repos_cut_short) = partiality(&repos_skipped);
+
     let summary = RecapSummary {
         total_files: all_files.len() as u32,
         total_repos: repo_summaries.len() as u32,
@@ -248,6 +351,12 @@ async fn analyze_handler(
         new_tables: database_changes.len() as u32,
         new_components: ui_components.len() as u32,
         categories,
+        // ONE statement, three fields: `git_budget_exhausted` is
+        // `!repos_skipped.is_empty()`, so `scan_complete` is its negation and
+        // the two counts partition the list.
+        scan_complete,
+        repos_not_started,
+        repos_cut_short,
     };
 
     let now = chrono::Utc::now();
@@ -1064,7 +1173,20 @@ impl RecapBudget {
         Some(slice)
     }
 
+    /// Is the aggregate spent? Read at the TOP of each repo, which is what
+    /// decides NOT-STARTED vs CUT-SHORT.
+    ///
+    /// The test-only `serve_limit` is honoured here as well as in
+    /// [`Self::next_child`], so the seam cannot contradict itself: without
+    /// this, a limit-driven test left `exhausted()` reading the (still alive)
+    /// wall clock while every child was refused, so a repo nothing ran for was
+    /// classified CUT-SHORT — the very conflation the two states exist to
+    /// remove, reintroduced by the harness.
     fn exhausted(&self) -> bool {
+        #[cfg(test)]
+        if self.served.get() >= self.serve_limit.get() {
+            return true;
+        }
         self.remaining().is_none()
     }
 
@@ -1089,9 +1211,10 @@ struct RepoScan {
     database_changes: Vec<DbChange>,
     ui_components: Vec<ComponentInfo>,
     dependency_graph: Vec<DependencyEdge>,
-    /// Repos skipped outright or cut short mid-scan — see
-    /// [`SessionRecap::repos_skipped`], which this is published as verbatim.
-    repos_skipped: Vec<String>,
+    /// Repos skipped outright or cut short mid-scan, each typed with which —
+    /// see [`SessionRecap::repos_skipped`], which this is published as
+    /// verbatim.
+    repos_skipped: Vec<RepoScanGap>,
     /// `!repos_skipped.is_empty()` — see [`SessionRecap::git_budget_exhausted`].
     git_budget_exhausted: bool,
 }
@@ -1123,12 +1246,15 @@ fn scan_repos_with(repos: &[(String, PathBuf)], lookback: &str, budget: RecapBud
     let mut endpoints_added = Vec::new();
     let mut database_changes = Vec::new();
     let mut ui_components = Vec::new();
-    let mut repos_skipped: Vec<String> = Vec::new();
+    let mut repos_skipped: Vec<RepoScanGap> = Vec::new();
 
     for (repo_name, repo_path) in repos {
         if budget.exhausted() {
             // NOT STARTED — no child was spawned for this repo at all.
-            repos_skipped.push(repo_name.clone());
+            repos_skipped.push(RepoScanGap::new(
+                repo_name.clone(),
+                RepoScanGapState::NotStarted,
+            ));
             continue;
         }
 
@@ -1166,7 +1292,10 @@ fn scan_repos_with(repos: &[(String, PathBuf)], lookback: &str, budget: RecapBud
         // CUT SHORT: at least one of this repo's git children was refused for
         // want of budget, so what it contributed above is incomplete.
         if budget.refusals() > refusals_before {
-            repos_skipped.push(repo_name.clone());
+            repos_skipped.push(RepoScanGap::new(
+                repo_name.clone(),
+                RepoScanGapState::CutShort,
+            ));
         }
     }
 
@@ -1190,7 +1319,11 @@ fn scan_repos_with(repos: &[(String, PathBuf)], lookback: &str, budget: RecapBud
              PARTIAL: {} repo(s) skipped or cut short ({}), {} git child(ren) refused",
             RECAP_GIT_TOTAL_BUDGET.as_secs(),
             repos_skipped.len(),
-            repos_skipped.join(", "),
+            repos_skipped
+                .iter()
+                .map(|g| format!("{} ({:?})", g.repo, g.state))
+                .collect::<Vec<_>>()
+                .join(", "),
             budget.refusals()
         );
     }
@@ -1319,12 +1452,27 @@ mod tests {
 
     // ── `repos_skipped` and `git_budget_exhausted` ─────────────────────────
 
-    /// A repo the budget never reached: no child spawned, and it is listed.
-    /// (Unchanged behaviour — pinned so the rework below cannot lose it.)
+    /// `(name, state)` for each gap — what the flat `Vec<String>` could not say.
+    fn gaps(scan: &RepoScan) -> Vec<(&str, RepoScanGapState)> {
+        scan.repos_skipped
+            .iter()
+            .map(|g| (g.repo.as_str(), g.state))
+            .collect()
+    }
+
+    /// A repo the budget never reached: no child spawned, and it is listed —
+    /// as NOT-STARTED, which is the half of the old flat list that meant
+    /// "absent from the recap entirely".
     #[test]
     fn a_repo_the_budget_never_reached_is_listed_as_skipped() {
         let scan = scan_repos_with(&repo_list(&["repo-a", "repo-b"]), "1 day", spent());
-        assert_eq!(scan.repos_skipped, vec!["repo-a", "repo-b"]);
+        assert_eq!(
+            gaps(&scan),
+            vec![
+                ("repo-a", RepoScanGapState::NotStarted),
+                ("repo-b", RepoScanGapState::NotStarted),
+            ]
+        );
         assert!(scan.git_budget_exhausted);
         assert!(scan.repo_summaries.is_empty());
     }
@@ -1347,11 +1495,62 @@ mod tests {
         let scan = scan_repos_with(&repo_list(&["repo-cut-short"]), "1 day", budget);
 
         assert_eq!(
-            scan.repos_skipped,
-            vec!["repo-cut-short"],
-            "the repo whose scan was actually cut short must be the one listed"
+            gaps(&scan),
+            vec![("repo-cut-short", RepoScanGapState::CutShort)],
+            "the repo whose scan was actually cut short must be the one listed, \
+             and it must be TYPED as cut-short rather than sharing one flat list \
+             with the repos nothing ran for"
         );
         assert!(scan.git_budget_exhausted);
+    }
+
+    /// **The conflation.** The two states are not interchangeable, and the
+    /// flat `Vec<String>` made them look it:
+    ///
+    /// * a NOT-STARTED repo is absent from `repos_touched` — its absence is a
+    ///   budget artefact;
+    /// * a CUT-SHORT repo is PRESENT in `repos_touched` and in the summary
+    ///   totals, with partial numbers — so the same name in the old list meant
+    ///   two opposite things, and a reader could not tell which.
+    ///
+    /// Driven through the real seam: `repo-cut-short` is scanned in `.`, a
+    /// real git repo, so it produces a summary; `repo-never-reached` comes up
+    /// after the budget is spent.
+    #[test]
+    fn a_cut_short_repo_is_typed_apart_from_one_that_never_started() {
+        let budget = RecapBudget::new(Duration::from_secs(30));
+        // Enough children for the first repo to produce a summary, then spent.
+        budget.serve_limit.set(2);
+
+        let scan = scan_repos_with(
+            &repo_list(&["repo-cut-short", "repo-never-reached"]),
+            "1 day",
+            budget,
+        );
+
+        assert_eq!(
+            gaps(&scan),
+            vec![
+                ("repo-cut-short", RepoScanGapState::CutShort),
+                ("repo-never-reached", RepoScanGapState::NotStarted),
+            ],
+            "one list, two states, each named"
+        );
+
+        // And the states are distinguishable in the way that matters: the
+        // cut-short repo also appears in `repos_touched`, the other cannot.
+        assert!(
+            !scan
+                .repo_summaries
+                .iter()
+                .any(|r| r.name == "repo-never-reached"),
+            "a repo no child ran for cannot contribute a summary"
+        );
+
+        // Every gap carries its own operator sentence — a consumer never has
+        // to re-derive what the token means.
+        assert!(scan.repos_skipped[0].detail.contains("only in part"));
+        assert!(scan.repos_skipped[1].detail.contains("Not scanned at all"));
     }
 
     /// **The false positive.** A scan that reached every repo and spawned every
@@ -1400,5 +1599,44 @@ mod tests {
                 "flag and list disagreed for {repos:?} @ limit {limit}"
             );
         }
+    }
+
+    /// **Partiality must survive the summary being detached.** The recap page
+    /// persists `JSON.stringify(recap.summary)` alone into the observations
+    /// store, so a truncated scan whose only partiality signal lives beside
+    /// the summary is filed as a complete one — permanently, and read back
+    /// later as "we looked and there was nothing".
+    ///
+    /// `partiality()` is what the handler folds into `RecapSummary`, so
+    /// asserting it here asserts what gets written.
+    #[test]
+    fn the_summary_partiality_triple_partitions_the_gap_list() {
+        // Complete scan: nothing lost.
+        assert_eq!(partiality(&[]), (true, 0, 0));
+
+        // One of each, driven through the real scan seam.
+        let budget = RecapBudget::new(Duration::from_secs(30));
+        budget.serve_limit.set(2);
+        let scan = scan_repos_with(
+            &repo_list(&["repo-cut-short", "repo-never-reached"]),
+            "1 day",
+            budget,
+        );
+        let (scan_complete, not_started, cut_short) = partiality(&scan.repos_skipped);
+        assert!(
+            !scan_complete,
+            "a scan that lost two repos is not a complete one"
+        );
+        assert_eq!(not_started, 1);
+        assert_eq!(cut_short, 1);
+        assert_eq!(
+            (not_started + cut_short) as usize,
+            scan.repos_skipped.len(),
+            "the two counts must partition the list — no row unaccounted for"
+        );
+        assert_eq!(
+            scan_complete, !scan.git_budget_exhausted,
+            "the summary's completeness and the recap's flag are ONE statement"
+        );
     }
 }
