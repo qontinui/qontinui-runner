@@ -4345,19 +4345,6 @@ pub(crate) fn should_persist_migration(
     needs_persist && !is_secondary && provenance.is_authoritative()
 }
 
-/// Gate-2 split migration (plan `2026-07-10-split-cloud-sync-consent`):
-/// carry a pre-split user's explicit `cloud_sync_enabled` decision forward
-/// onto the new, independent `session_metadata_sync_enabled` flag.
-///
-/// - New key already present in the raw JSON → already migrated (or the
-///   user explicitly set it post-split); leave `settings` untouched.
-/// - New key absent AND legacy `cloud_sync_enabled` present as a bool →
-///   carry that value forward. This does not silently grant or revoke
-///   anything beyond what the user already decided when the two gates were
-///   still one toggle.
-/// - Neither key present (genuinely fresh settings content, e.g. `{}`) →
-///   leave `settings` untouched; the field's own serde default (`true`)
-///   already applied during deserialization.
 /// Back-fill [`Settings::tier_chosen_explicitly`] on a document written before
 /// that field existed.
 ///
@@ -4396,6 +4383,19 @@ pub(crate) fn migrate_tier_chosen_explicitly(raw: &serde_json::Value, settings: 
     }
 }
 
+/// Gate-2 split migration (plan `2026-07-10-split-cloud-sync-consent`):
+/// carry a pre-split user's explicit `cloud_sync_enabled` decision forward
+/// onto the new, independent `session_metadata_sync_enabled` flag.
+///
+/// - New key already present in the raw JSON → already migrated (or the
+///   user explicitly set it post-split); leave `settings` untouched.
+/// - New key absent AND legacy `cloud_sync_enabled` present as a bool →
+///   carry that value forward. This does not silently grant or revoke
+///   anything beyond what the user already decided when the two gates were
+///   still one toggle.
+/// - Neither key present (genuinely fresh settings content, e.g. `{}`) →
+///   leave `settings` untouched; the field's own serde default (`true`)
+///   already applied during deserialization.
 fn migrate_metadata_sync_flag(raw: &serde_json::Value, settings: &mut Settings) {
     if raw.get("session_metadata_sync_enabled").is_some() {
         return;
