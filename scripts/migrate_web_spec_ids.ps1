@@ -17,11 +17,13 @@
 # renamed). Safe to re-run.
 #
 # Usage:
-#   pwsh -File D:/qontinui-root/qontinui-runner/scripts/migrate_web_spec_ids.ps1
+#   pwsh -File <workspace-root>/qontinui-runner/scripts/migrate_web_spec_ids.ps1
 
 $ErrorActionPreference = 'Stop'
 
-$webSpecs = 'D:/qontinui-root/qontinui-web/frontend/specs/pages'
+# Workspace root: $QONTINUI_ROOT if set, else the grandparent of this script
+# (<root>/qontinui-runner/scripts). Replaces a hardcoded operator-drive path.
+$webSpecs = (Join-Path $(if ($env:QONTINUI_ROOT) { $env:QONTINUI_ROOT } else { (Get-Item $PSScriptRoot).Parent.Parent.FullName }) 'qontinui-web/frontend/specs/pages')
 
 $renames = [ordered]@{
     'runs-runs'                                              = 'runs'
