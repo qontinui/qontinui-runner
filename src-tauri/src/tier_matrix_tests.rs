@@ -51,6 +51,8 @@
 //! | 2d| `headless_server_mode_infers_qontinui_account`   | fresh install + `QONTINUI_SERVER_MODE` → Tier 2 |
 //! | 2e| `runner_tier_env_overlay_beats_the_headless_default` | `QONTINUI_RUNNER_TIER=local` wins over 2d, in memory |
 //! | 2e2| `the_headless_default_is_never_persisted`        | …and 2d never reaches disk, so the opt-out survives a restart |
+//! | 2e3| `an_env_overlaid_runner_token_promotion_is_process_local` | QONTINUI_RUNNER_TOKEN is process-local too, and never reaches disk |
+//! | 2e4| `a_disk_runner_token_promotion_is_still_durable`  | …while the same token ON DISK still persists |
 //! | 2f| `runtime_tier_override_beats_the_headless_default`   | `set_runner_tier` wins over 2d *and* 2e |
 //! | 2g| `an_explicit_tier_choice_short_circuits_the_headless_default` | `tier_chosen_explicitly` closes the inference for good |
 //! | 2h| `server_mode_is_a_process_fact_not_a_document_fact`  | the document reader ignores it; the process reader does not |
@@ -102,6 +104,28 @@ fn settings_with(tier: RunnerTier, runner_token: &str) -> Settings {
     }
 }
 
+/// [`crate::settings::migrate_tier_in_place`] for a fixture whose
+/// `web_integration.runner_token` — if it has one — is a fact ON DISK.
+///
+/// The real function takes `disk_runner_token` separately from the struct
+/// field, because `load_settings_full` may have overwritten that field from
+/// `QONTINUI_RUNNER_TOKEN` (a runtime-only override) before calling it: the
+/// struct value drives the inference, the disk value decides whether the
+/// promotion may be WRITTEN. Every fixture in this file except
+/// `an_env_overlaid_runner_token_promotion_is_process_local` models a plain
+/// on-disk document, so deriving the flag here keeps them honest instead of
+/// asking each call site to restate it — and leaves that one test calling the
+/// real function with an explicit `false`, which is visibly what makes it the
+/// odd one out.
+fn migrate_from_disk(
+    s: &mut Settings,
+    server_mode: bool,
+    paired: bool,
+) -> crate::settings::TierMigration {
+    let disk_runner_token = !s.web_integration.runner_token.trim().is_empty();
+    crate::settings::migrate_tier_in_place(s, server_mode, paired, disk_runner_token)
+}
+
 // ----------------------------------------------------------------------------
 // #1 — Default tier
 // ----------------------------------------------------------------------------
@@ -140,7 +164,7 @@ fn tier_inference_from_runner_token_promotes() {
 
     // Run the migration in-memory (no disk I/O).
     let mut s = s;
-    let migrated = crate::settings::migrate_tier_in_place(
+    let migrated = migrate_from_disk(
         &mut s, /* server_mode = */ false, /* paired = */ false,
     );
     assert!(migrated.changed(), "migration must report it ran");
@@ -158,7 +182,7 @@ fn tier_inference_without_runner_token_stays_local() {
     let mut s: Settings = serde_json::from_str(json).expect("must deserialize");
     s.tier_initialized = false;
 
-    let migrated = crate::settings::migrate_tier_in_place(
+    let migrated = migrate_from_disk(
         &mut s, /* server_mode = */ false, /* paired = */ false,
     );
     assert!(migrated.changed());
@@ -191,7 +215,7 @@ fn desktop_install_without_server_mode_stays_local() {
     let mut s = Settings::default();
     assert!(!s.tier_initialized, "fixture must be a fresh install");
 
-    let migrated = crate::settings::migrate_tier_in_place(
+    let migrated = migrate_from_disk(
         &mut s, /* server_mode = */ false, /* paired = */ false,
     );
     assert!(migrated.changed(), "a fresh install must still be migrated");
@@ -215,7 +239,7 @@ fn headless_server_mode_infers_qontinui_account() {
     let mut s = Settings::default();
     assert!(s.web_integration.runner_token.is_empty(), "no legacy token");
 
-    let migrated = crate::settings::migrate_tier_in_place(
+    let migrated = migrate_from_disk(
         &mut s, /* server_mode = */ true, /* paired = */ false,
     );
     assert!(migrated.changed(), "migration must report it ran");
@@ -241,7 +265,7 @@ fn headless_server_mode_infers_qontinui_account() {
 #[test]
 fn runner_tier_env_overlay_beats_the_headless_default() {
     let mut s = Settings::default();
-    crate::settings::migrate_tier_in_place(
+    migrate_from_disk(
         &mut s, /* server_mode = */ true, /* paired = */ false,
     );
     assert_eq!(s.tier, RunnerTier::QontinuiAccount, "default applied first");
@@ -275,18 +299,17 @@ fn runner_tier_env_overlay_beats_the_headless_default() {
 /// of every write, including one taken for an unrelated reason.
 #[test]
 fn the_headless_default_is_never_persisted() {
-    use crate::settings::{document_to_persist, PreMigrationTier, TierMigration};
+    use crate::settings::{document_to_persist, TierMigration};
 
     // The latched box the headless defect produces: inferred `local`, no
-    // explicit choice, no durable signal.
+    // explicit choice, no durable signal. `on_disk` is the document exactly as
+    // the file has it — what `load_settings_full` captures before its first
+    // overlay, and the base every persist is built from.
     let mut s = settings_with(RunnerTier::Local, "");
     s.tier_initialized = true;
-    let pre = PreMigrationTier {
-        tier: s.tier,
-        tier_initialized: s.tier_initialized,
-    };
+    let on_disk = s.clone();
 
-    let migrated = crate::settings::migrate_tier_in_place(
+    let migrated = migrate_from_disk(
         &mut s, /* server_mode = */ true, /* paired = */ false,
     );
     assert_eq!(
@@ -307,7 +330,7 @@ fn the_headless_default_is_never_persisted() {
     // minted a local_user_id) carries the file's own tier, not this one.
     let mut with_uuid = s.clone();
     with_uuid.local_user_id = "1f0a1c2e-0000-4000-8000-000000000001".to_string();
-    let to_persist = document_to_persist(&with_uuid, Some(pre));
+    let to_persist = document_to_persist(&on_disk, &with_uuid, migrated);
     assert_eq!(
         to_persist.tier,
         RunnerTier::Local,
@@ -316,7 +339,7 @@ fn the_headless_default_is_never_persisted() {
     );
     assert!(
         to_persist.tier_initialized,
-        "…and nothing else is rolled back"
+        "…and the file's own sentinel is what survives"
     );
     assert_eq!(
         to_persist.local_user_id, with_uuid.local_user_id,
@@ -328,7 +351,8 @@ fn the_headless_default_is_never_persisted() {
     // re-derive anyway.
     let mut durable = settings_with(RunnerTier::Local, "");
     durable.tier_initialized = true;
-    let migrated = crate::settings::migrate_tier_in_place(
+    let durable_on_disk = durable.clone();
+    let migrated = migrate_from_disk(
         &mut durable,
         /* server_mode = */ true,
         /* paired = */ true,
@@ -336,9 +360,105 @@ fn the_headless_default_is_never_persisted() {
     assert_eq!(migrated, TierMigration::Durable);
     assert!(migrated.persists());
     assert_eq!(
-        document_to_persist(&durable, None).tier,
+        document_to_persist(&durable_on_disk, &durable, migrated).tier,
         RunnerTier::QontinuiAccount
     );
+}
+
+/// The SECOND process-local signal, and the one the first remediation pass
+/// missed: `QONTINUI_RUNNER_TOKEN`.
+///
+/// `load_settings_full` runs `apply_web_integration_env_overlay` BEFORE the
+/// migration, so by the time `migrate_tier_in_place` reads
+/// `web_integration.runner_token` the value may be the env's, not the file's.
+/// Classifying off the struct field therefore called an env-only promotion
+/// DURABLE and wrote `tier: "qontinui_account"` to disk — the identical
+/// escape-hatch-lost-on-disk defect `the_headless_default_is_never_persisted`
+/// pins for `QONTINUI_SERVER_MODE`, reached through the other signal.
+///
+/// The struct field still drives the INFERENCE (a runner holding that token
+/// really is Tier 2 for this process — that is what makes the headless deploy
+/// work); only the persist classification consults the disk.
+#[test]
+fn an_env_overlaid_runner_token_promotion_is_process_local() {
+    use crate::settings::{document_to_persist, TierMigration};
+
+    // The latched box, with an EMPTY token on disk …
+    let mut s = settings_with(RunnerTier::Local, "");
+    s.tier_initialized = true;
+    let on_disk = s.clone();
+
+    // … and `QONTINUI_RUNNER_TOKEN` copied in, which is the ONE thing
+    // `apply_web_integration_env_overlay` does to this field. Assigned rather
+    // than driven through that function because this suite touches no process
+    // env (see the module doc); the file-bytes test
+    // `settings::load_persist_tests::env_overlays_never_reach_the_persisted_settings_document`
+    // exercises the real overlay end to end.
+    s.web_integration.runner_token = "env-only-token".to_string();
+
+    let migrated = crate::settings::migrate_tier_in_place(
+        &mut s, /* server_mode = */ false, /* paired = */ false,
+        /* disk_runner_token = */ false,
+    );
+    assert_eq!(
+        s.tier,
+        RunnerTier::QontinuiAccount,
+        "in memory the token DOES promote — that is the runtime-only override \
+         working as documented"
+    );
+    assert_eq!(
+        migrated,
+        TierMigration::ProcessLocal,
+        "but a token that exists only in this process's environment is not a \
+         fact about the install"
+    );
+    assert!(!migrated.persists());
+
+    // The side door: a load that persists for an unrelated reason (the lazy
+    // local_user_id mint) must still write the file's own tier — and none of
+    // the overlay.
+    let mut with_uuid = s.clone();
+    with_uuid.local_user_id = "1f0a1c2e-0000-4000-8000-000000000002".to_string();
+    let to_persist = document_to_persist(&on_disk, &with_uuid, migrated);
+    assert_eq!(
+        to_persist.tier,
+        RunnerTier::Local,
+        "QONTINUI_RUNNER_TIER=local (applied after the persist) must survive a \
+         restart, so the tier the file already had is what gets written"
+    );
+    assert_eq!(
+        to_persist.web_integration.runner_token, "",
+        "and the runtime-only credential must not be written either — \
+         `document_to_persist` builds from the on-disk document"
+    );
+    assert_eq!(
+        to_persist.local_user_id, with_uuid.local_user_id,
+        "the reason for the write survives it"
+    );
+}
+
+/// The contrast that keeps the rule honest: the SAME token, present on disk,
+/// is a fact about the install and persists exactly as it always did. This is
+/// the legacy-upgrade path — a pre-tier `settings.json` carrying only a
+/// `runner_token` — so classifying it process-local would have been a
+/// regression of its own.
+#[test]
+fn a_disk_runner_token_promotion_is_still_durable() {
+    use crate::settings::TierMigration;
+
+    let mut s = settings_with(RunnerTier::Local, "qontinui_runner_on_disk");
+    assert!(
+        !s.tier_initialized,
+        "the pre-tier document, so this is the plain first-boot inference \
+         rather than the unlatch"
+    );
+
+    let migrated = migrate_from_disk(
+        &mut s, /* server_mode = */ false, /* paired = */ false,
+    );
+    assert_eq!(s.tier, RunnerTier::QontinuiAccount);
+    assert_eq!(migrated, TierMigration::Durable);
+    assert!(migrated.persists());
 }
 
 /// Escape hatch 2, and the top of the stack: the runtime override that
@@ -355,7 +475,7 @@ fn runtime_tier_override_beats_the_headless_default() {
     let mut s = Settings::default();
 
     // 1. inference (headless default)
-    crate::settings::migrate_tier_in_place(
+    migrate_from_disk(
         &mut s, /* server_mode = */ true, /* paired = */ false,
     );
     assert_eq!(s.tier, RunnerTier::QontinuiAccount);
@@ -377,7 +497,7 @@ fn runtime_tier_override_beats_the_headless_default() {
 
     // And `None` (no runtime choice was ever made) must change nothing.
     let mut s2 = Settings::default();
-    crate::settings::migrate_tier_in_place(
+    migrate_from_disk(
         &mut s2, /* server_mode = */ true, /* paired = */ false,
     );
     crate::settings::apply_in_memory_tier_overlay(&mut s2, None);
@@ -403,7 +523,7 @@ fn an_explicit_tier_choice_short_circuits_the_headless_default() {
     s.tier_initialized = true;
     s.tier_chosen_explicitly = true;
 
-    let migrated = crate::settings::migrate_tier_in_place(
+    let migrated = migrate_from_disk(
         &mut s, /* server_mode = */ true, /* paired = */ true,
     );
     assert!(
@@ -422,19 +542,13 @@ fn an_explicit_tier_choice_short_circuits_the_headless_default() {
     let mut s = settings_with(RunnerTier::LocalProvider, "");
     s.tier_initialized = true;
     assert!(!s.tier_chosen_explicitly, "the pre-Phase-3 upgrade shape");
-    assert!(!crate::settings::migrate_tier_in_place(
-        &mut s, /* server_mode = */ true, /* paired = */ true
-    )
-    .changed());
+    assert!(!migrate_from_disk(&mut s, /* server_mode = */ true, /* paired = */ true).changed());
     assert_eq!(s.tier, RunnerTier::LocalProvider);
 
     // And Tier 2 is closed for the trivial reason: there is nothing above it.
     let mut s = settings_with(RunnerTier::QontinuiAccount, "");
     s.tier_initialized = true;
-    assert!(!crate::settings::migrate_tier_in_place(
-        &mut s, /* server_mode = */ false, /* paired = */ false
-    )
-    .changed());
+    assert!(!migrate_from_disk(&mut s, /* server_mode = */ false, /* paired = */ false).changed());
     assert_eq!(s.tier, RunnerTier::QontinuiAccount);
 }
 
@@ -477,7 +591,7 @@ fn server_mode_is_a_process_fact_not_a_document_fact() {
     // In memory, the headless default resolves this install to Tier 2 …
     let mut s: Settings = serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
         .expect("must deserialize");
-    crate::settings::migrate_tier_in_place(
+    migrate_from_disk(
         &mut s, /* server_mode = */ true, /* paired = */ false,
     );
     assert_eq!(s.tier, RunnerTier::QontinuiAccount);
@@ -540,7 +654,7 @@ fn paired_box_infers_tier_2_in_both_readers() {
     // Reader 1 — the runner bin's `Settings` path.
     let mut s = Settings::default();
     assert!(s.web_integration.runner_token.is_empty(), "no legacy token");
-    let migrated = crate::settings::migrate_tier_in_place(
+    let migrated = migrate_from_disk(
         &mut s, /* server_mode = */ false, /* paired = */ true,
     );
     assert!(migrated.changed(), "migration must report it ran");
@@ -588,7 +702,7 @@ fn paired_box_infers_tier_2_in_both_readers() {
 fn inferred_local_is_re_inferred_but_an_explicit_one_is_not() {
     // (a) Booted unpaired: the inference latched it at Tier 0.
     let mut inferred = Settings::default();
-    assert!(crate::settings::migrate_tier_in_place(
+    assert!(migrate_from_disk(
         &mut inferred,
         /* server_mode = */ false,
         /* paired = */ false
@@ -611,7 +725,7 @@ fn inferred_local_is_re_inferred_but_an_explicit_one_is_not() {
 
     // The box is then paired. Only (a) moves.
     assert!(
-        crate::settings::migrate_tier_in_place(
+        migrate_from_disk(
             &mut inferred,
             /* server_mode = */ false,
             /* paired = */ true
@@ -623,7 +737,7 @@ fn inferred_local_is_re_inferred_but_an_explicit_one_is_not() {
     assert_eq!(inferred.tier, RunnerTier::QontinuiAccount);
 
     assert!(
-        !crate::settings::migrate_tier_in_place(
+        !migrate_from_disk(
             &mut chosen,
             /* server_mode = */ false,
             /* paired = */ true
@@ -642,17 +756,14 @@ fn inferred_local_is_re_inferred_but_an_explicit_one_is_not() {
 #[test]
 fn re_inference_never_demotes() {
     let mut s = Settings::default();
-    crate::settings::migrate_tier_in_place(
+    migrate_from_disk(
         &mut s, /* server_mode = */ false, /* paired = */ true,
     );
     assert_eq!(s.tier, RunnerTier::QontinuiAccount);
 
     // Every signal now gone — and the tier stands.
     assert!(
-        !crate::settings::migrate_tier_in_place(
-            &mut s, /* server_mode = */ false, /* paired = */ false
-        )
-        .changed(),
+        !migrate_from_disk(&mut s, /* server_mode = */ false, /* paired = */ false).changed(),
         "an unpaired Tier 2 box must not be re-inferred at all"
     );
     assert_eq!(s.tier, RunnerTier::QontinuiAccount);
@@ -679,10 +790,7 @@ fn settings_without_tier_chosen_explicitly_reads_false() {
         !s.tier_chosen_explicitly,
         "an absent key must read as 'never chosen', not 'chosen'"
     );
-    assert!(crate::settings::migrate_tier_in_place(
-        &mut s, /* server_mode = */ false, /* paired = */ true
-    )
-    .changed());
+    assert!(migrate_from_disk(&mut s, /* server_mode = */ false, /* paired = */ true).changed());
     assert_eq!(s.tier, RunnerTier::QontinuiAccount);
 
     // Reader 2 — the raw JSON parse, where the key is simply missing.
@@ -757,10 +865,7 @@ fn a_pre_phase_3_explicit_local_is_back_filled() {
         "`local` + a token is a value no automatic writer could have produced"
     );
     assert!(
-        !crate::settings::migrate_tier_in_place(
-            &mut s, /* server_mode = */ true, /* paired = */ true
-        )
-        .changed(),
+        !migrate_from_disk(&mut s, /* server_mode = */ true, /* paired = */ true).changed(),
         "so nothing may re-infer over it — not pairing, not a headless launch"
     );
     assert_eq!(s.tier, RunnerTier::Local);
@@ -788,10 +893,7 @@ fn a_pre_phase_3_explicit_local_is_back_filled() {
         !s.tier_chosen_explicitly,
         "a present key is read as written"
     );
-    assert!(crate::settings::migrate_tier_in_place(
-        &mut s, /* server_mode = */ false, /* paired = */ false
-    )
-    .changed());
+    assert!(migrate_from_disk(&mut s, /* server_mode = */ false, /* paired = */ false).changed());
     assert_eq!(s.tier, RunnerTier::QontinuiAccount);
 
     let path = dir.path().join("explicit_false.json");
@@ -845,8 +947,7 @@ fn sign_out_state_is_not_demoted_by_the_re_inference() {
     for paired in [true, false] {
         let mut s = s.clone();
         assert!(
-            !crate::settings::migrate_tier_in_place(&mut s, /* server_mode = */ false, paired)
-                .changed(),
+            !migrate_from_disk(&mut s, /* server_mode = */ false, paired).changed(),
             "signed out, paired={paired}: nothing to re-infer"
         );
         assert_eq!(
@@ -867,10 +968,7 @@ fn unpaired_tokenless_desktop_box_still_resolves_local() {
     use qontinui_runner_lib::profiles::{read_runner_tier_at, TierRead};
 
     let mut s = Settings::default();
-    assert!(crate::settings::migrate_tier_in_place(
-        &mut s, /* server_mode = */ false, /* paired = */ false
-    )
-    .changed());
+    assert!(migrate_from_disk(&mut s, /* server_mode = */ false, /* paired = */ false).changed());
     assert_eq!(
         s.tier,
         RunnerTier::Local,
