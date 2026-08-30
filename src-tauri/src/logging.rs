@@ -415,6 +415,37 @@ where
 ///   hang inside someone else's `Drop`.
 const CONSOLE_BUFFERED_LINES_LIMIT: usize = 128_000;
 
+/// The `RUST_LOG` string used when the environment does not supply one.
+///
+/// # Why `tao` and `wry` are named explicitly
+///
+/// `EnvFilter` has no global default directive here — every directive in this
+/// string is target-scoped — and an `EnvFilter` built that way **disables every
+/// target that matches no directive**. So `qontinui_runner=…,tauri=info` did
+/// not merely turn the windowing crates down, it turned them OFF: a 17 MB
+/// instance log contained 0 `tao`, 0 `wry` and 0 `webview2` lines.
+///
+/// That is not cosmetic. `tao` reaches this subscriber through the `log` →
+/// `tracing` bridge that `SubscriberInitExt::init` installs (`tao` logs via
+/// `#[macro_use] extern crate log`), and the one diagnostic our vendored
+/// `tao` patch emits for the `ERROR_INVALID_WINDOW_HANDLE` `PostMessage`
+/// storm — `platform_impl/windows/event_loop.rs`'s "target window {:#x} is
+/// destroyed", deliberately bounded to one line per window — is a
+/// `log::warn!` on the `tao::…` target. Without a `tao` directive that warning
+/// is dropped inside the filter, which makes the patch **unfalsifiable**: the
+/// fix cannot be distinguished from the race never firing.
+///
+/// `warn` rather than `info` is the level because these crates are chatty at
+/// `info` and below on Windows, and the events worth having are exactly the
+/// ones that report a broken window handle or a failed webview operation.
+///
+/// Keeping the level for our own crate a parameter (rather than hard-coding
+/// `info`) preserves the existing behaviour where the persisted log level
+/// steers `qontinui_runner`'s verbosity and nothing else.
+fn default_env_filter(level: Level) -> String {
+    format!("qontinui_runner={level},tauri=info,tao=warn,wry=warn")
+}
+
 pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> {
     std::fs::create_dir_all(&config.log_dir)?;
 
@@ -428,8 +459,7 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
     let (otel_guard, otel_layer) = crate::otel::init_otel(&config.otel);
 
     let env_filter = EnvFilter::new(
-        std::env::var("RUST_LOG")
-            .unwrap_or_else(|_| format!("qontinui_runner={},tauri=info", config.level)),
+        std::env::var("RUST_LOG").unwrap_or_else(|_| default_env_filter(config.level)),
     );
 
     // Dev-only (`debug-tokio-console`): `EnvFilter` is installed below as a
@@ -1161,6 +1191,151 @@ mod console_jam_tests {
             verdict.is_ok(),
             "a jammed console sink blocked its caller: the wrapper must drop lines under \
              back-pressure, never wait on the sink"
+        );
+    }
+}
+
+/// Behavioural tests for [`default_env_filter`].
+///
+/// Separate from the main `tests` module on purpose: these install *scoped*
+/// subscribers, and keeping them in their own module keeps the
+/// `tracing_subscriber::Layer` import out of the rest of the file's namespace.
+#[cfg(test)]
+mod default_filter_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use tracing_subscriber::Layer;
+
+    /// The target `tao` logs the vendored `event_loop.rs` patch's
+    /// `ERROR_INVALID_WINDOW_HANDLE` warning on. `tao` logs through the `log`
+    /// crate (`#[macro_use] extern crate log` in its `lib.rs`), and the `log`
+    /// → `tracing` bridge preserves the module path as the event target, so
+    /// this is the exact string `EnvFilter` matches against at runtime.
+    const TAO_EVENT_LOOP_TARGET: &str = "tao::platform_impl::platform::event_loop";
+
+    /// Counts every event that survives the filter above it.
+    #[derive(Clone)]
+    struct CountingLayer(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> Layer<S> for CountingLayer {
+        fn on_event(
+            &self,
+            _event: &tracing::Event<'_>,
+            _cx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counter() -> (Arc<AtomicUsize>, CountingLayer) {
+        let n = Arc::new(AtomicUsize::new(0));
+        (Arc::clone(&n), CountingLayer(Arc::clone(&n)))
+    }
+
+    /// The regression this fix exists for, with its own negative control.
+    ///
+    /// The two `warn!` invocations are deliberately written out twice rather
+    /// than factored into a helper: each `warn!` is a distinct *callsite*, and
+    /// a shared helper would evaluate ONE callsite under both filters, letting
+    /// `tracing`'s per-callsite interest cache decide the second verdict from
+    /// the first. Two sites, two filters, no cache to share.
+    ///
+    /// The pre-fix arm is not decoration. Without it this test passes just as
+    /// happily against a filter that enables everything, and would not have
+    /// caught the bug it is named for: the shipped default emitted 0 `tao`
+    /// lines into a 17 MB log because `EnvFilter` disables every target that
+    /// matches no directive.
+    #[test]
+    fn the_default_filter_passes_taos_destroyed_window_warning_and_the_pre_fix_one_dropped_it() {
+        // Shipped default.
+        let (shipped, layer) = counter();
+        let subscriber = Registry::default()
+            .with(EnvFilter::new(default_env_filter(Level::INFO)))
+            .with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: TAO_EVENT_LOOP_TARGET,
+                "tao: target window 0x1234 is destroyed; dropping queued closures for it."
+            );
+        });
+
+        // NEGATIVE CONTROL: the exact filter string that shipped before this
+        // fix, spelled as a literal so it cannot drift with the helper.
+        let (pre_fix, layer) = counter();
+        let subscriber = Registry::default()
+            .with(EnvFilter::new("qontinui_runner=INFO,tauri=info"))
+            .with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: TAO_EVENT_LOOP_TARGET,
+                "tao: target window 0x1234 is destroyed; dropping queued closures for it."
+            );
+        });
+
+        assert_eq!(
+            pre_fix.load(Ordering::SeqCst),
+            0,
+            "negative control failed: the pre-fix filter was supposed to DROP the tao warning. \
+             If this counts 1, the test proves nothing about the fix."
+        );
+        assert_eq!(
+            shipped.load(Ordering::SeqCst),
+            1,
+            "the default filter dropped tao's destroyed-window warning — the vendored \
+             event_loop.rs patch is unverifiable again"
+        );
+    }
+
+    /// Pins the literal directives, so removing one is a test failure rather
+    /// than a silent loss of diagnostics. Asserted against a hard-coded string
+    /// rather than against `default_env_filter`'s own output, which would pin
+    /// nothing.
+    #[test]
+    fn the_default_filter_string_is_exactly_the_four_expected_directives() {
+        assert_eq!(
+            default_env_filter(Level::INFO),
+            "qontinui_runner=INFO,tauri=info,tao=warn,wry=warn"
+        );
+        assert_eq!(
+            default_env_filter(Level::DEBUG),
+            "qontinui_runner=DEBUG,tauri=info,tao=warn,wry=warn",
+            "the configured level must steer qontinui_runner ONLY; tao/wry stay at warn"
+        );
+    }
+
+    /// `wry` reaches the subscriber the same way `tao` does, and was equally
+    /// invisible (0 `wry` lines in the same 17 MB log). WebView2 creation
+    /// failures — the `HRESULT(0x8007139F)` class that pop-out windows hit —
+    /// surface here.
+    #[test]
+    fn the_default_filter_passes_wry_warnings() {
+        let (seen, layer) = counter();
+        let subscriber = Registry::default()
+            .with(EnvFilter::new(default_env_filter(Level::INFO)))
+            .with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "wry::webview", "webview creation failed");
+        });
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "wry warnings are filtered out");
+    }
+
+    /// The level choice, stated as a test: `tao` at `info` and below is chatty
+    /// enough to drown the log, so only `warn` and above may pass.
+    #[test]
+    fn the_default_filter_still_suppresses_tao_info_chatter() {
+        let (seen, layer) = counter();
+        let subscriber = Registry::default()
+            .with(EnvFilter::new(default_env_filter(Level::DEBUG)))
+            .with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: TAO_EVENT_LOOP_TARGET, "routine windowing chatter");
+            tracing::debug!(target: TAO_EVENT_LOOP_TARGET, "routine windowing chatter");
+        });
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "tao=warn must not widen to info/debug even when qontinui_runner is at debug"
         );
     }
 }
