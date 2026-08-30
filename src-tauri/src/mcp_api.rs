@@ -2006,6 +2006,21 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// gates: a read coord grants on its READ-ONLY floor, so it carries no authority a
 /// session lacks. It is IN for the same reason the other reads here are.
 ///
+/// `coord_post_notification` is IN because withholding it would withhold a
+/// REPORT, never an action. It is the notify half of NOTIFY-AFTER-ACTION
+/// (`escalation-bar` `do-reversible-mechanical-work`, operator-revised
+/// 2026-08-30): a session that publishes a version or force-pushes a ref does so
+/// through its own shell, not through coord, so filtering the tool cannot stop
+/// the irreversible step — it can only stop the operator from hearing about it.
+/// Authority-wise it is the twin of `coord_post_finding`, already granted here:
+/// an append-only, self-attributed row about the caller's own action, whose
+/// `kind` is hard-coded coord-side and whose `actor` is derived from the
+/// credential, so it cannot forge a coord-internal notification. Added with the
+/// tool itself (plan
+/// `2026-08-30-agent-emitted-notifications-and-configurable-push` Phase 2b)
+/// rather than after a session tripped over `-32601`, which is how the three
+/// drift instances above were each found.
+///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
@@ -2062,6 +2077,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_mute_gate",
     "coord_orient",
     "coord_post_finding",
+    "coord_post_notification",
     "coord_pr_status",
     "coord_predict_resource_collisions",
     "coord_recent_errors",
@@ -8334,6 +8350,16 @@ mod coord_mcp_body_gate_tests {
             // is exactly what it exists to prevent, so withholding it here
             // re-opened the gap it closed.
             "coord_memory_overview",
+            // The notify half of NOTIFY-AFTER-ACTION. Pinned in the SAME test
+            // as the three silent subtractions above, and deliberately BEFORE
+            // one could happen: this entry landed with the coord tool rather
+            // than months later after a session hit -32601. Withholding it
+            // would withhold a REPORT and not an action — the irreversible step
+            // runs in the session's own shell either way — so a filter here
+            // only costs the operator the notification that
+            // `escalation-bar` `do-reversible-mechanical-work` makes the
+            // compensating control for the gate it removed.
+            "coord_post_notification",
         ] {
             assert!(
                 gate(serde_json::json!({
