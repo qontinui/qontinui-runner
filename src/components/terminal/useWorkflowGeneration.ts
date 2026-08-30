@@ -81,7 +81,7 @@ interface UseWorkflowGenerationResult {
   handleBuildPlanImplementationWorkflow: (planContent: string) => void;
   handleBuildPlanFromFile: () => void;
   handleBuildPlanImplementationFromFile: () => void;
-  loadPlanContent: () => Promise<void>;
+  loadPlanContent: () => Promise<{ filename: string | null; chars: number; error?: string }>;
   handleSelectTranscriptSession: (sessionId: string) => Promise<void>;
 }
 
@@ -127,7 +127,20 @@ export function useWorkflowGeneration({
 
   // ── Plan content ───────────────────────────────────────────────────────────
 
-  const loadPlanContent = useCallback(async () => {
+  /**
+   * Reload the workspace plan file, and REPORT what was found.
+   *
+   * Every failure here used to be swallowed: a backend error was caught and
+   * ignored, and a workspace with no PLAN*.md simply cleared the state. Both
+   * left `/plan-refresh` rendering success for a refresh that loaded nothing.
+   * The silent-catch is kept for the mount-time best-effort call (which has
+   * no one to report to); the return value is what the command surface reads.
+   */
+  const loadPlanContent = useCallback(async (): Promise<{
+    filename: string | null;
+    chars: number;
+    error?: string;
+  }> => {
     setIsPlanLoading(true);
     try {
       const result = await invoke<CommandResponse>("get_latest_plan_content");
@@ -136,13 +149,20 @@ export function useWorkflowGeneration({
         if (d.found && d.content && d.filename) {
           setLatestPlanContent(d.content);
           setPlanFileName(d.filename);
-        } else {
-          setLatestPlanContent("");
-          setPlanFileName(null);
+          return { filename: d.filename, chars: d.content.length };
         }
+        setLatestPlanContent("");
+        setPlanFileName(null);
+        return { filename: null, chars: 0 };
       }
-    } catch {
-      // Silently ignore — plan content is best-effort
+      return { filename: null, chars: 0, error: result.message || "plan lookup failed" };
+    } catch (err) {
+      // Still silent for the caller that does not look (the mount effect).
+      return {
+        filename: null,
+        chars: 0,
+        error: err instanceof Error ? err.message : String(err),
+      };
     } finally {
       setIsPlanLoading(false);
     }

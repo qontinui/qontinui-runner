@@ -97,6 +97,15 @@ export function loadRealRegistry(): Promise<RealRegistryHarness> {
 
 async function build(): Promise<RealRegistryHarness> {
   const calls: EffectCall[] = [];
+  /**
+   * The mounted-pane registry, hoisted so `useTerminalSession`'s mock and the
+   * `ctx.approveAll` stub below read the SAME map.
+   *
+   * It is EMPTY, and that is the fixture's most load-bearing property: it is
+   * the state in which `/approve-all` used to report three approvals having
+   * written nothing at all.
+   */
+  const terminalRefs = new Map<string, { current: unknown }>();
   const rec =
     <T>(name: string, result: T) =>
     (...args: unknown[]): T => {
@@ -156,13 +165,20 @@ async function build(): Promise<RealRegistryHarness> {
       activeId: "tab-a",
       setActiveId: rec("session.setActiveId", undefined),
       closeTerminal: rec("session.closeTerminal", undefined),
-      terminalRefs: { current: new Map() },
+      terminalRefs: { current: terminalRefs },
       sessionStates: { "tab-a": "needs-input", "tab-b": "idle" },
       pageId: "page-1",
       stateTimeAccum: { current: {} },
       zoneLayout: {
         focusedZone: 0,
         layout: { id: "quad", zones: [{}, {}, {}, {}] },
+        // `layoutId` is the STATE `setLayoutId` writes; `layout` is derived
+        // from it. `/layout` reads the former as its pre-state, so the two
+        // must agree here or the stub would model a page that cannot exist.
+        layoutId: "quad",
+        // null = nothing maximized, which is what `/maximize` reads to decide
+        // whether it is maximizing or restoring.
+        maximizedZone: null,
         assignments: { 0: "tab-a", 1: "tab-b" },
         focusNextZone: rec("zone.focusNextZone", undefined),
         focusPrevZone: rec("zone.focusPrevZone", undefined),
@@ -187,26 +203,51 @@ async function build(): Promise<RealRegistryHarness> {
         handleSaveWorkflow: recAsync("workflow.save", undefined),
         handleBuildPlanFromFile: recAsync("workflow.buildPlan", undefined),
         handleBuildPlanImplementationFromFile: recAsync("workflow.buildPlanImpl", undefined),
-        loadPlanContent: recAsync("workflow.loadPlanContent", ""),
+        // Was stubbed as `""` while the real function returned `void` — the
+        // stub, not the product, is what put `evidence=true` on
+        // `/plan-refresh`'s golden row. Both now report the same shape: what
+        // the reload actually found. `filename: null` is the honest answer
+        // for a fixture with no workspace plan file.
+        loadPlanContent: recAsync("workflow.loadPlanContent", { filename: null, chars: 0 }),
+        rightPanelMode: null,
         setRightPanelMode: rec("workflow.setRightPanelMode", undefined),
+        showSidebar: false,
         setShowSidebar: rec("workflow.setShowSidebar", undefined),
       },
       findingsActions: { handleToggleFindings: rec("findings.toggle", undefined) },
-      analysis: { handleAnalyze: rec("analysis.handleAnalyze", undefined) },
+      // `/analyze` now awaits this and reads the outcome; a metered call that
+      // came back with no panels is no longer a `✓`.
+      analysis: { handleAnalyze: recAsync("analysis.handleAnalyze", { ok: true, panels: 2 }) },
     }),
+    // Every `*Enabled` / `auto*` field below is now READ by a handler as its
+    // observed pre-state, not just written to. They are pinned `false`/`[…]`
+    // so the toggles all run their "was off, turning on" arm, which is the
+    // arm the golden table characterizes.
     useTransitionEffects: () => ({
       autoApprovePatterns: ["armed"],
       setAutoApprovePatterns: rec("effects.setAutoApprovePatterns", undefined),
       autoApproveCount: 0,
+      autoRestart: false,
       autoRestartCount: 0,
       setAutoRestart: rec("effects.setAutoRestart", undefined),
+      desktopNotify: false,
       setDesktopNotify: rec("effects.setDesktopNotify", undefined),
       soundEnabled: false,
       toggleSound: rec("effects.toggleSound", undefined),
+      autoFocusNeedsInput: false,
       toggleAutoFocus: rec("effects.toggleAutoFocus", undefined),
-      handleRestartInZone: rec("effects.handleRestartInZone", undefined),
+      // `/restart` now AWAITS this and reads the outcome. The stub answers
+      // the failure arm, because the canonical fixture's zone-1 session is
+      // `needs-input` and therefore not restartable at all — a `restarted:
+      // true` here would model a transition the fixture cannot reach.
+      handleRestartInZone: recAsync("effects.handleRestartInZone", {
+        restarted: false,
+        reason: "not-restartable",
+      }),
     }),
     useUIStateCx: () => ({
+      // `state` is read by `/shortcuts` and `/focus-mode` as pre-state.
+      state: { showShortcutsOverlay: false, focusMode: false, selectedZones: new Set<number>() },
       dispatch: rec("ui.dispatch", undefined),
       toggleFocusMode: rec("ui.toggleFocusMode", undefined),
     }),
@@ -250,10 +291,38 @@ async function build(): Promise<RealRegistryHarness> {
       { label: "hotmail", config_dir: "/cfg/hotmail", usage_delta: -0.9 },
     ],
     tenantCandidates: ["2299aaaa-0000-4000-8000-000000000001", "acme"],
-    sortZones: rec("ctx.sortZones", undefined),
-    exportAll: rec("ctx.exportAll", undefined),
-    openDocFinder: rec("ctx.openDocFinder", undefined),
-    openPromptModal: rec("ctx.openPromptModal", undefined),
+    /**
+     * `/approve-all`'s delivery path — the stub that makes the count
+     * falsifiable.
+     *
+     * It answers from the SAME `terminalRefs` map the product reads, which in
+     * this fixture is EMPTY. So the canonical run has one waiting tab, zero
+     * mounted handles, and therefore zero deliveries — which is exactly the
+     * situation `handlers.test.ts` used to pin as "`✓` with no PTY reached".
+     * A stub that answered `delivered: tabIds.length` would have re-created
+     * the defect inside the harness meant to catch it.
+     */
+    approveAll: async (...args: unknown[]) => {
+      const tabIds = (args[0] as string[]) ?? [];
+      const refs = terminalRefs as Map<string, { current?: unknown }>;
+      const deliveries = tabIds.map((tabId) => ({
+        tabId,
+        route: refs.get(tabId)?.current ? "mounted" : "by-id",
+        delivered: Boolean(refs.get(tabId)?.current),
+        ...(refs.get(tabId)?.current ? {} : { code: "TERMINAL_WRITE_FAILED" }),
+      }));
+      const report = {
+        targeted: tabIds.length,
+        delivered: deliveries.filter((d) => d.delivered).length,
+        deliveries,
+      };
+      calls.push({ name: "ctx.approveAll", args, evidence: true });
+      return report;
+    },
+    sortZones: rec("ctx.sortZones", { moved: 0, total: 2 }),
+    exportAll: recAsync("ctx.exportAll", { exported: 2, cancelled: false }),
+    openDocFinder: rec("ctx.openDocFinder", { changed: true }),
+    openPromptModal: rec("ctx.openPromptModal", { changed: true }),
     showCard: rec("ctx.showCard", undefined),
   } as never);
 

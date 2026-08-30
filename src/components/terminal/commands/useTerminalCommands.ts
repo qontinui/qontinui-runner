@@ -62,6 +62,8 @@ import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { useOrchestrateCommand } from "./orchestrateCommand";
+import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
+import type { ApprovalReport } from "../approveAll";
 
 /**
  * Inputs that can't be read from the existing React contexts — handed in
@@ -108,36 +110,70 @@ export interface TerminalCommandsContext {
    */
   tenantCandidates: readonly string[];
   /**
+   * Deliver an approval keystroke to the named panes and report what
+   * actually reached a PTY (`../approveAll.ts`).
+   *
+   * This closure exists because the handler could not observe its own effect.
+   * `/approve-all` wrote through
+   * `terminalRefs.current.get(id)?.current?.writeToTerminal("y\r")` and then
+   * counted the tabs it had INTENDED to reach — two optional chains, neither
+   * observed, on the most irreversible command on the page. The count is now
+   * the number of write envelopes that said `success: true`, and the page
+   * supplies a route that works for an unmounted pane instead of silently
+   * skipping it.
+   */
+  approveAll: (tabIds: readonly string[], text: string) => Promise<ApprovalReport>;
+  /**
    * Sort the zone-grid by session state — `needs-input` first, then
    * `error`, then the rest. Mirrors `useZoneActions.handleSortZones`,
    * which is the closure ZoneStatusBar's "Sort Zones" button used.
    * Threaded through here so the registry can fire it without
    * re-importing `useZoneActions`.
+   *
+   * Reports how many zone assignments the sort actually MOVED. A grid that is
+   * already sorted moves nothing, and `/sort-zones` used to render `✓` for it
+   * — a `() => void` closure cannot tell the two apart, which is why the
+   * signature changed rather than the handler.
    */
-  sortZones: () => void;
+  sortZones: () => { moved: number; total: number };
   /**
    * Export every session's transcript to file. Mirrors
    * `useZoneActions.handleExportOutput`, the closure ZoneStatusBar's
    * "Export" button used.
+   *
+   * Reports the number of sessions written, and whether the operator
+   * DISMISSED the save dialog — which the void version rendered as `✓` for an
+   * export that never happened.
    */
-  exportAll: () => void;
+  exportAll: () => Promise<{ exported: number; cancelled: boolean; error?: string }>;
   /**
    * Open the DocFinder modal. Mirrors the closure ZoneStatusBar's
    * "Doc" button used (now lifted into `TerminalPage` so the modal
    * mount and the `/doc-finder` registry action share a single
    * `showDocFinder` state).
+   *
+   * `changed` is false when the modal was ALREADY open — the minimum signal
+   * that distinguishes doing the thing from being in that state already.
    */
-  openDocFinder: () => void;
+  openDocFinder: () => { changed: boolean };
   /**
    * Open the prompt-library modal (`/prompt`). Same lifted-state pattern
    * as `openDocFinder`: `TerminalPage` holds the `showPrompt` state so
    * the modal mount and this registry action share one source of truth.
    */
-  openPromptModal: () => void;
+  openPromptModal: () => { changed: boolean };
   /**
    * Pop a result card. Threaded in from `TerminalPageInner` (which holds
    * the `ResultCardProvider`'s `showCard`). Used by `/metrics` and
    * `/history` to present the ZoneStatusBar popover bodies as a card.
+   *
+   * DELIBERATELY still `void`. `ResultCardContext.showCard` is a bare
+   * `setState` into a provider this page does not own; making it return
+   * `{shown: true}` would be a signal the closure invents about itself, which
+   * is the assertion this phase is removing rather than a fix for it. The two
+   * handlers that use it derive their verdict from the card SPEC they built
+   * instead — a metrics card with no rows reports zero, which is the
+   * observation that actually matters.
    */
   showCard: (spec: ResultCardSpec) => void;
 }
@@ -192,16 +228,6 @@ const SCHEMA = {
   swap: { a: "number (1-based zone index)", b: "number (1-based zone index)" },
 } as const;
 
-/** Helper: build a successful result. */
-function ok<T>(value?: T): CommandResult<T> {
-  return { ok: true, value };
-}
-
-/** Helper: build a failure result with a stable machine code. */
-function fail(code: string, message?: string): CommandResult<never> {
-  return { ok: false, code, message };
-}
-
 /**
  * Turn a spawn closure's return into an HONEST verdict.
  *
@@ -219,6 +245,21 @@ function fail(code: string, message?: string): CommandResult<never> {
  *
  * Exported so the contract is unit-testable without mounting the hook,
  * same split as `resolveZoneTarget` / `resolveTenantArg`.
+ *
+ * It is now a THIN ADAPTER over `deriveVerdict`, which generalizes the five
+ * properties this function pioneered (see `verdict.ts`). The adaptation is
+ * two things and nothing else:
+ *
+ *  - `what` is already PLURAL at all three call sites (`"terminals"`,
+ *    `"AI sessions"`), so it is passed as both singular and plural rather
+ *    than re-pluralised;
+ *  - the success `value` stays the ID ARRAY, not an `EffectReport`. That is
+ *    not stylistic: `TerminalPage.tsx` and `ZoneLayoutPicker.tsx` reach these
+ *    three handlers through `callRegistry<string[]>("terminal.spawn", …)` and
+ *    reshape the ids onto the UI Bridge wire (`{success, tab_ids,
+ *    task_run_ids}`). Swapping the payload for a report would break external
+ *    agents for a nicer status line, which is a bad trade — so `/spawn`
+ *    renders the plain `✓` and the ids stay the contract.
  */
 export function spawnVerdict(
   result: string[] | void,
@@ -226,10 +267,67 @@ export function spawnVerdict(
   what: string = "terminals",
 ): CommandResult<string[]> {
   const ids = Array.isArray(result) ? result : [];
-  if (ids.length < count) {
-    return fail("spawn-failed", `spawned ${ids.length} of ${count} ${what}`);
+  const verdict = deriveVerdict({
+    produced: ids,
+    requested: count,
+    verb: "spawned",
+    noun: what,
+    nounPlural: what,
+    code: "spawn-failed",
+  });
+  return verdict.ok ? ok(ids) : verdict;
+}
+
+/**
+ * Name WHY an approval did not land, from the write envelopes themselves.
+ *
+ * The codes are the ones `terminalWriteResult.ts` distinguishes because their
+ * recoveries differ — `TERMINAL_EXITED` means restart the pane, and
+ * `TERMINAL_WRITE_FAILED` means the pane is live and the IPC failed — so
+ * collapsing them into "some failed" would throw away the only part of the
+ * report the operator can act on.
+ */
+function describeUndelivered(report: ApprovalReport): string {
+  const failed = report.deliveries.filter((d) => !d.delivered);
+  if (failed.length === 0) return "";
+  const byCode = new Map<string, number>();
+  for (const d of failed) {
+    const code = d.code ?? "unknown";
+    byCode.set(code, (byCode.get(code) ?? 0) + 1);
   }
-  return ok(ids);
+  return [...byCode].map(([code, n]) => `${n} ${code}`).join(", ");
+}
+
+/**
+ * How many DATA ROWS a result card actually carries.
+ *
+ * `/metrics` and `/history` are the two commands whose only effect is showing
+ * a card, and `ResultCardContext.showCard` is a bare `setState` that always
+ * succeeds — so the closure has nothing honest to say about itself. What IS
+ * observable is what went into the card: a metrics card built from a page
+ * with no sessions has zero rows, and rendering that identically to a card
+ * with forty is the same false-success shape as everything else in this
+ * phase, one layer up.
+ */
+function countCardRows(spec: ResultCardSpec): number {
+  return (spec.sections ?? []).reduce((n, section) => n + section.rows.length, 0);
+}
+
+/**
+ * `/close`'s report for the one session it closed.
+ *
+ * `closeTerminal` is still `(id: string) => void`, and it is left that way on
+ * purpose: it is called from a dozen places across `ZoneGrid`,
+ * `TerminalTabBar`, the hover actions and the restart path, and widening it
+ * would put a return value nobody reads on all of them. What made `/close`
+ * dishonest was never the void return — it was that the handler did not check
+ * whether the id named anything. It does now (`unknown-tab`, `no-target`,
+ * `zone N has no session`), so by the time this is reached the target has been
+ * OBSERVED to exist in `tabs`, and `affected: 1` is derived from that
+ * observation rather than from the call having returned.
+ */
+function closedOne(tabId: string): EffectReport {
+  return effect("closed", "session", 1, { detail: tabId });
 }
 
 /**
@@ -501,7 +599,12 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     analysis,
   } = session;
   const transitionEffects = useTransitionEffects();
-  const { dispatch: uiDispatch, toggleFocusMode } = useUIStateCx();
+  // `state` is read, not just dispatched into: several handlers below derive
+  // their verdict by comparing the store's CURRENT value against the value
+  // they are about to set. A React reducer cannot be read back synchronously
+  // after a dispatch, so the honest observation is the pre-state — see the
+  // "observed pre-state" note on `/show-shortcuts`.
+  const { state: uiState, dispatch: uiDispatch, toggleFocusMode } = useUIStateCx();
   const { labelsAndTags, metrics: metricsRef, eventHistory } = useZoneMetadata();
 
   /**
@@ -538,17 +641,24 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
           : typeof raw === "string" && /^needs[-_ ]?input$/.test(raw)
             ? "needs-input"
             : raw;
-      if (target === "next") {
-        zoneLayout.focusNextZone();
-        return ok();
-      }
-      if (target === "prev") {
-        zoneLayout.focusPrevZone();
-        return ok();
+      // `focusNextZone` / `focusPrevZone` are `() => void`, but the verdict
+      // does not need them to speak: with fewer than two zones there is
+      // nowhere to move, and that is observable from the layout the handler
+      // already holds. A single-zone grid answering `✓` to `/focus next` was
+      // a no-op rendered as an effect.
+      const zoneCount = zoneLayout.layout.zones.length;
+      if (target === "next" || target === "prev") {
+        if (zoneCount < 2) {
+          return ok(effect("focused", "zone", 0, { detail: `only ${zoneCount} zone in the grid` }));
+        }
+        if (target === "next") zoneLayout.focusNextZone();
+        else zoneLayout.focusPrevZone();
+        return ok(effect("focused", "zone", 1));
       }
       if (target === "needs-input") {
+        // Already honest: `focusNextNeedsInput` returns whether it found one.
         const found = zoneLayout.focusNextNeedsInput(sessionStates);
-        return found ? ok() : fail("none-needs-input");
+        return found ? ok(effect("focused", "zone", 1)) : fail("none-needs-input");
       }
       // D9 — a bare `/focus` used to render `✓` for a no-op. `SCHEMA.focus`
       // declares `target` with NO default (unlike `count`, whose schema
@@ -567,8 +677,15 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const zone = resolveZone({ zone: target ?? args.zone });
       if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
       if (zone.kind === "out-of-range") return fail("out-of-range");
+      // Observed pre-state: focusing the zone that is ALREADY focused is a
+      // no-op, and the operator should be able to see that it was.
+      if (zone.index === zoneLayout.focusedZone) {
+        return ok(
+          effect("focused", "zone", 0, { detail: `zone ${zone.index + 1} was already focused` }),
+        );
+      }
       zoneLayout.setFocusedZone(zone.index);
-      return ok();
+      return ok(effect("focused", "zone", 1));
     },
   });
 
@@ -705,12 +822,33 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Same behavior as Ctrl+Shift+Enter.",
     paramSchema: SCHEMA.empty,
     patterns: [/^approve(?:\s+all)?$/i, /^yes\s+all$/i],
-    handler: async (): Promise<CommandResult<{ approved: number }>> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
       const waiting = tabs.filter((t) => sessionStates[t.id] === "needs-input");
-      for (const tab of waiting) {
-        terminalRefs.current.get(tab.id)?.current?.writeToTerminal("y\r");
-      }
-      return ok({ approved: waiting.length });
+      // The count comes from DELIVERY, not from intent. `ctx.approveAll`
+      // awaits each pane's `TerminalWriteResult` and counts the envelopes
+      // that said the bytes reached a process; see `../approveAll.ts` for why
+      // an unreported write is a failure and is never retried.
+      const report = await ctx.approveAll(
+        waiting.map((t) => t.id),
+        "y\r",
+      );
+      // `requested` is deliberately OMITTED rather than set to
+      // `waiting.length`. A shortfall here is not the operator asking for
+      // something that could not be done — they asked for "all", and "all"
+      // was zero, or was three of which one pane is dead. Failing the whole
+      // command would hide the two approvals that DID land, and there is no
+      // retry that is safe (a second `y\r` answers a prompt nobody read).
+      // So it is a success that states both numbers, and the status line
+      // renders a partial delivery differently from a complete one.
+      return ok(
+        effect("approved", "session", report.delivered, {
+          requested: report.targeted,
+          detail:
+            report.delivered === report.targeted
+              ? undefined
+              : describeUndelivered(report),
+        }),
+      );
     },
   });
 
@@ -728,8 +866,14 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const zone = resolveZone(args);
       if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
       if (zone.kind === "out-of-range") return fail("out-of-range");
+      // A toggle always changes something, so the useful report is WHICH way
+      // it went — `maximized`/`restored` is the distinction the operator is
+      // actually looking for after typing the same command twice.
+      const wasMaximized = zoneLayout.maximizedZone === zone.index;
       zoneLayout.toggleMaximize(zone.index);
-      return ok();
+      return ok(
+        stateEffect(wasMaximized ? "restored" : "maximized", `zone ${zone.index + 1}`, true),
+      );
     },
   });
 
@@ -769,7 +913,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
           return fail("unknown-tab", `"${explicitTabId}" is not an open tab id`);
         }
         closeTerminal(explicitTabId);
-        return ok();
+        return ok(closedOne(explicitTabId));
       }
       const zone = resolveZone(args);
       if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
@@ -781,7 +925,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         if (zone.supplied) return fail("out-of-range");
         if (!activeId) return fail("no-target", "no session to close");
         closeTerminal(activeId);
-        return ok();
+        return ok(closedOne(activeId));
       }
       // A named-but-EMPTY zone must say so rather than closing whatever
       // happens to be active — closing the wrong session is the one
@@ -794,7 +938,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         );
       }
       closeTerminal(tabId);
-      return ok();
+      return ok(closedOne(tabId));
     },
   });
 
@@ -821,8 +965,19 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if (!LAYOUT_IDS.includes(normalized)) {
         return fail("invalid-preset", `preset must be one of: ${LAYOUT_IDS.join(", ")}`);
       }
+      // Observed pre-state. `/layout quad` on a grid that is already quad
+      // called `setLayoutId("quad")` and rendered `✓` — indistinguishable
+      // from a layout that actually moved. `handlers.test.ts` pins that exact
+      // case, and this is the line that changes its answer.
+      // `layoutId` (the STATE `setLayoutId` writes), not `layout.id` (derived,
+      // and synthesized for the past-9 flow grid).
+      if (zoneLayout.layoutId === normalized) {
+        return ok(
+          effect("changed", "layout", 0, { detail: `already ${normalized}` }),
+        );
+      }
       zoneLayout.setLayoutId(normalized);
-      return ok();
+      return ok(effect("changed", "layout", 1, { detail: normalized }));
     },
   });
 
@@ -854,8 +1009,21 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if (state !== "completed" && state !== "error") {
         return fail("not-restartable", `session state is ${state}`);
       }
-      transitionEffects.handleRestartInZone(zone.index);
-      return ok();
+      // AWAITED, and its outcome read. `handleRestartInZone` creates the
+      // replacement terminal first and retires the old pane only once it
+      // exists — so `createTerminal` returning null (the resource gate
+      // refusing below the free-commit floor, or the operator declining the
+      // override) leaves the ORIGINAL pane in place. The un-awaited void call
+      // rendered `✓` for exactly that, which told the operator their errored
+      // session had been replaced when it had not.
+      const restarted = await transitionEffects.handleRestartInZone(zone.index);
+      return deriveVerdict({
+        produced: restarted,
+        requested: 1,
+        verb: "restarted",
+        noun: "session",
+        code: "restart-failed",
+      });
     },
   });
 
@@ -884,12 +1052,24 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if (aIdx < 0 || aIdx >= maxIdx || bIdx < 0 || bIdx >= maxIdx) {
         return fail("out-of-range");
       }
-      if (aIdx === bIdx) return ok();
+      if (aIdx === bIdx) {
+        return ok(effect("swapped", "zone", 0, { detail: "both indices name the same zone" }));
+      }
       const aTabId = zoneLayout.assignments[aIdx];
       const bTabId = zoneLayout.assignments[bIdx];
-      if (aTabId) zoneLayout.assignTabToZone(bIdx, aTabId);
-      if (bTabId) zoneLayout.assignTabToZone(aIdx, bTabId);
-      return ok();
+      // Observed pre-state: `/swap 3 4` between two EMPTY zones calls
+      // `assignTabToZone` zero times and moved nothing, and used to render
+      // the same `✓` as a swap that moved two sessions.
+      let moved = 0;
+      if (aTabId) {
+        zoneLayout.assignTabToZone(bIdx, aTabId);
+        moved += 1;
+      }
+      if (bTabId) {
+        zoneLayout.assignTabToZone(aIdx, bTabId);
+        moved += 1;
+      }
+      return ok(effect("moved", "session", moved));
     },
   });
 
@@ -913,9 +1093,14 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Same as Ctrl+Shift+D and the Eye icon in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^focus[ -]mode$/i, /^toggle\s+focus[ -]mode$/i],
-    handler: async (): Promise<CommandResult> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      // A toggle always changes the flag, so `affected` is always 1; what the
+      // operator needs is WHICH WAY it went, which the observed pre-state
+      // gives. `toggleFocusMode()` is a `dispatch`, which cannot be read back
+      // synchronously — the pre-state is the honest observation available.
+      const wasOn = uiState.focusMode;
       toggleFocusMode();
-      return ok();
+      return ok(stateEffect(wasOn ? "disabled" : "enabled", "focus mode", true));
     },
   });
 
@@ -930,9 +1115,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "needs-input state. Same as Ctrl+Shift+A and the Focus icon in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^auto[ -]focus$/i, /^toggle\s+auto[ -]focus$/i],
-    handler: async (): Promise<CommandResult> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      const wasOn = transitionEffects.autoFocusNeedsInput;
       transitionEffects.toggleAutoFocus();
-      return ok();
+      return ok(stateEffect(wasOn ? "disabled" : "enabled", "auto-focus", true));
     },
   });
 
@@ -952,9 +1138,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Ctrl+Shift+S and the speaker icon in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^toggle\s+sound$/i, /^sound$/i],
-    handler: async (): Promise<CommandResult<{ soundEnabled: boolean }>> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      const wasOn = transitionEffects.soundEnabled;
       transitionEffects.toggleSound();
-      return ok({ soundEnabled: !transitionEffects.soundEnabled });
+      return ok(stateEffect(wasOn ? "muted" : "unmuted", "sound", true));
     },
   });
 
@@ -968,9 +1155,14 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "again leaves the sound muted.",
     paramSchema: SCHEMA.empty,
     patterns: [/^mute$/i],
-    handler: async (): Promise<CommandResult<{ soundEnabled: boolean }>> => {
-      if (transitionEffects.soundEnabled) transitionEffects.toggleSound();
-      return ok({ soundEnabled: false });
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      // The idempotence is the whole point of this action existing separately
+      // from `/sound`, and it is now VISIBLE: a second `/mute` reports
+      // "sound was already muted" rather than the check-mark that made it
+      // indistinguishable from the first.
+      const wasOn = transitionEffects.soundEnabled;
+      if (wasOn) transitionEffects.toggleSound();
+      return ok(stateEffect("muted", "sound", wasOn));
     },
   });
 
@@ -984,9 +1176,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "again leaves the sound on.",
     paramSchema: SCHEMA.empty,
     patterns: [/^unmute$/i],
-    handler: async (): Promise<CommandResult<{ soundEnabled: boolean }>> => {
-      if (!transitionEffects.soundEnabled) transitionEffects.toggleSound();
-      return ok({ soundEnabled: true });
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      const wasOn = transitionEffects.soundEnabled;
+      if (!wasOn) transitionEffects.toggleSound();
+      return ok(stateEffect("unmuted", "sound", !wasOn));
     },
   });
 
@@ -1006,13 +1199,14 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "RefreshCw icon in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^auto[ -]restart$/i, /^toggle\s+auto[ -]restart$/i],
-    handler: async (): Promise<CommandResult> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      const wasOn = transitionEffects.autoRestart;
       transitionEffects.setAutoRestart((prev: boolean) => {
         const next = !prev;
         instanceStorage.setItem("zone-auto-restart", String(next));
         return next;
       });
-      return ok();
+      return ok(stateEffect(wasOn ? "disabled" : "enabled", "auto-restart", true));
     },
   });
 
@@ -1027,9 +1221,15 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "completed. Same as the ArrowUpDown icon in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^sort(?:\s+zones)?$/i],
-    handler: async (): Promise<CommandResult> => {
-      ctx.sortZones();
-      return ok();
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      // `sortZones` now reports how many assignments it MOVED. An
+      // already-sorted grid moves nothing and says so.
+      const { moved, total } = ctx.sortZones();
+      return ok(
+        effect("moved", "zone", moved, {
+          detail: moved === 0 && total > 0 ? "grid was already sorted" : undefined,
+        }),
+      );
     },
   });
 
@@ -1044,9 +1244,16 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Download icon in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^export(?:\s+all)?$/i],
-    handler: async (): Promise<CommandResult> => {
-      ctx.exportAll();
-      return ok();
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      // AWAITED. The void version returned before the save dialog had even
+      // been answered, so success was rendered for an export the operator
+      // went on to cancel -- and for one that threw on write.
+      const out = await ctx.exportAll();
+      if (out.error) return fail("export-failed", out.error);
+      if (out.cancelled) {
+        return ok(effect("exported", "session", 0, { detail: "save dialog dismissed" }));
+      }
+      return ok(effect("exported", "session", out.exported));
     },
   });
 
@@ -1061,9 +1268,14 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "and the Keyboard icon in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^shortcuts$/i, /^keys$/i, /^help$/i],
-    handler: async (): Promise<CommandResult> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      // Observed pre-state. A reducer cannot be read back synchronously after
+      // a dispatch, so "was it already open" is the observation available --
+      // and it is the one that matters, because `SET_SHOW_SHORTCUTS: true` on
+      // an already-open overlay changes nothing at all.
+      const wasOpen = uiState.showShortcutsOverlay;
       uiDispatch({ type: "SET_SHOW_SHORTCUTS", payload: true });
-      return ok();
+      return ok(stateEffect("opened", "the shortcuts overlay", !wasOpen));
     },
   });
 
@@ -1084,9 +1296,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Open/close the SessionManagerPanel — browses Claude Code sessions for resume / inspection.",
     paramSchema: SCHEMA.empty,
     patterns: [/^sessions$/i, /^toggle\s+sessions$/i],
-    handler: async (): Promise<CommandResult> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      const wasOpen = workflowGen.showSidebar;
       workflowGen.setShowSidebar((v: boolean) => !v);
-      return ok();
+      return ok(stateEffect(wasOpen ? "closed" : "opened", "the sessions sidebar", true));
     },
   });
 
@@ -1101,9 +1314,11 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     description: "Open the sessions sidebar (always opens, never closes).",
     paramSchema: SCHEMA.empty,
     patterns: [/^resume$/i],
-    handler: async (): Promise<CommandResult> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      // Force-open, so the honest report is whether it was already open.
+      const wasOpen = workflowGen.showSidebar;
       workflowGen.setShowSidebar(true);
-      return ok();
+      return ok(stateEffect("opened", "the sessions sidebar", !wasOpen));
     },
   });
 
@@ -1117,9 +1332,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Show/hide the findings decisions panel in the right sidebar (drift / quality / regression findings from the active session).",
     paramSchema: SCHEMA.empty,
     patterns: [/^findings$/i, /^toggle\s+findings$/i],
-    handler: async (): Promise<CommandResult> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      const wasOpen = workflowGen.rightPanelMode === "findings";
       findingsActions.handleToggleFindings();
-      return ok();
+      return ok(stateEffect(wasOpen ? "closed" : "opened", "the findings panel", true));
     },
   });
 
@@ -1133,11 +1349,12 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Show/hide the file-ownership heatmap (recent session-touched files) in the right sidebar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^file[- ]ownership$/i, /^files$/i],
-    handler: async (): Promise<CommandResult> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      const wasOpen = workflowGen.rightPanelMode === "file-ownership";
       workflowGen.setRightPanelMode((prev) =>
         prev === "file-ownership" ? null : "file-ownership",
       );
-      return ok();
+      return ok(stateEffect(wasOpen ? "closed" : "opened", "the file-ownership heatmap", true));
     },
   });
 
@@ -1154,13 +1371,14 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Show/hide native desktop notifications when sessions enter needs-input or error states.",
     paramSchema: SCHEMA.empty,
     patterns: [/^desktop[- ]notify$/i, /^notifications$/i],
-    handler: async (): Promise<CommandResult> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      const wasOn = transitionEffects.desktopNotify;
       transitionEffects.setDesktopNotify((prev: boolean) => {
         const next = !prev;
         instanceStorage.setItem("zone-desktop-notify", String(next));
         return next;
       });
-      return ok();
+      return ok(stateEffect(wasOn ? "disabled" : "enabled", "desktop notifications", true));
     },
   });
 
@@ -1174,9 +1392,20 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Reload the workspace's PLAN*.md / TODO*.md file from disk. Useful after editing the plan in another editor while the runner is open.",
     paramSchema: SCHEMA.empty,
     patterns: [/^plan[- ]refresh$/i, /^refresh\s+plan$/i],
-    handler: async (): Promise<CommandResult> => {
-      await workflowGen.loadPlanContent();
-      return ok();
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      // `loadPlanContent` swallowed every failure -- a backend error, and a
+      // workspace with no PLAN*.md at all, both left the check-mark in place.
+      // It now reports what it found.
+      const found = await workflowGen.loadPlanContent();
+      if (found.error) return fail("plan-load-failed", found.error);
+      if (!found.filename) {
+        return ok(
+          effect("reloaded", "plan file", 0, {
+            detail: "no PLAN*.md / TODO*.md in the workspace",
+          }),
+        );
+      }
+      return ok(effect("reloaded", "plan file", 1, { detail: found.filename }));
     },
   });
 
@@ -1202,9 +1431,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       /^auto-approve\s+(?<action>add|remove)\s+(?<pattern>.+)$/i,
       /^auto-approve\s+(?<action>list|clear)$/i,
     ],
-    handler: async (
-      args: Record<string, unknown>,
-    ): Promise<CommandResult<{ patterns: string[] }>> => {
+    handler: async (args: Record<string, unknown>): Promise<CommandResult<EffectReport>> => {
       // D13 — a bare `/auto-approve` used to report `unknown action ""`,
       // which describes an argument the operator supplied as empty. They
       // supplied nothing. `resolveText` is the three-state read that tells
@@ -1219,16 +1446,33 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const action = actionRead.text.toLowerCase();
       const pattern = textArg(args, "pattern");
       const current = transitionEffects.autoApprovePatterns ?? [];
-      if (action === "list") return ok({ patterns: current });
+      // Every arm below derives from a LIST DIFF against the observed current
+      // patterns, not from `setAutoApprovePatterns` having been called. An
+      // auto-approve rule answers `y` on the operator's behalf, so "is one
+      // armed" is the one thing this command must never be vague about.
+      if (action === "list") {
+        return ok(
+          effect("listed", "auto-approve pattern", current.length, {
+            detail: current.length > 0 ? current.join(", ") : undefined,
+          }),
+        );
+      }
       if (action === "clear") {
         transitionEffects.setAutoApprovePatterns([]);
-        return ok({ patterns: [] });
+        return ok(effect("cleared", "auto-approve pattern", current.length));
       }
       if (action === "add") {
         if (!pattern) return fail("invalid-args", "pattern required for add");
-        const next = current.includes(pattern) ? current : [...current, pattern];
+        // Re-adding a pattern that is already armed changes nothing. It used
+        // to render the same success as arming a new one.
+        const already = current.includes(pattern);
+        const next = already ? current : [...current, pattern];
         transitionEffects.setAutoApprovePatterns(next);
-        return ok({ patterns: next });
+        return ok(
+          effect("added", "auto-approve pattern", already ? 0 : 1, {
+            detail: already ? `"${pattern}" was already armed` : `"${pattern}"`,
+          }),
+        );
       }
       if (action === "remove") {
         if (!pattern) return fail("invalid-args", "pattern required for remove");
@@ -1243,7 +1487,11 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         }
         const next = current.filter((p) => p !== pattern);
         transitionEffects.setAutoApprovePatterns(next);
-        return ok({ patterns: next });
+        return ok(
+          effect("removed", "auto-approve pattern", current.length - next.length, {
+            detail: `"${pattern}"`,
+          }),
+        );
       }
       return fail("invalid-args", `unknown action "${action}"`);
     },
@@ -1267,7 +1515,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       state: 'string — one of "idle", "working", "needs-input", "completed", "error"',
     },
     patterns: [/^select(?:-by-state)?\s+(?<state>idle|working|needs[-_ ]?input|completed|error)$/i],
-    handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+    handler: async (args: Record<string, unknown>): Promise<CommandResult<EffectReport>> => {
       const raw = textArg(args, "state").toLowerCase();
       const state = /^needs[-_ ]?input$/.test(raw) ? "needs-input" : raw;
       const valid = ["idle", "working", "needs-input", "completed", "error"];
@@ -1281,7 +1529,12 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         }
       }
       uiDispatch({ type: "SET_SELECTED_ZONES", payload: zones });
-      return ok({ count: zones.size });
+      // The count was already computed here and already correct -- it was the
+      // RENDERER that threw it away and printed a bare check-mark, so
+      // `/select-by-state error` on a grid with no errors read exactly like
+      // one that selected five zones. Same number, reported in the shape the
+      // status line can render.
+      return ok(effect("selected", "zone", zones.size, { detail: state }));
     },
   });
 
@@ -1297,7 +1550,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "the selected tags.",
     paramSchema: { tag: "string (tag name; case-sensitive match against zone labels)" },
     patterns: [/^tag\s+(?<tag>\S+)$/i, /^filter-tag\s+(?<tag>\S+)$/i],
-    handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+    handler: async (args: Record<string, unknown>): Promise<CommandResult<EffectReport>> => {
       const tag = textArg(args, "tag").trim();
       if (!tag) return fail("invalid-args", "tag required");
       // Now that `activeTagFilters` actually narrows the grid, a filter on
@@ -1313,13 +1566,19 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
             : `"${tag}" is not a zone tag (have: ${labelsAndTags.allTags.join(", ")})`,
         );
       }
+      // Observed pre-state: which WAY the filter went is the whole verdict
+      // here, because both directions are legal and the grid looks very
+      // different afterwards.
+      const wasActive = labelsAndTags.activeTagFilters.has(tag);
       labelsAndTags.setActiveTagFilters((prev) => {
         const next = new Set(prev);
         if (next.has(tag)) next.delete(tag);
         else next.add(tag);
         return next;
       });
-      return ok();
+      return ok(
+        stateEffect(wasActive ? "cleared" : "applied", `tag filter "${tag}"`, true),
+      );
     },
   });
 
@@ -1334,9 +1593,14 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "ZoneStatusBar when one or more tag filters are active.",
     paramSchema: SCHEMA.empty,
     patterns: [/^tag-clear$/i, /^tags?-clear$/i, /^clear-tags?$/i],
-    handler: async (): Promise<CommandResult> => {
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      // The named no-op from `handlers.test.ts`: clearing an ALREADY-empty
+      // filter set called the setter and reported the same success as
+      // clearing three live filters. Legitimately a no-op rather than an
+      // error -- so it reports zero and the status line renders it neutrally.
+      const cleared = labelsAndTags.activeTagFilters.size;
       labelsAndTags.setActiveTagFilters(new Set());
-      return ok();
+      return ok(effect("cleared", "tag filter", cleared));
     },
   });
 
@@ -1406,7 +1670,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     patterns: [
       /^analyze\s+(?<type>session-summary|architecture|change-impact|progress|cross-tab|page-architecture)$/i,
     ],
-    handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+    handler: async (args: Record<string, unknown>): Promise<CommandResult<EffectReport>> => {
       const raw = textArg(args, "type").toLowerCase();
       const valid = [
         "session-summary",
@@ -1419,8 +1683,13 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if (!(valid as readonly string[]).includes(raw)) {
         return fail("invalid-args", `type must be one of: ${valid.join(", ")}`);
       }
-      analysis.handleAnalyze(raw as (typeof valid)[number]);
-      return ok();
+      // AWAITED, and its outcome read. This is a COSTLY action: every type
+      // fans out to a metered Claude call, and `handleAnalyze` swallowed both
+      // of its failure arms into React state the handler could not see -- so
+      // an analysis that came back empty, or errored, still rendered success.
+      const outcome = await analysis.handleAnalyze(raw as (typeof valid)[number]);
+      if (outcome && !outcome.ok) return fail("analysis-failed", outcome.message);
+      return ok(effect("produced", "analysis panel", outcome?.panels ?? 0, { detail: raw }));
     },
   });
 
@@ -1484,9 +1753,8 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Same as the Doc button in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^docs?$/i, /^doc-finder$/i],
-    handler: async (): Promise<CommandResult> => {
-      ctx.openDocFinder();
-      return ok();
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      return ok(stateEffect("opened", "the doc finder", ctx.openDocFinder().changed));
     },
   });
 
@@ -1505,9 +1773,8 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "insert it into an open session, or copy it.",
     paramSchema: SCHEMA.empty,
     patterns: [/^prompts?$/i, /^prompt[- ]library$/i],
-    handler: async (): Promise<CommandResult> => {
-      ctx.openPromptModal();
-      return ok();
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      return ok(stateEffect("opened", "the prompt library", ctx.openPromptModal().changed));
     },
   });
 
@@ -1523,9 +1790,12 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "time-in-state, top keywords). Same as the chart icon in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^(?:metrics|stats)$/i],
-    handler: async (): Promise<CommandResult> => {
-      ctx.showCard(
-        buildMetricsCardSpec({
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      // `showCard` stays void on purpose (see `TerminalCommandsContext`), so
+      // the verdict comes from the SPEC this handler built instead: a card
+      // with no rows is a card with nothing in it, and that is what the
+      // operator needs to know.
+      const spec = buildMetricsCardSpec({
           metrics: metricsRef.current,
           sessionStates,
           tabs,
@@ -1538,9 +1808,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
           assignments: zoneLayout.assignments,
           zoneLabels: labelsAndTags.zoneLabels,
           stateDurations: getTerminalHotStore(pageId).getField("stateDurations"),
-        }),
-      );
-      return ok();
+      });
+      ctx.showCard(spec);
+      return ok(effect("showed", "metric", countCardRows(spec)));
     },
   });
 
@@ -1556,9 +1826,12 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Same as the clock icon in ZoneStatusBar.",
     paramSchema: SCHEMA.empty,
     patterns: [/^(?:history|events)$/i],
-    handler: async (): Promise<CommandResult> => {
-      ctx.showCard(buildHistoryCardSpec(eventHistory ?? []));
-      return ok();
+    handler: async (): Promise<CommandResult<EffectReport>> => {
+      // Same shape as `/metrics`: an empty event history used to render the
+      // identical success as a page with forty transitions on it.
+      const spec = buildHistoryCardSpec(eventHistory ?? []);
+      ctx.showCard(spec);
+      return ok(effect("showed", "event", countCardRows(spec)));
     },
   });
 

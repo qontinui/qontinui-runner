@@ -8,6 +8,19 @@
 
 export type { CommandAction, CommandResult, RegistryListener, ResolverContext } from "./types";
 
+export {
+  countOf,
+  deriveVerdict,
+  describeReport,
+  effect,
+  fail,
+  isEffectReport,
+  ok,
+  pluralize,
+  stateEffect,
+} from "./verdict";
+export type { DeriveVerdictInput, EffectReport } from "./verdict";
+
 export { getAll, getById, getBySlash, register, subscribe, unregister } from "./registry";
 
 export { useCommandAction } from "./useCommandAction";

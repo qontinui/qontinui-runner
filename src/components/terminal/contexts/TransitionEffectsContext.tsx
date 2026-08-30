@@ -15,8 +15,22 @@ import { getTerminalHotStore } from "../terminalHotStore";
 
 type TransitionEffectsReturn = ReturnType<typeof useStateTransitionEffects>;
 
+/**
+ * What a restart attempt actually did.
+ *
+ * `handleRestartInZone` has three exits and the void signature made all three
+ * look alike to a caller: the zone was not in a restartable state, the
+ * replacement terminal failed to spawn (the resource gate refuses below the
+ * free-commit floor, and the operator can decline the override), or the swap
+ * completed. The middle one leaves the ORIGINAL errored pane in place, and
+ * `/restart` rendered success for it.
+ */
+export type RestartOutcome =
+  | { restarted: true; tabId: string; retiredTabId: string | null }
+  | { restarted: false; reason: "not-restartable" | "spawn-failed"; state?: string };
+
 export interface TransitionEffectsContextValue extends TransitionEffectsReturn {
-  handleRestartInZone: (zoneIdx: number) => void;
+  handleRestartInZone: (zoneIdx: number) => Promise<RestartOutcome>;
   handleRestartInZoneRef: React.MutableRefObject<(zoneIdx: number) => void>;
 }
 
@@ -78,11 +92,13 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
    * would lose the only evidence of what went wrong.
    */
   const handleRestartInZone = useCallback(
-    async (zoneIdx: number) => {
+    async (zoneIdx: number): Promise<RestartOutcome> => {
       const oldTabId = zoneLayout.assignments[zoneIdx];
       const oldTab = tabs.find((t) => t.id === oldTabId);
       const state = oldTabId ? (stateTracking.sessionStates[oldTabId] ?? "idle") : "idle";
-      if (state !== "completed" && state !== "error") return;
+      if (state !== "completed" && state !== "error") {
+        return { restarted: false, reason: "not-restartable", state };
+      }
       const label = labelsAndTags.zoneLabels[zoneIdx];
       const tabId = await createTerminal(
         oldTab?.title ? `${oldTab.title} (2)` : undefined,
@@ -99,7 +115,12 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
         if (oldTabId) {
           closeTerminal(oldTabId);
         }
+        return { restarted: true, tabId, retiredTabId: oldTabId ?? null };
       }
+      // `createTerminal` returned nothing: the replacement never existed, so
+      // the old pane was deliberately NOT retired. Saying so is the whole
+      // point of this return type.
+      return { restarted: false, reason: "spawn-failed" };
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [

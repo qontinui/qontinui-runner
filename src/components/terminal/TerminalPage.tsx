@@ -15,6 +15,7 @@ import { DocFinderModal } from "./DocFinderModal";
 import { PromptModal } from "./PromptModal";
 import { usePromptLibrary } from "./usePromptLibrary";
 import { usePromptLibraryCommands } from "./commands/usePromptLibraryCommands";
+import { deliverApprovals } from "./approveAll";
 import { writeToTerminalById } from "./writeToTerminalById";
 import { buildSessionCloseRecord } from "./useTerminalManager";
 import { buildTerminalSessionRoster } from "./terminalSessionRoster";
@@ -1138,9 +1139,18 @@ function TerminalPageInner({
   // dynamic `/<slug>` action below.
   const promptLibrary = usePromptLibrary();
 
-  const openPromptModal = (focusSlug?: string) => {
+  /**
+   * Open the prompt-library modal, and report whether that CHANGED anything.
+   *
+   * `changed` is false when the modal was already open — the minimum signal
+   * that lets `/prompt` distinguish doing the thing from being in that state
+   * already, which a `() => void` structurally cannot.
+   */
+  const openPromptModal = (focusSlug?: string): { changed: boolean } => {
     setPromptFocusSlug(focusSlug ?? null);
+    const wasOpen = showPrompt;
     setShowPrompt(true);
+    return { changed: !wasOpen };
   };
 
   // Spawn a fresh AI session with the rendered prompt auto-typed. Account
@@ -1204,14 +1214,35 @@ function TerminalPageInner({
     return subscribeActiveProject(consume);
   }, []);
 
+  /**
+   * `/approve-all`'s delivery path.
+   *
+   * The handler used to write through
+   * `terminalRefs.current.get(id)?.current?.writeToTerminal("y\r")` and then
+   * count the tabs it INTENDED to reach. Both optional chains are silent, and
+   * a pane with no mounted `TerminalInstance` — the normal state for an
+   * offscreen flow-grid zone — was skipped without a trace. `deliverApprovals`
+   * awaits each write envelope and falls through to the mount-independent
+   * `terminal_write` route when there is no handle, so the count is deliveries
+   * rather than intentions and an offscreen pane is actually approvable.
+   */
+  const approveAll = (tabIds: readonly string[], text: string) =>
+    deliverApprovals(tabIds, terminalRefs.current, text);
+
   useTerminalCommands({
     spawnPlain: handleQuickLaunch,
     spawnAi: handleLaunchAiSession,
     accounts: spawnAccounts,
     tenantCandidates,
+    approveAll,
     sortZones: handleSortZones,
     exportAll: handleExportOutput,
-    openDocFinder: () => setShowDocFinder(true),
+    // `changed: false` when the modal is already open — see `openPromptModal`.
+    openDocFinder: () => {
+      const wasOpen = showDocFinder;
+      setShowDocFinder(true);
+      return { changed: !wasOpen };
+    },
     openPromptModal: () => openPromptModal(),
     showCard,
   });

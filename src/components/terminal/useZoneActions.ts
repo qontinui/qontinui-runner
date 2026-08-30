@@ -149,7 +149,17 @@ export function useZoneActions({
     ],
   );
 
-  const handleSortZones = useCallback(() => {
+  /**
+   * Reorder zones by session state, and report how many assignments MOVED.
+   *
+   * It used to be `() => void`, which made `/sort-zones` structurally unable
+   * to tell an operator whether anything happened: a grid that is already
+   * sorted -- the common case, since the sort is idempotent -- rendered the
+   * same success as one that moved five sessions. The `moved` count is a
+   * comparison of the pre-existing assignment against the one written, so it
+   * is observed rather than asserted.
+   */
+  const handleSortZones = useCallback((): { moved: number; total: number } => {
     const STATE_PRIORITY: Record<SessionState, number> = {
       "needs-input": 0,
       error: 1,
@@ -166,19 +176,36 @@ export function useZoneActions({
       .sort((a, b) => a.priority - b.priority);
 
     const sortedTabIds = entries.map((e) => e.tabId);
+    let moved = 0;
     for (let i = 0; i < sortedTabIds.length; i++) {
+      if (zoneLayout.assignments[i] !== sortedTabIds[i]) moved += 1;
       zoneLayout.assignTabToZone(i, sortedTabIds[i]);
     }
+    return { moved, total: sortedTabIds.length };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [zoneLayout.assignments, zoneLayout.assignTabToZone, stateTracking.sessionStates]);
 
-  const handleExportOutput = useCallback(async () => {
+  /**
+   * Export every session's output, and report what actually reached disk.
+   *
+   * The three outcomes were previously indistinguishable to a caller: the
+   * operator DISMISSING the save dialog returned early, and a failed
+   * `writeTextFile` was caught and turned into a notification -- both leaving
+   * a `() => void` that `/export-all` rendered as success. The notification
+   * is kept (it is the button's feedback channel); the return value is what
+   * the command surface needs.
+   */
+  const handleExportOutput = useCallback(async (): Promise<{
+    exported: number;
+    cancelled: boolean;
+    error?: string;
+  }> => {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const filePath = await save({
       defaultPath: `session-output-${timestamp}.txt`,
       filters: [{ name: "Text Files", extensions: ["txt"] }],
     });
-    if (!filePath) return;
+    if (!filePath) return { exported: 0, cancelled: true };
 
     const lines: string[] = [];
     lines.push(`Session Output Export — ${new Date().toLocaleString()}`);
@@ -213,14 +240,21 @@ export function useZoneActions({
       }
     }
 
+    // Count the sessions whose output is actually in the file: every assigned
+    // zone whose tab still exists, plus the unassigned ones written above.
+    const exported =
+      Object.values(zoneLayout.assignments).filter((tabId) =>
+        tabs.some((t) => t.id === tabId),
+      ).length + unassigned.length;
+
     try {
       await writeTextFile(filePath, lines.join("\n"));
       setNotification({ message: `Exported to ${filePath}`, type: "success" });
+      return { exported, cancelled: false };
     } catch (err) {
-      setNotification({
-        message: `Export failed: ${err instanceof Error ? err.message : String(err)}`,
-        type: "error",
-      });
+      const message = err instanceof Error ? err.message : String(err);
+      setNotification({ message: `Export failed: ${message}`, type: "error" });
+      return { exported: 0, cancelled: false, error: message };
     }
   }, [
     tabs,

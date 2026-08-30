@@ -75,6 +75,18 @@ export interface Outcome extends Binding {
    *   - `"threw"`       — handler threw
    */
   verdict: string;
+  /**
+   * The handler's `CommandResult.value` on a successful run.
+   *
+   * Added when effects started reporting: `ok` is no longer the interesting
+   * half of a verdict. `/approve-all` answering `ok` says nothing; it
+   * answering `ok` with `{affected: 0, requested: 1}` is the finding. A spec
+   * that can only see the verdict string cannot tell a no-op from an effect,
+   * which is the exact blindness this whole phase is removing from the
+   * OPERATOR — leaving it in the harness would be the same defect one layer
+   * down.
+   */
+  value?: unknown;
 }
 
 /**
@@ -148,7 +160,11 @@ export async function run(
   const action = lookup(b.actionId);
   try {
     const result = await action.handler(b.args ?? {}, { source: "slash" });
-    return { ...b, verdict: result.ok ? "ok" : `error:${result.code}` };
+    return {
+      ...b,
+      verdict: result.ok ? "ok" : `error:${result.code}`,
+      value: result.ok ? result.value : undefined,
+    };
   } catch {
     return { ...b, verdict: "threw" };
   }

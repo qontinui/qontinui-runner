@@ -34,6 +34,10 @@ import { textArg } from "./parse";
 import { resolveRecipe } from "./recipes";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { useCommandAction } from "./useCommandAction";
+// One `ok`/`fail`, not three. The three copies had already drifted — this
+// file's `ok<T>` took a value while `usePromptLibraryCommands`'s took none,
+// so a prompt action structurally could not report anything about itself.
+import { fail, ok } from "./verdict";
 
 /** The `Run` row returned by `start_orchestration_run` (serde snake_case). */
 interface OrchestrationRun {
@@ -63,16 +67,6 @@ export interface TerminalOpenPageDetail {
   pageId: string;
   /** Human-readable tab label. */
   name: string;
-}
-
-/** Build a successful result. */
-function ok<T>(value?: T): CommandResult<T> {
-  return { ok: true, value };
-}
-
-/** Build a failure result with a stable machine code. */
-function fail(code: string, message?: string): CommandResult<never> {
-  return { ok: false, code, message };
 }
 
 /**
