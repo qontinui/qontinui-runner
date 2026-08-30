@@ -812,8 +812,80 @@ pub async fn acquire_for_terminal(
             wd,
             crate::coord_mcp::resolve_bound_api_port(),
         );
+        // The fleet COMMANDS and SKILLS belong at this same chokepoint, for the
+        // same reason coord-mcp does: they are per-session cwd artifacts, and
+        // PROJECT-scoped skills and commands resolve only from the cwd `claude`
+        // was launched in (`<cwd>/.claude/commands/*.md`,
+        // `<cwd>/.claude/skills/<name>/SKILL.md`). A user-scoped `~/.claude`
+        // also resolves, but most fleet devices have none.
+        //
+        // They were wired into the AGENT spawn paths only (`agent_runtime`
+        // x2, `looping_agent_supervisor`). centralize-coord-mcp-provisioning
+        // ADDED this chokepoint for coord-mcp's terminal coverage (it did not
+        // replace those agent-path calls, which still stand) — and the
+        // commands/skills provisioning never followed. So an interactive session
+        // (operator tab, HTTP /terminals, tauri proxy, backend relay) got a
+        // working `.mcp.json` and NO skills. On a device with no
+        // `qontinui-claude-config` checkout that leaves the session with no
+        // `.claude/skills` at all, which is precisely the floor
+        // `fleet_skills` exists to provide: `/coord-revive` — the documented
+        // first step out of a stale coord-mcp proxy key, and the one named by
+        // `coord_mcp::PROXY_KEY_RECOVERY_HINT` — was unresolvable in exactly
+        // the sessions most likely to need it.
+        //
+        // Both are fail-soft, so neither can abort an otherwise-launchable
+        // spawn. Note "idempotent" in their docs means UNCONDITIONAL OVERWRITE,
+        // not "writes only when it would change something" — which is exactly
+        // why the guard below is needed.
+        //
+        // GUARDED, unlike the three agent-path call sites. Those target a fresh
+        // agent worktree or an agent-private home dir, where an unconditional
+        // overwrite is correct and wanted. THIS chokepoint can resolve to an
+        // arbitrary operator cwd — including `qontinui-claude-config`, which
+        // TRACKS 124 paths under `.claude/` and is the upstream these bundled
+        // bodies were copied from. Provisioning there would overwrite the
+        // canonical hand-authored sources with the binary's (older) snapshot,
+        // and `dirty.rs` counts a tracked ` M ` line as dirty — so the repo
+        // would also be dirty-from-birth and pinned out of every pull.
+        //
+        // `.claude/` cannot be handled the way `.mcp.json` is: `fleet.rs`'s
+        // MANAGED_REPO_EXCLUDES roster forbids adding it, because excluding it
+        // would hide an operator's intended new `.claude/commands/*.md` from
+        // `git status`. So the guard lives here instead.
+        if claude_tree_is_repo_authored(wd) {
+            info!(
+                workdir = %wd,
+                "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo                  authors its own skills/commands and the bundle must not clobber them"
+            );
+        } else {
+            crate::fleet_commands::provision_fleet_commands_for_session(wd);
+            crate::fleet_skills::provision_fleet_skills_for_session(wd);
+        }
     }
     out
+}
+
+/// Does `workdir` track its own `.claude/` tree in git?
+///
+/// The non-clobber predicate for fleet provisioning, and the sibling of
+/// `coord_mcp::coord_mcp_safe_to_write` — the guard the neighbouring
+/// `provision_coord_mcp_for_session` call spent a plan acquiring, applied to
+/// the artifact family that needs it for the same reason.
+///
+/// TRUE means "this repo authors these files; leave them alone". Only a clean
+/// `git ls-files -- .claude` that actually names a path counts: a non-repo cwd
+/// (exit 128), an absent `.claude/`, or no `git` on PATH all yield FALSE, which
+/// is the provisioning arm — correctly, since none of those can have a tracked
+/// file to destroy.
+fn claude_tree_is_repo_authored(workdir: &str) -> bool {
+    if !Path::new(workdir).join(".claude").is_dir() {
+        return false;
+    }
+    std::process::Command::new("git")
+        .args(["-C", workdir, "ls-files", "--", ".claude"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// Read the device UUID from `~/.qontinui/machine.json`. Accepts the
@@ -885,6 +957,59 @@ impl IsolatedEditContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+    }
+
+    /// The blocker this guard exists for: `qontinui-claude-config` TRACKS its
+    /// `.claude/` tree, and the bundled bodies differ from it (measured: 18
+    /// files). Provisioning there would overwrite the canonical hand-authored
+    /// sources with the binary's older snapshot.
+    #[test]
+    fn tracked_claude_tree_is_recognized_as_repo_authored() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@t"]);
+        git(root, &["config", "user.name", "t"]);
+        std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
+        std::fs::write(root.join(".claude/commands/policy.md"), b"canonical").unwrap();
+        git(root, &["add", ".claude"]);
+        git(root, &["commit", "-qm", "track .claude"]);
+
+        assert!(
+            claude_tree_is_repo_authored(root.to_str().unwrap()),
+            "a repo that tracks .claude/ must be left alone"
+        );
+    }
+
+    /// The provisioning arm must still fire on the case the feature exists for:
+    /// a device with no `qontinui-claude-config` checkout, whose session cwd has
+    /// no `.claude/` at all.
+    #[test]
+    fn absent_or_untracked_claude_tree_is_provisionable() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path();
+        // (a) no .claude/ at all, not even a repo
+        assert!(!claude_tree_is_repo_authored(root.to_str().unwrap()));
+
+        // (b) a repo whose .claude/ exists but is untracked — ours from a prior
+        //     provision, so a refresh on runner upgrade is correct.
+        git(root, &["init", "-q"]);
+        std::fs::create_dir_all(root.join(".claude/skills")).unwrap();
+        std::fs::write(root.join(".claude/skills/x.md"), b"ours").unwrap();
+        assert!(
+            !claude_tree_is_repo_authored(root.to_str().unwrap()),
+            "an untracked .claude/ is the runner's own and may be refreshed"
+        );
+    }
 
     /// Build a `(MaterializedWorktree, worktree-kind ActiveClaim)` pair for
     /// `repo`, with the claim keyed on the SAME canonical-path resource_key
