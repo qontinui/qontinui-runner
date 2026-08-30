@@ -3296,7 +3296,11 @@ impl TerminalSession {
                 cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
                 // Floored, unlike the joins: an exhausted budget may skip a
                 // thread join, but it must never skip the kill — that would
-                // leak the whole PTY child tree.
+                // leak the whole PTY child tree. Bounding it at all is what
+                // `close_all()` needs: it walks EVERY live terminal on
+                // shutdown (138 were live during the 2026-08-30 wedge), so an
+                // unbounded taskkill is a per-terminal blocked thread at
+                // exactly the moment the process is trying to exit.
                 let budget =
                     std::cmp::max(clamp_to_deadline(TASKKILL_TIMEOUT, deadline), KILL_FLOOR);
                 if let Ok(None) = crate::drain::output_with_timeout(cmd, budget) {

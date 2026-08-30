@@ -422,7 +422,8 @@ impl OneshotLlm for OneshotClaudeApiWarm {
         let join_result = tauri::async_runtime::spawn_blocking(move || {
             // Counted for the wedge diagnostics' blocking-pool saturation figure.
             // `tauri::async_runtime::spawn_blocking` delegates to tokio's pool, so an
-            // uncounted body here would make "N/512 slots in use" undercount.
+            // uncounted body is invisible to `tracked_blocking_bodies`, which is
+            // already only a LOWER bound — so it can only push it further down.
             let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
             super::claude_api_warm::run_claude_api_warm_with_structured_output(
                 &system,
@@ -552,7 +553,8 @@ impl OneshotLlm for OneshotClaudeApi {
         let join_result = tauri::async_runtime::spawn_blocking(move || {
             // Counted for the wedge diagnostics' blocking-pool saturation figure.
             // `tauri::async_runtime::spawn_blocking` delegates to tokio's pool, so an
-            // uncounted body here would make "N/512 slots in use" undercount.
+            // uncounted body is invisible to `tracked_blocking_bodies`, which is
+            // already only a LOWER bound — so it can only push it further down.
             let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
             super::claude_api::run_claude_api_with_structured_output(
                 &prompt,
@@ -678,7 +680,8 @@ impl OneshotLlm for OneshotGeminiApi {
         let join_result = tauri::async_runtime::spawn_blocking(move || {
             // Counted for the wedge diagnostics' blocking-pool saturation figure.
             // `tauri::async_runtime::spawn_blocking` delegates to tokio's pool, so an
-            // uncounted body here would make "N/512 slots in use" undercount.
+            // uncounted body is invisible to `tracked_blocking_bodies`, which is
+            // already only a LOWER bound — so it can only push it further down.
             let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
             super::gemini_api::run_gemini_api_with_structured_output(
                 &prompt,
@@ -817,7 +820,8 @@ impl OneshotLlm for OneshotLocal {
         let join_result = tauri::async_runtime::spawn_blocking(move || {
             // Counted for the wedge diagnostics' blocking-pool saturation figure.
             // `tauri::async_runtime::spawn_blocking` delegates to tokio's pool, so an
-            // uncounted body here would make "N/512 slots in use" undercount.
+            // uncounted body is invisible to `tracked_blocking_bodies`, which is
+            // already only a LOWER bound — so it can only push it further down.
             let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
             super::gemma_local_warm::run_gemma_local_warm_with_structured_output(
                 &augmented_system,

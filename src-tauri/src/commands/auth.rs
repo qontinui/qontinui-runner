@@ -694,7 +694,8 @@ pub async fn set_runner_tier(tier: String) -> Result<SetRunnerTierResult, String
     let result = tauri::async_runtime::spawn_blocking(move || {
         // Counted for the wedge diagnostics' blocking-pool saturation figure.
         // `tauri::async_runtime::spawn_blocking` delegates to tokio's pool, so an
-        // uncounted body here would make "N/512 slots in use" undercount.
+        // uncounted body is invisible to `tracked_blocking_bodies`, which is
+        // already only a LOWER bound — so it can only push it further down.
         let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
         if is_secondary {
             // NOT a no-op any more: actually apply the tier for this process.

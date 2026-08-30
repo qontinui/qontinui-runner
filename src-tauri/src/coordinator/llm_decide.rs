@@ -173,7 +173,8 @@ pub(crate) async fn maybe_decide_with_llm(
     let join_result = tauri::async_runtime::spawn_blocking(move || {
         // Counted for the wedge diagnostics' blocking-pool saturation figure.
         // `tauri::async_runtime::spawn_blocking` delegates to tokio's pool, so an
-        // uncounted body here would make "N/512 slots in use" undercount.
+        // uncounted body is invisible to `tracked_blocking_bodies`, which is
+        // already only a LOWER bound — so it can only push it further down.
         let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
         claude_api_warm::run_claude_api_warm_with_structured_output(
             &system_prefix,

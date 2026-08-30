@@ -45,49 +45,180 @@
 //! behind — a thread leak triggered by the very condition being reported.
 
 use serde::Serialize;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Blocking-pool saturation counter
+// Tracked blocking-body counter
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Bodies currently EXECUTING on tokio's blocking pool, counted by
-/// [`spawn_blocking_tracked`].
-///
-/// Queued-but-not-yet-started tasks are deliberately not counted: a blocking
-/// pool slot is consumed by a running body, and saturation is exactly the state
-/// where every slot is running. Counting the queue would report a number the
-/// 512 ceiling cannot be compared against.
-static BLOCKING_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Distinct spawning-thread names given their own counter, plus one overflow
+/// lane. Small on purpose: the lanes are a fixed array of atomics read by the
+/// watchdog thread without a lock, and this process has a handful of runtimes,
+/// not a handful of hundreds.
+pub const MAX_BLOCKING_LANES: usize = 15;
 
-/// Tokio's **documented default** `max_blocking_threads`.
+/// Index of the catch-all lane. Everything past [`MAX_BLOCKING_LANES`] distinct
+/// thread names lands here rather than being dropped, so the total stays honest
+/// even when the breakdown cannot.
+const OVERFLOW_LANE: usize = MAX_BLOCKING_LANES;
+
+const TOTAL_LANES: usize = MAX_BLOCKING_LANES + 1;
+
+/// Key reported for the overflow lane.
+pub const OVERFLOW_LANE_NAME: &str = "<other-threads>";
+
+/// Key reported for a thread with no name.
+pub const UNNAMED_LANE_NAME: &str = "<unnamed-thread>";
+
+/// In-flight tracked bodies, **one counter per spawning-thread name**.
 ///
-/// This is the default, NOT a measured value. Nothing in this crate builds the
-/// application runtime with an explicit `max_blocking_threads` — the only two
-/// call sites are the deliberately-tiny fixtures in `health_monitor`'s own
-/// tests — so the app runtime runs on tokio's default of 512. If a
-/// `max_blocking_threads(..)` is ever added to the real runtime builder, this
+/// A single process-global counter would be a category error, and the record it
+/// fed was one: this process runs several INDEPENDENT tokio runtimes, each with
+/// its own blocking pool and its own `max_blocking_threads` ceiling. Verified in
+/// this crate, not assumed — the app's Tauri runtime (nothing ever calls
+/// `tauri::async_runtime::set`), the dedicated multi-thread `fleet-pub-rt` built
+/// in `main.rs` for the tree publisher / census / reclaim callers, the
+/// `fleet-heartbeat` current-thread runtime, and a further set of short-lived
+/// `new_current_thread` runtimes (`cognito`, `embedded_pg`, `env_agent`, `pair`,
+/// `agent_commands`, the CLI binaries). Summing their in-flight bodies into one
+/// number and printing it over ONE runtime's 512-slot ceiling produces readings
+/// that are not merely coarse but false in both directions: a genuinely
+/// saturated Tauri pool reads as `472/512` ("fine") once 40 bodies are charged
+/// to `fleet-pub-rt`, and two healthy pools at 300 and 250 read as `550/512`, an
+/// over-saturation that cannot happen.
+static LANE_COUNTS: [AtomicUsize; TOTAL_LANES] = [const { AtomicUsize::new(0) }; TOTAL_LANES];
+
+/// Lane name for each occupied index, published once and never changed.
+///
+/// `OnceLock` so the READ side — which runs on the watchdog thread during a
+/// wedge — takes no lock at all. Registration is the only writer and happens at
+/// most once per thread.
+static LANE_NAMES: [OnceLock<String>; TOTAL_LANES] = [const { OnceLock::new() }; TOTAL_LANES];
+
+/// Serialises lane ALLOCATION only. Never taken on the read path, and never
+/// taken twice by the same thread — a thread resolves its lane once and caches
+/// the index.
+static LANE_REGISTRATION: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// This thread's lane index, resolved on first use.
+    static MY_LANE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Find (or claim) the lane for `name`.
+///
+/// Cold path: at most once per thread. The unlocked scan is the common case
+/// once the lanes have filled; the lock covers the claim so two threads racing
+/// on the same new name cannot take two lanes for it.
+fn register_lane(name: &str) -> usize {
+    for (i, slot) in LANE_NAMES.iter().enumerate().take(MAX_BLOCKING_LANES) {
+        match slot.get() {
+            Some(n) if n == name => return i,
+            Some(_) => continue,
+            // Lanes fill in order under the lock, so the first empty one means
+            // "not registered yet" — fall through to claim it.
+            None => break,
+        }
+    }
+    let _guard = LANE_REGISTRATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (i, slot) in LANE_NAMES.iter().enumerate().take(MAX_BLOCKING_LANES) {
+        match slot.get() {
+            Some(n) if n == name => return i,
+            Some(_) => continue,
+            None => {
+                let _ = slot.set(name.to_string());
+                return i;
+            }
+        }
+    }
+    OVERFLOW_LANE
+}
+
+/// The calling thread's lane, cached in a thread-local after the first call.
+///
+/// Falls back to the overflow lane rather than panicking when the thread-local
+/// is already destroyed (a body charged during thread teardown), because nothing
+/// on this path may ever make a sick process sicker.
+fn current_thread_lane() -> usize {
+    let resolve = || {
+        let current = std::thread::current();
+        match current.name() {
+            Some(n) => register_lane(n),
+            None => register_lane(UNNAMED_LANE_NAME),
+        }
+    };
+    MY_LANE
+        .try_with(|cell| match cell.get() {
+            Some(i) => i,
+            None => {
+                let i = resolve();
+                cell.set(Some(i));
+                i
+            }
+        })
+        .unwrap_or(OVERFLOW_LANE)
+}
+
+/// Tokio's **documented default** `max_blocking_threads`, **per runtime**.
+///
+/// This is the default, NOT a measured value, and it is a PER-RUNTIME ceiling —
+/// every runtime in the process gets its own pool of this size. Nothing in this
+/// crate builds a *production* runtime with an explicit `max_blocking_threads`;
+/// the only call sites are deliberately-tiny test fixtures, which is a claim
+/// worth re-checking rather than trusting, and the way to re-check it is
+/// `rg 'max_blocking_threads' src/` — never a count written down here, because a
+/// count in a comment goes stale silently and an enumeration invites a reader to
+/// trust it. If one is ever added to a runtime the app actually runs on, this
 /// constant must be read from the same place instead of restated here.
 pub const BLOCKING_POOL_DEFAULT_CAPACITY: usize = 512;
 
-/// RAII counter for one in-flight blocking body.
+/// RAII counter for one in-flight tracked blocking body.
 ///
 /// A guard rather than a manual decrement so a body that panics still gives its
-/// slot back during unwind — a leaked count would make the saturation figure
-/// climb monotonically and report a wedge that is not there.
+/// slot back during unwind — a leaked count would make the figure climb
+/// monotonically and report a wedge that is not there.
+///
+/// `#[must_use]`: the whole mechanism is "hold the guard for the duration of the
+/// body", and `let _ = BlockingSlot::enter();` drops it immediately and counts
+/// nothing. Every current call site binds `_slot` correctly; the attribute is
+/// what stops the next one from silently not doing so.
+#[must_use = "a BlockingSlot counts its body only while it is HELD — bind it \
+              (`let _slot = ...`), never `let _ = ...`, which drops it at once \
+              and counts nothing"]
 pub struct BlockingSlot {
-    _private: (),
+    lane: usize,
 }
 
 impl BlockingSlot {
-    /// Take a slot. Held until dropped.
+    /// Take a slot, charged to the CALLING thread's lane. Held until dropped.
+    ///
+    /// Called directly (rather than through [`spawn_blocking_tracked`]) from
+    /// bodies already inside a `tokio::task::spawn_blocking` closure. There the
+    /// calling thread is a blocking-pool thread, which tokio names from the
+    /// owning runtime's `thread_name` — so the lane still identifies the right
+    /// runtime.
     pub fn enter() -> Self {
-        BLOCKING_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
-        Self { _private: () }
+        Self::enter_lane(current_thread_lane())
+    }
+
+    /// Take a slot charged to an explicit lane.
+    ///
+    /// [`spawn_blocking_tracked`] resolves the lane on the SPAWNING thread and
+    /// carries it into the body: that thread is the one whose runtime's pool the
+    /// body was handed to, and for a `new_current_thread` runtime (whose pool
+    /// threads carry tokio's default name) it is the only place that identity is
+    /// still visible.
+    fn enter_lane(lane: usize) -> Self {
+        LANE_COUNTS[lane].fetch_add(1, Ordering::SeqCst);
+        Self { lane }
     }
 }
 
@@ -95,40 +226,87 @@ impl Drop for BlockingSlot {
     fn drop(&mut self) {
         // `fetch_update` rather than `fetch_sub`: a saturating floor at 0 means
         // a hypothetical unbalanced drop can never wrap to `usize::MAX` and
-        // publish a nonsense "18446744073709551615/512 slots in use".
-        let _ = BLOCKING_IN_FLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+        // publish a nonsense 18446744073709551615.
+        let _ = LANE_COUNTS[self.lane].fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             Some(n.saturating_sub(1))
         });
     }
 }
 
 /// Drop-in replacement for [`tokio::task::spawn_blocking`] that counts the
-/// body while it runs.
+/// body while it runs, charged to the spawning thread's lane.
 ///
 /// Tokio exposes blocking-pool depth only through `RuntimeMetrics`, which needs
 /// the `tokio_unstable` cfg — not enabled here, and (per the plan's Phase 5
 /// non-goal for the shipped build) not something to enable for a metric. This
-/// wrapper is the lightweight substitute: it makes
-/// `"N/512 blocking-pool slots in use"` a fact the watchdog can state directly
-/// instead of a number the reader has to infer from a total thread count.
+/// wrapper is the lightweight substitute. What it is NOT is a measurement of
+/// pool occupancy: see [`TrackedBlockingBodies`] for exactly what the number it
+/// feeds does and does not mean.
+///
+/// `#[track_caller]`, matching `tokio::task::spawn_blocking`'s own attribute.
+/// Without it every one of this crate's several hundred call sites reports THIS
+/// file's line in the "there is no reactor running" panic, erasing the single
+/// datum that identifies the real site.
+#[track_caller]
 pub fn spawn_blocking_tracked<F, R>(f: F) -> tokio::task::JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    // Resolved HERE, on the caller's thread — not inside the closure, which runs
+    // on a pool thread whose name is tokio's default for every
+    // `new_current_thread` runtime in the process and would merge them all into
+    // one indistinguishable bucket.
+    let lane = current_thread_lane();
     tokio::task::spawn_blocking(move || {
-        let _slot = BlockingSlot::enter();
+        let _slot = BlockingSlot::enter_lane(lane);
         f()
     })
 }
 
-/// Blocking bodies executing right now. Never blocks; a plain atomic load.
-pub fn blocking_pool_in_flight() -> usize {
-    BLOCKING_IN_FLIGHT.load(Ordering::SeqCst)
+/// Tracked bodies executing right now, summed across every lane. Never blocks;
+/// a handful of atomic loads.
+///
+/// A **lower bound** on blocking-pool pressure, not a measurement of it — see
+/// [`TrackedBlockingBodies`].
+pub fn tracked_blocking_in_flight() -> usize {
+    LANE_COUNTS.iter().map(|c| c.load(Ordering::SeqCst)).sum()
 }
 
-/// The blocking pool's slot ceiling. See [`BLOCKING_POOL_DEFAULT_CAPACITY`].
-pub fn blocking_pool_capacity() -> usize {
+/// Tracked bodies executing right now, keyed by the thread that charged them.
+///
+/// Empty lanes are omitted: a zero carries no information and every byte on this
+/// line is a byte a human reads during an incident.
+pub fn tracked_blocking_by_thread() -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for (i, slot) in LANE_NAMES.iter().enumerate().take(MAX_BLOCKING_LANES) {
+        let n = LANE_COUNTS[i].load(Ordering::SeqCst);
+        if n == 0 {
+            continue;
+        }
+        match slot.get() {
+            Some(name) => {
+                out.insert(name.clone(), n);
+            }
+            None => {
+                // A lane counted before its name was published cannot happen
+                // (registration sets the name before the index is returned), but
+                // losing the count would be worse than naming it vaguely.
+                *out.entry(OVERFLOW_LANE_NAME.to_string()).or_insert(0) += n;
+            }
+        }
+    }
+    let overflow = LANE_COUNTS[OVERFLOW_LANE].load(Ordering::SeqCst);
+    if overflow > 0 {
+        *out.entry(OVERFLOW_LANE_NAME.to_string()).or_insert(0) += overflow;
+    }
+    out
+}
+
+/// The PER-RUNTIME blocking-pool slot ceiling. See
+/// [`BLOCKING_POOL_DEFAULT_CAPACITY`] — and note that it is not a ceiling on
+/// [`tracked_blocking_in_flight`], which sums across runtimes.
+pub fn per_runtime_blocking_pool_capacity() -> usize {
     BLOCKING_POOL_DEFAULT_CAPACITY
 }
 
@@ -182,8 +360,19 @@ pub struct ChildProcess {
     pub name: String,
     /// Seconds since the child started.
     pub elapsed_secs: u64,
-    /// Approximate CPU share. Derived from a single `sysinfo` refresh, so it is
-    /// coarse by construction — a shape indicator, not a measurement.
+    /// Percent of ONE core, measured over
+    /// [`CPU_SAMPLE_INTERVAL`] — so >100 is possible for a multi-threaded child.
+    ///
+    /// This is a real sample, not a single-refresh artefact. `sysinfo`'s
+    /// `cpu_usage()` is a time DIFF and needs the process refreshed twice: on
+    /// Linux one refresh returns exactly `0.0` for every process
+    /// (`unix/linux/process.rs` short-circuits while `old_utime == old_stime ==
+    /// 0`), and on Windows it diffs against zeroed counters and yields
+    /// process-lifetime CPU over system-uptime CPU — a child pinning a core for
+    /// ten seconds on a box up for five days reads as ~0.0. Both are the same
+    /// defect: the field could not distinguish a spinning child from an idle
+    /// one, which is the ONLY question a wedge record wants it for.
+    /// [`capture_child_census`] therefore refreshes twice.
     pub cpu_percent: f32,
 }
 
@@ -203,20 +392,89 @@ pub struct ChildCensus {
     pub oldest: Vec<ChildProcess>,
 }
 
-/// Blocking-pool occupancy at the moment of the escalation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct BlockingPoolSnapshot {
-    pub in_flight: usize,
-    pub capacity: usize,
+/// The prose the record carries about its own headline number.
+///
+/// On the wire, in the record, on every line — not only in this source file.
+/// The file is an append-only evidence sink read during an incident, often by
+/// someone who has never opened this module; the one thing it must not do is let
+/// a low number be read as "the pool is healthy".
+pub const TRACKED_BLOCKING_WHAT: &str = "lower bound. Counts only bodies routed \
+    through spawn_blocking_tracked/BlockingSlot, summed across EVERY tokio runtime \
+    in this process (each has its own pool and its own capacity, so the total is \
+    NOT comparable to any single capacity). Untracked consumers take real slots \
+    and are invisible here, so a low number is never evidence of a healthy pool.";
+
+/// Blocking-pool consumers this counter cannot see, named on the wire.
+///
+/// Not decoration. `tokio::fs::*` has 85 call sites across 15 files in this
+/// crate and every one of them occupies a real blocking-pool slot; so does
+/// `tokio::process`'s stdio and child reaping. A pool exhausted by `tokio::fs`
+/// against a hung network drive would report a LOW tracked figure — the failure
+/// direction that hides the wedge. The reader is told this in the record rather
+/// than being left to infer it.
+pub const UNTRACKED_POOL_CONSUMERS: &[&str] = &[
+    "tokio::fs::*",
+    "tokio::process (stdio + child reaping)",
+    "any spawn_blocking not routed through this module",
+];
+
+/// Tracked blocking bodies in flight at the moment of the escalation.
+///
+/// **What this is.** A lower bound on how many blocking-pool slots this process
+/// is holding, broken down by the thread that charged each body.
+///
+/// **What it is emphatically not.** It is not blocking-pool occupancy, for two
+/// independent reasons, and the field names say so because the previous shape —
+/// `{"in_flight": N, "capacity": 512}` — said the opposite:
+///
+/// 1. **It spans runtimes.** The process runs several independent tokio
+///    runtimes; `512` is ONE runtime's ceiling. Summing across pools and
+///    printing the sum over one ceiling yields readings that are false in both
+///    directions (see [`LANE_COUNTS`]). Hence `by_spawning_thread`, and a
+///    capacity field named for what it actually is.
+/// 2. **It is a lower bound.** Only bodies routed through this module are
+///    counted; see [`UNTRACKED_POOL_CONSUMERS`].
+///
+/// So the record can prove PRESSURE (a lane at or near 512 is real saturation)
+/// and can never prove HEALTH. That asymmetry is the whole point, and it is
+/// stated on the wire in [`TRACKED_BLOCKING_WHAT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrackedBlockingBodies {
+    /// [`TRACKED_BLOCKING_WHAT`] — the record explaining itself.
+    pub what: &'static str,
+    /// Sum of every lane. Explicitly named `all_runtimes` so it cannot be read
+    /// as one pool's occupancy.
+    pub tracked_in_flight_all_runtimes: usize,
+    /// Tracked bodies keyed by the name of the thread that charged them — the
+    /// closest available proxy for "which runtime's pool this went to", since
+    /// tokio publishes no stable runtime identity without `tokio_unstable`.
+    /// Tokio names a runtime's worker AND blocking threads from the same
+    /// `thread_name`, so `fleet-pub-rt` is the dedicated publisher runtime and
+    /// `tokio-runtime-worker` is a runtime that did not set one. Threads with
+    /// no name appear as `<unnamed-thread>`; past [`MAX_BLOCKING_LANES`]
+    /// distinct names the rest aggregate into `<other-threads>` rather than
+    /// being lost.
+    pub by_spawning_thread: BTreeMap<String, usize>,
+    /// Tokio's default `max_blocking_threads` — **per runtime**. Each lane above
+    /// is compared against THIS; the total is not.
+    pub per_runtime_pool_capacity_default: usize,
+    /// [`UNTRACKED_POOL_CONSUMERS`].
+    pub untracked_pool_consumers: &'static [&'static str],
 }
 
-impl BlockingPoolSnapshot {
-    /// Read the live counters. Two atomic loads — cannot block, so it needs no
-    /// deadline of its own.
+impl TrackedBlockingBodies {
+    /// Read the live counters. A handful of atomic loads and one small map
+    /// build — cannot block, so it needs no deadline of its own.
     pub fn sample() -> Self {
+        let by_spawning_thread = tracked_blocking_by_thread();
         Self {
-            in_flight: blocking_pool_in_flight(),
-            capacity: blocking_pool_capacity(),
+            what: TRACKED_BLOCKING_WHAT,
+            // Summed from the same lanes the breakdown was built from, so the
+            // total and the map can never disagree with each other.
+            tracked_in_flight_all_runtimes: by_spawning_thread.values().sum(),
+            by_spawning_thread,
+            per_runtime_pool_capacity_default: per_runtime_blocking_pool_capacity(),
+            untracked_pool_consumers: UNTRACKED_POOL_CONSUMERS,
         }
     }
 }
@@ -236,7 +494,7 @@ pub struct WedgeDiagnosticRecord {
     /// measured on a monotonic clock. Not `failures × nominal interval`.
     pub unresponsive_for_secs: u64,
     pub unresponsive_for_ms: u64,
-    pub blocking_pool: BlockingPoolSnapshot,
+    pub tracked_blocking_bodies: TrackedBlockingBodies,
     pub threads: Captured<ThreadCensus>,
     pub children: Captured<ChildCensus>,
 }
@@ -287,6 +545,15 @@ pub const MAX_CHILDREN_LISTED: usize = 10;
 
 /// Distinct child names kept in the frequency tally per record.
 pub const MAX_CHILD_NAMES: usize = 12;
+
+/// Gap between the two `sysinfo` refreshes the child census needs to produce a
+/// CPU figure at all.
+///
+/// `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL` is the crate's own documented floor —
+/// sampling faster than it returns a meaningless diff — so it is read from
+/// `sysinfo` rather than guessed at here. It is a fraction of the
+/// [`CAPTURE_STEP_DEADLINE_SECS`] budget the child step runs under.
+pub const CPU_SAMPLE_INTERVAL: Duration = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
 
 /// Is `name` one of our rolled diagnostics files?
 ///
@@ -529,15 +796,35 @@ pub fn capture_thread_census() -> Option<ThreadCensus> {
 /// gives name, start time and CPU in one pass on every platform. The Windows
 /// thread census below cannot use it only because `sysinfo` has no per-thread
 /// API at all.
-pub fn capture_child_census() -> Option<ChildCensus> {
+/// **Two refreshes, deliberately.** See [`ChildProcess::cpu_percent`]: one
+/// refresh cannot produce a CPU figure at all. The pause between them is
+/// `sysinfo`'s own documented minimum and costs
+/// [`CPU_SAMPLE_INTERVAL`], which sits comfortably inside this step's
+/// [`CAPTURE_STEP_DEADLINE_SECS`] budget — and it is paid on the capture WORKER
+/// thread, under that deadline, never on the watchdog thread.
+/// Enumerate this process's direct children, **uncapped and unsorted**.
+///
+/// Split out from [`capture_child_census`] so a test can assert on the CPU
+/// sampling itself rather than on the capped `oldest` projection. That
+/// distinction is not academic: `oldest` keeps only the
+/// [`MAX_CHILDREN_LISTED`] oldest children, so a freshly-spawned child is the
+/// FIRST thing the cap discards — a test that spawns one and then looks for it
+/// in `oldest` passes when the process happens to have few children and fails
+/// under a full test run, which is the worst kind of flake.
+fn collect_children() -> Vec<ChildProcess> {
     use sysinfo::{ProcessesToUpdate, System};
 
     let me = sysinfo::Pid::from_u32(std::process::id());
     let mut sys = System::new();
+    // First refresh: establishes the baseline CPU counters. Every `cpu_usage()`
+    // read against it alone would be 0.0 (Linux) or a lifetime-vs-uptime ratio
+    // (Windows).
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    std::thread::sleep(CPU_SAMPLE_INTERVAL);
+    // Second refresh: `cpu_usage()` is now a real diff over the interval.
     sys.refresh_processes(ProcessesToUpdate::All, true);
 
-    let mut kids: Vec<ChildProcess> = sys
-        .processes()
+    sys.processes()
         .values()
         .filter(|p| p.parent() == Some(me))
         .map(|p| ChildProcess {
@@ -546,7 +833,11 @@ pub fn capture_child_census() -> Option<ChildCensus> {
             elapsed_secs: p.run_time(),
             cpu_percent: p.cpu_usage(),
         })
-        .collect();
+        .collect()
+}
+
+pub fn capture_child_census() -> Option<ChildCensus> {
+    let mut kids = collect_children();
 
     let total = kids.len();
     let mut by_name: BTreeMap<String, usize> = BTreeMap::new();
@@ -733,6 +1024,15 @@ mod windows_thread_census {
 
         for _ in 0..MAX_PROCESSES_WALKED {
             if offset.checked_add(proc_size)? > len {
+                return None;
+            }
+            // The reference below requires 8-byte alignment (`base` is a
+            // `Vec<u64>` cast down, so `offset` alone decides). The kernel always
+            // 8-aligns `NextEntryOffset`, so this is not reachable today — but
+            // "not reachable" here is INHERITED from the kernel, and a corrupt
+            // offset would create a misaligned reference, which is UB rather
+            // than a wrong answer. One check makes the guarantee local.
+            if !offset.is_multiple_of(core::mem::align_of::<SystemProcessInformation>()) {
                 return None;
             }
             let spi = &*(base.add(offset) as *const SystemProcessInformation);
@@ -928,10 +1228,10 @@ impl WedgeDiagnostics {
         consecutive_failures: u32,
         unresponsive_for: Duration,
     ) -> WedgeDiagnosticRecord {
-        // Read the pool counters FIRST. Two atomic loads that cannot block, so
-        // the saturation figure describes the moment of the escalation rather
-        // than the moment the last enumeration happened to finish.
-        let blocking_pool = BlockingPoolSnapshot::sample();
+        // Read the lane counters FIRST. Atomic loads that cannot block, so the
+        // figure describes the moment of the escalation rather than the moment
+        // the last enumeration happened to finish.
+        let tracked_blocking_bodies = TrackedBlockingBodies::sample();
 
         let threads = match self.capturer.capture(CaptureStep::Threads) {
             Ok(StepOutput::Threads(Some(c))) => Captured::Value(c),
@@ -953,7 +1253,7 @@ impl WedgeDiagnostics {
             consecutive_failures,
             unresponsive_for_secs: unresponsive_for.as_secs(),
             unresponsive_for_ms: unresponsive_for.as_millis().min(u64::MAX as u128) as u64,
-            blocking_pool,
+            tracked_blocking_bodies,
             threads,
             children,
         }
@@ -1024,6 +1324,24 @@ fn unsupported_or_failed() -> &'static str {
     }
 }
 
+/// The build script, compiled into the LIBRARY's test binary.
+///
+/// `cargo test` never compiles a build script in test mode — Cargo builds it as
+/// its own crate, runs it, and throws the binary away — so a `#[cfg(test)] mod
+/// tests` inside `build.rs` is text no CI run ever executes. Pulling the file in
+/// here with `#[path]` is what makes `guard_tokio_console_cfg`'s flag parsing
+/// actually tested: the guard's entire value is that it fires on exactly the
+/// wrong invocations and on no correct one, and it shipped rejecting
+/// `--cfg=tokio_unstable`, a spelling rustc accepts.
+///
+/// `build.rs`'s `main` is `#[cfg(not(test))]` for this reason: it is the one item
+/// that reaches for `tauri_build`, which is a build-dependency the library cannot
+/// resolve. Everything else in the file is plain `std`.
+#[cfg(test)]
+#[path = "../build.rs"]
+#[allow(dead_code)]
+mod build_script;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1041,13 +1359,13 @@ mod tests {
     #[test]
     fn a_tracked_blocking_body_increments_and_decrements() {
         let _g = POOL_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let before = blocking_pool_in_flight();
+        let before = tracked_blocking_in_flight();
         {
             let _slot = BlockingSlot::enter();
-            assert_eq!(blocking_pool_in_flight(), before + 1);
+            assert_eq!(tracked_blocking_in_flight(), before + 1);
         }
         assert_eq!(
-            blocking_pool_in_flight(),
+            tracked_blocking_in_flight(),
             before,
             "the slot was not returned on drop"
         );
@@ -1060,14 +1378,14 @@ mod tests {
     #[test]
     fn a_panicking_blocking_body_still_returns_its_slot() {
         let _g = POOL_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let before = blocking_pool_in_flight();
+        let before = tracked_blocking_in_flight();
         let r = std::panic::catch_unwind(|| {
             let _slot = BlockingSlot::enter();
             panic!("boom");
         });
         assert!(r.is_err(), "the fixture must actually panic");
         assert_eq!(
-            blocking_pool_in_flight(),
+            tracked_blocking_in_flight(),
             before,
             "a panicking body leaked its blocking-pool slot"
         );
@@ -1081,7 +1399,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let before = blocking_pool_in_flight();
+        let before = tracked_blocking_in_flight();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<usize>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         // `rt.enter()` rather than `block_on(async { .. })`: an async block whose
@@ -1091,7 +1409,7 @@ mod tests {
         let handle = {
             let _guard = rt.enter();
             spawn_blocking_tracked(move || {
-                let _ = entered_tx.send(blocking_pool_in_flight());
+                let _ = entered_tx.send(tracked_blocking_in_flight());
                 let _ = release_rx.recv();
             })
         };
@@ -1103,14 +1421,169 @@ mod tests {
             before + 1,
             "the body did not hold a slot while it was executing"
         );
+        // ...and it is charged to the SPAWNING thread's lane, not the pool
+        // thread's. That is the whole point of resolving the lane before the
+        // closure: a `new_current_thread` runtime's pool threads all carry
+        // tokio's default name, so charging at execution time would merge every
+        // such runtime into one indistinguishable bucket.
+        let spawner = std::thread::current()
+            .name()
+            .unwrap_or(UNNAMED_LANE_NAME)
+            .to_string();
+        assert_eq!(
+            tracked_blocking_by_thread().get(&spawner).copied(),
+            Some(1),
+            "the body was not charged to the thread that spawned it; lanes: {:?}",
+            tracked_blocking_by_thread()
+        );
+
         let _ = release_tx.send(());
         rt.block_on(handle).expect("join");
-        assert_eq!(blocking_pool_in_flight(), before);
+        assert_eq!(tracked_blocking_in_flight(), before);
+        assert!(
+            !tracked_blocking_by_thread().contains_key(&spawner),
+            "a finished body left its lane occupied"
+        );
+    }
+
+    /// Two threads, two lanes. The defect this replaces was a single global
+    /// counter summed across every runtime in the process and printed over ONE
+    /// runtime's 512-slot ceiling — a reading that is false in both directions.
+    #[test]
+    fn bodies_from_different_threads_land_in_different_lanes() {
+        let _g = POOL_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let mut joins = Vec::new();
+        let mut releases = Vec::new();
+        for name in ["lane-fixture-alpha", "lane-fixture-beta"] {
+            let entered = entered_tx.clone();
+            // One release channel per fixture: an `mpsc::Receiver` is not
+            // cloneable, and a shared one would let either thread take the other
+            // thread's wake-up.
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            releases.push(release_tx);
+            joins.push(
+                std::thread::Builder::new()
+                    .name(name.to_string())
+                    .spawn(move || {
+                        let _slot = BlockingSlot::enter();
+                        let _ = entered.send(());
+                        let _ = release_rx.recv();
+                    })
+                    .expect("spawn a named fixture thread"),
+            );
+        }
+        for _ in 0..2 {
+            entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("both fixture bodies must start");
+        }
+
+        let lanes = tracked_blocking_by_thread();
+        assert_eq!(
+            lanes.get("lane-fixture-alpha").copied(),
+            Some(1),
+            "lanes: {lanes:?}"
+        );
+        assert_eq!(
+            lanes.get("lane-fixture-beta").copied(),
+            Some(1),
+            "lanes: {lanes:?}"
+        );
+
+        for r in &releases {
+            let _ = r.send(());
+        }
+        for j in joins {
+            j.join().expect("fixture thread");
+        }
+        let lanes = tracked_blocking_by_thread();
+        assert!(
+            !lanes.contains_key("lane-fixture-alpha"),
+            "lanes: {lanes:?}"
+        );
+        assert!(!lanes.contains_key("lane-fixture-beta"), "lanes: {lanes:?}");
+    }
+
+    /// `#[track_caller]` must actually PROPAGATE, not merely be written down.
+    ///
+    /// `tokio::task::spawn_blocking` carries the attribute, so without it on the
+    /// wrapper every one of this crate's several hundred call sites reports this
+    /// file's line in the "there is no reactor running" panic — losing the one
+    /// datum that identifies the real site. Asserting on the recorded panic
+    /// LOCATION is the only way to prove the chain holds; a source-level check
+    /// that the attribute is present would pass even if tokio dropped its own.
+    ///
+    /// Neuter check: delete `#[track_caller]` from `spawn_blocking_tracked` and
+    /// this fails with the wrapper's own line number.
+    #[test]
+    fn spawn_blocking_tracked_blames_its_caller_not_this_module() {
+        let _g = POOL_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let seen: std::sync::Arc<std::sync::Mutex<Option<(String, u32)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = seen.clone();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(loc) = info.location() {
+                // Only OUR panic: another test panicking on purpose in a
+                // different file must not overwrite the observation.
+                if loc.file().ends_with("wedge_diagnostics.rs") {
+                    *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((loc.file().to_string(), loc.line()));
+                }
+            }
+        }));
+
+        // No runtime is entered here, so `spawn_blocking` panics with
+        // "there is no reactor running".
+        let call_line = line!() + 2;
+        let caught = std::panic::catch_unwind(|| {
+            spawn_blocking_tracked(|| ());
+        });
+        std::panic::set_hook(previous);
+
+        assert!(caught.is_err(), "the fixture must actually panic");
+        let (file, line) = seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("the panic hook recorded no location");
+        assert!(
+            file.ends_with("wedge_diagnostics.rs"),
+            "unexpected panic file {file}"
+        );
+        assert_eq!(
+            line, call_line,
+            "the panic was blamed on line {line} instead of the CALL SITE at line \
+             {call_line} — #[track_caller] is not propagating, so all of this crate's \
+             spawn_blocking_tracked call sites would report this module's line instead \
+             of their own"
+        );
     }
 
     #[test]
-    fn the_capacity_is_tokios_documented_default() {
-        assert_eq!(blocking_pool_capacity(), 512);
+    fn the_per_runtime_capacity_is_tokios_documented_default() {
+        assert_eq!(per_runtime_blocking_pool_capacity(), 512);
+    }
+
+    /// Past [`MAX_BLOCKING_LANES`] distinct names the breakdown degrades into an
+    /// explicit `<other-threads>` bucket — it never silently drops a body, which
+    /// would understate exactly the pressure the record exists to show.
+    #[test]
+    fn the_overflow_lane_keeps_the_total_honest() {
+        let _g = POOL_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let before = tracked_blocking_in_flight();
+        let slots: Vec<BlockingSlot> = (0..3)
+            .map(|_| BlockingSlot::enter_lane(OVERFLOW_LANE))
+            .collect();
+        assert_eq!(tracked_blocking_in_flight(), before + 3);
+        let lanes = tracked_blocking_by_thread();
+        assert!(
+            lanes.get(OVERFLOW_LANE_NAME).copied().unwrap_or(0) >= 3,
+            "the overflow bucket did not report its bodies: {lanes:?}"
+        );
+        drop(slots);
+        assert_eq!(tracked_blocking_in_flight(), before);
     }
 
     // ---- the record's wire shape (pure: no threads, no clock) ----
@@ -1123,9 +1596,20 @@ mod tests {
             consecutive_failures: 3,
             unresponsive_for_secs: 4093,
             unresponsive_for_ms: 4_093_500,
-            blocking_pool: BlockingPoolSnapshot {
-                in_flight: 512,
-                capacity: 512,
+            // Deliberately the incident's own shape: a saturated Tauri pool
+            // AND a second runtime holding bodies of its own. Under the old
+            // single-counter/single-ceiling schema this rendered as
+            // `{"in_flight":512,"capacity":512}` — a number that is simply not
+            // true of either pool.
+            tracked_blocking_bodies: TrackedBlockingBodies {
+                what: TRACKED_BLOCKING_WHAT,
+                tracked_in_flight_all_runtimes: 552,
+                by_spawning_thread: BTreeMap::from([
+                    ("fleet-pub-rt".to_string(), 40),
+                    ("tokio-runtime-worker".to_string(), 512),
+                ]),
+                per_runtime_pool_capacity_default: 512,
+                untracked_pool_consumers: UNTRACKED_POOL_CONSUMERS,
             },
             threads: Captured::Value(ThreadCensus {
                 total: 540,
@@ -1160,8 +1644,22 @@ mod tests {
         assert_eq!(v["event"], "escalate");
         assert_eq!(v["consecutive_failures"], 3);
         assert_eq!(v["unresponsive_for_secs"], 4093);
-        assert_eq!(v["blocking_pool"]["in_flight"], 512);
-        assert_eq!(v["blocking_pool"]["capacity"], 512);
+        assert_eq!(
+            v["tracked_blocking_bodies"]["tracked_in_flight_all_runtimes"],
+            552
+        );
+        assert_eq!(
+            v["tracked_blocking_bodies"]["by_spawning_thread"]["tokio-runtime-worker"],
+            512
+        );
+        assert_eq!(
+            v["tracked_blocking_bodies"]["by_spawning_thread"]["fleet-pub-rt"],
+            40
+        );
+        assert_eq!(
+            v["tracked_blocking_bodies"]["per_runtime_pool_capacity_default"],
+            512
+        );
         assert_eq!(v["threads"]["total"], 540);
         assert_eq!(v["threads"]["by_wait_reason"]["UserRequest"], 528);
         assert_eq!(v["children"]["total"], 324);
@@ -1175,19 +1673,92 @@ mod tests {
     /// struct definition happens to say next month.
     #[test]
     fn the_wire_format_is_pinned() {
-        assert_eq!(
-            render_record(&fixture_record()),
-            concat!(
-                r#"{"ts":"2026-08-30T12:00:00+00:00","pid":4242,"event":"escalate","#,
-                r#""consecutive_failures":3,"unresponsive_for_secs":4093,"#,
-                r#""unresponsive_for_ms":4093500,"#,
-                r#""blocking_pool":{"in_flight":512,"capacity":512},"#,
-                r#""threads":{"total":540,"by_wait_reason":{"Executive":12,"UserRequest":528}},"#,
-                r#""children":{"total":324,"by_name":{"git.exe":324},"#,
-                r#""oldest":[{"pid":9001,"name":"git.exe","elapsed_secs":4000,"#,
-                r#""cpu_percent":0.0}]}}"#,
-                "\n"
-            )
+        // The two self-describing fields are spliced in from their constants
+        // rather than retyped: pinning the PROSE here would make every wording
+        // fix a two-file edit, while pinning the field names and their ORDER —
+        // which is what a downstream reader or tool binds to — is the contract
+        // that actually matters.
+        let what = serde_json::to_string(TRACKED_BLOCKING_WHAT).expect("what");
+        let untracked = serde_json::to_string(UNTRACKED_POOL_CONSUMERS).expect("untracked");
+        let expected = String::new()
+            + r#"{"ts":"2026-08-30T12:00:00+00:00","pid":4242,"event":"escalate","#
+            + r#""consecutive_failures":3,"unresponsive_for_secs":4093,"#
+            + r#""unresponsive_for_ms":4093500,"#
+            + r#""tracked_blocking_bodies":{"what":"#
+            + &what
+            + r#","tracked_in_flight_all_runtimes":552,"#
+            + r#""by_spawning_thread":{"fleet-pub-rt":40,"tokio-runtime-worker":512},"#
+            + r#""per_runtime_pool_capacity_default":512,"untracked_pool_consumers":"#
+            + &untracked
+            + r#"},"#
+            + r#""threads":{"total":540,"by_wait_reason":{"Executive":12,"UserRequest":528}},"#
+            + r#""children":{"total":324,"by_name":{"git.exe":324},"#
+            + r#""oldest":[{"pid":9001,"name":"git.exe","elapsed_secs":4000,"#
+            + r#""cpu_percent":0.0}]}}"#
+            + "\n";
+        assert_eq!(render_record(&fixture_record()), expected);
+    }
+
+    /// **The headline number must not be readable as pool occupancy.**
+    ///
+    /// The finding this pins: one process-global counter printed as
+    /// `{"in_flight":N,"capacity":512}` invited two false conclusions during an
+    /// incident — `472/512` reads as a healthy pool when 40 of those bodies
+    /// belong to a *different* runtime and the Tauri pool is actually full, and
+    /// `550/512` reads as an impossible over-saturation when it is two healthy
+    /// pools summed. Both are gone only if the wire says what the number is, so
+    /// the wire is what is asserted here.
+    #[test]
+    fn the_record_cannot_be_read_as_single_pool_occupancy() {
+        let v: serde_json::Value =
+            serde_json::from_str(render_record(&fixture_record()).trim_end()).expect("valid JSON");
+        let b = &v["tracked_blocking_bodies"];
+
+        // The old, misleading field names must not come back.
+        assert!(
+            v.get("blocking_pool").is_none(),
+            "the ambiguous `blocking_pool` object is back on the wire"
+        );
+        assert!(
+            b.get("in_flight").is_none() && b.get("capacity").is_none(),
+            "`in_flight`/`capacity` invite exactly the N-over-512 misreading"
+        );
+
+        // The record states its own limits, in the record.
+        let what = b["what"].as_str().expect("the record must describe itself");
+        assert!(
+            what.contains("lower bound"),
+            "the record does not say it is a lower bound: {what}"
+        );
+        assert!(
+            what.contains("EVERY tokio runtime"),
+            "the record does not say the total spans runtimes: {what}"
+        );
+
+        // The `tokio::fs` blind spot is named, not left to be inferred.
+        let untracked: Vec<&str> = b["untracked_pool_consumers"]
+            .as_array()
+            .expect("untracked_pool_consumers must be a list")
+            .iter()
+            .map(|c| c.as_str().expect("a string"))
+            .collect();
+        assert!(
+            untracked.iter().any(|c| c.contains("tokio::fs")),
+            "the tokio::fs blind spot is not disclosed: {untracked:?}"
+        );
+        assert!(
+            untracked.iter().any(|c| c.contains("tokio::process")),
+            "the tokio::process blind spot is not disclosed: {untracked:?}"
+        );
+
+        // The capacity that IS on the wire is per-runtime, and each lane — not
+        // the total — is what it bounds.
+        assert_eq!(b["per_runtime_pool_capacity_default"], 512);
+        assert!(
+            b["tracked_in_flight_all_runtimes"].as_u64().unwrap()
+                > b["per_runtime_pool_capacity_default"].as_u64().unwrap(),
+            "the fixture is meant to exercise a cross-runtime total that EXCEEDS one \
+             pool's ceiling — the reading that used to be an impossible `550/512`"
         );
     }
 
@@ -1517,6 +2088,64 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// **A spinning child must not report 0.0%.**
+    ///
+    /// The finding this pins: with a single `sysinfo` refresh, `cpu_usage()`
+    /// returns EXACTLY `0.0` for every process on Linux
+    /// (`unix/linux/process.rs` short-circuits while the previous utime/stime
+    /// are both zero), and on Windows a lifetime-over-uptime ratio that rounds
+    /// to ~0 on a long-lived box. Either way the field could not tell a child
+    /// pinning a core from an idle one — the one question a wedge record wants
+    /// it for. [`capture_child_census`] therefore refreshes twice, separated by
+    /// [`CPU_SAMPLE_INTERVAL`].
+    ///
+    /// Neuter check: delete the second `refresh_processes` and this test reads
+    /// 0.0 for a child burning a whole core.
+    ///
+    /// Linux-only assertion: the Windows arm needs a real Windows box, and a
+    /// test that silently passes on the platform it cannot measure is worse
+    /// than one that says so.
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the busy-child CPU assertion is measured on Linux only"
+    )]
+    fn a_spinning_child_reports_meaningful_cpu() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "while :; do :; done"])
+            .spawn()
+            .expect("spawn a spinning child");
+        let pid = child.id();
+        // Let it actually get on a core before the first refresh reads it.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Deliberately the UNCAPPED seam, not `capture_child_census()`: the
+        // census's `oldest` list keeps only the oldest MAX_CHILDREN_LISTED
+        // children, so this just-spawned child is the first one the cap
+        // discards. Asserting through `oldest` passed in isolation and failed
+        // under the full suite, where the process has many live children.
+        let kids = collect_children();
+        let mine = kids.iter().find(|c| c.pid == pid).cloned();
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let mine = mine.unwrap_or_else(|| {
+            panic!(
+                "the spinning child (pid {pid}) was not among the {} direct children \
+                 enumerated — the census could not see it at all",
+                kids.len()
+            )
+        });
+        assert!(
+            mine.cpu_percent > 5.0,
+            "a child spinning a core flat out reported {}% CPU — a single-refresh \
+             `sysinfo` reading, which is exactly 0.0 on Linux and cannot distinguish \
+             a spinning child from an idle one",
+            mine.cpu_percent
+        );
     }
 
     // ---- pure parsers ----

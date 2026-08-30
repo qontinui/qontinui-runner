@@ -401,10 +401,24 @@ pub async fn github_clone_repo(repo: String, dest_parent: String) -> Result<Valu
     .await
     .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?
     .map_err(|e| {
-        String::from(AppError::ProcessError(format!(
-            "Failed to run git: {}. Is git installed?",
-            e
-        )))
+        // A hang and a missing binary are different failures; "Is git
+        // installed?" is wrong advice for a clone that stalled at 900s against
+        // an unreachable remote. `e` names the PROGRAM only, never the argv —
+        // `process_helpers::program_label` — so the tokenised clone URL cannot
+        // reach this string the way it did before.
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            String::from(AppError::ProcessError(format!(
+                "git clone did not finish within {}s and was killed. The remote may be \
+                 unreachable, or the repository may be too large for this budget. ({})",
+                CLONE_TIMEOUT.as_secs(),
+                e
+            )))
+        } else {
+            String::from(AppError::ProcessError(format!(
+                "Failed to run git: {}. Is git installed?",
+                e
+            )))
+        }
     })?;
 
     if !clone_out.status.success() {

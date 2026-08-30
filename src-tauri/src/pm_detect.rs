@@ -17,10 +17,24 @@
 //! `<name>.cmd` for Windows-shimmed installs. [`pm_command`] centralizes the
 //! workaround so the install invocation hits the same resolution as the probe.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
+
+/// Hard budget for one `<pm> --version` probe.
+///
+/// `--version` is a sub-100ms operation for every manager we probe, so this is
+/// generous even for a cold `.cmd` shim on Windows. It exists because the probe
+/// is a real child process: a corrupt shim, a network-mounted `node_modules`,
+/// or a package manager that stops to ask something can otherwise block the
+/// caller forever, and `detect_node_package_manager` fires 2-4 of these.
+const PM_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pick the preferred Node package manager. Order: `pnpm`, then `npm`.
-/// Resolved at startup and at each install (cheap — `--version` is fast).
+///
+/// **Not cached.** Every call re-probes, so this is 2-4 bounded child processes
+/// per call, and it BLOCKS. Callers on an async task must run it on the
+/// blocking pool (`spawn_blocking_tracked`) — `wrappers::install` does — never
+/// inline on a tokio worker thread.
 ///
 /// Returns the bare manager name (`"pnpm"` / `"npm"`); [`pm_command`] resolves
 /// the `.cmd` shim on Windows when the invocation needs it.
@@ -44,15 +58,26 @@ pub fn detect_node_package_manager() -> Option<&'static str> {
     })
 }
 
-/// Probe a package-manager binary by running `<name> --version`, swallowing
-/// all output. Returns true iff it exits 0.
+/// Probe a package-manager binary by running `<name> --version`, discarding all
+/// output. Returns true iff it exits 0 **inside [`PM_PROBE_TIMEOUT`]**.
+///
+/// Bounded, not a bare `Command::status()`. `status()` has no timeout: a shim
+/// that never returns parks the calling thread permanently, and this function's
+/// only production caller reaches it from an async request handler. A probe
+/// that overruns is killed (with its whole tree — a `.cmd` shim runs the real
+/// manager as a grandchild) and reported as "not usable here", which is the
+/// same verdict a non-zero exit produces.
 pub fn probe_pm(name: &str) -> bool {
     let mut cmd = Command::new(name);
-    cmd.arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.arg("--version");
     no_window(&mut cmd);
-    cmd.status().map(|s| s.success()).unwrap_or(false)
+    // `run_with_timeout` pipes both streams and nulls stdin itself, so the
+    // output is captured-and-dropped rather than inherited — same effect as the
+    // previous `Stdio::null()`, minus the chance of blocking on a prompt.
+    matches!(
+        crate::process_helpers::run_with_timeout(cmd, PM_PROBE_TIMEOUT),
+        Ok(crate::process_helpers::TimedOutput::Completed(o)) if o.status.success()
+    )
 }
 
 /// Build a [`Command`] for the given package-manager binary that also works on

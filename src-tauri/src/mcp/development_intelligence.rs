@@ -9,6 +9,7 @@ use axum::{extract::State, http::StatusCode, response::Json, routing::post, Rout
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use crate::mcp::types::ApiState;
@@ -122,10 +123,20 @@ struct FeatureHealth {
     page: String,
     route: String,
     component_path: String,
+    /// `"active"` | `"stale"` | `"abandoned"` | `"spec-drift"` | `"unknown"`.
+    ///
+    /// `"unknown"` is NOT a classification of the feature — it means the git
+    /// history probe did not answer, so no classification was possible. It
+    /// exists because the alternative was publishing "abandoned" off a
+    /// fabricated 1970 timestamp.
     status: String,
     last_code_change: String,
     last_spec_change: String,
     code_commit_count_30d: usize,
+    /// Whether `code_commit_count_30d` was actually MEASURED. `false` means
+    /// the probe degraded and the count is a placeholder zero, not an
+    /// observation. Additive on the wire; older clients ignore it.
+    code_commit_count_known: bool,
     spec_age: f64,
     code_age: f64,
     staleness: f64,
@@ -146,6 +157,10 @@ struct FeatureHealthSummary {
     stale: usize,
     abandoned: usize,
     spec_drift: usize,
+    /// Features whose git history could not be read at all. Counted
+    /// separately so a degraded run is visible in the summary instead of
+    /// inflating `abandoned`.
+    unknown: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -334,46 +349,140 @@ fn extract_keywords(name: &str) -> Vec<String> {
 // Git history helpers
 // ============================================================================
 
-fn git_last_change(project_path: &Path, file_path: &str) -> Option<String> {
-    // Bounded: called once PER FILE from the analysis handler, so a wedged git
-    // multiplies into one leaked thread per file in the request.
+/// Budget for ONE `git log` child.
+const GIT_HISTORY_CHILD_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Aggregate budget for ALL git history probes in a single feature-health
+/// request.
+///
+/// Bounding each child was not enough. `feature_health` loops over
+/// `specs.iter()` — an unbounded collection — and issues two `git log` calls
+/// per spec, so 50 specs against a wedged git was 50 x 2 x 20s ≈ **33
+/// minutes** of one blocking-pool thread for one HTTP request, and the route
+/// is pollable. This caps the git portion of the whole request; once it is
+/// spent the remaining specs report their history as UNKNOWN instead of
+/// spawning more children.
+const GIT_HISTORY_TOTAL_BUDGET: Duration = Duration::from_secs(45);
+
+/// Wall-clock budget shared by every git probe of one request.
+///
+/// Not a thread pool or a semaphore — just a deadline the probes consult, so
+/// the aggregate cost of an unbounded loop is bounded by construction.
+struct GitBudget {
+    deadline: Instant,
+}
+
+impl GitBudget {
+    fn new(total: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + total,
+        }
+    }
+
+    /// How long the next child may run: the smaller of the per-child budget
+    /// and what is left of the aggregate. `None` once the aggregate is spent —
+    /// callers must then answer UNKNOWN **without spawning**.
+    fn next_child(&self) -> Option<Duration> {
+        let left = self.deadline.checked_duration_since(Instant::now());
+        match left {
+            Some(left) if !left.is_zero() => Some(left.min(GIT_HISTORY_CHILD_TIMEOUT)),
+            _ => None,
+        }
+    }
+}
+
+/// When a file was last touched, per git — tri-state.
+///
+/// The two-state `Option<String>` this replaced could not tell "git says this
+/// path has no commits" from "git never answered", and the caller mapped BOTH
+/// onto the literal `"1970-01-01T00:00:00Z"`. That sentinel is ~20,000 days
+/// old, so `code_age > 90 && !has_test_files` fired and the feature was
+/// published as **abandoned** with the specific-sounding prose "No git commits
+/// touching this component since 1970-01-01" — a pure probe artifact,
+/// indistinguishable from a real finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LastChange {
+    /// git answered with a commit date (RFC3339).
+    At(String),
+    /// git answered, and no commit touches this path.
+    Never,
+    /// The probe did not answer: killed at its budget, unspawnable, or skipped
+    /// because the request's aggregate git budget was already spent.
+    Unknown,
+}
+
+fn git_last_change(project_path: &Path, file_path: &str, budget: &GitBudget) -> LastChange {
+    // Bounded per child AND in aggregate: this is called twice per spec from
+    // the feature-health handler, over an unbounded spec list.
+    let Some(child_budget) = budget.next_child() else {
+        return LastChange::Unknown;
+    };
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(["log", "-1", "--format=%aI", "--", file_path])
         .current_dir(project_path);
-    let crate::process_helpers::ProbeOutcome::Captured(stdout) = crate::process_helpers::run_probe(
-        cmd,
-        std::time::Duration::from_secs(20),
-        "development_intelligence: git log",
-    ) else {
-        return None;
+    let crate::process_helpers::ProbeOutcome::Captured(stdout) =
+        crate::process_helpers::run_probe(cmd, child_budget, "development_intelligence: git log")
+    else {
+        return LastChange::Unknown;
     };
 
     let date = String::from_utf8_lossy(&stdout).trim().to_string();
     if date.is_empty() {
-        None
+        LastChange::Never
     } else {
-        Some(date)
+        LastChange::At(date)
     }
 }
 
-fn git_commit_count_since(project_path: &Path, file_path: &str, days: u32) -> usize {
+/// Commits touching `file_path` in the last `days`. `None` when the probe did
+/// not answer — `0` is a real measurement and must not be manufactured.
+fn git_commit_count_since(
+    project_path: &Path,
+    file_path: &str,
+    days: u32,
+    budget: &GitBudget,
+) -> Option<usize> {
+    let child_budget = budget.next_child()?;
     let since = format!("--since={} days ago", days);
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(["log", "--oneline", &since, "--", file_path])
         .current_dir(project_path);
     let output = crate::process_helpers::run_probe(
         cmd,
-        std::time::Duration::from_secs(20),
+        child_budget,
         "development_intelligence: git log --oneline",
     );
 
     match output {
         crate::process_helpers::ProbeOutcome::Captured(stdout) => {
-            String::from_utf8_lossy(&stdout).lines().count()
+            Some(String::from_utf8_lossy(&stdout).lines().count())
         }
-        crate::process_helpers::ProbeOutcome::Degraded(_) => 0,
+        crate::process_helpers::ProbeOutcome::Degraded(_) => None,
     }
 }
+
+/// Render a [`LastChange`] into the plain string the response carries.
+///
+/// * `At(d)`   → the real date.
+/// * `Never`   → the epoch. This one IS a genuine "arbitrarily long ago": git
+///   answered and no commit touches the path, so the abandoned classification
+///   it produces is a real finding (the prose says "has ever" rather than
+///   naming 1970).
+/// * `Unknown` → **now**. An unreadable probe must not push a feature toward
+///   stale/abandoned, and the caller has already forced `status = "unknown"`
+///   plus an explicit signal, so the numeric fields only need to be inert.
+fn render_last_change(c: &LastChange) -> String {
+    match c {
+        LastChange::At(d) => d.clone(),
+        LastChange::Never => NEVER_COMMITTED_SENTINEL.to_string(),
+        LastChange::Unknown => chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+/// The timestamp that stands for "git answered: no commit has ever touched
+/// this path". Named rather than inlined so it can never again be reused as
+/// the value for "the probe failed".
+const NEVER_COMMITTED_SENTINEL: &str = "1970-01-01T00:00:00Z";
 
 fn days_since(iso_date: &str) -> f64 {
     use chrono::{DateTime, Utc};
@@ -744,6 +853,10 @@ pub async fn feature_health(
     let specs = load_specs(&request.app_id, &project_path).await;
     let result = spawn_blocking_tracked(move || {
         let test_files = scan_test_files(&project_path);
+        // ONE wall-clock budget for every git child of this request — see
+        // `GIT_HISTORY_TOTAL_BUDGET`. `specs` is unbounded, so a per-child
+        // bound alone leaves the aggregate unbounded.
+        let budget = GitBudget::new(GIT_HISTORY_TOTAL_BUDGET);
 
         let features: Vec<FeatureHealth> = specs
             .iter()
@@ -764,19 +877,16 @@ pub async fn feature_health(
                 // Component path (best guess)
                 let component_path = format!("src/components/{}", page_id);
 
-                // Git history
-                let last_code_change = git_last_change(&project_path, &component_path)
-                    .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-                let last_spec_change = spec
-                    .metadata
-                    .updated_at
-                    .clone()
-                    .or_else(|| git_last_change(&project_path, &spec_file))
-                    .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-
-                let code_age = days_since(&last_code_change);
-                let spec_age = days_since(&last_spec_change);
-                let code_commits_30d = git_commit_count_since(&project_path, &component_path, 30);
+                // Git history — tri-state, so a probe that never answered can
+                // never be rendered as a date.
+                let code_change = git_last_change(&project_path, &component_path, &budget);
+                let spec_change = match spec.metadata.updated_at.clone() {
+                    // The spec's own metadata is authoritative and costs no git.
+                    Some(updated) => LastChange::At(updated),
+                    None => git_last_change(&project_path, &spec_file, &budget),
+                };
+                let code_commits_30d =
+                    git_commit_count_since(&project_path, &component_path, 30, &budget);
 
                 let has_test_files = test_files.iter().any(|tf| {
                     tf.referenced_components.iter().any(|r| r == &component)
@@ -786,25 +896,66 @@ pub async fn feature_health(
                             .contains(&page_id.to_lowercase())
                 });
 
+                // Wire shapes: `lastCodeChange` is a plain string and
+                // `codeAge` a plain number in the response the dashboard
+                // parses (it re-derives its own ages from `lastCodeChange`),
+                // so an UNKNOWN cannot be spelled as null without a frontend
+                // change. It is instead spelled as `status = "unknown"` plus an
+                // explicit signal, and the numeric fields are rendered as
+                // "just now" — the one value that cannot masquerade as a
+                // finding. What must NEVER reappear is the 1970 sentinel, which
+                // read as a 20,000-day-old file and classified the feature as
+                // abandoned.
+                let history_unknown =
+                    code_change == LastChange::Unknown || spec_change == LastChange::Unknown;
+
+                let last_code_change = render_last_change(&code_change);
+                let last_spec_change = render_last_change(&spec_change);
+                let code_age = days_since(&last_code_change);
+                let spec_age = days_since(&last_spec_change);
+
                 // Classification
                 let mut signals = vec![];
                 let status;
 
-                if code_age <= 30.0 && spec_age <= 60.0 {
+                if history_unknown {
+                    // Say so, in the status AND in the prose. Anything else
+                    // publishes a classification derived from a probe that
+                    // never ran.
+                    status = "unknown".to_string();
+                    signals.push(
+                        "Git history for this feature could not be read (the probe timed out, \
+                         failed to spawn, or the request's git budget was exhausted) — its age \
+                         is UNKNOWN, not old"
+                            .to_string(),
+                    );
+                } else if code_age <= 30.0 && spec_age <= 60.0 {
                     status = "active".to_string();
                 } else if code_age <= 30.0 && spec_age > 90.0 {
                     status = "spec-drift".to_string();
-                    signals.push(format!(
-                        "Component modified {} times in 30 days but spec unchanged for {} months",
-                        code_commits_30d,
-                        (spec_age / 30.0).round() as u32,
-                    ));
+                    signals.push(match code_commits_30d {
+                        Some(n) => format!(
+                            "Component modified {} times in 30 days but spec unchanged for {} months",
+                            n,
+                            (spec_age / 30.0).round() as u32,
+                        ),
+                        None => format!(
+                            "Component changed recently but spec unchanged for {} months \
+                             (30-day commit count unavailable — the git probe degraded)",
+                            (spec_age / 30.0).round() as u32,
+                        ),
+                    });
                 } else if code_age > 90.0 && !has_test_files {
                     status = "abandoned".to_string();
-                    signals.push(format!(
-                        "No git commits touching this component since {}",
-                        truncate_str(&last_code_change, 10),
-                    ));
+                    signals.push(match &code_change {
+                        LastChange::Never => {
+                            "No git commit has ever touched this component path".to_string()
+                        }
+                        _ => format!(
+                            "No git commits touching this component since {}",
+                            truncate_str(&last_code_change, 10),
+                        ),
+                    });
                     signals.push("No test files reference this component".to_string());
                 } else if code_age > 60.0 {
                     status = "stale".to_string();
@@ -826,7 +977,8 @@ pub async fn feature_health(
                     status,
                     last_code_change,
                     last_spec_change,
-                    code_commit_count_30d: code_commits_30d,
+                    code_commit_count_30d: code_commits_30d.unwrap_or(0),
+                    code_commit_count_known: code_commits_30d.is_some(),
                     spec_age,
                     code_age,
                     staleness,
@@ -840,6 +992,14 @@ pub async fn feature_health(
         let stale = features.iter().filter(|f| f.status == "stale").count();
         let abandoned = features.iter().filter(|f| f.status == "abandoned").count();
         let spec_drift = features.iter().filter(|f| f.status == "spec-drift").count();
+        let unknown = features.iter().filter(|f| f.status == "unknown").count();
+        if unknown > 0 {
+            warn!(
+                "feature_health: {unknown}/{total} features have UNREADABLE git history \
+                 (probe degraded or the {}s aggregate git budget was exhausted)",
+                GIT_HISTORY_TOTAL_BUDGET.as_secs()
+            );
+        }
 
         FeatureHealthResult {
             summary: FeatureHealthSummary {
@@ -848,6 +1008,7 @@ pub async fn feature_health(
                 stale,
                 abandoned,
                 spec_drift,
+                unknown,
             },
             features,
         }

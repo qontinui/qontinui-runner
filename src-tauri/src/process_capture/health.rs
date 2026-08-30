@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::process_helpers::{run_probe, ProbeOutcome};
+use crate::process_helpers::{run_probe, run_probe_quiet, ProbeOutcome};
 
 // ── Bounded external-tool budgets ────────────────────────────────────────────
 //
@@ -291,7 +291,12 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
     // We look for the `pid=<n>` token.
     let mut ss_cmd = crate::process_helpers::no_window("ss");
     ss_cmd.args(["-ltnp"]);
-    if let ProbeOutcome::Captured(raw) = run_probe(
+    // `run_probe_quiet`: `ss` is simply ABSENT on macOS and on minimal Linux
+    // images, and exits non-zero when it has nothing to report. Both are
+    // expected here — the `lsof` fallback below is the whole reason this arm is
+    // allowed to fail — and this runs on the per-process capture timer, so
+    // WARNing on it is pure volume that buries the timeout WARN.
+    if let ProbeOutcome::Captured(raw) = run_probe_quiet(
         ss_cmd,
         TABLE_READ_TIMEOUT,
         "process_capture::health: ss port owner",
@@ -326,7 +331,10 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
     // `-t` emits only PIDs, one per line.
     let mut lsof_cmd = crate::process_helpers::no_window("lsof");
     lsof_cmd.args(["-t", &format!("-i:{}", port)]);
-    let ProbeOutcome::Captured(raw) = run_probe(
+    // `run_probe_quiet`: `lsof -t -i:<port>` exits 1 whenever NOTHING owns the
+    // port — the common case for a health check — and "nobody is listening" is
+    // the answer, not a fault.
+    let ProbeOutcome::Captured(raw) = run_probe_quiet(
         lsof_cmd,
         TABLE_READ_TIMEOUT,
         "process_capture::health: lsof port owner",
@@ -418,7 +426,10 @@ exit 0
         "/C",
         &format!("netstat -ano | findstr LISTENING | findstr :{}", port),
     ]);
-    let ProbeOutcome::Captured(raw) = run_probe(
+    // `run_probe_quiet`: `netstat | findstr LISTENING | findstr :<port>` exits 1
+    // when the port is not listening, which is exactly the "nothing to kill"
+    // outcome this function is asking about.
+    let ProbeOutcome::Captured(raw) = run_probe_quiet(
         netstat_cmd,
         TABLE_READ_TIMEOUT,
         "process_capture::health: kill_port_process netstat",
@@ -436,7 +447,14 @@ exit 0
                 if pid > 0 && seen.insert(pid) {
                     let mut kill_cmd = crate::process_helpers::no_window("taskkill");
                     kill_cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-                    let _ = run_probe(kill_cmd, KILL_TIMEOUT, "process_capture::health: taskkill");
+                    // `run_probe_quiet`: `taskkill /F /T /PID` exits 128 for a
+                    // pid that already went away between the netstat read and
+                    // here — a race we WANT to lose, not one to WARN about.
+                    let _ = run_probe_quiet(
+                        kill_cmd,
+                        KILL_TIMEOUT,
+                        "process_capture::health: taskkill",
+                    );
                     killed_any = true;
                 }
             }
@@ -450,7 +468,9 @@ exit 0
 pub async fn kill_port_process(port: u16) -> bool {
     let mut lsof_cmd = crate::process_helpers::no_window("lsof");
     lsof_cmd.args(["-ti", &format!(":{}", port)]);
-    let ProbeOutcome::Captured(raw) = run_probe(
+    // `run_probe_quiet`: same as the probe above — `lsof -ti :<port>` exits 1
+    // when nothing owns the port, i.e. when there is nothing to kill.
+    let ProbeOutcome::Captured(raw) = run_probe_quiet(
         lsof_cmd,
         TABLE_READ_TIMEOUT,
         "process_capture::health: kill_port_process lsof",
@@ -464,7 +484,9 @@ pub async fn kill_port_process(port: u16) -> bool {
             if pid > 0 {
                 let mut kill_cmd = crate::process_helpers::no_window("kill");
                 kill_cmd.args(["-9", &pid.to_string()]);
-                let _ = run_probe(kill_cmd, KILL_TIMEOUT, "process_capture::health: kill -9");
+                // `run_probe_quiet`: `kill -9` exits 1 for a pid that exited
+                // between the `lsof` read and here — the same benign race.
+                let _ = run_probe_quiet(kill_cmd, KILL_TIMEOUT, "process_capture::health: kill -9");
                 return true;
             }
         }

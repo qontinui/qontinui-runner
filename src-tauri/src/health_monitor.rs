@@ -538,8 +538,13 @@ struct WedgeDetector {
     /// Reset on recovery, so a second incident measures its own onset rather
     /// than inheriting the first one's.
     first_failure_at: Option<Instant>,
-    /// Phase 4's capture rig, created on the first escalation. `Option` so
-    /// `WedgeDetector::default()` stays free of threads and file IO.
+    /// Phase 4's capture rig.
+    ///
+    /// `Option` for ONE reason only: `WedgeDetector::default()` — which every
+    /// unit test below uses — must stay free of threads and file IO. The
+    /// production detector is built by [`WedgeDetector::with_diagnostics`] and
+    /// carries a live rig from the moment the monitor starts; see that
+    /// constructor for why it is not created lazily.
     diagnostics: Option<qontinui_runner_lib::wedge_diagnostics::WedgeDiagnostics>,
 }
 
@@ -902,10 +907,10 @@ impl WedgeDetector {
 
     /// Capture one structured diagnostic record (Phase 4).
     ///
-    /// The rig — and with it the single capture worker thread — is created
-    /// LAZILY, on the first escalation ever seen. A healthy runner therefore
-    /// pays nothing, and the unit tests that drive `WedgeDetector::default()`
-    /// below never spawn a thread or touch the operator's dev-logs dir.
+    /// The rig is normally already present — [`WedgeDetector::with_diagnostics`]
+    /// builds it at monitor start. The `get_or_insert_with` here is the fallback
+    /// for a detector built by `default()` (the unit tests, which never reach
+    /// this path) and NOT the intended production route: see that constructor.
     ///
     /// Best-effort and silent by contract, like every other reporting step on
     /// this path.
@@ -921,6 +926,43 @@ impl WedgeDetector {
             )
         });
         rig.capture_and_append(event, consecutive_failures, unresponsive_for);
+    }
+
+    /// The PRODUCTION constructor: build the Phase-4 rig now, at monitor start.
+    ///
+    /// **Why eagerly, at the cost of one idle thread for the life of the
+    /// process.** The rig owns a `BoundedCapturer`, whose constructor spawns the
+    /// single `wedge-capture` worker thread. Building it on the first escalation
+    /// means building it *during* the incident — and the incident this whole
+    /// module exists for is thread exhaustion. If `std::thread::Builder::spawn`
+    /// fails there, `BoundedCapturer` records `alive = false`, never retries, and
+    /// every capture for the rest of the process's life returns
+    /// `"capture_thread_unavailable"`. The diagnostic would be permanently
+    /// disabled by exactly the condition it was written to diagnose, and the
+    /// resulting record would be indistinguishable from a healthy-but-empty one.
+    ///
+    /// Constructing it at start — when threads are plentiful and the dev-logs
+    /// path resolves without contention — makes the rig's existence a property of
+    /// startup rather than of the sick machine's ability to allocate a thread.
+    ///
+    /// `default()` is deliberately left alone: it must keep spawning no thread
+    /// and touching no file, because that is what lets every test in this module
+    /// drive the state machine without side effects.
+    ///
+    /// Takes `kind` because BOTH rungs are now built this way: the capture
+    /// rig captures process/thread state, which is not specific to which rung
+    /// noticed the wedge, so the UI-thread rung gets the same eager-build
+    /// guarantee as the backend rung.
+    fn with_diagnostics(kind: WedgeKind) -> Self {
+        Self {
+            kind,
+            diagnostics: Some(
+                qontinui_runner_lib::wedge_diagnostics::WedgeDiagnostics::new(
+                    crate::paths::get_dev_logs_dir(),
+                ),
+            ),
+            ..Self::default()
+        }
     }
 }
 
@@ -1659,12 +1701,18 @@ pub fn start_health_monitor() {
 
     // ── The probe loop: the wedge detector, and nothing that can block it ──
     std::thread::spawn(|| {
-        let mut wedge = WedgeDetector::new(WedgeKind::Backend);
+        // `with_diagnostics`, not `default()`: the Phase-4 capture rig (and its
+        // worker thread) is built HERE, at start, not on the first escalation —
+        // see the constructor for why building it mid-incident can disable the
+        // diagnostic permanently.
+        let mut wedge = WedgeDetector::with_diagnostics(WedgeKind::Backend);
         // The SECOND rung rides the SAME thread and the SAME cadence on
         // purpose. A dedicated monitor thread for the UI probe would double
         // the thing whose survival is the entire point, and this loop is
-        // already proved to keep its cadence through a wedge.
-        let mut ui_wedge = WedgeDetector::new(WedgeKind::UiThread);
+        // already proved to keep its cadence through a wedge. It gets its own
+        // eager diagnostics rig too — a UI-thread wedge is exactly as
+        // undiagnosable after the fact as a backend one.
+        let mut ui_wedge = WedgeDetector::with_diagnostics(WedgeKind::UiThread);
         let mut prober = LivezProber::new();
         while MONITOR_RUNNING.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(SELF_PROBE_INTERVAL_SECS));
@@ -2990,6 +3038,58 @@ mod tests {
         assert!(
             (PROBE_HARD_DEADLINE_SECS as i64) < WATCHDOG_MONITOR_STALL_SECS,
             "the per-probe deadline must be well inside the monitor-stall window"
+        );
+    }
+
+    /// **The Phase-4 rig must exist before the wedge does — for BOTH rungs.**
+    ///
+    /// Built lazily on the first escalation, it was constructed *during* thread
+    /// exhaustion — and a failed `std::thread::Builder::spawn` there sets
+    /// `BoundedCapturer`'s `alive = false` with no retry, disabling the capture
+    /// for the life of the process at precisely the moment it is needed. A
+    /// source-level invariant is the cheapest guard, and the same shape the
+    /// probe/metrics split below already uses: the production probe loop must
+    /// construct EACH detector with `with_diagnostics(..)`, never `default()`.
+    #[test]
+    fn the_probe_loop_builds_its_diagnostics_rig_at_start() {
+        let src = include_str!("health_monitor.rs");
+        let body = src
+            .split("pub fn start_health_monitor()")
+            .nth(1)
+            .expect("start_health_monitor must exist");
+        // Production code only: every test below drives `WedgeDetector::default()`
+        // on purpose, and that is the property the second assertion protects, not
+        // one it should trip over.
+        let body = &body[..body.find("#[cfg(test)]").unwrap_or(body.len())];
+        assert!(
+            body.contains("WedgeDetector::with_diagnostics(WedgeKind::Backend)"),
+            "the probe loop no longer builds the backend rung's Phase-4 rig eagerly — a \
+             spawn failure during thread exhaustion would then disable wedge capture \
+             permanently"
+        );
+        assert!(
+            body.contains("WedgeDetector::with_diagnostics(WedgeKind::UiThread)"),
+            "the probe loop no longer builds the UI-thread rung's Phase-4 rig eagerly — \
+             see the backend-rung assertion above for why that matters"
+        );
+        assert!(
+            !body.contains("WedgeDetector::default()"),
+            "the production probe loop is back on `default()`, which defers the capture \
+             thread's creation into the incident itself"
+        );
+    }
+
+    /// ...and the eager construction must NOT leak into `default()`, which every
+    /// test in this module drives. `default()` spawning a worker thread and
+    /// resolving the operator's dev-logs dir would give the whole unit suite
+    /// side effects on the developer's machine.
+    #[test]
+    fn the_default_detector_still_builds_no_rig() {
+        let d = WedgeDetector::default();
+        assert!(
+            d.diagnostics.is_none(),
+            "WedgeDetector::default() built a capture rig — it must stay free of \
+             threads and file IO"
         );
     }
 

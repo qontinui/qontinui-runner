@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 
 use once_cell::sync::Lazy;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use regex::Regex;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -126,7 +127,18 @@ async fn check_and_warn(
 ) -> Result<(), String> {
     // 1. Resolve the repo's canonical path → the coord `worktree`
     //    resource key.
-    let (repo_slug, resource_key) = resolve_repo(working_dir)
+    //
+    // `resolve_repo` can shell out (`git rev-parse --show-toplevel`), so it
+    // goes to the BLOCKING POOL rather than running inline on this async task.
+    // The task itself is spawned per PTY line matching a branch-mutating git,
+    // across every live terminal — 138 concurrent sessions were live during the
+    // 2026-08-30 wedge — so an inline sync child here is an unbounded number of
+    // reactor workers parked on git.
+    let working_dir_owned = working_dir.to_string();
+    let resolved = spawn_blocking_tracked(move || resolve_repo(&working_dir_owned))
+        .await
+        .map_err(|e| format!("repo resolution task failed: {e}"))?;
+    let (repo_slug, resource_key) = resolved
         .ok_or_else(|| "working_dir not under a known repo / no git toplevel".to_string())?;
 
     // 2. Resolve coord HTTP base + our device id.
@@ -248,6 +260,19 @@ fn resolve_repo(working_dir: &str) -> Option<(String, String)> {
     ))
 }
 
+/// Budget for the one git call this module makes.
+///
+/// **Deliberately short.** `rev-parse --show-toplevel` reads `.git` and prints
+/// a path — measured at ~2ms — and this fires per PTY line matching a
+/// branch-mutating git, across every live terminal (138 concurrent sessions
+/// during the 2026-08-30 wedge). The previous 20s was copied from the
+/// repository-walking budgets, where it buys patience with a genuinely slow
+/// operation; here it buys nothing but 20s of a held blocking-pool slot per
+/// wedged line, multiplied by every terminal. The whole feature is a
+/// DISMISSIBLE ADVISORY BANNER, so a missed warning costs nothing — 3s is
+/// three orders of magnitude over the healthy case and still fails fast.
+const TOPLEVEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// `git -C <dir> rev-parse --show-toplevel`, or `None` if `dir` isn't in a
 /// git repo / git is unavailable.
 fn git_toplevel(dir: &Path) -> Option<PathBuf> {
@@ -261,7 +286,7 @@ fn git_toplevel(dir: &Path) -> Option<PathBuf> {
         .args(["rev-parse", "--show-toplevel"]);
     let crate::process_helpers::ProbeOutcome::Captured(stdout) = crate::process_helpers::run_probe(
         cmd,
-        std::time::Duration::from_secs(20),
+        TOPLEVEL_TIMEOUT,
         "coord_warn: git rev-parse --show-toplevel",
     ) else {
         return None;

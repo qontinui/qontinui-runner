@@ -929,16 +929,29 @@ pub async fn transcript_find_external_processes(
         .map_err(|e| format!("Failed to lock ai_pid_tracker: {e}"))?
         .clone();
 
-    let external = transcript::find_external_claude_processes(&managed_pids);
-
-    Ok(CommandResponse {
-        success: true,
-        message: Some(format!(
-            "Found {} external Claude processes",
-            external.len()
-        )),
-        data: Some(serde_json::to_value(&external).unwrap_or_default()),
-    })
+    // A degraded enumeration must NOT render as "found 0". The underlying
+    // scan is the same `Get-CimInstance Win32_Process` call that wedged the
+    // runner, so a hang here is expected rather than exotic — and an empty
+    // list reported as `success: true` is indistinguishable from a genuine
+    // "no external processes", which is the one answer a caller acts on.
+    match transcript::scan_external_claude_processes(&managed_pids) {
+        transcript::ExternalClaudeScan::Complete(external) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!(
+                "Found {} external Claude processes",
+                external.len()
+            )),
+            data: Some(serde_json::to_value(&external).unwrap_or_default()),
+        }),
+        transcript::ExternalClaudeScan::Degraded { reason } => Ok(CommandResponse {
+            success: false,
+            message: Some(format!(
+                "Could not enumerate external Claude processes: {reason}. This is UNKNOWN, \
+                 not zero — no conclusion can be drawn about external processes."
+            )),
+            data: None,
+        }),
+    }
 }
 
 /// Generate a workflow from arbitrary text context (no task_run_id required).

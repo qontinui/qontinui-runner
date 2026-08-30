@@ -173,7 +173,26 @@ async fn fetch_registered_repos(coord_base: &str) -> Result<Vec<String>, String>
 /// `.output()` calls behind one wedged git is 130 lost blocking-pool threads.
 const GIT_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-fn is_git_repo(working_dir: &Path) -> bool {
+/// Whether `working_dir` is a git work tree — tri-state.
+///
+/// The two-state `bool` this replaced folded "git answered: not a repo" into
+/// the same `false` as "git never answered". [`setup_credential_helper`] skips
+/// the whole install on `false`, so a `rev-parse --git-dir` killed at
+/// [`GIT_CONFIG_TIMEOUT`] silently produced a session with NO credential
+/// helper — i.e. the interactive `git push` password prompts this subsystem
+/// exists to eliminate, in the exact situation (a contended `index.lock`) that
+/// the bounded-subprocess work is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitRepoProbe {
+    /// `rev-parse --git-dir` exited 0.
+    Yes,
+    /// git ran and said this is not a work tree.
+    No,
+    /// The probe was killed at its budget or could not be spawned.
+    Unknown,
+}
+
+fn is_git_repo(working_dir: &Path) -> GitRepoProbe {
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args([
         "-C",
@@ -181,14 +200,17 @@ fn is_git_repo(working_dir: &Path) -> bool {
         "rev-parse",
         "--git-dir",
     ]);
-    matches!(
-        crate::process_helpers::run_probe(
-            cmd,
-            GIT_CONFIG_TIMEOUT,
-            "credential_helper: git rev-parse --git-dir"
-        ),
-        crate::process_helpers::ProbeOutcome::Captured(_)
-    )
+    match crate::process_helpers::run_probe(
+        cmd,
+        GIT_CONFIG_TIMEOUT,
+        "credential_helper: git rev-parse --git-dir",
+    ) {
+        crate::process_helpers::ProbeOutcome::Captured(_) => GitRepoProbe::Yes,
+        crate::process_helpers::ProbeOutcome::Degraded(
+            crate::process_helpers::DegradeReason::Status,
+        ) => GitRepoProbe::No,
+        crate::process_helpers::ProbeOutcome::Degraded(_) => GitRepoProbe::Unknown,
+    }
 }
 
 fn git_config_local(working_dir: &Path, key: &str, value: &str) -> Result<(), String> {
@@ -420,9 +442,25 @@ fn ensure_global_credential_hygiene(
 
 pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
     let working_path = Path::new(working_dir);
-    if !is_git_repo(working_path) {
-        debug!("credential_helper: {working_dir} is not a git repo, skipping");
-        return;
+    match is_git_repo(working_path) {
+        GitRepoProbe::Yes => {}
+        GitRepoProbe::No => {
+            debug!("credential_helper: {working_dir} is not a git repo, skipping");
+            return;
+        }
+        // PROCEED on an unknown. Skipping here is not the safe arm: it hands
+        // the agent the interactive credential prompts this module exists to
+        // eliminate, and the failure is invisible. Attempting the install
+        // costs a handful of bounded `git config --local` children which fail
+        // harmlessly (and are reported) outside a work tree — strictly cheaper
+        // than a wedged interactive push.
+        GitRepoProbe::Unknown => {
+            warn!(
+                "credential_helper: could not determine whether {working_dir} is a git repo \
+                 (the `rev-parse --git-dir` probe degraded) — attempting the helper install \
+                 anyway rather than silently leaving this session with interactive prompts"
+            );
+        }
     }
 
     // Set the low-speed bounds before the credential-helper install so

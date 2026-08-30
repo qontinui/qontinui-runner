@@ -1,3 +1,12 @@
+// `build.rs` is ALSO compiled into the library's test binary, via a
+// `#[cfg(test)] #[path = "../build.rs"] mod build_script;` declaration in
+// `src/wedge_diagnostics.rs`. That is the only way `cargo test` can execute the
+// unit tests below: Cargo compiles a build script as its own crate and never in
+// test mode, so a `#[cfg(test)] mod tests` here would otherwise be dead text
+// that no CI run ever proves. `main` is gated off that compilation because it is
+// the one item that reaches for `tauri_build`, a build-dependency the library
+// cannot resolve.
+#[cfg(not(test))]
 fn main() {
     // Fail FAST and legibly when `debug-tokio-console` is on without the
     // build-wide `--cfg tokio_unstable` rustc flag it requires. Without this
@@ -531,9 +540,9 @@ fn ensure_sidecar_placeholders() {
 /// (`scripts/dev-tokio-console.sh` / `.ps1` do it for you), and this guard
 /// turns the "forgot it" case into a one-line error.
 ///
-/// Reads `CARGO_ENCODED_RUSTFLAGS` (the authoritative, `\x1f`-separated list
-/// Cargo hands every build script, which already folds in `.cargo/config.toml`)
-/// and falls back to the raw `RUSTFLAGS` string.
+/// The parse itself lives in [`rustflags_carry_tokio_unstable`], which honours
+/// Cargo's precedence between `CARGO_ENCODED_RUSTFLAGS` and `RUSTFLAGS` and
+/// accepts both `--cfg tokio_unstable` and `--cfg=tokio_unstable`.
 fn guard_tokio_console_cfg() {
     // Cargo only re-runs this script when a watched input changes; without
     // these the guard would go stale after a RUSTFLAGS change.
@@ -546,30 +555,203 @@ fn guard_tokio_console_cfg() {
         return;
     }
 
-    let encoded = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
-    let has_cfg = encoded
-        .split('\x1f')
-        .any(|flag| flag.trim() == "tokio_unstable")
-        || std::env::var("RUSTFLAGS")
-            .unwrap_or_default()
-            .split_whitespace()
-            .any(|flag| flag == "tokio_unstable");
+    let encoded = std::env::var("CARGO_ENCODED_RUSTFLAGS").ok();
+    let raw = std::env::var("RUSTFLAGS").ok();
+    if rustflags_carry_tokio_unstable(encoded.as_deref(), raw.as_deref()) {
+        return;
+    }
 
-    if !has_cfg {
-        panic!(
-            "\n\n\
-             qontinui-runner: feature `debug-tokio-console` requires \
-             RUSTFLAGS=\"--cfg tokio_unstable\".\n\n\
-             Run one of these instead:\n\
-             \x20   scripts/dev-tokio-console.sh   run           # bash / WSL\n\
-             \x20   scripts/dev-tokio-console.ps1  -Action run   # PowerShell\n\n\
-             Or set it by hand:\n\
-             \x20   RUSTFLAGS=\"--cfg tokio_unstable\" cargo run --features debug-tokio-console\n\n\
-             This flag is intentionally NOT set in .cargo/config.toml: it is \
-             build-wide, so pinning it there would put tokio's unstable API \
-             surface into the shipped release build too. Note that changing \
-             RUSTFLAGS invalidates the build cache — expect a full rebuild of \
-             the dependency graph. See src-tauri/docs/tokio-console.md.\n"
-        );
+    panic!(
+        "\n\n\
+         qontinui-runner: feature `debug-tokio-console` requires \
+         RUSTFLAGS=\"--cfg tokio_unstable\".\n\n\
+         Run one of these instead:\n\
+         \x20   scripts/dev-tokio-console.sh   run           # bash / WSL\n\
+         \x20   scripts/dev-tokio-console.ps1  -Action run   # PowerShell\n\n\
+         Or set it by hand (either spelling is accepted):\n\
+         \x20   RUSTFLAGS=\"--cfg tokio_unstable\" cargo run --features debug-tokio-console\n\
+         \x20   RUSTFLAGS=\"--cfg=tokio_unstable\" cargo run --features debug-tokio-console\n\n\
+         This flag is intentionally NOT set in .cargo/config.toml: it is \
+         build-wide, so pinning it there would put tokio's unstable API \
+         surface into the shipped release build too. Note that changing \
+         RUSTFLAGS invalidates the build cache — expect a full rebuild of \
+         the dependency graph. See src-tauri/docs/tokio-console.md.\n"
+    );
+}
+
+/// Does the build actually carry `--cfg tokio_unstable`?
+///
+/// Pure — a function of the two environment strings alone — so the parsing this
+/// guard's whole value rests on is unit-tested instead of only ever exercised by
+/// a developer hitting the panic.
+///
+/// **Cargo's precedence, honoured rather than `||`-ed.** `CARGO_ENCODED_RUSTFLAGS`
+/// is the authoritative, `\x1f`-separated list Cargo will hand rustc; it already
+/// folds in `RUSTFLAGS`, `.cargo/config.toml`'s `[build] rustflags`, and
+/// per-target `rustflags`. So when it is **present** it is the whole truth and
+/// `RUSTFLAGS` must be ignored — including when it is present and *empty*, which
+/// is exactly the "a stale `RUSTFLAGS` is exported in this shell but Cargo is not
+/// forwarding it" case. `||`-ing the two lets that stale value satisfy the guard
+/// while rustc never sees the cfg, which reproduces the runtime
+/// `ConsoleLayer::build` assert this guard exists to prevent. The raw `RUSTFLAGS`
+/// arm is therefore a fallback for the only case it can be right about: a
+/// non-Cargo invocation where the encoded variable is absent entirely.
+fn rustflags_carry_tokio_unstable(encoded: Option<&str>, raw: Option<&str>) -> bool {
+    match encoded {
+        // `\x1f`-separated, and Cargo does NOT re-split on whitespace: a field
+        // is one flag.
+        Some(e) => flags_carry_tokio_unstable(e.split('\x1f')),
+        // Absent means "not invoked by a Cargo that sets it". `RUSTFLAGS` is a
+        // single string rustc-style, so it whitespace-splits.
+        None => raw.is_some_and(|r| flags_carry_tokio_unstable(r.split_whitespace())),
+    }
+}
+
+/// Scan an already-split flag list for `--cfg tokio_unstable`.
+///
+/// **Both spellings, because rustc accepts both and developers write both.**
+/// `--cfg tokio_unstable` arrives as two tokens; `--cfg=tokio_unstable` arrives
+/// as one. The previous guard compared every token against the bare string
+/// `"tokio_unstable"`, so the joined spelling — the one
+/// `src-tauri/.cargo/config.toml` already uses for `--remap-path-prefix=…`, and
+/// therefore the one a developer here would plausibly copy — failed the guard
+/// and told them to set a flag they had already set.
+///
+/// A bare `tokio_unstable` token that is NOT preceded by `--cfg` is deliberately
+/// not a match: it is not a cfg, and accepting it would let an unrelated flag
+/// value wave the guard through.
+fn flags_carry_tokio_unstable<'a, I: IntoIterator<Item = &'a str>>(flags: I) -> bool {
+    let mut prev_was_cfg = false;
+    for flag in flags {
+        let flag = flag.trim();
+        if flag.is_empty() {
+            continue;
+        }
+        if prev_was_cfg && flag == "tokio_unstable" {
+            return true;
+        }
+        if let Some(value) = flag.strip_prefix("--cfg=") {
+            if value.trim() == "tokio_unstable" {
+                return true;
+            }
+        }
+        prev_was_cfg = flag == "--cfg";
+    }
+    false
+}
+
+/// Unit tests for the build script's pure helpers.
+///
+/// These run under `cargo test --lib` because `src/wedge_diagnostics.rs` pulls
+/// this file into the library's test binary with `#[path]`; see the comment on
+/// `main` above for why that indirection exists.
+#[cfg(test)]
+mod tests {
+    use super::{flags_carry_tokio_unstable, rustflags_carry_tokio_unstable};
+
+    /// `RUSTFLAGS="--cfg tokio_unstable"` — two whitespace-separated tokens.
+    #[test]
+    fn the_two_field_spelling_is_accepted() {
+        assert!(rustflags_carry_tokio_unstable(
+            None,
+            Some("--cfg tokio_unstable")
+        ));
+    }
+
+    /// `RUSTFLAGS="--cfg=tokio_unstable"` — one token. rustc accepts it, and the
+    /// old guard rejected it, telling the developer to set a flag they had set.
+    #[test]
+    fn the_joined_spelling_is_accepted() {
+        assert!(rustflags_carry_tokio_unstable(
+            None,
+            Some("--cfg=tokio_unstable")
+        ));
+        // And the same spelling arriving through the encoded variable, which is
+        // what a `.cargo/config.toml` `rustflags = ["--cfg=tokio_unstable"]`
+        // produces.
+        assert!(rustflags_carry_tokio_unstable(
+            Some("--cfg=tokio_unstable"),
+            None
+        ));
+    }
+
+    /// The authoritative variable is `\x1f`-separated, never whitespace-split.
+    #[test]
+    fn the_encoded_variable_is_split_on_the_unit_separator() {
+        assert!(rustflags_carry_tokio_unstable(
+            Some("--cfg\u{1f}tokio_unstable"),
+            None
+        ));
+        assert!(rustflags_carry_tokio_unstable(
+            Some("-C\u{1f}target-cpu=native\u{1f}--cfg\u{1f}tokio_unstable"),
+            None
+        ));
+        // A field is ONE flag: `"--cfg tokio_unstable"` as a single `\x1f`
+        // field is not two flags, and rustc would reject it too.
+        assert!(!rustflags_carry_tokio_unstable(
+            Some("--cfg tokio_unstable"),
+            None
+        ));
+    }
+
+    /// Nothing set at all — the case the guard exists for.
+    #[test]
+    fn an_absent_flag_is_rejected() {
+        assert!(!rustflags_carry_tokio_unstable(None, None));
+        assert!(!rustflags_carry_tokio_unstable(Some(""), None));
+        assert!(!rustflags_carry_tokio_unstable(
+            Some("-C\u{1f}debuginfo=2"),
+            Some("-C debuginfo=2")
+        ));
+    }
+
+    /// **Cargo's precedence.** `CARGO_ENCODED_RUSTFLAGS` present — even empty —
+    /// is the whole truth; a stale `RUSTFLAGS` inherited from the shell must not
+    /// wave the guard through, because rustc will never see the cfg and the
+    /// build would panic inside `ConsoleLayer::build` at startup instead.
+    #[test]
+    fn a_stale_rustflags_cannot_satisfy_the_guard_when_cargo_encoded_is_present() {
+        assert!(!rustflags_carry_tokio_unstable(
+            Some(""),
+            Some("--cfg tokio_unstable")
+        ));
+        assert!(!rustflags_carry_tokio_unstable(
+            Some("-C\u{1f}debuginfo=2"),
+            Some("--cfg=tokio_unstable")
+        ));
+    }
+
+    /// A bare `tokio_unstable` with no `--cfg` in front of it is a value, not a
+    /// cfg, and must not satisfy the guard.
+    #[test]
+    fn a_bare_token_is_not_a_cfg() {
+        assert!(!flags_carry_tokio_unstable(["tokio_unstable"]));
+        assert!(!flags_carry_tokio_unstable([
+            "--allow",
+            "tokio_unstable",
+            "-C",
+            "opt-level=0"
+        ]));
+        // ...but the flag directly after `--cfg` is.
+        assert!(flags_carry_tokio_unstable([
+            "--allow",
+            "unused",
+            "--cfg",
+            "tokio_unstable"
+        ]));
+    }
+
+    /// Empty fields (a trailing separator, a double space) must not break the
+    /// two-token pairing.
+    #[test]
+    fn empty_fields_do_not_break_the_pairing() {
+        assert!(rustflags_carry_tokio_unstable(
+            Some("--cfg\u{1f}\u{1f}tokio_unstable\u{1f}"),
+            None
+        ));
+        assert!(rustflags_carry_tokio_unstable(
+            None,
+            Some("  --cfg   tokio_unstable  ")
+        ));
     }
 }

@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
@@ -38,6 +41,14 @@ struct SessionRecapRequest {
 #[derive(Debug, Serialize, Clone)]
 struct SessionRecap {
     timespan: TimeSpan,
+    /// `true` when the aggregate git budget ran out mid-scan, so the recap is
+    /// PARTIAL. Published rather than swallowed: an empty recap and a
+    /// truncated one look identical otherwise, and "nothing changed" is the
+    /// wrong conclusion to hand a caller.
+    git_budget_exhausted: bool,
+    /// Repos whose scan was skipped or cut short (budget exhausted, or git
+    /// degraded on them). Empty on a complete scan.
+    repos_skipped: Vec<String>,
     repos_touched: Vec<RepoSummary>,
     files_created: Vec<FileChange>,
     files_modified: Vec<FileChange>,
@@ -156,25 +167,39 @@ async fn analyze_handler(
         )
     })?;
 
-    let mut all_files: Vec<FileChange> = Vec::new();
-    let mut repo_summaries: Vec<RepoSummary> = Vec::new();
+    // Every git child below runs on the BLOCKING POOL, under ONE aggregate
+    // budget. Before this the whole scan ran inline on the async handler, i.e.
+    // on a reactor worker: ~5-7 bounded-but-30s git children per repo, over
+    // every repo, TWICE (the two loops each resolved the lookback ref and
+    // re-shelled out). Fourteen repos behind a wedged git was ~49 minutes of
+    // one worker, and the route's own contract is that any client may poll it —
+    // a handful of concurrent polls exhausted the workers and stalled every
+    // `:9876` route INCLUDING `/health`, which is what the wedge watchdog
+    // reads. Blinding the diagnostic subsystem is the worst possible failure
+    // mode for a diagnostic endpoint.
+    let scan = spawn_blocking_tracked({
+        let lookback = lookback.clone();
+        move || scan_repos(&repos, &lookback)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Recap scan task failed: {}", e))),
+        )
+    })?;
 
-    for (repo_name, repo_path) in &repos {
-        // Resolve lookback to a concrete git ref per-repo
-        let diff_ref = resolve_lookback_ref(repo_path, &lookback);
-        let changes = collect_file_changes(repo_name, repo_path, &diff_ref);
-        if !changes.is_empty() {
-            let lines_added: u32 = changes.iter().map(|f| f.lines_added).sum();
-            let lines_removed: u32 = changes.iter().map(|f| f.lines_removed).sum();
-            repo_summaries.push(RepoSummary {
-                name: repo_name.clone(),
-                files_changed: changes.len() as u32,
-                lines_added,
-                lines_removed,
-            });
-            all_files.extend(changes);
-        }
-    }
+    let RepoScan {
+        all_files,
+        repo_summaries,
+        types_defined,
+        endpoints_added,
+        database_changes,
+        ui_components,
+        dependency_graph,
+        repos_skipped,
+        git_budget_exhausted,
+    } = scan;
 
     // Separate by change type
     let files_created: Vec<FileChange> = all_files
@@ -192,24 +217,6 @@ async fn analyze_handler(
         .filter(|f| f.change_type == "deleted")
         .cloned()
         .collect();
-
-    // Parse new/modified files for semantic content
-    let mut types_defined = Vec::new();
-    let mut endpoints_added = Vec::new();
-    let mut database_changes = Vec::new();
-    let mut ui_components = Vec::new();
-
-    for (repo_name, repo_path) in &repos {
-        let diff_ref = resolve_lookback_ref(repo_path, &lookback);
-        let diff_content = get_diff_content(repo_path, &diff_ref);
-        types_defined.extend(extract_types(&diff_content, repo_name));
-        endpoints_added.extend(extract_endpoints(&diff_content, repo_name));
-        database_changes.extend(extract_db_changes(&diff_content, repo_name));
-        ui_components.extend(extract_components(&diff_content, repo_name));
-    }
-
-    // Build dependency graph from imports in changed files
-    let dependency_graph = build_dependency_graph(&all_files, &repos);
 
     // Category breakdown
     let mut categories: HashMap<String, u32> = HashMap::new();
@@ -236,6 +243,8 @@ async fn analyze_handler(
             end: now.to_rfc3339(),
             lookback_spec: lookback,
         },
+        git_budget_exhausted,
+        repos_skipped,
         repos_touched: repo_summaries,
         files_created,
         files_modified,
@@ -342,7 +351,7 @@ fn discover_repos(
 /// Resolves a lookback spec into a concrete git commit ref for a given repo.
 /// For time-based lookbacks ("3 hours"), finds the oldest commit in that range.
 /// For ref-based ("HEAD~10"), returns it directly.
-fn resolve_lookback_ref(repo_path: &Path, lookback: &str) -> String {
+fn resolve_lookback_ref(repo_path: &Path, lookback: &str, budget: &RecapBudget) -> String {
     match lookback {
         s if s.starts_with("HEAD~") || s.starts_with("HEAD^") => s.to_string(),
         "since last commit" => "HEAD".to_string(),
@@ -363,6 +372,7 @@ fn resolve_lookback_ref(repo_path: &Path, lookback: &str) -> String {
                         &format!("--since={}", since),
                         "-1",
                     ],
+                    budget,
                 );
                 match result {
                     Ok(hash) if !hash.trim().is_empty() => {
@@ -382,19 +392,24 @@ fn resolve_lookback_ref(repo_path: &Path, lookback: &str) -> String {
     }
 }
 
-fn collect_file_changes(repo_name: &str, repo_path: &Path, diff_ref: &str) -> Vec<FileChange> {
+fn collect_file_changes(
+    repo_name: &str,
+    repo_path: &Path,
+    diff_ref: &str,
+    budget: &RecapBudget,
+) -> Vec<FileChange> {
     let mut changes = Vec::new();
 
     // Use git diff --numstat <ref> to get per-file stats
-    let output = run_git(repo_path, &["diff", "--numstat", diff_ref]);
+    let output = run_git(repo_path, &["diff", "--numstat", diff_ref], budget);
     let output = match output {
         Ok(o) => o,
         Err(_) => return changes,
     };
 
     // Get lists of added/deleted files for accurate change_type
-    let new_files = get_files_by_filter(repo_path, diff_ref, "A");
-    let deleted_files = get_files_by_filter(repo_path, diff_ref, "D");
+    let new_files = get_files_by_filter(repo_path, diff_ref, "A", budget);
+    let deleted_files = get_files_by_filter(repo_path, diff_ref, "D", budget);
 
     for line in output.lines() {
         let line = line.trim();
@@ -439,18 +454,27 @@ fn collect_file_changes(repo_name: &str, repo_path: &Path, diff_ref: &str) -> Ve
     changes
 }
 
-fn get_files_by_filter(repo_path: &Path, diff_ref: &str, filter: &str) -> Vec<String> {
+fn get_files_by_filter(
+    repo_path: &Path,
+    diff_ref: &str,
+    filter: &str,
+    budget: &RecapBudget,
+) -> Vec<String> {
     let filter_arg = format!("--diff-filter={}", filter);
-    run_git(repo_path, &["diff", &filter_arg, "--name-only", diff_ref])
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect()
+    run_git(
+        repo_path,
+        &["diff", &filter_arg, "--name-only", diff_ref],
+        budget,
+    )
+    .unwrap_or_default()
+    .lines()
+    .map(|l| l.trim().to_string())
+    .filter(|l| !l.is_empty())
+    .collect()
 }
 
-fn get_diff_content(repo_path: &Path, diff_ref: &str) -> String {
-    run_git(repo_path, &["diff", "-U0", diff_ref]).unwrap_or_default()
+fn get_diff_content(repo_path: &Path, diff_ref: &str, budget: &RecapBudget) -> String {
+    run_git(repo_path, &["diff", "-U0", diff_ref], budget).unwrap_or_default()
 }
 
 fn detect_language(path: &str) -> String {
@@ -946,15 +970,148 @@ fn normalize_import_path(path: &str) -> String {
         .to_string()
 }
 
-fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    // Bounded: reached from the `POST /session-recap/analyze` route, which any
-    // client can poll. `Command::output()` with no timeout on an HTTP handler
-    // is a thread leak per request.
+/// Budget for ONE git child in the recap scan.
+const RECAP_GIT_CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Aggregate budget for the git portion of ONE recap request.
+///
+/// Bounding each child left the aggregate unbounded: the scan loops over every
+/// discovered repo (14 on this fleet) issuing ~5 git calls each, so a wedged
+/// git cost 14 x 5 x 30s ≈ 35 minutes for a single poll of a route "any client
+/// can poll". This caps the whole request; repos not reached are reported in
+/// `repos_skipped` rather than silently contributing nothing.
+const RECAP_GIT_TOTAL_BUDGET: Duration = Duration::from_secs(120);
+
+/// Wall-clock budget shared by every git child of one recap request.
+struct RecapBudget {
+    deadline: Instant,
+}
+
+impl RecapBudget {
+    fn new(total: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + total,
+        }
+    }
+
+    /// How long the next child may run, or `None` once the aggregate is spent.
+    fn next_child(&self) -> Option<Duration> {
+        match self.deadline.checked_duration_since(Instant::now()) {
+            Some(left) if !left.is_zero() => Some(left.min(RECAP_GIT_CHILD_TIMEOUT)),
+            _ => None,
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.next_child().is_none()
+    }
+}
+
+/// Everything one blocking scan pass produces.
+struct RepoScan {
+    all_files: Vec<FileChange>,
+    repo_summaries: Vec<RepoSummary>,
+    types_defined: Vec<TypeDefinition>,
+    endpoints_added: Vec<EndpointInfo>,
+    database_changes: Vec<DbChange>,
+    ui_components: Vec<ComponentInfo>,
+    dependency_graph: Vec<DependencyEdge>,
+    repos_skipped: Vec<String>,
+    git_budget_exhausted: bool,
+}
+
+/// The whole git-shelling half of a recap, in ONE pass per repo.
+///
+/// Runs on the blocking pool (see the call site). Two things changed beyond
+/// the move:
+///
+/// * **One pass, not two.** The handler used to loop over the repos twice and
+///   call `resolve_lookback_ref` in BOTH, so every repo paid for the lookback
+///   resolution — a `git log` — twice for identical output. The diff ref is
+///   now resolved once per repo and reused.
+/// * **An aggregate budget.** Once [`RECAP_GIT_TOTAL_BUDGET`] is spent the
+///   remaining repos are recorded in `repos_skipped` instead of spawning more
+///   children, so the cost of the unbounded repo list is bounded.
+fn scan_repos(repos: &[(String, PathBuf)], lookback: &str) -> RepoScan {
+    let budget = RecapBudget::new(RECAP_GIT_TOTAL_BUDGET);
+
+    let mut all_files: Vec<FileChange> = Vec::new();
+    let mut repo_summaries: Vec<RepoSummary> = Vec::new();
+    let mut types_defined = Vec::new();
+    let mut endpoints_added = Vec::new();
+    let mut database_changes = Vec::new();
+    let mut ui_components = Vec::new();
+    let mut repos_skipped: Vec<String> = Vec::new();
+
+    for (repo_name, repo_path) in repos {
+        if budget.exhausted() {
+            repos_skipped.push(repo_name.clone());
+            continue;
+        }
+
+        // Resolved ONCE per repo and reused by both halves below.
+        let diff_ref = resolve_lookback_ref(repo_path, lookback, &budget);
+
+        let changes = collect_file_changes(repo_name, repo_path, &diff_ref, &budget);
+        if !changes.is_empty() {
+            let lines_added: u32 = changes.iter().map(|f| f.lines_added).sum();
+            let lines_removed: u32 = changes.iter().map(|f| f.lines_removed).sum();
+            repo_summaries.push(RepoSummary {
+                name: repo_name.clone(),
+                files_changed: changes.len() as u32,
+                lines_added,
+                lines_removed,
+            });
+            all_files.extend(changes);
+        }
+
+        let diff_content = get_diff_content(repo_path, &diff_ref, &budget);
+        types_defined.extend(extract_types(&diff_content, repo_name));
+        endpoints_added.extend(extract_endpoints(&diff_content, repo_name));
+        database_changes.extend(extract_db_changes(&diff_content, repo_name));
+        ui_components.extend(extract_components(&diff_content, repo_name));
+    }
+
+    let dependency_graph = build_dependency_graph(&all_files, repos);
+    let git_budget_exhausted = budget.exhausted();
+    if git_budget_exhausted {
+        tracing::warn!(
+            "session_recap: the {}s aggregate git budget was exhausted — {} repo(s) skipped, \
+             the recap is PARTIAL",
+            RECAP_GIT_TOTAL_BUDGET.as_secs(),
+            repos_skipped.len()
+        );
+    }
+
+    RepoScan {
+        all_files,
+        repo_summaries,
+        types_defined,
+        endpoints_added,
+        database_changes,
+        ui_components,
+        dependency_graph,
+        repos_skipped,
+        git_budget_exhausted,
+    }
+}
+
+/// One bounded git child, charged against the request's aggregate budget.
+///
+/// Returns `Err` when the child failed, was killed at its budget, OR when the
+/// aggregate budget was already spent (in which case nothing is spawned at
+/// all). Every caller already degrades on `Err`.
+fn run_git(repo_path: &Path, args: &[&str], budget: &RecapBudget) -> Result<String, String> {
+    let Some(child_budget) = budget.next_child() else {
+        return Err(format!(
+            "git {} skipped: the request's aggregate git budget is spent",
+            args.join(" ")
+        ));
+    };
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(args).current_dir(repo_path);
-    let output =
-        crate::process_helpers::output_with_timeout(cmd, std::time::Duration::from_secs(30))
-            .map_err(|e| format!("Failed to run git: {}", e))?;
+    let output = crate::process_helpers::output_with_timeout(cmd, child_budget)
+        .map_err(|e| format!("Failed to run git: {}", e))?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
