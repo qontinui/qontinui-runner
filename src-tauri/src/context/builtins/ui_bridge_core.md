@@ -175,6 +175,8 @@ If not using the Python client:
 
 - `includeHidden` (bool, optional, **default true**): match elements regardless of visibility — preserves historical front-end behaviour (the registry contains hidden elements like collapsed-sidebar children). Pass `false` to opt into the visibility filter.
 
+`/ui-bridge/control/find` and `/ui-bridge/control/discover` take the **same** filter set (the SDK's `FindRequest`; `DiscoveryRequest` is a deprecated alias of it), and the runner now forwards it whole on both routes. Beyond the common filters (`types`, `element_type`, `text`, `exact_text`, `role`, `label`, `selector`, `root`, `interactiveOnly`, `includeHidden`, `limit`) that means `testId`, `contentRole`, `includeContent`, `contentOnly`, `skipSettle`, `settleTimeout` and the media filters (`includeMedia`, `mediaOnly`, `mediaType`, `brokenOnly`, `missingAltOnly`, `srcPattern`, `oversizeThreshold`) reach the SDK on **either** route. Both `interactive_only`/`interactiveOnly` and `include_hidden`/`includeHidden` spellings are accepted.
+
 ### Choosing a wait / nav / batch primitive
 
 Prefer these primitives over `sleep N && re-discover`; they all already exist. Each pairs a bounded wait or a single round-trip with a verification signal, which is usually what the naive sleep is trying to approximate.
