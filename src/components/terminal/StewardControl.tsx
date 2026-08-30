@@ -77,21 +77,100 @@ export function buildStewardUrl(
   return `http://127.0.0.1:${port}/steward/${kind}/${path}`;
 }
 
+/**
+ * The reason a non-2xx response carries, falling back to its status code.
+ *
+ * Shared by the action path and the roster poll so both surface the backend's
+ * own message. That message is load-bearing: `POST /steward/{kind}/start`
+ * answers 400 with the character it refused, 409 with the terminal already
+ * running, and — from the unattended-spawn resource floor — a refusal quoting
+ * lane/headroom/floor. Only the status code survives if the body is not JSON.
+ */
+export async function readErrorDetail(resp: {
+  status: number;
+  json: () => Promise<unknown>;
+}): Promise<string> {
+  try {
+    const json = (await resp.json()) as StewardApiResponse<unknown>;
+    if (json.error) return json.error;
+  } catch {
+    // Non-JSON body — keep the status-code fallback.
+  }
+  return `HTTP ${resp.status}`;
+}
+
+/**
+ * Coarse "how long has this been up" for a running steward, from the
+ * `started_at` the roster already returns.
+ *
+ * Returns `null` rather than a placeholder whenever the input cannot support a
+ * claim: a missing/zero timestamp (`TerminalInfo::created_at` defaults to 0),
+ * a non-finite one, or a future one. A steward's whole purpose is to run
+ * unattended, so "has this actually been alive, or did it restart a minute
+ * ago?" is the operator's first question — and an uptime that silently reads
+ * `0m` for an absent timestamp answers it wrongly.
+ */
+export function formatUptime(startedAtMs: number | undefined, nowMs: number): string | null {
+  if (typeof startedAtMs !== "number" || !Number.isFinite(startedAtMs) || startedAtMs <= 0) {
+    return null;
+  }
+  const elapsedMs = nowMs - startedAtMs;
+  // Clock skew between the runner's `created_at` and the renderer can put a
+  // just-started steward slightly in the future; treat that as "just now"
+  // rather than refusing to render.
+  if (elapsedMs < 0) return "0m";
+
+  const minutes = Math.floor(elapsedMs / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
+/**
+ * The detail line for a running steward: what it was launched as, and for how
+ * long.
+ *
+ * `GET /stewards` has always returned `interval` and `started_at` alongside
+ * `mode`, but the running row rendered `mode` alone — so the cadence an
+ * operator can read on the *stopped* row (`default_mode · default_interval`)
+ * disappeared the moment the steward started, which is when it matters. Every
+ * part is omitted when absent rather than rendered as a blank, so a runner
+ * that reports less still produces a well-formed line.
+ */
+export function formatRunningSummary(steward: StewardStatus, nowMs: number): string {
+  const uptime = formatUptime(steward.started_at, nowMs);
+  return [steward.mode, steward.interval, uptime ? `up ${uptime}` : undefined]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ");
+}
+
 export function StewardControl() {
   const [stewards, setStewards] = useState<StewardStatus[]>([]);
   const [busyKinds, setBusyKinds] = useState<ReadonlySet<string>>(() => new Set());
   const [errors, setErrors] = useState<Readonly<Record<string, string>>>({});
-  const [reachable, setReachable] = useState(true);
+  /** Why the roster is not current, or `null` while it is. */
+  const [rosterError, setRosterError] = useState<string | null>(null);
 
   const fetchStatus = useCallback(async (): Promise<void> => {
     try {
       const port = resolvePort();
       const resp = await fetch(buildStewardsUrl(port));
-      if (!resp.ok) return;
+      // `fetch` does not throw on a non-2xx. The action path was fixed to read
+      // the error body; this path still discarded it AND left the previous
+      // "reachable" verdict standing, so a 500 from the roster endpoint made
+      // the whole control render `null` — silently absent, indistinguishable
+      // from a runner with no stewards. Every non-success arm now names itself.
+      if (!resp.ok) {
+        setRosterError(await readErrorDetail(resp));
+        return;
+      }
       const json = (await resp.json()) as StewardApiResponse<StewardStatus[]>;
       if (json.success && json.data) {
         setStewards(json.data);
-        setReachable(true);
+        setRosterError(null);
+      } else {
+        setRosterError(json.error ?? "runner returned no roster");
       }
     } catch {
       // Network error — leave the existing roster in place so the control
@@ -99,7 +178,7 @@ export function StewardControl() {
       // the roster is current. An empty roster that renders nothing at all
       // is indistinguishable from "this runner has no stewards", so the
       // unreachable case gets its own line below.
-      setReachable(false);
+      setRosterError("runner API unreachable");
     }
   }, []);
 
@@ -134,18 +213,13 @@ export function StewardControl() {
       });
       // `fetch` does not throw on a non-2xx, so without this the button
       // would fail silently. The backend deliberately puts its reason in the
-      // body — a 409 (already running) and, more importantly, the
+      // body — a 400 (a mode/interval the launcher refused to type into a
+      // shell), a 409 (already running) and, more importantly, the
       // unattended-spawn resource-floor refusal that carries lane/headroom/
       // floor detail. Discarding that leaves an operator with a button that
       // does nothing and says nothing.
       if (!resp.ok) {
-        let detail = `HTTP ${resp.status}`;
-        try {
-          const json = (await resp.json()) as StewardApiResponse<unknown>;
-          if (json.error) detail = json.error;
-        } catch {
-          // Non-JSON body — keep the status-code fallback.
-        }
+        const detail = await readErrorDetail(resp);
         setErrors((prev) => ({ ...prev, [kind]: detail }));
       }
     } catch (e) {
@@ -168,16 +242,16 @@ export function StewardControl() {
   };
 
   if (stewards.length === 0) {
-    // Render nothing only when the roster is genuinely empty AND we could
-    // reach the runner to learn that. Vanishing on an unreachable runner
-    // would hide the control exactly when something is wrong.
-    if (reachable) return null;
+    // Render nothing only when the roster is genuinely empty AND the runner
+    // answered successfully, so we know that. Vanishing on any failure would
+    // hide the control exactly when something is wrong.
+    if (rosterError === null) return null;
     return (
       <div
         className="px-3 py-1.5 border-b border-[#2a2d3d] bg-[#13141f] text-[11px] text-[#565f89]"
         data-testid="steward-unreachable"
       >
-        Stewards unavailable — runner API unreachable
+        Stewards unavailable — {rosterError}
       </div>
     );
   }
@@ -187,6 +261,11 @@ export function StewardControl() {
       {stewards.map((steward) => {
         const busy = busyKinds.has(steward.kind);
         const error = errors[steward.kind];
+        // Read the clock per render rather than holding it in state: the poll
+        // above replaces `stewards` every STEWARD_POLL_INTERVAL_MS with a new
+        // array, so this component already re-renders on that cadence and the
+        // uptime advances with it. A second timer would only add a re-render.
+        const summary = formatRunningSummary(steward, Date.now());
         return (
           <div key={steward.kind} data-testid={`steward-row-${steward.kind}`}>
             <div className="flex items-center gap-2 px-3 py-1.5">
@@ -201,8 +280,13 @@ export function StewardControl() {
                     data-testid={`steward-status-label-${steward.kind}`}
                   >
                     {steward.label}: Running
-                    {steward.mode && (
-                      <span className="ml-1.5 text-[10px] text-[#565f89]">({steward.mode})</span>
+                    {summary && (
+                      <span
+                        className="ml-1.5 text-[10px] text-[#565f89]"
+                        data-testid={`steward-running-summary-${steward.kind}`}
+                      >
+                        ({summary})
+                      </span>
                     )}
                   </span>
                   <button
