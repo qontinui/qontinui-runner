@@ -565,4 +565,123 @@ mod tests {
             );
         }
     }
+
+    /// The two UNKNOWN arms that a degraded delivery read makes LOOK CLEAN, as
+    /// `(token, why it is load-bearing)`.
+    ///
+    /// [`IN_PROGRESS_DELIVERY_GUARD_CLAUSES`] covers the arms whose absence a
+    /// reader would notice: the evaluation order, the fail-closed default, the
+    /// unidentified-stamp STOP, arm 1's closeout route. These two are different
+    /// in kind — **neither is error-shaped**. Both answer `200` with a
+    /// parseable `delivery` and no `citations_error`, so arm 6's enumeration
+    /// (errors, unparseable or non-2xx bodies, an absent `delivery`, a dead
+    /// transport) does not reach them, and a copy carrying arm 6 alone still
+    /// scores a degraded window as arm 5 — "a clean, complete observation of
+    /// not delivered".
+    ///
+    /// They were the last thing to reach the copies: `implement-plan.md`
+    /// carried the arm order and arm 6 but named neither of these until the
+    /// follow-up that added this guard.
+    const CLEAN_LOOKING_UNKNOWN_ARMS: &[(&str, &str)] = &[
+        (
+            "evidence_complete",
+            "arm 2's only discriminator, and it must NOT be keyed on `shipped`: the two \
+             derive independently (`shipped = inputs.delivered`, `evidence_complete = \
+             evidence_gaps.is_empty()`) and the merged-predicate-degraded gap is \
+             unit-independent, so `shipped: true` with `evidence_complete: false` is \
+             reachable and falls through to the permissive arm without it",
+        ),
+        (
+            "merged_degraded_reason",
+            "arm 3, evaluated ahead of every arm but 4. It sits BESIDE `delivery` and is \
+             present even when the verdict could not be derived at all, so while it is \
+             set every citation's `merged: false` is UNKNOWN rather than an observation \
+             — and nothing about the response looks like an error",
+        ),
+        (
+            "unknown-must-not-render-as-a-default",
+            "the served `verification-and-evidence` clause both arms exist to satisfy. A \
+             copy that drops the citation keeps the arms but loses the reason, which is \
+             what invites the next editor to collapse them back into `not shipped`",
+        ),
+    ];
+
+    /// Every command in the scope of
+    /// [`bundled_delivery_guard_commands_carry_the_fail_closed_clauses`] must
+    /// also name [`CLEAN_LOOKING_UNKNOWN_ARMS`].
+    ///
+    /// Same scope probe ([`DELIVERY_READ`]) and the same reasoning, so the two
+    /// compose: that guard keeps the arms a reader would miss, this one keeps
+    /// the arms a reader would not.
+    #[test]
+    fn bundled_delivery_guard_commands_name_the_clean_looking_unknown_arms() {
+        let mut checked = 0usize;
+        for (name, contents) in FLEET_COMMANDS {
+            if !contents.contains(DELIVERY_READ) {
+                continue;
+            }
+            checked += 1;
+            for (token, why) in CLEAN_LOOKING_UNKNOWN_ARMS {
+                assert!(
+                    contents.contains(token),
+                    "bundled agent command {name} teaches the `IN PROGRESS` delivery \
+                     guard (it names {DELIVERY_READ}) but never mentions {token:?} — \
+                     {why}. A copy missing it fails OPEN on the one response shape that \
+                     reads as a clean observation, and on a device with no \
+                     qontinui-claude-config checkout this file is the ONLY copy; add it \
+                     in src-tauri/src/fleet_commands/{name}.md"
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "no bundled command mentions {DELIVERY_READ:?} — either the bundle lost its \
+             `IN PROGRESS` delivery guard entirely or this guard's content probe went \
+             stale. Both need a human look; neither is a passing test"
+        );
+    }
+
+    /// A command may not teach the do-not-overwrite lifecycle tokens and then
+    /// OMIT `IN PROGRESS`.
+    ///
+    /// This is the original defect, encoded. The two guards above are scoped by
+    /// [`DELIVERY_READ`], so they say nothing about a command that teaches the
+    /// lifecycle list while carrying no delivery guard AT ALL — which is
+    /// exactly the state `/vet-plan` was in: `SHIPPED` / `SUPERSEDED` /
+    /// `OBSOLETE` listed as protected, `IN PROGRESS` simply absent, and a vet
+    /// pass free to re-stamp a plan whose work had landed, satisfy its own
+    /// VETTED gate with the stamp it had just written, and re-run phase agents
+    /// against `main`.
+    ///
+    /// The probe is the CO-OCCURRENCE of two of the trio rather than one token:
+    /// the two spellings in the bundle punctuate the list differently
+    /// (`` `SHIPPED` / `SUPERSEDED` / `OBSOLETE` `` against `` `SHIPPED`,
+    /// `SUPERSEDED` or `OBSOLETE` ``), so no single literal matches both, and
+    /// `SUPERSEDED` alone is an ordinary English word a later command could use
+    /// in prose having nothing to do with a plan stamp.
+    #[test]
+    fn bundled_lifecycle_commands_dispose_of_in_progress() {
+        let mut checked = 0usize;
+        for (name, contents) in FLEET_COMMANDS {
+            if !(contents.contains("SUPERSEDED") && contents.contains("OBSOLETE")) {
+                continue; // not a command that disposes of a plan lifecycle stamp
+            }
+            checked += 1;
+            assert!(
+                contents.contains("is CONDITIONALLY overwritable"),
+                "bundled agent command {name} teaches the do-not-overwrite lifecycle \
+                 tokens but never says what to do with an `IN PROGRESS` stamp. That \
+                 exact omission is what let a vet pass overwrite a plan whose work had \
+                 already landed and then re-implement it; restore the \"`IN PROGRESS` is \
+                 CONDITIONALLY overwritable\" disposition in \
+                 src-tauri/src/fleet_commands/{name}.md"
+            );
+        }
+        assert!(
+            checked > 0,
+            "no bundled command mentions both `SUPERSEDED` and `OBSOLETE` — either the \
+             bundle lost its plan-lifecycle procedures or this guard's content probe \
+             went stale"
+        );
+    }
 }
