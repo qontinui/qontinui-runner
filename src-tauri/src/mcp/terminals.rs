@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 use crate::terminal::{strip_ansi, TerminalManager};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Request Types
@@ -652,7 +653,7 @@ pub async fn close_terminal_handler(
 
     info!("HTTP: Closing terminal session: {}", id);
 
-    tokio::task::spawn_blocking(move || manager.close(&terminal_id))
+    spawn_blocking_tracked(move || manager.close(&terminal_id))
         .await
         .map_err(|e| {
             error!("HTTP: spawn_blocking error for close terminal: {}", e);

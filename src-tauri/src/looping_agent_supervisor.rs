@@ -56,6 +56,7 @@ use qontinui_runner_lib::looping_agent::policy::{self, Action, Liveness, SpawnRe
 use qontinui_runner_lib::looping_agent::registry::{
     DesiredState, LoopingAgentDef, LoopingAgentRecord, LoopingAgentRegistry, MERGE_SHEPHERD_ID,
 };
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Supervisor tick interval. Overridable via
 /// `QONTINUI_LOOPING_AGENT_TICK_MS` (floored at 500ms). 5s is well under any
@@ -468,7 +469,7 @@ async fn supervise_one(
             // slow or perturb the loop it observes.
             // Returns None when this tick saw the SAME ending already
             // journalled — the common case at a 5s tick.
-            tokio::task::spawn_blocking(move || {
+            spawn_blocking_tracked(move || {
                 if let Some(ending) = crate::turn_ending_shadow::observe_turn_ending(
                     &agent_id,
                     &journal_path,
@@ -1010,7 +1011,7 @@ async fn spawn_looping_agent_terminal(
     // instantly with a 401 under a quota-exhausted/unauthenticated default.
     // Resolved BEFORE the argv build so its per-account launch command can layer
     // into the shared launch seam.
-    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
     let (selected_config_dir, _config_dir_source) = {
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)

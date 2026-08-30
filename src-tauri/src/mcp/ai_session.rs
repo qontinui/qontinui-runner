@@ -30,6 +30,7 @@ use qontinui_types::scheduler::McpConnectionRef;
 // Re-export AiSessionContext from the canonical location
 pub use crate::execution_context::AiSessionContext;
 use crate::runtime_env::{AiSessionContextExt, ExecutionContextExt};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ===========================================================================
 // The runner-injected rules block (plan
@@ -2351,7 +2352,7 @@ If your task requires running visual automation, use the Runner API to execute w
         let resp_account_for_spawn = resp_account.clone();
         let resp_config_dir_for_spawn = resp_config_dir.clone();
         let resp_cooldown_warning_for_spawn = resp_cooldown_warning.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = spawn_blocking_tracked(move || {
             let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
             let spawn_script = scripts_path.join("spawn-independent-claude.py");
             let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));

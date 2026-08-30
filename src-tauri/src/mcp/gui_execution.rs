@@ -18,6 +18,7 @@ use crate::mcp::misc::{generate_id_from_path, path_to_name};
 use crate::mcp::types::{api_error, ApiResponse, ApiState, GoToStateRequest, GoToStateResult};
 use crate::settings;
 use crate::timeout_config::Timeouts;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Request / Response Types
@@ -242,7 +243,7 @@ pub async fn load_config(
     let config_path = request.config_path.clone();
     let config_path_for_event = request.config_path.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         // Step 1: Load and validate the configuration file
         let config = ConfigLoader::load_from_file(&config_path).map_err(|e| {
             error!(
@@ -437,7 +438,7 @@ pub async fn load_last_config(
     let config_path_clone = config_path.clone();
     let config_path_for_event = config_path.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         // Load and validate the configuration file
         let config = ConfigLoader::load_from_file(&config_path_clone).map_err(|e| {
             error!(
@@ -785,7 +786,7 @@ pub async fn stop_execution(
 
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| match bridge.stop_execution() {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("Failed to stop execution: {}", e)),
@@ -837,7 +838,7 @@ pub async fn execute_python_command(
     let params = request.params.clone();
 
     // Use spawn_blocking for the synchronous bridge operation
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());

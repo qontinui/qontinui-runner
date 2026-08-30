@@ -626,7 +626,7 @@ pub async fn get_status(
     let app_state = state.app_state.clone();
 
     // Run blocking operations in a separate thread to avoid blocking the async runtime
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         // Use with_default_bridge helper for bridge access
         let (executor_running, executor_state) = match with_default_bridge(&app_state, |bridge| {
             (bridge.is_running(), bridge.get_state().name().to_string())
@@ -1252,7 +1252,7 @@ pub async fn capture_screenshot_ipc(
         "format": format,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -1285,7 +1285,7 @@ pub async fn capture_screenshot_ipc(
 pub async fn get_monitors_ipc(
     app_state: Arc<crate::AppState>,
 ) -> Result<serde_json::Value, String> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -1976,6 +1976,7 @@ async fn purge_stale_instances(
 // Wire types live in `qontinui_types::wire::placement` so the supervisor
 // parses the exact shape the runner emits — no hand-maintained duplicate.
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use qontinui_types::wire::placement::{
     SpawnPlacementPreviewQuery, SpawnPlacementResponse, TempPlacementLookupQuery,
     TempPlacementsListResponse,

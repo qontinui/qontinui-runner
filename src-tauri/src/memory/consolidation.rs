@@ -20,6 +20,7 @@ use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
 use crate::memory::importance;
 use crate::str_utils::{truncate_str, truncate_str_ellipsis};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // =============================================================================
 // Types
@@ -568,7 +569,7 @@ async fn run_consolidation_inner(
 
         let model_override = config.model_override.clone();
         let provider_override = config.provider_override.clone();
-        let response = tokio::task::spawn_blocking(move || {
+        let response = spawn_blocking_tracked(move || {
             ai_provider::run_prompt_with_model_override(
                 &prompt,
                 &context,
@@ -772,7 +773,7 @@ async fn try_llm_inductive(
 
     let context = TaskContext::from_prompt(&prompt);
 
-    let response = tokio::task::spawn_blocking(move || {
+    let response = spawn_blocking_tracked(move || {
         ai_provider::run_prompt_with_model_override(
             &prompt,
             &context,
@@ -837,7 +838,7 @@ async fn try_llm_abductive(
 
     let context = TaskContext::from_prompt(&prompt);
 
-    let response = tokio::task::spawn_blocking(move || {
+    let response = spawn_blocking_tracked(move || {
         ai_provider::run_prompt_with_model_override(
             &prompt,
             &context,

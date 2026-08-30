@@ -106,6 +106,7 @@ use command::CommandHandler;
 use effect_check::EffectCheckHandler;
 use execute_playbook::ExecutePlaybookHandler;
 use native_accessibility::NativeAccessibilityHandler;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use restart_process::RestartProcessHandler;
 use save_workflow_artifact::SaveWorkflowArtifactHandler;
 use spec_check::SpecCheckHandler;
@@ -661,7 +662,7 @@ impl PromptStepHandler {
 
         // Run Claude CLI session with full tool access via spawn_blocking (sync function)
         let start = std::time::Instant::now();
-        let ai_result = tokio::task::spawn_blocking(move || {
+        let ai_result = spawn_blocking_tracked(move || {
             crate::claude_session::runner::run_claude_session_with_retry(
                 &workspace_root,
                 &eval_prompt,
@@ -776,7 +777,7 @@ impl PromptStepHandler {
         let prompt_clone = eval_prompt.clone();
         let doctor_handle = context.app_state.doctor_handle.lock().await.clone();
         let start = std::time::Instant::now();
-        let ai_result = tokio::task::spawn_blocking(move || {
+        let ai_result = spawn_blocking_tracked(move || {
             crate::ai_provider::run_prompt_with_routing(
                 &prompt_clone,
                 &task_context,
@@ -842,7 +843,7 @@ impl PromptStepHandler {
                 let retry_task_context = crate::ai_router::TaskContext::from_prompt(&retry_prompt);
                 let retry_prompt_clone = retry_prompt.clone();
                 let doctor_handle2 = context.app_state.doctor_handle.lock().await.clone();
-                let retry_result = tokio::task::spawn_blocking(move || {
+                let retry_result = spawn_blocking_tracked(move || {
                     crate::ai_provider::run_prompt_with_routing(
                         &retry_prompt_clone,
                         &retry_task_context,

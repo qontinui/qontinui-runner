@@ -13,6 +13,7 @@ use tracing::{info, warn};
 use super::{HandlerContext, StepHandler, StepHandlerResult};
 use crate::step_executor::ExecutionStepConfig;
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Handler for check steps.
 pub struct CheckHandler;
@@ -890,7 +891,7 @@ impl CheckHandler {
         let task_context = crate::ai_router::TaskContext::from_prompt(&full_prompt);
         let prompt_clone = full_prompt.clone();
         let doctor_handle = context.app_state.doctor_handle.lock().await.clone();
-        let ai_result = tokio::task::spawn_blocking(move || {
+        let ai_result = spawn_blocking_tracked(move || {
             crate::ai_provider::run_prompt_with_routing(
                 &prompt_clone,
                 &task_context,

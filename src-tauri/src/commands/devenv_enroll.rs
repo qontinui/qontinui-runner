@@ -13,6 +13,7 @@ use tracing::info;
 use qontinui_runner_lib::env_agent::enroll::{self, EnrollParams};
 
 use super::CommandResponse;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Current enrollment status for the Settings panel (mirrors `env show`).
 #[derive(Serialize)]
@@ -40,7 +41,7 @@ pub async fn devenv_enroll(
     code: String,
     backend: Option<String>,
 ) -> Result<CommandResponse, String> {
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = spawn_blocking_tracked(move || {
         let backend = enroll::resolve_backend_base(backend.as_deref())?;
         let identity = enroll::local_machine_identity();
         enroll::run_enroll(EnrollParams {
@@ -127,7 +128,7 @@ pub fn devenv_enroll_status() -> Result<CommandResponse, String> {
 #[tauri::command]
 pub async fn devenv_install_cli_path() -> Result<CommandResponse, String> {
     let outcome =
-        tokio::task::spawn_blocking(qontinui_runner_lib::profile_cli::install_cli_on_user_path)
+        spawn_blocking_tracked(qontinui_runner_lib::profile_cli::install_cli_on_user_path)
             .await
             .map_err(|e| format!("PATH install task panicked: {e}"))??;
     info!(

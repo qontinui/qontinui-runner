@@ -10,6 +10,7 @@ use crate::mcp::types::ApiState;
 use crate::mcp::ui_bridge::{self, CircuitBreakerState as CbState};
 
 use super::types::{CircuitBreakerState, SdkConnectionInfo, UiBridgeHealth};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 pub struct QueryRoot;
 
@@ -503,7 +504,7 @@ impl QueryRoot {
         let app_state = state.app_state.clone();
 
         let (executor_running, executor_state, config_loaded, config_path) =
-            tokio::task::spawn_blocking(move || {
+            spawn_blocking_tracked(move || {
                 let (executor_running, executor_state) =
                     match crate::executor::with_default_bridge(&app_state, |bridge| {
                         (bridge.is_running(), bridge.get_state().name().to_string())

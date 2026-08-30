@@ -24,6 +24,7 @@ use super::credentials::CredentialStore;
 use super::manager::WrapperManager;
 use super::registry::{scan_one, WrapperRegistry};
 use crate::pm_detect::{detect_node_package_manager, pm_command};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Body for `POST /wrappers/install`.
 ///
@@ -128,7 +129,7 @@ pub async fn install(
     let stage_clone = stage.clone();
     let pm_owned = pm.to_string();
     let spec_owned = spec.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+    let result = spawn_blocking_tracked(move || -> Result<(), String> {
         // pm_command resolves the .cmd shim on Windows when needed.
         let mut cmd = pm_command(&pm_owned);
         cmd.current_dir(&stage_clone)

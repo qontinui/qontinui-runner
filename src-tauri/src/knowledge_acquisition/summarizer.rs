@@ -1,4 +1,5 @@
 use crate::config_facade::ai_keychain;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 const DEFAULT_MAX_LENGTH: usize = 2000;
 const SUMMARIZATION_THRESHOLD: usize = 3000;
@@ -71,7 +72,7 @@ async fn llm_summarize(content: &str, query: &str, max_length: usize) -> Result<
     });
 
     // Use spawn_blocking to wrap the blocking HTTP call
-    let summary = tokio::task::spawn_blocking(move || {
+    let summary = spawn_blocking_tracked(move || {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()

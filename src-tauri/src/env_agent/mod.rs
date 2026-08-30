@@ -69,6 +69,7 @@ use tracing::{debug, info, warn};
 
 use self::collectors::Section;
 use self::config::EnvAgentConfig;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Current envelope schema version. Must match the backend's expectation.
 const SCHEMA_VERSION: u32 = 1;
@@ -264,7 +265,7 @@ pub async fn build_envelope() -> ConfigEnvelope {
     // door, so calling it inline parked one of those workers for the duration.
     // `spawn_blocking` puts it on the blocking pool where a long synchronous
     // call belongs.
-    let versions = tokio::task::spawn_blocking(collectors::collect_versions)
+    let versions = spawn_blocking_tracked(collectors::collect_versions)
         .await
         .unwrap_or_else(|e| {
             // A panicked/cancelled collector degrades to "we have no local data

@@ -20,6 +20,7 @@ async fn pg_get_task_run(state: &Arc<ApiState>, id: &str) -> Result<Option<TaskR
     state.app_state.pg_db.get_task_run(id).await
 }
 use crate::summary_generator;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use tauri::Manager;
 
 // Re-export handlers from extracted submodules for backward compatibility
@@ -2518,7 +2519,7 @@ pub async fn generate_workflow_from_session(
     // See transcript.rs rationale — thread AppState for brief-mode port.
     let app_state_for_gen = state.app_state.clone();
 
-    let gen_result = tokio::task::spawn_blocking(move || {
+    let gen_result = spawn_blocking_tracked(move || {
         let (response, mut artifact) = crate::workflow_generation::generate_workflow(
             request,
             doctor_handle.as_ref(),

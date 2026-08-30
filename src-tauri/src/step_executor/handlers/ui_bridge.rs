@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 
 use super::{ExecutionStepConfig, HandlerContext, StepHandler, StepHandlerResult};
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ---------------------------------------------------------------------------
 // Pure helper functions (#1 — foundation for typed parsing and compare logic)
@@ -1398,7 +1399,7 @@ impl UiBridgeHandler {
         let prompt_clone = prompt.clone();
         let doctor_handle = context.app_state.doctor_handle.lock().await.clone();
 
-        let ai_result = tokio::task::spawn_blocking(move || {
+        let ai_result = spawn_blocking_tracked(move || {
             crate::ai_provider::run_prompt_with_routing(
                 &prompt_clone,
                 &task_context,

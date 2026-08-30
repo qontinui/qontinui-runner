@@ -31,6 +31,7 @@ use crate::commands::AppState;
 use crate::error::AppError;
 use crate::server_mode::{ServerModeConfig, ServerModeState};
 use crate::settings::{self, WebIntegrationSettings};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Name of the Tauri event emitted when web-integration state is hot-reloaded.
 /// Frontend should re-fetch status when it sees this event.
@@ -646,7 +647,7 @@ pub async fn redeem_pair_code(
     let code_for_blocking = code_trimmed.clone();
     let device_id_for_blocking = device_id.clone();
     let web_base_for_blocking = web_base.clone();
-    let resp = tokio::task::spawn_blocking(move || {
+    let resp = spawn_blocking_tracked(move || {
         pair_with_pair_code(
             &web_base_for_blocking,
             &code_for_blocking,

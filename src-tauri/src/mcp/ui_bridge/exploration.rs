@@ -24,6 +24,7 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use super::types::{
     DiscoverStatesRequest, StartUIBridgeExplorationRequest, UIBridgeExplorationStatusRequest,
 };
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Classify an executor-bridge failure into the `(status, code)` a caller
 /// should see.
@@ -100,7 +101,7 @@ pub async fn start_ui_bridge_exploration(
     // Short timeout since this just starts the background job
     let timeout = std::time::Duration::from_secs(30);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -162,7 +163,7 @@ pub async fn get_ui_bridge_exploration_status(
 
     let timeout = std::time::Duration::from_secs(10);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -216,7 +217,7 @@ pub async fn get_ui_bridge_exploration_results(
 
     let timeout = std::time::Duration::from_secs(30);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -270,7 +271,7 @@ pub async fn stop_ui_bridge_exploration(
 
     let timeout = std::time::Duration::from_secs(10);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -332,7 +333,7 @@ pub async fn discover_states_from_renders(
     // Allow more time for analysis of large render logs
     let timeout = std::time::Duration::from_secs(60);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -440,7 +441,7 @@ fn list_windows_native() -> Result<Vec<WindowInfo>, String> {
 pub async fn ui_bridge_list_windows_handler(
     State(_state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<Vec<WindowInfo>>> {
-    match tokio::task::spawn_blocking(list_windows_native).await {
+    match spawn_blocking_tracked(list_windows_native).await {
         Ok(Ok(windows)) => {
             info!("UI Bridge: Listed {} capturable windows", windows.len());
             Json(ApiResponse::success(windows))

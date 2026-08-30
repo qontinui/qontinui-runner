@@ -10,6 +10,7 @@ use tracing::info;
 
 use crate::mcp::types::{ApiResponse, ApiState};
 use crate::str_utils::truncate_str_ellipsis;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -190,7 +191,7 @@ async fn handle_scan(
     );
 
     // Run the file-system scan on a blocking thread to avoid holding the async executor
-    let surface = tokio::task::spawn_blocking(move || {
+    let surface = spawn_blocking_tracked(move || {
         scan_codebase(
             &project_root,
             &src_tauri,

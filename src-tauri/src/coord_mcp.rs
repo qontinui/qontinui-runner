@@ -61,6 +61,7 @@
 //!   where the machine cannot state its tenant by any route, which is refused
 //!   outright (see `session_tenant_or_refuse`).
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -1166,7 +1167,7 @@ pub(crate) fn log_proxy_nonce_rejected(nonce: Option<&str>, cause: &str) {
 pub(crate) fn spawn_log_proxy_nonce_rejected(nonce: Option<&str>, cause: impl Into<String>) {
     let nonce = nonce.map(str::to_owned);
     let cause = cause.into();
-    tokio::task::spawn_blocking(move || log_proxy_nonce_rejected(nonce.as_deref(), &cause));
+    spawn_blocking_tracked(move || log_proxy_nonce_rejected(nonce.as_deref(), &cause));
 }
 
 /// Project the live nonce map down to the DEVICE-only shape the encrypted store
@@ -3140,7 +3141,7 @@ pub(crate) fn resolve_session_tenant(
 pub(crate) async fn session_bearer_and_tenant_or_refuse(
     nonce: Option<String>,
 ) -> Result<(Option<Uuid>, Option<String>), (u16, String)> {
-    match tokio::task::spawn_blocking(move || {
+    match spawn_blocking_tracked(move || {
         session_tenant_or_refuse(nonce.as_deref())
             .map(|t| (t, crate::auth::device_bearer_for(t.as_ref())))
     })
@@ -3777,7 +3778,7 @@ pub(crate) async fn read_usable_device_jwt() -> Option<String> {
 /// than silently acting as the default tenant. `None` ⇒ legacy default slot
 /// (the pre-B3 behavior every existing default-binding session relies on).
 pub(crate) async fn read_usable_device_jwt_for(tenant: Option<Uuid>) -> Option<String> {
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_tracked(move || {
         // Phase 1a: the freshness test applies to the token this actually
         // RETURNS. It used to gate on `AuthManager::device_jwt_needs_refresh()`,
         // which reads the LEGACY `access_token` slot only, and then return

@@ -666,6 +666,7 @@ use display::DisplayProcessor;
 use doctor::{start_doctor_async, DoctorConfig};
 use error_monitor::{start_error_monitor_async, ErrorMonitorConfig};
 use logging::{init_logging, setup_panic_handler, LoggingConfig};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Arc, Mutex};
 use storage::LocalStorage;
@@ -5153,7 +5154,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Refreshing Claude account usage snapshot at startup...");
                 commands::ai_settings::refresh_account_usage_snapshot().await;
                 info!("Running account selection at startup...");
-                tokio::task::spawn_blocking(ai_provider::pick_best_account)
+                spawn_blocking_tracked(ai_provider::pick_best_account)
                     .await
                     .ok();
 
@@ -5213,7 +5214,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     "Port {} still in use, waiting up to 5 s for instance '{}'",
                                     config.port, config.name
                                 );
-                                let free = tokio::task::spawn_blocking({
+                                let free = spawn_blocking_tracked({
                                     let port = config.port;
                                     move || instance_manager::wait_for_port_free(
                                         port,

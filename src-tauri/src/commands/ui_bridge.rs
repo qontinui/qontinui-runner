@@ -41,6 +41,7 @@ use tracing::{error, info};
 // `ui_bridge_run_exploration` uses multi-State (Bridge + Health).
 use super::compartments::BridgeCompartment;
 use super::CommandResponse;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // Re-export wire-format DTOs from qontinui-types (canonical source of truth).
 pub use qontinui_types::ui_bridge::{
@@ -349,7 +350,7 @@ pub async fn ui_bridge_discover_states_from_fingerprints(
     info!("UI Bridge: Discovering states from fingerprints (Rust)");
 
     // Run on a blocking thread since the discovery may be CPU-intensive
-    tokio::task::spawn_blocking(move || -> Result<CommandResponse, AppError> {
+    spawn_blocking_tracked(move || -> Result<CommandResponse, AppError> {
         // Deserialize the co-occurrence export — serde_json::Error converts via `?`.
         let export: crate::exploration::types::CooccurrenceExport =
             serde_json::from_value(cooccurrence_export)?;
@@ -492,7 +493,7 @@ pub async fn ui_bridge_run_exploration(
         format!("http://localhost:{}", port)
     };
 
-    tokio::task::spawn_blocking(move || -> Result<CommandResponse, String> {
+    spawn_blocking_tracked(move || -> Result<CommandResponse, String> {
         let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
             bridge_compartment.extraction_executor(),
             "extraction_executor",
@@ -562,7 +563,7 @@ pub async fn ui_bridge_stop_exploration(
 
     let bridge_compartment = state.inner().clone();
 
-    let response_result = tokio::task::spawn_blocking(
+    let response_result = spawn_blocking_tracked(
         move || -> Result<crate::executor::lifecycle::CommandResponseResult, String> {
             let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
                 bridge_compartment.extraction_executor(),

@@ -14,6 +14,7 @@ use crate::commands::ai_generation::build_provider_settings;
 use crate::executor::with_default_bridge;
 use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Request Types
@@ -152,7 +153,7 @@ pub async fn generate_test_handler(
     let provider_settings = build_provider_settings(&ai_settings);
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": request.user_prompt,
             "test_type": request.test_type,
@@ -204,7 +205,7 @@ pub async fn generate_shell_command_handler(
     let provider_settings = build_provider_settings(&ai_settings);
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": request.user_prompt,
             "target_os": request.target_os,
@@ -255,7 +256,7 @@ pub async fn generate_api_request_handler(
     let provider_settings = build_provider_settings(&ai_settings);
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": request.user_prompt,
             "base_url": request.base_url,
@@ -302,7 +303,7 @@ pub async fn generate_context_handler(
     let provider_settings = build_provider_settings(&ai_settings);
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": request.user_prompt,
             "ai_provider": ai_provider,
@@ -349,7 +350,7 @@ pub async fn generate_prompt_handler(
     let provider_settings = build_provider_settings(&ai_settings);
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": request.user_prompt,
             "mode": request.mode,
@@ -396,7 +397,7 @@ pub async fn generate_macro_handler(
     let provider_settings = build_provider_settings(&ai_settings);
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": request.user_prompt,
             "category": request.category.unwrap_or_else(|| "general".to_string()),
@@ -443,7 +444,7 @@ pub async fn generate_prompt_snippet_handler(
     let provider_settings = build_provider_settings(&ai_settings);
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": request.user_prompt,
             "language": request.language.unwrap_or_else(|| "python".to_string()),
@@ -493,7 +494,7 @@ pub async fn suggest_check_groups_handler(
     let provider_settings = build_provider_settings(&ai_settings);
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_prompt": request.user_prompt,
             "existing_checks": request.existing_checks,
@@ -540,7 +541,7 @@ pub async fn suggest_exploration_strategy_handler(
     let provider_settings = build_provider_settings(&ai_settings);
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let params = serde_json::json!({
             "user_goal": request.user_goal,
             "config_path": request.config_path,

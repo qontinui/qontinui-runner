@@ -13,6 +13,7 @@ use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
 use crate::timeout_config::Timeouts;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Types
@@ -373,7 +374,7 @@ pub async fn load_rag_project(
     let config_path_str = config_path.to_string_lossy().to_string();
     let app_state = state.app_state.clone();
 
-    let load_result = tokio::task::spawn_blocking(move || {
+    let load_result = spawn_blocking_tracked(move || {
         crate::mcp::misc::load_config_internal(&app_state, &config_path_str)
     })
     .await
@@ -502,7 +503,7 @@ pub async fn segment_screenshot(
     });
 
     // Use spawn_blocking for the synchronous bridge operation
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());

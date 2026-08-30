@@ -17,6 +17,7 @@ use tauri::State;
 use tracing::{error, info, warn};
 
 use super::CommandResponse;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Load a configuration file from the specified path.
 ///
@@ -108,7 +109,7 @@ pub async fn load_configuration(
             let path_clone = path.clone();
             let debug_settings = settings::get_debug_settings();
 
-            tokio::task::spawn_blocking(move || {
+            spawn_blocking_tracked(move || {
                 // First send debug settings to ensure they're applied before config execution
                 let _ = manager_clone.with_default_bridge(|bridge| {
                     if let Err(e) = bridge.set_debug_settings(

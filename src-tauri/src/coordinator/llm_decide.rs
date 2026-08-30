@@ -171,6 +171,10 @@ pub(crate) async fn maybe_decide_with_llm(
     // tokio reactor for the 5–60s round-trip. (Reference template:
     // `script_emitter.rs:302-315`.)
     let join_result = tauri::async_runtime::spawn_blocking(move || {
+        // Counted for the wedge diagnostics' blocking-pool saturation figure.
+        // `tauri::async_runtime::spawn_blocking` delegates to tokio's pool, so an
+        // uncounted body here would make "N/512 slots in use" undercount.
+        let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
         claude_api_warm::run_claude_api_warm_with_structured_output(
             &system_prefix,
             &user_message,

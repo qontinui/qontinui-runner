@@ -18,6 +18,7 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::str_utils::truncate_str;
 use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::workflow_generation;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GenerateWorkflowAsyncResponse {
@@ -855,7 +856,7 @@ pub async fn generate_unified_workflow_handler(
     // See transcript.rs rationale — thread AppState for brief-mode port.
     let app_state_for_gen = state.app_state.clone();
 
-    let (result, artifact) = tokio::task::spawn_blocking(move || {
+    let (result, artifact) = spawn_blocking_tracked(move || {
         let (response, artifact) = workflow_generation::generate_workflow(
             request,
             doctor_handle.as_ref(),

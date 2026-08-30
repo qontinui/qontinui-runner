@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::database::pg::PgDb;
 use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Default lookback window for derivation, in days. 90 d matches the design
 /// doc's chosen decay window — observations older than this are treated as
@@ -179,7 +180,7 @@ pub async fn derive(
     //    `auto_load_default_state_machine` — spawn_blocking around the
     //    synchronous `with_default_bridge` helper.
     let app_state_for_bridge = app_state.clone();
-    let dispatch = tokio::task::spawn_blocking(move || {
+    let dispatch = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state_for_bridge, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());

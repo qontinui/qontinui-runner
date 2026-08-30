@@ -216,6 +216,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use super::census::{is_junction, qontinui_root};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Env flag arming destructive removal. Unset/false → dry-run (log only).
 pub const REAP_ENABLED_ENV: &str = "COORD_ORPHAN_TARGET_REAP_ENABLED";
@@ -1773,7 +1774,7 @@ pub fn spawn_orphan_reaper() {
                 );
                 continue;
             }
-            if let Err(e) = tokio::task::spawn_blocking(tick_once).await {
+            if let Err(e) = spawn_blocking_tracked(tick_once).await {
                 warn!("orphan_target_reaper: cycle task panicked/cancelled: {e}");
             }
         }
