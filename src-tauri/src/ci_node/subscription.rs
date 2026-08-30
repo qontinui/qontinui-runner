@@ -297,18 +297,14 @@ mod tests {
     #[test]
     fn ci_ws_url_agrees_with_the_spawn_gate_on_every_tier() {
         let _g = crate::test_env::env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(&[
-            "COORD_HTTP_URL",
-            "QONTINUI_ENV",
-            "QONTINUI_CONFIG_DIR",
-            // The tier is no longer a pure function of settings.json:
-            // `profiles::read_runner_tier` also probes `paired_user.json`
-            // (`pair::device_is_paired`) — a paired device is bound to a
-            // Qontinui account, which is what Tier 2 means. Unpinned, the
-            // `tier: "local"` case below reads the DEVELOPER's real pairing
-            // state and resolves to `qontinui_account`.
-            "QONTINUI_SECURE_STORAGE_DIR",
-        ]);
+        // The tier is not a pure function of settings.json: it also reads
+        // pairing state (`paired_user.json`, under
+        // `QONTINUI_SECURE_STORAGE_DIR`) and — because `read_runner_tier` is the
+        // PROCESS reader — `QONTINUI_SERVER_MODE`. Unpinned, the `tier: "local"`
+        // case below resolves `qontinui_account` on a developer box that is
+        // paired or headless. `crate::test_env` pins the whole set from the
+        // lib's own declaration (`profiles::COORD_BASE_ENV_KEYS`).
+        let _restore = crate::test_env::capture_coord_env();
         let device = uuid::Uuid::nil();
         // (settings.json body, expected ws url)
         let cases: [(&str, Option<String>); 3] = [
@@ -325,12 +321,7 @@ mod tests {
         ];
         for (settings, expected) in cases {
             let dir = tempfile::tempdir().unwrap();
-            std::env::remove_var("COORD_HTTP_URL");
-            std::env::set_var("QONTINUI_ENV", "__qontinui_test_no_such_profile__");
-            std::env::set_var("QONTINUI_CONFIG_DIR", dir.path());
-            // Empty dir ⇒ no `paired_user.json` ⇒ not paired.
-            std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir.path());
-            std::fs::write(dir.path().join("settings.json"), settings).unwrap();
+            crate::test_env::isolate_coord_env(dir.path(), settings);
 
             let gate = qontinui_runner_lib::profiles::connected_coord_base();
             let ws = ci_ws_url(device);
