@@ -1164,7 +1164,7 @@ impl PgDb {
         conn.execute(
             r#"INSERT INTO execution_state_snapshots
                (execution_id, span_id, snapshot_ts, state_type, summary, context_json)
-               VALUES ($1, $2, $3::timestamptz, $4, $5, $6)"#,
+               VALUES ($1, $2, $3::text::timestamptz, $4, $5, $6)"#,
             &[
                 &execution_id as &(dyn tokio_postgres::types::ToSql + Sync),
                 &span_id,

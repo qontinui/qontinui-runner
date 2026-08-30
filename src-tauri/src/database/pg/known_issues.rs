@@ -187,8 +187,8 @@ impl PgDb {
                 $11, $12, $13, $14,
                 $15, $16, $17, $18,
                 $19, $20,
-                $21, $22, $23, NULL,
-                NULL, $24::TIMESTAMPTZ, $24::TIMESTAMPTZ
+                $21, $22, $23::TEXT::TIMESTAMPTZ, NULL,
+                NULL, $24::TEXT::TIMESTAMPTZ, $24::TEXT::TIMESTAMPTZ
             )
             "#,
             &[
@@ -355,8 +355,8 @@ impl PgDb {
                 confidence = $15,
                 verification_hint = $16,
                 verification_step_template = $17,
-                resolved_at = $18,
-                updated_at = $19::TIMESTAMPTZ
+                resolved_at = $18::TEXT::TIMESTAMPTZ,
+                updated_at = $19::TEXT::TIMESTAMPTZ
             WHERE id = $1
             "#,
             &[
@@ -400,7 +400,7 @@ impl PgDb {
         conn.execute(
             r#"UPDATE known_issues
                SET times_checked = COALESCE(times_checked, 0) + 1,
-                   last_checked_at = $2, updated_at = $2
+                   last_checked_at = $2::TEXT::TIMESTAMPTZ, updated_at = $2::TEXT::TIMESTAMPTZ
                WHERE id = $1"#,
             &[&id, &now],
         )
@@ -420,7 +420,7 @@ impl PgDb {
         conn.execute(
             r#"UPDATE known_issues
                SET times_detected = COALESCE(times_detected, 0) + 1,
-                   last_detected_at = $2, updated_at = $2
+                   last_detected_at = $2::TEXT::TIMESTAMPTZ, updated_at = $2::TEXT::TIMESTAMPTZ
                WHERE id = $1"#,
             &[&id, &now],
         )
@@ -461,7 +461,7 @@ impl PgDb {
         if new_confidence < AUTO_RESOLVE_THRESHOLD {
             conn.execute(
                 r#"UPDATE known_issues
-                   SET confidence = $2, status = 'resolved', resolved_at = $3, updated_at = $3
+                   SET confidence = $2, status = 'resolved', resolved_at = $3::TEXT::TIMESTAMPTZ, updated_at = $3::TEXT::TIMESTAMPTZ
                    WHERE id = $1"#,
                 &[&id, &new_confidence, &now],
             )
@@ -469,7 +469,7 @@ impl PgDb {
             .map_err(|e| format!("PG auto-resolve known issue: {}", e))?;
         } else {
             conn.execute(
-                r#"UPDATE known_issues SET confidence = $2, updated_at = $3 WHERE id = $1"#,
+                r#"UPDATE known_issues SET confidence = $2, updated_at = $3::TEXT::TIMESTAMPTZ WHERE id = $1"#,
                 &[&id, &new_confidence, &now],
             )
             .await
@@ -513,9 +513,9 @@ impl PgDb {
                 r#"
                 UPDATE known_issues
                 SET status = 'resolved',
-                    resolved_at = $2,
+                    resolved_at = $2::TEXT::TIMESTAMPTZ,
                     description = description || E'\n\n' || 'Resolution: ' || $3,
-                    updated_at = $2
+                    updated_at = $2::TEXT::TIMESTAMPTZ
                 WHERE id = $1
                 "#,
                 &[&id, &now, &note],
@@ -527,8 +527,8 @@ impl PgDb {
                 r#"
                 UPDATE known_issues
                 SET status = 'resolved',
-                    resolved_at = $2,
-                    updated_at = $2
+                    resolved_at = $2::TEXT::TIMESTAMPTZ,
+                    updated_at = $2::TEXT::TIMESTAMPTZ
                 WHERE id = $1
                 "#,
                 &[&id, &now],
@@ -664,7 +664,7 @@ impl PgDb {
             ) VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7, $8,
-                $9, $10, $11::TIMESTAMPTZ, $11::TIMESTAMPTZ
+                $9, $10, $11::TEXT::TIMESTAMPTZ, $11::TEXT::TIMESTAMPTZ
             )
             "#,
             &[

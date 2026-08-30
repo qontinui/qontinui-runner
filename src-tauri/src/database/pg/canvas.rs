@@ -20,7 +20,7 @@ impl PgDb {
         conn.execute(
             r#"
             INSERT INTO canvas_panels (id, task_run_id, component, title, data_json, priority, size, group_name, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::TIMESTAMPTZ, $10::TIMESTAMPTZ)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::TEXT::TIMESTAMPTZ, $10::TEXT::TIMESTAMPTZ)
             ON CONFLICT(id) DO UPDATE SET
                 component = $3,
                 title = $4,
@@ -28,7 +28,7 @@ impl PgDb {
                 priority = $6,
                 size = $7,
                 group_name = $8,
-                updated_at = $10::TIMESTAMPTZ
+                updated_at = $10::TEXT::TIMESTAMPTZ
             "#,
             &[
                 &panel.panel_id as &(dyn tokio_postgres::types::ToSql + Sync),

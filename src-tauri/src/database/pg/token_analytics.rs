@@ -237,7 +237,7 @@ impl PgDb {
                     COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read,
                     COALESCE(SUM(cost_cents), 0)::bigint as cost_cents
                 FROM phase_token_usage
-                WHERE created_at > $1::timestamptz
+                WHERE created_at > $1::text::timestamptz
                 GROUP BY phase
                 ORDER BY cost_cents DESC"#,
                 &[&since],
@@ -309,7 +309,7 @@ impl PgDb {
                     COALESCE(SUM(cache_creation_tokens), 0)::float8 as total_cache_create,
                     COALESCE(SUM(input_tokens), 0)::float8 as total_input
                 FROM phase_token_usage
-                WHERE model_used = $1 AND created_at >= $2::timestamptz",
+                WHERE model_used = $1 AND created_at >= $2::text::timestamptz",
                 &[&model_id, &period_start],
             )
             .await

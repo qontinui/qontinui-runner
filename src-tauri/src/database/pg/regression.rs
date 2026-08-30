@@ -144,7 +144,7 @@ impl PgDb {
                 started_at, completed_at, run_result_json, drift_report_json
             ) VALUES (
                 $1, $2, $3, $4, $5,
-                $6::timestamptz, $7::timestamptz, $8::jsonb, $9::jsonb
+                $6::text::timestamptz, $7::text::timestamptz, $8::jsonb, $9::jsonb
             )
             "#,
             &[
